@@ -1,0 +1,13 @@
+[package]
+name = "devflow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "DevFlow CLI — agent-agnostic development workflow automation"
+
+[dependencies]
+devflow-core = { path = "../devflow-core" }
+clap.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true
