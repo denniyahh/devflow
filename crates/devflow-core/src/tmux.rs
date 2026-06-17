@@ -18,6 +18,9 @@ pub enum TmuxError {
 }
 
 /// Launch an agent in a detached tmux session and return the session name.
+///
+/// The agent command runs as the session's main process. When the agent exits,
+/// tmux automatically destroys the session — no send-keys or persistent shell.
 pub fn launch_agent(state: &State) -> Result<String, TmuxError> {
     let session = state.tmux_session_name();
     if agent_running(&session)? {
@@ -25,22 +28,13 @@ pub fn launch_agent(state: &State) -> Result<String, TmuxError> {
     }
 
     let root = state.project_root.to_str().ok_or(TmuxError::NonUtf8Path)?;
+    let command = state.agent.launch_command(root, state.phase);
     let status = Command::new("tmux")
-        .args(["new-session", "-d", "-s", &session, "sh"])
+        .args(["new-session", "-d", "-s", &session, &command])
         .status()?;
     if !status.success() {
         return Err(TmuxError::Command(format!(
             "new-session exited with {status}"
-        )));
-    }
-
-    let command = state.agent.launch_command(root);
-    let status = Command::new("tmux")
-        .args(["send-keys", "-t", &session, &command, "C-m"])
-        .status()?;
-    if !status.success() {
-        return Err(TmuxError::Command(format!(
-            "send-keys exited with {status}"
         )));
     }
 

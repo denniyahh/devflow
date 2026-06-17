@@ -114,12 +114,12 @@ impl Agent {
     }
 
     /// The shell command to launch this agent inside a tmux session.
-    pub fn launch_command(self, project_root: &str) -> String {
+    pub fn launch_command(self, project_root: &str, phase: u32) -> String {
         let root = shell_quote(project_root);
         match self {
             Agent::Claude => format!("cd {root} && claude --dangerously-skip-permissions"),
             Agent::Omx => format!("cd {root} && omx exec --full-auto --sandbox danger-full-access"),
-            Agent::Codex => format!("cd {root} && codex exec --full-auto"),
+            Agent::Codex => format!("cd {root} && codex exec --sandbox workspace-write \"Work on phase {phase} of this project. Read AGENTS.md, CLAUDE.md, and the .planning/ directory to understand the current state and what needs to be done.\""),
             Agent::OpenCode => format!("cd {root} && opencode run"),
         }
     }
