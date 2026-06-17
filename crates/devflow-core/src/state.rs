@@ -119,7 +119,9 @@ impl Agent {
         match self {
             Agent::Claude => format!("cd {root} && claude --dangerously-skip-permissions"),
             Agent::Omx => format!("cd {root} && omx exec --full-auto --sandbox danger-full-access"),
-            Agent::Codex => format!("cd {root} && codex exec --sandbox workspace-write \"Work on phase {phase} of this project. Read AGENTS.md, CLAUDE.md, and the .planning/ directory to understand the current state and what needs to be done.\""),
+            Agent::Codex => format!(
+                "cd {root} && codex exec --sandbox workspace-write \"Work on phase {phase} of this project. Read AGENTS.md, CLAUDE.md, and the .planning/ directory to understand the current state and what needs to be done.\""
+            ),
             Agent::OpenCode => format!("cd {root} && opencode run"),
         }
     }

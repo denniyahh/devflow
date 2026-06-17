@@ -34,10 +34,7 @@ pub enum MonitorError {
 /// Returns the PID of the spawned monitor.
 pub fn spawn_monitor(state: &State) -> Result<u32, MonitorError> {
     let session_name = state.tmux_session_name();
-    let session = state
-        .tmux_session
-        .as_deref()
-        .unwrap_or(&session_name);
+    let session = state.tmux_session.as_deref().unwrap_or(&session_name);
 
     let project_root = state
         .project_root

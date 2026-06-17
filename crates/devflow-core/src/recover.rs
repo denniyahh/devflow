@@ -5,7 +5,7 @@
 //! offers to clean up / restart.
 
 use crate::state::State;
-use crate::workflow::{self, load_state, WorkflowError};
+use crate::workflow::{self, WorkflowError, load_state};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 

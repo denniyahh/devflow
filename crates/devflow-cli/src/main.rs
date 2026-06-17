@@ -175,16 +175,17 @@ fn check(project_root: &Path) -> Result<(), CliError> {
     let state = workflow::load_state(project_root)?;
 
     if state.step == Step::Executing
-        && let Some(session) = &state.tmux_session {
-            match tmux::agent_running(session) {
-                Ok(true) => {
-                    println!("agent still running in tmux session: {session}");
-                    return Ok(());
-                }
-                Ok(false) => println!("agent session ended: {session}"),
-                Err(err) => println!("warning: could not inspect tmux session: {err}"),
+        && let Some(session) = &state.tmux_session
+    {
+        match tmux::agent_running(session) {
+            Ok(true) => {
+                println!("agent still running in tmux session: {session}");
+                return Ok(());
             }
+            Ok(false) => println!("agent session ended: {session}"),
+            Err(err) => println!("warning: could not inspect tmux session: {err}"),
         }
+    }
 
     let result = workflow::advance_state(state, &config)?;
     println!("{}", result.message);
@@ -286,7 +287,11 @@ fn recover_cmd(project_root: &Path, do_clean: bool) -> Result<(), CliError> {
             println!("no state to recover — project is idle");
             return Ok(());
         }
-        Err(err) => return Err(CliError::Message(format!("recover inspection failed: {err}"))),
+        Err(err) => {
+            return Err(CliError::Message(format!(
+                "recover inspection failed: {err}"
+            )));
+        }
     };
 
     println!("phase: {}", status.state.phase);

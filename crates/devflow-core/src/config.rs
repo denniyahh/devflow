@@ -122,7 +122,6 @@ fn default_auto_version() -> String {
     "patch".into()
 }
 
-
 impl Default for VersionConfig {
     fn default() -> Self {
         VersionConfig {

@@ -13,10 +13,7 @@ use std::path::{Path, PathBuf};
 pub enum LockError {
     /// Lock file already exists — another process holds it.
     #[error("lock already held by pid {pid} at {path}")]
-    Contended {
-        pid: String,
-        path: PathBuf,
-    },
+    Contended { pid: String, path: PathBuf },
     /// Filesystem operation failed.
     #[error("lock I/O failed: {0}")]
     Io(#[from] io::Error),
