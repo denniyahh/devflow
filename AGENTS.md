@@ -62,22 +62,25 @@ git_flow:
 
 ## What's Already Done
 
-The workspace is scaffolded:
-- `Cargo.toml` (workspace root)
-- `crates/devflow-core/` — library with `Cargo.toml`, `src/lib.rs`, `src/state.rs`, `src/config.rs`
-- `crates/devflow-cli/` — binary with `Cargo.toml`, empty `src/main.rs`
+- **Core library** (`devflow-core`): State machine, config, git flow, tmux launcher, monitor daemon, version bumper, error recovery, lock file, workflow persistence — 1,278 lines across 10 modules
+- **CLI binary** (`devflow-cli`): Full CLI with all 6 commands — 318 lines in `src/main.rs`
+- **Agent launch**: Agent command runs as tmux main process (session auto-dies on exit, monitor detects completion)
+- **Monitor**: Background daemon with SIGTERM handling, auto-advances state machine on agent exit
+- **Recovery**: `devflow recover` with stale state detection (>24h + no tmux session)
+- **Lock file**: Prevents concurrent `devflow check` invocations
+- **Version bumper**: Reads/writes version from `pyproject.toml` / `Cargo.toml` / `package.json`
+- **Tests**: Unit tests for state machine, config, lock, version bumper, workflow persistence; integration tests for git flow and tmux (in progress)
 
-The state machine (`state.rs`) has:
-- `Step` enum: Idle, Branching, Executing, Verifying, Docsing, Shipping, Cleaning
-- `State` struct: step, phase, agent, tmux_session, monitor_pid, started_at, project_root
-- `Agent` enum: Claude, Omx, Codex, OpenCode
-- Agent `launch_command()` method
-- `State::advance()` → next step
+## What Needs to Be Built
 
-The config (`config.rs`) has:
-- Full `Config` struct with defaults
-- `Config::load()` from `.devflow.yaml`
-- `Config::should_skip()` for automation toggles
+See `.planning/ROADMAP.md` for the current 6-phase plan. Highest priority items:
+
+- **CI pipeline** (Phase 1 — in progress)
+- **Test coverage** >60% (Phase 1 — in progress)
+- **Cargo.toml version support** (Phase 2)
+- **Verify/docs execution** (Phase 3)
+- **Hermes skill** (Phase 4)
+- **Agent trait refactor** (Phase 5)
 
 ## What Needs to Be Built
 

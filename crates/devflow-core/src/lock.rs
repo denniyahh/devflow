@@ -28,7 +28,13 @@ pub enum LockError {
 /// that releases the lock when dropped.
 pub fn acquire(project_root: &Path) -> Result<LockGuard, LockError> {
     let path = lock_path(project_root);
-    fs::create_dir_all(path.parent().unwrap())?;
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "lock path has no parent directory",
+        )
+    })?;
+    fs::create_dir_all(parent)?;
 
     match File::create_new(&path) {
         Ok(mut f) => {

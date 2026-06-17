@@ -9,6 +9,7 @@ use std::path::Path;
 /// Project-level configuration read from `.devflow.yaml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub struct Config {
     /// Version management settings.
     #[serde(default)]
@@ -121,15 +122,6 @@ fn default_auto_version() -> String {
     "patch".into()
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Config {
-            version: VersionConfig::default(),
-            automation: AutomationConfig::default(),
-            git_flow: GitFlowConfig::default(),
-        }
-    }
-}
 
 impl Default for VersionConfig {
     fn default() -> Self {

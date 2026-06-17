@@ -95,10 +95,10 @@ pub fn is_stale_state(state: &State) -> bool {
     }
 
     // Only stale if the agent session is gone
+    #[allow(clippy::collapsible_if)]
     if let Some(session) = &state.tmux_session {
-        match crate::tmux::agent_running(session) {
-            Ok(true) => return false,
-            Ok(false) | Err(_) => {}
+        if crate::tmux::agent_running(session).unwrap_or(false) {
+            return false;
         }
     }
 

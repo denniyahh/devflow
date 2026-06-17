@@ -174,8 +174,8 @@ fn check(project_root: &Path) -> Result<(), CliError> {
     let config = Config::load(project_root)?;
     let state = workflow::load_state(project_root)?;
 
-    if state.step == Step::Executing {
-        if let Some(session) = &state.tmux_session {
+    if state.step == Step::Executing
+        && let Some(session) = &state.tmux_session {
             match tmux::agent_running(session) {
                 Ok(true) => {
                     println!("agent still running in tmux session: {session}");
@@ -185,7 +185,6 @@ fn check(project_root: &Path) -> Result<(), CliError> {
                 Err(err) => println!("warning: could not inspect tmux session: {err}"),
             }
         }
-    }
 
     let result = workflow::advance_state(state, &config)?;
     println!("{}", result.message);
