@@ -1,2 +1,25 @@
+# Build artifacts
 /target
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Agent runtimes (local state, not project code)
 .omx/
+.claude/
+.codex/
+.opencode/
+.gemini/
+
+# DevFlow own state (dogfooding)
+.devflow/state.json
+.devflow/lock
+.planning/
