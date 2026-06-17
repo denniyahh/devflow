@@ -5,7 +5,9 @@
 
 pub mod config;
 pub mod git;
+pub mod lock;
 pub mod monitor;
+pub mod recover;
 pub mod state;
 pub mod tmux;
 pub mod version;

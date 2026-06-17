@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use devflow_core::config::Config;
 use devflow_core::git::GitFlow;
 use devflow_core::state::{Agent, State, Step};
-use devflow_core::{monitor, tmux, version, workflow};
+use devflow_core::{lock, monitor, recover, tmux, version, workflow};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Parser)]
@@ -66,6 +66,15 @@ enum Command {
         #[arg(default_value = ".")]
         project: PathBuf,
     },
+    /// Recover or inspect stale/abandoned workflow state.
+    Recover {
+        /// Project root.
+        #[arg(default_value = ".")]
+        project: PathBuf,
+        /// Clean up the stale state instead of just inspecting.
+        #[arg(long)]
+        clean: bool,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -74,6 +83,8 @@ enum CliError {
     Config(#[from] devflow_core::config::ConfigError),
     #[error(transparent)]
     Workflow(#[from] devflow_core::workflow::WorkflowError),
+    #[error(transparent)]
+    Recover(#[from] devflow_core::recover::RecoverError),
     #[error(transparent)]
     Git(#[from] devflow_core::git::GitError),
     #[error(transparent)]
@@ -106,6 +117,7 @@ fn run() -> Result<(), CliError> {
         Command::Ship { project } => ship(&project_root(project)?),
         Command::Init { project, force } => init(&project_root(project)?, force),
         Command::Config { project } => show_config(&project_root(project)?),
+        Command::Recover { project, clean } => recover_cmd(&project_root(project)?, clean),
     }
 }
 
@@ -149,6 +161,16 @@ fn start(project_root: &Path, phase: u32, agent: Agent, use_monitor: bool) -> Re
 }
 
 fn check(project_root: &Path) -> Result<(), CliError> {
+    let _lock = match lock::acquire(project_root) {
+        Ok(guard) => Some(guard),
+        Err(lock::LockError::Contended { pid, path: _ }) => {
+            return Err(CliError::Message(format!(
+                "another devflow process (pid {pid}) is already running — \
+                 if this is stale, run `devflow recover --clean`"
+            )));
+        }
+        Err(err) => return Err(CliError::Message(format!("lock error: {err}"))),
+    };
     let config = Config::load(project_root)?;
     let state = workflow::load_state(project_root)?;
 
@@ -250,6 +272,45 @@ fn project_root(project: PathBuf) -> Result<PathBuf, CliError> {
             project.display()
         )))
     }
+}
+
+fn recover_cmd(project_root: &Path, do_clean: bool) -> Result<(), CliError> {
+    if do_clean {
+        recover::clean(project_root)?;
+        println!("cleaned up abandoned workflow state");
+        return Ok(());
+    }
+
+    let status = match recover::inspect(project_root) {
+        Ok(s) => s,
+        Err(recover::RecoverError::NothingToRecover) => {
+            println!("no state to recover — project is idle");
+            return Ok(());
+        }
+        Err(err) => return Err(CliError::Message(format!("recover inspection failed: {err}"))),
+    };
+
+    println!("phase: {}", status.state.phase);
+    println!("step: {}", status.state.step);
+    println!("agent: {}", status.state.agent.name());
+    println!("started: {}", status.state.started_at);
+    println!("age: {}", status.age);
+    println!("agent_running: {}", status.agent_running);
+    println!("is_stale: {}", status.is_stale);
+    match status.lock_held {
+        Some(pid) => println!("lock_held: pid {pid}"),
+        None => println!("lock_held: none"),
+    }
+
+    if status.is_stale {
+        println!("\nstate is stale — run `devflow recover --clean` to clear it");
+    } else if !status.agent_running {
+        println!("\nagent is not running but state is recent — run `devflow check` to advance");
+    } else {
+        println!("\nagent is still running — no action needed");
+    }
+
+    Ok(())
 }
 
 fn default_config_yaml() -> &'static str {

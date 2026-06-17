@@ -54,8 +54,11 @@ pub fn spawn_monitor(state: &State) -> Result<u32, MonitorError> {
     // Uses a polling loop: check every 30s if the session still exists.
     // When it disappears, run `devflow check` to advance the state machine,
     // then `devflow check` again to run through remaining steps (verify, docs, ship, clean).
+    //
+    // Traps SIGTERM and SIGINT for clean shutdown (no orphaned state).
     let script = format!(
-        "while tmux has-session -t {session} 2>/dev/null; do sleep 30; done; \
+        "cleanup() {{ exit 0; }}; trap cleanup TERM INT; \
+         while tmux has-session -t {session} 2>/dev/null; do sleep 30; done; \
          {binary} check {project_root}; \
          {binary} check {project_root}; \
          {binary} check {project_root}; \
