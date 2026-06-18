@@ -28,6 +28,8 @@ pub enum AgentStatus {
     Success,
     /// Agent self-reported failure, or exit code + commit gate indicated failure.
     Failed,
+    /// Agent stopped because an upstream API or usage quota rate-limited it.
+    RateLimited,
     /// No signal received — fallback to exit code / commit heuristic.
     Unknown,
 }
@@ -66,6 +68,64 @@ pub fn parse_devflow_result(stdout: &str) -> Option<AgentResult> {
     parse_marker_lines(stdout)
 }
 
+/// Detect agent-specific rate-limit output and return the retry description.
+///
+/// Claude can emit a JSON result envelope when run with `--output-format json`;
+/// Codex commonly emits plain text such as "Try again at ...". This function is
+/// intentionally conservative so ordinary progress text does not become a
+/// false positive.
+pub fn detect_rate_limit(stdout: &str) -> Option<String> {
+    detect_claude_rate_limit(stdout).or_else(|| detect_codex_rate_limit(stdout))
+}
+
+fn detect_claude_rate_limit(stdout: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
+    let rate_limited = json_has_str(&value, "subtype", "error_rate_limit")
+        || json_has_i64(&value, "api_error_status", 429)
+        || json_has_i64(&value, "status", 429)
+        || json_has_i64(&value, "status_code", 429);
+    if !rate_limited {
+        return None;
+    }
+    json_find_key(&value, "retry_after")
+        .and_then(json_scalar_to_string)
+        .or_else(|| json_find_key(&value, "message").and_then(json_scalar_to_string))
+        .or_else(|| json_find_key(&value, "error").and_then(json_scalar_to_string))
+        .or_else(|| Some("usage limit".to_string()))
+}
+
+fn detect_codex_rate_limit(stdout: &str) -> Option<String> {
+    let lower = stdout.to_ascii_lowercase();
+    if let Some(idx) = lower.find("try again at ") {
+        let start = idx + "try again at ".len();
+        let retry = stdout[start..]
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .trim_end_matches(|c: char| c == '.' || c == ',' || c == ';')
+            .trim();
+        if !retry.is_empty() {
+            return Some(retry.to_string());
+        }
+    }
+
+    if lower.contains("usage limit") || lower.contains("rate limit") || lower.contains("429") {
+        stdout
+            .lines()
+            .find(|line| {
+                let line = line.to_ascii_lowercase();
+                line.contains("usage limit") || line.contains("rate limit") || line.contains("429")
+            })
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .or_else(|| Some("usage limit".to_string()))
+    } else {
+        None
+    }
+}
+
 /// If `stdout` is a JSON result envelope, return the decoded `result` text
 /// field (with escapes such as `\n` resolved). Returns `None` for plain text.
 fn extract_json_result_text(stdout: &str) -> Option<String> {
@@ -75,6 +135,47 @@ fn extract_json_result_text(stdout: &str) -> Option<String> {
     }
     let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
     value.get("result")?.as_str().map(str::to_string)
+}
+
+fn json_has_str(value: &serde_json::Value, key: &str, expected: &str) -> bool {
+    match value {
+        serde_json::Value::Object(map) => map
+            .iter()
+            .any(|(k, v)| (k == key && v.as_str() == Some(expected)) || json_has_str(v, key, expected)),
+        serde_json::Value::Array(values) => values.iter().any(|v| json_has_str(v, key, expected)),
+        _ => false,
+    }
+}
+
+fn json_has_i64(value: &serde_json::Value, key: &str, expected: i64) -> bool {
+    match value {
+        serde_json::Value::Object(map) => map.iter().any(|(k, v)| {
+            (k == key && v.as_i64() == Some(expected)) || json_has_i64(v, key, expected)
+        }),
+        serde_json::Value::Array(values) => values.iter().any(|v| json_has_i64(v, key, expected)),
+        _ => false,
+    }
+}
+
+fn json_find_key<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(found) = map.get(key) {
+                return Some(found);
+            }
+            map.values().find_map(|v| json_find_key(v, key))
+        }
+        serde_json::Value::Array(values) => values.iter().find_map(|v| json_find_key(v, key)),
+        _ => None,
+    }
+}
+
+fn json_scalar_to_string(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
 }
 
 /// Scan the tail of `stdout` line-by-line for the last DEVFLOW_RESULT marker.
@@ -112,7 +213,15 @@ fn parse_marker_lines(stdout: &str) -> Option<AgentResult> {
 pub fn evaluate_layer1(project_root: &Path, phase: u32) -> Option<AgentResult> {
     let stdout_path = devflow_dir(project_root).join(format!("phase-{:02}-stdout", phase));
     let stdout = std::fs::read_to_string(&stdout_path).ok()?;
-    parse_devflow_result(&stdout)
+    parse_devflow_result(&stdout).or_else(|| {
+        detect_rate_limit(&stdout).map(|retry| AgentResult {
+            status: AgentStatus::RateLimited,
+            exit_code: None,
+            reason: Some(format!("rate limited until {retry}")),
+            commits: None,
+            summary: None,
+        })
+    })
 }
 
 /// Layer 2: Use exit code + commit count to determine result.
@@ -433,6 +542,55 @@ mod tests {
     fn parse_json_envelope_without_marker_returns_none() {
         let stdout = r#"{"result":"did some work but forgot the marker","session_id":"x"}"#;
         assert!(parse_devflow_result(stdout).is_none());
+    }
+
+    #[test]
+    fn detect_claude_json_rate_limit_by_subtype() {
+        let stdout = r#"{"type":"result","subtype":"error_rate_limit","retry_after":"2026-06-18T15:45:30Z","result":"rate limited"}"#;
+        assert_eq!(
+            detect_rate_limit(stdout).as_deref(),
+            Some("2026-06-18T15:45:30Z")
+        );
+    }
+
+    #[test]
+    fn detect_claude_json_rate_limit_by_429() {
+        let stdout = r#"{"type":"result","api_error_status":429,"error":{"message":"Too many requests. Try later."}}"#;
+        assert_eq!(
+            detect_rate_limit(stdout).as_deref(),
+            Some("Too many requests. Try later.")
+        );
+    }
+
+    #[test]
+    fn detect_codex_try_again_rate_limit() {
+        let stdout = "Usage limit reached. Try again at 3:45 PM.\n";
+        assert_eq!(detect_rate_limit(stdout).as_deref(), Some("3:45 PM"));
+    }
+
+    #[test]
+    fn detect_rate_limit_ignores_normal_stdout() {
+        let stdout = "implemented feature\nDEVFLOW_RESULT: {\"status\":\"success\"}\n";
+        assert!(detect_rate_limit(stdout).is_none());
+    }
+
+    #[test]
+    fn evaluate_layer1_reports_rate_limited_without_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 7),
+            r#"{"type":"result","subtype":"error_rate_limit","retry_after":"2026-06-18T15:45:30Z"}"#,
+        )
+        .unwrap();
+
+        let result = evaluate_layer1(dir.path(), 7).unwrap();
+
+        assert_eq!(result.status, AgentStatus::RateLimited);
+        assert_eq!(
+            result.reason.as_deref(),
+            Some("rate limited until 2026-06-18T15:45:30Z")
+        );
     }
 
     #[test]
