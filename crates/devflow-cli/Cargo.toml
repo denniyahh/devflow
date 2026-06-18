@@ -11,3 +11,6 @@ devflow-core = { path = "../devflow-core" }
 clap.workspace = true
 tracing-subscriber.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

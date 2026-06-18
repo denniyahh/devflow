@@ -551,9 +551,19 @@ fn run_agent_blocking(
     let capture = agent::capture_agent_output(child, phase, project_root)
         .map_err(|err| CliError::Message(format!("failed to capture agent output: {err}")))?;
     println!("agent {agent} exited with code {}", capture.exit_code);
-    Ok(devflow_core::agent_result::parse_devflow_result(
-        &capture.stdout,
-    ))
+    Ok(
+        devflow_core::agent_result::parse_devflow_result(&capture.stdout).or_else(|| {
+            devflow_core::agent_result::detect_rate_limit(&capture.stdout).map(|retry| {
+                devflow_core::agent_result::AgentResult {
+                    status: devflow_core::agent_result::AgentStatus::RateLimited,
+                    exit_code: Some(capture.exit_code),
+                    reason: Some(format!("rate limited until {retry}")),
+                    commits: None,
+                    summary: None,
+                }
+            })
+        }),
+    )
 }
 
 /// Integrate an agent branch into the shared base, pushing if a remote exists.
@@ -578,6 +588,7 @@ fn sequentagent(
     force: bool,
 ) -> Result<(), CliError> {
     let config = Config::load(project_root)?;
+    let _ = devflow_core::ship::delete_cron_instructions(project_root);
     let (agent_a, agent_b) = split_two_agents(agents)?;
     let git = GitFlow::new(project_root, config.git_flow.clone());
     let base = format!("{}phase-{:02}", config.git_flow.feature_prefix, phase);
@@ -608,13 +619,28 @@ fn sequentagent(
 
     // 3. Run agent A; stop before touching B if it fails.
     println!("\n=== agent A: {agent_a} ===");
-    if let Some(result) = run_agent_blocking(project_root, phase, agent_a, &wt_a)?
-        && result.status == devflow_core::agent_result::AgentStatus::Failed
-    {
-        return Err(CliError::Message(format!(
-            "agent A ({agent_a}) failed: {}",
-            result.reason.unwrap_or_else(|| "no details".into())
-        )));
+    if let Some(result) = run_agent_blocking(project_root, phase, agent_a, &wt_a)? {
+        match result.status {
+            devflow_core::agent_result::AgentStatus::Failed => {
+                return Err(CliError::Message(format!(
+                    "agent A ({agent_a}) failed: {}",
+                    result.reason.unwrap_or_else(|| "no details".into())
+                )));
+            }
+            devflow_core::agent_result::AgentStatus::RateLimited => {
+                let retry_after = retry_after_from_reason(result.reason.as_deref());
+                write_rate_limit_cron(project_root, phase, &retry_after, agents)?;
+                let commits = count_commits_between(project_root, &base, &branch_a)?;
+                if commits == 0 {
+                    println!(
+                        "Agent A rate-limited with zero commits; paused and wrote .devflow/cron-instructions.json"
+                    );
+                    return Ok(());
+                }
+                println!("Agent A rate-limited; handing off to agent B");
+            }
+            _ => {}
+        }
     }
     integrate_agent_branch(&git, &base, &branch_a)?;
 
@@ -631,10 +657,19 @@ fn sequentagent(
     // 5. Run agent B and integrate.
     println!("\n=== agent B: {agent_b} ===");
     if let Some(result) = run_agent_blocking(project_root, phase, agent_b, &wt_b)?
-        && result.status == devflow_core::agent_result::AgentStatus::Failed
+        && matches!(
+            result.status,
+            devflow_core::agent_result::AgentStatus::Failed
+                | devflow_core::agent_result::AgentStatus::RateLimited
+        )
     {
+        let label = if result.status == devflow_core::agent_result::AgentStatus::RateLimited {
+            "rate-limited"
+        } else {
+            "failed"
+        };
         return Err(CliError::Message(format!(
-            "agent B ({agent_b}) failed: {}",
+            "agent B ({agent_b}) {label}: {}",
             result.reason.unwrap_or_else(|| "no details".into())
         )));
     }
@@ -642,6 +677,46 @@ fn sequentagent(
 
     println!("\nsequentagent complete — both agents integrated into {base}");
     Ok(())
+}
+
+fn retry_after_from_reason(reason: Option<&str>) -> String {
+    reason
+        .and_then(|s| s.strip_prefix("rate limited until "))
+        .or(reason)
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn write_rate_limit_cron(
+    project_root: &Path,
+    phase: u32,
+    retry_after: &str,
+    agents: &str,
+) -> Result<(), CliError> {
+    let instructions =
+        devflow_core::ship::build_cron_instructions(project_root, phase, retry_after, agents);
+    devflow_core::ship::write_cron_instructions(project_root, &instructions)?;
+    println!("wrote .devflow/cron-instructions.json");
+    Ok(())
+}
+
+fn count_commits_between(project_root: &Path, base: &str, branch: &str) -> Result<u32, CliError> {
+    let range = format!("{base}..{branch}");
+    let output = std::process::Command::new("git")
+        .args(["rev-list", "--count", &range])
+        .current_dir(project_root)
+        .output()
+        .map_err(|err| CliError::Message(format!("could not count commits on {branch}: {err}")))?;
+    if !output.status.success() {
+        return Err(CliError::Message(format!(
+            "could not count commits on {branch}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u32>()
+        .map_err(|err| CliError::Message(format!("invalid commit count for {branch}: {err}")))
 }
 
 /// Add a worktree, turning the "already exists" error into actionable advice.
@@ -789,6 +864,15 @@ fn check(project_root: &Path) -> Result<(), CliError> {
                                 .unwrap_or_else(|| "no details available".into())
                         )));
                     }
+                    devflow_core::agent_result::AgentStatus::RateLimited => {
+                        return Err(CliError::Message(format!(
+                            "phase {} rate-limited: {}",
+                            state.phase,
+                            result
+                                .reason
+                                .unwrap_or_else(|| "no details available".into())
+                        )));
+                    }
                     devflow_core::agent_result::AgentStatus::Unknown => {
                         // Layer 3 fallback — advance with warning.
                         if let Some(ref reason) = result.reason {
@@ -929,7 +1013,21 @@ fn status(project_root: &Path) -> Result<(), CliError> {
     print_open_branches(project_root);
     // Show active git worktrees
     print_worktrees(project_root, current_worktree.as_deref());
+    if let Some(hint) = cron_instruction_hint(project_root) {
+        println!("\n{hint}");
+    }
     Ok(())
+}
+
+fn cron_instruction_hint(project_root: &Path) -> Option<String> {
+    devflow_core::ship::cron_instructions_path(project_root)
+        .exists()
+        .then(|| {
+            format!(
+                "Cron instruction pending: hermes cron create --from-devflow {}",
+                project_root.display()
+            )
+        })
 }
 
 /// Print active phase worktrees with branch and inferred phase/agent.
@@ -1148,6 +1246,7 @@ fn confirm(project_root: &Path) -> Result<(), CliError> {
 
     let _ = workflow::clear_state(project_root);
     devflow_core::ship::delete(project_root)?;
+    let _ = devflow_core::ship::delete_cron_instructions(project_root);
     println!(
         "phase {} confirmed at v{} — ship record cleared",
         record.phase, record.version_to
@@ -1576,5 +1675,37 @@ mod tests {
         assert!(split_two_agents("claude").is_err());
         assert!(split_two_agents("claude,codex,opencode").is_err());
         assert!(split_two_agents("claude,bogus").is_err());
+    }
+
+    #[test]
+    fn retry_after_from_reason_strips_prefix() {
+        assert_eq!(
+            retry_after_from_reason(Some("rate limited until 2026-06-18T15:45:30Z")),
+            "2026-06-18T15:45:30Z"
+        );
+        assert_eq!(retry_after_from_reason(Some("usage limit")), "usage limit");
+        assert_eq!(retry_after_from_reason(None), "unknown");
+    }
+
+    #[test]
+    fn cron_instruction_hint_includes_hermes_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let instructions = devflow_core::ship::build_cron_instructions(
+            dir.path(),
+            7,
+            "2026-06-18T15:45:30Z",
+            "claude,codex",
+        );
+        devflow_core::ship::write_cron_instructions(dir.path(), &instructions).unwrap();
+
+        let hint = cron_instruction_hint(dir.path()).unwrap();
+
+        assert_eq!(
+            hint,
+            format!(
+                "Cron instruction pending: hermes cron create --from-devflow {}",
+                dir.path().display()
+            )
+        );
     }
 }

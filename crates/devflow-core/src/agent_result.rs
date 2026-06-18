@@ -139,9 +139,9 @@ fn extract_json_result_text(stdout: &str) -> Option<String> {
 
 fn json_has_str(value: &serde_json::Value, key: &str, expected: &str) -> bool {
     match value {
-        serde_json::Value::Object(map) => map
-            .iter()
-            .any(|(k, v)| (k == key && v.as_str() == Some(expected)) || json_has_str(v, key, expected)),
+        serde_json::Value::Object(map) => map.iter().any(|(k, v)| {
+            (k == key && v.as_str() == Some(expected)) || json_has_str(v, key, expected)
+        }),
         serde_json::Value::Array(values) => values.iter().any(|v| json_has_str(v, key, expected)),
         _ => false,
     }

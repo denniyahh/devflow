@@ -67,7 +67,8 @@ fn monitor_owns_fake_agent_and_records_devflow_result() {
     // Fake agent: emit the success marker on stdout, then exit 0.
     let args = vec![
         "-c".to_string(),
-        "printf 'work done\\nDEVFLOW_RESULT: {\"status\":\"success\",\"commits\":1}\\n'".to_string(),
+        "printf 'work done\\nDEVFLOW_RESULT: {\"status\":\"success\",\"commits\":1}\\n'"
+            .to_string(),
     ];
 
     spawn_monitor(&state, "sh", &args).expect("spawn monitor");
