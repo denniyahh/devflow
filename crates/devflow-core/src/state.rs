@@ -122,9 +122,33 @@ impl Agent {
     /// user input.
     pub fn exec_command(self, _project_root: &str, phase: u32) -> (&'static str, Vec<String>) {
         let prompt = format!(
-            "Work on phase {phase} of this project. Read AGENTS.md, CLAUDE.md, \
-             and the .planning/ directory to understand the current state and \
-             what needs to be done."
+            "Complete phase {phase} of this project.\n\
+             \n\
+             ## Required Reading\n\
+             1. CLAUDE.md — project conventions, architecture, coding standards\n\
+             2. .planning/ROADMAP.md — what to build and success criteria for phase {phase}\n\
+             3. .planning/phases/{phase:02}-*/CONTEXT.md — phase-specific tasks and notes\n\
+             4. AGENTS.md — agent preferences and tooling\n\
+             \n\
+             ## Process\n\
+             - Read the required files first to understand what needs to be built\n\
+             - Implement the changes described in the phase plan\n\
+             - Run `cargo test` before committing to verify nothing breaks\n\
+             - Run `cargo clippy` to catch common mistakes\n\
+             - Run `cargo fmt` to format code\n\
+             - Commit with descriptive messages explaining what was done\n\
+             - If the phase includes multiple sub-tasks, commit each sub-task separately\n\
+             - When all tasks from CONTEXT.md are complete, commit a final status update\n\
+             \n\
+             ## Available Commands\n\
+             - `cargo test` — run all tests\n\
+             - `cargo clippy -- -D warnings` — lint with strict mode\n\
+             - `cargo fmt -- --check` — verify formatting\n\
+             - `cargo build --release` — production build\n\
+             \n\
+             ## Success\n\
+             The phase is complete when all checklist items in CONTEXT.md are done\n\
+             and all tests pass."
         );
         match self {
             Agent::Claude => (
@@ -331,9 +355,11 @@ mod tests {
         assert!(joined.contains("-p"));
         assert!(joined.contains("--output-format json"));
         assert!(joined.contains("--dangerously-skip-permissions"));
-        assert!(joined.contains("--bare"));
         assert!(joined.contains("--max-turns"));
         assert!(joined.contains("phase 3"));
+        assert!(joined.contains("ROADMAP.md"));
+        assert!(joined.contains("CONTEXT.md"));
+        assert!(joined.contains("cargo test"));
     }
 
     #[test]
