@@ -323,9 +323,8 @@ mod tests {
 
     #[test]
     fn parse_ignores_unknown_keys_and_sections() {
-        let config =
-            parse_config("unknown:\n  foo: bar\nversion:\n  mystery: 1\n  file: x.toml\n")
-                .expect("parse");
+        let config = parse_config("unknown:\n  foo: bar\nversion:\n  mystery: 1\n  file: x.toml\n")
+            .expect("parse");
         assert_eq!(config.version.file, "x.toml");
     }
 

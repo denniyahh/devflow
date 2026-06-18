@@ -182,7 +182,10 @@ mod tests {
     fn bump_none_is_identity() {
         assert_eq!(bump("1.2.3", "none").expect("none"), "1.2.3");
         // "none" short-circuits before any parsing.
-        assert_eq!(bump("not-a-version", "none").expect("none"), "not-a-version");
+        assert_eq!(
+            bump("not-a-version", "none").expect("none"),
+            "not-a-version"
+        );
     }
 
     #[test]

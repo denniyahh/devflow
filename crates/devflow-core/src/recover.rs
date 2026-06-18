@@ -5,7 +5,7 @@
 //! offers to clean up / restart.
 
 use crate::state::State;
-use crate::workflow::{self, load_state, WorkflowError};
+use crate::workflow::{self, WorkflowError, load_state};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -51,7 +51,7 @@ pub fn inspect(project_root: &Path) -> Result<RecoveryStatus, RecoverError> {
         Err(err) => return Err(err.into()),
     };
 
-    let agent_running = state.agent_pid.map_or(false, crate::agent::agent_running);
+    let agent_running = state.agent_pid.is_some_and(crate::agent::agent_running);
     let is_stale = is_stale_state(&state);
     let age = format_age(state.started_at.as_str());
     let lock_held = crate::lock::holder(project_root).map(|(pid, _)| pid);
@@ -89,10 +89,10 @@ pub fn is_stale_state(state: &State) -> bool {
     }
 
     // Only stale if the agent process is gone
-    if let Some(pid) = state.agent_pid {
-        if crate::agent::agent_running(pid) {
-            return false;
-        }
+    if let Some(pid) = state.agent_pid
+        && crate::agent::agent_running(pid)
+    {
+        return false;
     }
 
     true
@@ -116,5 +116,98 @@ fn format_age(started_at: &str) -> String {
         Some(s) if s < 86400 => format!("{}h ago", s / 3600),
         Some(s) => format!("{}d ago", s / 86400),
         None => "unknown".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{Agent, State};
+    use std::path::PathBuf;
+
+    /// Build a state whose `started_at` is `age_secs` in the past.
+    fn state_aged(age_secs: u64, agent_pid: Option<u32>) -> State {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut state = State::new(1, Agent::Claude, PathBuf::from("/tmp/project"));
+        state.started_at = now.saturating_sub(age_secs).to_string();
+        state.agent_pid = agent_pid;
+        state
+    }
+
+    /// A PID that is essentially certain not to map to a live process.
+    const DEAD_PID: u32 = 0x7FFF_FFFE;
+
+    #[test]
+    fn fresh_state_is_not_stale() {
+        // One hour old, well under the 24h threshold.
+        let state = state_aged(3600, None);
+        assert!(!is_stale_state(&state));
+    }
+
+    #[test]
+    fn old_state_with_no_agent_is_stale() {
+        let state = state_aged(STALE_THRESHOLD.as_secs() + 60, None);
+        assert!(is_stale_state(&state));
+    }
+
+    #[test]
+    fn old_state_with_dead_agent_is_stale() {
+        let state = state_aged(STALE_THRESHOLD.as_secs() + 60, Some(DEAD_PID));
+        assert!(is_stale_state(&state));
+    }
+
+    #[test]
+    fn old_state_with_live_agent_is_not_stale() {
+        // Our own PID is guaranteed to be running.
+        let own_pid = std::process::id();
+        let state = state_aged(STALE_THRESHOLD.as_secs() + 60, Some(own_pid));
+        assert!(!is_stale_state(&state));
+    }
+
+    #[test]
+    fn unparseable_timestamp_is_never_stale() {
+        let mut state = State::new(1, Agent::Claude, PathBuf::from("/tmp/project"));
+        state.started_at = "not-a-number".into();
+        assert!(!is_stale_state(&state));
+        assert_eq!(state_age_secs(&state.started_at), None);
+    }
+
+    #[test]
+    fn state_age_secs_parses_epoch() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let started = (now - 120).to_string();
+        let age = state_age_secs(&started).expect("age");
+        // Allow a small window for clock drift during the test.
+        assert!((118..=125).contains(&age), "unexpected age: {age}");
+    }
+
+    #[test]
+    fn format_age_buckets_by_magnitude() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let ago = |secs: u64| format_age(&(now - secs).to_string());
+        assert!(ago(30).ends_with("s ago"));
+        assert!(ago(120).ends_with("m ago"));
+        assert!(ago(7200).ends_with("h ago"));
+        assert!(ago(2 * 86400).ends_with("d ago"));
+        assert_eq!(format_age("garbage"), "unknown");
+    }
+
+    #[test]
+    fn inspect_missing_state_reports_nothing_to_recover() {
+        let dir = std::env::temp_dir().join(format!("devflow-recover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let err = inspect(&dir).expect_err("should have no state");
+        assert!(matches!(err, RecoverError::NothingToRecover));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

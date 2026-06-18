@@ -160,13 +160,7 @@ impl Agent {
                     prompt,
                 ],
             ),
-            Agent::OpenCode => (
-                "opencode",
-                vec![
-                    "run".into(),
-                    prompt,
-                ],
-            ),
+            Agent::OpenCode => ("opencode", vec!["run".into(), prompt]),
         }
     }
 }
