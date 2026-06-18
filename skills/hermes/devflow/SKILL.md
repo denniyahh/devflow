@@ -24,7 +24,6 @@ DevFlow is an agent-agnostic CLI that automates the entire development workflow.
 DevFlow spawns agents as **direct child processes** (no tmux):
 - **Claude:** `claude -p "<prompt>" --output-format json --dangerously-skip-permissions --max-turns 50`
 - **Codex:** `codex exec "<prompt>" --sandbox workspace-write --json`
-- **OMX:** `omx exec "<prompt>" --sandbox workspace-write --json`
 - **OpenCode:** `opencode run "<prompt>"`
 
 Agents run headless — no interactive prompts, no trust dialogs. They produce structured output and exit when done.
@@ -34,7 +33,7 @@ Agents run headless — no interactive prompts, no trust dialogs. They produce s
 - `devflow` binary installed and on PATH
 - Project has `.devflow.yaml` (run `devflow init`)
 - Git flow branches configured (`main` and `develop` exist) — or set `auto_branch: false` for GSD-style workflows
-- Agent CLI tools available on host PATH: `claude`, `codex`, `omx`, `opencode`
+- Agent CLI tools available on host PATH: `claude`, `codex`, `opencode`
 
 ## Workflow
 
@@ -139,7 +138,6 @@ automation:
   docs_auto_commit: false
   continue_on_error: true
 git_flow:
-  enabled: false            # set false for GSD-style workflow
   main: main
   develop: develop
   feature_prefix: feature/
@@ -170,10 +168,8 @@ Codex CLI reads stdin in a loop and `/dev/null` never produces EOF for it. Fix: 
 ### Codex rate limits
 OpenAI Codex CLI has usage caps. If you see "You've hit your usage limit. Try again at XX:XX PM", switch to Claude: `devflow start --phase N --agent claude --monitor`.
 
-Note: Codex and OMX share the same OpenAI API rate limit bucket. If Codex is rate-limited, OMX will also fail.
-
 ### Multi-agent rotation
-When rate limits hit, chain through available providers: Claude (Anthropic) → Codex (OpenAI) → OMX via Fish (OpenAI, shared bucket with Codex). Run phases in parallel when multiple providers are available. OMX requires Fish shell for PATH: `fish -lc 'echo "" | omx exec --sandbox workspace-write --json "prompt"'`.
+When rate limits hit, chain through available providers: Claude (Anthropic) → Codex (OpenAI) → OpenCode. Run phases in parallel when multiple providers are available.
 
 ### `?` operator on Option returns silently fails
 When writing Rust parsing logic inside `Option`-returning functions, never use `?` on methods like `split_once()` — the `?` propagates `None` as the function's return value even when it just means "skip this line." Use `if let` instead. See `references/agent-launch-debugging.md` § Issue 6 for reproduction and fix.

@@ -11,10 +11,6 @@ cargo build
 cargo test
 ```
 
-### Dev Container
-
-A VS Code / GitHub Codespaces dev container is available (`.devcontainer/devcontainer.json`) with Rust and all dependencies pre-installed.
-
 ### Distrobox (optional)
 
 If you use [distrobox](https://github.com/89luca89/distrobox), you can create an isolated environment:
@@ -44,6 +40,26 @@ cargo fmt -- --check
 cargo run -- status
 ```
 
+### Testing notes
+
+The git-flow tests create throwaway fixture repositories. If you sign commits
+or tags globally, disable signing for these fixtures so the tests don't block
+on a GPG prompt. The test harness sets this per-fixture, but if you run any
+manual git steps against a fixture, use:
+
+```bash
+git config commit.gpgsign false
+git config tag.gpgsign false
+```
+
+## Phase Plans (`.planning/`)
+
+DevFlow drives agents from per-phase plans under `.planning/`. The launch prompt
+(`agents::phase_prompt()`) reads `.planning/ROADMAP.md` and
+`.planning/phases/NN-*/CONTEXT.md`, so these files are tracked in the repo — they
+are DevFlow's phase-plan convention, not private scratch. When adding a phase,
+commit its `CONTEXT.md` so agents (and reviewers) can read the plan.
+
 ## Project Structure
 
 ```
@@ -65,10 +81,15 @@ crates/
 1. Fork the repo
 2. Create a feature branch: `git checkout -b feature/my-feature`
 3. Write code, add tests
-4. Ensure `cargo test` passes and `cargo clippy` is clean
+4. Ensure `cargo test` passes and `cargo clippy -- -D warnings` is clean
 5. `cargo fmt`
 6. Submit a PR against `develop`
-7. CI will run tests + clippy + format check
+7. CI runs tests + clippy + format check
+
+Ordinary code contributions need no agent credentials or API keys — the build
+and the full test suite run offline. Agent CLIs (Claude, Codex, OpenCode) are
+only needed to exercise `devflow start` against a live agent, not to build,
+test, or pass CI.
 
 ## Commit Conventions
 
@@ -83,17 +104,24 @@ We use conventional commits:
 
 ## Architecture
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for design documentation (available in v1.2.0).
+See [ARCHITECTURE.md](ARCHITECTURE.md) for design documentation.
 
 ### Adding a New Agent
 
-DevFlow is agent-agnostic. Adding a new agent requires exactly 3 changes:
+DevFlow is agent-agnostic; agent-specific code lives only under
+`crates/devflow-core/src/agents/`. Adding a backend is a short checklist — keep
+these in sync or tests/builds fail:
 
-1. Create a new file in `crates/devflow-core/src/agents/` implementing the `Agent` trait
-2. Add a variant to `AgentKind` enum in `state.rs`
-3. Add an entry to `agents::adapter_for()` match arm
+1. Add an adapter file in `crates/devflow-core/src/agents/` implementing the `Agent` trait
+2. Add a variant to the `AgentKind`/`Agent` enum in `state.rs`
+3. Update the `FromStr` parser, `Display`, and `AgentParseError` text in `state.rs`
+4. Add a match arm in `agents::adapter_for()`
+5. Add the `pub mod` / `pub use` exports in `agents/mod.rs`
+6. Extend tests (adapter name, parser aliases, shared-prompt)
+7. Update docs (README, this file, ARCHITECTURE.md, DEPENDENCIES.md)
 
-That's it. No other files need to change.
+See [ARCHITECTURE.md](ARCHITECTURE.md#extension-points--adding-an-agent) for the
+authoritative version of this checklist.
 
 ## Questions?
 

@@ -2,8 +2,9 @@
 
 **Agent-agnostic development workflow automation.**
 
+[![CI](https://github.com/denniyahh/devflow/actions/workflows/ci.yml/badge.svg)](https://github.com/denniyahh/devflow/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.91%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org)
 
 DevFlow automates the mechanical steps of AI-assisted development — branching, monitoring, verifying, documenting, shipping — so you and your coding agents can focus on building.
 
@@ -64,10 +65,10 @@ crates/
 
 **Key design decisions:**
 
-- **Agent-agnostic** — Claude, Codex, and OpenCode all implement the same `Agent` trait. Adding a new agent takes 3 changes.
+- **Agent-agnostic** — Claude, Codex, and OpenCode all implement the same `Agent` trait. Adding a new agent follows a small checklist (see [ARCHITECTURE.md](ARCHITECTURE.md#extension-points--adding-an-agent)).
 - **Worktree isolation** — agents run in isolated git worktrees (`.worktrees/phase-NN/`), preventing cross-phase contamination.
 - **Monitor daemon** — optional background process detects agent completion and auto-advances the state machine. No cron, no polling, no tmux.
-- **Three-layer evaluation** — agents self-report via `DEVFLOW_RESULT` markers in stdout; fallback layers: exit code, then stdout existence.
+- **Three-layer evaluation** — agents self-report via `DEVFLOW_RESULT` markers in stdout; fallback layers: exit code + commit count, then a commit-count heuristic.
 - **Shared prompts** — all agents receive the same prompt via `phase_prompt()`. No agent-specific prompt logic.
 
 ## Agent Protocol
@@ -83,8 +84,8 @@ DevFlow evaluates agent output in three layers:
 | Layer | Method | Authority |
 |---|---|---|
 | 1. Marker | Parse `DEVFLOW_RESULT` JSON from stdout | Authoritative |
-| 2. Exit code | Exit 0 = success, non-zero = failed | Fallback |
-| 3. Existence | stdout exists = success, empty = failed | Last resort |
+| 2. Exit code + commits | Exit 0 **and** commits on the feature branch = success; otherwise failed | Fallback |
+| 3. Commit heuristic | Exit code unknown: commits exist = probable success (with warning) | Last resort |
 
 Rate-limit detection: if an agent's stdout contains rate-limit messages (429), DevFlow writes `.devflow/cron-instructions.json` for rescheduling.
 
@@ -131,6 +132,7 @@ Rate-limit detection: if an agent's stdout contains rate-limit messages (429), D
 | `devflow init` | Bootstrap `.devflow.yaml` and `.devflow/` directory |
 | `devflow config` | Show effective configuration |
 | `devflow recover` | Inspect or clean up stale/abandoned workflow state |
+| `devflow doctor` | Check that required tools and agents are installed |
 
 ## Configuration
 
@@ -155,7 +157,6 @@ automation:
   docs_command: cargo doc --no-deps
 
 git_flow:
-  enabled: true
   main: main
   develop: develop
   feature_prefix: feature/
@@ -173,7 +174,7 @@ Agents must be installed separately. Run `devflow doctor` to verify availability
 
 ## Requirements
 
-- **Rust** 1.91+ (build from source)
+- **Rust** stable, edition 2024 (build from source) — see `rust-toolchain.toml`
 - **git** 2.30+
 - **gh CLI** 2.0+ (for PR creation, shipping)
 - **A POSIX shell** (sh/bash)
@@ -205,7 +206,7 @@ devflow doctor
 ## Documentation
 
 - [DEPENDENCIES.md](DEPENDENCIES.md) — full dependency matrix
-- [ARCHITECTURE.md](ARCHITECTURE.md) — design documentation (coming in v1.2.0)
+- [ARCHITECTURE.md](ARCHITECTURE.md) — design documentation
 - [CONTRIBUTING.md](CONTRIBUTING.md) — how to contribute
 - [CHANGELOG.md](CHANGELOG.md) — version history
 

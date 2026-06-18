@@ -23,7 +23,16 @@ Thumbs.db
 .devflow/state.json
 .devflow/lock
 .devflow/last-ship.json
-.planning/
+
+# DevFlow phase plans — the `.planning/` directory is DevFlow's tracked
+# phase-plan convention. `phase_prompt()` reads .planning/ROADMAP.md and
+# .planning/phases/NN-*/CONTEXT.md, so those files are kept committable.
+# Only top-level scratch files under .planning/ are ignored.
+# See ARCHITECTURE.md and CONTRIBUTING.md.
+.planning/*
+!.planning/ROADMAP.md
+!.planning/PROJECT.md
+!.planning/phases/
 
 # Git worktrees created by `devflow start --worktree` / `parallel` / `sequentagent`
 .worktrees/

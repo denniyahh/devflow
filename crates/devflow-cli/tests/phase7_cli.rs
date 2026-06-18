@@ -407,12 +407,10 @@ fn reference_and_cleanup_worktree_cli_flow() {
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
-    let fake_bin = fake_bin_dir(&[
-        (
-            "claude",
-            "#!/bin/sh\nprintf 'DEVFLOW_RESULT: {\"status\":\"success\"}\n'\n",
-        ),
-    ]);
+    let fake_bin = fake_bin_dir(&[(
+        "claude",
+        "#!/bin/sh\nprintf 'DEVFLOW_RESULT: {\"status\":\"success\"}\n'\n",
+    )]);
 
     // reference — creates static snapshot
     let out = run_devflow(root, &fake_bin.path, &["reference"]);
