@@ -106,6 +106,11 @@ Commands using clap:
 - `bump(version, component)` → increment major/minor/patch
 - `build_number(config)` → git rev-list --count or timestamp
 - `write_version(config, new_version)` → write back to file
+- Auto-detects: Cargo.toml (with workspace support) > pyproject.toml > package.json
+- `read_version(config)` → parse current version from pyproject.toml / Cargo.toml / package.json
+- `bump(version, component)` → increment major/minor/patch
+- `build_number(config)` → git rev-list --count or timestamp
+- `write_version(config, new_version)` → write back to file
 
 ### 4. Tmux launcher (crates/devflow-core/src/tmux.rs)
 - `launch_agent(state)` → tmux new-session, send-keys launch command

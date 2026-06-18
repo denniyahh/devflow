@@ -1,129 +1,62 @@
 ---
 name: devflow
-description: "Automated development workflow via DevFlow CLI — branch management, agent launch, monitoring, version bumping, shipping. One command, end-to-end."
-version: "0.1.0"
+description: Drive DevFlow automated development workflows — start, monitor, and ship phased agent-driven work
+category: software-development
+triggers:
+  - "start phase"
+  - "devflow"
+  - "feature branch"
+  - "ship phase"
 ---
 
-# DevFlow — Hermes Integration
+# DevFlow — Hermes Skill
 
-DevFlow is an agent-agnostic CLI that automates the entire development workflow. This skill teaches Hermes when and how to invoke it.
+## What is DevFlow?
+DevFlow is an agent-agnostic development workflow automation CLI written in Rust. It manages the mechanical parts of AI-driven development: branching, agent launching, monitoring, verification, documentation, version bumping, and shipping.
 
-## When to use
+## When to Use
+Use this skill when:
+- User wants to start work on a numbered phase in a DevFlow project
+- User asks "what's the status of phase X?"
+- User wants to ship/merge a completed phase
+- You detect a `.devflow.yaml` in a project root
 
-- User says "work on Phase N" or "start Phase N" or "develop Phase N"
-- User says "ship it" or "create release" or "bump version"
-- User asks "what's the dev status?" or "what phase are we on?"
-- User says "continue development" or "keep working on this project"
+## Project Detection
+Check for `.devflow.yaml` in the project root. If present, the project uses DevFlow. Read the config to understand automation settings.
 
-## Prerequisites
+## Commands
 
-- `devflow` binary installed and on PATH
-- Project has `.devflow.yaml` (run `devflow init` if not)
-- Tmux available (for agent launching)
-- Git flow branches configured (`main` and `develop` exist)
+### `devflow start --phase N --agent <agent> [--monitor]`
+Start work on phase N with the specified agent. Recommended: always use `--monitor` so the agent runs in background with auto-advancement.
+
+Supported agents: `claude`, `codex`, `omx`, `opencode`
+
+### `devflow status`
+Show current workflow state: step, phase, agent, PID, running status.
+
+### `devflow check`
+Poll and advance the state machine if the agent has exited.
+
+### `devflow ship`
+Create release branch, bump version, and prepare for PR.
+
+### `devflow config`
+Show effective DevFlow configuration.
 
 ## Workflow
+1. When user says "work on phase N" → `devflow start --phase N --agent claude --monitor`
+2. Report what was launched: "Phase N started — Claude Code (PID X), monitor PID Y"
+3. Monitor auto-advances when agent exits — no need to poll
+4. When done, report: "Phase N complete — X commits, Y files changed"
+5. Merge to develop: `git checkout develop && git merge --no-ff feature/phase-0N`
 
-### Starting a phase
+## Phase Context
+Each phase has a `.planning/phases/0N-*/CONTEXT.md` file with detailed task lists.
+Agents read these automatically via the prompt.
 
-When the user wants to start work on a phase:
-
-```bash
-devflow start --phase N --agent <agent> --monitor
-```
-
-- `--phase N`: phase number
-- `--agent`: claude, omx, codex, or opencode (default: claude)
-- `--monitor`: spawns a background watcher that auto-advances when agent exits
-
-**Agent selection:** Use the agent configured in `.devflow.yaml` if present. Otherwise default to `claude`. If the user explicitly names an agent, use that.
-
-**Example:**
-```
-User: "work on Phase 3"
-→ devflow start --phase 3 --agent claude --monitor
-→ Report: "Phase 3 started. Claude launched in tmux:devflow-project-03. Monitor PID 12345 active."
-```
-
-### Checking status
-
-When the user asks about progress:
-
-```bash
-devflow status
-```
-
-Report the step, phase, agent, and whether the agent is still running.
-
-### Shipping
-
-When the user wants to create a release:
-
-```bash
-devflow ship
-```
-
-This bumps the version and creates a release branch. It does NOT merge or push — that requires manual confirmation.
-
-### Bootstrapping a project
-
-If a project doesn't have `.devflow.yaml`:
-
-```bash
-devflow init
-```
-
-This creates the config file with sensible defaults. Review and adjust before starting phases.
-
-## What DevFlow handles automatically
-
-| Step | What happens |
-|---|---|
-| **Branch** | Creates `feature/phase-NN-name` from `develop` |
-| **Launch** | Starts agent in detached tmux session |
-| **Monitor** | Background process watches tmux session |
-| **Advance** | When agent exits: verify → docs → ship → clean |
-| **Version** | Bumps semver + git build number |
-| **Release** | Creates release branch, merges to main + develop |
-| **Cleanup** | Deletes merged feature/release branches |
-
-## Configuration
-
-Projects configure DevFlow via `.devflow.yaml` (git-tracked):
-
-```yaml
-agent: claude              # default agent
-version:
-  scheme: semver
-  file: Cargo.toml          # or pyproject.toml, package.json
-  field: package.version    # dotted path to version field
-  build_number: git
-automation:
-  auto_branch: true
-  auto_verify: true
-  auto_docs: true
-  auto_version: patch
-  auto_ship: false          # false = confirm before release
-  auto_cleanup: true
-git_flow:
-  main: main
-  develop: develop
-  feature_prefix: feature/
-```
-
-## Recovery
-
-If a monitor dies or the machine reboots:
-
-```bash
-devflow status              # check current state
-devflow check               # manually advance if agent exited
-devflow start --phase N --monitor  # re-launch if needed
-```
-
-## Pitfalls
-
-- **Agents take time** — don't poll `devflow check` in a tight loop. The monitor handles this.
-- **Tmux sessions persist** — `devflow check` cleans up when the session dies.
-- **Sandbox limitations** — agents running inside sandboxes (Codex) can't use tmux themselves. This is fine; DevFlow runs on the host.
-- **Git state** — ensure `main` and `develop` branches exist before starting. `devflow init` doesn't create them.
+## Verification
+Phase completion should include:
+- `cargo test` passes
+- `cargo clippy -- -D warnings` clean
+- `cargo fmt -- --check` clean
+- Descriptive commits per sub-task
