@@ -239,4 +239,49 @@ mod tests {
             "expected MONITOR_READY in captured stdout, got {captured:?}"
         );
     }
+
+    #[test]
+    fn spawn_monitor_runs_agent_in_worktree_but_captures_in_project_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join(".worktrees/phase-04");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let mut state = state_in(dir.path());
+        state.worktree_path = Some(worktree.clone());
+
+        // Stub agent: print its cwd so the test proves the monitor changed
+        // directories before launching the agent.
+        let args = vec!["-c".to_string(), "pwd; echo WORKTREE_READY".to_string()];
+
+        let monitor_pid = spawn_monitor(&state, "sh", &args).unwrap();
+        assert!(monitor_pid > 0);
+
+        let agent_pid = wait_for_agent_pid(dir.path(), state.phase)
+            .expect("monitor should record the agent pid in the main project");
+        assert!(agent_pid > 0);
+
+        let stdout_path = crate::agent_result::stdout_path(dir.path(), state.phase);
+        let mut captured = String::new();
+        for _ in 0..100 {
+            if let Ok(contents) = std::fs::read_to_string(&stdout_path)
+                && contents.contains("WORKTREE_READY")
+            {
+                captured = contents;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(
+            captured.contains(&worktree.display().to_string()),
+            "agent did not run in worktree cwd; captured stdout: {captured:?}"
+        );
+        assert!(
+            stdout_path.exists(),
+            "stdout capture missing in main .devflow"
+        );
+        assert!(
+            !crate::agent_result::stdout_path(&worktree, state.phase).exists(),
+            "stdout capture should not be written under the worktree"
+        );
+    }
 }
