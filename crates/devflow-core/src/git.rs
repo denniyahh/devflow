@@ -84,6 +84,32 @@ impl GitFlow {
         Ok(deleted)
     }
 
+    /// Stage all changes and commit with the given message.
+    /// Returns Ok(()) whether or not there were changes to commit.
+    pub fn commit_all(&self, message: &str) -> Result<(), GitError> {
+        self.git(["add", "."])?;
+        // --allow-empty so we don't fail when there are no changes
+        match self.git_raw(&["commit", "--allow-empty", "-m", message]) {
+            Ok(()) => Ok(()),
+            // If the commit produced no changes and we used --allow-empty,
+            // this should still succeed. But just in case, ignore "nothing to commit".
+            Err(GitError::Command(ref msg)) if msg.contains("nothing to commit") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn git_raw(&self, args: &[&str]) -> Result<(), GitError> {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&self.root)
+            .output()?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(GitError::Command(stderr_or_status(&output)))
+        }
+    }
+
     fn git<const N: usize>(&self, args: [&str; N]) -> Result<(), GitError> {
         let output = Command::new("git")
             .args(args)

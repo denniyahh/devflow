@@ -72,6 +72,26 @@ pub struct AutomationConfig {
     /// Delete merged branches after shipping.
     #[serde(default = "default_true")]
     pub auto_cleanup: bool,
+
+    /// Shell command for verification (e.g., "cargo test").
+    #[serde(default = "default_verify_command")]
+    pub verify_command: String,
+
+    /// Shell command for linting (e.g., "cargo clippy -- -D warnings").
+    #[serde(default = "default_lint_command")]
+    pub lint_command: String,
+
+    /// Shell command for docs generation (e.g., "cargo doc --no-deps").
+    #[serde(default = "default_docs_command")]
+    pub docs_command: String,
+
+    /// Continue advancing even if verify/lint/docs fails.
+    #[serde(default = "default_false")]
+    pub continue_on_error: bool,
+
+    /// Auto-commit documentation changes after docs_command succeeds.
+    #[serde(default = "default_false")]
+    pub docs_auto_commit: bool,
 }
 
 /// Git flow branch model settings.
@@ -121,6 +141,15 @@ fn default_feature_prefix() -> String {
 fn default_auto_version() -> String {
     "patch".into()
 }
+fn default_verify_command() -> String {
+    "cargo test".into()
+}
+fn default_lint_command() -> String {
+    "cargo clippy -- -D warnings".into()
+}
+fn default_docs_command() -> String {
+    "cargo doc --no-deps 2>&1".into()
+}
 
 impl Default for VersionConfig {
     fn default() -> Self {
@@ -142,6 +171,11 @@ impl Default for AutomationConfig {
             auto_version: default_auto_version(),
             auto_ship: default_false(),
             auto_cleanup: default_true(),
+            verify_command: default_verify_command(),
+            lint_command: default_lint_command(),
+            docs_command: default_docs_command(),
+            continue_on_error: default_false(),
+            docs_auto_commit: default_false(),
         }
     }
 }
@@ -178,7 +212,7 @@ impl Config {
     /// Render this config as DevFlow's canonical YAML shape.
     pub fn to_yaml(&self) -> String {
         format!(
-            "version:\n  scheme: {}\n  file: {}\n  field: {}\n  build_number: {}\nautomation:\n  auto_branch: {}\n  auto_verify: {}\n  auto_docs: {}\n  auto_version: {}\n  auto_ship: {}\n  auto_cleanup: {}\ngit_flow:\n  main: {}\n  develop: {}\n  feature_prefix: {}\n",
+            "version:\n  scheme: {}\n  file: {}\n  field: {}\n  build_number: {}\nautomation:\n  auto_branch: {}\n  auto_verify: {}\n  auto_docs: {}\n  auto_version: {}\n  auto_ship: {}\n  auto_cleanup: {}\n  verify_command: \"{}\"\n  lint_command: \"{}\"\n  docs_command: \"{}\"\n  continue_on_error: {}\n  docs_auto_commit: {}\ngit_flow:\n  main: {}\n  develop: {}\n  feature_prefix: {}\n",
             self.version.scheme,
             self.version.file,
             self.version.field,
@@ -189,6 +223,11 @@ impl Config {
             self.automation.auto_version,
             self.automation.auto_ship,
             self.automation.auto_cleanup,
+            self.automation.verify_command,
+            self.automation.lint_command,
+            self.automation.docs_command,
+            self.automation.continue_on_error,
+            self.automation.docs_auto_commit,
             self.git_flow.main,
             self.git_flow.develop,
             self.git_flow.feature_prefix,
@@ -247,6 +286,11 @@ fn parse_config(contents: &str) -> Result<Config, ConfigError> {
             ("automation", "auto_version") => config.automation.auto_version = value,
             ("automation", "auto_ship") => config.automation.auto_ship = parse_bool(&value)?,
             ("automation", "auto_cleanup") => config.automation.auto_cleanup = parse_bool(&value)?,
+            ("automation", "verify_command") => config.automation.verify_command = value,
+            ("automation", "lint_command") => config.automation.lint_command = value,
+            ("automation", "docs_command") => config.automation.docs_command = value,
+            ("automation", "continue_on_error") => config.automation.continue_on_error = parse_bool(&value)?,
+            ("automation", "docs_auto_commit") => config.automation.docs_auto_commit = parse_bool(&value)?,
             ("git_flow", "main") => config.git_flow.main = value,
             ("git_flow", "develop") => config.git_flow.develop = value,
             ("git_flow", "feature_prefix") => config.git_flow.feature_prefix = value,
@@ -304,6 +348,11 @@ mod tests {
         assert_eq!(config.automation.auto_version, "patch");
         assert!(!config.automation.auto_ship);
         assert!(config.automation.auto_cleanup);
+        assert_eq!(config.automation.verify_command, "cargo test");
+        assert_eq!(config.automation.lint_command, "cargo clippy -- -D warnings");
+        assert_eq!(config.automation.docs_command, "cargo doc --no-deps 2>&1");
+        assert!(!config.automation.continue_on_error);
+        assert!(!config.automation.docs_auto_commit);
         assert_eq!(config.git_flow.main, "main");
         assert_eq!(config.git_flow.develop, "develop");
         assert_eq!(config.git_flow.feature_prefix, "feature/");
@@ -361,6 +410,19 @@ mod tests {
         assert!(!config.automation.auto_docs);
         assert!(config.automation.auto_ship);
         assert!(!config.automation.auto_cleanup);
+    }
+
+    #[test]
+    fn parse_new_automation_fields() {
+        let config = parse_config(
+            "automation:\n  verify_command: \"cargo test --release\"\n  lint_command: \"cargo clippy\"\n  docs_command: \"cargo doc\"\n  continue_on_error: true\n  docs_auto_commit: true\n",
+        )
+        .expect("parse");
+        assert_eq!(config.automation.verify_command, "cargo test --release");
+        assert_eq!(config.automation.lint_command, "cargo clippy");
+        assert_eq!(config.automation.docs_command, "cargo doc");
+        assert!(config.automation.continue_on_error);
+        assert!(config.automation.docs_auto_commit);
     }
 
     #[test]
@@ -434,11 +496,11 @@ impl VersionConfig {
         if cargo.exists() {
             self.file = "Cargo.toml".into();
             // Check for workspace pattern first
-            if let Ok(contents) = std::fs::read_to_string(&cargo) {
-                if contents.contains("[workspace.package]") {
-                    self.field = "workspace.package.version".into();
-                    return;
-                }
+            if let Ok(contents) = std::fs::read_to_string(&cargo)
+                && contents.contains("[workspace.package]")
+            {
+                self.field = "workspace.package.version".into();
+                return;
             }
             self.field = "package.version".into();
         } else if pyproject.exists() {

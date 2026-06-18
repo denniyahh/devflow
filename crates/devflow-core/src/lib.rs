@@ -10,6 +10,7 @@ pub mod lock;
 pub mod monitor;
 pub mod recover;
 pub mod state;
+pub mod verify;
 pub mod version;
 pub mod workflow;
 
