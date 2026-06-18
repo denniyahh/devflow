@@ -138,13 +138,14 @@ fn find_version_in_contents(contents: &str, field: &str) -> Option<String> {
         if current != section {
             continue;
         }
-        let (lhs, value) = trimmed.split_once(['=', ':'])?;
+        if let Some((lhs, value)) = trimmed.split_once(['=', ':']) {
         // Strip JSON-style quotes from the key (e.g., `"version": "1.0"`)
         let lhs_key = lhs.trim().trim_matches('"').trim_matches('\'');
         if lhs_key != key {
             continue;
         }
         return Some(value.trim().trim_matches(['"', '\'']).to_string());
+    }
     }
     None
 }
