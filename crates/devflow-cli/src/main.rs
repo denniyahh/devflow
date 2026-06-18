@@ -41,6 +41,21 @@ enum Command {
         #[arg(default_value = ".")]
         project: PathBuf,
     },
+    /// Run multiple phases concurrently, each in its own worktree + monitor.
+    Parallel {
+        /// Comma-separated phase numbers, e.g. `7,8`.
+        #[arg(long)]
+        phases: String,
+        /// Comma-separated agents matched positionally to phases (default claude).
+        #[arg(long)]
+        agents: Option<String>,
+        /// Recreate worktrees if they already exist.
+        #[arg(long)]
+        force: bool,
+        /// Project root.
+        #[arg(default_value = ".")]
+        project: PathBuf,
+    },
     /// Poll state and advance if the agent is done.
     Check {
         /// Project root.
@@ -157,6 +172,12 @@ fn run() -> Result<(), CliError> {
             force,
             worktree,
         ),
+        Command::Parallel {
+            phases,
+            agents,
+            force,
+            project,
+        } => parallel(&project_root(project)?, &phases, agents.as_deref(), force),
         Command::Check { project } => check(&project_root(project)?),
         Command::Status { project } => status(&project_root(project)?),
         Command::List { project } => list(&project_root(project)?),
@@ -337,6 +358,70 @@ fn ensure_phase_worktree(
         }
         Err(err) => Err(err.into()),
     }
+}
+
+/// Parse `--phases` and optional `--agents` into positional (phase, agent)
+/// pairs. Agents default to `claude` when fewer are given than phases; an error
+/// is returned when more agents than phases are supplied.
+fn parse_phase_agent_pairs(
+    phases: &str,
+    agents: Option<&str>,
+) -> Result<Vec<(u32, Agent)>, CliError> {
+    let phases: Vec<u32> = phases
+        .split(',')
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            p.parse::<u32>()
+                .map_err(|_| CliError::Message(format!("invalid phase number `{p}`")))
+        })
+        .collect::<Result<_, _>>()?;
+    if phases.is_empty() {
+        return Err(CliError::Message("no phases given".into()));
+    }
+
+    let agents: Vec<Agent> = match agents {
+        Some(list) => list
+            .split(',')
+            .map(|a| a.trim())
+            .filter(|a| !a.is_empty())
+            .map(|a| {
+                a.parse::<Agent>()
+                    .map_err(|err| CliError::Message(err.to_string()))
+            })
+            .collect::<Result<_, _>>()?,
+        None => Vec::new(),
+    };
+    if agents.len() > phases.len() {
+        return Err(CliError::Message(format!(
+            "got {} agents for {} phases — provide at most one agent per phase",
+            agents.len(),
+            phases.len()
+        )));
+    }
+
+    Ok(phases
+        .into_iter()
+        .enumerate()
+        .map(|(i, phase)| (phase, agents.get(i).copied().unwrap_or(Agent::Claude)))
+        .collect())
+}
+
+/// Spawn one monitored worktree run per phase, concurrently.
+fn parallel(
+    project_root: &Path,
+    phases: &str,
+    agents: Option<&str>,
+    force: bool,
+) -> Result<(), CliError> {
+    let pairs = parse_phase_agent_pairs(phases, agents)?;
+    println!("launching {} phase(s) in parallel worktrees", pairs.len());
+    for (phase, agent) in pairs {
+        println!("\n=== phase {phase} ({agent}) ===");
+        // Monitor mode keeps each run non-blocking so the phases run together.
+        start(project_root, phase, agent, true, force, true)?;
+    }
+    Ok(())
 }
 
 fn check(project_root: &Path) -> Result<(), CliError> {
@@ -732,4 +817,39 @@ fn docs_cmd(project_root: &Path) -> Result<(), CliError> {
 
 fn default_config_yaml() -> &'static str {
     "version:\n  scheme: semver\n  file: pyproject.toml\n  field: project.version\n  build_number: git\nautomation:\n  auto_branch: true\n  auto_verify: true\n  auto_docs: true\n  auto_version: patch\n  auto_ship: false\n  auto_cleanup: true\n  verify_command: \"cargo test\"\n  lint_command: \"cargo clippy -- -D warnings\"\n  docs_command: \"cargo doc --no-deps 2>&1\"\n  continue_on_error: false\n  docs_auto_commit: false\ngit_flow:\n  main: main\n  develop: develop\n  feature_prefix: feature/\n"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pairs_default_missing_agents_to_claude() {
+        let pairs = parse_phase_agent_pairs("7,8", Some("codex")).unwrap();
+        assert_eq!(pairs, vec![(7, Agent::Codex), (8, Agent::Claude)]);
+    }
+
+    #[test]
+    fn pairs_match_agents_positionally() {
+        let pairs = parse_phase_agent_pairs("7, 8", Some("claude, codex")).unwrap();
+        assert_eq!(pairs, vec![(7, Agent::Claude), (8, Agent::Codex)]);
+    }
+
+    #[test]
+    fn pairs_default_all_to_claude_without_agents() {
+        let pairs = parse_phase_agent_pairs("3,4", None).unwrap();
+        assert_eq!(pairs, vec![(3, Agent::Claude), (4, Agent::Claude)]);
+    }
+
+    #[test]
+    fn pairs_reject_more_agents_than_phases() {
+        let err = parse_phase_agent_pairs("7", Some("claude,codex")).unwrap_err();
+        assert!(matches!(err, CliError::Message(_)));
+    }
+
+    #[test]
+    fn pairs_reject_invalid_phase() {
+        assert!(parse_phase_agent_pairs("7,x", None).is_err());
+        assert!(parse_phase_agent_pairs("", None).is_err());
+    }
 }
