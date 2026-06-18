@@ -90,7 +90,13 @@ pub struct State {
     pub started_at: String,
     /// Path to the project root.
     pub project_root: PathBuf,
-    /// Parsed agent completion result (from DEVLOW_RESULT or exit code).
+    /// Working directory for the agent when running in a git worktree.
+    ///
+    /// `None` means the agent runs in `project_root`. State and capture files
+    /// always live under the main `project_root`; only the agent's cwd changes.
+    #[serde(default)]
+    pub worktree_path: Option<PathBuf>,
+    /// Parsed agent completion result (from DEVFLOW_RESULT or exit code).
     #[serde(skip)]
     pub agent_result: Option<AgentResult>,
     /// Path where agent stdout was saved.
@@ -182,6 +188,7 @@ impl State {
             agent_label: None,
             started_at: timestamp_now(),
             project_root,
+            worktree_path: None,
             agent_result: None,
             agent_stdout_path: None,
         }
@@ -321,6 +328,11 @@ mod tests {
         assert!(joined.contains("--sandbox workspace-write"));
         assert!(joined.contains("--json"));
         assert!(joined.contains("phase 7"));
+        // Codex now receives the same rich prompt contract as Claude.
+        assert!(joined.contains("ROADMAP.md"));
+        assert!(joined.contains("CONTEXT.md"));
+        assert!(joined.contains("cargo test"));
+        assert!(joined.contains("DEVFLOW_RESULT"));
     }
 
     #[test]

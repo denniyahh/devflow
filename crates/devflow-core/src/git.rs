@@ -92,6 +92,106 @@ impl GitFlow {
         Ok(branch)
     }
 
+    /// Delete a single local branch.
+    ///
+    /// With `force`, uses `git branch -D` (deletes even if unmerged); otherwise
+    /// `git branch -d` (refuses to delete unmerged work). Protected branches
+    /// (`main`, `develop`) are never deleted.
+    pub fn delete_branch(&self, branch: &str, force: bool) -> Result<(), GitError> {
+        if branch == self.config.main || branch == self.config.develop {
+            return Err(GitError::Command(format!(
+                "refusing to delete protected branch `{branch}`"
+            )));
+        }
+        let flag = if force { "-D" } else { "-d" };
+        self.git(["branch", flag, branch])
+    }
+
+    /// Whether a local branch exists.
+    pub fn branch_exists(&self, branch: &str) -> bool {
+        Command::new("git")
+            .args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ])
+            .current_dir(&self.root)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// The commit SHA at the tip of `branch`.
+    pub fn branch_tip(&self, branch: &str) -> Result<String, GitError> {
+        Ok(self.git_output(["rev-parse", branch])?.trim().to_string())
+    }
+
+    /// Create `branch` at `start_point` if it does not already exist, without
+    /// checking it out (leaves the current checkout untouched).
+    pub fn ensure_branch(&self, branch: &str, start_point: &str) -> Result<(), GitError> {
+        if self.branch_exists(branch) {
+            return Ok(());
+        }
+        self.git(["branch", branch, start_point])
+    }
+
+    /// Fast-forward `target`'s ref to `source` (must be a descendant).
+    ///
+    /// `target` must not be checked out in any worktree. Errors if the move
+    /// would not be a fast-forward.
+    pub fn fast_forward_branch(&self, target: &str, source: &str) -> Result<(), GitError> {
+        let is_ancestor = Command::new("git")
+            .args(["merge-base", "--is-ancestor", target, source])
+            .current_dir(&self.root)
+            .output()?
+            .status
+            .success();
+        if !is_ancestor {
+            return Err(GitError::Command(format!(
+                "{target} is not an ancestor of {source}; refusing non-fast-forward update"
+            )));
+        }
+        self.git(["branch", "-f", target, source])
+    }
+
+    /// Rebase the branch checked out at `dir` onto `onto`.
+    ///
+    /// Runs `git rebase` inside the given worktree directory. On conflict the
+    /// rebase is aborted and an error is returned so the caller can surface it.
+    pub fn rebase_in(&self, dir: &Path, onto: &str) -> Result<(), GitError> {
+        match git_in(dir, &["rebase", onto]) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                // Leave the worktree clean for the user to retry.
+                let _ = git_in(dir, &["rebase", "--abort"]);
+                Err(err)
+            }
+        }
+    }
+
+    /// Check out an existing branch in the main worktree.
+    pub fn checkout(&self, branch: &str) -> Result<(), GitError> {
+        self.git(["checkout", branch])
+    }
+
+    /// Delete `branch` on `origin` (best-effort; errors if no remote/branch).
+    pub fn delete_remote_branch(&self, branch: &str) -> Result<(), GitError> {
+        self.git(["push", "origin", "--delete", branch])
+    }
+
+    /// Whether the repository has at least one configured remote.
+    pub fn has_remote(&self) -> bool {
+        self.git_output(["remote"])
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Push `branch` to `origin`, setting upstream.
+    pub fn push(&self, branch: &str) -> Result<(), GitError> {
+        self.git(["push", "-u", "origin", branch])
+    }
+
     /// Delete local branches already merged into the current branch.
     pub fn cleanup_merged(&self) -> Result<Vec<String>, GitError> {
         let output = self.git_output(["branch", "--merged"])?;
@@ -223,6 +323,16 @@ impl GitFlow {
         } else {
             Err(GitError::Command(stderr_or_status(&output)))
         }
+    }
+}
+
+/// Run a git command in an arbitrary directory (e.g. a worktree).
+fn git_in(dir: &Path, args: &[&str]) -> Result<(), GitError> {
+    let output = Command::new("git").args(args).current_dir(dir).output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(GitError::Command(stderr_or_status(&output)))
     }
 }
 
@@ -374,6 +484,110 @@ mod tests {
         // Protected branches survive.
         assert!(!deleted.contains(&"develop".to_string()));
         assert!(!deleted.contains(&"main".to_string()));
+    }
+
+    #[test]
+    fn delete_branch_removes_unmerged_with_force_and_protects_trunk() {
+        let repo = init_repo();
+        let root = repo.path();
+        let gf = flow(root);
+
+        // Create a feature branch with an unmerged commit.
+        gf.feature_start(8).expect("start");
+        commit_file(root, "unmerged.txt");
+        // Switch back to develop so the branch isn't checked out.
+        git(root, &["checkout", "-q", "develop"]);
+
+        // -d would refuse (unmerged); force deletes it.
+        assert!(gf.delete_branch("feature/phase-08", false).is_err());
+        gf.delete_branch("feature/phase-08", true)
+            .expect("force delete");
+        let branches = Command::new("git")
+            .args(["branch"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&branches.stdout).contains("feature/phase-08"));
+
+        // Protected branches are never deleted.
+        assert!(gf.delete_branch("develop", true).is_err());
+        assert!(gf.delete_branch("main", true).is_err());
+    }
+
+    #[test]
+    fn sequentagent_helpers_integrate_and_rebase_cleanly() {
+        let repo = init_repo();
+        let root = repo.path();
+        let gf = flow(root);
+
+        // Base branch off develop, not checked out anywhere.
+        gf.ensure_branch("feature/phase-07", "develop")
+            .expect("ensure base");
+        assert!(gf.branch_exists("feature/phase-07"));
+        assert!(!gf.branch_tip("feature/phase-07").unwrap().is_empty());
+        // ensure_branch is idempotent.
+        gf.ensure_branch("feature/phase-07", "develop")
+            .expect("ensure again");
+
+        // Two agent worktrees off the same base tip.
+        let wt_a = root.join(".worktrees/a");
+        let wt_b = root.join(".worktrees/b");
+        crate::worktree::add(root, &wt_a, "feat-a", "feature/phase-07", true).expect("add A");
+        crate::worktree::add(root, &wt_b, "feat-b", "feature/phase-07", true).expect("add B");
+
+        // Agent A commits a new file, then we integrate A into the base (ff).
+        std::fs::write(wt_a.join("a.txt"), "from-a\n").unwrap();
+        git(&wt_a, &["add", "."]);
+        git(&wt_a, &["commit", "-q", "-m", "a work"]);
+        gf.fast_forward_branch("feature/phase-07", "feat-a")
+            .expect("ff base to A");
+        assert_eq!(
+            gf.branch_tip("feature/phase-07").unwrap(),
+            gf.branch_tip("feat-a").unwrap()
+        );
+
+        // Agent B (no overlapping changes) rebases onto the updated base cleanly.
+        gf.rebase_in(&wt_b, "feature/phase-07")
+            .expect("clean rebase");
+        // B now contains A's file.
+        assert!(wt_b.join("a.txt").exists());
+    }
+
+    #[test]
+    fn rebase_in_aborts_and_errors_on_conflict() {
+        let repo = init_repo();
+        let root = repo.path();
+        let gf = flow(root);
+
+        gf.ensure_branch("feature/phase-07", "develop")
+            .expect("ensure base");
+
+        // Worktree B is created off the ORIGINAL base, then edits a.txt.
+        let wt_b = root.join(".worktrees/b");
+        crate::worktree::add(root, &wt_b, "feat-b", "feature/phase-07", true).expect("add B");
+        std::fs::write(wt_b.join("a.txt"), "from-b\n").unwrap();
+        git(&wt_b, &["add", "."]);
+        git(&wt_b, &["commit", "-q", "-m", "b edits a"]);
+
+        // Meanwhile the base advances with a conflicting a.txt (via worktree A).
+        let wt_a = root.join(".worktrees/a");
+        crate::worktree::add(root, &wt_a, "feat-a", "feature/phase-07", true).expect("add A");
+        std::fs::write(wt_a.join("a.txt"), "from-base\n").unwrap();
+        git(&wt_a, &["add", "."]);
+        git(&wt_a, &["commit", "-q", "-m", "base edits a"]);
+        gf.fast_forward_branch("feature/phase-07", "feat-a")
+            .expect("ff base to A");
+
+        // Rebasing B onto the updated base conflicts on a.txt → error + abort.
+        let err = gf.rebase_in(&wt_b, "feature/phase-07").unwrap_err();
+        assert!(matches!(err, GitError::Command(_)));
+        // The abort left no rebase-in-progress state behind.
+        assert!(!root.join(".git/worktrees/b/rebase-merge").exists());
+        // B is still usable: its own commit is intact.
+        assert_eq!(
+            std::fs::read_to_string(wt_b.join("a.txt")).unwrap(),
+            "from-b\n"
+        );
     }
 
     #[test]

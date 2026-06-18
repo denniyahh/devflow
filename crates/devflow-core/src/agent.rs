@@ -25,14 +25,18 @@ pub enum AgentError {
 
 /// Launch an agent as a child process and return the spawned child + its PID.
 ///
+/// `workdir` is the directory the agent process runs in — the project root in
+/// normal mode, or a git worktree path when worktree mode is active. Capture
+/// and state files are keyed off the main project root separately.
+///
 /// The agent runs in non-interactive mode with structured output.
 /// Caller is responsible for waiting on the child.
 pub fn launch_agent(
     agent: &dyn crate::agents::Agent,
     phase: u32,
-    project_root: &Path,
+    workdir: &Path,
 ) -> Result<(Child, u32), AgentError> {
-    let root = project_root.to_str().ok_or(AgentError::NonUtf8Path)?;
+    let root = workdir.to_str().ok_or(AgentError::NonUtf8Path)?;
 
     let (program, args) = agent.exec_command(phase);
 

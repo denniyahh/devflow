@@ -39,11 +39,7 @@ pub enum MonitorError {
 /// 3. Runs `devflow check` to advance the workflow through its remaining steps
 ///
 /// Returns the PID of the spawned monitor.
-pub fn spawn_monitor(
-    state: &State,
-    program: &str,
-    args: &[String],
-) -> Result<u32, MonitorError> {
+pub fn spawn_monitor(state: &State, program: &str, args: &[String]) -> Result<u32, MonitorError> {
     let project_root = state
         .project_root
         .to_str()
@@ -68,6 +64,16 @@ pub fn spawn_monitor(
     let exit_file = exit_file.to_str().ok_or(MonitorError::NonUtf8Path)?;
     let pid_file = pid_file.to_str().ok_or(MonitorError::NonUtf8Path)?;
 
+    // The agent runs in its worktree when worktree mode is active; otherwise it
+    // runs in the project root. Capture/state files and the `devflow check`
+    // calls below always use the main project root, regardless of cwd.
+    let workdir = state
+        .worktree_path
+        .as_deref()
+        .unwrap_or(&state.project_root)
+        .to_str()
+        .ok_or(MonitorError::NonUtf8Path)?;
+
     // Build the shell-escaped agent command.
     let mut agent_cmd = shell_escape(program);
     for arg in args {
@@ -80,11 +86,12 @@ pub fn spawn_monitor(
     // is the agent's parent, capture survives the CLI exiting.
     //
     // stderr is discarded so it cannot corrupt the (possibly JSON) stdout
-    // capture that DevFlow parses for DEVLOW_RESULT.
+    // capture that DevFlow parses for DEVFLOW_RESULT.
     //
     // Traps SIGTERM and SIGINT for clean shutdown.
     let script = format!(
         "cleanup() {{ exit 0; }}; trap cleanup TERM INT; \
+         cd {workdir} || exit 1; \
          {agent_cmd} > {stdout_file} 2>/dev/null & \
          apid=$!; echo $apid > {pid_file}; \
          wait $apid; echo $? > {exit_file}; \
@@ -94,6 +101,7 @@ pub fn spawn_monitor(
          {binary} check {project_root}; \
          {binary} check {project_root}",
         agent_cmd = agent_cmd,
+        workdir = shell_escape(workdir),
         stdout_file = shell_escape(stdout_file),
         exit_file = shell_escape(exit_file),
         pid_file = shell_escape(pid_file),
@@ -168,7 +176,11 @@ mod tests {
     fn wait_for_agent_pid_returns_pid_when_file_exists() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
-        std::fs::write(crate::agent_result::agent_pid_path(dir.path(), 4), "12345\n").unwrap();
+        std::fs::write(
+            crate::agent_result::agent_pid_path(dir.path(), 4),
+            "12345\n",
+        )
+        .unwrap();
 
         assert_eq!(wait_for_agent_pid(dir.path(), 4), Some(12345));
     }
@@ -184,19 +196,92 @@ mod tests {
     fn wait_for_agent_pid_returns_none_for_garbage_content() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
-        std::fs::write(crate::agent_result::agent_pid_path(dir.path(), 4), "not-a-pid").unwrap();
+        std::fs::write(
+            crate::agent_result::agent_pid_path(dir.path(), 4),
+            "not-a-pid",
+        )
+        .unwrap();
 
         assert_eq!(wait_for_agent_pid(dir.path(), 4), None);
     }
 
     #[test]
-    fn spawn_monitor_returns_pid_for_valid_input() {
+    fn spawn_monitor_captures_agent_pid_and_output() {
         let dir = tempfile::tempdir().unwrap();
         let state = state_in(dir.path());
-        let args = vec!["-c".to_string(), "true".to_string()];
+        // Stub agent: write a known marker to stdout, then exit cleanly.
+        let args = vec!["-c".to_string(), "echo MONITOR_READY".to_string()];
 
         let monitor_pid = spawn_monitor(&state, "sh", &args).unwrap();
-
         assert!(monitor_pid > 0);
+
+        // Observable side effect #1: the monitor records the agent PID to its
+        // pid file with valid numeric content.
+        let agent_pid = wait_for_agent_pid(dir.path(), state.phase)
+            .expect("monitor should record the agent pid");
+        assert!(agent_pid > 0);
+
+        // Observable side effect #2: the agent's stdout is captured to the
+        // phase stdout file (proving the monitor actually ran the agent).
+        let stdout_path = crate::agent_result::stdout_path(dir.path(), state.phase);
+        let mut captured = String::new();
+        for _ in 0..100 {
+            if let Ok(contents) = std::fs::read_to_string(&stdout_path)
+                && contents.contains("MONITOR_READY")
+            {
+                captured = contents;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            captured.contains("MONITOR_READY"),
+            "expected MONITOR_READY in captured stdout, got {captured:?}"
+        );
+    }
+
+    #[test]
+    fn spawn_monitor_runs_agent_in_worktree_but_captures_in_project_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join(".worktrees/phase-04");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let mut state = state_in(dir.path());
+        state.worktree_path = Some(worktree.clone());
+
+        // Stub agent: print its cwd so the test proves the monitor changed
+        // directories before launching the agent.
+        let args = vec!["-c".to_string(), "pwd; echo WORKTREE_READY".to_string()];
+
+        let monitor_pid = spawn_monitor(&state, "sh", &args).unwrap();
+        assert!(monitor_pid > 0);
+
+        let agent_pid = wait_for_agent_pid(dir.path(), state.phase)
+            .expect("monitor should record the agent pid in the main project");
+        assert!(agent_pid > 0);
+
+        let stdout_path = crate::agent_result::stdout_path(dir.path(), state.phase);
+        let mut captured = String::new();
+        for _ in 0..100 {
+            if let Ok(contents) = std::fs::read_to_string(&stdout_path)
+                && contents.contains("WORKTREE_READY")
+            {
+                captured = contents;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(
+            captured.contains(&worktree.display().to_string()),
+            "agent did not run in worktree cwd; captured stdout: {captured:?}"
+        );
+        assert!(
+            stdout_path.exists(),
+            "stdout capture missing in main .devflow"
+        );
+        assert!(
+            !crate::agent_result::stdout_path(&worktree, state.phase).exists(),
+            "stdout capture should not be written under the worktree"
+        );
     }
 }

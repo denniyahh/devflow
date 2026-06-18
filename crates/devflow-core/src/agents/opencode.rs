@@ -27,8 +27,8 @@ fn simple_prompt(phase: u32) -> String {
          \n\
          ## REQUIRED: Output one of these as your last message:\n\
          \n\
-         Success → DEVLOW_RESULT: {{\"status\": \"success\"}}\n\
-         Failure → DEVLOW_RESULT: {{\"status\": \"failed\", \"reason\": \"why\"}}\n\
+         Success → DEVFLOW_RESULT: {{\"status\": \"success\"}}\n\
+         Failure → DEVFLOW_RESULT: {{\"status\": \"failed\", \"reason\": \"why\"}}\n\
          \n\
          Nothing after this line. DevFlow uses it to track completion."
     )
