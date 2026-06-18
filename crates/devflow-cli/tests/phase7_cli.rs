@@ -99,6 +99,21 @@ fn wait_for(path: &Path) {
     panic!("timed out waiting for {}", path.display());
 }
 
+fn git_stdout(root: &Path, args: &[&str]) -> String {
+    String::from_utf8_lossy(&git(root, args).stdout)
+        .trim()
+        .to_string()
+}
+
+fn seed_feature_branch(root: &Path, phase: u32) {
+    let branch = format!("feature/phase-{phase:02}");
+    git(root, &["checkout", "-q", "-b", &branch]);
+    fs::write(root.join("initial.txt"), "initial phase work\n").unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-q", "-m", "initial phase work"]);
+    git(root, &["checkout", "-q", "develop"]);
+}
+
 #[test]
 fn parallel_creates_two_worktrees_and_spawns_two_monitors() {
     let repo = tempfile::tempdir().unwrap();
@@ -151,4 +166,69 @@ fn parallel_creates_two_worktrees_and_spawns_two_monitors() {
     assert!(root.join(".devflow/state.json").exists());
     assert!(root.join(".devflow/phase-07-stdout").exists());
     assert!(root.join(".devflow/phase-08-stdout").exists());
+}
+
+#[test]
+fn sequentagent_integrates_agent_a_then_rebases_agent_b() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    seed_feature_branch(root, 7);
+    let fake_bin = fake_bin_dir(&[
+        (
+            "claude",
+            "#!/bin/sh\n\
+             echo workA\n\
+             printf 'from A\\n' > a.txt\n\
+             git add a.txt\n\
+             git commit --allow-empty -m A\n\
+             printf 'DEVFLOW_RESULT: {\"status\":\"success\",\"commits\":1}\\n'\n",
+        ),
+        (
+            "codex",
+            "#!/bin/sh\n\
+             if test -f a.txt; then printf 'saw A\\n' > \"$DEVFLOW_TEST_ROOT/b-saw-a\"; fi\n\
+             git log --oneline > \"$DEVFLOW_TEST_ROOT/b-log\"\n\
+             printf 'from B\\n' > b.txt\n\
+             git add b.txt\n\
+             git commit --allow-empty -m B\n\
+             printf 'DEVFLOW_RESULT: {\"status\":\"success\",\"commits\":1}\\n'\n",
+        ),
+    ]);
+
+    let output = run_devflow(
+        root,
+        &fake_bin.path,
+        &[
+            "sequentagent",
+            "--phase",
+            "7",
+            "--agents",
+            "claude,codex",
+            "--force",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("sequentagent complete"));
+
+    let base_log = git_stdout(root, &["log", "--oneline", "feature/phase-07"]);
+    assert!(
+        base_log.contains(" A"),
+        "base branch missing A:\n{base_log}"
+    );
+    assert!(
+        base_log.contains(" B"),
+        "base branch missing B:\n{base_log}"
+    );
+
+    let b_log = git_stdout(root, &["log", "--oneline", "feature/phase-07-codex"]);
+    assert!(
+        b_log.contains(" A"),
+        "agent B branch was not rebased onto A:\n{b_log}"
+    );
+    assert!(b_log.contains(" B"), "agent B branch missing B:\n{b_log}");
+    assert!(
+        root.join("b-saw-a").exists(),
+        "agent B did not see A's file"
+    );
 }
