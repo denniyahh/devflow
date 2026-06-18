@@ -260,12 +260,16 @@ pub fn exit_code_path(project_root: &Path, phase: u32) -> PathBuf {
     devflow_dir(project_root).join(format!("phase-{:02}-exit", phase))
 }
 
-/// Clean up old stdout and exit code files for a phase before starting.
+/// Path to the file where the monitor records the launched agent's PID.
+pub fn agent_pid_path(project_root: &Path, phase: u32) -> PathBuf {
+    devflow_dir(project_root).join(format!("phase-{:02}-agent-pid", phase))
+}
+
+/// Clean up old stdout, exit code, and agent-pid files for a phase before starting.
 pub fn cleanup_phase_files(project_root: &Path, phase: u32) {
-    let stdout = stdout_path(project_root, phase);
-    let exit = exit_code_path(project_root, phase);
-    let _ = std::fs::remove_file(&stdout);
-    let _ = std::fs::remove_file(&exit);
+    let _ = std::fs::remove_file(stdout_path(project_root, phase));
+    let _ = std::fs::remove_file(exit_code_path(project_root, phase));
+    let _ = std::fs::remove_file(agent_pid_path(project_root, phase));
 }
 
 #[cfg(test)]

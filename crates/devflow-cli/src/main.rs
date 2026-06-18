@@ -211,47 +211,36 @@ fn start(
 
     state.step = Step::Executing;
     let adapter = devflow_core::agents::adapter_for(state.agent);
-    let (child, pid) = agent::launch_agent(&*adapter, state.phase, project_root)?;
-    state.agent_pid = Some(pid);
-    state.agent_label = Some(agent::agent_label(agent, pid));
-    println!("launched {} (pid {})", devflow_core::agents::adapter_for(agent).name(), pid);
 
     if use_monitor {
-        // Monitor mode: spawn a background thread to capture stdout + exit code,
-        // then spawn the monitor daemon.
-        let phase_dir = project_root.to_path_buf();
-        std::thread::spawn(move || {
-            let capture = agent::capture_agent_output(child, phase, &phase_dir);
-            match capture {
-                Ok(c) => {
-                    // Parse DEVLOW_RESULT for logging (state is not available here).
-                    if let Some(result) =
-                        devflow_core::agent_result::parse_devlow_result(&c.stdout)
-                    {
-                        eprintln!(
-                            "agent self-reported: {:?} (exit code {})",
-                            result.status, c.exit_code
-                        );
-                    }
-                }
-                Err(e) => {
-                    eprintln!("failed to capture agent output: {e}");
-                }
-            }
-        });
-
-        match monitor::spawn_monitor(&state) {
+        // Monitor mode: the monitor daemon *owns* the agent so stdout/exit
+        // capture survives this CLI process exiting. The CLI does not launch
+        // or wait on the agent itself.
+        let (program, args) = adapter.exec_command(state.phase);
+        match monitor::spawn_monitor(&state, program, &args) {
             Ok(mon_pid) => {
                 state.monitor_pid = Some(mon_pid);
+                // The monitor records the agent PID; poll briefly so status
+                // and `devflow check` can report it.
+                if let Some(agent_pid) = monitor::wait_for_agent_pid(project_root, phase) {
+                    state.agent_pid = Some(agent_pid);
+                    state.agent_label = Some(agent::agent_label(agent, agent_pid));
+                    println!("launched {} (pid {agent_pid})", adapter.name());
+                }
                 println!("monitor spawned (pid {mon_pid}) — will auto-advance when agent exits");
             }
             Err(err) => {
-                println!("warning: could not spawn monitor: {err}");
-                println!("agent stdout will be captured — check back with `devflow check`");
+                return Err(CliError::Message(format!(
+                    "could not spawn monitor: {err}"
+                )));
             }
         }
     } else {
-        // Blocking mode: capture output directly.
+        // Blocking mode: the CLI launches the agent and captures output directly.
+        let (child, pid) = agent::launch_agent(&*adapter, state.phase, project_root)?;
+        state.agent_pid = Some(pid);
+        state.agent_label = Some(agent::agent_label(agent, pid));
+        println!("launched {} (pid {pid})", adapter.name());
         println!("waiting for agent to complete (no monitor — blocking)...");
         match agent::capture_agent_output(child, phase, project_root) {
             Ok(capture) => {

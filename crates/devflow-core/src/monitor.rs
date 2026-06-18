@@ -1,14 +1,20 @@
 //! Background monitor daemon.
 //!
-//! Spawns a detached child process that watches a spawned agent process.
-//! When the agent exits, it automatically runs `devflow check` to advance
-//! the state machine.
+//! Spawns a detached child process that *owns* the coding agent: it launches
+//! the agent, captures its stdout and exit code into `.devflow/`, and — when
+//! the agent exits — runs `devflow check` to advance the state machine.
 //!
-//! This is the key automation primitive — no cron, no scheduler,
+//! Owning the agent is the key fix over a CLI-scoped capture thread: because
+//! the monitor outlives `devflow start`, the agent's stdout keeps flowing into
+//! the capture file and its exit code is still reaped after the CLI exits.
+//!
+//! This is the core automation primitive — no cron, no scheduler,
 //! no agent cooperation needed.
 
 use crate::state::State;
+use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 /// Errors produced by monitor operations.
 #[derive(Debug, thiserror::Error)]
@@ -22,22 +28,22 @@ pub enum MonitorError {
     /// Could not determine the current executable path.
     #[error("could not determine devflow binary path")]
     NoBinaryPath,
-    /// No agent PID to monitor.
-    #[error("no agent PID recorded — cannot spawn monitor")]
-    NoAgentPid,
 }
 
-/// Spawn a background monitor for the given workflow state.
+/// Spawn a background monitor that owns the agent for the given workflow state.
 ///
-/// The monitor is a detached child process that:
-/// 1. Polls every 30s to check if the agent process is still alive
-/// 2. When the agent exits, runs `devflow check` to advance the workflow
-/// 3. Exits
+/// The monitor is a detached shell process that:
+/// 1. Launches the agent (`program` + `args`) with stdout redirected to the
+///    phase stdout file, recording the agent PID to the agent-pid file
+/// 2. Waits for the agent to exit and records its exit code to the exit file
+/// 3. Runs `devflow check` to advance the workflow through its remaining steps
 ///
 /// Returns the PID of the spawned monitor.
-pub fn spawn_monitor(state: &State) -> Result<u32, MonitorError> {
-    let agent_pid = state.agent_pid.ok_or(MonitorError::NoAgentPid)?;
-
+pub fn spawn_monitor(
+    state: &State,
+    program: &str,
+    args: &[String],
+) -> Result<u32, MonitorError> {
     let project_root = state
         .project_root
         .to_str()
@@ -49,20 +55,48 @@ pub fn spawn_monitor(state: &State) -> Result<u32, MonitorError> {
         .ok_or(MonitorError::NonUtf8Path)?
         .to_string();
 
-    // Shell script that watches the agent PID. Uses kill -0 to check
-    // process existence (POSIX standard, no signal sent). When the agent
-    // exits, runs `devflow check` multiple times to advance through all
-    // remaining workflow steps.
+    let stdout_file = crate::agent_result::stdout_path(&state.project_root, state.phase);
+    let exit_file = crate::agent_result::exit_code_path(&state.project_root, state.phase);
+    let pid_file = crate::agent_result::agent_pid_path(&state.project_root, state.phase);
+
+    // Ensure the capture directory exists before the detached process runs.
+    if let Some(parent) = stdout_file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let stdout_file = stdout_file.to_str().ok_or(MonitorError::NonUtf8Path)?;
+    let exit_file = exit_file.to_str().ok_or(MonitorError::NonUtf8Path)?;
+    let pid_file = pid_file.to_str().ok_or(MonitorError::NonUtf8Path)?;
+
+    // Build the shell-escaped agent command.
+    let mut agent_cmd = shell_escape(program);
+    for arg in args {
+        agent_cmd.push(' ');
+        agent_cmd.push_str(&shell_escape(arg));
+    }
+
+    // Shell script that launches the agent in the background, captures its
+    // stdout and exit code, then advances the workflow. Because this process
+    // is the agent's parent, capture survives the CLI exiting.
+    //
+    // stderr is discarded so it cannot corrupt the (possibly JSON) stdout
+    // capture that DevFlow parses for DEVLOW_RESULT.
     //
     // Traps SIGTERM and SIGINT for clean shutdown.
     let script = format!(
         "cleanup() {{ exit 0; }}; trap cleanup TERM INT; \
-         while kill -0 {agent_pid} 2>/dev/null; do sleep 30; done; \
+         {agent_cmd} > {stdout_file} 2>/dev/null & \
+         apid=$!; echo $apid > {pid_file}; \
+         wait $apid; echo $? > {exit_file}; \
          {binary} check {project_root}; \
          {binary} check {project_root}; \
          {binary} check {project_root}; \
          {binary} check {project_root}; \
          {binary} check {project_root}",
+        agent_cmd = agent_cmd,
+        stdout_file = shell_escape(stdout_file),
+        exit_file = shell_escape(exit_file),
+        pid_file = shell_escape(pid_file),
         binary = shell_escape(&binary),
         project_root = shell_escape(project_root),
     );
@@ -77,6 +111,23 @@ pub fn spawn_monitor(state: &State) -> Result<u32, MonitorError> {
 
     let pid = child.id();
     Ok(pid)
+}
+
+/// Poll for the agent PID that the monitor records, for up to ~1 second.
+///
+/// Returns the PID once the monitor has launched the agent, or `None` if it
+/// does not appear in time (the monitor still runs; only the display PID is lost).
+pub fn wait_for_agent_pid(project_root: &Path, phase: u32) -> Option<u32> {
+    let path = crate::agent_result::agent_pid_path(project_root, phase);
+    for _ in 0..50 {
+        if let Ok(contents) = std::fs::read_to_string(&path)
+            && let Ok(pid) = contents.trim().parse::<u32>()
+        {
+            return Some(pid);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    None
 }
 
 /// Escape a string for safe use in a single-quoted shell context.
