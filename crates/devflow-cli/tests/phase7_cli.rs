@@ -378,3 +378,26 @@ fn rejectpr_redo_reverts_version_deletes_branch_and_clears_last_ship() {
     );
     assert!(!root.join(".devflow/last-ship.json").exists());
 }
+
+#[test]
+fn status_prints_cron_hint_when_cron_instructions_exist() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let instructions = devflow_core::ship::build_cron_instructions(
+        root,
+        7,
+        "2026-06-18T15:45:30Z",
+        "claude,codex",
+    );
+    devflow_core::ship::write_cron_instructions(root, &instructions).unwrap();
+    let fake_bin = fake_bin_dir(&[]);
+
+    let output = run_devflow(root, &fake_bin.path, &["status"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(stdout.contains(&format!(
+        "Cron instruction pending: hermes cron create --from-devflow {}",
+        root.display()
+    )));
+}
