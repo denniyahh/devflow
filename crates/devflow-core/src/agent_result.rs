@@ -46,11 +46,38 @@ pub enum ResultError {
     NoPhaseDir,
 }
 
-/// Search the last 4000 characters of stdout for a DEVLOW_RESULT marker.
+/// Search stdout for a DEVLOW_RESULT marker.
 ///
 /// The marker is a single line starting with `DEVLOW_RESULT:` followed by
 /// a JSON object with at minimum a `status` field. Matching is case-insensitive.
+///
+/// When an agent is run with `--output-format json` (e.g. Claude), its final
+/// message is wrapped in a JSON result envelope with the text — and its
+/// embedded newlines — escaped inside a `result` field. In that case the
+/// marker never appears at the start of a line, so we first unwrap the
+/// envelope and search the inner text.
 pub fn parse_devlow_result(stdout: &str) -> Option<AgentResult> {
+    if let Some(inner) = extract_json_result_text(stdout)
+        && let Some(result) = parse_marker_lines(&inner)
+    {
+        return Some(result);
+    }
+    parse_marker_lines(stdout)
+}
+
+/// If `stdout` is a JSON result envelope, return the decoded `result` text
+/// field (with escapes such as `\n` resolved). Returns `None` for plain text.
+fn extract_json_result_text(stdout: &str) -> Option<String> {
+    let trimmed = stdout.trim();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    value.get("result")?.as_str().map(str::to_string)
+}
+
+/// Scan the tail of `stdout` line-by-line for the last DEVLOW_RESULT marker.
+fn parse_marker_lines(stdout: &str) -> Option<AgentResult> {
     // Only search the tail — agents may echo the marker in their prompt
     // and we want the LAST occurrence (which is their actual final status).
     let tail: String = stdout
@@ -303,6 +330,30 @@ mod tests {
         assert_eq!(result.status, AgentStatus::Success);
         assert_eq!(result.commits, Some(3));
         assert_eq!(result.summary.unwrap(), "added tests");
+    }
+
+    #[test]
+    fn parse_marker_inside_json_result_envelope() {
+        // Claude --output-format json wraps the final text in a `result` field
+        // with embedded newlines escaped.
+        let stdout = r#"{"type":"result","subtype":"success","result":"All done.\nDEVLOW_RESULT: {\"status\": \"success\", \"commits\": 2}","session_id":"abc"}"#;
+        let result = parse_devlow_result(stdout).unwrap();
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(result.commits, Some(2));
+    }
+
+    #[test]
+    fn parse_failed_marker_inside_json_envelope() {
+        let stdout = r#"{"result":"work\nDEVLOW_RESULT: {\"status\": \"failed\", \"reason\": \"tests failed\"}"}"#;
+        let result = parse_devlow_result(stdout).unwrap();
+        assert_eq!(result.status, AgentStatus::Failed);
+        assert_eq!(result.reason.unwrap(), "tests failed");
+    }
+
+    #[test]
+    fn parse_json_envelope_without_marker_returns_none() {
+        let stdout = r#"{"result":"did some work but forgot the marker","session_id":"x"}"#;
+        assert!(parse_devlow_result(stdout).is_none());
     }
 
     #[test]
