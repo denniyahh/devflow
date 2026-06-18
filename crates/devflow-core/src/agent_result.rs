@@ -103,7 +103,7 @@ fn detect_codex_rate_limit(stdout: &str) -> Option<String> {
             .next()
             .unwrap_or_default()
             .trim()
-            .trim_end_matches(|c: char| c == '.' || c == ',' || c == ';')
+            .trim_end_matches(['.', ',', ';'])
             .trim();
         if !retry.is_empty() {
             return Some(retry.to_string());

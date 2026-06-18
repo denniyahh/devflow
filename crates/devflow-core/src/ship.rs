@@ -397,13 +397,13 @@ fn split_time_and_offset(time: &str) -> (&str, i32) {
                 parse_offset_minutes(&trimmed[idx..]).unwrap_or(0),
             );
         }
-        if let Some(idx) = trimmed.rfind('-') {
-            if idx > 0 {
-                return (
-                    &trimmed[..idx],
-                    parse_offset_minutes(&trimmed[idx..]).unwrap_or(0),
-                );
-            }
+        if let Some(idx) = trimmed.rfind('-')
+            && idx > 0
+        {
+            return (
+                &trimmed[..idx],
+                parse_offset_minutes(&trimmed[idx..]).unwrap_or(0),
+            );
         }
     }
     (trimmed, 0)
