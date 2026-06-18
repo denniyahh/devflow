@@ -105,27 +105,65 @@ pub fn write_version(
     Ok(path)
 }
 
+/// Split a dotted field path into its TOML section path and the final key.
+///
+/// `workspace.package.version` -> (`workspace.package`, `version`), matching the
+/// `[workspace.package]` table header. A field with no dot (e.g. `version`)
+/// targets the root/top-level scope, which is also how flat YAML files behave.
+fn split_field(field: &str) -> (&str, &str) {
+    match field.rsplit_once('.') {
+        Some((section, key)) => (section, key),
+        None => ("", field),
+    }
+}
+
+/// Return the dotted table path for a TOML section header line, if any.
+///
+/// `[workspace.package]` -> `workspace.package`. Returns `None` for non-header
+/// lines so the caller leaves the current section untouched.
+fn parse_section_header(trimmed: &str) -> Option<&str> {
+    let inner = trimmed.strip_prefix('[')?.strip_suffix(']')?;
+    Some(inner.trim())
+}
+
 fn find_version_in_contents(contents: &str, field: &str) -> Option<String> {
-    let key = field.rsplit('.').next()?;
+    let (section, key) = split_field(field);
+    let mut current = "";
     for line in contents.lines() {
         let trimmed = line.trim();
-        if !trimmed.starts_with(key) {
+        if let Some(header) = parse_section_header(trimmed) {
+            current = header;
             continue;
         }
-        let (_, value) = trimmed.split_once(['=', ':'])?;
+        if current != section {
+            continue;
+        }
+        let (lhs, value) = trimmed.split_once(['=', ':'])?;
+        if lhs.trim() != key {
+            continue;
+        }
         return Some(value.trim().trim_matches(['"', '\'']).to_string());
     }
     None
 }
 
 fn replace_version_in_contents(contents: &str, field: &str, new_version: &str) -> Option<String> {
-    let key = field.rsplit('.').next()?;
+    let (section, key) = split_field(field);
+    let mut current = "";
     let mut changed = false;
     let mut output = String::new();
     for line in contents.lines() {
-        let trimmed = line.trim_start();
-        if !changed && trimmed.starts_with(key) {
-            if let Some((left, value)) = line.split_once('=') {
+        let trimmed = line.trim();
+        if let Some(header) = parse_section_header(trimmed) {
+            current = header;
+            output.push_str(line);
+            output.push('\n');
+            continue;
+        }
+        if !changed && current == section {
+            if let Some((left, value)) = line.split_once('=')
+                && left.trim() == key
+            {
                 let quote = if value.contains('\'') { "'" } else { "\"" };
                 output.push_str(left.trim_end());
                 output.push_str(" = ");
@@ -135,8 +173,9 @@ fn replace_version_in_contents(contents: &str, field: &str, new_version: &str) -
                 output.push('\n');
                 changed = true;
                 continue;
-            }
-            if let Some((left, _value)) = line.split_once(':') {
+            } else if let Some((left, _value)) = line.split_once(':')
+                && left.trim() == key
+            {
                 output.push_str(left.trim_end());
                 output.push_str(": ");
                 output.push_str(new_version);
@@ -215,6 +254,71 @@ mod tests {
         .unwrap();
         let cfg = version_config("Cargo.toml", "package.version");
         assert_eq!(read_version(dir.path(), &cfg).unwrap(), "0.5.0");
+    }
+
+    /// A workspace root Cargo.toml: version lives under `[workspace.package]`,
+    /// and `[workspace.dependencies]` carries unrelated inline `version` keys.
+    const WORKSPACE_CARGO_TOML: &str = "\
+[workspace]
+members = [\"crates/core\"]
+
+[workspace.package]
+version = \"0.5.0\"
+edition = \"2024\"
+
+[workspace.dependencies]
+serde = { version = \"1\", features = [\"derive\"] }
+clap = \"4\"
+";
+
+    #[test]
+    fn read_version_from_workspace_package_section() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), WORKSPACE_CARGO_TOML).unwrap();
+        let cfg = version_config("Cargo.toml", "workspace.package.version");
+        // Must return the workspace package version, not a dependency's version.
+        assert_eq!(read_version(dir.path(), &cfg).unwrap(), "0.5.0");
+    }
+
+    #[test]
+    fn read_version_ignores_dependency_versions_in_wrong_section() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), WORKSPACE_CARGO_TOML).unwrap();
+        // Asking for a non-existent root [package] version must not fall through
+        // to the dependency `version = "1"` line.
+        let cfg = version_config("Cargo.toml", "package.version");
+        assert!(matches!(
+            read_version(dir.path(), &cfg).unwrap_err(),
+            VersionError::Parse(_)
+        ));
+    }
+
+    #[test]
+    fn write_version_in_workspace_package_leaves_dependencies_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("Cargo.toml");
+        std::fs::write(&file, WORKSPACE_CARGO_TOML).unwrap();
+        let cfg = version_config("Cargo.toml", "workspace.package.version");
+
+        write_version(dir.path(), &cfg, "0.6.0").unwrap();
+        let contents = std::fs::read_to_string(&file).unwrap();
+
+        assert!(contents.contains("version = \"0.6.0\""));
+        // The dependency pin must be untouched.
+        assert!(contents.contains("serde = { version = \"1\""));
+        assert_eq!(read_version(dir.path(), &cfg).unwrap(), "0.6.0");
+    }
+
+    #[test]
+    fn read_version_from_root_package_section() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"1.2.3\"\n\n[dependencies]\nserde = \"1\"\n",
+        )
+        .unwrap();
+        let cfg = version_config("Cargo.toml", "package.version");
+        assert_eq!(read_version(dir.path(), &cfg).unwrap(), "1.2.3");
     }
 
     #[test]
