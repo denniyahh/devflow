@@ -25,10 +25,7 @@ pub enum AgentError {
 /// The agent runs in non-interactive mode with structured output.
 /// Caller is responsible for waiting on the child.
 pub fn launch_agent(state: &State) -> Result<(Child, u32), AgentError> {
-    let root = state
-        .project_root
-        .to_str()
-        .ok_or(AgentError::NonUtf8Path)?;
+    let root = state.project_root.to_str().ok_or(AgentError::NonUtf8Path)?;
 
     let (program, args) = state.agent.exec_command(root, state.phase);
 
@@ -61,4 +58,27 @@ pub fn agent_running(pid: u32) -> bool {
 /// Generate a human-readable label for the agent session.
 pub fn agent_label(agent: Agent, pid: u32) -> String {
     format!("{}-{}", agent, pid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_running_detects_self() {
+        // The current process is, by definition, running.
+        assert!(agent_running(std::process::id()));
+    }
+
+    #[test]
+    fn agent_running_false_for_dead_pid() {
+        // A PID near the top of the range is essentially never live.
+        assert!(!agent_running(0x7FFF_FFFE));
+    }
+
+    #[test]
+    fn agent_label_combines_agent_and_pid() {
+        assert_eq!(agent_label(Agent::Claude, 42), "claude-42");
+        assert_eq!(agent_label(Agent::OpenCode, 7), "opencode-7");
+    }
 }

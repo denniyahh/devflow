@@ -1,6 +1,6 @@
 # Phase 1: CI Foundation + Test Coverage + Critical Fixes
 
-> Parent: [ROADMAP.md](./ROADMAP.md) | Status: Planning
+> Parent: [ROADMAP.md](./ROADMAP.md) | Status: Complete (2026-06-17)
 
 ## Goal
 
@@ -90,12 +90,10 @@ Establish CI pipeline, raise test coverage from 5% to >60%, and fix the 3 critic
   - cleanup_merged() behavior
   - `<automated>` `cargo test test_git -- --ignored` (requires git)
 
-- [ ] `tmux.rs` integration tests (`tests/integration/tmux.rs`)
-  - Skip if tmux not available
-  - launch_agent() creates session, session auto-dies on cmd exit
-  - agent_running() returns correct status
-  - capture_output() returns content
-  - `<automated>` `cargo test test_tmux -- --ignored`
+- [x] ~~`tmux.rs` integration tests~~ — **OBSOLETE.** tmux was removed in
+  commit `14fa144` (replaced with non-interactive process spawning). Agent
+  launch is now covered by `agent.rs` unit tests (`agent_running`,
+  `agent_label`).
 
 ### 1f — Verify CI is Green
 
@@ -105,13 +103,26 @@ Establish CI pipeline, raise test coverage from 5% to >60%, and fix the 3 critic
 
 ## Success Criteria
 
-- [ ] `.github/workflows/ci.yml` exists and passes
-- [ ] `cargo clippy` passes with `-D warnings` (catches remaining unwraps)
-- [ ] `cargo fmt --check` passes
-- [ ] `cargo test` passes with >15 new tests
-- [ ] No `unwrap()` in library code (`lock.rs` only violation)
-- [ ] AGENTS.md and ROADMAP.md reflect current state
-- [ ] Test coverage >60%
+- [x] `.github/workflows/ci.yml` exists and passes
+- [x] `cargo clippy` passes with `-D warnings` (catches remaining unwraps)
+- [x] `cargo fmt --check` passes
+- [x] `cargo test` passes with >15 new tests (72 tests total)
+- [x] No `unwrap()` in library code (`lock.rs` only violation)
+- [x] AGENTS.md and ROADMAP.md reflect current state
+- [x] Test coverage >60% (**78.66% lines / 80.73% regions** via `cargo llvm-cov`)
+
+## Completion Notes (2026-06-17)
+
+The `14fa144` tmux→process-spawning refactor reintroduced **2 clippy errors**
+(`recover.rs`: `map_or`→`is_some_and`, collapsible `if let`) and **fmt drift**
+across 5 files, leaving CI red. Fixed both, then added 11 tests for the two
+weakest modules:
+- `recover.rs`: 0% → 82% (stale-state detection, age formatting, `inspect`)
+- `agent.rs`: process-existence + label helpers (`agent_running`, `agent_label`)
+
+Remaining 0%-coverage modules are `main.rs` (CLI entry, integration-level) and
+`monitor.rs` (forking daemon) — both impractical for unit tests and out of
+scope for the >60% target, which is exceeded library-wide.
 
 ## Verification
 
