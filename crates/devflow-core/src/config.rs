@@ -271,6 +271,7 @@ fn parse_bool(value: &str) -> Result<bool, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::Step;
 
     #[test]
     fn parses_devflow_yaml_shape() {
@@ -281,5 +282,136 @@ mod tests {
         assert_eq!(config.version.file, "Cargo.toml");
         assert!(!config.automation.auto_verify);
         assert_eq!(config.git_flow.develop, "dev");
+    }
+
+    #[test]
+    fn defaults_match_documented_schema() {
+        let config = Config::default();
+        assert_eq!(config.version.scheme, "semver");
+        assert_eq!(config.version.file, "pyproject.toml");
+        assert_eq!(config.version.field, "project.version");
+        assert_eq!(config.version.build_number, "git");
+        assert!(config.automation.auto_branch);
+        assert!(config.automation.auto_verify);
+        assert!(config.automation.auto_docs);
+        assert_eq!(config.automation.auto_version, "patch");
+        assert!(!config.automation.auto_ship);
+        assert!(config.automation.auto_cleanup);
+        assert_eq!(config.git_flow.main, "main");
+        assert_eq!(config.git_flow.develop, "develop");
+        assert_eq!(config.git_flow.feature_prefix, "feature/");
+    }
+
+    #[test]
+    fn parse_keeps_defaults_for_omitted_fields() {
+        let config = parse_config("version:\n  file: Cargo.toml\n").expect("parse");
+        // Unspecified fields retain defaults.
+        assert_eq!(config.version.scheme, "semver");
+        assert_eq!(config.git_flow.main, "main");
+        assert_eq!(config.version.file, "Cargo.toml");
+    }
+
+    #[test]
+    fn parse_strips_comments_and_quotes() {
+        let config = parse_config(
+            "version:\n  file: \"Cargo.toml\"  # the manifest\n  field: 'package.version'\n",
+        )
+        .expect("parse");
+        assert_eq!(config.version.file, "Cargo.toml");
+        assert_eq!(config.version.field, "package.version");
+    }
+
+    #[test]
+    fn parse_ignores_unknown_keys_and_sections() {
+        let config =
+            parse_config("unknown:\n  foo: bar\nversion:\n  mystery: 1\n  file: x.toml\n")
+                .expect("parse");
+        assert_eq!(config.version.file, "x.toml");
+    }
+
+    #[test]
+    fn parse_rejects_line_without_colon() {
+        let err = parse_config("version:\n  not-a-pair\n").unwrap_err();
+        assert!(matches!(err, ConfigError::Parse(_)));
+    }
+
+    #[test]
+    fn parse_rejects_non_boolean_toggle() {
+        let err = parse_config("automation:\n  auto_ship: maybe\n").unwrap_err();
+        match err {
+            ConfigError::Parse(msg) => assert!(msg.contains("boolean")),
+            other => panic!("expected parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_accepts_all_boolean_toggles() {
+        let config = parse_config(
+            "automation:\n  auto_branch: false\n  auto_verify: false\n  auto_docs: false\n  auto_ship: true\n  auto_cleanup: false\n",
+        )
+        .expect("parse");
+        assert!(!config.automation.auto_branch);
+        assert!(!config.automation.auto_verify);
+        assert!(!config.automation.auto_docs);
+        assert!(config.automation.auto_ship);
+        assert!(!config.automation.auto_cleanup);
+    }
+
+    #[test]
+    fn load_missing_file_returns_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::load(dir.path()).expect("load");
+        assert_eq!(config.version.file, "pyproject.toml");
+    }
+
+    #[test]
+    fn load_reads_file_from_project_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".devflow.yaml"),
+            "version:\n  file: Cargo.toml\n",
+        )
+        .unwrap();
+        let config = Config::load(dir.path()).expect("load");
+        assert_eq!(config.version.file, "Cargo.toml");
+    }
+
+    #[test]
+    fn to_yaml_round_trips_through_parser() {
+        let mut original = Config::default();
+        original.version.file = "Cargo.toml".into();
+        original.automation.auto_ship = true;
+        original.git_flow.develop = "trunk".into();
+
+        let yaml = original.to_yaml();
+        let parsed = parse_config(&yaml).expect("re-parse rendered yaml");
+
+        assert_eq!(parsed.version.file, "Cargo.toml");
+        assert!(parsed.automation.auto_ship);
+        assert_eq!(parsed.git_flow.develop, "trunk");
+        assert_eq!(parsed.version.scheme, original.version.scheme);
+    }
+
+    #[test]
+    fn should_skip_follows_automation_toggles() {
+        let mut config = Config::default();
+        // All enabled by default → nothing skipped except never-skip steps.
+        assert!(!config.should_skip(&Step::Verifying));
+        assert!(!config.should_skip(&Step::Docsing));
+        assert!(!config.should_skip(&Step::Cleaning));
+        // Shipping is never auto-skipped.
+        assert!(!config.should_skip(&Step::Shipping));
+        // Non-optional steps never skip.
+        assert!(!config.should_skip(&Step::Idle));
+        assert!(!config.should_skip(&Step::Branching));
+        assert!(!config.should_skip(&Step::Executing));
+
+        config.automation.auto_verify = false;
+        config.automation.auto_docs = false;
+        config.automation.auto_cleanup = false;
+        assert!(config.should_skip(&Step::Verifying));
+        assert!(config.should_skip(&Step::Docsing));
+        assert!(config.should_skip(&Step::Cleaning));
+        assert!(!config.should_skip(&Step::Shipping));
     }
 }

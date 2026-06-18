@@ -84,3 +84,72 @@ impl Drop for LockGuard {
 fn lock_path(project_root: &Path) -> PathBuf {
     project_root.join(".devflow").join("lock")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn acquire_creates_lock_and_records_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = acquire(dir.path()).expect("acquire");
+
+        let (pid, path) = holder(dir.path()).expect("holder present");
+        assert_eq!(pid, std::process::id().to_string());
+        assert!(path.exists());
+        drop(guard);
+    }
+
+    #[test]
+    fn acquire_creates_devflow_directory_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!dir.path().join(".devflow").exists());
+        let _guard = acquire(dir.path()).expect("acquire");
+        assert!(dir.path().join(".devflow").exists());
+    }
+
+    #[test]
+    fn second_acquire_is_contended() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = acquire(dir.path()).expect("first acquire");
+
+        match acquire(dir.path()) {
+            Err(LockError::Contended { pid, .. }) => {
+                assert_eq!(pid, std::process::id().to_string());
+            }
+            Ok(_) => panic!("second acquire must fail"),
+            Err(other) => panic!("expected Contended, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dropping_guard_releases_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let _guard = acquire(dir.path()).expect("acquire");
+            assert!(holder(dir.path()).is_some());
+        }
+        // After the guard drops the lock file is gone and re-acquiring works.
+        assert!(holder(dir.path()).is_none());
+        let _again = acquire(dir.path()).expect("re-acquire after release");
+    }
+
+    #[test]
+    fn holder_is_none_without_lock_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(holder(dir.path()).is_none());
+    }
+
+    #[test]
+    fn holder_cleans_up_empty_lock_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = lock_path(dir.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "   \n").unwrap();
+
+        assert!(holder(dir.path()).is_none());
+        // Empty/stale lock should be removed so a fresh acquire succeeds.
+        assert!(!path.exists());
+        let _guard = acquire(dir.path()).expect("acquire after stale cleanup");
+    }
+}

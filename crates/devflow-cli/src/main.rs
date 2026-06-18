@@ -1,8 +1,9 @@
 use clap::{Parser, Subcommand};
+use devflow_core::agent;
 use devflow_core::config::Config;
 use devflow_core::git::GitFlow;
 use devflow_core::state::{Agent, State, Step};
-use devflow_core::{lock, monitor, recover, tmux, version, workflow};
+use devflow_core::{lock, monitor, recover, version, workflow};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Parser)]
@@ -88,7 +89,7 @@ enum CliError {
     #[error(transparent)]
     Git(#[from] devflow_core::git::GitError),
     #[error(transparent)]
-    Tmux(#[from] devflow_core::tmux::TmuxError),
+    Agent(#[from] devflow_core::agent::AgentError),
     #[error(transparent)]
     Version(#[from] devflow_core::version::VersionError),
     #[error("{0}")]
@@ -134,30 +135,66 @@ fn start(project_root: &Path, phase: u32, agent: Agent, use_monitor: bool) -> Re
     }
 
     state.step = Step::Executing;
-    match tmux::launch_agent(&state) {
-        Ok(session) => {
-            state.tmux_session = Some(session.clone());
-            println!("launched {} in tmux session: {session}", agent.name());
-        }
-        Err(err) => {
-            state.tmux_session = Some(state.tmux_session_name());
-            println!("warning: could not launch tmux agent: {err}");
-        }
-    }
+    let (child, pid) = agent::launch_agent(&state)?;
+    state.agent_pid = Some(pid);
+    state.agent_label = Some(agent::agent_label(agent, pid));
+    println!("launched {} (pid {})", agent.name(), pid);
 
     if use_monitor {
         match monitor::spawn_monitor(&state) {
-            Ok(pid) => {
-                state.monitor_pid = Some(pid);
-                println!("monitor spawned (pid {pid}) — will auto-advance when agent exits");
+            Ok(mon_pid) => {
+                state.monitor_pid = Some(mon_pid);
+                println!("monitor spawned (pid {mon_pid}) — will auto-advance when agent exits");
             }
-            Err(err) => println!("warning: could not spawn monitor: {err}"),
+            Err(err) => {
+                println!("warning: could not spawn monitor: {err}");
+                println!("agent stdout will be captured — check back with `devflow check`");
+            }
         }
+    } else {
+        // Without monitor, wait for agent to finish
+        println!("waiting for agent to complete (no monitor — blocking)...");
+        wait_for_agent(child, pid);
+        println!("agent exited — run `devflow check` to advance");
     }
 
     workflow::save_state(&state)?;
     println!("started phase {} at {}", state.phase, state.started_at);
     Ok(())
+}
+
+/// Wait for the agent child process to exit, capturing its stdout.
+fn wait_for_agent(mut child: std::process::Child, pid: u32) {
+    use std::io::Read;
+    let mut stdout = String::new();
+    if let Some(ref mut pipe) = child.stdout {
+        let _ = pipe.read_to_string(&mut stdout);
+    }
+    match child.wait() {
+        Ok(status) => {
+            if status.success() {
+                println!("agent (pid {pid}) completed successfully");
+            } else {
+                println!("agent (pid {pid}) exited with {status}");
+            }
+        }
+        Err(err) => println!("error waiting for agent (pid {pid}): {err}"),
+    }
+    if !stdout.is_empty() {
+        // Print the last 2000 chars of agent output to keep it manageable.
+        let preview: String = stdout
+            .chars()
+            .rev()
+            .take(2000)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        println!("\n--- agent output (last 2000 chars) ---\n{preview}");
+        if stdout.len() > 2000 {
+            println!("... ({} total chars truncated)", stdout.len());
+        }
+    }
 }
 
 fn check(project_root: &Path) -> Result<(), CliError> {
@@ -174,16 +211,15 @@ fn check(project_root: &Path) -> Result<(), CliError> {
     let config = Config::load(project_root)?;
     let state = workflow::load_state(project_root)?;
 
-    if state.step == Step::Executing
-        && let Some(session) = &state.tmux_session
-    {
-        match tmux::agent_running(session) {
-            Ok(true) => {
-                println!("agent still running in tmux session: {session}");
+    if state.step == Step::Executing {
+        if let Some(pid) = state.agent_pid {
+            if agent::agent_running(pid) {
+                println!("agent still running (pid {pid})");
                 return Ok(());
             }
-            Ok(false) => println!("agent session ended: {session}"),
-            Err(err) => println!("warning: could not inspect tmux session: {err}"),
+            println!("agent process ended (pid {pid})");
+        } else {
+            println!("no agent PID recorded — advancing state");
         }
     }
 
@@ -201,13 +237,13 @@ fn status(project_root: &Path) -> Result<(), CliError> {
             println!("agent: {}", state.agent.name());
             println!("started_at: {}", state.started_at);
             println!("project_root: {}", state.project_root.display());
-            match &state.tmux_session {
-                Some(session) => {
-                    let running = tmux::agent_running(session).unwrap_or(false);
-                    println!("tmux_session: {session}");
+            match state.agent_pid {
+                Some(pid) => {
+                    let running = agent::agent_running(pid);
+                    println!("agent_pid: {pid}");
                     println!("agent_running: {running}");
                 }
-                None => println!("tmux_session: none"),
+                None => println!("agent_pid: none"),
             }
         }
         Err(devflow_core::workflow::WorkflowError::MissingState(_)) => {
@@ -299,19 +335,20 @@ fn recover_cmd(project_root: &Path, do_clean: bool) -> Result<(), CliError> {
     println!("agent: {}", status.state.agent.name());
     println!("started: {}", status.state.started_at);
     println!("age: {}", status.age);
-    println!("agent_running: {}", status.agent_running);
-    println!("is_stale: {}", status.is_stale);
-    match status.lock_held {
-        Some(pid) => println!("lock_held: pid {pid}"),
-        None => println!("lock_held: none"),
+    match status.state.agent_pid {
+        Some(pid) => {
+            let running = agent::agent_running(pid);
+            println!("agent_pid: {pid}");
+            println!("agent_running: {running}");
+            if !running {
+                println!("\nagent is not running — run `devflow check` to advance");
+            }
+        }
+        None => println!("agent_pid: none"),
     }
 
     if status.is_stale {
         println!("\nstate is stale — run `devflow recover --clean` to clear it");
-    } else if !status.agent_running {
-        println!("\nagent is not running but state is recent — run `devflow check` to advance");
-    } else {
-        println!("\nagent is still running — no action needed");
     }
 
     Ok(())

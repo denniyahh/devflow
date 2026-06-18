@@ -154,11 +154,174 @@ fn replace_version_in_contents(contents: &str, field: &str, new_version: &str) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
+
+    fn version_config(file: &str, field: &str) -> VersionConfig {
+        VersionConfig {
+            scheme: "semver".into(),
+            file: file.into(),
+            field: field.into(),
+            build_number: "git".into(),
+        }
+    }
 
     #[test]
     fn bumps_semver_components() {
         assert_eq!(bump("1.2.3", "patch").expect("patch"), "1.2.4");
         assert_eq!(bump("1.2.3", "minor").expect("minor"), "1.3.0");
         assert_eq!(bump("1.2.3", "major").expect("major"), "2.0.0");
+    }
+
+    #[test]
+    fn bump_strips_prerelease_and_build_metadata() {
+        assert_eq!(bump("1.2.3-rc.1", "patch").expect("patch"), "1.2.4");
+        assert_eq!(bump("1.2.3+build.9", "minor").expect("minor"), "1.3.0");
+    }
+
+    #[test]
+    fn bump_none_is_identity() {
+        assert_eq!(bump("1.2.3", "none").expect("none"), "1.2.3");
+        // "none" short-circuits before any parsing.
+        assert_eq!(bump("not-a-version", "none").expect("none"), "not-a-version");
+    }
+
+    #[test]
+    fn bump_rejects_non_numeric_parts() {
+        assert!(bump("1.x.3", "patch").is_err());
+    }
+
+    #[test]
+    fn bump_rejects_wrong_part_count() {
+        assert!(bump("1.2", "patch").is_err());
+        assert!(bump("1.2.3.4", "patch").is_err());
+    }
+
+    #[test]
+    fn bump_rejects_unknown_component() {
+        let err = bump("1.2.3", "epoch").unwrap_err();
+        assert!(err.to_string().contains("epoch"));
+    }
+
+    #[test]
+    fn read_version_from_toml_style_field() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.5.0\"\n",
+        )
+        .unwrap();
+        let cfg = version_config("Cargo.toml", "package.version");
+        assert_eq!(read_version(dir.path(), &cfg).unwrap(), "0.5.0");
+    }
+
+    #[test]
+    fn read_version_from_yaml_style_field() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("info.yaml"), "name: x\nversion: 1.4.2\n").unwrap();
+        let cfg = version_config("info.yaml", "version");
+        assert_eq!(read_version(dir.path(), &cfg).unwrap(), "1.4.2");
+    }
+
+    #[test]
+    fn read_version_errors_when_field_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        let cfg = version_config("Cargo.toml", "package.version");
+        let err = read_version(dir.path(), &cfg).unwrap_err();
+        assert!(matches!(err, VersionError::Parse(_)));
+    }
+
+    #[test]
+    fn read_version_errors_when_file_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = version_config("nope.toml", "version");
+        assert!(matches!(
+            read_version(dir.path(), &cfg).unwrap_err(),
+            VersionError::Io(_)
+        ));
+    }
+
+    #[test]
+    fn write_version_replaces_and_preserves_quote_style() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("Cargo.toml");
+        std::fs::write(&file, "[package]\nversion = \"0.5.0\"\n").unwrap();
+        let cfg = version_config("Cargo.toml", "package.version");
+
+        let written = write_version(dir.path(), &cfg, "0.6.0").unwrap();
+        assert_eq!(written, file);
+
+        let contents = std::fs::read_to_string(&file).unwrap();
+        assert!(contents.contains("version = \"0.6.0\""));
+        // Round-trips: reading back gives the new version.
+        assert_eq!(read_version(dir.path(), &cfg).unwrap(), "0.6.0");
+    }
+
+    #[test]
+    fn write_version_handles_yaml_colon_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("info.yaml");
+        std::fs::write(&file, "version: 1.0.0\n").unwrap();
+        let cfg = version_config("info.yaml", "version");
+
+        write_version(dir.path(), &cfg, "1.0.1").unwrap();
+        let contents = std::fs::read_to_string(&file).unwrap();
+        assert!(contents.contains("version: 1.0.1"));
+    }
+
+    #[test]
+    fn write_version_errors_when_field_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        let cfg = version_config("Cargo.toml", "package.version");
+        assert!(matches!(
+            write_version(dir.path(), &cfg, "1.0.0").unwrap_err(),
+            VersionError::Parse(_)
+        ));
+    }
+
+    #[test]
+    fn build_number_timestamp_is_numeric() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = version_config("Cargo.toml", "version");
+        cfg.build_number = "timestamp".into();
+        let out = build_number(dir.path(), &cfg).unwrap();
+        assert!(out.parse::<u64>().is_ok());
+        assert!(out.parse::<u64>().unwrap() > 0);
+    }
+
+    #[test]
+    fn build_number_rejects_unknown_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = version_config("Cargo.toml", "version");
+        cfg.build_number = "moon-phase".into();
+        let err = build_number(dir.path(), &cfg).unwrap_err();
+        assert!(err.to_string().contains("moon-phase"));
+    }
+
+    #[test]
+    fn build_number_git_counts_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let run = |args: &[&str]| {
+            let ok = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        run(&["config", "core.hooksPath", "/dev/null"]);
+        std::fs::write(root.join("a.txt"), "hi").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "first"]);
+
+        let cfg = version_config("Cargo.toml", "version");
+        assert_eq!(build_number(root, &cfg).unwrap(), "1");
     }
 }

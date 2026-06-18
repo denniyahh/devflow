@@ -1,8 +1,8 @@
 //! Background monitor daemon.
 //!
-//! Spawns a detached child process that watches a tmux session.
-//! When the session dies (agent exited), it automatically runs
-//! `devflow check` to advance the state machine.
+//! Spawns a detached child process that watches a spawned agent process.
+//! When the agent exits, it automatically runs `devflow check` to advance
+//! the state machine.
 //!
 //! This is the key automation primitive — no cron, no scheduler,
 //! no agent cooperation needed.
@@ -22,19 +22,21 @@ pub enum MonitorError {
     /// Could not determine the current executable path.
     #[error("could not determine devflow binary path")]
     NoBinaryPath,
+    /// No agent PID to monitor.
+    #[error("no agent PID recorded — cannot spawn monitor")]
+    NoAgentPid,
 }
 
 /// Spawn a background monitor for the given workflow state.
 ///
 /// The monitor is a detached child process that:
-/// 1. Waits for the tmux session to disappear
-/// 2. Runs `devflow check <project>` to advance the workflow
+/// 1. Polls every 30s to check if the agent process is still alive
+/// 2. When the agent exits, runs `devflow check` to advance the workflow
 /// 3. Exits
 ///
 /// Returns the PID of the spawned monitor.
 pub fn spawn_monitor(state: &State) -> Result<u32, MonitorError> {
-    let session_name = state.tmux_session_name();
-    let session = state.tmux_session.as_deref().unwrap_or(&session_name);
+    let agent_pid = state.agent_pid.ok_or(MonitorError::NoAgentPid)?;
 
     let project_root = state
         .project_root
@@ -47,21 +49,20 @@ pub fn spawn_monitor(state: &State) -> Result<u32, MonitorError> {
         .ok_or(MonitorError::NonUtf8Path)?
         .to_string();
 
-    // Shell script that watches the tmux session and auto-advances.
-    // Uses a polling loop: check every 30s if the session still exists.
-    // When it disappears, run `devflow check` to advance the state machine,
-    // then `devflow check` again to run through remaining steps (verify, docs, ship, clean).
+    // Shell script that watches the agent PID. Uses kill -0 to check
+    // process existence (POSIX standard, no signal sent). When the agent
+    // exits, runs `devflow check` multiple times to advance through all
+    // remaining workflow steps.
     //
-    // Traps SIGTERM and SIGINT for clean shutdown (no orphaned state).
+    // Traps SIGTERM and SIGINT for clean shutdown.
     let script = format!(
         "cleanup() {{ exit 0; }}; trap cleanup TERM INT; \
-         while tmux has-session -t {session} 2>/dev/null; do sleep 30; done; \
+         while kill -0 {agent_pid} 2>/dev/null; do sleep 30; done; \
          {binary} check {project_root}; \
          {binary} check {project_root}; \
          {binary} check {project_root}; \
          {binary} check {project_root}; \
          {binary} check {project_root}",
-        session = shell_escape(session),
         binary = shell_escape(&binary),
         project_root = shell_escape(project_root),
     );

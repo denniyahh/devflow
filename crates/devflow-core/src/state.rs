@@ -17,7 +17,7 @@ pub enum Step {
     Idle,
     /// Creating the feature branch via git flow.
     Branching,
-    /// Coding agent is running in tmux.
+    /// Coding agent is running (spawned as child process).
     Executing,
     /// Running verification (tests, lint).
     Verifying,
@@ -78,10 +78,12 @@ pub struct State {
     pub phase: u32,
     /// Which coding agent was launched.
     pub agent: Agent,
-    /// Tmux session name the agent runs in.
-    pub tmux_session: Option<String>,
-    /// PID of the background monitor (child process waiting for agent exit).
+    /// PID of the spawned agent process (None if not yet launched).
+    pub agent_pid: Option<u32>,
+    /// PID of the background monitor (child process watching for agent exit).
     pub monitor_pid: Option<u32>,
+    /// Human-readable label for the agent session (for status display).
+    pub agent_label: Option<String>,
     /// When the phase started.
     pub started_at: String,
     /// Path to the project root.
@@ -113,16 +115,58 @@ impl Agent {
         }
     }
 
-    /// The shell command to launch this agent inside a tmux session.
-    pub fn launch_command(self, project_root: &str, phase: u32) -> String {
-        let root = shell_quote(project_root);
+    /// The command and arguments to launch this agent in non-interactive mode.
+    ///
+    /// Returns `(program, args)` where the agent runs headless, produces
+    /// structured output, and exits when done — never blocks waiting for
+    /// user input.
+    pub fn exec_command(self, _project_root: &str, phase: u32) -> (&'static str, Vec<String>) {
+        let prompt = format!(
+            "Work on phase {phase} of this project. Read AGENTS.md, CLAUDE.md, \
+             and the .planning/ directory to understand the current state and \
+             what needs to be done."
+        );
         match self {
-            Agent::Claude => format!("cd {root} && claude --dangerously-skip-permissions"),
-            Agent::Omx => format!("cd {root} && omx exec --full-auto --sandbox danger-full-access"),
-            Agent::Codex => format!(
-                "cd {root} && codex exec --sandbox workspace-write \"Work on phase {phase} of this project. Read AGENTS.md, CLAUDE.md, and the .planning/ directory to understand the current state and what needs to be done.\""
+            Agent::Claude => (
+                "claude",
+                vec![
+                    "-p".into(),
+                    prompt,
+                    "--output-format".into(),
+                    "json".into(),
+                    "--dangerously-skip-permissions".into(),
+                    "--bare".into(),
+                    "--max-turns".into(),
+                    "50".into(),
+                ],
             ),
-            Agent::OpenCode => format!("cd {root} && opencode run"),
+            Agent::Codex => (
+                "codex",
+                vec![
+                    "exec".into(),
+                    "--sandbox".into(),
+                    "workspace-write".into(),
+                    "--json".into(),
+                    prompt,
+                ],
+            ),
+            Agent::Omx => (
+                "omx",
+                vec![
+                    "exec".into(),
+                    "--sandbox".into(),
+                    "workspace-write".into(),
+                    "--json".into(),
+                    prompt,
+                ],
+            ),
+            Agent::OpenCode => (
+                "opencode",
+                vec![
+                    "run".into(),
+                    prompt,
+                ],
+            ),
         }
     }
 }
@@ -165,8 +209,9 @@ impl State {
             step: Step::Idle,
             phase,
             agent,
-            tmux_session: None,
+            agent_pid: None,
             monitor_pid: None,
+            agent_label: None,
             started_at: timestamp_now(),
             project_root,
         }
@@ -192,25 +237,6 @@ impl State {
         }
         self.step
     }
-
-    /// The tmux session name for this phase.
-    pub fn tmux_session_name(&self) -> String {
-        let project = self
-            .project_root
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("project")
-            .chars()
-            .map(|ch| {
-                if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                    ch
-                } else {
-                    '-'
-                }
-            })
-            .collect::<String>();
-        format!("devflow-{project}-{:02}", self.phase)
-    }
 }
 
 fn timestamp_now() -> String {
@@ -220,6 +246,165 @@ fn timestamp_now() -> String {
     }
 }
 
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use std::path::PathBuf;
+
+    #[test]
+    fn next_walks_full_chain_then_terminates() {
+        assert_eq!(Step::Idle.next(), Some(Step::Branching));
+        assert_eq!(Step::Branching.next(), Some(Step::Executing));
+        assert_eq!(Step::Executing.next(), Some(Step::Verifying));
+        assert_eq!(Step::Verifying.next(), Some(Step::Docsing));
+        assert_eq!(Step::Docsing.next(), Some(Step::Shipping));
+        assert_eq!(Step::Shipping.next(), Some(Step::Cleaning));
+        assert_eq!(Step::Cleaning.next(), None);
+    }
+
+    #[test]
+    fn only_executing_waits_on_an_agent() {
+        assert!(Step::Executing.is_waiting());
+        for step in [
+            Step::Idle,
+            Step::Branching,
+            Step::Verifying,
+            Step::Docsing,
+            Step::Shipping,
+            Step::Cleaning,
+        ] {
+            assert!(!step.is_waiting(), "{step} should not wait");
+        }
+    }
+
+    #[test]
+    fn skippable_steps_are_verify_docs_ship() {
+        assert!(Step::Verifying.is_skippable());
+        assert!(Step::Docsing.is_skippable());
+        assert!(Step::Shipping.is_skippable());
+        assert!(!Step::Idle.is_skippable());
+        assert!(!Step::Branching.is_skippable());
+        assert!(!Step::Executing.is_skippable());
+        assert!(!Step::Cleaning.is_skippable());
+    }
+
+    #[test]
+    fn step_display_is_lowercase() {
+        assert_eq!(Step::Idle.to_string(), "idle");
+        assert_eq!(Step::Branching.to_string(), "branching");
+        assert_eq!(Step::Executing.to_string(), "executing");
+        assert_eq!(Step::Verifying.to_string(), "verifying");
+        assert_eq!(Step::Docsing.to_string(), "docsing");
+        assert_eq!(Step::Shipping.to_string(), "shipping");
+        assert_eq!(Step::Cleaning.to_string(), "cleaning");
+    }
+
+    #[test]
+    fn agent_name_and_display() {
+        assert_eq!(Agent::Claude.name(), "Claude Code");
+        assert_eq!(Agent::Omx.name(), "oh-my-codex");
+        assert_eq!(Agent::Codex.name(), "OpenAI Codex");
+        assert_eq!(Agent::OpenCode.name(), "OpenCode");
+
+        assert_eq!(Agent::Claude.to_string(), "claude");
+        assert_eq!(Agent::Omx.to_string(), "omx");
+        assert_eq!(Agent::Codex.to_string(), "codex");
+        assert_eq!(Agent::OpenCode.to_string(), "opencode");
+    }
+
+    #[test]
+    fn agent_from_str_accepts_canonical_and_aliases() {
+        assert_eq!("claude".parse::<Agent>().unwrap(), Agent::Claude);
+        assert_eq!("CLAUDE".parse::<Agent>().unwrap(), Agent::Claude);
+        assert_eq!("omx".parse::<Agent>().unwrap(), Agent::Omx);
+        assert_eq!("oh-my-codex".parse::<Agent>().unwrap(), Agent::Omx);
+        assert_eq!("codex".parse::<Agent>().unwrap(), Agent::Codex);
+        assert_eq!("opencode".parse::<Agent>().unwrap(), Agent::OpenCode);
+        assert_eq!("open-code".parse::<Agent>().unwrap(), Agent::OpenCode);
+    }
+
+    #[test]
+    fn agent_from_str_rejects_unknown() {
+        let err = "aider".parse::<Agent>().unwrap_err();
+        assert!(err.to_string().contains("aider"));
+    }
+
+    #[test]
+    fn exec_command_claude_uses_noninteractive_flags() {
+        let (_prog, args) = Agent::Claude.exec_command("/repo", 3);
+        let joined = args.join(" ");
+        assert!(joined.contains("-p"));
+        assert!(joined.contains("--output-format json"));
+        assert!(joined.contains("--dangerously-skip-permissions"));
+        assert!(joined.contains("--bare"));
+        assert!(joined.contains("--max-turns"));
+        assert!(joined.contains("phase 3"));
+    }
+
+    #[test]
+    fn exec_command_codex_uses_exec_and_json() {
+        let (_prog, args) = Agent::Codex.exec_command("/repo", 7);
+        let joined = args.join(" ");
+        assert!(joined.contains("exec"));
+        assert!(joined.contains("--sandbox workspace-write"));
+        assert!(joined.contains("--json"));
+        assert!(joined.contains("phase 7"));
+    }
+
+    #[test]
+    fn new_state_starts_idle_with_no_pid() {
+        let state = State::new(2, Agent::Claude, PathBuf::from("/repo"));
+        assert_eq!(state.step, Step::Idle);
+        assert_eq!(state.phase, 2);
+        assert_eq!(state.agent, Agent::Claude);
+        assert!(state.agent_pid.is_none());
+        assert!(state.monitor_pid.is_none());
+        assert!(!state.started_at.is_empty());
+    }
+
+    #[test]
+    fn advance_walks_chain_then_returns_none_at_terminal() {
+        let mut state = State::new(1, Agent::Claude, PathBuf::from("/repo"));
+        assert_eq!(state.advance(), Some(Step::Branching));
+        state.step = Step::Cleaning;
+        assert_eq!(state.advance(), None);
+        assert_eq!(state.step, Step::Cleaning);
+    }
+
+    #[test]
+    fn advance_skipping_jumps_over_disabled_steps() {
+        let mut config = Config::default();
+        config.automation.auto_verify = false;
+        config.automation.auto_docs = false;
+
+        let mut state = State::new(1, Agent::Claude, PathBuf::from("/repo"));
+        state.step = Step::Executing;
+        state.advance(); // -> Verifying (skipped) -> Docsing (skipped) -> Shipping
+        let landed = state.advance_skipping(&config);
+        assert_eq!(landed, Step::Shipping);
+    }
+
+    #[test]
+    fn advance_skipping_returns_to_idle_when_all_remaining_skipped() {
+        let mut config = Config::default();
+        config.automation.auto_cleanup = false;
+
+        let mut state = State::new(1, Agent::Claude, PathBuf::from("/repo"));
+        state.step = Step::Shipping;
+        state.advance(); // -> Cleaning
+        let landed = state.advance_skipping(&config);
+        assert_eq!(landed, Step::Idle);
+    }
+
+    #[test]
+    fn state_serde_round_trips() {
+        let state = State::new(9, Agent::Codex, PathBuf::from("/repo"));
+        let json = serde_json::to_string(&state).unwrap();
+        let back: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.phase, 9);
+        assert_eq!(back.agent, Agent::Codex);
+        assert_eq!(back.step, Step::Idle);
+        assert!(back.agent_pid.is_none());
+    }
 }
