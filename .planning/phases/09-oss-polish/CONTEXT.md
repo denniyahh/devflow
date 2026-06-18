@@ -58,6 +58,15 @@ A stranger can discover, understand, build, and contribute to DevFlow — no Den
 - [ ] `.devflow.yaml` schema in README matches actual `Config` parser (no phantom `enabled` field)
 - [ ] Deprecated commands removed from all public docs
 
+### 9a.6 — Doctor: detect stale binaries on PATH
+
+Users accumulate stale devflow binaries (`~/.cargo/bin/devflow`, `~/.local/bin/devflow`) from old `cargo install` runs. `devflow doctor` should warn when it finds devflow binaries on PATH that differ from the running one.
+
+- [ ] Add `which -a devflow` equivalent logic to `doctor()` — list all devflow binaries on PATH
+- [ ] Compare each binary's version against the running version
+- [ ] Warn if any binary is older or at a different path
+- [ ] Output: `⚠ stale devflow v0.1.0 found at ~/.cargo/bin/devflow — remove with: rm ~/.cargo/bin/devflow`
+
 ---
 
 ## 9b — Contribution Infrastructure
