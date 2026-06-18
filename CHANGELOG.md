@@ -2,6 +2,24 @@
 
 All notable changes to DevFlow.
 
+## [1.0.1] — 2026-06-18
+
+### Added
+- `devflow doctor` command — environment audit with version detection, JSON output mode
+- `scripts/install.sh` — single-command bootstrap for Linux/macOS
+- `DEPENDENCIES.md` — full dependency matrix with install instructions
+- Standard OSS files: LICENSE (MIT OR Apache-2.0), CONTRIBUTING.md, CODE_OF_CONDUCT.md, SECURITY.md
+
+### Changed
+- README completely rewritten for v1.0.0 — accurate command listing, state machine diagram, quick start
+- Removed all tmux, OMX, and deprecated references from docs
+- `.github/ISSUE_TEMPLATE/` and `.github/PULL_REQUEST_TEMPLATE.md` added
+
+### Fixed
+- Ship merge direction: now merges from current feature branch, not develop
+- Ship guard: requires running from a `feature/*` branch
+- Stale binary detection in `devflow doctor`
+
 ## [1.0.0] — 2026-06-18
 
 ### Added

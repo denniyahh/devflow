@@ -8,7 +8,7 @@ Areas are ordered by dependency. Within each area, tasks are ordered.
 
 ```
 9a.4 (OMX removal) → 9a.1 (Dennis cleanup) → 9a.2 (ARCHITECTURE) → 9a.3 (agent verification)
-→ 9a.5 (doc correctness) → 9b.1 (dev container) → 9b.2 (distrobox) → 9c (CI polish)
+→ 9a.5 (ship branch fix) → 9a.6 (doc correctness) → 9b.1 (dev container) → 9b.2 (distrobox) → 9c (CI polish)
 ```
 
 ---
@@ -74,7 +74,21 @@ Areas are ordered by dependency. Within each area, tasks are ordered.
 
 ---
 
-## 9a.5 — Document Correctness
+## 9a.5 — Ship Branch Safety Fix
+
+**Bug:** `release_start()` in `git.rs` hardcodes `checkout develop`, so if you run `devflow ship` from a feature branch with unmerged commits, it silently abandons them — branches from develop instead of the current branch. This is what caused the Phase 8 data loss.
+
+| # | Task | File(s) | Verification |
+|---|---|---|---|
+| 1 | Change `release_start()` to branch from current HEAD, not develop | `crates/devflow-core/src/git.rs` | `release_start("1.0.0")` on `feature/x` creates `release/1.0.0` from `feature/x` |
+| 2 | Remove any compensating logic in `ship.rs` (if the earlier "must be on feature branch" check was a workaround for this) | `crates/devflow-cli/src/main.rs` or `crates/devflow-core/src/ship.rs` | Ship still works from feature branches |
+| 3 | Add test: ship from feature branch with unmerged commits — those commits appear in release branch | `crates/devflow-core/tests/` | Test passes |
+
+**Estimated:** 1 commit, ~20 lines changed.
+
+---
+
+## 9a.6 — Document Correctness
 
 | # | Task | File(s) | Verification |
 |---|---|---|---|
@@ -126,13 +140,14 @@ Areas are ordered by dependency. Within each area, tasks are ordered.
 ## Commit Plan
 
 | # | Area | Files | Lines |
-|---|---|---|---|
+|---|------|-------|-------|
 | 1 | 9a.4 | OMX removal (~7 files) | -80 |
 | 2 | 9a.1 | Dennis cleanup (3 files) | -30 |
 | 3 | 9a.2 | ARCHITECTURE.md | +200 |
-| 4 | 9a.3 + 9a.5 | Agent verification + doc correctness | +90 |
-| 5 | 9b + 9c | Dev container + CI | +50 |
-| **Total** | | | ~430 changed, 6 commits |
+| 4 | 9a.3 + 9a.5 | Agent verification + ship branch fix | +30 |
+| 5 | 9a.6 | Doc correctness | +50 |
+| 6 | 9b + 9c | Dev container + CI | +70 |
+| **Total** | | | ~460 changed, 6 commits |
 
 ## Verification Gates
 
