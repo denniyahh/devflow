@@ -39,11 +39,7 @@ pub enum MonitorError {
 /// 3. Runs `devflow check` to advance the workflow through its remaining steps
 ///
 /// Returns the PID of the spawned monitor.
-pub fn spawn_monitor(
-    state: &State,
-    program: &str,
-    args: &[String],
-) -> Result<u32, MonitorError> {
+pub fn spawn_monitor(state: &State, program: &str, args: &[String]) -> Result<u32, MonitorError> {
     let project_root = state
         .project_root
         .to_str()
@@ -168,7 +164,11 @@ mod tests {
     fn wait_for_agent_pid_returns_pid_when_file_exists() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
-        std::fs::write(crate::agent_result::agent_pid_path(dir.path(), 4), "12345\n").unwrap();
+        std::fs::write(
+            crate::agent_result::agent_pid_path(dir.path(), 4),
+            "12345\n",
+        )
+        .unwrap();
 
         assert_eq!(wait_for_agent_pid(dir.path(), 4), Some(12345));
     }
@@ -184,19 +184,47 @@ mod tests {
     fn wait_for_agent_pid_returns_none_for_garbage_content() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
-        std::fs::write(crate::agent_result::agent_pid_path(dir.path(), 4), "not-a-pid").unwrap();
+        std::fs::write(
+            crate::agent_result::agent_pid_path(dir.path(), 4),
+            "not-a-pid",
+        )
+        .unwrap();
 
         assert_eq!(wait_for_agent_pid(dir.path(), 4), None);
     }
 
     #[test]
-    fn spawn_monitor_returns_pid_for_valid_input() {
+    fn spawn_monitor_captures_agent_pid_and_output() {
         let dir = tempfile::tempdir().unwrap();
         let state = state_in(dir.path());
-        let args = vec!["-c".to_string(), "true".to_string()];
+        // Stub agent: write a known marker to stdout, then exit cleanly.
+        let args = vec!["-c".to_string(), "echo MONITOR_READY".to_string()];
 
         let monitor_pid = spawn_monitor(&state, "sh", &args).unwrap();
-
         assert!(monitor_pid > 0);
+
+        // Observable side effect #1: the monitor records the agent PID to its
+        // pid file with valid numeric content.
+        let agent_pid = wait_for_agent_pid(dir.path(), state.phase)
+            .expect("monitor should record the agent pid");
+        assert!(agent_pid > 0);
+
+        // Observable side effect #2: the agent's stdout is captured to the
+        // phase stdout file (proving the monitor actually ran the agent).
+        let stdout_path = crate::agent_result::stdout_path(dir.path(), state.phase);
+        let mut captured = String::new();
+        for _ in 0..100 {
+            if let Ok(contents) = std::fs::read_to_string(&stdout_path)
+                && contents.contains("MONITOR_READY")
+            {
+                captured = contents;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            captured.contains("MONITOR_READY"),
+            "expected MONITOR_READY in captured stdout, got {captured:?}"
+        );
     }
 }

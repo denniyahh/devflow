@@ -87,14 +87,41 @@
 
 ---
 
-## Phase 6: GitHub PR Integration (Priority: LOW, v1.0.0)
+## Phase 6: Ship Readiness (Priority: HIGH — COMPLETED v0.5.1)
 
-- [ ] PR creation via `gh` CLI on ship
-- [ ] PR body auto-generated from phase summary
-- [ ] Merge detection — auto-advance on PR merge
-- [ ] `CODE_OF_CONDUCT.md`, `CHANGELOG.md`
-- [ ] Release workflow: build + publish binary artifacts
-- [ ] `cargo install devflow` install path
+**Shipped:** Agent completion protocol (DEVLOW_RESULT), three-layer result evaluation, monitor daemon owns agent capture, JSON envelope parsing, config-threaded git-flow, clippy clean. 115 tests.
+
+---
+
+## Phase 7: Git Worktrees + PR Integration (Priority: HIGH, v1.0.0)
+
+### 7a — Git Worktree Support
+- [ ] `devflow start --phase N --worktree` creates isolated working directory
+- [ ] Worktrees live at `.worktrees/phase-NN/` within the repo
+- [ ] Agent prompts use absolute worktree path as workdir
+- [ ] `devflow cleanup` removes worktree via `git worktree remove`
+- [ ] `devflow status` lists active worktrees
+- [ ] **Use-case:** Agent isolation — Claude/Codex each get their own sandbox
+- [ ] **Use-case:** Parallel phase execution without stash/checkout churn
+- [ ] **Use-case:** Reference worktree on develop for diffing/testing while feature branch builds
+- [ ] **Verify:** Two agents can run concurrently in separate worktrees without conflict
+
+### 7b — PR Creation via `gh` CLI
+- [ ] `devflow ship` creates PR via `gh pr create` with auto-generated body
+- [ ] PR body includes: phase summary, changed files, test results, TDD audit trail
+- [ ] PR merge detection — auto-advance state when PR merged
+- [ ] **Verify:** `devflow ship` on devflow itself creates a valid PR
+
+### 7c — Test Hardening (from Claude's Phase 6 review)
+- [ ] Fix weak `spawn_monitor` test — assert on observable output, not `pid > 0`
+- [ ] Add Layer 2 failure-path tests (exit=0+commits=0, exit≠0)
+- [ ] Cover lowercase-no-space marker variant in agent_result
+- [ ] End-to-end monitor integration test (spawn → agent writes DEVLOW_RESULT → check advances)
+
+### 7d — Prompt Rationalization
+- [ ] Extract shared `phase_prompt()` to `agents/mod.rs`
+- [ ] Delete `simple_prompt()` — Codex gets the same rich contract as Claude
+- [ ] **Verify:** Both agents receive identical instruction text, differing only in CLI flags
 
 ---
 
@@ -106,7 +133,8 @@ Phase 2 (Cargo version)  ████████████      HIGH     — 
 Phase 3 (Verify/docs)    ████████████      HIGH     — makes phases meaningful
 Phase 4 (Hermes skill)   ████████          MEDIUM   — better Hermes integration
 Phase 5 (Agent trait)    ████████          MEDIUM   — cleaner extension
-Phase 6 (PR integration) ████              LOW      — v1.0.0 polish
+Phase 6 (Ship readiness) ████████████      HIGH     — agent completion, monitor capture
+Phase 7 (Worktrees + PR) ████████████      HIGH     — v1.0.0: parallel agents, PR shipping
 ```
 
 ## Success Criteria per Phase

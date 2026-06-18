@@ -318,6 +318,23 @@ mod tests {
         git(root, &["commit", "-m", "feature work"]);
     }
 
+    /// Like `init_repo_with_feature_commit`, but the feature branch sits at
+    /// develop's tip with **no** extra commit (0 commits ahead).
+    fn init_repo_with_feature_no_commit(root: &Path, phase: u32) {
+        git(root, &["init"]);
+        git(root, &["config", "user.email", "devflow@example.com"]);
+        git(root, &["config", "user.name", "DevFlow Tests"]);
+        git(root, &["config", "commit.gpgsign", "false"]);
+        git(root, &["config", "tag.gpgsign", "false"]);
+        git(root, &["checkout", "-b", "develop"]);
+        std::fs::write(root.join("README.md"), "base\n").unwrap();
+        git(root, &["add", "README.md"]);
+        git(root, &["commit", "-m", "base"]);
+
+        let branch = format!("feature/phase-{phase:02}");
+        git(root, &["checkout", "-b", &branch]);
+    }
+
     #[test]
     fn parse_success_marker() {
         let stdout = "some output\nDEVLOW_RESULT: {\"status\":\"success\"}\n";
@@ -356,6 +373,15 @@ mod tests {
     #[test]
     fn parse_marker_without_space_after_colon() {
         let stdout = "DEVLOW_RESULT:{\"status\":\"success\"}\n";
+        let result = parse_devlow_result(stdout).unwrap();
+        assert_eq!(result.status, AgentStatus::Success);
+    }
+
+    #[test]
+    fn parse_lowercase_no_space_marker() {
+        // Lowercase prefix AND no space after the colon — the combination that
+        // the Phase 6 review flagged as uncovered.
+        let stdout = "devlow_result:{\"status\":\"success\"}\n";
         let result = parse_devlow_result(stdout).unwrap();
         assert_eq!(result.status, AgentStatus::Success);
     }
@@ -481,6 +507,44 @@ mod tests {
         assert_eq!(result.exit_code, Some(0));
         assert_eq!(result.commits, Some(1));
         assert!(result.reason.unwrap().contains("1 commits"));
+    }
+
+    #[test]
+    fn evaluate_layer2_exit_zero_no_commits_is_failed() {
+        // exit=0 but the feature branch has 0 commits ahead of develop →
+        // "no work done" failure (the Layer 2 middle branch).
+        let dir = tempfile::tempdir().unwrap();
+        init_repo_with_feature_no_commit(dir.path(), 4);
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(exit_code_path(dir.path(), 4), "0").unwrap();
+        let state = state_in(dir.path(), 4);
+
+        let result = evaluate_layer2(dir.path(), 4, &state, &GitFlowConfig::default())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result.status, AgentStatus::Failed);
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.commits, Some(0));
+        assert!(result.reason.unwrap().contains("no commits"));
+    }
+
+    #[test]
+    fn evaluate_layer2_nonzero_exit_is_failed() {
+        // Non-zero exit code → failure regardless of commit count.
+        let dir = tempfile::tempdir().unwrap();
+        init_repo_with_feature_commit(dir.path(), 4);
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(exit_code_path(dir.path(), 4), "1").unwrap();
+        let state = state_in(dir.path(), 4);
+
+        let result = evaluate_layer2(dir.path(), 4, &state, &GitFlowConfig::default())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result.status, AgentStatus::Failed);
+        assert_eq!(result.exit_code, Some(1));
+        assert!(result.reason.unwrap().contains("exited with code 1"));
     }
 
     #[test]
