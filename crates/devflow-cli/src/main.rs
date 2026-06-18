@@ -56,6 +56,25 @@ enum Command {
         #[arg(default_value = ".")]
         project: PathBuf,
     },
+    /// Run two agents sequentially on one phase, each in its own worktree.
+    ///
+    /// Agent A runs first; its work is integrated into `feature/phase-NN`, then
+    /// agent B rebases onto the updated base and runs. Rebase conflicts are
+    /// surfaced for manual resolution — the worktree boundary is the isolation.
+    Sequentagent {
+        /// Phase number to work on.
+        #[arg(long)]
+        phase: u32,
+        /// Exactly two comma-separated agents, e.g. `claude,codex`.
+        #[arg(long)]
+        agents: String,
+        /// Recreate agent worktrees/branches if they already exist.
+        #[arg(long)]
+        force: bool,
+        /// Project root.
+        #[arg(default_value = ".")]
+        project: PathBuf,
+    },
     /// Poll state and advance if the agent is done.
     Check {
         /// Project root.
@@ -178,6 +197,12 @@ fn run() -> Result<(), CliError> {
             force,
             project,
         } => parallel(&project_root(project)?, &phases, agents.as_deref(), force),
+        Command::Sequentagent {
+            phase,
+            agents,
+            force,
+            project,
+        } => sequentagent(&project_root(project)?, phase, &agents, force),
         Command::Check { project } => check(&project_root(project)?),
         Command::Status { project } => status(&project_root(project)?),
         Command::List { project } => list(&project_root(project)?),
@@ -422,6 +447,155 @@ fn parallel(
         start(project_root, phase, agent, true, force, true)?;
     }
     Ok(())
+}
+
+/// Parse exactly two comma-separated agents for `sequentagent`.
+fn split_two_agents(agents: &str) -> Result<(Agent, Agent), CliError> {
+    let parsed: Vec<Agent> = agents
+        .split(',')
+        .map(|a| a.trim())
+        .filter(|a| !a.is_empty())
+        .map(|a| {
+            a.parse::<Agent>()
+                .map_err(|err| CliError::Message(err.to_string()))
+        })
+        .collect::<Result<_, _>>()?;
+    if parsed.len() != 2 {
+        return Err(CliError::Message(format!(
+            "sequentagent requires exactly two agents (e.g. claude,codex), got {}",
+            parsed.len()
+        )));
+    }
+    Ok((parsed[0], parsed[1]))
+}
+
+/// Launch one agent, block until it exits, and return its self-reported result
+/// (parsed from the DEVLOW_RESULT marker, if present).
+fn run_agent_blocking(
+    project_root: &Path,
+    phase: u32,
+    agent: Agent,
+    workdir: &Path,
+) -> Result<Option<devflow_core::agent_result::AgentResult>, CliError> {
+    devflow_core::agent_result::cleanup_phase_files(project_root, phase);
+    let adapter = devflow_core::agents::adapter_for(agent);
+    let (child, pid) = agent::launch_agent(&*adapter, phase, workdir)?;
+    println!(
+        "launched {} (pid {pid}) in {}",
+        adapter.name(),
+        workdir.display()
+    );
+    let capture = agent::capture_agent_output(child, phase, project_root)
+        .map_err(|err| CliError::Message(format!("failed to capture agent output: {err}")))?;
+    println!("agent {agent} exited with code {}", capture.exit_code);
+    Ok(devflow_core::agent_result::parse_devlow_result(
+        &capture.stdout,
+    ))
+}
+
+/// Integrate an agent branch into the shared base, pushing if a remote exists.
+fn integrate_agent_branch(git: &GitFlow, base: &str, agent_branch: &str) -> Result<(), CliError> {
+    git.fast_forward_branch(base, agent_branch)?;
+    println!("integrated {agent_branch} into {base}");
+    if git.has_remote() {
+        match git.push(base) {
+            Ok(()) => println!("pushed {base} to origin"),
+            Err(err) => println!("warning: could not push {base}: {err}"),
+        }
+    }
+    Ok(())
+}
+
+/// Run two agents sequentially on one phase, each in its own worktree, with a
+/// rebase handoff between them. See the `Sequentagent` command docs.
+fn sequentagent(
+    project_root: &Path,
+    phase: u32,
+    agents: &str,
+    force: bool,
+) -> Result<(), CliError> {
+    let config = Config::load(project_root)?;
+    let (agent_a, agent_b) = split_two_agents(agents)?;
+    let git = GitFlow::new(project_root, config.git_flow.clone());
+    let base = format!("{}phase-{:02}", config.git_flow.feature_prefix, phase);
+
+    // 1. Ensure the shared base branch exists off develop, without leaving the
+    //    main checkout on it.
+    git.ensure_branch(&base, &config.git_flow.develop)?;
+
+    // 2. Create one worktree per agent, both off the current base tip.
+    let branch_a = format!("{base}-{agent_a}");
+    let branch_b = format!("{base}-{agent_b}");
+    let wt_a = worktree::phase_agent_path(project_root, phase, &agent_a.to_string());
+    let wt_b = worktree::phase_agent_path(project_root, phase, &agent_b.to_string());
+
+    if force {
+        for (wt, branch) in [(&wt_a, &branch_a), (&wt_b, &branch_b)] {
+            if wt.exists() {
+                worktree::remove(project_root, wt, true)?;
+            }
+            let _ = git.delete_branch(branch, true);
+        }
+    }
+
+    add_or_explain(project_root, &wt_a, &branch_a, &base)?;
+    add_or_explain(project_root, &wt_b, &branch_b, &base)?;
+    println!("worktree A: {} ({branch_a})", wt_a.display());
+    println!("worktree B: {} ({branch_b})", wt_b.display());
+
+    // 3. Run agent A; stop before touching B if it fails.
+    println!("\n=== agent A: {agent_a} ===");
+    if let Some(result) = run_agent_blocking(project_root, phase, agent_a, &wt_a)?
+        && result.status == devflow_core::agent_result::AgentStatus::Failed
+    {
+        return Err(CliError::Message(format!(
+            "agent A ({agent_a}) failed: {}",
+            result.reason.unwrap_or_else(|| "no details".into())
+        )));
+    }
+    integrate_agent_branch(&git, &base, &branch_a)?;
+
+    // 4. Rebase B onto the updated base; surface conflicts for manual fixing.
+    git.rebase_in(&wt_b, &base).map_err(|err| {
+        CliError::Message(format!(
+            "rebase of {branch_b} onto {base} hit conflicts — resolve them in {} \
+             then re-run sequentagent: {err}",
+            wt_b.display()
+        ))
+    })?;
+    println!("rebased {branch_b} onto {base}");
+
+    // 5. Run agent B and integrate.
+    println!("\n=== agent B: {agent_b} ===");
+    if let Some(result) = run_agent_blocking(project_root, phase, agent_b, &wt_b)?
+        && result.status == devflow_core::agent_result::AgentStatus::Failed
+    {
+        return Err(CliError::Message(format!(
+            "agent B ({agent_b}) failed: {}",
+            result.reason.unwrap_or_else(|| "no details".into())
+        )));
+    }
+    integrate_agent_branch(&git, &base, &branch_b)?;
+
+    println!("\nsequentagent complete — both agents integrated into {base}");
+    Ok(())
+}
+
+/// Add a worktree, turning the "already exists" error into actionable advice.
+fn add_or_explain(
+    project_root: &Path,
+    path: &Path,
+    branch: &str,
+    base: &str,
+) -> Result<(), CliError> {
+    match worktree::add(project_root, path, branch, base, true) {
+        Ok(()) => Ok(()),
+        Err(devflow_core::worktree::WorktreeError::Exists(p)) => Err(CliError::Message(format!(
+            "worktree already exists at {} — use --force to recreate it",
+            p.display()
+        ))),
+        Err(err) => Err(err.into()),
+    }
 }
 
 fn check(project_root: &Path) -> Result<(), CliError> {
@@ -851,5 +1025,16 @@ mod tests {
     fn pairs_reject_invalid_phase() {
         assert!(parse_phase_agent_pairs("7,x", None).is_err());
         assert!(parse_phase_agent_pairs("", None).is_err());
+    }
+
+    #[test]
+    fn split_two_agents_requires_exactly_two() {
+        assert_eq!(
+            split_two_agents("claude, codex").unwrap(),
+            (Agent::Claude, Agent::Codex)
+        );
+        assert!(split_two_agents("claude").is_err());
+        assert!(split_two_agents("claude,codex,opencode").is_err());
+        assert!(split_two_agents("claude,bogus").is_err());
     }
 }
