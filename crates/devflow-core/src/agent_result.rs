@@ -275,6 +275,48 @@ pub fn cleanup_phase_files(project_root: &Path, phase: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::GitFlowConfig;
+    use crate::state::{Agent, State};
+    use std::process::Command;
+
+    fn state_in(root: &Path, phase: u32) -> State {
+        let mut state = State::new(phase, Agent::Claude, root.to_path_buf());
+        state.step = crate::state::Step::Executing;
+        state
+    }
+
+    fn git(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed\nstdout: {}\nstderr: {}",
+            args,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_repo_with_feature_commit(root: &Path, phase: u32) {
+        git(root, &["init"]);
+        git(root, &["config", "user.email", "devflow@example.com"]);
+        git(root, &["config", "user.name", "DevFlow Tests"]);
+        git(root, &["config", "commit.gpgsign", "false"]);
+        git(root, &["config", "tag.gpgsign", "false"]);
+        git(root, &["checkout", "-b", "develop"]);
+        std::fs::write(root.join("README.md"), "base\n").unwrap();
+        git(root, &["add", "README.md"]);
+        git(root, &["commit", "-m", "base"]);
+
+        let branch = format!("feature/phase-{phase:02}");
+        git(root, &["checkout", "-b", &branch]);
+        std::fs::write(root.join("phase.txt"), "feature work\n").unwrap();
+        git(root, &["add", "phase.txt"]);
+        git(root, &["commit", "-m", "feature work"]);
+    }
 
     #[test]
     fn parse_success_marker() {
@@ -386,5 +428,71 @@ mod tests {
         let root = dir.path();
         // Should not panic when files don't exist.
         cleanup_phase_files(root, 1);
+    }
+
+    #[test]
+    fn evaluate_agent_result_reads_files_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 6),
+            "done\nDEVLOW_RESULT: {\"status\":\"success\",\"commits\":2,\"summary\":\"ok\"}\n",
+        )
+        .unwrap();
+        std::fs::write(exit_code_path(dir.path(), 6), "0").unwrap();
+        let state = state_in(dir.path(), 6);
+
+        let result = evaluate_agent_result(dir.path(), &state, &GitFlowConfig::default()).unwrap();
+
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(result.commits, Some(2));
+        assert_eq!(result.summary.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn evaluate_layer1_finds_devlow_result_in_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 3),
+            "output\ndevlow_result: {\"status\":\"failed\",\"reason\":\"bad output\"}\n",
+        )
+        .unwrap();
+
+        let result = evaluate_layer1(dir.path(), 3).unwrap();
+
+        assert_eq!(result.status, AgentStatus::Failed);
+        assert_eq!(result.reason.as_deref(), Some("bad output"));
+    }
+
+    #[test]
+    fn evaluate_layer2_falls_back_to_exit_code_and_commit_count() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo_with_feature_commit(dir.path(), 4);
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(exit_code_path(dir.path(), 4), "0").unwrap();
+        let state = state_in(dir.path(), 4);
+
+        let result = evaluate_layer2(dir.path(), 4, &state, &GitFlowConfig::default())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.commits, Some(1));
+        assert!(result.reason.unwrap().contains("1 commits"));
+    }
+
+    #[test]
+    fn evaluate_layer3_falls_back_to_commit_count() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo_with_feature_commit(dir.path(), 5);
+
+        let result = evaluate_layer3(dir.path(), 5, &GitFlowConfig::default()).unwrap();
+
+        assert_eq!(result.status, AgentStatus::Unknown);
+        assert_eq!(result.exit_code, None);
+        assert_eq!(result.commits, Some(1));
+        assert!(result.reason.unwrap().contains("1 commits"));
     }
 }
