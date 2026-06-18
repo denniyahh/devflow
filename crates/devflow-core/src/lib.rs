@@ -11,6 +11,7 @@ pub mod git;
 pub mod lock;
 pub mod monitor;
 pub mod recover;
+pub mod ship;
 pub mod state;
 pub mod verify;
 pub mod version;
