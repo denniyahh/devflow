@@ -186,6 +186,15 @@ enum Command {
         #[arg(default_value = ".")]
         project: PathBuf,
     },
+    /// Audit the environment and report what's installed, what's missing, and what needs fixing.
+    Doctor {
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Project root (optional — doctor works without a project too).
+        #[arg(default_value = ".")]
+        project: PathBuf,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -276,6 +285,7 @@ fn run() -> Result<(), CliError> {
         Command::Verify { project } => verify_cmd(&project_root(project)?),
         Command::Lint { project } => lint_cmd(&project_root(project)?),
         Command::Docs { project } => docs_cmd(&project_root(project)?),
+        Command::Doctor { json, project } => doctor(&project_root(project)?, json),
     }
 }
 
@@ -1477,12 +1487,14 @@ fn init(project_root: &Path, force: bool) -> Result<(), CliError> {
     let config_path = project_root.join(".devflow.yaml");
     if config_path.exists() && !force {
         println!("config already exists: {}", config_path.display());
-        return Ok(());
+    } else {
+        std::fs::write(&config_path, default_config_yaml())
+            .map_err(|err| CliError::Message(format!("failed to write config: {err}")))?;
+        println!("initialized DevFlow config: {}", config_path.display());
     }
-    std::fs::write(&config_path, default_config_yaml())
-        .map_err(|err| CliError::Message(format!("failed to write config: {err}")))?;
-    println!("initialized DevFlow config: {}", config_path.display());
-    Ok(())
+    // Always run doctor after init to show what's ready and what's missing.
+    println!();
+    doctor(project_root, false)
 }
 
 fn show_config(project_root: &Path) -> Result<(), CliError> {
@@ -1613,6 +1625,111 @@ fn docs_cmd(project_root: &Path) -> Result<(), CliError> {
 
 fn default_config_yaml() -> &'static str {
     "version:\n  scheme: semver\n  file: pyproject.toml\n  field: project.version\n  build_number: git\nautomation:\n  auto_branch: true\n  auto_verify: true\n  auto_docs: true\n  auto_version: patch\n  auto_ship: false\n  auto_cleanup: true\n  verify_command: \"cargo test\"\n  lint_command: \"cargo clippy -- -D warnings\"\n  docs_command: \"cargo doc --no-deps 2>&1\"\n  continue_on_error: false\n  docs_auto_commit: false\ngit_flow:\n  main: main\n  develop: develop\n  feature_prefix: feature/\n"
+}
+
+/// Audit the environment and report what's installed, what's missing, and what
+/// needs fixing.
+fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
+    use std::process::Command;
+
+    struct Check {
+        name: String,
+        status: String,
+        version: Option<String>,
+        install_hint: Option<String>,
+    }
+
+    fn cmd_check(name: &str, cmd: &str, version_arg: &str, install_hint: &str) -> Check {
+        match Command::new(cmd).arg(version_arg).output() {
+            Ok(out) if out.status.success() => {
+                let version = String::from_utf8_lossy(&out.stdout)
+                    .lines().next().unwrap_or("unknown").trim().to_string();
+                Check { name: name.into(), status: "ok".into(), version: Some(version), install_hint: None }
+            }
+            Ok(out) => {
+                let version = String::from_utf8_lossy(&out.stderr)
+                    .lines().next().unwrap_or("unknown").trim().to_string();
+                Check { name: name.into(), status: "ok".into(), version: Some(version), install_hint: None }
+            }
+            Err(_) => Check {
+                name: name.into(), status: "missing".into(), version: None,
+                install_hint: Some(install_hint.into()),
+            },
+        }
+    }
+
+    fn bool_check(name: &str, ok: bool, version: &str, install_hint: &str) -> Check {
+        Check {
+            name: name.into(),
+            status: if ok { "ok".into() } else { "missing".into() },
+            version: Some(version.into()),
+            install_hint: if ok { None } else { Some(install_hint.into()) },
+        }
+    }
+
+    let devflow_version = env!("CARGO_PKG_VERSION");
+    let config_exists = project_root.join(".devflow.yaml").exists();
+
+    let checks: Vec<Check> = vec![
+        cmd_check("git", "git", "--version", "Install from https://git-scm.com/downloads"),
+        bool_check("sh (POSIX shell)", cfg!(unix), "built-in", "Unsupported OS"),
+        cmd_check("cargo/rust", "cargo", "--version", "curl https://sh.rustup.rs -sSf | sh"),
+        cmd_check("gh CLI", "gh", "--version", "brew install gh / apt install gh"),
+        cmd_check("claude", "claude", "--version", "npm i -g @anthropic-ai/claude-code"),
+        cmd_check("codex", "codex", "--version", "npm i -g @openai/codex"),
+        cmd_check("opencode", "opencode", "--version", "cargo install opencode"),
+        Check { name: format!("devflow v{devflow_version}"), status: "ok".into(), version: Some(devflow_version.into()), install_hint: None },
+        Check {
+            name: ".devflow.yaml".into(),
+            status: if config_exists { "ok".into() } else { "missing".into() },
+            version: if config_exists { Some("found".into()) } else { Some("not found".into()) },
+            install_hint: if config_exists { None } else { Some("Run 'devflow init' to bootstrap".into()) },
+        },
+    ];
+
+    if json {
+        let mut out = String::from("[\n");
+        for (i, c) in checks.iter().enumerate() {
+            out.push_str("  {\n");
+            out.push_str(&format!("    \"name\": {:?},\n", c.name));
+            out.push_str(&format!("    \"status\": {:?},\n", c.status));
+            if let Some(v) = &c.version {
+                out.push_str(&format!("    \"version\": {:?},\n", v));
+            } else {
+                out.push_str("    \"version\": null,\n");
+            }
+            if let Some(h) = &c.install_hint {
+                out.push_str(&format!("    \"install_hint\": {:?}\n", h));
+            } else {
+                out.push_str("    \"install_hint\": null\n");
+            }
+            out.push('}');
+            if i + 1 < checks.len() {
+                out.push(',');
+            }
+            out.push('\n');
+        }
+        out.push_str("]\n");
+        print!("{out}");
+    } else {
+        for c in &checks {
+            let icon = match c.status.as_str() {
+                "ok" => "✓",
+                "missing" => "✗",
+                _ => "?",
+            };
+            let version_str = c.version.as_deref().unwrap_or("-");
+            print!("  {:<20} {:<20} {}", c.name, version_str, icon);
+            if c.status == "missing" {
+                if let Some(hint) = &c.install_hint {
+                    print!(" — install: {hint}");
+                }
+            }
+            println!();
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
