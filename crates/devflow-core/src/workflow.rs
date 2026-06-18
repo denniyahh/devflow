@@ -72,6 +72,20 @@ pub fn advance_state(
     mut state: State,
     config: &crate::config::Config,
 ) -> Result<AdvanceResult, WorkflowError> {
+    if state.step == Step::Executing
+        && state
+            .agent_result
+            .as_ref()
+            .is_some_and(|result| result.status == crate::agent_result::AgentStatus::Failed)
+    {
+        save_state(&state)?;
+        return Ok(AdvanceResult {
+            state,
+            changed: false,
+            message: String::from("agent failed; staying at executing"),
+        });
+    }
+
     let before = state.step;
     let message = if state.advance().is_some() {
         state.advance_skipping(config);
@@ -101,6 +115,7 @@ pub fn advance_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_result::{AgentResult, AgentStatus};
     use crate::config::Config;
     use crate::state::Agent;
 
@@ -202,5 +217,46 @@ mod tests {
         // Cleaning is disabled, so the workflow finishes at Idle.
         assert_eq!(result.state.step, Step::Idle);
         assert!(!state_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn advance_state_with_success_agent_result_advances_normally() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state_in(dir.path(), Step::Executing);
+        state.agent_result = Some(AgentResult {
+            status: AgentStatus::Success,
+            exit_code: Some(0),
+            reason: None,
+            commits: Some(1),
+            summary: None,
+        });
+        let config = Config::default();
+
+        let result = advance_state(state, &config).expect("advance");
+
+        assert!(result.changed);
+        assert_eq!(result.state.step, Step::Verifying);
+        assert_eq!(load_state(dir.path()).unwrap().step, Step::Verifying);
+    }
+
+    #[test]
+    fn advance_state_with_failed_agent_result_stays_executing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state_in(dir.path(), Step::Executing);
+        state.agent_result = Some(AgentResult {
+            status: AgentStatus::Failed,
+            exit_code: Some(1),
+            reason: Some("tests failed".into()),
+            commits: Some(0),
+            summary: None,
+        });
+        let config = Config::default();
+
+        let result = advance_state(state, &config).expect("advance");
+
+        assert!(!result.changed);
+        assert_eq!(result.state.step, Step::Executing);
+        assert!(result.message.contains("agent failed"));
+        assert_eq!(load_state(dir.path()).unwrap().step, Step::Executing);
     }
 }
