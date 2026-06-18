@@ -158,14 +158,21 @@ impl Default for GitFlowConfig {
 
 impl Config {
     /// Load config from `.devflow.yaml` in the given project root.
+    /// Auto-detects version file format if not explicitly configured.
     pub fn load(project_root: &Path) -> Result<Config, ConfigError> {
         let path = project_root.join(".devflow.yaml");
-        if !path.exists() {
-            return Ok(Config::default());
+        let mut config = if !path.exists() {
+            Config::default()
+        } else {
+            let contents = std::fs::read_to_string(&path).map_err(ConfigError::Io)?;
+            parse_config(&contents)?
+        };
+        // Auto-detect version file if using the default (pyproject.toml)
+        // or if the configured file doesn't exist
+        if config.version.file == "pyproject.toml" && !project_root.join(&config.version.file).exists() {
+            config.version.auto_detect(project_root);
         }
-
-        let contents = std::fs::read_to_string(&path).map_err(ConfigError::Io)?;
-        parse_config(&contents)
+        Ok(config)
     }
 
     /// Render this config as DevFlow's canonical YAML shape.
@@ -412,5 +419,34 @@ mod tests {
         assert!(config.should_skip(&Step::Docsing));
         assert!(config.should_skip(&Step::Cleaning));
         assert!(!config.should_skip(&Step::Shipping));
+    }
+}
+
+impl VersionConfig {
+    /// Auto-detect the version file and field from the project root.
+    ///
+    /// Checks for common project files in order: Cargo.toml, pyproject.toml, package.json.
+    pub fn auto_detect(&mut self, project_root: &Path) {
+        let cargo = project_root.join("Cargo.toml");
+        let pyproject = project_root.join("pyproject.toml");
+        let package_json = project_root.join("package.json");
+
+        if cargo.exists() {
+            self.file = "Cargo.toml".into();
+            // Check for workspace pattern first
+            if let Ok(contents) = std::fs::read_to_string(&cargo) {
+                if contents.contains("[workspace.package]") {
+                    self.field = "workspace.package.version".into();
+                    return;
+                }
+            }
+            self.field = "package.version".into();
+        } else if pyproject.exists() {
+            self.file = "pyproject.toml".into();
+            self.field = "project.version".into();
+        } else if package_json.exists() {
+            self.file = "package.json".into();
+            self.field = "version".into();
+        }
     }
 }
