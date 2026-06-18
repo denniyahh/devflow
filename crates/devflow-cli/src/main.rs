@@ -230,9 +230,7 @@ fn start(
                 println!("monitor spawned (pid {mon_pid}) — will auto-advance when agent exits");
             }
             Err(err) => {
-                return Err(CliError::Message(format!(
-                    "could not spawn monitor: {err}"
-                )));
+                return Err(CliError::Message(format!("could not spawn monitor: {err}")));
             }
         }
     } else {
@@ -436,7 +434,10 @@ fn status(project_root: &Path) -> Result<(), CliError> {
         Ok(state) => {
             println!("step: {}", state.step);
             println!("phase: {}", state.phase);
-            println!("agent: {}", devflow_core::agents::adapter_for(state.agent).name());
+            println!(
+                "agent: {}",
+                devflow_core::agents::adapter_for(state.agent).name()
+            );
             println!("started_at: {}", state.started_at);
             println!("project_root: {}", state.project_root.display());
             match state.agent_pid {
@@ -581,7 +582,10 @@ fn recover_cmd(project_root: &Path, do_clean: bool) -> Result<(), CliError> {
 
     println!("phase: {}", status.state.phase);
     println!("step: {}", status.state.step);
-    println!("agent: {}", devflow_core::agents::adapter_for(status.state.agent).name());
+    println!(
+        "agent: {}",
+        devflow_core::agents::adapter_for(status.state.agent).name()
+    );
     println!("started: {}", status.state.started_at);
     println!("age: {}", status.age);
     match status.state.agent_pid {

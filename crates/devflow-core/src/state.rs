@@ -321,6 +321,11 @@ mod tests {
         assert!(joined.contains("--sandbox workspace-write"));
         assert!(joined.contains("--json"));
         assert!(joined.contains("phase 7"));
+        // Codex now receives the same rich prompt contract as Claude.
+        assert!(joined.contains("ROADMAP.md"));
+        assert!(joined.contains("CONTEXT.md"));
+        assert!(joined.contains("cargo test"));
+        assert!(joined.contains("DEVLOW_RESULT"));
     }
 
     #[test]

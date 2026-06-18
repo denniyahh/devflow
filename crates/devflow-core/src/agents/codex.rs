@@ -19,7 +19,7 @@ impl Agent for CodexAgent {
                 "--sandbox".into(),
                 "workspace-write".into(),
                 "--json".into(),
-                simple_prompt(phase),
+                super::phase_prompt(phase),
             ],
         )
     }
@@ -27,19 +27,4 @@ impl Agent for CodexAgent {
     fn completion_signal_detected(&self, _output: &str) -> bool {
         false
     }
-}
-
-fn simple_prompt(phase: u32) -> String {
-    format!(
-        "Complete phase {phase}. Read .planning/phases/{phase:02}-*/CONTEXT.md for tasks. \
-         Implement, test with `cargo test`, lint with `cargo clippy`, format with `cargo fmt`, \
-         and commit with descriptive messages.\n\
-         \n\
-         ## REQUIRED: Output one of these as your last message:\n\
-         \n\
-         Success → DEVLOW_RESULT: {{\"status\": \"success\"}}\n\
-         Failure → DEVLOW_RESULT: {{\"status\": \"failed\", \"reason\": \"why\"}}\n\
-         \n\
-         Nothing after this line. DevFlow uses it to track completion."
-    )
 }
