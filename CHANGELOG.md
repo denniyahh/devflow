@@ -6,6 +6,7 @@ All notable changes to DevFlow.
 
 ### Added
 - Root `ARCHITECTURE.md` documenting crates, state machine, agent model, three-layer completion evaluation, monitor daemon, worktree model, git/ship model, configuration schema, and the add-an-agent checklist
+- Stale binary detection in `devflow doctor`
 
 ### Changed
 - Corrected docs: removed the phantom `git_flow.enabled` field from examples, fixed the completion-evaluation description (Layer 2 = exit code + commit count, Layer 3 = commit heuristic), and replaced the "3 changes" agent claim with the real checklist
@@ -29,9 +30,6 @@ All notable changes to DevFlow.
 - README completely rewritten for v1.0.0 — accurate command listing, state machine diagram, quick start
 - Removed tmux references from docs
 - `.github/ISSUE_TEMPLATE/` and `.github/PULL_REQUEST_TEMPLATE.md` added
-
-### Fixed
-- Stale binary detection in `devflow doctor`
 
 ## [1.0.0] — 2026-06-18
 
