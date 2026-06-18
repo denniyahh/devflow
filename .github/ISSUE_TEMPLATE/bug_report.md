@@ -37,10 +37,8 @@ $ devflow doctor
 
 ## Debug Output
 
-If applicable, paste the last 20 lines of the audit log:
+If applicable, paste relevant output from the failed command.
 
 ```
-$ devflow audit --tail 20
+$ devflow doctor --json
 ```
-
-Or relevant output from the failed command.

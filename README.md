@@ -2,7 +2,7 @@
 
 **Agent-agnostic development workflow automation.**
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange.svg)](https://www.rust-lang.org)
 
 DevFlow automates the mechanical steps of AI-assisted development — branching, monitoring, verifying, documenting, shipping — so you and your coding agents can focus on building.
@@ -215,4 +215,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). PRs welcome.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT OR Apache-2.0 — see [LICENSE](LICENSE).

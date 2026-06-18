@@ -83,7 +83,7 @@ We use conventional commits:
 
 ## Architecture
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for design documentation.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for design documentation (available in v1.2.0).
 
 ### Adding a New Agent
 

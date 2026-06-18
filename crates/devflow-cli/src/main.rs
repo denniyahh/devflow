@@ -1720,6 +1720,8 @@ fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
             };
             let version_str = c.version.as_deref().unwrap_or("-");
             print!("  {:<20} {:<20} {}", c.name, version_str, icon);
+            // clippy: collapsible_if false positive — collapsing would require unstable let-chains
+            #[allow(clippy::collapsible_if)]
             if c.status == "missing" {
                 if let Some(hint) = &c.install_hint {
                     print!(" — install: {hint}");
