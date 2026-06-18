@@ -110,7 +110,6 @@ pub struct State {
 pub enum Agent {
     /// Anthropic Claude Code CLI.
     Claude,
-    // Omx,  // OMX support disabled — preserved for potential future re-enable
     /// OpenAI Codex CLI.
     Codex,
     /// OpenCode CLI.
@@ -149,7 +148,6 @@ impl fmt::Display for Agent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
             Agent::Claude => "claude",
-            // Agent::Omx => "omx",  // OMX disabled
             Agent::Codex => "codex",
             Agent::OpenCode => "opencode",
         };
@@ -163,7 +161,6 @@ impl FromStr for Agent {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.to_ascii_lowercase().as_str() {
             "claude" => Ok(Agent::Claude),
-            // "omx" | "oh-my-codex" => Ok(Agent::Omx),  // OMX disabled
             "codex" => Ok(Agent::Codex),
             "opencode" | "open-code" => Ok(Agent::OpenCode),
             other => Err(AgentParseError(other.to_string())),
@@ -281,12 +278,10 @@ mod tests {
     fn agent_name_and_display() {
         use crate::agents::adapter_for;
         assert_eq!(adapter_for(AgentKind::Claude).name(), "Claude Code");
-        // Agent::Omx disabled
         assert_eq!(adapter_for(AgentKind::Codex).name(), "OpenAI Codex");
         assert_eq!(adapter_for(AgentKind::OpenCode).name(), "OpenCode");
 
         assert_eq!(Agent::Claude.to_string(), "claude");
-        // Agent::Omx disabled
         assert_eq!(Agent::Codex.to_string(), "codex");
         assert_eq!(Agent::OpenCode.to_string(), "opencode");
     }
@@ -295,7 +290,6 @@ mod tests {
     fn agent_from_str_accepts_canonical_and_aliases() {
         assert_eq!("claude".parse::<Agent>().unwrap(), Agent::Claude);
         assert_eq!("CLAUDE".parse::<Agent>().unwrap(), Agent::Claude);
-        // "omx" and "oh-my-codex" disabled — OMX support removed
         assert_eq!("codex".parse::<Agent>().unwrap(), Agent::Codex);
         assert_eq!("opencode".parse::<Agent>().unwrap(), Agent::OpenCode);
         assert_eq!("open-code".parse::<Agent>().unwrap(), Agent::OpenCode);
