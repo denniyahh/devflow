@@ -134,3 +134,69 @@ pub fn wait_for_agent_pid(project_root: &Path, phase: u32) -> Option<u32> {
 fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{Agent, State};
+
+    fn state_in(root: &Path) -> State {
+        let mut state = State::new(4, Agent::Claude, root.to_path_buf());
+        state.step = crate::state::Step::Executing;
+        state
+    }
+
+    #[test]
+    fn shell_escape_wraps_basic_strings() {
+        assert_eq!(shell_escape("hello"), "'hello'");
+        assert_eq!(shell_escape("hello world"), "'hello world'");
+        assert_eq!(shell_escape("/tmp/devflow"), "'/tmp/devflow'");
+    }
+
+    #[test]
+    fn shell_escape_handles_single_quotes() {
+        assert_eq!(shell_escape("can't"), "'can'\\''t'");
+        assert_eq!(shell_escape("a'b'c"), "'a'\\''b'\\''c'");
+    }
+
+    #[test]
+    fn shell_escape_handles_empty_string() {
+        assert_eq!(shell_escape(""), "''");
+    }
+
+    #[test]
+    fn wait_for_agent_pid_returns_pid_when_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(crate::agent_result::agent_pid_path(dir.path(), 4), "12345\n").unwrap();
+
+        assert_eq!(wait_for_agent_pid(dir.path(), 4), Some(12345));
+    }
+
+    #[test]
+    fn wait_for_agent_pid_returns_none_when_file_missing() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert_eq!(wait_for_agent_pid(dir.path(), 4), None);
+    }
+
+    #[test]
+    fn wait_for_agent_pid_returns_none_for_garbage_content() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(crate::agent_result::agent_pid_path(dir.path(), 4), "not-a-pid").unwrap();
+
+        assert_eq!(wait_for_agent_pid(dir.path(), 4), None);
+    }
+
+    #[test]
+    fn spawn_monitor_returns_pid_for_valid_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_in(dir.path());
+        let args = vec!["-c".to_string(), "true".to_string()];
+
+        let monitor_pid = spawn_monitor(&state, "sh", &args).unwrap();
+
+        assert!(monitor_pid > 0);
+    }
+}
