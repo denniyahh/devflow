@@ -111,6 +111,7 @@ pub fn agent_label(agent: Agent, pid: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Stdio;
 
     #[test]
     fn agent_running_detects_self() {
@@ -128,5 +129,60 @@ mod tests {
     fn agent_label_combines_agent_and_pid() {
         assert_eq!(agent_label(Agent::Claude, 42), "claude-42");
         assert_eq!(agent_label(Agent::OpenCode, 7), "opencode-7");
+    }
+
+    #[test]
+    fn capture_agent_output_writes_stdout_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = Command::new("sh")
+            .args(["-c", "printf 'hello\n'"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let capture = capture_agent_output(child, 7, dir.path()).unwrap();
+
+        assert_eq!(capture.stdout, "hello\n");
+        assert_eq!(
+            std::fs::read_to_string(agent_result::stdout_path(dir.path(), 7)).unwrap(),
+            "hello\n"
+        );
+    }
+
+    #[test]
+    fn capture_agent_output_records_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = Command::new("sh")
+            .args(["-c", "exit 42"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let capture = capture_agent_output(child, 8, dir.path()).unwrap();
+
+        assert_eq!(capture.exit_code, 42);
+        assert_eq!(
+            std::fs::read_to_string(agent_result::exit_code_path(dir.path(), 8)).unwrap(),
+            "42"
+        );
+    }
+
+    #[test]
+    fn capture_agent_output_handles_empty_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = Command::new("sh")
+            .args(["-c", "true"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let capture = capture_agent_output(child, 9, dir.path()).unwrap();
+
+        assert_eq!(capture.stdout, "");
+        assert_eq!(capture.exit_code, 0);
+        assert_eq!(
+            std::fs::read_to_string(agent_result::stdout_path(dir.path(), 9)).unwrap(),
+            ""
+        );
     }
 }
