@@ -1643,16 +1643,36 @@ fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
         match Command::new(cmd).arg(version_arg).output() {
             Ok(out) if out.status.success() => {
                 let version = String::from_utf8_lossy(&out.stdout)
-                    .lines().next().unwrap_or("unknown").trim().to_string();
-                Check { name: name.into(), status: "ok".into(), version: Some(version), install_hint: None }
+                    .lines()
+                    .next()
+                    .unwrap_or("unknown")
+                    .trim()
+                    .to_string();
+                Check {
+                    name: name.into(),
+                    status: "ok".into(),
+                    version: Some(version),
+                    install_hint: None,
+                }
             }
             Ok(out) => {
                 let version = String::from_utf8_lossy(&out.stderr)
-                    .lines().next().unwrap_or("unknown").trim().to_string();
-                Check { name: name.into(), status: "ok".into(), version: Some(version), install_hint: None }
+                    .lines()
+                    .next()
+                    .unwrap_or("unknown")
+                    .trim()
+                    .to_string();
+                Check {
+                    name: name.into(),
+                    status: "ok".into(),
+                    version: Some(version),
+                    install_hint: None,
+                }
             }
             Err(_) => Check {
-                name: name.into(), status: "missing".into(), version: None,
+                name: name.into(),
+                status: "missing".into(),
+                version: None,
                 install_hint: Some(install_hint.into()),
             },
         }
@@ -1671,19 +1691,61 @@ fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
     let config_exists = project_root.join(".devflow.yaml").exists();
 
     let checks: Vec<Check> = vec![
-        cmd_check("git", "git", "--version", "Install from https://git-scm.com/downloads"),
+        cmd_check(
+            "git",
+            "git",
+            "--version",
+            "Install from https://git-scm.com/downloads",
+        ),
         bool_check("sh (POSIX shell)", cfg!(unix), "built-in", "Unsupported OS"),
-        cmd_check("cargo/rust", "cargo", "--version", "curl https://sh.rustup.rs -sSf | sh"),
-        cmd_check("gh CLI", "gh", "--version", "brew install gh / apt install gh"),
-        cmd_check("claude", "claude", "--version", "npm i -g @anthropic-ai/claude-code"),
+        cmd_check(
+            "cargo/rust",
+            "cargo",
+            "--version",
+            "curl https://sh.rustup.rs -sSf | sh",
+        ),
+        cmd_check(
+            "gh CLI",
+            "gh",
+            "--version",
+            "brew install gh / apt install gh",
+        ),
+        cmd_check(
+            "claude",
+            "claude",
+            "--version",
+            "npm i -g @anthropic-ai/claude-code",
+        ),
         cmd_check("codex", "codex", "--version", "npm i -g @openai/codex"),
-        cmd_check("opencode", "opencode", "--version", "cargo install opencode"),
-        Check { name: format!("devflow v{devflow_version}"), status: "ok".into(), version: Some(devflow_version.into()), install_hint: None },
+        cmd_check(
+            "opencode",
+            "opencode",
+            "--version",
+            "cargo install opencode",
+        ),
+        Check {
+            name: format!("devflow v{devflow_version}"),
+            status: "ok".into(),
+            version: Some(devflow_version.into()),
+            install_hint: None,
+        },
         Check {
             name: ".devflow.yaml".into(),
-            status: if config_exists { "ok".into() } else { "missing".into() },
-            version: if config_exists { Some("found".into()) } else { Some("not found".into()) },
-            install_hint: if config_exists { None } else { Some("Run 'devflow init' to bootstrap".into()) },
+            status: if config_exists {
+                "ok".into()
+            } else {
+                "missing".into()
+            },
+            version: if config_exists {
+                Some("found".into())
+            } else {
+                Some("not found".into())
+            },
+            install_hint: if config_exists {
+                None
+            } else {
+                Some("Run 'devflow init' to bootstrap".into())
+            },
         },
     ];
 

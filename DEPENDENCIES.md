@@ -10,7 +10,7 @@ These must be on `$PATH` for DevFlow to function.
 |---|---|---|
 | **git** | 2.30+ | Built-in (Linux/macOS) |
 | **sh/bash** | Any POSIX | Built-in |
-| **cargo/rust** | 1.91+ | [rustup.rs](https://rustup.rs) |
+| **cargo/rust** | stable (edition 2024) | [rustup.rs](https://rustup.rs) |
 
 ## Required for Shipping
 

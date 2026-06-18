@@ -2,8 +2,9 @@
 
 **Agent-agnostic development workflow automation.**
 
+[![CI](https://github.com/denniyahh/devflow/actions/workflows/ci.yml/badge.svg)](https://github.com/denniyahh/devflow/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.91%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org)
 
 DevFlow automates the mechanical steps of AI-assisted development — branching, monitoring, verifying, documenting, shipping — so you and your coding agents can focus on building.
 
@@ -173,7 +174,7 @@ Agents must be installed separately. Run `devflow doctor` to verify availability
 
 ## Requirements
 
-- **Rust** 1.91+ (build from source)
+- **Rust** stable, edition 2024 (build from source) — see `rust-toolchain.toml`
 - **git** 2.30+
 - **gh CLI** 2.0+ (for PR creation, shipping)
 - **A POSIX shell** (sh/bash)
