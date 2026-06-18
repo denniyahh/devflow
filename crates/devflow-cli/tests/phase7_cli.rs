@@ -232,3 +232,67 @@ fn sequentagent_integrates_agent_a_then_rebases_agent_b() {
         "agent B did not see A's file"
     );
 }
+
+#[test]
+fn sequentagent_hands_off_after_rate_limit_and_writes_cron_instructions() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    seed_feature_branch(root, 7);
+    let fake_bin = fake_bin_dir(&[
+        (
+            "claude",
+            "#!/bin/sh\n\
+             printf 'partial from A\\n' > a.txt\n\
+             git add a.txt\n\
+             git commit -q --allow-empty -m A\n\
+             printf '{\"type\":\"result\",\"subtype\":\"error_rate_limit\",\"retry_after\":\"2026-06-18T15:45:30Z\",\"result\":\"rate limited\"}\\n'\n",
+        ),
+        (
+            "codex",
+            "#!/bin/sh\n\
+             if test -f a.txt; then printf 'saw A\\n' > \"$DEVFLOW_TEST_ROOT/rate-limit-b-saw-a\"; fi\n\
+             printf 'from B\\n' > b.txt\n\
+             git add b.txt\n\
+             git commit -q --allow-empty -m B\n\
+             printf 'DEVFLOW_RESULT: {\"status\":\"success\",\"commits\":1}\\n'\n",
+        ),
+    ]);
+
+    let output = run_devflow(
+        root,
+        &fake_bin.path,
+        &[
+            "sequentagent",
+            "--phase",
+            "7",
+            "--agents",
+            "claude,codex",
+            "--force",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Agent A rate-limited; handing off to agent B"));
+    assert!(stdout.contains("sequentagent complete"));
+
+    let base_log = git_stdout(root, &["log", "--oneline", "feature/phase-07"]);
+    assert!(
+        base_log.contains(" A"),
+        "base branch missing A:\n{base_log}"
+    );
+    assert!(
+        base_log.contains(" B"),
+        "base branch missing B:\n{base_log}"
+    );
+    assert!(
+        root.join("rate-limit-b-saw-a").exists(),
+        "agent B did not run after A's rate limit"
+    );
+
+    let cron_path = root.join(".devflow/cron-instructions.json");
+    assert!(cron_path.exists(), "cron instructions were not written");
+    let cron = fs::read_to_string(cron_path).unwrap();
+    assert!(cron.contains("\"status\": \"rate_limited\""));
+    assert!(cron.contains("\"retry_after\": \"2026-06-18T15:45:30Z\""));
+    assert!(cron.contains("devflow sequentagent --phase 7 --agents claude,codex"));
+}
