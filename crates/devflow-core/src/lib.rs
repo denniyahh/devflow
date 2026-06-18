@@ -4,6 +4,8 @@
 //! frontends such as the CLI format output for humans or machines.
 
 pub mod agent;
+pub mod agent_result;
+pub mod agents;
 pub mod config;
 pub mod git;
 pub mod lock;
@@ -15,5 +17,6 @@ pub mod version;
 pub mod workflow;
 
 // Re-exports for convenience.
+pub use agent::launch_agent;
 pub use config::Config;
-pub use state::{Agent, State, Step};
+pub use state::{Agent, AgentKind, State, Step};

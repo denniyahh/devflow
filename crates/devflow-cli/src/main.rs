@@ -31,6 +31,9 @@ enum Command {
         /// Spawn a background monitor that auto-advances when the agent exits.
         #[arg(long)]
         monitor: bool,
+        /// Overwrite the feature branch if it already exists.
+        #[arg(long)]
+        force: bool,
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
@@ -43,6 +46,12 @@ enum Command {
     },
     /// Show current workflow state.
     Status {
+        /// Project root.
+        #[arg(default_value = ".")]
+        project: PathBuf,
+    },
+    /// List all feature branches with divergence from develop.
+    List {
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
@@ -132,10 +141,12 @@ fn run() -> Result<(), CliError> {
             phase,
             agent,
             monitor: use_monitor,
+            force,
             project,
-        } => start(&project_root(project)?, phase, agent, use_monitor),
+        } => start(&project_root(project)?, phase, agent, use_monitor, force),
         Command::Check { project } => check(&project_root(project)?),
         Command::Status { project } => status(&project_root(project)?),
+        Command::List { project } => list(&project_root(project)?),
         Command::Ship { project } => ship(&project_root(project)?),
         Command::Init { project, force } => init(&project_root(project)?, force),
         Command::Config { project } => show_config(&project_root(project)?),
@@ -146,79 +157,125 @@ fn run() -> Result<(), CliError> {
     }
 }
 
-fn start(project_root: &Path, phase: u32, agent: Agent, use_monitor: bool) -> Result<(), CliError> {
+fn start(
+    project_root: &Path,
+    phase: u32,
+    agent: Agent,
+    use_monitor: bool,
+    force: bool,
+) -> Result<(), CliError> {
     let config = Config::load(project_root)?;
     let mut state = State::new(phase, agent, project_root.to_path_buf());
 
     if config.automation.auto_branch {
         let git = GitFlow::new(project_root, config.git_flow.clone());
-        match git.feature_start(phase) {
+        let result = if force {
+            git.feature_start_force(phase)
+        } else {
+            git.feature_start(phase)
+        };
+        match result {
             Ok(branch) => println!("created feature branch: {branch}"),
-            Err(err) => println!("warning: could not create feature branch: {err}"),
+            Err(err) => {
+                if !force {
+                    return Err(CliError::Message(format!(
+                        "{err}\nUse --force to overwrite the existing branch."
+                    )));
+                }
+                return Err(err.into());
+            }
+        }
+    }
+
+    // Clean up old stdout/exit files from a prior run of the same phase.
+    devflow_core::agent_result::cleanup_phase_files(project_root, phase);
+
+    // Pre-start divergence check: warn if develop has advanced significantly.
+    let git = GitFlow::new(project_root, config.git_flow.clone());
+    match git.divergence_from_develop() {
+        Ok((_ahead, behind)) => {
+            if behind > 50 {
+                return Err(CliError::Message(format!(
+                    "develop is {behind} commits ahead — your branch is too far behind. \
+                     Rebase onto develop first, or use --force to override."
+                )));
+            }
+            if behind > 10 {
+                println!("warning: develop is {behind} commits ahead — consider rebasing first");
+            }
+        }
+        Err(_) => {
+            // If divergence check fails (e.g., no git repo), just continue.
         }
     }
 
     state.step = Step::Executing;
-    let (child, pid) = agent::launch_agent(&state)?;
-    state.agent_pid = Some(pid);
-    state.agent_label = Some(agent::agent_label(agent, pid));
-    println!("launched {} (pid {})", agent.name(), pid);
+    let adapter = devflow_core::agents::adapter_for(state.agent);
 
     if use_monitor {
-        match monitor::spawn_monitor(&state) {
+        // Monitor mode: the monitor daemon *owns* the agent so stdout/exit
+        // capture survives this CLI process exiting. The CLI does not launch
+        // or wait on the agent itself.
+        let (program, args) = adapter.exec_command(state.phase);
+        match monitor::spawn_monitor(&state, program, &args) {
             Ok(mon_pid) => {
                 state.monitor_pid = Some(mon_pid);
+                // The monitor records the agent PID; poll briefly so status
+                // and `devflow check` can report it.
+                if let Some(agent_pid) = monitor::wait_for_agent_pid(project_root, phase) {
+                    state.agent_pid = Some(agent_pid);
+                    state.agent_label = Some(agent::agent_label(agent, agent_pid));
+                    println!("launched {} (pid {agent_pid})", adapter.name());
+                }
                 println!("monitor spawned (pid {mon_pid}) — will auto-advance when agent exits");
             }
             Err(err) => {
-                println!("warning: could not spawn monitor: {err}");
-                println!("agent stdout will be captured — check back with `devflow check`");
+                return Err(CliError::Message(format!(
+                    "could not spawn monitor: {err}"
+                )));
             }
         }
     } else {
-        // Without monitor, wait for agent to finish
+        // Blocking mode: the CLI launches the agent and captures output directly.
+        let (child, pid) = agent::launch_agent(&*adapter, state.phase, project_root)?;
+        state.agent_pid = Some(pid);
+        state.agent_label = Some(agent::agent_label(agent, pid));
+        println!("launched {} (pid {pid})", adapter.name());
         println!("waiting for agent to complete (no monitor — blocking)...");
-        wait_for_agent(child, pid);
-        println!("agent exited — run `devflow check` to advance");
+        match agent::capture_agent_output(child, phase, project_root) {
+            Ok(capture) => {
+                println!("agent (pid {pid}) exited with code {}", capture.exit_code);
+                // Parse DEVLOW_RESULT and store in state.
+                let result = devflow_core::agent_result::parse_devlow_result(&capture.stdout);
+                state.agent_result = result;
+                state.agent_stdout_path =
+                    Some(devflow_core::agent_result::stdout_path(project_root, phase));
+                if !capture.stdout.is_empty() {
+                    let preview: String = capture
+                        .stdout
+                        .chars()
+                        .rev()
+                        .take(2000)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
+                    println!("\n--- agent output (last 2000 chars) ---\n{preview}");
+                    if capture.stdout.len() > 2000 {
+                        println!("... ({} total chars truncated)", capture.stdout.len());
+                    }
+                }
+                println!("agent exited — run `devflow check` to advance");
+            }
+            Err(err) => {
+                println!("error capturing agent output (pid {pid}): {err}");
+            }
+        }
     }
 
     workflow::save_state(&state)?;
     println!("started phase {} at {}", state.phase, state.started_at);
     Ok(())
-}
-
-/// Wait for the agent child process to exit, capturing its stdout.
-fn wait_for_agent(mut child: std::process::Child, pid: u32) {
-    use std::io::Read;
-    let mut stdout = String::new();
-    if let Some(ref mut pipe) = child.stdout {
-        let _ = pipe.read_to_string(&mut stdout);
-    }
-    match child.wait() {
-        Ok(status) => {
-            if status.success() {
-                println!("agent (pid {pid}) completed successfully");
-            } else {
-                println!("agent (pid {pid}) exited with {status}");
-            }
-        }
-        Err(err) => println!("error waiting for agent (pid {pid}): {err}"),
-    }
-    if !stdout.is_empty() {
-        // Print the last 2000 chars of agent output to keep it manageable.
-        let preview: String = stdout
-            .chars()
-            .rev()
-            .take(2000)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-        println!("\n--- agent output (last 2000 chars) ---\n{preview}");
-        if stdout.len() > 2000 {
-            println!("... ({} total chars truncated)", stdout.len());
-        }
-    }
 }
 
 fn check(project_root: &Path) -> Result<(), CliError> {
@@ -244,6 +301,44 @@ fn check(project_root: &Path) -> Result<(), CliError> {
             println!("agent process ended (pid {pid})");
         } else {
             println!("no agent PID recorded — advancing state");
+        }
+
+        // Three-layer agent result evaluation.
+        match devflow_core::agent_result::evaluate_agent_result(
+            project_root,
+            &state,
+            &config.git_flow,
+        ) {
+            Ok(result) => {
+                match result.status {
+                    devflow_core::agent_result::AgentStatus::Success => {
+                        println!("agent reported success");
+                        if let Some(ref reason) = result.reason {
+                            println!("  detail: {reason}");
+                        }
+                    }
+                    devflow_core::agent_result::AgentStatus::Failed => {
+                        return Err(CliError::Message(format!(
+                            "phase {} failed: {}",
+                            state.phase,
+                            result
+                                .reason
+                                .unwrap_or_else(|| "no details available".into())
+                        )));
+                    }
+                    devflow_core::agent_result::AgentStatus::Unknown => {
+                        // Layer 3 fallback — advance with warning.
+                        if let Some(ref reason) = result.reason {
+                            println!("warning: could not verify agent completion — {reason}");
+                        } else {
+                            println!("warning: could not verify agent completion status");
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                println!("warning: could not evaluate agent result: {err}");
+            }
         }
     }
 
@@ -341,7 +436,7 @@ fn status(project_root: &Path) -> Result<(), CliError> {
         Ok(state) => {
             println!("step: {}", state.step);
             println!("phase: {}", state.phase);
-            println!("agent: {}", state.agent.name());
+            println!("agent: {}", devflow_core::agents::adapter_for(state.agent).name());
             println!("started_at: {}", state.started_at);
             println!("project_root: {}", state.project_root.display());
             match state.agent_pid {
@@ -359,7 +454,54 @@ fn status(project_root: &Path) -> Result<(), CliError> {
         }
         Err(err) => return Err(err.into()),
     }
+    // Show open feature branches
+    print_open_branches(project_root);
     Ok(())
+}
+
+fn list(project_root: &Path) -> Result<(), CliError> {
+    let config = Config::load(project_root)?;
+    let git = GitFlow::new(project_root, config.git_flow.clone());
+    let branches = git.list_feature_branches()?;
+    if branches.is_empty() {
+        println!("no open feature branches");
+        return Ok(());
+    }
+    println!(
+        "{:<25} {:>6} {:>7}  LAST COMMIT",
+        "BRANCH", "AHEAD", "BEHIND"
+    );
+    for b in &branches {
+        println!(
+            "{:<25} {:>6} {:>7}  {}",
+            b.name, b.ahead, b.behind, b.last_commit
+        );
+    }
+    Ok(())
+}
+
+fn print_open_branches(project_root: &Path) {
+    let config = match Config::load(project_root) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let git = GitFlow::new(project_root, config.git_flow.clone());
+    let branches = match git.list_feature_branches() {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    if branches.is_empty() {
+        return;
+    }
+    println!("\nopen branches:");
+    for b in &branches {
+        let staleness = if b.behind > 0 {
+            format!(" ({} behind develop)", b.behind)
+        } else {
+            String::new()
+        };
+        println!("  {} — {} ahead{staleness}", b.name, b.ahead);
+    }
 }
 
 fn ship(project_root: &Path) -> Result<(), CliError> {
@@ -439,7 +581,7 @@ fn recover_cmd(project_root: &Path, do_clean: bool) -> Result<(), CliError> {
 
     println!("phase: {}", status.state.phase);
     println!("step: {}", status.state.step);
-    println!("agent: {}", status.state.agent.name());
+    println!("agent: {}", devflow_core::agents::adapter_for(status.state.agent).name());
     println!("started: {}", status.state.started_at);
     println!("age: {}", status.age);
     match status.state.agent_pid {
