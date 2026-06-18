@@ -315,7 +315,11 @@ fn check(project_root: &Path) -> Result<(), CliError> {
         }
 
         // Three-layer agent result evaluation.
-        match devflow_core::agent_result::evaluate_agent_result(project_root, &state) {
+        match devflow_core::agent_result::evaluate_agent_result(
+            project_root,
+            &state,
+            &config.git_flow,
+        ) {
             Ok(result) => {
                 match result.status {
                     devflow_core::agent_result::AgentStatus::Success => {

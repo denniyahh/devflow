@@ -6,6 +6,7 @@
 //! 2. Exit code + commit count gate (reliable fallback)
 //! 3. Process gone + commits exist (last resort warning)
 
+use crate::config::GitFlowConfig;
 use crate::state::State;
 use std::path::{Path, PathBuf};
 
@@ -127,6 +128,7 @@ pub fn evaluate_layer2(
     project_root: &Path,
     phase: u32,
     state: &State,
+    git_flow: &GitFlowConfig,
 ) -> Result<Option<AgentResult>, ResultError> {
     let exit_path = devflow_dir(project_root).join(format!("phase-{:02}-exit", phase));
     let exit_code: i32 = match std::fs::read_to_string(&exit_path) {
@@ -134,11 +136,7 @@ pub fn evaluate_layer2(
         Err(_) => return Ok(None), // fall to Layer 3
     };
 
-    let branch = format!(
-        "{}phase-{:02}",
-        "feature/", // hardcoded — read from state/config if needed
-        phase
-    );
+    let branch = format!("{}phase-{:02}", git_flow.feature_prefix, phase);
 
     // Verify branch exists before counting commits.
     let branch_exists = std::process::Command::new("git")
@@ -149,7 +147,7 @@ pub fn evaluate_layer2(
         .unwrap_or(false);
 
     let commits: u32 = if branch_exists {
-        let range = format!("develop..{branch}");
+        let range = format!("{}..{branch}", git_flow.develop);
         std::process::Command::new("git")
             .args(["rev-list", "--count", &range])
             .current_dir(&state.project_root)
@@ -193,10 +191,18 @@ pub fn evaluate_layer2(
 ///
 /// Returns Unknown status with a warning. This only fires when
 /// neither Layer 1 nor Layer 2 produced a definitive result.
-pub fn evaluate_layer3(project_root: &Path, phase: u32) -> Result<AgentResult, ResultError> {
-    let branch = format!("feature/phase-{:02}", phase);
+pub fn evaluate_layer3(
+    project_root: &Path,
+    phase: u32,
+    git_flow: &GitFlowConfig,
+) -> Result<AgentResult, ResultError> {
+    let branch = format!("{}phase-{:02}", git_flow.feature_prefix, phase);
     let commits = std::process::Command::new("git")
-        .args(["rev-list", "--count", &format!("develop..{branch}")])
+        .args([
+            "rev-list",
+            "--count",
+            &format!("{}..{branch}", git_flow.develop),
+        ])
         .current_dir(project_root)
         .output()
         .ok()
@@ -223,6 +229,7 @@ pub fn evaluate_layer3(project_root: &Path, phase: u32) -> Result<AgentResult, R
 pub fn evaluate_agent_result(
     project_root: &Path,
     state: &State,
+    git_flow: &GitFlowConfig,
 ) -> Result<AgentResult, ResultError> {
     // Layer 1: DEVLOW_RESULT marker (authoritative)
     if let Some(result) = evaluate_layer1(project_root, state.phase) {
@@ -230,12 +237,12 @@ pub fn evaluate_agent_result(
     }
 
     // Layer 2: Exit code + commit gate
-    if let Some(result) = evaluate_layer2(project_root, state.phase, state)? {
+    if let Some(result) = evaluate_layer2(project_root, state.phase, state, git_flow)? {
         return Ok(result);
     }
 
     // Layer 3: Process existence + commits
-    evaluate_layer3(project_root, state.phase)
+    evaluate_layer3(project_root, state.phase, git_flow)
 }
 
 /// Path to the .devflow directory for a project root.
