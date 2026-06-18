@@ -114,6 +114,29 @@ fn seed_feature_branch(root: &Path, phase: u32) {
     git(root, &["checkout", "-q", "develop"]);
 }
 
+fn write_last_ship(root: &Path, version_from: &str, version_to: &str, release_branch: &str) {
+    fs::create_dir_all(root.join(".devflow")).unwrap();
+    fs::write(
+        root.join(".devflow/last-ship.json"),
+        format!(
+            r#"{{
+  "phase": 7,
+  "version_from": "{version_from}",
+  "version_to": "{version_to}",
+  "release_branch": "{release_branch}",
+  "pr_number": null,
+  "pr_url": null,
+  "version_file": "{}",
+  "rejected": false,
+  "reject_reason": null,
+  "created_at": "1750000000"
+}}"#,
+            root.join("Cargo.toml").display()
+        ),
+    )
+    .unwrap();
+}
+
 #[test]
 fn parallel_creates_two_worktrees_and_spawns_two_monitors() {
     let repo = tempfile::tempdir().unwrap();
@@ -295,4 +318,31 @@ fn sequentagent_hands_off_after_rate_limit_and_writes_cron_instructions() {
     assert!(cron.contains("\"status\": \"rate_limited\""));
     assert!(cron.contains("\"retry_after\": \"2026-06-18T15:45:30Z\""));
     assert!(cron.contains("devflow sequentagent --phase 7 --agents claude,codex"));
+}
+
+#[test]
+fn confirm_finalizes_docs_and_deletes_last_ship_record() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    fs::create_dir_all(root.join(".planning")).unwrap();
+    fs::write(
+        root.join(".planning/ROADMAP.md"),
+        "# Roadmap\n\n## Phase 7 — Worktrees + PR\n\nPending work.\n",
+    )
+    .unwrap();
+    write_last_ship(root, "0.5.1", "0.5.2", "release/0.5.2");
+    let fake_bin = fake_bin_dir(&[]);
+
+    let output = run_devflow(root, &fake_bin.path, &["confirm"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("phase 7 confirmed at v0.5.2"));
+
+    let changelog = fs::read_to_string(root.join("CHANGELOG.md")).unwrap();
+    assert!(changelog.contains("# Changelog"));
+    assert!(changelog.contains("## 0.5.2"));
+
+    let roadmap = fs::read_to_string(root.join(".planning/ROADMAP.md")).unwrap();
+    assert!(roadmap.contains("## Phase 7 — Worktrees + PR — COMPLETED v0.5.2"));
+    assert!(!root.join(".devflow/last-ship.json").exists());
 }
