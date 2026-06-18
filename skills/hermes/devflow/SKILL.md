@@ -138,7 +138,6 @@ automation:
   docs_auto_commit: false
   continue_on_error: true
 git_flow:
-  enabled: false            # set false for GSD-style workflow
   main: main
   develop: develop
   feature_prefix: feature/

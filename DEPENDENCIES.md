@@ -38,7 +38,6 @@ For contributing to DevFlow itself.
 |---|---|---|
 | **cargo-clippy** | Linting | `rustup component add clippy` |
 | **cargo-fmt** | Formatting | `rustup component add rustfmt` |
-| **VS Code / Codespaces** | Dev container | `.devcontainer/devcontainer.json` included |
 
 ## Verification
 
