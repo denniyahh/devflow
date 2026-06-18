@@ -24,7 +24,7 @@ pub trait Agent {
 /// One prompt source: Claude and Codex receive identical instruction text and
 /// differ only in their CLI flags. The prompt instructs the agent to read the
 /// phase context, implement + test + lint + format, commit per sub-task, and
-/// emit the `DEVLOW_RESULT` completion marker that DevFlow parses.
+/// emit the `DEVFLOW_RESULT` completion marker that DevFlow parses.
 pub fn phase_prompt(phase: u32) -> String {
     format!(
         "Complete phase {phase} of this project.\n\
@@ -59,11 +59,11 @@ pub fn phase_prompt(phase: u32) -> String {
          \n\
          After finishing all work, your FINAL message must be exactly:\n\
          \n\
-         DEVLOW_RESULT: {{\"status\": \"success\"}}\n\
+         DEVFLOW_RESULT: {{\"status\": \"success\"}}\n\
          \n\
          If something prevents completion, your final message must be:\n\
          \n\
-         DEVLOW_RESULT: {{\"status\": \"failed\", \"reason\": \"specific explanation\"}}\n\
+         DEVFLOW_RESULT: {{\"status\": \"failed\", \"reason\": \"specific explanation\"}}\n\
          \n\
          DevFlow reads this to determine whether the phase succeeded. Do NOT output anything after this line."
     )

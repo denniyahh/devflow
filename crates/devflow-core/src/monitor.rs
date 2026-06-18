@@ -86,7 +86,7 @@ pub fn spawn_monitor(state: &State, program: &str, args: &[String]) -> Result<u3
     // is the agent's parent, capture survives the CLI exiting.
     //
     // stderr is discarded so it cannot corrupt the (possibly JSON) stdout
-    // capture that DevFlow parses for DEVLOW_RESULT.
+    // capture that DevFlow parses for DEVFLOW_RESULT.
     //
     // Traps SIGTERM and SIGINT for clean shutdown.
     let script = format!(

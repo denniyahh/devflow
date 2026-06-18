@@ -382,8 +382,8 @@ fn start(
         match agent::capture_agent_output(child, phase, project_root) {
             Ok(capture) => {
                 println!("agent (pid {pid}) exited with code {}", capture.exit_code);
-                // Parse DEVLOW_RESULT and store in state.
-                let result = devflow_core::agent_result::parse_devlow_result(&capture.stdout);
+                // Parse DEVFLOW_RESULT and store in state.
+                let result = devflow_core::agent_result::parse_devflow_result(&capture.stdout);
                 state.agent_result = result;
                 state.agent_stdout_path =
                     Some(devflow_core::agent_result::stdout_path(project_root, phase));
@@ -533,7 +533,7 @@ fn split_two_agents(agents: &str) -> Result<(Agent, Agent), CliError> {
 }
 
 /// Launch one agent, block until it exits, and return its self-reported result
-/// (parsed from the DEVLOW_RESULT marker, if present).
+/// (parsed from the DEVFLOW_RESULT marker, if present).
 fn run_agent_blocking(
     project_root: &Path,
     phase: u32,
@@ -551,7 +551,7 @@ fn run_agent_blocking(
     let capture = agent::capture_agent_output(child, phase, project_root)
         .map_err(|err| CliError::Message(format!("failed to capture agent output: {err}")))?;
     println!("agent {agent} exited with code {}", capture.exit_code);
-    Ok(devflow_core::agent_result::parse_devlow_result(
+    Ok(devflow_core::agent_result::parse_devflow_result(
         &capture.stdout,
     ))
 }

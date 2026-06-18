@@ -1,7 +1,7 @@
 //! End-to-end monitor integration test.
 //!
 //! Spawns a real background monitor that owns a *fake* agent (a `sh` script
-//! that prints a `DEVLOW_RESULT` marker and exits 0), then asserts the monitor
+//! that prints a `DEVFLOW_RESULT` marker and exits 0), then asserts the monitor
 //! captured everything `devflow check` needs to advance the state machine.
 //!
 //! Boundary note: the real `devflow` binary is not built inside the library's
@@ -67,7 +67,7 @@ fn monitor_owns_fake_agent_and_records_devflow_result() {
     // Fake agent: emit the success marker on stdout, then exit 0.
     let args = vec![
         "-c".to_string(),
-        "printf 'work done\\nDEVLOW_RESULT: {\"status\":\"success\",\"commits\":1}\\n'".to_string(),
+        "printf 'work done\\nDEVFLOW_RESULT: {\"status\":\"success\",\"commits\":1}\\n'".to_string(),
     ];
 
     spawn_monitor(&state, "sh", &args).expect("spawn monitor");
@@ -91,7 +91,7 @@ fn monitor_owns_fake_agent_and_records_devflow_result() {
     // Captured stdout contains the marker.
     let stdout = std::fs::read_to_string(stdout_path(root, phase)).unwrap();
     assert!(
-        stdout.contains("DEVLOW_RESULT"),
+        stdout.contains("DEVFLOW_RESULT"),
         "captured stdout missing marker: {stdout:?}"
     );
 

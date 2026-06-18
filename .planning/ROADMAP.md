@@ -89,7 +89,7 @@
 
 ## Phase 6: Ship Readiness (Priority: HIGH — COMPLETED v0.5.1)
 
-**Shipped:** Agent completion protocol (DEVLOW_RESULT), three-layer result evaluation, monitor daemon owns agent capture, JSON envelope parsing, config-threaded git-flow, clippy clean. 115 tests.
+**Shipped:** Agent completion protocol (DEVFLOW_RESULT), three-layer result evaluation, monitor daemon owns agent capture, JSON envelope parsing, config-threaded git-flow, clippy clean. 115 tests.
 
 ---
 
@@ -116,7 +116,7 @@
 - [ ] Fix weak `spawn_monitor` test — assert on observable output, not `pid > 0`
 - [ ] Add Layer 2 failure-path tests (exit=0+commits=0, exit≠0)
 - [ ] Cover lowercase-no-space marker variant in agent_result
-- [ ] End-to-end monitor integration test (spawn → agent writes DEVLOW_RESULT → check advances)
+- [ ] End-to-end monitor integration test (spawn → agent writes DEVFLOW_RESULT → check advances)
 
 ### 7d — Prompt Rationalization
 - [ ] Extract shared `phase_prompt()` to `agents/mod.rs`

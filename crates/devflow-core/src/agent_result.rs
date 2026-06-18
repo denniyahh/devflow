@@ -1,8 +1,8 @@
-//! Agent completion detection — parses DEVLOW_RESULT markers and evaluates
+//! Agent completion detection — parses DEVFLOW_RESULT markers and evaluates
 //! exit codes to determine whether a coding agent succeeded or failed.
 //!
 //! Three-layer decision engine:
-//! 1. Parse DEVLOW_RESULT from agent stdout (authoritative)
+//! 1. Parse DEVFLOW_RESULT from agent stdout (authoritative)
 //! 2. Exit code + commit count gate (reliable fallback)
 //! 3. Process gone + commits exist (last resort warning)
 
@@ -24,7 +24,7 @@ pub struct AgentResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentStatus {
-    /// Agent self-reported success via DEVLOW_RESULT.
+    /// Agent self-reported success via DEVFLOW_RESULT.
     Success,
     /// Agent self-reported failure, or exit code + commit gate indicated failure.
     Failed,
@@ -47,9 +47,9 @@ pub enum ResultError {
     NoPhaseDir,
 }
 
-/// Search stdout for a DEVLOW_RESULT marker.
+/// Search stdout for a DEVFLOW_RESULT marker.
 ///
-/// The marker is a single line starting with `DEVLOW_RESULT:` followed by
+/// The marker is a single line starting with `DEVFLOW_RESULT:` followed by
 /// a JSON object with at minimum a `status` field. Matching is case-insensitive.
 ///
 /// When an agent is run with `--output-format json` (e.g. Claude), its final
@@ -57,7 +57,7 @@ pub enum ResultError {
 /// embedded newlines — escaped inside a `result` field. In that case the
 /// marker never appears at the start of a line, so we first unwrap the
 /// envelope and search the inner text.
-pub fn parse_devlow_result(stdout: &str) -> Option<AgentResult> {
+pub fn parse_devflow_result(stdout: &str) -> Option<AgentResult> {
     if let Some(inner) = extract_json_result_text(stdout)
         && let Some(result) = parse_marker_lines(&inner)
     {
@@ -77,7 +77,7 @@ fn extract_json_result_text(stdout: &str) -> Option<String> {
     value.get("result")?.as_str().map(str::to_string)
 }
 
-/// Scan the tail of `stdout` line-by-line for the last DEVLOW_RESULT marker.
+/// Scan the tail of `stdout` line-by-line for the last DEVFLOW_RESULT marker.
 fn parse_marker_lines(stdout: &str) -> Option<AgentResult> {
     // Only search the tail — agents may echo the marker in their prompt
     // and we want the LAST occurrence (which is their actual final status).
@@ -92,10 +92,10 @@ fn parse_marker_lines(stdout: &str) -> Option<AgentResult> {
 
     for line in tail.lines().rev() {
         let Some(json_str) = line
-            .strip_prefix("DEVLOW_RESULT: ")
-            .or_else(|| line.strip_prefix("devlow_result: "))
-            .or_else(|| line.strip_prefix("DEVLOW_RESULT:"))
-            .or_else(|| line.strip_prefix("devlow_result:"))
+            .strip_prefix("DEVFLOW_RESULT: ")
+            .or_else(|| line.strip_prefix("devflow_result: "))
+            .or_else(|| line.strip_prefix("DEVFLOW_RESULT:"))
+            .or_else(|| line.strip_prefix("devflow_result:"))
         else {
             continue;
         };
@@ -108,11 +108,11 @@ fn parse_marker_lines(stdout: &str) -> Option<AgentResult> {
     None
 }
 
-/// Layer 1: Try to detect agent result from DEVLOW_RESULT marker in stdout.
+/// Layer 1: Try to detect agent result from DEVFLOW_RESULT marker in stdout.
 pub fn evaluate_layer1(project_root: &Path, phase: u32) -> Option<AgentResult> {
     let stdout_path = devflow_dir(project_root).join(format!("phase-{:02}-stdout", phase));
     let stdout = std::fs::read_to_string(&stdout_path).ok()?;
-    parse_devlow_result(&stdout)
+    parse_devflow_result(&stdout)
 }
 
 /// Layer 2: Use exit code + commit count to determine result.
@@ -231,7 +231,7 @@ pub fn evaluate_agent_result(
     state: &State,
     git_flow: &GitFlowConfig,
 ) -> Result<AgentResult, ResultError> {
-    // Layer 1: DEVLOW_RESULT marker (authoritative)
+    // Layer 1: DEVFLOW_RESULT marker (authoritative)
     if let Some(result) = evaluate_layer1(project_root, state.phase) {
         return Ok(result);
     }
@@ -337,16 +337,16 @@ mod tests {
 
     #[test]
     fn parse_success_marker() {
-        let stdout = "some output\nDEVLOW_RESULT: {\"status\":\"success\"}\n";
-        let result = parse_devlow_result(stdout).unwrap();
+        let stdout = "some output\nDEVFLOW_RESULT: {\"status\":\"success\"}\n";
+        let result = parse_devflow_result(stdout).unwrap();
         assert_eq!(result.status, AgentStatus::Success);
     }
 
     #[test]
     fn parse_failed_marker_with_reason() {
         let stdout =
-            "work done\nDEVLOW_RESULT: {\"status\":\"failed\",\"reason\":\"clippy errors\"}\n";
-        let result = parse_devlow_result(stdout).unwrap();
+            "work done\nDEVFLOW_RESULT: {\"status\":\"failed\",\"reason\":\"clippy errors\"}\n";
+        let result = parse_devflow_result(stdout).unwrap();
         assert_eq!(result.status, AgentStatus::Failed);
         assert_eq!(result.reason.unwrap(), "clippy errors");
     }
@@ -354,26 +354,26 @@ mod tests {
     #[test]
     fn parse_missing_marker_returns_none() {
         let stdout = "just some output\nno marker here\n";
-        assert!(parse_devlow_result(stdout).is_none());
+        assert!(parse_devflow_result(stdout).is_none());
     }
 
     #[test]
     fn parse_malformed_json_returns_none() {
-        let stdout = "DEVLOW_RESULT: {not valid json}\n";
-        assert!(parse_devlow_result(stdout).is_none());
+        let stdout = "DEVFLOW_RESULT: {not valid json}\n";
+        assert!(parse_devflow_result(stdout).is_none());
     }
 
     #[test]
     fn parse_lowercase_marker() {
-        let stdout = "devlow_result: {\"status\":\"success\"}\n";
-        let result = parse_devlow_result(stdout).unwrap();
+        let stdout = "devflow_result: {\"status\":\"success\"}\n";
+        let result = parse_devflow_result(stdout).unwrap();
         assert_eq!(result.status, AgentStatus::Success);
     }
 
     #[test]
     fn parse_marker_without_space_after_colon() {
-        let stdout = "DEVLOW_RESULT:{\"status\":\"success\"}\n";
-        let result = parse_devlow_result(stdout).unwrap();
+        let stdout = "DEVFLOW_RESULT:{\"status\":\"success\"}\n";
+        let result = parse_devflow_result(stdout).unwrap();
         assert_eq!(result.status, AgentStatus::Success);
     }
 
@@ -381,16 +381,16 @@ mod tests {
     fn parse_lowercase_no_space_marker() {
         // Lowercase prefix AND no space after the colon — the combination that
         // the Phase 6 review flagged as uncovered.
-        let stdout = "devlow_result:{\"status\":\"success\"}\n";
-        let result = parse_devlow_result(stdout).unwrap();
+        let stdout = "devflow_result:{\"status\":\"success\"}\n";
+        let result = parse_devflow_result(stdout).unwrap();
         assert_eq!(result.status, AgentStatus::Success);
     }
 
     #[test]
     fn parse_finds_last_marker_in_tail() {
         // Multiple markers — should find the last one.
-        let stdout = "DEVLOW_RESULT: {\"status\":\"failed\"}\nsome more output\nDEVLOW_RESULT: {\"status\":\"success\"}\n";
-        let result = parse_devlow_result(stdout).unwrap();
+        let stdout = "DEVFLOW_RESULT: {\"status\":\"failed\"}\nsome more output\nDEVFLOW_RESULT: {\"status\":\"success\"}\n";
+        let result = parse_devflow_result(stdout).unwrap();
         assert_eq!(result.status, AgentStatus::Success);
     }
 
@@ -398,14 +398,14 @@ mod tests {
     fn parse_marker_only_in_last_4000_chars() {
         // Marker beyond 4000 chars from end should not be found.
         let prefix = "a".repeat(5000);
-        let stdout = format!("DEVLOW_RESULT: {{\"status\":\"success\"}}\n{prefix}");
-        assert!(parse_devlow_result(&stdout).is_none());
+        let stdout = format!("DEVFLOW_RESULT: {{\"status\":\"success\"}}\n{prefix}");
+        assert!(parse_devflow_result(&stdout).is_none());
     }
 
     #[test]
     fn parse_marker_with_commits_and_summary() {
-        let stdout = r#"DEVLOW_RESULT: {"status":"success","commits":3,"summary":"added tests"}"#;
-        let result = parse_devlow_result(stdout).unwrap();
+        let stdout = r#"DEVFLOW_RESULT: {"status":"success","commits":3,"summary":"added tests"}"#;
+        let result = parse_devflow_result(stdout).unwrap();
         assert_eq!(result.status, AgentStatus::Success);
         assert_eq!(result.commits, Some(3));
         assert_eq!(result.summary.unwrap(), "added tests");
@@ -415,16 +415,16 @@ mod tests {
     fn parse_marker_inside_json_result_envelope() {
         // Claude --output-format json wraps the final text in a `result` field
         // with embedded newlines escaped.
-        let stdout = r#"{"type":"result","subtype":"success","result":"All done.\nDEVLOW_RESULT: {\"status\": \"success\", \"commits\": 2}","session_id":"abc"}"#;
-        let result = parse_devlow_result(stdout).unwrap();
+        let stdout = r#"{"type":"result","subtype":"success","result":"All done.\nDEVFLOW_RESULT: {\"status\": \"success\", \"commits\": 2}","session_id":"abc"}"#;
+        let result = parse_devflow_result(stdout).unwrap();
         assert_eq!(result.status, AgentStatus::Success);
         assert_eq!(result.commits, Some(2));
     }
 
     #[test]
     fn parse_failed_marker_inside_json_envelope() {
-        let stdout = r#"{"result":"work\nDEVLOW_RESULT: {\"status\": \"failed\", \"reason\": \"tests failed\"}"}"#;
-        let result = parse_devlow_result(stdout).unwrap();
+        let stdout = r#"{"result":"work\nDEVFLOW_RESULT: {\"status\": \"failed\", \"reason\": \"tests failed\"}"}"#;
+        let result = parse_devflow_result(stdout).unwrap();
         assert_eq!(result.status, AgentStatus::Failed);
         assert_eq!(result.reason.unwrap(), "tests failed");
     }
@@ -432,7 +432,7 @@ mod tests {
     #[test]
     fn parse_json_envelope_without_marker_returns_none() {
         let stdout = r#"{"result":"did some work but forgot the marker","session_id":"x"}"#;
-        assert!(parse_devlow_result(stdout).is_none());
+        assert!(parse_devflow_result(stdout).is_none());
     }
 
     #[test]
@@ -462,7 +462,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
         std::fs::write(
             stdout_path(dir.path(), 6),
-            "done\nDEVLOW_RESULT: {\"status\":\"success\",\"commits\":2,\"summary\":\"ok\"}\n",
+            "done\nDEVFLOW_RESULT: {\"status\":\"success\",\"commits\":2,\"summary\":\"ok\"}\n",
         )
         .unwrap();
         std::fs::write(exit_code_path(dir.path(), 6), "0").unwrap();
@@ -476,12 +476,12 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_layer1_finds_devlow_result_in_file() {
+    fn evaluate_layer1_finds_devflow_result_in_file() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
         std::fs::write(
             stdout_path(dir.path(), 3),
-            "output\ndevlow_result: {\"status\":\"failed\",\"reason\":\"bad output\"}\n",
+            "output\ndevflow_result: {\"status\":\"failed\",\"reason\":\"bad output\"}\n",
         )
         .unwrap();
 

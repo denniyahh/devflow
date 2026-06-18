@@ -96,7 +96,7 @@ pub struct State {
     /// always live under the main `project_root`; only the agent's cwd changes.
     #[serde(default)]
     pub worktree_path: Option<PathBuf>,
-    /// Parsed agent completion result (from DEVLOW_RESULT or exit code).
+    /// Parsed agent completion result (from DEVFLOW_RESULT or exit code).
     #[serde(skip)]
     pub agent_result: Option<AgentResult>,
     /// Path where agent stdout was saved.
@@ -332,7 +332,7 @@ mod tests {
         assert!(joined.contains("ROADMAP.md"));
         assert!(joined.contains("CONTEXT.md"));
         assert!(joined.contains("cargo test"));
-        assert!(joined.contains("DEVLOW_RESULT"));
+        assert!(joined.contains("DEVFLOW_RESULT"));
     }
 
     #[test]
