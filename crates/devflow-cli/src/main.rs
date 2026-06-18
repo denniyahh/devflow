@@ -114,8 +114,32 @@ enum Command {
         #[arg(default_value = ".")]
         project: PathBuf,
     },
-    /// Create a release branch and bump the configured version.
+    /// Bump version, push a release branch, and open a PR via `gh`.
     Ship {
+        /// Phase being shipped (defaults to active state or current branch).
+        #[arg(long)]
+        phase: Option<u32>,
+        /// Bump + release branch only — skip push and PR creation.
+        #[arg(long)]
+        no_pr: bool,
+        /// Project root.
+        #[arg(default_value = ".")]
+        project: PathBuf,
+    },
+    /// Finalize a shipped phase: check merge, update docs, clear ship record.
+    Confirm {
+        /// Project root.
+        #[arg(default_value = ".")]
+        project: PathBuf,
+    },
+    /// Reject the last ship; with --redo, undo the PR/branch/version bump.
+    Rejectpr {
+        /// Why the ship was rejected.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Undo: close PR, delete release branch, revert version, reopen phase.
+        #[arg(long)]
+        redo: bool,
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
@@ -182,6 +206,8 @@ enum CliError {
     Verify(#[from] devflow_core::verify::VerifyError),
     #[error(transparent)]
     Worktree(#[from] devflow_core::worktree::WorktreeError),
+    #[error(transparent)]
+    Ship(#[from] devflow_core::ship::ShipError),
     #[error("{0}")]
     Message(String),
 }
@@ -233,7 +259,17 @@ fn run() -> Result<(), CliError> {
         Command::Check { project } => check(&project_root(project)?),
         Command::Status { project } => status(&project_root(project)?),
         Command::List { project } => list(&project_root(project)?),
-        Command::Ship { project } => ship(&project_root(project)?),
+        Command::Ship {
+            phase,
+            no_pr,
+            project,
+        } => ship(&project_root(project)?, phase, no_pr),
+        Command::Confirm { project } => confirm(&project_root(project)?),
+        Command::Rejectpr {
+            reason,
+            redo,
+            project,
+        } => rejectpr(&project_root(project)?, reason, redo),
         Command::Init { project, force } => init(&project_root(project)?, force),
         Command::Config { project } => show_config(&project_root(project)?),
         Command::Recover { project, clean } => recover_cmd(&project_root(project)?, clean),
@@ -987,8 +1023,11 @@ fn print_open_branches(project_root: &Path) {
     }
 }
 
-fn ship(project_root: &Path) -> Result<(), CliError> {
+fn ship(project_root: &Path, phase_arg: Option<u32>, no_pr: bool) -> Result<(), CliError> {
     let config = Config::load(project_root)?;
+    // Resolve the phase before release_start switches branches.
+    let phase = resolve_phase(project_root, phase_arg);
+
     let current = match version::read_version(project_root, &config.version) {
         Ok(version) => version,
         Err(err) => {
@@ -998,15 +1037,339 @@ fn ship(project_root: &Path) -> Result<(), CliError> {
         }
     };
     let next = version::bump(&current, &config.automation.auto_version)?;
-    let written = version::write_version(project_root, &config.version, &next)?;
+    let version_file = version::write_version(project_root, &config.version, &next)?;
     let git = GitFlow::new(project_root, config.git_flow.clone());
-    match git.release_start(&next) {
-        Ok(branch) => println!("created release branch: {branch}"),
-        Err(err) => println!("warning: could not create release branch: {err}"),
-    }
+    let release_branch = match git.release_start(&next) {
+        Ok(branch) => {
+            println!("created release branch: {branch}");
+            branch
+        }
+        Err(err) => {
+            return Err(CliError::Message(format!(
+                "could not create release branch: {err}"
+            )));
+        }
+    };
     println!("bumped version: {current} -> {next}");
-    println!("updated: {}", written.display());
+    println!("updated: {}", version_file.display());
+
+    // Commit the version bump on the release branch.
+    git.commit_all(&format!("chore: bump version to {next}"))?;
+
+    if no_pr {
+        println!("--no-pr set; skipping push and PR creation");
+        return Ok(());
+    }
+
+    // Push the release branch and open a PR (each step fail-soft).
+    let mut pr_number = None;
+    let mut pr_url = None;
+    if git.has_remote() {
+        match git.push(&release_branch) {
+            Ok(()) => {
+                println!("pushed {release_branch} to origin");
+                let body = devflow_core::ship::build_pr_body(
+                    project_root,
+                    phase,
+                    &config.git_flow,
+                    &config.automation.verify_command,
+                );
+                match gh_pr_create(
+                    project_root,
+                    &config.git_flow.develop,
+                    &release_branch,
+                    &next,
+                    phase,
+                    &body,
+                ) {
+                    Ok((number, url)) => {
+                        println!("opened PR: {url}");
+                        pr_number = number;
+                        pr_url = Some(url);
+                    }
+                    Err(err) => {
+                        println!("warning: could not create PR via gh: {err}");
+                        println!("open a PR manually, then use `devflow confirm`/`rejectpr`");
+                    }
+                }
+            }
+            Err(err) => {
+                println!("warning: could not push {release_branch}: {err}");
+                println!("skipping PR creation");
+            }
+        }
+    } else {
+        println!("no git remote configured — skipping push + PR (open one manually)");
+    }
+
+    // Always record the ship so confirm/rejectpr work even for a manual PR.
+    let record = devflow_core::ship::LastShip {
+        phase,
+        version_from: current,
+        version_to: next,
+        release_branch,
+        pr_number,
+        pr_url,
+        version_file,
+        rejected: false,
+        reject_reason: None,
+        created_at: unix_now(),
+    };
+    devflow_core::ship::save(project_root, &record)?;
+    println!("recorded ship to .devflow/last-ship.json");
+    println!("review the PR, then run `devflow confirm` (or `devflow rejectpr --redo`)");
     Ok(())
+}
+
+/// Finalize a shipped phase (Model B: warns but does not block on unmerged PR).
+fn confirm(project_root: &Path) -> Result<(), CliError> {
+    let record = match devflow_core::ship::load(project_root) {
+        Ok(r) => r,
+        Err(devflow_core::ship::ShipError::Missing) => {
+            return Err(CliError::Message(
+                "nothing to confirm — no last-ship record".into(),
+            ));
+        }
+        Err(err) => return Err(err.into()),
+    };
+
+    if let Some(number) = record.pr_number {
+        match gh_pr_merged(project_root, number) {
+            Ok(true) => println!("PR #{number} is merged"),
+            Ok(false) => {
+                println!("warning: PR #{number} is not merged yet — confirming anyway")
+            }
+            Err(err) => println!("warning: could not check PR #{number} status: {err}"),
+        }
+    }
+
+    finalize_changelog(project_root, &record.version_to)?;
+    finalize_roadmap(project_root, record.phase, &record.version_to);
+
+    let _ = workflow::clear_state(project_root);
+    devflow_core::ship::delete(project_root)?;
+    println!(
+        "phase {} confirmed at v{} — ship record cleared",
+        record.phase, record.version_to
+    );
+    Ok(())
+}
+
+/// Reject the last ship; with `--redo`, undo the PR, branch, and version bump.
+fn rejectpr(project_root: &Path, reason: Option<String>, redo: bool) -> Result<(), CliError> {
+    let config = Config::load(project_root)?;
+    let mut record = devflow_core::ship::load(project_root).map_err(|err| match err {
+        devflow_core::ship::ShipError::Missing => {
+            CliError::Message("nothing to reject — no last-ship record".into())
+        }
+        other => other.into(),
+    })?;
+
+    if !redo {
+        record.rejected = true;
+        record.reject_reason = reason;
+        devflow_core::ship::save(project_root, &record)?;
+        println!("rejection recorded for phase {}", record.phase);
+        return Ok(());
+    }
+
+    let git = GitFlow::new(project_root, config.git_flow.clone());
+
+    // 1. Close the PR if there is one.
+    if let Some(number) = record.pr_number {
+        match gh_pr_close(project_root, number) {
+            Ok(()) => println!("closed PR #{number}"),
+            Err(err) => println!("warning: could not close PR #{number}: {err}"),
+        }
+    }
+
+    // 2. Delete the release branch locally (off it first) and on origin.
+    let _ = git.checkout(&config.git_flow.develop);
+    match git.delete_branch(&record.release_branch, true) {
+        Ok(()) => println!("deleted local branch {}", record.release_branch),
+        Err(err) => println!("warning: could not delete {}: {err}", record.release_branch),
+    }
+    if git.has_remote() {
+        match git.delete_remote_branch(&record.release_branch) {
+            Ok(()) => println!("deleted origin/{}", record.release_branch),
+            Err(err) => println!("warning: could not delete remote branch: {err}"),
+        }
+    }
+
+    // 3. Revert the version bump.
+    match version::write_version(project_root, &config.version, &record.version_from) {
+        Ok(path) => println!(
+            "reverted version to {} in {}",
+            record.version_from,
+            path.display()
+        ),
+        Err(err) => println!("warning: could not revert version: {err}"),
+    }
+
+    // 4. Reopen the phase: clear workflow state so it can be re-run.
+    let _ = workflow::clear_state(project_root);
+    devflow_core::ship::delete(project_root)?;
+    println!("ship undone — phase {} reopened", record.phase);
+    Ok(())
+}
+
+/// Resolve the phase from an explicit flag, active state, or branch name.
+fn resolve_phase(project_root: &Path, explicit: Option<u32>) -> u32 {
+    if let Some(phase) = explicit {
+        return phase;
+    }
+    if let Ok(state) = workflow::load_state(project_root) {
+        return state.phase;
+    }
+    current_branch_phase(project_root).unwrap_or(0)
+}
+
+/// Parse a phase number from the current branch name (`feature/phase-NN`).
+fn current_branch_phase(project_root: &Path) -> Option<u32> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(project_root)
+        .output()
+        .ok()?;
+    let branch = String::from_utf8_lossy(&output.stdout);
+    branch.trim().rsplit_once("phase-")?.1.trim().parse().ok()
+}
+
+/// Append a CHANGELOG.md entry for `version`, creating the file if needed.
+fn finalize_changelog(project_root: &Path, version: &str) -> Result<(), CliError> {
+    let path = project_root.join("CHANGELOG.md");
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let updated = devflow_core::ship::prepend_changelog(&existing, version, &today());
+    std::fs::write(&path, updated)
+        .map_err(|err| CliError::Message(format!("could not write CHANGELOG.md: {err}")))?;
+    println!("updated CHANGELOG.md");
+    Ok(())
+}
+
+/// Mark the phase complete in `.planning/ROADMAP.md` (best-effort).
+fn finalize_roadmap(project_root: &Path, phase: u32, version: &str) {
+    let path = project_root.join(".planning").join("ROADMAP.md");
+    let Ok(existing) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let updated = devflow_core::ship::mark_phase_complete(&existing, phase, version);
+    if updated != existing {
+        if std::fs::write(&path, updated).is_ok() {
+            println!("marked phase {phase} complete in ROADMAP.md");
+        }
+    } else {
+        println!("ROADMAP.md: phase {phase} already marked (or heading not found)");
+    }
+}
+
+/// `gh pr create` → returns (pr_number, pr_url). The PR body is passed via file.
+fn gh_pr_create(
+    project_root: &Path,
+    base: &str,
+    head: &str,
+    version: &str,
+    phase: u32,
+    body: &str,
+) -> Result<(Option<u64>, String), CliError> {
+    let title = format!("Release {version} (phase {phase})");
+    let tmp = std::env::temp_dir().join(format!("devflow-pr-body-{}.md", std::process::id()));
+    std::fs::write(&tmp, body)
+        .map_err(|err| CliError::Message(format!("could not write PR body: {err}")))?;
+    let body_file = tmp.to_string_lossy().to_string();
+
+    let output = std::process::Command::new("gh")
+        .args([
+            "pr",
+            "create",
+            "--base",
+            base,
+            "--head",
+            head,
+            "--title",
+            &title,
+            "--body-file",
+            &body_file,
+        ])
+        .current_dir(project_root)
+        .output()
+        .map_err(|err| CliError::Message(format!("could not run gh: {err}")))?;
+    let _ = std::fs::remove_file(&tmp);
+
+    if !output.status.success() {
+        return Err(CliError::Message(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok((parse_pr_number(&url), url))
+}
+
+/// Whether a PR is merged via `gh pr view <n> --json state,mergedAt`.
+fn gh_pr_merged(project_root: &Path, number: u64) -> Result<bool, CliError> {
+    let output = std::process::Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            &number.to_string(),
+            "--json",
+            "state,mergedAt",
+        ])
+        .current_dir(project_root)
+        .output()
+        .map_err(|err| CliError::Message(format!("could not run gh: {err}")))?;
+    if !output.status.success() {
+        return Err(CliError::Message(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
+    // Lightweight check against the `--json state,mergedAt` payload — avoids a
+    // serde_json dependency in the thin CLI crate.
+    let json = String::from_utf8_lossy(&output.stdout);
+    let merged = json.contains("\"state\":\"MERGED\"")
+        || json.replace(' ', "").contains("\"state\":\"MERGED\"")
+        || (json.contains("\"mergedAt\"") && !json.replace(' ', "").contains("\"mergedAt\":null"));
+    Ok(merged)
+}
+
+/// Close a PR via `gh pr close <n>`.
+fn gh_pr_close(project_root: &Path, number: u64) -> Result<(), CliError> {
+    let output = std::process::Command::new("gh")
+        .args(["pr", "close", &number.to_string()])
+        .current_dir(project_root)
+        .output()
+        .map_err(|err| CliError::Message(format!("could not run gh: {err}")))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(CliError::Message(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ))
+    }
+}
+
+/// Parse the trailing PR number out of a `gh pr create` URL.
+fn parse_pr_number(url: &str) -> Option<u64> {
+    url.trim().rsplit('/').next()?.parse().ok()
+}
+
+/// Today's date as YYYY-MM-DD (best-effort via the `date` command).
+fn today() -> String {
+    std::process::Command::new("date")
+        .arg("+%Y-%m-%d")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unreleased".to_string())
+}
+
+/// Current Unix time in seconds as a string.
+fn unix_now() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string())
 }
 
 fn init(project_root: &Path, force: bool) -> Result<(), CliError> {
@@ -1185,6 +1548,13 @@ mod tests {
     fn pairs_reject_invalid_phase() {
         assert!(parse_phase_agent_pairs("7,x", None).is_err());
         assert!(parse_phase_agent_pairs("", None).is_err());
+    }
+
+    #[test]
+    fn parse_pr_number_reads_trailing_segment() {
+        assert_eq!(parse_pr_number("https://github.com/o/r/pull/42"), Some(42));
+        assert_eq!(parse_pr_number("https://github.com/o/r/pull/7\n"), Some(7));
+        assert_eq!(parse_pr_number("not-a-url"), None);
     }
 
     #[test]

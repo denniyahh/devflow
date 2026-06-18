@@ -170,6 +170,16 @@ impl GitFlow {
         }
     }
 
+    /// Check out an existing branch in the main worktree.
+    pub fn checkout(&self, branch: &str) -> Result<(), GitError> {
+        self.git(["checkout", branch])
+    }
+
+    /// Delete `branch` on `origin` (best-effort; errors if no remote/branch).
+    pub fn delete_remote_branch(&self, branch: &str) -> Result<(), GitError> {
+        self.git(["push", "origin", "--delete", branch])
+    }
+
     /// Whether the repository has at least one configured remote.
     pub fn has_remote(&self) -> bool {
         self.git_output(["remote"])

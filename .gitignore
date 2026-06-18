@@ -22,6 +22,7 @@ Thumbs.db
 # DevFlow own state (dogfooding)
 .devflow/state.json
 .devflow/lock
+.devflow/last-ship.json
 .planning/
 
 # Git worktrees created by `devflow start --worktree` / `parallel` / `sequentagent`
