@@ -508,6 +508,7 @@ pub fn mark_phase_complete(roadmap: &str, phase: u32, version: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     fn sample(root: &Path) -> LastShip {
         LastShip {
@@ -655,6 +656,31 @@ mod tests {
     }
 
     #[test]
+    fn build_pr_body_includes_real_git_diff_stat() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q"]);
+        git(root, &["config", "user.email", "devflow@example.com"]);
+        git(root, &["config", "user.name", "DevFlow Tests"]);
+        git(root, &["config", "commit.gpgsign", "false"]);
+        git(root, &["config", "core.hooksPath", "/dev/null"]);
+        git(root, &["checkout", "-q", "-b", "develop"]);
+        std::fs::write(root.join("README.md"), "base\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-q", "-m", "base"]);
+
+        git(root, &["checkout", "-q", "-b", "feature/phase-07"]);
+        std::fs::write(root.join("src.txt"), "one\ntwo\nthree\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-q", "-m", "feature work"]);
+
+        let body = build_pr_body(root, 7, &GitFlowConfig::default(), "true");
+
+        assert!(body.contains("src.txt"));
+        assert!(body.contains("1 file changed"));
+    }
+
+    #[test]
     fn count_passed_tests_sums_across_lines() {
         let output = "test result: ok. 115 passed; 0 failed\n\
                       test result: ok. 1 passed; 0 failed\n";
@@ -687,5 +713,18 @@ mod tests {
         // Running again does not double-annotate.
         let twice = mark_phase_complete(&once, 7, "0.5.2");
         assert_eq!(once, twice);
+    }
+
+    fn git(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("spawn git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
