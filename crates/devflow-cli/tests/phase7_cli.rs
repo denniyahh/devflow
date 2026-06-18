@@ -401,3 +401,56 @@ fn status_prints_cron_hint_when_cron_instructions_exist() {
         root.display()
     )));
 }
+
+#[test]
+fn reference_and_cleanup_worktree_cli_flow() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let fake_bin = fake_bin_dir(&[
+        (
+            "claude",
+            "#!/bin/sh\nprintf 'DEVFLOW_RESULT: {\"status\":\"success\"}\n'\n",
+        ),
+    ]);
+
+    // reference — creates static snapshot
+    let out = run_devflow(root, &fake_bin.path, &["reference"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("reference worktree"));
+    assert!(root.join(".worktrees/reference").is_dir());
+
+    // start --worktree — creates phase worktree
+    let out = run_devflow(
+        root,
+        &fake_bin.path,
+        &["start", "--phase", "8", "--agent", "claude", "--worktree"],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("phase 8"));
+    assert!(
+        root.join(".worktrees/phase-08").is_dir(),
+        "worktree not created"
+    );
+
+    // status — lists active worktrees
+    let out = run_devflow(root, &fake_bin.path, &["status"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(".worktrees/reference"),
+        "status missing reference\n{stdout}"
+    );
+    assert!(
+        stdout.contains(".worktrees/phase-08"),
+        "status missing phase worktree\n{stdout}"
+    );
+
+    // cleanup — removes worktrees
+    let out = run_devflow(root, &fake_bin.path, &["cleanup", "--force"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("removed"));
+
+    // cleanup --force removes everything including reference
+    assert!(!root.join(".worktrees/reference").is_dir());
+    assert!(!root.join(".worktrees/phase-08").is_dir());
+}
