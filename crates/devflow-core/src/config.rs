@@ -203,7 +203,9 @@ impl Config {
         };
         // Auto-detect version file if using the default (pyproject.toml)
         // or if the configured file doesn't exist
-        if config.version.file == "pyproject.toml" && !project_root.join(&config.version.file).exists() {
+        if config.version.file == "pyproject.toml"
+            && !project_root.join(&config.version.file).exists()
+        {
             config.version.auto_detect(project_root);
         }
         Ok(config)
@@ -289,8 +291,12 @@ fn parse_config(contents: &str) -> Result<Config, ConfigError> {
             ("automation", "verify_command") => config.automation.verify_command = value,
             ("automation", "lint_command") => config.automation.lint_command = value,
             ("automation", "docs_command") => config.automation.docs_command = value,
-            ("automation", "continue_on_error") => config.automation.continue_on_error = parse_bool(&value)?,
-            ("automation", "docs_auto_commit") => config.automation.docs_auto_commit = parse_bool(&value)?,
+            ("automation", "continue_on_error") => {
+                config.automation.continue_on_error = parse_bool(&value)?
+            }
+            ("automation", "docs_auto_commit") => {
+                config.automation.docs_auto_commit = parse_bool(&value)?
+            }
             ("git_flow", "main") => config.git_flow.main = value,
             ("git_flow", "develop") => config.git_flow.develop = value,
             ("git_flow", "feature_prefix") => config.git_flow.feature_prefix = value,
@@ -349,7 +355,10 @@ mod tests {
         assert!(!config.automation.auto_ship);
         assert!(config.automation.auto_cleanup);
         assert_eq!(config.automation.verify_command, "cargo test");
-        assert_eq!(config.automation.lint_command, "cargo clippy -- -D warnings");
+        assert_eq!(
+            config.automation.lint_command,
+            "cargo clippy -- -D warnings"
+        );
         assert_eq!(config.automation.docs_command, "cargo doc --no-deps 2>&1");
         assert!(!config.automation.continue_on_error);
         assert!(!config.automation.docs_auto_commit);

@@ -139,13 +139,13 @@ fn find_version_in_contents(contents: &str, field: &str) -> Option<String> {
             continue;
         }
         if let Some((lhs, value)) = trimmed.split_once(['=', ':']) {
-        // Strip JSON-style quotes from the key (e.g., `"version": "1.0"`)
-        let lhs_key = lhs.trim().trim_matches('"').trim_matches('\'');
-        if lhs_key != key {
-            continue;
+            // Strip JSON-style quotes from the key (e.g., `"version": "1.0"`)
+            let lhs_key = lhs.trim().trim_matches('"').trim_matches('\'');
+            if lhs_key != key {
+                continue;
+            }
+            return Some(value.trim().trim_matches(['"', '\'']).to_string());
         }
-        return Some(value.trim().trim_matches(['"', '\'']).to_string());
-    }
     }
     None
 }
@@ -163,7 +163,8 @@ fn replace_version_in_contents(contents: &str, field: &str, new_version: &str) -
             output.push('\n');
             continue;
         }
-        if !changed && current == section
+        if !changed
+            && current == section
             && let Some((left, value)) = line.split_once(['=', ':'])
         {
             let left_key = left.trim().trim_matches('"').trim_matches('\'');
@@ -174,8 +175,7 @@ fn replace_version_in_contents(contents: &str, field: &str, new_version: &str) -
                 } else {
                     "\""
                 };
-                let needs_quote =
-                    value.trim().starts_with('"') || value.trim().starts_with('\'');
+                let needs_quote = value.trim().starts_with('"') || value.trim().starts_with('\'');
                 output.push_str(left.trim_end());
                 output.push_str(separator);
                 if needs_quote {
@@ -447,6 +447,7 @@ clap = \"4\"
         run(&["config", "user.email", "test@example.com"]);
         run(&["config", "user.name", "Test"]);
         run(&["config", "core.hooksPath", "/dev/null"]);
+        run(&["config", "commit.gpgsign", "false"]);
         std::fs::write(root.join("a.txt"), "hi").unwrap();
         run(&["add", "."]);
         run(&["commit", "-q", "-m", "first"]);

@@ -9,6 +9,8 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::agent_result::AgentResult;
+
 /// The current step in the development workflow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -88,6 +90,12 @@ pub struct State {
     pub started_at: String,
     /// Path to the project root.
     pub project_root: PathBuf,
+    /// Parsed agent completion result (from DEVLOW_RESULT or exit code).
+    #[serde(skip)]
+    pub agent_result: Option<AgentResult>,
+    /// Path where agent stdout was saved.
+    #[serde(skip)]
+    pub agent_stdout_path: Option<PathBuf>,
 }
 
 /// Supported coding agents.
@@ -96,96 +104,38 @@ pub struct State {
 pub enum Agent {
     /// Anthropic Claude Code CLI.
     Claude,
-    /// oh-my-codex CLI.
-    Omx,
+    // Omx,  // OMX support disabled — preserved for potential future re-enable
     /// OpenAI Codex CLI.
     Codex,
     /// OpenCode CLI.
     OpenCode,
 }
 
+/// Type alias so the agents module can reference Agent without colliding
+/// with its own Agent trait name.
+pub type AgentKind = Agent;
+
 impl Agent {
-    /// Human-readable name.
+    /// Human-readable name — delegates to the agent trait.
+    #[deprecated(
+        since = "0.6.0",
+        note = "use agents::adapter_for(kind).name() directly"
+    )]
     pub fn name(self) -> &'static str {
-        match self {
-            Agent::Claude => "Claude Code",
-            Agent::Omx => "oh-my-codex",
-            Agent::Codex => "OpenAI Codex",
-            Agent::OpenCode => "OpenCode",
-        }
+        crate::agents::adapter_for(self).name()
     }
 
     /// The command and arguments to launch this agent in non-interactive mode.
     ///
+    /// Delegates to the `agents::Agent` trait implementation for each agent kind.
     /// Returns `(program, args)` where the agent runs headless, produces
-    /// structured output, and exits when done — never blocks waiting for
-    /// user input.
+    /// structured output, and exits when done — never blocks waiting for user input.
+    #[deprecated(
+        since = "0.6.0",
+        note = "use agents::adapter_for(kind).exec_command(phase) directly"
+    )]
     pub fn exec_command(self, _project_root: &str, phase: u32) -> (&'static str, Vec<String>) {
-        let prompt = format!(
-            "Complete phase {phase} of this project.\n\
-             \n\
-             ## Required Reading\n\
-             1. CLAUDE.md — project conventions, architecture, coding standards\n\
-             2. .planning/ROADMAP.md — what to build and success criteria for phase {phase}\n\
-             3. .planning/phases/{phase:02}-*/CONTEXT.md — phase-specific tasks and notes\n\
-             4. AGENTS.md — agent preferences and tooling\n\
-             \n\
-             ## Process\n\
-             - Read the required files first to understand what needs to be built\n\
-             - Implement the changes described in the phase plan\n\
-             - Run `cargo test` before committing to verify nothing breaks\n\
-             - Run `cargo clippy` to catch common mistakes\n\
-             - Run `cargo fmt` to format code\n\
-             - Commit with descriptive messages explaining what was done\n\
-             - If the phase includes multiple sub-tasks, commit each sub-task separately\n\
-             - When all tasks from CONTEXT.md are complete, commit a final status update\n\
-             \n\
-             ## Available Commands\n\
-             - `cargo test` — run all tests\n\
-             - `cargo clippy -- -D warnings` — lint with strict mode\n\
-             - `cargo fmt -- --check` — verify formatting\n\
-             - `cargo build --release` — production build\n\
-             \n\
-             ## Success\n\
-             The phase is complete when all checklist items in CONTEXT.md are done\n\
-             and all tests pass."
-        );
-        match self {
-            Agent::Claude => (
-                "claude",
-                vec![
-                    "-p".into(),
-                    prompt,
-                    "--output-format".into(),
-                    "json".into(),
-                    "--dangerously-skip-permissions".into(),
-                    "--bare".into(),
-                    "--max-turns".into(),
-                    "50".into(),
-                ],
-            ),
-            Agent::Codex => (
-                "codex",
-                vec![
-                    "exec".into(),
-                    "--sandbox".into(),
-                    "workspace-write".into(),
-                    "--json".into(),
-                    prompt,
-                ],
-            ),
-            Agent::Omx => (
-                "omx",
-                vec![
-                    "exec".into(),
-                    "--sandbox".into(),
-                    "workspace-write".into(),
-                    "--json".into(),
-                    prompt,
-                ],
-            ),
-            Agent::OpenCode => ("opencode", vec!["run".into(), prompt]),
-        }
+        crate::agents::adapter_for(self).exec_command(phase)
     }
 }
 
@@ -193,7 +143,7 @@ impl fmt::Display for Agent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
             Agent::Claude => "claude",
-            Agent::Omx => "omx",
+            // Agent::Omx => "omx",  // OMX disabled
             Agent::Codex => "codex",
             Agent::OpenCode => "opencode",
         };
@@ -207,7 +157,7 @@ impl FromStr for Agent {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.to_ascii_lowercase().as_str() {
             "claude" => Ok(Agent::Claude),
-            "omx" | "oh-my-codex" => Ok(Agent::Omx),
+            // "omx" | "oh-my-codex" => Ok(Agent::Omx),  // OMX disabled
             "codex" => Ok(Agent::Codex),
             "opencode" | "open-code" => Ok(Agent::OpenCode),
             other => Err(AgentParseError(other.to_string())),
@@ -217,7 +167,7 @@ impl FromStr for Agent {
 
 /// Error returned when parsing an unsupported agent name.
 #[derive(Debug, Clone, thiserror::Error)]
-#[error("unsupported agent `{0}`; expected claude, omx, codex, or opencode")]
+#[error("unsupported agent `{0}`; expected claude, codex, or opencode")]
 pub struct AgentParseError(String);
 
 impl State {
@@ -232,6 +182,8 @@ impl State {
             agent_label: None,
             started_at: timestamp_now(),
             project_root,
+            agent_result: None,
+            agent_stdout_path: None,
         }
     }
 
@@ -321,12 +273,12 @@ mod tests {
     #[test]
     fn agent_name_and_display() {
         assert_eq!(Agent::Claude.name(), "Claude Code");
-        assert_eq!(Agent::Omx.name(), "oh-my-codex");
+        // Agent::Omx disabled
         assert_eq!(Agent::Codex.name(), "OpenAI Codex");
         assert_eq!(Agent::OpenCode.name(), "OpenCode");
 
         assert_eq!(Agent::Claude.to_string(), "claude");
-        assert_eq!(Agent::Omx.to_string(), "omx");
+        // Agent::Omx disabled
         assert_eq!(Agent::Codex.to_string(), "codex");
         assert_eq!(Agent::OpenCode.to_string(), "opencode");
     }
@@ -335,8 +287,7 @@ mod tests {
     fn agent_from_str_accepts_canonical_and_aliases() {
         assert_eq!("claude".parse::<Agent>().unwrap(), Agent::Claude);
         assert_eq!("CLAUDE".parse::<Agent>().unwrap(), Agent::Claude);
-        assert_eq!("omx".parse::<Agent>().unwrap(), Agent::Omx);
-        assert_eq!("oh-my-codex".parse::<Agent>().unwrap(), Agent::Omx);
+        // "omx" and "oh-my-codex" disabled — OMX support removed
         assert_eq!("codex".parse::<Agent>().unwrap(), Agent::Codex);
         assert_eq!("opencode".parse::<Agent>().unwrap(), Agent::OpenCode);
         assert_eq!("open-code".parse::<Agent>().unwrap(), Agent::OpenCode);
@@ -355,7 +306,6 @@ mod tests {
         assert!(joined.contains("-p"));
         assert!(joined.contains("--output-format json"));
         assert!(joined.contains("--dangerously-skip-permissions"));
-        assert!(joined.contains("--max-turns"));
         assert!(joined.contains("phase 3"));
         assert!(joined.contains("ROADMAP.md"));
         assert!(joined.contains("CONTEXT.md"));
