@@ -163,31 +163,31 @@ fn replace_version_in_contents(contents: &str, field: &str, new_version: &str) -
             output.push('\n');
             continue;
         }
-        if !changed && current == section {
-            if let Some((left, value)) = line.split_once(['=', ':']) {
-                let left_key = left.trim().trim_matches('"').trim_matches('\'');
-                if left_key == key {
-                    let separator: &str = if trimmed.contains('=') { " = " } else { ": " };
-                    let quote_char: &str = if value.trim().starts_with('\'') {
-                        "'"
-                    } else {
-                        "\""
-                    };
-                    let needs_quote =
-                        value.trim().starts_with('"') || value.trim().starts_with('\'');
-                    output.push_str(left.trim_end());
-                    output.push_str(separator);
-                    if needs_quote {
-                        output.push_str(quote_char);
-                        output.push_str(new_version);
-                        output.push_str(quote_char);
-                    } else {
-                        output.push_str(new_version);
-                    }
-                    output.push('\n');
-                    changed = true;
-                    continue;
+        if !changed && current == section
+            && let Some((left, value)) = line.split_once(['=', ':'])
+        {
+            let left_key = left.trim().trim_matches('"').trim_matches('\'');
+            if left_key == key {
+                let separator: &str = if trimmed.contains('=') { " = " } else { ": " };
+                let quote_char: &str = if value.trim().starts_with('\'') {
+                    "'"
+                } else {
+                    "\""
+                };
+                let needs_quote =
+                    value.trim().starts_with('"') || value.trim().starts_with('\'');
+                output.push_str(left.trim_end());
+                output.push_str(separator);
+                if needs_quote {
+                    output.push_str(quote_char);
+                    output.push_str(new_version);
+                    output.push_str(quote_char);
+                } else {
+                    output.push_str(new_version);
                 }
+                output.push('\n');
+                changed = true;
+                continue;
             }
         }
         output.push_str(line);
