@@ -11,10 +11,6 @@ cargo build
 cargo test
 ```
 
-### Dev Container
-
-A VS Code / GitHub Codespaces dev container is available (`.devcontainer/devcontainer.json`) with Rust and all dependencies pre-installed.
-
 ### Distrobox (optional)
 
 If you use [distrobox](https://github.com/89luca89/distrobox), you can create an isolated environment:
@@ -43,6 +39,26 @@ cargo fmt -- --check
 # Run a specific command
 cargo run -- status
 ```
+
+### Testing notes
+
+The git-flow tests create throwaway fixture repositories. If you sign commits
+or tags globally, disable signing for these fixtures so the tests don't block
+on a GPG prompt. The test harness sets this per-fixture, but if you run any
+manual git steps against a fixture, use:
+
+```bash
+git config commit.gpgsign false
+git config tag.gpgsign false
+```
+
+## Phase Plans (`.planning/`)
+
+DevFlow drives agents from per-phase plans under `.planning/`. The launch prompt
+(`agents::phase_prompt()`) reads `.planning/ROADMAP.md` and
+`.planning/phases/NN-*/CONTEXT.md`, so these files are tracked in the repo — they
+are DevFlow's phase-plan convention, not private scratch. When adding a phase,
+commit its `CONTEXT.md` so agents (and reviewers) can read the plan.
 
 ## Project Structure
 
