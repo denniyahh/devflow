@@ -139,7 +139,9 @@ fn find_version_in_contents(contents: &str, field: &str) -> Option<String> {
             continue;
         }
         let (lhs, value) = trimmed.split_once(['=', ':'])?;
-        if lhs.trim() != key {
+        // Strip JSON-style quotes from the key (e.g., `"version": "1.0"`)
+        let lhs_key = lhs.trim().trim_matches('"').trim_matches('\'');
+        if lhs_key != key {
             continue;
         }
         return Some(value.trim().trim_matches(['"', '\'']).to_string());
@@ -161,27 +163,30 @@ fn replace_version_in_contents(contents: &str, field: &str, new_version: &str) -
             continue;
         }
         if !changed && current == section {
-            if let Some((left, value)) = line.split_once('=')
-                && left.trim() == key
-            {
-                let quote = if value.contains('\'') { "'" } else { "\"" };
-                output.push_str(left.trim_end());
-                output.push_str(" = ");
-                output.push_str(quote);
-                output.push_str(new_version);
-                output.push_str(quote);
-                output.push('\n');
-                changed = true;
-                continue;
-            } else if let Some((left, _value)) = line.split_once(':')
-                && left.trim() == key
-            {
-                output.push_str(left.trim_end());
-                output.push_str(": ");
-                output.push_str(new_version);
-                output.push('\n');
-                changed = true;
-                continue;
+            if let Some((left, value)) = line.split_once(['=', ':']) {
+                let left_key = left.trim().trim_matches('"').trim_matches('\'');
+                if left_key == key {
+                    let separator: &str = if trimmed.contains('=') { " = " } else { ": " };
+                    let quote_char: &str = if value.trim().starts_with('\'') {
+                        "'"
+                    } else {
+                        "\""
+                    };
+                    let needs_quote =
+                        value.trim().starts_with('"') || value.trim().starts_with('\'');
+                    output.push_str(left.trim_end());
+                    output.push_str(separator);
+                    if needs_quote {
+                        output.push_str(quote_char);
+                        output.push_str(new_version);
+                        output.push_str(quote_char);
+                    } else {
+                        output.push_str(new_version);
+                    }
+                    output.push('\n');
+                    changed = true;
+                    continue;
+                }
             }
         }
         output.push_str(line);
@@ -385,6 +390,23 @@ clap = \"4\"
             write_version(dir.path(), &cfg, "1.0.0").unwrap_err(),
             VersionError::Parse(_)
         ));
+    }
+
+    #[test]
+    fn read_and_write_package_json_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("package.json");
+        std::fs::write(
+            &file,
+            "{\n  \"name\": \"myapp\",\n  \"version\": \"2.1.0\"\n}\n",
+        )
+        .unwrap();
+        let cfg = version_config("package.json", "version");
+        assert_eq!(read_version(dir.path(), &cfg).unwrap(), "2.1.0");
+        write_version(dir.path(), &cfg, "3.0.0").unwrap();
+        let contents = std::fs::read_to_string(&file).unwrap();
+        assert!(contents.contains("\"version\": \"3.0.0\""));
+        assert_eq!(read_version(dir.path(), &cfg).unwrap(), "3.0.0");
     }
 
     #[test]
