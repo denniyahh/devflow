@@ -15,6 +15,7 @@ pub mod state;
 pub mod verify;
 pub mod version;
 pub mod workflow;
+pub mod worktree;
 
 // Re-exports for convenience.
 pub use agent::launch_agent;

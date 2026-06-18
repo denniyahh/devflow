@@ -23,3 +23,6 @@ Thumbs.db
 .devflow/state.json
 .devflow/lock
 .planning/
+
+# Git worktrees created by `devflow start --worktree` / `parallel` / `sequentagent`
+.worktrees/
