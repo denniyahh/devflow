@@ -72,10 +72,14 @@ impl GitFlow {
         Ok(branch)
     }
 
-    /// Create a release branch from develop.
+    /// Create or reset a release branch from the current `HEAD`.
+    ///
+    /// The release branch is cut from wherever the caller currently is — the
+    /// branch being shipped — not from `develop`. `devflow ship` writes the
+    /// version bump into the working tree first, so branching from `HEAD`
+    /// keeps any commits unique to the shipped branch in the release.
     pub fn release_start(&self, version: &str) -> Result<String, GitError> {
         let branch = format!("release/{version}");
-        self.git(["checkout", &self.config.develop])?;
         self.git(["checkout", "-B", &branch])?;
         Ok(branch)
     }
@@ -463,6 +467,38 @@ mod tests {
             .output()
             .unwrap();
         assert!(!String::from_utf8_lossy(&branches.stdout).contains("release/1.2.0"));
+    }
+
+    #[test]
+    fn release_start_branches_from_current_head_not_develop() {
+        let repo = init_repo();
+        let root = repo.path();
+        let gf = flow(root);
+
+        // Ship from a feature branch carrying a commit that is NOT on develop.
+        gf.feature_start(5).expect("feature_start");
+        commit_file(root, "feature-only.txt");
+        let feature_tip = gf.branch_tip("feature/phase-05").expect("feature tip");
+
+        let branch = gf.release_start("2.0.0").expect("release_start");
+        assert_eq!(branch, "release/2.0.0");
+        assert_eq!(current_branch(root), "release/2.0.0");
+
+        // The release branch tip must descend from the feature commit — i.e.
+        // the feature-only work is present, not dropped to develop's HEAD.
+        let release_tip = gf.branch_tip("release/2.0.0").expect("release tip");
+        let is_ancestor = Command::new("git")
+            .args(["merge-base", "--is-ancestor", &feature_tip, &release_tip])
+            .current_dir(root)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(
+            is_ancestor,
+            "release branch must descend from the shipped feature commit"
+        );
+        assert!(root.join("feature-only.txt").exists());
     }
 
     #[test]
