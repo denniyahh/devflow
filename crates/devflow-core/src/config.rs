@@ -325,6 +325,35 @@ fn parse_bool(value: &str) -> Result<bool, ConfigError> {
     }
 }
 
+impl VersionConfig {
+    /// Auto-detect the version file and field from the project root.
+    ///
+    /// Checks for common project files in order: Cargo.toml, pyproject.toml, package.json.
+    pub fn auto_detect(&mut self, project_root: &Path) {
+        let cargo = project_root.join("Cargo.toml");
+        let pyproject = project_root.join("pyproject.toml");
+        let package_json = project_root.join("package.json");
+
+        if cargo.exists() {
+            self.file = "Cargo.toml".into();
+            // Check for workspace pattern first
+            if let Ok(contents) = std::fs::read_to_string(&cargo)
+                && contents.contains("[workspace.package]")
+            {
+                self.field = "workspace.package.version".into();
+                return;
+            }
+            self.field = "package.version".into();
+        } else if pyproject.exists() {
+            self.file = "pyproject.toml".into();
+            self.field = "project.version".into();
+        } else if package_json.exists() {
+            self.file = "package.json".into();
+            self.field = "version".into();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -490,34 +519,5 @@ mod tests {
         assert!(config.should_skip(&Step::Docsing));
         assert!(config.should_skip(&Step::Cleaning));
         assert!(!config.should_skip(&Step::Shipping));
-    }
-}
-
-impl VersionConfig {
-    /// Auto-detect the version file and field from the project root.
-    ///
-    /// Checks for common project files in order: Cargo.toml, pyproject.toml, package.json.
-    pub fn auto_detect(&mut self, project_root: &Path) {
-        let cargo = project_root.join("Cargo.toml");
-        let pyproject = project_root.join("pyproject.toml");
-        let package_json = project_root.join("package.json");
-
-        if cargo.exists() {
-            self.file = "Cargo.toml".into();
-            // Check for workspace pattern first
-            if let Ok(contents) = std::fs::read_to_string(&cargo)
-                && contents.contains("[workspace.package]")
-            {
-                self.field = "workspace.package.version".into();
-                return;
-            }
-            self.field = "package.version".into();
-        } else if pyproject.exists() {
-            self.file = "pyproject.toml".into();
-            self.field = "project.version".into();
-        } else if package_json.exists() {
-            self.file = "package.json".into();
-            self.field = "version".into();
-        }
     }
 }

@@ -272,10 +272,11 @@ mod tests {
 
     #[test]
     fn agent_name_and_display() {
-        assert_eq!(Agent::Claude.name(), "Claude Code");
+        use crate::agents::adapter_for;
+        assert_eq!(adapter_for(AgentKind::Claude).name(), "Claude Code");
         // Agent::Omx disabled
-        assert_eq!(Agent::Codex.name(), "OpenAI Codex");
-        assert_eq!(Agent::OpenCode.name(), "OpenCode");
+        assert_eq!(adapter_for(AgentKind::Codex).name(), "OpenAI Codex");
+        assert_eq!(adapter_for(AgentKind::OpenCode).name(), "OpenCode");
 
         assert_eq!(Agent::Claude.to_string(), "claude");
         // Agent::Omx disabled
@@ -301,7 +302,7 @@ mod tests {
 
     #[test]
     fn exec_command_claude_uses_noninteractive_flags() {
-        let (_prog, args) = Agent::Claude.exec_command("/repo", 3);
+        let (_prog, args) = crate::agents::adapter_for(AgentKind::Claude).exec_command(3);
         let joined = args.join(" ");
         assert!(joined.contains("-p"));
         assert!(joined.contains("--output-format json"));
@@ -314,7 +315,7 @@ mod tests {
 
     #[test]
     fn exec_command_codex_uses_exec_and_json() {
-        let (_prog, args) = Agent::Codex.exec_command("/repo", 7);
+        let (_prog, args) = crate::agents::adapter_for(AgentKind::Codex).exec_command(7);
         let joined = args.join(" ");
         assert!(joined.contains("exec"));
         assert!(joined.contains("--sandbox workspace-write"));
