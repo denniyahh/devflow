@@ -4,7 +4,7 @@ use devflow_core::config::Config;
 use devflow_core::git::GitFlow;
 use devflow_core::state::{Agent, State, Step};
 use devflow_core::verify;
-use devflow_core::{lock, monitor, recover, version, workflow};
+use devflow_core::{lock, monitor, recover, version, workflow, worktree};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Parser)]
@@ -34,6 +34,9 @@ enum Command {
         /// Overwrite the feature branch if it already exists.
         #[arg(long)]
         force: bool,
+        /// Run the agent in an isolated git worktree at `.worktrees/phase-NN/`.
+        #[arg(long)]
+        worktree: bool,
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
@@ -122,6 +125,8 @@ enum CliError {
     Version(#[from] devflow_core::version::VersionError),
     #[error(transparent)]
     Verify(#[from] devflow_core::verify::VerifyError),
+    #[error(transparent)]
+    Worktree(#[from] devflow_core::worktree::WorktreeError),
     #[error("{0}")]
     Message(String),
 }
@@ -142,8 +147,16 @@ fn run() -> Result<(), CliError> {
             agent,
             monitor: use_monitor,
             force,
+            worktree,
             project,
-        } => start(&project_root(project)?, phase, agent, use_monitor, force),
+        } => start(
+            &project_root(project)?,
+            phase,
+            agent,
+            use_monitor,
+            force,
+            worktree,
+        ),
         Command::Check { project } => check(&project_root(project)?),
         Command::Status { project } => status(&project_root(project)?),
         Command::List { project } => list(&project_root(project)?),
@@ -163,11 +176,23 @@ fn start(
     agent: Agent,
     use_monitor: bool,
     force: bool,
+    worktree: bool,
 ) -> Result<(), CliError> {
     let config = Config::load(project_root)?;
     let mut state = State::new(phase, agent, project_root.to_path_buf());
 
-    if config.automation.auto_branch {
+    if worktree {
+        // Worktree mode: create an isolated checkout instead of mutating the
+        // main working copy. The agent's cwd becomes the worktree path.
+        let wt = ensure_phase_worktree(project_root, &config, phase, force)?;
+        println!(
+            "created worktree: {} (branch {}phase-{:02})",
+            wt.display(),
+            config.git_flow.feature_prefix,
+            phase
+        );
+        state.worktree_path = Some(wt);
+    } else if config.automation.auto_branch {
         let git = GitFlow::new(project_root, config.git_flow.clone());
         let result = if force {
             git.feature_start_force(phase)
@@ -279,6 +304,39 @@ fn start(
     workflow::save_state(&state)?;
     println!("started phase {} at {}", state.phase, state.started_at);
     Ok(())
+}
+
+/// Create the phase worktree at `.worktrees/phase-NN/` on `feature/phase-NN`.
+///
+/// With `force`, an existing worktree directory and its branch are removed
+/// first so the worktree can be recreated cleanly from `develop`.
+fn ensure_phase_worktree(
+    project_root: &Path,
+    config: &Config,
+    phase: u32,
+    force: bool,
+) -> Result<PathBuf, CliError> {
+    let wt = worktree::phase_path(project_root, phase);
+    let branch = format!("{}phase-{:02}", config.git_flow.feature_prefix, phase);
+
+    if force {
+        if wt.exists() {
+            worktree::remove(project_root, &wt, true)?;
+        }
+        // Best-effort: drop the branch so it can be recreated from develop.
+        let _ = GitFlow::new(project_root, config.git_flow.clone()).delete_branch(&branch, true);
+    }
+
+    match worktree::add(project_root, &wt, &branch, &config.git_flow.develop, true) {
+        Ok(()) => Ok(wt),
+        Err(devflow_core::worktree::WorktreeError::Exists(path)) => {
+            Err(CliError::Message(format!(
+                "worktree already exists at {} — use --force to recreate it",
+                path.display()
+            )))
+        }
+        Err(err) => Err(err.into()),
+    }
 }
 
 fn check(project_root: &Path) -> Result<(), CliError> {

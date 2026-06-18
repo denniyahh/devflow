@@ -92,6 +92,21 @@ impl GitFlow {
         Ok(branch)
     }
 
+    /// Delete a single local branch.
+    ///
+    /// With `force`, uses `git branch -D` (deletes even if unmerged); otherwise
+    /// `git branch -d` (refuses to delete unmerged work). Protected branches
+    /// (`main`, `develop`) are never deleted.
+    pub fn delete_branch(&self, branch: &str, force: bool) -> Result<(), GitError> {
+        if branch == self.config.main || branch == self.config.develop {
+            return Err(GitError::Command(format!(
+                "refusing to delete protected branch `{branch}`"
+            )));
+        }
+        let flag = if force { "-D" } else { "-d" };
+        self.git(["branch", flag, branch])
+    }
+
     /// Delete local branches already merged into the current branch.
     pub fn cleanup_merged(&self) -> Result<Vec<String>, GitError> {
         let output = self.git_output(["branch", "--merged"])?;
@@ -374,6 +389,34 @@ mod tests {
         // Protected branches survive.
         assert!(!deleted.contains(&"develop".to_string()));
         assert!(!deleted.contains(&"main".to_string()));
+    }
+
+    #[test]
+    fn delete_branch_removes_unmerged_with_force_and_protects_trunk() {
+        let repo = init_repo();
+        let root = repo.path();
+        let gf = flow(root);
+
+        // Create a feature branch with an unmerged commit.
+        gf.feature_start(8).expect("start");
+        commit_file(root, "unmerged.txt");
+        // Switch back to develop so the branch isn't checked out.
+        git(root, &["checkout", "-q", "develop"]);
+
+        // -d would refuse (unmerged); force deletes it.
+        assert!(gf.delete_branch("feature/phase-08", false).is_err());
+        gf.delete_branch("feature/phase-08", true)
+            .expect("force delete");
+        let branches = Command::new("git")
+            .args(["branch"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&branches.stdout).contains("feature/phase-08"));
+
+        // Protected branches are never deleted.
+        assert!(gf.delete_branch("develop", true).is_err());
+        assert!(gf.delete_branch("main", true).is_err());
     }
 
     #[test]
