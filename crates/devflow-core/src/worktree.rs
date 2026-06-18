@@ -81,6 +81,26 @@ pub fn add(
     }
 }
 
+/// Add a worktree checked out at `commitish` in **detached HEAD** state.
+///
+/// Used for the static reference snapshot: a branch already checked out in the
+/// main worktree cannot be checked out again, but it can be snapshotted detached
+/// at its tip.
+pub fn add_detached(
+    project_root: &Path,
+    path: &Path,
+    commitish: &str,
+) -> Result<(), WorktreeError> {
+    if path.exists() {
+        return Err(WorktreeError::Exists(path.to_path_buf()));
+    }
+    let path_str = path.to_string_lossy();
+    run(
+        project_root,
+        &["worktree", "add", "--detach", &path_str, commitish],
+    )
+}
+
 /// Remove a worktree directory via `git worktree remove [--force] <path>`.
 pub fn remove(project_root: &Path, path: &Path, force: bool) -> Result<(), WorktreeError> {
     let path_str = path.to_string_lossy();

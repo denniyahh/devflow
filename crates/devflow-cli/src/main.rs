@@ -75,6 +75,27 @@ enum Command {
         #[arg(default_value = ".")]
         project: PathBuf,
     },
+    /// Create or refresh a static reference worktree at `.worktrees/reference/`.
+    Reference {
+        /// Branch to check out (defaults to develop).
+        #[arg(long)]
+        branch: Option<String>,
+        /// Update an existing reference snapshot in place.
+        #[arg(long)]
+        refresh: bool,
+        /// Project root.
+        #[arg(default_value = ".")]
+        project: PathBuf,
+    },
+    /// Remove phase worktrees and their feature branches.
+    Cleanup {
+        /// Project root.
+        #[arg(default_value = ".")]
+        project: PathBuf,
+        /// Also remove the reference worktree and force-remove dirty worktrees.
+        #[arg(long)]
+        force: bool,
+    },
     /// Poll state and advance if the agent is done.
     Check {
         /// Project root.
@@ -203,6 +224,12 @@ fn run() -> Result<(), CliError> {
             force,
             project,
         } => sequentagent(&project_root(project)?, phase, &agents, force),
+        Command::Reference {
+            branch,
+            refresh,
+            project,
+        } => reference(&project_root(project)?, branch, refresh),
+        Command::Cleanup { project, force } => cleanup(&project_root(project)?, force),
         Command::Check { project } => check(&project_root(project)?),
         Command::Status { project } => status(&project_root(project)?),
         Command::List { project } => list(&project_root(project)?),
@@ -598,6 +625,86 @@ fn add_or_explain(
     }
 }
 
+/// Create or refresh the static reference worktree (CONTEXT Q3: manual only).
+fn reference(project_root: &Path, branch: Option<String>, refresh: bool) -> Result<(), CliError> {
+    let config = Config::load(project_root)?;
+    let branch = branch.unwrap_or_else(|| config.git_flow.develop.clone());
+    let path = worktree::reference_path(project_root);
+
+    // Detached snapshot: `branch` may already be checked out in the main
+    // worktree, so we pin a detached HEAD at its tip rather than checking it out.
+    if path.exists() {
+        if !refresh {
+            println!(
+                "reference exists at {} (use --refresh to update it)",
+                path.display()
+            );
+            return Ok(());
+        }
+        worktree::remove(project_root, &path, true)?;
+        worktree::add_detached(project_root, &path, &branch)?;
+        println!(
+            "refreshed reference worktree at {} (snapshot of {branch})",
+            path.display()
+        );
+    } else {
+        worktree::add_detached(project_root, &path, &branch)?;
+        println!(
+            "created reference worktree at {} (snapshot of {branch})",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Remove phase worktrees (and the reference with --force), deleting their
+/// associated feature branches, then prune and clean up merged branches.
+fn cleanup(project_root: &Path, force: bool) -> Result<(), CliError> {
+    let config = Config::load(project_root)?;
+    let git = GitFlow::new(project_root, config.git_flow.clone());
+    let worktrees_dir = worktree::worktrees_dir(project_root);
+    let reference = worktree::reference_path(project_root);
+
+    let worktrees = worktree::list(project_root)?;
+    let mut removed = 0usize;
+    for wt in &worktrees {
+        // Only touch worktrees under `.worktrees/` (never the main checkout).
+        if !wt.path.starts_with(&worktrees_dir) {
+            continue;
+        }
+        if wt.path == reference && !force {
+            println!("keeping reference worktree (use --force to remove it)");
+            continue;
+        }
+        worktree::remove(project_root, &wt.path, force)?;
+        print!("removed worktree {}", wt.path.display());
+        match &wt.branch {
+            Some(branch) if branch.starts_with(&config.git_flow.feature_prefix) => {
+                match git.delete_branch(branch, force) {
+                    Ok(()) => println!(" + deleted branch {branch}"),
+                    Err(err) => println!(" (branch {branch} kept: {err})"),
+                }
+            }
+            _ => println!(),
+        }
+        removed += 1;
+    }
+
+    worktree::prune(project_root)?;
+    if removed == 0 {
+        println!("no worktrees to clean up");
+    }
+    match git.cleanup_merged() {
+        Ok(merged) => {
+            for branch in merged {
+                println!("deleted merged branch {branch}");
+            }
+        }
+        Err(err) => println!("warning: could not prune merged branches: {err}"),
+    }
+    Ok(())
+}
+
 fn check(project_root: &Path) -> Result<(), CliError> {
     let _lock = match lock::acquire(project_root) {
         Ok(guard) => Some(guard),
@@ -752,6 +859,7 @@ fn run_docs(config: &Config, project_root: &Path) -> Result<(), CliError> {
 }
 
 fn status(project_root: &Path) -> Result<(), CliError> {
+    let mut current_worktree: Option<PathBuf> = None;
     match workflow::load_state(project_root) {
         Ok(state) => {
             println!("step: {}", state.step);
@@ -762,6 +870,10 @@ fn status(project_root: &Path) -> Result<(), CliError> {
             );
             println!("started_at: {}", state.started_at);
             println!("project_root: {}", state.project_root.display());
+            if let Some(ref wt) = state.worktree_path {
+                println!("worktree: {}", wt.display());
+            }
+            current_worktree = state.worktree_path.clone();
             match state.agent_pid {
                 Some(pid) => {
                     let running = agent::agent_running(pid);
@@ -779,7 +891,55 @@ fn status(project_root: &Path) -> Result<(), CliError> {
     }
     // Show open feature branches
     print_open_branches(project_root);
+    // Show active git worktrees
+    print_worktrees(project_root, current_worktree.as_deref());
     Ok(())
+}
+
+/// Print active phase worktrees with branch and inferred phase/agent.
+///
+/// Tolerates git errors (no repo) the same way `print_open_branches` does.
+fn print_worktrees(project_root: &Path, current: Option<&Path>) {
+    let worktrees_dir = worktree::worktrees_dir(project_root);
+    let worktrees = match worktree::list(project_root) {
+        Ok(w) => w,
+        Err(_) => return,
+    };
+    let active: Vec<_> = worktrees
+        .iter()
+        .filter(|w| w.path.starts_with(&worktrees_dir))
+        .collect();
+    if active.is_empty() {
+        return;
+    }
+    println!("\nactive worktrees:");
+    for wt in active {
+        let label = wt
+            .path
+            .file_name()
+            .map(|n| describe_worktree_dir(&n.to_string_lossy()))
+            .unwrap_or_default();
+        let branch = wt.branch.as_deref().unwrap_or("(detached)");
+        let marker = if current == Some(wt.path.as_path()) {
+            " *"
+        } else {
+            ""
+        };
+        println!("  {} [{branch}]{label}{marker}", wt.path.display());
+    }
+}
+
+/// Turn a worktree dir name like `phase-07-claude` into ` — phase 7, agent claude`.
+fn describe_worktree_dir(name: &str) -> String {
+    let Some(rest) = name.strip_prefix("phase-") else {
+        return String::new();
+    };
+    match rest.split_once('-') {
+        Some((phase, agent)) => {
+            format!(" — phase {}, agent {agent}", phase.trim_start_matches('0'))
+        }
+        None => format!(" — phase {}", rest.trim_start_matches('0')),
+    }
 }
 
 fn list(project_root: &Path) -> Result<(), CliError> {
@@ -1025,6 +1185,16 @@ mod tests {
     fn pairs_reject_invalid_phase() {
         assert!(parse_phase_agent_pairs("7,x", None).is_err());
         assert!(parse_phase_agent_pairs("", None).is_err());
+    }
+
+    #[test]
+    fn describe_worktree_dir_infers_phase_and_agent() {
+        assert_eq!(
+            describe_worktree_dir("phase-07-claude"),
+            " — phase 7, agent claude"
+        );
+        assert_eq!(describe_worktree_dir("phase-08"), " — phase 8");
+        assert_eq!(describe_worktree_dir("reference"), "");
     }
 
     #[test]
