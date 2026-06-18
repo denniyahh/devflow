@@ -64,6 +64,16 @@ pub fn spawn_monitor(state: &State, program: &str, args: &[String]) -> Result<u3
     let exit_file = exit_file.to_str().ok_or(MonitorError::NonUtf8Path)?;
     let pid_file = pid_file.to_str().ok_or(MonitorError::NonUtf8Path)?;
 
+    // The agent runs in its worktree when worktree mode is active; otherwise it
+    // runs in the project root. Capture/state files and the `devflow check`
+    // calls below always use the main project root, regardless of cwd.
+    let workdir = state
+        .worktree_path
+        .as_deref()
+        .unwrap_or(&state.project_root)
+        .to_str()
+        .ok_or(MonitorError::NonUtf8Path)?;
+
     // Build the shell-escaped agent command.
     let mut agent_cmd = shell_escape(program);
     for arg in args {
@@ -81,6 +91,7 @@ pub fn spawn_monitor(state: &State, program: &str, args: &[String]) -> Result<u3
     // Traps SIGTERM and SIGINT for clean shutdown.
     let script = format!(
         "cleanup() {{ exit 0; }}; trap cleanup TERM INT; \
+         cd {workdir} || exit 1; \
          {agent_cmd} > {stdout_file} 2>/dev/null & \
          apid=$!; echo $apid > {pid_file}; \
          wait $apid; echo $? > {exit_file}; \
@@ -90,6 +101,7 @@ pub fn spawn_monitor(state: &State, program: &str, args: &[String]) -> Result<u3
          {binary} check {project_root}; \
          {binary} check {project_root}",
         agent_cmd = agent_cmd,
+        workdir = shell_escape(workdir),
         stdout_file = shell_escape(stdout_file),
         exit_file = shell_escape(exit_file),
         pid_file = shell_escape(pid_file),

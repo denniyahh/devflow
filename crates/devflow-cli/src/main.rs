@@ -235,7 +235,12 @@ fn start(
         }
     } else {
         // Blocking mode: the CLI launches the agent and captures output directly.
-        let (child, pid) = agent::launch_agent(&*adapter, state.phase, project_root)?;
+        // The agent runs in its worktree when set; capture stays in project_root.
+        let workdir = state
+            .worktree_path
+            .clone()
+            .unwrap_or_else(|| project_root.to_path_buf());
+        let (child, pid) = agent::launch_agent(&*adapter, state.phase, &workdir)?;
         state.agent_pid = Some(pid);
         state.agent_label = Some(agent::agent_label(agent, pid));
         println!("launched {} (pid {pid})", adapter.name());

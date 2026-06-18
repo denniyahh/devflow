@@ -90,6 +90,12 @@ pub struct State {
     pub started_at: String,
     /// Path to the project root.
     pub project_root: PathBuf,
+    /// Working directory for the agent when running in a git worktree.
+    ///
+    /// `None` means the agent runs in `project_root`. State and capture files
+    /// always live under the main `project_root`; only the agent's cwd changes.
+    #[serde(default)]
+    pub worktree_path: Option<PathBuf>,
     /// Parsed agent completion result (from DEVLOW_RESULT or exit code).
     #[serde(skip)]
     pub agent_result: Option<AgentResult>,
@@ -182,6 +188,7 @@ impl State {
             agent_label: None,
             started_at: timestamp_now(),
             project_root,
+            worktree_path: None,
             agent_result: None,
             agent_stdout_path: None,
         }
