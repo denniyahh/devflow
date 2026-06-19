@@ -248,8 +248,9 @@ mod tests {
     }
 
     #[test]
-    fn only_executing_waits_on_an_agent() {
+    fn only_executing_and_planning_wait() {
         assert!(Step::Executing.is_waiting());
+        assert!(Step::Planning.is_waiting());
         for step in [
             Step::Idle,
             Step::Branching,
@@ -263,7 +264,8 @@ mod tests {
     }
 
     #[test]
-    fn skippable_steps_are_verify_docs_ship() {
+    fn skippable_steps_include_planning() {
+        assert!(Step::Planning.is_skippable());
         assert!(Step::Verifying.is_skippable());
         assert!(Step::Docsing.is_skippable());
         assert!(Step::Shipping.is_skippable());
@@ -277,6 +279,7 @@ mod tests {
     fn step_display_is_lowercase() {
         assert_eq!(Step::Idle.to_string(), "idle");
         assert_eq!(Step::Branching.to_string(), "branching");
+        assert_eq!(Step::Planning.to_string(), "planning");
         assert_eq!(Step::Executing.to_string(), "executing");
         assert_eq!(Step::Verifying.to_string(), "verifying");
         assert_eq!(Step::Docsing.to_string(), "docsing");
