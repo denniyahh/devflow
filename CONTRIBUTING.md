@@ -94,7 +94,7 @@ test, or pass CI.
 ## Commit Conventions
 
 **Deprecated — June 2026.** The conventional commits model is being replaced by a
-per-phase branding and merge scheme (Phase 11). Until then, write descriptive
+per-phase branching and merge scheme (Phase 11). Until then, write descriptive
 commit messages that explain what changed and why, without a required prefix
 format.
 

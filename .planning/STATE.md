@@ -5,7 +5,7 @@
 ## Active
 
 - **Phase 10 (Next):** Logging + Planning Step — CONTEXT.md written, not started
-- **Phase 11 (Planned):** Branding & Merge Scheme + Dev Container — CONTEXT.md written
+- **Phase 11 (Planned):** Branching & Merge Scheme + Dev Container — CONTEXT.md written
 - **Phase 12 (Planned):** Hermes Adapter — CONTEXT.md written
 
 ## Completed
