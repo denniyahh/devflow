@@ -391,6 +391,7 @@ mod tests {
         assert_eq!(config.automation.auto_version, "patch");
         assert!(!config.automation.auto_ship);
         assert!(config.automation.auto_cleanup);
+        assert!(!config.automation.auto_plan);
         assert_eq!(config.automation.verify_command, "cargo test");
         assert_eq!(
             config.automation.lint_command,
@@ -448,7 +449,7 @@ mod tests {
     #[test]
     fn parse_accepts_all_boolean_toggles() {
         let config = parse_config(
-            "automation:\n  auto_branch: false\n  auto_verify: false\n  auto_docs: false\n  auto_ship: true\n  auto_cleanup: false\n",
+            "automation:\n  auto_branch: false\n  auto_verify: false\n  auto_docs: false\n  auto_ship: true\n  auto_cleanup: false\n  auto_plan: true\n",
         )
         .expect("parse");
         assert!(!config.automation.auto_branch);
@@ -456,6 +457,7 @@ mod tests {
         assert!(!config.automation.auto_docs);
         assert!(config.automation.auto_ship);
         assert!(!config.automation.auto_cleanup);
+        assert!(config.automation.auto_plan);
     }
 
     #[test]
