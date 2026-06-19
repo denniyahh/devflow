@@ -172,11 +172,11 @@ mod tests {
 
         let result = advance_state(state, &config).expect("advance");
         assert!(result.changed);
-        assert_eq!(result.state.step, Step::Executing);
+        assert_eq!(result.state.step, Step::Planning);
         assert!(result.message.contains("branching"));
-        assert!(result.message.contains("executing"));
+        assert!(result.message.contains("planning"));
         // Non-idle state is persisted.
-        assert_eq!(load_state(dir.path()).unwrap().step, Step::Executing);
+        assert_eq!(load_state(dir.path()).unwrap().step, Step::Planning);
     }
 
     #[test]

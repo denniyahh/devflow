@@ -840,6 +840,14 @@ fn check(project_root: &Path) -> Result<(), CliError> {
     let config = Config::load(project_root)?;
     let state = workflow::load_state(project_root)?;
 
+    if state.step == Step::Planning && !config.automation.auto_plan {
+        println!(
+            "awaiting plan review — run `devflow check` when ready to proceed to phase {} execution",
+            state.phase
+        );
+        return Ok(());
+    }
+
     if state.step == Step::Executing {
         if let Some(pid) = state.agent_pid {
             if agent::agent_running(pid) {
@@ -993,6 +1001,9 @@ fn status(project_root: &Path) -> Result<(), CliError> {
     match workflow::load_state(project_root) {
         Ok(state) => {
             println!("step: {}", state.step);
+            if state.step == Step::Planning {
+                println!("  awaiting plan review");
+            }
             println!("phase: {}", state.phase);
             println!(
                 "agent: {}",

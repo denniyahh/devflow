@@ -73,6 +73,10 @@ pub struct AutomationConfig {
     #[serde(default = "default_true")]
     pub auto_cleanup: bool,
 
+    /// Auto-advance past the Planning step without pausing for review.
+    #[serde(default = "default_false")]
+    pub auto_plan: bool,
+
     /// Shell command for verification (e.g., "cargo test").
     #[serde(default = "default_verify_command")]
     pub verify_command: String,
@@ -171,6 +175,7 @@ impl Default for AutomationConfig {
             auto_version: default_auto_version(),
             auto_ship: default_false(),
             auto_cleanup: default_true(),
+            auto_plan: default_false(),
             verify_command: default_verify_command(),
             lint_command: default_lint_command(),
             docs_command: default_docs_command(),
@@ -214,7 +219,7 @@ impl Config {
     /// Render this config as DevFlow's canonical YAML shape.
     pub fn to_yaml(&self) -> String {
         format!(
-            "version:\n  scheme: {}\n  file: {}\n  field: {}\n  build_number: {}\nautomation:\n  auto_branch: {}\n  auto_verify: {}\n  auto_docs: {}\n  auto_version: {}\n  auto_ship: {}\n  auto_cleanup: {}\n  verify_command: \"{}\"\n  lint_command: \"{}\"\n  docs_command: \"{}\"\n  continue_on_error: {}\n  docs_auto_commit: {}\ngit_flow:\n  main: {}\n  develop: {}\n  feature_prefix: {}\n",
+            "version:\n  scheme: {}\n  file: {}\n  field: {}\n  build_number: {}\nautomation:\n  auto_branch: {}\n  auto_verify: {}\n  auto_docs: {}\n  auto_version: {}\n  auto_ship: {}\n  auto_cleanup: {}\n  auto_plan: {}\n  verify_command: \"{}\"\n  lint_command: \"{}\"\n  docs_command: \"{}\"\n  continue_on_error: {}\n  docs_auto_commit: {}\ngit_flow:\n  main: {}\n  develop: {}\n  feature_prefix: {}\n",
             self.version.scheme,
             self.version.file,
             self.version.field,
@@ -225,6 +230,7 @@ impl Config {
             self.automation.auto_version,
             self.automation.auto_ship,
             self.automation.auto_cleanup,
+            self.automation.auto_plan,
             self.automation.verify_command,
             self.automation.lint_command,
             self.automation.docs_command,
@@ -239,6 +245,7 @@ impl Config {
     /// Whether the given step should be skipped per automation config.
     pub fn should_skip(&self, step: &crate::state::Step) -> bool {
         match step {
+            crate::state::Step::Planning => self.automation.auto_plan,
             crate::state::Step::Verifying => !self.automation.auto_verify,
             crate::state::Step::Docsing => !self.automation.auto_docs,
             crate::state::Step::Shipping => false,
@@ -288,6 +295,7 @@ fn parse_config(contents: &str) -> Result<Config, ConfigError> {
             ("automation", "auto_version") => config.automation.auto_version = value,
             ("automation", "auto_ship") => config.automation.auto_ship = parse_bool(&value)?,
             ("automation", "auto_cleanup") => config.automation.auto_cleanup = parse_bool(&value)?,
+            ("automation", "auto_plan") => config.automation.auto_plan = parse_bool(&value)?,
             ("automation", "verify_command") => config.automation.verify_command = value,
             ("automation", "lint_command") => config.automation.lint_command = value,
             ("automation", "docs_command") => config.automation.docs_command = value,

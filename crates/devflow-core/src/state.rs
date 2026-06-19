@@ -1,7 +1,7 @@
 //! DevFlow state machine.
 //!
 //! Drives the development workflow through a deterministic sequence of steps:
-//! IDLE → BRANCHING → EXECUTING → VERIFYING → DOCSING → SHIPPING → CLEANING → IDLE
+//! IDLE → BRANCHING → PLANNING → EXECUTING → VERIFYING → DOCSING → SHIPPING → CLEANING → IDLE
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -19,6 +19,8 @@ pub enum Step {
     Idle,
     /// Creating the feature branch via git flow.
     Branching,
+    /// Reviewing and editing the phase plan before execution.
+    Planning,
     /// Coding agent is running (spawned as child process).
     Executing,
     /// Running verification (tests, lint).
@@ -36,7 +38,8 @@ impl Step {
     pub fn next(self) -> Option<Step> {
         match self {
             Step::Idle => Some(Step::Branching),
-            Step::Branching => Some(Step::Executing),
+            Step::Branching => Some(Step::Planning),
+            Step::Planning => Some(Step::Executing),
             Step::Executing => Some(Step::Verifying),
             Step::Verifying => Some(Step::Docsing),
             Step::Docsing => Some(Step::Shipping),
@@ -47,12 +50,12 @@ impl Step {
 
     /// Whether this step is waiting on an external agent (human or AI).
     pub fn is_waiting(self) -> bool {
-        matches!(self, Step::Executing)
+        matches!(self, Step::Planning | Step::Executing)
     }
 
     /// Whether this step can be skipped per config.
     pub fn is_skippable(self) -> bool {
-        matches!(self, Step::Verifying | Step::Docsing | Step::Shipping)
+        matches!(self, Step::Planning | Step::Verifying | Step::Docsing | Step::Shipping)
     }
 }
 
@@ -61,6 +64,7 @@ impl fmt::Display for Step {
         let name = match self {
             Step::Idle => "idle",
             Step::Branching => "branching",
+            Step::Planning => "planning",
             Step::Executing => "executing",
             Step::Verifying => "verifying",
             Step::Docsing => "docsing",
@@ -229,7 +233,8 @@ mod tests {
     #[test]
     fn next_walks_full_chain_then_terminates() {
         assert_eq!(Step::Idle.next(), Some(Step::Branching));
-        assert_eq!(Step::Branching.next(), Some(Step::Executing));
+        assert_eq!(Step::Branching.next(), Some(Step::Planning));
+        assert_eq!(Step::Planning.next(), Some(Step::Executing));
         assert_eq!(Step::Executing.next(), Some(Step::Verifying));
         assert_eq!(Step::Verifying.next(), Some(Step::Docsing));
         assert_eq!(Step::Docsing.next(), Some(Step::Shipping));
