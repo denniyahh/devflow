@@ -129,7 +129,10 @@ pub fn advance_state(
             phase = state.phase,
             "workflow complete"
         );
-        info!("workflow complete for phase {}; returned to idle", state.phase);
+        info!(
+            "workflow complete for phase {}; returned to idle",
+            state.phase
+        );
         String::from("workflow complete; returned to idle")
     };
 

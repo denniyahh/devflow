@@ -55,7 +55,10 @@ impl Step {
 
     /// Whether this step can be skipped per config.
     pub fn is_skippable(self) -> bool {
-        matches!(self, Step::Planning | Step::Verifying | Step::Docsing | Step::Shipping)
+        matches!(
+            self,
+            Step::Planning | Step::Verifying | Step::Docsing | Step::Shipping
+        )
     }
 }
 

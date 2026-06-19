@@ -23,14 +23,16 @@ The workflow is a deterministic step sequence (`crates/devflow-core/src/state.rs
 persisted via `crates/devflow-core/src/workflow.rs`):
 
 ```
-Idle → Branching → Executing → Verifying → Docsing → Shipping → Cleaning → Idle
+Idle → Branching → Planning → Executing → Verifying → Docsing → Shipping → Cleaning → Idle
 ```
 
 - `Step::next()` defines the transitions; `Cleaning` is terminal (returns to `Idle`).
-- `Step::is_waiting()` is true only for `Executing` — the step that blocks on the agent.
-- `Step::is_skippable()` is true for `Verifying`, `Docsing`, and `Shipping`.
+- `Step::is_waiting()` is true for `Planning` and `Executing` — the steps that block
+  on user review (Planning) or agent completion (Executing).
+- `Step::is_skippable()` is true for `Planning`, `Verifying`, `Docsing`, and `Shipping`.
   `State::advance_skipping()` consults `Config::should_skip()` so disabled
-  automation steps are stepped over (note: `Shipping` is never auto-skipped by
+  automation steps are stepped over. The `auto_plan` config toggle controls whether
+  `Planning` is auto-skipped (note: `Shipping` is never auto-skipped by
   config — see `should_skip`).
 - `State` (step, phase, agent, PIDs, label, project root, optional worktree path)
   is serialized to `.devflow/state.json`.
@@ -154,6 +156,62 @@ git_flow:
 
 `git_flow` has exactly `main`, `develop`, and `feature_prefix` — there is no
 `enabled` field.
+
+## Logging
+
+DevFlow uses the [`tracing`](https://docs.rs/tracing) ecosystem for structured
+diagnostic logging. All log output goes to **stderr** via `tracing-subscriber`;
+**stdout is reserved** for agent/system output and structured results.
+
+### Configuration
+
+| Environment variable | Purpose | Default |
+|---|---|---|
+| `RUST_LOG` | Controls log verbosity via `tracing-subscriber::EnvFilter`. Accepts bare levels (`error`, `warn`, `info`, `debug`, `trace`) or targeted directives (`devflow_core=debug,devflow=info`). | `info` |
+| `DEVFLOW_LOG_FORMAT` | When set to `json`, enables JSON-structured log output (one JSON object per line on stderr). Any other value (or unset) produces human-readable plain-text logs. | plain text |
+
+### Instrumentation
+
+Key modules are instrumented with `tracing` spans and events:
+
+- **`workflow.rs`** — State transitions emit `step_entered` / `step_exited` events
+  at `INFO` level with `(before, after, phase)` fields. State I/O operations
+  (`save_state`, `load_state`, `clear_state`) are logged at `DEBUG`.
+- **`state.rs`** — `State::advance()` and `State::advance_skipping()` carry
+  `#[tracing::instrument]` spans so call chains appear in log output.
+- **`git.rs`** — Branch operations (`feature_start`, `feature_finish`) log at
+  `INFO`; checkout and merge operations log at `DEBUG`; force operations log at
+  `WARN`.
+- **`monitor.rs`** — Agent spawn and PID tracking are logged at `INFO`; exit
+  polling at `DEBUG`.
+- **`ship.rs`** — Version bumps and PR creation log at `INFO`; confirm/reject
+  at `WARN`.
+
+### Log levels
+
+| Level | Usage |
+|---|---|
+| `ERROR` | Unrecoverable conditions that abort an operation. |
+| `WARN` | Recoverable anomalies (force operations, invalid config, stale state). |
+| `INFO` | State transitions, agent lifecycle, branch/ship milestones. |
+| `DEBUG` | I/O details, merge/checkout operations, exit polling. |
+| `TRACE` | Fine-grained execution tracing (rarely needed outside debugging). |
+
+### JSON output
+
+When `DEVFLOW_LOG_FORMAT=json`, each log event is a single JSON line containing
+`timestamp`, `level`, `target`, `fields`, and optional `span` information. This
+format is designed for machine consumption (e.g., Hermes watching agent output
+via structured logging).
+
+```bash
+# JSON log smoke test
+DEVFLOW_LOG_FORMAT=json RUST_LOG=info cargo run -- status 2>devflow.json
+head -1 devflow.json | python3 -m json.tool  # Should parse as valid JSON
+```
+
+`devflow doctor` includes a `RUST_LOG` environment check that validates the
+variable is set to a parseable value and warns when it is missing or invalid.
 
 ## Extension points — adding an agent
 

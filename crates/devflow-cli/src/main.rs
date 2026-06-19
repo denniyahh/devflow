@@ -1725,15 +1725,9 @@ fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
                 // Check if it's a bare level like "info" or "debug"
                 // or a target=level directive like "devflow_core=debug"
                 if let Some((_target, level)) = directive.split_once('=') {
-                    matches!(
-                        level.trim(),
-                        "error" | "warn" | "info" | "debug" | "trace"
-                    )
+                    matches!(level.trim(), "error" | "warn" | "info" | "debug" | "trace")
                 } else {
-                    matches!(
-                        directive,
-                        "error" | "warn" | "info" | "debug" | "trace"
-                    )
+                    matches!(directive, "error" | "warn" | "info" | "debug" | "trace")
                 }
             });
             if all_valid {

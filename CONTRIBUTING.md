@@ -98,6 +98,57 @@ per-phase branching and merge scheme (Phase 11). Until then, write descriptive
 commit messages that explain what changed and why, without a required prefix
 format.
 
+## Logging Conventions
+
+DevFlow uses the [`tracing`](https://docs.rs/tracing) crate for structured
+diagnostic logging. All log output goes to **stderr**; stdout is reserved for
+agent/system output.
+
+### Writing log events
+
+```rust
+use tracing::{info, debug, warn, error};
+
+// State transitions and milestones
+info!(before = %old_step, after = %new_step, phase = phase, "step_entered");
+
+// I/O and detail operations
+debug!(path = %path, "saved state to disk");
+
+// Recoverable anomalies
+warn!("force-pushing branch {branch}");
+
+// Fatal conditions
+error!("failed to load config: {err}");
+```
+
+### Structured events for state transitions
+
+State transitions in `workflow.rs` should emit paired `step_entered` /
+`step_exited` events at `INFO` level with `(before, after, phase)` fields:
+
+```rust
+info!(before = %current, after = %next, phase = state.phase, "step_entered");
+```
+
+### Controlling log output
+
+| Variable | Purpose |
+|---|---|
+| `RUST_LOG` | Controls verbosity. Set to `error`, `warn`, `info`, `debug`, or `trace`. Use targeted directives like `devflow_core=debug,devflow=info` to filter by crate. |
+| `DEVFLOW_LOG_FORMAT` | Set to `json` for machine-readable JSON output (one JSON object per line on stderr). |
+
+### Do's and Don'ts
+
+- **Do** use `tracing` macros (`info!`, `debug!`, `warn!`, `error!`) — never
+  `println!` or `eprintln!` for diagnostic output.
+- **Do** log to stderr; reserve stdout for structured results and agent output.
+- **Do** use structured fields (`field = value`) instead of string interpolation
+  for machine-parseable log entries.
+- **Do** add `#[tracing::instrument]` to key state-machine functions so call
+  chains appear in log output.
+- **Don't** log secrets, tokens, or API keys.
+
 ## Architecture
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for design documentation.
