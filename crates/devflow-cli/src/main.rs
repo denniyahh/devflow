@@ -1708,6 +1708,51 @@ fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
     let devflow_version = env!("CARGO_PKG_VERSION");
     let config_exists = project_root.join(".devflow.yaml").exists();
 
+    // RUST_LOG environment check: validate the value is a parsable log directive.
+    let (rust_log_status, rust_log_version, rust_log_hint) = match std::env::var("RUST_LOG") {
+        Ok(ref val) if val.is_empty() => {
+            // Empty string is technically valid (disables logging), but warn about it.
+            (
+                "warn",
+                Some("empty (logging disabled)".into()),
+                Some("Set RUST_LOG=info for better diagnostics".into()),
+            )
+        }
+        Ok(val) => {
+            // Validate each comma-separated directive as a valid EnvFilter string.
+            let all_valid = val.split(',').all(|directive| {
+                let directive = directive.trim();
+                // Check if it's a bare level like "info" or "debug"
+                // or a target=level directive like "devflow_core=debug"
+                if let Some((_target, level)) = directive.split_once('=') {
+                    matches!(
+                        level.trim(),
+                        "error" | "warn" | "info" | "debug" | "trace"
+                    )
+                } else {
+                    matches!(
+                        directive,
+                        "error" | "warn" | "info" | "debug" | "trace"
+                    )
+                }
+            });
+            if all_valid {
+                ("ok", Some(val), None)
+            } else {
+                (
+                    "warn",
+                    Some(val),
+                    Some("RUST_LOG value may be invalid — expected error, warn, info, debug, or trace".into()),
+                )
+            }
+        }
+        Err(_) => (
+            "missing",
+            Some("not set — defaulting to info".into()),
+            Some("Set RUST_LOG=info for better diagnostics".into()),
+        ),
+    };
+
     let checks: Vec<Check> = vec![
         cmd_check(
             "git",
@@ -1765,6 +1810,12 @@ fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
                 Some("Run 'devflow init' to bootstrap".into())
             },
         },
+        Check {
+            name: "RUST_LOG".into(),
+            status: rust_log_status.into(),
+            version: rust_log_version,
+            install_hint: rust_log_hint,
+        },
     ];
 
     if json {
@@ -1796,15 +1847,16 @@ fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
             let icon = match c.status.as_str() {
                 "ok" => "✓",
                 "missing" => "✗",
+                "warn" => "⚠",
                 _ => "?",
             };
             let version_str = c.version.as_deref().unwrap_or("-");
             print!("  {:<20} {:<20} {}", c.name, version_str, icon);
             // clippy: collapsible_if false positive — collapsing would require unstable let-chains
             #[allow(clippy::collapsible_if)]
-            if c.status == "missing" {
+            if c.status == "missing" || c.status == "warn" {
                 if let Some(hint) = &c.install_hint {
-                    print!(" — install: {hint}");
+                    print!(" — {}", hint);
                 }
             }
             println!();
