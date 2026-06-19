@@ -196,6 +196,7 @@ impl State {
     }
 
     /// Advance to the next step. Returns `None` if already at terminal step.
+    #[tracing::instrument(skip(self))]
     pub fn advance(&mut self) -> Option<Step> {
         if let Some(next) = self.step.next() {
             self.step = next;
@@ -206,6 +207,7 @@ impl State {
     }
 
     /// Advance past configured skip steps and return the current step.
+    #[tracing::instrument(skip(self, config))]
     pub fn advance_skipping(&mut self, config: &crate::config::Config) -> Step {
         while config.should_skip(&self.step) {
             if self.advance().is_none() {

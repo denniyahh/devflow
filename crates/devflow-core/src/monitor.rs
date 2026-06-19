@@ -15,6 +15,7 @@ use crate::state::State;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
+use tracing::{debug, info};
 
 /// Errors produced by monitor operations.
 #[derive(Debug, thiserror::Error)]
@@ -50,6 +51,12 @@ pub fn spawn_monitor(state: &State, program: &str, args: &[String]) -> Result<u3
         .to_str()
         .ok_or(MonitorError::NonUtf8Path)?
         .to_string();
+
+    info!(
+        "spawning monitor for phase {}: {program} {}",
+        state.phase,
+        args.join(" ")
+    );
 
     let stdout_file = crate::agent_result::stdout_path(&state.project_root, state.phase);
     let exit_file = crate::agent_result::exit_code_path(&state.project_root, state.phase);
@@ -118,6 +125,7 @@ pub fn spawn_monitor(state: &State, program: &str, args: &[String]) -> Result<u3
         .spawn()?;
 
     let pid = child.id();
+    info!("monitor spawned with pid {pid}");
     Ok(pid)
 }
 
@@ -127,6 +135,7 @@ pub fn spawn_monitor(state: &State, program: &str, args: &[String]) -> Result<u3
 /// does not appear in time (the monitor still runs; only the display PID is lost).
 pub fn wait_for_agent_pid(project_root: &Path, phase: u32) -> Option<u32> {
     let path = crate::agent_result::agent_pid_path(project_root, phase);
+    debug!("polling for agent PID for phase {phase}");
     for _ in 0..50 {
         if let Ok(contents) = std::fs::read_to_string(&path)
             && let Ok(pid) = contents.trim().parse::<u32>()
@@ -135,6 +144,7 @@ pub fn wait_for_agent_pid(project_root: &Path, phase: u32) -> Option<u32> {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+    debug!("agent PID not found for phase {phase} after polling");
     None
 }
 

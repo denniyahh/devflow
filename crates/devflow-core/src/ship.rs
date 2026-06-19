@@ -8,6 +8,7 @@ use crate::config::GitFlowConfig;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use tracing::{debug, info};
 
 /// Record of the most recent `devflow ship`, enabling confirm/reject later.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -100,6 +101,10 @@ pub fn cron_instructions_path(project_root: &Path) -> PathBuf {
 /// Persist the last-ship record.
 pub fn save(project_root: &Path, record: &LastShip) -> Result<(), ShipError> {
     let path = last_ship_path(project_root);
+    info!(
+        "saving ship record: phase={} version={} → {}",
+        record.phase, record.version_from, record.version_to
+    );
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -110,6 +115,7 @@ pub fn save(project_root: &Path, record: &LastShip) -> Result<(), ShipError> {
 /// Load the last-ship record, or [`ShipError::Missing`] if absent.
 pub fn load(project_root: &Path) -> Result<LastShip, ShipError> {
     let path = last_ship_path(project_root);
+    debug!("loading ship record from {}", path.display());
     if !path.exists() {
         return Err(ShipError::Missing);
     }
@@ -142,6 +148,7 @@ pub fn load_cron_instructions(project_root: &Path) -> Result<CronInstructions, S
 pub fn delete(project_root: &Path) -> Result<(), ShipError> {
     let path = last_ship_path(project_root);
     if path.exists() {
+        debug!("deleting ship record at {}", path.display());
         std::fs::remove_file(path)?;
     }
     Ok(())

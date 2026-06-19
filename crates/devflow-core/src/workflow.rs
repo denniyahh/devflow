@@ -3,6 +3,7 @@
 use crate::state::{State, Step};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use tracing::{debug, info};
 
 /// Result of advancing workflow state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +42,7 @@ pub fn state_path(project_root: &Path) -> PathBuf {
 
 /// Save workflow state to `.devflow/state.json`.
 pub fn save_state(state: &State) -> Result<(), WorkflowError> {
+    debug!("saving state: phase={} step={}", state.phase, state.step);
     let dir = devflow_dir(&state.project_root);
     std::fs::create_dir_all(&dir)?;
     let contents = serde_json::to_string_pretty(state)?;
@@ -51,6 +53,7 @@ pub fn save_state(state: &State) -> Result<(), WorkflowError> {
 /// Load workflow state from `.devflow/state.json`.
 pub fn load_state(project_root: &Path) -> Result<State, WorkflowError> {
     let path = state_path(project_root);
+    debug!("loading state from {}", path.display());
     if !path.exists() {
         return Err(WorkflowError::MissingState(path));
     }
@@ -62,6 +65,7 @@ pub fn load_state(project_root: &Path) -> Result<State, WorkflowError> {
 pub fn clear_state(project_root: &Path) -> Result<(), WorkflowError> {
     let path = state_path(project_root);
     if path.exists() {
+        debug!("clearing state at {}", path.display());
         std::fs::remove_file(path)?;
     }
     Ok(())
@@ -87,14 +91,45 @@ pub fn advance_state(
     }
 
     let before = state.step;
+    let before_phase = state.phase;
+
+    // Emit step_exited event
+    tracing::event!(
+        tracing::Level::INFO,
+        step_exited = before.to_string(),
+        phase = before_phase,
+        "exiting step"
+    );
+
     let message = if state.advance().is_some() {
         state.advance_skipping(config);
         if state.step == Step::Cleaning && config.should_skip(&Step::Cleaning) {
             state.step = Step::Idle;
         }
+
+        // Emit step_entered event
+        tracing::event!(
+            tracing::Level::INFO,
+            step_entered = state.step.to_string(),
+            phase = state.phase,
+            "entered step"
+        );
+
+        info!(
+            "state transition: {} → {} (phase {})",
+            before, state.step, state.phase
+        );
         format!("advanced from {before} to {}", state.step)
     } else {
         state.step = Step::Idle;
+        // Emit step_entered for idle
+        tracing::event!(
+            tracing::Level::INFO,
+            step_entered = "idle",
+            phase = state.phase,
+            "workflow complete"
+        );
+        info!("workflow complete for phase {}; returned to idle", state.phase);
         String::from("workflow complete; returned to idle")
     };
 
