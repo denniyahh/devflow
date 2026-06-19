@@ -222,7 +222,14 @@ enum CliError {
 }
 
 fn main() {
-    tracing_subscriber::fmt::init();
+    match std::env::var("DEVFLOW_LOG_FORMAT").as_deref() {
+        Ok("json") => {
+            tracing_subscriber::fmt().json().init();
+        }
+        _ => {
+            tracing_subscriber::fmt::init();
+        }
+    }
     if let Err(err) = run() {
         eprintln!("error: {err}");
         std::process::exit(1);

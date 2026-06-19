@@ -2,6 +2,54 @@
 //!
 //! The core library returns structured types and performs workflow mechanics;
 //! frontends such as the CLI format output for humans or machines.
+//!
+//! ## Logging
+//!
+//! DevFlow uses the [`tracing`] crate for structured, level-aware logging. All
+//! log output goes to **stderr** so stdout remains available for agent output,
+//! structured results, and machine-readable data.
+//!
+//! ### Log Levels
+//!
+//! Set the `RUST_LOG` environment variable to control verbosity:
+//!
+//! | Level   | Use case |
+//! |---------|----------|
+//! | `error` | Fatal conditions that abort the workflow |
+//! | `warn`  | Unexpected but recoverable conditions (e.g., force operations) |
+//! | `info`  | Normal workflow events (state transitions, git operations) |
+//! | `debug` | Detailed I/O and git commands |
+//! | `trace` | Full tracing subscriber internals |
+//!
+//! ```bash
+//! RUST_LOG=info devflow check        # Default: shows state transitions
+//! RUST_LOG=debug devflow start       # Also shows git commands and file I/O
+//! RUST_LOG=warn devflow ship         # Suppress info, show only warnings
+//! ```
+//!
+//! The default log level is `info` when `RUST_LOG` is not set.
+//!
+//! ### JSON Output
+//!
+//! Set `DEVFLOW_LOG_FORMAT=json` for machine-readable JSON log lines on stderr:
+//!
+//! ```bash
+//! DEVFLOW_LOG_FORMAT=json RUST_LOG=info devflow status 2>log.json
+//! ```
+//!
+//! Each line is a JSON object with `timestamp`, `level`, `fields`, and
+//! `target` keys. Structured events like `step_entered`/`step_exited` include
+//! `phase` and step-name fields.
+//!
+//! ### Structured Events
+//!
+//! State machine transitions emit structured `tracing` events:
+//!
+//! - `step_exited` — emitted when leaving a step, with `phase` and step name
+//! - `step_entered` — emitted when entering a step, with `phase` and step name
+//!
+//! These events are at `INFO` level and include the phase number as a named
+//! field, making them filterable and parseable by external tooling.
 
 pub mod agent;
 pub mod agent_result;
