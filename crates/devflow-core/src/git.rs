@@ -3,6 +3,7 @@
 use crate::config::GitFlowConfig;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use tracing::{debug, info, warn};
 
 /// Errors produced by git-flow operations.
 #[derive(Debug, thiserror::Error)]
@@ -50,6 +51,7 @@ impl GitFlow {
     /// [`feature_start_force`] to overwrite).
     pub fn feature_start(&self, phase: u32) -> Result<String, GitError> {
         let branch = format!("{}phase-{:02}", self.config.feature_prefix, phase);
+        info!("creating feature branch: {branch}");
         self.git(["checkout", &self.config.develop])?;
         self.git(["checkout", "-b", &branch])?;
         Ok(branch)
@@ -58,6 +60,7 @@ impl GitFlow {
     /// Create or reset a feature branch, overwriting it if it already exists.
     pub fn feature_start_force(&self, phase: u32) -> Result<String, GitError> {
         let branch = format!("{}phase-{:02}", self.config.feature_prefix, phase);
+        warn!("force-creating feature branch: {branch}");
         self.git(["checkout", &self.config.develop])?;
         self.git(["checkout", "-B", &branch])?;
         Ok(branch)
@@ -66,6 +69,7 @@ impl GitFlow {
     /// Merge a feature branch into develop and delete it.
     pub fn feature_finish(&self, phase: u32) -> Result<String, GitError> {
         let branch = format!("{}phase-{:02}", self.config.feature_prefix, phase);
+        info!("finishing feature branch: {branch}");
         self.git(["checkout", &self.config.develop])?;
         self.git(["merge", "--no-ff", &branch])?;
         self.git(["branch", "-d", &branch])?;
@@ -80,6 +84,7 @@ impl GitFlow {
     /// keeps any commits unique to the shipped branch in the release.
     pub fn release_start(&self, version: &str) -> Result<String, GitError> {
         let branch = format!("release/{version}");
+        info!("creating release branch: {branch}");
         self.git(["checkout", "-B", &branch])?;
         Ok(branch)
     }
@@ -87,6 +92,7 @@ impl GitFlow {
     /// Merge a release branch into main and develop, tag it, and delete it.
     pub fn release_finish(&self, version: &str) -> Result<String, GitError> {
         let branch = format!("release/{version}");
+        info!("finishing release branch: {branch}");
         self.git(["checkout", &self.config.main])?;
         self.git(["merge", "--no-ff", &branch])?;
         self.git(["tag", &format!("v{version}")])?;
@@ -108,6 +114,11 @@ impl GitFlow {
             )));
         }
         let flag = if force { "-D" } else { "-d" };
+        if force {
+            warn!("force-deleting branch: {branch}");
+        } else {
+            info!("deleting branch: {branch}");
+        }
         self.git(["branch", flag, branch])
     }
 
@@ -164,10 +175,12 @@ impl GitFlow {
     /// Runs `git rebase` inside the given worktree directory. On conflict the
     /// rebase is aborted and an error is returned so the caller can surface it.
     pub fn rebase_in(&self, dir: &Path, onto: &str) -> Result<(), GitError> {
+        debug!("rebasing worktree at {} onto {onto}", dir.display());
         match git_in(dir, &["rebase", onto]) {
             Ok(()) => Ok(()),
             Err(err) => {
                 // Leave the worktree clean for the user to retry.
+                warn!("rebase conflict in {}; aborting", dir.display());
                 let _ = git_in(dir, &["rebase", "--abort"]);
                 Err(err)
             }
@@ -176,11 +189,13 @@ impl GitFlow {
 
     /// Check out an existing branch in the main worktree.
     pub fn checkout(&self, branch: &str) -> Result<(), GitError> {
+        debug!("checking out branch: {branch}");
         self.git(["checkout", branch])
     }
 
     /// Delete `branch` on `origin` (best-effort; errors if no remote/branch).
     pub fn delete_remote_branch(&self, branch: &str) -> Result<(), GitError> {
+        info!("deleting remote branch: {branch}");
         self.git(["push", "origin", "--delete", branch])
     }
 
@@ -193,6 +208,7 @@ impl GitFlow {
 
     /// Push `branch` to `origin`, setting upstream.
     pub fn push(&self, branch: &str) -> Result<(), GitError> {
+        info!("pushing branch: {branch}");
         self.git(["push", "-u", "origin", branch])
     }
 
@@ -206,6 +222,7 @@ impl GitFlow {
             if branch.is_empty() || protected.contains(&branch) {
                 continue;
             }
+            info!("cleaning up merged branch: {branch}");
             self.git(["branch", "-d", branch])?;
             deleted.push(branch.to_string());
         }
@@ -215,6 +232,7 @@ impl GitFlow {
     /// Stage all changes and commit with the given message.
     /// Returns Ok(()) whether or not there were changes to commit.
     pub fn commit_all(&self, message: &str) -> Result<(), GitError> {
+        debug!("committing all changes: {message}");
         self.git(["add", "."])?;
         // --allow-empty so we don't fail when there are no changes
         match self.git_raw(&["commit", "--allow-empty", "-m", message]) {
@@ -294,6 +312,7 @@ impl GitFlow {
     }
 
     fn git_raw(&self, args: &[&str]) -> Result<(), GitError> {
+        debug!("git {}", args.join(" "));
         let output = Command::new("git")
             .args(args)
             .current_dir(&self.root)
@@ -306,6 +325,7 @@ impl GitFlow {
     }
 
     fn git<const N: usize>(&self, args: [&str; N]) -> Result<(), GitError> {
+        debug!("git {}", args.iter().copied().collect::<Vec<_>>().join(" "));
         let output = Command::new("git")
             .args(args)
             .current_dir(&self.root)
@@ -332,6 +352,7 @@ impl GitFlow {
 
 /// Run a git command in an arbitrary directory (e.g. a worktree).
 fn git_in(dir: &Path, args: &[&str]) -> Result<(), GitError> {
+    debug!("git (in {}) {}", dir.display(), args.join(" "));
     let output = Command::new("git").args(args).current_dir(dir).output()?;
     if output.status.success() {
         Ok(())
