@@ -1,7 +1,7 @@
 //! DevFlow state machine.
 //!
-//! Drives the development workflow through a deterministic sequence of steps:
-//! IDLE → BRANCHING → PLANNING → EXECUTING → VERIFYING → DOCSING → SHIPPING → CLEANING → IDLE
+//! Drives the development workflow through a single linear chain of five stages:
+//! Define → Plan → Code → Validate → Ship. See [`crate::stage::Stage`].
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -10,90 +10,29 @@ use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::agent_result::AgentResult;
-
-/// The current step in the development workflow.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Step {
-    /// No active workflow — waiting for `devflow start`.
-    Idle,
-    /// Creating the feature branch via git flow.
-    Branching,
-    /// Reviewing and editing the phase plan before execution.
-    Planning,
-    /// Coding agent is running (spawned as child process).
-    Executing,
-    /// Running verification (tests, lint).
-    Verifying,
-    /// Updating documentation.
-    Docsing,
-    /// Creating release branch, bumping version, merging.
-    Shipping,
-    /// Deleting merged branches.
-    Cleaning,
-}
-
-impl Step {
-    /// Returns the next step in the workflow, or `None` if this is the terminal step.
-    pub fn next(self) -> Option<Step> {
-        match self {
-            Step::Idle => Some(Step::Branching),
-            Step::Branching => Some(Step::Planning),
-            Step::Planning => Some(Step::Executing),
-            Step::Executing => Some(Step::Verifying),
-            Step::Verifying => Some(Step::Docsing),
-            Step::Docsing => Some(Step::Shipping),
-            Step::Shipping => Some(Step::Cleaning),
-            Step::Cleaning => None,
-        }
-    }
-
-    /// Whether this step is waiting on an external agent (human or AI).
-    pub fn is_waiting(self) -> bool {
-        matches!(self, Step::Planning | Step::Executing)
-    }
-
-    /// Whether this step can be skipped per config.
-    pub fn is_skippable(self) -> bool {
-        matches!(
-            self,
-            Step::Planning | Step::Verifying | Step::Docsing | Step::Shipping
-        )
-    }
-}
-
-impl fmt::Display for Step {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = match self {
-            Step::Idle => "idle",
-            Step::Branching => "branching",
-            Step::Planning => "planning",
-            Step::Executing => "executing",
-            Step::Verifying => "verifying",
-            Step::Docsing => "docsing",
-            Step::Shipping => "shipping",
-            Step::Cleaning => "cleaning",
-        };
-        f.write_str(name)
-    }
-}
+use crate::mode::Mode;
+use crate::stage::Stage;
 
 /// Full workflow state persisted to `.devflow/state.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct State {
-    /// Current workflow step.
-    pub step: Step,
+    /// Current workflow stage.
+    pub stage: Stage,
     /// Phase number being worked on.
     pub phase: u32,
     /// Which coding agent was launched.
     pub agent: Agent,
-    /// PID of the spawned agent process (None if not yet launched).
-    pub agent_pid: Option<u32>,
-    /// PID of the background monitor (child process watching for agent exit).
-    pub monitor_pid: Option<u32>,
-    /// Human-readable label for the agent session (for status display).
-    pub agent_label: Option<String>,
-    /// When the phase started.
+    /// How the pipeline is driven (auto vs. supervise).
+    pub mode: Mode,
+    /// Whether a gate has been written and is awaiting a human response.
+    #[serde(default)]
+    pub gate_pending: bool,
+    /// Consecutive Validate failures — drives the Auto-mode forced gate after
+    /// [`crate::mode::MAX_CONSECUTIVE_FAILURES`] failures. Persisted across
+    /// `devflow advance` invocations so the counter survives monitor restarts.
+    #[serde(default)]
+    pub consecutive_failures: u32,
+    /// When the phase started (Unix seconds).
     pub started_at: String,
     /// Path to the project root.
     pub project_root: PathBuf,
@@ -127,30 +66,6 @@ pub enum Agent {
 /// with its own Agent trait name.
 pub type AgentKind = Agent;
 
-impl Agent {
-    /// Human-readable name — delegates to the agent trait.
-    #[deprecated(
-        since = "0.6.0",
-        note = "use agents::adapter_for(kind).name() directly"
-    )]
-    pub fn name(self) -> &'static str {
-        crate::agents::adapter_for(self).name()
-    }
-
-    /// The command and arguments to launch this agent in non-interactive mode.
-    ///
-    /// Delegates to the `agents::Agent` trait implementation for each agent kind.
-    /// Returns `(program, args)` where the agent runs headless, produces
-    /// structured output, and exits when done — never blocks waiting for user input.
-    #[deprecated(
-        since = "0.6.0",
-        note = "use agents::adapter_for(kind).exec_command(phase) directly"
-    )]
-    pub fn exec_command(self, _project_root: &str, phase: u32) -> (&'static str, Vec<String>) {
-        crate::agents::adapter_for(self).exec_command(phase)
-    }
-}
-
 impl fmt::Display for Agent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
@@ -181,15 +96,15 @@ impl FromStr for Agent {
 pub struct AgentParseError(String);
 
 impl State {
-    /// Create a new state for starting a phase.
-    pub fn new(phase: u32, agent: Agent, project_root: PathBuf) -> Self {
+    /// Create a new state for starting a phase at the [`Stage::Define`] stage.
+    pub fn new(phase: u32, agent: Agent, mode: Mode, project_root: PathBuf) -> Self {
         State {
-            step: Step::Idle,
+            stage: Stage::Define,
             phase,
             agent,
-            agent_pid: None,
-            monitor_pid: None,
-            agent_label: None,
+            mode,
+            gate_pending: false,
+            consecutive_failures: 0,
             started_at: timestamp_now(),
             project_root,
             worktree_path: None,
@@ -198,28 +113,6 @@ impl State {
         }
     }
 
-    /// Advance to the next step. Returns `None` if already at terminal step.
-    #[tracing::instrument(skip(self))]
-    pub fn advance(&mut self) -> Option<Step> {
-        if let Some(next) = self.step.next() {
-            self.step = next;
-            Some(next)
-        } else {
-            None
-        }
-    }
-
-    /// Advance past configured skip steps and return the current step.
-    #[tracing::instrument(skip(self, config))]
-    pub fn advance_skipping(&mut self, config: &crate::config::Config) -> Step {
-        while config.should_skip(&self.step) {
-            if self.advance().is_none() {
-                self.step = Step::Idle;
-                break;
-            }
-        }
-        self.step
-    }
 }
 
 fn timestamp_now() -> String {
@@ -232,60 +125,7 @@ fn timestamp_now() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
     use std::path::PathBuf;
-
-    #[test]
-    fn next_walks_full_chain_then_terminates() {
-        assert_eq!(Step::Idle.next(), Some(Step::Branching));
-        assert_eq!(Step::Branching.next(), Some(Step::Planning));
-        assert_eq!(Step::Planning.next(), Some(Step::Executing));
-        assert_eq!(Step::Executing.next(), Some(Step::Verifying));
-        assert_eq!(Step::Verifying.next(), Some(Step::Docsing));
-        assert_eq!(Step::Docsing.next(), Some(Step::Shipping));
-        assert_eq!(Step::Shipping.next(), Some(Step::Cleaning));
-        assert_eq!(Step::Cleaning.next(), None);
-    }
-
-    #[test]
-    fn only_executing_and_planning_wait() {
-        assert!(Step::Executing.is_waiting());
-        assert!(Step::Planning.is_waiting());
-        for step in [
-            Step::Idle,
-            Step::Branching,
-            Step::Verifying,
-            Step::Docsing,
-            Step::Shipping,
-            Step::Cleaning,
-        ] {
-            assert!(!step.is_waiting(), "{step} should not wait");
-        }
-    }
-
-    #[test]
-    fn skippable_steps_include_planning() {
-        assert!(Step::Planning.is_skippable());
-        assert!(Step::Verifying.is_skippable());
-        assert!(Step::Docsing.is_skippable());
-        assert!(Step::Shipping.is_skippable());
-        assert!(!Step::Idle.is_skippable());
-        assert!(!Step::Branching.is_skippable());
-        assert!(!Step::Executing.is_skippable());
-        assert!(!Step::Cleaning.is_skippable());
-    }
-
-    #[test]
-    fn step_display_is_lowercase() {
-        assert_eq!(Step::Idle.to_string(), "idle");
-        assert_eq!(Step::Branching.to_string(), "branching");
-        assert_eq!(Step::Planning.to_string(), "planning");
-        assert_eq!(Step::Executing.to_string(), "executing");
-        assert_eq!(Step::Verifying.to_string(), "verifying");
-        assert_eq!(Step::Docsing.to_string(), "docsing");
-        assert_eq!(Step::Shipping.to_string(), "shipping");
-        assert_eq!(Step::Cleaning.to_string(), "cleaning");
-    }
 
     #[test]
     fn agent_name_and_display() {
@@ -315,86 +155,41 @@ mod tests {
     }
 
     #[test]
-    fn exec_command_claude_uses_noninteractive_flags() {
-        let (_prog, args) = crate::agents::adapter_for(AgentKind::Claude).exec_command(3);
-        let joined = args.join(" ");
-        assert!(joined.contains("-p"));
-        assert!(joined.contains("--output-format json"));
-        assert!(joined.contains("--dangerously-skip-permissions"));
-        assert!(joined.contains("phase 3"));
-        assert!(joined.contains("ROADMAP.md"));
-        assert!(joined.contains("CONTEXT.md"));
-        assert!(joined.contains("cargo test"));
-    }
-
-    #[test]
-    fn exec_command_codex_uses_exec_and_json() {
-        let (_prog, args) = crate::agents::adapter_for(AgentKind::Codex).exec_command(7);
-        let joined = args.join(" ");
-        assert!(joined.contains("exec"));
-        assert!(joined.contains("--sandbox workspace-write"));
-        assert!(joined.contains("--json"));
-        assert!(joined.contains("phase 7"));
-        // Codex now receives the same rich prompt contract as Claude.
-        assert!(joined.contains("ROADMAP.md"));
-        assert!(joined.contains("CONTEXT.md"));
-        assert!(joined.contains("cargo test"));
-        assert!(joined.contains("DEVFLOW_RESULT"));
-    }
-
-    #[test]
-    fn new_state_starts_idle_with_no_pid() {
-        let state = State::new(2, Agent::Claude, PathBuf::from("/repo"));
-        assert_eq!(state.step, Step::Idle);
+    fn new_state_starts_at_define() {
+        let state = State::new(2, Agent::Claude, Mode::Auto, PathBuf::from("/repo"));
+        assert_eq!(state.stage, Stage::Define);
         assert_eq!(state.phase, 2);
         assert_eq!(state.agent, Agent::Claude);
-        assert!(state.agent_pid.is_none());
-        assert!(state.monitor_pid.is_none());
+        assert_eq!(state.mode, Mode::Auto);
+        assert!(!state.gate_pending);
+        assert_eq!(state.consecutive_failures, 0);
         assert!(!state.started_at.is_empty());
     }
 
     #[test]
-    fn advance_walks_chain_then_returns_none_at_terminal() {
-        let mut state = State::new(1, Agent::Claude, PathBuf::from("/repo"));
-        assert_eq!(state.advance(), Some(Step::Branching));
-        state.step = Step::Cleaning;
-        assert_eq!(state.advance(), None);
-        assert_eq!(state.step, Step::Cleaning);
-    }
-
-    #[test]
-    fn advance_skipping_jumps_over_disabled_steps() {
-        let mut config = Config::default();
-        config.automation.auto_verify = false;
-        config.automation.auto_docs = false;
-
-        let mut state = State::new(1, Agent::Claude, PathBuf::from("/repo"));
-        state.step = Step::Executing;
-        state.advance(); // -> Verifying (skipped) -> Docsing (skipped) -> Shipping
-        let landed = state.advance_skipping(&config);
-        assert_eq!(landed, Step::Shipping);
-    }
-
-    #[test]
-    fn advance_skipping_returns_to_idle_when_all_remaining_skipped() {
-        let mut config = Config::default();
-        config.automation.auto_cleanup = false;
-
-        let mut state = State::new(1, Agent::Claude, PathBuf::from("/repo"));
-        state.step = Step::Shipping;
-        state.advance(); // -> Cleaning
-        let landed = state.advance_skipping(&config);
-        assert_eq!(landed, Step::Idle);
-    }
-
-    #[test]
     fn state_serde_round_trips() {
-        let state = State::new(9, Agent::Codex, PathBuf::from("/repo"));
+        let state = State::new(9, Agent::Codex, Mode::Supervise, PathBuf::from("/repo"));
         let json = serde_json::to_string(&state).unwrap();
         let back: State = serde_json::from_str(&json).unwrap();
         assert_eq!(back.phase, 9);
         assert_eq!(back.agent, Agent::Codex);
-        assert_eq!(back.step, Step::Idle);
-        assert!(back.agent_pid.is_none());
+        assert_eq!(back.stage, Stage::Define);
+        assert_eq!(back.mode, Mode::Supervise);
+    }
+
+    #[test]
+    fn consecutive_failures_persists_across_advance_calls() {
+        let mut state = State::new(1, Agent::Claude, Mode::Auto, PathBuf::from("/repo"));
+        state.consecutive_failures = 3;
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(
+            json.contains("consecutive_failures"),
+            "consecutive_failures must appear in persisted JSON"
+        );
+        let loaded: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            loaded.consecutive_failures, 3,
+            "consecutive_failures must round-trip through serde"
+        );
     }
 }

@@ -1,9 +1,33 @@
-//! Version reading and bumping helpers.
+//! Hybrid Git-based SemVer.
+//!
+//! v2.0.0 derives the version from a mix of the project's version file and git
+//! history rather than a config-driven scheme:
+//!
+//! - **MAJOR** — read from the auto-detected version file (`Cargo.toml`,
+//!   `pyproject.toml`, or `package.json`). This is the one component a human
+//!   bumps deliberately.
+//! - **MINOR** — the number of git tags (one tag per shipped milestone).
+//! - **PATCH** — commits since the most recent tag.
 
-use crate::config::VersionConfig;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+
+/// A computed semantic version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Version {
+    /// Major component, from the version file.
+    pub major: u32,
+    /// Minor component, from the git tag count.
+    pub minor: u32,
+    /// Patch component, from commits since the last tag.
+    pub patch: u32,
+}
+
+impl std::fmt::Display for Version {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
 
 /// Errors produced by version operations.
 #[derive(Debug, thiserror::Error)]
@@ -14,102 +38,134 @@ pub enum VersionError {
     /// Version field could not be found or parsed.
     #[error("version parse failed: {0}")]
     Parse(String),
-    /// Build-number command failed.
-    #[error("build number failed: {0}")]
-    BuildNumber(String),
+    /// A git command failed.
+    #[error("git command failed: {0}")]
+    Git(String),
 }
 
-/// Read the configured version string.
-pub fn read_version(project_root: &Path, config: &VersionConfig) -> Result<String, VersionError> {
-    let path = project_root.join(&config.file);
-    let contents = std::fs::read_to_string(&path)?;
-    find_version_in_contents(&contents, &config.field)
-        .ok_or_else(|| VersionError::Parse(format!("field `{}` not found", config.field)))
+/// Detect the project's version file, checking Cargo.toml, then pyproject.toml,
+/// then package.json. Returns the first that exists.
+pub fn detect_version_file(project_root: &Path) -> Option<PathBuf> {
+    for name in ["Cargo.toml", "pyproject.toml", "package.json"] {
+        let path = project_root.join(name);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    None
 }
 
-/// Bump a semantic version component.
-pub fn bump(version: &str, component: &str) -> Result<String, VersionError> {
-    if component == "none" {
-        return Ok(version.to_string());
-    }
-    let core = version.split(['+', '-']).next().unwrap_or(version);
-    let mut parts = core
-        .split('.')
-        .map(|part| part.parse::<u64>())
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|err| VersionError::Parse(format!("invalid semver `{version}`: {err}")))?;
-    if parts.len() != 3 {
-        return Err(VersionError::Parse(format!(
-            "expected major.minor.patch, got `{version}`"
-        )));
-    }
-
-    match component {
-        "major" => {
-            parts[0] += 1;
-            parts[1] = 0;
-            parts[2] = 0;
-        }
-        "minor" => {
-            parts[1] += 1;
-            parts[2] = 0;
-        }
-        "patch" => parts[2] += 1,
-        other => {
-            return Err(VersionError::Parse(format!(
-                "unsupported bump component `{other}`"
-            )));
-        }
-    }
-    Ok(format!("{}.{}.{}", parts[0], parts[1], parts[2]))
-}
-
-/// Generate a build number from git commit count or current timestamp.
-pub fn build_number(project_root: &Path, config: &VersionConfig) -> Result<String, VersionError> {
-    match config.build_number.as_str() {
-        "git" => {
-            let output = Command::new("git")
-                .args(["rev-list", "--count", "HEAD"])
-                .current_dir(project_root)
-                .output()
-                .map_err(|err| VersionError::BuildNumber(err.to_string()))?;
-            if output.status.success() {
-                Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+/// The dotted field path that holds the version in a given file.
+fn field_for(path: &Path, contents: &str) -> &'static str {
+    match path.file_name().and_then(|n| n.to_str()) {
+        Some("Cargo.toml") => {
+            if contents.contains("[workspace.package]") {
+                "workspace.package.version"
             } else {
-                Err(VersionError::BuildNumber(
-                    String::from_utf8_lossy(&output.stderr).trim().to_string(),
-                ))
+                "package.version"
             }
         }
-        "timestamp" => match SystemTime::now().duration_since(UNIX_EPOCH) {
-            Ok(duration) => Ok(duration.as_secs().to_string()),
-            Err(err) => Err(VersionError::BuildNumber(err.to_string())),
-        },
-        other => Err(VersionError::BuildNumber(format!(
-            "unsupported build number source `{other}`"
-        ))),
+        Some("pyproject.toml") => "project.version",
+        Some("package.json") => "version",
+        _ => "version",
     }
 }
 
-/// Write the configured version string back to the configured file.
-pub fn write_version(
-    project_root: &Path,
-    config: &VersionConfig,
-    new_version: &str,
-) -> Result<PathBuf, VersionError> {
-    let path = project_root.join(&config.file);
+/// Read the MAJOR version component from a version file.
+pub fn read_major_version(path: &Path) -> Result<u32, VersionError> {
+    let contents = std::fs::read_to_string(path)?;
+    let field = field_for(path, &contents);
+    let version = find_version_in_contents(&contents, field)
+        .ok_or_else(|| VersionError::Parse(format!("field `{field}` not found in {path:?}")))?;
+    let major = version
+        .split(['.', '+', '-'])
+        .next()
+        .unwrap_or("0")
+        .parse::<u32>()
+        .map_err(|err| VersionError::Parse(format!("invalid major in `{version}`: {err}")))?;
+    Ok(major)
+}
+
+/// Count all git tags (the MINOR component).
+pub fn count_git_tags(project_root: &Path) -> Result<u32, VersionError> {
+    let output = Command::new("git")
+        .arg("tag")
+        .current_dir(project_root)
+        .output()
+        .map_err(|err| VersionError::Git(err.to_string()))?;
+    if !output.status.success() {
+        return Err(VersionError::Git(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
+    let count = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .count();
+    Ok(count as u32)
+}
+
+/// Count commits since the most recent tag (the PATCH component). If there are
+/// no tags yet, counts all commits reachable from HEAD.
+pub fn commits_since_last_minor_tag(project_root: &Path) -> Result<u32, VersionError> {
+    let last_tag = Command::new("git")
+        .args(["describe", "--tags", "--abbrev=0"])
+        .current_dir(project_root)
+        .output()
+        .map_err(|err| VersionError::Git(err.to_string()))?;
+
+    let range = if last_tag.status.success() {
+        let tag = String::from_utf8_lossy(&last_tag.stdout).trim().to_string();
+        format!("{tag}..HEAD")
+    } else {
+        "HEAD".to_string()
+    };
+
+    let output = Command::new("git")
+        .args(["rev-list", "--count", &range])
+        .current_dir(project_root)
+        .output()
+        .map_err(|err| VersionError::Git(err.to_string()))?;
+    if !output.status.success() {
+        // No commits yet (e.g. empty repo) → zero patch.
+        return Ok(0);
+    }
+    let count = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u32>()
+        .unwrap_or(0);
+    Ok(count)
+}
+
+/// Compute the full version: MAJOR from the version file, MINOR from the tag
+/// count, PATCH from commits since the last tag.
+pub fn compute_version(project_root: &Path) -> Result<Version, VersionError> {
+    let major = match detect_version_file(project_root) {
+        Some(path) => read_major_version(&path)?,
+        None => 0,
+    };
+    let minor = count_git_tags(project_root)?;
+    let patch = commits_since_last_minor_tag(project_root)?;
+    Ok(Version {
+        major,
+        minor,
+        patch,
+    })
+}
+
+/// Write `version` into the project's auto-detected version file.
+pub fn write_version(project_root: &Path, version: &Version) -> Result<PathBuf, VersionError> {
+    let path = detect_version_file(project_root)
+        .ok_or_else(|| VersionError::Parse("no version file found".into()))?;
     let contents = std::fs::read_to_string(&path)?;
-    let replaced = replace_version_in_contents(&contents, &config.field, new_version)
-        .ok_or_else(|| VersionError::Parse(format!("field `{}` not found", config.field)))?;
+    let field = field_for(&path, &contents);
+    let replaced = replace_version_in_contents(&contents, field, &version.to_string())
+        .ok_or_else(|| VersionError::Parse(format!("field `{field}` not found")))?;
     std::fs::write(&path, replaced)?;
     Ok(path)
 }
 
 /// Split a dotted field path into its TOML section path and the final key.
-///
-/// `workspace.package.version` -> (`workspace.package`, `version`), matching the
-/// `[workspace.package]` table header. A field with no dot (e.g. `version`)
-/// targets the root/top-level scope, which is also how flat YAML files behave.
 fn split_field(field: &str) -> (&str, &str) {
     match field.rsplit_once('.') {
         Some((section, key)) => (section, key),
@@ -118,9 +174,6 @@ fn split_field(field: &str) -> (&str, &str) {
 }
 
 /// Return the dotted table path for a TOML section header line, if any.
-///
-/// `[workspace.package]` -> `workspace.package`. Returns `None` for non-header
-/// lines so the caller leaves the current section untouched.
 fn parse_section_header(trimmed: &str) -> Option<&str> {
     let inner = trimmed.strip_prefix('[')?.strip_suffix(']')?;
     Some(inner.trim())
@@ -139,7 +192,6 @@ fn find_version_in_contents(contents: &str, field: &str) -> Option<String> {
             continue;
         }
         if let Some((lhs, value)) = trimmed.split_once(['=', ':']) {
-            // Strip JSON-style quotes from the key (e.g., `"version": "1.0"`)
             let lhs_key = lhs.trim().trim_matches('"').trim_matches('\'');
             if lhs_key != key {
                 continue;
@@ -201,258 +253,140 @@ mod tests {
     use super::*;
     use std::process::Command;
 
-    fn version_config(file: &str, field: &str) -> VersionConfig {
-        VersionConfig {
-            scheme: "semver".into(),
-            file: file.into(),
-            field: field.into(),
-            build_number: "git".into(),
-        }
+    fn git(root: &Path, args: &[&str]) {
+        let ok = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    fn init_repo(root: &Path) {
+        git(root, &["init", "-q"]);
+        git(root, &["config", "user.email", "test@example.com"]);
+        git(root, &["config", "user.name", "Test"]);
+        git(root, &["config", "commit.gpgsign", "false"]);
+        git(root, &["config", "tag.gpgsign", "false"]);
+        git(root, &["config", "core.hooksPath", "/dev/null"]);
+    }
+
+    fn commit(root: &Path, name: &str) {
+        std::fs::write(root.join(name), name).unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-q", "-m", &format!("add {name}")]);
     }
 
     #[test]
-    fn bumps_semver_components() {
-        assert_eq!(bump("1.2.3", "patch").expect("patch"), "1.2.4");
-        assert_eq!(bump("1.2.3", "minor").expect("minor"), "1.3.0");
-        assert_eq!(bump("1.2.3", "major").expect("major"), "2.0.0");
-    }
-
-    #[test]
-    fn bump_strips_prerelease_and_build_metadata() {
-        assert_eq!(bump("1.2.3-rc.1", "patch").expect("patch"), "1.2.4");
-        assert_eq!(bump("1.2.3+build.9", "minor").expect("minor"), "1.3.0");
-    }
-
-    #[test]
-    fn bump_none_is_identity() {
-        assert_eq!(bump("1.2.3", "none").expect("none"), "1.2.3");
-        // "none" short-circuits before any parsing.
-        assert_eq!(
-            bump("not-a-version", "none").expect("none"),
-            "not-a-version"
+    fn detect_prefers_cargo_then_pyproject_then_package_json() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(detect_version_file(dir.path()).is_none());
+        std::fs::write(dir.path().join("package.json"), "{\"version\":\"1.0.0\"}").unwrap();
+        assert!(
+            detect_version_file(dir.path())
+                .unwrap()
+                .ends_with("package.json")
+        );
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nversion=\"1.0.0\"",
+        )
+        .unwrap();
+        assert!(
+            detect_version_file(dir.path())
+                .unwrap()
+                .ends_with("Cargo.toml")
         );
     }
 
     #[test]
-    fn bump_rejects_non_numeric_parts() {
-        assert!(bump("1.x.3", "patch").is_err());
-    }
-
-    #[test]
-    fn bump_rejects_wrong_part_count() {
-        assert!(bump("1.2", "patch").is_err());
-        assert!(bump("1.2.3.4", "patch").is_err());
-    }
-
-    #[test]
-    fn bump_rejects_unknown_component() {
-        let err = bump("1.2.3", "epoch").unwrap_err();
-        assert!(err.to_string().contains("epoch"));
-    }
-
-    #[test]
-    fn read_version_from_toml_style_field() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("Cargo.toml"),
-            "[package]\nname = \"x\"\nversion = \"0.5.0\"\n",
-        )
-        .unwrap();
-        let cfg = version_config("Cargo.toml", "package.version");
-        assert_eq!(read_version(dir.path(), &cfg).unwrap(), "0.5.0");
-    }
-
-    /// A workspace root Cargo.toml: version lives under `[workspace.package]`,
-    /// and `[workspace.dependencies]` carries unrelated inline `version` keys.
-    const WORKSPACE_CARGO_TOML: &str = "\
-[workspace]
-members = [\"crates/core\"]
-
-[workspace.package]
-version = \"0.5.0\"
-edition = \"2024\"
-
-[workspace.dependencies]
-serde = { version = \"1\", features = [\"derive\"] }
-clap = \"4\"
-";
-
-    #[test]
-    fn read_version_from_workspace_package_section() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("Cargo.toml"), WORKSPACE_CARGO_TOML).unwrap();
-        let cfg = version_config("Cargo.toml", "workspace.package.version");
-        // Must return the workspace package version, not a dependency's version.
-        assert_eq!(read_version(dir.path(), &cfg).unwrap(), "0.5.0");
-    }
-
-    #[test]
-    fn read_version_ignores_dependency_versions_in_wrong_section() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("Cargo.toml"), WORKSPACE_CARGO_TOML).unwrap();
-        // Asking for a non-existent root [package] version must not fall through
-        // to the dependency `version = "1"` line.
-        let cfg = version_config("Cargo.toml", "package.version");
-        assert!(matches!(
-            read_version(dir.path(), &cfg).unwrap_err(),
-            VersionError::Parse(_)
-        ));
-    }
-
-    #[test]
-    fn write_version_in_workspace_package_leaves_dependencies_intact() {
+    fn read_major_from_workspace_package() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("Cargo.toml");
-        std::fs::write(&file, WORKSPACE_CARGO_TOML).unwrap();
-        let cfg = version_config("Cargo.toml", "workspace.package.version");
-
-        write_version(dir.path(), &cfg, "0.6.0").unwrap();
-        let contents = std::fs::read_to_string(&file).unwrap();
-
-        assert!(contents.contains("version = \"0.6.0\""));
-        // The dependency pin must be untouched.
-        assert!(contents.contains("serde = { version = \"1\""));
-        assert_eq!(read_version(dir.path(), &cfg).unwrap(), "0.6.0");
-    }
-
-    #[test]
-    fn read_version_from_root_package_section() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("Cargo.toml"),
-            "[package]\nname = \"x\"\nversion = \"1.2.3\"\n\n[dependencies]\nserde = \"1\"\n",
-        )
-        .unwrap();
-        let cfg = version_config("Cargo.toml", "package.version");
-        assert_eq!(read_version(dir.path(), &cfg).unwrap(), "1.2.3");
-    }
-
-    #[test]
-    fn read_version_from_yaml_style_field() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("info.yaml"), "name: x\nversion: 1.4.2\n").unwrap();
-        let cfg = version_config("info.yaml", "version");
-        assert_eq!(read_version(dir.path(), &cfg).unwrap(), "1.4.2");
-    }
-
-    #[test]
-    fn read_version_errors_when_field_missing() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
-        let cfg = version_config("Cargo.toml", "package.version");
-        let err = read_version(dir.path(), &cfg).unwrap_err();
-        assert!(matches!(err, VersionError::Parse(_)));
-    }
-
-    #[test]
-    fn read_version_errors_when_file_missing() {
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = version_config("nope.toml", "version");
-        assert!(matches!(
-            read_version(dir.path(), &cfg).unwrap_err(),
-            VersionError::Io(_)
-        ));
-    }
-
-    #[test]
-    fn write_version_replaces_and_preserves_quote_style() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("Cargo.toml");
-        std::fs::write(&file, "[package]\nversion = \"0.5.0\"\n").unwrap();
-        let cfg = version_config("Cargo.toml", "package.version");
-
-        let written = write_version(dir.path(), &cfg, "0.6.0").unwrap();
-        assert_eq!(written, file);
-
-        let contents = std::fs::read_to_string(&file).unwrap();
-        assert!(contents.contains("version = \"0.6.0\""));
-        // Round-trips: reading back gives the new version.
-        assert_eq!(read_version(dir.path(), &cfg).unwrap(), "0.6.0");
-    }
-
-    #[test]
-    fn write_version_handles_yaml_colon_field() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("info.yaml");
-        std::fs::write(&file, "version: 1.0.0\n").unwrap();
-        let cfg = version_config("info.yaml", "version");
-
-        write_version(dir.path(), &cfg, "1.0.1").unwrap();
-        let contents = std::fs::read_to_string(&file).unwrap();
-        assert!(contents.contains("version: 1.0.1"));
-    }
-
-    #[test]
-    fn write_version_errors_when_field_missing() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
-        let cfg = version_config("Cargo.toml", "package.version");
-        assert!(matches!(
-            write_version(dir.path(), &cfg, "1.0.0").unwrap_err(),
-            VersionError::Parse(_)
-        ));
-    }
-
-    #[test]
-    fn read_and_write_package_json_version() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("package.json");
         std::fs::write(
             &file,
-            "{\n  \"name\": \"myapp\",\n  \"version\": \"2.1.0\"\n}\n",
+            "[workspace.package]\nversion = \"2.5.7\"\nedition = \"2024\"\n",
         )
         .unwrap();
-        let cfg = version_config("package.json", "version");
-        assert_eq!(read_version(dir.path(), &cfg).unwrap(), "2.1.0");
-        write_version(dir.path(), &cfg, "3.0.0").unwrap();
-        let contents = std::fs::read_to_string(&file).unwrap();
-        assert!(contents.contains("\"version\": \"3.0.0\""));
-        assert_eq!(read_version(dir.path(), &cfg).unwrap(), "3.0.0");
+        assert_eq!(read_major_version(&file).unwrap(), 2);
     }
 
     #[test]
-    fn build_number_timestamp_is_numeric() {
+    fn read_major_from_package_json() {
         let dir = tempfile::tempdir().unwrap();
-        let mut cfg = version_config("Cargo.toml", "version");
-        cfg.build_number = "timestamp".into();
-        let out = build_number(dir.path(), &cfg).unwrap();
-        assert!(out.parse::<u64>().is_ok());
-        assert!(out.parse::<u64>().unwrap() > 0);
+        let file = dir.path().join("package.json");
+        std::fs::write(&file, "{\n  \"version\": \"3.1.0\"\n}\n").unwrap();
+        assert_eq!(read_major_version(&file).unwrap(), 3);
     }
 
     #[test]
-    fn build_number_rejects_unknown_source() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut cfg = version_config("Cargo.toml", "version");
-        cfg.build_number = "moon-phase".into();
-        let err = build_number(dir.path(), &cfg).unwrap_err();
-        assert!(err.to_string().contains("moon-phase"));
-    }
-
-    #[test]
-    fn build_number_git_counts_commits() {
+    fn count_tags_and_commits_drive_minor_and_patch() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let run = |args: &[&str]| {
-            let ok = Command::new("git")
-                .args(args)
-                .current_dir(root)
-                .output()
-                .unwrap()
-                .status
-                .success();
-            assert!(ok, "git {args:?} failed");
-        };
-        run(&["init", "-q"]);
-        run(&["config", "user.email", "test@example.com"]);
-        run(&["config", "user.name", "Test"]);
-        run(&["config", "core.hooksPath", "/dev/null"]);
-        run(&["config", "commit.gpgsign", "false"]);
-        std::fs::write(root.join("a.txt"), "hi").unwrap();
-        run(&["add", "."]);
-        run(&["commit", "-q", "-m", "first"]);
+        init_repo(root);
+        std::fs::write(root.join("Cargo.toml"), "[package]\nversion = \"2.0.0\"\n").unwrap();
+        commit(root, "a.txt");
+        // No tags yet → minor 0, patch counts all commits.
+        assert_eq!(count_git_tags(root).unwrap(), 0);
+        let v = compute_version(root).unwrap();
+        assert_eq!(v.major, 2);
+        assert_eq!(v.minor, 0);
+        assert!(v.patch >= 1);
 
-        let cfg = version_config("Cargo.toml", "version");
-        assert_eq!(build_number(root, &cfg).unwrap(), "1");
+        git(root, &["tag", "v2.0.0"]);
+        commit(root, "b.txt");
+        commit(root, "c.txt");
+        assert_eq!(count_git_tags(root).unwrap(), 1);
+        assert_eq!(commits_since_last_minor_tag(root).unwrap(), 2);
+
+        let v = compute_version(root).unwrap();
+        assert_eq!(
+            v,
+            Version {
+                major: 2,
+                minor: 1,
+                patch: 2
+            }
+        );
+        assert_eq!(v.to_string(), "2.1.2");
+    }
+
+    #[test]
+    fn write_version_replaces_in_cargo_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let path = write_version(
+            dir.path(),
+            &Version {
+                major: 2,
+                minor: 3,
+                patch: 4,
+            },
+        )
+        .unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("version = \"2.3.4\""));
+    }
+
+    #[test]
+    fn write_version_errors_without_version_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            write_version(
+                dir.path(),
+                &Version {
+                    major: 1,
+                    minor: 0,
+                    patch: 0
+                }
+            ),
+            Err(VersionError::Parse(_))
+        ));
     }
 }

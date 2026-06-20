@@ -364,6 +364,12 @@ pub fn stdout_path(project_root: &Path, phase: u32) -> PathBuf {
     devflow_dir(project_root).join(format!("phase-{:02}-stdout", phase))
 }
 
+/// Path where the agent's stderr is captured for a given phase.
+/// Lives alongside `stdout_path` under `.devflow/`.
+pub fn stderr_path(project_root: &Path, phase: u32) -> PathBuf {
+    devflow_dir(project_root).join(format!("phase-{phase:02}-stderr.log"))
+}
+
 /// Path to the exit code file for a given phase.
 pub fn exit_code_path(project_root: &Path, phase: u32) -> PathBuf {
     devflow_dir(project_root).join(format!("phase-{:02}-exit", phase))
@@ -385,12 +391,14 @@ pub fn cleanup_phase_files(project_root: &Path, phase: u32) {
 mod tests {
     use super::*;
     use crate::config::GitFlowConfig;
+    use crate::mode::Mode;
+    use crate::stage::Stage;
     use crate::state::{Agent, State};
     use std::process::Command;
 
     fn state_in(root: &Path, phase: u32) -> State {
-        let mut state = State::new(phase, Agent::Claude, root.to_path_buf());
-        state.step = crate::state::Step::Executing;
+        let mut state = State::new(phase, Agent::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
         state
     }
 

@@ -34,11 +34,12 @@ pub enum AgentError {
 pub fn launch_agent(
     agent: &dyn crate::agents::Agent,
     phase: u32,
+    prompt: &str,
     workdir: &Path,
 ) -> Result<(Child, u32), AgentError> {
     let root = workdir.to_str().ok_or(AgentError::NonUtf8Path)?;
 
-    let (program, args) = agent.exec_command(phase);
+    let (program, args) = agent.exec_command(phase, prompt);
 
     let child = Command::new(program)
         .args(&args)

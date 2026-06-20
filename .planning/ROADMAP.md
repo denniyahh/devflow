@@ -2,18 +2,20 @@
 
 > Phase plan source of truth. Each phase drives a `devflow start` agent session.
 
-## v1.3.0 (Phase 10–12)
+## v2.0.0 (Phase 11–13)
 
 | Phase | Name | Status |
 |---|---|---|
-| 10 | Logging + Planning Step | To Do |
-| 11 | Branching & Merge Scheme + Dev Container | To Do |
-| 12 | Hermes Adapter | To Do |
+| 11 | Refactor to GSD-Native Architecture | In Review |
+| 11r | Remediation Sprint (fix 5 criticals from Phase 11 review) | Ready |
+| 12 | Bootstrap + Housekeeping | Scoped |
+| 13 | OSS Readiness + Hermes Plugin | Scoped |
 
 ## Shipped
 
 | Phase | Name | Version |
 |---|---|---|
+| 10 | Logging + Planning Step | — |
 | 9 | Open-Source Polish | 1.2.0 |
 | 8 | Docs & Onboarding | 1.0.1 |
 | 7 | Worktrees & PR Integration | 1.0.0 |
@@ -22,9 +24,8 @@
 
 ## Reorganized (June 2026)
 
-Phase planning was restructured after OSS polish (Phase 9):
-
-- **Conventional commits deprecated** — replaced by per-phase branching and merge scheme (Phase 11).
-- **Phase 10 recast** from original scope to logging infrastructure + planning workflow step.
-- **Hermes adapter deferred** from Phase 10 to Phase 12.
-- **Dev container floats** — Phase 11 if capacity, otherwise Phase 13.
+- **Conventional commits deprecated** — no commit-message-based versioning
+- **Phase 10 shipped** — logging + Planning step (Planning known bug, addressed in Phase 11 refactor)
+- **Phase 11 recast** — full architecture refactor to GSD-native execution engine
+- **Phase 12** — Bootstrap (new-project, map-codebase) + versioning automation
+- **Phase 13** — OSS readiness (dev container, contributing, CI) + Hermes plugin + Hermes/Antigravity adapters

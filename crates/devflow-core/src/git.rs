@@ -37,11 +37,12 @@ pub struct BranchInfo {
 }
 
 impl GitFlow {
-    /// Create a git-flow helper for a project root.
-    pub fn new(root: impl AsRef<Path>, config: GitFlowConfig) -> Self {
+    /// Create a git-flow helper for a project root, using the hardcoded
+    /// git-flow constants (`main`, `develop`, `feature/`).
+    pub fn new(root: impl AsRef<Path>) -> Self {
         Self {
             root: root.as_ref().to_path_buf(),
-            config,
+            config: GitFlowConfig::default(),
         }
     }
 
@@ -100,6 +101,12 @@ impl GitFlow {
         self.git(["merge", "--no-ff", &branch])?;
         self.git(["branch", "-d", &branch])?;
         Ok(branch)
+    }
+
+    /// Create an annotated-free lightweight tag at the current `HEAD`.
+    pub fn tag(&self, tag: &str) -> Result<(), GitError> {
+        info!("tagging {tag}");
+        self.git(["tag", tag])
     }
 
     /// Delete a single local branch.
@@ -423,7 +430,7 @@ mod tests {
     }
 
     fn flow(root: &Path) -> GitFlow {
-        GitFlow::new(root, GitFlowConfig::default())
+        GitFlow::new(root)
     }
 
     #[test]
