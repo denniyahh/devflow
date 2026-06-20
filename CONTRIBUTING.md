@@ -93,14 +93,10 @@ test, or pass CI.
 
 ## Commit Conventions
 
-We use conventional commits:
-
-- `feat:` — new feature
-- `fix:` — bug fix
-- `docs:` — documentation
-- `test:` — tests
-- `refactor:` — code change that neither fixes a bug nor adds a feature
-- `chore:` — maintenance, CI, tooling
+**Deprecated — June 2026.** The conventional commits model is being replaced by a
+per-phase branching and merge scheme (Phase 11). Until then, write descriptive
+commit messages that explain what changed and why, without a required prefix
+format.
 
 ## Architecture
 
