@@ -29,7 +29,8 @@ pub struct State {
     pub gate_pending: bool,
     /// Consecutive Validate failures in this session — drives the Auto-mode
     /// forced gate after [`crate::mode::MAX_CONSECUTIVE_FAILURES`] failures.
-    #[serde(default)]
+    /// Not persisted: always starts at 0 on monitor restart (runtime-only).
+    #[serde(skip)]
     pub consecutive_failures: u32,
     /// When the phase started (Unix seconds).
     pub started_at: String,
@@ -112,14 +113,6 @@ impl State {
         }
     }
 
-    /// Advance to the next stage. Returns the new stage, or `None` if already at
-    /// the terminal [`Stage::Ship`].
-    #[tracing::instrument(skip(self))]
-    pub fn advance(&mut self) -> Option<Stage> {
-        let next = self.stage.next()?;
-        self.stage = next;
-        Some(next)
-    }
 }
 
 fn timestamp_now() -> String {
@@ -174,15 +167,6 @@ mod tests {
     }
 
     #[test]
-    fn advance_walks_chain_then_returns_none_at_terminal() {
-        let mut state = State::new(1, Agent::Claude, Mode::Auto, PathBuf::from("/repo"));
-        assert_eq!(state.advance(), Some(Stage::Plan));
-        state.stage = Stage::Ship;
-        assert_eq!(state.advance(), None);
-        assert_eq!(state.stage, Stage::Ship);
-    }
-
-    #[test]
     fn state_serde_round_trips() {
         let state = State::new(9, Agent::Codex, Mode::Supervise, PathBuf::from("/repo"));
         let json = serde_json::to_string(&state).unwrap();
@@ -191,5 +175,21 @@ mod tests {
         assert_eq!(back.agent, Agent::Codex);
         assert_eq!(back.stage, Stage::Define);
         assert_eq!(back.mode, Mode::Supervise);
+    }
+
+    #[test]
+    fn consecutive_failures_is_runtime_only_not_persisted() {
+        let mut state = State::new(1, Agent::Claude, Mode::Auto, PathBuf::from("/repo"));
+        state.consecutive_failures = 7;
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(
+            !json.contains("consecutive_failures"),
+            "runtime-only field must not appear in persisted JSON"
+        );
+        let loaded: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            loaded.consecutive_failures, 0,
+            "consecutive_failures must reset to 0 on state load"
+        );
     }
 }
