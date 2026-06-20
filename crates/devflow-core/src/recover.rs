@@ -51,7 +51,7 @@ pub fn inspect(project_root: &Path) -> Result<RecoveryStatus, RecoverError> {
         Err(err) => return Err(err.into()),
     };
 
-    let agent_running = state.agent_pid.is_some_and(crate::agent::agent_running);
+    let agent_running = agent_pid_for(&state).is_some_and(crate::agent::agent_running);
     let is_stale = is_stale_state(&state);
     let age = format_age(state.started_at.as_str());
     let lock_held = crate::lock::holder(project_root).map(|(pid, _)| pid);
@@ -89,13 +89,20 @@ pub fn is_stale_state(state: &State) -> bool {
     }
 
     // Only stale if the agent process is gone
-    if let Some(pid) = state.agent_pid
+    if let Some(pid) = agent_pid_for(state)
         && crate::agent::agent_running(pid)
     {
         return false;
     }
 
     true
+}
+
+/// Read the launched agent PID the monitor recorded for this state's phase, if
+/// the pid file is present and parseable.
+fn agent_pid_for(state: &State) -> Option<u32> {
+    let path = crate::agent_result::agent_pid_path(&state.project_root, state.phase);
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 /// Compute the age of a state's `started_at` timestamp in seconds.
@@ -122,18 +129,23 @@ fn format_age(started_at: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mode::Mode;
     use crate::state::{Agent, State};
-    use std::path::PathBuf;
 
-    /// Build a state whose `started_at` is `age_secs` in the past.
-    fn state_aged(age_secs: u64, agent_pid: Option<u32>) -> State {
+    /// Build a state in `root` whose `started_at` is `age_secs` in the past,
+    /// optionally writing the monitor's agent-pid file with `agent_pid`.
+    fn state_aged(root: &Path, age_secs: u64, agent_pid: Option<u32>) -> State {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let mut state = State::new(1, Agent::Claude, PathBuf::from("/tmp/project"));
+        let mut state = State::new(1, Agent::Claude, Mode::Auto, root.to_path_buf());
         state.started_at = now.saturating_sub(age_secs).to_string();
-        state.agent_pid = agent_pid;
+        if let Some(pid) = agent_pid {
+            let path = crate::agent_result::agent_pid_path(root, state.phase);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, pid.to_string()).unwrap();
+        }
         state
     }
 
@@ -143,33 +155,38 @@ mod tests {
     #[test]
     fn fresh_state_is_not_stale() {
         // One hour old, well under the 24h threshold.
-        let state = state_aged(3600, None);
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_aged(dir.path(), 3600, None);
         assert!(!is_stale_state(&state));
     }
 
     #[test]
     fn old_state_with_no_agent_is_stale() {
-        let state = state_aged(STALE_THRESHOLD.as_secs() + 60, None);
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_aged(dir.path(), STALE_THRESHOLD.as_secs() + 60, None);
         assert!(is_stale_state(&state));
     }
 
     #[test]
     fn old_state_with_dead_agent_is_stale() {
-        let state = state_aged(STALE_THRESHOLD.as_secs() + 60, Some(DEAD_PID));
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_aged(dir.path(), STALE_THRESHOLD.as_secs() + 60, Some(DEAD_PID));
         assert!(is_stale_state(&state));
     }
 
     #[test]
     fn old_state_with_live_agent_is_not_stale() {
         // Our own PID is guaranteed to be running.
+        let dir = tempfile::tempdir().unwrap();
         let own_pid = std::process::id();
-        let state = state_aged(STALE_THRESHOLD.as_secs() + 60, Some(own_pid));
+        let state = state_aged(dir.path(), STALE_THRESHOLD.as_secs() + 60, Some(own_pid));
         assert!(!is_stale_state(&state));
     }
 
     #[test]
     fn unparseable_timestamp_is_never_stale() {
-        let mut state = State::new(1, Agent::Claude, PathBuf::from("/tmp/project"));
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::new(1, Agent::Claude, Mode::Auto, dir.path().to_path_buf());
         state.started_at = "not-a-number".into();
         assert!(!is_stale_state(&state));
         assert_eq!(state_age_secs(&state.started_at), None);
