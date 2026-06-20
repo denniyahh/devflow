@@ -1,0 +1,62 @@
+/* Mermaid diagram full-screen maximize */
+.mermaid {
+  cursor: pointer;
+  position: relative;
+  transition: opacity 0.2s;
+}
+
+.mermaid::after {
+  content: "⛶";
+  position: absolute;
+  top: 4px;
+  right: 8px;
+  font-size: 14px;
+  opacity: 0;
+  transition: opacity 0.2s;
+  pointer-events: none;
+}
+
+.mermaid:hover::after {
+  opacity: 0.6;
+}
+
+.mermaid.maximized {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  z-index: 9999;
+  background: var(--md-default-bg-color, #fff);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: auto;
+  padding: 2rem;
+  cursor: zoom-out;
+}
+
+.mermaid.maximized svg {
+  max-width: 95vw;
+  max-height: 90vh;
+  width: auto;
+  height: auto;
+}
+
+/* dim backdrop */
+.mermaid-backdrop {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 9998;
+}
+
+.mermaid-backdrop.active {
+  display: block;
+}
+
+/* hide max-width clamp when maximized */
+.mermaid.maximized > svg {
+  max-width: none !important;
+}
