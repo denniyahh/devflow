@@ -55,18 +55,23 @@ pub mod agent;
 pub mod agent_result;
 pub mod agents;
 pub mod config;
+pub mod gates;
 pub mod git;
+pub mod hooks;
 pub mod lock;
+pub mod mode;
 pub mod monitor;
+pub mod prompt;
 pub mod recover;
 pub mod ship;
+pub mod stage;
 pub mod state;
-pub mod verify;
 pub mod version;
 pub mod workflow;
 pub mod worktree;
 
 // Re-exports for convenience.
 pub use agent::launch_agent;
-pub use config::Config;
-pub use state::{Agent, AgentKind, State, Step};
+pub use mode::Mode;
+pub use stage::Stage;
+pub use state::{Agent, AgentKind, State};
