@@ -512,9 +512,9 @@ fn run_gate(
     );
     match Gates::poll_response(project_root, state.phase, stage, GATE_TIMEOUT_SECS) {
         Some(response) => {
-            Gates::ack(project_root, state.phase, stage)?;
             state.gate_pending = false;
             workflow::save_state(state)?;
+            Gates::ack(project_root, state.phase, stage)?;
             Ok(GateAction::from_response(&response))
         }
         None => Err(CliError::Message(format!(
