@@ -2,7 +2,7 @@
 //!
 //! Spawns a detached child process that *owns* the coding agent: it launches
 //! the agent, captures its stdout and exit code into `.devflow/`, and — when
-//! the agent exits — runs `devflow check` to advance the state machine.
+//! the agent exits — runs `devflow advance` to advance the stage machine.
 //!
 //! Owning the agent is the key fix over a CLI-scoped capture thread: because
 //! the monitor outlives `devflow start`, the agent's stdout keeps flowing into
@@ -37,7 +37,7 @@ pub enum MonitorError {
 /// 1. Launches the agent (`program` + `args`) with stdout redirected to the
 ///    phase stdout file, recording the agent PID to the agent-pid file
 /// 2. Waits for the agent to exit and records its exit code to the exit file
-/// 3. Runs `devflow check` to advance the workflow through its remaining steps
+/// 3. Runs `devflow advance` to advance the workflow through its remaining stages
 ///
 /// Returns the PID of the spawned monitor.
 pub fn spawn_monitor(state: &State, program: &str, args: &[String]) -> Result<u32, MonitorError> {
@@ -95,6 +95,9 @@ pub fn spawn_monitor(state: &State, program: &str, args: &[String]) -> Result<u3
     // stderr is discarded so it cannot corrupt the (possibly JSON) stdout
     // capture that DevFlow parses for DEVFLOW_RESULT.
     //
+    // `devflow advance` evaluates the agent result, moves the stage machine
+    // forward, and (for an agent stage) spawns the next monitor itself.
+    //
     // Traps SIGTERM and SIGINT for clean shutdown.
     let script = format!(
         "cleanup() {{ exit 0; }}; trap cleanup TERM INT; \
@@ -102,11 +105,7 @@ pub fn spawn_monitor(state: &State, program: &str, args: &[String]) -> Result<u3
          {agent_cmd} > {stdout_file} 2>/dev/null & \
          apid=$!; echo $apid > {pid_file}; \
          wait $apid; echo $? > {exit_file}; \
-         {binary} check {project_root}; \
-         {binary} check {project_root}; \
-         {binary} check {project_root}; \
-         {binary} check {project_root}; \
-         {binary} check {project_root}",
+         {binary} advance {project_root}",
         agent_cmd = agent_cmd,
         workdir = shell_escape(workdir),
         stdout_file = shell_escape(stdout_file),
@@ -156,11 +155,13 @@ fn shell_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mode::Mode;
+    use crate::stage::Stage;
     use crate::state::{Agent, State};
 
     fn state_in(root: &Path) -> State {
-        let mut state = State::new(4, Agent::Claude, root.to_path_buf());
-        state.step = crate::state::Step::Executing;
+        let mut state = State::new(4, Agent::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
         state
     }
 
