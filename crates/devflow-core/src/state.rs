@@ -27,10 +27,10 @@ pub struct State {
     /// Whether a gate has been written and is awaiting a human response.
     #[serde(default)]
     pub gate_pending: bool,
-    /// Consecutive Validate failures in this session — drives the Auto-mode
-    /// forced gate after [`crate::mode::MAX_CONSECUTIVE_FAILURES`] failures.
-    /// Not persisted: always starts at 0 on monitor restart (runtime-only).
-    #[serde(skip)]
+    /// Consecutive Validate failures — drives the Auto-mode forced gate after
+    /// [`crate::mode::MAX_CONSECUTIVE_FAILURES`] failures. Persisted across
+    /// `devflow advance` invocations so the counter survives monitor restarts.
+    #[serde(default)]
     pub consecutive_failures: u32,
     /// When the phase started (Unix seconds).
     pub started_at: String,
@@ -178,18 +178,18 @@ mod tests {
     }
 
     #[test]
-    fn consecutive_failures_is_runtime_only_not_persisted() {
+    fn consecutive_failures_persists_across_advance_calls() {
         let mut state = State::new(1, Agent::Claude, Mode::Auto, PathBuf::from("/repo"));
-        state.consecutive_failures = 7;
+        state.consecutive_failures = 3;
         let json = serde_json::to_string(&state).unwrap();
         assert!(
-            !json.contains("consecutive_failures"),
-            "runtime-only field must not appear in persisted JSON"
+            json.contains("consecutive_failures"),
+            "consecutive_failures must appear in persisted JSON"
         );
         let loaded: State = serde_json::from_str(&json).unwrap();
         assert_eq!(
-            loaded.consecutive_failures, 0,
-            "consecutive_failures must reset to 0 on state load"
+            loaded.consecutive_failures, 3,
+            "consecutive_failures must round-trip through serde"
         );
     }
 }
