@@ -112,7 +112,6 @@ impl State {
             agent_stdout_path: None,
         }
     }
-
 }
 
 fn timestamp_now() -> String {
