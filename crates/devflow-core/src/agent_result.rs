@@ -385,12 +385,14 @@ pub fn cleanup_phase_files(project_root: &Path, phase: u32) {
 mod tests {
     use super::*;
     use crate::config::GitFlowConfig;
+    use crate::mode::Mode;
+    use crate::stage::Stage;
     use crate::state::{Agent, State};
     use std::process::Command;
 
     fn state_in(root: &Path, phase: u32) -> State {
-        let mut state = State::new(phase, Agent::Claude, root.to_path_buf());
-        state.step = crate::state::Step::Executing;
+        let mut state = State::new(phase, Agent::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
         state
     }
 
