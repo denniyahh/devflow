@@ -12,13 +12,12 @@ impl Agent for ClaudeAgent {
         "Claude Code"
     }
 
-    fn exec_command(&self, phase: u32) -> (&'static str, Vec<String>) {
-        let prompt = super::phase_prompt(phase);
+    fn exec_command(&self, _phase: u32, prompt: &str) -> (&'static str, Vec<String>) {
         (
             "claude",
             vec![
                 "-p".into(),
-                prompt,
+                prompt.to_string(),
                 "--output-format".into(),
                 "json".into(),
                 "--dangerously-skip-permissions".into(),

@@ -11,7 +11,7 @@ impl Agent for CodexAgent {
         "OpenAI Codex"
     }
 
-    fn exec_command(&self, phase: u32) -> (&'static str, Vec<String>) {
+    fn exec_command(&self, _phase: u32, prompt: &str) -> (&'static str, Vec<String>) {
         (
             "codex",
             vec![
@@ -19,7 +19,7 @@ impl Agent for CodexAgent {
                 "--sandbox".into(),
                 "workspace-write".into(),
                 "--json".into(),
-                super::phase_prompt(phase),
+                prompt.to_string(),
             ],
         )
     }
