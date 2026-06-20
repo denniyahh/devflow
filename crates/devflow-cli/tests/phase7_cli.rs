@@ -186,9 +186,14 @@ fn parallel_creates_two_worktrees_and_spawns_two_monitors() {
             > 0
     );
 
+    let phase7_stdout = root.join(".devflow/phase-07-stdout");
+    let phase8_stdout = root.join(".devflow/phase-08-stdout");
+    wait_for(&phase7_stdout);
+    wait_for(&phase8_stdout);
+
     assert!(root.join(".devflow/state.json").exists());
-    assert!(root.join(".devflow/phase-07-stdout").exists());
-    assert!(root.join(".devflow/phase-08-stdout").exists());
+    assert!(phase7_stdout.exists());
+    assert!(phase8_stdout.exists());
 }
 
 #[test]
