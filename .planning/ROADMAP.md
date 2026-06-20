@@ -6,7 +6,8 @@
 
 | Phase | Name | Status |
 |---|---|---|
-| 11 | Refactor to GSD-Native Architecture | Planned |
+| 11 | Refactor to GSD-Native Architecture | In Review |
+| 11r | Remediation Sprint (fix 5 criticals from Phase 11 review) | Ready |
 | 12 | Bootstrap + Housekeeping | Scoped |
 | 13 | OSS Readiness + Hermes Plugin | Scoped |
 
