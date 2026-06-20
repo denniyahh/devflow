@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use devflow_core::agent;
 use devflow_core::config::{DEVELOP, FEATURE_PREFIX, GitFlowConfig};
-use devflow_core::gates::{self, GateAction, Gates};
+use devflow_core::gates::{GateAction, Gates};
 use devflow_core::git::GitFlow;
 use devflow_core::hooks::{self, HookContext};
 use devflow_core::mode::{self, Mode};
@@ -217,7 +217,13 @@ fn run() -> Result<(), CliError> {
             mode,
             force,
             project,
-        } => parallel(&project_root(project)?, &phases, agents.as_deref(), mode, force),
+        } => parallel(
+            &project_root(project)?,
+            &phases,
+            agents.as_deref(),
+            mode,
+            force,
+        ),
         Command::Sequentagent {
             phase,
             agents,
@@ -312,8 +318,7 @@ fn start(
 /// monitor calls `devflow advance` when the agent exits. An optional
 /// `prompt_override` is used for Code loop-backs (fix prompts).
 fn launch_stage(state: &State, prompt_override: Option<String>) -> Result<(), CliError> {
-    let prompt =
-        prompt_override.unwrap_or_else(|| prompt::stage_prompt(state.stage, state.phase));
+    let prompt = prompt_override.unwrap_or_else(|| prompt::stage_prompt(state.stage, state.phase));
     let adapter = agents::adapter_for(state.agent);
     let (program, args) = adapter.exec_command(state.phase, &prompt);
 
@@ -351,7 +356,10 @@ fn advance(project_root: &Path) -> Result<(), CliError> {
         println!("  detail: {reason}");
     }
 
-    let failed = matches!(result.status, AgentStatus::Failed | AgentStatus::RateLimited);
+    let failed = matches!(
+        result.status,
+        AgentStatus::Failed | AgentStatus::RateLimited
+    );
     if failed {
         return match stage {
             // Validate failures drive the Code↔Validate loop (or a gate).
@@ -359,7 +367,9 @@ fn advance(project_root: &Path) -> Result<(), CliError> {
             // Other stages have no auto-loop — halt and leave state for recovery.
             _ => Err(CliError::Message(format!(
                 "stage {stage} failed: {}",
-                result.reason.unwrap_or_else(|| "no details available".into())
+                result
+                    .reason
+                    .unwrap_or_else(|| "no details available".into())
             ))),
         };
     }
@@ -414,7 +424,12 @@ fn handle_validate_outcome(
 
 /// Decide what happens after the Ship stage completes — always gated.
 fn handle_ship_outcome(project_root: &Path, state: &mut State) -> Result<(), CliError> {
-    match run_gate(project_root, state, Stage::Ship, "Ship complete — approve merge?")? {
+    match run_gate(
+        project_root,
+        state,
+        Stage::Ship,
+        "Ship complete — approve merge?",
+    )? {
         GateAction::Advance => finish_workflow(project_root, state),
         GateAction::LoopBack(_) => loop_back_to_code(project_root, state),
         GateAction::Abort(reason) => abort(project_root, state, &reason),
@@ -453,7 +468,10 @@ fn loop_back_to_code(project_root: &Path, state: &mut State) -> Result<(), CliEr
         state.consecutive_failures
     );
     let _ = project_root;
-    launch_stage(state, Some(prompt::fix_prompt(FixType::GapsOnly, state.phase)))
+    launch_stage(
+        state,
+        Some(prompt::fix_prompt(FixType::GapsOnly, state.phase)),
+    )
 }
 
 /// Run the terminal hooks (version bump + branch cleanup) and clear state.
@@ -559,12 +577,12 @@ fn ensure_phase_worktree(
 
     match worktree::add(project_root, &wt, &branch, DEVELOP, true) {
         Ok(()) => Ok(wt),
-        Err(devflow_core::worktree::WorktreeError::Exists(path)) => Err(CliError::Message(
-            format!(
+        Err(devflow_core::worktree::WorktreeError::Exists(path)) => {
+            Err(CliError::Message(format!(
                 "worktree already exists at {} — use --force to recreate it",
                 path.display()
-            ),
-        )),
+            )))
+        }
         Err(err) => Err(err.into()),
     }
 }
@@ -948,7 +966,11 @@ fn status(project_root: &Path) -> Result<(), CliError> {
     let mut current_worktree: Option<PathBuf> = None;
     match workflow::load_state(project_root) {
         Ok(state) => {
-            let gate = if state.gate_pending { "pending" } else { "none" };
+            let gate = if state.gate_pending {
+                "pending"
+            } else {
+                "none"
+            };
             println!(
                 "stage: {} | mode: {} | gate: {}",
                 state.stage, state.mode, gate

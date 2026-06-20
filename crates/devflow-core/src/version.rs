@@ -289,7 +289,11 @@ mod tests {
                 .unwrap()
                 .ends_with("package.json")
         );
-        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nversion=\"1.0.0\"").unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nversion=\"1.0.0\"",
+        )
+        .unwrap();
         assert!(
             detect_version_file(dir.path())
                 .unwrap()
@@ -338,14 +342,25 @@ mod tests {
         assert_eq!(commits_since_last_minor_tag(root).unwrap(), 2);
 
         let v = compute_version(root).unwrap();
-        assert_eq!(v, Version { major: 2, minor: 1, patch: 2 });
+        assert_eq!(
+            v,
+            Version {
+                major: 2,
+                minor: 1,
+                patch: 2
+            }
+        );
         assert_eq!(v.to_string(), "2.1.2");
     }
 
     #[test]
     fn write_version_replaces_in_cargo_toml() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nversion = \"0.1.0\"\n").unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
         let path = write_version(
             dir.path(),
             &Version {

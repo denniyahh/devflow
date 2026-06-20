@@ -232,7 +232,9 @@ mod tests {
     fn branch_create_makes_feature_branch() {
         let dir = tempfile::tempdir().unwrap();
         init_repo(dir.path());
-        Hook::BranchCreate.run(&ctx(dir.path(), Stage::Define)).unwrap();
+        Hook::BranchCreate
+            .run(&ctx(dir.path(), Stage::Define))
+            .unwrap();
         assert!(GitFlow::new(dir.path()).branch_exists("feature/phase-11"));
     }
 
@@ -254,7 +256,9 @@ mod tests {
         // Hybrid SemVer: major 2 (Cargo.toml), minor 0 (no tags), patch from
         // the commit count since the last tag — one `init` commit → v2.0.1.
         let expected = format!("v{}", version::compute_version(dir.path()).unwrap());
-        Hook::VersionBump.run(&ctx(dir.path(), Stage::Ship)).unwrap();
+        Hook::VersionBump
+            .run(&ctx(dir.path(), Stage::Ship))
+            .unwrap();
         let tags = Command::new("git")
             .arg("tag")
             .current_dir(dir.path())

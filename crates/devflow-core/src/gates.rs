@@ -166,7 +166,10 @@ impl Gates {
     /// Write an ack file signalling the response was read.
     pub fn ack(project_root: &Path, phase: u32, stage: Stage) -> Result<PathBuf, GateError> {
         let path = Self::ack_path(project_root, phase, stage);
-        write_atomic(&path, &serde_json::to_string_pretty(&GateAck { received: true })?)?;
+        write_atomic(
+            &path,
+            &serde_json::to_string_pretty(&GateAck { received: true })?,
+        )?;
         Ok(path)
     }
 
