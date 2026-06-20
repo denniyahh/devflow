@@ -22,7 +22,7 @@ You use AI coding agents (Claude Code, Codex, OpenCode) to build features. But e
 8. Merge to main/develop
 9. Clean up merged branches
 
-DevFlow handles all of this. You say `devflow start --phase 3 --agent claude --monitor` and walk away.
+DevFlow handles all of this. You say `devflow start --phase 3 --agent claude --mode auto` and walk away.
 
 ## Quick Start
 
@@ -37,23 +37,20 @@ cargo install devflow
 cd your-project
 devflow init
 
-# Start working on Phase 3 with Claude Code (background monitor)
-devflow start --phase 3 --agent claude --monitor
+# Start working on Phase 3 with Claude Code in auto mode
+devflow start --phase 3 --agent claude --mode auto
 
 # Check status anytime
 devflow status
-
-# When ready to ship (bumps version, creates PR)
-devflow ship
 ```
 
-## State Machine
+## Pipeline
 
 ```
-IDLE → BRANCHING → EXECUTING → VERIFYING → DOCSING → SHIPPING → CLEANING → IDLE
+IDLE → BRANCHING → EXECUTING → VERIFYING → PLANNING → SHIPPING
 ```
 
-Each step is automated or skippable via `.devflow.yaml` configuration. State is persisted to `.devflow/state.json` and survives restarts.
+The 5-stage pipeline is driven by GSD-native execution. State is persisted to `.devflow/state.json` and survives restarts. Gates between stages can be configured as `auto` (advance automatically) or `manual` (wait for explicit confirmation).
 
 ## Architecture
 
@@ -95,9 +92,8 @@ Rate-limit detection: if an agent's stdout contains rate-limit messages (429), D
 
 | Command | Description |
 |---|---|
-| `devflow start --phase N [--agent X] [--monitor] [--worktree]` | Begin a phase: branch → launch agent → (optional) monitor |
-| `devflow check` | Poll state, advance if agent done |
-| `devflow status` | Show current step, phase, agent, PID, age |
+| `devflow start --phase N --agent X [--mode auto\|manual]` | Begin a phase: branch → launch agent → monitor pipeline |
+| `devflow status` | Show current stage, phase, agent, PID, age |
 | `devflow list` | List all feature branches with divergence from develop |
 | `devflow cleanup` | Remove phase worktrees and their feature branches |
 
@@ -113,7 +109,6 @@ Rate-limit detection: if an agent's stdout contains rate-limit messages (429), D
 
 | Command | Description |
 |---|---|
-| `devflow ship [--phase N]` | Bump version, create release branch, open a PR via `gh` |
 | `devflow confirm` | Finalize a shipped phase: check merge, update docs |
 | `devflow rejectpr [--reason X] [--redo]` | Reject the last ship; `--redo` unwinds PR/branch/version |
 
@@ -123,44 +118,27 @@ Rate-limit detection: if an agent's stdout contains rate-limit messages (429), D
 |---|---|
 | `devflow verify` | Run configured verification command (e.g., `cargo test`) |
 | `devflow lint` | Run configured lint command (e.g., `cargo clippy`) |
-| `devflow docs` | Run configured docs command with optional auto-commit |
 
 ### Setup & Recovery
 
 | Command | Description |
 |---|---|
-| `devflow init` | Bootstrap `.devflow.yaml` and `.devflow/` directory |
+| `devflow init` | Bootstrap `.devflow/` directory and initial state |
 | `devflow config` | Show effective configuration |
 | `devflow recover` | Inspect or clean up stale/abandoned workflow state |
 | `devflow doctor` | Check that required tools and agents are installed |
 
 ## Configuration
 
-Projects declare their workflow in `.devflow.yaml` (git-tracked, portable):
+DevFlow stores runtime state in `.devflow/state.json` (git-ignored). No config file is required — all workflow options are supplied as CLI flags to `devflow start`.
 
-```yaml
-version:
-  scheme: semver
-  file: Cargo.toml              # or pyproject.toml, package.json
-  field: workspace.package.version
-  build_number: git
+Key flags:
 
-automation:
-  auto_branch: true
-  auto_verify: true
-  auto_docs: true
-  auto_version: patch           # major | minor | patch
-  auto_ship: false              # set true for full automation
-  auto_cleanup: true
-  verify_command: cargo test
-  lint_command: cargo clippy -- -D warnings
-  docs_command: cargo doc --no-deps
-
-git_flow:
-  main: main
-  develop: develop
-  feature_prefix: feature/
-```
+| Flag | Description |
+|---|---|
+| `--phase N` | Phase number to execute |
+| `--agent claude\|codex\|opencode` | Agent to launch |
+| `--mode auto\|manual` | Gate mode: `auto` advances stages automatically; `manual` waits for confirmation |
 
 ## Supported Agents
 
