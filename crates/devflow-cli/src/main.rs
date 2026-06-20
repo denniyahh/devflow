@@ -265,6 +265,19 @@ fn start(
         return Ok(());
     }
 
+    // Pre-start divergence check: runs on current HEAD before any git mutation.
+    if let Ok((_ahead, behind)) = GitFlow::new(project_root).divergence_from_develop() {
+        if behind > 50 {
+            return Err(CliError::Message(format!(
+                "develop is {behind} commits ahead — your branch is too far behind. \
+                 Rebase onto develop first, or use --force to override."
+            )));
+        }
+        if behind > 10 {
+            println!("warning: develop is {behind} commits ahead — consider rebasing first");
+        }
+    }
+
     if worktree {
         let wt = ensure_phase_worktree(project_root, phase, force)?;
         println!(
@@ -289,19 +302,6 @@ fn start(
                 }
                 return Err(err.into());
             }
-        }
-    }
-
-    // Pre-start divergence check: warn if develop has advanced significantly.
-    if let Ok((_ahead, behind)) = GitFlow::new(project_root).divergence_from_develop() {
-        if behind > 50 {
-            return Err(CliError::Message(format!(
-                "develop is {behind} commits ahead — your branch is too far behind. \
-                 Rebase onto develop first, or use --force to override."
-            )));
-        }
-        if behind > 10 {
-            println!("warning: develop is {behind} commits ahead — consider rebasing first");
         }
     }
 
