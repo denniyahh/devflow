@@ -59,6 +59,7 @@ pub fn spawn_monitor(state: &State, program: &str, args: &[String]) -> Result<u3
     );
 
     let stdout_file = crate::agent_result::stdout_path(&state.project_root, state.phase);
+    let stderr_file = crate::agent_result::stderr_path(&state.project_root, state.phase);
     let exit_file = crate::agent_result::exit_code_path(&state.project_root, state.phase);
     let pid_file = crate::agent_result::agent_pid_path(&state.project_root, state.phase);
 
@@ -68,6 +69,7 @@ pub fn spawn_monitor(state: &State, program: &str, args: &[String]) -> Result<u3
     }
 
     let stdout_file = stdout_file.to_str().ok_or(MonitorError::NonUtf8Path)?;
+    let stderr_file = stderr_file.to_str().ok_or(MonitorError::NonUtf8Path)?;
     let exit_file = exit_file.to_str().ok_or(MonitorError::NonUtf8Path)?;
     let pid_file = pid_file.to_str().ok_or(MonitorError::NonUtf8Path)?;
 
@@ -92,8 +94,9 @@ pub fn spawn_monitor(state: &State, program: &str, args: &[String]) -> Result<u3
     // stdout and exit code, then advances the workflow. Because this process
     // is the agent's parent, capture survives the CLI exiting.
     //
-    // stderr is discarded so it cannot corrupt the (possibly JSON) stdout
-    // capture that DevFlow parses for DEVFLOW_RESULT.
+    // stderr is captured to a separate file so it cannot corrupt the (possibly
+    // JSON) stdout capture that DevFlow parses for DEVFLOW_RESULT. Inspect
+    // .devflow/phase-NN-stderr.log for agent error output on failures.
     //
     // `devflow advance` evaluates the agent result, moves the stage machine
     // forward, and (for an agent stage) spawns the next monitor itself.
@@ -102,13 +105,14 @@ pub fn spawn_monitor(state: &State, program: &str, args: &[String]) -> Result<u3
     let script = format!(
         "cleanup() {{ exit 0; }}; trap cleanup TERM INT; \
          cd {workdir} || exit 1; \
-         {agent_cmd} > {stdout_file} 2>/dev/null & \
+         {agent_cmd} > {stdout_file} 2>{stderr_file} & \
          apid=$!; echo $apid > {pid_file}; \
          wait $apid; echo $? > {exit_file}; \
          {binary} advance {project_root}",
         agent_cmd = agent_cmd,
         workdir = shell_escape(workdir),
         stdout_file = shell_escape(stdout_file),
+        stderr_file = shell_escape(stderr_file),
         exit_file = shell_escape(exit_file),
         pid_file = shell_escape(pid_file),
         binary = shell_escape(&binary),
