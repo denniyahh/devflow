@@ -96,9 +96,19 @@ fn branch_cleanup(ctx: &HookContext) -> Result<(), HookError> {
     let git = GitFlow::new(&ctx.project_root);
     let branch = format!("{}phase-{:02}", ctx.git_flow.feature_prefix, ctx.phase);
     if git.branch_exists(&branch) {
+        // Non-force cleanup is intentional: never discard unmerged work.
         match git.delete_branch(&branch, false) {
             Ok(()) => info!("BranchCleanup: deleted {branch}"),
-            Err(err) => warn!("BranchCleanup: could not delete {branch}: {err}"),
+            Err(err) => {
+                let message = err.to_string();
+                if message.contains("not fully merged") || message.contains("not yet merged") {
+                    warn!(
+                        "BranchCleanup: feature branch {branch} is not merged yet — left in place"
+                    );
+                } else {
+                    warn!("BranchCleanup: could not delete {branch}: {err}");
+                }
+            }
         }
     }
     Ok(())
