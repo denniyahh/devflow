@@ -839,7 +839,11 @@ fn write_rate_limit_cron(
     let instructions =
         devflow_core::ship::build_cron_instructions(project_root, phase, retry_after, agents);
     devflow_core::ship::write_cron_instructions(project_root, &instructions)?;
-    println!("wrote .devflow/cron-instructions.json");
+    if instructions.hermes_cron.schedule.is_empty() {
+        println!("no parseable retry time — auto-resume cron not scheduled; resume manually");
+    } else {
+        println!("wrote .devflow/cron-instructions.json");
+    }
     Ok(())
 }
 

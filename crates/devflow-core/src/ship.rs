@@ -188,7 +188,7 @@ pub fn build_cron_instructions(
             args,
         },
         hermes_cron: HermesCronJob {
-            schedule: cron_schedule_from_retry_after(retry_after),
+            schedule: cron_schedule_from_retry_after(retry_after).unwrap_or_default(),
             name: format!("devflow-phase-{phase:02}-resume"),
             command: format!(
                 "cd {} && devflow sequentagent --phase {phase} --agents {next_agents}",
@@ -201,10 +201,9 @@ pub fn build_cron_instructions(
 
 /// Convert a retry timestamp to `M H D M W` cron syntax, rounding up to the
 /// nearest minute. Supports RFC3339-like timestamps and Unix epoch seconds.
-pub fn cron_schedule_from_retry_after(retry_after: &str) -> String {
-    parse_retry_timestamp(retry_after)
-        .map(|ts| ts.round_up_minute().to_cron())
-        .unwrap_or_else(|| "* * * * *".to_string())
+pub fn cron_schedule_from_retry_after(retry_after: &str) -> Option<String> {
+    // WR-06: never turn unparseable agent output into an every-minute cron.
+    parse_retry_timestamp(retry_after).map(|ts| ts.round_up_minute().to_cron())
 }
 
 /// Build a Markdown PR body from the phase Goal, the diffstat, and a test count.
@@ -580,17 +579,20 @@ mod tests {
     fn cron_schedule_rounds_up_to_nearest_minute() {
         assert_eq!(
             cron_schedule_from_retry_after("2026-06-18T15:45:30Z"),
-            "46 15 18 6 *"
+            Some("46 15 18 6 *".to_string())
         );
         assert_eq!(
             cron_schedule_from_retry_after("2026-06-18T15:45:00Z"),
-            "45 15 18 6 *"
+            Some("45 15 18 6 *".to_string())
         );
     }
 
     #[test]
     fn cron_schedule_formats_unix_seconds() {
-        assert_eq!(cron_schedule_from_retry_after("1766678401"), "1 16 25 12 *");
+        assert_eq!(
+            cron_schedule_from_retry_after("1766678401"),
+            Some("1 16 25 12 *".to_string())
+        );
     }
 
     #[test]
