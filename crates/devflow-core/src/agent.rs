@@ -61,10 +61,13 @@ pub fn launch_agent(
 }
 
 /// Check whether a process with the given PID is still running.
+///
+/// Supported Linux and macOS process IDs fit in `libc::pid_t`, so converting
+/// the externally stored `u32` PID is safe in practice on those platforms.
 pub fn agent_running(pid: u32) -> bool {
     // kill(pid, 0) is the standard POSIX way to check process existence
     // without sending an actual signal.
-    unsafe { libc::kill(pid as i32, 0) == 0 }
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
 /// Capture agent stdout and exit code, writing both to `.devflow/` files.
