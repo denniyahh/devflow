@@ -2,12 +2,13 @@
 
 > Phase plan source of truth. Each phase drives a `devflow start` agent session.
 
-## v2.0.0 (Phase 11–13)
+## v2.0.0 (Phase 11–14)
 
 | Phase | Name | Status |
 |---|---|---|
 | 12 | Bootstrap + Housekeeping | Scoped |
 | 13 | OSS Readiness + Hermes Plugin | Scoped |
+| 14 | Reliability & Observability Hardening | Scoped |
 
 ## Shipped
 
@@ -26,5 +27,57 @@
 - **Conventional commits deprecated** — no commit-message-based versioning
 - **Phase 10 shipped** — logging + Planning step (Planning known bug, addressed in Phase 11 refactor)
 - **Phase 11 recast** — full architecture refactor to GSD-native execution engine
-- **Phase 12** — Bootstrap (new-project, map-codebase) + versioning automation
+- **Phase 12** — Bootstrap (new-project, map-codebase) + versioning automation + publish `devflow` to crates.io (name confirmed available, 2026-07-08)
 - **Phase 13** — OSS readiness (dev container, contributing, CI) + Hermes plugin + Hermes/Antigravity adapters
+- **Phase 14** — reliability + observability hardening, scoped from external code review feedback (2026-07-08)
+
+### Phase 12: Bootstrap + Housekeeping
+
+**Goal:** Pay down the Phase 11 code-review debt (WR-01…WR-10, IN-02…IN-05), close the untested orchestration-core paths and never-run manual verifications, harden versioning (WR-04 + version-consistency to 1.2.0), and get the crates publish-ready (metadata + dry-run, NO publish). Bootstrap (12a new-project/map-codebase) is DEFERRED to its own future phase — see CONTEXT.md "Planning-Time Decisions".
+**Requirements**: WR-01, WR-02, WR-03, WR-04, WR-05, WR-06, WR-07, WR-08, WR-09, WR-10, IN-02, IN-03, IN-04, IN-05, 12b, 12c, 12f, 12g (see CONTEXT.md — no formal REQ-IDs)
+**Depends on:** Phase 11
+**Plans:** 12 plans
+
+Plans:
+**Wave 1**
+
+- [ ] 12-01-PLAN.md — WR-07: atomic `save_state` (temp+rename) so a kill mid-write can't corrupt state.json
+- [ ] 12-02-PLAN.md — WR-06 runaway-cron guard + IN-04 `cargo fmt --check`
+- [ ] 12-03-PLAN.md — WR-01: monitor spawns the agent as argv (no shell interpolation)
+- [ ] 12-04-PLAN.md — WR-02/WR-03 + 12f Validate→Ship hook-firing test
+- [ ] 12-05-PLAN.md — WR-04 TOML parser robustness + 12f workspace write_version + IN-05 version→1.2.0
+- [ ] 12-06-PLAN.md — 12c publish-prep: crates.io metadata + dry-run/package (NO publish)
+- [ ] 12-07-PLAN.md — WR-10 config-decoy test cleanup + WR-09 marker-scan doc/guard
+- [ ] 12-08-PLAN.md — 12f: gate-timeout fast path + branch ahead/behind + monitor advance-failure
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
+- [ ] 12-09-PLAN.md — 12f: advance()/finish + consecutive-failures→gate→abort (main.rs)
+- [ ] 12-10-PLAN.md — WR-05/WR-08 + 12f parse_rfc3339ish negative-offset (ship.rs)
+- [ ] 12-12-PLAN.md — 12g manual verifications (Hermes gate, real agent, DocsUpdate; Full-Ship blocked)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
+- [ ] 12-11-PLAN.md — IN-02 dead-field removal + IN-03 Agent→AgentKind / trait→AgentAdapter rename
+
+### Phase 13: OSS Readiness + Hermes Plugin
+
+**Goal:** Make DevFlow ready for public consumption — dev container, contribution docs, a full ARCHITECTURE.md/README rewrite against v2 reality, Hermes + Antigravity agent support, and a first-class Hermes plugin.
+**Requirements**: TBD (see CONTEXT.md)
+**Depends on:** Phase 11
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (run /gsd-plan-phase 13 to break down)
+
+### Phase 14: Reliability & Observability Hardening
+
+**Goal:** Close the gap between "agent exited" and "agent succeeded," surface loop progress instead of a black box, and stop shipping an unattended tool with a 7-day silent gate timeout and full permission bypass by default.
+**Requirements**: TBD (see CONTEXT.md)
+**Depends on:** Phase 13
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (run /gsd-plan-phase 14 to break down)
