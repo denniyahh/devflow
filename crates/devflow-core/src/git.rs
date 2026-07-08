@@ -290,10 +290,10 @@ impl GitFlow {
                 continue;
             }
             let ahead = self
-                .rev_count(&format!("{name}..{dev}", dev = self.config.develop))
+                .rev_count(&format!("{dev}..{name}", dev = self.config.develop))
                 .unwrap_or(0);
             let behind = self
-                .rev_count(&format!("{dev}..{name}", dev = self.config.develop))
+                .rev_count(&format!("{name}..{dev}", dev = self.config.develop))
                 .unwrap_or(0);
             let last_commit = self
                 .git_output(["log", "-1", "--format=%aI", name])
