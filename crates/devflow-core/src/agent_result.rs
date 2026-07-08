@@ -178,7 +178,11 @@ fn json_scalar_to_string(value: &serde_json::Value) -> Option<String> {
     }
 }
 
-/// Scan the tail of `stdout` line-by-line for the last DEVFLOW_RESULT marker.
+/// Scan the last ~4000 characters of `stdout` in reverse line order.
+///
+/// `DEVFLOW_RESULT` markers are ASCII. Searching the bounded tail and returning
+/// the last valid marker ensures the agent's final status wins over an earlier
+/// prompt echo without requiring the surrounding output to be ASCII.
 fn parse_marker_lines(stdout: &str) -> Option<AgentResult> {
     // Only search the tail — agents may echo the marker in their prompt
     // and we want the LAST occurrence (which is their actual final status).
@@ -508,6 +512,20 @@ mod tests {
         // Multiple markers — should find the last one.
         let stdout = "DEVFLOW_RESULT: {\"status\":\"failed\"}\nsome more output\nDEVFLOW_RESULT: {\"status\":\"success\"}\n";
         let result = parse_devflow_result(stdout).unwrap();
+        assert_eq!(result.status, AgentStatus::Success);
+    }
+
+    #[test]
+    fn parse_marker_lines_returns_last_marker_in_long_output() {
+        let stdout = format!(
+            "{}\nDEVFLOW_RESULT: {{\"status\":\"failed\"}}\n{}\n\
+             DEVFLOW_RESULT: {{\"status\":\"success\"}}\n",
+            "prefix".repeat(900),
+            "tail output".repeat(100)
+        );
+
+        let result = parse_marker_lines(&stdout).unwrap();
+
         assert_eq!(result.status, AgentStatus::Success);
     }
 
