@@ -12,6 +12,9 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/denniyahh/devflow"
 description = "Agent-agnostic development workflow automation CLI"
 authors = ["Dennis Kim <denniyahh@gmail.com>"]
+readme = "README.md"
+keywords = ["cli", "workflow", "automation", "git", "devops"]
+categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
