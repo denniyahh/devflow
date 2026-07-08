@@ -613,6 +613,15 @@ mod tests {
     }
 
     #[test]
+    fn cron_instructions_reject_unparseable_retry_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = build_cron_instructions(dir.path(), 7, "unknown", "codex,claude");
+
+        assert_ne!(record.hermes_cron.schedule, "* * * * *");
+        assert!(record.hermes_cron.schedule.is_empty());
+    }
+
+    #[test]
     fn extract_section_reads_goal_until_next_heading() {
         let text = "# Title\n\n## Goal\n\nDo the thing.\nAnd more.\n\n---\n\n## Next\nignored\n";
         let goal = extract_section(text, "## Goal").unwrap();
