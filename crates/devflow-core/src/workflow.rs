@@ -34,7 +34,19 @@ pub fn save_state(state: &State) -> Result<(), WorkflowError> {
     let dir = devflow_dir(&state.project_root);
     std::fs::create_dir_all(&dir)?;
     let contents = serde_json::to_string_pretty(state)?;
-    std::fs::write(dir.join("state.json"), contents)?;
+    write_state_atomic(&dir.join("state.json"), &contents)?;
+    Ok(())
+}
+
+/// Write state through a sibling temporary file so readers never observe a
+/// truncated or partially written `state.json`.
+fn write_state_atomic(path: &Path, contents: &str) -> Result<(), WorkflowError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, contents)?;
+    std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
