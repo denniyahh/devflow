@@ -443,6 +443,28 @@ mod tests {
     }
 
     #[test]
+    fn list_feature_branches_reports_ahead_and_behind_semantics() {
+        let repo = init_repo();
+        let root = repo.path();
+        let gf = flow(root);
+
+        gf.feature_start(12).expect("feature_start");
+        commit_file(root, "feature-one.txt");
+        commit_file(root, "feature-two.txt");
+        git(root, &["checkout", "-q", "develop"]);
+        commit_file(root, "develop-only.txt");
+
+        let branches = gf.list_feature_branches().unwrap();
+        let branch = branches
+            .iter()
+            .find(|branch| branch.name == "feature/phase-12")
+            .unwrap();
+
+        assert_eq!(branch.ahead, 2);
+        assert_eq!(branch.behind, 1);
+    }
+
+    #[test]
     fn feature_finish_merges_into_develop_and_deletes() {
         let repo = init_repo();
         let root = repo.path();
