@@ -600,6 +600,20 @@ mod tests {
     }
 
     #[test]
+    fn cron_schedule_normalizes_negative_offset() {
+        // 15:45:30 local at UTC-5 → 20:45:30 UTC → round up to 20:46.
+        assert_eq!(
+            cron_schedule_from_retry_after("2026-06-18T15:45:30-05:00"),
+            Some("46 20 18 6 *".to_string())
+        );
+        // 15:45:00 local at UTC-5:30 → 21:15:00 UTC, no rounding needed.
+        assert_eq!(
+            cron_schedule_from_retry_after("2026-06-18T15:45:00-05:30"),
+            Some("15 21 18 6 *".to_string())
+        );
+    }
+
+    #[test]
     fn cron_schedule_formats_unix_seconds() {
         assert_eq!(
             cron_schedule_from_retry_after("1766678401"),
