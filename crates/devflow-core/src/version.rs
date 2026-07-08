@@ -175,7 +175,11 @@ fn split_field(field: &str) -> (&str, &str) {
 
 /// Return the dotted table path for a TOML section header line, if any.
 fn parse_section_header(trimmed: &str) -> Option<&str> {
-    let inner = trimmed.strip_prefix('[')?.strip_suffix(']')?;
+    let inner = if trimmed.starts_with("[[") && trimmed.ends_with("]]") {
+        trimmed.strip_prefix("[[")?.strip_suffix("]]")?
+    } else {
+        trimmed.strip_prefix('[')?.strip_suffix(']')?
+    };
     Some(inner.trim())
 }
 
@@ -196,7 +200,11 @@ fn find_version_in_contents(contents: &str, field: &str) -> Option<String> {
             if lhs_key != key {
                 continue;
             }
-            return Some(value.trim().trim_matches(['"', '\'']).to_string());
+            let value = value.trim();
+            if value.starts_with('{') {
+                continue;
+            }
+            return Some(value.trim_matches(['"', '\'']).to_string());
         }
     }
     None
@@ -220,7 +228,7 @@ fn replace_version_in_contents(contents: &str, field: &str, new_version: &str) -
             && let Some((left, value)) = line.split_once(['=', ':'])
         {
             let left_key = left.trim().trim_matches('"').trim_matches('\'');
-            if left_key == key {
+            if left_key == key && !value.trim().starts_with('{') {
                 let separator: &str = if trimmed.contains('=') { " = " } else { ": " };
                 let quote_char: &str = if value.trim().starts_with('\'') {
                     "'"
