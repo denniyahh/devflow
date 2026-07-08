@@ -1,6 +1,6 @@
 //! Stage-specific agent prompts.
 //!
-//! v2.0.0 prompts are minimal: each stage hands the agent its GSD slash command
+//! Prompts are minimal: each stage hands the agent its GSD slash command
 //! (from [`Stage::gsd_command`]) and the `DEVFLOW_RESULT` completion contract.
 //! There is no long instruction template — the GSD command carries the process,
 //! and DevFlow only needs the structured completion marker back.

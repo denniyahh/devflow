@@ -1,4 +1,4 @@
-//! DevFlow v2.0.0 stage machine.
+//! DevFlow stage machine.
 //!
 //! The workflow is a single linear chain of five stages:
 //! Define → Plan → Code → Validate → Ship.

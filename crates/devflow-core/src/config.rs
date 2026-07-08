@@ -1,6 +1,6 @@
 //! Git-flow branch model.
 //!
-//! v2.0.0 has no `.devflow.yaml` and no automation toggles — all behavior is
+//! DevFlow has no `.devflow.yaml` and no automation toggles — all behavior is
 //! driven by CLI flags (`--mode`, `--agent`, …). The only project configuration
 //! left is the git-flow branch model, and that is hardcoded to opinionated
 //! constants: `main`, `develop`, and the `feature/` prefix.
@@ -12,7 +12,7 @@ pub const DEVELOP: &str = "develop";
 /// Prefix for per-phase feature branches.
 pub const FEATURE_PREFIX: &str = "feature/";
 
-/// The git-flow branch names, fixed to the v2.0.0 constants.
+/// The fixed git-flow branch names used by the current pipeline.
 ///
 /// Kept as a struct (rather than bare constants) so the modules that build
 /// branch names — git, ship, agent-result evaluation — can take a single value

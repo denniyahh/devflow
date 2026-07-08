@@ -1,6 +1,6 @@
 //! Hybrid Git-based SemVer.
 //!
-//! v2.0.0 derives the version from a mix of the project's version file and git
+//! DevFlow derives the version from a mix of the project's version file and git
 //! history rather than a config-driven scheme:
 //!
 //! - **MAJOR** — read from the auto-detected version file (`Cargo.toml`,
