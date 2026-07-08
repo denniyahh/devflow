@@ -314,6 +314,35 @@ mod tests {
     }
 
     #[test]
+    fn inline_table_version_does_not_shadow_workspace_package() {
+        assert_eq!(parse_section_header("[[bin]]"), Some("bin"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("Cargo.toml");
+        std::fs::write(
+            &file,
+            "[[bin]]\nname = \"devflow\"\n\
+             [workspace.dependencies]\nserde = { version = \"1\", features = [\"derive\"] }\n\
+             [workspace.package]\nversion = \"1.2.0\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(read_major_version(&file).unwrap(), 1);
+        write_version(
+            dir.path(),
+            &Version {
+                major: 2,
+                minor: 3,
+                patch: 4,
+            },
+        )
+        .unwrap();
+        let contents = std::fs::read_to_string(file).unwrap();
+        assert!(contents.contains("serde = { version = \"1\""));
+        assert!(contents.contains("[workspace.package]\nversion = \"2.3.4\""));
+    }
+
+    #[test]
     fn read_major_from_package_json() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("package.json");
