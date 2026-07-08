@@ -294,4 +294,38 @@ mod tests {
             "stdout capture should not be written under the worktree"
         );
     }
+
+    #[test]
+    fn spawn_monitor_treats_agent_args_as_literal_argv() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_in(dir.path());
+        let payload = "value; touch INJECTED";
+        let args = vec![
+            "-c".to_string(),
+            "printf '%s\\n' \"$0\"; echo ARGV_SAFE".to_string(),
+            payload.to_string(),
+        ];
+
+        spawn_monitor(&state, "sh", &args).unwrap();
+        wait_for_agent_pid(dir.path(), state.phase).expect("monitor should record the agent pid");
+
+        let stdout_path = crate::agent_result::stdout_path(dir.path(), state.phase);
+        let mut captured = String::new();
+        for _ in 0..100 {
+            if let Ok(contents) = std::fs::read_to_string(&stdout_path)
+                && contents.contains("ARGV_SAFE")
+            {
+                captured = contents;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(
+            captured.contains(payload),
+            "literal argv missing: {captured:?}"
+        );
+        assert!(captured.contains("ARGV_SAFE"));
+        assert!(!dir.path().join("INJECTED").exists());
+    }
 }
