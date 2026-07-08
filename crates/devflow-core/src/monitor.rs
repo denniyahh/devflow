@@ -83,13 +83,6 @@ pub fn spawn_monitor(state: &State, program: &str, args: &[String]) -> Result<u3
         .to_str()
         .ok_or(MonitorError::NonUtf8Path)?;
 
-    // Build the shell-escaped agent command.
-    let mut agent_cmd = shell_escape(program);
-    for arg in args {
-        agent_cmd.push(' ');
-        agent_cmd.push_str(&shell_escape(arg));
-    }
-
     // Shell script that launches the agent in the background, captures its
     // stdout and exit code, then advances the workflow. Because this process
     // is the agent's parent, capture survives the CLI exiting.
@@ -105,11 +98,10 @@ pub fn spawn_monitor(state: &State, program: &str, args: &[String]) -> Result<u3
     let script = format!(
         "cleanup() {{ exit 0; }}; trap cleanup TERM INT; \
          cd {workdir} || exit 1; \
-         {agent_cmd} > {stdout_file} 2>{stderr_file} & \
+         \"$@\" > {stdout_file} 2>{stderr_file} & \
          apid=$!; echo $apid > {pid_file}; \
          wait $apid; echo $? > {exit_file}; \
          {binary} advance {project_root}",
-        agent_cmd = agent_cmd,
         workdir = shell_escape(workdir),
         stdout_file = shell_escape(stdout_file),
         stderr_file = shell_escape(stderr_file),
@@ -122,6 +114,9 @@ pub fn spawn_monitor(state: &State, program: &str, args: &[String]) -> Result<u3
     let child = Command::new("sh")
         .arg("-c")
         .arg(&script)
+        .arg("sh")
+        .arg(program)
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
