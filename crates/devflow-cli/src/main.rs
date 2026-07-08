@@ -1553,4 +1553,42 @@ mod tests {
         assert!(!Gates::ack_path(root, phase, Stage::Ship).exists());
         assert!(!Gates::gate_path(root, phase, Stage::Validate).exists());
     }
+
+    /// Reaching `MAX_CONSECUTIVE_FAILURES` on a failed Validate must force a
+    /// gate (even in Auto mode, which otherwise auto-loops), and an `abort`
+    /// gate response must end the workflow (state cleared) without spawning a
+    /// new stage (11-VALIDATION.md 12f). The gate response is pre-seeded so the
+    /// poll inside `run_gate` returns immediately.
+    #[test]
+    fn validate_failure_threshold_forces_gate_then_aborts() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let phase = 22;
+        let mut state = State::new(phase, Agent::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        state.consecutive_failures = mode::MAX_CONSECUTIVE_FAILURES - 1;
+        workflow::save_state(&state).unwrap();
+
+        // Pre-write a rejected response whose note says "abort" so
+        // `GateAction::from_response` resolves to `Abort` rather than a
+        // loop-back-to-Code.
+        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"abort: requirements changed","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        handle_validate_outcome(root, &mut state, false).unwrap();
+
+        assert_eq!(state.consecutive_failures, mode::MAX_CONSECUTIVE_FAILURES);
+        assert!(
+            Gates::gate_path(root, phase, Stage::Validate).exists(),
+            "forced gate request must be written at the failure threshold"
+        );
+        let err = workflow::load_state(root).unwrap_err();
+        assert!(matches!(err, workflow::WorkflowError::MissingState(_)));
+    }
 }
