@@ -254,6 +254,27 @@ mod tests {
     }
 
     #[test]
+    fn poll_response_returns_immediately_at_full_timeout() {
+        const SEVEN_DAYS: u64 = 7 * 24 * 60 * 60;
+
+        let dir = tempfile::tempdir().unwrap();
+        let response = GateResponse {
+            approved: true,
+            note: None,
+            responded_by: Some("human".into()),
+        };
+        let path = Gates::response_path(dir.path(), 11, Stage::Validate);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_string(&response).unwrap()).unwrap();
+
+        let started = std::time::Instant::now();
+        let got = Gates::poll_response(dir.path(), 11, Stage::Validate, SEVEN_DAYS).unwrap();
+
+        assert_eq!(got, response);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
     fn poll_response_times_out_when_absent() {
         let dir = tempfile::tempdir().unwrap();
         assert!(Gates::poll_response(dir.path(), 11, Stage::Ship, 0).is_none());
