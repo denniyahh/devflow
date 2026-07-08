@@ -105,6 +105,21 @@ mod tests {
     }
 
     #[test]
+    fn save_state_writes_atomically_and_leaves_no_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_in(dir.path(), Stage::Validate);
+
+        save_state(&state).expect("save");
+
+        let path = state_path(dir.path());
+        assert!(path.exists());
+        let loaded = load_state(dir.path()).expect("load");
+        assert_eq!(loaded.stage, Stage::Validate);
+        assert_eq!(loaded.phase, state.phase);
+        assert!(!path.with_extension("tmp").exists());
+    }
+
+    #[test]
     fn load_missing_state_errors() {
         let dir = tempfile::tempdir().unwrap();
         let err = load_state(dir.path()).unwrap_err();
