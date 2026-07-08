@@ -1454,7 +1454,7 @@ mod tests {
             retry_after_from_reason(Some("rate limited until 2026-06-18T15:45:30Z")),
             "2026-06-18T15:45:30Z"
         );
-        assert_eq!(retry_after_from_reason(Some("usage limit")), "usage limit");
+        assert_eq!(retry_after_from_reason(Some("usage limit")), "unknown");
         assert_eq!(retry_after_from_reason(None), "unknown");
     }
 
