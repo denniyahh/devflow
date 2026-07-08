@@ -19,6 +19,7 @@ use devflow_core::mode::Mode;
 use devflow_core::monitor::{spawn_monitor, wait_for_agent_pid};
 use devflow_core::stage::Stage;
 use devflow_core::state::{Agent, State};
+use devflow_core::workflow::{WorkflowError, load_state};
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
@@ -115,4 +116,20 @@ fn monitor_owns_fake_agent_and_records_devflow_result() {
         stdout_path(root, phase),
         agent_result::stdout_path(root, phase)
     );
+}
+
+#[test]
+fn advance_state_loading_fails_cleanly_for_missing_and_corrupt_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    assert!(matches!(
+        load_state(root),
+        Err(WorkflowError::MissingState(_))
+    ));
+
+    std::fs::create_dir_all(root.join(".devflow")).unwrap();
+    std::fs::write(root.join(".devflow/state.json"), "{\"stage\":").unwrap();
+
+    assert!(matches!(load_state(root), Err(WorkflowError::Json(_))));
 }
