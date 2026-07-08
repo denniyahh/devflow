@@ -40,17 +40,6 @@ fn init_repo(root: &Path) {
     git(root, &["add", "."]);
     git(root, &["commit", "-q", "-m", "base"]);
     git(root, &["branch", "main"]);
-    write_config(root);
-}
-
-fn write_config(root: &Path) {
-    fs::write(
-        root.join(".devflow.yaml"),
-        "version:\n  scheme: semver\n  file: Cargo.toml\n  field: package.version\n  build_number: git\n\
-         automation:\n  auto_branch: true\n  auto_verify: false\n  auto_docs: false\n  auto_version: patch\n  auto_ship: false\n  auto_cleanup: true\n  verify_command: \"true\"\n  lint_command: \"true\"\n  docs_command: \"true\"\n  continue_on_error: false\n  docs_auto_commit: false\n\
-         git_flow:\n  main: main\n  develop: develop\n  feature_prefix: feature/\n",
-    )
-    .unwrap();
 }
 
 fn fake_bin_dir(scripts: &[(&str, &str)]) -> FakeBin {
@@ -114,27 +103,22 @@ fn seed_feature_branch(root: &Path, phase: u32) {
     git(root, &["checkout", "-q", "develop"]);
 }
 
-fn write_last_ship(root: &Path, version_from: &str, version_to: &str, release_branch: &str) {
-    fs::create_dir_all(root.join(".devflow")).unwrap();
+#[test]
+fn devflow_ignores_stray_devflow_yaml() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
     fs::write(
-        root.join(".devflow/last-ship.json"),
-        format!(
-            r#"{{
-  "phase": 7,
-  "version_from": "{version_from}",
-  "version_to": "{version_to}",
-  "release_branch": "{release_branch}",
-  "pr_number": null,
-  "pr_url": null,
-  "version_file": "{}",
-  "rejected": false,
-  "reject_reason": null,
-  "created_at": "1750000000"
-}}"#,
-            root.join("Cargo.toml").display()
-        ),
+        root.join(".devflow.yaml"),
+        "this: is: deliberately: not: valid: config",
     )
     .unwrap();
+    let fake_bin = fake_bin_dir(&[]);
+
+    let output = run_devflow(root, &fake_bin.path, &["doctor"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(stdout.contains("devflow v1.2.0"));
 }
 
 #[test]
