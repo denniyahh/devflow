@@ -412,6 +412,27 @@ mod tests {
     }
 
     #[test]
+    fn write_version_replaces_in_workspace_cargo_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace.package]\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        let path = write_version(
+            dir.path(),
+            &Version {
+                major: 2,
+                minor: 3,
+                patch: 4,
+            },
+        )
+        .unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("[workspace.package]\nversion = \"2.3.4\""));
+    }
+
+    #[test]
     fn write_version_errors_without_version_file() {
         let dir = tempfile::tempdir().unwrap();
         assert!(matches!(
