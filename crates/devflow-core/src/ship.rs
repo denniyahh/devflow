@@ -390,6 +390,12 @@ fn parse_rfc3339ish(input: &str) -> Option<RetryTimestamp> {
     };
     let utc_minutes = ts.to_epoch_minutes() - i64::from(offset_minutes);
     let mut normalized = RetryTimestamp::from_epoch_minutes(utc_minutes);
+    // `to_epoch_minutes`/`from_epoch_minutes` normalize at whole-minute
+    // granularity (the offset subtraction above only ever shifts whole
+    // minutes, since `offset_minutes` is itself an integer minute count),
+    // so `from_epoch_minutes` always zeroes `second`. A timezone offset never
+    // carries a sub-minute component, so the original `second` is
+    // timezone-invariant and safe to restore verbatim here.
     normalized.second = second;
     Some(normalized)
 }
