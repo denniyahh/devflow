@@ -1175,7 +1175,7 @@ fn test_cmd(project_root: &Path) -> Result<(), CliError> {
     let checks = [
         ("cargo test", "cargo test"),
         ("cargo clippy", "cargo clippy -- -D warnings"),
-        ("cargo fmt --check", "cargo fmt -- --check"),
+        ("cargo fmt --check", "cargo fmt --check"),
     ];
     let mut failures = Vec::new();
     for (label, cmd) in checks {
