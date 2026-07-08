@@ -231,6 +231,20 @@ mod tests {
     }
 
     #[test]
+    fn validate_to_ship_hooks_append_changelog() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let context = ctx(dir.path(), Stage::Ship);
+
+        for hook in hooks_for_transition(Stage::Validate, Stage::Ship) {
+            hook.run(&context).unwrap();
+        }
+
+        let changelog = std::fs::read_to_string(dir.path().join("CHANGELOG.md")).unwrap();
+        assert!(changelog.contains("## "));
+    }
+
+    #[test]
     fn after_ship_runs_version_and_cleanup() {
         assert_eq!(
             hooks_after_ship(),
