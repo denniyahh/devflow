@@ -826,7 +826,6 @@ fn sequentagent(
 fn retry_after_from_reason(reason: Option<&str>) -> String {
     reason
         .and_then(|s| s.strip_prefix("rate limited until "))
-        .or(reason)
         .unwrap_or("unknown")
         .to_string()
 }
