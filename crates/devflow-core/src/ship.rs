@@ -454,10 +454,16 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
 }
 
 fn shell_quote(value: &str) -> String {
-    if value
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
-    {
+    // Characters that never need quoting in a POSIX shell word: alphanumerics
+    // plus the common punctuation used in paths, versions, and identifiers
+    // (`/ . _ -`) and additional unambiguously-safe characters (`~ : @ + = %`)
+    // that have no special meaning to the shell when unquoted. Anything not
+    // in this set falls through to single-quote wrapping below, so widening
+    // this list only reduces over-quoting — it can never under-quote.
+    if value.chars().all(|c| {
+        c.is_ascii_alphanumeric()
+            || matches!(c, '/' | '.' | '_' | '-' | '~' | ':' | '@' | '+' | '=' | '%')
+    }) {
         value.to_string()
     } else {
         format!("'{}'", value.replace('\'', "'\\''"))
@@ -599,6 +605,21 @@ mod tests {
             cron_schedule_from_retry_after("1766678401"),
             Some("1 16 25 12 *".to_string())
         );
+    }
+
+    #[test]
+    fn shell_quote_leaves_common_safe_chars_unquoted() {
+        assert_eq!(
+            shell_quote("user@host:1.2.3+build"),
+            "user@host:1.2.3+build"
+        );
+        assert_eq!(shell_quote("~/proj/build=1_2%3"), "~/proj/build=1_2%3");
+    }
+
+    #[test]
+    fn shell_quote_quotes_unsafe_input() {
+        assert_eq!(shell_quote("a b"), "'a b'");
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
     }
 
     #[test]
