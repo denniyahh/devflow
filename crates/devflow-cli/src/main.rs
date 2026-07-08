@@ -1482,4 +1482,75 @@ mod tests {
             )
         );
     }
+
+    /// Build a real git repo (main + develop, with a Cargo.toml committed) so
+    /// the terminal-path hooks (`VersionBump`, `BranchCleanup`) exercised below
+    /// have real git plumbing to operate on rather than an empty directory.
+    fn init_repo(root: &Path) {
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "devflow@example.com"]);
+        git(&["config", "user.name", "DevFlow Tests"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        git(&["config", "tag.gpgsign", "false"]);
+        git(&["config", "core.hooksPath", "/dev/null"]);
+        std::fs::write(root.join("Cargo.toml"), "[package]\nversion = \"2.0.0\"\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        git(&["branch", "-M", "main"]);
+        git(&["checkout", "-q", "-b", "develop"]);
+    }
+
+    /// `advance()` over a Ship-stage success with an approved Ship gate must run
+    /// the terminal `finish_workflow` path (after-ship hooks + gate cleanup +
+    /// state cleared) — the only non-spawning branch of `advance`'s orchestration
+    /// (11-VALIDATION.md 12f). The gate response is pre-seeded on disk so
+    /// `run_gate`'s poll returns immediately instead of blocking.
+    #[test]
+    fn advance_ship_success_runs_finish_workflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 21;
+        let mut state = State::new(phase, Agent::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Ship;
+        workflow::save_state(&state).unwrap();
+
+        // Seed a DEVFLOW_RESULT success marker so `evaluate_agent_result` resolves
+        // at Layer 1 without needing the exit-code/commit-count fallback.
+        std::fs::write(
+            agent_result::stdout_path(root, phase),
+            "DEVFLOW_RESULT: {\"status\":\"success\"}\n",
+        )
+        .unwrap();
+
+        // Pre-write an approved Ship gate response so `run_gate` returns
+        // `GateAction::Advance` immediately instead of polling.
+        let response_path = Gates::response_path(root, phase, Stage::Ship);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":true,"note":null,"responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        advance(root).unwrap();
+
+        let err = workflow::load_state(root).unwrap_err();
+        assert!(matches!(err, workflow::WorkflowError::MissingState(_)));
+        assert!(!Gates::gate_path(root, phase, Stage::Ship).exists());
+        assert!(!Gates::response_path(root, phase, Stage::Ship).exists());
+        assert!(!Gates::ack_path(root, phase, Stage::Ship).exists());
+        assert!(!Gates::gate_path(root, phase, Stage::Validate).exists());
+    }
 }
