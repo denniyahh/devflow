@@ -9,7 +9,6 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::agent_result::AgentResult;
 use crate::mode::Mode;
 use crate::stage::Stage;
 
@@ -42,12 +41,6 @@ pub struct State {
     /// always live under the main `project_root`; only the agent's cwd changes.
     #[serde(default)]
     pub worktree_path: Option<PathBuf>,
-    /// Parsed agent completion result (from DEVFLOW_RESULT or exit code).
-    #[serde(skip)]
-    pub agent_result: Option<AgentResult>,
-    /// Path where agent stdout was saved.
-    #[serde(skip)]
-    pub agent_stdout_path: Option<PathBuf>,
 }
 
 /// Supported coding agents.
@@ -108,8 +101,6 @@ impl State {
             started_at: timestamp_now(),
             project_root,
             worktree_path: None,
-            agent_result: None,
-            agent_stdout_path: None,
         }
     }
 }
