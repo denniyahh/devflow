@@ -2,11 +2,11 @@
 //!
 //! Launches `opencode run "<prompt>"` in non-interactive mode.
 
-use super::Agent;
+use super::AgentAdapter;
 
 pub struct OpenCodeAgent;
 
-impl Agent for OpenCodeAgent {
+impl AgentAdapter for OpenCodeAgent {
     fn name(&self) -> &'static str {
         "OpenCode"
     }

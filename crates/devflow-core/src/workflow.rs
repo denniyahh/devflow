@@ -76,10 +76,10 @@ mod tests {
     use super::*;
     use crate::mode::Mode;
     use crate::stage::Stage;
-    use crate::state::Agent;
+    use crate::state::AgentKind;
 
     fn state_in(root: &Path, stage: Stage) -> State {
-        let mut state = State::new(1, Agent::Claude, Mode::Auto, root.to_path_buf());
+        let mut state = State::new(1, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = stage;
         state
     }
@@ -100,7 +100,7 @@ mod tests {
         let loaded = load_state(dir.path()).expect("load");
         assert_eq!(loaded.stage, Stage::Code);
         assert_eq!(loaded.phase, 1);
-        assert_eq!(loaded.agent, Agent::Claude);
+        assert_eq!(loaded.agent, AgentKind::Claude);
         assert_eq!(loaded.mode, Mode::Auto);
     }
 

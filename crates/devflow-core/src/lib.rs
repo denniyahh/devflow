@@ -74,4 +74,4 @@ pub mod worktree;
 pub use agent::launch_agent;
 pub use mode::Mode;
 pub use stage::Stage;
-pub use state::{Agent, AgentKind, State};
+pub use state::{AgentKind, State};

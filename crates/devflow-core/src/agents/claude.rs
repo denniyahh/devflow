@@ -3,11 +3,11 @@
 //! Launches `claude -p "<prompt>"` in non-interactive mode with structured
 //! JSON output. Claude runs headless — no trust dialogs, no user prompts.
 
-use super::Agent;
+use super::AgentAdapter;
 
 pub struct ClaudeAgent;
 
-impl Agent for ClaudeAgent {
+impl AgentAdapter for ClaudeAgent {
     fn name(&self) -> &'static str {
         "Claude Code"
     }

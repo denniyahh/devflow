@@ -397,11 +397,11 @@ mod tests {
     use crate::config::GitFlowConfig;
     use crate::mode::Mode;
     use crate::stage::Stage;
-    use crate::state::{Agent, State};
+    use crate::state::{AgentKind, State};
     use std::process::Command;
 
     fn state_in(root: &Path, phase: u32) -> State {
-        let mut state = State::new(phase, Agent::Claude, Mode::Auto, root.to_path_buf());
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
         state
     }

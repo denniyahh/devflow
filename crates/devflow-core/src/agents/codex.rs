@@ -2,11 +2,11 @@
 //!
 //! Launches `codex exec "<prompt>"` in non-interactive mode with JSON output.
 
-use super::Agent;
+use super::AgentAdapter;
 
 pub struct CodexAgent;
 
-impl Agent for CodexAgent {
+impl AgentAdapter for CodexAgent {
     fn name(&self) -> &'static str {
         "OpenAI Codex"
     }

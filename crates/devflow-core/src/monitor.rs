@@ -156,10 +156,10 @@ mod tests {
     use super::*;
     use crate::mode::Mode;
     use crate::stage::Stage;
-    use crate::state::{Agent, State};
+    use crate::state::{AgentKind, State};
 
     fn state_in(root: &Path) -> State {
-        let mut state = State::new(4, Agent::Claude, Mode::Auto, root.to_path_buf());
+        let mut state = State::new(4, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
         state
     }

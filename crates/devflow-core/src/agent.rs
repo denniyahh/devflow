@@ -4,7 +4,7 @@
 //! They produce structured output and exit when done — never block on input.
 
 use crate::agent_result::{self, AgentCapture};
-use crate::state::Agent;
+use crate::state::AgentKind;
 use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -32,7 +32,7 @@ pub enum AgentError {
 /// The agent runs in non-interactive mode with structured output.
 /// Caller is responsible for waiting on the child.
 pub fn launch_agent(
-    agent: &dyn crate::agents::Agent,
+    agent: &dyn crate::agents::AgentAdapter,
     phase: u32,
     prompt: &str,
     workdir: &Path,
@@ -112,7 +112,7 @@ pub fn capture_agent_output(
 }
 
 /// Generate a human-readable label for the agent session.
-pub fn agent_label(agent: Agent, pid: u32) -> String {
+pub fn agent_label(agent: AgentKind, pid: u32) -> String {
     format!("{}-{}", agent, pid)
 }
 
@@ -135,8 +135,8 @@ mod tests {
 
     #[test]
     fn agent_label_combines_agent_and_pid() {
-        assert_eq!(agent_label(Agent::Claude, 42), "claude-42");
-        assert_eq!(agent_label(Agent::OpenCode, 7), "opencode-7");
+        assert_eq!(agent_label(AgentKind::Claude, 42), "claude-42");
+        assert_eq!(agent_label(AgentKind::OpenCode, 7), "opencode-7");
     }
 
     #[test]

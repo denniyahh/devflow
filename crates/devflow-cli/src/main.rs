@@ -7,7 +7,7 @@ use devflow_core::hooks::{self, HookContext};
 use devflow_core::mode::{self, Mode};
 use devflow_core::prompt::{self, FixType};
 use devflow_core::stage::Stage;
-use devflow_core::state::{Agent, State};
+use devflow_core::state::{AgentKind, State};
 use devflow_core::{agent_result, agents, lock, monitor, recover, worktree};
 use devflow_core::{agent_result::AgentStatus, workflow};
 use std::path::{Path, PathBuf};
@@ -35,7 +35,7 @@ enum Command {
         phase: u32,
         /// Agent to launch.
         #[arg(long, default_value = "claude")]
-        agent: Agent,
+        agent: AgentKind,
         /// Pipeline mode: `auto` runs to Ship unattended; `supervise` gates at Validate.
         #[arg(long)]
         mode: Mode,
@@ -252,7 +252,7 @@ fn run() -> Result<(), CliError> {
 fn start(
     project_root: &Path,
     phase: u32,
-    agent: Agent,
+    agent: AgentKind,
     mode: Mode,
     force: bool,
     worktree: bool,
@@ -597,7 +597,7 @@ fn ensure_phase_worktree(
 fn parse_phase_agent_pairs(
     phases: &str,
     agents: Option<&str>,
-) -> Result<Vec<(u32, Agent)>, CliError> {
+) -> Result<Vec<(u32, AgentKind)>, CliError> {
     let phases: Vec<u32> = phases
         .split(',')
         .map(|p| p.trim())
@@ -611,13 +611,13 @@ fn parse_phase_agent_pairs(
         return Err(CliError::Message("no phases given".into()));
     }
 
-    let agents: Vec<Agent> = match agents {
+    let agents: Vec<AgentKind> = match agents {
         Some(list) => list
             .split(',')
             .map(|a| a.trim())
             .filter(|a| !a.is_empty())
             .map(|a| {
-                a.parse::<Agent>()
+                a.parse::<AgentKind>()
                     .map_err(|err| CliError::Message(err.to_string()))
             })
             .collect::<Result<_, _>>()?,
@@ -634,7 +634,7 @@ fn parse_phase_agent_pairs(
     Ok(phases
         .into_iter()
         .enumerate()
-        .map(|(i, phase)| (phase, agents.get(i).copied().unwrap_or(Agent::Claude)))
+        .map(|(i, phase)| (phase, agents.get(i).copied().unwrap_or(AgentKind::Claude)))
         .collect())
 }
 
@@ -657,13 +657,13 @@ fn parallel(
 }
 
 /// Parse exactly two comma-separated agents for `sequentagent`.
-fn split_two_agents(agents: &str) -> Result<(Agent, Agent), CliError> {
-    let parsed: Vec<Agent> = agents
+fn split_two_agents(agents: &str) -> Result<(AgentKind, AgentKind), CliError> {
+    let parsed: Vec<AgentKind> = agents
         .split(',')
         .map(|a| a.trim())
         .filter(|a| !a.is_empty())
         .map(|a| {
-            a.parse::<Agent>()
+            a.parse::<AgentKind>()
                 .map_err(|err| CliError::Message(err.to_string()))
         })
         .collect::<Result<_, _>>()?;
@@ -682,7 +682,7 @@ fn split_two_agents(agents: &str) -> Result<(Agent, Agent), CliError> {
 fn run_agent_blocking(
     project_root: &Path,
     phase: u32,
-    agent: Agent,
+    agent: AgentKind,
     workdir: &Path,
 ) -> Result<Option<agent_result::AgentResult>, CliError> {
     agent_result::cleanup_phase_files(project_root, phase);
@@ -1403,19 +1403,19 @@ mod tests {
     #[test]
     fn pairs_default_missing_agents_to_claude() {
         let pairs = parse_phase_agent_pairs("7,8", Some("codex")).unwrap();
-        assert_eq!(pairs, vec![(7, Agent::Codex), (8, Agent::Claude)]);
+        assert_eq!(pairs, vec![(7, AgentKind::Codex), (8, AgentKind::Claude)]);
     }
 
     #[test]
     fn pairs_match_agents_positionally() {
         let pairs = parse_phase_agent_pairs("7, 8", Some("claude, codex")).unwrap();
-        assert_eq!(pairs, vec![(7, Agent::Claude), (8, Agent::Codex)]);
+        assert_eq!(pairs, vec![(7, AgentKind::Claude), (8, AgentKind::Codex)]);
     }
 
     #[test]
     fn pairs_default_all_to_claude_without_agents() {
         let pairs = parse_phase_agent_pairs("3,4", None).unwrap();
-        assert_eq!(pairs, vec![(3, Agent::Claude), (4, Agent::Claude)]);
+        assert_eq!(pairs, vec![(3, AgentKind::Claude), (4, AgentKind::Claude)]);
     }
 
     #[test]
@@ -1444,7 +1444,7 @@ mod tests {
     fn split_two_agents_requires_exactly_two() {
         assert_eq!(
             split_two_agents("claude, codex").unwrap(),
-            (Agent::Claude, Agent::Codex)
+            (AgentKind::Claude, AgentKind::Codex)
         );
         assert!(split_two_agents("claude").is_err());
         assert!(split_two_agents("claude,codex,opencode").is_err());
@@ -1522,7 +1522,7 @@ mod tests {
         init_repo(root);
 
         let phase = 21;
-        let mut state = State::new(phase, Agent::Claude, Mode::Auto, root.to_path_buf());
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Ship;
         workflow::save_state(&state).unwrap();
 
@@ -1565,7 +1565,7 @@ mod tests {
         let root = dir.path();
 
         let phase = 22;
-        let mut state = State::new(phase, Agent::Claude, Mode::Auto, root.to_path_buf());
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         state.consecutive_failures = mode::MAX_CONSECUTIVE_FAILURES - 1;
         workflow::save_state(&state).unwrap();

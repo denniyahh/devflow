@@ -7,7 +7,7 @@
 use crate::state::AgentKind;
 
 /// Common behavior implemented by every supported coding-agent backend.
-pub trait Agent {
+pub trait AgentAdapter {
     /// Human-readable adapter name.
     fn name(&self) -> &'static str;
 
@@ -20,7 +20,7 @@ pub trait Agent {
 }
 
 /// Return an adapter for a configured agent kind.
-pub fn adapter_for(kind: AgentKind) -> Box<dyn Agent> {
+pub fn adapter_for(kind: AgentKind) -> Box<dyn AgentAdapter> {
     match kind {
         AgentKind::Claude => Box::new(ClaudeAgent),
         AgentKind::Codex => Box::new(CodexAgent),

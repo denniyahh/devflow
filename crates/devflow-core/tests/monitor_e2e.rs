@@ -18,7 +18,7 @@ use devflow_core::config::GitFlowConfig;
 use devflow_core::mode::Mode;
 use devflow_core::monitor::{spawn_monitor, wait_for_agent_pid};
 use devflow_core::stage::Stage;
-use devflow_core::state::{Agent, State};
+use devflow_core::state::{AgentKind, State};
 use devflow_core::workflow::{WorkflowError, load_state};
 use std::path::Path;
 use std::process::Command;
@@ -64,7 +64,7 @@ fn monitor_owns_fake_agent_and_records_devflow_result() {
     let phase = 7;
     init_repo(root, phase);
 
-    let mut state = State::new(phase, Agent::Claude, Mode::Auto, root.to_path_buf());
+    let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
     state.stage = Stage::Code;
 
     // Fake agent: emit the success marker on stdout, then exit 0.

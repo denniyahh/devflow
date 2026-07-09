@@ -130,7 +130,7 @@ fn format_age(started_at: &str) -> String {
 mod tests {
     use super::*;
     use crate::mode::Mode;
-    use crate::state::{Agent, State};
+    use crate::state::{AgentKind, State};
 
     /// Build a state in `root` whose `started_at` is `age_secs` in the past,
     /// optionally writing the monitor's agent-pid file with `agent_pid`.
@@ -139,7 +139,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let mut state = State::new(1, Agent::Claude, Mode::Auto, root.to_path_buf());
+        let mut state = State::new(1, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.started_at = now.saturating_sub(age_secs).to_string();
         if let Some(pid) = agent_pid {
             let path = crate::agent_result::agent_pid_path(root, state.phase);
@@ -186,7 +186,7 @@ mod tests {
     #[test]
     fn unparseable_timestamp_is_never_stale() {
         let dir = tempfile::tempdir().unwrap();
-        let mut state = State::new(1, Agent::Claude, Mode::Auto, dir.path().to_path_buf());
+        let mut state = State::new(1, AgentKind::Claude, Mode::Auto, dir.path().to_path_buf());
         state.started_at = "not-a-number".into();
         assert!(!is_stale_state(&state));
         assert_eq!(state_age_secs(&state.started_at), None);
