@@ -1,47 +1,106 @@
 # DevFlow
 
-> Agent-agnostic development workflow automation CLI
+## What This Is
 
-## Overview
+DevFlow is a Rust CLI that automates the mechanical workflow steps an AI
+coding agent needs to drive a development phase end-to-end: branch creation,
+agent launch, completion detection, gated human checkpoints, versioning,
+docs/changelog updates, and cleanup. It runs a 5-stage pipeline
+(Define → Plan → Code → Validate → Ship) against any of several agent-agnostic
+adapters (Claude Code, OpenAI Codex, OpenCode), in either `auto` (unattended)
+or `supervise` (gated) mode.
 
-**Language:** Rust (edition 2024)
-**Version:** 0.5.0
-**License:** MIT OR Apache-2.0
-**Repository:** https://github.com/denniyahh/devflow
+## Core Value
 
-DevFlow automates the mechanical workflow steps that AI coding agents need:
-branch creation, agent launch, completion monitoring, version bumping, documentation,
-and cleanup. Agent-agnostic — works with Claude Code, OpenAI Codex, OMX, and OpenCode.
+A developer should be able to run `devflow start --phase N` and walk away —
+DevFlow must reliably drive the agent through the full pipeline and never
+silently corrupt its own state or lose a human's gate decision, even under a
+mid-run crash or kill.
 
-## Project Status
+## Requirements
 
-| Item | Status |
-|---|---|
-| Core state machine | ✅ |
-| CLI (start/check/status/ship/init/config) | ✅ |
-| Git flow (feature/release branching) | ✅ |
-| Tmux agent launcher | ✅ (fixed monitor deadlock 2026-06-17) |
-| Monitor daemon | ✅ |
-| Error recovery (recover, lock, SIGTERM) | ✅ |
-| Version bumper (pyproject.toml only) | 🟡 Partial |
-| CI/CD | ❌ None |
-| Tests | ❌ 2 tests (5% coverage) |
-| Hermes skill | ❌ |
-| GitHub PR integration | ❌ |
-| TUI | ❌ |
+### Validated
+
+- ✓ 5-stage GSD-native pipeline (Define→Plan→Code→Validate→Ship), `Mode`
+  (auto/supervise) with forced-gate-on-repeated-failure — Phase 11
+- ✓ File-based human gate protocol (write/poll/ack, 7-day timeout) — Phase 11
+- ✓ Agent-agnostic adapters (Claude Code, Codex, OpenCode) — Phase 11
+- ✓ Hybrid git-based SemVer (`version.rs`), hardened against workspace +
+  array-of-tables `Cargo.toml` shapes — Phase 11, hardened in Phase 12
+- ✓ Crash-safe state persistence (atomic temp+rename `save_state`) — Phase 12
+- ✓ Argv-based agent spawn (no shell interpolation of agent-controlled
+  data) — Phase 12
+- ✓ crates.io publish-readiness (metadata, `--dry-run`, `cargo package`) —
+  Phase 12, publish itself intentionally held until after Phase 13/14
+
+### Active
+
+- Phase 13 — OSS readiness (dev container, contribution docs, a full
+  README/ARCHITECTURE.md rewrite against current reality), Hermes plugin,
+  Hermes/Antigravity agent adapters
+- Phase 14 — reliability & observability hardening: close the "agent exited"
+  vs. "agent succeeded" gap, replace the silent 7-day gate timeout and
+  default permission bypass, add real progress observability
+
+### Out of Scope
+
+- Bootstrap tooling (`new-project`, `map-codebase`) — deferred to its own
+  future phase; no detailed requirements exist yet (Phase 12 CONTEXT.md,
+  2026-07-08)
+- `devflow.toml` / configurable pipeline — shelved 2026-07-08 (see STATE.md);
+  open to reconsidering per external review feedback, but not scoped to any
+  current phase
+- GSD-native `ship.rs` rewrite (`ship_phase()`, `/gsd-ship` +
+  `/gsd-code-review` integration) — a real, unclaimed architectural gap
+  flagged since Phase 11; not yet assigned to Phase 13, 14, or its own phase
+
+## Context
+
+- Originally built around `tmux` for agent launching; Phase 11's GSD-native
+  refactor replaced this entirely with direct process spawning + a monitor
+  daemon (`monitor.rs`) that captures stdout/stderr/exit/pid to files and
+  invokes `devflow advance` on completion. `tmux` is no longer a runtime
+  dependency.
+- The CLI surface was substantially cut and rebuilt in Phase 11: `check`,
+  `verify`, `lint`, `docs`, `ship`, `confirm`, `rejectpr`, `init`, and
+  `config` subcommands were removed. Current commands: `start`, `advance`
+  (hidden, internal), `parallel`, `sequentagent`, `reference`, `cleanup`,
+  `status`, `list`, `recover`, `doctor`, `test`.
+- Workspace version is `1.2.0`. Code/docs historically over-claimed
+  "v2.0.0" as current; Phase 12 corrected this — 2.0.0 is the *target*
+  version for the Phase 11–14 arc, not yet shipped, and will only be bumped
+  when that line actually ships.
+- No `.planning/REQUIREMENTS.md` exists in this project; requirements are
+  tracked per-phase in each phase's `CONTEXT.md`, not via formal REQ-IDs.
+
+## Constraints
+
+- **Tech stack**: Rust 2024 edition, workspace of `devflow-core` (lib) +
+  `devflow-cli` (binary). Dependencies: serde, clap, thiserror, tracing (zero
+  network deps).
+- **Runtime**: `git` required; no `tmux` dependency since Phase 11.
+- **Build**: `cargo build --release` → single static binary (~20MB).
+- **Versioning**: hybrid git-based SemVer via `version.rs` — do not
+  reintroduce commit-message-based versioning (deprecated, reorganized June
+  2026).
+
+## Key Decisions
+
+| Decision | Rationale | Outcome |
+|----------|-----------|---------|
+| Replace tmux-based agent launch with direct process spawn + monitor daemon | tmux launcher had a monitor deadlock bug; direct spawn + file-based capture is simpler and testable | ✓ Good |
+| File-based gate protocol instead of a live RPC/socket | Human response can come from any interface (Hermes, manual file drop, future UI) without DevFlow depending on any one of them | ✓ Good |
+| Hold `cargo publish` until after Phase 13 (OSS docs) + Phase 14 (reliability) | Publishing is irreversible — a version can never be reused or unpublished; first public release should be reliability-hardened and documented | — Pending |
+| Shelve `devflow.toml` / configurable pipeline | Config was fully removed in Phase 11 for simplicity; open to reconsidering per external review feedback, but not urgent | — Pending |
+| Defer bootstrap (`new-project`/`map-codebase`) out of Phase 12 | Genuinely unscoped — no detailed requirements exist yet; inventing them would be speculative | — Pending |
 
 ## Key Files
 
 | File | Purpose |
 |---|---|
-| `ROADMAP.md` | Original version roadmap (v0.1.0 → v1.1+, partially stale) |
-| `AGENTS.md` | AI agent context (partially stale — references old tmux approach) |
-| `.planning/codebase/` | Codebase map (7 documents, 2026-06-17) |
-| `.planning/CONCERNS.md` | Top findings from codebase audit |
+| `.planning/ROADMAP.md` | Phase plan source of truth (current — not the stale pre-GSD `ROADMAP.md` at repo root, which predates the GSD reorg) |
+| `.planning/codebase/` | Codebase map (7 documents, 2026-06-17 — predates Phases 1-12; consider `/gsd-map-codebase` before Phase 13) |
+| `.planning/CONCERNS.md` | Top findings from the original pre-Phase-1 codebase audit |
 
-## Tech Stack
-
-- **Rust 2024** — workspace: `devflow-core` (lib) + `devflow-cli` (binary)
-- **Dependencies**: serde, clap, thiserror, tracing (zero network deps)
-- **System**: tmux, git (required at runtime)
-- **Build**: `cargo build --release` → single static binary (~20MB)
+---
+*Last updated: 2026-07-11 after Phase 12 (bootstrap-housekeeping) completion*
