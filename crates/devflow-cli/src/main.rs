@@ -460,6 +460,12 @@ fn transition(project_root: &Path, state: &mut State, to: Stage) -> Result<(), C
 
 /// Loop the pipeline back to Code with a gaps-only fix prompt.
 fn loop_back_to_code(project_root: &Path, state: &mut State) -> Result<(), CliError> {
+    // Capture the stage the gate actually fired on before it's mutated below,
+    // so cleanup targets the right stage's gate files (see CR-01: a stale
+    // response/ack left on disk after a loop-back is silently reused by a
+    // later gate for the same phase+stage).
+    let gate_stage = state.stage;
+    let _ = Gates::cleanup(project_root, state.phase, gate_stage);
     state.stage = Stage::Code;
     state.gate_pending = false;
     workflow::save_state(state)?;
@@ -467,7 +473,6 @@ fn loop_back_to_code(project_root: &Path, state: &mut State) -> Result<(), CliEr
         "looping back to Code (validate failures: {})",
         state.consecutive_failures
     );
-    let _ = project_root;
     launch_stage(
         state,
         Some(prompt::fix_prompt(FixType::GapsOnly, state.phase)),
@@ -526,6 +531,9 @@ fn run_gate(
 /// Abort the workflow with a reason, clearing state.
 fn abort(project_root: &Path, state: &State, reason: &str) -> Result<(), CliError> {
     println!("workflow aborted for phase {}: {reason}", state.phase);
+    // See CR-01: without this, a stale response/ack for this phase+stage
+    // survives on disk and is silently reused if the gate fires again later.
+    let _ = Gates::cleanup(project_root, state.phase, state.stage);
     let _ = workflow::clear_state(project_root);
     Ok(())
 }
@@ -1584,11 +1592,68 @@ mod tests {
         handle_validate_outcome(root, &mut state, false).unwrap();
 
         assert_eq!(state.consecutive_failures, mode::MAX_CONSECUTIVE_FAILURES);
+        // CR-01: the forced gate's request file (along with its response and
+        // ack) must be cleaned up once it resolves to Abort — previously
+        // only the terminal Ship-success path cleaned up gate files, leaving
+        // this one on disk to be silently reused by a later gate.
         assert!(
-            Gates::gate_path(root, phase, Stage::Validate).exists(),
-            "forced gate request must be written at the failure threshold"
+            !Gates::gate_path(root, phase, Stage::Validate).exists(),
+            "forced gate's files must be cleaned up once it resolves to Abort"
         );
         let err = workflow::load_state(root).unwrap_err();
         assert!(matches!(err, workflow::WorkflowError::MissingState(_)));
+    }
+
+    /// Regression test for CR-01: `abort()` must clean up the gate's
+    /// response/ack files for the stage the gate actually fired on. Without
+    /// that cleanup, a later gate for the same phase+stage would find the
+    /// old, already-consumed response still on disk and `poll_response`
+    /// would resolve from it instantly instead of waiting for a fresh human
+    /// decision.
+    #[test]
+    fn abort_cleans_up_gate_files_so_a_later_gate_does_not_reuse_stale_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let phase = 23;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        state.consecutive_failures = mode::MAX_CONSECUTIVE_FAILURES - 1;
+        workflow::save_state(&state).unwrap();
+
+        // Pre-write a rejected response whose note says "abort" so
+        // `GateAction::from_response` resolves to `Abort`.
+        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"abort: requirements changed","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        handle_validate_outcome(root, &mut state, false).unwrap();
+
+        // The gate, response, and ack files for the stage the gate fired on
+        // (Validate) must all be gone after the Abort path runs.
+        assert!(!Gates::gate_path(root, phase, Stage::Validate).exists());
+        assert!(
+            !Gates::response_path(root, phase, Stage::Validate).exists(),
+            "stale response file must not survive an aborted gate"
+        );
+        assert!(!Gates::ack_path(root, phase, Stage::Validate).exists());
+
+        // Simulate the phase reaching the same gate again later (e.g. after
+        // a restart) — write a fresh request but no new response. If cleanup
+        // had not happened, `poll_response` would instantly return the old,
+        // already-consumed response instead of blocking for a fresh human
+        // decision.
+        Gates::write_gate(root, phase, Stage::Validate, "re-fired gate").unwrap();
+        let started = std::time::Instant::now();
+        let got = Gates::poll_response(root, phase, Stage::Validate, 1);
+        assert!(
+            got.is_none(),
+            "poll_response must not instantly resolve from a stale response after cleanup"
+        );
+        assert!(started.elapsed() >= std::time::Duration::from_secs(1));
     }
 }
