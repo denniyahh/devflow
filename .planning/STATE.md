@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
 status: In progress
-stopped_at: Completed 13-02-PLAN.md
-last_updated: "2026-07-14T20:31:13.285Z"
+stopped_at: Completed 13-03-PLAN.md
+last_updated: "2026-07-14T20:44:36.620Z"
 progress:
   total_phases: 4
   completed_phases: 1
   total_plans: 18
-  completed_plans: 14
-  percent: 78
+  completed_plans: 15
+  percent: 83
 ---
 
 # DevFlow — Project State
@@ -72,6 +72,9 @@ None.
 - [Phase 13]: 13-01: non_validate_failure_fires_gate_and_hook asserts notify-hook-fired + a pure should_gate() check rather than the exact env value, since DEVFLOW_GATE_NOTIFY_CMD is process-global and races other concurrently-running gate tests
 - [Phase 13]: 13-02: Made no-ship-on-Critical MANDATORY in the Ship prompt (not just review-first sequencing) so a headless run never reaches /gsd-ship's interactive optional_review step
 - [Phase 13]: 13-02: Adopted the review: reason-string prefix convention (trim + case-fold) for ReviewFailed instead of a new AgentStatus enum variant, to avoid a serde-format break
+- [Phase 13]: 13-03: is_error checked before DEVFLOW_RESULT marker in evaluate_layer1, so a Claude envelope's is_error: true always overrides a stale success marker
+- [Phase 13]: 13-03: Codex turn.completed returns None (defers), never Success -- a marker-less turn cannot silently advance a stage
+- [Phase 13]: 13-03: Layer 2 commit gate uses explicit matches!(stage, Stage::Plan | Stage::Code), not is_agent_stage(), since is_agent_stage() also includes Define
 
 ## Roadmap Evolution
 
@@ -91,9 +94,10 @@ None.
 | Phase 12-bootstrap-housekeeping P12 | n/a | 3 tasks | 0 files |
 | Phase 13-mvp-core-loop P01 | 17min | 3 tasks | 3 files |
 | Phase 13-mvp-core-loop P02 | 10min | 2 tasks | 2 files |
+| Phase 13-mvp-core-loop P03 | 12min | 3 tasks | 1 files |
 
 ## Session
 
-**Last session:** 2026-07-14T20:30:01.084Z
-**Stopped at:** Completed 13-02-PLAN.md
+**Last session:** 2026-07-14T20:43:39.070Z
+**Stopped at:** Completed 13-03-PLAN.md
 **Resume file:** None
