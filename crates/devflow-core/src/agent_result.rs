@@ -19,6 +19,19 @@ pub struct AgentResult {
     pub reason: Option<String>,
     pub commits: Option<u32>,
     pub summary: Option<String>,
+    /// The Validate stage's self-reported verdict — distinct from `status`.
+    /// `status` reports whether the stage's task (running `/gsd-validate-phase`)
+    /// completed; `verdict` reports whether validation ITSELF passed. Only
+    /// `Some(Verdict::Pass)` should advance Validate to Ship; `Some(Verdict::Gaps)`
+    /// and `None` both gate/loop back to Code (see `advance()`'s Validate arm).
+    /// Ignored entirely for non-Validate stages.
+    ///
+    /// Deserialized leniently via [`deserialize_verdict_lenient`]: an absent,
+    /// unknown, or mis-cased value becomes `None` rather than failing the
+    /// whole `AgentResult` parse (T-13-14) — a malformed verdict must never
+    /// silently drop a valid `status` to Layer 2.
+    #[serde(default, deserialize_with = "deserialize_verdict_lenient")]
+    pub verdict: Option<Verdict>,
 }
 
 /// Agent completion status determined by DevFlow.
@@ -33,6 +46,39 @@ pub enum AgentStatus {
     RateLimited,
     /// No signal received — fallback to exit code / commit heuristic.
     Unknown,
+}
+
+/// The Validate stage's self-reported verdict (13b verdict-vs-ran split).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Verdict {
+    /// Validation found no gaps — ready to advance to Ship.
+    Pass,
+    /// Validation found gaps that still need fixing — must loop back to Code
+    /// (or gate, depending on the consecutive-failure threshold).
+    Gaps,
+}
+
+/// Deserialize `verdict` leniently: an absent, unknown, or mis-cased value
+/// (e.g. `"wat"`, `"Pass"`) becomes `Ok(None)` rather than an error, so a
+/// malformed verdict never fails the whole `from_str::<AgentResult>` parse
+/// and silently drops a valid `status` to Layer 2 (T-13-14, consensus #5).
+///
+/// Matching is intentionally exact-case (only the wire-format lowercase
+/// strings `"pass"`/`"gaps"` are accepted) — a mis-cased value like `"Pass"`
+/// is NOT case-folded into a match; it is treated the same as an unknown
+/// value and maps to `None`, so a subtly wrong-case verdict fails safe
+/// (gate/loop) instead of silently passing.
+fn deserialize_verdict_lenient<'de, D>(deserializer: D) -> Result<Option<Verdict>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <Option<String> as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(raw.and_then(|s| match s.as_str() {
+        "pass" => Some(Verdict::Pass),
+        "gaps" => Some(Verdict::Gaps),
+        _ => None,
+    }))
 }
 
 /// Capture from an agent child process: stdout contents and exit code.
@@ -226,6 +272,7 @@ fn detect_claude_envelope_failure(stdout: &str) -> Option<AgentResult> {
         reason: Some(reason),
         commits: None,
         summary: None,
+        verdict: None,
     })
 }
 
@@ -297,6 +344,7 @@ fn parse_codex_event_result(stdout: &str) -> Option<AgentResult> {
         reason: Some(reason),
         commits: None,
         summary: None,
+        verdict: None,
     })
 }
 
@@ -355,6 +403,7 @@ pub fn evaluate_layer1(project_root: &Path, phase: u32) -> Option<AgentResult> {
                 reason: Some(format!("rate limited until {retry}")),
                 commits: None,
                 summary: None,
+                verdict: None,
             })
         })
 }
@@ -443,6 +492,7 @@ pub fn evaluate_layer2(
         },
         commits: Some(commits),
         summary: None,
+        verdict: None,
     }))
 }
 
@@ -481,6 +531,7 @@ pub fn evaluate_layer3(
         },
         commits: Some(commits),
         summary: None,
+        verdict: None,
     })
 }
 
@@ -1052,5 +1103,45 @@ mod tests {
         assert_eq!(result.exit_code, None);
         assert_eq!(result.commits, Some(1));
         assert!(result.reason.unwrap().contains("1 commits"));
+    }
+
+    #[test]
+    fn parse_devflow_result_reads_verdict() {
+        let stdout = r#"DEVFLOW_RESULT: {"status":"success","verdict":"gaps"}"#;
+        let result = parse_devflow_result(stdout).unwrap();
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(result.verdict, Some(Verdict::Gaps));
+    }
+
+    #[test]
+    fn parse_devflow_result_reads_verdict_pass() {
+        let stdout = r#"DEVFLOW_RESULT: {"status":"success","verdict":"pass"}"#;
+        let result = parse_devflow_result(stdout).unwrap();
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(result.verdict, Some(Verdict::Pass));
+    }
+
+    #[test]
+    fn parse_devflow_result_verdict_absent_is_none() {
+        let stdout = r#"DEVFLOW_RESULT: {"status":"success"}"#;
+        let result = parse_devflow_result(stdout).unwrap();
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(result.verdict, None);
+    }
+
+    #[test]
+    fn parse_devflow_result_malformed_verdict_is_none_not_parse_error() {
+        // An unknown verdict string must not fail the whole marker parse —
+        // status must still come through as Success with verdict None (T-13-14).
+        let unknown = r#"DEVFLOW_RESULT: {"status":"success","verdict":"wat"}"#;
+        let result = parse_devflow_result(unknown).unwrap();
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(result.verdict, None);
+
+        // Mis-cased ("Pass" instead of "pass") must also be lenient, not an error.
+        let miscased = r#"DEVFLOW_RESULT: {"status":"success","verdict":"Pass"}"#;
+        let result = parse_devflow_result(miscased).unwrap();
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(result.verdict, None);
     }
 }

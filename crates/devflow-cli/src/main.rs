@@ -826,6 +826,7 @@ fn run_agent_blocking(
                     reason: Some(format!("rate limited until {retry}")),
                     commits: None,
                     summary: None,
+                    verdict: None,
                 }
             })
         }),
