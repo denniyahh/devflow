@@ -8,8 +8,8 @@
 |---|---|---|
 | 12 | Bootstrap + Housekeeping | Complete |
 | 13 | MVP Core Loop | Scoped |
-| 14 | Observability Hardening | Scoped |
-| 15 | OSS Readiness + Hermes Plugin | Scoped |
+| 14 | Observability + Hermes Support | Scoped |
+| 15 | OSS Readiness | Scoped |
 
 ## Shipped
 
@@ -35,8 +35,8 @@
 ## Reorganized for MVP (2026-07-14)
 
 - **Phase 13 repurposed as MVP Core Loop** — priority is getting Define→Plan→Code→Validate→Ship working end-to-end unattended (Claude + Codex, gates via notify hook) so DevFlow can be dogfooded on real projects again. Claims the previously unclaimed `ship.rs` GSD-native rewrite; absorbs the reliability items from old Phase 14 (verdict-vs-ran, native envelope parsing, WR-11, notify hook, gate timeout, worktree default).
-- **Phase 14 rescoped to Observability Hardening** — residual `devflow logs`/`events.jsonl`/`status` work plus the previously unclaimed `capture_agent_output()` sync-path decision (now claimed there).
-- **Phase 15 (was 13)** — OSS readiness + Hermes plugin, content unchanged, plus the actual crates.io publish.
+- **Phase 14 rescoped to Observability + Hermes Support** — residual `devflow logs`/`events.jsonl`/`status` work plus the previously unclaimed `capture_agent_output()` sync-path decision (now claimed there). Hermes work (agent adapter, skill-file rewrite, plugin) moved in from Phase 15 (2026-07-14) — the plugin's gate watcher consumes this phase's `events.jsonl`, so they ship together.
+- **Phase 15 (was 13)** — OSS readiness (docs, dev container, contributing, Antigravity adapter) plus the actual crates.io publish. Hermes items moved out to Phase 14.
 
 ### Phase 12: Bootstrap + Housekeeping
 
@@ -78,9 +78,9 @@ Plans:
 
 - [ ] TBD (run /gsd-plan-phase 13 to break down)
 
-### Phase 14: Observability Hardening
+### Phase 14: Observability + Hermes Support
 
-**Goal:** Surface loop progress instead of a black box — `devflow logs [--follow]`, append-only `events.jsonl`, richer `devflow status` — and settle the `capture_agent_output()` sync-path decision.
+**Goal:** Surface loop progress instead of a black box — `devflow logs [--follow]`, append-only `events.jsonl`, richer `devflow status` — settle the `capture_agent_output()` sync-path decision, and add first-class Hermes support: `HermesAgent` adapter (14c), skill-file rewrite (14d), and the Hermes plugin session mode (14e, gate watcher built on 13c's notify hook + this phase's events.jsonl).
 **Requirements**: TBD (see CONTEXT.md)
 **Depends on:** Phase 13
 **Plans:** 0 plans
@@ -89,11 +89,11 @@ Plans:
 
 - [ ] TBD (run /gsd-plan-phase 14 to break down)
 
-### Phase 15: OSS Readiness + Hermes Plugin
+### Phase 15: OSS Readiness
 
-**Goal:** Make DevFlow ready for public consumption — dev container, contribution docs, a full ARCHITECTURE.md/README rewrite against v2 reality, Hermes + Antigravity agent support, a first-class Hermes plugin, and the actual crates.io publish.
+**Goal:** Make DevFlow ready for public consumption — dev container, contribution docs, a full ARCHITECTURE.md/README rewrite against v2 reality, Antigravity agent support, and the actual crates.io publish.
 **Requirements**: TBD (see CONTEXT.md)
-**Depends on:** Phase 13 (docs must describe the post-MVP loop; plugin builds on the 13c notify hook)
+**Depends on:** Phase 13 (docs must describe the post-MVP loop)
 **Plans:** 0 plans
 
 Plans:

@@ -1,17 +1,19 @@
-# Phase 15: OSS Readiness + Hermes Plugin
+# Phase 15: OSS Readiness
 
 **Status:** Scoped | **Priority:** MEDIUM | **Target:** TBD
 
 > Renumbered from Phase 13 on 2026-07-14 — Phase 13 was repurposed as
-> "MVP Core Loop" per the MVP restructure decision. Content unchanged
-> except section renumbering, the crates.io publish item, and the gate
-> watcher note in 15d.
+> "MVP Core Loop" per the MVP restructure decision. Later the same day,
+> all Hermes work (agent adapter, skill-file rewrite, plugin) moved to
+> Phase 14 (Observability + Hermes Support) for workload balance and
+> synergy with `events.jsonl`. This phase keeps the pure OSS packaging
+> plus the Antigravity adapter.
 
 ## Goal
 
-Make DevFlow ready for public consumption: dev container, contribution docs,
-Hermes + Antigravity agent support, and a first-class Hermes plugin that gives
-Hermes a dedicated DevFlow session mode.
+Make DevFlow ready for public consumption: dev container, contribution
+docs, README/ARCHITECTURE rewrite, Antigravity agent support, and the
+actual crates.io publish.
 
 ---
 
@@ -55,12 +57,6 @@ Hermes a dedicated DevFlow session mode.
 - [ ] `--help` snapshot test — commit a snapshot of `devflow --help` output
       and assert it in CI, so README/CLI drift can't recur silently.
       (Build on the phase7 CLI test harness.)
-- [ ] Hermes skill file (`skills/hermes/devflow/SKILL.md`) is independently
-      stale: says `v0.5.0+`, references `--max-turns 50` (not a real
-      adapter flag) and `devflow check` (now `advance`), and has
-      machine-specific paths (`~/Github/devflow`, distrobox notes). Rewrite
-      against current CLI/adapter behavior as part of this pass, ahead of
-      15d's plugin work.
 - [ ] CODE_OF_CONDUCT.md, SECURITY.md (if missing)
 - [ ] CI badge + PR gate status
 - [ ] Publish `devflow` to crates.io — metadata + dry-run/package landed
@@ -69,49 +65,20 @@ Hermes a dedicated DevFlow session mode.
 
 ---
 
-## 15c — Hermes + Antigravity Agent Adapters
+## 15c — Antigravity Agent Adapter
 
-- [ ] `HermesAgent` adapter — `hermes exec --non-interactive --json`
 - [ ] `AntigravityAgent` adapter — launch protocol for Antigravity CLI
-- [ ] AgentKind variants + parser + display + adapter_for()
+- [ ] AgentKind variant + parser + display + adapter_for()
 - [ ] Tests: parser aliases, shared prompt, adapter name
 
 ---
 
-## 15d — Hermes Plugin
+## Moved to Phase 14 (2026-07-14)
 
-A first-class DevFlow session mode for Hermes. When active, Hermes operates as
-DevFlow's human interface rather than a general assistant — preventing confusion
-between devflow commands and general LLM prompts, and facilitating tighter
-integration with gate responses, stage transitions, and state inspection.
-
-### Mode Behavior
-
-When DevFlow mode is active, Hermes:
-
-- **Interprets gate responses directly** — "approved", "reject", "review" trigger
-  gate response file writes without the user needing to address Hermes explicitly
-- **Surfaces devflow state** — `devflow status` auto-runs on session start,
-  active gates shown prominently
-- **Prevents prompt confusion** — general questions ("what's the capital of
-  France?") are redirected or handled separately from devflow operations
-- **Auto-loads devflow context** — project state, active phase, open gates
-
-### Implementation
-
-- [ ] Hermes plugin: `~/.hermes/plugins/devflow/` — session mode, tools, hooks
-- [ ] Toggle: `/devflow on` / `/devflow off`
-- [ ] Gate watcher integration: replaces cron poll with plugin-native push
-      (build on the Phase 13 gate notify hook and Phase 14 `events.jsonl`
-      rather than a bespoke integration)
-- [ ] Status display: active phase, current stage, open gates in session header
-- [ ] Auto-response: intercept "approved"/"reject"/"review" in Telegram and write
-  response files
-- [ ] Plugin docs: installation, usage, configuration
-
----
+- `HermesAgent` adapter (was 15c)
+- Hermes skill-file rewrite (was in 15b)
+- Hermes plugin (was 15d)
 
 ## Deferred From Phase 11
 
-- Dev container (was capacity-permitting in Phase 11, now Phase 13)
-- Hermes agent adapter (was Phase 12, pushed to 13)
+- Dev container (was capacity-permitting in Phase 11, now this phase)

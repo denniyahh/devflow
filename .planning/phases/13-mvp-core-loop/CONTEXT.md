@@ -15,11 +15,11 @@ Repurposed 2026-07-14 from the old "OSS Readiness + Hermes Plugin" phase
 (content moved wholesale to Phase 15). MVP scope decisions, confirmed with
 the operator:
 
-- **Agents:** Claude Code + Codex. Hermes/Antigravity adapters deferred
-  (Phase 15).
+- **Agents:** Claude Code + Codex. Hermes adapter deferred (Phase 14),
+  Antigravity adapter deferred (Phase 15).
 - **Gates:** answered via a pluggable notify hook (ntfy/desktop) —
   unattended runs, no terminal babysitting. Hermes plugin deferred
-  (Phase 15).
+  (Phase 14).
 - **Ship:** full loop including the automated Ship stage — the unclaimed
   `ship.rs` rewrite is claimed here.
 
@@ -109,10 +109,11 @@ The phase's exit criterion is not "tasks complete" but "the loop ran."
 
 ## Explicitly Out of Scope (this phase)
 
-- Hermes + Antigravity agent adapters, Hermes plugin — Phase 15
-- README/ARCHITECTURE rewrite, `.devflow.yaml` decoy removal, IN-01
-  rustdoc, `--help` snapshot CI test, dev container, CONTRIBUTING/CoC —
-  Phase 15
+- Hermes agent adapter, Hermes skill-file rewrite, Hermes plugin —
+  Phase 14 (moved from 15, 2026-07-14)
+- Antigravity agent adapter, README/ARCHITECTURE rewrite, `.devflow.yaml`
+  decoy removal, IN-01 rustdoc, `--help` snapshot CI test, dev container,
+  CONTRIBUTING/CoC — Phase 15
 - `devflow logs [--follow]`, `events.jsonl`, `devflow status` enrichment,
   `capture_agent_output()` sync-path decision — remain in Phase 14
 - `devflow.toml` / configurable pipeline — still shelved per 2026-07-08

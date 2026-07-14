@@ -40,12 +40,13 @@ mid-run crash or kill.
   projects. Claims the `ship.rs` GSD-native rewrite; verdict-vs-ran split;
   native Claude/Codex envelope parsing; WR-11 + gate notify hook +
   configurable timeout; worktree-by-default; dogfood run as acceptance test
-- Phase 14 — observability hardening: `devflow logs [--follow]`,
+- Phase 14 — observability + Hermes support: `devflow logs [--follow]`,
   `events.jsonl`, richer `status`; `capture_agent_output()` sync-path
-  decision
-- Phase 15 (was 13) — OSS readiness (dev container, contribution docs, a
-  full README/ARCHITECTURE.md rewrite against current reality), Hermes
-  plugin, Hermes/Antigravity agent adapters, actual crates.io publish
+  decision; HermesAgent adapter, Hermes skill-file rewrite, and the Hermes
+  plugin session mode (moved from 15, 2026-07-14)
+- Phase 15 (was 13) — OSS readiness: dev container, contribution docs, a
+  full README/ARCHITECTURE.md rewrite against current reality, Antigravity
+  agent adapter, actual crates.io publish
 
 ### Out of Scope
 
