@@ -54,9 +54,14 @@ enum Command {
         /// Overwrite the feature branch if it already exists.
         #[arg(long)]
         force: bool,
-        /// Run the agent in an isolated git worktree at `.worktrees/phase-NN/`.
-        #[arg(long)]
+        /// Deprecated: a worktree is now created by default; this flag is a
+        /// no-op kept for one release for backward compatibility.
+        #[arg(long, hide = true)]
         worktree: bool,
+        /// Run the agent directly in the primary checkout instead of an
+        /// isolated worktree (not recommended for unattended runs).
+        #[arg(long)]
+        no_worktree: bool,
         /// Print the pipeline that would run without launching anything.
         #[arg(long)]
         dry_run: bool,
@@ -210,18 +215,25 @@ fn run() -> Result<(), CliError> {
             agent,
             mode,
             force,
-            worktree,
+            worktree: _worktree,
+            no_worktree,
             dry_run,
             project,
-        } => start(
-            &project_root(project)?,
-            phase,
-            agent,
-            mode,
-            force,
-            worktree,
-            dry_run,
-        ),
+        } => {
+            // Worktree is now the default; the deprecated `--worktree` flag is
+            // an intentionally ignored no-op (see field doc comment above).
+            // `--no-worktree` is the only switch that changes behavior.
+            let worktree = !no_worktree;
+            start(
+                &project_root(project)?,
+                phase,
+                agent,
+                mode,
+                force,
+                worktree,
+                dry_run,
+            )
+        }
         Command::Advance { project } => advance(&project_root(project)?),
         Command::Parallel {
             phases,
