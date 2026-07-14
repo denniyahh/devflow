@@ -601,6 +601,43 @@ mod tests {
     }
 
     #[test]
+    fn claude_envelope_is_error_detected() {
+        let stdout = r#"{"type":"result","subtype":"error","is_error":true,"num_turns":2,"result":"tool call failed","session_id":"abc"}"#;
+        let result = detect_claude_envelope_failure(stdout).unwrap();
+        assert_eq!(result.status, AgentStatus::Failed);
+    }
+
+    #[test]
+    fn claude_is_error_overrides_success_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 9),
+            r#"{"type":"result","is_error":true,"num_turns":3,"result":"oops\nDEVFLOW_RESULT: {\"status\":\"success\"}","session_id":"abc"}"#,
+        )
+        .unwrap();
+
+        let result = evaluate_layer1(dir.path(), 9).unwrap();
+
+        assert_eq!(result.status, AgentStatus::Failed);
+    }
+
+    #[test]
+    fn claude_envelope_is_error_false_defers() {
+        let stdout = r#"{"type":"result","is_error":false,"num_turns":1,"result":"did some work","session_id":"abc"}"#;
+        assert!(detect_claude_envelope_failure(stdout).is_none());
+    }
+
+    #[test]
+    fn claude_envelope_marker_still_wins() {
+        let stdout = r#"{"type":"result","is_error":false,"result":"done\nDEVFLOW_RESULT: {\"status\":\"success\",\"commits\":2}","session_id":"abc"}"#;
+        assert!(detect_claude_envelope_failure(stdout).is_none());
+        let result = parse_devflow_result(stdout).unwrap();
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(result.commits, Some(2));
+    }
+
+    #[test]
     fn evaluate_layer1_reports_rate_limited_without_marker() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
