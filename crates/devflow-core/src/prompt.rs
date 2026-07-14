@@ -71,10 +71,49 @@ fn ship_stage_prompt(phase: u32) -> String {
     )
 }
 
+/// The Validate stage's dedicated prompt.
+///
+/// 13b verdict-vs-ran: `status` only reports whether the stage's task (running
+/// `/gsd-validate-phase {N}`) completed — it says nothing about whether
+/// validation itself passed. This prompt REQUIRES a distinct `verdict` field
+/// so `advance()`'s Validate arm can tell "the agent ran validation" apart
+/// from "validation passed," and never advances to Ship on a bare `status:
+/// success` for this stage.
+fn validate_stage_prompt(phase: u32) -> String {
+    let command = gsd_command_for(Stage::Validate, phase);
+    format!(
+        "Run the GSD workflow command for this stage:\n\n    {command}\n\n\
+        ## Completion Protocol (REQUIRED)\n\
+        \n\
+        When all work is done, your FINAL message must be exactly one of:\n\
+        \n\
+        DEVFLOW_RESULT: {{\"status\": \"success\", \"verdict\": \"pass\"}}\n\
+        \n\
+        if validation found NO gaps, or:\n\
+        \n\
+        DEVFLOW_RESULT: {{\"status\": \"success\", \"verdict\": \"gaps\"}}\n\
+        \n\
+        if validation found gaps that still need fixing. The `verdict` field \
+        is REQUIRED for this stage — it is distinct from `status` (which only \
+        reports whether the validation task itself completed) and MUST be \
+        exactly the lowercase string `pass` or `gaps`.\n\
+        \n\
+        If something prevents completion:\n\
+        \n\
+        DEVFLOW_RESULT: {{\"status\": \"failed\", \"reason\": \"specific explanation\"}}\n\
+        \n\
+        DevFlow reads this line to decide whether the stage succeeded. \
+        Output nothing after it."
+    )
+}
+
 /// Build the prompt for a stage of a phase.
 pub fn stage_prompt(stage: Stage, phase: u32) -> String {
     if stage == Stage::Ship {
         return ship_stage_prompt(phase);
+    }
+    if stage == Stage::Validate {
+        return validate_stage_prompt(phase);
     }
     let command = gsd_command_for(stage, phase);
     format!(
@@ -159,12 +198,14 @@ mod tests {
     }
 
     #[test]
-    fn non_ship_stage_prompts_are_unchanged_single_command_template() {
+    fn non_ship_non_validate_stage_prompts_are_unchanged_single_command_template() {
+        // Validate is excluded here (Task 2, 13-05): it now gets its own
+        // dedicated prompt requiring a verdict — see
+        // `validate_stage_prompt_requires_verdict` below.
         let cases = [
             (Stage::Define, "/gsd-discuss-phase 9"),
             (Stage::Plan, "/gsd-plan-phase 9"),
             (Stage::Code, "/gsd-execute-phase 9"),
-            (Stage::Validate, "/gsd-validate-phase 9"),
         ];
         for (stage, command) in cases {
             let prompt = stage_prompt(stage, 9);
@@ -175,6 +216,25 @@ mod tests {
                 "{stage} prompt should not carry Ship-specific code-review sequencing"
             );
         }
+    }
+
+    #[test]
+    fn validate_stage_prompt_requires_verdict() {
+        let prompt = stage_prompt(Stage::Validate, 13);
+        assert!(
+            prompt.contains("/gsd-validate-phase 13"),
+            "Validate prompt missing its GSD command"
+        );
+        assert!(
+            prompt.contains("\"verdict\": \"pass\""),
+            "Validate prompt must name the exact lowercase pass verdict"
+        );
+        assert!(
+            prompt.contains("\"verdict\": \"gaps\""),
+            "Validate prompt must name the exact lowercase gaps verdict"
+        );
+        assert!(prompt.contains("REQUIRED"));
+        assert!(prompt.contains("DEVFLOW_RESULT"));
     }
 
     #[test]

@@ -9,7 +9,10 @@ use devflow_core::prompt::{self, FixType};
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
 use devflow_core::{agent_result, agents, lock, monitor, recover, worktree};
-use devflow_core::{agent_result::AgentStatus, workflow};
+use devflow_core::{
+    agent_result::{AgentStatus, Verdict},
+    workflow,
+};
 use std::path::{Path, PathBuf};
 use tracing::info;
 
@@ -402,7 +405,15 @@ fn advance(project_root: &Path) -> Result<(), CliError> {
         Stage::Define => transition(project_root, &mut state, Stage::Plan),
         Stage::Plan => transition(project_root, &mut state, Stage::Code),
         Stage::Code => transition(project_root, &mut state, Stage::Validate),
-        Stage::Validate => handle_validate_outcome(project_root, &mut state, true),
+        Stage::Validate => {
+            // 13b verdict-vs-ran: the Validate prompt now REQUIRES a verdict,
+            // so ONLY an explicit `verdict: pass` advances to Ship. A missing
+            // verdict is a fail-safe (gate/loop), NOT a silent pass — closes
+            // the composition bug where a marker-less/verdict-less Validate
+            // could otherwise reach Ship.
+            let passed = matches!(result.verdict, Some(Verdict::Pass));
+            handle_validate_outcome(project_root, &mut state, passed)
+        }
         Stage::Ship => handle_ship_outcome(project_root, &mut state),
     }
 }
@@ -1721,6 +1732,133 @@ mod tests {
         );
         let err = workflow::load_state(root).unwrap_err();
         assert!(matches!(err, workflow::WorkflowError::MissingState(_)));
+    }
+
+    /// Seed a Validate-stage DEVFLOW_RESULT marker (with the given verdict
+    /// JSON fragment, or `None` to omit the key entirely) and drive `advance()`
+    /// on a scoped thread, busy-polling for the Validate gate file to appear
+    /// so its `context` text — the only externally observable signal of the
+    /// `passed` value `advance()` computed from the verdict — can be read
+    /// before resolving the gate with an Abort response. Forcing a gate for
+    /// every case (rather than letting a `passed=true` case fall through to a
+    /// bare `transition`) is deliberate: `transition`/`loop_back_to_code` both
+    /// call `launch_stage`, which spawns the real configured agent CLI and
+    /// must never fire from a unit test (see `ship_review_failed_loops_to_code`).
+    fn drive_validate_advance_and_read_gate_context(
+        root: &Path,
+        phase: u32,
+        consecutive_failures: u32,
+        verdict_json: Option<&str>,
+    ) -> String {
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        state.consecutive_failures = consecutive_failures;
+        workflow::save_state(&state).unwrap();
+
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        let marker = match verdict_json {
+            Some(verdict) => {
+                format!(r#"DEVFLOW_RESULT: {{"status":"success","verdict":"{verdict}"}}"#)
+            }
+            None => r#"DEVFLOW_RESULT: {"status":"success"}"#.to_string(),
+        };
+        std::fs::write(agent_result::stdout_path(root, phase), marker).unwrap();
+
+        let gate_path = Gates::gate_path(root, phase, Stage::Validate);
+        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        let mut context = String::new();
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                advance(root).unwrap();
+            });
+
+            let mut seen = false;
+            for _ in 0..150 {
+                if gate_path.exists() {
+                    seen = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert!(
+                seen,
+                "advance() must force a Validate gate, not advance silently"
+            );
+
+            context = std::fs::read_to_string(&gate_path).unwrap();
+
+            std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &response_path,
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap();
+        });
+
+        context
+    }
+
+    /// 13b verdict-vs-ran: a Validate agent that ran successfully but found
+    /// gaps (`verdict: "gaps"`) must NOT advance to Ship — `advance()`'s
+    /// Validate arm must compute `passed = false` and route through
+    /// `handle_validate_outcome`'s failure path (gate/loop), never Ship.
+    #[test]
+    fn validate_gaps_does_not_advance_to_ship() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let context = drive_validate_advance_and_read_gate_context(
+            root,
+            60,
+            mode::MAX_CONSECUTIVE_FAILURES - 1,
+            Some("gaps"),
+        );
+        assert!(
+            context.contains("Validation failed"),
+            "a gaps verdict must be treated as a failed validation, not a pass: {context}"
+        );
+    }
+
+    /// 13b verdict-vs-ran (consensus #1): because the Validate prompt now
+    /// REQUIRES a verdict, its absence must be treated as a fail-safe
+    /// (gate/loop), NOT a silent pass — this is the composition fix that
+    /// closes the marker-less/verdict-less Validate → Ship false-advance.
+    #[test]
+    fn validate_missing_verdict_does_not_advance() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let context = drive_validate_advance_and_read_gate_context(
+            root,
+            61,
+            mode::MAX_CONSECUTIVE_FAILURES - 1,
+            None,
+        );
+        assert!(
+            context.contains("Validation failed"),
+            "a missing verdict must be treated as a failed validation, not a pass: {context}"
+        );
+    }
+
+    /// A Validate result with an explicit `verdict: "pass"` must advance to
+    /// Ship — `consecutive_failures` is pre-seeded at the gate threshold
+    /// itself (rather than `threshold - 1`) because a `passed=true` result
+    /// never increments the counter, so the gate must already be at the
+    /// threshold to force it open without falling through to a real
+    /// `transition`/`launch_stage` spawn.
+    #[test]
+    fn validate_pass_advances() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let context = drive_validate_advance_and_read_gate_context(
+            root,
+            62,
+            mode::MAX_CONSECUTIVE_FAILURES,
+            Some("pass"),
+        );
+        assert!(
+            context.contains("Validation passed"),
+            "an explicit pass verdict must advance to Ship: {context}"
+        );
     }
 
     /// Regression test for CR-01: `abort()` must clean up the gate's
