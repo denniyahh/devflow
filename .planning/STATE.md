@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
-status: Ready to plan
-stopped_at: Completed 12-12-PLAN.md
-last_updated: "2026-07-14T00:00:00.000Z"
+status: In progress
+stopped_at: Completed 13-01-PLAN.md
+last_updated: "2026-07-14T20:20:55.606Z"
 progress:
   total_phases: 4
   completed_phases: 1
-  total_plans: 12
-  completed_plans: 12
-  percent: 25
+  total_plans: 18
+  completed_plans: 13
+  percent: 72
 ---
 
 # DevFlow — Project State
@@ -68,6 +68,8 @@ None.
 - [Phase 12-10]: widened shell_quote's safe set additively, documented parse_rfc3339ish's timezone-safe second-restoration, and closed the negative-UTC-offset test gap (WR-05, WR-08, 12f)
 - [Phase 12]: 12-11: renamed Agent enum -> AgentKind (deleting the AgentKind=Agent alias) and adapter trait Agent -> AgentAdapter workspace-wide; removed dead State.agent_result/agent_stdout_path fields (IN-02, IN-03 closed)
 - [Phase 12]: 12-12: manual-verified live Hermes gate round-trip, real Claude CLI launch+capture, and DocsUpdate fail-soft WARN visibility against the real compiled devflow binary; Full-Ship workflow recorded BLOCKED on out-of-scope ship.rs rewrite. Phase 12 (12/12 plans) complete.
+- [Phase 13]: 13-01: split loop_back_to_code into prepare_loop_back_to_code (pure state mutation) + launch_stage so ReviewFailed dispatch is unit-testable without spawning the real configured agent CLI
+- [Phase 13]: 13-01: non_validate_failure_fires_gate_and_hook asserts notify-hook-fired + a pure should_gate() check rather than the exact env value, since DEVFLOW_GATE_NOTIFY_CMD is process-global and races other concurrently-running gate tests
 
 ## Roadmap Evolution
 
@@ -85,9 +87,10 @@ None.
 | Phase 12-bootstrap-housekeeping P10 | 15min | 3 tasks | 1 files |
 | Phase 12-bootstrap-housekeeping P11 | 15min | 2 tasks | 13 files |
 | Phase 12-bootstrap-housekeeping P12 | n/a | 3 tasks | 0 files |
+| Phase 13-mvp-core-loop P01 | 17min | 3 tasks | 3 files |
 
 ## Session
 
-**Last session:** 2026-07-10T23:25:17.987Z
-**Stopped at:** Completed 12-12-PLAN.md
+**Last session:** 2026-07-14T20:20:55.589Z
+**Stopped at:** Completed 13-01-PLAN.md
 **Resume file:** None
