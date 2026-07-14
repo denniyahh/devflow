@@ -124,6 +124,7 @@ dependencies = [
  "devflow-core",
  "tempfile",
  "thiserror",
+ "tracing",
  "tracing-subscriber",
 ]
 

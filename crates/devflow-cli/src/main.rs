@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use devflow_core::agent;
 use devflow_core::config::{DEVELOP, FEATURE_PREFIX, GitFlowConfig};
-use devflow_core::gates::{GateAction, Gates};
+use devflow_core::gates::{self, GateAction, Gates};
 use devflow_core::git::GitFlow;
 use devflow_core::hooks::{self, HookContext};
 use devflow_core::mode::{self, Mode};
@@ -11,9 +11,21 @@ use devflow_core::state::{AgentKind, State};
 use devflow_core::{agent_result, agents, lock, monitor, recover, worktree};
 use devflow_core::{agent_result::AgentStatus, workflow};
 use std::path::{Path, PathBuf};
+use tracing::info;
 
-/// How long a background gate poll waits for a human response (7 days).
-const GATE_TIMEOUT_SECS: u64 = 7 * 24 * 60 * 60;
+/// Parse `DEVFLOW_GATE_TIMEOUT_SECS`'s raw value, falling back to 7 days on
+/// an absent or unparsable value. Pure (no env access) so it's unit-testable
+/// without mutating process-global env.
+fn parse_gate_timeout(raw: Option<String>) -> u64 {
+    const SEVEN_DAYS: u64 = 7 * 24 * 60 * 60;
+    raw.and_then(|s| s.parse().ok()).unwrap_or(SEVEN_DAYS)
+}
+
+/// How long a background gate poll waits for a human response, configurable
+/// via `DEVFLOW_GATE_TIMEOUT_SECS` (defaults to 7 days).
+fn gate_timeout_secs() -> u64 {
+    parse_gate_timeout(std::env::var("DEVFLOW_GATE_TIMEOUT_SECS").ok())
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -364,13 +376,12 @@ fn advance(project_root: &Path) -> Result<(), CliError> {
         return match stage {
             // Validate failures drive the Code↔Validate loop (or a gate).
             Stage::Validate => handle_validate_outcome(project_root, &mut state, false),
-            // Other stages have no auto-loop — halt and leave state for recovery.
-            _ => Err(CliError::Message(format!(
-                "stage {stage} failed: {}",
-                result
-                    .reason
-                    .unwrap_or_else(|| "no details available".into())
-            ))),
+            // Ship distinguishes an agent crash (AgentFailed) from a review
+            // rejection (ReviewFailed, `review:`-prefixed reason).
+            Stage::Ship => handle_ship_failure(project_root, &mut state, result.reason),
+            // Every other non-Validate failure is never silent (WR-11): it
+            // always fires a gate + notify instead of returning a bare error.
+            _ => handle_stage_failure(project_root, &mut state, stage, result.reason),
         };
     }
 
@@ -410,7 +421,7 @@ fn handle_validate_outcome(
         };
         return match run_gate(project_root, state, Stage::Validate, &context)? {
             GateAction::Advance => transition(project_root, state, Stage::Ship),
-            GateAction::LoopBack(_) => loop_back_to_code(project_root, state),
+            GateAction::LoopBack(_) => loop_back_to_code(project_root, state, FixType::GapsOnly),
             GateAction::Abort(reason) => abort(project_root, state, &reason),
         };
     }
@@ -418,7 +429,7 @@ fn handle_validate_outcome(
     if passed {
         transition(project_root, state, Stage::Ship)
     } else {
-        loop_back_to_code(project_root, state)
+        loop_back_to_code(project_root, state, FixType::GapsOnly)
     }
 }
 
@@ -431,9 +442,68 @@ fn handle_ship_outcome(project_root: &Path, state: &mut State) -> Result<(), Cli
         "Ship complete — approve merge?",
     )? {
         GateAction::Advance => finish_workflow(project_root, state),
-        GateAction::LoopBack(_) => loop_back_to_code(project_root, state),
+        GateAction::LoopBack(_) => loop_back_to_code(project_root, state, FixType::GapsOnly),
         GateAction::Abort(reason) => abort(project_root, state, &reason),
     }
+}
+
+/// Handle a non-Validate stage failure (Define/Plan/Code, or a Ship agent
+/// crash routed in via [`handle_ship_failure`]). WR-11: this path must never
+/// be silent — it unconditionally fires a gate + notify via [`run_gate`]
+/// (independent of `Mode::should_gate`; `run_gate` marks it as an unexpected
+/// gate and notifies accordingly), then lets the operator retry, loop back,
+/// or abort. Deliberately kept separate from `handle_validate_outcome`: it
+/// does not touch `consecutive_failures` and never auto-loops.
+fn handle_stage_failure(
+    project_root: &Path,
+    state: &mut State,
+    stage: Stage,
+    reason: Option<String>,
+) -> Result<(), CliError> {
+    let context = format!(
+        "[never-silent] stage {stage} failed: {} — human review needed (retry, loop-to-code, or abort)",
+        reason.unwrap_or_else(|| "no details available".into())
+    );
+    match run_gate(project_root, state, stage, &context)? {
+        GateAction::Advance => {
+            // CR-01: clean up the stale gate/response/ack before retrying so
+            // the retry cannot silently consume the prior response.
+            let _ = Gates::cleanup(project_root, state.phase, stage);
+            state.gate_pending = false;
+            launch_stage(state, None)
+        }
+        GateAction::LoopBack(_) => {
+            // Retry the SAME failed stage — Code is not a valid recovery
+            // target before planning exists for a Define/Plan failure
+            // (Codex 13-01 MEDIUM). Only Ship's ReviewFailed path (handled
+            // separately in `handle_ship_failure`) actually loops to Code.
+            let _ = Gates::cleanup(project_root, state.phase, stage);
+            launch_stage(state, None)
+        }
+        GateAction::Abort(reason) => abort(project_root, state, &reason),
+    }
+}
+
+/// Handle the Ship stage's failure outcome, distinguishing an agent crash
+/// (`AgentFailed`) from a review rejection (`ReviewFailed`). A `review:`-
+/// prefixed reason (trimmed, case-folded) is the agent-reported convention
+/// for "the change was reviewed and rejected" — that loops back to Code with
+/// the `/gsd-audit-fix` prompt rather than firing a gate (consensus #7).
+/// Anything else is treated as an agent crash and routed through the generic
+/// never-silent gate path.
+fn handle_ship_failure(
+    project_root: &Path,
+    state: &mut State,
+    reason: Option<String>,
+) -> Result<(), CliError> {
+    let is_review_failure = reason
+        .as_deref()
+        .map(|r| r.trim().to_ascii_lowercase().starts_with("review:"))
+        .unwrap_or(false);
+    if is_review_failure {
+        return loop_back_to_code(project_root, state, FixType::AuditFix);
+    }
+    handle_stage_failure(project_root, state, Stage::Ship, reason)
 }
 
 /// Fire the hooks for `from → to`, persist the new stage, and launch its agent.
@@ -458,8 +528,9 @@ fn transition(project_root: &Path, state: &mut State, to: Stage) -> Result<(), C
     launch_stage(state, None)
 }
 
-/// Loop the pipeline back to Code with a gaps-only fix prompt.
-fn loop_back_to_code(project_root: &Path, state: &mut State) -> Result<(), CliError> {
+/// Loop the pipeline back to Code with the given fix prompt (`GapsOnly` for a
+/// Validate rejection, `AuditFix` for a Ship `review:` rejection).
+fn loop_back_to_code(project_root: &Path, state: &mut State, fix: FixType) -> Result<(), CliError> {
     // Capture the stage the gate actually fired on before it's mutated below,
     // so cleanup targets the right stage's gate files (see CR-01: a stale
     // response/ack left on disk after a loop-back is silently reused by a
@@ -473,10 +544,7 @@ fn loop_back_to_code(project_root: &Path, state: &mut State) -> Result<(), CliEr
         "looping back to Code (validate failures: {})",
         state.consecutive_failures
     );
-    launch_stage(
-        state,
-        Some(prompt::fix_prompt(FixType::GapsOnly, state.phase)),
-    )
+    launch_stage(state, Some(prompt::fix_prompt(fix, state.phase)))
 }
 
 /// Run the terminal hooks (version bump + branch cleanup) and clear state.
@@ -515,7 +583,18 @@ fn run_gate(
         "gate written: .devflow/gates/{:02}-{stage}.json — awaiting response",
         state.phase
     );
-    match Gates::poll_response(project_root, state.phase, stage, GATE_TIMEOUT_SECS) {
+    // A gate is "unexpected" when the active mode would not normally fire
+    // one for this stage (e.g. a Define/Plan/Code failure in Auto mode) —
+    // WR-11's never-silent path gates unconditionally, independent of mode.
+    let unexpected = !state.mode.should_gate(stage, state.consecutive_failures);
+    if unexpected {
+        info!(
+            "never-silent gate: {stage} failed in {:?} mode — surfacing an unattended gate this mode would not normally fire",
+            state.mode
+        );
+    }
+    gates::fire_gate_notify(state.phase, stage, context, unexpected);
+    match Gates::poll_response(project_root, state.phase, stage, gate_timeout_secs()) {
         Some(response) => {
             state.gate_pending = false;
             workflow::save_state(state)?;
