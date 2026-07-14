@@ -72,7 +72,7 @@ Plans:
 **Goal:** Get the basic AI development loop (Define→Plan→Code→Validate→Ship) working end-to-end so DevFlow is usable on real projects again — `ship.rs` GSD-native rewrite (13a), completion-protocol correctness: verdict-vs-ran + native Claude/Codex envelope parsing (13b), never-silent failures: WR-11 + gate notify hook + configurable timeout (13c), worktree-by-default (13d), and a real dogfood run as the acceptance test (13e).
 **Requirements**: 13a–13e, WR-11 (see CONTEXT.md)
 **Depends on:** Phase 12
-**Plans:** 4/6 plans executed
+**Plans:** 5/6 plans executed
 
 Plans:
 
@@ -88,7 +88,7 @@ Plans:
 
 **Wave 3** *(blocked on Waves 1–2: shares agent_result.rs/prompt.rs/main.rs)*
 
-- [ ] 13-05-PLAN.md — 13b: verdict-vs-ran split — Verdict enum, Validate prompt verdict, advance() verdict gating (agent_result.rs, prompt.rs, main.rs)
+- [x] 13-05-PLAN.md — 13b: verdict-vs-ran split — Verdict enum, Validate prompt verdict, advance() verdict gating (agent_result.rs, prompt.rs, main.rs)
 
 **Wave 4** *(final: manual acceptance, blocked on all)*
 

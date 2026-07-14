@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
 status: In progress
-stopped_at: Completed 13-04-PLAN.md
-last_updated: "2026-07-14T20:56:54.480Z"
+stopped_at: Completed 13-05-PLAN.md
+last_updated: "2026-07-14T21:14:48.037Z"
 progress:
   total_phases: 4
   completed_phases: 1
   total_plans: 18
-  completed_plans: 16
+  completed_plans: 17
   percent: 25
 ---
 
@@ -77,6 +77,8 @@ None.
 - [Phase 13]: 13-03: Layer 2 commit gate uses explicit matches!(stage, Stage::Plan | Stage::Code), not is_agent_stage(), since is_agent_stage() also includes Define
 - [Phase 13]: 13-04: Retained --worktree as a hidden deprecated no-op alias for one release instead of removing it, per cross-AI review consensus (#6)
 - [Phase 13]: 13-04: Computed effective worktree flag as !no_worktree in the Start match arm, leaving start()'s internal signature and parallel()/sequentagent() call sites unchanged
+- [Phase 13]: 13-05: Verdict deserializer uses exact-case matching (not case-folding) per the plan's explicit fail-safe test contract.
+- [Phase 13]: 13-05: Excluded Stage::Validate from the generic single-command-template prompt test (renamed it) since Validate now has its own dedicated verdict-requiring prompt, mirroring Ship's existing special-case exclusion.
 
 ## Roadmap Evolution
 
@@ -98,9 +100,10 @@ None.
 | Phase 13-mvp-core-loop P02 | 10min | 2 tasks | 2 files |
 | Phase 13-mvp-core-loop P03 | 12min | 3 tasks | 1 files |
 | Phase 13-mvp-core-loop P04 | 7min | 2 tasks | 2 files |
+| Phase 13-mvp-core-loop P05 | 15min | 2 tasks | 3 files |
 
 ## Session
 
-**Last session:** 2026-07-14T20:56:32.595Z
-**Stopped at:** Completed 13-04-PLAN.md
+**Last session:** 2026-07-14T21:14:33.201Z
+**Stopped at:** Completed 13-05-PLAN.md
 **Resume file:** None
