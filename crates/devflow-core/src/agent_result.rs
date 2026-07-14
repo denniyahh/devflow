@@ -942,6 +942,65 @@ mod tests {
     }
 
     #[test]
+    fn layer2_nonzero_exit_is_failed_all_stages() {
+        // Non-zero exit is Failed regardless of stage — including Define and
+        // Validate, which are exempt from the zero-commit gate but NOT from
+        // the exit-code check.
+        let dir = tempfile::tempdir().unwrap();
+        init_repo_with_feature_no_commit(dir.path(), 10);
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(exit_code_path(dir.path(), 10), "1").unwrap();
+        let mut state = state_in(dir.path(), 10);
+
+        for stage in [
+            Stage::Define,
+            Stage::Plan,
+            Stage::Code,
+            Stage::Validate,
+            Stage::Ship,
+        ] {
+            state.stage = stage;
+            let result = evaluate_layer2(dir.path(), 10, &state, &GitFlowConfig::default(), stage)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                result.status,
+                AgentStatus::Failed,
+                "stage {stage:?} should be Failed on nonzero exit"
+            );
+        }
+    }
+
+    #[test]
+    fn layer2_skips_commit_gate_for_define_and_validate() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo_with_feature_no_commit(dir.path(), 11);
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(exit_code_path(dir.path(), 11), "0").unwrap();
+        let mut state = state_in(dir.path(), 11);
+
+        for stage in [Stage::Define, Stage::Validate] {
+            state.stage = stage;
+            let result = evaluate_layer2(dir.path(), 11, &state, &GitFlowConfig::default(), stage)
+                .unwrap()
+                .unwrap();
+            assert_ne!(
+                result.status,
+                AgentStatus::Failed,
+                "stage {stage:?} should not be Failed for zero commits"
+            );
+        }
+
+        // Code stage with the same zero-commit inputs is still Failed
+        // (existing behavior preserved).
+        state.stage = Stage::Code;
+        let result = evaluate_layer2(dir.path(), 11, &state, &GitFlowConfig::default(), Stage::Code)
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.status, AgentStatus::Failed);
+    }
+
+    #[test]
     fn evaluate_layer3_falls_back_to_commit_count() {
         let dir = tempfile::tempdir().unwrap();
         init_repo_with_feature_commit(dir.path(), 5);
