@@ -72,11 +72,27 @@ Plans:
 **Goal:** Get the basic AI development loop (Define→Plan→Code→Validate→Ship) working end-to-end so DevFlow is usable on real projects again — `ship.rs` GSD-native rewrite (13a), completion-protocol correctness: verdict-vs-ran + native Claude/Codex envelope parsing (13b), never-silent failures: WR-11 + gate notify hook + configurable timeout (13c), worktree-by-default (13d), and a real dogfood run as the acceptance test (13e).
 **Requirements**: 13a–13e, WR-11 (see CONTEXT.md)
 **Depends on:** Phase 12
-**Plans:** 0 plans
+**Plans:** 6 plans
 
 Plans:
 
-- [ ] TBD (run /gsd-plan-phase 13 to break down)
+**Wave 1** *(front-loaded: riskiest failure-handling + parsing)*
+
+- [ ] 13-01-PLAN.md — 13a/13c/WR-11: never-silent failure handling — Ship failure branch, handle_stage_failure, notify hook, env gate timeout (main.rs, gates.rs)
+- [ ] 13-02-PLAN.md — 13a: delete dead v1 ship.rs bookkeeping + headless-safe Ship prompt (code-review before ship) (ship.rs, prompt.rs)
+- [ ] 13-03-PLAN.md — 13b: native envelope parsing — Claude is_error/num_turns, Codex JSONL, stage-scoped Layer 2 (agent_result.rs)
+
+**Wave 2** *(blocked on Wave 1: shares main.rs)*
+
+- [ ] 13-04-PLAN.md — 13d: worktree-by-default with `--no-worktree` opt-out (main.rs, phase7_cli.rs)
+
+**Wave 3** *(blocked on Waves 1–2: shares agent_result.rs/prompt.rs/main.rs)*
+
+- [ ] 13-05-PLAN.md — 13b: verdict-vs-ran split — Verdict enum, Validate prompt verdict, advance() verdict gating (agent_result.rs, prompt.rs, main.rs)
+
+**Wave 4** *(final: manual acceptance, blocked on all)*
+
+- [ ] 13-06-PLAN.md — 13e: MVP acceptance dogfood run — Claude full-loop + Full-Ship re-verification + Codex leg (manual checkpoints)
 
 ### Phase 14: Observability + Hermes Support
 
