@@ -36,8 +36,46 @@ fn gsd_command_for(stage: Stage, phase: u32) -> String {
     stage.gsd_command().replace("{N}", &phase.to_string())
 }
 
+/// The Ship stage's dedicated prompt.
+///
+/// Headless-safety rationale: `/gsd-ship`'s own `optional_review` step is an
+/// interactive `AskUserQuestion` with undefined behavior under
+/// `--dangerously-skip-permissions` (RESEARCH Pitfall 2). Rather than relying
+/// on that step being skipped, this prompt sidesteps it entirely: the agent
+/// runs `/gsd-code-review {N}` first (non-interactive; writes `REVIEW.md`
+/// with severity-classified findings), and MUST NOT run `/gsd-ship {N}` at
+/// all if `REVIEW.md` contains any Critical-severity finding — instead it
+/// reports a `review:`-prefixed failure. Only a clean (no-Critical) review
+/// proceeds to `/gsd-ship {N}`. The `review:` reason prefix is the
+/// ReviewFailed contract that `handle_ship_failure` matches (trimmed,
+/// case-folded) to loop back to Code with `AuditFix`.
+fn ship_stage_prompt(phase: u32) -> String {
+    let code_review = format!("/gsd-code-review {phase}");
+    let ship = format!("/gsd-ship {phase}");
+    format!(
+        "Run the Ship stage in two steps:\n\
+        \n\
+        1. Run `{code_review}` (non-interactive). This writes a `REVIEW.md` \
+        artifact with severity-classified findings.\n\
+        2. Check `REVIEW.md` for the Critical-severity gate:\n\
+        \n\
+        - If `REVIEW.md` contains ANY finding at Critical severity: do NOT \
+        run `{ship}` at all. Your FINAL message must be exactly:\n\
+        \n\
+        DEVFLOW_RESULT: {{\"status\": \"failed\", \"reason\": \"review: <short summary of the Critical findings>\"}}\n\
+        \n\
+        - If `REVIEW.md` has NO Critical-severity findings: run `{ship}` and \
+        report the outcome via the normal completion protocol below.\n\
+        \n\
+        {COMPLETION_PROTOCOL}"
+    )
+}
+
 /// Build the prompt for a stage of a phase.
 pub fn stage_prompt(stage: Stage, phase: u32) -> String {
+    if stage == Stage::Ship {
+        return ship_stage_prompt(phase);
+    }
     let command = gsd_command_for(stage, phase);
     format!(
         "Run the GSD workflow command for this stage:\n\n    {command}\n\n{COMPLETION_PROTOCOL}"
@@ -108,7 +146,9 @@ mod tests {
             "Ship prompt must name the Critical-severity gate"
         );
         assert!(
-            prompt.contains("do not run") || prompt.contains("do NOT run") || prompt.contains("DO NOT run"),
+            prompt.contains("do not run")
+                || prompt.contains("do NOT run")
+                || prompt.contains("DO NOT run"),
             "Ship prompt must instruct the agent not to run /gsd-ship on Critical findings"
         );
         assert!(
