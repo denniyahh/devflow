@@ -228,6 +228,77 @@ fn detect_claude_envelope_failure(stdout: &str) -> Option<AgentResult> {
     })
 }
 
+/// Determine whether a set of parsed JSONL lines look like a Codex `--json`
+/// event stream (as opposed to a single-document Claude envelope or plain
+/// text) — i.e. at least one line is a `thread.started` or `turn.*` event.
+fn is_codex_event_stream(events: &[serde_json::Value]) -> bool {
+    events.iter().any(|v| {
+        v.get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|t| t == "thread.started" || t.starts_with("turn."))
+    })
+}
+
+/// Parse a Codex `--json` JSONL event stream (one JSON object per line) and
+/// look at the LAST terminal event (`turn.completed` / `turn.failed`).
+///
+/// Only decisive when the captured stdout is actually a Codex event stream
+/// (per [`is_codex_event_stream`]) — a single-document Claude envelope
+/// (`type: "result"`, no `turn.*` lines) is not consumed here and returns
+/// `None`, so the Claude envelope/marker paths handle it instead.
+///
+/// `turn.failed` is decisive: returns `AgentStatus::Failed` with `reason`
+/// from `error.message`. A final `turn.completed` with no `DEVFLOW_RESULT`
+/// marker returns `None` (defers to Layer 2) rather than an unconditional
+/// Success — a marker-less turn must not silently advance a stage (this is
+/// the composition fix that keeps a marker-less Validate run from
+/// false-passing to Ship).
+///
+/// NOTE: written against the documented `--json` event schema (thread.started
+/// / turn.started / item.* / turn.completed with usage / turn.failed with
+/// error.message) but not yet verified against the installed Codex CLI
+/// version — the 13-06 dogfood run captures real output and reconciles any
+/// delta, the same empirical practice 12-12-SUMMARY.md used for Claude.
+fn parse_codex_event_result(stdout: &str) -> Option<AgentResult> {
+    let events: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .collect();
+
+    if !is_codex_event_stream(&events) {
+        return None;
+    }
+
+    let terminal = events.iter().rev().find(|v| {
+        matches!(
+            v.get("type").and_then(serde_json::Value::as_str),
+            Some("turn.completed") | Some("turn.failed")
+        )
+    })?;
+
+    if terminal.get("type").and_then(serde_json::Value::as_str) != Some("turn.failed") {
+        // turn.completed (or any other terminal we don't recognize) defers
+        // to Layer 2 rather than an unconditional Success.
+        return None;
+    }
+
+    let reason = terminal
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| "codex turn failed".to_string());
+
+    Some(AgentResult {
+        status: AgentStatus::Failed,
+        exit_code: None,
+        reason: Some(reason),
+        commits: None,
+        summary: None,
+    })
+}
+
 /// Scan the last ~4000 characters of `stdout` in reverse line order.
 ///
 /// `DEVFLOW_RESULT` markers are ASCII. Searching the bounded tail and returning
@@ -263,17 +334,19 @@ fn parse_marker_lines(stdout: &str) -> Option<AgentResult> {
     None
 }
 
-/// Layer 1: Try to detect agent result from the native Claude envelope or
-/// the DEVFLOW_RESULT marker in stdout.
+/// Layer 1: Try to detect agent result from the native per-adapter envelope
+/// or the DEVFLOW_RESULT marker in stdout.
 ///
 /// Precedence: Claude envelope `is_error: true` (authoritative, overrides a
 /// success marker) → DEVFLOW_RESULT marker (portable; works for plain text
-/// and a Claude envelope's unwrapped `result` text) → rate limit.
+/// and a Claude envelope's unwrapped `result` text) → Codex JSONL event
+/// stream (`turn.failed` decisive; `turn.completed` defers) → rate limit.
 pub fn evaluate_layer1(project_root: &Path, phase: u32) -> Option<AgentResult> {
     let stdout_path = devflow_dir(project_root).join(format!("phase-{:02}-stdout", phase));
     let stdout = std::fs::read_to_string(&stdout_path).ok()?;
     detect_claude_envelope_failure(&stdout)
         .or_else(|| parse_devflow_result(&stdout))
+        .or_else(|| parse_codex_event_result(&stdout))
         .or_else(|| {
             detect_rate_limit(&stdout).map(|retry| AgentResult {
                 status: AgentStatus::RateLimited,
