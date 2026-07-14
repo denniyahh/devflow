@@ -2,13 +2,14 @@
 
 > Phase plan source of truth. Each phase drives a `devflow start` agent session.
 
-## v2.0.0 (Phase 11–14)
+## v2.0.0 (Phase 11–15)
 
 | Phase | Name | Status |
 |---|---|---|
-| 12 | Bootstrap + Housekeeping | Scoped |
-| 13 | OSS Readiness + Hermes Plugin | Scoped |
-| 14 | Reliability & Observability Hardening | Scoped |
+| 12 | Bootstrap + Housekeeping | Complete |
+| 13 | MVP Core Loop | Scoped |
+| 14 | Observability Hardening | Scoped |
+| 15 | OSS Readiness + Hermes Plugin | Scoped |
 
 ## Shipped
 
@@ -30,6 +31,12 @@
 - **Phase 12** — Bootstrap (new-project, map-codebase) + versioning automation + publish `devflow` to crates.io (name confirmed available, 2026-07-08)
 - **Phase 13** — OSS readiness (dev container, contributing, CI) + Hermes plugin + Hermes/Antigravity adapters
 - **Phase 14** — reliability + observability hardening, scoped from external code review feedback (2026-07-08)
+
+## Reorganized for MVP (2026-07-14)
+
+- **Phase 13 repurposed as MVP Core Loop** — priority is getting Define→Plan→Code→Validate→Ship working end-to-end unattended (Claude + Codex, gates via notify hook) so DevFlow can be dogfooded on real projects again. Claims the previously unclaimed `ship.rs` GSD-native rewrite; absorbs the reliability items from old Phase 14 (verdict-vs-ran, native envelope parsing, WR-11, notify hook, gate timeout, worktree default).
+- **Phase 14 rescoped to Observability Hardening** — residual `devflow logs`/`events.jsonl`/`status` work plus the previously unclaimed `capture_agent_output()` sync-path decision (now claimed there).
+- **Phase 15 (was 13)** — OSS readiness + Hermes plugin, content unchanged, plus the actual crates.io publish.
 
 ### Phase 12: Bootstrap + Housekeeping
 
@@ -60,20 +67,20 @@ Plans:
 
 - [x] 12-11-PLAN.md — IN-02 dead-field removal + IN-03 Agent→AgentKind / trait→AgentAdapter rename
 
-### Phase 13: OSS Readiness + Hermes Plugin
+### Phase 13: MVP Core Loop
 
-**Goal:** Make DevFlow ready for public consumption — dev container, contribution docs, a full ARCHITECTURE.md/README rewrite against v2 reality, Hermes + Antigravity agent support, and a first-class Hermes plugin.
-**Requirements**: TBD (see CONTEXT.md)
-**Depends on:** Phase 11
+**Goal:** Get the basic AI development loop (Define→Plan→Code→Validate→Ship) working end-to-end so DevFlow is usable on real projects again — `ship.rs` GSD-native rewrite (13a), completion-protocol correctness: verdict-vs-ran + native Claude/Codex envelope parsing (13b), never-silent failures: WR-11 + gate notify hook + configurable timeout (13c), worktree-by-default (13d), and a real dogfood run as the acceptance test (13e).
+**Requirements**: 13a–13e, WR-11 (see CONTEXT.md)
+**Depends on:** Phase 12
 **Plans:** 0 plans
 
 Plans:
 
 - [ ] TBD (run /gsd-plan-phase 13 to break down)
 
-### Phase 14: Reliability & Observability Hardening
+### Phase 14: Observability Hardening
 
-**Goal:** Close the gap between "agent exited" and "agent succeeded," surface loop progress instead of a black box, and stop shipping an unattended tool with a 7-day silent gate timeout and full permission bypass by default.
+**Goal:** Surface loop progress instead of a black box — `devflow logs [--follow]`, append-only `events.jsonl`, richer `devflow status` — and settle the `capture_agent_output()` sync-path decision.
 **Requirements**: TBD (see CONTEXT.md)
 **Depends on:** Phase 13
 **Plans:** 0 plans
@@ -81,3 +88,14 @@ Plans:
 Plans:
 
 - [ ] TBD (run /gsd-plan-phase 14 to break down)
+
+### Phase 15: OSS Readiness + Hermes Plugin
+
+**Goal:** Make DevFlow ready for public consumption — dev container, contribution docs, a full ARCHITECTURE.md/README rewrite against v2 reality, Hermes + Antigravity agent support, a first-class Hermes plugin, and the actual crates.io publish.
+**Requirements**: TBD (see CONTEXT.md)
+**Depends on:** Phase 13 (docs must describe the post-MVP loop; plugin builds on the 13c notify hook)
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (run /gsd-plan-phase 15 to break down)

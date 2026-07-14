@@ -4,25 +4,24 @@ milestone: v2.0.0
 milestone_name: milestone
 status: Ready to plan
 stopped_at: Completed 12-12-PLAN.md
-last_updated: "2026-07-11T01:40:49.514Z"
+last_updated: "2026-07-14T00:00:00.000Z"
 progress:
-  total_phases: 3
+  total_phases: 4
   completed_phases: 1
   total_plans: 12
   completed_plans: 12
-  percent: 33
+  percent: 25
 ---
 
 # DevFlow — Project State
 
-> Last updated: 2026-06-19
+> Last updated: 2026-07-14
 
 ## Active
 
-- **Phase 11 (Planned):** Refactor to GSD-Native Architecture — CONTEXT.md resolved, PLAN.md written (2026-06-19)
-- **Phase 12 (Planned):** Bootstrap + Housekeeping — scoped
-- **Phase 13 (Planned):** OSS Readiness + Hermes Plugin — scoped, extended with docs-accuracy items (2026-07-08)
-- **Phase 14 (Planned):** Reliability & Observability Hardening — scoped (2026-07-08)
+- **Phase 13 (Scoped):** MVP Core Loop — repurposed 2026-07-14; ship.rs rewrite + completion-protocol correctness + never-silent gates + dogfood run. Next up: `/gsd-plan-phase 13`
+- **Phase 14 (Scoped):** Observability Hardening — rescoped 2026-07-14 (reliability items moved to 13; claims capture_agent_output() decision)
+- **Phase 15 (Scoped):** OSS Readiness + Hermes Plugin — renumbered from 13 (2026-07-14), content unchanged + crates.io publish
 
 ## Completed
 
@@ -39,6 +38,8 @@ progress:
 | 8 | Docs + OSS Onboarding | v1.0.1 | 2026-06-18 |
 | 9 | OSS Polish | v1.2.0 | 2026-06-18 |
 | 10 | Logging + Planning Step | — | 2026-06-19 |
+| 11 | GSD-Native Architecture + Remediation | v1.2.0 | 2026-06-20 |
+| 12 | Bootstrap + Housekeeping | — | 2026-07-10 |
 
 *Phases 8 and 10 shipped without a SUMMARY.md at the time; both were retroactively documented 2026-07-08 (see `8-SUMMARY.md`, `10-SUMMARY.md`) after reconstruction from git history. Phase 11 was reviewed and found already adequately closed out via `11-VALIDATION.md`/`11r-VALIDATION.md` (Nyquist-compliant, sign-off dated 2026-06-20) — no retroactive SUMMARY.md was needed.*
 
@@ -59,6 +60,7 @@ None.
 | 2026-06-17 | Use GSD for project management going forward |
 | 2026-07-08 | External code review (verified against codebase before scoping): confirmed README/ARCHITECTURE describe the pre-Phase-11 product, agent prompts are hardcoded to GSD slash commands, completion protocol conflates "stage ran" with "stage verdict," and defaults (7-day silent gate timeout, worktree opt-in with permission bypass always on) favor a personal setup over general use. Routed to Phase 13 (docs accuracy) and new Phase 14 (reliability/observability). |
 | 2026-07-08 | **Reconsidering "Config eliminated" (2026-06-19):** open to reintroducing a `devflow.toml` (agent-agnostic stage/command templates, branch model) per review feedback, but deliberately **shelved** — not part of Phase 13 or 14. Revisit as its own phase when picked up. |
+| 2026-07-14 | **MVP restructure:** priority shifted to getting the core loop (Define→Plan→Code→Validate→Ship) working end-to-end so DevFlow can be dogfooded on real projects again. Operator-confirmed scope: agents = Claude + Codex (Hermes/Antigravity deferred); gates answered via pluggable notify hook (ntfy/desktop), not terminal babysitting or Hermes plugin; MVP includes the automated Ship stage. Phase 13 repurposed as **MVP Core Loop** — claims the previously unclaimed `ship.rs` GSD-native rewrite (11h-1…4) and absorbs old-14's verdict-vs-ran split, native envelope parsing, WR-11 silent-halt fix, notify hook + configurable gate timeout, and worktree-by-default; exit criterion is a real dogfood run incl. the Full-Ship verification left BLOCKED in 12-12. Old Phase 13 (OSS + Hermes plugin) renumbered to **Phase 15** unchanged (+ actual crates.io publish). Phase 14 rescoped to pure observability (`logs`/`events.jsonl`/`status`) and now claims the previously unclaimed `capture_agent_output()` sync-path decision — both flagged-unclaimed items from the 2026-07-08 audit are now assigned. |
 | 2026-07-08 | **Phase 11 closeout audit:** reviewed `11-REVIEW.md`/`11-VALIDATION.md`/`11r-VALIDATION.md`. All 5 CRITICAL findings confirmed fixed and verified. All 11 WARNING + 5 INFO findings confirmed still open in current code (spot-checked directly, none touched since Phase 11 shipped) — these were explicitly deferred to Phase 12 by `11r-CONTEXT.md` and are now scoped there (12d/12e), plus 9 untested orchestration paths (12f) and 4 never-executed manual verifications (12g) from `11-VALIDATION.md`. Two items routed to their overlapping phase instead of 12: WR-11 → Phase 14, IN-01 → Phase 13. Two items (`ship.rs` GSD-native rewrite, `capture_agent_output()` sync-path decision) remain **unclaimed by any phase** — flagged in Phase 12 CONTEXT.md, not assigned. |
 
 - [Phase 12]: 12-09: added advance()/Ship-finish and Validate-threshold/abort terminal-path tests to close the last two 12f unit-test gaps
@@ -68,6 +70,7 @@ None.
 
 ## Roadmap Evolution
 
+- MVP restructure (2026-07-14): Phase 13 repurposed as MVP Core Loop (dir `13-mvp-core-loop`); old Phase 13 OSS/Hermes content moved to new Phase 15 (dir renamed `13-oss-hermes-plugin` → `15-oss-hermes-plugin`); Phase 14 rescoped to Observability Hardening. See 2026-07-14 decision entry.
 - Phase 14 added: Reliability & Observability Hardening — verdict-vs-ran split in completion protocol, native per-agent JSON envelope parsing, worktree-isolation-by-default for `start`, observability (`devflow logs`, `events.jsonl`, gate notify hook, configurable gate timeout). Scoped from external code review (2026-07-08). Extended 2026-07-08 with WR-11 (silent halt on non-Validate stage failure, from Phase 11 code review).
 - Phase 13 scope extended: ARCHITECTURE.md full rewrite, `.devflow.yaml` decoy removal, `--help` snapshot CI test, Hermes skill file rewrite — added to existing 13b alongside the already-scoped README rewrite. Extended 2026-07-08 with IN-01 (stale lib.rs rustdoc, from Phase 11 code review).
 - Phase 12 scope extended: publish `devflow` to crates.io (name confirmed available 2026-07-08). Fully scoped 2026-07-08 (CONTEXT.md written): bootstrap/versioning/crates.io plus Phase 11's deferred code-review debt (WR-01–10, IN-02–05), test coverage gaps, and never-executed manual verifications.

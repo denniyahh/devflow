@@ -1,6 +1,11 @@
-# Phase 13: OSS Readiness + Hermes Plugin
+# Phase 15: OSS Readiness + Hermes Plugin
 
 **Status:** Scoped | **Priority:** MEDIUM | **Target:** TBD
+
+> Renumbered from Phase 13 on 2026-07-14 — Phase 13 was repurposed as
+> "MVP Core Loop" per the MVP restructure decision. Content unchanged
+> except section renumbering, the crates.io publish item, and the gate
+> watcher note in 15d.
 
 ## Goal
 
@@ -10,7 +15,7 @@ Hermes a dedicated DevFlow session mode.
 
 ---
 
-## 13a — Dev Container
+## 15a — Dev Container
 
 - [ ] `.devcontainer/devcontainer.json` — Rust + git + fish
 - [ ] Dockerfile: Fedora 41 base, cargo, claude, codex CLI
@@ -20,7 +25,7 @@ Hermes a dedicated DevFlow session mode.
 
 ---
 
-## 13b — Open Source Contributing
+## 15b — Open Source Contributing
 
 - [ ] CONTRIBUTING.md: fork → branch → test → PR workflow
 - [ ] ARCHITECTURE.md: full rewrite against current code — the existing
@@ -55,13 +60,16 @@ Hermes a dedicated DevFlow session mode.
       adapter flag) and `devflow check` (now `advance`), and has
       machine-specific paths (`~/Github/devflow`, distrobox notes). Rewrite
       against current CLI/adapter behavior as part of this pass, ahead of
-      13d's plugin work.
+      15d's plugin work.
 - [ ] CODE_OF_CONDUCT.md, SECURITY.md (if missing)
 - [ ] CI badge + PR gate status
+- [ ] Publish `devflow` to crates.io — metadata + dry-run/package landed
+      in Phase 12 (12-06); the actual publish belongs here, once docs
+      describe the real product
 
 ---
 
-## 13c — Hermes + Antigravity Agent Adapters
+## 15c — Hermes + Antigravity Agent Adapters
 
 - [ ] `HermesAgent` adapter — `hermes exec --non-interactive --json`
 - [ ] `AntigravityAgent` adapter — launch protocol for Antigravity CLI
@@ -70,7 +78,7 @@ Hermes a dedicated DevFlow session mode.
 
 ---
 
-## 13d — Hermes Plugin
+## 15d — Hermes Plugin
 
 A first-class DevFlow session mode for Hermes. When active, Hermes operates as
 DevFlow's human interface rather than a general assistant — preventing confusion
@@ -94,6 +102,8 @@ When DevFlow mode is active, Hermes:
 - [ ] Hermes plugin: `~/.hermes/plugins/devflow/` — session mode, tools, hooks
 - [ ] Toggle: `/devflow on` / `/devflow off`
 - [ ] Gate watcher integration: replaces cron poll with plugin-native push
+      (build on the Phase 13 gate notify hook and Phase 14 `events.jsonl`
+      rather than a bespoke integration)
 - [ ] Status display: active phase, current stage, open gates in session header
 - [ ] Auto-response: intercept "approved"/"reject"/"review" in Telegram and write
   response files

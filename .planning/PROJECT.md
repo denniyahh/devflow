@@ -31,16 +31,21 @@ mid-run crash or kill.
 - ✓ Argv-based agent spawn (no shell interpolation of agent-controlled
   data) — Phase 12
 - ✓ crates.io publish-readiness (metadata, `--dry-run`, `cargo package`) —
-  Phase 12, publish itself intentionally held until after Phase 13/14
+  Phase 12, publish itself intentionally held until Phase 15 (OSS readiness)
 
 ### Active
 
-- Phase 13 — OSS readiness (dev container, contribution docs, a full
-  README/ARCHITECTURE.md rewrite against current reality), Hermes plugin,
-  Hermes/Antigravity agent adapters
-- Phase 14 — reliability & observability hardening: close the "agent exited"
-  vs. "agent succeeded" gap, replace the silent 7-day gate timeout and
-  default permission bypass, add real progress observability
+- Phase 13 — **MVP Core Loop** (repurposed 2026-07-14): get
+  Define→Plan→Code→Validate→Ship working end-to-end unattended on real
+  projects. Claims the `ship.rs` GSD-native rewrite; verdict-vs-ran split;
+  native Claude/Codex envelope parsing; WR-11 + gate notify hook +
+  configurable timeout; worktree-by-default; dogfood run as acceptance test
+- Phase 14 — observability hardening: `devflow logs [--follow]`,
+  `events.jsonl`, richer `status`; `capture_agent_output()` sync-path
+  decision
+- Phase 15 (was 13) — OSS readiness (dev container, contribution docs, a
+  full README/ARCHITECTURE.md rewrite against current reality), Hermes
+  plugin, Hermes/Antigravity agent adapters, actual crates.io publish
 
 ### Out of Scope
 
@@ -50,9 +55,6 @@ mid-run crash or kill.
 - `devflow.toml` / configurable pipeline — shelved 2026-07-08 (see STATE.md);
   open to reconsidering per external review feedback, but not scoped to any
   current phase
-- GSD-native `ship.rs` rewrite (`ship_phase()`, `/gsd-ship` +
-  `/gsd-code-review` integration) — a real, unclaimed architectural gap
-  flagged since Phase 11; not yet assigned to Phase 13, 14, or its own phase
 
 ## Context
 
@@ -68,7 +70,7 @@ mid-run crash or kill.
   `status`, `list`, `recover`, `doctor`, `test`.
 - Workspace version is `1.2.0`. Code/docs historically over-claimed
   "v2.0.0" as current; Phase 12 corrected this — 2.0.0 is the *target*
-  version for the Phase 11–14 arc, not yet shipped, and will only be bumped
+  version for the Phase 11–15 arc, not yet shipped, and will only be bumped
   when that line actually ships.
 - No `.planning/REQUIREMENTS.md` exists in this project; requirements are
   tracked per-phase in each phase's `CONTEXT.md`, not via formal REQ-IDs.
@@ -90,7 +92,8 @@ mid-run crash or kill.
 |----------|-----------|---------|
 | Replace tmux-based agent launch with direct process spawn + monitor daemon | tmux launcher had a monitor deadlock bug; direct spawn + file-based capture is simpler and testable | ✓ Good |
 | File-based gate protocol instead of a live RPC/socket | Human response can come from any interface (Hermes, manual file drop, future UI) without DevFlow depending on any one of them | ✓ Good |
-| Hold `cargo publish` until after Phase 13 (OSS docs) + Phase 14 (reliability) | Publishing is irreversible — a version can never be reused or unpublished; first public release should be reliability-hardened and documented | — Pending |
+| Hold `cargo publish` until Phase 15 (OSS readiness) — after MVP loop (13) + observability (14) | Publishing is irreversible — a version can never be reused or unpublished; first public release should be reliability-hardened and documented | — Pending |
+| MVP restructure (2026-07-14): Phase 13 → MVP Core Loop, old 13 → 15 | Priority is dogfooding the core loop on real projects again; OSS packaging is worthless until the loop it packages works end-to-end | — Pending |
 | Shelve `devflow.toml` / configurable pipeline | Config was fully removed in Phase 11 for simplicity; open to reconsidering per external review feedback, but not urgent | — Pending |
 | Defer bootstrap (`new-project`/`map-codebase`) out of Phase 12 | Genuinely unscoped — no detailed requirements exist yet; inventing them would be speculative | — Pending |
 
@@ -103,4 +106,4 @@ mid-run crash or kill.
 | `.planning/CONCERNS.md` | Top findings from the original pre-Phase-1 codebase audit |
 
 ---
-*Last updated: 2026-07-11 after Phase 12 (bootstrap-housekeeping) completion*
+*Last updated: 2026-07-14 after MVP restructure (Phase 13 → MVP Core Loop, old 13 → 15)*
