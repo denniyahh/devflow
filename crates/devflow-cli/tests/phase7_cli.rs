@@ -181,6 +181,77 @@ fn parallel_creates_two_worktrees_and_spawns_two_monitors() {
 }
 
 #[test]
+fn start_defaults_to_worktree() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let fake_bin = fake_bin_dir(&[(
+        "claude",
+        "#!/bin/sh\nprintf 'DEVFLOW_RESULT: {\"status\":\"success\"}\\n'\n",
+    )]);
+
+    // No worktree flag at all — worktree-by-default (13d) means this must
+    // create the isolated worktree without an explicit opt-in.
+    run_devflow(
+        root,
+        &fake_bin.path,
+        &[
+            "start", "--phase", "11", "--agent", "claude", "--mode", "auto",
+        ],
+    );
+
+    // start returns before the detached monitor finishes; wait for the
+    // worktree directory like the other integration tests do.
+    wait_for(&root.join(".worktrees/phase-11"));
+    assert!(root.join(".worktrees/phase-11").is_dir());
+
+    let state = devflow_core::workflow::load_state(root).expect("load state");
+    assert!(
+        state.worktree_path.is_some(),
+        "expected worktree_path to be Some(_) by default, got {:?}",
+        state.worktree_path
+    );
+}
+
+#[test]
+fn start_no_worktree_uses_feature_branch() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let fake_bin = fake_bin_dir(&[(
+        "claude",
+        "#!/bin/sh\nprintf 'DEVFLOW_RESULT: {\"status\":\"success\"}\\n'\n",
+    )]);
+
+    run_devflow(
+        root,
+        &fake_bin.path,
+        &[
+            "start",
+            "--phase",
+            "12",
+            "--agent",
+            "claude",
+            "--mode",
+            "auto",
+            "--no-worktree",
+        ],
+    );
+
+    // start returns before the detached monitor finishes; wait for the
+    // agent pid file that the monitor writes on the feature-branch path.
+    wait_for(&root.join(".devflow/phase-12-agent-pid"));
+    assert!(!root.join(".worktrees/phase-12").exists());
+
+    let state = devflow_core::workflow::load_state(root).expect("load state");
+    assert!(
+        state.worktree_path.is_none(),
+        "expected worktree_path to be None with --no-worktree, got {:?}",
+        state.worktree_path
+    );
+}
+
+#[test]
 fn sequentagent_integrates_agent_a_then_rebases_agent_b() {
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
