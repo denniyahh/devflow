@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
 status: In progress
-stopped_at: Completed 13-01-PLAN.md
-last_updated: "2026-07-14T20:20:55.606Z"
+stopped_at: Completed 13-02-PLAN.md
+last_updated: "2026-07-14T20:31:13.285Z"
 progress:
   total_phases: 4
   completed_phases: 1
   total_plans: 18
-  completed_plans: 13
-  percent: 72
+  completed_plans: 14
+  percent: 78
 ---
 
 # DevFlow — Project State
@@ -70,6 +70,8 @@ None.
 - [Phase 12]: 12-12: manual-verified live Hermes gate round-trip, real Claude CLI launch+capture, and DocsUpdate fail-soft WARN visibility against the real compiled devflow binary; Full-Ship workflow recorded BLOCKED on out-of-scope ship.rs rewrite. Phase 12 (12/12 plans) complete.
 - [Phase 13]: 13-01: split loop_back_to_code into prepare_loop_back_to_code (pure state mutation) + launch_stage so ReviewFailed dispatch is unit-testable without spawning the real configured agent CLI
 - [Phase 13]: 13-01: non_validate_failure_fires_gate_and_hook asserts notify-hook-fired + a pure should_gate() check rather than the exact env value, since DEVFLOW_GATE_NOTIFY_CMD is process-global and races other concurrently-running gate tests
+- [Phase 13]: 13-02: Made no-ship-on-Critical MANDATORY in the Ship prompt (not just review-first sequencing) so a headless run never reaches /gsd-ship's interactive optional_review step
+- [Phase 13]: 13-02: Adopted the review: reason-string prefix convention (trim + case-fold) for ReviewFailed instead of a new AgentStatus enum variant, to avoid a serde-format break
 
 ## Roadmap Evolution
 
@@ -88,9 +90,10 @@ None.
 | Phase 12-bootstrap-housekeeping P11 | 15min | 2 tasks | 13 files |
 | Phase 12-bootstrap-housekeeping P12 | n/a | 3 tasks | 0 files |
 | Phase 13-mvp-core-loop P01 | 17min | 3 tasks | 3 files |
+| Phase 13-mvp-core-loop P02 | 10min | 2 tasks | 2 files |
 
 ## Session
 
-**Last session:** 2026-07-14T20:20:55.589Z
-**Stopped at:** Completed 13-01-PLAN.md
+**Last session:** 2026-07-14T20:30:01.084Z
+**Stopped at:** Completed 13-02-PLAN.md
 **Resume file:** None
