@@ -15,8 +15,9 @@
 use crate::stage::Stage;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// The gate request DevFlow writes when it pauses for a human decision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -188,6 +189,52 @@ impl Gates {
     }
 }
 
+/// Fire the operator-configured gate notify hook, if any.
+///
+/// Reads `DEVFLOW_GATE_NOTIFY_CMD`; if unset or empty, this is a silent no-op
+/// (no notify command configured). Otherwise delegates to
+/// [`run_notify_command`]. `unexpected` marks a gate fired on a stage the
+/// active [`crate::mode::Mode`] would not normally gate (e.g. a Define/Plan/Code
+/// failure in Auto mode) — a never-silent gate per WR-11.
+pub fn fire_gate_notify(phase: u32, stage: Stage, context: &str, unexpected: bool) {
+    let cmd = match std::env::var("DEVFLOW_GATE_NOTIFY_CMD") {
+        Ok(cmd) if !cmd.is_empty() => cmd,
+        _ => return,
+    };
+    run_notify_command(&cmd, phase, stage, context, unexpected);
+}
+
+/// Run the notify `cmd` via `sh -c`, passing gate metadata to the child as
+/// environment variables — never interpolated into the command string
+/// (WR-01 argv-not-shell precedent; `context` may contain agent-generated,
+/// untrusted text). Fail-soft: a non-zero exit or spawn error is logged via
+/// `warn!` and otherwise ignored — this must never propagate an error that
+/// could abort `run_gate`.
+fn run_notify_command(cmd: &str, phase: u32, stage: Stage, context: &str, unexpected: bool) {
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .env("DEVFLOW_GATE_PHASE", phase.to_string())
+        .env("DEVFLOW_GATE_STAGE", stage.to_string())
+        .env("DEVFLOW_GATE_CONTEXT", context)
+        .env(
+            "DEVFLOW_NON_SILENT_GATE",
+            if unexpected { "1" } else { "0" },
+        )
+        .output();
+    match output {
+        Ok(out) if out.status.success() => {
+            debug!("gate notify hook ran successfully");
+        }
+        Ok(out) => warn!(
+            "gate notify hook exited with status {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+        Err(err) => warn!("gate notify hook could not be spawned: {err}"),
+    }
+}
+
 /// Write `contents` to `path` atomically: write a temp file in the same
 /// directory, then rename over the target so readers never see a partial write.
 fn write_atomic(path: &Path, contents: &str) -> Result<(), GateError> {
@@ -210,6 +257,12 @@ fn unix_now() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes tests that mutate process-global env vars (`set_var`/
+    /// `remove_var` are process-wide and `cargo test` runs in parallel by
+    /// default) so they don't race each other.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn gate_file_round_trips_through_serde() {
@@ -341,5 +394,62 @@ mod tests {
             GateAction::from_response(&response),
             GateAction::Abort(_)
         ));
+    }
+
+    /// `run_notify_command` takes the command string as an argument (not an
+    /// env var), so this test needs no env mutation and cannot race other
+    /// tests.
+    #[test]
+    fn notify_hook_runs_configured_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join("sentinel");
+        let cmd = format!("touch {}", sentinel.display());
+        run_notify_command(&cmd, 11, Stage::Ship, "ctx", false);
+        assert!(sentinel.exists());
+    }
+
+    #[test]
+    fn notify_hook_failure_is_fail_soft() {
+        // A command that always fails must not panic or otherwise abort the
+        // caller — fail-soft per T-13-02.
+        run_notify_command("exit 1", 11, Stage::Ship, "ctx", false);
+    }
+
+    #[test]
+    fn notify_hook_sets_non_silent_flag() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let sentinel_unexpected = dir.path().join("unexpected");
+        let cmd_unexpected = format!(
+            "echo -n \"$DEVFLOW_NON_SILENT_GATE\" > {}",
+            sentinel_unexpected.display()
+        );
+        run_notify_command(&cmd_unexpected, 11, Stage::Code, "ctx", true);
+        assert_eq!(
+            std::fs::read_to_string(&sentinel_unexpected).unwrap(),
+            "1"
+        );
+
+        let sentinel_expected = dir.path().join("expected");
+        let cmd_expected = format!(
+            "echo -n \"$DEVFLOW_NON_SILENT_GATE\" > {}",
+            sentinel_expected.display()
+        );
+        run_notify_command(&cmd_expected, 11, Stage::Ship, "ctx", false);
+        assert_eq!(std::fs::read_to_string(&sentinel_expected).unwrap(), "0");
+    }
+
+    /// This test mutates process-global env, so it acquires `ENV_MUTEX` to
+    /// avoid racing any other env-touching test in this module.
+    #[test]
+    fn notify_hook_unset_is_noop() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        // SAFETY: serialized under ENV_MUTEX — no other thread in this
+        // process reads/writes DEVFLOW_GATE_NOTIFY_CMD concurrently.
+        unsafe {
+            std::env::remove_var("DEVFLOW_GATE_NOTIFY_CMD");
+        }
+        // Must return normally without touching the filesystem or panicking.
+        fire_gate_notify(11, Stage::Ship, "ctx", false);
     }
 }
