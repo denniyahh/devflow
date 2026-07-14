@@ -695,6 +695,49 @@ mod tests {
     }
 
     #[test]
+    fn codex_event_stream_parses_turn_failed() {
+        let stdout = concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"t1\"}\n",
+            "{\"type\":\"turn.started\"}\n",
+            "{\"type\":\"item.started\",\"item\":{}}\n",
+            "{\"type\":\"turn.failed\",\"error\":{\"message\":\"sandbox denied write\"}}\n",
+        );
+        let result = parse_codex_event_result(stdout).unwrap();
+        assert_eq!(result.status, AgentStatus::Failed);
+        assert_eq!(result.reason.as_deref(), Some("sandbox denied write"));
+    }
+
+    #[test]
+    fn codex_turn_completed_no_marker_defers() {
+        let stdout = concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"t1\"}\n",
+            "{\"type\":\"turn.started\"}\n",
+            "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}\n",
+        );
+        assert!(parse_codex_event_result(stdout).is_none());
+    }
+
+    #[test]
+    fn codex_event_stream_ignores_progress_and_unparseable_lines() {
+        let stdout = concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"t1\"}\n",
+            "not json at all\n",
+            "{\"type\":\"item.started\",\"item\":{}}\n",
+            "{\"type\":\"item.updated\",\"item\":{}}\n",
+            "{\"type\":\"turn.failed\",\"error\":{\"message\":\"boom\"}}\n",
+        );
+        let result = parse_codex_event_result(stdout).unwrap();
+        assert_eq!(result.status, AgentStatus::Failed);
+        assert_eq!(result.reason.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn claude_envelope_not_consumed_by_codex_parser() {
+        let stdout = r#"{"type":"result","subtype":"success","is_error":false,"num_turns":4,"result":"All done.","session_id":"abc"}"#;
+        assert!(parse_codex_event_result(stdout).is_none());
+    }
+
+    #[test]
     fn evaluate_layer1_reports_rate_limited_without_marker() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
