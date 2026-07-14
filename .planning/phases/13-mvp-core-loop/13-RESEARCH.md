@@ -392,22 +392,25 @@ A `turn.failed` event (not shown above but documented) carries an `error` object
 | A4 | Codex's captured stdout can be parsed as buffered JSONL (not truly streamed) because DevFlow's `capture_agent_output` already reads the full stdout to a string before `advance` runs | Don't Hand-Roll, Pitfall 4 | Confirmed true by direct reading of `agent.rs::capture_agent_output` [VERIFIED: source] — low risk, but worth planner awareness that no async/streaming parser is needed. |
 | A5 | The `/gsd-ship` workflow's interactive `AskUserQuestion` review step has undefined behavior under `--dangerously-skip-permissions` headless execution with no human present | Pitfall 2 | This is untested from DevFlow's side (12-12-SUMMARY.md's Task 2 explicitly avoided `--dangerously-skip-permissions` for exactly this class of risk). 13e's dogfood run may surface a real hang here; the planner should treat this as a pre-flight risk to investigate before attempting the full Ship-stage dogfood run, not assume it "just works." |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **Exact shape of the Ship-stage `ReviewFailed`/`AgentFailed` signal**
    - What we know: CONTEXT.md names both states explicitly as required handling; `AgentResult`/`AgentStatus` already has `Success`/`Failed`/`RateLimited`/`Unknown`.
    - What's unclear: Whether `ReviewFailed` becomes a new `AgentStatus` enum variant (breaking change to a `#[serde(rename_all = "lowercase")]` enum with existing test coverage) or is conveyed via the existing `reason: Option<String>` field with a string convention devflow parses (e.g. `reason` containing `"review:"` prefix), analogous to how `GateAction::from_response` already string-matches on `note.contains("abort")`.
    - Recommendation: Prefer extending `reason`-string convention (lower blast radius, no serde-format break) unless the planner has a strong reason to add a new enum variant — but this should be an explicit planning decision, not silently assumed.
+   - RESOLVED: Adopted the `reason`-string convention (no new enum variant) — 13-02 Task 2 defines the `review:` prefix contract in the Ship prompt and 13-01 Task 2 consumes it in `handle_ship_failure` via `reason.trim().to_ascii_lowercase().starts_with("review:")`.
 
 2. **Should the Ship-stage prompt explicitly instruct the agent to run `/gsd-code-review` before `/gsd-ship`, or rely on `/gsd-ship`'s own optional-review step?**
    - What we know: `/gsd-ship`'s own `optional_review` step is interactive (`AskUserQuestion`) unless `workflow.code_review_command` is configured; `/gsd-code-review` is a separate, non-interactive, fully automatable skill that produces a `REVIEW.md` artifact with severity-classified findings.
    - What's unclear: Whether 13a's "13a — `/gsd-ship` + `/gsd-code-review` integration" language means devflow's `prompt::stage_prompt(Stage::Ship, ...)` should be extended to explicitly sequence `/gsd-code-review {N}` then `/gsd-ship {N}` (making review non-interactive and headless-safe), or whether it means something narrower (e.g. just correctly parsing whatever the agent reports).
    - Recommendation: Given the headless/unattended-dogfood goal (13e) and Pitfall 2's identified risk, the safer design is to have DevFlow's own prompt explicitly sequence `/gsd-code-review {N}` (non-interactive) before `/gsd-ship {N}`, and have the agent report `ReviewFailed` if `REVIEW.md` contains Critical findings — this avoids ever hitting `/gsd-ship`'s interactive `AskUserQuestion` step in headless mode at all. Flag this for explicit confirmation during planning/discuss-phase, since it changes `prompt.rs` behavior beyond pure parsing.
+   - RESOLVED: Yes — 13-02 Task 2 special-cases the Ship prompt in `stage_prompt` to mandatorily sequence `/gsd-code-review {N}` before `/gsd-ship {N}` and forbid running `/gsd-ship` when REVIEW.md has Critical findings, sidestepping the interactive step.
 
 3. **Does 13d's worktree-by-default change interact with `Parallel`/`Sequentagent`, which already force worktree mode unconditionally?**
    - What we know: `parallel()` already calls `start(..., true, false)` (worktree hardcoded `true`) and `sequentagent` creates its own worktrees directly, bypassing `Start`'s flag entirely.
    - What's unclear: Whether flipping `Start`'s default has any observable effect on these two commands (it shouldn't, since they don't read the CLI flag's default — they call `start()` as a function with an explicit bool) — low risk, but worth a planner test asserting `parallel`/`sequentagent` behavior is unchanged by the flip.
    - Recommendation: Add a regression test (or confirm existing `parallel_creates_two_worktrees_and_spawns_two_monitors` / `sequentagent_*` tests already cover this) asserting no behavior change post-flip.
+   - RESOLVED: No interaction — 13-04 leaves `start()`'s internal bool parameter/body unchanged so `parallel`/`sequentagent`'s explicit-bool call sites are untouched, and Task 1's acceptance criteria assert `parallel` still calls `start(..., true, false)` unchanged post-flip.
 
 ## Environment Availability
 
