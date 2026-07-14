@@ -7,6 +7,7 @@
 //! 3. Process gone + commits exist (last resort warning)
 
 use crate::config::GitFlowConfig;
+use crate::stage::Stage;
 use crate::state::State;
 use std::path::{Path, PathBuf};
 
@@ -362,16 +363,28 @@ pub fn evaluate_layer1(project_root: &Path, phase: u32) -> Option<AgentResult> {
 ///
 /// Reads exit code from `.devflow/phase-NN-exit` file.
 /// Counts commits in `feature/phase-NN` branch (if it exists).
+///
+/// The commit-count gate ("no commits → failed") is scoped to `stage` — it
+/// only applies to `Stage::Plan`/`Stage::Code` (checked via an explicit
+/// `matches!`, NOT `Stage::is_agent_stage()`, since that also includes
+/// `Define`, which legitimately produces zero commits). `exit≠0` is ALWAYS
+/// `Failed`, for every stage — only the `exit=0`/zero-commits branch is
+/// stage-scoped.
+///
 /// Decision matrix:
-///   exit=0, commits>0 → advance (probable ok)
-///   exit=0, commits=0 → halt "no work done"
-///   exit≠0            → halt "agent failed"
-///   exit unknown      → fall to Layer 3 (return None)
+///   exit≠0                                              → Failed (ALL stages)
+///   exit=0, stage in {Plan, Code}, commits=0             → Failed ("no work done")
+///   exit=0, stage in {Plan, Code}, commits>0             → Success
+///   exit=0, stage NOT in {Plan, Code} (Define/Validate/Ship), commits=0 → Success
+///           (not commit-gated; Validate's real pass signal is its verdict,
+///           not a bare zero-commit — see Task 2's turn.completed deferral)
+///   exit unknown                                         → fall to Layer 3 (return None)
 pub fn evaluate_layer2(
     project_root: &Path,
     phase: u32,
     state: &State,
     git_flow: &GitFlowConfig,
+    stage: Stage,
 ) -> Result<Option<AgentResult>, ResultError> {
     let exit_path = devflow_dir(project_root).join(format!("phase-{:02}-exit", phase));
     let exit_code: i32 = match std::fs::read_to_string(&exit_path) {
@@ -402,11 +415,14 @@ pub fn evaluate_layer2(
         0
     };
 
+    let commit_gated = matches!(stage, Stage::Plan | Stage::Code);
+    let no_work_done = commit_gated && commits == 0;
+
     Ok(Some(AgentResult {
-        status: if exit_code == 0 && commits > 0 {
-            AgentStatus::Success
-        } else {
+        status: if exit_code != 0 || no_work_done {
             AgentStatus::Failed
+        } else {
+            AgentStatus::Success
         },
         exit_code: Some(exit_code),
         reason: if exit_code != 0 {
@@ -414,7 +430,7 @@ pub fn evaluate_layer2(
                 "agent exited with code {} ({} commits on {})",
                 exit_code, commits, branch
             ))
-        } else if commits == 0 {
+        } else if no_work_done {
             Some(format!(
                 "no commits found on {} (agent exit code was {})",
                 branch, exit_code
@@ -480,7 +496,8 @@ pub fn evaluate_agent_result(
     }
 
     // Layer 2: Exit code + commit gate
-    if let Some(result) = evaluate_layer2(project_root, state.phase, state, git_flow)? {
+    if let Some(result) = evaluate_layer2(project_root, state.phase, state, git_flow, state.stage)?
+    {
         return Ok(result);
     }
 
@@ -893,9 +910,15 @@ mod tests {
         std::fs::write(exit_code_path(dir.path(), 4), "0").unwrap();
         let state = state_in(dir.path(), 4);
 
-        let result = evaluate_layer2(dir.path(), 4, &state, &GitFlowConfig::default())
-            .unwrap()
-            .unwrap();
+        let result = evaluate_layer2(
+            dir.path(),
+            4,
+            &state,
+            &GitFlowConfig::default(),
+            state.stage,
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(result.status, AgentStatus::Success);
         assert_eq!(result.exit_code, Some(0));
@@ -913,9 +936,15 @@ mod tests {
         std::fs::write(exit_code_path(dir.path(), 4), "0").unwrap();
         let state = state_in(dir.path(), 4);
 
-        let result = evaluate_layer2(dir.path(), 4, &state, &GitFlowConfig::default())
-            .unwrap()
-            .unwrap();
+        let result = evaluate_layer2(
+            dir.path(),
+            4,
+            &state,
+            &GitFlowConfig::default(),
+            state.stage,
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(result.status, AgentStatus::Failed);
         assert_eq!(result.exit_code, Some(0));
@@ -932,9 +961,15 @@ mod tests {
         std::fs::write(exit_code_path(dir.path(), 4), "1").unwrap();
         let state = state_in(dir.path(), 4);
 
-        let result = evaluate_layer2(dir.path(), 4, &state, &GitFlowConfig::default())
-            .unwrap()
-            .unwrap();
+        let result = evaluate_layer2(
+            dir.path(),
+            4,
+            &state,
+            &GitFlowConfig::default(),
+            state.stage,
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(result.status, AgentStatus::Failed);
         assert_eq!(result.exit_code, Some(1));
@@ -994,9 +1029,15 @@ mod tests {
         // Code stage with the same zero-commit inputs is still Failed
         // (existing behavior preserved).
         state.stage = Stage::Code;
-        let result = evaluate_layer2(dir.path(), 11, &state, &GitFlowConfig::default(), Stage::Code)
-            .unwrap()
-            .unwrap();
+        let result = evaluate_layer2(
+            dir.path(),
+            11,
+            &state,
+            &GitFlowConfig::default(),
+            Stage::Code,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(result.status, AgentStatus::Failed);
     }
 
