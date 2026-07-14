@@ -178,6 +178,56 @@ fn json_scalar_to_string(value: &serde_json::Value) -> Option<String> {
     }
 }
 
+/// Read the top-level `is_error` boolean (and, if present, `num_turns`) from
+/// a Claude JSON result envelope (`--output-format json`) and treat
+/// `is_error: true` as an authoritative Layer-1 failure.
+///
+/// This is checked BEFORE the `DEVFLOW_RESULT` marker path in
+/// [`evaluate_layer1`], so `is_error: true` OVERRIDES a stale/echoed success
+/// marker embedded in the same envelope's `result` text — the envelope is
+/// authoritative for errors. `is_error` absent or `false` returns `None`,
+/// deferring to the marker path and, ultimately, Layer 2.
+///
+/// Per RESEARCH Pitfall 5, `is_error` (not specific `subtype` strings) is
+/// the documented, stable signal — this does not special-case non-success
+/// subtype values beyond what already exists in `detect_claude_rate_limit`.
+fn detect_claude_envelope_failure(stdout: &str) -> Option<AgentResult> {
+    let trimmed = stdout.trim();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    let is_error = value.get("is_error")?.as_bool()?;
+    if !is_error {
+        return None;
+    }
+
+    let num_turns = value.get("num_turns").and_then(serde_json::Value::as_u64);
+    let base_reason = value
+        .get("result")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            value
+                .get("subtype")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "agent reported is_error".to_string());
+    let reason = match num_turns {
+        Some(n) => format!("{base_reason} (num_turns: {n})"),
+        None => base_reason,
+    };
+
+    Some(AgentResult {
+        status: AgentStatus::Failed,
+        exit_code: None,
+        reason: Some(reason),
+        commits: None,
+        summary: None,
+    })
+}
+
 /// Scan the last ~4000 characters of `stdout` in reverse line order.
 ///
 /// `DEVFLOW_RESULT` markers are ASCII. Searching the bounded tail and returning
@@ -213,19 +263,26 @@ fn parse_marker_lines(stdout: &str) -> Option<AgentResult> {
     None
 }
 
-/// Layer 1: Try to detect agent result from DEVFLOW_RESULT marker in stdout.
+/// Layer 1: Try to detect agent result from the native Claude envelope or
+/// the DEVFLOW_RESULT marker in stdout.
+///
+/// Precedence: Claude envelope `is_error: true` (authoritative, overrides a
+/// success marker) → DEVFLOW_RESULT marker (portable; works for plain text
+/// and a Claude envelope's unwrapped `result` text) → rate limit.
 pub fn evaluate_layer1(project_root: &Path, phase: u32) -> Option<AgentResult> {
     let stdout_path = devflow_dir(project_root).join(format!("phase-{:02}-stdout", phase));
     let stdout = std::fs::read_to_string(&stdout_path).ok()?;
-    parse_devflow_result(&stdout).or_else(|| {
-        detect_rate_limit(&stdout).map(|retry| AgentResult {
-            status: AgentStatus::RateLimited,
-            exit_code: None,
-            reason: Some(format!("rate limited until {retry}")),
-            commits: None,
-            summary: None,
+    detect_claude_envelope_failure(&stdout)
+        .or_else(|| parse_devflow_result(&stdout))
+        .or_else(|| {
+            detect_rate_limit(&stdout).map(|retry| AgentResult {
+                status: AgentStatus::RateLimited,
+                exit_code: None,
+                reason: Some(format!("rate limited until {retry}")),
+                commits: None,
+                summary: None,
+            })
         })
-    })
 }
 
 /// Layer 2: Use exit code + commit count to determine result.
