@@ -425,10 +425,7 @@ mod tests {
             sentinel_unexpected.display()
         );
         run_notify_command(&cmd_unexpected, 11, Stage::Code, "ctx", true);
-        assert_eq!(
-            std::fs::read_to_string(&sentinel_unexpected).unwrap(),
-            "1"
-        );
+        assert_eq!(std::fs::read_to_string(&sentinel_unexpected).unwrap(), "1");
 
         let sentinel_expected = dir.path().join("expected");
         let cmd_expected = format!(

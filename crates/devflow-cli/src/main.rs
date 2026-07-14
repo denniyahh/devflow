@@ -496,14 +496,21 @@ fn handle_ship_failure(
     state: &mut State,
     reason: Option<String>,
 ) -> Result<(), CliError> {
-    let is_review_failure = reason
-        .as_deref()
-        .map(|r| r.trim().to_ascii_lowercase().starts_with("review:"))
-        .unwrap_or(false);
-    if is_review_failure {
+    if is_ship_review_failure(&reason) {
         return loop_back_to_code(project_root, state, FixType::AuditFix);
     }
     handle_stage_failure(project_root, state, Stage::Ship, reason)
+}
+
+/// Whether a Ship-stage failure `reason` is a review rejection (`review:`
+/// prefix, trimmed + case-folded) rather than an agent crash. This string
+/// convention is an inherent limitation of the agent-reported DEVFLOW_RESULT
+/// contract (T-13-04) — verified live against a real agent in 13-06.
+fn is_ship_review_failure(reason: &Option<String>) -> bool {
+    reason
+        .as_deref()
+        .map(|r| r.trim().to_ascii_lowercase().starts_with("review:"))
+        .unwrap_or(false)
 }
 
 /// Fire the hooks for `from → to`, persist the new stage, and launch its agent.
@@ -531,6 +538,20 @@ fn transition(project_root: &Path, state: &mut State, to: Stage) -> Result<(), C
 /// Loop the pipeline back to Code with the given fix prompt (`GapsOnly` for a
 /// Validate rejection, `AuditFix` for a Ship `review:` rejection).
 fn loop_back_to_code(project_root: &Path, state: &mut State, fix: FixType) -> Result<(), CliError> {
+    let prompt = prepare_loop_back_to_code(project_root, state, fix)?;
+    launch_stage(state, Some(prompt))
+}
+
+/// The state-mutating half of `loop_back_to_code`, split out so it's
+/// unit-testable without spawning a real agent process (`launch_stage`
+/// invokes the actual configured agent CLI). Cleans up the stale gate for
+/// the stage the gate fired on (CR-01), moves `state` to Code, persists it,
+/// and returns the fix prompt the caller should launch with.
+fn prepare_loop_back_to_code(
+    project_root: &Path,
+    state: &mut State,
+    fix: FixType,
+) -> Result<String, CliError> {
     // Capture the stage the gate actually fired on before it's mutated below,
     // so cleanup targets the right stage's gate files (see CR-01: a stale
     // response/ack left on disk after a loop-back is silently reused by a
@@ -544,7 +565,7 @@ fn loop_back_to_code(project_root: &Path, state: &mut State, fix: FixType) -> Re
         "looping back to Code (validate failures: {})",
         state.consecutive_failures
     );
-    launch_stage(state, Some(prompt::fix_prompt(fix, state.phase)))
+    Ok(prompt::fix_prompt(fix, state.phase))
 }
 
 /// Run the terminal hooks (version bump + branch cleanup) and clear state.
@@ -1486,6 +1507,12 @@ fn doctor(_project_root: &Path, json: bool) -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes tests that mutate process-global env vars (`set_var`/
+    /// `remove_var` are process-wide and `cargo test` runs in parallel by
+    /// default) so they don't race each other.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn pairs_default_missing_agents_to_claude() {
@@ -1729,6 +1756,234 @@ mod tests {
         Gates::write_gate(root, phase, Stage::Validate, "re-fired gate").unwrap();
         let started = std::time::Instant::now();
         let got = Gates::poll_response(root, phase, Stage::Validate, 1);
+        assert!(
+            got.is_none(),
+            "poll_response must not instantly resolve from a stale response after cleanup"
+        );
+        assert!(started.elapsed() >= std::time::Duration::from_secs(1));
+    }
+
+    /// `parse_gate_timeout` is a pure function — no env mutation needed, so
+    /// this test cannot race any other test.
+    #[test]
+    fn parse_gate_timeout_env_override() {
+        const SEVEN_DAYS: u64 = 7 * 24 * 60 * 60;
+        assert_eq!(parse_gate_timeout(Some("42".into())), 42);
+        assert_eq!(parse_gate_timeout(Some("bad".into())), SEVEN_DAYS);
+        assert_eq!(parse_gate_timeout(None), SEVEN_DAYS);
+    }
+
+    /// A Ship-stage AgentFailed result (no `review:` prefix) must write a
+    /// gate file and block for a response — not silently return an `Err`
+    /// with nothing surfaced (WR-11; the pre-Task-2 catch-all never wrote a
+    /// gate at all for this case). Runs `handle_ship_failure` on a scoped
+    /// thread and busy-polls for the gate file to appear while the call is
+    /// still blocked in `run_gate`'s poll, then unblocks it with an Abort
+    /// response so the thread can finish without spawning a real monitor
+    /// (Abort resolves via `abort()`, which never calls `launch_stage`).
+    #[test]
+    fn ship_agent_failed_fires_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let phase = 40;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Ship;
+        workflow::save_state(&state).unwrap();
+
+        let gate_path = Gates::gate_path(root, phase, Stage::Ship);
+        let response_path = Gates::response_path(root, phase, Stage::Ship);
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                handle_ship_failure(root, &mut state, Some("agent crashed".into())).unwrap();
+            });
+
+            let mut seen = false;
+            for _ in 0..150 {
+                if gate_path.exists() {
+                    seen = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert!(
+                seen,
+                "handle_ship_failure must write a gate file, not silently return an Err"
+            );
+
+            // Unblock the poll with an Abort response so the spawned thread
+            // finishes (abort() cleans up on its own; no monitor spawned).
+            std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &response_path,
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap();
+        });
+    }
+
+    /// A Ship-stage result whose reason starts with `review:` must loop back
+    /// to Code instead of firing a gate — it does not go through `run_gate`
+    /// at all, so no gate file is ever written for this path.
+    ///
+    /// Exercises `is_ship_review_failure` (the exact dispatch predicate
+    /// `handle_ship_failure` uses) plus `prepare_loop_back_to_code` (the
+    /// state-mutating half of `loop_back_to_code`) directly, rather than the
+    /// full `handle_ship_failure` → `loop_back_to_code` → `launch_stage`
+    /// chain: `launch_stage` spawns the real configured agent CLI (e.g. real
+    /// `claude -p ... --dangerously-skip-permissions` if it's on `$PATH`),
+    /// which must never fire from a unit test.
+    #[test]
+    fn ship_review_failed_loops_to_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let phase = 41;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Ship;
+        workflow::save_state(&state).unwrap();
+
+        let reason = Some("review: please fix naming".to_string());
+        assert!(is_ship_review_failure(&reason));
+
+        prepare_loop_back_to_code(root, &mut state, FixType::AuditFix).unwrap();
+
+        assert_eq!(state.stage, Stage::Code);
+        assert!(!Gates::gate_path(root, phase, Stage::Ship).exists());
+        // Not finished — finish_workflow would have cleared state entirely.
+        assert!(workflow::load_state(root).is_ok());
+    }
+
+    /// The ReviewFailed loop-back must select `FixType::AuditFix`
+    /// (`/gsd-audit-fix`), not the Validate path's `FixType::GapsOnly`
+    /// (consensus #7 / OpenCode HIGH #2).
+    #[test]
+    fn ship_review_failed_uses_audit_fix() {
+        assert!(is_ship_review_failure(&Some(
+            "review: needs changes".into()
+        )));
+        assert!(is_ship_review_failure(&Some("  Review: nitpick".into())));
+        assert!(!is_ship_review_failure(&Some("agent crashed".into())));
+        assert!(!is_ship_review_failure(&None));
+
+        let prompt = prompt::fix_prompt(FixType::AuditFix, 11);
+        assert!(prompt.contains("/gsd-audit-fix"));
+        assert!(!prompt.contains("--gaps-only"));
+    }
+
+    /// A Code-stage failure must fire a gate AND run the configured notify
+    /// hook — with `DEVFLOW_NON_SILENT_GATE=1` since Auto mode would not
+    /// normally gate a Code failure (unexpected/never-silent gate). The
+    /// notify sentinel is a side effect distinct from the gate file itself,
+    /// so it survives even though `Gates::cleanup` removes the gate/
+    /// response/ack once the gate resolves. This test sets
+    /// `DEVFLOW_GATE_NOTIFY_CMD`, so it's serialized under `ENV_MUTEX`.
+    #[test]
+    fn non_validate_failure_fires_gate_and_hook() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let sentinel = root.join("notify-sentinel");
+
+        // SAFETY: serialized under ENV_MUTEX — no other thread in this
+        // process sets/removes DEVFLOW_GATE_NOTIFY_CMD concurrently. Note
+        // this only prevents races between env-*mutating* tests: any other
+        // concurrently-running test that calls `run_gate` (most of them do)
+        // will also read whatever we set here and may itself fire our
+        // sentinel command with its own `unexpected` value. So we assert
+        // only that the hook fired at all (sentinel created), not its exact
+        // content — the exact DEVFLOW_NON_SILENT_GATE propagation is already
+        // covered contamination-free by gates.rs's
+        // `notify_hook_sets_non_silent_flag` (calls the pure
+        // `run_notify_command` directly, no global env involved).
+        unsafe {
+            std::env::set_var(
+                "DEVFLOW_GATE_NOTIFY_CMD",
+                format!("touch {}", sentinel.display()),
+            );
+        }
+
+        let phase = 42;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+
+        // A Code-stage failure in Auto mode is exactly the "unexpected" case
+        // `run_gate` computes (`!should_gate(..)`) and passes to
+        // `fire_gate_notify` — asserted here as a pure, race-free check.
+        assert!(
+            !state
+                .mode
+                .should_gate(Stage::Code, state.consecutive_failures)
+        );
+
+        // Pre-write an Abort response so the call resolves without spawning
+        // a monitor (the notify hook already fired by the time `run_gate`
+        // starts polling, so this doesn't affect what we're asserting).
+        let response_path = Gates::response_path(root, phase, Stage::Code);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        let result =
+            handle_stage_failure(root, &mut state, Stage::Code, Some("build failed".into()));
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            std::env::remove_var("DEVFLOW_GATE_NOTIFY_CMD");
+        }
+
+        result.unwrap();
+        assert!(
+            sentinel.exists(),
+            "handle_stage_failure must fire the configured notify hook, not silently skip it"
+        );
+    }
+
+    /// CR-01 regression: after a stage failure's gate resolves via Advance
+    /// and the retry (also a stage failure) fires a fresh gate, the SECOND
+    /// gate's poll must not instantly resolve from the FIRST gate's
+    /// already-consumed response/ack — `handle_stage_failure` must clean
+    /// those up before the retry launches.
+    #[test]
+    fn stage_failure_retry_cleans_stale_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let phase = 43;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+
+        // Pre-write an Abort response so the first failure resolves
+        // immediately without spawning a monitor.
+        let response_path = Gates::response_path(root, phase, Stage::Code);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        handle_stage_failure(root, &mut state, Stage::Code, Some("first failure".into())).unwrap();
+
+        // abort() must have cleaned up the gate/response/ack for Code.
+        assert!(!Gates::gate_path(root, phase, Stage::Code).exists());
+        assert!(!Gates::response_path(root, phase, Stage::Code).exists());
+        assert!(!Gates::ack_path(root, phase, Stage::Code).exists());
+
+        // Simulate the phase reaching the same gate again later (e.g. a
+        // fresh retry after abort would normally clear state, but re-fire
+        // here directly to prove the CR-01 stale-response reuse regression
+        // is closed): write a fresh gate but no new response.
+        Gates::write_gate(root, phase, Stage::Code, "re-fired gate").unwrap();
+        let started = std::time::Instant::now();
+        let got = Gates::poll_response(root, phase, Stage::Code, 1);
         assert!(
             got.is_none(),
             "poll_response must not instantly resolve from a stale response after cleanup"
