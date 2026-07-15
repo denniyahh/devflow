@@ -68,8 +68,11 @@ pub fn launch_agent(
 /// the externally stored `u32` PID is safe in practice on those platforms.
 pub fn agent_running(pid: u32) -> bool {
     // kill(pid, 0) is the standard POSIX way to check process existence
-    // without sending an actual signal.
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    // without sending an actual signal. kill(0, sig) instead signals the
+    // caller's entire process group, so a corrupted/truncated PID file
+    // containing "0" must be rejected explicitly rather than treated as
+    // a live PID.
+    pid != 0 && unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
 /// Capture agent stdout and exit code, writing both to `.devflow/` files.
