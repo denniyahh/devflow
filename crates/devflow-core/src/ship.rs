@@ -261,10 +261,20 @@ fn split_time_and_offset(time: &str) -> (&str, i32) {
 }
 
 fn parse_offset_minutes(offset: &str) -> Option<i32> {
+    // WR-07 (13-REVIEW.md): require the colon-separated HH:MM form and
+    // bound-check the parsed values. A non-colon numeric offset like
+    // "+0530" would otherwise have `parts.next()` consume the whole string
+    // as `hours` ("0530" → 530), silently yielding 530 *hours* instead of
+    // 5h30m — a malformed-but-parseable input must fail safe (None), not
+    // produce a wildly wrong cron schedule.
     let sign = if offset.starts_with('-') { -1 } else { 1 };
-    let mut parts = offset.get(1..)?.split(':');
-    let hours = parts.next()?.parse::<i32>().ok()?;
-    let minutes = parts.next().unwrap_or("0").parse::<i32>().ok()?;
+    let rest = offset.get(1..)?;
+    let (h, m) = rest.split_once(':')?;
+    let hours = h.parse::<i32>().ok()?;
+    let minutes = m.parse::<i32>().ok()?;
+    if !(0..=23).contains(&hours) || !(0..=59).contains(&minutes) {
+        return None;
+    }
     Some(sign * (hours * 60 + minutes))
 }
 
@@ -377,6 +387,28 @@ mod tests {
         assert_eq!(
             cron_schedule_from_retry_after("2026-06-18T15:45:00-05:30"),
             Some("15 21 18 6 *".to_string())
+        );
+    }
+
+    /// WR-07 (13-REVIEW.md): a non-colon numeric offset like "+0530" (a
+    /// valid ISO-8601 variant `parse_offset_minutes` never handled) must not
+    /// be silently misparsed as 530 *hours* instead of 5h30m. Before the
+    /// fix, `parts.next()` consumed the whole "0530" string as `hours`,
+    /// producing a wildly wrong schedule (a "malformed but parseable" input
+    /// that the module's own fail-safe design goal says must not happen).
+    /// After the fix, the unparseable offset falls back to UTC (0 minutes)
+    /// — the same fail-safe `unwrap_or(0)` `split_time_and_offset` already
+    /// uses for a `None` result — rather than shifting the schedule by
+    /// hundreds of hours.
+    #[test]
+    fn cron_schedule_rejects_non_colon_offset_instead_of_misparsing_it() {
+        // No colon in the offset: before the fix this was misread as
+        // sign=1, hours=530, i.e. an offset of 31,800 minutes instead of
+        // 330. After the fix it's rejected and treated as UTC+0 — matching
+        // the plain "Z"/no-offset schedule for the same wall-clock time.
+        assert_eq!(
+            cron_schedule_from_retry_after("2026-06-18T15:45:30+0530"),
+            cron_schedule_from_retry_after("2026-06-18T15:45:30Z"),
         );
     }
 
