@@ -7,7 +7,7 @@
 | Phase | Name | Status |
 |---|---|---|
 | 12 | Bootstrap + Housekeeping | Complete |
-| 13 | MVP Core Loop | Scoped |
+| 13 | MVP Core Loop | In Progress|
 | 14 | Observability + Hermes Support | Scoped |
 | 15 | OSS Readiness | Scoped |
 
@@ -72,7 +72,7 @@ Plans:
 **Goal:** Get the basic AI development loop (Define→Plan→Code→Validate→Ship) working end-to-end so DevFlow is usable on real projects again — `ship.rs` GSD-native rewrite (13a), completion-protocol correctness: verdict-vs-ran + native Claude/Codex envelope parsing (13b), never-silent failures: WR-11 + gate notify hook + configurable timeout (13c), worktree-by-default (13d), and a real dogfood run as the acceptance test (13e).
 **Requirements**: 13a–13e, WR-11 (see CONTEXT.md)
 **Depends on:** Phase 12
-**Plans:** 5/6 plans executed
+**Plans:** 6/6 plans executed
 
 Plans:
 
@@ -92,7 +92,7 @@ Plans:
 
 **Wave 4** *(final: manual acceptance, blocked on all)*
 
-- [ ] 13-06-PLAN.md — 13e: MVP acceptance dogfood run — Claude full-loop + Full-Ship re-verification + Codex leg (manual checkpoints)
+- [x] 13-06-PLAN.md — 13e: MVP acceptance dogfood run — Claude full-loop + Full-Ship re-verification + Codex leg (manual checkpoints)
 
 ### Phase 14: Observability + Hermes Support
 
