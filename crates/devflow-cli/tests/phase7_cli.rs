@@ -382,12 +382,17 @@ fn sequentagent_hands_off_after_rate_limit_and_writes_cron_instructions() {
         "agent B did not run after A's rate limit"
     );
 
+    // The cron instructions are written when A rate-limits...
+    assert!(stdout.contains("wrote .devflow/cron-instructions.json"));
+    // ...but WR-02 (13-REVIEW.md): once B completes successfully the phase
+    // has shipped, so the stale file must be deleted rather than surviving
+    // to mislead `devflow status`/a Hermes cron into re-running a completed
+    // phase.
     let cron_path = root.join(".devflow/cron-instructions.json");
-    assert!(cron_path.exists(), "cron instructions were not written");
-    let cron = fs::read_to_string(cron_path).unwrap();
-    assert!(cron.contains("\"status\": \"rate_limited\""));
-    assert!(cron.contains("\"retry_after\": \"2026-06-18T15:45:30Z\""));
-    assert!(cron.contains("devflow sequentagent --phase 7 --agents claude,codex"));
+    assert!(
+        !cron_path.exists(),
+        "cron instructions should be deleted after a successful post-rate-limit handoff"
+    );
 }
 
 #[test]

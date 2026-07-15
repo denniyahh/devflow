@@ -1054,6 +1054,7 @@ fn sequentagent(
         )));
     }
     integrate_agent_branch(&git, &base, &branch_b)?;
+    let _ = devflow_core::ship::delete_cron_instructions(project_root);
 
     println!("\nsequentagent complete — both agents integrated into {base}");
     Ok(())
