@@ -54,7 +54,7 @@ pub fn inspect(project_root: &Path) -> Result<RecoveryStatus, RecoverError> {
     let agent_running = agent_pid_for(&state).is_some_and(crate::agent::agent_running);
     let is_stale = is_stale_state(&state);
     let age = format_age(state.started_at.as_str());
-    let lock_held = crate::lock::holder(project_root).map(|(pid, _)| pid);
+    let lock_held = crate::lock::holder(project_root, state.phase).map(|(pid, _)| pid);
 
     Ok(RecoveryStatus {
         state,
@@ -67,12 +67,20 @@ pub fn inspect(project_root: &Path) -> Result<RecoveryStatus, RecoverError> {
 
 /// Clean up a stale or abandoned workflow state.
 ///
-/// Removes the state file and lock file (if present).
+/// Removes the state file and any per-phase lock files (if present). Locks
+/// are scoped per-phase (`.devflow/lock-{phase:02}`, see CR-03,
+/// 13-REVIEW.md), so this sweeps every `lock-*` file under `.devflow/`
+/// rather than a single known path — `recover --clean` is an operator-driven
+/// broad reset, not scoped to one phase.
 pub fn clean(project_root: &Path) -> Result<(), RecoverError> {
     workflow::clear_state(project_root)?;
-    let lock_path = project_root.join(".devflow").join("lock");
-    if lock_path.exists() {
-        std::fs::remove_file(&lock_path)?;
+    let devflow_dir = project_root.join(".devflow");
+    if let Ok(entries) = std::fs::read_dir(&devflow_dir) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with("lock-") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
     }
     Ok(())
 }

@@ -445,7 +445,15 @@ fn launch_stage(state: &State, prompt_override: Option<String>) -> Result<(), Cl
 /// Advance the stage machine after a monitored agent for `state.stage` exits.
 /// Invoked by the monitor process; not normally run by a human.
 fn advance(project_root: &Path) -> Result<(), CliError> {
-    let _lock = match lock::acquire(project_root) {
+    // CR-03 (13-REVIEW.md): the lock is scoped per-phase, not per-project.
+    // advance() holds it across a gate's multi-day blocking wait, and every
+    // successful run ends at a mandatory Ship gate — a project-wide lock
+    // would starve `devflow parallel`'s sibling phases with no retry. Load
+    // state before acquiring so the lock can be keyed on this phase; this is
+    // safe because it's a plain read and same-phase races still contend on
+    // the same phase-scoped lock file below.
+    let mut state = workflow::load_state(project_root)?;
+    let _lock = match lock::acquire(project_root, state.phase) {
         Ok(guard) => guard,
         Err(lock::LockError::Contended { pid, path: _ }) => {
             return Err(CliError::Message(format!(
@@ -455,7 +463,6 @@ fn advance(project_root: &Path) -> Result<(), CliError> {
         Err(err) => return Err(CliError::Message(format!("lock error: {err}"))),
     };
 
-    let mut state = workflow::load_state(project_root)?;
     let git_flow = GitFlowConfig::default();
     let result = agent_result::evaluate_agent_result(project_root, &state, &git_flow)
         .map_err(|err| CliError::Message(format!("could not evaluate agent result: {err}")))?;

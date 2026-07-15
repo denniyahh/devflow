@@ -1,8 +1,14 @@
-//! File-based lock to prevent concurrent `devflow check` invocations.
+//! File-based lock to prevent concurrent `devflow advance` invocations for
+//! the same phase.
 //!
-//! Creates `.devflow/lock` with the PID of the lock holder.
+//! Creates `.devflow/lock-{phase:02}` with the PID of the lock holder.
 //! Uses O_EXCL for atomic acquisition — if the file already exists,
 //! the lock is contended.
+//!
+//! The lock is scoped per-phase (not per-project): `advance()` holds it
+//! across a gate's multi-day blocking wait, and every phase run ends at a
+//! mandatory Ship gate, so a project-wide lock would starve `devflow
+//! parallel`'s sibling phases with no retry (CR-03, 13-REVIEW.md).
 
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -19,12 +25,12 @@ pub enum LockError {
     Io(#[from] io::Error),
 }
 
-/// Acquire an exclusive lock for the given project root.
+/// Acquire an exclusive lock for the given project root and phase.
 ///
-/// Writes the current PID into `.devflow/lock`. Returns a guard
+/// Writes the current PID into `.devflow/lock-{phase:02}`. Returns a guard
 /// that releases the lock when dropped.
-pub fn acquire(project_root: &Path) -> Result<LockGuard, LockError> {
-    let path = lock_path(project_root);
+pub fn acquire(project_root: &Path, phase: u32) -> Result<LockGuard, LockError> {
+    let path = lock_path(project_root, phase);
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -96,10 +102,10 @@ fn pid_is_alive(pid: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Check whether a lock is currently held for this project,
+/// Check whether a lock is currently held for this project/phase,
 /// returning the PID of the holder if the file exists.
-pub fn holder(project_root: &Path) -> Option<(String, PathBuf)> {
-    let path = lock_path(project_root);
+pub fn holder(project_root: &Path, phase: u32) -> Option<(String, PathBuf)> {
+    let path = lock_path(project_root, phase);
     let pid = fs::read_to_string(&path).ok()?;
     let pid = pid.trim().to_string();
     if pid.is_empty() {
@@ -127,8 +133,10 @@ impl Drop for LockGuard {
     }
 }
 
-fn lock_path(project_root: &Path) -> PathBuf {
-    project_root.join(".devflow").join("lock")
+fn lock_path(project_root: &Path, phase: u32) -> PathBuf {
+    project_root
+        .join(".devflow")
+        .join(format!("lock-{phase:02}"))
 }
 
 #[cfg(test)]
@@ -138,9 +146,9 @@ mod tests {
     #[test]
     fn acquire_creates_lock_and_records_pid() {
         let dir = tempfile::tempdir().unwrap();
-        let guard = acquire(dir.path()).expect("acquire");
+        let guard = acquire(dir.path(), 1).expect("acquire");
 
-        let (pid, path) = holder(dir.path()).expect("holder present");
+        let (pid, path) = holder(dir.path(), 1).expect("holder present");
         assert_eq!(pid, std::process::id().to_string());
         assert!(path.exists());
         drop(guard);
@@ -150,16 +158,16 @@ mod tests {
     fn acquire_creates_devflow_directory_when_absent() {
         let dir = tempfile::tempdir().unwrap();
         assert!(!dir.path().join(".devflow").exists());
-        let _guard = acquire(dir.path()).expect("acquire");
+        let _guard = acquire(dir.path(), 1).expect("acquire");
         assert!(dir.path().join(".devflow").exists());
     }
 
     #[test]
     fn second_acquire_is_contended() {
         let dir = tempfile::tempdir().unwrap();
-        let _guard = acquire(dir.path()).expect("first acquire");
+        let _guard = acquire(dir.path(), 1).expect("first acquire");
 
-        match acquire(dir.path()) {
+        match acquire(dir.path(), 1) {
             Err(LockError::Contended { pid, .. }) => {
                 assert_eq!(pid, std::process::id().to_string());
             }
@@ -168,35 +176,46 @@ mod tests {
         }
     }
 
+    /// CR-03 (13-REVIEW.md): the lock is scoped per-phase, so a different
+    /// phase in the same project must never contend on another phase's lock
+    /// — this is what lets `devflow parallel`'s sibling phases keep making
+    /// progress while one phase blocks on a multi-day gate wait.
+    #[test]
+    fn different_phases_do_not_contend() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard_a = acquire(dir.path(), 1).expect("acquire phase 1");
+        let _guard_b = acquire(dir.path(), 2).expect("acquire phase 2 must not contend");
+    }
+
     #[test]
     fn dropping_guard_releases_lock() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let _guard = acquire(dir.path()).expect("acquire");
-            assert!(holder(dir.path()).is_some());
+            let _guard = acquire(dir.path(), 1).expect("acquire");
+            assert!(holder(dir.path(), 1).is_some());
         }
         // After the guard drops the lock file is gone and re-acquiring works.
-        assert!(holder(dir.path()).is_none());
-        let _again = acquire(dir.path()).expect("re-acquire after release");
+        assert!(holder(dir.path(), 1).is_none());
+        let _again = acquire(dir.path(), 1).expect("re-acquire after release");
     }
 
     #[test]
     fn holder_is_none_without_lock_file() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(holder(dir.path()).is_none());
+        assert!(holder(dir.path(), 1).is_none());
     }
 
     #[test]
     fn holder_cleans_up_empty_lock_file() {
         let dir = tempfile::tempdir().unwrap();
-        let path = lock_path(dir.path());
+        let path = lock_path(dir.path(), 1);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, "   \n").unwrap();
 
-        assert!(holder(dir.path()).is_none());
+        assert!(holder(dir.path(), 1).is_none());
         // Empty/stale lock should be removed so a fresh acquire succeeds.
         assert!(!path.exists());
-        let _guard = acquire(dir.path()).expect("acquire after stale cleanup");
+        let _guard = acquire(dir.path(), 1).expect("acquire after stale cleanup");
     }
 
     /// 13-06 dogfood regression: a killed poller's abandoned lock wedged
@@ -205,13 +224,13 @@ mod tests {
     #[test]
     fn acquire_reclaims_lock_from_dead_holder() {
         let dir = tempfile::tempdir().unwrap();
-        let path = lock_path(dir.path());
+        let path = lock_path(dir.path(), 1);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         // Above default kernel pid_max (4194304) — guaranteed not alive.
         fs::write(&path, "9999999").unwrap();
 
-        let guard = acquire(dir.path()).expect("stale lock must be reclaimed");
-        let (pid, _) = holder(dir.path()).expect("holder present");
+        let guard = acquire(dir.path(), 1).expect("stale lock must be reclaimed");
+        let (pid, _) = holder(dir.path(), 1).expect("holder present");
         assert_eq!(pid, std::process::id().to_string());
         drop(guard);
     }
@@ -219,10 +238,10 @@ mod tests {
     #[test]
     fn acquire_reclaims_lock_with_corrupt_pid() {
         let dir = tempfile::tempdir().unwrap();
-        let path = lock_path(dir.path());
+        let path = lock_path(dir.path(), 1);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, "not-a-pid").unwrap();
 
-        acquire(dir.path()).expect("corrupt lock must be reclaimed");
+        acquire(dir.path(), 1).expect("corrupt lock must be reclaimed");
     }
 }
