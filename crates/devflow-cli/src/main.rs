@@ -932,20 +932,13 @@ fn run_agent_blocking(
     let capture = agent::capture_agent_output(child, phase, project_root)
         .map_err(|err| CliError::Message(format!("failed to capture agent output: {err}")))?;
     println!("agent {agent} exited with code {}", capture.exit_code);
-    Ok(
-        agent_result::parse_devflow_result(&capture.stdout).or_else(|| {
-            agent_result::detect_rate_limit(&capture.stdout).map(|retry| {
-                agent_result::AgentResult {
-                    status: AgentStatus::RateLimited,
-                    exit_code: Some(capture.exit_code),
-                    reason: Some(format!("rate limited until {retry}")),
-                    commits: None,
-                    summary: None,
-                    verdict: None,
-                }
-            })
-        }),
-    )
+    // capture_agent_output already wrote stdout to the same file
+    // evaluate_layer1 reads, so delegate to it directly rather than
+    // re-implementing a subset of its precedence here — this is the single
+    // code path that knows how to find a Codex agent's DEVFLOW_RESULT
+    // marker inside its JSONL `--json` event stream (parse_codex_event_result),
+    // which the previous parse_devflow_result-only chain never called.
+    Ok(agent_result::evaluate_layer1(project_root, phase))
 }
 
 /// Integrate an agent branch into the shared base, pushing if a remote exists.
