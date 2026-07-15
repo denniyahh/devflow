@@ -392,8 +392,15 @@ fn start(
         }
     }
 
-    workflow::save_state(&state)?;
+    // WR-11 (13-REVIEW.md): save state only after launch_stage is confirmed
+    // to succeed. Saving first (the previous order) left `.devflow/state.json`
+    // reflecting a phase "in progress" with no agent PID and no monitor
+    // running if launch_stage failed (e.g. a missing agent binary or a
+    // failure to spawn the monitor's `sh`), making `devflow status`/`devflow
+    // recover` report a stuck-looking state that needed `recover --clean`
+    // even though nothing was actually launched.
     launch_stage(&state, None)?;
+    workflow::save_state(&state)?;
     println!(
         "started phase {} in {mode} mode at {} — monitor will auto-advance",
         state.phase, state.started_at
