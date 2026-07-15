@@ -12,7 +12,12 @@ impl AgentAdapter for ClaudeAgent {
         "Claude Code"
     }
 
-    fn exec_command(&self, _phase: u32, prompt: &str) -> (&'static str, Vec<String>) {
+    fn exec_command(
+        &self,
+        _phase: u32,
+        prompt: &str,
+        _extra_writable_root: Option<&std::path::Path>,
+    ) -> (&'static str, Vec<String>) {
         (
             "claude",
             vec![
