@@ -37,6 +37,16 @@ fn init_repo(root: &Path) {
     git(root, &["config", "core.hooksPath", "/dev/null"]);
     git(root, &["checkout", "-q", "-b", "develop"]);
     fs::write(root.join("README.md"), "base\n").unwrap();
+    // Pre-baked GSD context for every phase these tests launch — the
+    // fresh-codex pre-flight (13-06) refuses codex runs on phases with no
+    // CONTEXT.md on develop, and these fixtures exercise phases 7–9 with
+    // both agents.
+    for phase in ["07", "08", "09"] {
+        let dir = root.join(format!(".planning/phases/{phase}-test"));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("{phase}-CONTEXT.md")), "ctx\n").unwrap();
+        fs::write(dir.join(format!("{phase}-01-PLAN.md")), "plan\n").unwrap();
+    }
     git(root, &["add", "."]);
     git(root, &["commit", "-q", "-m", "base"]);
     git(root, &["branch", "main"]);
@@ -461,4 +471,44 @@ fn reference_and_cleanup_worktree_cli_flow() {
     // cleanup --force removes everything including reference
     assert!(!root.join(".worktrees/reference").is_dir());
     assert!(!root.join(".worktrees/phase-08").is_dir());
+}
+
+/// 13-06 dogfood regression (Codex leg): a fresh headless Codex run can
+/// never pass Define, so `start --agent codex` on a phase with no CONTEXT.md
+/// on develop must fail fast in pre-flight — before any worktree, branch, or
+/// monitor is created.
+#[test]
+fn start_codex_without_context_fails_preflight() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let fake_bin = fake_bin_dir(&[]);
+
+    let output = Command::new(devflow_bin())
+        .args([
+            "start", "--phase", "42", "--agent", "codex", "--mode", "auto",
+        ])
+        .arg(root)
+        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .current_dir(root)
+        .output()
+        .expect("run devflow");
+
+    assert!(
+        !output.status.success(),
+        "codex start on a context-less phase must fail pre-flight"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no CONTEXT.md"),
+        "pre-flight error must name the missing artifact\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("/gsd-discuss-phase 42"),
+        "pre-flight error must include the remediation command\nstderr: {stderr}"
+    );
+    assert!(
+        !root.join(".worktrees/phase-42").exists(),
+        "pre-flight failure must not create a worktree"
+    );
 }

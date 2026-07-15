@@ -107,6 +107,43 @@ fn validate_stage_prompt(phase: u32) -> String {
     )
 }
 
+/// The Define and Plan stages' idempotency contract.
+///
+/// Headless-safety rationale (13-06 dogfood finding, Codex leg): GSD's
+/// discuss-phase demands an interactive "Overwrite/Append/Cancel" decision
+/// when the phase's CONTEXT.md already exists, and headless Codex cannot
+/// answer it (`request_user_input is unavailable`) — the stage would fail on
+/// every retry, forever. When the stage's deliverable already exists, the
+/// stage's work is done: re-running it must be a no-op success, not an
+/// interactive dead end. This is idempotency for a completed stage, NOT the
+/// v1 skip-stage config flags removed by the 2026-06-19 architecture
+/// decision — a stage with no pre-existing artifact still runs in full.
+fn idempotent_stage_prompt(stage: Stage, phase: u32) -> String {
+    let artifact = match stage {
+        Stage::Define => "CONTEXT.md",
+        _ => "PLAN.md",
+    };
+    let command = gsd_command_for(stage, phase);
+    let padded = format!("{phase:02}");
+    format!(
+        "First check whether this stage's deliverable already exists:\n\
+        \n\
+        ls .planning/phases/{padded}-*/{padded}-*{artifact} 2>/dev/null\n\
+        \n\
+        - If it EXISTS: the stage's work is already done. Do NOT run the GSD \
+        command, do NOT ask for input, and do NOT modify the existing \
+        artifacts. Your FINAL message must be exactly:\n\
+        \n\
+        DEVFLOW_RESULT: {{\"status\": \"success\"}}\n\
+        \n\
+        - If it does NOT exist: run the GSD workflow command for this stage:\n\
+        \n\
+        \x20   {command}\n\
+        \n\
+        {COMPLETION_PROTOCOL}"
+    )
+}
+
 /// Build the prompt for a stage of a phase.
 pub fn stage_prompt(stage: Stage, phase: u32) -> String {
     if stage == Stage::Ship {
@@ -114,6 +151,9 @@ pub fn stage_prompt(stage: Stage, phase: u32) -> String {
     }
     if stage == Stage::Validate {
         return validate_stage_prompt(phase);
+    }
+    if matches!(stage, Stage::Define | Stage::Plan) {
+        return idempotent_stage_prompt(stage, phase);
     }
     let command = gsd_command_for(stage, phase);
     format!(
@@ -198,23 +238,51 @@ mod tests {
     }
 
     #[test]
-    fn non_ship_non_validate_stage_prompts_are_unchanged_single_command_template() {
+    fn code_stage_prompt_is_unchanged_single_command_template() {
         // Validate is excluded here (Task 2, 13-05): it now gets its own
         // dedicated prompt requiring a verdict — see
-        // `validate_stage_prompt_requires_verdict` below.
+        // `validate_stage_prompt_requires_verdict` below. Define and Plan
+        // are excluded too (13-06 dogfood): they carry the idempotency
+        // contract — see `define_and_plan_prompts_are_idempotent` below.
+        let prompt = stage_prompt(Stage::Code, 9);
+        assert!(prompt.contains("/gsd-execute-phase 9"));
+        assert!(prompt.contains("DEVFLOW_RESULT"));
+        assert!(
+            !prompt.contains("/gsd-code-review"),
+            "Code prompt should not carry Ship-specific code-review sequencing"
+        );
+        assert!(
+            !prompt.contains("already exists"),
+            "Code prompt should not carry the Define/Plan idempotency contract"
+        );
+    }
+
+    /// 13-06 dogfood regression (Codex leg): GSD's discuss-phase demands an
+    /// interactive decision when CONTEXT.md already exists, which headless
+    /// Codex can never answer — Define/Plan must no-op with success when
+    /// their deliverable pre-exists.
+    #[test]
+    fn define_and_plan_prompts_are_idempotent() {
         let cases = [
-            (Stage::Define, "/gsd-discuss-phase 9"),
-            (Stage::Plan, "/gsd-plan-phase 9"),
-            (Stage::Code, "/gsd-execute-phase 9"),
+            (Stage::Define, "/gsd-discuss-phase 9", "09-*CONTEXT.md"),
+            (Stage::Plan, "/gsd-plan-phase 9", "09-*PLAN.md"),
         ];
-        for (stage, command) in cases {
+        for (stage, command, artifact_glob) in cases {
             let prompt = stage_prompt(stage, 9);
             assert!(prompt.contains(command), "{stage} prompt missing {command}");
-            assert!(prompt.contains("DEVFLOW_RESULT"));
             assert!(
-                !prompt.contains("/gsd-code-review"),
-                "{stage} prompt should not carry Ship-specific code-review sequencing"
+                prompt.contains(artifact_glob),
+                "{stage} prompt must check for its pre-existing artifact"
             );
+            assert!(
+                prompt.contains("Do NOT run the GSD command"),
+                "{stage} prompt must no-op when the artifact exists"
+            );
+            assert!(
+                prompt.contains("do NOT ask for input"),
+                "{stage} prompt must forbid interactive input"
+            );
+            assert!(prompt.contains("DEVFLOW_RESULT"));
         }
     }
 

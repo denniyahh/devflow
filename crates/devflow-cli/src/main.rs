@@ -276,6 +276,34 @@ fn run() -> Result<(), CliError> {
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
+/// Whether phase `{NN}`'s GSD planning artifact (a `.planning/phases/{NN}-*/`
+/// file ending in `suffix`, e.g. `-CONTEXT.md`) exists on `develop` — the
+/// branch phase worktrees fork from. Fail-open on git errors (missing
+/// develop, not a repo): pre-flight must never block a run the later, more
+/// specific checks would allow.
+fn phase_artifact_on_develop(project_root: &Path, phase: u32, suffix: &str) -> bool {
+    let prefix = format!(".planning/phases/{phase:02}-");
+    let output = std::process::Command::new("git")
+        .args([
+            "ls-tree",
+            "-r",
+            "--name-only",
+            "develop",
+            "--",
+            ".planning/phases/",
+        ])
+        .current_dir(project_root)
+        .output();
+    let Ok(out) = output else { return true };
+    if !out.status.success() {
+        return true;
+    }
+    String::from_utf8_lossy(&out.stdout).lines().any(|path| {
+        path.strip_prefix(&prefix)
+            .is_some_and(|rest| rest.contains('/') && rest.ends_with(suffix))
+    })
+}
+
 fn start(
     project_root: &Path,
     phase: u32,
@@ -290,6 +318,29 @@ fn start(
     if dry_run {
         print_dry_run(&state);
         return Ok(());
+    }
+
+    // 13-06 dogfood pre-flight (Codex leg): a fresh headless Codex run can
+    // never pass Define — GSD's discuss-phase is an interview, and Codex's
+    // exec mode cannot answer it (`request_user_input is unavailable in
+    // Default mode`). Fail in one second with instructions instead of after
+    // a burned agent run and a dead-end gate. Checked on `develop` (the
+    // branch worktrees fork from), so the result does not depend on what the
+    // primary checkout happens to have checked out.
+    if agent == AgentKind::Codex {
+        if !phase_artifact_on_develop(project_root, phase, "-CONTEXT.md") {
+            return Err(CliError::Message(format!(
+                "phase {phase} has no CONTEXT.md on develop, and codex cannot run an \
+                 interactive discussion headless. Run /gsd-discuss-phase {phase} \
+                 interactively first (any agent), or use --agent claude."
+            )));
+        }
+        if !phase_artifact_on_develop(project_root, phase, "-PLAN.md") {
+            println!(
+                "warning: phase {phase} has no PLAN.md on develop — headless codex \
+                 planning is untested and may need input; pre-writing plans is safer"
+            );
+        }
     }
 
     // Pre-start divergence check: runs on current HEAD before any git mutation.
@@ -1936,6 +1987,42 @@ mod tests {
         assert_eq!(parse_gate_timeout(Some("42".into())), 42);
         assert_eq!(parse_gate_timeout(Some("bad".into())), SEVEN_DAYS);
         assert_eq!(parse_gate_timeout(None), SEVEN_DAYS);
+    }
+
+    /// 13-06 dogfood regression (Codex leg): a fresh headless Codex run can
+    /// never pass Define, so `start --agent codex` pre-flights on the
+    /// phase's CONTEXT.md existing on develop.
+    #[test]
+    fn phase_artifact_on_develop_detects_context_and_fails_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("spawn git");
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@e.st"]);
+        run(&["config", "user.name", "t"]);
+        run(&["config", "commit.gpgsign", "false"]);
+        run(&["config", "core.hooksPath", "/dev/null"]);
+        std::fs::create_dir_all(root.join(".planning/phases/03-widget")).unwrap();
+        std::fs::write(root.join(".planning/phases/03-widget/03-CONTEXT.md"), "ctx").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "init"]);
+        run(&["branch", "develop"]);
+
+        assert!(phase_artifact_on_develop(root, 3, "-CONTEXT.md"));
+        assert!(!phase_artifact_on_develop(root, 3, "-PLAN.md"));
+        assert!(!phase_artifact_on_develop(root, 4, "-CONTEXT.md"));
+
+        // Fail-open: outside a repo (or with no develop branch) the
+        // pre-flight must not block.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(phase_artifact_on_develop(empty.path(), 3, "-CONTEXT.md"));
     }
 
     /// 13-06 dogfood regression: a multi-KB parser-derived reason reached
