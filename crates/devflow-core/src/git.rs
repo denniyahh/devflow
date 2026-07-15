@@ -96,7 +96,13 @@ impl GitFlow {
         info!("finishing release branch: {branch}");
         self.git(["checkout", &self.config.main])?;
         self.git(["merge", "--no-ff", &branch])?;
-        self.git(["tag", &format!("v{version}")])?;
+        // `-c tag.gpgSign=false` scopes the override to this invocation only
+        // (never the user's global/repo config) — without it, a global
+        // `tag.gpgsign=true` forces this lightweight tag into an
+        // annotated+signed one requiring a message, which blocks on
+        // `$EDITOR` in what must be a headless, unattended flow (Phase 13
+        // dogfood finding).
+        self.git(["-c", "tag.gpgSign=false", "tag", &format!("v{version}")])?;
         self.git(["checkout", &self.config.develop])?;
         self.git(["merge", "--no-ff", &branch])?;
         self.git(["branch", "-d", &branch])?;
@@ -104,9 +110,16 @@ impl GitFlow {
     }
 
     /// Create an annotated-free lightweight tag at the current `HEAD`.
+    ///
+    /// Passes `-c tag.gpgSign=false` scoped to this invocation only — a
+    /// global `tag.gpgsign=true` (common for developers who sign their own
+    /// tags) otherwise forces this lightweight tag into an annotated+signed
+    /// one requiring a message, which blocks on `$EDITOR` in what must be a
+    /// headless, unattended flow (Phase 13 dogfood finding: VersionBump hung
+    /// on a live `devflow start --mode auto` run).
     pub fn tag(&self, tag: &str) -> Result<(), GitError> {
         info!("tagging {tag}");
-        self.git(["tag", tag])
+        self.git(["-c", "tag.gpgSign=false", "tag", tag])
     }
 
     /// Delete a single local branch.
@@ -517,6 +530,47 @@ mod tests {
             .output()
             .unwrap();
         assert!(!String::from_utf8_lossy(&branches.stdout).contains("release/1.2.0"));
+    }
+
+    /// A global/repo `tag.gpgsign=true` must not turn `tag()`'s lightweight
+    /// tag into an annotated+signed one — that would require a tag message
+    /// and block on `$EDITOR`, silently hanging a headless, unattended run
+    /// (Phase 13 dogfood finding: VersionBump hung on a live
+    /// `devflow start --mode auto` run because the operator's global
+    /// gitconfig sets `tag.gpgsign=true`).
+    #[test]
+    fn tag_stays_lightweight_when_gpgsign_is_forced_on() {
+        let repo = init_repo();
+        let root = repo.path();
+        // Simulate an operator whose global config signs tags by default —
+        // override the test harness's own `tag.gpgsign false` to prove
+        // `tag()`'s per-invocation `-c` override wins regardless.
+        git(root, &["config", "tag.gpgsign", "true"]);
+
+        flow(root)
+            .tag("v9.9.9")
+            .expect("tag must not block on $EDITOR");
+
+        let tags = Command::new("git")
+            .args(["tag", "-l"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&tags.stdout).contains("v9.9.9"));
+
+        // Confirm it's a lightweight tag (points directly at the commit),
+        // not an annotated tag object (which `cat-file -t` would report as
+        // "tag" rather than "commit").
+        let obj_type = Command::new("git")
+            .args(["cat-file", "-t", "v9.9.9"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&obj_type.stdout).trim(),
+            "commit",
+            "tag() must stay lightweight even when tag.gpgsign=true"
+        );
     }
 
     #[test]
