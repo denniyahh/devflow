@@ -223,6 +223,52 @@ fn start_defaults_to_worktree() {
     );
 }
 
+/// WR-10 (13-REVIEW.md): the pre-start divergence check must not inspect the
+/// main checkout's current HEAD when worktree mode is active (the default)
+/// — worktree mode always forks fresh from `develop` regardless of what's
+/// checked out in the main repo, so a stale/unrelated branch left checked
+/// out there must not block `start`. Before the fix, this test's "ancient"
+/// branch (60+ commits behind develop) would hard-fail `start` with a
+/// "develop is N commits ahead" error that had nothing to do with the new
+/// phase's worktree, which always starts at ahead=0, behind=0.
+#[test]
+fn start_worktree_mode_ignores_main_checkout_divergence() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+
+    // Branch off develop, then leave develop far ahead (60 commits — past
+    // the `behind > 50` hard-fail threshold) while the main checkout stays
+    // on the stale branch.
+    git(root, &["checkout", "-q", "-b", "ancient", "develop"]);
+    git(root, &["checkout", "-q", "develop"]);
+    for i in 0..60 {
+        fs::write(root.join(format!("f{i}.txt")), i.to_string()).unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-q", "-m", &format!("commit {i}")]);
+    }
+    git(root, &["checkout", "-q", "ancient"]);
+
+    let fake_bin = fake_bin_dir(&[(
+        "claude",
+        "#!/bin/sh\nprintf 'DEVFLOW_RESULT: {\"status\":\"success\"}\\n'\n",
+    )]);
+
+    // Worktree mode is the default — no --no-worktree flag. This must
+    // succeed (run_devflow asserts a zero exit status) despite the main
+    // checkout being 60 commits behind develop.
+    run_devflow(
+        root,
+        &fake_bin.path,
+        &[
+            "start", "--phase", "13", "--agent", "claude", "--mode", "auto",
+        ],
+    );
+
+    wait_for(&root.join(".worktrees/phase-13"));
+    assert!(root.join(".worktrees/phase-13").is_dir());
+}
+
 #[test]
 fn start_no_worktree_uses_feature_branch() {
     let repo = tempfile::tempdir().unwrap();

@@ -343,8 +343,17 @@ fn start(
         }
     }
 
-    // Pre-start divergence check: runs on current HEAD before any git mutation.
-    if let Ok((_ahead, behind)) = GitFlow::new(project_root).divergence_from_develop() {
+    // Pre-start divergence check: runs on current HEAD before any git
+    // mutation. WR-10 (13-REVIEW.md): only meaningful for the --no-worktree
+    // (branch-in-place) flow, where `start` actually branches from the main
+    // checkout's current HEAD. In worktree mode (the default) the agent's
+    // work always forks fresh from `develop` via `worktree::add`, independent
+    // of whatever happens to be checked out in the main repo — checking the
+    // main checkout's divergence there is unrelated to what's about to
+    // happen and can either hard-fail on a stale unrelated branch or
+    // silently no-op if the main checkout happens to be on develop.
+    if !worktree && let Ok((_ahead, behind)) = GitFlow::new(project_root).divergence_from_develop()
+    {
         if behind > 50 {
             return Err(CliError::Message(format!(
                 "develop is {behind} commits ahead — your branch is too far behind. \
