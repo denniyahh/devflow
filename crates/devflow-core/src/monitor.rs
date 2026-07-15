@@ -99,9 +99,16 @@ pub fn spawn_monitor(
     // `devflow advance` evaluates the agent result, moves the stage machine
     // forward, and (for an agent stage) spawns the next monitor itself.
     //
-    // Traps SIGTERM and SIGINT for clean shutdown.
+    // Traps SIGTERM and SIGINT for clean shutdown. WR-08 (13-REVIEW.md):
+    // the trap must also kill the backgrounded agent ($apid) — previously
+    // it only exited the monitor shell itself, orphaning the agent so it
+    // kept running/committing unsupervised with nothing left to call
+    // `devflow advance` once it finished. `apid` is initialized to empty
+    // before the trap is installed so a signal arriving before the agent is
+    // even backgrounded doesn't reference an unset variable.
     let script = format!(
-        "cleanup() {{ exit 0; }}; trap cleanup TERM INT; \
+        "apid=''; cleanup() {{ [ -n \"$apid\" ] && kill \"$apid\" 2>/dev/null; exit 0; }}; \
+         trap cleanup TERM INT; \
          cd {workdir} || exit 1; \
          \"$@\" > {stdout_file} 2>{stderr_file} & \
          apid=$!; echo $apid > {pid_file}; \
@@ -255,6 +262,49 @@ mod tests {
         assert!(
             captured.contains("MONITOR_READY"),
             "expected MONITOR_READY in captured stdout, got {captured:?}"
+        );
+    }
+
+    /// WR-08 (13-REVIEW.md): sending SIGTERM/SIGINT to the monitor must also
+    /// terminate the agent it owns. Before the fix, `cleanup()` only exited
+    /// the monitor shell, leaving the agent orphaned and running/committing
+    /// unsupervised with nothing left to call `devflow advance` for it.
+    #[test]
+    fn sigterm_to_monitor_also_kills_the_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_in(dir.path());
+        // Stub agent that runs long enough to observe: sleeps well past the
+        // window this test needs to send SIGTERM and check liveness.
+        let args = vec!["-c".to_string(), "sleep 30".to_string()];
+
+        let monitor_pid = spawn_monitor(&state, "sh", &args, &[]).unwrap();
+        let agent_pid = wait_for_agent_pid(dir.path(), state.phase)
+            .expect("monitor should record the agent pid");
+        assert!(
+            crate::agent::agent_running(agent_pid),
+            "agent should be running before SIGTERM"
+        );
+
+        // SIGTERM the monitor, as an operator (or lock.rs's stale-holder
+        // reclaim path) would to abort a run.
+        unsafe {
+            libc::kill(monitor_pid as libc::pid_t, libc::SIGTERM);
+        }
+
+        // The agent should be killed promptly by the monitor's trap —
+        // poll rather than sleep a fixed amount to keep this fast and
+        // avoid flaking under load.
+        let mut still_running = true;
+        for _ in 0..100 {
+            if !crate::agent::agent_running(agent_pid) {
+                still_running = false;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !still_running,
+            "agent (pid {agent_pid}) was orphaned — still running after monitor SIGTERM"
         );
     }
 
