@@ -477,6 +477,20 @@ fn handle_ship_outcome(project_root: &Path, state: &mut State) -> Result<(), Cli
 /// gate and notifies accordingly), then lets the operator retry, loop back,
 /// or abort. Deliberately kept separate from `handle_validate_outcome`: it
 /// does not touch `consecutive_failures` and never auto-loops.
+/// Cap a failure reason before it enters a gate context (and from there the
+/// operator's notification). Reasons are agent- or parser-derived and can
+/// embed arbitrary output — 13-06 dogfood finding: a multi-KB raw JSONL line
+/// reached the desktop notification verbatim. Full detail stays available in
+/// `.devflow/phase-NN-stdout`; the gate only needs a readable headline.
+fn truncate_reason(reason: &str) -> String {
+    const MAX: usize = 300;
+    if reason.chars().count() <= MAX {
+        return reason.to_string();
+    }
+    let head: String = reason.chars().take(MAX).collect();
+    format!("{head}… [truncated; full output in .devflow/]")
+}
+
 fn handle_stage_failure(
     project_root: &Path,
     state: &mut State,
@@ -485,7 +499,7 @@ fn handle_stage_failure(
 ) -> Result<(), CliError> {
     let context = format!(
         "[never-silent] stage {stage} failed: {} — human review needed (retry, loop-to-code, or abort)",
-        reason.unwrap_or_else(|| "no details available".into())
+        truncate_reason(&reason.unwrap_or_else(|| "no details available".into()))
     );
     match run_gate(project_root, state, stage, &context)? {
         GateAction::Advance => {
@@ -1922,6 +1936,18 @@ mod tests {
         assert_eq!(parse_gate_timeout(Some("42".into())), 42);
         assert_eq!(parse_gate_timeout(Some("bad".into())), SEVEN_DAYS);
         assert_eq!(parse_gate_timeout(None), SEVEN_DAYS);
+    }
+
+    /// 13-06 dogfood regression: a multi-KB parser-derived reason reached
+    /// the operator's desktop notification verbatim. Gate contexts must cap
+    /// the reason to a readable headline.
+    #[test]
+    fn truncate_reason_caps_long_reasons_and_keeps_short_ones() {
+        assert_eq!(truncate_reason("short reason"), "short reason");
+        let long = "x".repeat(5000);
+        let capped = truncate_reason(&long);
+        assert!(capped.chars().count() < 400);
+        assert!(capped.ends_with("[truncated; full output in .devflow/]"));
     }
 
     /// A Ship-stage AgentFailed result (no `review:` prefix) must write a

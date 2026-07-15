@@ -142,6 +142,22 @@ fn detect_claude_rate_limit(stdout: &str) -> Option<String> {
 }
 
 fn detect_codex_rate_limit(stdout: &str) -> Option<String> {
+    // This heuristic exists for Codex's PLAIN-TEXT output. JSONL event lines
+    // are authoritative and handled by parse_codex_event_result — scanning
+    // them here false-positives on document content echoed into events
+    // (13-06 dogfood finding: GSD reference tables mentioning "rate limiting"
+    // were read by the agent, echoed into an `item.completed` payload, and
+    // this scan returned that entire multi-KB line as the "retry time").
+    let stdout: String = stdout
+        .lines()
+        .filter(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .map(|v| !v.is_object())
+                .unwrap_or(true)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let stdout = stdout.as_str();
     let lower = stdout.to_ascii_lowercase();
     if let Some(idx) = lower.find("try again at ") {
         let start = idx + "try again at ".len();
@@ -316,6 +332,27 @@ fn parse_codex_event_result(stdout: &str) -> Option<AgentResult> {
 
     if !is_codex_event_stream(&events) {
         return None;
+    }
+
+    // Codex delivers the agent's DEVFLOW_RESULT self-report inside an
+    // `agent_message` item's `text` — never as a raw stdout line — so the
+    // top-level marker scan cannot see it (13-06 dogfood finding: a Codex
+    // `DEVFLOW_RESULT: failed` was invisible and the run fell through to
+    // heuristics). The decoded `text` is a plain marker line; reuse the
+    // marker parser on it. Last marker wins, matching parse_marker_lines.
+    let marker = events.iter().rev().find_map(|v| {
+        if v.get("type").and_then(serde_json::Value::as_str) != Some("item.completed") {
+            return None;
+        }
+        let item = v.get("item")?;
+        if item.get("type").and_then(serde_json::Value::as_str) != Some("agent_message") {
+            return None;
+        }
+        let text = item.get("text").and_then(serde_json::Value::as_str)?;
+        parse_marker_lines(text)
+    });
+    if marker.is_some() {
+        return marker;
     }
 
     let terminal = events.iter().rev().find(|v| {
@@ -856,6 +893,58 @@ mod tests {
             "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}\n",
         );
         assert!(parse_codex_event_result(stdout).is_none());
+    }
+
+    /// 13-06 dogfood regression: Codex delivers the DEVFLOW_RESULT marker
+    /// inside an `agent_message` item's text, never as a raw stdout line. A
+    /// self-reported failure followed by a bare `turn.completed` must parse
+    /// as Failed with the agent's reason — not defer to Layer 2 (which would
+    /// see exit 0 and call it a success).
+    #[test]
+    fn codex_agent_message_marker_failed_wins_over_bare_turn_completed() {
+        let stdout = concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"t1\"}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_7\",\"type\":\"agent_message\",\"text\":\"DEVFLOW_RESULT: {\\\"status\\\": \\\"failed\\\", \\\"reason\\\": \\\"interactive input unavailable\\\"}\"}}\n",
+            "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}\n",
+        );
+        let result = parse_codex_event_result(stdout).unwrap();
+        assert_eq!(result.status, AgentStatus::Failed);
+        assert_eq!(
+            result.reason.as_deref(),
+            Some("interactive input unavailable")
+        );
+    }
+
+    #[test]
+    fn codex_agent_message_marker_success_short_circuits() {
+        let stdout = concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"t1\"}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_2\",\"type\":\"agent_message\",\"text\":\"DEVFLOW_RESULT: {\\\"status\\\": \\\"success\\\"}\"}}\n",
+            "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}\n",
+        );
+        let result = parse_codex_event_result(stdout).unwrap();
+        assert_eq!(result.status, AgentStatus::Success);
+    }
+
+    /// 13-06 dogfood regression: document content echoed into a JSONL event
+    /// (GSD reference tables mentioning "rate limiting") must not trip the
+    /// plain-text rate-limit heuristic — it returned the entire multi-KB
+    /// event line as the "retry time" and that reached the desktop
+    /// notification verbatim.
+    #[test]
+    fn detect_rate_limit_ignores_json_event_lines() {
+        let stdout = concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"t1\"}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_4\",\"type\":\"command_execution\",\"aggregated_output\":\"| API keys | Rate limiting per key? |\"}}\n",
+            "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}\n",
+        );
+        assert_eq!(detect_rate_limit(stdout), None);
+    }
+
+    #[test]
+    fn detect_rate_limit_still_reads_codex_plain_text() {
+        let stdout = "Rate limit reached.\nTry again at 3:45 PM.\n";
+        assert_eq!(detect_rate_limit(stdout).as_deref(), Some("3:45 PM"));
     }
 
     #[test]
