@@ -465,10 +465,15 @@ pub fn evaluate_layer1(project_root: &Path, phase: u32) -> Option<AgentResult> {
 ///           (not commit-gated; Validate's real pass signal is its verdict,
 ///           not a bare zero-commit — see Task 2's turn.completed deferral)
 ///   exit unknown                                         → fall to Layer 3 (return None)
+///
+/// WR-06 (13-REVIEW.md): takes only the explicit `project_root` parameter
+/// for both the `.devflow/` file paths and the git subprocess `current_dir`
+/// — previously it also accepted `state: &State` and used `state.project_root`
+/// for the git calls, which every caller happened to pass consistently with
+/// `project_root` but which the function itself had no way to enforce.
 pub fn evaluate_layer2(
     project_root: &Path,
     phase: u32,
-    state: &State,
     git_flow: &GitFlowConfig,
     stage: Stage,
 ) -> Result<Option<AgentResult>, ResultError> {
@@ -483,7 +488,7 @@ pub fn evaluate_layer2(
     // Verify branch exists before counting commits.
     let branch_exists = std::process::Command::new("git")
         .args(["rev-parse", "--verify", &branch])
-        .current_dir(&state.project_root)
+        .current_dir(project_root)
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
@@ -492,7 +497,7 @@ pub fn evaluate_layer2(
         let range = format!("{}..{branch}", git_flow.develop);
         std::process::Command::new("git")
             .args(["rev-list", "--count", &range])
-            .current_dir(&state.project_root)
+            .current_dir(project_root)
             .output()
             .ok()
             .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
@@ -584,8 +589,7 @@ pub fn evaluate_agent_result(
     }
 
     // Layer 2: Exit code + commit gate
-    if let Some(result) = evaluate_layer2(project_root, state.phase, state, git_flow, state.stage)?
-    {
+    if let Some(result) = evaluate_layer2(project_root, state.phase, git_flow, state.stage)? {
         return Ok(result);
     }
 
@@ -1050,15 +1054,9 @@ mod tests {
         std::fs::write(exit_code_path(dir.path(), 4), "0").unwrap();
         let state = state_in(dir.path(), 4);
 
-        let result = evaluate_layer2(
-            dir.path(),
-            4,
-            &state,
-            &GitFlowConfig::default(),
-            state.stage,
-        )
-        .unwrap()
-        .unwrap();
+        let result = evaluate_layer2(dir.path(), 4, &GitFlowConfig::default(), state.stage)
+            .unwrap()
+            .unwrap();
 
         assert_eq!(result.status, AgentStatus::Success);
         assert_eq!(result.exit_code, Some(0));
@@ -1076,15 +1074,9 @@ mod tests {
         std::fs::write(exit_code_path(dir.path(), 4), "0").unwrap();
         let state = state_in(dir.path(), 4);
 
-        let result = evaluate_layer2(
-            dir.path(),
-            4,
-            &state,
-            &GitFlowConfig::default(),
-            state.stage,
-        )
-        .unwrap()
-        .unwrap();
+        let result = evaluate_layer2(dir.path(), 4, &GitFlowConfig::default(), state.stage)
+            .unwrap()
+            .unwrap();
 
         assert_eq!(result.status, AgentStatus::Failed);
         assert_eq!(result.exit_code, Some(0));
@@ -1101,15 +1093,9 @@ mod tests {
         std::fs::write(exit_code_path(dir.path(), 4), "1").unwrap();
         let state = state_in(dir.path(), 4);
 
-        let result = evaluate_layer2(
-            dir.path(),
-            4,
-            &state,
-            &GitFlowConfig::default(),
-            state.stage,
-        )
-        .unwrap()
-        .unwrap();
+        let result = evaluate_layer2(dir.path(), 4, &GitFlowConfig::default(), state.stage)
+            .unwrap()
+            .unwrap();
 
         assert_eq!(result.status, AgentStatus::Failed);
         assert_eq!(result.exit_code, Some(1));
@@ -1125,7 +1111,6 @@ mod tests {
         init_repo_with_feature_no_commit(dir.path(), 10);
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
         std::fs::write(exit_code_path(dir.path(), 10), "1").unwrap();
-        let mut state = state_in(dir.path(), 10);
 
         for stage in [
             Stage::Define,
@@ -1134,8 +1119,7 @@ mod tests {
             Stage::Validate,
             Stage::Ship,
         ] {
-            state.stage = stage;
-            let result = evaluate_layer2(dir.path(), 10, &state, &GitFlowConfig::default(), stage)
+            let result = evaluate_layer2(dir.path(), 10, &GitFlowConfig::default(), stage)
                 .unwrap()
                 .unwrap();
             assert_eq!(
@@ -1152,11 +1136,9 @@ mod tests {
         init_repo_with_feature_no_commit(dir.path(), 11);
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
         std::fs::write(exit_code_path(dir.path(), 11), "0").unwrap();
-        let mut state = state_in(dir.path(), 11);
 
         for stage in [Stage::Define, Stage::Validate] {
-            state.stage = stage;
-            let result = evaluate_layer2(dir.path(), 11, &state, &GitFlowConfig::default(), stage)
+            let result = evaluate_layer2(dir.path(), 11, &GitFlowConfig::default(), stage)
                 .unwrap()
                 .unwrap();
             assert_ne!(
@@ -1168,16 +1150,9 @@ mod tests {
 
         // Code stage with the same zero-commit inputs is still Failed
         // (existing behavior preserved).
-        state.stage = Stage::Code;
-        let result = evaluate_layer2(
-            dir.path(),
-            11,
-            &state,
-            &GitFlowConfig::default(),
-            Stage::Code,
-        )
-        .unwrap()
-        .unwrap();
+        let result = evaluate_layer2(dir.path(), 11, &GitFlowConfig::default(), Stage::Code)
+            .unwrap()
+            .unwrap();
         assert_eq!(result.status, AgentStatus::Failed);
     }
 
