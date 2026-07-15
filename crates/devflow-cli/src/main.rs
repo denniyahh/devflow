@@ -392,6 +392,28 @@ fn start(
     Ok(())
 }
 
+/// The sandbox writable roots a worktree-hosted agent needs to commit: the
+/// main repo's common `.git/` (objects, refs) and the linked worktree's
+/// admin dir (`index.lock`, `HEAD`) — resolved from the worktree's `.git`
+/// gitdir pointer when readable, with the creation-convention path as
+/// fallback (13-06 dogfood finding).
+fn worktree_writable_roots(project_root: &Path, worktree: &Path) -> Vec<PathBuf> {
+    let git_dir = project_root.join(".git");
+    let admin = std::fs::read_to_string(worktree.join(".git"))
+        .ok()
+        .and_then(|s| {
+            s.trim()
+                .strip_prefix("gitdir:")
+                .map(|p| PathBuf::from(p.trim()))
+        })
+        .unwrap_or_else(|| {
+            git_dir
+                .join("worktrees")
+                .join(worktree.file_name().unwrap_or_default())
+        });
+    vec![git_dir, admin]
+}
+
 /// Spawn the background monitor that owns the agent for `state.stage`. The
 /// monitor calls `devflow advance` when the agent exits. An optional
 /// `prompt_override` is used for Code loop-backs (fix prompts).
@@ -400,15 +422,17 @@ fn launch_stage(state: &State, prompt_override: Option<String>) -> Result<(), Cl
     let adapter = agents::adapter_for(state.agent);
     // In worktree mode the agent's cwd is the linked worktree, but git
     // metadata for commits lives under the main repo's `.git/` — sandboxed
-    // agents need it writable (13-06 dogfood finding).
-    let git_dir = state
+    // agents need it (and the worktree admin dir, which Codex read-only-
+    // mounts otherwise) writable (13-06 dogfood finding).
+    let roots = state
         .worktree_path
-        .as_ref()
-        .map(|_| state.project_root.join(".git"));
-    let (program, args) = adapter.exec_command(state.phase, &prompt, git_dir.as_deref());
+        .as_deref()
+        .map(|wt| worktree_writable_roots(&state.project_root, wt))
+        .unwrap_or_default();
+    let (program, args) = adapter.exec_command(state.phase, &prompt, &roots);
 
     agent_result::cleanup_phase_files(&state.project_root, state.phase);
-    let pid = monitor::spawn_monitor(state, program, &args)
+    let pid = monitor::spawn_monitor(state, program, &args, &adapter.extra_env())
         .map_err(|err| CliError::Message(format!("could not spawn monitor: {err}")))?;
     println!(
         "stage {} → launched {} (monitor pid {pid})",
@@ -891,10 +915,15 @@ fn run_agent_blocking(
     agent_result::cleanup_phase_files(project_root, phase);
     let adapter = agents::adapter_for(agent);
     let prompt = prompt::stage_prompt(Stage::Code, phase);
-    // sequentagent always runs in a worktree — the main repo's `.git/` must
-    // stay writable for sandboxed agents to commit (13-06 dogfood finding).
-    let git_dir = (workdir != project_root).then(|| project_root.join(".git"));
-    let (child, pid) = agent::launch_agent(&*adapter, phase, &prompt, workdir, git_dir.as_deref())?;
+    // sequentagent always runs in a worktree — the main repo's `.git/` and
+    // the worktree admin dir must stay writable for sandboxed agents to
+    // commit (13-06 dogfood finding).
+    let roots = if workdir == project_root {
+        Vec::new()
+    } else {
+        worktree_writable_roots(project_root, workdir)
+    };
+    let (child, pid) = agent::launch_agent(&*adapter, phase, &prompt, workdir, &roots)?;
     println!(
         "launched {} (pid {pid}) in {}",
         adapter.name(),

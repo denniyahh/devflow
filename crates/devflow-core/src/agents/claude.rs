@@ -16,7 +16,7 @@ impl AgentAdapter for ClaudeAgent {
         &self,
         _phase: u32,
         prompt: &str,
-        _extra_writable_root: Option<&std::path::Path>,
+        _extra_writable_roots: &[std::path::PathBuf],
     ) -> (&'static str, Vec<String>) {
         (
             "claude",

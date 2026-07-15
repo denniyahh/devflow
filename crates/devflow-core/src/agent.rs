@@ -36,14 +36,15 @@ pub fn launch_agent(
     phase: u32,
     prompt: &str,
     workdir: &Path,
-    extra_writable_root: Option<&Path>,
+    extra_writable_roots: &[std::path::PathBuf],
 ) -> Result<(Child, u32), AgentError> {
     let root = workdir.to_str().ok_or(AgentError::NonUtf8Path)?;
 
-    let (program, args) = agent.exec_command(phase, prompt, extra_writable_root);
+    let (program, args) = agent.exec_command(phase, prompt, extra_writable_roots);
 
     let child = Command::new(program)
         .args(&args)
+        .envs(agent.extra_env())
         .current_dir(root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

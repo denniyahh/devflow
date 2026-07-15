@@ -74,7 +74,7 @@ fn monitor_owns_fake_agent_and_records_devflow_result() {
             .to_string(),
     ];
 
-    spawn_monitor(&state, "sh", &args).expect("spawn monitor");
+    spawn_monitor(&state, "sh", &args, &[]).expect("spawn monitor");
 
     // The monitor records the agent PID.
     let agent_pid = wait_for_agent_pid(root, phase).expect("agent pid recorded");

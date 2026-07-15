@@ -40,7 +40,12 @@ pub enum MonitorError {
 /// 3. Runs `devflow advance` to advance the workflow through its remaining stages
 ///
 /// Returns the PID of the spawned monitor.
-pub fn spawn_monitor(state: &State, program: &str, args: &[String]) -> Result<u32, MonitorError> {
+pub fn spawn_monitor(
+    state: &State,
+    program: &str,
+    args: &[String],
+    envs: &[(String, String)],
+) -> Result<u32, MonitorError> {
     let project_root = state
         .project_root
         .to_str()
@@ -117,6 +122,9 @@ pub fn spawn_monitor(state: &State, program: &str, args: &[String]) -> Result<u3
         .arg("sh")
         .arg(program)
         .args(args)
+        // Adapter-scoped env (e.g. Codex's unsigned-commit override) rides
+        // the whole monitor chain: sh → agent → its git children (13-06).
+        .envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -222,7 +230,7 @@ mod tests {
         // Stub agent: write a known marker to stdout, then exit cleanly.
         let args = vec!["-c".to_string(), "echo MONITOR_READY".to_string()];
 
-        let monitor_pid = spawn_monitor(&state, "sh", &args).unwrap();
+        let monitor_pid = spawn_monitor(&state, "sh", &args, &[]).unwrap();
         assert!(monitor_pid > 0);
 
         // Observable side effect #1: the monitor records the agent PID to its
@@ -262,7 +270,7 @@ mod tests {
         // directories before launching the agent.
         let args = vec!["-c".to_string(), "pwd; echo WORKTREE_READY".to_string()];
 
-        let monitor_pid = spawn_monitor(&state, "sh", &args).unwrap();
+        let monitor_pid = spawn_monitor(&state, "sh", &args, &[]).unwrap();
         assert!(monitor_pid > 0);
 
         let agent_pid = wait_for_agent_pid(dir.path(), state.phase)
@@ -306,7 +314,7 @@ mod tests {
             payload.to_string(),
         ];
 
-        spawn_monitor(&state, "sh", &args).unwrap();
+        spawn_monitor(&state, "sh", &args, &[]).unwrap();
         wait_for_agent_pid(dir.path(), state.phase).expect("monitor should record the agent pid");
 
         let stdout_path = crate::agent_result::stdout_path(dir.path(), state.phase);
