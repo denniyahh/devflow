@@ -232,9 +232,15 @@ impl GitFlow {
         self.git(["push", "-u", "origin", branch])
     }
 
-    /// Delete local branches already merged into the current branch.
+    /// Delete local branches already merged into `develop`.
+    ///
+    /// WR-04 (13-REVIEW.md): passes `develop` explicitly rather than relying
+    /// on `git branch --merged`'s default of "whatever HEAD currently is" —
+    /// if the main checkout is ever left on a branch other than `develop`
+    /// when this runs, an implicit baseline would silently prune branches
+    /// merged into that other branch instead.
     pub fn cleanup_merged(&self) -> Result<Vec<String>, GitError> {
-        let output = self.git_output(["branch", "--merged"])?;
+        let output = self.git_output(["branch", "--merged", &self.config.develop])?;
         let protected = [self.config.main.as_str(), self.config.develop.as_str()];
         let mut deleted = Vec::new();
         for line in output.lines() {
@@ -624,6 +630,42 @@ mod tests {
         // Protected branches survive.
         assert!(!deleted.contains(&"develop".to_string()));
         assert!(!deleted.contains(&"main".to_string()));
+    }
+
+    /// WR-04 (13-REVIEW.md): `cleanup_merged` must compute "merged" relative
+    /// to `develop` explicitly, not whatever the main checkout's current
+    /// HEAD happens to be. If the main checkout is left on a divergent
+    /// branch, an implicit-HEAD baseline would wrongly identify (and
+    /// delete) a branch that's merged into that other branch but was never
+    /// actually merged into `develop`.
+    #[test]
+    fn cleanup_merged_is_relative_to_develop_not_current_head() {
+        let repo = init_repo();
+        let root = repo.path();
+        let gf = flow(root);
+
+        // `topic` diverges from develop with a unique commit develop never
+        // sees, then `premature` branches off `topic`'s tip — so
+        // `premature` is merged into `topic` but NOT into `develop`.
+        git(root, &["checkout", "-q", "-b", "topic", "develop"]);
+        commit_file(root, "topic-only.txt");
+        git(root, &["checkout", "-q", "-b", "premature", "topic"]);
+
+        // Leave the main checkout on `topic` — NOT `develop` — before
+        // calling cleanup_merged, mirroring an operator who forgot to
+        // check out develop first. (`topic` itself is also technically
+        // "merged into HEAD" under an implicit baseline since it IS HEAD,
+        // which git's own `-d` correctly refuses as the checked-out branch
+        // — so the call's overall Ok/Err is not itself decisive here; check
+        // the actual side effect on `premature` instead.)
+        git(root, &["checkout", "-q", "topic"]);
+
+        let _ = gf.cleanup_merged();
+        assert!(
+            gf.branch_exists("premature"),
+            "premature is merged into topic (current HEAD) but not into \
+             develop — it must survive cleanup_merged when the baseline is develop"
+        );
     }
 
     /// WR-03 (13-REVIEW.md): `git branch --merged` prefixes a branch checked
