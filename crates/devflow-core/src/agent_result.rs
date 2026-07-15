@@ -69,15 +69,24 @@ pub enum Verdict {
 /// is NOT case-folded into a match; it is treated the same as an unknown
 /// value and maps to `None`, so a subtly wrong-case verdict fails safe
 /// (gate/loop) instead of silently passing.
+///
+/// WR-09 (13-REVIEW.md): decodes as `serde_json::Value` first, then only
+/// pattern-matches the string case — a non-string JSON type (`true`, `123`,
+/// an object) is a wrong *type*, not a malformed string value, and must
+/// still fall through to `None` rather than erroring out the entire
+/// `AgentResult` parse (the same guarantee this deserializer already gives
+/// mis-cased/unknown string values).
 fn deserialize_verdict_lenient<'de, D>(deserializer: D) -> Result<Option<Verdict>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let raw = <Option<String> as serde::Deserialize>::deserialize(deserializer)?;
-    Ok(raw.and_then(|s| match s.as_str() {
-        "pass" => Some(Verdict::Pass),
-        "gaps" => Some(Verdict::Gaps),
-        _ => None,
+    let raw = <Option<serde_json::Value> as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(raw.and_then(|v| {
+        v.as_str().and_then(|s| match s {
+            "pass" => Some(Verdict::Pass),
+            "gaps" => Some(Verdict::Gaps),
+            _ => None,
+        })
     }))
 }
 
@@ -1205,6 +1214,30 @@ mod tests {
         // Mis-cased ("Pass" instead of "pass") must also be lenient, not an error.
         let miscased = r#"DEVFLOW_RESULT: {"status":"success","verdict":"Pass"}"#;
         let result = parse_devflow_result(miscased).unwrap();
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(result.verdict, None);
+    }
+
+    /// WR-09 (13-REVIEW.md): a `verdict` field present with a non-string
+    /// JSON *type* (bool, number, object) must be just as lenient as a
+    /// malformed string value — before the fix, deserializing straight to
+    /// `Option<String>` errored out the entire `AgentResult` parse for a
+    /// type mismatch, defeating the doc comment's "a malformed verdict must
+    /// never silently drop a valid status" guarantee for this specific case.
+    #[test]
+    fn parse_devflow_result_non_string_verdict_type_is_none_not_parse_error() {
+        let bool_verdict = r#"DEVFLOW_RESULT: {"status":"success","verdict":true}"#;
+        let result = parse_devflow_result(bool_verdict).unwrap();
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(result.verdict, None);
+
+        let numeric_verdict = r#"DEVFLOW_RESULT: {"status":"success","verdict":123}"#;
+        let result = parse_devflow_result(numeric_verdict).unwrap();
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(result.verdict, None);
+
+        let object_verdict = r#"DEVFLOW_RESULT: {"status":"success","verdict":{"x":1}}"#;
+        let result = parse_devflow_result(object_verdict).unwrap();
         assert_eq!(result.status, AgentStatus::Success);
         assert_eq!(result.verdict, None);
     }
