@@ -238,7 +238,7 @@ impl GitFlow {
         let protected = [self.config.main.as_str(), self.config.develop.as_str()];
         let mut deleted = Vec::new();
         for line in output.lines() {
-            let branch = line.trim().trim_start_matches('*').trim();
+            let branch = line.trim().trim_start_matches(['*', '+']).trim();
             if branch.is_empty() || protected.contains(&branch) {
                 continue;
             }
@@ -624,6 +624,56 @@ mod tests {
         // Protected branches survive.
         assert!(!deleted.contains(&"develop".to_string()));
         assert!(!deleted.contains(&"main".to_string()));
+    }
+
+    /// WR-03 (13-REVIEW.md): `git branch --merged` prefixes a branch checked
+    /// out in a linked worktree with `+` (not `*`). Before the fix, that `+`
+    /// survived into the ref name passed to `git branch -d`, producing an
+    /// "invalid ref" error instead of git's own "used by worktree" error.
+    /// A branch still checked out in a worktree can never actually be
+    /// deleted by plain `git branch -d` (by design — git itself refuses),
+    /// so this only asserts the parsing no longer corrupts the ref name:
+    /// deletion still fails, but for git's real reason, not a mangled name.
+    #[test]
+    fn cleanup_merged_strips_worktree_plus_prefix_from_ref_name() {
+        let repo = init_repo();
+        let root = repo.path();
+        let gf = flow(root);
+
+        // Merge a branch into develop WITHOUT deleting it (feature_finish
+        // deletes on merge, which would leave nothing to check out).
+        git(root, &["checkout", "-q", "-b", "worktree-merged", "develop"]);
+        commit_file(root, "g.txt");
+        git(root, &["checkout", "-q", "develop"]);
+        git(root, &["merge", "-q", "--no-ff", "worktree-merged"]);
+
+        // Check the merged branch out in a linked worktree so
+        // `git branch --merged` reports it with a `+` prefix.
+        let wt_dir = tempfile::tempdir().unwrap();
+        git(
+            root,
+            &[
+                "worktree",
+                "add",
+                wt_dir.path().to_str().unwrap(),
+                "worktree-merged",
+            ],
+        );
+
+        let err = gf.cleanup_merged().expect_err("branch is still checked out");
+        let msg = err.to_string();
+        // Before the fix, the unstripped "+ worktree-merged" line (git's raw
+        // `--merged` format is "+ <name>", not "+<name>") was passed
+        // verbatim to `git branch -d`, producing "branch '+ worktree-merged'
+        // not found" — an invalid-ref error, not git's real reason.
+        assert!(
+            !msg.contains("+ worktree-merged") && !msg.contains("+worktree-merged"),
+            "ref name still carries the worktree '+' prefix: {msg}"
+        );
+        assert!(
+            msg.contains("used by worktree") && msg.contains("worktree-merged"),
+            "expected git's real 'used by worktree' error, got: {msg}"
+        );
     }
 
     #[test]
