@@ -84,11 +84,14 @@ pub fn capture_agent_output(
     phase: u32,
     project_root: &Path,
 ) -> std::io::Result<AgentCapture> {
-    // Read stdout pipe.
-    let mut stdout = String::new();
+    // Read stdout pipe. Read raw bytes and convert lossily instead of
+    // failing the whole capture on invalid UTF-8 — never silently drop
+    // output that may carry the DEVFLOW_RESULT marker.
+    let mut buf = Vec::new();
     if let Some(ref mut pipe) = child.stdout {
-        let _ = pipe.read_to_string(&mut stdout);
+        let _ = pipe.read_to_end(&mut buf);
     }
+    let stdout = String::from_utf8_lossy(&buf).into_owned();
 
     // Wait for exit code.
     let exit_code = match child.wait() {
