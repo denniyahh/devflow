@@ -1472,7 +1472,7 @@ fn doctor(_project_root: &Path, json: bool) -> Result<(), CliError> {
                 }
             }
             Ok(out) => {
-                let version = String::from_utf8_lossy(&out.stderr)
+                let detail = String::from_utf8_lossy(&out.stderr)
                     .lines()
                     .next()
                     .unwrap_or("unknown")
@@ -1480,9 +1480,11 @@ fn doctor(_project_root: &Path, json: bool) -> Result<(), CliError> {
                     .to_string();
                 Check {
                     name: name.into(),
-                    status: "ok".into(),
-                    version: Some(version),
-                    install_hint: None,
+                    status: "warn".into(),
+                    version: Some(detail),
+                    install_hint: Some(format!(
+                        "`{cmd} {version_arg}` exited non-zero — reinstall or check PATH"
+                    )),
                 }
             }
             Err(_) => Check {
