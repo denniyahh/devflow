@@ -1,84 +1,78 @@
-# Phase 15: OSS Readiness
+# Phase 15: Dogfood Enablement + OSS Readiness
 
-**Status:** Scoped | **Priority:** MEDIUM | **Target:** TBD
+**Status:** In progress (15a) | **Priority:** HIGH (15a) / MEDIUM (15b) | **Target:** TBD
 
-> Renumbered from Phase 13 on 2026-07-14 — Phase 13 was repurposed as
-> "MVP Core Loop" per the MVP restructure decision. Later the same day,
-> all Hermes work (agent adapter, skill-file rewrite, plugin) moved to
-> Phase 14 (Observability + Hermes Support) for workload balance and
-> synergy with `events.jsonl`. This phase keeps the pure OSS packaging
-> plus the Antigravity adapter.
+> Renumbered from Phase 13 on 2026-07-14; Hermes work moved to Phase 14
+> (later split to Phase 16). **Rescoped 2026-07-16 (dogfood-first):** the
+> operator's top priority is a fully functional MVP for dogfooding, so this
+> phase now leads with a small "dogfood enablement" wave (15a) — the
+> `devflow gate` subcommand that removes the last hand-edited-JSON step,
+> an accurate operator reference, and the doc-accuracy quick hits pulled
+> forward from old 15b. The OSS packaging (15b) follows, and is intended to
+> be executed **through DevFlow itself** as the first post-MVP dogfood run.
+> The Antigravity adapter (old 15c) is deferred out of the phase entirely —
+> it serves neither dogfooding nor OSS readiness urgently.
 
 ## Goal
 
-Make DevFlow ready for public consumption: dev container, contribution
-docs, README/ARCHITECTURE rewrite, Antigravity agent support, and the
-actual crates.io publish.
+15a: remove the remaining dogfooding friction — answering gates via CLI
+instead of hand-written response files, one truthful operator page, and the
+small accuracy items (decoy config, stale rustdoc, `--help` snapshot guard).
+Exit criterion: a real phase runs end-to-end with every gate answered via
+`devflow gate` + the notify hook.
+
+15b: make DevFlow ready for public consumption — README/ARCHITECTURE
+rewrite against v2 reality, CONTRIBUTING, dev container, crates.io publish.
+Run as a DevFlow dogfood.
 
 ---
 
-## 15a — Dev Container
+## 15a — Dogfood Enablement *(added 2026-07-16)*
 
-- [ ] `.devcontainer/devcontainer.json` — Rust + git + fish
-- [ ] Dockerfile: Fedora 41 base, cargo, claude, codex CLI
-- [ ] Mount `~/Github` for project access
-- [ ] Container test: `cargo build && cargo test && cargo clippy` passes
-- [ ] `devflow devcontainer` subcommand: `enter`, `build`, `destroy`
+- [ ] `devflow gate` subcommand:
+      `gate list` (open gates: phase, stage, age, context),
+      `gate approve <phase> [--stage S] [--note ...]`,
+      `gate reject <phase> --note ... [--stage S]` (note containing
+      "abort" aborts, per `GateAction::from_response`). Stage
+      auto-resolves when the phase has exactly one open gate. Core side:
+      `Gates::list_open` + `Gates::respond` (atomic write; refuses when no
+      gate is open or a response already exists). Response writes emit a
+      `gate_response_written` event.
+- [ ] `OPERATIONS.md` — accurate operator reference: pipeline, real command
+      table, gate protocol + subcommand, env vars
+      (`DEVFLOW_GATE_NOTIFY_CMD`, `DEVFLOW_GATE_TIMEOUT_SECS`,
+      `DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS`, `RUST_LOG`,
+      `DEVFLOW_LOG_FORMAT`), `.devflow/` file inventory, notify-hook recipe.
+- [ ] Delete the stray `.devflow.yaml` at repo root (decoy; contradicts
+      config.rs's "v2.0.0 has no .devflow.yaml"; 11k-13).
+- [ ] **(IN-01)** Fix stale `lib.rs` module rustdoc examples against the
+      real CLI (start requires `--mode`; no `check`/`ship`).
+- [ ] `--help` snapshot test — commit `devflow --help` output and assert it
+      in tests so CLI/doc drift can't recur silently.
 
----
+## 15b — Open Source Packaging *(run as a DevFlow dogfood)*
 
-## 15b — Open Source Contributing
+- [ ] README: full rewrite against `main.rs` — currently documents
+      `init`/`config`/`verify`/`lint`/`ship`/`confirm`/`rejectpr` (none
+      exist) and `--mode auto|manual` instead of `auto|supervise`.
+      Installation, quickstart, agent support table; link OPERATIONS.md.
+- [ ] ARCHITECTURE.md: full rewrite against current code (Stage enum, GSD
+      prompts, hooks, per-phase state + two-level locking, events.jsonl,
+      monitor ownership). Extension-point docs for agent adapters.
+- [ ] CONTRIBUTING.md: fork → branch → test → PR workflow.
+- [ ] Dev container: `.devcontainer/devcontainer.json`, Dockerfile,
+      container test (`cargo build && cargo test && cargo clippy`).
+      (`devflow devcontainer` subcommand only if it earns its keep.)
+- [ ] CI badge + PR gate status; CODE_OF_CONDUCT/SECURITY refresh if needed.
+- [ ] Publish `devflow` to crates.io (publish-prep landed in 12-06; publish
+      once docs describe the real product).
 
-- [ ] CONTRIBUTING.md: fork → branch → test → PR workflow
-- [ ] ARCHITECTURE.md: full rewrite against current code — the existing
-      file still describes the deleted v1 step machine (`Idle → Branching →
-      Planning → Executing → Verifying → Docsing → Shipping → Cleaning`),
-      `.devflow.yaml` parsing, `phase_prompt()`, `auto_verify`/`auto_docs`,
-      `feature_finish`/`release_finish`. Replace with the actual Stage enum
-      (`stage.rs`), GSD slash-command prompts (`prompt.rs`), and hooks
-      (`hooks.rs`). Include extension point docs for agent adapters.
-- [ ] README: full command-table rewrite against `main.rs` — currently
-      documents `init`/`config`/`verify`/`lint`/`ship`/`confirm`/
-      `rejectpr`, none of which exist, and `--mode auto|manual` instead of
-      the real `auto|supervise`. Also installation, quickstart, agent
-      support table.
-- [ ] Delete the stray `.devflow.yaml` at repo root — decoy file left over
-      from before config was eliminated in Phase 11; contradicts the doc
-      comment in `config.rs` stating v2.0.0 has no `.devflow.yaml`. Note:
-      `11-VALIDATION.md` (11k-13) originally deferred this specific item to
-      Phase 12 ("delete the file or move it to a docs/ example directory");
-      routed here instead since it's the same class of work as the rest of
-      13b. Don't duplicate in Phase 12.
-- [ ] **(IN-01, Phase 11 code review)** `crates/devflow-core/src/lib.rs:26`
-      module-level rustdoc still shows `devflow check` and `devflow ship`
-      as example commands — both removed in Phase 11. Replace with valid
-      examples (`devflow start`, `devflow status`). Confirmed still present
-      (2026-07-08).
-- [ ] `--help` snapshot test — commit a snapshot of `devflow --help` output
-      and assert it in CI, so README/CLI drift can't recur silently.
-      (Build on the phase7 CLI test harness.)
-- [ ] CODE_OF_CONDUCT.md, SECURITY.md (if missing)
-- [ ] CI badge + PR gate status
-- [ ] Publish `devflow` to crates.io — metadata + dry-run/package landed
-      in Phase 12 (12-06); the actual publish belongs here, once docs
-      describe the real product
+## Deferred out of this phase (2026-07-16)
 
----
+- **Antigravity agent adapter** (old 15c) — unscheduled backlog; revisit
+  after Phase 16 when there's a concrete need.
 
-## 15c — Antigravity Agent Adapter
+## Moved to Phase 14 → 16 (2026-07-14 / 2026-07-16)
 
-- [ ] `AntigravityAgent` adapter — launch protocol for Antigravity CLI
-- [ ] AgentKind variant + parser + display + adapter_for()
-- [ ] Tests: parser aliases, shared prompt, adapter name
-
----
-
-## Moved to Phase 14 (2026-07-14)
-
-- `HermesAgent` adapter (was 15c)
-- Hermes skill-file rewrite (was in 15b)
-- Hermes plugin (was 15d)
-
-## Deferred From Phase 11
-
-- Dev container (was capacity-permitting in Phase 11, now this phase)
+- `HermesAgent` adapter, Hermes skill-file rewrite, Hermes plugin — now
+  Phase 16 (Hermes Support).
