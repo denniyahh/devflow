@@ -3,7 +3,7 @@
   "timestamp": "2026-07-16T09:06:52.899Z",
   "phase": "13-14-transition",
   "phase_name": "Phase 13 closeout → Phase 14 discussion (not yet started)",
-  "phase_dir": ".planning/phases/14-observability-hermes",
+  "phase_dir": ".planning/phases/14-parallel-safety-observability",
   "plan": null,
   "task": null,
   "total_tasks": null,
@@ -18,7 +18,7 @@
     {"id": 7, "name": "Marked Phase 13 complete in STATE.md, pushed 31 commits to origin/develop", "status": "done", "commit": "10d790a (pushed)"}
   ],
   "remaining_tasks": [
-    {"id": 8, "name": "Run /gsd-discuss-phase 14 to gather requirements/goals for Phase 14 (Observability + Hermes Support)", "status": "not_started"}
+    {"id": 8, "name": "Run /gsd-discuss-phase 14 to gather requirements/goals for Phase 14 (Parallel Safety + Observability)", "status": "not_started"}
   ],
   "blockers": [],
   "async_jobs": [],
@@ -32,6 +32,6 @@
     ".gitignore (pre-existing modification from before this session — not touched)",
     ".bg-shell/, .codex/, .gsd/, .mcp.json (pre-existing untracked — not touched)"
   ],
-  "next_action": "Run /gsd-discuss-phase 14 to begin requirements/goals discussion for Phase 14 (Observability + Hermes Support). Phase 14 CONTEXT.md already exists at .planning/phases/14-observability-hermes/CONTEXT.md with prior scoping (14a observability, 14b capture_agent_output sync-path decision, 14c-e Hermes adapter/skill/plugin) — read it first, then also read 13-DEFERRED-CR-03.md since that work is now folded into this phase.",
+  "next_action": "Run /gsd-discuss-phase 14 to begin requirements/goals discussion for Phase 14 (Parallel Safety + Observability — rescoped 2026-07-16, Hermes work moved to Phase 16). Phase 14 CONTEXT.md exists at .planning/phases/14-parallel-safety-observability/CONTEXT.md with scoping (14a CR-03 parallel safety, 14b capture_agent_output sync-path decision, 14c observability) — read it first, then also read 13-DEFERRED-CR-03.md since that work leads the phase.",
   "context_notes": "This session did TWO things in sequence: (1) executed /gsd-code-review 13 --fix, which ran the standard reviewer+fixer agents and produced 13-REVIEW.md / 13-REVIEW-FIX.md (15 findings fixed); (2) the user then asked for an independent, deeper /code-review (skill, not gsd-code-review) of those 15 fix commits specifically, run at high effort with 8 parallel finder angles + verification — this caught real regressions the first pass introduced (a startup race in WR-11's reorder, a TOCTOU in CR-03's lock, a rate-limit misclassification in CR-02, plus several incomplete fixes). All 10 survived-verification findings were fixed with tests, verified fail-vs-old-code where practical, and pushed. Phase 13 is now genuinely done — verified, reviewed, re-reviewed, fixed, and closed out in STATE.md/ROADMAP.md. Next step is purely forward motion into Phase 14 discussion; there is no unfinished Phase 13 work."
 }

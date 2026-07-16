@@ -30,7 +30,49 @@ pub enum LockError {
 /// Writes the current PID into `.devflow/lock-{phase:02}`. Returns a guard
 /// that releases the lock when dropped.
 pub fn acquire(project_root: &Path, phase: u32) -> Result<LockGuard, LockError> {
-    let path = lock_path(project_root, phase);
+    acquire_path(lock_path(project_root, phase))
+}
+
+/// Acquire the short-held, project-wide lock that serializes mutations of the
+/// primary checkout (version-bump commits/tags, docs commits, branch
+/// integration/cleanup) across concurrently finishing phases
+/// (13-DEFERRED-CR-03 fix shape #3).
+///
+/// This is the second level of the two-level model: per-phase locks guard a
+/// phase's own advance (held across gate-days), while this coarse lock guards
+/// the shared git checkout and is held for seconds. It must NEVER be held
+/// across a gate wait.
+pub fn acquire_project(project_root: &Path) -> Result<LockGuard, LockError> {
+    acquire_path(project_lock_path(project_root))
+}
+
+/// Blocking variant of [`acquire_project`]: waits out a sibling phase's short
+/// critical section, polling with backoff up to `timeout`. Returns the last
+/// `Contended` error if the sibling still holds the lock at the deadline —
+/// after `timeout` of waiting the holder is more likely wedged than slow, and
+/// failing loudly beats mutating the checkout concurrently.
+pub fn acquire_project_blocking(
+    project_root: &Path,
+    timeout: std::time::Duration,
+) -> Result<LockGuard, LockError> {
+    let start = std::time::Instant::now();
+    let mut backoff = std::time::Duration::from_millis(100);
+    loop {
+        match acquire_project(project_root) {
+            Ok(guard) => return Ok(guard),
+            Err(err @ LockError::Contended { .. }) => {
+                if start.elapsed() >= timeout {
+                    return Err(err);
+                }
+                std::thread::sleep(backoff.min(timeout.saturating_sub(start.elapsed())));
+                backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn acquire_path(path: PathBuf) -> Result<LockGuard, LockError> {
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -119,6 +161,7 @@ fn release(path: &Path) {
 }
 
 /// Guard that releases the lock file on drop.
+#[derive(Debug)]
 pub struct LockGuard {
     path: PathBuf,
 }
@@ -131,12 +174,20 @@ impl Drop for LockGuard {
 
 /// Filename prefix shared by every per-phase lock file. Owned here so
 /// sweepers (e.g. `recover --clean`) never hardcode the naming scheme.
+/// The project-wide checkout lock (`lock-project`) shares the prefix
+/// deliberately: the same stale-holder sweep covers it.
 const LOCK_FILE_PREFIX: &str = "lock-";
 
 fn lock_path(project_root: &Path, phase: u32) -> PathBuf {
     project_root
         .join(".devflow")
         .join(format!("{LOCK_FILE_PREFIX}{phase:02}"))
+}
+
+fn project_lock_path(project_root: &Path) -> PathBuf {
+    project_root
+        .join(".devflow")
+        .join(format!("{LOCK_FILE_PREFIX}project"))
 }
 
 /// Remove this project's per-phase lock files, skipping any whose recorded
@@ -302,6 +353,58 @@ mod tests {
         assert!(!dead.exists(), "dead holder's lock must be swept");
         assert_eq!(warnings.len(), 1, "keeping a live lock must be reported");
         assert!(warnings[0].contains("still alive"));
+    }
+
+    /// Two-level locking (13-DEFERRED-CR-03): the coarse checkout lock is
+    /// independent of every per-phase lock — holding a phase's advance lock
+    /// (potentially for gate-days) must not block another phase's
+    /// seconds-long checkout mutation, and vice versa.
+    #[test]
+    fn project_lock_is_independent_of_phase_locks() {
+        let dir = tempfile::tempdir().unwrap();
+        let _phase = acquire(dir.path(), 1).expect("phase lock");
+        let _project = acquire_project(dir.path()).expect("project lock must not contend");
+    }
+
+    #[test]
+    fn project_lock_contends_with_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let _held = acquire_project(dir.path()).expect("first acquire");
+        assert!(matches!(
+            acquire_project(dir.path()),
+            Err(LockError::Contended { .. })
+        ));
+    }
+
+    /// The blocking variant must wait out a short critical section instead of
+    /// failing fast — that is the whole point of a seconds-scale coarse lock.
+    #[test]
+    fn project_lock_blocking_waits_for_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = acquire_project(dir.path()).expect("first acquire");
+        let root = dir.path().to_path_buf();
+
+        std::thread::scope(|scope| {
+            let waiter = scope
+                .spawn(move || acquire_project_blocking(&root, std::time::Duration::from_secs(10)));
+            // Give the waiter time to hit contention at least once, then
+            // release; it must then acquire rather than time out.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(held);
+            waiter
+                .join()
+                .expect("waiter thread")
+                .expect("blocking acquire must succeed once the holder releases");
+        });
+    }
+
+    #[test]
+    fn project_lock_blocking_times_out_against_live_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let _held = acquire_project(dir.path()).expect("first acquire");
+        let err = acquire_project_blocking(dir.path(), std::time::Duration::from_millis(300))
+            .expect_err("must time out while the live holder keeps the lock");
+        assert!(matches!(err, LockError::Contended { .. }));
     }
 
     /// A lock file containing "0" parses as a valid u32, but `kill -0 0`

@@ -98,6 +98,23 @@ fn wait_for(path: &Path) {
     panic!("timed out waiting for {}", path.display());
 }
 
+/// Wait until a monitor-written pid file exists AND holds a parseable pid,
+/// returning it. A plain `wait_for` + one-shot read is racy: each stage
+/// transition's `cleanup_phase_files` briefly deletes the pid file before
+/// the next monitor recreates it, so a read can land in the gap and hit
+/// NotFound even though the pipeline is healthy.
+fn wait_for_pid(path: &Path) -> u32 {
+    for _ in 0..200 {
+        if let Ok(contents) = fs::read_to_string(path)
+            && let Ok(pid) = contents.trim().parse::<u32>()
+        {
+            return pid;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("timed out waiting for a pid in {}", path.display());
+}
+
 fn git_stdout(root: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&git(root, args).stdout)
         .trim()
@@ -161,31 +178,24 @@ fn parallel_creates_two_worktrees_and_spawns_two_monitors() {
 
     let phase7_pid = root.join(".devflow/phase-07-agent-pid");
     let phase8_pid = root.join(".devflow/phase-08-agent-pid");
-    wait_for(&phase7_pid);
-    wait_for(&phase8_pid);
-    assert!(
-        fs::read_to_string(phase7_pid)
-            .unwrap()
-            .trim()
-            .parse::<u32>()
-            .unwrap()
-            > 0
-    );
-    assert!(
-        fs::read_to_string(phase8_pid)
-            .unwrap()
-            .trim()
-            .parse::<u32>()
-            .unwrap()
-            > 0
-    );
+    assert!(wait_for_pid(&phase7_pid) > 0);
+    assert!(wait_for_pid(&phase8_pid) > 0);
 
     let phase7_stdout = root.join(".devflow/phase-07-stdout");
     let phase8_stdout = root.join(".devflow/phase-08-stdout");
     wait_for(&phase7_stdout);
     wait_for(&phase8_stdout);
 
-    assert!(root.join(".devflow/state.json").exists());
+    // 13-DEFERRED-CR-03: each parallel phase persists its own state file —
+    // the second start no longer clobbers the first phase's state.
+    let state7 = devflow_core::workflow::load_state(root, 7).expect("phase 7 state");
+    let state8 = devflow_core::workflow::load_state(root, 8).expect("phase 8 state");
+    assert_eq!(state7.phase, 7);
+    assert_eq!(state8.phase, 8);
+    assert!(
+        !root.join(".devflow/state.json").exists(),
+        "legacy single-slot state.json must not be written anymore"
+    );
     assert!(phase7_stdout.exists());
     assert!(phase8_stdout.exists());
 }
@@ -215,7 +225,7 @@ fn start_defaults_to_worktree() {
     wait_for(&root.join(".worktrees/phase-11"));
     assert!(root.join(".worktrees/phase-11").is_dir());
 
-    let state = devflow_core::workflow::load_state(root).expect("load state");
+    let state = devflow_core::workflow::load_state(root, 11).expect("load state");
     assert!(
         state.worktree_path.is_some(),
         "expected worktree_path to be Some(_) by default, got {:?}",
@@ -299,7 +309,7 @@ fn start_no_worktree_uses_feature_branch() {
     wait_for(&root.join(".devflow/phase-12-agent-pid"));
     assert!(!root.join(".worktrees/phase-12").exists());
 
-    let state = devflow_core::workflow::load_state(root).expect("load state");
+    let state = devflow_core::workflow::load_state(root, 12).expect("load state");
     assert!(
         state.worktree_path.is_none(),
         "expected worktree_path to be None with --no-worktree, got {:?}",
@@ -486,16 +496,23 @@ fn sequentagent_hands_off_after_rate_limit_and_writes_cron_instructions() {
         "agent B did not run after A's rate limit"
     );
 
-    // The cron instructions are written when A rate-limits...
-    assert!(stdout.contains("wrote .devflow/cron-instructions.json"));
+    // The cron instructions are written when A rate-limits — and the message
+    // must name the per-phase file that is actually written (14-CR-08).
+    assert!(
+        stdout.contains("wrote .devflow/cron-instructions-07.json"),
+        "message must name the real per-phase cron file:\n{stdout}"
+    );
     // ...but WR-02 (13-REVIEW.md): once B completes successfully the phase
     // has shipped, so the stale file must be deleted rather than surviving
     // to mislead `devflow status`/a Hermes cron into re-running a completed
     // phase.
-    let cron_path = root.join(".devflow/cron-instructions.json");
     assert!(
-        !cron_path.exists(),
+        !root.join(".devflow/cron-instructions-07.json").exists(),
         "cron instructions should be deleted after a successful post-rate-limit handoff"
+    );
+    assert!(
+        !root.join(".devflow/cron-instructions.json").exists(),
+        "the legacy single-slot record must never be written"
     );
 }
 
@@ -517,7 +534,7 @@ fn status_prints_cron_hint_when_cron_instructions_exist() {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(stdout.contains(&format!(
-        "Cron instruction pending: hermes cron create --from-devflow {}",
+        "Cron instruction pending (phase 7): hermes cron create --from-devflow {}",
         root.display()
     )));
 }
@@ -591,7 +608,9 @@ fn start_codex_without_context_fails_preflight() {
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
-    let fake_bin = fake_bin_dir(&[]);
+    // codex IS installed (the 13-06 dogfood scenario) — the binary preflight
+    // (14-CR-05) passes and the CONTEXT.md artifact check must fire next.
+    let fake_bin = fake_bin_dir(&[("codex", "#!/bin/sh\nexit 0\n")]);
 
     let output = Command::new(devflow_bin())
         .args([

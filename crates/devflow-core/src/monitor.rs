@@ -37,7 +37,8 @@ pub enum MonitorError {
 /// 1. Launches the agent (`program` + `args`) with stdout redirected to the
 ///    phase stdout file, recording the agent PID to the agent-pid file
 /// 2. Waits for the agent to exit and records its exit code to the exit file
-/// 3. Runs `devflow advance` to advance the workflow through its remaining stages
+/// 3. Runs `devflow advance --phase N` to advance the workflow through its
+///    remaining stages
 ///
 /// Returns the PID of the spawned monitor.
 pub fn spawn_monitor(
@@ -45,6 +46,30 @@ pub fn spawn_monitor(
     program: &str,
     args: &[String],
     envs: &[(String, String)],
+) -> Result<u32, MonitorError> {
+    spawn_monitor_inner(state, program, args, envs, true)
+}
+
+/// Spawn a monitor that owns the agent and records its capture files but does
+/// NOT advance the stage machine when the agent exits. Used by `sequentagent`,
+/// which drives its own synchronous handoff loop: the CLI blocks on the exit
+/// file (see [`wait_for_agent_exit`]) while the monitor guarantees capture
+/// survives even if the CLI dies.
+pub fn spawn_monitor_no_advance(
+    state: &State,
+    program: &str,
+    args: &[String],
+    envs: &[(String, String)],
+) -> Result<u32, MonitorError> {
+    spawn_monitor_inner(state, program, args, envs, false)
+}
+
+fn spawn_monitor_inner(
+    state: &State,
+    program: &str,
+    args: &[String],
+    envs: &[(String, String)],
+    run_advance: bool,
 ) -> Result<u32, MonitorError> {
     let project_root = state
         .project_root
@@ -96,8 +121,12 @@ pub fn spawn_monitor(
     // JSON) stdout capture that DevFlow parses for DEVFLOW_RESULT. Inspect
     // .devflow/phase-NN-stderr.log for agent error output on failures.
     //
-    // `devflow advance` evaluates the agent result, moves the stage machine
-    // forward, and (for an agent stage) spawns the next monitor itself.
+    // `devflow advance --phase N` evaluates the agent result, moves the stage
+    // machine forward, and (for an agent stage) spawns the next monitor
+    // itself. The phase is recorded here at spawn time so advance's identity
+    // never depends on a shared state singleton (13-DEFERRED-CR-03): under
+    // `devflow parallel`, each phase's monitor advances exactly its own
+    // stage machine.
     //
     // Traps SIGTERM and SIGINT for clean shutdown. WR-08 (13-REVIEW.md):
     // the trap must also kill the backgrounded agent ($apid) — previously
@@ -106,21 +135,28 @@ pub fn spawn_monitor(
     // `devflow advance` once it finished. `apid` is initialized to empty
     // before the trap is installed so a signal arriving before the agent is
     // even backgrounded doesn't reference an unset variable.
+    let advance_tail = if run_advance {
+        format!(
+            "; {binary} advance {project_root} --phase {phase}",
+            binary = shell_escape(&binary),
+            project_root = shell_escape(project_root),
+            phase = state.phase,
+        )
+    } else {
+        String::new()
+    };
     let script = format!(
         "apid=''; cleanup() {{ [ -n \"$apid\" ] && kill \"$apid\" 2>/dev/null; exit 0; }}; \
          trap cleanup TERM INT; \
          cd {workdir} || exit 1; \
          \"$@\" > {stdout_file} 2>{stderr_file} & \
          apid=$!; echo $apid > {pid_file}; \
-         wait $apid; echo $? > {exit_file}; \
-         {binary} advance {project_root}",
+         wait $apid; echo $? > {exit_file}{advance_tail}",
         workdir = shell_escape(workdir),
         stdout_file = shell_escape(stdout_file),
         stderr_file = shell_escape(stderr_file),
         exit_file = shell_escape(exit_file),
         pid_file = shell_escape(pid_file),
-        binary = shell_escape(&binary),
-        project_root = shell_escape(project_root),
     );
 
     let child = Command::new("sh")
@@ -159,6 +195,42 @@ pub fn wait_for_agent_pid(project_root: &Path, phase: u32) -> Option<u32> {
     }
     debug!("agent PID not found for phase {phase} after polling");
     None
+}
+
+/// Block until the monitor records the agent's exit code, returning it.
+///
+/// Used by callers that need a synchronous run on top of monitor-owned
+/// execution (sequentagent's rebase handoff). Polls the exit file; if the
+/// monitor process disappears without ever writing it (killed, crashed),
+/// returns an error instead of hanging forever. There is deliberately no
+/// time-based cap — agent runs are legitimately long (tens of minutes) and
+/// monitor liveness is the meaningful bound.
+pub fn wait_for_agent_exit(
+    project_root: &Path,
+    phase: u32,
+    monitor_pid: u32,
+) -> Result<i32, MonitorError> {
+    let exit_path = crate::agent_result::exit_code_path(project_root, phase);
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(&exit_path)
+            && let Ok(code) = contents.trim().parse::<i32>()
+        {
+            return Ok(code);
+        }
+        if !crate::agent::agent_running(monitor_pid) {
+            // One final read: the monitor may have written the file and
+            // exited between our read above and the liveness check.
+            if let Ok(contents) = std::fs::read_to_string(&exit_path)
+                && let Ok(code) = contents.trim().parse::<i32>()
+            {
+                return Ok(code);
+            }
+            return Err(MonitorError::Io(std::io::Error::other(format!(
+                "monitor (pid {monitor_pid}) exited without recording an exit code for phase {phase}"
+            ))));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// Escape a string for safe use in a single-quoted shell context.
@@ -293,9 +365,10 @@ mod tests {
 
         // The agent should be killed promptly by the monitor's trap —
         // poll rather than sleep a fixed amount to keep this fast and
-        // avoid flaking under load.
+        // avoid flaking under load. (Window widened to 5s: at 2s this
+        // still flaked under a fully parallel workspace test run.)
         let mut still_running = true;
-        for _ in 0..100 {
+        for _ in 0..250 {
             if !crate::agent::agent_running(agent_pid) {
                 still_running = false;
                 break;
@@ -306,6 +379,39 @@ mod tests {
             !still_running,
             "agent (pid {agent_pid}) was orphaned — still running after monitor SIGTERM"
         );
+    }
+
+    /// 14b: sequentagent's synchronous handoff = no-advance monitor + a
+    /// blocking wait on the exit file. The monitor still owns capture; the
+    /// caller gets the real exit code back.
+    #[test]
+    fn no_advance_monitor_plus_wait_returns_exit_code_and_captures() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_in(dir.path());
+        let args = vec!["-c".to_string(), "echo SEQ_READY; exit 3".to_string()];
+
+        let monitor_pid = spawn_monitor_no_advance(&state, "sh", &args, &[]).unwrap();
+        let code = wait_for_agent_exit(dir.path(), state.phase, monitor_pid)
+            .expect("exit code must be reaped");
+
+        assert_eq!(code, 3);
+        let captured =
+            std::fs::read_to_string(crate::agent_result::stdout_path(dir.path(), state.phase))
+                .unwrap_or_default();
+        assert!(
+            captured.contains("SEQ_READY"),
+            "stdout captured: {captured:?}"
+        );
+    }
+
+    /// A dead monitor that never wrote the exit file must yield an error, not
+    /// an infinite hang.
+    #[test]
+    fn wait_for_agent_exit_errors_when_monitor_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        // PID that is essentially certain not to be alive; no exit file.
+        let err = wait_for_agent_exit(dir.path(), 4, 0x7FFF_FFFE).unwrap_err();
+        assert!(err.to_string().contains("without recording an exit code"));
     }
 
     #[test]

@@ -55,6 +55,7 @@ pub mod agent;
 pub mod agent_result;
 pub mod agents;
 pub mod config;
+pub mod events;
 pub mod gates;
 pub mod git;
 pub mod hooks;
@@ -71,7 +72,6 @@ pub mod workflow;
 pub mod worktree;
 
 // Re-exports for convenience.
-pub use agent::launch_agent;
 pub use mode::Mode;
 pub use stage::Stage;
 pub use state::{AgentKind, State};
