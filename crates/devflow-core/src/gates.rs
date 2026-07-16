@@ -88,6 +88,25 @@ pub enum GateError {
     /// JSON parse or serialization failed.
     #[error("gate JSON failed: {0}")]
     Json(#[from] serde_json::Error),
+    /// Responding to a gate that was never fired (or already resolved).
+    #[error("no open gate for phase {phase} stage {stage} — see `devflow gate list`")]
+    NoOpenGate { phase: u32, stage: Stage },
+    /// Responding to a gate that already has a response on disk.
+    #[error("gate for phase {phase} stage {stage} already has a response awaiting pickup")]
+    AlreadyResponded { phase: u32, stage: Stage },
+}
+
+/// An open gate: a request the workflow wrote that has no response yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenGate {
+    /// Phase the gate belongs to.
+    pub phase: u32,
+    /// Stage that fired the gate.
+    pub stage: Stage,
+    /// Human-readable context from the request.
+    pub context: String,
+    /// Unix timestamp (seconds) when the gate was written.
+    pub timestamp: String,
 }
 
 /// The gate-file protocol, scoped to a project's `.devflow/gates/` directory.
@@ -112,6 +131,70 @@ impl Gates {
     /// Path to the ack file for a phase + stage.
     pub fn ack_path(project_root: &Path, phase: u32, stage: Stage) -> PathBuf {
         Self::dir(project_root).join(format!("{phase:02}-{stage}.ack.json"))
+    }
+
+    /// Every open gate (request written, no response yet), sorted by phase
+    /// then stage. Request files are `NN-{stage}.json`; `.response.json` and
+    /// `.ack.json` siblings are protocol artifacts, not requests, and any
+    /// unparsable file is skipped — listing must degrade, not die.
+    pub fn list_open(project_root: &Path) -> Vec<OpenGate> {
+        let mut open = Vec::new();
+        let Ok(entries) = std::fs::read_dir(Self::dir(project_root)) else {
+            return open;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !name.ends_with(".json")
+                || name.ends_with(".response.json")
+                || name.ends_with(".ack.json")
+            {
+                continue;
+            }
+            let Ok(contents) = std::fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            let Ok(gate) = serde_json::from_str::<GateFile>(&contents) else {
+                continue;
+            };
+            if Self::response_path(project_root, gate.phase, gate.stage).exists() {
+                continue;
+            }
+            open.push(OpenGate {
+                phase: gate.phase,
+                stage: gate.stage,
+                context: gate.context,
+                timestamp: gate.timestamp,
+            });
+        }
+        open.sort_by_key(|g| (g.phase, g.stage.to_string()));
+        open
+    }
+
+    /// Answer an open gate by writing its response file atomically — the
+    /// programmatic form of what a human previously hand-edited. Refuses
+    /// when no gate request is open for the phase+stage, and when a
+    /// response is already on disk awaiting the workflow's poller (silently
+    /// replacing an unconsumed answer would race the poll).
+    pub fn respond(
+        project_root: &Path,
+        phase: u32,
+        stage: Stage,
+        response: &GateResponse,
+    ) -> Result<PathBuf, GateError> {
+        if !Self::gate_path(project_root, phase, stage).exists() {
+            return Err(GateError::NoOpenGate { phase, stage });
+        }
+        let path = Self::response_path(project_root, phase, stage);
+        if path.exists() {
+            return Err(GateError::AlreadyResponded { phase, stage });
+        }
+        write_atomic(&path, &serde_json::to_string_pretty(response)?)?;
+        info!(
+            "gate response written for phase {phase} {stage}: approved={}",
+            response.approved
+        );
+        Ok(path)
     }
 
     /// Write a gate request, creating the gates directory if needed.
@@ -358,6 +441,92 @@ mod tests {
         assert!(!Gates::ack_path(dir.path(), 11, Stage::Validate).exists());
         // Idempotent: cleaning again with nothing present succeeds.
         Gates::cleanup(dir.path(), 11, Stage::Validate).unwrap();
+    }
+
+    /// 15a: `devflow gate list` — a gate is open until its response lands;
+    /// response/ack protocol files must never be mistaken for requests.
+    #[test]
+    fn list_open_shows_unanswered_gates_only() {
+        let dir = tempfile::tempdir().unwrap();
+        Gates::write_gate(dir.path(), 7, Stage::Ship, "approve merge?").unwrap();
+        Gates::write_gate(dir.path(), 8, Stage::Validate, "review gaps").unwrap();
+        // Phase 8's gate gets answered; its response/ack must hide it.
+        Gates::respond(
+            dir.path(),
+            8,
+            Stage::Validate,
+            &GateResponse {
+                approved: true,
+                note: None,
+                responded_by: Some("test".into()),
+            },
+        )
+        .unwrap();
+        Gates::ack(dir.path(), 8, Stage::Validate).unwrap();
+        // Corrupt junk in the gates dir is skipped, not fatal.
+        std::fs::write(Gates::dir(dir.path()).join("junk.json"), "{nope").unwrap();
+
+        let open = Gates::list_open(dir.path());
+
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].phase, 7);
+        assert_eq!(open[0].stage, Stage::Ship);
+        assert_eq!(open[0].context, "approve merge?");
+    }
+
+    #[test]
+    fn list_open_is_empty_without_gates_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(Gates::list_open(dir.path()).is_empty());
+    }
+
+    /// 15a: `respond` is the programmatic answer path — it must round-trip
+    /// through the same file `poll_response` reads.
+    #[test]
+    fn respond_writes_a_response_poll_response_consumes() {
+        let dir = tempfile::tempdir().unwrap();
+        Gates::write_gate(dir.path(), 9, Stage::Ship, "ctx").unwrap();
+        let response = GateResponse {
+            approved: false,
+            note: Some("abort: nope".into()),
+            responded_by: Some("cli".into()),
+        };
+
+        Gates::respond(dir.path(), 9, Stage::Ship, &response).unwrap();
+
+        let polled = Gates::poll_response(dir.path(), 9, Stage::Ship, 1).unwrap();
+        assert_eq!(polled, response);
+        assert!(matches!(
+            GateAction::from_response(&polled),
+            GateAction::Abort(_)
+        ));
+    }
+
+    #[test]
+    fn respond_refuses_when_no_gate_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let response = GateResponse {
+            approved: true,
+            note: None,
+            responded_by: None,
+        };
+        let err = Gates::respond(dir.path(), 3, Stage::Ship, &response).unwrap_err();
+        assert!(matches!(err, GateError::NoOpenGate { phase: 3, .. }));
+    }
+
+    #[test]
+    fn respond_refuses_to_clobber_unconsumed_response() {
+        let dir = tempfile::tempdir().unwrap();
+        Gates::write_gate(dir.path(), 4, Stage::Validate, "ctx").unwrap();
+        let response = GateResponse {
+            approved: true,
+            note: None,
+            responded_by: None,
+        };
+        Gates::respond(dir.path(), 4, Stage::Validate, &response).unwrap();
+
+        let err = Gates::respond(dir.path(), 4, Stage::Validate, &response).unwrap_err();
+        assert!(matches!(err, GateError::AlreadyResponded { phase: 4, .. }));
     }
 
     #[test]

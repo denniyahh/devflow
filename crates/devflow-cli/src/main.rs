@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use devflow_core::agent;
 use devflow_core::config::{DEVELOP, FEATURE_PREFIX, GitFlowConfig};
-use devflow_core::gates::{self, GateAction, Gates};
+use devflow_core::gates::{self, GateAction, GateResponse, Gates};
 use devflow_core::git::GitFlow;
 use devflow_core::hooks::{self, HookContext};
 use devflow_core::mode::{self, Mode};
@@ -98,6 +98,12 @@ enum Command {
         /// spawn time so advance never depends on a shared state singleton.
         #[arg(long)]
         phase: Option<u32>,
+    },
+    /// Inspect and answer human gates (the pause points where the workflow
+    /// waits for approval).
+    Gate {
+        #[command(subcommand)]
+        action: GateCmd,
     },
     /// Print or follow an agent's captured output for a phase.
     Logs {
@@ -216,6 +222,48 @@ enum Command {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum GateCmd {
+    /// List gates awaiting a response.
+    List {
+        /// Project root.
+        #[arg(default_value = ".")]
+        project: PathBuf,
+    },
+    /// Approve an open gate — the workflow advances.
+    Approve {
+        /// Phase whose gate to approve.
+        phase: u32,
+        /// Stage of the gate (auto-resolved when the phase has exactly one
+        /// open gate).
+        #[arg(long)]
+        stage: Option<Stage>,
+        /// Optional free-text note recorded with the approval.
+        #[arg(long)]
+        note: Option<String>,
+        /// Project root.
+        #[arg(default_value = ".")]
+        project: PathBuf,
+    },
+    /// Reject an open gate — loops back to Code, or aborts the phase when
+    /// the note contains "abort".
+    Reject {
+        /// Phase whose gate to reject.
+        phase: u32,
+        /// Stage of the gate (auto-resolved when the phase has exactly one
+        /// open gate).
+        #[arg(long)]
+        stage: Option<Stage>,
+        /// Required note explaining the rejection (include "abort" to end
+        /// the phase instead of looping back to Code).
+        #[arg(long)]
+        note: String,
+        /// Project root.
+        #[arg(default_value = ".")]
+        project: PathBuf,
+    },
+}
+
 #[derive(Debug, thiserror::Error)]
 enum CliError {
     #[error(transparent)]
@@ -277,6 +325,21 @@ fn run() -> Result<(), CliError> {
             )
         }
         Command::Advance { project, phase } => advance(&project_root(project)?, phase),
+        Command::Gate { action } => match action {
+            GateCmd::List { project } => gate_list(&project_root(project)?),
+            GateCmd::Approve {
+                phase,
+                stage,
+                note,
+                project,
+            } => gate_respond(&project_root(project)?, phase, stage, true, note),
+            GateCmd::Reject {
+                phase,
+                stage,
+                note,
+                project,
+            } => gate_respond(&project_root(project)?, phase, stage, false, Some(note)),
+        },
         Command::Logs {
             phase,
             follow,
@@ -1699,6 +1762,102 @@ fn status(project_root: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
+/// List every gate awaiting a human response.
+fn gate_list(project_root: &Path) -> Result<(), CliError> {
+    let open = Gates::list_open(project_root);
+    if open.is_empty() {
+        println!("no open gates");
+        return Ok(());
+    }
+    println!("{:<6} {:<9} {:<9} CONTEXT", "PHASE", "STAGE", "AGE");
+    for gate in &open {
+        let mut context = gate.context.replace('\n', " ");
+        if context.chars().count() > 100 {
+            context = format!("{}…", context.chars().take(100).collect::<String>());
+        }
+        println!(
+            "{:<6} {:<9} {:<9} {context}",
+            gate.phase,
+            gate.stage.to_string(),
+            recover::format_age(&gate.timestamp),
+        );
+    }
+    println!(
+        "\nanswer with: devflow gate approve <phase> [--note ...] | \
+         devflow gate reject <phase> --note ... (note with \"abort\" ends the phase)"
+    );
+    Ok(())
+}
+
+/// Answer an open gate from the CLI — the dogfood-facing replacement for
+/// hand-writing `.devflow/gates/NN-stage.response.json` (15a).
+fn gate_respond(
+    project_root: &Path,
+    phase: u32,
+    stage: Option<Stage>,
+    approved: bool,
+    note: Option<String>,
+) -> Result<(), CliError> {
+    let stage = match stage {
+        Some(stage) => stage,
+        None => {
+            let open: Vec<_> = Gates::list_open(project_root)
+                .into_iter()
+                .filter(|g| g.phase == phase)
+                .collect();
+            match open.as_slice() {
+                [] => {
+                    return Err(CliError::Message(format!(
+                        "no open gate for phase {phase} — see `devflow gate list`"
+                    )));
+                }
+                [one] => one.stage,
+                many => {
+                    return Err(CliError::Message(format!(
+                        "phase {phase} has several open gates ({}) — pass --stage",
+                        many.iter()
+                            .map(|g| g.stage.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )));
+                }
+            }
+        }
+    };
+    let responded_by = std::env::var("USER")
+        .ok()
+        .filter(|user| !user.is_empty())
+        .unwrap_or_else(|| "devflow-cli".into());
+    let response = GateResponse {
+        approved,
+        note,
+        responded_by: Some(responded_by),
+    };
+    let path = Gates::respond(project_root, phase, stage, &response)?;
+    events::emit(
+        project_root,
+        phase,
+        "gate_response_written",
+        serde_json::json!({
+            "stage": stage.to_string(),
+            "approved": approved,
+            "via": "cli",
+        }),
+    );
+    let outcome = match GateAction::from_response(&response) {
+        GateAction::Advance => "workflow will advance",
+        GateAction::LoopBack(_) => "workflow will loop back to Code",
+        GateAction::Abort(_) => "phase will abort",
+    };
+    println!(
+        "{} gate for phase {phase} {stage} — {outcome} once the waiting monitor polls it \
+         (response at {})",
+        if approved { "approved" } else { "rejected" },
+        path.display()
+    );
+    Ok(())
+}
+
 /// Print (or follow) a phase's captured agent output.
 fn logs(
     project_root: &Path,
@@ -2432,6 +2591,47 @@ mod tests {
     fn default_logs_phase_errors_with_nothing_to_show() {
         let dir = tempfile::tempdir().unwrap();
         assert!(default_logs_phase(dir.path()).is_err());
+    }
+
+    /// 15a: `devflow gate approve` resolves the stage automatically when a
+    /// phase has exactly one open gate and writes a response the workflow's
+    /// poller will consume.
+    #[test]
+    fn gate_respond_auto_resolves_single_open_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        Gates::write_gate(root, 15, Stage::Ship, "approve merge?").unwrap();
+
+        gate_respond(root, 15, None, true, Some("lgtm".into())).unwrap();
+
+        let polled = Gates::poll_response(root, 15, Stage::Ship, 1).expect("response readable");
+        assert!(polled.approved);
+        assert_eq!(polled.note.as_deref(), Some("lgtm"));
+        let event = devflow_core::events::last_event_for_phase(root, 15).unwrap();
+        assert_eq!(event["event"], "gate_response_written");
+        assert_eq!(event["stage"], "ship");
+    }
+
+    #[test]
+    fn gate_respond_requires_stage_when_ambiguous_and_errors_when_none_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let err = gate_respond(root, 15, None, true, None).unwrap_err();
+        assert!(err.to_string().contains("no open gate"), "{err}");
+
+        Gates::write_gate(root, 15, Stage::Validate, "a").unwrap();
+        Gates::write_gate(root, 15, Stage::Ship, "b").unwrap();
+        let err = gate_respond(root, 15, None, false, Some("nope".into())).unwrap_err();
+        assert!(err.to_string().contains("--stage"), "{err}");
+
+        // Explicit --stage disambiguates.
+        gate_respond(root, 15, Some(Stage::Validate), false, Some("gaps".into())).unwrap();
+        assert!(
+            Gates::response_path(root, 15, Stage::Validate).exists(),
+            "explicit-stage rejection must land"
+        );
+        assert!(!Gates::response_path(root, 15, Stage::Ship).exists());
     }
 
     /// 14-CR-05: a missing agent binary must fail fast with the actionable
