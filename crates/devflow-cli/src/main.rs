@@ -471,12 +471,10 @@ fn advance(project_root: &Path) -> Result<(), CliError> {
     // CR-03 (13-REVIEW.md): the lock is scoped per-phase, not per-project.
     // advance() holds it across a gate's multi-day blocking wait, and every
     // successful run ends at a mandatory Ship gate — a project-wide lock
-    // would starve `devflow parallel`'s sibling phases with no retry. Load
-    // state before acquiring so the lock can be keyed on this phase; this is
-    // safe because it's a plain read and same-phase races still contend on
-    // the same phase-scoped lock file below.
-    let mut state = workflow::load_state(project_root)?;
-    let _lock = match lock::acquire(project_root, state.phase) {
+    // would starve `devflow parallel`'s sibling phases with no retry. The
+    // pre-lock read below exists ONLY to key the lock on this phase.
+    let phase = workflow::load_state(project_root)?.phase;
+    let _lock = match lock::acquire(project_root, phase) {
         Ok(guard) => guard,
         Err(lock::LockError::Contended { pid, path: _ }) => {
             return Err(CliError::Message(format!(
@@ -485,6 +483,17 @@ fn advance(project_root: &Path) -> Result<(), CliError> {
         }
         Err(err) => return Err(CliError::Message(format!("lock error: {err}"))),
     };
+    // Re-load under the lock: the pre-lock snapshot may be stale — a
+    // concurrent advance that held the lock while we waited can have
+    // transitioned the stage (or finished the phase) before we acquired, and
+    // acting on the old snapshot would double-advance the stage machine.
+    let mut state = workflow::load_state(project_root)?;
+    if state.phase != phase {
+        return Err(CliError::Message(format!(
+            "state changed while acquiring lock (phase {phase} → {}) — rerun advance",
+            state.phase
+        )));
+    }
 
     let git_flow = GitFlowConfig::default();
     let result = agent_result::evaluate_agent_result(project_root, &state, &git_flow)
