@@ -140,6 +140,26 @@ pub fn list_states(project_root: &Path) -> Vec<State> {
     states
 }
 
+/// Delete a legacy `state.json` that cannot be parsed — and therefore can
+/// never be migrated by [`migrate_legacy_state`] or matched by
+/// [`clear_state`]'s phase check (14-CR-04). Ordinary reads deliberately
+/// leave such a file in place; only the operator-driven reset
+/// (`recover --clean`) is sanctioned to call this. Returns whether a file
+/// was removed.
+pub fn remove_corrupt_legacy_state(project_root: &Path) -> Result<bool, WorkflowError> {
+    let legacy = legacy_state_path(project_root);
+    let Ok(contents) = std::fs::read_to_string(&legacy) else {
+        return Ok(false);
+    };
+    if serde_json::from_str::<State>(&contents).is_ok() {
+        // Parsable: the normal migration path owns it.
+        return Ok(false);
+    }
+    std::fs::remove_file(&legacy)?;
+    warn!("removed unparsable legacy state at {}", legacy.display());
+    Ok(true)
+}
+
 /// Remove a phase's persisted state if present.
 pub fn clear_state(project_root: &Path, phase: u32) -> Result<(), WorkflowError> {
     let path = state_path(project_root, phase);

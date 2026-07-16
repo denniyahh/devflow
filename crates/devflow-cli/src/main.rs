@@ -174,9 +174,14 @@ enum Command {
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
-        /// Clean up the stale state instead of just inspecting.
+        /// Clean up stale state instead of just inspecting. Only stale
+        /// phases are swept; combine with --phase to clear a specific
+        /// phase regardless of staleness.
         #[arg(long)]
         clean: bool,
+        /// Restrict the command to one phase.
+        #[arg(long)]
+        phase: Option<u32>,
     },
     /// Run local quality checks: cargo test, clippy, and fmt --check.
     Test {
@@ -289,7 +294,11 @@ fn run() -> Result<(), CliError> {
         Command::Cleanup { project, force } => cleanup(&project_root(project)?, force),
         Command::Status { project } => status(&project_root(project)?),
         Command::List { project } => list(&project_root(project)?),
-        Command::Recover { project, clean } => recover_cmd(&project_root(project)?, clean),
+        Command::Recover {
+            project,
+            clean,
+            phase,
+        } => recover_cmd(&project_root(project)?, clean, phase),
         Command::Test { project } => test_cmd(&project_root(project)?),
         Command::Doctor { json, project } => doctor(&project_root(project)?, json),
     }
@@ -1775,13 +1784,22 @@ fn project_root(project: PathBuf) -> Result<PathBuf, CliError> {
     }
 }
 
-fn recover_cmd(project_root: &Path, do_clean: bool) -> Result<(), CliError> {
+fn recover_cmd(project_root: &Path, do_clean: bool, phase: Option<u32>) -> Result<(), CliError> {
     if do_clean {
-        let warnings = recover::clean(project_root)?;
+        let warnings = match phase {
+            // Explicit phase: clear it regardless of staleness (14-CR-01's
+            // escape hatch for a wedged-but-fresh run).
+            Some(phase) => recover::clean_phase(project_root, phase)?,
+            // Implicit sweep: stale phases only.
+            None => recover::clean(project_root)?,
+        };
         for warning in &warnings {
             println!("warning: {warning}");
         }
-        println!("cleaned up abandoned workflow state");
+        match phase {
+            Some(phase) => println!("cleaned up workflow state for phase {phase}"),
+            None => println!("cleaned up stale workflow state"),
+        }
         return Ok(());
     }
 
@@ -1800,6 +1818,11 @@ fn recover_cmd(project_root: &Path, do_clean: bool) -> Result<(), CliError> {
 
     let mut any_stale = false;
     for status in &statuses {
+        if let Some(only) = phase
+            && status.state.phase != only
+        {
+            continue;
+        }
         println!("phase: {}", status.state.phase);
         println!("  stage: {}", status.state.stage);
         println!("  mode: {}", status.state.mode);
@@ -1825,7 +1848,10 @@ fn recover_cmd(project_root: &Path, do_clean: bool) -> Result<(), CliError> {
     }
 
     if any_stale {
-        println!("\nstale state found — run `devflow recover --clean` to clear it");
+        println!(
+            "\nstale state found — `devflow recover --clean` clears stale phases only; \
+             use `--clean --phase N` for a specific phase"
+        );
     }
 
     Ok(())

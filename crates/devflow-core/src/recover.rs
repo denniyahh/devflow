@@ -72,21 +72,74 @@ fn inspect_state(project_root: &Path, state: State) -> RecoveryStatus {
 
 /// Clean up stale or abandoned workflow state.
 ///
-/// Removes every phase's state file, any lock files whose holder is dead
-/// (the sweep lives in [`crate::lock::remove_stale_locks`], which owns the
-/// lock naming and refuses to delete a live holder's lock out from under a
-/// running `advance`), and leftover cron-instruction files — self-describing
-/// "auto-re-run this phase" records that must not survive an operator-driven
-/// reset, or a Hermes cron re-runs a phase that was just cleaned. Returns
-/// warnings for anything that could not be removed.
+/// 14-CR-01: only STALE phases are swept — a phase whose agent is still
+/// running, or whose state is simply fresh, is kept (with a warning naming
+/// the explicit `--phase` escape hatch), so cleaning one dead phase under
+/// `devflow parallel` can never orphan a healthy sibling. Also removes an
+/// unparsable legacy `state.json` (14-CR-04 — this reset is the one
+/// sanctioned place), lock files whose holder is dead (the sweep lives in
+/// [`crate::lock::remove_stale_locks`], which refuses to delete a live
+/// holder's lock), and cron-instruction records for phases that no longer
+/// have state — self-describing "auto-re-run this phase" records that must
+/// not survive an operator-driven reset. Returns warnings for anything kept
+/// or that could not be removed.
 pub fn clean(project_root: &Path) -> Result<Vec<String>, RecoverError> {
+    let mut warnings = Vec::new();
     for state in workflow::list_states(project_root) {
-        workflow::clear_state(project_root, state.phase)?;
+        let phase = state.phase;
+        if agent_pid_for(&state).is_some_and(crate::agent::agent_running) {
+            warnings.push(format!(
+                "kept phase {phase} — its agent is still running (clear explicitly with --phase {phase})"
+            ));
+            continue;
+        }
+        if !is_stale_state(&state) {
+            warnings.push(format!(
+                "kept phase {phase} — state is not stale yet (clear explicitly with --phase {phase})"
+            ));
+            continue;
+        }
+        workflow::clear_state(project_root, phase)?;
     }
-    let mut warnings = crate::lock::remove_stale_locks(project_root);
-    if let Err(err) = crate::ship::delete_all_cron_instructions(project_root) {
-        warnings.push(format!("could not remove cron-instruction files: {err}"));
+    match workflow::remove_corrupt_legacy_state(project_root) {
+        Ok(true) => warnings.push("removed unparsable legacy state.json".into()),
+        Ok(false) => {}
+        Err(err) => warnings.push(format!("could not remove corrupt legacy state.json: {err}")),
     }
+    warnings.append(&mut crate::lock::remove_stale_locks(project_root));
+    // Drop cron records only for phases without surviving state, so a kept
+    // phase's pending re-run record is preserved.
+    for instructions in crate::ship::list_cron_instructions(project_root) {
+        if workflow::state_path(project_root, instructions.phase).exists() {
+            continue;
+        }
+        if let Err(err) = crate::ship::delete_cron_instructions(project_root, instructions.phase) {
+            warnings.push(format!(
+                "could not remove cron-instructions for phase {}: {err}",
+                instructions.phase
+            ));
+        }
+    }
+    Ok(warnings)
+}
+
+/// Explicitly clean ONE phase, regardless of staleness — the operator's
+/// escape hatch for a wedged-but-fresh run. Clears its state and cron
+/// record; warns (but proceeds) when the recorded agent still looks alive.
+pub fn clean_phase(project_root: &Path, phase: u32) -> Result<Vec<String>, RecoverError> {
+    let mut warnings = Vec::new();
+    if let Ok(state) = workflow::load_state(project_root, phase)
+        && agent_pid_for(&state).is_some_and(crate::agent::agent_running)
+    {
+        warnings.push(format!(
+            "phase {phase}'s agent appears to still be running — cleared anyway (explicit --phase)"
+        ));
+    }
+    workflow::clear_state(project_root, phase)?;
+    if let Err(err) = crate::ship::delete_cron_instructions(project_root, phase) {
+        warnings.push(format!("could not remove cron-instructions: {err}"));
+    }
+    warnings.append(&mut crate::lock::remove_stale_locks(project_root));
     Ok(warnings)
 }
 
@@ -150,11 +203,15 @@ mod tests {
     /// Build a state in `root` whose `started_at` is `age_secs` in the past,
     /// optionally writing the monitor's agent-pid file with `agent_pid`.
     fn state_aged(root: &Path, age_secs: u64, agent_pid: Option<u32>) -> State {
+        state_aged_phase(root, 1, age_secs, agent_pid)
+    }
+
+    fn state_aged_phase(root: &Path, phase: u32, age_secs: u64, agent_pid: Option<u32>) -> State {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let mut state = State::new(1, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.started_at = now.saturating_sub(age_secs).to_string();
         if let Some(pid) = agent_pid {
             let path = crate::agent_result::agent_pid_path(root, state.phase);
@@ -260,16 +317,103 @@ mod tests {
         );
     }
 
+    /// 14-CR-01: `recover --clean` must never delete a phase whose agent is
+    /// still running — under `devflow parallel`, cleaning a stale phase must
+    /// not orphan a healthy sibling.
     #[test]
-    fn clean_clears_every_phase_state() {
+    fn clean_keeps_phase_with_live_agent() {
         let dir = tempfile::tempdir().unwrap();
-        workflow::save_state(&state_aged(dir.path(), 60, None)).unwrap();
-        let mut other = state_aged(dir.path(), 60, None);
-        other.phase = 2;
-        workflow::save_state(&other).unwrap();
+        // Stale-aged but the recorded agent (our own pid) is alive.
+        let live = state_aged_phase(
+            dir.path(),
+            1,
+            STALE_THRESHOLD.as_secs() + 60,
+            Some(std::process::id()),
+        );
+        workflow::save_state(&live).unwrap();
+        // Genuinely stale sibling: old and dead.
+        let stale = state_aged_phase(
+            dir.path(),
+            2,
+            STALE_THRESHOLD.as_secs() + 60,
+            Some(DEAD_PID),
+        );
+        workflow::save_state(&stale).unwrap();
+
+        let warnings = clean(dir.path()).expect("clean");
+
+        let remaining: Vec<u32> = workflow::list_states(dir.path())
+            .iter()
+            .map(|s| s.phase)
+            .collect();
+        assert_eq!(remaining, vec![1], "live phase must survive, stale cleared");
+        assert!(
+            warnings.iter().any(|w| w.contains("phase 1")),
+            "keeping a live phase must be reported: {warnings:?}"
+        );
+    }
+
+    /// 14-CR-01: a fresh (not yet stale) phase is also kept — only stale
+    /// phases are swept implicitly; anything else needs explicit `--phase`.
+    #[test]
+    fn clean_keeps_fresh_phase() {
+        let dir = tempfile::tempdir().unwrap();
+        workflow::save_state(&state_aged_phase(dir.path(), 3, 60, None)).unwrap();
+
+        let warnings = clean(dir.path()).expect("clean");
+
+        assert_eq!(workflow::list_states(dir.path()).len(), 1);
+        assert!(warnings.iter().any(|w| w.contains("--phase 3")));
+    }
+
+    #[test]
+    fn clean_clears_stale_phase_state() {
+        let dir = tempfile::tempdir().unwrap();
+        workflow::save_state(&state_aged_phase(
+            dir.path(),
+            2,
+            STALE_THRESHOLD.as_secs() + 60,
+            Some(DEAD_PID),
+        ))
+        .unwrap();
 
         clean(dir.path()).expect("clean");
 
         assert!(workflow::list_states(dir.path()).is_empty());
+    }
+
+    /// 14-CR-04: a corrupt legacy `state.json` (old binary killed mid-write)
+    /// can never be migrated or matched by a per-phase clear — the operator
+    /// reset is the one sanctioned place to remove it.
+    #[test]
+    fn clean_removes_corrupt_legacy_state_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join(".devflow/state.json");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "{\"stage\":").unwrap();
+
+        clean(dir.path()).expect("clean");
+
+        assert!(
+            !legacy.exists(),
+            "recover --clean must remove an unparsable legacy state.json"
+        );
+    }
+
+    /// 14-CR-01: explicit `--phase` cleanup clears exactly that phase, even
+    /// when it is fresh, and leaves siblings alone.
+    #[test]
+    fn clean_phase_clears_only_the_named_phase() {
+        let dir = tempfile::tempdir().unwrap();
+        workflow::save_state(&state_aged_phase(dir.path(), 4, 60, None)).unwrap();
+        workflow::save_state(&state_aged_phase(dir.path(), 5, 60, None)).unwrap();
+
+        clean_phase(dir.path(), 4).expect("clean_phase");
+
+        let remaining: Vec<u32> = workflow::list_states(dir.path())
+            .iter()
+            .map(|s| s.phase)
+            .collect();
+        assert_eq!(remaining, vec![5]);
     }
 }

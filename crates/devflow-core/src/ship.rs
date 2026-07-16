@@ -151,24 +151,6 @@ pub fn delete_cron_instructions(project_root: &Path, phase: u32) -> Result<(), S
     Ok(())
 }
 
-/// Remove every cron-instructions record (all phases + legacy). Idempotent.
-pub fn delete_all_cron_instructions(project_root: &Path) -> Result<(), ShipError> {
-    let legacy = legacy_cron_instructions_path(project_root);
-    if legacy.exists() {
-        std::fs::remove_file(&legacy)?;
-    }
-    if let Ok(entries) = std::fs::read_dir(project_root.join(".devflow")) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            if name.starts_with("cron-instructions-") && name.ends_with(".json") {
-                std::fs::remove_file(entry.path())?;
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Build a Hermes cron-instructions manifest for resuming `sequentagent`.
 pub fn build_cron_instructions(
     project_root: &Path,
