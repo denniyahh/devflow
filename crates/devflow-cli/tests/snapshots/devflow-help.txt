@@ -1,0 +1,22 @@
+Agent-agnostic, GSD-native development workflow automation
+
+Usage: devflow <COMMAND>
+
+Commands:
+  start         Begin the workflow for a phase: Define → Plan → Code → Validate → Ship
+  gate          Inspect and answer human gates (the pause points where the workflow waits for approval)
+  logs          Print or follow an agent's captured output for a phase
+  parallel      Run multiple phases concurrently, each in its own worktree + monitor
+  sequentagent  Run two agents sequentially on one phase, each in its own worktree
+  reference     Create or refresh a static reference worktree at `.worktrees/reference/`
+  cleanup       Remove phase worktrees and their feature branches
+  status        Show current workflow state
+  list          List all feature branches with divergence from develop
+  recover       Recover or inspect stale/abandoned workflow state
+  test          Run local quality checks: cargo test, clippy, and fmt --check
+  doctor        Audit the environment and report what's installed, missing, or broken
+  help          Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
