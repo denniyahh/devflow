@@ -89,17 +89,14 @@ pub fn acquire(project_root: &Path, phase: u32) -> Result<LockGuard, LockError> 
 /// Whether the pid recorded in a lock file refers to a live process.
 ///
 /// A non-numeric pid (corrupt lock) is treated as dead so the lock can be
-/// reclaimed. Uses `kill -0` (POSIX): exit 0 means the process exists —
-/// matching the `sh`-based process model the monitor already assumes.
+/// reclaimed. Delegates to [`crate::agent::agent_running`] — the crate's one
+/// PID-liveness implementation — which also rejects `0` (a `kill -0 0`
+/// probes the caller's own process group and always succeeds, making a
+/// corrupted lock permanently "held") and values that would wrap negative
+/// through the `pid_t` cast.
 fn pid_is_alive(pid: &str) -> bool {
-    if pid.parse::<u32>().is_err() {
-        return false;
-    }
-    std::process::Command::new("kill")
-        .args(["-0", pid])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    pid.parse::<u32>()
+        .is_ok_and(crate::agent::agent_running)
 }
 
 /// Check whether a lock is currently held for this project/phase,
@@ -243,5 +240,19 @@ mod tests {
         fs::write(&path, "not-a-pid").unwrap();
 
         acquire(dir.path(), 1).expect("corrupt lock must be reclaimed");
+    }
+
+    /// A lock file containing "0" parses as a valid u32, but `kill -0 0`
+    /// probes the caller's own process group and always succeeds — the old
+    /// subprocess-based check treated it as a live holder forever, wedging
+    /// every future acquire behind a Contended error.
+    #[test]
+    fn acquire_reclaims_lock_with_pid_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = lock_path(dir.path(), 1);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "0").unwrap();
+
+        acquire(dir.path(), 1).expect("pid-0 lock must be reclaimed");
     }
 }
