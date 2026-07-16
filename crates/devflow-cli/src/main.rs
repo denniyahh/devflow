@@ -968,7 +968,25 @@ fn run_agent_blocking(
     // code path that knows how to find a Codex agent's DEVFLOW_RESULT
     // marker inside its JSONL `--json` event stream (parse_codex_event_result),
     // which the previous parse_devflow_result-only chain never called.
-    Ok(agent_result::evaluate_layer1(project_root, phase))
+    let result = agent_result::evaluate_layer1(project_root, phase);
+    // Layer-1 silence is not success: a crashed agent (nonzero exit, no
+    // marker, no envelope) yields None here, and sequentagent's callers
+    // treat None as "proceed to integrate". Mirror Layer 2's exit-code gate
+    // so a crash never fast-forwards a half-finished branch into the base.
+    if result.is_none() && capture.exit_code != 0 {
+        return Ok(Some(agent_result::AgentResult {
+            status: AgentStatus::Failed,
+            exit_code: Some(capture.exit_code),
+            reason: Some(format!(
+                "agent exited with code {} without reporting a result",
+                capture.exit_code
+            )),
+            commits: None,
+            summary: None,
+            verdict: None,
+        }));
+    }
+    Ok(result)
 }
 
 /// Integrate an agent branch into the shared base, pushing if a remote exists.

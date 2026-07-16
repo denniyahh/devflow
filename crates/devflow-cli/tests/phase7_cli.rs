@@ -372,6 +372,64 @@ fn sequentagent_integrates_agent_a_then_rebases_agent_b() {
     );
 }
 
+/// CR-02 completion: Layer-1 silence is not success. An agent that crashes —
+/// nonzero exit, no DEVFLOW_RESULT marker, no envelope — must fail
+/// sequentagent instead of being silently fast-forwarded into the shared
+/// base branch and handed off to agent B.
+#[test]
+fn sequentagent_fails_when_agent_a_crashes_without_result() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    seed_feature_branch(root, 7);
+    let fake_bin = fake_bin_dir(&[
+        (
+            "claude",
+            "#!/bin/sh\n\
+             echo 'starting work'\n\
+             exit 3\n",
+        ),
+        (
+            "codex",
+            "#!/bin/sh\n\
+             : > \"$DEVFLOW_TEST_ROOT/crash-b-ran\"\n\
+             printf 'DEVFLOW_RESULT: {\"status\":\"success\"}\\n'\n",
+        ),
+    ]);
+
+    let output = Command::new(devflow_bin())
+        .args([
+            "sequentagent",
+            "--phase",
+            "7",
+            "--agents",
+            "claude,codex",
+            "--force",
+        ])
+        .arg(root)
+        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .env("DEVFLOW_TEST_ROOT", root)
+        .current_dir(root)
+        .output()
+        .expect("run devflow");
+
+    assert!(
+        !output.status.success(),
+        "sequentagent must fail when agent A crashes without a result\nstdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("agent A (claude) failed")
+            && stderr.contains("exited with code 3 without reporting a result"),
+        "expected agent-A crash failure, got:\n{stderr}"
+    );
+    assert!(
+        !root.join("crash-b-ran").exists(),
+        "agent B must not run after agent A crashes"
+    );
+}
+
 #[test]
 fn sequentagent_hands_off_after_rate_limit_and_writes_cron_instructions() {
     let repo = tempfile::tempdir().unwrap();
