@@ -8,7 +8,7 @@
 |---|---|---|
 | 12 | Bootstrap + Housekeeping | Complete |
 | 13 | MVP Core Loop | Complete    |
-| 14 | Parallel Safety + Observability | Scoped |
+| 14 | Parallel Safety + Observability | Complete |
 | 15 | OSS Readiness | Scoped |
 | 16 | Hermes Support | Scoped |
 
@@ -105,11 +105,16 @@ Plans:
 **Goal:** Make concurrent phases safe by construction, then surface loop progress instead of a black box. Leads with the deferred CR-03 design flaw from Phase 13's post-fix review: per-phase locks sit on a project-global `state.json` and unguarded main-checkout git ops, so `devflow parallel` is unsafe by construction — fix shape and acceptance criteria in `phases/13-mvp-core-loop/13-DEFERRED-CR-03.md` (per-phase state files, phase-threaded monitor advance, short coarse lock for main-checkout mutations) (14a). Then the `capture_agent_output()` sync-path decision, taken alongside CR-03's sequentagent re-check (14b), and observability — `devflow logs [--follow]`, append-only phase-aware `events.jsonl`, richer `devflow status` — built on the per-phase state model (14c). Hermes work moved out to Phase 16 (2026-07-16).
 **Requirements**: 13-DEFERRED-CR-03 (parallel-safety), 14a–14c (see CONTEXT.md)
 **Depends on:** Phase 13
-**Plans:** 0 plans
+**Plans:** 4/4 plans complete
 
 Plans:
 
-- [ ] TBD (run /gsd-plan-phase 14 to break down; plan order 14a → 14b → 14c per CONTEXT.md)
+- [x] 14-01-PLAN.md — 14a core: per-phase state files + phase-threaded `advance --phase N` (workflow.rs, monitor.rs, main.rs)
+- [x] 14-02-PLAN.md — 14a/14b: coarse checkout lock + sequentagent behind the monitor, sync capture path deleted (lock.rs, monitor.rs, agent.rs, main.rs)
+- [x] 14-03-PLAN.md — 14a closeout: multi-phase status/recover + concurrent-advance acceptance test
+- [x] 14-04-PLAN.md — 14c: events.jsonl (schema v1) + `devflow logs [--follow]` + richer per-phase status
+
+See `14-SUMMARY.md` for validation + live two-phase e2e acceptance evidence.
 
 ### Phase 15: OSS Readiness
 

@@ -185,7 +185,16 @@ fn parallel_creates_two_worktrees_and_spawns_two_monitors() {
     wait_for(&phase7_stdout);
     wait_for(&phase8_stdout);
 
-    assert!(root.join(".devflow/state.json").exists());
+    // 13-DEFERRED-CR-03: each parallel phase persists its own state file —
+    // the second start no longer clobbers the first phase's state.
+    let state7 = devflow_core::workflow::load_state(root, 7).expect("phase 7 state");
+    let state8 = devflow_core::workflow::load_state(root, 8).expect("phase 8 state");
+    assert_eq!(state7.phase, 7);
+    assert_eq!(state8.phase, 8);
+    assert!(
+        !root.join(".devflow/state.json").exists(),
+        "legacy single-slot state.json must not be written anymore"
+    );
     assert!(phase7_stdout.exists());
     assert!(phase8_stdout.exists());
 }
@@ -215,7 +224,7 @@ fn start_defaults_to_worktree() {
     wait_for(&root.join(".worktrees/phase-11"));
     assert!(root.join(".worktrees/phase-11").is_dir());
 
-    let state = devflow_core::workflow::load_state(root).expect("load state");
+    let state = devflow_core::workflow::load_state(root, 11).expect("load state");
     assert!(
         state.worktree_path.is_some(),
         "expected worktree_path to be Some(_) by default, got {:?}",
@@ -299,7 +308,7 @@ fn start_no_worktree_uses_feature_branch() {
     wait_for(&root.join(".devflow/phase-12-agent-pid"));
     assert!(!root.join(".worktrees/phase-12").exists());
 
-    let state = devflow_core::workflow::load_state(root).expect("load state");
+    let state = devflow_core::workflow::load_state(root, 12).expect("load state");
     assert!(
         state.worktree_path.is_none(),
         "expected worktree_path to be None with --no-worktree, got {:?}",
@@ -517,7 +526,7 @@ fn status_prints_cron_hint_when_cron_instructions_exist() {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(stdout.contains(&format!(
-        "Cron instruction pending: hermes cron create --from-devflow {}",
+        "Cron instruction pending (phase 7): hermes cron create --from-devflow {}",
         root.display()
     )));
 }

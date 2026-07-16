@@ -8,7 +8,7 @@ use devflow_core::mode::{self, Mode};
 use devflow_core::prompt::{self, FixType};
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
-use devflow_core::{agent_result, agents, lock, monitor, recover, worktree};
+use devflow_core::{agent_result, agents, events, lock, monitor, recover, worktree};
 use devflow_core::{
     agent_result::{AgentStatus, Verdict},
     workflow,
@@ -75,6 +75,26 @@ enum Command {
     /// Internal: advance the stage machine after a monitored agent exits.
     #[command(hide = true)]
     Advance {
+        /// Project root.
+        #[arg(default_value = ".")]
+        project: PathBuf,
+        /// Phase whose stage machine to advance. Recorded by the monitor at
+        /// spawn time so advance never depends on a shared state singleton.
+        #[arg(long)]
+        phase: Option<u32>,
+    },
+    /// Print or follow an agent's captured output for a phase.
+    Logs {
+        /// Phase to show (defaults to the single active phase, else the
+        /// most recently written capture file).
+        #[arg(long)]
+        phase: Option<u32>,
+        /// Keep watching for new output until the agent exits.
+        #[arg(long, short = 'f')]
+        follow: bool,
+        /// Show the agent's stderr capture instead of stdout.
+        #[arg(long)]
+        stderr: bool,
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
@@ -184,8 +204,6 @@ enum CliError {
     #[error(transparent)]
     Git(#[from] devflow_core::git::GitError),
     #[error(transparent)]
-    Agent(#[from] devflow_core::agent::AgentError),
-    #[error(transparent)]
     Worktree(#[from] devflow_core::worktree::WorktreeError),
     #[error(transparent)]
     Gate(#[from] devflow_core::gates::GateError),
@@ -237,7 +255,13 @@ fn run() -> Result<(), CliError> {
                 dry_run,
             )
         }
-        Command::Advance { project } => advance(&project_root(project)?),
+        Command::Advance { project, phase } => advance(&project_root(project)?, phase),
+        Command::Logs {
+            phase,
+            follow,
+            stderr,
+            project,
+        } => logs(&project_root(project)?, phase, follow, stderr),
         Command::Parallel {
             phases,
             agents,
@@ -402,8 +426,18 @@ fn start(
     // launch fails, clear the just-saved state so `devflow status`/`recover`
     // don't report a phantom run (the failure WR-11 originally targeted).
     workflow::save_state(&state)?;
+    events::emit(
+        project_root,
+        phase,
+        "workflow_started",
+        serde_json::json!({
+            "agent": state.agent.to_string(),
+            "mode": state.mode.to_string(),
+            "worktree": state.worktree_path.as_ref().map(|p| p.display().to_string()),
+        }),
+    );
     if let Err(err) = launch_stage(&state, None) {
-        if let Err(clear_err) = workflow::clear_state(project_root) {
+        if let Err(clear_err) = workflow::clear_state(project_root, phase) {
             eprintln!("warning: could not clear state after failed launch: {clear_err}");
         }
         return Err(err);
@@ -457,6 +491,16 @@ fn launch_stage(state: &State, prompt_override: Option<String>) -> Result<(), Cl
     agent_result::cleanup_phase_files(&state.project_root, state.phase);
     let pid = monitor::spawn_monitor(state, program, &args, &adapter.extra_env())
         .map_err(|err| CliError::Message(format!("could not spawn monitor: {err}")))?;
+    events::emit(
+        &state.project_root,
+        state.phase,
+        "stage_launched",
+        serde_json::json!({
+            "stage": state.stage.to_string(),
+            "agent": state.agent.to_string(),
+            "monitor_pid": pid,
+        }),
+    );
     println!(
         "stage {} → launched {} (monitor pid {pid})",
         state.stage,
@@ -465,15 +509,42 @@ fn launch_stage(state: &State, prompt_override: Option<String>) -> Result<(), Cl
     Ok(())
 }
 
+/// Resolve which phase a bare `devflow advance` (no `--phase`) refers to:
+/// only unambiguous when exactly one phase is active. Exists for monitors
+/// spawned by a pre-14a binary that doesn't pass `--phase`.
+fn resolve_sole_active_phase(project_root: &Path) -> Result<u32, CliError> {
+    let states = workflow::list_states(project_root);
+    match states.as_slice() {
+        [] => Err(CliError::Message(
+            "no active DevFlow state — nothing to advance".into(),
+        )),
+        [one] => Ok(one.phase),
+        many => Err(CliError::Message(format!(
+            "multiple active phases ({}) — pass --phase to pick one",
+            many.iter()
+                .map(|s| s.phase.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
 /// Advance the stage machine after a monitored agent for `state.stage` exits.
 /// Invoked by the monitor process; not normally run by a human.
-fn advance(project_root: &Path) -> Result<(), CliError> {
+fn advance(project_root: &Path, phase: Option<u32>) -> Result<(), CliError> {
+    // 13-DEFERRED-CR-03 fix shape #2: the phase is threaded in by the monitor
+    // (recorded at spawn time), so advance's identity never depends on a
+    // shared state singleton — under `devflow parallel`, each monitor
+    // advances exactly its own phase. The Option fallback only serves
+    // monitors spawned by an older binary.
+    let phase = match phase {
+        Some(phase) => phase,
+        None => resolve_sole_active_phase(project_root)?,
+    };
     // CR-03 (13-REVIEW.md): the lock is scoped per-phase, not per-project.
     // advance() holds it across a gate's multi-day blocking wait, and every
     // successful run ends at a mandatory Ship gate — a project-wide lock
-    // would starve `devflow parallel`'s sibling phases with no retry. The
-    // pre-lock read below exists ONLY to key the lock on this phase.
-    let phase = workflow::load_state(project_root)?.phase;
+    // would starve `devflow parallel`'s sibling phases with no retry.
     let _lock = match lock::acquire(project_root, phase) {
         Ok(guard) => guard,
         Err(lock::LockError::Contended { pid, path: _ }) => {
@@ -483,17 +554,12 @@ fn advance(project_root: &Path) -> Result<(), CliError> {
         }
         Err(err) => return Err(CliError::Message(format!("lock error: {err}"))),
     };
-    // Re-load under the lock: the pre-lock snapshot may be stale — a
-    // concurrent advance that held the lock while we waited can have
-    // transitioned the stage (or finished the phase) before we acquired, and
-    // acting on the old snapshot would double-advance the stage machine.
-    let mut state = workflow::load_state(project_root)?;
-    if state.phase != phase {
-        return Err(CliError::Message(format!(
-            "state changed while acquiring lock (phase {phase} → {}) — rerun advance",
-            state.phase
-        )));
-    }
+    // Load under the lock: with per-phase state files keyed by the same
+    // phase as the lock, there is no cross-phase TOCTOU left by
+    // construction — a concurrent advance of another phase touches a
+    // different file and a duplicate advance of THIS phase is excluded by
+    // the lock itself.
+    let mut state = workflow::load_state(project_root, phase)?;
 
     let git_flow = GitFlowConfig::default();
     let result = agent_result::evaluate_agent_result(project_root, &state, &git_flow)
@@ -503,6 +569,17 @@ fn advance(project_root: &Path) -> Result<(), CliError> {
     if let Some(reason) = &result.reason {
         println!("  detail: {reason}");
     }
+    events::emit(
+        project_root,
+        phase,
+        "advance_evaluated",
+        serde_json::json!({
+            "stage": stage.to_string(),
+            "status": format!("{:?}", result.status).to_ascii_lowercase(),
+            "verdict": result.verdict.map(|v| format!("{v:?}").to_ascii_lowercase()),
+            "reason": result.reason.as_deref().map(truncate_reason),
+        }),
+    );
 
     let failed = matches!(
         result.status,
@@ -671,25 +748,77 @@ fn is_ship_review_failure(reason: &Option<String>) -> bool {
         .unwrap_or(false)
 }
 
-/// Fire the hooks for `from → to`, persist the new stage, and launch its agent.
-fn transition(project_root: &Path, state: &mut State, to: Stage) -> Result<(), CliError> {
-    let from = state.stage;
+/// How long a caller waits out a sibling phase's short critical section on
+/// the project-wide checkout lock before giving up. Generous relative to the
+/// seconds the lock is held for, tiny relative to a gate wait.
+const CHECKOUT_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Run a batch of hooks against the primary checkout, serialized across
+/// phases by the coarse project lock (13-DEFERRED-CR-03 fix shape #3): the
+/// hooks commit/tag/delete branches in the shared main checkout, and two
+/// phases doing that concurrently race git's `index.lock`/`HEAD`. Held for
+/// seconds — never across a gate wait. Hook failures stay fail-soft (warn
+/// and continue), as before.
+fn run_checkout_hooks(project_root: &Path, state: &State, batch: &[hooks::Hook], stage: Stage) {
+    if batch.is_empty() {
+        return;
+    }
+    let _checkout_lock = match lock::acquire_project_blocking(project_root, CHECKOUT_LOCK_TIMEOUT) {
+        Ok(guard) => Some(guard),
+        Err(err) => {
+            // Fail-soft like the hooks themselves: a wedged sibling should
+            // not abort this phase's advance, but running unserialized must
+            // be visible.
+            println!("warning: proceeding without checkout lock: {err}");
+            None
+        }
+    };
     let git_flow = GitFlowConfig::default();
-    for hook in hooks::hooks_for_transition(from, to) {
+    for hook in batch {
         let ctx = HookContext {
             phase: state.phase,
             project_root: project_root.to_path_buf(),
-            stage: to,
+            stage,
             git_flow: git_flow.clone(),
         };
-        if let Err(err) = hook.run(&ctx) {
+        let outcome = hook.run(&ctx);
+        if let Err(ref err) = outcome {
             println!("warning: hook {hook:?} failed: {err}");
         }
+        events::emit(
+            project_root,
+            state.phase,
+            "hook_run",
+            serde_json::json!({
+                "hook": format!("{hook:?}"),
+                "ok": outcome.is_ok(),
+            }),
+        );
     }
+}
+
+/// Fire the hooks for `from → to`, persist the new stage, and launch its agent.
+fn transition(project_root: &Path, state: &mut State, to: Stage) -> Result<(), CliError> {
+    let from = state.stage;
+    run_checkout_hooks(
+        project_root,
+        state,
+        &hooks::hooks_for_transition(from, to),
+        to,
+    );
     state.stage = to;
     state.consecutive_failures = 0;
     state.gate_pending = false;
     workflow::save_state(state)?;
+    events::emit(
+        project_root,
+        state.phase,
+        "transition",
+        serde_json::json!({
+            "from": from.to_string(),
+            "to": to.to_string(),
+        }),
+    );
     launch_stage(state, None)
 }
 
@@ -719,6 +848,15 @@ fn prepare_loop_back_to_code(
     state.stage = Stage::Code;
     state.gate_pending = false;
     workflow::save_state(state)?;
+    events::emit(
+        project_root,
+        state.phase,
+        "loop_back",
+        serde_json::json!({
+            "from": gate_stage.to_string(),
+            "consecutive_failures": state.consecutive_failures,
+        }),
+    );
     println!(
         "looping back to Code (validate failures: {})",
         state.consecutive_failures
@@ -728,21 +866,16 @@ fn prepare_loop_back_to_code(
 
 /// Run the terminal hooks (version bump + branch cleanup) and clear state.
 fn finish_workflow(project_root: &Path, state: &mut State) -> Result<(), CliError> {
-    let git_flow = GitFlowConfig::default();
-    for hook in hooks::hooks_after_ship() {
-        let ctx = HookContext {
-            phase: state.phase,
-            project_root: project_root.to_path_buf(),
-            stage: Stage::Ship,
-            git_flow: git_flow.clone(),
-        };
-        if let Err(err) = hook.run(&ctx) {
-            println!("warning: hook {hook:?} failed: {err}");
-        }
-    }
+    run_checkout_hooks(project_root, state, &hooks::hooks_after_ship(), Stage::Ship);
     let _ = Gates::cleanup(project_root, state.phase, Stage::Validate);
     let _ = Gates::cleanup(project_root, state.phase, Stage::Ship);
-    workflow::clear_state(project_root)?;
+    workflow::clear_state(project_root, state.phase)?;
+    events::emit(
+        project_root,
+        state.phase,
+        "workflow_finished",
+        serde_json::Value::Null,
+    );
     println!("phase {} shipped — workflow complete", state.phase);
     Ok(())
 }
@@ -772,17 +905,57 @@ fn run_gate(
             state.mode
         );
     }
+    events::emit(
+        project_root,
+        state.phase,
+        "gate_fired",
+        serde_json::json!({
+            "stage": stage.to_string(),
+            "unexpected": unexpected,
+            "context": context,
+        }),
+    );
     gates::fire_gate_notify(state.phase, stage, context, unexpected);
+    events::emit(
+        project_root,
+        state.phase,
+        "notify_fired",
+        serde_json::json!({ "stage": stage.to_string(), "unexpected": unexpected }),
+    );
     match Gates::poll_response(project_root, state.phase, stage, gate_timeout_secs()) {
         Some(response) => {
             state.gate_pending = false;
             workflow::save_state(state)?;
             Gates::ack(project_root, state.phase, stage)?;
-            Ok(GateAction::from_response(&response))
+            let action = GateAction::from_response(&response);
+            events::emit(
+                project_root,
+                state.phase,
+                "gate_resolved",
+                serde_json::json!({
+                    "stage": stage.to_string(),
+                    "approved": response.approved,
+                    "action": match &action {
+                        GateAction::Advance => "advance",
+                        GateAction::LoopBack(_) => "loop_back",
+                        GateAction::Abort(_) => "abort",
+                    },
+                    "responded_by": response.responded_by,
+                }),
+            );
+            Ok(action)
         }
-        None => Err(CliError::Message(format!(
-            "gate for stage {stage} timed out awaiting a response"
-        ))),
+        None => {
+            events::emit(
+                project_root,
+                state.phase,
+                "gate_timeout",
+                serde_json::json!({ "stage": stage.to_string() }),
+            );
+            Err(CliError::Message(format!(
+                "gate for stage {stage} timed out awaiting a response"
+            )))
+        }
     }
 }
 
@@ -792,7 +965,13 @@ fn abort(project_root: &Path, state: &State, reason: &str) -> Result<(), CliErro
     // See CR-01: without this, a stale response/ack for this phase+stage
     // survives on disk and is silently reused if the gate fires again later.
     let _ = Gates::cleanup(project_root, state.phase, state.stage);
-    let _ = workflow::clear_state(project_root);
+    let _ = workflow::clear_state(project_root, state.phase);
+    events::emit(
+        project_root,
+        state.phase,
+        "workflow_aborted",
+        serde_json::json!({ "reason": truncate_reason(reason) }),
+    );
     Ok(())
 }
 
@@ -942,9 +1121,16 @@ fn split_two_agents(agents: &str) -> Result<(AgentKind, AgentKind), CliError> {
     Ok((parsed[0], parsed[1]))
 }
 
-/// Launch one agent, block until it exits, and return its self-reported result
-/// (parsed from the DEVFLOW_RESULT marker, if present). Used by sequentagent,
-/// where the rebase handoff between agents requires a synchronous run.
+/// Launch one agent via a no-advance monitor, block until it exits, and
+/// return its self-reported result (parsed from the DEVFLOW_RESULT marker,
+/// if present). Used by sequentagent, where the rebase handoff between
+/// agents requires a synchronous run.
+///
+/// 14b: this used to be a CLI-owned `launch_agent` + `capture_agent_output`
+/// pipe — the last synchronous execution path. It now rides the same
+/// monitor-owned execution as everything else (stderr separated from the
+/// parseable stdout capture, exit code reaped even if this CLI dies) and
+/// simply blocks on the exit file the monitor writes.
 fn run_agent_blocking(
     project_root: &Path,
     phase: u32,
@@ -962,33 +1148,42 @@ fn run_agent_blocking(
     } else {
         worktree_writable_roots(project_root, workdir)
     };
-    let (child, pid) = agent::launch_agent(&*adapter, phase, &prompt, workdir, &roots)?;
+    let (program, args) = adapter.exec_command(phase, &prompt, &roots);
+    // Synthetic, never-persisted state: the monitor only reads project_root,
+    // phase, and worktree_path from it — sequentagent does not participate
+    // in the stage machine.
+    let mut state = State::new(phase, agent, Mode::Auto, project_root.to_path_buf());
+    state.stage = Stage::Code;
+    if workdir != project_root {
+        state.worktree_path = Some(workdir.to_path_buf());
+    }
+    let monitor_pid =
+        monitor::spawn_monitor_no_advance(&state, program, &args, &adapter.extra_env())
+            .map_err(|err| CliError::Message(format!("could not spawn monitor: {err}")))?;
     println!(
-        "launched {} (pid {pid}) in {}",
+        "launched {} (monitor pid {monitor_pid}) in {}",
         adapter.name(),
         workdir.display()
     );
-    let capture = agent::capture_agent_output(child, phase, project_root)
-        .map_err(|err| CliError::Message(format!("failed to capture agent output: {err}")))?;
-    println!("agent {agent} exited with code {}", capture.exit_code);
-    // capture_agent_output already wrote stdout to the same file
-    // evaluate_layer1 reads, so delegate to it directly rather than
-    // re-implementing a subset of its precedence here — this is the single
-    // code path that knows how to find a Codex agent's DEVFLOW_RESULT
-    // marker inside its JSONL `--json` event stream (parse_codex_event_result),
-    // which the previous parse_devflow_result-only chain never called.
+    let exit_code = monitor::wait_for_agent_exit(project_root, phase, monitor_pid)
+        .map_err(|err| CliError::Message(format!("agent run did not complete: {err}")))?;
+    println!("agent {agent} exited with code {exit_code}");
+    // The monitor wrote stdout to the same file evaluate_layer1 reads, so
+    // delegate to it directly rather than re-implementing a subset of its
+    // precedence here — this is the single code path that knows how to find
+    // a Codex agent's DEVFLOW_RESULT marker inside its JSONL `--json` event
+    // stream (parse_codex_event_result).
     let result = agent_result::evaluate_layer1(project_root, phase);
     // Layer-1 silence is not success: a crashed agent (nonzero exit, no
     // marker, no envelope) yields None here, and sequentagent's callers
     // treat None as "proceed to integrate". Mirror Layer 2's exit-code gate
     // so a crash never fast-forwards a half-finished branch into the base.
-    if result.is_none() && capture.exit_code != 0 {
+    if result.is_none() && exit_code != 0 {
         return Ok(Some(agent_result::AgentResult {
             status: AgentStatus::Failed,
-            exit_code: Some(capture.exit_code),
+            exit_code: Some(exit_code),
             reason: Some(format!(
-                "agent exited with code {} without reporting a result",
-                capture.exit_code
+                "agent exited with code {exit_code} without reporting a result"
             )),
             commits: None,
             summary: None,
@@ -998,8 +1193,18 @@ fn run_agent_blocking(
     Ok(result)
 }
 
-/// Integrate an agent branch into the shared base, pushing if a remote exists.
-fn integrate_agent_branch(git: &GitFlow, base: &str, agent_branch: &str) -> Result<(), CliError> {
+/// Integrate an agent branch into the shared base, pushing if a remote
+/// exists. Serialized on the coarse checkout lock: branch fast-forwards and
+/// pushes mutate shared refs that a concurrently finishing phase's hooks
+/// also touch (13-DEFERRED-CR-03 sequentagent re-check).
+fn integrate_agent_branch(
+    project_root: &Path,
+    git: &GitFlow,
+    base: &str,
+    agent_branch: &str,
+) -> Result<(), CliError> {
+    let _checkout_lock = lock::acquire_project_blocking(project_root, CHECKOUT_LOCK_TIMEOUT)
+        .map_err(|err| CliError::Message(format!("could not lock checkout: {err}")))?;
     git.fast_forward_branch(base, agent_branch)?;
     println!("integrated {agent_branch} into {base}");
     if git.has_remote() {
@@ -1019,16 +1224,33 @@ fn sequentagent(
     agents: &str,
     force: bool,
 ) -> Result<(), CliError> {
-    if let Err(err) = devflow_core::ship::delete_cron_instructions(project_root) {
-        println!("warning: could not remove stale cron-instructions.json: {err}");
+    // 14b: hold this phase's lock for the whole run — a monitored pipeline
+    // run and a sequentagent run for the same phase share capture files and
+    // branches, and previously nothing excluded them from colliding.
+    let _phase_lock = match lock::acquire(project_root, phase) {
+        Ok(guard) => guard,
+        Err(lock::LockError::Contended { pid, path: _ }) => {
+            return Err(CliError::Message(format!(
+                "phase {phase} is already being driven by another devflow process (pid {pid})"
+            )));
+        }
+        Err(err) => return Err(CliError::Message(format!("lock error: {err}"))),
+    };
+    if let Err(err) = devflow_core::ship::delete_cron_instructions(project_root, phase) {
+        println!("warning: could not remove stale cron-instructions file: {err}");
     }
     let (agent_a, agent_b) = split_two_agents(agents)?;
     let git = GitFlow::new(project_root);
     let base = format!("{FEATURE_PREFIX}phase-{phase:02}");
 
     // 1. Ensure the shared base branch exists off develop, without leaving the
-    //    main checkout on it.
-    git.ensure_branch(&base, DEVELOP)?;
+    //    main checkout on it. Ref creation is serialized on the checkout lock
+    //    like every other shared-ref mutation.
+    {
+        let _checkout_lock = lock::acquire_project_blocking(project_root, CHECKOUT_LOCK_TIMEOUT)
+            .map_err(|err| CliError::Message(format!("could not lock checkout: {err}")))?;
+        git.ensure_branch(&base, DEVELOP)?;
+    }
 
     // 2. Create one worktree per agent, both off the current base tip.
     let branch_a = format!("{base}-{agent_a}");
@@ -1075,7 +1297,7 @@ fn sequentagent(
             _ => {}
         }
     }
-    integrate_agent_branch(&git, &base, &branch_a)?;
+    integrate_agent_branch(project_root, &git, &base, &branch_a)?;
 
     // 4. Rebase B onto the updated base; surface conflicts for manual fixing.
     git.rebase_in(&wt_b, &base).map_err(|err| {
@@ -1105,12 +1327,12 @@ fn sequentagent(
             result.reason.unwrap_or_else(|| "no details".into())
         )));
     }
-    integrate_agent_branch(&git, &base, &branch_b)?;
-    // WR-02: the phase has shipped — a surviving cron-instructions.json would
+    integrate_agent_branch(project_root, &git, &base, &branch_b)?;
+    // WR-02: the phase has shipped — a surviving cron-instructions file would
     // mislead `devflow status`/a Hermes cron into re-running it. A failed
     // delete must be visible, not swallowed, for the same reason.
-    if let Err(err) = devflow_core::ship::delete_cron_instructions(project_root) {
-        println!("warning: could not remove cron-instructions.json: {err}");
+    if let Err(err) = devflow_core::ship::delete_cron_instructions(project_root, phase) {
+        println!("warning: could not remove cron-instructions file: {err}");
     }
 
     println!("\nsequentagent complete — both agents integrated into {base}");
@@ -1260,49 +1482,181 @@ fn cleanup(project_root: &Path, force: bool) -> Result<(), CliError> {
 }
 
 fn status(project_root: &Path) -> Result<(), CliError> {
+    // 13-DEFERRED-CR-03 acceptance: enumerate every active phase, not just
+    // the last one started.
+    let states = workflow::list_states(project_root);
     let mut current_worktree: Option<PathBuf> = None;
-    match workflow::load_state(project_root) {
-        Ok(state) => {
+    if states.is_empty() {
+        println!("stage: idle");
+        println!("project_root: {}", project_root.display());
+    } else {
+        println!("project_root: {}", project_root.display());
+        println!(
+            "active phases: {}",
+            states
+                .iter()
+                .map(|s| s.phase.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        for state in &states {
             let gate = if state.gate_pending {
                 "pending"
             } else {
                 "none"
             };
+            println!("\nphase {}:", state.phase);
             println!(
-                "stage: {} | mode: {} | gate: {}",
+                "  stage: {} | mode: {} | gate: {}",
                 state.stage, state.mode, gate
             );
-            println!("phase: {}", state.phase);
-            println!("agent: {}", agents::adapter_for(state.agent).name());
+            println!("  agent: {}", agents::adapter_for(state.agent).name());
             if state.consecutive_failures > 0 {
-                println!("validate failures: {}", state.consecutive_failures);
+                println!("  validate failures: {}", state.consecutive_failures);
             }
-            println!("started_at: {}", state.started_at);
-            println!("project_root: {}", state.project_root.display());
+            println!(
+                "  started: {} ({})",
+                state.started_at,
+                recover::format_age(&state.started_at)
+            );
             if let Some(ref wt) = state.worktree_path {
-                println!("worktree: {}", wt.display());
+                println!("  worktree: {}", wt.display());
             }
-            current_worktree = state.worktree_path.clone();
+            current_worktree = current_worktree.or_else(|| state.worktree_path.clone());
             match agent_pid_from_file(project_root, state.phase) {
                 Some(pid) => {
-                    println!("agent_pid: {pid}");
-                    println!("agent_running: {}", agent::agent_running(pid));
+                    println!(
+                        "  agent_pid: {pid} (running: {})",
+                        agent::agent_running(pid)
+                    );
                 }
-                None => println!("agent_pid: none"),
+                None => println!("  agent_pid: none"),
+            }
+            if let Some(event) = events::last_event_for_phase(project_root, state.phase) {
+                let ago = event
+                    .get("ts")
+                    .and_then(|t| t.as_u64())
+                    .map(|t| format!(" ({})", recover::format_age(&t.to_string())))
+                    .unwrap_or_default();
+                println!("  last action: {}{ago}", events::describe(&event));
             }
         }
-        Err(devflow_core::workflow::WorkflowError::MissingState(_)) => {
-            println!("stage: idle");
-            println!("project_root: {}", project_root.display());
-        }
-        Err(err) => return Err(err.into()),
     }
     print_open_branches(project_root);
     print_worktrees(project_root, current_worktree.as_deref());
-    if let Some(hint) = cron_instruction_hint(project_root) {
+    for hint in cron_instruction_hints(project_root) {
         println!("\n{hint}");
     }
     Ok(())
+}
+
+/// Print (or follow) a phase's captured agent output.
+fn logs(
+    project_root: &Path,
+    phase: Option<u32>,
+    follow: bool,
+    stderr: bool,
+) -> Result<(), CliError> {
+    let phase = match phase {
+        Some(p) => p,
+        None => default_logs_phase(project_root)?,
+    };
+    let path = if stderr {
+        agent_result::stderr_path(project_root, phase)
+    } else {
+        agent_result::stdout_path(project_root, phase)
+    };
+    if !path.exists() && !follow {
+        return Err(CliError::Message(format!(
+            "no capture file for phase {phase} at {}",
+            path.display()
+        )));
+    }
+    eprintln!("== phase {phase}: {} ==", path.display());
+    let mut offset = print_capture_from(&path, 0)?;
+    if !follow {
+        return Ok(());
+    }
+    // Follow until the agent's exit code lands AND one further quiescent
+    // poll produced no new bytes — the natural end of a run. (An operator
+    // can always Ctrl-C sooner.)
+    let exit_path = agent_result::exit_code_path(project_root, phase);
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let new_offset = print_capture_from(&path, offset)?;
+        if exit_path.exists() && new_offset == offset {
+            if let Ok(code) = std::fs::read_to_string(&exit_path) {
+                eprintln!("== agent exited with code {} ==", code.trim());
+            }
+            return Ok(());
+        }
+        offset = new_offset;
+    }
+}
+
+/// Print the capture file's contents from `offset`, returning the new offset.
+/// A missing file is treated as empty (it may not exist yet under --follow).
+fn print_capture_from(path: &Path, offset: u64) -> Result<u64, CliError> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return Ok(offset);
+    };
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|err| CliError::Message(format!("could not seek capture file: {err}")))?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)
+        .map_err(|err| CliError::Message(format!("could not read capture file: {err}")))?;
+    if !buf.is_empty() {
+        let mut stdout = std::io::stdout().lock();
+        let _ = stdout.write_all(&buf);
+        let _ = stdout.flush();
+    }
+    Ok(offset + buf.len() as u64)
+}
+
+/// Pick the phase `devflow logs` should show when none is given: the single
+/// active phase, else the phase with the most recently modified capture file.
+fn default_logs_phase(project_root: &Path) -> Result<u32, CliError> {
+    let states = workflow::list_states(project_root);
+    match states.as_slice() {
+        [one] => return Ok(one.phase),
+        [_, ..] => {
+            return Err(CliError::Message(format!(
+                "multiple active phases ({}) — pass --phase to pick one",
+                states
+                    .iter()
+                    .map(|s| s.phase.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        [] => {}
+    }
+    // No active state: fall back to the newest capture file on disk.
+    let devflow = workflow::devflow_dir(project_root);
+    let mut newest: Option<(std::time::SystemTime, u32)> = None;
+    if let Ok(entries) = std::fs::read_dir(&devflow) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(phase) = name
+                .strip_prefix("phase-")
+                .and_then(|rest| rest.strip_suffix("-stdout"))
+                .and_then(|num| num.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+                continue;
+            };
+            if newest.is_none_or(|(when, _)| modified > when) {
+                newest = Some((modified, phase));
+            }
+        }
+    }
+    newest.map(|(_, phase)| phase).ok_or_else(|| {
+        CliError::Message("no active phase and no capture files — nothing to show".into())
+    })
 }
 
 /// Read the launched agent PID the monitor recorded for `phase`, if present.
@@ -1311,15 +1665,17 @@ fn agent_pid_from_file(project_root: &Path, phase: u32) -> Option<u32> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-fn cron_instruction_hint(project_root: &Path) -> Option<String> {
-    devflow_core::ship::cron_instructions_path(project_root)
-        .exists()
-        .then(|| {
+fn cron_instruction_hints(project_root: &Path) -> Vec<String> {
+    devflow_core::ship::list_cron_instructions(project_root)
+        .iter()
+        .map(|instructions| {
             format!(
-                "Cron instruction pending: hermes cron create --from-devflow {}",
+                "Cron instruction pending (phase {}): hermes cron create --from-devflow {}",
+                instructions.phase,
                 project_root.display()
             )
         })
+        .collect()
 }
 
 /// Print active phase worktrees with branch and inferred phase/agent.
@@ -1429,7 +1785,7 @@ fn recover_cmd(project_root: &Path, do_clean: bool) -> Result<(), CliError> {
         return Ok(());
     }
 
-    let status = match recover::inspect(project_root) {
+    let statuses = match recover::inspect_all(project_root) {
         Ok(s) => s,
         Err(recover::RecoverError::NothingToRecover) => {
             println!("no state to recover — project is idle");
@@ -1442,26 +1798,34 @@ fn recover_cmd(project_root: &Path, do_clean: bool) -> Result<(), CliError> {
         }
     };
 
-    println!("phase: {}", status.state.phase);
-    println!("stage: {}", status.state.stage);
-    println!("mode: {}", status.state.mode);
-    println!("agent: {}", agents::adapter_for(status.state.agent).name());
-    println!("started: {}", status.state.started_at);
-    println!("age: {}", status.age);
-    match agent_pid_from_file(project_root, status.state.phase) {
-        Some(pid) => {
-            let running = agent::agent_running(pid);
-            println!("agent_pid: {pid}");
-            println!("agent_running: {running}");
-            if !running {
-                println!("\nagent is not running — the monitor may have already advanced");
+    let mut any_stale = false;
+    for status in &statuses {
+        println!("phase: {}", status.state.phase);
+        println!("  stage: {}", status.state.stage);
+        println!("  mode: {}", status.state.mode);
+        println!(
+            "  agent: {}",
+            agents::adapter_for(status.state.agent).name()
+        );
+        println!("  started: {} ({})", status.state.started_at, status.age);
+        match agent_pid_from_file(project_root, status.state.phase) {
+            Some(pid) => {
+                let running = agent::agent_running(pid);
+                println!("  agent_pid: {pid} (running: {running})");
+                if !running {
+                    println!("  agent is not running — the monitor may have already advanced");
+                }
             }
+            None => println!("  agent_pid: none"),
         }
-        None => println!("agent_pid: none"),
+        if status.is_stale {
+            any_stale = true;
+            println!("  state is stale");
+        }
     }
 
-    if status.is_stale {
-        println!("\nstate is stale — run `devflow recover --clean` to clear it");
+    if any_stale {
+        println!("\nstale state found — run `devflow recover --clean` to clear it");
     }
 
     Ok(())
@@ -1767,24 +2131,98 @@ mod tests {
     }
 
     #[test]
-    fn cron_instruction_hint_includes_hermes_command() {
+    fn cron_instruction_hints_include_hermes_command_per_phase() {
         let dir = tempfile::tempdir().unwrap();
-        let instructions = devflow_core::ship::build_cron_instructions(
-            dir.path(),
-            7,
-            "2026-06-18T15:45:30Z",
-            "claude,codex",
-        );
-        devflow_core::ship::write_cron_instructions(dir.path(), &instructions).unwrap();
+        for phase in [7, 9] {
+            let instructions = devflow_core::ship::build_cron_instructions(
+                dir.path(),
+                phase,
+                "2026-06-18T15:45:30Z",
+                "claude,codex",
+            );
+            devflow_core::ship::write_cron_instructions(dir.path(), &instructions).unwrap();
+        }
 
-        let hint = cron_instruction_hint(dir.path()).unwrap();
+        let hints = cron_instruction_hints(dir.path());
 
+        assert_eq!(hints.len(), 2);
         assert_eq!(
-            hint,
+            hints[0],
             format!(
-                "Cron instruction pending: hermes cron create --from-devflow {}",
+                "Cron instruction pending (phase 7): hermes cron create --from-devflow {}",
                 dir.path().display()
             )
+        );
+        assert!(hints[1].contains("(phase 9)"));
+    }
+
+    #[test]
+    fn default_logs_phase_prefers_single_active_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::new(6, AgentKind::Claude, Mode::Auto, dir.path().to_path_buf());
+        workflow::save_state(&state).unwrap();
+
+        assert_eq!(default_logs_phase(dir.path()).unwrap(), 6);
+    }
+
+    #[test]
+    fn default_logs_phase_is_ambiguous_with_two_active_states() {
+        let dir = tempfile::tempdir().unwrap();
+        for phase in [6, 7] {
+            let state = State::new(
+                phase,
+                AgentKind::Claude,
+                Mode::Auto,
+                dir.path().to_path_buf(),
+            );
+            workflow::save_state(&state).unwrap();
+        }
+
+        let err = default_logs_phase(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("--phase"));
+    }
+
+    #[test]
+    fn default_logs_phase_falls_back_to_newest_capture_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(agent_result::stdout_path(dir.path(), 3), "old").unwrap();
+        // Ensure a strictly newer mtime on the second capture.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(agent_result::stdout_path(dir.path(), 5), "new").unwrap();
+
+        assert_eq!(default_logs_phase(dir.path()).unwrap(), 5);
+    }
+
+    #[test]
+    fn default_logs_phase_errors_with_nothing_to_show() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(default_logs_phase(dir.path()).is_err());
+    }
+
+    #[test]
+    fn print_capture_from_tracks_offsets_across_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("capture");
+        std::fs::write(&path, "hello ").unwrap();
+
+        let offset = print_capture_from(&path, 0).unwrap();
+        assert_eq!(offset, 6);
+        // Nothing new: offset unchanged.
+        assert_eq!(print_capture_from(&path, offset).unwrap(), 6);
+
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(b"world").unwrap();
+        drop(f);
+        assert_eq!(print_capture_from(&path, offset).unwrap(), 11);
+        // Missing file is treated as "no new bytes yet".
+        assert_eq!(
+            print_capture_from(Path::new("/nonexistent/x"), 4).unwrap(),
+            4
         );
     }
 
@@ -1849,14 +2287,73 @@ mod tests {
         )
         .unwrap();
 
-        advance(root).unwrap();
+        advance(root, Some(phase)).unwrap();
 
-        let err = workflow::load_state(root).unwrap_err();
+        let err = workflow::load_state(root, phase).unwrap_err();
         assert!(matches!(err, workflow::WorkflowError::MissingState(_)));
         assert!(!Gates::gate_path(root, phase, Stage::Ship).exists());
         assert!(!Gates::response_path(root, phase, Stage::Ship).exists());
         assert!(!Gates::ack_path(root, phase, Stage::Ship).exists());
         assert!(!Gates::gate_path(root, phase, Stage::Validate).exists());
+    }
+
+    /// 13-DEFERRED-CR-03 acceptance: two phases advancing their Ship stages
+    /// CONCURRENTLY must each finish their own stage machine — per-phase
+    /// state files prevent cross-phase clobbering, and the coarse checkout
+    /// lock serializes both `finish_workflow`s' git operations on the shared
+    /// primary checkout. Gate responses are pre-seeded so neither advance
+    /// blocks polling.
+    #[test]
+    fn concurrent_ship_advances_finish_both_phases_independently() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phases = [31u32, 32u32];
+        for &phase in &phases {
+            let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+            state.stage = Stage::Ship;
+            workflow::save_state(&state).unwrap();
+            std::fs::write(
+                agent_result::stdout_path(root, phase),
+                "DEVFLOW_RESULT: {\"status\":\"success\"}\n",
+            )
+            .unwrap();
+            let response_path = Gates::response_path(root, phase, Stage::Ship);
+            std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &response_path,
+                r#"{"approved":true,"note":null,"responded_by":"test"}"#,
+            )
+            .unwrap();
+        }
+
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = phases
+                .iter()
+                .map(|&phase| scope.spawn(move || advance(root, Some(phase))))
+                .collect();
+            for handle in handles {
+                handle.join().expect("advance thread").expect("advance ok");
+            }
+        });
+
+        for &phase in &phases {
+            assert!(
+                matches!(
+                    workflow::load_state(root, phase),
+                    Err(workflow::WorkflowError::MissingState(_))
+                ),
+                "phase {phase} must be finished (state cleared)"
+            );
+            assert!(!Gates::gate_path(root, phase, Stage::Ship).exists());
+            let last = devflow_core::events::last_event_for_phase(root, phase)
+                .expect("events recorded for phase");
+            assert_eq!(
+                last["event"], "workflow_finished",
+                "phase {phase}'s own event stream must end in workflow_finished"
+            );
+        }
     }
 
     /// Reaching `MAX_CONSECUTIVE_FAILURES` on a failed Validate must force a
@@ -1897,7 +2394,7 @@ mod tests {
             !Gates::gate_path(root, phase, Stage::Validate).exists(),
             "forced gate's files must be cleaned up once it resolves to Abort"
         );
-        let err = workflow::load_state(root).unwrap_err();
+        let err = workflow::load_state(root, phase).unwrap_err();
         assert!(matches!(err, workflow::WorkflowError::MissingState(_)));
     }
 
@@ -1937,7 +2434,7 @@ mod tests {
 
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                advance(root).unwrap();
+                advance(root, Some(phase)).unwrap();
             });
 
             let mut seen = false;
@@ -2218,7 +2715,7 @@ mod tests {
         assert_eq!(state.stage, Stage::Code);
         assert!(!Gates::gate_path(root, phase, Stage::Ship).exists());
         // Not finished — finish_workflow would have cleared state entirely.
-        assert!(workflow::load_state(root).is_ok());
+        assert!(workflow::load_state(root, phase).is_ok());
     }
 
     /// The ReviewFailed loop-back must select `FixType::AuditFix`

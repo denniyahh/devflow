@@ -124,12 +124,20 @@ fn advance_state_loading_fails_cleanly_for_missing_and_corrupt_state() {
     let root = dir.path();
 
     assert!(matches!(
-        load_state(root),
+        load_state(root, 7),
         Err(WorkflowError::MissingState(_))
     ));
 
     std::fs::create_dir_all(root.join(".devflow")).unwrap();
-    std::fs::write(root.join(".devflow/state.json"), "{\"stage\":").unwrap();
+    std::fs::write(root.join(".devflow/state-07.json"), "{\"stage\":").unwrap();
 
-    assert!(matches!(load_state(root), Err(WorkflowError::Json(_))));
+    assert!(matches!(load_state(root, 7), Err(WorkflowError::Json(_))));
+
+    // A corrupt LEGACY state.json must not wedge loading either — it is left
+    // in place (unmigratable) and per-phase reads proceed independently.
+    std::fs::write(root.join(".devflow/state.json"), "{\"stage\":").unwrap();
+    assert!(matches!(
+        load_state(root, 8),
+        Err(WorkflowError::MissingState(_))
+    ));
 }

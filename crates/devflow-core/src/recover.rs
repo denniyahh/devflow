@@ -5,7 +5,7 @@
 //! offers to clean up / restart.
 
 use crate::state::State;
-use crate::workflow::{self, WorkflowError, load_state};
+use crate::workflow::{self, WorkflowError};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -41,44 +41,51 @@ pub struct RecoveryStatus {
     pub lock_held: Option<String>,
 }
 
-/// Load state, inspect the agent process, and produce a recovery status.
-pub fn inspect(project_root: &Path) -> Result<RecoveryStatus, RecoverError> {
-    let state = match load_state(project_root) {
-        Ok(s) => s,
-        Err(WorkflowError::MissingState(_)) => {
-            return Err(RecoverError::NothingToRecover);
-        }
-        Err(err) => return Err(err.into()),
-    };
+/// Inspect every active phase state, producing one recovery status per phase
+/// (sorted by phase number). Errors with [`RecoverError::NothingToRecover`]
+/// when no phase has persisted state.
+pub fn inspect_all(project_root: &Path) -> Result<Vec<RecoveryStatus>, RecoverError> {
+    let states = workflow::list_states(project_root);
+    if states.is_empty() {
+        return Err(RecoverError::NothingToRecover);
+    }
+    Ok(states
+        .into_iter()
+        .map(|state| inspect_state(project_root, state))
+        .collect())
+}
 
+fn inspect_state(project_root: &Path, state: State) -> RecoveryStatus {
     let agent_running = agent_pid_for(&state).is_some_and(crate::agent::agent_running);
     let is_stale = is_stale_state(&state);
     let age = format_age(state.started_at.as_str());
     let lock_held = crate::lock::holder(project_root, state.phase).map(|(pid, _)| pid);
 
-    Ok(RecoveryStatus {
+    RecoveryStatus {
         state,
         agent_running,
         is_stale,
         age,
         lock_held,
-    })
+    }
 }
 
-/// Clean up a stale or abandoned workflow state.
+/// Clean up stale or abandoned workflow state.
 ///
-/// Removes the state file, any per-phase lock files whose holder is dead
+/// Removes every phase's state file, any lock files whose holder is dead
 /// (the sweep lives in [`crate::lock::remove_stale_locks`], which owns the
 /// lock naming and refuses to delete a live holder's lock out from under a
-/// running `advance`), and a leftover `cron-instructions.json` — a
-/// self-describing "auto-re-run this phase" record that must not survive an
-/// operator-driven reset, or a Hermes cron re-runs a phase that was just
-/// cleaned. Returns warnings for anything that could not be removed.
+/// running `advance`), and leftover cron-instruction files — self-describing
+/// "auto-re-run this phase" records that must not survive an operator-driven
+/// reset, or a Hermes cron re-runs a phase that was just cleaned. Returns
+/// warnings for anything that could not be removed.
 pub fn clean(project_root: &Path) -> Result<Vec<String>, RecoverError> {
-    workflow::clear_state(project_root)?;
+    for state in workflow::list_states(project_root) {
+        workflow::clear_state(project_root, state.phase)?;
+    }
     let mut warnings = crate::lock::remove_stale_locks(project_root);
-    if let Err(err) = crate::ship::delete_cron_instructions(project_root) {
-        warnings.push(format!("could not remove cron-instructions.json: {err}"));
+    if let Err(err) = crate::ship::delete_all_cron_instructions(project_root) {
+        warnings.push(format!("could not remove cron-instruction files: {err}"));
     }
     Ok(warnings)
 }
@@ -121,8 +128,10 @@ fn state_age_secs(started_at: &str) -> Option<u64> {
     now.checked_sub(started)
 }
 
-/// Format an age in seconds to a human-readable string.
-fn format_age(started_at: &str) -> String {
+/// Format a unix-seconds timestamp's age as a human-readable string
+/// ("5m ago"). Public since 14c: `devflow status` reuses it for elapsed
+/// time and event recency.
+pub fn format_age(started_at: &str) -> String {
     match state_age_secs(started_at) {
         Some(s) if s < 60 => format!("{s}s ago"),
         Some(s) if s < 3600 => format!("{}m ago", s / 60),
@@ -225,12 +234,42 @@ mod tests {
     }
 
     #[test]
-    fn inspect_missing_state_reports_nothing_to_recover() {
+    fn inspect_all_missing_state_reports_nothing_to_recover() {
         let dir = std::env::temp_dir().join(format!("devflow-recover-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create temp dir");
-        let err = inspect(&dir).expect_err("should have no state");
+        let err = inspect_all(&dir).expect_err("should have no state");
         assert!(matches!(err, RecoverError::NothingToRecover));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 13-DEFERRED-CR-03 acceptance: recover must enumerate ALL active
+    /// phases, not just the last one started.
+    #[test]
+    fn inspect_all_enumerates_every_active_phase() {
+        let dir = tempfile::tempdir().unwrap();
+        workflow::save_state(&state_aged(dir.path(), 60, None)).unwrap();
+        let mut other = state_aged(dir.path(), 60, None);
+        other.phase = 2;
+        workflow::save_state(&other).unwrap();
+
+        let statuses = inspect_all(dir.path()).expect("two phases active");
+        assert_eq!(
+            statuses.iter().map(|s| s.state.phase).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn clean_clears_every_phase_state() {
+        let dir = tempfile::tempdir().unwrap();
+        workflow::save_state(&state_aged(dir.path(), 60, None)).unwrap();
+        let mut other = state_aged(dir.path(), 60, None);
+        other.phase = 2;
+        workflow::save_state(&other).unwrap();
+
+        clean(dir.path()).expect("clean");
+
+        assert!(workflow::list_states(dir.path()).is_empty());
     }
 }

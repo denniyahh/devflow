@@ -60,17 +60,27 @@ pub enum ShipError {
     Missing,
 }
 
-/// Path to the cron-instructions record for a project.
-pub fn cron_instructions_path(project_root: &Path) -> PathBuf {
+/// Path to a phase's cron-instructions record. Per-phase since 14a
+/// (13-DEFERRED-CR-03): the old single-slot `cron-instructions.json` let one
+/// phase's rate-limit record clobber another's under `devflow parallel`.
+pub fn cron_instructions_path(project_root: &Path, phase: u32) -> PathBuf {
+    project_root
+        .join(".devflow")
+        .join(format!("cron-instructions-{phase:02}.json"))
+}
+
+/// Path of the legacy single-slot record written by pre-14a binaries. Still
+/// read/deleted for compatibility; never written.
+fn legacy_cron_instructions_path(project_root: &Path) -> PathBuf {
     project_root.join(".devflow").join("cron-instructions.json")
 }
 
-/// Persist Hermes cron instructions.
+/// Persist Hermes cron instructions for the phase recorded inside them.
 pub fn write_cron_instructions(
     project_root: &Path,
     instructions: &CronInstructions,
 ) -> Result<(), ShipError> {
-    let path = cron_instructions_path(project_root);
+    let path = cron_instructions_path(project_root, instructions.phase);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -78,20 +88,83 @@ pub fn write_cron_instructions(
     Ok(())
 }
 
-/// Load Hermes cron instructions, or [`ShipError::Missing`] if absent.
-pub fn load_cron_instructions(project_root: &Path) -> Result<CronInstructions, ShipError> {
-    let path = cron_instructions_path(project_root);
-    if !path.exists() {
-        return Err(ShipError::Missing);
+/// Load a phase's Hermes cron instructions, or [`ShipError::Missing`] if
+/// absent. Falls back to a legacy single-slot record when it names this phase.
+pub fn load_cron_instructions(
+    project_root: &Path,
+    phase: u32,
+) -> Result<CronInstructions, ShipError> {
+    let path = cron_instructions_path(project_root, phase);
+    if path.exists() {
+        return Ok(serde_json::from_str(&std::fs::read_to_string(&path)?)?);
     }
-    Ok(serde_json::from_str(&std::fs::read_to_string(&path)?)?)
+    let legacy = legacy_cron_instructions_path(project_root);
+    if legacy.exists() {
+        let instructions: CronInstructions =
+            serde_json::from_str(&std::fs::read_to_string(&legacy)?)?;
+        if instructions.phase == phase {
+            return Ok(instructions);
+        }
+    }
+    Err(ShipError::Missing)
 }
 
-/// Remove the cron-instructions record. Idempotent.
-pub fn delete_cron_instructions(project_root: &Path) -> Result<(), ShipError> {
-    let path = cron_instructions_path(project_root);
+/// Every pending cron-instructions record (per-phase files plus a legacy
+/// single-slot one), sorted by phase. Unparsable files are skipped.
+pub fn list_cron_instructions(project_root: &Path) -> Vec<CronInstructions> {
+    let mut found = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(project_root.join(".devflow")) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !name.starts_with("cron-instructions") || !name.ends_with(".json") {
+                continue;
+            }
+            if let Ok(contents) = std::fs::read_to_string(entry.path())
+                && let Ok(instructions) = serde_json::from_str::<CronInstructions>(&contents)
+            {
+                found.push(instructions);
+            }
+        }
+    }
+    found.sort_by_key(|i| i.phase);
+    found.dedup_by_key(|i| i.phase);
+    found
+}
+
+/// Remove a phase's cron-instructions record (and a legacy single-slot record
+/// naming the same phase). Idempotent.
+pub fn delete_cron_instructions(project_root: &Path, phase: u32) -> Result<(), ShipError> {
+    let path = cron_instructions_path(project_root, phase);
     if path.exists() {
         std::fs::remove_file(path)?;
+    }
+    let legacy = legacy_cron_instructions_path(project_root);
+    if legacy.exists()
+        && let Ok(contents) = std::fs::read_to_string(&legacy)
+        && serde_json::from_str::<CronInstructions>(&contents)
+            .map(|i| i.phase == phase)
+            .unwrap_or(true)
+    {
+        std::fs::remove_file(&legacy)?;
+    }
+    Ok(())
+}
+
+/// Remove every cron-instructions record (all phases + legacy). Idempotent.
+pub fn delete_all_cron_instructions(project_root: &Path) -> Result<(), ShipError> {
+    let legacy = legacy_cron_instructions_path(project_root);
+    if legacy.exists() {
+        std::fs::remove_file(&legacy)?;
+    }
+    if let Ok(entries) = std::fs::read_dir(project_root.join(".devflow")) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.starts_with("cron-instructions-") && name.ends_with(".json") {
+                std::fs::remove_file(entry.path())?;
+            }
+        }
     }
     Ok(())
 }
@@ -361,7 +434,7 @@ mod tests {
 
         write_cron_instructions(dir.path(), &record).unwrap();
 
-        assert_eq!(load_cron_instructions(dir.path()).unwrap(), record);
+        assert_eq!(load_cron_instructions(dir.path(), 7).unwrap(), record);
     }
 
     #[test]
@@ -370,9 +443,47 @@ mod tests {
         let record = build_cron_instructions(dir.path(), 7, "2026-06-18T15:45:30Z", "codex,claude");
         write_cron_instructions(dir.path(), &record).unwrap();
 
-        delete_cron_instructions(dir.path()).unwrap();
-        assert!(!cron_instructions_path(dir.path()).exists());
-        delete_cron_instructions(dir.path()).unwrap();
+        delete_cron_instructions(dir.path(), 7).unwrap();
+        assert!(!cron_instructions_path(dir.path(), 7).exists());
+        delete_cron_instructions(dir.path(), 7).unwrap();
+    }
+
+    /// 13-DEFERRED-CR-03 re-check: two phases' rate-limit records must
+    /// coexist — the old single-slot file let one clobber the other.
+    #[test]
+    fn cron_instructions_are_per_phase() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = build_cron_instructions(dir.path(), 7, "2026-06-18T15:45:30Z", "claude,codex");
+        let b = build_cron_instructions(dir.path(), 8, "2026-06-18T16:45:30Z", "codex,claude");
+        write_cron_instructions(dir.path(), &a).unwrap();
+        write_cron_instructions(dir.path(), &b).unwrap();
+
+        assert_eq!(load_cron_instructions(dir.path(), 7).unwrap(), a);
+        assert_eq!(load_cron_instructions(dir.path(), 8).unwrap(), b);
+        let listed = list_cron_instructions(dir.path());
+        assert_eq!(listed.iter().map(|i| i.phase).collect::<Vec<_>>(), [7, 8]);
+
+        delete_cron_instructions(dir.path(), 7).unwrap();
+        assert!(load_cron_instructions(dir.path(), 7).is_err());
+        assert_eq!(load_cron_instructions(dir.path(), 8).unwrap(), b);
+    }
+
+    /// Upgrade path: a legacy single-slot `cron-instructions.json` written by
+    /// an older binary is still loadable/listable/deletable for its phase.
+    #[test]
+    fn legacy_cron_instructions_are_read_and_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = build_cron_instructions(dir.path(), 5, "2026-06-18T15:45:30Z", "claude,codex");
+        let legacy = legacy_cron_instructions_path(dir.path());
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, serde_json::to_string_pretty(&record).unwrap()).unwrap();
+
+        assert_eq!(load_cron_instructions(dir.path(), 5).unwrap(), record);
+        assert!(load_cron_instructions(dir.path(), 6).is_err());
+        assert_eq!(list_cron_instructions(dir.path()).len(), 1);
+
+        delete_cron_instructions(dir.path(), 5).unwrap();
+        assert!(!legacy.exists());
     }
 
     #[test]
