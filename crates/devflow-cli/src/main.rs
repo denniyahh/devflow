@@ -1629,14 +1629,35 @@ fn logs(
     let exit_path = agent_result::exit_code_path(project_root, phase);
     loop {
         std::thread::sleep(std::time::Duration::from_millis(500));
-        let new_offset = print_capture_from(&path, offset)?;
-        if exit_path.exists() && new_offset == offset {
+        // 14-CR-03: a stage transition deletes and recreates the capture
+        // file (launch_stage → cleanup_phase_files), so a shrunken file
+        // means the next stage started — reset to the top instead of
+        // seeking past EOF forever and silently skipping its output.
+        let base = rollover_offset(&path, offset);
+        if base != offset {
+            eprintln!("== capture restarted (next stage) — following from the top ==");
+        }
+        let new_offset = print_capture_from(&path, base)?;
+        // Quiescent only if no rollover happened AND no new bytes appeared.
+        if exit_path.exists() && base == offset && new_offset == offset {
             if let Ok(code) = std::fs::read_to_string(&exit_path) {
                 eprintln!("== agent exited with code {} ==", code.trim());
             }
             return Ok(());
         }
         offset = new_offset;
+    }
+}
+
+/// Detect capture-file rollover for `logs --follow` (14-CR-03): a file
+/// shorter than the follower's offset was deleted and recreated by the next
+/// stage's monitor, so following must restart from 0. A missing file (the
+/// mid-rollover gap) keeps the current offset — the recreated file's shorter
+/// length triggers the reset on a later poll if output restarted.
+fn rollover_offset(path: &Path, offset: u64) -> u64 {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.len() < offset => 0,
+        _ => offset,
     }
 }
 
@@ -2320,6 +2341,24 @@ mod tests {
     fn default_logs_phase_errors_with_nothing_to_show() {
         let dir = tempfile::tempdir().unwrap();
         assert!(default_logs_phase(dir.path()).is_err());
+    }
+
+    /// 14-CR-03: a capture file SHORTER than the follower's offset means the
+    /// next stage's monitor deleted and recreated it — the follower must
+    /// restart from 0, not seek past EOF forever.
+    #[test]
+    fn rollover_offset_resets_on_shrunken_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("capture");
+        std::fs::write(&path, "abc").unwrap();
+
+        // File (3 bytes) shorter than offset 10 → rollover → 0.
+        assert_eq!(rollover_offset(&path, 10), 0);
+        // File longer than or equal to the offset → keep the offset.
+        assert_eq!(rollover_offset(&path, 3), 3);
+        assert_eq!(rollover_offset(&path, 2), 2);
+        // Missing file (mid-rollover gap) → keep the offset for now.
+        assert_eq!(rollover_offset(&dir.path().join("gone"), 7), 7);
     }
 
     #[test]
