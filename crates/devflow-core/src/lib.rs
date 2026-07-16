@@ -22,8 +22,8 @@
 //! | `trace` | Full tracing subscriber internals |
 //!
 //! ```bash
-//! RUST_LOG=info devflow start --phase 3 --agent claude   # Default: shows state transitions
-//! RUST_LOG=debug devflow start --phase 3 --agent claude  # Also shows git commands and file I/O
+//! RUST_LOG=info devflow start --phase 3 --agent claude --mode auto   # Default: shows state transitions
+//! RUST_LOG=debug devflow start --phase 3 --agent claude --mode auto  # Also shows git commands and file I/O
 //! RUST_LOG=warn devflow status                           # Suppress info, show only warnings
 //! ```
 //!

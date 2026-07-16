@@ -9,7 +9,7 @@
 | 12 | Bootstrap + Housekeeping | Complete |
 | 13 | MVP Core Loop | Complete    |
 | 14 | Parallel Safety + Observability | Complete |
-| 15 | OSS Readiness | Scoped |
+| 15 | Dogfood Enablement + OSS Readiness | 15a Complete / 15b Scoped |
 | 16 | Hermes Support | Scoped |
 
 ## Shipped
@@ -116,16 +116,17 @@ Plans:
 
 See `14-SUMMARY.md` for validation + live two-phase e2e acceptance evidence.
 
-### Phase 15: OSS Readiness
+### Phase 15: Dogfood Enablement + OSS Readiness
 
-**Goal:** Make DevFlow ready for public consumption — dev container, contribution docs, a full ARCHITECTURE.md/README rewrite against v2 reality, Antigravity agent support, and the actual crates.io publish.
-**Requirements**: TBD (see CONTEXT.md)
-**Depends on:** Phase 13 (docs must describe the post-MVP loop)
-**Plans:** 0 plans
+**Goal:** Rescoped 2026-07-16 (dogfood-first — operator priority is a fully functional MVP for dogfooding). **15a Dogfood Enablement:** `devflow gate` subcommand (list/approve/reject — removes the last hand-edited-JSON step in the loop), an accurate `OPERATIONS.md` operator reference, and the doc-accuracy quick hits (`.devflow.yaml` decoy removal, IN-01 lib.rs rustdoc, `--help` snapshot test); exit criterion: a real phase runs end-to-end with gates answered only via `devflow gate` + the notify hook. **15b OSS Packaging** (run *through* DevFlow as the first post-MVP dogfood): README/ARCHITECTURE rewrite against v2 reality, CONTRIBUTING, dev container, crates.io publish. Antigravity adapter (old 15c) deferred out of the phase to unscheduled backlog.
+**Requirements**: 15a, 15b (see CONTEXT.md)
+**Depends on:** Phase 14
+**Plans:** 15a in progress
 
 Plans:
 
-- [ ] TBD (run /gsd-plan-phase 15 to break down)
+- [x] 15a — dogfood enablement (gate subcommand, OPERATIONS.md, accuracy fixes) — complete 2026-07-16; exit criterion verified live (full phase with the gate answered only via `devflow gate approve`)
+- [ ] 15b — OSS packaging (run /gsd-plan-phase 15 to break down; execute via DevFlow dogfood)
 
 ### Phase 16: Hermes Support
 

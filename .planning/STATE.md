@@ -3,7 +3,7 @@ gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
 status: In progress
-stopped_at: Phase 14 complete incl. post-ship review fixes (14-REVIEW-FIX.md; 260 tests, live two-phase e2e); next Phase 15 (OSS Readiness)
+stopped_at: Phase 15a complete (devflow gate CLI, OPERATIONS.md, accuracy fixes; 267 tests; live e2e with gate answered via CLI) — dogfooding unblocked; next 15b OSS packaging AS a DevFlow dogfood run
 last_updated: "2026-07-16T12:00:00.000Z"
 progress:
   total_phases: 5
@@ -19,7 +19,7 @@ progress:
 
 ## Active
 
-- **Phase 15 (Scoped):** OSS Readiness — renumbered from 13 (2026-07-14); docs/devcontainer/contributing + Antigravity adapter + crates.io publish. Docs must now also cover Phase 14's `devflow logs`, `advance --phase`, and per-phase `.devflow/` file naming
+- **Phase 15 (15a Complete / 15b Scoped):** Dogfood Enablement + OSS Readiness — rescoped 2026-07-16 dogfood-first. 15a COMPLETE: `devflow gate list/approve/reject`, OPERATIONS.md, `.devflow.yaml` decoy removed, lib.rs examples fixed, `--help` snapshot guard; exit criterion verified live (full phase, gate answered only via CLI). 15b: OSS packaging (README/ARCHITECTURE/CONTRIBUTING/devcontainer/crates.io publish), to be run through DevFlow as the first post-MVP dogfood — `devflow start --phase 15 --agent claude --mode auto`. Antigravity adapter deferred to unscheduled backlog
 - **Phase 16 (Scoped):** Hermes Support — split out of Phase 14 (2026-07-16); HermesAgent adapter, skill-file rewrite, Hermes plugin. Depends on Phase 14's events.jsonl + Phase 13's notify hook
 
 ## Completed
@@ -52,6 +52,7 @@ None.
 
 | Date | Decision |
 |---|---|
+| 2026-07-16 | **Phase 15 rescoped dogfood-first:** operator priority is a fully functional MVP for dogfooding. The MVP engine is done (13 + 14); the remaining friction is operational: gate responses required hand-writing `.devflow/gates/NN-stage.response.json`, and no accurate operator reference exists. Phase 15 now leads with 15a Dogfood Enablement (`devflow gate` list/approve/reject, OPERATIONS.md, plus pulled-forward accuracy items: `.devflow.yaml` decoy removal, IN-01 lib.rs rustdoc, `--help` snapshot test); 15b OSS packaging follows and is to be executed through DevFlow itself as the first post-MVP dogfood run. Antigravity adapter (old 15c) deferred to unscheduled backlog — serves neither priority. Phase 14 was merged to develop (431c743) before this rescope. |
 | 2026-07-16 | **Phase 14 post-ship code review + fixes:** independent high-effort review (8 finder angles, 1-vote verification) found 10 issues — 2 critical (recover --clean wiped live sibling phases; checkout-lock timeout ran hooks unserialized), 7 warning, 1 info — all documented in `14-REVIEW.md` and resolved in `14-REVIEW-FIX.md` (7 fixed, 2 mitigated, 1 accepted-by-design). Notable policy calls: `recover --clean` now sweeps stale phases only with `--phase N` as the explicit escape hatch; a checkout-lock timeout skips the hook batch rather than ever mutating the checkout unserialized (`DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS` tunable); agent binaries are preflighted before any monitor spawns. |
 | 2026-07-16 | **Phase 14 complete — CR-03 closed:** per-phase `state-{NN}.json` + `advance --phase N` threaded from the monitor at spawn time (no shared singleton, pre-lock read deleted), two-level locking (per-phase advance lock + seconds-scale `lock-project` around all primary-checkout git mutation), per-phase `cron-instructions-{NN}.json`, sequentagent behind a no-advance monitor holding its phase lock (sync `launch_agent`/`capture_agent_output` deleted), `events.jsonl` schema v1, `devflow logs [--follow]`, multi-phase `status`/`recover`. Legacy `state.json`/`cron-instructions.json` migrate/read-compat on first touch. Checkout-lock acquisition in the hook path is fail-soft (warn + proceed unserialized after 120s) — a wedged sibling must not abort an advance; integrate paths fail hard instead. Validated: 252 tests, clippy/fmt clean, live two-phase e2e with both Ship gates open concurrently and both version-bump tags landing. |
 | 2026-07-16 | **Phase 14 split — Hermes work (14c–e) moved to new Phase 16:** the 2026-07-14 move of Hermes into 14 was a workload-balance call made before CR-03 was deferred there (2026-07-15), which made 14 the heaviest phase instead of the slimmest. Phase 14 is now Parallel Safety + Observability, ordered 14a (CR-03) → 14b (capture_agent_output sync-path) → 14c (observability) because per-phase state files dictate what `status`/`logs`/`events.jsonl` enumerate — building observability first would mean rebuilding it. Phase 16 (Hermes Support) sits after Phase 15 so personal-infrastructure work doesn't gate OSS readiness; it depends on 14's `events.jsonl` and 13's notify hook. Dir renamed: `14-observability-hermes` → `14-parallel-safety-observability`; new `16-hermes-support` (neither 14 nor 16 had plans yet). |
