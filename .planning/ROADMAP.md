@@ -2,14 +2,15 @@
 
 > Phase plan source of truth. Each phase drives a `devflow start` agent session.
 
-## v2.0.0 (Phase 11–15)
+## v2.0.0 (Phase 11–16)
 
 | Phase | Name | Status |
 |---|---|---|
 | 12 | Bootstrap + Housekeeping | Complete |
 | 13 | MVP Core Loop | Complete    |
-| 14 | Observability + Hermes Support | Scoped |
+| 14 | Parallel Safety + Observability | Scoped |
 | 15 | OSS Readiness | Scoped |
+| 16 | Hermes Support | Scoped |
 
 ## Shipped
 
@@ -37,6 +38,11 @@
 - **Phase 13 repurposed as MVP Core Loop** — priority is getting Define→Plan→Code→Validate→Ship working end-to-end unattended (Claude + Codex, gates via notify hook) so DevFlow can be dogfooded on real projects again. Claims the previously unclaimed `ship.rs` GSD-native rewrite; absorbs the reliability items from old Phase 14 (verdict-vs-ran, native envelope parsing, WR-11, notify hook, gate timeout, worktree default).
 - **Phase 14 rescoped to Observability + Hermes Support** — residual `devflow logs`/`events.jsonl`/`status` work plus the previously unclaimed `capture_agent_output()` sync-path decision (now claimed there). Hermes work (agent adapter, skill-file rewrite, plugin) moved in from Phase 15 (2026-07-14) — the plugin's gate watcher consumes this phase's `events.jsonl`, so they ship together.
 - **Phase 15 (was 13)** — OSS readiness (docs, dev container, contributing, Antigravity adapter) plus the actual crates.io publish. Hermes items moved out to Phase 14.
+
+## Phase 14 split (2026-07-16)
+
+- **Phase 14 rescoped to Parallel Safety + Observability** — the 2026-07-14 move of Hermes into Phase 14 was a workload-balance call made before the CR-03 parallel-safety flaw was deferred there (2026-07-15), which made 14 the heaviest phase instead of the slimmest. Phase 14 now leads with CR-03 (per-phase state files, phase-threaded monitor advance, coarse lock for main-checkout mutations), keeps the `capture_agent_output()` sync-path decision, and builds observability (`logs`/`events.jsonl`/`status`) on the final per-phase state model — in that order, since the state-file shape dictates what `status`/`logs`/`events.jsonl` enumerate.
+- **Phase 16 (new): Hermes Support** — HermesAgent adapter, skill-file rewrite, and Hermes plugin moved out of 14. Depends on Phase 14 (the plugin's gate watcher consumes `events.jsonl` and the Phase 13 notify hook); sits after Phase 15 so public-facing OSS readiness isn't gated on personal-infrastructure work.
 
 ### Phase 12: Bootstrap + Housekeeping
 
@@ -94,16 +100,16 @@ Plans:
 
 - [x] 13-06-PLAN.md — 13e: MVP acceptance dogfood run — Claude full-loop + Full-Ship re-verification + Codex leg (manual checkpoints)
 
-### Phase 14: Observability + Hermes Support
+### Phase 14: Parallel Safety + Observability
 
-**Goal:** Surface loop progress instead of a black box — `devflow logs [--follow]`, append-only `events.jsonl`, richer `devflow status` — settle the `capture_agent_output()` sync-path decision, and add first-class Hermes support: `HermesAgent` adapter (14c), skill-file rewrite (14d), and the Hermes plugin session mode (14e, gate watcher built on 13c's notify hook + this phase's events.jsonl). Also owns the deferred CR-03 design flaw from Phase 13's post-fix review: per-phase locks sit on a project-global `state.json` and unguarded main-checkout git ops, so `devflow parallel` is unsafe by construction — fix shape and acceptance criteria in `phases/13-mvp-core-loop/13-DEFERRED-CR-03.md` (per-phase state files, phase-threaded monitor advance, short coarse lock for main-checkout mutations).
-**Requirements**: TBD (see CONTEXT.md); 13-DEFERRED-CR-03 (parallel-safety)
+**Goal:** Make concurrent phases safe by construction, then surface loop progress instead of a black box. Leads with the deferred CR-03 design flaw from Phase 13's post-fix review: per-phase locks sit on a project-global `state.json` and unguarded main-checkout git ops, so `devflow parallel` is unsafe by construction — fix shape and acceptance criteria in `phases/13-mvp-core-loop/13-DEFERRED-CR-03.md` (per-phase state files, phase-threaded monitor advance, short coarse lock for main-checkout mutations) (14a). Then the `capture_agent_output()` sync-path decision, taken alongside CR-03's sequentagent re-check (14b), and observability — `devflow logs [--follow]`, append-only phase-aware `events.jsonl`, richer `devflow status` — built on the per-phase state model (14c). Hermes work moved out to Phase 16 (2026-07-16).
+**Requirements**: 13-DEFERRED-CR-03 (parallel-safety), 14a–14c (see CONTEXT.md)
 **Depends on:** Phase 13
 **Plans:** 0 plans
 
 Plans:
 
-- [ ] TBD (run /gsd-plan-phase 14 to break down)
+- [ ] TBD (run /gsd-plan-phase 14 to break down; plan order 14a → 14b → 14c per CONTEXT.md)
 
 ### Phase 15: OSS Readiness
 
@@ -115,3 +121,14 @@ Plans:
 Plans:
 
 - [ ] TBD (run /gsd-plan-phase 15 to break down)
+
+### Phase 16: Hermes Support
+
+**Goal:** First-class Hermes support — `HermesAgent` adapter with native-envelope completion parsing (16a), rewrite of the stale `skills/hermes/devflow/SKILL.md` against current CLI behavior (16b), and the Hermes plugin session mode with an events.jsonl-driven gate watcher (16c). Split out of Phase 14 on 2026-07-16 so personal-infrastructure work doesn't gate parallel-safety correctness or OSS readiness.
+**Requirements**: TBD (see CONTEXT.md)
+**Depends on:** Phase 14 (consumes `events.jsonl` + the Phase 13 notify hook)
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (run /gsd-plan-phase 16 to break down)

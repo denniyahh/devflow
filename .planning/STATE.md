@@ -6,11 +6,11 @@ status: In progress
 stopped_at: Phase 13 complete (verified 24/24, code review + post-fix review applied); next /gsd-discuss-phase 14
 last_updated: "2026-07-16T00:00:00.000Z"
 progress:
-  total_phases: 4
+  total_phases: 5
   completed_phases: 2
   total_plans: 18
   completed_plans: 18
-  percent: 50
+  percent: 40
 ---
 
 # DevFlow — Project State
@@ -19,8 +19,9 @@ progress:
 
 ## Active
 
-- **Phase 14 (Scoped):** Observability + Hermes Support — rescoped 2026-07-14 (reliability items moved to 13; claims capture_agent_output() decision; Hermes adapter/skill/plugin moved in from 15). Also owns the deferred CR-03 parallel-safety flaw (`phases/13-mvp-core-loop/13-DEFERRED-CR-03.md`). Next up: `/gsd-discuss-phase 14`
-- **Phase 15 (Scoped):** OSS Readiness — renumbered from 13 (2026-07-14); docs/devcontainer/contributing + Antigravity adapter + crates.io publish (Hermes items moved to 14)
+- **Phase 14 (Scoped):** Parallel Safety + Observability — split 2026-07-16 (Hermes work moved out to new Phase 16). Leads with the deferred CR-03 parallel-safety flaw (`phases/13-mvp-core-loop/13-DEFERRED-CR-03.md`), then the capture_agent_output() sync-path decision, then observability (`logs`/`events.jsonl`/`status`) on the per-phase state model. Next up: `/gsd-discuss-phase 14`
+- **Phase 15 (Scoped):** OSS Readiness — renumbered from 13 (2026-07-14); docs/devcontainer/contributing + Antigravity adapter + crates.io publish
+- **Phase 16 (Scoped):** Hermes Support — split out of Phase 14 (2026-07-16); HermesAgent adapter, skill-file rewrite, Hermes plugin. Depends on Phase 14's events.jsonl + Phase 13's notify hook
 
 ## Completed
 
@@ -51,6 +52,7 @@ None.
 
 | Date | Decision |
 |---|---|
+| 2026-07-16 | **Phase 14 split — Hermes work (14c–e) moved to new Phase 16:** the 2026-07-14 move of Hermes into 14 was a workload-balance call made before CR-03 was deferred there (2026-07-15), which made 14 the heaviest phase instead of the slimmest. Phase 14 is now Parallel Safety + Observability, ordered 14a (CR-03) → 14b (capture_agent_output sync-path) → 14c (observability) because per-phase state files dictate what `status`/`logs`/`events.jsonl` enumerate — building observability first would mean rebuilding it. Phase 16 (Hermes Support) sits after Phase 15 so personal-infrastructure work doesn't gate OSS readiness; it depends on 14's `events.jsonl` and 13's notify hook. Dir renamed: `14-observability-hermes` → `14-parallel-safety-observability`; new `16-hermes-support` (neither 14 nor 16 had plans yet). |
 | 2026-07-15 | **CR-03 follow-up deferred to Phase 14:** per-phase locks are correct, but `state.json` and main-checkout git ops stayed project-global, so `devflow parallel` remains unsafe. Fix shape (per-phase state files, phase-threaded monitor advance, coarse lock for checkout mutations) + acceptance criteria in `phases/13-mvp-core-loop/13-DEFERRED-CR-03.md`. |
 | 2026-06-19 | **v2.0.0 architecture:** DevFlow is a GSD-native execution engine with gate file protocol. Two modes (full auto, supervise). State machine: Define→Plan→Code→Validate→Ship. All skip logic removed. Conventional commits permanently deprecated. |
 | 2026-06-19 | **Versioning:** Hybrid Git-Based SemVer. MAJOR from project version file. MINOR = git tag count. PATCH = commit count since last minor tag. Zero human decisions per release. |
@@ -83,6 +85,7 @@ None.
 
 ## Roadmap Evolution
 
+- Phase 14 split (2026-07-16): Hermes work (adapter, skill rewrite, plugin) moved out of 14 to new Phase 16 (`16-hermes-support`); 14 retitled Parallel Safety + Observability (dir `14-parallel-safety-observability`), leading with the deferred CR-03 flaw. See 2026-07-16 decision entry.
 - MVP restructure (2026-07-14): Phase 13 repurposed as MVP Core Loop (dir `13-mvp-core-loop`); old Phase 13 OSS/Hermes content moved to new Phase 15; Phase 14 rescoped to observability. Later same day: Hermes work moved 15 → 14 (now `14-observability-hermes`), 15 slimmed to OSS Readiness (`15-oss-readiness`). See 2026-07-14 decision entries.
 - Phase 14 added: Reliability & Observability Hardening — verdict-vs-ran split in completion protocol, native per-agent JSON envelope parsing, worktree-isolation-by-default for `start`, observability (`devflow logs`, `events.jsonl`, gate notify hook, configurable gate timeout). Scoped from external code review (2026-07-08). Extended 2026-07-08 with WR-11 (silent halt on non-Validate stage failure, from Phase 11 code review).
 - Phase 13 scope extended: ARCHITECTURE.md full rewrite, `.devflow.yaml` decoy removal, `--help` snapshot CI test, Hermes skill file rewrite — added to existing 13b alongside the already-scoped README rewrite. Extended 2026-07-08 with IN-01 (stale lib.rs rustdoc, from Phase 11 code review).
