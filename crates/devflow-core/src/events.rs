@@ -70,15 +70,30 @@ pub fn emit(project_root: &Path, phase: u32, event: &str, fields: serde_json::Va
     }
 }
 
-/// Read the last event line recorded for `phase`, if any. Used by
-/// `devflow status` to show a phase's most recent action.
-pub fn last_event_for_phase(project_root: &Path, phase: u32) -> Option<serde_json::Value> {
-    let contents = std::fs::read_to_string(events_path(project_root)).ok()?;
-    contents
+/// The most recent event per phase, from ONE read + parse pass over the log
+/// (14-CR-10) — `devflow status` renders N phases without N full-file scans.
+pub fn last_events_by_phase(
+    project_root: &Path,
+) -> std::collections::HashMap<u32, serde_json::Value> {
+    let mut latest = std::collections::HashMap::new();
+    let Ok(contents) = std::fs::read_to_string(events_path(project_root)) else {
+        return latest;
+    };
+    for event in contents
         .lines()
-        .rev()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .find(|event| event.get("phase").and_then(|p| p.as_u64()) == Some(phase as u64))
+    {
+        if let Some(phase) = event.get("phase").and_then(|p| p.as_u64()) {
+            // Later lines overwrite earlier ones — appends are chronological.
+            latest.insert(phase as u32, event);
+        }
+    }
+    latest
+}
+
+/// Read the last event line recorded for `phase`, if any.
+pub fn last_event_for_phase(project_root: &Path, phase: u32) -> Option<serde_json::Value> {
+    last_events_by_phase(project_root).remove(&phase)
 }
 
 /// Render an event as a short human-readable summary ("gate_fired (ship)").
@@ -178,6 +193,32 @@ mod tests {
         let other = last_event_for_phase(dir.path(), 2).expect("phase 2 events exist");
         assert_eq!(other["event"], "workflow_started");
         assert!(last_event_for_phase(dir.path(), 3).is_none());
+    }
+
+    /// 14-CR-10: one pass over the log yields every phase's latest event.
+    #[test]
+    fn last_events_by_phase_collects_latest_per_phase_in_one_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        emit(dir.path(), 1, "workflow_started", serde_json::Value::Null);
+        emit(dir.path(), 2, "workflow_started", serde_json::Value::Null);
+        emit(
+            dir.path(),
+            1,
+            "transition",
+            serde_json::json!({"to": "plan"}),
+        );
+        emit(
+            dir.path(),
+            2,
+            "gate_fired",
+            serde_json::json!({"stage": "ship"}),
+        );
+
+        let latest = last_events_by_phase(dir.path());
+        assert_eq!(latest.len(), 2);
+        assert_eq!(latest[&1]["event"], "transition");
+        assert_eq!(latest[&2]["event"], "gate_fired");
+        assert!(last_events_by_phase(&dir.path().join("empty")).is_empty());
     }
 
     #[test]

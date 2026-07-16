@@ -567,16 +567,15 @@ fn launch_stage(state: &State, prompt_override: Option<String>) -> Result<(), Cl
     Ok(())
 }
 
-/// Resolve which phase a bare `devflow advance` (no `--phase`) refers to:
-/// only unambiguous when exactly one phase is active. Exists for monitors
-/// spawned by a pre-14a binary that doesn't pass `--phase`.
-fn resolve_sole_active_phase(project_root: &Path) -> Result<u32, CliError> {
+/// The single active phase: `Ok(Some)` when exactly one is active, `Ok(None)`
+/// when none, and an error naming the candidates when several are — shared by
+/// `advance`'s legacy fallback and `logs`'s default-phase resolution so the
+/// ambiguity rule and message live in one place.
+fn single_active_phase(project_root: &Path) -> Result<Option<u32>, CliError> {
     let states = workflow::list_states(project_root);
     match states.as_slice() {
-        [] => Err(CliError::Message(
-            "no active DevFlow state — nothing to advance".into(),
-        )),
-        [one] => Ok(one.phase),
+        [] => Ok(None),
+        [one] => Ok(Some(one.phase)),
         many => Err(CliError::Message(format!(
             "multiple active phases ({}) — pass --phase to pick one",
             many.iter()
@@ -585,6 +584,14 @@ fn resolve_sole_active_phase(project_root: &Path) -> Result<u32, CliError> {
                 .join(", ")
         ))),
     }
+}
+
+/// Resolve which phase a bare `devflow advance` (no `--phase`) refers to:
+/// only unambiguous when exactly one phase is active. Exists for monitors
+/// spawned by a pre-14a binary that doesn't pass `--phase`.
+fn resolve_sole_active_phase(project_root: &Path) -> Result<u32, CliError> {
+    single_active_phase(project_root)?
+        .ok_or_else(|| CliError::Message("no active DevFlow state — nothing to advance".into()))
 }
 
 /// Advance the stage machine after a monitored agent for `state.stage` exits.
@@ -597,7 +604,23 @@ fn advance(project_root: &Path, phase: Option<u32>) -> Result<(), CliError> {
     // monitors spawned by an older binary.
     let phase = match phase {
         Some(phase) => phase,
-        None => resolve_sole_active_phase(project_root)?,
+        None => match resolve_sole_active_phase(project_root) {
+            Ok(phase) => phase,
+            Err(err) => {
+                // 14-CR-06: a legacy monitor's bare `advance` failing here
+                // would otherwise be invisible (its output goes to
+                // /dev/null) and its phase silently stalls — record the
+                // failure in events.jsonl. Phase 0 is the "could not
+                // attribute a phase" sentinel; no real phase is 0.
+                events::emit(
+                    project_root,
+                    0,
+                    "advance_failed",
+                    serde_json::json!({ "reason": err.to_string() }),
+                );
+                return Err(err);
+            }
+        },
     };
     // CR-03 (13-REVIEW.md): the lock is scoped per-phase, not per-project.
     // advance() holds it across a gate's multi-day blocking wait, and every
@@ -1286,8 +1309,20 @@ fn integrate_agent_branch(
     base: &str,
     agent_branch: &str,
 ) -> Result<(), CliError> {
+    // 14-CR-07: this hard-fails on a lock timeout by design (a shared-ref
+    // mutation must never run unlocked), which can leave an earlier agent's
+    // branch integrated and this one not — so the error carries resume
+    // guidance instead of leaving the operator to guess (re-running with
+    // --force would re-run agents on top of already-integrated work).
     let _checkout_lock = lock::acquire_project_blocking(project_root, checkout_lock_timeout())
-        .map_err(|err| CliError::Message(format!("could not lock checkout: {err}")))?;
+        .map_err(|err| {
+            CliError::Message(format!(
+                "could not lock checkout to integrate {agent_branch} into {base}: {err}. \
+                 Earlier integrations into {base} are already in place; once the lock \
+                 holder finishes, integrate manually with \
+                 `git fetch . {agent_branch}:{base}` — do NOT re-run sequentagent --force."
+            ))
+        })?;
     git.fast_forward_branch(base, agent_branch)?;
     println!("integrated {agent_branch} into {base}");
     if git.has_remote() {
@@ -1586,6 +1621,9 @@ fn status(project_root: &Path) -> Result<(), CliError> {
         println!("stage: idle");
         println!("project_root: {}", project_root.display());
     } else {
+        // 14-CR-10: one pass over events.jsonl for every phase's last event,
+        // instead of a full-file scan per phase.
+        let mut last_events = events::last_events_by_phase(project_root);
         println!("project_root: {}", project_root.display());
         println!(
             "active phases: {}",
@@ -1628,7 +1666,7 @@ fn status(project_root: &Path) -> Result<(), CliError> {
                 }
                 None => println!("  agent_pid: none"),
             }
-            if let Some(event) = events::last_event_for_phase(project_root, state.phase) {
+            if let Some(event) = last_events.remove(&state.phase) {
                 let ago = event
                     .get("ts")
                     .and_then(|t| t.as_u64())
@@ -1734,20 +1772,8 @@ fn print_capture_from(path: &Path, offset: u64) -> Result<u64, CliError> {
 /// Pick the phase `devflow logs` should show when none is given: the single
 /// active phase, else the phase with the most recently modified capture file.
 fn default_logs_phase(project_root: &Path) -> Result<u32, CliError> {
-    let states = workflow::list_states(project_root);
-    match states.as_slice() {
-        [one] => return Ok(one.phase),
-        [_, ..] => {
-            return Err(CliError::Message(format!(
-                "multiple active phases ({}) — pass --phase to pick one",
-                states
-                    .iter()
-                    .map(|s| s.phase.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )));
-        }
-        [] => {}
+    if let Some(phase) = single_active_phase(project_root)? {
+        return Ok(phase);
     }
     // No active state: fall back to the newest capture file on disk.
     let devflow = workflow::devflow_dir(project_root);

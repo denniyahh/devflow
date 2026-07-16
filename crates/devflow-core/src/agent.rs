@@ -7,8 +7,6 @@
 //! `sequentagent` moved behind monitor-owned execution — the monitor is now
 //! the single way an agent process is spawned.
 
-use crate::state::AgentKind;
-
 /// Check whether a process with the given PID is still running.
 ///
 /// The PID typically comes from parsing an on-disk file, so hostile or
@@ -24,11 +22,6 @@ pub fn agent_running(pid: u32) -> bool {
         return false;
     };
     pid > 0 && unsafe { libc::kill(pid, 0) == 0 }
-}
-
-/// Generate a human-readable label for the agent session.
-pub fn agent_label(agent: AgentKind, pid: u32) -> String {
-    format!("{}-{}", agent, pid)
 }
 
 #[cfg(test)]
@@ -56,11 +49,5 @@ mod tests {
         // kill(-1, 0) probes every signalable process — almost always "alive".
         assert!(!agent_running(u32::MAX));
         assert!(!agent_running(i32::MAX as u32 + 1));
-    }
-
-    #[test]
-    fn agent_label_combines_agent_and_pid() {
-        assert_eq!(agent_label(AgentKind::Claude, 42), "claude-42");
-        assert_eq!(agent_label(AgentKind::OpenCode, 7), "opencode-7");
     }
 }
