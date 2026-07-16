@@ -471,6 +471,7 @@ fn start(
         "started phase {} in {mode} mode at {} — monitor will auto-advance",
         state.phase, state.started_at
     );
+    println!("  watch live: devflow logs -f --phase {phase}");
     Ok(())
 }
 
@@ -496,6 +497,37 @@ fn worktree_writable_roots(project_root: &Path, worktree: &Path) -> Vec<PathBuf>
     vec![git_dir, admin]
 }
 
+/// Whether `program` resolves to an executable — a direct check for paths
+/// containing a separator, a PATH scan otherwise. Restores the fail-fast
+/// "is it installed?" diagnosis (14-CR-05) that the deleted synchronous
+/// launch path used to get from `ErrorKind::NotFound`: the monitor's `sh`
+/// exec of a missing binary only surfaces as a cryptic exit 127 after
+/// worktrees and monitors were already set up.
+fn agent_binary_available(program: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let executable = |path: &Path| {
+        path.is_file()
+            && std::fs::metadata(path)
+                .map(|m| m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+    };
+    if program.contains('/') {
+        return executable(Path::new(program));
+    }
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| executable(&dir.join(program))))
+        .unwrap_or(false)
+}
+
+fn ensure_agent_binary(program: &str) -> Result<(), CliError> {
+    if agent_binary_available(program) {
+        return Ok(());
+    }
+    Err(CliError::Message(format!(
+        "agent binary `{program}` not found — is it installed? (run `devflow doctor`)"
+    )))
+}
+
 /// Spawn the background monitor that owns the agent for `state.stage`. The
 /// monitor calls `devflow advance` when the agent exits. An optional
 /// `prompt_override` is used for Code loop-backs (fix prompts).
@@ -512,6 +544,7 @@ fn launch_stage(state: &State, prompt_override: Option<String>) -> Result<(), Cl
         .map(|wt| worktree_writable_roots(&state.project_root, wt))
         .unwrap_or_default();
     let (program, args) = adapter.exec_command(state.phase, &prompt, &roots);
+    ensure_agent_binary(program)?;
 
     agent_result::cleanup_phase_files(&state.project_root, state.phase);
     let pid = monitor::spawn_monitor(state, program, &args, &adapter.extra_env())
@@ -1195,6 +1228,7 @@ fn run_agent_blocking(
         worktree_writable_roots(project_root, workdir)
     };
     let (program, args) = adapter.exec_command(phase, &prompt, &roots);
+    ensure_agent_binary(program)?;
     // Synthetic, never-persisted state: the monitor only reads project_root,
     // phase, and worktree_path from it — sequentagent does not participate
     // in the stage machine.
@@ -1211,6 +1245,9 @@ fn run_agent_blocking(
         adapter.name(),
         workdir.display()
     );
+    // 14-CR-09: the sync path used to stream agent stderr to this terminal;
+    // the monitor captures it instead — tell the operator where to watch.
+    println!("  watch live: devflow logs -f --phase {phase} [--stderr]");
     let exit_code = monitor::wait_for_agent_exit(project_root, phase, monitor_pid)
         .map_err(|err| CliError::Message(format!("agent run did not complete: {err}")))?;
     println!("agent {agent} exited with code {exit_code}");
@@ -1334,7 +1371,8 @@ fn sequentagent(
                 let commits = count_commits_between(project_root, &base, &branch_a)?;
                 if commits == 0 {
                     println!(
-                        "Agent A rate-limited with zero commits; paused and wrote .devflow/cron-instructions.json"
+                        "Agent A rate-limited with zero commits; paused — resume record at {}",
+                        devflow_core::ship::cron_instructions_path(project_root, phase).display()
                     );
                     return Ok(());
                 }
@@ -1404,7 +1442,19 @@ fn write_rate_limit_cron(
     if instructions.hermes_cron.schedule.is_empty() {
         println!("no parseable retry time — auto-resume cron not scheduled; resume manually");
     } else {
-        println!("wrote .devflow/cron-instructions.json");
+        // 14-CR-08: name the file that was actually written (per-phase),
+        // not the retired single-slot path.
+        println!(
+            "wrote {}",
+            devflow_core::ship::cron_instructions_path(project_root, phase)
+                .strip_prefix(project_root)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| {
+                    devflow_core::ship::cron_instructions_path(project_root, phase)
+                        .display()
+                        .to_string()
+                })
+        );
     }
     Ok(())
 }
@@ -2341,6 +2391,21 @@ mod tests {
     fn default_logs_phase_errors_with_nothing_to_show() {
         let dir = tempfile::tempdir().unwrap();
         assert!(default_logs_phase(dir.path()).is_err());
+    }
+
+    /// 14-CR-05: a missing agent binary must fail fast with the actionable
+    /// "is it installed?" message, not a post-worktree exit-127 mystery.
+    #[test]
+    fn ensure_agent_binary_diagnoses_missing_program() {
+        // `sh` is guaranteed present on any host that can run devflow.
+        assert!(ensure_agent_binary("sh").is_ok());
+        assert!(ensure_agent_binary("/bin/sh").is_ok());
+
+        let err = ensure_agent_binary("definitely-not-a-real-agent-xyz").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not found — is it installed?"), "{msg}");
+        assert!(msg.contains("devflow doctor"), "{msg}");
+        assert!(ensure_agent_binary("/nonexistent/path/agent").is_err());
     }
 
     /// 14-CR-03: a capture file SHORTER than the follower's offset means the

@@ -365,9 +365,10 @@ mod tests {
 
         // The agent should be killed promptly by the monitor's trap —
         // poll rather than sleep a fixed amount to keep this fast and
-        // avoid flaking under load.
+        // avoid flaking under load. (Window widened to 5s: at 2s this
+        // still flaked under a fully parallel workspace test run.)
         let mut still_running = true;
-        for _ in 0..100 {
+        for _ in 0..250 {
             if !crate::agent::agent_running(agent_pid) {
                 still_running = false;
                 break;

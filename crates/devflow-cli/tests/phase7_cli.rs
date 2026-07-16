@@ -496,16 +496,23 @@ fn sequentagent_hands_off_after_rate_limit_and_writes_cron_instructions() {
         "agent B did not run after A's rate limit"
     );
 
-    // The cron instructions are written when A rate-limits...
-    assert!(stdout.contains("wrote .devflow/cron-instructions.json"));
+    // The cron instructions are written when A rate-limits — and the message
+    // must name the per-phase file that is actually written (14-CR-08).
+    assert!(
+        stdout.contains("wrote .devflow/cron-instructions-07.json"),
+        "message must name the real per-phase cron file:\n{stdout}"
+    );
     // ...but WR-02 (13-REVIEW.md): once B completes successfully the phase
     // has shipped, so the stale file must be deleted rather than surviving
     // to mislead `devflow status`/a Hermes cron into re-running a completed
     // phase.
-    let cron_path = root.join(".devflow/cron-instructions.json");
     assert!(
-        !cron_path.exists(),
+        !root.join(".devflow/cron-instructions-07.json").exists(),
         "cron instructions should be deleted after a successful post-rate-limit handoff"
+    );
+    assert!(
+        !root.join(".devflow/cron-instructions.json").exists(),
+        "the legacy single-slot record must never be written"
     );
 }
 
