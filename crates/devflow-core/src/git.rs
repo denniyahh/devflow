@@ -704,7 +704,10 @@ mod tests {
 
         // Merge a branch into develop WITHOUT deleting it (feature_finish
         // deletes on merge, which would leave nothing to check out).
-        git(root, &["checkout", "-q", "-b", "worktree-merged", "develop"]);
+        git(
+            root,
+            &["checkout", "-q", "-b", "worktree-merged", "develop"],
+        );
         commit_file(root, "g.txt");
         git(root, &["checkout", "-q", "develop"]);
         git(root, &["merge", "-q", "--no-ff", "worktree-merged"]);

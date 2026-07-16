@@ -95,8 +95,7 @@ pub fn acquire(project_root: &Path, phase: u32) -> Result<LockGuard, LockError> 
 /// corrupted lock permanently "held") and values that would wrap negative
 /// through the `pid_t` cast.
 fn pid_is_alive(pid: &str) -> bool {
-    pid.parse::<u32>()
-        .is_ok_and(crate::agent::agent_running)
+    pid.parse::<u32>().is_ok_and(crate::agent::agent_running)
 }
 
 /// Check whether a lock is currently held for this project/phase,

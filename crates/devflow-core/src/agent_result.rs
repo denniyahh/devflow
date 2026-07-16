@@ -1104,7 +1104,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
         let mut bytes = b"progress \xff\xfe garbage\n".to_vec();
-        bytes.extend_from_slice(b"DEVFLOW_RESULT: {\"status\":\"failed\",\"reason\":\"review: bad\"}\n");
+        bytes.extend_from_slice(
+            b"DEVFLOW_RESULT: {\"status\":\"failed\",\"reason\":\"review: bad\"}\n",
+        );
         std::fs::write(stdout_path(dir.path(), 5), bytes).unwrap();
 
         let result = evaluate_layer1(dir.path(), 5).unwrap();

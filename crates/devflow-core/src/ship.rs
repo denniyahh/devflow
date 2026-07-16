@@ -276,7 +276,7 @@ fn parse_offset_minutes(offset: &str) -> Option<i32> {
     let (hours_part, minutes_part) = match rest.split_once(':') {
         Some((hours, minutes)) => (hours, minutes),
         None => match rest.len() {
-            2 => (rest, "0"),           // ±HH
+            2 => (rest, "0"),              // ±HH
             4 => (&rest[..2], &rest[2..]), // ±HHMM
             _ => return None,
         },
