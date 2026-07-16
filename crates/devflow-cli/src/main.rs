@@ -30,6 +30,22 @@ fn gate_timeout_secs() -> u64 {
     parse_gate_timeout(std::env::var("DEVFLOW_GATE_TIMEOUT_SECS").ok())
 }
 
+/// Parse `DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS`, falling back to 120s. Pure
+/// (no env access) so it's unit-testable without mutating process-global env.
+fn parse_checkout_lock_timeout(raw: Option<String>) -> std::time::Duration {
+    const DEFAULT_SECS: u64 = 120;
+    std::time::Duration::from_secs(raw.and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_SECS))
+}
+
+/// How long a caller waits out a sibling phase's short critical section on
+/// the project-wide checkout lock before giving up, configurable via
+/// `DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS` (defaults to 120s) — generous
+/// relative to the seconds the lock is held for, tiny relative to a gate
+/// wait.
+fn checkout_lock_timeout() -> std::time::Duration {
+    parse_checkout_lock_timeout(std::env::var("DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS").ok())
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "devflow",
@@ -757,29 +773,50 @@ fn is_ship_review_failure(reason: &Option<String>) -> bool {
         .unwrap_or(false)
 }
 
-/// How long a caller waits out a sibling phase's short critical section on
-/// the project-wide checkout lock before giving up. Generous relative to the
-/// seconds the lock is held for, tiny relative to a gate wait.
-const CHECKOUT_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-
 /// Run a batch of hooks against the primary checkout, serialized across
 /// phases by the coarse project lock (13-DEFERRED-CR-03 fix shape #3): the
 /// hooks commit/tag/delete branches in the shared main checkout, and two
 /// phases doing that concurrently race git's `index.lock`/`HEAD`. Held for
 /// seconds — never across a gate wait. Hook failures stay fail-soft (warn
 /// and continue), as before.
+///
+/// 14-CR-02: a lock timeout SKIPS the batch instead of running it
+/// unserialized — mutating the shared checkout concurrently is the exact
+/// race this lock exists to prevent, and the hooks are individually
+/// fail-soft anyway, so skipping them preserves the phase's liveness at the
+/// cost of a loudly-reported missing docs/changelog/version-bump pass.
 fn run_checkout_hooks(project_root: &Path, state: &State, batch: &[hooks::Hook], stage: Stage) {
     if batch.is_empty() {
         return;
     }
-    let _checkout_lock = match lock::acquire_project_blocking(project_root, CHECKOUT_LOCK_TIMEOUT) {
-        Ok(guard) => Some(guard),
+    let _checkout_lock = match lock::acquire_project_blocking(project_root, checkout_lock_timeout())
+    {
+        Ok(guard) => guard,
         Err(err) => {
-            // Fail-soft like the hooks themselves: a wedged sibling should
-            // not abort this phase's advance, but running unserialized must
-            // be visible.
-            println!("warning: proceeding without checkout lock: {err}");
-            None
+            println!(
+                "warning: could not acquire the checkout lock ({err}) — \
+                 SKIPPING hooks {batch:?} rather than mutating the checkout \
+                 unserialized. Re-run them once the holder finishes."
+            );
+            events::emit(
+                project_root,
+                state.phase,
+                "checkout_lock_timeout",
+                serde_json::json!({ "stage": stage.to_string(), "error": err.to_string() }),
+            );
+            for hook in batch {
+                events::emit(
+                    project_root,
+                    state.phase,
+                    "hook_run",
+                    serde_json::json!({
+                        "hook": format!("{hook:?}"),
+                        "ok": false,
+                        "skipped": "checkout lock timeout",
+                    }),
+                );
+            }
+            return;
         }
     };
     let git_flow = GitFlowConfig::default();
@@ -1212,7 +1249,7 @@ fn integrate_agent_branch(
     base: &str,
     agent_branch: &str,
 ) -> Result<(), CliError> {
-    let _checkout_lock = lock::acquire_project_blocking(project_root, CHECKOUT_LOCK_TIMEOUT)
+    let _checkout_lock = lock::acquire_project_blocking(project_root, checkout_lock_timeout())
         .map_err(|err| CliError::Message(format!("could not lock checkout: {err}")))?;
     git.fast_forward_branch(base, agent_branch)?;
     println!("integrated {agent_branch} into {base}");
@@ -1256,7 +1293,7 @@ fn sequentagent(
     //    main checkout on it. Ref creation is serialized on the checkout lock
     //    like every other shared-ref mutation.
     {
-        let _checkout_lock = lock::acquire_project_blocking(project_root, CHECKOUT_LOCK_TIMEOUT)
+        let _checkout_lock = lock::acquire_project_blocking(project_root, checkout_lock_timeout())
             .map_err(|err| CliError::Message(format!("could not lock checkout: {err}")))?;
         git.ensure_branch(&base, DEVELOP)?;
     }
@@ -2180,6 +2217,65 @@ mod tests {
             )
         );
         assert!(hints[1].contains("(phase 9)"));
+    }
+
+    #[test]
+    fn parse_checkout_lock_timeout_defaults_and_parses() {
+        assert_eq!(
+            parse_checkout_lock_timeout(None),
+            std::time::Duration::from_secs(120)
+        );
+        assert_eq!(
+            parse_checkout_lock_timeout(Some("5".into())),
+            std::time::Duration::from_secs(5)
+        );
+        assert_eq!(
+            parse_checkout_lock_timeout(Some("nope".into())),
+            std::time::Duration::from_secs(120)
+        );
+    }
+
+    /// 14-CR-02: when the checkout lock cannot be acquired, the hook batch
+    /// must be SKIPPED — never run unserialized against the shared checkout
+    /// — and the skip must be recorded in events.jsonl. ChangelogAppend
+    /// would observably create CHANGELOG.md if the batch ran. Env-mutating,
+    /// so serialized under ENV_MUTEX; the "0" timeout only affects a
+    /// concurrent test if it is actually contended, which none are (no other
+    /// test holds the project lock).
+    #[test]
+    fn checkout_hooks_skip_instead_of_running_unserialized_on_lock_timeout() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // A live holder (this process) keeps the lock contended; the stale-
+        // holder reclaim cannot fire.
+        let _held = lock::acquire_project(root).expect("hold checkout lock");
+        unsafe {
+            std::env::set_var("DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS", "0");
+        }
+
+        let state = State::new(33, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        run_checkout_hooks(
+            root,
+            &state,
+            &hooks::hooks_for_transition(Stage::Validate, Stage::Ship),
+            Stage::Ship,
+        );
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            std::env::remove_var("DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS");
+        }
+
+        assert!(
+            !root.join("CHANGELOG.md").exists(),
+            "hooks must not run while the checkout lock is held elsewhere"
+        );
+        let last = devflow_core::events::last_event_for_phase(root, 33)
+            .expect("skip must be recorded in events.jsonl");
+        assert_eq!(last["event"], "hook_run");
+        assert_eq!(last["ok"], false);
+        assert_eq!(last["skipped"], "checkout lock timeout");
     }
 
     #[test]
