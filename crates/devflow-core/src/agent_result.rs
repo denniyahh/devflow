@@ -302,7 +302,11 @@ fn json_scalar_to_string(value: &serde_json::Value) -> Option<String> {
 /// [`evaluate_layer1`], so `is_error: true` OVERRIDES a stale/echoed success
 /// marker embedded in the same envelope's `result` text — the envelope is
 /// authoritative for errors. `is_error` absent or `false` returns `None`,
-/// deferring to the marker path and, ultimately, Layer 2.
+/// deferring to the marker path and, ultimately, Layer 2. It runs AFTER
+/// `detect_claude_rate_limit`, though: rate-limit envelopes also carry
+/// `is_error: true`, and the specific `RateLimited` classification (which
+/// drives sequentagent's handoff and the resume cron) must win over this
+/// generic `Failed`.
 ///
 /// Per RESEARCH Pitfall 5, `is_error` (not specific `subtype` strings) is
 /// the documented, stable signal — this does not special-case non-success
@@ -476,10 +480,14 @@ fn parse_marker_lines(stdout: &str) -> Option<AgentResult> {
 /// Layer 1: Try to detect agent result from the native per-adapter envelope
 /// or the DEVFLOW_RESULT marker in stdout.
 ///
-/// Precedence: Claude envelope `is_error: true` (authoritative, overrides a
-/// success marker) → DEVFLOW_RESULT marker (portable; works for plain text
-/// and a Claude envelope's unwrapped `result` text) → Codex JSONL event
-/// stream (`turn.failed` decisive; `turn.completed` defers) → rate limit.
+/// Precedence: Claude rate-limit envelope (a SPECIFIC failure that must
+/// outrank the generic `is_error` check — rate-limit envelopes carry
+/// `is_error: true`, and classifying them `Failed` would kill sequentagent's
+/// handoff/cron path) → Claude envelope `is_error: true` (authoritative,
+/// overrides a success marker) → DEVFLOW_RESULT marker (portable; works for
+/// plain text and a Claude envelope's unwrapped `result` text) → Codex JSONL
+/// event stream (`turn.failed` decisive; `turn.completed` defers) → Codex
+/// plain-text rate-limit heuristic (least authoritative, stays last).
 pub fn evaluate_layer1(project_root: &Path, phase: u32) -> Option<AgentResult> {
     let stdout_path = devflow_dir(project_root).join(format!("phase-{:02}-stdout", phase));
     // Read lossily: in monitor mode the agent's stdout reaches this file via
@@ -489,19 +497,24 @@ pub fn evaluate_layer1(project_root: &Path, phase: u32) -> Option<AgentResult> {
     // fixed in the blocking-mode capture.
     let bytes = std::fs::read(&stdout_path).ok()?;
     let stdout = String::from_utf8_lossy(&bytes);
-    detect_claude_envelope_failure(&stdout)
+    detect_claude_rate_limit(&stdout)
+        .map(rate_limited_result)
+        .or_else(|| detect_claude_envelope_failure(&stdout))
         .or_else(|| parse_devflow_result(&stdout))
         .or_else(|| parse_codex_event_result(&stdout))
-        .or_else(|| {
-            detect_rate_limit(&stdout).map(|retry| AgentResult {
-                status: AgentStatus::RateLimited,
-                exit_code: None,
-                reason: Some(format!("rate limited until {retry}")),
-                commits: None,
-                summary: None,
-                verdict: None,
-            })
-        })
+        .or_else(|| detect_codex_rate_limit(&stdout).map(rate_limited_result))
+}
+
+/// Build the `RateLimited` result Layer 1 reports for a detected retry hint.
+fn rate_limited_result(retry: String) -> AgentResult {
+    AgentResult {
+        status: AgentStatus::RateLimited,
+        exit_code: None,
+        reason: Some(format!("rate limited until {retry}")),
+        commits: None,
+        summary: None,
+        verdict: None,
+    }
 }
 
 /// Layer 2: Use exit code + commit count to determine result.
@@ -1071,6 +1084,29 @@ mod tests {
         std::fs::write(
             stdout_path(dir.path(), 7),
             r#"{"type":"result","subtype":"error_rate_limit","retry_after":"2026-06-18T15:45:30Z"}"#,
+        )
+        .unwrap();
+
+        let result = evaluate_layer1(dir.path(), 7).unwrap();
+
+        assert_eq!(result.status, AgentStatus::RateLimited);
+        assert_eq!(
+            result.reason.as_deref(),
+            Some("rate limited until 2026-06-18T15:45:30Z")
+        );
+    }
+
+    /// A real Claude rate-limit envelope carries `is_error: true` alongside
+    /// `subtype: "error_rate_limit"`. The specific RateLimited classification
+    /// must outrank the generic is_error → Failed path, or sequentagent's
+    /// handoff/cron machinery never triggers for the exact case it exists for.
+    #[test]
+    fn evaluate_layer1_rate_limit_envelope_with_is_error_is_rate_limited() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 7),
+            r#"{"type":"result","subtype":"error_rate_limit","is_error":true,"retry_after":"2026-06-18T15:45:30Z"}"#,
         )
         .unwrap();
 
