@@ -3,7 +3,7 @@ gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
 status: In progress
-stopped_at: Phase 14 complete (parallel safety + observability; 252 tests, live two-phase e2e); next Phase 15 (OSS Readiness)
+stopped_at: Phase 14 complete incl. post-ship review fixes (14-REVIEW-FIX.md; 260 tests, live two-phase e2e); next Phase 15 (OSS Readiness)
 last_updated: "2026-07-16T12:00:00.000Z"
 progress:
   total_phases: 5
