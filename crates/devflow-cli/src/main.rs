@@ -369,6 +369,10 @@ fn start(
         return Ok(());
     }
 
+    // 14-CR-05: fail on a missing agent binary BEFORE any branch/worktree is
+    // scaffolded (launch_stage re-checks for the advance-time launch paths).
+    ensure_agent_binary(agent_program(agent))?;
+
     // 13-06 dogfood pre-flight (Codex leg): a fresh headless Codex run can
     // never pass Define — GSD's discuss-phase is an interview, and Codex's
     // exec mode cannot answer it (`request_user_input is unavailable in
@@ -517,6 +521,13 @@ fn agent_binary_available(program: &str) -> bool {
     std::env::var_os("PATH")
         .map(|paths| std::env::split_paths(&paths).any(|dir| executable(&dir.join(program))))
         .unwrap_or(false)
+}
+
+/// The executable an agent kind launches, for preflighting before any
+/// scaffolding. The prompt/roots passed here are throwaways — adapters
+/// return a static program name regardless.
+fn agent_program(agent: AgentKind) -> &'static str {
+    agents::adapter_for(agent).exec_command(0, "", &[]).0
 }
 
 fn ensure_agent_binary(program: &str) -> Result<(), CliError> {
@@ -1358,6 +1369,10 @@ fn sequentagent(
         println!("warning: could not remove stale cron-instructions file: {err}");
     }
     let (agent_a, agent_b) = split_two_agents(agents)?;
+    // 14-CR-05: both binaries must resolve before any branch/worktree is
+    // scaffolded — agent B's absence should not surface after A's full run.
+    ensure_agent_binary(agent_program(agent_a))?;
+    ensure_agent_binary(agent_program(agent_b))?;
     let git = GitFlow::new(project_root);
     let base = format!("{FEATURE_PREFIX}phase-{phase:02}");
 

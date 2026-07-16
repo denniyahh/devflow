@@ -69,6 +69,15 @@ the history recorded **both** version bumps as separate tags (v0.0.1,
 v0.1.0). 46 events in events.jsonl; `logs`/`status` observed the run from a
 second terminal.
 
+## Post-ship review (2026-07-16)
+
+An independent high-effort code review of the phase diff found 10 verified
+issues (2 critical) — see `14-REVIEW.md` — all resolved same-day in
+`14-REVIEW-FIX.md` (7 fixed, 2 mitigated, 1 accepted). The critical pair:
+`recover --clean` indiscriminately wiped live sibling phases (now stale-only
++ `--phase N`), and the checkout-lock timeout fallback ran hooks
+unserialized (now skips the batch, loudly).
+
 ## Notes for later phases
 
 - Phase 16's Hermes gate watcher can consume `events.jsonl` as designed

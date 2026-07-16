@@ -608,7 +608,9 @@ fn start_codex_without_context_fails_preflight() {
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
-    let fake_bin = fake_bin_dir(&[]);
+    // codex IS installed (the 13-06 dogfood scenario) — the binary preflight
+    // (14-CR-05) passes and the CONTEXT.md artifact check must fire next.
+    let fake_bin = fake_bin_dir(&[("codex", "#!/bin/sh\nexit 0\n")]);
 
     let output = Command::new(devflow_bin())
         .args([
