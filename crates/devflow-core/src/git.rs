@@ -239,18 +239,39 @@ impl GitFlow {
     /// if the main checkout is ever left on a branch other than `develop`
     /// when this runs, an implicit baseline would silently prune branches
     /// merged into that other branch instead.
+    ///
+    /// Deletion uses `-D`, not `-d`: `-d` verifies merged-into-HEAD, which
+    /// contradicts the `--merged develop` listing above in exactly the
+    /// checkout-not-on-develop scenario WR-04 targets (every genuinely
+    /// merged branch would be refused as "not fully merged"). The listing IS
+    /// the merge safety check. A branch git still refuses to delete (e.g.
+    /// checked out in a worktree) is logged and skipped so one failure
+    /// doesn't abort the rest of the sweep.
     pub fn cleanup_merged(&self) -> Result<Vec<String>, GitError> {
         let output = self.git_output(["branch", "--merged", &self.config.develop])?;
         let protected = [self.config.main.as_str(), self.config.develop.as_str()];
         let mut deleted = Vec::new();
         for line in output.lines() {
-            let branch = line.trim().trim_start_matches(['*', '+']).trim();
-            if branch.is_empty() || protected.contains(&branch) {
+            // git's porcelain marker is an exact two-char prefix ("* " for
+            // the current branch, "+ " for a worktree checkout, "  "
+            // otherwise) — strip it positionally rather than trimming
+            // marker CHARACTERS, which would mangle a branch legitimately
+            // named e.g. "+foo" (WR-03, revised).
+            let branch = line
+                .strip_prefix("* ")
+                .or_else(|| line.strip_prefix("+ "))
+                .unwrap_or(line)
+                .trim();
+            // Skip blanks, protected trunks, and the detached-HEAD line
+            // ("(HEAD detached at ...)"), which is not a branch name.
+            if branch.is_empty() || branch.starts_with('(') || protected.contains(&branch) {
                 continue;
             }
             info!("cleaning up merged branch: {branch}");
-            self.git(["branch", "-d", branch])?;
-            deleted.push(branch.to_string());
+            match self.git(["branch", "-D", branch]) {
+                Ok(()) => deleted.push(branch.to_string()),
+                Err(err) => warn!("could not delete merged branch {branch}: {err}"),
+            }
         }
         Ok(deleted)
     }
@@ -668,16 +689,15 @@ mod tests {
         );
     }
 
-    /// WR-03 (13-REVIEW.md): `git branch --merged` prefixes a branch checked
-    /// out in a linked worktree with `+` (not `*`). Before the fix, that `+`
-    /// survived into the ref name passed to `git branch -d`, producing an
-    /// "invalid ref" error instead of git's own "used by worktree" error.
-    /// A branch still checked out in a worktree can never actually be
-    /// deleted by plain `git branch -d` (by design — git itself refuses),
-    /// so this only asserts the parsing no longer corrupts the ref name:
-    /// deletion still fails, but for git's real reason, not a mangled name.
+    /// WR-03 (13-REVIEW.md), revised: `git branch --merged` prefixes a
+    /// branch checked out in a linked worktree with `+ `. The prefix must be
+    /// stripped positionally (not by trimming marker characters, which would
+    /// mangle a branch legitimately named "+foo"), and a branch git refuses
+    /// to delete — a worktree checkout can never be deleted, by design —
+    /// must be skipped with a warning rather than aborting the sweep before
+    /// the remaining merged branches.
     #[test]
-    fn cleanup_merged_strips_worktree_plus_prefix_from_ref_name() {
+    fn cleanup_merged_skips_worktree_branch_and_continues_sweep() {
         let repo = init_repo();
         let root = repo.path();
         let gf = flow(root);
@@ -690,7 +710,7 @@ mod tests {
         git(root, &["merge", "-q", "--no-ff", "worktree-merged"]);
 
         // Check the merged branch out in a linked worktree so
-        // `git branch --merged` reports it with a `+` prefix.
+        // `git branch --merged` reports it with a `+ ` prefix.
         let wt_dir = tempfile::tempdir().unwrap();
         git(
             root,
@@ -702,20 +722,50 @@ mod tests {
             ],
         );
 
-        let err = gf.cleanup_merged().expect_err("branch is still checked out");
-        let msg = err.to_string();
-        // Before the fix, the unstripped "+ worktree-merged" line (git's raw
-        // `--merged` format is "+ <name>", not "+<name>") was passed
-        // verbatim to `git branch -d`, producing "branch '+ worktree-merged'
-        // not found" — an invalid-ref error, not git's real reason.
+        // A second merged branch that sorts after "worktree-merged" would be
+        // reached only if the sweep survives the worktree refusal; "zz-" also
+        // guards against luck in iteration order via the branch before it.
+        git(root, &["branch", "aa-stale"]);
+        git(root, &["branch", "zz-stale"]);
+
+        let deleted = gf
+            .cleanup_merged()
+            .expect("a skipped worktree branch must not abort the sweep");
+        assert!(deleted.contains(&"aa-stale".to_string()));
+        assert!(deleted.contains(&"zz-stale".to_string()));
         assert!(
-            !msg.contains("+ worktree-merged") && !msg.contains("+worktree-merged"),
-            "ref name still carries the worktree '+' prefix: {msg}"
+            !deleted.contains(&"worktree-merged".to_string()),
+            "worktree checkout cannot be deleted"
         );
+        assert!(gf.branch_exists("worktree-merged"));
+    }
+
+    /// The delete side must agree with the `--merged develop` listing: `-d`
+    /// verifies merged-into-HEAD, so with the main checkout parked on a
+    /// stale branch every genuinely-merged branch was refused as "not fully
+    /// merged" — in exactly the scenario WR-04 exists for.
+    #[test]
+    fn cleanup_merged_deletes_when_head_is_not_on_develop() {
+        let repo = init_repo();
+        let root = repo.path();
+        let gf = flow(root);
+
+        // `old` is parked before the merge below, so nothing merged later is
+        // reachable from HEAD while it's checked out.
+        git(root, &["checkout", "-q", "-b", "old", "develop"]);
+        git(root, &["checkout", "-q", "develop"]);
+        git(root, &["checkout", "-q", "-b", "merged-feature", "develop"]);
+        commit_file(root, "h.txt");
+        git(root, &["checkout", "-q", "develop"]);
+        git(root, &["merge", "-q", "--no-ff", "merged-feature"]);
+        git(root, &["checkout", "-q", "old"]);
+
+        let deleted = gf.cleanup_merged().expect("cleanup");
         assert!(
-            msg.contains("used by worktree") && msg.contains("worktree-merged"),
-            "expected git's real 'used by worktree' error, got: {msg}"
+            deleted.contains(&"merged-feature".to_string()),
+            "merged-into-develop branch must be deleted even when HEAD is elsewhere: {deleted:?}"
         );
+        assert!(!gf.branch_exists("merged-feature"));
     }
 
     #[test]
