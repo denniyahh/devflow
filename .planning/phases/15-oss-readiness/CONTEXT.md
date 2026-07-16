@@ -1,6 +1,6 @@
 # Phase 15: Dogfood Enablement + OSS Readiness
 
-**Status:** In progress (15a) | **Priority:** HIGH (15a) / MEDIUM (15b) | **Target:** TBD
+**Status:** 15a Complete (2026-07-16) | 15b Scoped | **Priority:** HIGH (15a) / MEDIUM (15b) | **Target:** TBD
 
 > Renumbered from Phase 13 on 2026-07-14; Hermes work moved to Phase 14
 > (later split to Phase 16). **Rescoped 2026-07-16 (dogfood-first):** the
@@ -29,7 +29,7 @@ Run as a DevFlow dogfood.
 
 ## 15a — Dogfood Enablement *(added 2026-07-16)*
 
-- [ ] `devflow gate` subcommand:
+- [x] `devflow gate` subcommand:
       `gate list` (open gates: phase, stage, age, context),
       `gate approve <phase> [--stage S] [--note ...]`,
       `gate reject <phase> --note ... [--stage S]` (note containing
@@ -38,16 +38,16 @@ Run as a DevFlow dogfood.
       `Gates::list_open` + `Gates::respond` (atomic write; refuses when no
       gate is open or a response already exists). Response writes emit a
       `gate_response_written` event.
-- [ ] `OPERATIONS.md` — accurate operator reference: pipeline, real command
+- [x] `OPERATIONS.md` — accurate operator reference: pipeline, real command
       table, gate protocol + subcommand, env vars
       (`DEVFLOW_GATE_NOTIFY_CMD`, `DEVFLOW_GATE_TIMEOUT_SECS`,
       `DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS`, `RUST_LOG`,
       `DEVFLOW_LOG_FORMAT`), `.devflow/` file inventory, notify-hook recipe.
-- [ ] Delete the stray `.devflow.yaml` at repo root (decoy; contradicts
+- [x] Delete the stray `.devflow.yaml` at repo root (decoy; contradicts
       config.rs's "v2.0.0 has no .devflow.yaml"; 11k-13).
-- [ ] **(IN-01)** Fix stale `lib.rs` module rustdoc examples against the
+- [x] **(IN-01)** Fix stale `lib.rs` module rustdoc examples against the
       real CLI (start requires `--mode`; no `check`/`ship`).
-- [ ] `--help` snapshot test — commit `devflow --help` output and assert it
+- [x] `--help` snapshot test — commit `devflow --help` output and assert it
       in tests so CLI/doc drift can't recur silently.
 
 ## 15b — Open Source Packaging *(run as a DevFlow dogfood)*

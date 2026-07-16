@@ -9,7 +9,7 @@
 | 12 | Bootstrap + Housekeeping | Complete |
 | 13 | MVP Core Loop | Complete    |
 | 14 | Parallel Safety + Observability | Complete |
-| 15 | Dogfood Enablement + OSS Readiness | In progress (15a) |
+| 15 | Dogfood Enablement + OSS Readiness | 15a Complete / 15b Scoped |
 | 16 | Hermes Support | Scoped |
 
 ## Shipped
@@ -125,7 +125,7 @@ See `14-SUMMARY.md` for validation + live two-phase e2e acceptance evidence.
 
 Plans:
 
-- [ ] 15a — dogfood enablement (gate subcommand, OPERATIONS.md, accuracy fixes)
+- [x] 15a — dogfood enablement (gate subcommand, OPERATIONS.md, accuracy fixes) — complete 2026-07-16; exit criterion verified live (full phase with the gate answered only via `devflow gate approve`)
 - [ ] 15b — OSS packaging (run /gsd-plan-phase 15 to break down; execute via DevFlow dogfood)
 
 ### Phase 16: Hermes Support

@@ -3,7 +3,7 @@ gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
 status: In progress
-stopped_at: Phase 14 complete incl. post-ship review fixes (14-REVIEW-FIX.md; 260 tests, live two-phase e2e); next Phase 15 (OSS Readiness)
+stopped_at: Phase 15a complete (devflow gate CLI, OPERATIONS.md, accuracy fixes; 267 tests; live e2e with gate answered via CLI) — dogfooding unblocked; next 15b OSS packaging AS a DevFlow dogfood run
 last_updated: "2026-07-16T12:00:00.000Z"
 progress:
   total_phases: 5
@@ -19,7 +19,7 @@ progress:
 
 ## Active
 
-- **Phase 15 (In progress):** Dogfood Enablement + OSS Readiness — rescoped 2026-07-16 dogfood-first. 15a: `devflow gate` subcommand + OPERATIONS.md + accuracy fixes (decoy, IN-01, --help snapshot). 15b: OSS packaging (README/ARCHITECTURE/CONTRIBUTING/devcontainer/crates.io publish), to be run through DevFlow as the first post-MVP dogfood. Antigravity adapter deferred to unscheduled backlog
+- **Phase 15 (15a Complete / 15b Scoped):** Dogfood Enablement + OSS Readiness — rescoped 2026-07-16 dogfood-first. 15a COMPLETE: `devflow gate list/approve/reject`, OPERATIONS.md, `.devflow.yaml` decoy removed, lib.rs examples fixed, `--help` snapshot guard; exit criterion verified live (full phase, gate answered only via CLI). 15b: OSS packaging (README/ARCHITECTURE/CONTRIBUTING/devcontainer/crates.io publish), to be run through DevFlow as the first post-MVP dogfood — `devflow start --phase 15 --agent claude --mode auto`. Antigravity adapter deferred to unscheduled backlog
 - **Phase 16 (Scoped):** Hermes Support — split out of Phase 14 (2026-07-16); HermesAgent adapter, skill-file rewrite, Hermes plugin. Depends on Phase 14's events.jsonl + Phase 13's notify hook
 
 ## Completed
