@@ -209,35 +209,79 @@ fn extract_json_result_text(stdout: &str) -> Option<String> {
     value.get("result")?.as_str().map(str::to_string)
 }
 
+// WR-12 (13-REVIEW.md): these traversal helpers run on the coding agent's
+// raw stdout (via detect_claude_rate_limit, which every `devflow advance`
+// invocation runs through evaluate_layer1). Deeply nested JSON — accidental
+// or adversarial (prompt injection) — must not stack-overflow the process.
+// Each helper caps its recursion depth and treats over-depth input as "no
+// match" (fails safe) rather than crashing; the depth-tracking parameter is
+// kept internal via a `_at_depth` variant so the public call sites below are
+// unaffected.
+const MAX_JSON_TRAVERSAL_DEPTH: u32 = 64;
+
 fn json_has_str(value: &serde_json::Value, key: &str, expected: &str) -> bool {
+    json_has_str_at_depth(value, key, expected, 0)
+}
+
+fn json_has_str_at_depth(value: &serde_json::Value, key: &str, expected: &str, depth: u32) -> bool {
+    if depth >= MAX_JSON_TRAVERSAL_DEPTH {
+        return false;
+    }
     match value {
         serde_json::Value::Object(map) => map.iter().any(|(k, v)| {
-            (k == key && v.as_str() == Some(expected)) || json_has_str(v, key, expected)
+            (k == key && v.as_str() == Some(expected))
+                || json_has_str_at_depth(v, key, expected, depth + 1)
         }),
-        serde_json::Value::Array(values) => values.iter().any(|v| json_has_str(v, key, expected)),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(|v| json_has_str_at_depth(v, key, expected, depth + 1)),
         _ => false,
     }
 }
 
 fn json_has_i64(value: &serde_json::Value, key: &str, expected: i64) -> bool {
+    json_has_i64_at_depth(value, key, expected, 0)
+}
+
+fn json_has_i64_at_depth(value: &serde_json::Value, key: &str, expected: i64, depth: u32) -> bool {
+    if depth >= MAX_JSON_TRAVERSAL_DEPTH {
+        return false;
+    }
     match value {
         serde_json::Value::Object(map) => map.iter().any(|(k, v)| {
-            (k == key && v.as_i64() == Some(expected)) || json_has_i64(v, key, expected)
+            (k == key && v.as_i64() == Some(expected))
+                || json_has_i64_at_depth(v, key, expected, depth + 1)
         }),
-        serde_json::Value::Array(values) => values.iter().any(|v| json_has_i64(v, key, expected)),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(|v| json_has_i64_at_depth(v, key, expected, depth + 1)),
         _ => false,
     }
 }
 
 fn json_find_key<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+    json_find_key_at_depth(value, key, 0)
+}
+
+fn json_find_key_at_depth<'a>(
+    value: &'a serde_json::Value,
+    key: &str,
+    depth: u32,
+) -> Option<&'a serde_json::Value> {
+    if depth >= MAX_JSON_TRAVERSAL_DEPTH {
+        return None;
+    }
     match value {
         serde_json::Value::Object(map) => {
             if let Some(found) = map.get(key) {
                 return Some(found);
             }
-            map.values().find_map(|v| json_find_key(v, key))
+            map.values()
+                .find_map(|v| json_find_key_at_depth(v, key, depth + 1))
         }
-        serde_json::Value::Array(values) => values.iter().find_map(|v| json_find_key(v, key)),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .find_map(|v| json_find_key_at_depth(v, key, depth + 1)),
         _ => None,
     }
 }
@@ -840,6 +884,40 @@ mod tests {
     fn detect_codex_try_again_rate_limit() {
         let stdout = "Usage limit reached. Try again at 3:45 PM.\n";
         assert_eq!(detect_rate_limit(stdout).as_deref(), Some("3:45 PM"));
+    }
+
+    /// WR-12 (13-REVIEW.md): `json_has_str`/`json_has_i64`/`json_find_key`
+    /// run on the coding agent's raw stdout via `detect_claude_rate_limit`,
+    /// which every `devflow advance` invocation goes through. Deeply nested
+    /// JSON — accidental or adversarial (prompt injection) — must not
+    /// stack-overflow the process; over-depth input must fail safe (no
+    /// match) instead of crashing. 1,000 levels comfortably exceeds
+    /// `MAX_JSON_TRAVERSAL_DEPTH` (64) while staying well within what
+    /// `serde_json::from_str` itself can parse without its own recursion
+    /// limit (a separate, unrelated concern from these traversal helpers).
+    #[test]
+    fn detect_rate_limit_does_not_stack_overflow_on_deeply_nested_json() {
+        // Comfortably exceeds MAX_JSON_TRAVERSAL_DEPTH (64) while staying
+        // well under serde_json's own default parse-time recursion limit
+        // (well over 100 but under 1000, empirically) — this isolates the
+        // traversal helpers' depth cap as the thing under test, rather than
+        // serde_json failing to even parse the input.
+        const DEPTH: usize = 100;
+        let mut stdout = String::new();
+        for _ in 0..DEPTH {
+            stdout.push_str(r#"{"nested":"#);
+        }
+        stdout.push_str(r#"{"type":"result","subtype":"error_rate_limit","retry_after":"deep"}"#);
+        for _ in 0..DEPTH {
+            stdout.push('}');
+        }
+
+        // Must return promptly without crashing. The rate-limit marker is
+        // buried past the depth cap, so the fail-safe result is None — not
+        // finding a match on over-depth input is the correct, safe outcome
+        // (the alternative, silently ignoring a real marker, is already
+        // covered by `detect_rate_limit_ignores_normal_stdout`).
+        assert_eq!(detect_rate_limit(&stdout), None);
     }
 
     #[test]
