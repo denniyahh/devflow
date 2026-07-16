@@ -96,8 +96,8 @@ Plans:
 
 ### Phase 14: Observability + Hermes Support
 
-**Goal:** Surface loop progress instead of a black box — `devflow logs [--follow]`, append-only `events.jsonl`, richer `devflow status` — settle the `capture_agent_output()` sync-path decision, and add first-class Hermes support: `HermesAgent` adapter (14c), skill-file rewrite (14d), and the Hermes plugin session mode (14e, gate watcher built on 13c's notify hook + this phase's events.jsonl).
-**Requirements**: TBD (see CONTEXT.md)
+**Goal:** Surface loop progress instead of a black box — `devflow logs [--follow]`, append-only `events.jsonl`, richer `devflow status` — settle the `capture_agent_output()` sync-path decision, and add first-class Hermes support: `HermesAgent` adapter (14c), skill-file rewrite (14d), and the Hermes plugin session mode (14e, gate watcher built on 13c's notify hook + this phase's events.jsonl). Also owns the deferred CR-03 design flaw from Phase 13's post-fix review: per-phase locks sit on a project-global `state.json` and unguarded main-checkout git ops, so `devflow parallel` is unsafe by construction — fix shape and acceptance criteria in `phases/13-mvp-core-loop/13-DEFERRED-CR-03.md` (per-phase state files, phase-threaded monitor advance, short coarse lock for main-checkout mutations).
+**Requirements**: TBD (see CONTEXT.md); 13-DEFERRED-CR-03 (parallel-safety)
 **Depends on:** Phase 13
 **Plans:** 0 plans
 

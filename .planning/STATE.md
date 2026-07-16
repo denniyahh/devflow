@@ -3,8 +3,8 @@ gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
 status: In progress
-stopped_at: Completed 13-06-PLAN.md (dogfood done)
-last_updated: "2026-07-15T19:15:32.177Z"
+stopped_at: Phase 13 complete (verified 24/24, code review + post-fix review applied); next /gsd-discuss-phase 14
+last_updated: "2026-07-16T00:00:00.000Z"
 progress:
   total_phases: 4
   completed_phases: 2
@@ -15,12 +15,11 @@ progress:
 
 # DevFlow — Project State
 
-> Last updated: 2026-07-14
+> Last updated: 2026-07-16
 
 ## Active
 
-- **Phase 13 (Scoped):** MVP Core Loop — repurposed 2026-07-14; ship.rs rewrite + completion-protocol correctness + never-silent gates + dogfood run. Next up: `/gsd-plan-phase 13`
-- **Phase 14 (Scoped):** Observability + Hermes Support — rescoped 2026-07-14 (reliability items moved to 13; claims capture_agent_output() decision; Hermes adapter/skill/plugin moved in from 15)
+- **Phase 14 (Scoped):** Observability + Hermes Support — rescoped 2026-07-14 (reliability items moved to 13; claims capture_agent_output() decision; Hermes adapter/skill/plugin moved in from 15). Also owns the deferred CR-03 parallel-safety flaw (`phases/13-mvp-core-loop/13-DEFERRED-CR-03.md`). Next up: `/gsd-discuss-phase 14`
 - **Phase 15 (Scoped):** OSS Readiness — renumbered from 13 (2026-07-14); docs/devcontainer/contributing + Antigravity adapter + crates.io publish (Hermes items moved to 14)
 
 ## Completed
@@ -40,6 +39,7 @@ progress:
 | 10 | Logging + Planning Step | — | 2026-06-19 |
 | 11 | GSD-Native Architecture + Remediation | v1.2.0 | 2026-06-20 |
 | 12 | Bootstrap + Housekeeping | — | 2026-07-10 |
+| 13 | MVP Core Loop | — | 2026-07-15 |
 
 *Phases 8 and 10 shipped without a SUMMARY.md at the time; both were retroactively documented 2026-07-08 (see `8-SUMMARY.md`, `10-SUMMARY.md`) after reconstruction from git history. Phase 11 was reviewed and found already adequately closed out via `11-VALIDATION.md`/`11r-VALIDATION.md` (Nyquist-compliant, sign-off dated 2026-06-20) — no retroactive SUMMARY.md was needed.*
 
@@ -51,6 +51,7 @@ None.
 
 | Date | Decision |
 |---|---|
+| 2026-07-15 | **CR-03 follow-up deferred to Phase 14:** per-phase locks are correct, but `state.json` and main-checkout git ops stayed project-global, so `devflow parallel` remains unsafe. Fix shape (per-phase state files, phase-threaded monitor advance, coarse lock for checkout mutations) + acceptance criteria in `phases/13-mvp-core-loop/13-DEFERRED-CR-03.md`. |
 | 2026-06-19 | **v2.0.0 architecture:** DevFlow is a GSD-native execution engine with gate file protocol. Two modes (full auto, supervise). State machine: Define→Plan→Code→Validate→Ship. All skip logic removed. Conventional commits permanently deprecated. |
 | 2026-06-19 | **Versioning:** Hybrid Git-Based SemVer. MAJOR from project version file. MINOR = git tag count. PATCH = commit count since last minor tag. Zero human decisions per release. |
 | 2026-06-19 | **Config eliminated:** No `.devflow.yaml` needed. Hardcode git-flow (main/develop/feature/), auto-detect version file, CLI flag for mode. |
