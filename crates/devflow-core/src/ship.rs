@@ -261,18 +261,29 @@ fn split_time_and_offset(time: &str) -> (&str, i32) {
 }
 
 fn parse_offset_minutes(offset: &str) -> Option<i32> {
-    // WR-07 (13-REVIEW.md): require the colon-separated HH:MM form and
-    // bound-check the parsed values. A non-colon numeric offset like
-    // "+0530" would otherwise have `parts.next()` consume the whole string
-    // as `hours` ("0530" → 530), silently yielding 530 *hours* instead of
-    // 5h30m — a malformed-but-parseable input must fail safe (None), not
-    // produce a wildly wrong cron schedule.
+    // WR-07 (13-REVIEW.md), revised: accept the three ISO-8601 offset forms
+    // — ±HH:MM, ±HHMM, and hour-only ±HH — with bound-checked values.
+    // Requiring a colon (the first WR-07 fix) silently rescheduled valid
+    // ±HH/±HHMM timestamps to UTC through the callers' `unwrap_or(0)`,
+    // firing the resume cron hours off; the original pre-WR-07 code misread
+    // ±HHMM as HHMM *hours*. Anything else (wrong digit count, out-of-range
+    // values) still fails safe as None. `retry_after` is raw agent output,
+    // so no producer guarantees one form.
+    const MAX_OFFSET_HOURS: i32 = 23;
+    const MAX_OFFSET_MINUTES: i32 = 59;
     let sign = if offset.starts_with('-') { -1 } else { 1 };
     let rest = offset.get(1..)?;
-    let (h, m) = rest.split_once(':')?;
-    let hours = h.parse::<i32>().ok()?;
-    let minutes = m.parse::<i32>().ok()?;
-    if !(0..=23).contains(&hours) || !(0..=59).contains(&minutes) {
+    let (hours_part, minutes_part) = match rest.split_once(':') {
+        Some((hours, minutes)) => (hours, minutes),
+        None => match rest.len() {
+            2 => (rest, "0"),           // ±HH
+            4 => (&rest[..2], &rest[2..]), // ±HHMM
+            _ => return None,
+        },
+    };
+    let hours = hours_part.parse::<i32>().ok()?;
+    let minutes = minutes_part.parse::<i32>().ok()?;
+    if !(0..=MAX_OFFSET_HOURS).contains(&hours) || !(0..=MAX_OFFSET_MINUTES).contains(&minutes) {
         return None;
     }
     Some(sign * (hours * 60 + minutes))
@@ -390,26 +401,39 @@ mod tests {
         );
     }
 
-    /// WR-07 (13-REVIEW.md): a non-colon numeric offset like "+0530" (a
-    /// valid ISO-8601 variant `parse_offset_minutes` never handled) must not
-    /// be silently misparsed as 530 *hours* instead of 5h30m. Before the
-    /// fix, `parts.next()` consumed the whole "0530" string as `hours`,
-    /// producing a wildly wrong schedule (a "malformed but parseable" input
-    /// that the module's own fail-safe design goal says must not happen).
-    /// After the fix, the unparseable offset falls back to UTC (0 minutes)
-    /// — the same fail-safe `unwrap_or(0)` `split_time_and_offset` already
-    /// uses for a `None` result — rather than shifting the schedule by
-    /// hundreds of hours.
+    /// WR-07 (13-REVIEW.md), revised: all three ISO-8601 offset forms must
+    /// parse to their real value. The pre-WR-07 code misread "+0530" as 530
+    /// *hours*; the first WR-07 fix rejected everything without a colon, so
+    /// valid ±HHMM and hour-only ±HH offsets silently fell back to UTC via
+    /// `split_time_and_offset`'s `unwrap_or(0)` — scheduling the resume cron
+    /// hours away from when the rate limit actually lifts.
     #[test]
-    fn cron_schedule_rejects_non_colon_offset_instead_of_misparsing_it() {
-        // No colon in the offset: before the fix this was misread as
-        // sign=1, hours=530, i.e. an offset of 31,800 minutes instead of
-        // 330. After the fix it's rejected and treated as UTC+0 — matching
-        // the plain "Z"/no-offset schedule for the same wall-clock time.
+    fn cron_schedule_parses_all_iso8601_offset_forms() {
+        // ±HHMM: 15:45:30 at +05:30 → 10:15:30 UTC → 10:16 (seconds round up).
         assert_eq!(
             cron_schedule_from_retry_after("2026-06-18T15:45:30+0530"),
-            cron_schedule_from_retry_after("2026-06-18T15:45:30Z"),
+            cron_schedule_from_retry_after("2026-06-18T15:45:30+05:30"),
         );
+        // Hour-only ±HH: 15:45:30 at -05 → 20:45:30 UTC → 20:46.
+        assert_eq!(
+            cron_schedule_from_retry_after("2026-06-18T15:45:30-05"),
+            Some("46 20 18 6 *".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_offset_minutes_bounds_and_forms() {
+        assert_eq!(parse_offset_minutes("+05:30"), Some(330));
+        assert_eq!(parse_offset_minutes("+0530"), Some(330));
+        assert_eq!(parse_offset_minutes("-0530"), Some(-330));
+        assert_eq!(parse_offset_minutes("+05"), Some(300));
+        assert_eq!(parse_offset_minutes("-05"), Some(-300));
+        // Out-of-range and wrong digit counts fail safe.
+        assert_eq!(parse_offset_minutes("+24"), None);
+        assert_eq!(parse_offset_minutes("+05:60"), None);
+        assert_eq!(parse_offset_minutes("+5"), None);
+        assert_eq!(parse_offset_minutes("+530"), None);
+        assert_eq!(parse_offset_minutes("+abcd"), None);
     }
 
     #[test]
