@@ -98,6 +98,23 @@ fn wait_for(path: &Path) {
     panic!("timed out waiting for {}", path.display());
 }
 
+/// Wait until a monitor-written pid file exists AND holds a parseable pid,
+/// returning it. A plain `wait_for` + one-shot read is racy: each stage
+/// transition's `cleanup_phase_files` briefly deletes the pid file before
+/// the next monitor recreates it, so a read can land in the gap and hit
+/// NotFound even though the pipeline is healthy.
+fn wait_for_pid(path: &Path) -> u32 {
+    for _ in 0..200 {
+        if let Ok(contents) = fs::read_to_string(path)
+            && let Ok(pid) = contents.trim().parse::<u32>()
+        {
+            return pid;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("timed out waiting for a pid in {}", path.display());
+}
+
 fn git_stdout(root: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&git(root, args).stdout)
         .trim()
@@ -161,24 +178,8 @@ fn parallel_creates_two_worktrees_and_spawns_two_monitors() {
 
     let phase7_pid = root.join(".devflow/phase-07-agent-pid");
     let phase8_pid = root.join(".devflow/phase-08-agent-pid");
-    wait_for(&phase7_pid);
-    wait_for(&phase8_pid);
-    assert!(
-        fs::read_to_string(phase7_pid)
-            .unwrap()
-            .trim()
-            .parse::<u32>()
-            .unwrap()
-            > 0
-    );
-    assert!(
-        fs::read_to_string(phase8_pid)
-            .unwrap()
-            .trim()
-            .parse::<u32>()
-            .unwrap()
-            > 0
-    );
+    assert!(wait_for_pid(&phase7_pid) > 0);
+    assert!(wait_for_pid(&phase8_pid) > 0);
 
     let phase7_stdout = root.join(".devflow/phase-07-stdout");
     let phase8_stdout = root.join(".devflow/phase-08-stdout");
