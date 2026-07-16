@@ -482,7 +482,13 @@ fn parse_marker_lines(stdout: &str) -> Option<AgentResult> {
 /// stream (`turn.failed` decisive; `turn.completed` defers) → rate limit.
 pub fn evaluate_layer1(project_root: &Path, phase: u32) -> Option<AgentResult> {
     let stdout_path = devflow_dir(project_root).join(format!("phase-{:02}-stdout", phase));
-    let stdout = std::fs::read_to_string(&stdout_path).ok()?;
+    // Read lossily: in monitor mode the agent's stdout reaches this file via
+    // raw sh redirection, so one invalid UTF-8 byte in a strict
+    // read_to_string would silently disable ALL Layer-1 detection (marker,
+    // envelope, rate limit) — the same failure class CR-01 (13-REVIEW.md)
+    // fixed in the blocking-mode capture.
+    let bytes = std::fs::read(&stdout_path).ok()?;
+    let stdout = String::from_utf8_lossy(&bytes);
     detect_claude_envelope_failure(&stdout)
         .or_else(|| parse_devflow_result(&stdout))
         .or_else(|| parse_codex_event_result(&stdout))
@@ -1075,6 +1081,25 @@ mod tests {
             result.reason.as_deref(),
             Some("rate limited until 2026-06-18T15:45:30Z")
         );
+    }
+
+    /// CR-01 (13-REVIEW.md) completion: the monitor path writes raw agent
+    /// bytes to the stdout file via sh redirection, so evaluate_layer1 must
+    /// tolerate invalid UTF-8 rather than silently disabling all Layer-1
+    /// detection (the blocking-mode capture was fixed; the file read here is
+    /// the other half of the same bug).
+    #[test]
+    fn evaluate_layer1_finds_marker_despite_invalid_utf8_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        let mut bytes = b"progress \xff\xfe garbage\n".to_vec();
+        bytes.extend_from_slice(b"DEVFLOW_RESULT: {\"status\":\"failed\",\"reason\":\"review: bad\"}\n");
+        std::fs::write(stdout_path(dir.path(), 5), bytes).unwrap();
+
+        let result = evaluate_layer1(dir.path(), 5).unwrap();
+
+        assert_eq!(result.status, AgentStatus::Failed);
+        assert_eq!(result.reason.as_deref(), Some("review: bad"));
     }
 
     #[test]
