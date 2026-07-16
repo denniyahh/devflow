@@ -392,15 +392,22 @@ fn start(
         }
     }
 
-    // WR-11 (13-REVIEW.md): save state only after launch_stage is confirmed
-    // to succeed. Saving first (the previous order) left `.devflow/state.json`
-    // reflecting a phase "in progress" with no agent PID and no monitor
-    // running if launch_stage failed (e.g. a missing agent binary or a
-    // failure to spawn the monitor's `sh`), making `devflow status`/`devflow
-    // recover` report a stuck-looking state that needed `recover --clean`
-    // even though nothing was actually launched.
-    launch_stage(&state, None)?;
+    // WR-11 (13-REVIEW.md), revised: state must be on disk BEFORE the monitor
+    // exists. launch_stage spawns the detached monitor, which runs `devflow
+    // advance` the moment the agent exits — and advance begins with
+    // load_state. Launching first (the previous WR-11 order) raced a
+    // fast-exiting agent against this save: the monitor's advance found no
+    // state.json, died silently into /dev/null, and the save below then wrote
+    // an in-progress state nothing would ever advance. Save first; if the
+    // launch fails, clear the just-saved state so `devflow status`/`recover`
+    // don't report a phantom run (the failure WR-11 originally targeted).
     workflow::save_state(&state)?;
+    if let Err(err) = launch_stage(&state, None) {
+        if let Err(clear_err) = workflow::clear_state(project_root) {
+            eprintln!("warning: could not clear state after failed launch: {clear_err}");
+        }
+        return Err(err);
+    }
     println!(
         "started phase {} in {mode} mode at {} — monitor will auto-advance",
         state.phase, state.started_at
