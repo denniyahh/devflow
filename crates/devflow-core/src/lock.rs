@@ -130,10 +130,53 @@ impl Drop for LockGuard {
     }
 }
 
+/// Filename prefix shared by every per-phase lock file. Owned here so
+/// sweepers (e.g. `recover --clean`) never hardcode the naming scheme.
+const LOCK_FILE_PREFIX: &str = "lock-";
+
 fn lock_path(project_root: &Path, phase: u32) -> PathBuf {
     project_root
         .join(".devflow")
-        .join(format!("lock-{phase:02}"))
+        .join(format!("{LOCK_FILE_PREFIX}{phase:02}"))
+}
+
+/// Remove this project's per-phase lock files, skipping any whose recorded
+/// holder PID is still alive — deleting a live holder's lock would let a
+/// duplicate `advance` acquire it, after which the original holder's
+/// `LockGuard::Drop` deletes the NEW holder's file.
+///
+/// Returns human-readable warnings for anything skipped or that failed to
+/// delete, so callers surface problems instead of reporting a clean sweep
+/// that left wedging locks behind.
+pub fn remove_stale_locks(project_root: &Path) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let devflow_dir = project_root.join(".devflow");
+    let Ok(entries) = fs::read_dir(&devflow_dir) else {
+        return warnings;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(LOCK_FILE_PREFIX) {
+            continue;
+        }
+        let path = entry.path();
+        let holder_pid = fs::read_to_string(&path)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if pid_is_alive(&holder_pid) {
+            warnings.push(format!(
+                "kept {} — holder pid {holder_pid} is still alive",
+                path.display()
+            ));
+            continue;
+        }
+        if let Err(err) = fs::remove_file(&path) {
+            warnings.push(format!("could not remove {}: {err}", path.display()));
+        }
+    }
+    warnings
 }
 
 #[cfg(test)]
@@ -240,6 +283,26 @@ mod tests {
         fs::write(&path, "not-a-pid").unwrap();
 
         acquire(dir.path(), 1).expect("corrupt lock must be reclaimed");
+    }
+
+    /// `remove_stale_locks` must sweep dead-holder locks but never a live
+    /// holder's — deleting a held lock lets a duplicate advance acquire it,
+    /// and the original guard's Drop then removes the new holder's file.
+    #[test]
+    fn remove_stale_locks_keeps_live_holder_and_sweeps_dead() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = lock_path(dir.path(), 1);
+        let dead = lock_path(dir.path(), 2);
+        fs::create_dir_all(live.parent().unwrap()).unwrap();
+        fs::write(&live, std::process::id().to_string()).unwrap();
+        fs::write(&dead, "9999999").unwrap();
+
+        let warnings = remove_stale_locks(dir.path());
+
+        assert!(live.exists(), "live holder's lock must be kept");
+        assert!(!dead.exists(), "dead holder's lock must be swept");
+        assert_eq!(warnings.len(), 1, "keeping a live lock must be reported");
+        assert!(warnings[0].contains("still alive"));
     }
 
     /// A lock file containing "0" parses as a valid u32, but `kill -0 0`

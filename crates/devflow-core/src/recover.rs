@@ -67,22 +67,20 @@ pub fn inspect(project_root: &Path) -> Result<RecoveryStatus, RecoverError> {
 
 /// Clean up a stale or abandoned workflow state.
 ///
-/// Removes the state file and any per-phase lock files (if present). Locks
-/// are scoped per-phase (`.devflow/lock-{phase:02}`, see CR-03,
-/// 13-REVIEW.md), so this sweeps every `lock-*` file under `.devflow/`
-/// rather than a single known path — `recover --clean` is an operator-driven
-/// broad reset, not scoped to one phase.
-pub fn clean(project_root: &Path) -> Result<(), RecoverError> {
+/// Removes the state file, any per-phase lock files whose holder is dead
+/// (the sweep lives in [`crate::lock::remove_stale_locks`], which owns the
+/// lock naming and refuses to delete a live holder's lock out from under a
+/// running `advance`), and a leftover `cron-instructions.json` — a
+/// self-describing "auto-re-run this phase" record that must not survive an
+/// operator-driven reset, or a Hermes cron re-runs a phase that was just
+/// cleaned. Returns warnings for anything that could not be removed.
+pub fn clean(project_root: &Path) -> Result<Vec<String>, RecoverError> {
     workflow::clear_state(project_root)?;
-    let devflow_dir = project_root.join(".devflow");
-    if let Ok(entries) = std::fs::read_dir(&devflow_dir) {
-        for entry in entries.flatten() {
-            if entry.file_name().to_string_lossy().starts_with("lock-") {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
+    let mut warnings = crate::lock::remove_stale_locks(project_root);
+    if let Err(err) = crate::ship::delete_cron_instructions(project_root) {
+        warnings.push(format!("could not remove cron-instructions.json: {err}"));
     }
-    Ok(())
+    Ok(warnings)
 }
 
 /// Check whether a state is stale: >24h old with no running agent.

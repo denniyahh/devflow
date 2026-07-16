@@ -1019,7 +1019,9 @@ fn sequentagent(
     agents: &str,
     force: bool,
 ) -> Result<(), CliError> {
-    let _ = devflow_core::ship::delete_cron_instructions(project_root);
+    if let Err(err) = devflow_core::ship::delete_cron_instructions(project_root) {
+        println!("warning: could not remove stale cron-instructions.json: {err}");
+    }
     let (agent_a, agent_b) = split_two_agents(agents)?;
     let git = GitFlow::new(project_root);
     let base = format!("{FEATURE_PREFIX}phase-{phase:02}");
@@ -1104,7 +1106,12 @@ fn sequentagent(
         )));
     }
     integrate_agent_branch(&git, &base, &branch_b)?;
-    let _ = devflow_core::ship::delete_cron_instructions(project_root);
+    // WR-02: the phase has shipped — a surviving cron-instructions.json would
+    // mislead `devflow status`/a Hermes cron into re-running it. A failed
+    // delete must be visible, not swallowed, for the same reason.
+    if let Err(err) = devflow_core::ship::delete_cron_instructions(project_root) {
+        println!("warning: could not remove cron-instructions.json: {err}");
+    }
 
     println!("\nsequentagent complete — both agents integrated into {base}");
     Ok(())
@@ -1414,7 +1421,10 @@ fn project_root(project: PathBuf) -> Result<PathBuf, CliError> {
 
 fn recover_cmd(project_root: &Path, do_clean: bool) -> Result<(), CliError> {
     if do_clean {
-        recover::clean(project_root)?;
+        let warnings = recover::clean(project_root)?;
+        for warning in &warnings {
+            println!("warning: {warning}");
+        }
         println!("cleaned up abandoned workflow state");
         return Ok(());
     }
