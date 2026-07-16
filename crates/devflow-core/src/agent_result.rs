@@ -90,9 +90,11 @@ where
     }))
 }
 
-/// Capture from an agent child process: stdout contents and exit code.
+/// Capture from an agent child process. The stdout contents live in the
+/// `.devflow/phase-NN-stdout` file `capture_agent_output` writes (which is
+/// what `evaluate_layer1` reads) — they are deliberately not duplicated
+/// here, since agent output can run to many megabytes.
 pub struct AgentCapture {
-    pub stdout: String,
     pub exit_code: i32,
 }
 

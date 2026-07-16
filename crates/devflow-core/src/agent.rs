@@ -98,7 +98,9 @@ pub fn capture_agent_output(
     if let Some(ref mut pipe) = child.stdout {
         let _ = pipe.read_to_end(&mut buf);
     }
-    let stdout = String::from_utf8_lossy(&buf).into_owned();
+    // Cow: borrows `buf` unchanged when it is valid UTF-8 (the common case),
+    // allocating only when replacement characters are actually needed.
+    let stdout = String::from_utf8_lossy(&buf);
 
     // Wait for exit code.
     let exit_code = match child.wait() {
@@ -111,16 +113,13 @@ pub fn capture_agent_output(
     if let Some(parent) = stdout_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(&stdout_path, &stdout);
+    let _ = std::fs::write(&stdout_path, stdout.as_bytes());
 
     // Write exit code to file.
     let exit_path = agent_result::exit_code_path(project_root, phase);
     let _ = std::fs::write(&exit_path, exit_code.to_string());
 
-    Ok(AgentCapture {
-        stdout: stdout.clone(),
-        exit_code,
-    })
+    Ok(AgentCapture { exit_code })
 }
 
 /// Generate a human-readable label for the agent session.
@@ -173,7 +172,7 @@ mod tests {
 
         let capture = capture_agent_output(child, 7, dir.path()).unwrap();
 
-        assert_eq!(capture.stdout, "hello\n");
+        assert_eq!(capture.exit_code, 0);
         assert_eq!(
             std::fs::read_to_string(agent_result::stdout_path(dir.path(), 7)).unwrap(),
             "hello\n"
@@ -209,7 +208,6 @@ mod tests {
 
         let capture = capture_agent_output(child, 9, dir.path()).unwrap();
 
-        assert_eq!(capture.stdout, "");
         assert_eq!(capture.exit_code, 0);
         assert_eq!(
             std::fs::read_to_string(agent_result::stdout_path(dir.path(), 9)).unwrap(),
