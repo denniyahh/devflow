@@ -111,3 +111,17 @@ created: 2026-07-17
 **Not touched — plan not yet executed:** 15-05-T1/T2/T3 remain `⬜ pending`. Plan 15-05 (crates.io publish) is gated behind a `checkpoint:human-action` task requiring the operator's crates.io API token (see 15-05-PLAN.md Task 1) and has not run yet per `.planning/STATE.md` (`stopped_at: Completed 15-04-PLAN.md`). This is not a Nyquist coverage gap — 15-05-T1 is correctly typed as the sole manual checkpoint, and T2/T3's automated registry-resolution commands are already correctly designed — the wave is simply not yet executed. Phase 15 is not fully complete; re-run `/gsd-validate-phase 15` after 15-05 executes if its commands need auditing.
 
 **No implementation files were modified.** Only `15-VALIDATION.md`'s own command text and status cells changed.
+
+---
+
+## Validation Audit 2026-07-17 (re-confirmation)
+
+| Metric | Count |
+|--------|-------|
+| Gaps found | 0 |
+| Resolved | 0 |
+| Escalated | 0 |
+
+**What was audited:** Independent re-run of all 11 Automated Commands for 15-01 through 15-04 (the corrected commands from the prior audit above), plus a re-check of `.planning/STATE.md` and the phase directory for a 15-05-SUMMARY.md.
+
+**Result:** All 11 commands still pass, including `cargo publish --dry-run -p devflow-core && cargo package --workspace` (15-04-T2, re-run live). No drift since the prior audit. 15-05 still has no SUMMARY.md and `.planning/STATE.md` still reports `stopped_at: Completed 15-04-PLAN.md` — 15-05 remains unexecuted, unchanged from the previous audit's finding. No new gaps; nothing to fix.
