@@ -28,3 +28,20 @@
 {"event":"transition","from":"code","phase":15,"to":"validate","ts":1784309234,"v":1}
 {"agent":"claude","event":"stage_launched","monitor_pid":2788433,"phase":15,"stage":"validate","ts":1784309234,"v":1}
 {"event":"advance_evaluated","phase":15,"reason":null,"stage":"validate","status":"success","ts":1784309349,"v":1,"verdict":"pass"}
+{"event":"hook_run","hook":"DocsUpdate","ok":true,"phase":15,"ts":1784309363,"v":1}
+{"event":"hook_run","hook":"ChangelogAppend","ok":true,"phase":15,"ts":1784309363,"v":1}
+{"event":"transition","from":"validate","phase":15,"to":"ship","ts":1784309363,"v":1}
+{"agent":"claude","event":"stage_launched","monitor_pid":2795774,"phase":15,"stage":"ship","ts":1784309363,"v":1}
+{"event":"advance_evaluated","phase":15,"reason":"ship blocked: /gsd-ship preflight found no verification report for phase 15 (status=missing, plan 15-05 has no SUMMARY.md) — code review passed with 0 Critical findings, but phase execution/verification is incomplete; run /gsd:execute-phase 15 then /gsd-verify-work before shipping","stage":"ship","status":"failed","ts":1784309752,"v":1,"verdict":null}
+{"context":"[never-silent] stage ship failed: ship blocked: /gsd-ship preflight found no verification report for phase 15 (status=missing, plan 15-05 has no SUMMARY.md) — code review passed with 0 Critical findings, but phase execution/verification is incomplete; run /gsd:execute-phase 15 then /gsd-verify-work before shipping — human review needed (retry, loop-to-code, or abort)","event":"gate_fired","phase":15,"stage":"ship","ts":1784309752,"unexpected":false,"v":1}
+{"event":"notify_fired","phase":15,"stage":"ship","ts":1784309752,"unexpected":false,"v":1}
+{"approved":true,"event":"gate_response_written","phase":15,"stage":"ship","ts":1784311614,"v":1,"via":"cli"}
+{"action":"advance","approved":true,"event":"gate_resolved","phase":15,"responded_by":"denniyahh","stage":"ship","ts":1784311615,"v":1}
+{"agent":"claude","event":"stage_launched","monitor_pid":2887231,"phase":15,"stage":"ship","ts":1784311615,"v":1}
+{"event":"advance_evaluated","phase":15,"reason":"review: CR-01 critical — .gitignore never updated for per-phase runtime files (.devflow/state-{NN}.json, lock-{NN}, phase-{NN}-stdout/-stderr/-exit/-agent-pid); 3 such files are currently tracked in git including phase-07-stdout, which leaks a real Claude Code session blob (session_id, total_cost_us… [truncated; full output in .devflow/]","stage":"ship","status":"failed","ts":1784312181,"v":1,"verdict":null}
+{"consecutive_failures":0,"event":"loop_back","from":"ship","phase":15,"ts":1784312181,"v":1}
+{"agent":"claude","event":"stage_launched","monitor_pid":2905419,"phase":15,"stage":"code","ts":1784312181,"v":1}
+{"event":"advance_evaluated","phase":15,"reason":null,"stage":"code","status":"success","ts":1784312338,"v":1,"verdict":null}
+{"event":"transition","from":"code","phase":15,"to":"validate","ts":1784312338,"v":1}
+{"agent":"claude","event":"stage_launched","monitor_pid":2913892,"phase":15,"stage":"validate","ts":1784312338,"v":1}
+{"event":"advance_evaluated","phase":15,"reason":null,"stage":"validate","status":"success","ts":1784312553,"v":1,"verdict":"pass"}
