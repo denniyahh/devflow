@@ -248,7 +248,7 @@ mod tests {
     fn after_ship_runs_version_and_cleanup() {
         assert_eq!(
             hooks_after_ship(),
-            vec![Hook::VersionBump, Hook::BranchCleanup]
+            vec![Hook::Merge, Hook::VersionBump, Hook::BranchCleanup]
         );
     }
 
@@ -299,5 +299,13 @@ mod tests {
         Hook::BranchCleanup
             .run(&ctx(dir.path(), Stage::Ship))
             .unwrap();
+    }
+
+    #[test]
+    fn merge_is_fail_soft_when_branch_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        // No feature branch exists — merge must report a no-op and succeed.
+        Hook::Merge.run(&ctx(dir.path(), Stage::Ship)).unwrap();
     }
 }
