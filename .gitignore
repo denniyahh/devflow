@@ -19,10 +19,15 @@ Thumbs.db
 .opencode/
 .gemini/
 
-# DevFlow own state (dogfooding)
-.devflow/state.json
-.devflow/lock
-.devflow/last-ship.json
+# DevFlow own state (dogfooding) — per-phase since the 14a refactor
+.devflow/state-*.json
+.devflow/lock-*
+.devflow/phase-*-stdout
+.devflow/phase-*-stderr.log
+.devflow/phase-*-exit
+.devflow/phase-*-agent-pid
+.devflow/last-ship*.json
+.devflow/cron-instructions*.json
 
 # Git worktrees created by `devflow start --worktree` / `parallel` / `sequentagent`
 .worktrees/
