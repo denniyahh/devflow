@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
 status: In progress
-stopped_at: Phase 15a complete (devflow gate CLI, OPERATIONS.md, accuracy fixes; 267 tests; live e2e with gate answered via CLI) — dogfooding unblocked; next 15b OSS packaging AS a DevFlow dogfood run
-last_updated: "2026-07-16T12:00:00.000Z"
+stopped_at: Completed 15-01-PLAN.md (README/SECURITY/DEPENDENCIES accuracy pass)
+last_updated: "2026-07-17T14:12:27.549Z"
 progress:
   total_phases: 5
-  completed_phases: 3
-  total_plans: 22
-  completed_plans: 22
-  percent: 60
+  completed_phases: 2
+  total_plans: 27
+  completed_plans: 19
+  percent: 40
 ---
 
 # DevFlow — Project State
@@ -85,6 +85,7 @@ None.
 - [Phase 13]: 13-04: Computed effective worktree flag as !no_worktree in the Start match arm, leaving start()'s internal signature and parallel()/sequentagent() call sites unchanged
 - [Phase 13]: 13-05: Verdict deserializer uses exact-case matching (not case-folding) per the plan's explicit fail-safe test contract.
 - [Phase 13]: 13-05: Excluded Stage::Validate from the generic single-command-template prompt test (renamed it) since Validate now has its own dedicated verdict-requiring prompt, mirroring Ship's existing special-case exclusion.
+- [Phase 15]: 15-01: SECURITY.md Supported Versions (v1.0.0+) already covers Cargo.toml 1.2.0 — left unchanged; DEPENDENCIES.md's "Required for Shipping" header also dropped the phantom `devflow ship` command (alongside the plan-flagged `devflow confirm`) in favor of the real gate-driven Ship flow (`devflow gate approve <phase> --stage ship`)
 
 ## Roadmap Evolution
 
@@ -108,9 +109,14 @@ None.
 | Phase 13-mvp-core-loop P03 | 12min | 3 tasks | 1 files |
 | Phase 13-mvp-core-loop P04 | 7min | 2 tasks | 2 files |
 | Phase 13-mvp-core-loop P05 | 15min | 2 tasks | 3 files |
+**Per-Plan Metrics:**
+
+| Plan | Duration | Tasks | Files |
+|------|----------|-------|-------|
+| Phase 15-oss-readiness P01 | 15min | 3 tasks | 3 files |
 
 ## Session
 
-**Last session:** 2026-07-15T19:06:48.418Z
-**Stopped at:** Completed 13-06-PLAN.md (dogfood done)
+**Last session:** 2026-07-17T14:12:27.530Z
+**Stopped at:** Completed 15-01-PLAN.md (README/SECURITY/DEPENDENCIES accuracy pass)
 **Resume file:** None
