@@ -249,3 +249,21 @@ Added `.with_writer(std::io::stderr)` to both the plain-text and JSON `tracing_s
 **No republish:** This fix lands after the 2026-07-17 crates.io publish (15-05) without a version bump or republish, consistent with how the same round's CR-01/WR-01 fixes (`50db857`, `0f82caa`) and the second round's fixes (`d021e3a`, `5a8cbad`, `e7a35b7`) were handled — none of those triggered a republish either. Version bumping is owned by DevFlow's Ship-stage tooling on the next real release, not by validation fixes.
 
 **No other implementation files were modified.** Only `crates/devflow-cli/src/main.rs`, `crates/devflow-cli/tests/log_format_env.rs`, and this file's own Manual-Only table, Per-Task Map row, and audit trail changed.
+
+---
+
+## Validation Audit 2026-07-17 (final re-confirmation — /gsd-validate-phase 15)
+
+| Metric | Count |
+|--------|-------|
+| Gaps found | 0 |
+| Resolved | 0 |
+| Escalated | 0 |
+
+**What was audited:** Independent live re-run of all automated coverage for the complete phase (15-01 through 15-05, all three review rounds' regression guards): `git status --porcelain` (clean), `cargo test --workspace` (220 + 2 passed, 0 failed), `cargo clippy --workspace -- -D warnings` (clean), `cargo fmt --check` (clean), all 10 doc/config `rg`-based Automated Commands (15-01-T1/T2/T3, 15-02-T1/T2/T3, 15-03-T1/T2/T3, 15-04-T1), the four named integration test files (`help_snapshot`, `gitignore_coverage`, `log_format_env` — 3 tests including the CR-01 and CR-02 regression guards, `devcontainer_ci_failfast`), `cargo publish --dry-run -p devflow-core && cargo package --workspace` (15-04-T2), and both crates.io live registry resolutions (`cargo add devflow-core@1.2.0 --dry-run`, `cargo add devflow@1.2.0 --dry-run`, both 15-05-T2/T3). Also confirmed `git log 7d39826..HEAD` is empty — no commits landed since the prior audit closed the CR-02 escalation.
+
+**CR-02 fix independently re-confirmed in source** (not just trusted from the prior audit's own report): `rg -n 'with_writer' crates/devflow-cli/src/main.rs` shows `.with_writer(std::io::stderr)` on both the plain-text (line 292) and JSON (line 300) branches; `docs/guides/configuration.md:33` and `crates/devflow-core/src/lib.rs:9` both still claim stderr — code and docs now agree.
+
+**Result:** Zero gaps. Every requirement in the Per-Task Verification Map has automated coverage or a correctly-typed manual checkpoint. Phase 15 is Nyquist-compliant with no outstanding escalations.
+
+**No implementation files were modified.** Only this file's own audit trail changed.
