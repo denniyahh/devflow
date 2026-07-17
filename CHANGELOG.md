@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.0 — 2026-07-17
+
+- Phase 15: OSS readiness — README/ARCHITECTURE/guides rewritten against v2
+  reality, CONTRIBUTING + pinned devcontainer with CI parity, dual
+  MIT/Apache-2.0 licensing backed by both texts, devflow-core and devflow
+  1.2.0 published to crates.io, per-phase SECURITY.md threat verification.
+
 ## 1.2.176 — 2026-07-17
 
 - Released phase via DevFlow.
