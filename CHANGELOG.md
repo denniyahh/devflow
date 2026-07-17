@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.2.176 — 2026-07-17
+
+- Released phase via DevFlow.
+
 ## 1.2.175 — 2026-07-17
 
 - Released phase via DevFlow.

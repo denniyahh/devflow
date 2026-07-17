@@ -67,3 +67,20 @@
 {"event":"transition","from":"code","phase":15,"to":"validate","ts":1784314573,"v":1}
 {"agent":"claude","event":"stage_launched","monitor_pid":3002001,"phase":15,"stage":"validate","ts":1784314573,"v":1}
 {"event":"advance_evaluated","phase":15,"reason":null,"stage":"validate","status":"success","ts":1784314933,"v":1,"verdict":"pass"}
+{"event":"hook_run","hook":"DocsUpdate","ok":true,"phase":15,"ts":1784314933,"v":1}
+{"event":"hook_run","hook":"ChangelogAppend","ok":true,"phase":15,"ts":1784314933,"v":1}
+{"event":"transition","from":"validate","phase":15,"to":"ship","ts":1784314933,"v":1}
+{"agent":"claude","event":"stage_launched","monitor_pid":3017868,"phase":15,"stage":"ship","ts":1784314933,"v":1}
+{"event":"advance_evaluated","phase":15,"reason":"review: 2 Critical findings — CR-01: docs/guides/configuration.md and crates/devflow-core/src/lib.rs claim RUST_LOG defaults to 'info', but tracing-subscriber's EnvFilter::from_default_env() actually defaults to ERROR, so operators get no state-transition logs by default; CR-02: same docs claim log … [truncated; full output in .devflow/]","stage":"ship","status":"failed","ts":1784315511,"v":1,"verdict":null}
+{"consecutive_failures":0,"event":"loop_back","from":"ship","phase":15,"ts":1784315511,"v":1}
+{"agent":"claude","event":"stage_launched","monitor_pid":3036679,"phase":15,"stage":"code","ts":1784315511,"v":1}
+{"event":"advance_evaluated","phase":15,"reason":null,"stage":"code","status":"success","ts":1784315744,"v":1,"verdict":null}
+{"event":"transition","from":"code","phase":15,"to":"validate","ts":1784315744,"v":1}
+{"agent":"claude","event":"stage_launched","monitor_pid":3048066,"phase":15,"stage":"validate","ts":1784315744,"v":1}
+{"event":"advance_evaluated","phase":15,"reason":null,"stage":"validate","status":"success","ts":1784316110,"v":1,"verdict":"gaps"}
+{"consecutive_failures":1,"event":"loop_back","from":"validate","phase":15,"ts":1784316110,"v":1}
+{"agent":"claude","event":"stage_launched","monitor_pid":3063703,"phase":15,"stage":"code","ts":1784316110,"v":1}
+{"event":"advance_evaluated","phase":15,"reason":null,"stage":"code","status":"success","ts":1784316614,"v":1,"verdict":null}
+{"event":"transition","from":"code","phase":15,"to":"validate","ts":1784316614,"v":1}
+{"agent":"claude","event":"stage_launched","monitor_pid":3091261,"phase":15,"stage":"validate","ts":1784316614,"v":1}
+{"event":"advance_evaluated","phase":15,"reason":null,"stage":"validate","status":"success","ts":1784316734,"v":1,"verdict":"pass"}
