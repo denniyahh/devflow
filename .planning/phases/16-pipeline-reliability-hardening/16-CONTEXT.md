@@ -73,6 +73,13 @@ Explicitly out of scope: Hermes support (Phase 17), Antigravity adapter
   subcommand is documented, and every `.devflow/`-writing path in source is
   covered by `.gitignore` (16i is exactly this direction).
 
+### Sequencing
+- **D-09: 16k first.** User-confirmed 2026-07-17: begin the phase with the
+  16k forensics (gate-approval advance path, VersionBump wrong-checkout
+  bug, unconditional hook success) — every other reliability item assumes
+  the terminal pipeline signal means something, and 16k's findings will
+  inform 16a's verification design and 16f's root resolution.
+
 ### Claude's Discretion
 - 16e per-wave review gating semantics and depth (D-04).
 - 16a verification-contract syntax/timing/failure semantics, 16b/16h capture
@@ -154,7 +161,8 @@ Explicitly out of scope: Hermes support (Phase 17), Antigravity adapter
 <deferred>
 ## Deferred Ideas
 
-- **Candidate scope item (16j?) — operator notification gap, observed
+- **[PROMOTED to scope as 16j, 2026-07-17 — see scoping doc CONTEXT.md]**
+  Original candidate note (16j?) — operator notification gap, observed
   2026-07-17:** the Phase 15 ship security gate fired (`gate_fired` +
   `notify_fired` both logged to events.jsonl, `unexpected: false`) yet the
   operator received NO actual notice and only discovered the ~78-minute-old
@@ -181,7 +189,8 @@ Explicitly out of scope: Hermes support (Phase 17), Antigravity adapter
   bucket): either make `stage` positional-optional, drop the positional
   project in favor of `--project`, or add a "did you mean `--stage ship`?"
   hint when the unmatched positional equals a stage name.
-- **Candidate scope item (16k?) — ship terminal false positive, observed
+- **[PROMOTED to scope as 16k, 2026-07-17 — see scoping doc CONTEXT.md]**
+  Original candidate note (16k?) — ship terminal false positive, observed
   2026-07-17 (SEVERE, the worst signal failure of the entire dogfood run):**
   after the operator approved the final "Ship complete — approve merge?"
   gate, DevFlow emitted `hook_run VersionBump ok=true`, `hook_run

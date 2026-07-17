@@ -86,11 +86,33 @@ Ship's gating review catch what it currently misses on a single pass.
   entire dogfood run, and would catch the next rename-without-gitignore-
   update at commit/CI time instead of two Ship-review cycles later.
 
+- **16j — Verifiable operator notification.** Promoted from candidate
+  2026-07-17: three gates fired during the Phase 15 ship (78-minute security
+  gate, merge-approval gate, and the CLI-footgun retry) and the operator
+  received no actual notice of any of them — `notify_fired` logged
+  `unexpected: false` each time while delivering nothing a human saw. A
+  notify channel that verifiably reaches the operator (and/or a loud
+  persistent pending-gate indicator in `devflow status`), not just an event
+  log entry claiming success.
+- **16k — Ship terminal false positive (gate-approval advance path).**
+  Promoted from candidate 2026-07-17, severity: worst signal failure of the
+  dogfood run. After merge-gate approval DevFlow emitted `VersionBump
+  ok=true`, `BranchCleanup ok=true`, and `workflow_finished` while: no merge
+  happened (PR #7 left open, branch not an ancestor of develop); VersionBump
+  mutated the PRIMARY checkout — bumping 1.2.0→1.2.183 uncommitted and
+  tagging an unrelated docs commit; BranchCleanup deleted nothing; per-phase
+  state was then deleted, hiding everything from `devflow status`. Phase had
+  to be shipped by hand (merge 01d511c, v1.3.0). Forensic targets: the
+  gate-approval advance path in ship.rs/main.rs (missing/silently-failing
+  merge step), VersionBump's commit-count version against the wrong
+  checkout, unconditional hook success reporting, and the related bogus
+  CHANGELOG auto-entries (1.2.175/176/179).
+
 ## Explicitly Out of Scope (this phase)
 
 - Hermes support — Phase 17.
 - Antigravity adapter — unscheduled backlog.
 
-**Depends on:** Phase 15 (every item here was surfaced by dogfooding it;
-this phase should not start until Phase 15 actually ships, so nothing else
-surfaces before scope locks).
+**Depends on:** Phase 15 — SATISFIED 2026-07-17: v1.3.0 shipped (PR #7
+merged as 01d511c, tag pushed). Note the ship itself required manual
+completion (see 16k), which finalized this phase's scope.
