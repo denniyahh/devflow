@@ -11,6 +11,7 @@
 //! that migration, giving a real DEBUG-level log line to assert on — not
 //! just "the binary didn't crash".
 
+use devflow_core::gates::Gates;
 use devflow_core::mode::Mode;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
@@ -95,5 +96,50 @@ fn rust_log_default_suppresses_debug_under_json_log_format() {
         "with DEVFLOW_LOG_FORMAT=json and RUST_LOG unset, no DEBUG-level log \
          should reach stdout, but one did — RUST_LOG is not being consulted.\n\
          stdout:\n{stdout}"
+    );
+}
+
+/// Regression guard for CR-01 (15-REVIEW.md, third round, commit `50db857`):
+/// `main.rs` previously built its `EnvFilter` with the bare
+/// `EnvFilter::from_default_env()`, which defaults to ERROR-only when
+/// `RUST_LOG` is unset. Fixed by falling back to `EnvFilter::new("info")`
+/// via `try_from_default_env().unwrap_or_else(...)` on both branches, so
+/// `devflow` now logs at INFO level by default with no env var set at all.
+///
+/// This drives `devflow gate approve` against a project with a single open
+/// gate — `Gates::respond` emits `info!("gate response written for phase
+/// {phase} {stage}: approved=...")` as an unconditional side effect of a
+/// successful approval, giving a real INFO-level log line to assert on. If
+/// commit 50db857 were reverted (back to the bare `from_default_env()`),
+/// this line would default to being suppressed and this test would fail.
+fn project_with_open_gate(phase: u32, stage: Stage) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    Gates::write_gate(dir.path(), phase, stage, "test gate").expect("write gate");
+    dir
+}
+
+#[test]
+fn rust_log_unset_still_shows_info_level_logs_by_default() {
+    let dir = project_with_open_gate(15, Stage::Ship);
+
+    let mut cmd = Command::new(devflow_bin());
+    cmd.arg("gate").arg("approve").arg("15").arg(dir.path());
+    // No RUST_LOG, no DEVFLOW_LOG_FORMAT — exercise the true CLI default.
+    cmd.env_remove("RUST_LOG");
+    cmd.env_remove("DEVFLOW_LOG_FORMAT");
+
+    let output = cmd.output().expect("run devflow gate approve");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "devflow gate approve should succeed against a single open gate\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("gate response written for phase 15 ship: approved=true"),
+        "with RUST_LOG unset, an INFO-level tracing log should still reach stdout \
+         by default (CR-01 / commit 50db857 — default level is INFO, not \
+         ERROR-only), but it did not appear.\nstdout:\n{stdout}"
     );
 }
