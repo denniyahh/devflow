@@ -58,6 +58,7 @@ created: 2026-07-17
 | 15-05-T3 | 05 | 2 | 15b | — | `devflow` (CLI) live on registry post-publish, after core | integration | `cd "$(mktemp -d)" && cargo new _probe2 --bin >/dev/null 2>&1 && cd _probe2 && cargo add devflow@1.2.0 --dry-run` | ✅ | ✅ re-run live 2026-07-17 — resolves `devflow v1.2.0` from crates.io index |
 | 15-REVIEW2-WR-01 | — | — | 15b | 15-REVIEW.md WR-01 (this round) | `RUST_LOG` honored regardless of `DEVFLOW_LOG_FORMAT` (json or plain) — regression guard for the WR-01 bug fixed in commit `8672172`, where the json branch hardcoded `LevelFilter::INFO` and never consulted `RUST_LOG` | integration | `cargo test -p devflow --test log_format_env` | ✅ | ✅ |
 | 15-REVIEW2-CR-01 | — | — | 15b | 15-REVIEW.md CR-01 (this round) | `.github/workflows/devcontainer.yml`'s `runCmd` fails fast — `set -e` is the first command line, preceding every `cargo` invocation — regression guard for the CR-01 bug fixed in commit `3918792`, where a failing command earlier in the unguarded `bash -c` script could be masked as green by a later passing command | integration | `cargo test -p devflow --test devcontainer_ci_failfast` | ✅ | ✅ |
+| 15-REVIEW3-CR-01 | — | — | 15b | 15-REVIEW.md CR-01 (third round) | `devflow` defaults to INFO-level logging (not ERROR-only) when `RUST_LOG` is unset, on both the plain-text and JSON branches — regression guard for the CR-01 bug fixed in commit `50db857`, where the bare `EnvFilter::from_default_env()` silently defaulted to ERROR-only, contradicting the documented "default: info" behavior | integration | `cargo test -p devflow --test log_format_env` | ✅ | ✅ |
 
 *Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
 
@@ -77,6 +78,7 @@ created: 2026-07-17
 |----------|-------------|------------|-------------------|
 | Actual `cargo publish` (not dry-run) | 15b — crates.io publish | Requires a crates.io API token held by the operator; not automatable/scriptable | **Done 2026-07-17.** Operator ran `cargo login` then `cargo publish -p devflow-core` (17:39:23Z) followed by `cargo publish -p devflow` (17:40:31Z), leaf-first, directly — after two automated Code-stage attempts both false-positived without actually publishing (see 15-05-SUMMARY.md Decisions Made). Confirmed live via `curl .../api/v1/crates/{devflow-core,devflow}` (both `1.2.0`, `yanked: false`) |
 | CI badge / PR gate status rendering | 15b — CI badge | GitHub badge rendering can only be confirmed by viewing the rendered README on GitHub | View README on GitHub after merge; confirm badge renders and links to the real workflow |
+| **CR-02 (15-REVIEW.md, third round, OPEN — not yet fixed)**: `docs/guides/configuration.md:33` and `crates/devflow-core/src/lib.rs:9,34` both claim tracing log output goes to **stderr**; it actually goes to **stdout** on both the plain-text and JSON branches — `main.rs`'s `tracing_subscriber::fmt()` builder never calls `.with_writer(std::io::stderr)`. Confirmed live 2026-07-17: working tree clean, no fix commit exists for this finding (unlike the same round's CR-01 and WR-01, which were fixed in `50db857`/`0f82caa`). The project's own `log_format_env.rs` test already documents this at lines 64-66 ("tracing output... share stdout — assert against stdout, not stderr"). | 15b — doc/code accuracy | This is an **unresolved implementation defect**, not a test-coverage gap — Nyquist validation does not modify implementation files, and writing a "passing" test against the current stdout behavior would encode the bug as correct rather than guard against it. Requires either a code fix (`.with_writer(std::io::stderr)` on both branches) or a doc fix (strike "stderr" claims), then a regression test once the intended behavior is decided. | **Not done.** Escalated here by `/gsd-validate-phase 15` (2026-07-17) for a follow-up code-review/fix pass — see `15-REVIEW.md` CR-02 for full analysis and suggested fix. |
 
 ---
 
@@ -198,3 +200,27 @@ created: 2026-07-17
 **Resolution:** FILLED. Per-Task Verification Map rows `15-REVIEW2-WR-01` and `15-REVIEW2-CR-01` added, both ✅.
 
 **No implementation files were modified.** Only the two new test files and this file's own audit trail changed.
+
+---
+
+## Validation Audit 2026-07-17 (third review round — CR-01 log-level default coverage gap; CR-02 escalated)
+
+| Metric | Count |
+|--------|-------|
+| Gaps found | 1 |
+| Resolved | 1 |
+| Escalated | 1 |
+
+**What was audited:** Git history showed a *third* review round landed after the last audit above: `2108161` rewrote `15-REVIEW.md` in place (new timestamp `2026-07-17T19:08:30Z`) re-reviewing the same four files, with the prior round's CR-01/WR-01 confirmed fixed and three new findings raised: CR-01 (`configuration.md`/`lib.rs` claimed `RUST_LOG` defaults to `info`, but `main.rs` built the filter via bare `EnvFilter::from_default_env()`, which defaults to `ERROR`-only when unset), CR-02 (same docs claim log output goes to stderr; it actually goes to stdout — no `.with_writer(...)` override anywhere in `main.rs`), and WR-01 (quickstart.md's "Build from source" section ran `cargo install devflow`, which installs from the registry, not from a local clone). Two follow-up commits landed before this audit ran: `50db857` fixed CR-01 (switched to `try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))` on both branches) and `0f82caa` fixed WR-01 (quickstart now does `git clone` + `cd` + `cargo install --path crates/devflow-cli`, matching `scripts/install.sh`'s existing fallback). CR-02 has no fix commit — confirmed via `git status` (clean) and direct inspection of `main.rs` (neither branch calls `.with_writer(std::io::stderr)`).
+
+**Gap found:** `no_test_file` (MISSING) for the CR-01 fix. The existing `log_format_env.rs` test `rust_log_default_suppresses_debug_under_json_log_format` only asserted DEBUG-level output is absent by default — that was true both before and after the fix (default changed from ERROR to INFO, and INFO still suppresses DEBUG), so it provided zero regression coverage for the actual behavior change. A revert of `50db857` back to the bare `from_default_env()` would leave the whole suite green.
+
+**Gap resolved:** `gsd-nyquist-auditor` extended `crates/devflow-cli/tests/log_format_env.rs` with `rust_log_unset_still_shows_info_level_logs_by_default`, which shells `devflow gate approve` against a project with a single open gate (a real, unconditional `info!("gate response written for phase 15 ship: approved=true")` call in `Gates::respond`) with `RUST_LOG`/`DEVFLOW_LOG_FORMAT` both unset, and asserts the INFO-level line reaches stdout. The auditor adversarially verified real coverage: temporarily reverted `50db857` in a scratch working-tree state, confirmed the new test fails with the expected message, then `git checkout --` restored `main.rs` before returning. Added Per-Task Map row `15-REVIEW3-CR-01`.
+
+**Independently re-verified by the orchestrator (not just the auditor's self-report):** re-ran `cargo test -p devflow --test log_format_env` (3 passed), `cargo test --workspace` (full suite green), `cargo clippy --workspace -- -D warnings` (clean), `cargo fmt --check` (clean), and read the new test's diff in full to confirm it exercises real binary output rather than a shallow presence check.
+
+**WR-01 (quickstart.md fix):** No test created — per this file's own Wave 0 convention ("doc-prose accuracy is inherently a read-and-compare activity, not something to force into a new automated test"), and manually confirmed correct via `git show 0f82caa`.
+
+**CR-02 escalated, not resolved — requires a follow-up code or doc fix, not a Nyquist test:** `configuration.md`/`lib.rs` still claim stderr; `main.rs` still writes to stdout on both branches. This is a live, unfixed implementation/doc mismatch (an operator following `lib.rs`'s own worked example — `DEVFLOW_LOG_FORMAT=json RUST_LOG=info devflow status 2>log.json` — gets an empty `log.json`). Nyquist validation does not modify implementation files and will not write a test that encodes the current stdout behavior as "correct," since that would validate the bug rather than guard against it. Added to Manual-Only Verifications as an open item pointing back to `15-REVIEW.md` CR-02 for the actual fix. **This phase has an outstanding gap that Nyquist validation cannot close — recommend a follow-up `/code-review` or direct fix before treating Phase 15 as fully clean.**
+
+**No implementation files were modified by this audit.** Only `crates/devflow-cli/tests/log_format_env.rs` (new test) and this file's own Per-Task Map row, Manual-Only table, and audit trail changed.
