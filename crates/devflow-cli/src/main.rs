@@ -285,10 +285,15 @@ enum CliError {
 fn main() {
     match std::env::var("DEVFLOW_LOG_FORMAT").as_deref() {
         Ok("json") => {
-            tracing_subscriber::fmt().json().init();
+            let filter = tracing_subscriber::EnvFilter::from_default_env();
+            tracing_subscriber::fmt()
+                .json()
+                .with_env_filter(filter)
+                .init();
         }
         _ => {
-            tracing_subscriber::fmt::init();
+            let filter = tracing_subscriber::EnvFilter::from_default_env();
+            tracing_subscriber::fmt().with_env_filter(filter).init();
         }
     }
     if let Err(err) = run() {
