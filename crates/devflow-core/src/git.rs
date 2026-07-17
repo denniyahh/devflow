@@ -77,6 +77,24 @@ impl GitFlow {
         Ok(branch)
     }
 
+    /// Whether a phase feature branch has nothing left to merge into develop.
+    ///
+    /// An absent branch is treated as already merged so terminal hook retries
+    /// remain idempotent after a prior merge deleted the local branch.
+    pub fn is_merged_into_develop(&self, phase: u32) -> bool {
+        let branch = format!("{}phase-{:02}", self.config.feature_prefix, phase);
+        if !self.branch_exists(&branch) {
+            return true;
+        }
+
+        Command::new("git")
+            .args(["merge-base", "--is-ancestor", &branch, &self.config.develop])
+            .current_dir(&self.root)
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
     /// Create or reset a release branch from the current `HEAD`.
     ///
     /// The release branch is cut from wherever the caller currently is — the

@@ -22,6 +22,8 @@ pub enum Hook {
     BranchCleanup,
     /// Regenerate and commit docs.
     DocsUpdate,
+    /// Merge the phase feature branch into develop before release bookkeeping.
+    Merge,
     /// Append a CHANGELOG entry.
     ChangelogAppend,
     /// Compute and write the next version, then tag it.
@@ -62,6 +64,7 @@ impl Hook {
             Hook::BranchCreate => branch_create(ctx),
             Hook::BranchCleanup => branch_cleanup(ctx),
             Hook::DocsUpdate => docs_update(ctx),
+            Hook::Merge => merge_feature(ctx),
             Hook::ChangelogAppend => changelog_append(ctx),
             Hook::VersionBump => version_bump(ctx),
         }
@@ -71,7 +74,7 @@ impl Hook {
 /// Which hooks fire when moving `from` → `to`.
 ///
 /// - Validate → Ship: docs + changelog are finalized before shipping.
-/// - Ship → (done): version bump + branch cleanup.
+/// - Ship → (done): merge + version bump + branch cleanup.
 /// - everything else: none.
 pub fn hooks_for_transition(from: Stage, to: Stage) -> Vec<Hook> {
     match (from, to) {
@@ -82,7 +85,7 @@ pub fn hooks_for_transition(from: Stage, to: Stage) -> Vec<Hook> {
 
 /// Hooks that fire after Ship completes (the workflow's terminal transition).
 pub fn hooks_after_ship() -> Vec<Hook> {
-    vec![Hook::VersionBump, Hook::BranchCleanup]
+    vec![Hook::Merge, Hook::VersionBump, Hook::BranchCleanup]
 }
 
 fn branch_create(ctx: &HookContext) -> Result<(), HookError> {
@@ -111,6 +114,31 @@ fn branch_cleanup(ctx: &HookContext) -> Result<(), HookError> {
             }
         }
     }
+    Ok(())
+}
+
+fn merge_feature(ctx: &HookContext) -> Result<(), HookError> {
+    let git = GitFlow::new(&ctx.project_root);
+    let branch = format!("{}phase-{:02}", ctx.git_flow.feature_prefix, ctx.phase);
+    if git.is_merged_into_develop(ctx.phase) {
+        info!("Merge: {branch} is already merged or absent; nothing to merge");
+        crate::events::emit(
+            &ctx.project_root,
+            ctx.phase,
+            "merge_result",
+            serde_json::json!({"merged": false, "branch": branch}),
+        );
+        return Ok(());
+    }
+
+    git.feature_finish(ctx.phase)?;
+    info!("Merge: merged {branch} into develop");
+    crate::events::emit(
+        &ctx.project_root,
+        ctx.phase,
+        "merge_result",
+        serde_json::json!({"merged": true, "branch": branch}),
+    );
     Ok(())
 }
 
