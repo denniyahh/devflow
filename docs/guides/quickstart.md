@@ -9,7 +9,9 @@ Get DevFlow running in your project.
 curl -fsSL https://raw.githubusercontent.com/denniyahh/devflow/main/scripts/install.sh | bash
 
 # Build from source
-cargo install devflow
+git clone https://github.com/denniyahh/devflow.git
+cd devflow
+cargo install --path crates/devflow-cli
 ```
 
 ## Start a Phase
