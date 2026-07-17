@@ -14,7 +14,7 @@ These must be on `$PATH` for DevFlow to function.
 
 ## Required for Shipping
 
-Needed for `devflow ship` / `devflow confirm` (PR creation and merge).
+Needed for the gate-driven Ship stage (`devflow gate approve <phase> --stage ship`) — PR creation and merge.
 
 | Dependency | Min Version | Install |
 |---|---|---|
@@ -52,6 +52,5 @@ $ devflow doctor
   claude              ✓ (v2.1.181)
   codex               ✗ not found — install: npm i -g @openai/codex
   opencode            ✗ not found — install: cargo install opencode
-  devflow v1.0.0      ✓
-  .devflow.yaml       ✓ (found)
+  devflow 1.2.0       ✓
 ```
