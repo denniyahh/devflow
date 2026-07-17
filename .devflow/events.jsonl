@@ -56,3 +56,14 @@
 {"event":"transition","from":"code","phase":15,"to":"validate","ts":1784313570,"v":1}
 {"agent":"claude","event":"stage_launched","monitor_pid":2957120,"phase":15,"stage":"validate","ts":1784313570,"v":1}
 {"event":"advance_evaluated","phase":15,"reason":null,"stage":"validate","status":"success","ts":1784313853,"v":1,"verdict":"pass"}
+{"event":"hook_run","hook":"DocsUpdate","ok":true,"phase":15,"ts":1784313853,"v":1}
+{"event":"hook_run","hook":"ChangelogAppend","ok":true,"phase":15,"ts":1784313853,"v":1}
+{"event":"transition","from":"validate","phase":15,"to":"ship","ts":1784313853,"v":1}
+{"agent":"claude","event":"stage_launched","monitor_pid":2969937,"phase":15,"stage":"ship","ts":1784313853,"v":1}
+{"event":"advance_evaluated","phase":15,"reason":"review: Critical finding CR-01 — .github/workflows/devcontainer.yml runCmd lacks set -e/&& chaining, so a failing cargo build/test can still report a green CI job","stage":"ship","status":"failed","ts":1784314372,"v":1,"verdict":null}
+{"consecutive_failures":0,"event":"loop_back","from":"ship","phase":15,"ts":1784314372,"v":1}
+{"agent":"claude","event":"stage_launched","monitor_pid":2987940,"phase":15,"stage":"code","ts":1784314372,"v":1}
+{"event":"advance_evaluated","phase":15,"reason":null,"stage":"code","status":"success","ts":1784314573,"v":1,"verdict":null}
+{"event":"transition","from":"code","phase":15,"to":"validate","ts":1784314573,"v":1}
+{"agent":"claude","event":"stage_launched","monitor_pid":3002001,"phase":15,"stage":"validate","ts":1784314573,"v":1}
+{"event":"advance_evaluated","phase":15,"reason":null,"stage":"validate","status":"success","ts":1784314933,"v":1,"verdict":"pass"}
