@@ -78,6 +78,13 @@ Ship's gating review catch what it currently misses on a single pass.
 - **16h — Cross-attempt Ship/Code history view.** Reconstructing "what's
   been tried and fixed so far" currently requires manually diffing
   `events.jsonl` and successive `REVIEW.md` snapshots by hand.
+- **16i — `.gitignore`/runtime-file CI invariant.** A deterministic test
+  (not LLM review) that enumerates every `.devflow/`-writing path in source
+  (`agent_result.rs`, `lock.rs`, `ship.rs`, `events.rs`, `gates.rs`, etc.)
+  and asserts `.gitignore` covers it — this exact gap is what let real
+  session telemetry leak into git history undetected for the length of this
+  entire dogfood run, and would catch the next rename-without-gitignore-
+  update at commit/CI time instead of two Ship-review cycles later.
 
 ## Explicitly Out of Scope (this phase)
 
