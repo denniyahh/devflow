@@ -59,11 +59,11 @@ crates/
 
 **Key design decisions:**
 
-- **Agent-agnostic** — Claude, Codex, and OpenCode all implement the same `Agent` trait. Adding a new agent follows a small checklist (see [ARCHITECTURE.md](ARCHITECTURE.md#extension-points--adding-an-agent)).
+- **Agent-agnostic** — Claude, Codex, and OpenCode all implement the same `AgentAdapter` trait. Adding a new agent follows a small checklist (see [ARCHITECTURE.md](ARCHITECTURE.md#extension-points--adding-an-agent)).
 - **Worktree isolation by default** — agents run in isolated git worktrees (`.worktrees/phase-NN/`) unless `--no-worktree` is passed, preventing cross-phase contamination.
 - **Monitor daemon** — optional background process detects agent completion and auto-advances the state machine. No cron, no polling, no tmux.
 - **Three-layer evaluation** — agents self-report via `DEVFLOW_RESULT` markers in stdout; fallback layers: exit code + commit count, then a commit-count heuristic.
-- **Shared prompts** — all agents receive the same prompt via `phase_prompt()`. No agent-specific prompt logic.
+- **Per-stage prompts** — `stage_prompt(stage, phase)` builds a dedicated prompt per pipeline stage (not one shared instruction template); the same prompt text is used across agents for a given stage, with adapter-specific logic limited to CLI launch flags, not prompt content.
 
 ## Agent Protocol
 
@@ -83,7 +83,7 @@ DevFlow evaluates agent output in three layers:
 | 2. Exit code + commits | Exit 0 **and** commits on the feature branch = success; otherwise failed | Fallback |
 | 3. Commit heuristic | Exit code unknown: commits exist = probable success (with warning) | Last resort |
 
-Rate-limit detection: if an agent's stdout contains rate-limit messages (429), DevFlow writes `.devflow/cron-instructions.json` for rescheduling.
+Rate-limit detection: during `devflow sequentagent`, if an agent's stdout contains rate-limit messages (429), DevFlow writes a per-phase `.devflow/cron-instructions-{phase:02}.json` for rescheduling.
 
 ## Commands
 

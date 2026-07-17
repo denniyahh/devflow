@@ -64,7 +64,7 @@ git config tag.gpgsign false
 ## Phase Plans (`.planning/`)
 
 DevFlow drives agents from per-phase plans under `.planning/`. The launch prompt
-(`agents::phase_prompt()`) reads `.planning/ROADMAP.md` and
+(`crate::prompt::stage_prompt(stage, phase)`) reads `.planning/ROADMAP.md` and
 `.planning/phases/NN-*/CONTEXT.md`, so these files are tracked in the repo — they
 are DevFlow's phase-plan convention, not private scratch. When adding a phase,
 commit its `CONTEXT.md` so agents (and reviewers) can read the plan.
@@ -109,10 +109,15 @@ test, or pass CI.
 
 ## Commit Conventions
 
-**Deprecated — June 2026.** The conventional commits model is being replaced by a
-per-phase branching and merge scheme (Phase 11). Until then, write descriptive
-commit messages that explain what changed and why, without a required prefix
-format.
+DevFlow uses [Conventional Commits](https://www.conventionalcommits.org/):
+`type(scope): description`, imperative mood, no period at the end.
+
+Common types in this repo: `feat`, `fix`, `docs`, `test`, `ci`, `chore`,
+`refactor`. Scope is typically a crate/module (`cli`, `core`) or a phase/plan
+identifier (`15-05`, `phase-15`). Phase 11's per-phase branching/merge scheme
+(feature branches merged via `devflow finish`/`devflow ship`) works alongside
+Conventional Commits, not as a replacement for it — every commit in this
+project's own history follows the format.
 
 ## Logging Conventions
 
@@ -175,12 +180,12 @@ DevFlow is agent-agnostic; agent-specific code lives only under
 `crates/devflow-core/src/agents/`. Adding a backend is a short checklist — keep
 these in sync or tests/builds fail:
 
-1. Add an adapter file in `crates/devflow-core/src/agents/` implementing the `Agent` trait
-2. Add a variant to the `AgentKind`/`Agent` enum in `state.rs`
+1. Add an adapter file in `crates/devflow-core/src/agents/` implementing the `AgentAdapter` trait
+2. Add a variant to the `AgentKind` enum in `state.rs`
 3. Update the `FromStr` parser, `Display`, and `AgentParseError` text in `state.rs`
 4. Add a match arm in `agents::adapter_for()`
 5. Add the `pub mod` / `pub use` exports in `agents/mod.rs`
-6. Extend tests (adapter name, parser aliases, shared-prompt)
+6. Extend tests (adapter name, parser aliases, prompt-sharing)
 7. Update docs (README, this file, ARCHITECTURE.md, DEPENDENCIES.md)
 
 See [ARCHITECTURE.md](ARCHITECTURE.md#extension-points--adding-an-agent) for the
