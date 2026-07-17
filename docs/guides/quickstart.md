@@ -12,20 +12,19 @@ curl -fsSL https://raw.githubusercontent.com/denniyahh/devflow/main/scripts/inst
 cargo install devflow
 ```
 
-## Initialize a Project
+## Start a Phase
+
+No initialization step is required — DevFlow has no config file and no
+`init` command. Run `devflow start` directly from your project root:
 
 ```bash
 cd your-project
-devflow init
-```
-
-This creates `.devflow/state.json` and `.devflow.yaml` with sensible defaults.
-
-## Start a Phase
-
-```bash
 devflow start --phase 3 --agent claude --mode auto
 ```
+
+This creates a feature branch (in its own git worktree by default), launches
+the agent, and persists that phase's progress to
+`.devflow/state-03.json` (state is per-phase, not a single shared file).
 
 ## Check Status
 
@@ -33,11 +32,19 @@ devflow start --phase 3 --agent claude --mode auto
 devflow status
 ```
 
-## Ship a Completed Phase
+## Shipping
+
+Shipping is not a separate command you run — Ship is the pipeline's final
+stage, driven automatically once Validate passes. It always pauses at a
+human gate before merging:
 
 ```bash
-devflow ship
+devflow gate list
+devflow gate approve 3 --note "lgtm"
 ```
+
+See [OPERATIONS.md](../../OPERATIONS.md) for the full gate-answering
+reference.
 
 ## Prerequisites
 
