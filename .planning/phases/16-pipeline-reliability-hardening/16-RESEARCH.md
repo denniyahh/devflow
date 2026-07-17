@@ -174,7 +174,7 @@ boundaries.
 
 | Library | Version | Purpose | Why Standard |
 |---------|---------|---------|--------------|
-| `toml` [ASSUMED — see Assumptions Log A1] | ~0.9.x per websearch (2026-07-17); verify exact SemVer with `cargo add toml --dry-run` before locking in the plan | Parse/serialize the new minimal `devflow.toml` (D-03), serde-compatible | 10+ years old (first published 2014), 13.4M weekly downloads, canonical `toml-rs/toml` repo — the only serious choice in the Rust ecosystem for this |
+| `toml` [ASSUMED→verified — see Assumptions Log A1] | v1.1.3 (measured 2026-07-17 via `cargo add toml -p devflow-core --dry-run`; supersedes the earlier ~0.9.x websearch figure). Plan pins `toml = "1"` (semver-compatible) | Parse/serialize the new minimal `devflow.toml` (D-03), serde-compatible | 10+ years old (first published 2014), 13.4M weekly downloads, canonical `toml-rs/toml` repo — the only serious choice in the Rust ecosystem for this |
 | `serde`/`serde_json` (already a workspace dep) | `1` (workspace pin, unchanged) | Existing envelope/state/event (de)serialization; `devflow.toml`'s Rust struct also derives `Deserialize` | Already used everywhere in this codebase — no new pattern needed |
 | `clap` (already a workspace dep) | `4` (workspace pin, unchanged) | CLI arg parsing — 16g's footgun fix is a *schema* change within the existing `clap` derive macros, not a new dependency | Already the CLI framework |
 
@@ -198,17 +198,17 @@ boundaries.
 # In crates/devflow-core/Cargo.toml, add to [dependencies] (workspace-pinned):
 # toml.workspace = true
 # and to the root Cargo.toml [workspace.dependencies]:
-# toml = "0.9"
+# toml = "1"   # measured resolve: v1.1.3 (2026-07-17)
 cargo add toml -p devflow-core
 ```
 
-**Version verification:** Run `cargo add toml --dry-run -p devflow-core` (or `cargo search
-toml` if network policy allows) before locking the plan's dependency line — the ~0.9.x
-figure above is websearch-sourced (MEDIUM confidence), not fetched from crates.io directly
-in this session (direct `curl` to `crates.io/api/v1/crates/toml` returned **HTTP 403** per
-crates.io's data-access policy, requiring a compliant User-Agent header — the gsd-tools
-package-legitimacy check used a different, policy-compliant path and returned registry
-metadata but not the exact version string).
+**Version verification:** `cargo add toml -p devflow-core --dry-run` was run at plan-write
+time (2026-07-17) and resolves to **v1.1.3** — this supersedes the earlier websearch-sourced
+~0.9.x figure (the websearch pass could not reach crates.io directly: direct `curl` to
+`crates.io/api/v1/crates/toml` returned **HTTP 403** per crates.io's data-access policy,
+requiring a compliant User-Agent header). The plan pins `toml = "1"` (semver-compatible with
+v1.1.3); 16-02's blocking-human legitimacy checkpoint re-confirms the exact pin at execution
+time before the `Cargo.toml` edit is committed.
 
 ## Package Legitimacy Audit
 
@@ -643,7 +643,7 @@ not "implement merge logic from scratch."
 
 | # | Claim | Section | Risk if Wrong |
 |---|-------|---------|---------------|
-| A1 | `toml` crate is at approximately version `0.9.x` and is the correct/only serious choice for `devflow.toml` (D-03) | Standard Stack | Low risk to correctness (the crate is unambiguously the standard choice and its `0.x` API has been stable and serde-compatible across recent majors), but the exact version pin in the plan's `Cargo.toml` edit could be stale — planner should re-verify with `cargo add toml --dry-run` at plan-write time rather than hardcoding "0.9" |
+| A1 | `toml` crate is the correct/only serious choice for `devflow.toml` (D-03); exact version measured at plan-write time as **v1.1.3** (`cargo add toml -p devflow-core --dry-run`, 2026-07-17), superseding the earlier ~0.9.x websearch estimate | Standard Stack | RESOLVED — no longer an open assumption on correctness or version. The crate is unambiguously the standard choice; the version was verified by live `cargo add --dry-run` and the plan pins `toml = "1"` (semver-compatible). 16-02's blocking-human checkpoint re-confirms the pin before commit |
 | A2 | `ignore` crate would be the right tool IF 16i needs real gitignore glob semantics | Standard Stack / Don't Hand-Roll | Low risk — this is explicitly conditional advice, not a locked recommendation; if the planner's 16i design only needs flat literal-path matching (which the current enumerated path set suggests), no new dependency is needed at all |
 | A3 | ntfy/desktop-notify provide no first-party delivery-receipt API (16j design conclusion) | Phase Requirements table / Don't Hand-Roll | Medium — sourced from a single websearch pass, not exhaustive vendor-doc review; if a delivery-receipt mechanism does exist for the operator's specific notify channel, 16j's design could use it instead of falling back to a DevFlow-side persistent indicator. Recommend the planner confirm the operator's actual `DEVFLOW_GATE_NOTIFY_CMD` target (ntfy? desktop? something else?) before finalizing 16j's approach |
 | A4 | `clap`'s documented trailing-positional-plus-subcommand ambiguity is the exact mechanism behind the `devflow gate approve 15 ship` footgun | Phase Requirements table (16g) | Low — directly reproduced by reading `GateCmd::Approve`'s field order in `main.rs:234-247` (two bare positionals: `phase`, then `project` after keyword flags) against clap's own documented behavior; high confidence this is correct, but the exact clap version's exact parsing algorithm wasn't independently fetched from clap's own docs in this session |
