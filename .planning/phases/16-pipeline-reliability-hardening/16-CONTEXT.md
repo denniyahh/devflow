@@ -154,6 +154,18 @@ Explicitly out of scope: Hermes support (Phase 17), Antigravity adapter
 <deferred>
 ## Deferred Ideas
 
+- **Candidate scope item (16j?) — operator notification gap, observed
+  2026-07-17:** the Phase 15 ship security gate fired (`gate_fired` +
+  `notify_fired` both logged to events.jsonl, `unexpected: false`) yet the
+  operator received NO actual notice and only discovered the ~78-minute-old
+  blocked gate by manually asking for status. The notify path "fired"
+  according to DevFlow's own telemetry while delivering nothing a human saw
+  — a pipeline-feedback false positive, same family as the Code-stage false
+  positives that motivated this phase. Needs: a notify channel that
+  verifiably reaches the operator (and/or a loud persistent indicator in
+  `devflow status`/terminal), not just an event log entry claiming success.
+  User to promote via /gsd-phase if wanted in Phase 16 proper.
+
 - Full pipeline configurability via `devflow.toml` (stage behavior, hooks,
   agent defaults) — shelved 2026-07-08, still deferred; only the minimal
   new-knob file is in Phase 16.
