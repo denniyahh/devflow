@@ -181,6 +181,25 @@ Explicitly out of scope: Hermes support (Phase 17), Antigravity adapter
   bucket): either make `stage` positional-optional, drop the positional
   project in favor of `--project`, or add a "did you mean `--stage ship`?"
   hint when the unmatched positional equals a stage name.
+- **Candidate scope item (16k?) — ship terminal false positive, observed
+  2026-07-17 (SEVERE, the worst signal failure of the entire dogfood run):**
+  after the operator approved the final "Ship complete — approve merge?"
+  gate, DevFlow emitted `hook_run VersionBump ok=true`, `hook_run
+  BranchCleanup ok=true`, and `workflow_finished` — while in reality: (1)
+  NO merge was performed, locally or via the PR the ship agent had opened
+  (PR #7 was still open, feature/phase-15 not an ancestor of develop); (2)
+  VersionBump mutated the PRIMARY checkout — which contained none of the
+  phase's work — leaving an uncommitted Cargo.toml bump to a nonsense
+  version (1.2.0 → 1.2.183) and tagging v1.2.183 on an unrelated docs
+  commit; (3) BranchCleanup deleted nothing (worktree and branch intact)
+  yet reported ok=true; (4) per-phase state was deleted, so `devflow
+  status` showed nothing wrong. The phase had to be shipped by hand (manual
+  merge 01d511c, v1.3.0). Forensic targets: the gate-approval advance path
+  in ship.rs/main.rs — where the merge step should be and isn't (or fails
+  silently), why VersionBump computes x.y.<commit-count?> against the wrong
+  checkout, and why hook success is unconditional. Related earlier evidence:
+  CHANGELOG.md contains a series of bogus auto-entries (1.2.175/176/179
+  "Released phase via DevFlow") from the same mechanism.
 
 - Full pipeline configurability via `devflow.toml` (stage behavior, hooks,
   agent defaults) — shelved 2026-07-08, still deferred; only the minimal
