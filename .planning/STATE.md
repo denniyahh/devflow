@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
 status: In progress
-stopped_at: "Phase 16 planned — 7 plans, 4 waves, 16k-first per D-09; ready to execute"
-last_updated: "2026-07-17T22:51:54.000Z"
+stopped_at: Completed 16-01-PLAN.md
+last_updated: "2026-07-17T23:40:46.203Z"
 progress:
   total_phases: 6
-  completed_phases: 3
+  completed_phases: 4
   total_plans: 34
-  completed_plans: 27
-  percent: 50
+  completed_plans: 28
+  percent: 67
 ---
 
 # DevFlow — Project State
@@ -20,7 +20,7 @@ progress:
 ## Active
 
 - **Phase 15 (15a Complete / 15b Scoped):** Dogfood Enablement + OSS Readiness — rescoped 2026-07-16 dogfood-first. 15a COMPLETE: `devflow gate list/approve/reject`, OPERATIONS.md, `.devflow.yaml` decoy removed, lib.rs examples fixed, `--help` snapshot guard; exit criterion verified live (full phase, gate answered only via CLI). 15b: OSS packaging (README/ARCHITECTURE/CONTRIBUTING/devcontainer/crates.io publish), to be run through DevFlow as the first post-MVP dogfood — `devflow start --phase 15 --agent claude --mode auto`. Antigravity adapter deferred to unscheduled backlog
-- **Phase 16 (Planned — Ready to execute):** Pipeline Reliability Hardening — inserted 2026-07-17, surfaced entirely by dogfooding Phase 15 through DevFlow (two Code-stage false positives on the crates.io publish plan, four consecutive Ship-review failures on distinct legitimate findings). Planned 2026-07-17: 7 plans in 4 waves, 16k-first per D-09; plan-checker passed (1 revision); decision coverage 9/9. Next up: `/gsd-execute-phase 16`
+- **Phase 16 (In Progress — 1/7 plans):** Pipeline Reliability Hardening — 16-01 closed the terminal Ship false positive by merging before versioning, emitting truthful merge/no-op telemetry, and cleaning the corrupted release history. Next up: 16-02 minimal `devflow.toml` configuration foundation.
 - **Phase 17 (Scoped):** Hermes Support — renumbered from 16 to 17 (2026-07-17) to make room for Phase 16. HermesAgent adapter, skill-file rewrite, Hermes plugin. Depends on Phase 14's events.jsonl + Phase 13's notify hook
 
 ## Completed
@@ -91,6 +91,8 @@ None.
 - [Phase 15]: 15-02: ARCHITECTURE.md full rewrite also corrected the Agent model (trait renamed `Agent`->`AgentAdapter` in 12-11; prompts are per-stage via `prompt.rs::stage_prompt`, not one shared template) and Completion evaluation's Layer 2 commit gate (scoped to Plan/Code only, not every stage) — both classified "already accurate" by 15-PATTERNS.md but found stale on direct source verification; CONTRIBUTING.md's "Adding a New Agent" section left untouched (out of files_modified scope) despite already duplicating the checklist inline with the stale trait name — flagged for a future cleanup
 - [Phase 15]: 15-03: Verified devcontainer base image tag live against registry (2.0.13-1-bookworm, not stale illustrative 1-1-bookworm) and pinned devcontainers/ci action to @v0.3; CODE_OF_CONDUCT.md spot-checked and left unmodified (contact wording current)
 - [Phase 15]: 15-04: Sourced canonical Apache-2.0 body from an already-vendored copy in the local Cargo registry cache (byte-diffed) after an initial from-memory reconstruction was self-caught with garbled Section 8/9 text; kept dual license per plan's locked resolution
+- [Phase 16]: 16-01: absent feature branches are treated as already merged so terminal retries are safe after feature_finish deletes the branch
+- [Phase 16]: 16-01: merge_result telemetry separates actual merge effects from successful no-op hook execution
 
 ## Roadmap Evolution
 
@@ -122,9 +124,10 @@ None.
 | Phase 15-oss-readiness P02 | 40min | 3 tasks | 3 files |
 | Phase 15-oss-readiness P03 | 10min | 3 tasks | 3 files |
 | Phase 15-oss-readiness P04 | 12min | 2 tasks | 1 files |
+| Phase 16-pipeline-reliability-hardening P01 | 5min | 3 tasks | 3 files |
 
 ## Session
 
-**Last session:** 2026-07-17T22:51:54.000Z
-**Stopped at:** Phase 16 planned (7 plans, 4 waves); ready to execute
-**Resume file:** .planning/phases/16-pipeline-reliability-hardening/16-01-PLAN.md
+**Last session:** 2026-07-17T23:40:46.183Z
+**Stopped at:** Completed 16-01-PLAN.md
+**Resume file:** None
