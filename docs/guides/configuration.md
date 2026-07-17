@@ -33,6 +33,11 @@ environment variables, not config file fields:
 | `RUST_LOG` | `info` | Log verbosity (stderr) |
 | `DEVFLOW_LOG_FORMAT` | plain text | Set to `json` for machine-readable log lines |
 
+Gate metadata (`DEVFLOW_GATE_PHASE`/`DEVFLOW_GATE_STAGE`/`DEVFLOW_GATE_CONTEXT`)
+is passed as environment variables to the `DEVFLOW_GATE_NOTIFY_CMD` command,
+never interpolated into the command string — the notify command itself is
+still `sh -c`-evaluated, so treat it like any other shell command you control.
+
 ## Git-flow branch names
 
 Branch naming (`main`, `develop`, `feature/` prefix) is hardcoded, not
