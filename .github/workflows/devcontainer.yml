@@ -20,6 +20,7 @@ jobs:
         uses: devcontainers/ci@v0.3
         with:
           runCmd: |
+            set -e
             cargo build --workspace
             cargo test --workspace
             cargo clippy --workspace -- -D warnings
