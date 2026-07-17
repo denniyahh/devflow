@@ -2,7 +2,7 @@
 
 > Phase plan source of truth. Each phase drives a `devflow start` agent session.
 
-## v2.0.0 (Phase 11–16)
+## v2.0.0 (Phase 11–17)
 
 | Phase | Name | Status |
 |---|---|---|
@@ -10,7 +10,8 @@
 | 13 | MVP Core Loop | Complete    |
 | 14 | Parallel Safety + Observability | Complete |
 | 15 | Dogfood Enablement + OSS Readiness | 15a Complete / 15b Scoped |
-| 16 | Hermes Support | Scoped |
+| 16 | Pipeline Reliability Hardening | Scoped |
+| 17 | Hermes Support | Scoped |
 
 ## Shipped
 
@@ -128,13 +129,24 @@ Plans:
 - [x] 15a — dogfood enablement (gate subcommand, OPERATIONS.md, accuracy fixes) — complete 2026-07-16; exit criterion verified live (full phase with the gate answered only via `devflow gate approve`)
 - [ ] 15b — OSS packaging (run /gsd-plan-phase 15 to break down; execute via DevFlow dogfood)
 
-### Phase 16: Hermes Support
+### Phase 16: Pipeline Reliability Hardening
 
-**Goal:** First-class Hermes support — `HermesAgent` adapter with native-envelope completion parsing (16a), rewrite of the stale `skills/hermes/devflow/SKILL.md` against current CLI behavior (16b), and the Hermes plugin session mode with an events.jsonl-driven gate watcher (16c). Split out of Phase 14 on 2026-07-16 so personal-infrastructure work doesn't gate parallel-safety correctness or OSS readiness.
+**Goal:** Inserted 2026-07-17, pushing the prior Phase 16 (Hermes Support) to 17. Surfaced entirely by dogfooding Phase 15 through DevFlow itself: two Code-stage false positives on the crates.io publish plan (no repo-diff success signal, once via Layer-2 commit-count heuristic and once via an incorrect agent self-report), and four consecutive Ship-time code-review failures on legitimate but distinct findings (leaked runtime telemetry, an incomplete follow-up fix, a CI job that couldn't fail loud, a doc/behavior mismatch) that a single-pass standard-depth reviewer surfaced one at a time instead of together. Scope: (a) external post-condition verification for plans with no repo-diff success signal, (b) retained per-stage capture history instead of clobbering `.devflow/phase-NN-stdout` on every stage launch, (c) a deterministic doc-claim-vs-source checker, (d) deep-mode + multi-angle parallel review for Ship's gating pass instead of one single-pass standard-depth reviewer, (e) incremental per-plan/per-wave review instead of only at phase end, (f) worktree-aware `devflow status` (currently reports `idle` when run from inside the worktree it created), (g) legacy-state WARN cleanup/hint, (h) cross-attempt Ship/Code history view.
+**Requirements**: TBD (see CONTEXT.md)
+**Depends on:** Phase 15 (surfaced entirely by dogfooding it)
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (run /gsd-plan-phase 16 to break down)
+
+### Phase 17: Hermes Support
+
+**Goal:** First-class Hermes support — `HermesAgent` adapter with native-envelope completion parsing (17a), rewrite of the stale `skills/hermes/devflow/SKILL.md` against current CLI behavior (17b), and the Hermes plugin session mode with an events.jsonl-driven gate watcher (17c). Split out of Phase 14 on 2026-07-16 so personal-infrastructure work doesn't gate parallel-safety correctness or OSS readiness. Renumbered from 16 to 17 on 2026-07-17 to make room for Phase 16 (Pipeline Reliability Hardening).
 **Requirements**: TBD (see CONTEXT.md)
 **Depends on:** Phase 14 (consumes `events.jsonl` + the Phase 13 notify hook)
 **Plans:** 0 plans
 
 Plans:
 
-- [ ] TBD (run /gsd-plan-phase 16 to break down)
+- [ ] TBD (run /gsd-plan-phase 17 to break down)

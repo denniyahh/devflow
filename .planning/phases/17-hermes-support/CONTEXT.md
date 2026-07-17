@@ -1,4 +1,4 @@
-# Phase 16: Hermes Support
+# Phase 17: Hermes Support
 
 **Status:** Scoped | **Priority:** MEDIUM | **Target:** TBD
 
@@ -12,8 +12,8 @@
 
 ## Goal
 
-Add first-class Hermes support: `HermesAgent` adapter (16a), skill-file
-rewrite (16b), and the Hermes plugin session mode (16c).
+Add first-class Hermes support: `HermesAgent` adapter (17a), skill-file
+rewrite (17b), and the Hermes plugin session mode (17c).
 
 **Depends on:** Phase 14 — the plugin's gate watcher and status display
 consume Phase 14's `events.jsonl` and Phase 13's gate notify hook. Phase 15
@@ -21,7 +21,7 @@ consume Phase 14's `events.jsonl` and Phase 13's gate notify hook. Phase 15
 
 ---
 
-## 16a — Hermes Agent Adapter *(was 14c)*
+## 17a — Hermes Agent Adapter *(was 14c)*
 
 - [ ] `HermesAgent` adapter — `hermes exec --non-interactive --json`
 - [ ] AgentKind variant + parser + display + adapter_for()
@@ -30,9 +30,9 @@ consume Phase 14's `events.jsonl` and Phase 13's gate notify hook. Phase 15
       Claude/Codex (DEVFLOW_RESULT marker as fallback)
 - [ ] Tests: parser aliases, shared prompt, adapter name, envelope parsing
 
-## 16b — Hermes Skill-File Rewrite *(was 14d)*
+## 17b — Hermes Skill-File Rewrite *(was 14d)*
 
-Prerequisite for 16c's plugin work — the current gate-response path.
+Prerequisite for 17c's plugin work — the current gate-response path.
 
 - [ ] Hermes skill file (`skills/hermes/devflow/SKILL.md`) is stale: says
       `v0.5.0+`, references `--max-turns 50` (not a real adapter flag) and
@@ -41,7 +41,7 @@ Prerequisite for 16c's plugin work — the current gate-response path.
       CLI/adapter behavior, including the Phase 13 notify hook and
       configurable gate timeout.
 
-## 16c — Hermes Plugin *(was 14e)*
+## 17c — Hermes Plugin *(was 14e)*
 
 A first-class DevFlow session mode for Hermes. When active, Hermes operates
 as DevFlow's human interface rather than a general assistant — preventing
