@@ -94,7 +94,8 @@ Rate-limit detection: during `devflow sequentagent`, if an agent's stdout contai
 | `devflow start --phase N --agent X [--mode auto\|supervise] [--no-worktree]` | Begin a phase: branch/worktree → launch agent → monitor pipeline |
 | `devflow status` | Show current stage, phase, agent, PID, age |
 | `devflow list` | List all feature branches with divergence from develop |
-| `devflow gate list\|approve\|reject <phase> [--stage STAGE] [--note "..."]` | Inspect and answer human gates — the pause points where the workflow waits for approval |
+| `devflow gate list` | List gates awaiting a response |
+| `devflow gate approve\|reject <phase> [--stage STAGE] [--note "..."]` | Answer a human gate — the pause points where the workflow waits for approval |
 | `devflow logs [--phase N] [--follow] [--stderr]` | Print or follow an agent's captured output for a phase |
 | `devflow cleanup` | Remove phase worktrees and their feature branches |
 
