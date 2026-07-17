@@ -124,12 +124,16 @@ See `14-SUMMARY.md` for validation + live two-phase e2e acceptance evidence.
 **Plans:** 15a complete + 5 plans for 15b (waves 1-2)
 
 Plans:
+**Wave 1**
 
 - [x] 15a — dogfood enablement (gate subcommand, OPERATIONS.md, accuracy fixes) — complete 2026-07-16; exit criterion verified live (full phase with the gate answered only via `devflow gate approve`)
 - [ ] 15-01-PLAN.md (wave 1) — README/SECURITY/DEPENDENCIES accuracy pass against the real v2 CLI surface
 - [ ] 15-02-PLAN.md (wave 1) — ARCHITECTURE.md full rewrite against source + docs/guides accuracy
 - [ ] 15-03-PLAN.md (wave 1) — CONTRIBUTING refresh (required-checks note) + greenfield .devcontainer + container-parity CI job
 - [ ] 15-04-PLAN.md (wave 1) — dual-license fix (add LICENSE-APACHE) + publish dry-run verification
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
 - [ ] 15-05-PLAN.md (wave 2, non-autonomous) — publish devflow-core then devflow to crates.io (operator-held token gate)
 
 ### Phase 16: Hermes Support
