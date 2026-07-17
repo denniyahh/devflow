@@ -145,7 +145,7 @@ fn devflow_ignores_stray_devflow_yaml() {
     let output = run_devflow(root, &fake_bin.path, &["doctor"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    assert!(stdout.contains("devflow v1.2.0"));
+    assert!(stdout.contains(&format!("devflow v{}", env!("CARGO_PKG_VERSION"))));
 }
 
 #[test]
