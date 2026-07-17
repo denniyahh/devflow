@@ -10,6 +10,14 @@
 //! `debug!("migrated legacy state.json to ...")` line as a side effect of
 //! that migration, giving a real DEBUG-level log line to assert on — not
 //! just "the binary didn't crash".
+//!
+//! Regression guard for CR-02 (15-REVIEW.md, third round): `lib.rs` documents
+//! that "log output goes to stderr so stdout remains available for agent
+//! output", but `main.rs` built both `tracing_subscriber::fmt()` branches
+//! without a `.with_writer(...)` override, so log lines actually landed on
+//! stdout. Fixed by adding `.with_writer(std::io::stderr)` to both branches.
+//! Tests below now assert log lines on stderr and assert their absence from
+//! stdout.
 
 use devflow_core::gates::Gates;
 use devflow_core::mode::Mode;
@@ -47,7 +55,7 @@ fn project_with_legacy_state() -> tempfile::TempDir {
     dir
 }
 
-fn run_status(dir: &PathBuf, log_format: Option<&str>, rust_log: Option<&str>) -> String {
+fn run_status(dir: &PathBuf, log_format: Option<&str>, rust_log: Option<&str>) -> (String, String) {
     let mut cmd = Command::new(devflow_bin());
     cmd.arg("status").arg(dir);
 
@@ -62,23 +70,33 @@ fn run_status(dir: &PathBuf, log_format: Option<&str>, rust_log: Option<&str>) -
         cmd.env("RUST_LOG", level);
     }
 
-    // `tracing_subscriber::fmt()` writes to stdout by default (main.rs does
-    // not override the writer), so tracing output and the CLI's own printed
-    // output share stdout — assert against stdout, not stderr.
+    // `tracing_subscriber::fmt()` writes to stderr (main.rs sets
+    // `.with_writer(std::io::stderr)` — CR-02 fix), separate from the CLI's
+    // own `println!` output on stdout. Return both streams so callers can
+    // assert log lines land on stderr and never leak onto stdout.
     let output = cmd.output().expect("run devflow status");
-    String::from_utf8_lossy(&output.stdout).to_string()
+    (
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
 }
 
 #[test]
 fn rust_log_debug_is_honored_under_json_log_format() {
     let dir = project_with_legacy_state();
-    let stdout = run_status(&dir.path().to_path_buf(), Some("json"), Some("debug"));
+    let (stdout, stderr) = run_status(&dir.path().to_path_buf(), Some("json"), Some("debug"));
 
     assert!(
-        stdout.contains("migrated legacy state.json"),
+        stderr.contains("migrated legacy state.json"),
         "with DEVFLOW_LOG_FORMAT=json and RUST_LOG=debug, expected a DEBUG-level \
-         tracing log to reach stdout (proving RUST_LOG is consulted on the json \
-         branch, per WR-01 / commit 8672172), but it did not appear.\nstdout:\n{stdout}"
+         tracing log to reach stderr (proving RUST_LOG is consulted on the json \
+         branch, per WR-01 / commit 8672172), but it did not appear.\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("migrated legacy state.json"),
+        "log lines must not leak onto stdout (CR-02) — stdout is reserved for \
+         agent output and structured results per lib.rs's documented contract.\n\
+         stdout:\n{stdout}"
     );
 }
 
@@ -89,12 +107,17 @@ fn rust_log_default_suppresses_debug_under_json_log_format() {
     // defaults to ERROR-level-only when the env var is absent, so this DEBUG
     // line must NOT appear. If it does, RUST_LOG is being ignored (i.e. a
     // fixed, too-verbose level is hardcoded again), the exact WR-01 bug class.
-    let stdout = run_status(&dir.path().to_path_buf(), Some("json"), None);
+    let (stdout, stderr) = run_status(&dir.path().to_path_buf(), Some("json"), None);
 
     assert!(
-        !stdout.contains("migrated legacy state.json"),
+        !stderr.contains("migrated legacy state.json"),
         "with DEVFLOW_LOG_FORMAT=json and RUST_LOG unset, no DEBUG-level log \
-         should reach stdout, but one did — RUST_LOG is not being consulted.\n\
+         should reach stderr, but one did — RUST_LOG is not being consulted.\n\
+         stderr:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("migrated legacy state.json"),
+        "log lines must never leak onto stdout (CR-02), regardless of level.\n\
          stdout:\n{stdout}"
     );
 }
@@ -130,16 +153,21 @@ fn rust_log_unset_still_shows_info_level_logs_by_default() {
 
     let output = cmd.output().expect("run devflow gate approve");
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert!(
         output.status.success(),
-        "devflow gate approve should succeed against a single open gate\nstdout:\n{stdout}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stderr)
+        "devflow gate approve should succeed against a single open gate\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
-        stdout.contains("gate response written for phase 15 ship: approved=true"),
-        "with RUST_LOG unset, an INFO-level tracing log should still reach stdout \
+        stderr.contains("gate response written for phase 15 ship: approved=true"),
+        "with RUST_LOG unset, an INFO-level tracing log should still reach stderr \
          by default (CR-01 / commit 50db857 — default level is INFO, not \
-         ERROR-only), but it did not appear.\nstdout:\n{stdout}"
+         ERROR-only), but it did not appear.\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("gate response written for phase 15 ship: approved=true"),
+        "the tracing log line must not leak onto stdout (CR-02) — only the CLI's \
+         own printed confirmation message belongs there.\nstdout:\n{stdout}"
     );
 }
