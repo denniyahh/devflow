@@ -320,6 +320,35 @@ mod tests {
     }
 
     #[test]
+    fn terminal_hooks_version_post_merge_develop() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        git(dir.path(), &["checkout", "-q", "-b", "feature/phase-11"]);
+        std::fs::write(dir.path().join("feature.txt"), "phase work\n").unwrap();
+        git(dir.path(), &["add", "feature.txt"]);
+        git(dir.path(), &["commit", "-q", "-m", "phase work"]);
+
+        let feature_tip = git_output(dir.path(), &["rev-parse", "feature/phase-11"]);
+        let pre_merge_count = git_output(dir.path(), &["rev-list", "--count", "HEAD"]);
+
+        let context = ctx(dir.path(), Stage::Ship);
+        for hook in hooks_after_ship() {
+            hook.run(&context).unwrap();
+        }
+
+        git(
+            dir.path(),
+            &["merge-base", "--is-ancestor", &feature_tip, "develop"],
+        );
+        let post_merge_count = git_output(dir.path(), &["rev-list", "--count", "develop"]);
+        assert_ne!(pre_merge_count, post_merge_count);
+
+        let tag = git_output(dir.path(), &["tag", "--points-at", "develop"]);
+        assert_eq!(tag, format!("v2.0.{post_merge_count}"));
+        assert_ne!(tag, format!("v2.0.{pre_merge_count}"));
+    }
+
+    #[test]
     fn branch_cleanup_is_fail_soft_when_branch_absent() {
         let dir = tempfile::tempdir().unwrap();
         init_repo(dir.path());
@@ -335,5 +364,15 @@ mod tests {
         init_repo(dir.path());
         // No feature branch exists — merge must report a no-op and succeed.
         Hook::Merge.run(&ctx(dir.path(), Stage::Ship)).unwrap();
+    }
+
+    fn git_output(root: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?} failed");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 }
