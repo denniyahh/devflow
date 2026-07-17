@@ -165,6 +165,22 @@ Explicitly out of scope: Hermes support (Phase 17), Antigravity adapter
   verifiably reaches the operator (and/or a loud persistent indicator in
   `devflow status`/terminal), not just an event log entry claiming success.
   User to promote via /gsd-phase if wanted in Phase 16 proper.
+- **16f scope broadening — root resolution affects ALL subcommands, observed
+  2026-07-17:** `devflow gate approve 15` failed with "no open gate for
+  phase 15" when run from inside the phase worktree — same root cause as
+  16f's `status` symptom: `project` defaults to `.` and DevFlow never walks
+  up to find the real `.devflow/` in the primary checkout. USER-CONFIRMED
+  for Phase 16: fix as a shared walk-up resolver used by every subcommand
+  (status, gate, logs, recover, …), not a per-command patch. The live gate
+  approval had to be re-run from the main checkout to land.
+- **Gate CLI positional-arg footgun, observed 2026-07-17:** `devflow gate
+  approve 15 ship` fails with `error: project path does not exist: ship` —
+  the trailing positional project-root argument silently swallows a
+  misplaced `--stage` value and produces an error with no hint toward the
+  actual mistake. USER-CONFIRMED for Phase 16 (fits the 16g UX-cleanup
+  bucket): either make `stage` positional-optional, drop the positional
+  project in favor of `--project`, or add a "did you mean `--stage ship`?"
+  hint when the unmatched positional equals a stage name.
 
 - Full pipeline configurability via `devflow.toml` (stage behavior, hooks,
   agent defaults) — shelved 2026-07-08, still deferred; only the minimal
