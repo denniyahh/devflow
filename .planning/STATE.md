@@ -3,24 +3,24 @@ gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
 status: In progress
-stopped_at: "Phase 15 shipped v1.3.0 (manual merge — ship gate approval path reported success without merging; PR #7 closed by push); Phase 16 context gathered"
-last_updated: "2026-07-17T21:45:00.000Z"
+stopped_at: "Phase 16 planned — 7 plans, 4 waves, 16k-first per D-09; ready to execute"
+last_updated: "2026-07-17T22:51:54.000Z"
 progress:
   total_phases: 6
   completed_phases: 3
-  total_plans: 27
+  total_plans: 34
   completed_plans: 27
   percent: 50
 ---
 
 # DevFlow — Project State
 
-> Last updated: 2026-07-16
+> Last updated: 2026-07-17
 
 ## Active
 
 - **Phase 15 (15a Complete / 15b Scoped):** Dogfood Enablement + OSS Readiness — rescoped 2026-07-16 dogfood-first. 15a COMPLETE: `devflow gate list/approve/reject`, OPERATIONS.md, `.devflow.yaml` decoy removed, lib.rs examples fixed, `--help` snapshot guard; exit criterion verified live (full phase, gate answered only via CLI). 15b: OSS packaging (README/ARCHITECTURE/CONTRIBUTING/devcontainer/crates.io publish), to be run through DevFlow as the first post-MVP dogfood — `devflow start --phase 15 --agent claude --mode auto`. Antigravity adapter deferred to unscheduled backlog
-- **Phase 16 (Scoped):** Pipeline Reliability Hardening — inserted 2026-07-17, surfaced entirely by dogfooding Phase 15 through DevFlow (two Code-stage false positives on the crates.io publish plan, four consecutive Ship-review failures on distinct legitimate findings). Depends on Phase 15. Next up: `/gsd-discuss-phase 16`
+- **Phase 16 (Planned — Ready to execute):** Pipeline Reliability Hardening — inserted 2026-07-17, surfaced entirely by dogfooding Phase 15 through DevFlow (two Code-stage false positives on the crates.io publish plan, four consecutive Ship-review failures on distinct legitimate findings). Planned 2026-07-17: 7 plans in 4 waves, 16k-first per D-09; plan-checker passed (1 revision); decision coverage 9/9. Next up: `/gsd-execute-phase 16`
 - **Phase 17 (Scoped):** Hermes Support — renumbered from 16 to 17 (2026-07-17) to make room for Phase 16. HermesAgent adapter, skill-file rewrite, Hermes plugin. Depends on Phase 14's events.jsonl + Phase 13's notify hook
 
 ## Completed
@@ -125,6 +125,6 @@ None.
 
 ## Session
 
-**Last session:** 2026-07-17T21:45:00.000Z
-**Stopped at:** Phase 15 shipped v1.3.0 (manual merge); Phase 16 context gathered
-**Resume file:** .planning/phases/16-pipeline-reliability-hardening/16-CONTEXT.md
+**Last session:** 2026-07-17T22:51:54.000Z
+**Stopped at:** Phase 16 planned (7 plans, 4 waves); ready to execute
+**Resume file:** .planning/phases/16-pipeline-reliability-hardening/16-01-PLAN.md
