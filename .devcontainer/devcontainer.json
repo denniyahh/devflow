@@ -14,7 +14,7 @@
       "type": "volume"
     },
     {
-      "source": "devflow-target",
+      "source": "devflow-target-${localWorkspaceFolderBasename}",
       "target": "${containerWorkspaceFolder}/target",
       "type": "volume"
     }
