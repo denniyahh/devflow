@@ -47,7 +47,7 @@ devflow status
 Define → Plan → Code → Validate → Ship
 ```
 
-The 5-stage pipeline is driven by GSD-native execution. State is persisted to `.devflow/state.json` and survives restarts. `--mode auto` advances through Ship unattended (gating only on repeated Validate failure or an unexpected stage crash); `--mode supervise` also gates at Validate for human review.
+The 5-stage pipeline is driven by GSD-native execution. State is persisted per-phase to `.devflow/state-NN.json` and survives restarts. `--mode auto` advances through Ship unattended (gating only on repeated Validate failure or an unexpected stage crash); `--mode supervise` also gates at Validate for human review.
 
 ## Architecture
 
@@ -94,6 +94,8 @@ Rate-limit detection: if an agent's stdout contains rate-limit messages (429), D
 | `devflow start --phase N --agent X [--mode auto\|supervise] [--no-worktree]` | Begin a phase: branch/worktree → launch agent → monitor pipeline |
 | `devflow status` | Show current stage, phase, agent, PID, age |
 | `devflow list` | List all feature branches with divergence from develop |
+| `devflow gate list\|approve\|reject <phase> [--stage STAGE] [--note "..."]` | Inspect and answer human gates — the pause points where the workflow waits for approval |
+| `devflow logs [--phase N] [--follow] [--stderr]` | Print or follow an agent's captured output for a phase |
 | `devflow cleanup` | Remove phase worktrees and their feature branches |
 
 ### Multi-Agent
@@ -119,7 +121,7 @@ Rate-limit detection: if an agent's stdout contains rate-limit messages (429), D
 
 ## Configuration
 
-DevFlow stores runtime state in `.devflow/state.json` (git-ignored). No config file or init step is required — all workflow options are supplied as CLI flags to `devflow start`.
+DevFlow stores runtime state per-phase in `.devflow/state-NN.json` (git-ignored). No config file or init step is required — all workflow options are supplied as CLI flags to `devflow start`.
 
 Key flags:
 
@@ -177,6 +179,7 @@ devflow doctor
 
 - [DEPENDENCIES.md](DEPENDENCIES.md) — full dependency matrix
 - [ARCHITECTURE.md](ARCHITECTURE.md) — design documentation
+- [OPERATIONS.md](OPERATIONS.md) — operator reference (gate protocol, env vars, `.devflow/` file inventory)
 - [CONTRIBUTING.md](CONTRIBUTING.md) — how to contribute
 - [CHANGELOG.md](CHANGELOG.md) — version history
 
