@@ -1,190 +1,187 @@
 ---
 phase: 15-oss-readiness
-reviewed: 2026-07-17T17:34:21Z
+reviewed: 2026-07-17T18:12:51Z
 depth: standard
-files_reviewed: 10
+files_reviewed: 4
 files_reviewed_list:
+  - docs/guides/quickstart.md
+  - docs/guides/configuration.md
   - .devcontainer/devcontainer.json
   - .github/workflows/devcontainer.yml
-  - ARCHITECTURE.md
-  - CONTRIBUTING.md
-  - DEPENDENCIES.md
-  - LICENSE-APACHE
-  - README.md
-  - SECURITY.md
-  - docs/guides/configuration.md
-  - docs/guides/quickstart.md
 findings:
-  critical: 0
-  warning: 4
+  critical: 1
+  warning: 2
   info: 1
-  total: 5
+  total: 4
 status: issues_found
 ---
 
 # Phase 15: Code Review Report
 
-**Reviewed:** 2026-07-17T17:34:21Z
+**Reviewed:** 2026-07-17T18:12:51Z
 **Depth:** standard
-**Files Reviewed:** 10
+**Files Reviewed:** 4
 **Status:** issues_found
 
 ## Summary
 
-This phase's file set is entirely documentation, license, and CI/devcontainer
-config — no application source. There is no security or crash risk in this
-diff. However, several of the documentation files make claims that were
-cross-checked against the actual `crates/` source and do **not** match it,
-which directly undermines the stated goal of this phase (accurate OSS-facing
-docs) and ARCHITECTURE.md's own instruction to "treat the named source files
-as the source of truth if this drifts." All findings below are documentation
-accuracy defects (Warning) plus one process-consistency note (Info); nothing
-rises to Critical since no code, secrets, or executable logic is affected.
+Reviewed `docs/guides/quickstart.md`, `docs/guides/configuration.md`,
+`.devcontainer/devcontainer.json`, and `.github/workflows/devcontainer.yml`
+against the actual `crates/` source. The CLI-facing claims check out:
+`--phase`/`--agent`/`--mode`/`--force`/`--no-worktree`/`--dry-run` match the
+`Start` variant in `main.rs`; the per-phase state filename
+(`.devflow/state-{NN}.json`), the `DEVFLOW_GATE_NOTIFY_CMD` /
+`DEVFLOW_GATE_TIMEOUT_SECS` / `DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS` /
+`DEVFLOW_LOG_FORMAT` env vars, the hardcoded git-flow branch names, the
+Auto/Supervise gating semantics in `mode.rs`, and the crate name (`devflow`
+on crates.io) all match code. `devcontainer.json` is valid JSONC, the base
+image tag is pinned (not floating), and the named volumes/postCreateCommand
+are internally consistent.
 
-The `.devcontainer/devcontainer.json` base image tag
-(`mcr.microsoft.com/devcontainers/rust:2.0.13-1-bookworm`) was verified live
-against the MCR tag list and does exist — no issue there. `LICENSE`,
-`LICENSE-APACHE`, `OPERATIONS.md`, `scripts/install.sh`, and
-`.github/workflows/ci.yml` (all referenced by these docs) exist and are
-consistent with what's described. `--phase`, `--agent`, `--mode`, `--force`,
-`--no-worktree`, `--dry-run`, and the `gate approve/reject` flag surfaces all
-match the current `Command`/`GateCmd` enums in `main.rs`.
+While tracing the documented `.devflow/state-{NN}.json` per-phase file
+convention (quickstart.md:26-27) against the actual on-disk file set for
+this repo's own dogfooding, I found that `.gitignore` was never updated when
+the state/runtime file scheme moved from a single shared file to per-phase
+files, and that this has **already caused real runtime telemetry to be
+committed and tracked** in this repository (see CR-01). That is the
+highest-severity finding below. The remaining two findings are a
+devcontainer-CI naming/coverage gap and a Docker named-volume collision risk
+specific to this project's own worktree-heavy workflow.
+
+## Critical Issues
+
+### CR-01: `.gitignore` doesn't cover the per-phase runtime file scheme the reviewed docs describe — real telemetry is already leaked and tracked in this repo
+
+**File:** `.gitignore` (evidenced against `docs/guides/quickstart.md:26-27`, which documents the `.devflow/state-{NN}.json` per-phase convention this bug stems from)
+**Issue:** `quickstart.md` correctly documents that DevFlow persists
+per-phase progress to `.devflow/state-{NN}.json` ("state is per-phase, not a
+single shared file"). The actual runtime file set is broader still —
+`crates/devflow-core/src/agent_result.rs` and `lock.rs` also write
+`.devflow/lock-{NN}`, `.devflow/phase-{NN}-stdout`,
+`.devflow/phase-{NN}-stderr.log`, `.devflow/phase-{NN}-exit`, and
+`.devflow/phase-{NN}-agent-pid` per phase. `.gitignore`, however, still only
+excludes the **pre-refactor, singular** names:
+```
+.devflow/state.json
+.devflow/lock
+.devflow/last-ship.json
+```
+None of the current `-{NN}` per-phase patterns are covered. This is not
+theoretical — this exact working tree currently has three such files
+**tracked in git** (confirmed via `git ls-files .devflow`):
+```
+.devflow/phase-07-agent-pid
+.devflow/phase-07-exit
+.devflow/phase-07-stdout
+```
+`.devflow/phase-07-stdout` contains a real Claude Code agent JSON result
+blob with a `session_id`, `total_cost_usd`, full token-usage breakdown, and
+duration/telemetry data — internal operational data that has now leaked into
+this project's git history via commit `f223359`. For an OSS-readiness phase
+specifically concerned with what a public repo exposes, this is a live,
+provable information-disclosure defect, not a hypothetical one.
+**Fix:**
+```gitignore
+# DevFlow own state (dogfooding) — per-phase since the 14a refactor
+.devflow/state-*.json
+.devflow/lock-*
+.devflow/phase-*-stdout
+.devflow/phase-*-stderr.log
+.devflow/phase-*-exit
+.devflow/phase-*-agent-pid
+.devflow/last-ship*.json
+.devflow/cron-instructions*.json
+```
+And untrack the already-leaked files:
+```bash
+git rm --cached .devflow/phase-07-agent-pid .devflow/phase-07-exit .devflow/phase-07-stdout
+```
 
 ## Warnings
 
-### WR-01: README.md and CONTRIBUTING.md name a nonexistent `Agent` trait — actual trait is `AgentAdapter`
+### WR-01: `.github/workflows/devcontainer.yml`'s "CI-parity checks" step omits `cargo fmt --check`
 
-**File:** `README.md:62`, `CONTRIBUTING.md:178`
-**Issue:** README states "Claude, Codex, and OpenCode all implement the same
-`Agent` trait" and CONTRIBUTING.md's "Adding a New Agent" checklist says to
-implement "the `Agent` trait." Neither trait exists in the codebase — the
-actual trait, defined in `crates/devflow-core/src/agents/mod.rs:11`, is
-`AgentAdapter` (`pub trait AgentAdapter { ... }`). ARCHITECTURE.md correctly
-names `AgentAdapter` in its own "Extension points" section
-(ARCHITECTURE.md:395-396), so these two files have drifted from both the
-source and from ARCHITECTURE.md itself. A contributor following either
-checklist verbatim (`impl Agent for ...`) will get a compile error.
-**Fix:**
-```diff
-- Agent-agnostic — Claude, Codex, and OpenCode all implement the same `Agent` trait.
-+ Agent-agnostic — Claude, Codex, and OpenCode all implement the same `AgentAdapter` trait.
-```
-```diff
-- 1. Add an adapter file in `crates/devflow-core/src/agents/` implementing the `Agent` trait
-+ 1. Add an adapter file in `crates/devflow-core/src/agents/` implementing the `AgentAdapter` trait
-```
-
-### WR-02: README.md's "Shared prompts" claim contradicts the actual per-stage prompt implementation and cites a nonexistent function
-
-**File:** `README.md:66`, `CONTRIBUTING.md:67`
-**Issue:** README says: "Shared prompts — all agents receive the same prompt
-via `phase_prompt()`. No agent-specific prompt logic." CONTRIBUTING.md
-similarly says "The launch prompt (`agents::phase_prompt()`) reads
-`.planning/ROADMAP.md` and `.planning/phases/NN-*/CONTEXT.md`."
-
-Neither is accurate:
-- There is no `phase_prompt()` function anywhere in the codebase (verified
-  via `rg -n "fn phase_prompt|fn stage_prompt"` — only `stage_prompt` exists,
-  in `crates/devflow-core/src/prompt.rs:148`, not in the `agents` module).
-- The actual behavior is the opposite of "no agent-specific prompt logic":
-  ARCHITECTURE.md (the doc that IS accurate here) explicitly documents that
-  `stage_prompt(stage, phase)` builds **per-stage, not shared** prompts, and
-  that Define/Plan, Validate, and Ship each get dedicated logic (idempotent
-  re-run check, `verdict` field requirement, and the code-review gate before
-  `/gsd-ship`, respectively) — see ARCHITECTURE.md:101-118.
-
-This is a direct self-contradiction between README/CONTRIBUTING and
-ARCHITECTURE.md within the same reviewed doc set, and it references a
-function name that will not be found by anyone grepping the codebase.
-**Fix:**
-```diff
-- **Shared prompts** — all agents receive the same prompt via `phase_prompt()`. No agent-specific prompt logic.
-+ **Per-stage prompts** — `stage_prompt(stage, phase)` builds a dedicated prompt per pipeline stage (Define/Plan, Validate, Ship each have distinct completion contracts); all *agents* share the same prompt for a given stage.
-```
-```diff
-- The launch prompt (`agents::phase_prompt()`) reads `.planning/ROADMAP.md` and
-+ The launch prompt (`prompt::stage_prompt()`) reads `.planning/ROADMAP.md` and
+**File:** `.github/workflows/devcontainer.yml:19-25`
+**Issue:** The step is named "Build devcontainer and run CI-parity checks"
+and runs `cargo build --workspace`, `cargo test --workspace`, and `cargo
+clippy --workspace -- -D warnings` — but `ci.yml` has three required jobs
+(`test`, `clippy`, **and `fmt`** via `cargo fmt --check`). Because `stable`
+resolves independently in each environment (dtolnay/rust-toolchain@stable in
+`ci.yml` vs. the devcontainer's own rustup-resolved stable), a rustfmt
+formatting difference specific to the devcontainer's toolchain snapshot would
+never be caught here despite the step's name implying full parity with CI.
+**Fix:** Either rename the step to something narrower (e.g. "devcontainer
+build/test smoke check") or add the missing check for true parity:
+```yaml
+runCmd: |
+  cargo build --workspace
+  cargo test --workspace
+  cargo clippy --workspace -- -D warnings
+  cargo fmt --check
 ```
 
-### WR-03: README.md's rate-limit/cron-instructions description is stale — wrong filename and wrong scope
+### WR-02: Devcontainer named volumes are not scoped per checkout — collide across concurrent worktrees this project's own workflow encourages
 
-**File:** `README.md:86`
-**Issue:** README states, under the general "Agent Protocol" section (which
-describes `devflow start`'s evaluation layers): "Rate-limit detection: if an
-agent's stdout contains rate-limit messages (429), DevFlow writes
-`.devflow/cron-instructions.json` for rescheduling."
-
-Two problems, both confirmed against `crates/devflow-core/src/ship.rs` and
-`crates/devflow-cli/src/main.rs`:
-1. **Wrong filename.** The current, per-phase record is written to
-   `.devflow/cron-instructions-{phase:02}.json`
-   (`ship.rs::cron_instructions_path`, and asserted by
-   `phase7_cli.rs:502` — `"wrote .devflow/cron-instructions-07.json"`). The
-   flat `.devflow/cron-instructions.json` name is explicitly the **legacy**
-   single-slot path (`ship.rs:63-65`: "Per-phase since 14a
-   (13-DEFERRED-CR-03): the old single-slot `cron-instructions.json` let one
-   phase's rate-limit record clobber another's under `devflow parallel`"),
-   kept only as an upgrade-path fallback, not the primary output.
-2. **Wrong scope.** This behavior is wired into the `sequentagent` command
-   specifically (`write_rate_limit_cron` is called from
-   `main.rs:1483`, inside `run_sequentagent`), not into the generic
-   `devflow start`/monitor path the surrounding README section describes.
-   Placed where it is, the sentence implies any `devflow start` run detects
-   429s and writes this file, which is not what the code does.
-**Fix:**
-```diff
-- Rate-limit detection: if an agent's stdout contains rate-limit messages (429), DevFlow writes `.devflow/cron-instructions.json` for rescheduling.
-+ Rate-limit detection (`sequentagent` only): if agent A's stdout contains rate-limit messages (429), DevFlow writes `.devflow/cron-instructions-NN.json` (per-phase) for a Hermes cron poller to resume the handoff later.
+**File:** `.devcontainer/devcontainer.json:10-21`
+**Issue:** The `devflow-cargo-registry` and `devflow-target` mounts are
+plain, unqualified Docker named-volume names. Docker named volumes are
+global to the host, not scoped to a workspace folder or repo path. This
+project's entire CLI model (`devflow start --phase N`, `devflow parallel`)
+is built around running multiple phases concurrently, each in its **own git
+worktree** (this review itself is running from
+`.worktrees/phase-15`) — a setup where a contributor plausibly has two or
+more worktrees of the same repo open in VS Code at once. If each is reopened
+in its devcontainer, both containers mount the identical
+`devflow-cargo-registry`/`devflow-target` volumes, so a `cargo build` in one
+worktree can leave a stale/incompatible `target/` (different dependency
+versions, different workspace members on a divergent branch) that the other
+worktree's container then reuses, producing confusing, hard-to-diagnose
+build/link errors that look like source bugs.
+**Fix:** Scope the volume names to the workspace folder using a devcontainer
+variable, e.g.:
+```json
+"mounts": [
+  {
+    "source": "devflow-cargo-registry",
+    "target": "/usr/local/cargo/registry",
+    "type": "volume"
+  },
+  {
+    "source": "devflow-target-${localWorkspaceFolderBasename}",
+    "target": "${containerWorkspaceFolder}/target",
+    "type": "volume"
+  }
+]
 ```
-
-### WR-04: CONTRIBUTING.md's "Commit Conventions" section is contradicted by the project's own current git history
-
-**File:** `CONTRIBUTING.md:110-115`
-**Issue:** The doc states: "**Deprecated — June 2026.** The conventional
-commits model is being replaced by a per-phase branching and merge scheme
-(Phase 11). Until then, write descriptive commit messages that explain what
-changed and why, without a required prefix format."
-
-Today's date is 2026-07-17 — after the claimed June 2026 deprecation — yet
-the repository's own recent commit history (including every commit in this
-same phase 15 branch) still consistently uses conventional-commit-style
-`type(scope): subject` prefixes:
-```
-docs(phase-15): re-confirm validation strategy (0 new gaps)
-feat(15-04): add canonical LICENSE-APACHE for dual license
-ci(15-03): add devcontainer.yml for container-parity CI test
-fix: address Codex review — clippy, license dual, bug template, ARCHITECTURE link
-```
-A new contributor reading this section will be told the prefix format is
-deprecated and unnecessary, while the actual, current project convention
-(as demonstrated by every commit merging into this branch) still uses it.
-This is either a stale doc that should be updated/removed, or the stated
-deprecation was never actually enforced — either way it is misleading as
-written.
-**Fix:** Either update the section to reflect that conventional-commit
-prefixes remain the de facto convention (drop or correct the deprecation
-notice), or, if the intent genuinely is to move away from prefixes, actually
-adopt that going forward and note the discrepancy in the phase's plan.
+(the cargo registry cache is safe to share globally since it's
+content-addressed by crate/version; only the per-workspace `target/` build
+cache needs to be scoped.)
 
 ## Info
 
-### IN-01: `.github/workflows/devcontainer.yml` duplicates CI's build/test/clippy jobs without running `cargo fmt --check`
+### IN-01: Devcontainer doesn't include the GitHub CLI, despite `gh` being a documented DevFlow prerequisite
 
-**File:** `.github/workflows/devcontainer.yml:19-25`
-**Issue:** This workflow runs on every push/PR to `main`/`develop` (same
-triggers as `ci.yml`) and re-runs `cargo build --workspace`, `cargo test
---workspace`, and `cargo clippy --workspace -- -D warnings` inside the
-devcontainer for "CI-parity checks," but omits `cargo fmt --check`, which
-`ci.yml` and CONTRIBUTING.md's "Required checks" list both treat as a
-required gate. Not a correctness bug (this workflow is presumably meant as a
-devcontainer build smoke test, not a substitute for `ci.yml`), but the
-"CI-parity" framing in the step name is one check short of actual parity.
-**Fix:** Either rename the step to something less than "CI-parity" (e.g.
-"devcontainer smoke test") or add `cargo fmt --check` to `runCmd` for true
-parity with `ci.yml`'s three required jobs.
+**File:** `.devcontainer/devcontainer.json`
+**Issue:** `quickstart.md`'s Prerequisites section lists "**gh CLI** 2.0+
+(for PR creation)" as required to use DevFlow end-to-end (Ship stage), and
+`README.md` repeats this. `devcontainer.json` has no `features` block and
+the `mcr.microsoft.com/devcontainers/rust` base image does not bundle `gh`.
+A contributor who opens the devcontainer and tries to actually exercise
+`devflow start ... --mode auto` through Ship inside it will hit a missing
+`gh` binary. Low severity because `CONTRIBUTING.md` scopes the devcontainer's
+purpose narrowly to "reproducible build/test," not full pipeline execution,
+so this may be intentional — flagging for awareness rather than as a hard
+defect.
+**Fix:** If the devcontainer is meant to support exercising the full
+pipeline (not just `cargo build`/`cargo test`), add the GitHub CLI feature:
+```json
+"features": {
+  "ghcr.io/devcontainers/features/github-cli:1": {}
+}
+```
 
 ---
 
-_Reviewed: 2026-07-17T17:34:21Z_
+_Reviewed: 2026-07-17T18:12:51Z_
 _Reviewer: Claude (gsd-code-reviewer)_
 _Depth: standard_
