@@ -1,0 +1,11 @@
+{
+  "stage": "validate",
+  "phase": 15,
+  "agent": "claude",
+  "mode": "auto",
+  "gate_pending": false,
+  "consecutive_failures": 0,
+  "started_at": "1784294552",
+  "project_root": "/var/home/denniyahh/Github/devflow",
+  "worktree_path": "/var/home/denniyahh/Github/devflow/.worktrees/phase-15"
+}
