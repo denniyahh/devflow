@@ -1,73 +1,47 @@
 # Configuration
 
-DevFlow stores project configuration in `.devflow.yaml`.
+DevFlow has no project config file — there is no YAML/TOML file it reads on
+startup, and no command that scaffolds or prints one. All workflow options
+are supplied as flags to `devflow start`; runtime behavior that isn't a
+per-run workflow choice is tuned via environment variables.
 
-## Default Configuration
+## `devflow start` flags
 
-```yaml
-version:
-  scheme: semver
-  file: Cargo.toml
-  field: workspace.package.version
-  build_number: git
-
-automation:
-  auto_branch: true
-  auto_verify: true
-  auto_docs: true
-  auto_version: patch
-  auto_ship: false
-  auto_cleanup: true
-  verify_command: "cargo test"
-  lint_command: "cargo clippy -- -D warnings"
-  docs_command: "cargo doc --no-deps 2>&1"
-  continue_on_error: true
-  docs_auto_commit: false
-
-git_flow:
-  main: main
-  develop: develop
-  feature_prefix: feature/
-```
-
-## Configuration Fields
-
-### `version`
-
-| Field | Description | Default |
-|-------|-------------|---------|
-| `scheme` | Versioning scheme (`semver`) | `semver` |
-| `file` | File containing version | `Cargo.toml` |
-| `field` | Field path in version file | `workspace.package.version` |
-| `build_number` | Build number source (`git` = commit count) | `git` |
-
-### `automation`
-
-| Field | Description | Default |
-|-------|-------------|---------|
-| `auto_branch` | Auto-create feature branches | `true` |
-| `auto_verify` | Auto-run tests after agent completes | `true` |
-| `auto_docs` | Auto-update documentation | `true` |
-| `auto_version` | Auto-bump version (`patch`, `minor`, `major`) | `patch` |
-| `auto_ship` | Auto-create PR and release branch | `false` |
-| `auto_cleanup` | Auto-remove worktrees+branches after ship | `true` |
-| `verify_command` | Command to run for verification | `cargo test` |
-| `lint_command` | Command to run for linting | `cargo clippy -- -D warnings` |
-| `docs_command` | Command to generate docs | `cargo doc --no-deps` |
-| `continue_on_error` | Non-fatal errors don't halt pipeline | `true` |
-
-### `git_flow`
-
-| Field | Description | Default |
-|-------|-------------|---------|
-| `main` | Production branch name | `main` |
-| `develop` | Integration branch name | `develop` |
-| `feature_prefix` | Prefix for feature branches | `feature/` |
-
-## Viewing Effective Config
+| Flag | Description |
+|---|---|
+| `--phase N` | Phase number to execute |
+| `--agent claude\|codex\|opencode` | Agent to launch |
+| `--mode auto\|supervise` | `auto` advances through Ship unattended (gating only at Ship, plus never-silent failure gates); `supervise` also gates every Validate for human review |
+| `--force` | Overwrite the feature branch if it already exists |
+| `--no-worktree` | Run directly in the primary checkout instead of an isolated worktree (worktree is the default) |
+| `--dry-run` | Print the pipeline that would run without launching anything |
 
 ```bash
-devflow config
+devflow start --phase 3 --agent claude --mode auto
 ```
 
-Shows the merged configuration from `.devflow.yaml` defaults + overrides + CLI flags.
+## Environment variables
+
+Runtime behavior — gate notifications, timeouts, and logging — is tuned via
+environment variables, not config file fields:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `DEVFLOW_GATE_NOTIFY_CMD` | unset | Shell command fired when a gate is written (e.g. an `ntfy.sh`/desktop-notification call) |
+| `DEVFLOW_GATE_TIMEOUT_SECS` | 604800 (7 days) | How long a monitor waits at a gate before giving up |
+| `DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS` | 120 | How long to wait on the shared-checkout lock before skipping the hook batch rather than running it unserialized |
+| `RUST_LOG` | `info` | Log verbosity (stderr) |
+| `DEVFLOW_LOG_FORMAT` | plain text | Set to `json` for machine-readable log lines |
+
+## Git-flow branch names
+
+Branch naming (`main`, `develop`, `feature/` prefix) is hardcoded, not
+configurable — DevFlow assumes a standard git-flow layout rather than
+reading it from a config field.
+
+## The full operator reference
+
+This page only covers the "what can I configure" surface. For the complete
+picture — the gate protocol, the notify hook, the `.devflow/` file
+inventory, and a worked dogfood session — see
+[OPERATIONS.md](../../OPERATIONS.md).
