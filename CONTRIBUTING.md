@@ -21,6 +21,15 @@ distrobox enter devflow-dev
 # install Rust, build, test as above
 ```
 
+### Dev Container (optional)
+
+The repo includes a [`.devcontainer/devcontainer.json`](.devcontainer/devcontainer.json)
+with the `rust-toolchain.toml`-pinned stable toolchain (`clippy` + `rustfmt`) preinstalled and
+cargo registry/`target` caches persisted across rebuilds. Open the repo in VS Code and choose
+"Reopen in Container", or run `devcontainer up --workspace-folder .` (via the
+[Dev Containers CLI](https://github.com/devcontainers/cli)) to get a reproducible build/test
+environment without installing Rust locally.
+
 ## Development
 
 ```bash
@@ -85,6 +94,13 @@ crates/
 5. `cargo fmt`
 6. Submit a PR against `develop`
 7. CI runs tests + clippy + format check
+
+**Required checks** — a PR must pass all three CI jobs before it can merge
+(mirrors [`.github/workflows/ci.yml`](.github/workflows/ci.yml)):
+
+- `cargo test`
+- `cargo clippy -- -D warnings`
+- `cargo fmt --check`
 
 Ordinary code contributions need no agent credentials or API keys — the build
 and the full test suite run offline. Agent CLIs (Claude, Codex, OpenCode) are
