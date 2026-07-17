@@ -459,10 +459,15 @@ cargo publish -p devflow
 
 **If this table is empty:** N/A — assumptions listed above need brief confirmation, none are load-bearing for the core doc-accuracy work (which is independently verified against source).
 
-## Open Questions
+## Open Questions (RESOLVED — see .planning/phases/15-oss-readiness/15-0{1,2,3}-PLAN.md)
 
-1. **Are `DEPENDENCIES.md`, `docs/guides/quickstart.md`, `docs/guides/configuration.md`,
-   and `skills/hermes/devflow/SKILL.md` in scope for this phase's accuracy pass?**
+All three questions below were resolved during planning (2026-07-17) following each
+question's own recommendation; each resolution is recorded as a flagged assumption in
+the corresponding PLAN.md so the decision is visible to the executor, not just here.
+
+1. **(RESOLVED — folded in, per recommendation.)** **Are `DEPENDENCIES.md`,
+   `docs/guides/quickstart.md`, `docs/guides/configuration.md`, and
+   `skills/hermes/devflow/SKILL.md` in scope for this phase's accuracy pass?**
    - What we know: all four contain stale-but-plausible content (`devflow init`,
      `.devflow.yaml`, old `doctor` output, `devflow confirm`) at the same severity level
      CONTEXT.md describes for ARCHITECTURE.md, but CONTEXT.md's 15b checklist names only
@@ -477,8 +482,11 @@ cargo publish -p devflow
      phase (they are directly linked from README's "Documentation" list and from
      OPERATIONS.md), but confirm with the operator before the planner commits scope, since
      CONTEXT.md didn't name them explicitly.
+   - **Resolution:** folded in — `DEPENDENCIES.md` and the two `docs/guides/*.md` files got
+     a lightweight accuracy pass (15-01-T3, 15-02-T2, 15-02-T3); `skills/hermes/devflow/SKILL.md`
+     was left for Phase 16, as recommended. Recorded as a flagged assumption in each plan.
 
-2. **What does "PR gate status" badge mean concretely?**
+2. **(RESOLVED — option (b), per recommendation.)** **What does "PR gate status" badge mean concretely?**
    - What we know: GitHub has no separate native badge type for "PR merge gate /
      required-checks status" distinct from the existing workflow-run badge already in
      README. Branch protection required-status-checks are a repo *setting*, not a
@@ -490,8 +498,10 @@ cargo publish -p devflow
    - Recommendation: default to (b) — document required checks (test/clippy/fmt, all three
      jobs in `ci.yml`) in CONTRIBUTING.md's PR Process section — since (a) is already
      satisfied and (c) would require adding new CI tooling out of scope for a docs phase.
+   - **Resolution:** (b) — CONTRIBUTING.md's PR Process section now documents the required
+     checks (test/clippy/fmt) (15-03-T1).
 
-3. **Is the `devflow devcontainer` subcommand worth building?**
+3. **(RESOLVED — skip, per recommendation.)** **Is the `devflow devcontainer` subcommand worth building?**
    - What we know: CONTEXT.md explicitly frames this as conditional — "only if it earns
      its keep." No existing precedent subcommand in `main.rs` does anything comparable
      (closest is `devflow doctor`, which audits rather than launches tooling).
@@ -503,6 +513,8 @@ cargo publish -p devflow
      up`/VS Code "Reopen in Container" flow satisfies the phase goal without adding a new
      CLI surface (and a new npm-package dependency) to maintain and to keep the `--help`
      snapshot test in sync with.
+   - **Resolution:** skipped — 15-03 ships `.devcontainer/devcontainer.json` only, no new
+     `devflow devcontainer` subcommand.
 
 ## Environment Availability
 
