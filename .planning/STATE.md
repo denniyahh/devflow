@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
 status: In progress
-stopped_at: Phase 15a complete (devflow gate CLI, OPERATIONS.md, accuracy fixes; 267 tests; live e2e with gate answered via CLI) — dogfooding unblocked; next 15b OSS packaging AS a DevFlow dogfood run
-last_updated: "2026-07-16T12:00:00.000Z"
+stopped_at: Phase 16 context gathered
+last_updated: "2026-07-17T20:56:20.413Z"
 progress:
-  total_phases: 5
-  completed_phases: 3
+  total_phases: 6
+  completed_phases: 2
   total_plans: 22
-  completed_plans: 22
-  percent: 60
+  completed_plans: 18
+  percent: 33
 ---
 
 # DevFlow — Project State
@@ -113,6 +113,6 @@ None.
 
 ## Session
 
-**Last session:** 2026-07-15T19:06:48.418Z
-**Stopped at:** Completed 13-06-PLAN.md (dogfood done)
-**Resume file:** None
+**Last session:** 2026-07-17T20:56:20.392Z
+**Stopped at:** Phase 16 context gathered
+**Resume file:** .planning/phases/16-pipeline-reliability-hardening/16-CONTEXT.md
