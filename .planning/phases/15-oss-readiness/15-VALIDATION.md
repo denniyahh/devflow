@@ -56,6 +56,8 @@ created: 2026-07-17
 | 15-05-T1 (manual) | 05 | 2 | 15b | T-15-05-SC (high) | Operator holds crates.io token outside repo (`cargo login` / CI secret, never committed) | manual | N/A — see Manual-Only Verifications | manual only | ✅ done — operator ran `cargo login` + real `cargo publish` directly (15-05-SUMMARY.md); no token in any repo-tracked file |
 | 15-05-T2 | 05 | 2 | 15b | — | `devflow-core` live on registry post-publish | integration | `cd "$(mktemp -d)" && cargo new _probe --bin >/dev/null 2>&1 && cd _probe && cargo add devflow-core@1.2.0 --dry-run` | ✅ | ✅ re-run live 2026-07-17 — resolves `devflow-core v1.2.0` from crates.io index |
 | 15-05-T3 | 05 | 2 | 15b | — | `devflow` (CLI) live on registry post-publish, after core | integration | `cd "$(mktemp -d)" && cargo new _probe2 --bin >/dev/null 2>&1 && cd _probe2 && cargo add devflow@1.2.0 --dry-run` | ✅ | ✅ re-run live 2026-07-17 — resolves `devflow v1.2.0` from crates.io index |
+| 15-REVIEW2-WR-01 | — | — | 15b | 15-REVIEW.md WR-01 (this round) | `RUST_LOG` honored regardless of `DEVFLOW_LOG_FORMAT` (json or plain) — regression guard for the WR-01 bug fixed in commit `8672172`, where the json branch hardcoded `LevelFilter::INFO` and never consulted `RUST_LOG` | integration | `cargo test -p devflow --test log_format_env` | ✅ | ✅ |
+| 15-REVIEW2-CR-01 | — | — | 15b | 15-REVIEW.md CR-01 (this round) | `.github/workflows/devcontainer.yml`'s `runCmd` fails fast — `set -e` is the first command line, preceding every `cargo` invocation — regression guard for the CR-01 bug fixed in commit `3918792`, where a failing command earlier in the unguarded `bash -c` script could be masked as green by a later passing command | integration | `cargo test -p devflow --test devcontainer_ci_failfast` | ✅ | ✅ |
 
 *Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
 
@@ -170,3 +172,29 @@ created: 2026-07-17
 **Resolution:** FILLED. `cargo test -p devflow --test gitignore_coverage` passes and would fail if `.gitignore` ever again drops coverage of these three paths, closing the automated-guard gap that let CR-01 regress silently the first time.
 
 **No implementation files were modified.** `.gitignore` was read-only reference (already correct per `9b2fac4`); only the new test file and this file's own audit trail changed.
+
+---
+
+## Validation Audit 2026-07-17 (second review round — WR-01/CR-01 coverage gap)
+
+| Metric | Count |
+|--------|-------|
+| Gaps found | 2 |
+| Resolved | 2 |
+| Escalated | 0 |
+
+**What was audited:** `.planning/STATE.md` and prior audit entries in this file only covered plans 15-01 through 15-05 and the first review round (`15-REVIEW.md` findings CR-01/WR-01/WR-02 fixed in `d021e3a`/`5a8cbad`/`e7a35b7`). Git history showed a *second* review round landed after that: `2f09710` rewrote `15-REVIEW.md` in place (new timestamp `2026-07-17T18:50:51Z`) with two new findings, both already fixed before this audit ran: CR-01 (`.github/workflows/devcontainer.yml`'s `runCmd` had no `set -e`, so `bash -c` would report the exit code of only the *last* command — a failing `cargo test`/`cargo clippy` earlier in the block could go green) fixed in commit `3918792`; WR-01 (`RUST_LOG` silently ignored whenever `DEVFLOW_LOG_FORMAT=json`, because the json branch called `tracing_subscriber::fmt().json().init()` with a hardcoded `LevelFilter::INFO` while the plain-text branch honored `RUST_LOG`) fixed in commit `8672172`. Neither fix had a Per-Task Map row or any test coverage — confirmed via `rg` that no test file referenced `DEVFLOW_LOG_FORMAT`, `RUST_LOG`, `set -e`, or `devcontainer.yml` before this audit.
+
+**Gaps found:** Both `no_test_file` (MISSING) — genuine coverage gaps, not stale-status issues like the prior two audit rounds. `cargo test --workspace`, `cargo clippy --workspace -- -D warnings`, and `cargo fmt --check` were all green going in; the gap was purely the absence of regression guards for the two review findings.
+
+**Test written (WR-01):** `crates/devflow-cli/tests/log_format_env.rs`. Drives the built `devflow` binary against a project with a legacy `.devflow/state.json`, which makes `workflow::migrate_legacy_state` emit a deterministic `debug!("migrated legacy state.json to ...")` line. Two tests: (1) `DEVFLOW_LOG_FORMAT=json RUST_LOG=debug` asserts the DEBUG line reaches stdout (`tracing_subscriber::fmt()` writes to stdout by default — confirmed via the test's own discovery, not an assumption); (2) `DEVFLOW_LOG_FORMAT=json` with `RUST_LOG` unset asserts the DEBUG line is absent. Together these prove `RUST_LOG` is actually consulted on the json branch, not just that the code compiles.
+
+**Test written (CR-01):** `crates/devflow-cli/tests/devcontainer_ci_failfast.rs`. Line-parses the `runCmd: |` block scalar in `.github/workflows/devcontainer.yml` (no YAML dependency) and asserts `set -e` is literally the first command line and precedes every `cargo` invocation — not a substring grep, which the auditor correctly identified as insufficient (a grep for `set -e` anywhere in the file would still pass if a future edit moved it below a `cargo` line, reintroducing the exact bug). Verified as a real regression guard by temporarily reordering `set -e` after `cargo build --workspace` in the working tree — the test failed as expected — then restoring the file (confirmed via `git status --porcelain` showing the workflow file untouched afterward).
+
+**Debug iterations:** `log_format_env.rs` took 1 iteration — initial version used a nonexistent `--project` flag and asserted on stderr instead of stdout; both corrected. `devcontainer_ci_failfast.rs` passed on first run.
+
+**Verification performed independently by the orchestrator (not just the auditor's self-report):** re-ran both new tests (`cargo test -p devflow --test log_format_env` — 2 passed; `cargo test -p devflow --test devcontainer_ci_failfast` — 1 passed), `cargo clippy --workspace -- -D warnings` (clean), `cargo fmt --check` (clean), and `git status --porcelain` (only the two new test files untracked — no implementation files modified). Also read both test files in full to confirm they exercise real behavior (actual binary invocation / actual file-position assertion) rather than shallow presence checks.
+
+**Resolution:** FILLED. Per-Task Verification Map rows `15-REVIEW2-WR-01` and `15-REVIEW2-CR-01` added, both ✅.
+
+**No implementation files were modified.** Only the two new test files and this file's own audit trail changed.
