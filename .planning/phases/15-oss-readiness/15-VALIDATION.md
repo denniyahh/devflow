@@ -44,6 +44,7 @@ created: 2026-07-17
 | 15-01-T1 | 01 | 1 | 15b | — | README matches real CLI surface (gate/logs, per-phase state, no bare `state.json`) | integration | `cargo test -p devflow --test help_snapshot && rg -q 'OPERATIONS\.md' README.md && rg -q 'state-' README.md && ! rg -q 'state\.json' README.md` | ✅ | ✅ |
 | 15-01-T2 | 01 | 1 | 15b | T-15-01-SC (medium) | SECURITY.md points to real evidence files, not the phantom `audit.log` | unit | `! rg -q 'audit\.log' SECURITY.md && rg -q 'events\.jsonl' SECURITY.md && rg -q 'state-' SECURITY.md` | ✅ | ✅ |
 | 15-01-T3 | 01 | 1 | 15b | — | DEPENDENCIES.md free of decoy-config/phantom-command references | unit | `! rg -q '\.devflow\.yaml' DEPENDENCIES.md && ! rg -q 'devflow confirm' DEPENDENCIES.md && rg -q '1\.2\.0' DEPENDENCIES.md` | ✅ | ✅ |
+| 15-REVIEW-CR-01 | — | — | 15b | T-15-01-SC (medium) | `.gitignore` covers all DevFlow runtime-state paths SECURITY.md/ARCHITECTURE.md/README.md claim are ignored (`.devflow/state.json`, `.devflow/events.jsonl`, `.devflow/gates/`) — regression guard for CR-01 (15-REVIEW.md), the leaked-telemetry incident where a `.gitignore` rewrite silently dropped this coverage | integration | `cargo test -p devflow --test gitignore_coverage` | ✅ | ✅ |
 | 15-02-T1 | 02 | 1 | 15b | — | ARCHITECTURE.md matches current Stage/hooks/lock/events model, no dead 8-step machine | unit | `! rg -q 'Branching|Executing|Docsing' ARCHITECTURE.md && ! rg -q '\.devflow\.yaml' ARCHITECTURE.md && ! rg -q 'rejectpr' ARCHITECTURE.md && rg -q 'events\.jsonl' ARCHITECTURE.md && rg -q 'Define' ARCHITECTURE.md` | ✅ | ✅ |
 | 15-02-T2 | 02 | 1 | 15b | — | quickstart.md free of phantom `init`/config commands | unit | `! rg -q 'devflow init' docs/guides/quickstart.md && ! rg -q '\.devflow\.yaml' docs/guides/quickstart.md && rg -q 'devflow start --phase' docs/guides/quickstart.md` | ✅ | ✅ |
 | 15-02-T3 | 02 | 1 | 15b | — | configuration.md reflects no-config-file reality | unit | `! rg -q '\.devflow\.yaml' docs/guides/configuration.md && rg -q 'DEVFLOW_GATE_NOTIFY_CMD' docs/guides/configuration.md && rg -q 'OPERATIONS\.md' docs/guides/configuration.md` | ✅ | ✅ |
@@ -147,3 +148,25 @@ created: 2026-07-17
 **Also re-confirmed:** 15-01 through 15-04's 11 Automated Commands (unchanged since the prior re-confirmation audit) all still pass, including `cargo publish --dry-run -p devflow-core && cargo package --workspace` (15-04-T2).
 
 **No implementation files were modified.** Only `15-VALIDATION.md`'s own status cells and audit trail changed.
+
+---
+
+## Validation Audit 2026-07-17 (gsd-nyquist-auditor — CR-01 automated coverage gap)
+
+| Metric | Count |
+|--------|-------|
+| Gaps found | 1 |
+| Resolved | 1 |
+| Escalated | 0 |
+
+**What was audited:** The single outstanding MISSING gap flagged for adversarial coverage: no automated test asserted `.gitignore` actually covers `.devflow/state.json`, `.devflow/events.jsonl`, and `.devflow/gates/` — the exact three paths that regressed once already (CR-01 in `15-REVIEW.md`: commit `d021e3a` fixed a leaked-telemetry incident by rewriting `.gitignore`'s `.devflow/` patterns, but the rewrite silently dropped these three paths; a second code review caught it, fixed again in `9b2fac4`). Prior "coverage" (15-01-T2) only grepped SECURITY.md's prose, not the actual `.gitignore` patterns — exactly how the regression slipped through undetected.
+
+**Gap found:** `no_test_file` — no integration test exercised `git check-ignore` against these paths.
+
+**Test written:** `crates/devflow-cli/tests/gitignore_coverage.rs`, following this repo's existing `Command`-shelling convention from `crates/devflow-cli/tests/help_snapshot.rs`. Runs `git check-ignore -v .devflow/state.json .devflow/events.jsonl .devflow/gates/probe.json` and asserts exit success (all three paths matched). Pure pattern matching — no fixture files created or cleaned up.
+
+**Debug iteration (1/3):** First run failed — `git check-ignore` exited 1 with empty stdout/stderr. Root cause: `cargo test` runs test binaries with cwd set to the crate directory (`crates/devflow-cli/`), not the repo root, and `.gitignore`'s `.devflow/state.json` pattern is anchored (no leading `**/`), so it does not match when git is invoked from a subdirectory two levels deep. Confirmed manually: running the identical `git check-ignore` command from repo root exits 0 with all three patterns matching; running from `crates/devflow-cli/` exits 1. This was a test-harness bug, not an implementation bug — `.gitignore` itself is correct (confirmed via the repo-root run). Fixed by adding `current_dir(repo_root())` to the `Command`, resolving `CARGO_MANIFEST_DIR/../..` via `canonicalize()`. Re-ran: test passes.
+
+**Resolution:** FILLED. `cargo test -p devflow --test gitignore_coverage` passes and would fail if `.gitignore` ever again drops coverage of these three paths, closing the automated-guard gap that let CR-01 regress silently the first time.
+
+**No implementation files were modified.** `.gitignore` was read-only reference (already correct per `9b2fac4`); only the new test file and this file's own audit trail changed.
