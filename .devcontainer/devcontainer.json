@@ -1,0 +1,32 @@
+// DevFlow dev container: pinned Rust toolchain matching rust-toolchain.toml
+// (channel = "stable", components = ["clippy", "rustfmt"]), with cargo registry
+// and workspace target/ caches persisted across rebuilds.
+// Base image tag verified against mcr.microsoft.com/v2/devcontainers/rust/tags/list
+// (current published bookworm tag as of 2026-07-17) — pin deliberately; never use
+// an unversioned floating tag.
+{
+  "name": "DevFlow",
+  "image": "mcr.microsoft.com/devcontainers/rust:2.0.13-1-bookworm",
+  "mounts": [
+    {
+      "source": "devflow-cargo-registry",
+      "target": "/usr/local/cargo/registry",
+      "type": "volume"
+    },
+    {
+      "source": "devflow-target",
+      "target": "${containerWorkspaceFolder}/target",
+      "type": "volume"
+    }
+  ],
+  "postCreateCommand": "rustup component add clippy rustfmt && cargo build --workspace",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "vadimcn.vscode-lldb",
+        "tamasfe.even-better-toml"
+      ]
+    }
+  }
+}
