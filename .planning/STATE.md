@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
 status: In progress
-stopped_at: Completed 15-03-PLAN.md (CONTRIBUTING refresh + .devcontainer reproducible environment)
-last_updated: "2026-07-17T14:27:51.701Z"
+stopped_at: Completed 15-04-PLAN.md (dual-license LICENSE-APACHE + publish dry-run re-verification)
+last_updated: "2026-07-17T14:33:59.143Z"
 progress:
   total_phases: 5
   completed_phases: 2
   total_plans: 27
-  completed_plans: 21
+  completed_plans: 22
   percent: 40
 ---
 
@@ -88,6 +88,7 @@ None.
 - [Phase 15]: 15-01: SECURITY.md Supported Versions (v1.0.0+) already covers Cargo.toml 1.2.0 — left unchanged; DEPENDENCIES.md's "Required for Shipping" header also dropped the phantom `devflow ship` command (alongside the plan-flagged `devflow confirm`) in favor of the real gate-driven Ship flow (`devflow gate approve <phase> --stage ship`)
 - [Phase 15]: 15-02: ARCHITECTURE.md full rewrite also corrected the Agent model (trait renamed `Agent`->`AgentAdapter` in 12-11; prompts are per-stage via `prompt.rs::stage_prompt`, not one shared template) and Completion evaluation's Layer 2 commit gate (scoped to Plan/Code only, not every stage) — both classified "already accurate" by 15-PATTERNS.md but found stale on direct source verification; CONTRIBUTING.md's "Adding a New Agent" section left untouched (out of files_modified scope) despite already duplicating the checklist inline with the stale trait name — flagged for a future cleanup
 - [Phase 15]: 15-03: Verified devcontainer base image tag live against registry (2.0.13-1-bookworm, not stale illustrative 1-1-bookworm) and pinned devcontainers/ci action to @v0.3; CODE_OF_CONDUCT.md spot-checked and left unmodified (contact wording current)
+- [Phase 15]: 15-04: Sourced canonical Apache-2.0 body from an already-vendored copy in the local Cargo registry cache (byte-diffed) after an initial from-memory reconstruction was self-caught with garbled Section 8/9 text; kept dual license per plan's locked resolution
 
 ## Roadmap Evolution
 
@@ -118,9 +119,10 @@ None.
 | Phase 15-oss-readiness P01 | 15min | 3 tasks | 3 files |
 | Phase 15-oss-readiness P02 | 40min | 3 tasks | 3 files |
 | Phase 15-oss-readiness P03 | 10min | 3 tasks | 3 files |
+| Phase 15-oss-readiness P04 | 12min | 2 tasks | 1 files |
 
 ## Session
 
-**Last session:** 2026-07-17T14:27:51.684Z
-**Stopped at:** Completed 15-03-PLAN.md (CONTRIBUTING refresh + .devcontainer reproducible environment)
+**Last session:** 2026-07-17T14:33:59.124Z
+**Stopped at:** Completed 15-04-PLAN.md (dual-license LICENSE-APACHE + publish dry-run re-verification)
 **Resume file:** None
