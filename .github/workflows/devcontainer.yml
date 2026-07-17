@@ -1,0 +1,27 @@
+name: Devcontainer
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  devcontainer:
+    name: Build + test in devcontainer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build devcontainer and run CI-parity checks
+        uses: devcontainers/ci@v0.3
+        with:
+          runCmd: |
+            set -e
+            cargo build --workspace
+            cargo test --workspace
+            cargo clippy --workspace -- -D warnings
+            cargo fmt --check

@@ -47,7 +47,7 @@ devflow status
 Define → Plan → Code → Validate → Ship
 ```
 
-The 5-stage pipeline is driven by GSD-native execution. State is persisted to `.devflow/state.json` and survives restarts. `--mode auto` advances through Ship unattended (gating only on repeated Validate failure or an unexpected stage crash); `--mode supervise` also gates at Validate for human review.
+The 5-stage pipeline is driven by GSD-native execution. State is persisted per-phase to `.devflow/state-NN.json` and survives restarts. `--mode auto` advances through Ship unattended (gating only on repeated Validate failure or an unexpected stage crash); `--mode supervise` also gates at Validate for human review.
 
 ## Architecture
 
@@ -59,11 +59,11 @@ crates/
 
 **Key design decisions:**
 
-- **Agent-agnostic** — Claude, Codex, and OpenCode all implement the same `Agent` trait. Adding a new agent follows a small checklist (see [ARCHITECTURE.md](ARCHITECTURE.md#extension-points--adding-an-agent)).
+- **Agent-agnostic** — Claude, Codex, and OpenCode all implement the same `AgentAdapter` trait. Adding a new agent follows a small checklist (see [ARCHITECTURE.md](ARCHITECTURE.md#extension-points--adding-an-agent)).
 - **Worktree isolation by default** — agents run in isolated git worktrees (`.worktrees/phase-NN/`) unless `--no-worktree` is passed, preventing cross-phase contamination.
 - **Monitor daemon** — optional background process detects agent completion and auto-advances the state machine. No cron, no polling, no tmux.
 - **Three-layer evaluation** — agents self-report via `DEVFLOW_RESULT` markers in stdout; fallback layers: exit code + commit count, then a commit-count heuristic.
-- **Shared prompts** — all agents receive the same prompt via `phase_prompt()`. No agent-specific prompt logic.
+- **Per-stage prompts** — `stage_prompt(stage, phase)` builds a dedicated prompt per pipeline stage (not one shared instruction template); the same prompt text is used across agents for a given stage, with adapter-specific logic limited to CLI launch flags, not prompt content.
 
 ## Agent Protocol
 
@@ -83,7 +83,7 @@ DevFlow evaluates agent output in three layers:
 | 2. Exit code + commits | Exit 0 **and** commits on the feature branch = success; otherwise failed | Fallback |
 | 3. Commit heuristic | Exit code unknown: commits exist = probable success (with warning) | Last resort |
 
-Rate-limit detection: if an agent's stdout contains rate-limit messages (429), DevFlow writes `.devflow/cron-instructions.json` for rescheduling.
+Rate-limit detection: during `devflow sequentagent`, if an agent's stdout contains rate-limit messages (429), DevFlow writes a per-phase `.devflow/cron-instructions-{phase:02}.json` for rescheduling.
 
 ## Commands
 
@@ -94,6 +94,9 @@ Rate-limit detection: if an agent's stdout contains rate-limit messages (429), D
 | `devflow start --phase N --agent X [--mode auto\|supervise] [--no-worktree]` | Begin a phase: branch/worktree → launch agent → monitor pipeline |
 | `devflow status` | Show current stage, phase, agent, PID, age |
 | `devflow list` | List all feature branches with divergence from develop |
+| `devflow gate list` | List gates awaiting a response |
+| `devflow gate approve\|reject <phase> [--stage STAGE] [--note "..."]` | Answer a human gate — the pause points where the workflow waits for approval |
+| `devflow logs [--phase N] [--follow] [--stderr]` | Print or follow an agent's captured output for a phase |
 | `devflow cleanup` | Remove phase worktrees and their feature branches |
 
 ### Multi-Agent
@@ -119,7 +122,7 @@ Rate-limit detection: if an agent's stdout contains rate-limit messages (429), D
 
 ## Configuration
 
-DevFlow stores runtime state in `.devflow/state.json` (git-ignored). No config file or init step is required — all workflow options are supplied as CLI flags to `devflow start`.
+DevFlow stores runtime state per-phase in `.devflow/state-NN.json` (git-ignored). No config file or init step is required — all workflow options are supplied as CLI flags to `devflow start`.
 
 Key flags:
 
@@ -177,6 +180,7 @@ devflow doctor
 
 - [DEPENDENCIES.md](DEPENDENCIES.md) — full dependency matrix
 - [ARCHITECTURE.md](ARCHITECTURE.md) — design documentation
+- [OPERATIONS.md](OPERATIONS.md) — operator reference (gate protocol, env vars, `.devflow/` file inventory)
 - [CONTRIBUTING.md](CONTRIBUTING.md) — how to contribute
 - [CHANGELOG.md](CHANGELOG.md) — version history
 
