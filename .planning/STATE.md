@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
 status: In progress
-stopped_at: Completed 15-01-PLAN.md (README/SECURITY/DEPENDENCIES accuracy pass)
-last_updated: "2026-07-17T14:12:27.549Z"
+stopped_at: Completed 15-02-PLAN.md (ARCHITECTURE.md rewrite + docs/guides accuracy pass)
+last_updated: "2026-07-17T14:20:30.000Z"
 progress:
   total_phases: 5
   completed_phases: 2
   total_plans: 27
-  completed_plans: 19
+  completed_plans: 20
   percent: 40
 ---
 
@@ -86,6 +86,7 @@ None.
 - [Phase 13]: 13-05: Verdict deserializer uses exact-case matching (not case-folding) per the plan's explicit fail-safe test contract.
 - [Phase 13]: 13-05: Excluded Stage::Validate from the generic single-command-template prompt test (renamed it) since Validate now has its own dedicated verdict-requiring prompt, mirroring Ship's existing special-case exclusion.
 - [Phase 15]: 15-01: SECURITY.md Supported Versions (v1.0.0+) already covers Cargo.toml 1.2.0 — left unchanged; DEPENDENCIES.md's "Required for Shipping" header also dropped the phantom `devflow ship` command (alongside the plan-flagged `devflow confirm`) in favor of the real gate-driven Ship flow (`devflow gate approve <phase> --stage ship`)
+- [Phase 15]: 15-02: ARCHITECTURE.md full rewrite also corrected the Agent model (trait renamed `Agent`->`AgentAdapter` in 12-11; prompts are per-stage via `prompt.rs::stage_prompt`, not one shared template) and Completion evaluation's Layer 2 commit gate (scoped to Plan/Code only, not every stage) — both classified "already accurate" by 15-PATTERNS.md but found stale on direct source verification; CONTRIBUTING.md's "Adding a New Agent" section left untouched (out of files_modified scope) despite already duplicating the checklist inline with the stale trait name — flagged for a future cleanup
 
 ## Roadmap Evolution
 
@@ -114,9 +115,10 @@ None.
 | Plan | Duration | Tasks | Files |
 |------|----------|-------|-------|
 | Phase 15-oss-readiness P01 | 15min | 3 tasks | 3 files |
+| Phase 15-oss-readiness P02 | 40min | 3 tasks | 3 files |
 
 ## Session
 
-**Last session:** 2026-07-17T14:12:27.530Z
-**Stopped at:** Completed 15-01-PLAN.md (README/SECURITY/DEPENDENCIES accuracy pass)
+**Last session:** 2026-07-17T14:20:30.000Z
+**Stopped at:** Completed 15-02-PLAN.md (ARCHITECTURE.md rewrite + docs/guides accuracy pass)
 **Resume file:** None
