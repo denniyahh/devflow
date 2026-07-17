@@ -7,22 +7,6 @@
   MIT/Apache-2.0 licensing backed by both texts, devflow-core and devflow
   1.2.0 published to crates.io, per-phase SECURITY.md threat verification.
 
-## 1.2.176 — 2026-07-17
-
-- Released phase via DevFlow.
-
-## 1.2.175 — 2026-07-17
-
-- Released phase via DevFlow.
-
-## 1.2.174 — 2026-07-17
-
-- Released phase via DevFlow.
-
-## 1.2.173 — 2026-07-17
-
-- Released phase via DevFlow.
-
 All notable changes to DevFlow.
 
 ## [Unreleased]
