@@ -98,6 +98,7 @@ Rate-limit detection: during `devflow sequentagent`, if an agent's stdout contai
 | `devflow gate list` | List gates awaiting a response |
 | `devflow gate approve\|reject <phase> [--stage STAGE] [--note "..."]` | Answer a human gate — the pause points where the workflow waits for approval |
 | `devflow logs [--phase N] [--follow] [--stderr]` | Print or follow an agent's captured output for a phase |
+| `devflow history [N]` | Correlate a phase's events with retained capture and review evidence |
 | `devflow cleanup` | Remove phase worktrees and their feature branches |
 
 ### Multi-Agent

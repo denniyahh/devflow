@@ -31,6 +31,7 @@ Define → Plan → Code → Validate → Ship
 | `devflow start --phase N --agent claude\|codex\|opencode --mode auto\|supervise [--force] [--no-worktree] [--dry-run]` | Begin a phase; a detached monitor owns the agent and auto-advances |
 | `devflow status` | All active phases: stage, gate state, agent liveness, elapsed, last action |
 | `devflow logs [-f] [--phase N] [--stderr]` | Print/follow a phase's captured agent output |
+| `devflow history [N]` | Show chronological events with retained capture and review evidence for a phase |
 | `devflow gate list` | Gates awaiting a response |
 | `devflow gate approve <phase> [--stage S] [--note ...]` | Approve a gate — the workflow advances |
 | `devflow gate reject <phase> --note ... [--stage S]` | Reject — loops back to Code; a note containing `abort` ends the phase |

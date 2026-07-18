@@ -8,7 +8,7 @@ use devflow_core::mode::{self, Mode};
 use devflow_core::prompt::{self, FixType};
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
-use devflow_core::{agent_result, agents, events, lock, monitor, recover, worktree};
+use devflow_core::{agent_result, agents, events, history, lock, monitor, recover, worktree};
 use devflow_core::{
     agent_result::{AgentStatus, Verdict},
     workflow,
@@ -122,6 +122,14 @@ enum Command {
         /// Show the agent's stderr capture instead of stdout.
         #[arg(long)]
         stderr: bool,
+        /// Project root.
+        #[arg(default_value = ".")]
+        project: PathBuf,
+    },
+    /// Show a phase's chronological events and retained attempt evidence.
+    History {
+        /// Phase to show (defaults to the single active phase).
+        phase: Option<u32>,
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
@@ -382,6 +390,7 @@ fn run() -> Result<(), CliError> {
             stderr,
             project,
         } => logs(&project_root(project)?, phase, follow, stderr),
+        Command::History { phase, project } => history_cmd(&project_root(project)?, phase),
         Command::Parallel {
             phases,
             agents,
@@ -1987,6 +1996,21 @@ fn logs(
         }
         offset = new_offset;
     }
+}
+
+/// Render the read-only cross-attempt view for one phase.
+fn history_cmd(project_root: &Path, phase: Option<u32>) -> Result<(), CliError> {
+    let phase = match phase {
+        Some(phase) => phase,
+        None => single_active_phase(project_root)?.ok_or_else(|| {
+            CliError::Message("no active phase — pass a phase number to `devflow history`".into())
+        })?,
+    };
+    println!(
+        "{}",
+        history::render_timeline(&history::attempt_timeline(project_root, phase))
+    );
+    Ok(())
 }
 
 /// Detect capture-file rollover for `logs --follow` (14-CR-03): a file
