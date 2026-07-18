@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
 status: Phase 17 scoped and discussed - ready for planning
-stopped_at: Phase 17 context gathered
-last_updated: "2026-07-18T20:21:31.907Z"
+stopped_at: Completed 17-01-PLAN.md
+last_updated: "2026-07-18T23:32:33.623Z"
 progress:
   total_phases: 7
   completed_phases: 5
-  total_plans: 34
-  completed_plans: 34
+  total_plans: 39
+  completed_plans: 35
   percent: 71
 ---
 
@@ -108,6 +108,7 @@ None.
 - [Phase 15]: 15-04: Sourced canonical Apache-2.0 body from an already-vendored copy in the local Cargo registry cache (byte-diffed) after an initial from-memory reconstruction was self-caught with garbled Section 8/9 text; kept dual license per plan's locked resolution
 - [Phase 16]: 16-01: absent feature branches are treated as already merged so terminal retries are safe after feature_finish deletes the branch
 - [Phase 16]: 16-01: merge_result telemetry separates actual merge effects from successful no-op hook execution
+- [Phase 17]: 17-01: typed-outcome taxonomy + fail-closed policy table — ResourceKilled/AgentUnavailable, as_wire_str(), outcome_policy::decide_action, State.infra_failures/MAX_INFRA_FAILURES
 
 ## Roadmap Evolution
 
@@ -146,9 +147,10 @@ None.
 | Phase 16 P05 | 8min | 2 tasks | 14 files |
 | Phase 16 P06 | 3min | 2 tasks | 2 files |
 | Phase 16 P07 | 4min | 2 tasks | 7 files |
+| Phase 17 P01 | 15min | 2 tasks | 6 files |
 
 ## Session
 
-**Last session:** 2026-07-18T20:21:31.889Z
-**Stopped at:** Phase 17 context gathered
-**Resume file:** .planning/phases/17-pipeline-dogfood-followup/17-CONTEXT.md
+**Last session:** 2026-07-18T23:32:33.603Z
+**Stopped at:** Completed 17-01-PLAN.md
+**Resume file:** None

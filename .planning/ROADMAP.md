@@ -11,7 +11,7 @@
 | 14 | Parallel Safety + Observability | Complete |
 | 15 | Dogfood Enablement + OSS Readiness | Complete |
 | 16 | Pipeline Reliability Hardening | Complete    |
-| 17 | Pipeline Dogfood Follow-Up | Spiked |
+| 17 | Pipeline Dogfood Follow-Up | In Progress|
 | 18 | Hermes Support | Scoped |
 
 ## Shipped
@@ -187,13 +187,13 @@ state/event reconciliation and the WR-03 test fix were deferred to Phase 18 on
 against final HEAD rather than re-plan)
 **Depends on:** Phase 16
 **Blocks:** Phase 18 Hermes Support
-**Plans:** 5 plans
+**Plans:** 1/5 plans executed
 
 Plans:
 
 **Wave 1** *(devflow-core foundations + build script, no shared files)*
 
-- [ ] 17-01-PLAN.md — 17b: typed outcome taxonomy (ResourceKilled/AgentUnavailable), Layer 2 exit-code classification, pure exhaustive outcome→action policy module, separate infra-failure counter
+- [x] 17-01-PLAN.md — 17b: typed outcome taxonomy (ResourceKilled/AgentUnavailable), Layer 2 exit-code classification, pure exhaustive outcome→action policy module, separate infra-failure counter
 - [ ] 17-02-PLAN.md — 17d: first workspace build.rs embedding git provenance (commit/dirty/timestamp) with graceful no-git degradation
 
 **Wave 2** *(blocked on 17-01: shares agent_result.rs)*
