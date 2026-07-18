@@ -198,6 +198,20 @@ fn stage_prompt_with_project(stage: Stage, phase: u32, project_root: Option<&Pat
         return idempotent_stage_prompt(stage, phase);
     }
     let command = gsd_command_for(stage, phase);
+    if stage == Stage::Code {
+        return format!(
+            "Run the GSD workflow command for this stage:\n\n    {command}\n\n\
+            ## Advisory incremental self-review\n\
+            \n\
+            After each plan or wave lands, perform a quick, shallow self-check \
+            for doc accuracy, leaked data, CI/build correctness, and \
+            external-state claims. Record any drift in the working output and \
+            continue execution; the authoritative review happens during Ship. \
+            This check must not pause execution or request human input.\n\
+            \n\
+            {COMPLETION_PROTOCOL}"
+        );
+    }
     format!(
         "Run the GSD workflow command for this stage:\n\n    {command}\n\n{COMPLETION_PROTOCOL}"
     )
