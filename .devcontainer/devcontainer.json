@@ -19,7 +19,8 @@
       "type": "volume"
     }
   ],
-  "postCreateCommand": "rustup component add clippy rustfmt && cargo build --workspace",
+  // Docker creates fresh named volumes as root; claim writable Cargo volumes for the lifecycle user.
+  "postCreateCommand": "sudo chown -R \"$(id -u):$(id -g)\" /usr/local/cargo/registry \"${containerWorkspaceFolder}/target\" && rustup component add clippy rustfmt && cargo build --workspace",
   "customizations": {
     "vscode": {
       "extensions": [
