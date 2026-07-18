@@ -951,12 +951,31 @@ fn handle_ship_outcome(project_root: &Path, state: &mut State) -> Result<(), Cli
 /// reached the desktop notification verbatim. Full detail stays available in
 /// `.devflow/phase-NN-stdout`; the gate only needs a readable headline.
 fn truncate_reason(reason: &str) -> String {
-    const MAX: usize = 300;
-    if reason.chars().count() <= MAX {
-        return reason.to_string();
+    render_gate_context(reason, 300)
+}
+
+/// Render agent-controlled gate text as one bounded, terminal-safe line.
+fn render_gate_context(context: &str, max_chars: usize) -> String {
+    const TRUNCATED: &str = "… [truncated; full output in .devflow/]";
+    let sanitized: String = context
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    if sanitized.chars().count() <= max_chars {
+        return sanitized;
     }
-    let head: String = reason.chars().take(MAX).collect();
-    format!("{head}… [truncated; full output in .devflow/]")
+
+    let suffix_len = TRUNCATED.chars().count().min(max_chars);
+    let head_len = max_chars.saturating_sub(suffix_len);
+    let head: String = sanitized.chars().take(head_len).collect();
+    let suffix: String = TRUNCATED.chars().take(suffix_len).collect();
+    format!("{head}{suffix}")
 }
 
 fn handle_stage_failure(
@@ -1954,16 +1973,7 @@ fn render_pending_gate_banner(open: &[OpenGate], now: u64) -> Option<String> {
             .and_then(|timestamp| now.checked_sub(timestamp))
             .is_some_and(|age| age >= GATE_ESCALATION_THRESHOLD_SECS);
         let marker = if escalated { "!!! ESCALATED" } else { "!!!" };
-        let context: String = truncate_reason(&gate.context)
-            .chars()
-            .map(|character| {
-                if character.is_control() {
-                    ' '
-                } else {
-                    character
-                }
-            })
-            .collect();
+        let context = render_gate_context(&gate.context, 300);
         let stage = gate.stage.to_string();
         banner.push_str(&format!(
             "{marker}: phase {} {stage} ({})\n  {context}\n  approve: devflow gate approve {} --stage {stage}\n  reject:  devflow gate reject {} --stage {stage} --note <reason>\n",
@@ -1986,10 +1996,7 @@ fn gate_list(project_root: &Path) -> Result<(), CliError> {
     }
     println!("{:<6} {:<9} {:<9} CONTEXT", "PHASE", "STAGE", "AGE");
     for gate in &open {
-        let mut context = gate.context.replace('\n', " ");
-        if context.chars().count() > 100 {
-            context = format!("{}…", context.chars().take(100).collect::<String>());
-        }
+        let context = render_gate_context(&gate.context, 100);
         println!(
             "{:<6} {:<9} {:<9} {context}",
             gate.phase,
@@ -3544,8 +3551,19 @@ mod tests {
         assert_eq!(truncate_reason("short reason"), "short reason");
         let long = "x".repeat(5000);
         let capped = truncate_reason(&long);
-        assert!(capped.chars().count() < 400);
+        assert!(capped.chars().count() <= 300);
         assert!(capped.ends_with("[truncated; full output in .devflow/]"));
+    }
+
+    #[test]
+    fn gate_context_rendering_neutralizes_all_controls_and_obeys_limit() {
+        let rendered = render_gate_context("line 1\n\u{1b}[2J\tline 2\u{7}", 100);
+        assert!(!rendered.chars().any(char::is_control));
+        assert_eq!(rendered, "line 1  [2J line 2 ");
+
+        let bounded = render_gate_context(&"x".repeat(500), 100);
+        assert_eq!(bounded.chars().count(), 100);
+        assert!(bounded.ends_with("[truncated; full output in .devflow/]"));
     }
 
     #[test]
