@@ -18,7 +18,8 @@ use devflow_core::config::GitFlowConfig;
 use devflow_core::mode::Mode;
 use devflow_core::monitor::{spawn_monitor, wait_for_agent_pid};
 use devflow_core::stage::Stage;
-use devflow_core::state::{Agent, State};
+use devflow_core::state::{AgentKind, State};
+use devflow_core::workflow::{WorkflowError, load_state};
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
@@ -63,7 +64,7 @@ fn monitor_owns_fake_agent_and_records_devflow_result() {
     let phase = 7;
     init_repo(root, phase);
 
-    let mut state = State::new(phase, Agent::Claude, Mode::Auto, root.to_path_buf());
+    let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
     state.stage = Stage::Code;
 
     // Fake agent: emit the success marker on stdout, then exit 0.
@@ -73,7 +74,7 @@ fn monitor_owns_fake_agent_and_records_devflow_result() {
             .to_string(),
     ];
 
-    spawn_monitor(&state, "sh", &args).expect("spawn monitor");
+    spawn_monitor(&state, "sh", &args, &[]).expect("spawn monitor");
 
     // The monitor records the agent PID.
     let agent_pid = wait_for_agent_pid(root, phase).expect("agent pid recorded");
@@ -115,4 +116,28 @@ fn monitor_owns_fake_agent_and_records_devflow_result() {
         stdout_path(root, phase),
         agent_result::stdout_path(root, phase)
     );
+}
+
+#[test]
+fn advance_state_loading_fails_cleanly_for_missing_and_corrupt_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    assert!(matches!(
+        load_state(root, 7),
+        Err(WorkflowError::MissingState(_))
+    ));
+
+    std::fs::create_dir_all(root.join(".devflow")).unwrap();
+    std::fs::write(root.join(".devflow/state-07.json"), "{\"stage\":").unwrap();
+
+    assert!(matches!(load_state(root, 7), Err(WorkflowError::Json(_))));
+
+    // A corrupt LEGACY state.json must not wedge loading either — it is left
+    // in place (unmigratable) and per-phase reads proceed independently.
+    std::fs::write(root.join(".devflow/state.json"), "{\"stage\":").unwrap();
+    assert!(matches!(
+        load_state(root, 8),
+        Err(WorkflowError::MissingState(_))
+    ));
 }

@@ -1,6 +1,6 @@
 //! Hybrid Git-based SemVer.
 //!
-//! v2.0.0 derives the version from a mix of the project's version file and git
+//! DevFlow derives the version from a mix of the project's version file and git
 //! history rather than a config-driven scheme:
 //!
 //! - **MAJOR** — read from the auto-detected version file (`Cargo.toml`,
@@ -175,7 +175,11 @@ fn split_field(field: &str) -> (&str, &str) {
 
 /// Return the dotted table path for a TOML section header line, if any.
 fn parse_section_header(trimmed: &str) -> Option<&str> {
-    let inner = trimmed.strip_prefix('[')?.strip_suffix(']')?;
+    let inner = if trimmed.starts_with("[[") && trimmed.ends_with("]]") {
+        trimmed.strip_prefix("[[")?.strip_suffix("]]")?
+    } else {
+        trimmed.strip_prefix('[')?.strip_suffix(']')?
+    };
     Some(inner.trim())
 }
 
@@ -196,7 +200,11 @@ fn find_version_in_contents(contents: &str, field: &str) -> Option<String> {
             if lhs_key != key {
                 continue;
             }
-            return Some(value.trim().trim_matches(['"', '\'']).to_string());
+            let value = value.trim();
+            if value.starts_with('{') {
+                continue;
+            }
+            return Some(value.trim_matches(['"', '\'']).to_string());
         }
     }
     None
@@ -220,7 +228,7 @@ fn replace_version_in_contents(contents: &str, field: &str, new_version: &str) -
             && let Some((left, value)) = line.split_once(['=', ':'])
         {
             let left_key = left.trim().trim_matches('"').trim_matches('\'');
-            if left_key == key {
+            if left_key == key && !value.trim().starts_with('{') {
                 let separator: &str = if trimmed.contains('=') { " = " } else { ": " };
                 let quote_char: &str = if value.trim().starts_with('\'') {
                     "'"
@@ -314,6 +322,35 @@ mod tests {
     }
 
     #[test]
+    fn inline_table_version_does_not_shadow_workspace_package() {
+        assert_eq!(parse_section_header("[[bin]]"), Some("bin"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("Cargo.toml");
+        std::fs::write(
+            &file,
+            "[[bin]]\nname = \"devflow\"\n\
+             [workspace.dependencies]\nserde = { version = \"1\", features = [\"derive\"] }\n\
+             [workspace.package]\nversion = \"1.2.0\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(read_major_version(&file).unwrap(), 1);
+        write_version(
+            dir.path(),
+            &Version {
+                major: 2,
+                minor: 3,
+                patch: 4,
+            },
+        )
+        .unwrap();
+        let contents = std::fs::read_to_string(file).unwrap();
+        assert!(contents.contains("serde = { version = \"1\""));
+        assert!(contents.contains("[workspace.package]\nversion = \"2.3.4\""));
+    }
+
+    #[test]
     fn read_major_from_package_json() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("package.json");
@@ -372,6 +409,27 @@ mod tests {
         .unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();
         assert!(contents.contains("version = \"2.3.4\""));
+    }
+
+    #[test]
+    fn write_version_replaces_in_workspace_cargo_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace.package]\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        let path = write_version(
+            dir.path(),
+            &Version {
+                major: 2,
+                minor: 3,
+                patch: 4,
+            },
+        )
+        .unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("[workspace.package]\nversion = \"2.3.4\""));
     }
 
     #[test]

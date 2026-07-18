@@ -2,16 +2,21 @@
 //!
 //! Launches `opencode run "<prompt>"` in non-interactive mode.
 
-use super::Agent;
+use super::AgentAdapter;
 
 pub struct OpenCodeAgent;
 
-impl Agent for OpenCodeAgent {
+impl AgentAdapter for OpenCodeAgent {
     fn name(&self) -> &'static str {
         "OpenCode"
     }
 
-    fn exec_command(&self, _phase: u32, prompt: &str) -> (&'static str, Vec<String>) {
+    fn exec_command(
+        &self,
+        _phase: u32,
+        prompt: &str,
+        _extra_writable_roots: &[std::path::PathBuf],
+    ) -> (&'static str, Vec<String>) {
         ("opencode", vec!["run".into(), prompt.to_string()])
     }
 

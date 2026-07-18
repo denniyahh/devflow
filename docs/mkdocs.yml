@@ -1,0 +1,89 @@
+site_name: DevFlow Documentation
+site_description: Agent-agnostic development workflow automation — architecture, guides, and API reference
+repo_url: https://github.com/denniyahh/devflow
+edit_uri: edit/main/docs/
+docs_dir: .
+site_dir: ../site
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: blue
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: blue
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.indexes
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+
+extra_css:
+  - assets/extra.css
+
+extra_javascript:
+  - assets/extra.js
+
+plugins:
+  - search
+  - mermaid2:
+      arguments:
+        theme: base
+        fontSize: 14
+        flowchart:
+          useMaxWidth: true
+          htmlLabels: true
+          curve: basis
+          rankSpacing: 60
+          nodeSpacing: 40
+          padding: 15
+          wrappingWidth: 200
+        sequence:
+          useMaxWidth: true
+          wrap: true
+          width: 160
+          mirrorActors: false
+        state:
+          useMaxWidth: true
+          padding: 20
+  - panzoom
+
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:mermaid2.fence_mermaid_custom
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - admonition
+  - footnotes
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Architecture:
+      - Overview: architecture/overview.md
+      - State Machine: architecture/state-machine.md
+      - Agent Model: architecture/agent-model.md
+      - Git & Ship Model: architecture/git-ship.md
+  - Diagrams:
+      - System Architecture: diagrams/system.md
+      - Agent Lifecycle: diagrams/agent-lifecycle.md
+      - Ship Flow: diagrams/ship-flow.md
+      - Module Map: diagrams/module-map.md
+  - Guides:
+      - Quick Start: guides/quickstart.md
+      - Adding an Agent: guides/adding-agent.md
+      - Configuration: guides/configuration.md

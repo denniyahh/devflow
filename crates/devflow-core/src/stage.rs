@@ -1,4 +1,4 @@
-//! DevFlow v2.0.0 stage machine.
+//! DevFlow stage machine.
 //!
 //! The workflow is a single linear chain of five stages:
 //! Define → Plan → Code → Validate → Ship.
@@ -73,6 +73,26 @@ impl fmt::Display for Stage {
     }
 }
 
+impl std::str::FromStr for Stage {
+    type Err = StageParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "define" => Ok(Stage::Define),
+            "plan" => Ok(Stage::Plan),
+            "code" => Ok(Stage::Code),
+            "validate" => Ok(Stage::Validate),
+            "ship" => Ok(Stage::Ship),
+            other => Err(StageParseError(other.to_string())),
+        }
+    }
+}
+
+/// Error returned when parsing an unsupported stage name.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("unsupported stage `{0}`; expected define, plan, code, validate, or ship")]
+pub struct StageParseError(String);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,6 +140,22 @@ mod tests {
         assert_eq!(Stage::Code.to_string(), "code");
         assert_eq!(Stage::Validate.to_string(), "validate");
         assert_eq!(Stage::Ship.to_string(), "ship");
+    }
+
+    #[test]
+    fn from_str_round_trips_display_and_rejects_unknown() {
+        for stage in [
+            Stage::Define,
+            Stage::Plan,
+            Stage::Code,
+            Stage::Validate,
+            Stage::Ship,
+        ] {
+            assert_eq!(stage.to_string().parse::<Stage>().unwrap(), stage);
+        }
+        assert_eq!("SHIP".parse::<Stage>().unwrap(), Stage::Ship);
+        let err = "docsing".parse::<Stage>().unwrap_err();
+        assert!(err.to_string().contains("docsing"));
     }
 
     #[test]

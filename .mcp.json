@@ -1,0 +1,34 @@
+{
+  "mcpServers": {
+    "gsd-workflow": {
+      "command": "/var/home/linuxbrew/.linuxbrew/Cellar/node/26.4.0/bin/node",
+      "args": [
+        "/var/home/linuxbrew/.linuxbrew/lib/node_modules/@opengsd/gsd-pi/packages/mcp-server/dist/cli.js"
+      ],
+      "cwd": "/var/home/denniyahh/Github/devflow",
+      "env": {
+        "GSD_CLI_PATH": "/home/linuxbrew/.linuxbrew/bin/gsd",
+        "GSD_BIN_PATH": "/home/linuxbrew/.linuxbrew/bin/gsd",
+        "GSD_WORKFLOW_EXECUTORS_MODULE": "/var/home/denniyahh/.gsd/agent/extensions/gsd/tools/workflow-tool-executors.js",
+        "GSD_WORKFLOW_WRITE_GATE_MODULE": "/var/home/denniyahh/.gsd/agent/extensions/gsd/bootstrap/write-gate.js",
+        "GSD_PERSIST_WRITE_GATE_STATE": "1",
+        "GSD_WORKFLOW_PROJECT_ROOT": "/var/home/denniyahh/Github/devflow"
+      }
+    },
+    "gsd-browser": {
+      "command": "gsd-browser",
+      "args": [
+        "mcp",
+        "--session",
+        "gsd-devflow-55d25d5b",
+        "--identity-scope",
+        "project",
+        "--identity-key",
+        "gsd-devflow-55d25d5b",
+        "--identity-project",
+        "gsd-devflow-55d25d5b"
+      ],
+      "cwd": "/var/home/denniyahh/Github/devflow"
+    }
+  }
+}

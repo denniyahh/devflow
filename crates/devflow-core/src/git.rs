@@ -69,12 +69,39 @@ impl GitFlow {
 
     /// Merge a feature branch into develop and delete it.
     pub fn feature_finish(&self, phase: u32) -> Result<String, GitError> {
-        let branch = format!("{}phase-{:02}", self.config.feature_prefix, phase);
-        info!("finishing feature branch: {branch}");
-        self.git(["checkout", &self.config.develop])?;
-        self.git(["merge", "--no-ff", &branch])?;
+        let branch = self.merge_feature_into_develop(phase)?;
         self.git(["branch", "-d", &branch])?;
         Ok(branch)
+    }
+
+    /// Merge a feature branch into develop without deleting it.
+    ///
+    /// Default DevFlow runs keep the feature branch checked out in a linked
+    /// worktree, so deletion belongs to the later best-effort cleanup hook.
+    pub fn merge_feature_into_develop(&self, phase: u32) -> Result<String, GitError> {
+        let branch = format!("{}phase-{:02}", self.config.feature_prefix, phase);
+        info!("merging feature branch: {branch}");
+        self.git(["checkout", &self.config.develop])?;
+        self.git(["merge", "--no-ff", &branch])?;
+        Ok(branch)
+    }
+
+    /// Whether a phase feature branch has nothing left to merge into develop.
+    ///
+    /// An absent branch is not proof of a merge. Callers must fail closed
+    /// rather than treating a deleted or never-created branch as shipped.
+    pub fn is_merged_into_develop(&self, phase: u32) -> bool {
+        let branch = format!("{}phase-{:02}", self.config.feature_prefix, phase);
+        if !self.branch_exists(&branch) {
+            return false;
+        }
+
+        Command::new("git")
+            .args(["merge-base", "--is-ancestor", &branch, &self.config.develop])
+            .current_dir(&self.root)
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
     }
 
     /// Create or reset a release branch from the current `HEAD`.
@@ -96,7 +123,13 @@ impl GitFlow {
         info!("finishing release branch: {branch}");
         self.git(["checkout", &self.config.main])?;
         self.git(["merge", "--no-ff", &branch])?;
-        self.git(["tag", &format!("v{version}")])?;
+        // `-c tag.gpgSign=false` scopes the override to this invocation only
+        // (never the user's global/repo config) — without it, a global
+        // `tag.gpgsign=true` forces this lightweight tag into an
+        // annotated+signed one requiring a message, which blocks on
+        // `$EDITOR` in what must be a headless, unattended flow (Phase 13
+        // dogfood finding).
+        self.git(["-c", "tag.gpgSign=false", "tag", &format!("v{version}")])?;
         self.git(["checkout", &self.config.develop])?;
         self.git(["merge", "--no-ff", &branch])?;
         self.git(["branch", "-d", &branch])?;
@@ -104,9 +137,16 @@ impl GitFlow {
     }
 
     /// Create an annotated-free lightweight tag at the current `HEAD`.
+    ///
+    /// Passes `-c tag.gpgSign=false` scoped to this invocation only — a
+    /// global `tag.gpgsign=true` (common for developers who sign their own
+    /// tags) otherwise forces this lightweight tag into an annotated+signed
+    /// one requiring a message, which blocks on `$EDITOR` in what must be a
+    /// headless, unattended flow (Phase 13 dogfood finding: VersionBump hung
+    /// on a live `devflow start --mode auto` run).
     pub fn tag(&self, tag: &str) -> Result<(), GitError> {
         info!("tagging {tag}");
-        self.git(["tag", tag])
+        self.git(["-c", "tag.gpgSign=false", "tag", tag])
     }
 
     /// Delete a single local branch.
@@ -219,19 +259,46 @@ impl GitFlow {
         self.git(["push", "-u", "origin", branch])
     }
 
-    /// Delete local branches already merged into the current branch.
+    /// Delete local branches already merged into `develop`.
+    ///
+    /// WR-04 (13-REVIEW.md): passes `develop` explicitly rather than relying
+    /// on `git branch --merged`'s default of "whatever HEAD currently is" —
+    /// if the main checkout is ever left on a branch other than `develop`
+    /// when this runs, an implicit baseline would silently prune branches
+    /// merged into that other branch instead.
+    ///
+    /// Deletion uses `-D`, not `-d`: `-d` verifies merged-into-HEAD, which
+    /// contradicts the `--merged develop` listing above in exactly the
+    /// checkout-not-on-develop scenario WR-04 targets (every genuinely
+    /// merged branch would be refused as "not fully merged"). The listing IS
+    /// the merge safety check. A branch git still refuses to delete (e.g.
+    /// checked out in a worktree) is logged and skipped so one failure
+    /// doesn't abort the rest of the sweep.
     pub fn cleanup_merged(&self) -> Result<Vec<String>, GitError> {
-        let output = self.git_output(["branch", "--merged"])?;
+        let output = self.git_output(["branch", "--merged", &self.config.develop])?;
         let protected = [self.config.main.as_str(), self.config.develop.as_str()];
         let mut deleted = Vec::new();
         for line in output.lines() {
-            let branch = line.trim().trim_start_matches('*').trim();
-            if branch.is_empty() || protected.contains(&branch) {
+            // git's porcelain marker is an exact two-char prefix ("* " for
+            // the current branch, "+ " for a worktree checkout, "  "
+            // otherwise) — strip it positionally rather than trimming
+            // marker CHARACTERS, which would mangle a branch legitimately
+            // named e.g. "+foo" (WR-03, revised).
+            let branch = line
+                .strip_prefix("* ")
+                .or_else(|| line.strip_prefix("+ "))
+                .unwrap_or(line)
+                .trim();
+            // Skip blanks, protected trunks, and the detached-HEAD line
+            // ("(HEAD detached at ...)"), which is not a branch name.
+            if branch.is_empty() || branch.starts_with('(') || protected.contains(&branch) {
                 continue;
             }
             info!("cleaning up merged branch: {branch}");
-            self.git(["branch", "-d", branch])?;
-            deleted.push(branch.to_string());
+            match self.git(["branch", "-D", branch]) {
+                Ok(()) => deleted.push(branch.to_string()),
+                Err(err) => warn!("could not delete merged branch {branch}: {err}"),
+            }
         }
         Ok(deleted)
     }
@@ -290,10 +357,10 @@ impl GitFlow {
                 continue;
             }
             let ahead = self
-                .rev_count(&format!("{name}..{dev}", dev = self.config.develop))
+                .rev_count(&format!("{dev}..{name}", dev = self.config.develop))
                 .unwrap_or(0);
             let behind = self
-                .rev_count(&format!("{dev}..{name}", dev = self.config.develop))
+                .rev_count(&format!("{name}..{dev}", dev = self.config.develop))
                 .unwrap_or(0);
             let last_commit = self
                 .git_output(["log", "-1", "--format=%aI", name])
@@ -443,6 +510,28 @@ mod tests {
     }
 
     #[test]
+    fn list_feature_branches_reports_ahead_and_behind_semantics() {
+        let repo = init_repo();
+        let root = repo.path();
+        let gf = flow(root);
+
+        gf.feature_start(12).expect("feature_start");
+        commit_file(root, "feature-one.txt");
+        commit_file(root, "feature-two.txt");
+        git(root, &["checkout", "-q", "develop"]);
+        commit_file(root, "develop-only.txt");
+
+        let branches = gf.list_feature_branches().unwrap();
+        let branch = branches
+            .iter()
+            .find(|branch| branch.name == "feature/phase-12")
+            .unwrap();
+
+        assert_eq!(branch.ahead, 2);
+        assert_eq!(branch.behind, 1);
+    }
+
+    #[test]
     fn feature_finish_merges_into_develop_and_deletes() {
         let repo = init_repo();
         let root = repo.path();
@@ -497,6 +586,47 @@ mod tests {
         assert!(!String::from_utf8_lossy(&branches.stdout).contains("release/1.2.0"));
     }
 
+    /// A global/repo `tag.gpgsign=true` must not turn `tag()`'s lightweight
+    /// tag into an annotated+signed one — that would require a tag message
+    /// and block on `$EDITOR`, silently hanging a headless, unattended run
+    /// (Phase 13 dogfood finding: VersionBump hung on a live
+    /// `devflow start --mode auto` run because the operator's global
+    /// gitconfig sets `tag.gpgsign=true`).
+    #[test]
+    fn tag_stays_lightweight_when_gpgsign_is_forced_on() {
+        let repo = init_repo();
+        let root = repo.path();
+        // Simulate an operator whose global config signs tags by default —
+        // override the test harness's own `tag.gpgsign false` to prove
+        // `tag()`'s per-invocation `-c` override wins regardless.
+        git(root, &["config", "tag.gpgsign", "true"]);
+
+        flow(root)
+            .tag("v9.9.9")
+            .expect("tag must not block on $EDITOR");
+
+        let tags = Command::new("git")
+            .args(["tag", "-l"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&tags.stdout).contains("v9.9.9"));
+
+        // Confirm it's a lightweight tag (points directly at the commit),
+        // not an annotated tag object (which `cat-file -t` would report as
+        // "tag" rather than "commit").
+        let obj_type = Command::new("git")
+            .args(["cat-file", "-t", "v9.9.9"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&obj_type.stdout).trim(),
+            "commit",
+            "tag() must stay lightweight even when tag.gpgsign=true"
+        );
+    }
+
     #[test]
     fn release_start_branches_from_current_head_not_develop() {
         let repo = init_repo();
@@ -548,6 +678,124 @@ mod tests {
         // Protected branches survive.
         assert!(!deleted.contains(&"develop".to_string()));
         assert!(!deleted.contains(&"main".to_string()));
+    }
+
+    /// WR-04 (13-REVIEW.md): `cleanup_merged` must compute "merged" relative
+    /// to `develop` explicitly, not whatever the main checkout's current
+    /// HEAD happens to be. If the main checkout is left on a divergent
+    /// branch, an implicit-HEAD baseline would wrongly identify (and
+    /// delete) a branch that's merged into that other branch but was never
+    /// actually merged into `develop`.
+    #[test]
+    fn cleanup_merged_is_relative_to_develop_not_current_head() {
+        let repo = init_repo();
+        let root = repo.path();
+        let gf = flow(root);
+
+        // `topic` diverges from develop with a unique commit develop never
+        // sees, then `premature` branches off `topic`'s tip — so
+        // `premature` is merged into `topic` but NOT into `develop`.
+        git(root, &["checkout", "-q", "-b", "topic", "develop"]);
+        commit_file(root, "topic-only.txt");
+        git(root, &["checkout", "-q", "-b", "premature", "topic"]);
+
+        // Leave the main checkout on `topic` — NOT `develop` — before
+        // calling cleanup_merged, mirroring an operator who forgot to
+        // check out develop first. (`topic` itself is also technically
+        // "merged into HEAD" under an implicit baseline since it IS HEAD,
+        // which git's own `-d` correctly refuses as the checked-out branch
+        // — so the call's overall Ok/Err is not itself decisive here; check
+        // the actual side effect on `premature` instead.)
+        git(root, &["checkout", "-q", "topic"]);
+
+        let _ = gf.cleanup_merged();
+        assert!(
+            gf.branch_exists("premature"),
+            "premature is merged into topic (current HEAD) but not into \
+             develop — it must survive cleanup_merged when the baseline is develop"
+        );
+    }
+
+    /// WR-03 (13-REVIEW.md), revised: `git branch --merged` prefixes a
+    /// branch checked out in a linked worktree with `+ `. The prefix must be
+    /// stripped positionally (not by trimming marker characters, which would
+    /// mangle a branch legitimately named "+foo"), and a branch git refuses
+    /// to delete — a worktree checkout can never be deleted, by design —
+    /// must be skipped with a warning rather than aborting the sweep before
+    /// the remaining merged branches.
+    #[test]
+    fn cleanup_merged_skips_worktree_branch_and_continues_sweep() {
+        let repo = init_repo();
+        let root = repo.path();
+        let gf = flow(root);
+
+        // Merge a branch into develop WITHOUT deleting it (feature_finish
+        // deletes on merge, which would leave nothing to check out).
+        git(
+            root,
+            &["checkout", "-q", "-b", "worktree-merged", "develop"],
+        );
+        commit_file(root, "g.txt");
+        git(root, &["checkout", "-q", "develop"]);
+        git(root, &["merge", "-q", "--no-ff", "worktree-merged"]);
+
+        // Check the merged branch out in a linked worktree so
+        // `git branch --merged` reports it with a `+ ` prefix.
+        let wt_dir = tempfile::tempdir().unwrap();
+        git(
+            root,
+            &[
+                "worktree",
+                "add",
+                wt_dir.path().to_str().unwrap(),
+                "worktree-merged",
+            ],
+        );
+
+        // A second merged branch that sorts after "worktree-merged" would be
+        // reached only if the sweep survives the worktree refusal; "zz-" also
+        // guards against luck in iteration order via the branch before it.
+        git(root, &["branch", "aa-stale"]);
+        git(root, &["branch", "zz-stale"]);
+
+        let deleted = gf
+            .cleanup_merged()
+            .expect("a skipped worktree branch must not abort the sweep");
+        assert!(deleted.contains(&"aa-stale".to_string()));
+        assert!(deleted.contains(&"zz-stale".to_string()));
+        assert!(
+            !deleted.contains(&"worktree-merged".to_string()),
+            "worktree checkout cannot be deleted"
+        );
+        assert!(gf.branch_exists("worktree-merged"));
+    }
+
+    /// The delete side must agree with the `--merged develop` listing: `-d`
+    /// verifies merged-into-HEAD, so with the main checkout parked on a
+    /// stale branch every genuinely-merged branch was refused as "not fully
+    /// merged" — in exactly the scenario WR-04 exists for.
+    #[test]
+    fn cleanup_merged_deletes_when_head_is_not_on_develop() {
+        let repo = init_repo();
+        let root = repo.path();
+        let gf = flow(root);
+
+        // `old` is parked before the merge below, so nothing merged later is
+        // reachable from HEAD while it's checked out.
+        git(root, &["checkout", "-q", "-b", "old", "develop"]);
+        git(root, &["checkout", "-q", "develop"]);
+        git(root, &["checkout", "-q", "-b", "merged-feature", "develop"]);
+        commit_file(root, "h.txt");
+        git(root, &["checkout", "-q", "develop"]);
+        git(root, &["merge", "-q", "--no-ff", "merged-feature"]);
+        git(root, &["checkout", "-q", "old"]);
+
+        let deleted = gf.cleanup_merged().expect("cleanup");
+        assert!(
+            deleted.contains(&"merged-feature".to_string()),
+            "merged-into-develop branch must be deleted even when HEAD is elsewhere: {deleted:?}"
+        );
+        assert!(!gf.branch_exists("merged-feature"));
     }
 
     #[test]
