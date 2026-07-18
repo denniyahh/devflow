@@ -1557,6 +1557,9 @@ fn run_agent_blocking(
             commits: None,
             summary: None,
             verdict: None,
+            // Mirrors Layer 2's exit-code gate per this block's own comment
+            // (review consensus #3).
+            decided_by_layer: Some(2),
         }));
     }
     Ok(result)

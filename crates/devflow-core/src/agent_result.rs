@@ -33,6 +33,11 @@ pub struct AgentResult {
     /// silently drop a valid `status` to Layer 2.
     #[serde(default, deserialize_with = "deserialize_verdict_lenient")]
     pub verdict: Option<Verdict>,
+    /// Which evaluation layer (0-3) produced this result (D-10, 17-01). Set by
+    /// every constructor in this module; `None` is reserved for test-only
+    /// fixture literals that don't route through the real cascade.
+    #[serde(default)]
+    pub decided_by_layer: Option<u8>,
 }
 
 /// Agent completion status determined by DevFlow.
@@ -47,6 +52,34 @@ pub enum AgentStatus {
     RateLimited,
     /// No signal received — fallback to exit code / commit heuristic.
     Unknown,
+    /// Layer 2 classified the process as killed for resource exhaustion
+    /// (exit code 137, typically SIGKILL from an OOM killer) (D-07, 17b).
+    #[serde(rename = "resource_killed")]
+    ResourceKilled,
+    /// Layer 2 classified the process as unable to start (exit code 127,
+    /// typically "command not found") (D-07, 17b).
+    #[serde(rename = "agent_unavailable")]
+    AgentUnavailable,
+}
+
+impl AgentStatus {
+    /// The wire-format name for this variant, pinned equal to
+    /// `serde_json::to_string(&self)` with the surrounding quotes stripped
+    /// (see the `as_wire_str_matches_serde_form` test). Exhaustive match with
+    /// NO wildcard arm — adding a variant without updating this is a compile
+    /// error. This is the sanctioned replacement for
+    /// `format!("{:?}", status).to_ascii_lowercase()`, which collapses word
+    /// boundaries on multi-word variants (review consensus #1).
+    pub fn as_wire_str(&self) -> &'static str {
+        match self {
+            AgentStatus::Success => "success",
+            AgentStatus::Failed => "failed",
+            AgentStatus::RateLimited => "ratelimited",
+            AgentStatus::Unknown => "unknown",
+            AgentStatus::ResourceKilled => "resource_killed",
+            AgentStatus::AgentUnavailable => "agent_unavailable",
+        }
+    }
 }
 
 /// The Validate stage's self-reported verdict (13b verdict-vs-ran split).
@@ -321,6 +354,7 @@ fn detect_claude_envelope_failure(stdout: &str) -> Option<AgentResult> {
         commits: None,
         summary: None,
         verdict: None,
+        decided_by_layer: Some(1),
     })
 }
 
@@ -414,6 +448,7 @@ fn parse_codex_event_result(stdout: &str) -> Option<AgentResult> {
         commits: None,
         summary: None,
         verdict: None,
+        decided_by_layer: Some(1),
     })
 }
 
@@ -489,6 +524,7 @@ fn rate_limited_result(retry: String) -> AgentResult {
         commits: None,
         summary: None,
         verdict: None,
+        decided_by_layer: Some(1),
     }
 }
 
@@ -505,7 +541,9 @@ fn rate_limited_result(retry: String) -> AgentResult {
 /// stage-scoped.
 ///
 /// Decision matrix:
-///   exit≠0                                              → Failed (ALL stages)
+///   exit=137                                             → ResourceKilled (ALL stages, D-07)
+///   exit=127                                             → AgentUnavailable (ALL stages, D-07)
+///   exit≠0 (excluding 137/127)                           → Failed (ALL stages)
 ///   exit=0, stage in {Plan, Code}, commits=0             → Failed ("no work done")
 ///   exit=0, stage in {Plan, Code}, commits>0             → Success
 ///   exit=0, stage NOT in {Plan, Code} (Define/Validate/Ship), commits=0 → Success
@@ -556,14 +594,34 @@ pub fn evaluate_layer2(
     let commit_gated = matches!(stage, Stage::Plan | Stage::Code);
     let no_work_done = commit_gated && commits == 0;
 
+    // 137 (SIGKILL, typically OOM) and 127 (command not found) are classified
+    // BEFORE the generic `exit_code != 0 -> Failed` catch-all, using the same
+    // trusted plain-i32 already parsed above from the monitor-written exit
+    // file (D-07, 17b — no ExitStatusExt/signal API per Pitfall 1a).
+    let status = if exit_code == 137 {
+        AgentStatus::ResourceKilled
+    } else if exit_code == 127 {
+        AgentStatus::AgentUnavailable
+    } else if exit_code != 0 || no_work_done {
+        AgentStatus::Failed
+    } else {
+        AgentStatus::Success
+    };
+
     Ok(Some(AgentResult {
-        status: if exit_code != 0 || no_work_done {
-            AgentStatus::Failed
-        } else {
-            AgentStatus::Success
-        },
+        status,
         exit_code: Some(exit_code),
-        reason: if exit_code != 0 {
+        reason: if exit_code == 137 {
+            Some(format!(
+                "agent process was killed (exit code 137, likely OOM) ({} commits on {})",
+                commits, branch
+            ))
+        } else if exit_code == 127 {
+            Some(format!(
+                "agent command was unavailable (exit code 127, command not found) ({} commits on {})",
+                commits, branch
+            ))
+        } else if exit_code != 0 {
             Some(format!(
                 "agent exited with code {} ({} commits on {})",
                 exit_code, commits, branch
@@ -582,6 +640,7 @@ pub fn evaluate_layer2(
         commits: Some(commits),
         summary: None,
         verdict: None,
+        decided_by_layer: Some(2),
     }))
 }
 
@@ -621,6 +680,7 @@ pub fn evaluate_layer3(
         commits: Some(commits),
         summary: None,
         verdict: None,
+        decided_by_layer: Some(3),
     })
 }
 
@@ -651,6 +711,7 @@ fn evaluate_layer0(
             commits: None,
             summary: None,
             verdict: None,
+            decided_by_layer: Some(0),
         });
     }
     let Some(approved_commands) = approved_commands else {
@@ -664,6 +725,7 @@ fn evaluate_layer0(
             commits: None,
             summary: None,
             verdict: None,
+            decided_by_layer: Some(0),
         });
     };
     if commands != approved_commands {
@@ -674,6 +736,7 @@ fn evaluate_layer0(
             commits: None,
             summary: None,
             verdict: None,
+            decided_by_layer: Some(0),
         });
     }
     commands
@@ -686,6 +749,7 @@ fn evaluate_layer0(
             commits: None,
             summary: None,
             verdict: None,
+            decided_by_layer: Some(0),
         })
 }
 
@@ -1947,5 +2011,140 @@ mod tests {
         let result = parse_devflow_result(object_verdict).unwrap();
         assert_eq!(result.status, AgentStatus::Success);
         assert_eq!(result.verdict, None);
+    }
+
+    /// D-07 (17-01): the two new multi-word variants must serialize with
+    /// their word boundary preserved — `#[serde(rename_all = "lowercase")]`
+    /// alone would collapse `ResourceKilled` to `"resourcekilled"` (Pitfall 1).
+    #[test]
+    fn multi_word_variants_serialize_with_word_boundary() {
+        assert_eq!(
+            serde_json::to_string(&AgentStatus::ResourceKilled).unwrap(),
+            "\"resource_killed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentStatus::AgentUnavailable).unwrap(),
+            "\"agent_unavailable\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentStatus>("\"resource_killed\"").unwrap(),
+            AgentStatus::ResourceKilled
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentStatus>("\"agent_unavailable\"").unwrap(),
+            AgentStatus::AgentUnavailable
+        );
+    }
+
+    /// Existing variants must keep their pre-existing lowercase wire form
+    /// unchanged by the two new variants' additions.
+    #[test]
+    fn existing_variants_keep_wire_form() {
+        assert_eq!(
+            serde_json::to_string(&AgentStatus::Success).unwrap(),
+            "\"success\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentStatus::Failed).unwrap(),
+            "\"failed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentStatus::RateLimited).unwrap(),
+            "\"ratelimited\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentStatus::Unknown).unwrap(),
+            "\"unknown\""
+        );
+    }
+
+    /// review consensus #1: `as_wire_str()` must never diverge from the serde
+    /// form for ANY variant — pin it for all six via a single round-trip
+    /// assertion (quotes stripped).
+    #[test]
+    fn as_wire_str_matches_serde_form_for_every_variant() {
+        for variant in [
+            AgentStatus::Success,
+            AgentStatus::Failed,
+            AgentStatus::RateLimited,
+            AgentStatus::Unknown,
+            AgentStatus::ResourceKilled,
+            AgentStatus::AgentUnavailable,
+        ] {
+            let serde_form = serde_json::to_string(&variant).unwrap();
+            let stripped = serde_form.trim_matches('"');
+            assert_eq!(
+                variant.as_wire_str(),
+                stripped,
+                "as_wire_str() diverged from serde form for {variant:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn evaluate_layer2_exit_137_is_resource_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo_with_feature_commit(dir.path(), 20);
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(exit_code_path(dir.path(), 20), "137").unwrap();
+        let state = state_in(dir.path(), 20);
+
+        let result = evaluate_layer2(dir.path(), 20, &GitFlowConfig::default(), state.stage)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result.status, AgentStatus::ResourceKilled);
+        assert_eq!(result.exit_code, Some(137));
+    }
+
+    #[test]
+    fn evaluate_layer2_exit_127_is_agent_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo_with_feature_commit(dir.path(), 21);
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(exit_code_path(dir.path(), 21), "127").unwrap();
+        let state = state_in(dir.path(), 21);
+
+        let result = evaluate_layer2(dir.path(), 21, &GitFlowConfig::default(), state.stage)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result.status, AgentStatus::AgentUnavailable);
+        assert_eq!(result.exit_code, Some(127));
+    }
+
+    /// Unchanged-behavior guard: exit 0 with zero commits on a commit-gated
+    /// stage is still Failed (the pre-existing "no work done" branch, not
+    /// reclassified by the new 137/127 checks).
+    #[test]
+    fn evaluate_layer2_exit_0_zero_commits_still_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo_with_feature_no_commit(dir.path(), 22);
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(exit_code_path(dir.path(), 22), "0").unwrap();
+        let state = state_in(dir.path(), 22);
+
+        let result = evaluate_layer2(dir.path(), 22, &GitFlowConfig::default(), state.stage)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result.status, AgentStatus::Failed);
+    }
+
+    /// Unchanged-behavior guard: exit 1 is still Failed (not misclassified
+    /// as ResourceKilled/AgentUnavailable).
+    #[test]
+    fn evaluate_layer2_exit_1_still_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo_with_feature_commit(dir.path(), 23);
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(exit_code_path(dir.path(), 23), "1").unwrap();
+        let state = state_in(dir.path(), 23);
+
+        let result = evaluate_layer2(dir.path(), 23, &GitFlowConfig::default(), state.stage)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result.status, AgentStatus::Failed);
     }
 }
