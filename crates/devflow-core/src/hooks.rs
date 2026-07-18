@@ -131,7 +131,7 @@ fn merge_feature(ctx: &HookContext) -> Result<(), HookError> {
         return Ok(());
     }
 
-    git.feature_finish(ctx.phase)?;
+    git.merge_feature_into_develop(ctx.phase)?;
     info!("Merge: merged {branch} into develop");
     crate::events::emit(
         &ctx.project_root,
@@ -179,16 +179,16 @@ fn changelog_append(ctx: &HookContext) -> Result<(), HookError> {
 fn version_bump(ctx: &HookContext) -> Result<(), HookError> {
     let version = version::compute_version(&ctx.project_root)?;
     // Write the computed version into the version file when one exists.
-    match version::write_version(&ctx.project_root, &version) {
-        Ok(path) => info!("VersionBump: wrote {version} to {}", path.display()),
-        Err(err) => warn!("VersionBump: could not write version file: {err}"),
+    if has_version_file(&ctx.project_root) {
+        let path = version::write_version(&ctx.project_root, &version)?;
+        info!("VersionBump: wrote {version} to {}", path.display());
+    } else {
+        warn!("VersionBump: no supported version file; tagging only");
     }
     let git = GitFlow::new(&ctx.project_root);
     let tag = format!("v{version}");
-    match git.tag(&tag) {
-        Ok(()) => info!("VersionBump: tagged {tag}"),
-        Err(err) => warn!("VersionBump: could not tag {tag}: {err}"),
-    }
+    git.tag(&tag)?;
+    info!("VersionBump: tagged {tag}");
     Ok(())
 }
 
@@ -346,6 +346,38 @@ mod tests {
         let tag = git_output(dir.path(), &["tag", "--points-at", "develop"]);
         assert_eq!(tag, format!("v2.0.{post_merge_count}"));
         assert_ne!(tag, format!("v2.0.{pre_merge_count}"));
+    }
+
+    #[test]
+    fn merge_succeeds_while_feature_branch_is_checked_out_in_linked_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let worktree = dir.path().join("phase-worktree");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature/phase-11",
+                worktree.to_str().unwrap(),
+                "develop",
+            ],
+        );
+        std::fs::write(worktree.join("feature.txt"), "phase work\n").unwrap();
+        git(&worktree, &["add", "feature.txt"]);
+        git(&worktree, &["commit", "-q", "-m", "phase work"]);
+
+        Hook::Merge.run(&ctx(&repo, Stage::Ship)).unwrap();
+
+        git(
+            &repo,
+            &["merge-base", "--is-ancestor", "feature/phase-11", "develop"],
+        );
+        assert!(GitFlow::new(&repo).branch_exists("feature/phase-11"));
     }
 
     #[test]

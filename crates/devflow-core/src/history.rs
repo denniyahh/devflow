@@ -51,8 +51,33 @@ pub fn attempt_timeline(project_root: &Path, phase: u32) -> AttemptTimeline {
         })
         .collect::<Vec<_>>();
 
-    for (timestamp, files) in capture_generations(project_root, phase) {
-        attach_artifacts(&mut entries, timestamp, files, true);
+    for generation in capture_generations(project_root, phase) {
+        if let Some(index) = entries.iter().position(|entry| {
+            entry
+                .event
+                .as_ref()
+                .and_then(|event| event.get("stamp"))
+                .and_then(|stamp| stamp.as_str())
+                == Some(generation.stamp.as_str())
+        }) {
+            entries[index]
+                .capture_files
+                .extend(generation.capture_files);
+            entries[index].review_files.extend(generation.review_files);
+        } else {
+            attach_artifacts(
+                &mut entries,
+                generation.timestamp,
+                generation.capture_files,
+                true,
+            );
+            attach_artifacts(
+                &mut entries,
+                generation.timestamp,
+                generation.review_files,
+                false,
+            );
+        }
     }
     for review in review_files(project_root, phase) {
         let timestamp = modified_timestamp(&review);
@@ -88,12 +113,20 @@ pub fn render_timeline(timeline: &AttemptTimeline) -> String {
     rendered.trim_end().to_string()
 }
 
-fn capture_generations(project_root: &Path, phase: u32) -> Vec<(u64, Vec<PathBuf>)> {
+struct CaptureGeneration {
+    stamp: String,
+    timestamp: u64,
+    sequence: u64,
+    capture_files: Vec<PathBuf>,
+    review_files: Vec<PathBuf>,
+}
+
+fn capture_generations(project_root: &Path, phase: u32) -> Vec<CaptureGeneration> {
     let dir = agent_result::history_dir(project_root, phase);
     let Ok(files) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
-    let mut generations: BTreeMap<String, (u64, Vec<PathBuf>)> = BTreeMap::new();
+    let mut generations: BTreeMap<String, CaptureGeneration> = BTreeMap::new();
     for file in files.flatten() {
         let path = file.path();
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
@@ -101,7 +134,8 @@ fn capture_generations(project_root: &Path, phase: u32) -> Vec<(u64, Vec<PathBuf
         };
         let stamp = name
             .strip_suffix("-stdout")
-            .or_else(|| name.strip_suffix("-exit"));
+            .or_else(|| name.strip_suffix("-exit"))
+            .or_else(|| name.strip_suffix("-REVIEW.md"));
         let Some(stamp) = stamp else { continue };
         let Some(nanos) = stamp
             .split('-')
@@ -111,17 +145,33 @@ fn capture_generations(project_root: &Path, phase: u32) -> Vec<(u64, Vec<PathBuf
             continue;
         };
         let timestamp = (nanos / 1_000_000_000).min(u64::MAX as u128) as u64;
-        generations
-            .entry(stamp.to_string())
-            .or_insert_with(|| (timestamp, Vec::new()))
-            .1
-            .push(path);
+        let sequence = stamp
+            .split('-')
+            .nth(1)
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        let generation =
+            generations
+                .entry(stamp.to_string())
+                .or_insert_with(|| CaptureGeneration {
+                    stamp: stamp.to_string(),
+                    timestamp,
+                    sequence,
+                    capture_files: Vec::new(),
+                    review_files: Vec::new(),
+                });
+        if name.ends_with("-REVIEW.md") {
+            generation.review_files.push(path);
+        } else {
+            generation.capture_files.push(path);
+        }
     }
     let mut generations = generations.into_values().collect::<Vec<_>>();
-    for (_, files) in &mut generations {
-        files.sort();
+    for generation in &mut generations {
+        generation.capture_files.sort();
+        generation.review_files.sort();
     }
-    generations.sort_by_key(|(timestamp, _)| *timestamp);
+    generations.sort_by_key(|generation| (generation.timestamp, generation.sequence));
     generations
 }
 
@@ -215,6 +265,8 @@ mod tests {
                 "\n",
                 r#"{"v":1,"ts":20,"phase":16,"event":"gate_fired","stage":"ship"}"#,
                 "\n",
+                r#"{"v":1,"ts":21,"phase":16,"event":"capture_archived","stage":"ship","stamp":"20000000000-0"}"#,
+                "\n",
                 r#"{"v":1,"ts":15,"phase":99,"event":"workflow_started"}"#,
                 "\n",
             ),
@@ -233,13 +285,14 @@ mod tests {
 
         let timeline = attempt_timeline(dir.path(), 16);
 
-        assert_eq!(timeline.entries.len(), 3);
+        assert_eq!(timeline.entries.len(), 4);
         assert_eq!(timeline.entries[0].timestamp, 10);
         assert_eq!(timeline.entries[1].timestamp, 20);
-        assert_eq!(timeline.entries[2].timestamp, 30);
-        assert_eq!(timeline.entries[1].capture_files.len(), 2);
+        assert_eq!(timeline.entries[2].timestamp, 21);
+        assert_eq!(timeline.entries[3].timestamp, 30);
+        assert_eq!(timeline.entries[2].capture_files.len(), 2);
         assert!(
-            timeline.entries[1]
+            timeline.entries[2]
                 .capture_files
                 .iter()
                 .all(|path| path.starts_with(&captures))

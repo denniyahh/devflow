@@ -132,6 +132,10 @@ review_angles = ["doc accuracy", "security", "CI correctness", "external state"]
 external_verify_enabled = true
 ```
 
+PLAN-declared verification shell is agent-writable and requires explicit
+operator authorization: set `DEVFLOW_TRUST_EXTERNAL_VERIFY=1` only after
+reviewing the declared commands.
+
 Key flags:
 
 | Flag | Description |

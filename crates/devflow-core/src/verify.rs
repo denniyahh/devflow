@@ -1,9 +1,21 @@
-//! Operator-authored external post-condition verification.
+//! Explicitly operator-approved external post-condition verification.
 //!
-//! Commands are discovered only from PLAN.md YAML frontmatter. Agent output
-//! is deliberately outside this module's input boundary.
+//! Commands are discovered only from PLAN.md YAML frontmatter. Because those
+//! files are agent-writable, execution additionally requires the parent
+//! process's [`TRUST_EXTERNAL_VERIFY_ENV`] authorization.
 
 use std::path::{Path, PathBuf};
+
+/// Explicit operator-owned trust gate for executing PLAN-declared shell.
+pub const TRUST_EXTERNAL_VERIFY_ENV: &str = "DEVFLOW_TRUST_EXTERNAL_VERIFY";
+
+/// PLAN files are agent-writable, so enabling the feature in repository
+/// configuration is not sufficient authorization to execute their shell.
+pub fn external_verification_trusted() -> bool {
+    std::env::var(TRUST_EXTERNAL_VERIFY_ENV)
+        .ok()
+        .is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true"))
+}
 
 /// Return external verification commands declared by this phase's plans.
 ///
@@ -75,11 +87,12 @@ fn command_from_frontmatter(contents: &str) -> Option<String> {
     None
 }
 
-/// Run one trusted, operator-authored external verification command.
+/// Run one explicitly operator-approved external verification command.
 ///
 /// `sh -c` is intentional because probes may contain pipelines. The caller
-/// must source `cmd` from [`external_verify_commands`]. Spawn failures and
-/// non-zero exits fail closed.
+/// must source `cmd` from [`external_verify_commands`] and first require
+/// [`external_verification_trusted`]. Spawn failures and non-zero exits fail
+/// closed.
 pub fn run_external_verification(cmd: &str, project_root: &Path) -> bool {
     std::process::Command::new("sh")
         .arg("-c")
