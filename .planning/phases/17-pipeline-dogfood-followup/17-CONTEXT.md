@@ -145,8 +145,8 @@ terminal-Ship alarm was traced to a stale executable, not a live regression.
   is invisible to a cron-launched run. Consistent with the WR-11 never-silent
   idiom.
 
-- **D-16 (timing): before every stage launch, scoped to that stage's
-  requirements.** Directly fixes the observed miss — Ship's empty reviewer set
+- **D-16 (timing):** before every stage launch, scoped to that stage's
+  requirements. Directly fixes the observed miss — Ship's empty reviewer set
   and invalid GitHub auth surfaced only after Ship's work had run. A single
   up-front check cannot evaluate Ship-specific requirements hours ahead, nor
   catch credentials that expire mid-phase.
