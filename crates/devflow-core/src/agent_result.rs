@@ -703,21 +703,31 @@ pub fn evaluate_layer3(
 
 /// Layer 0: run explicitly operator-approved external post-condition probes.
 ///
-/// A failed probe outranks every agent-controlled signal. Successful probes
-/// defer to the existing Layer 1/2/3 cascade so ordinary completion evidence
-/// is still required. With no declarations (or when disabled), behavior is
-/// byte-for-byte the pre-Phase-16 cascade.
+/// A failed probe outranks every agent-controlled signal. An approved,
+/// all-passing set of declared probes is itself affirmative completion
+/// evidence — `Success` — so a legitimately external-only stage with zero
+/// commits can still complete cleanly (D-05 gap 2). Evaluated for EVERY
+/// stage, not only Code (D-05 gap 1 / D-06). With no declarations (or when
+/// disabled), behavior is byte-for-byte the pre-Phase-16 cascade.
+///
+/// Two roots are intentionally kept distinct (review Plan 03 MEDIUM,
+/// OpenCode): `project_root` is used to DISCOVER the PLAN's declared
+/// commands (`.planning/phases/` lives there, not in a worktree checkout),
+/// while `execution_root` — the worktree, when one is set — is where probes
+/// actually RUN. Conflating the two previously meant a worktree-based phase
+/// could not find its own declaration and silently mis-hit the
+/// "PLAN removed" veto below.
 fn evaluate_layer0(
     project_root: &Path,
     state: &State,
     approved_commands: Option<&[String]>,
 ) -> Option<AgentResult> {
-    if state.stage != Stage::Code || !crate::config::external_verify_enabled(project_root) {
+    if !crate::config::external_verify_enabled(project_root) {
         return None;
     }
 
     let execution_root = state.worktree_path.as_deref().unwrap_or(project_root);
-    let commands = crate::verify::external_verify_commands(execution_root, state.phase);
+    let commands = crate::verify::external_verify_commands(project_root, state.phase);
     if commands.is_empty() {
         return approved_commands.map(|_| AgentResult {
             status: AgentStatus::Failed,
@@ -756,10 +766,11 @@ fn evaluate_layer0(
             decided_by_layer: Some(0),
         });
     }
-    commands
+    match commands
         .into_iter()
         .find(|command| !crate::verify::run_external_verification(command, execution_root))
-        .map(|command| AgentResult {
+    {
+        Some(command) => Some(AgentResult {
             status: AgentStatus::Failed,
             exit_code: None,
             reason: Some(format!("external verification failed: {command}")),
@@ -767,7 +778,21 @@ fn evaluate_layer0(
             summary: None,
             verdict: None,
             decided_by_layer: Some(0),
-        })
+        }),
+        // Every declared, approved probe passed — affirmative completion
+        // evidence on its own (D-05 gap 2), even with zero commits.
+        None => Some(AgentResult {
+            status: AgentStatus::Success,
+            exit_code: None,
+            reason: Some(
+                "external verification passed — all declared, approved probes succeeded".into(),
+            ),
+            commits: None,
+            summary: None,
+            verdict: None,
+            decided_by_layer: Some(0),
+        }),
+    }
 }
 
 /// Full four-layer evaluation: returns the best available AgentResult.
