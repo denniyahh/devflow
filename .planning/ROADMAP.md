@@ -187,14 +187,14 @@ state/event reconciliation and the WR-03 test fix were deferred to Phase 18 on
 against final HEAD rather than re-plan)
 **Depends on:** Phase 16
 **Blocks:** Phase 18 Hermes Support
-**Plans:** 1/5 plans executed
+**Plans:** 2/5 plans executed
 
 Plans:
 
 **Wave 1** *(devflow-core foundations + build script, no shared files)*
 
 - [x] 17-01-PLAN.md — 17b: typed outcome taxonomy (ResourceKilled/AgentUnavailable), Layer 2 exit-code classification, pure exhaustive outcome→action policy module, separate infra-failure counter
-- [ ] 17-02-PLAN.md — 17d: first workspace build.rs embedding git provenance (commit/dirty/timestamp) with graceful no-git degradation
+- [x] 17-02-PLAN.md — 17d: first workspace build.rs embedding git provenance (commit/dirty/timestamp) with graceful no-git degradation
 
 **Wave 2** *(blocked on 17-01: shares agent_result.rs)*
 
