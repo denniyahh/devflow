@@ -1,122 +1,71 @@
 ---
 phase: 16-pipeline-reliability-hardening
-reviewed: 2026-07-18T02:22:08Z
-depth: standard
+reviewed: 2026-07-18T11:56:44Z
+depth: inline-standard
+baseline: af32f1a^
+head: 4cd0b0a
 files_reviewed: 19
-files_reviewed_list:
-  - crates/devflow-cli/src/main.rs
-  - crates/devflow-cli/tests/phase7_cli.rs
-  - crates/devflow-cli/tests/snapshots/devflow-help.txt
-  - crates/devflow-core/Cargo.toml
-  - crates/devflow-core/src/agent_result.rs
-  - crates/devflow-core/src/config.rs
-  - crates/devflow-core/src/doc_check.rs
-  - crates/devflow-core/src/git.rs
-  - crates/devflow-core/src/history.rs
-  - crates/devflow-core/src/hooks.rs
-  - crates/devflow-core/src/lib.rs
-  - crates/devflow-core/src/lock.rs
-  - crates/devflow-core/src/prompt.rs
-  - crates/devflow-core/src/ship.rs
-  - crates/devflow-core/src/verify.rs
-  - crates/devflow-core/src/workflow.rs
-  - docs/guides/adding-agent.md
-  - docs/guides/configuration.md
-  - docs/guides/quickstart.md
 findings:
-  critical: 1
-  warning: 2
+  critical: 0
+  warning: 1
   info: 0
-  total: 3
+  total: 1
 status: issues_found
+recommendation: APPROVE_WITH_WARNING
 ---
 
-# Phase 16: Code Review Report
-
-**Reviewed:** 2026-07-18T02:22:08Z
-**Depth:** standard
-**Files Reviewed:** 19
-**Status:** issues_found
+# Phase 16: Inline Code Review Report
 
 ## Summary
 
-The Phase 16 reliability paths were reviewed file by file, including terminal
-Ship finalization, external verification, capture/history retention, gate
-rendering, configuration, tests, and operator documentation. The implementation
-still has one Critical terminal-truth defect: deleting or otherwise losing the
-feature branch is treated as proof that it was merged, so DevFlow can tag and
-report a successful shipment without establishing that the phase work reached
-`develop`.
+The current Phase 16 implementation and the fixes applied after the previous
+review were inspected inline. No open Critical-severity finding remains. The
+terminal completion path now fails closed when the feature branch is absent,
+stops the ordered finalization batch after any hook failure, preserves the
+branch for retry, reopens an actionable Ship gate, and emits
+`workflow_finished` only after all required terminal hooks succeed.
 
-Validation completed successfully with `cargo test --workspace --all-targets`
-(309 tests), `cargo clippy --workspace --all-targets -- -D warnings`,
-`cargo fmt --all -- --check`, and `git diff --check`. These gates do not cover
-the missing-branch false-success case described below.
+The two earlier warning findings are also resolved: gate context rendering
+neutralizes all control characters through one bounded helper, and capture
+archival rolls back stdout/exit publication when a later archive operation
+fails.
 
-## Narrative Findings (AI reviewer)
+## Severity-classified findings
 
-## Critical Issues
+### Warning — WR-03: Parallel CLI integration test has a check-then-use race
 
-### CR-01: A missing feature branch is accepted as already merged
+**File:** `crates/devflow-cli/tests/phase7_cli.rs:184-200`
 
-**File:** `crates/devflow-core/src/git.rs:89-105`
-**Issue:** `is_merged_into_develop` returns `true` whenever the phase branch is
-absent. `merge_feature` then records a successful no-op, and
-`finish_workflow` is free to run version/tag bookkeeping, clear state, and emit
-`workflow_finished`. Branch absence does not prove ancestry: the branch may
-have been deleted before its commits reached `develop`, or may never have been
-created. The existing `merge_is_fail_soft_when_branch_absent` test explicitly
-locks in this unsafe behavior. This violates the terminal-truth contract and
-can report a shipped phase after its implementation commits have become
-unreachable (data-loss/false-success risk).
-**Fix:** Make branch absence fail closed unless DevFlow has durable evidence of
-an earlier successful merge. Persist the feature tip/merge commit before any
-cleanup, verify that commit is an ancestor of `develop` on retries, and only
-then allow an absent branch to count as merged. Also stop the terminal hook
-batch before branch cleanup after any preceding hook failure. For example:
+`parallel_creates_two_worktrees_and_spawns_two_monitors` waits until each live
+stdout capture exists, performs unrelated state assertions, and then asserts
+that the same capture paths still exist. A fast monitor can archive a capture
+between the wait and the final assertion. This produced one failure in the
+first full-suite run; the isolated rerun and a second full-suite run passed.
 
-```rust
-let feature_tip = persisted_feature_tip(state)?;
-if !git.is_ancestor(&feature_tip, DEVELOP)? {
-    return Err(HookError::Git(GitError::Command(
-        "phase feature tip is not present on develop".into(),
-    )));
-}
-```
+This is a test-harness reliability issue, not evidence of a product false
+success. A future cleanup should either read/assert the capture immediately,
+accept the corresponding retained-history generation, or wait for a stable
+workflow state rather than rechecking a transient live path.
 
-The relevant caller is `crates/devflow-core/src/hooks.rs:120-142`, and the
-terminal completion path is `crates/devflow-cli/src/main.rs:1174-1207`.
+## Prior finding verification
 
-## Warnings
+- CR-01 is closed by `83602c7`: absent feature branches are rejected as
+  unproven merges; terminal hook batches stop on the first failure; regression
+  tests cover the missing-branch and pre-cleanup failure paths.
+- WR-01 is closed by `5fcaaa5`: `render_gate_context` bounds output and maps
+  every control character to a safe space for both status and gate-list paths.
+- WR-02 is closed by `8db68bb`: archival uses a pending generation and restores
+  the complete live stdout/exit pair after second-publish or review-copy
+  failures.
 
-### WR-01: `gate list` prints agent-controlled terminal control sequences
+## Validation
 
-**File:** `crates/devflow-cli/src/main.rs:1985-1996`
-**Issue:** `gate_list` replaces newlines and truncates length, but leaves other
-control characters intact. Gate context originates from agent-controlled
-failure text, so ANSI sequences can clear the terminal, reposition the cursor,
-or spoof surrounding operator output. `render_pending_gate_banner` correctly
-sanitizes controls at lines 1955-1964, making this an inconsistent second
-rendering path.
-**Fix:** Centralize bounded gate-context rendering and map every control
-character to a safe visible separator before both `status` and `gate list`
-print it.
+- `cargo test --workspace --all-targets`: 313 passed on the final full rerun.
+- `cargo clippy --workspace --all-targets -- -D warnings`: passed.
+- `cargo fmt --all -- --check`: passed.
+- `git diff --check af32f1a^..HEAD`: passed.
 
-### WR-02: Capture archival can leave a partially moved generation on error
+## Gate decision
 
-**File:** `crates/devflow-core/src/agent_result.rs:812-824`
-**Issue:** The live stdout is renamed before the exit capture and REVIEW copy
-are attempted. If a later operation fails, the function returns an error after
-already removing stdout from its live path, leaving evidence split across a
-partial history generation and the live paths. A retry creates a new stamp, so
-the files can remain permanently mis-correlated. The current failure test only
-covers failure before the first rename.
-**Fix:** Stage all files under a temporary generation, then atomically publish
-the generation, or roll back every completed move when a later operation
-fails. Add failure-injection tests for the second rename and REVIEW copy.
-
----
-
-_Reviewed: 2026-07-18T02:22:08Z_
-_Reviewer: the agent (gsd-code-reviewer; generic-agent workaround)_
-_Depth: standard_
+Open Critical findings: **0**. Phase 16 is approved to proceed to the Ship
+workflow with WR-03 recorded as non-blocking follow-up debt.
