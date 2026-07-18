@@ -669,11 +669,103 @@ pub fn agent_pid_path(project_root: &Path, phase: u32) -> PathBuf {
     devflow_dir(project_root).join(format!("phase-{:02}-agent-pid", phase))
 }
 
-/// Clean up old stdout, exit code, and agent-pid files for a phase before starting.
-pub fn cleanup_phase_files(project_root: &Path, phase: u32) {
-    let _ = std::fs::remove_file(stdout_path(project_root, phase));
-    let _ = std::fs::remove_file(exit_code_path(project_root, phase));
+/// Path to the archived-capture-history directory for a phase (16b).
+///
+/// `.devflow/history/phase-NN/` holds retained per-stage capture generations
+/// so a false-positive self-report can be diagnosed after the fact. Exposed
+/// as a constructor (rather than inlined at each call site) so downstream
+/// tooling (16h in 16-07's correlation, 16i in 16-05's enumeration) always
+/// derives the path from here instead of hardcoding it.
+pub fn history_dir(project_root: &Path, phase: u32) -> PathBuf {
+    devflow_dir(project_root)
+        .join("history")
+        .join(format!("phase-{:02}", phase))
+}
+
+/// Monotonically increasing tie-breaker appended to the nanosecond timestamp
+/// used to stamp archived generations, so two archives issued within the
+/// same nanosecond (possible in a tight test loop) never collide.
+static ARCHIVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A stamp unique within this process, used to name an archived generation.
+/// The outgoing stage's name is not available at the `archive_phase_files`
+/// call site (see `launch_stage` in main.rs), so a monotonic timestamp is
+/// used instead — sufficient to order and identify generations.
+fn archive_stamp() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = ARCHIVE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{nanos}-{seq}")
+}
+
+/// Archive the prior stage's stdout/exit captures into bounded per-phase
+/// history instead of wiping them outright, so a false-positive self-report
+/// can be diagnosed after the fact (16b). Replaces the old
+/// `cleanup_phase_files`, which deleted these files unconditionally.
+///
+/// At most `retain` capture generations are kept per phase; older ones are
+/// pruned (see [`prune_history`]). The agent-pid file is still removed
+/// outright — it is process bookkeeping, not diagnostic output. When there
+/// is nothing to archive (first launch), this is a no-op success.
+pub fn archive_phase_files(project_root: &Path, phase: u32, retain: usize) {
     let _ = std::fs::remove_file(agent_pid_path(project_root, phase));
+
+    let stdout_src = stdout_path(project_root, phase);
+    let exit_src = exit_code_path(project_root, phase);
+    let stdout_exists = stdout_src.exists();
+    let exit_exists = exit_src.exists();
+    if !stdout_exists && !exit_exists {
+        return; // Nothing to archive — first launch.
+    }
+
+    let history_dir = history_dir(project_root, phase);
+    if std::fs::create_dir_all(&history_dir).is_err() {
+        return;
+    }
+
+    let stamp = archive_stamp();
+    if stdout_exists {
+        let _ = std::fs::rename(&stdout_src, history_dir.join(format!("{stamp}-stdout")));
+    }
+    if exit_exists {
+        let _ = std::fs::rename(&exit_src, history_dir.join(format!("{stamp}-exit")));
+    }
+
+    prune_history(&history_dir, retain);
+}
+
+/// Keep only the newest `retain` capture generations under `history_dir`,
+/// deleting older ones. Generations are grouped by their stamp (the shared
+/// prefix of a `{stamp}-stdout`/`{stamp}-exit` pair, split off the trailing
+/// `-stdout`/`-exit` suffix via `rsplit_once`) and ordered lexicographically,
+/// which matches numeric/chronological order for the fixed-width nanosecond
+/// stamps `archive_stamp` produces.
+fn prune_history(history_dir: &Path, retain: usize) {
+    let Ok(entries) = std::fs::read_dir(history_dir) else {
+        return;
+    };
+
+    let mut stamps: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_str()?.to_string();
+            name.rsplit_once('-').map(|(stamp, _suffix)| stamp.to_string())
+        })
+        .collect();
+    stamps.sort();
+    stamps.dedup();
+
+    if stamps.len() <= retain {
+        return;
+    }
+
+    let to_remove = stamps.len() - retain;
+    for stamp in &stamps[..to_remove] {
+        let _ = std::fs::remove_file(history_dir.join(format!("{stamp}-stdout")));
+        let _ = std::fs::remove_file(history_dir.join(format!("{stamp}-exit")));
+    }
 }
 
 #[cfg(test)]
@@ -1108,24 +1200,81 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_removes_phase_files() {
+    fn archive_moves_captures_into_history_and_removes_pid_file() {
+        // 16b: prior-stage captures must survive a simulated next-launch by
+        // appearing under .devflow/history/phase-NN/, not be wiped outright.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir_all(root.join(".devflow")).unwrap();
-        std::fs::write(root.join(".devflow/phase-01-stdout"), "test").unwrap();
+        std::fs::write(root.join(".devflow/phase-01-stdout"), "prior stdout").unwrap();
         std::fs::write(root.join(".devflow/phase-01-exit"), "0").unwrap();
+        std::fs::write(root.join(".devflow/phase-01-agent-pid"), "1234").unwrap();
 
-        cleanup_phase_files(root, 1);
+        archive_phase_files(root, 1, 5);
+
+        // The live capture paths are gone (moved, not merely deleted).
         assert!(!root.join(".devflow/phase-01-stdout").exists());
         assert!(!root.join(".devflow/phase-01-exit").exists());
+        // Agent-pid is bookkeeping, not diagnostic — still removed outright.
+        assert!(!root.join(".devflow/phase-01-agent-pid").exists());
+
+        let history = history_dir(root, 1);
+        let archived: Vec<_> = std::fs::read_dir(&history)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        let archived_stdout = archived
+            .iter()
+            .find(|name| name.ends_with("-stdout"))
+            .expect("stdout capture should be archived into history");
+        assert!(archived.iter().any(|name| name.ends_with("-exit")));
+        let contents = std::fs::read_to_string(history.join(archived_stdout)).unwrap();
+        assert_eq!(contents, "prior stdout");
     }
 
     #[test]
-    fn cleanup_handles_missing_files() {
+    fn archive_is_noop_when_nothing_to_archive() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        // Should not panic when files don't exist.
-        cleanup_phase_files(root, 1);
+        // Should not panic when there is nothing to archive (first launch).
+        archive_phase_files(root, 1, 5);
+        assert!(!history_dir(root, 1).exists());
+    }
+
+    #[test]
+    fn archive_handles_missing_devflow_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // No .devflow dir at all — should not panic.
+        archive_phase_files(root, 1, 5);
+    }
+
+    #[test]
+    fn archive_prunes_history_to_retain_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        for i in 0..7 {
+            std::fs::write(root.join(".devflow/phase-01-stdout"), format!("gen {i}")).unwrap();
+            std::fs::write(root.join(".devflow/phase-01-exit"), "0").unwrap();
+            archive_phase_files(root, 1, 3);
+        }
+
+        let history = history_dir(root, 1);
+        let stdout_count = std::fs::read_dir(&history)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with("-stdout"))
+            .count();
+        let exit_count = std::fs::read_dir(&history)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with("-exit"))
+            .count();
+        assert_eq!(stdout_count, 3, "expected at most 3 retained generations");
+        assert_eq!(exit_count, 3, "expected at most 3 retained generations");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use devflow_core::agent;
-use devflow_core::config::{DEVELOP, FEATURE_PREFIX, GitFlowConfig};
+use devflow_core::config::{DEVELOP, FEATURE_PREFIX, GitFlowConfig, capture_retention};
 use devflow_core::gates::{self, GateAction, GateResponse, Gates};
 use devflow_core::git::GitFlow;
 use devflow_core::hooks::{self, HookContext};
@@ -631,7 +631,11 @@ fn launch_stage(state: &State, prompt_override: Option<String>) -> Result<(), Cl
     let (program, args) = adapter.exec_command(state.phase, &prompt, &roots);
     ensure_agent_binary(program)?;
 
-    agent_result::cleanup_phase_files(&state.project_root, state.phase);
+    agent_result::archive_phase_files(
+        &state.project_root,
+        state.phase,
+        capture_retention(&state.project_root),
+    );
     let pid = monitor::spawn_monitor(state, program, &args, &adapter.extra_env())
         .map_err(|err| CliError::Message(format!("could not spawn monitor: {err}")))?;
     events::emit(
@@ -1324,7 +1328,7 @@ fn run_agent_blocking(
     agent: AgentKind,
     workdir: &Path,
 ) -> Result<Option<agent_result::AgentResult>, CliError> {
-    agent_result::cleanup_phase_files(project_root, phase);
+    agent_result::archive_phase_files(project_root, phase, capture_retention(project_root));
     let adapter = agents::adapter_for(agent);
     let prompt = prompt::stage_prompt(Stage::Code, phase);
     // sequentagent always runs in a worktree — the main repo's `.git/` and
@@ -1902,8 +1906,8 @@ fn logs(
     let exit_path = agent_result::exit_code_path(project_root, phase);
     loop {
         std::thread::sleep(std::time::Duration::from_millis(500));
-        // 14-CR-03: a stage transition deletes and recreates the capture
-        // file (launch_stage → cleanup_phase_files), so a shrunken file
+        // 14-CR-03: a stage transition archives and recreates the capture
+        // file (launch_stage → archive_phase_files), so a shrunken file
         // means the next stage started — reset to the top instead of
         // seeking past EOF forever and silently skipping its output.
         let base = rollover_offset(&path, offset);
