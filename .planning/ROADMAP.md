@@ -10,7 +10,7 @@
 | 13 | MVP Core Loop | Complete    |
 | 14 | Parallel Safety + Observability | Complete |
 | 15 | Dogfood Enablement + OSS Readiness | Complete |
-| 16 | Pipeline Reliability Hardening | In Progress|
+| 16 | Pipeline Reliability Hardening | Complete    |
 | 17 | Hermes Support | Scoped |
 
 ## Shipped
@@ -143,7 +143,7 @@ Plans:
 **Requirements**: 16a, 16b, 16c, 16d, 16e, 16f, 16g, 16h, 16i, 16j, 16k (scope items — no formal REQ-IDs; binding decisions D-01…D-09 in 16-CONTEXT.md)
 **UI hint**: no
 **Depends on:** Phase 15 (surfaced entirely by dogfooding it)
-**Plans:** 7/7 plans executed
+**Plans:** 7/7 plans complete
 
 Plans:
 

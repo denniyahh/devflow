@@ -3,8 +3,8 @@ gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
 status: In progress
-stopped_at: Completed 16-07-PLAN.md
-last_updated: "2026-07-18T01:22:58.258Z"
+stopped_at: Phase 16 complete; ready for Phase 17
+last_updated: "2026-07-18T02:02:52.975Z"
 progress:
   total_phases: 6
   completed_phases: 5
@@ -19,9 +19,7 @@ progress:
 
 ## Active
 
-- **Phase 15 (15a Complete / 15b Scoped):** Dogfood Enablement + OSS Readiness — rescoped 2026-07-16 dogfood-first. 15a COMPLETE: `devflow gate list/approve/reject`, OPERATIONS.md, `.devflow.yaml` decoy removed, lib.rs examples fixed, `--help` snapshot guard; exit criterion verified live (full phase, gate answered only via CLI). 15b: OSS packaging (README/ARCHITECTURE/CONTRIBUTING/devcontainer/crates.io publish), to be run through DevFlow as the first post-MVP dogfood — `devflow start --phase 15 --agent claude --mode auto`. Antigravity adapter deferred to unscheduled backlog
-- **Phase 16 (In Progress — 2/7 plans):** Pipeline Reliability Hardening — 16-01 closed the terminal Ship false positive; 16-02 added the minimal typed `devflow.toml` foundation with tested env > file > default resolvers. Next up: 16-03 external verification and retained capture history.
-- **Phase 17 (Scoped):** Hermes Support — renumbered from 16 to 17 (2026-07-17) to make room for Phase 16. HermesAgent adapter, skill-file rewrite, Hermes plugin. Depends on Phase 14's events.jsonl + Phase 13's notify hook
+- **Phase 17 (Scoped — next):** Hermes Support — renumbered from 16 to 17 (2026-07-17) to make room for Phase 16. HermesAgent adapter, skill-file rewrite, Hermes plugin. Depends on Phase 14's events.jsonl + Phase 13's notify hook.
 
 ## Completed
 
@@ -42,6 +40,8 @@ progress:
 | 12 | Bootstrap + Housekeeping | — | 2026-07-10 |
 | 13 | MVP Core Loop | — | 2026-07-15 |
 | 14 | Parallel Safety + Observability | — | 2026-07-16 |
+| 15 | Dogfood Enablement + OSS Readiness | — | 2026-07-17 |
+| 16 | Pipeline Reliability Hardening | — | 2026-07-17 |
 
 *Phases 8 and 10 shipped without a SUMMARY.md at the time; both were retroactively documented 2026-07-08 (see `8-SUMMARY.md`, `10-SUMMARY.md`) after reconstruction from git history. Phase 11 was reviewed and found already adequately closed out via `11-VALIDATION.md`/`11r-VALIDATION.md` (Nyquist-compliant, sign-off dated 2026-06-20) — no retroactive SUMMARY.md was needed.*
 
@@ -134,6 +134,6 @@ None.
 
 ## Session
 
-**Last session:** 2026-07-18T01:22:58.235Z
-**Stopped at:** Completed 16-07-PLAN.md
+**Last session:** 2026-07-18T02:02:52.975Z
+**Stopped at:** Phase 16 complete; ready for Phase 17
 **Resume file:** None
