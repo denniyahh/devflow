@@ -115,6 +115,27 @@ pub fn load_config(project_root: &Path) -> DevflowConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    struct EnvOverride(&'static str);
+
+    impl EnvOverride {
+        fn set(key: &'static str, value: &str) -> Self {
+            // SAFETY: Tests that mutate this process-global variable are
+            // serialized by ENV_MUTEX and the guard removes it on drop.
+            unsafe { std::env::set_var(key, value) };
+            Self(key)
+        }
+    }
+
+    impl Drop for EnvOverride {
+        fn drop(&mut self) {
+            // SAFETY: See EnvOverride::set; the same mutex guard is still held.
+            unsafe { std::env::remove_var(self.0) };
+        }
+    }
 
     #[test]
     fn default_uses_hardcoded_constants() {
@@ -122,5 +143,38 @@ mod tests {
         assert_eq!(config.main, "main");
         assert_eq!(config.develop, "develop");
         assert_eq!(config.feature_prefix, "feature/");
+    }
+
+    #[test]
+    fn missing_file_uses_devflow_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert_eq!(load_config(dir.path()), DevflowConfig::default());
+    }
+
+    #[test]
+    fn file_overrides_capture_retention_default() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("devflow.toml"), "capture_retention = 9\n").unwrap();
+
+        assert_eq!(load_config(dir.path()).capture_retention(), 9);
+    }
+
+    #[test]
+    fn env_overrides_file_capture_retention() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("devflow.toml"), "capture_retention = 9\n").unwrap();
+        let _env = EnvOverride::set("DEVFLOW_CAPTURE_RETENTION", "12");
+
+        assert_eq!(capture_retention(dir.path()), 12);
+    }
+
+    #[test]
+    fn malformed_file_falls_back_to_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("devflow.toml"), "capture_retention =\n").unwrap();
+
+        assert_eq!(load_config(dir.path()), DevflowConfig::default());
     }
 }
