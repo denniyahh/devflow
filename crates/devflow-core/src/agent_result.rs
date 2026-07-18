@@ -796,6 +796,16 @@ pub fn archive_phase_files(
     phase: u32,
     retain: usize,
 ) -> Result<Option<String>, std::io::Error> {
+    archive_phase_files_with_stamp(project_root, evidence_root, phase, retain, &archive_stamp())
+}
+
+fn archive_phase_files_with_stamp(
+    project_root: &Path,
+    evidence_root: &Path,
+    phase: u32,
+    retain: usize,
+    stamp: &str,
+) -> Result<Option<String>, std::io::Error> {
     let _ = std::fs::remove_file(agent_pid_path(project_root, phase));
 
     let stdout_src = stdout_path(project_root, phase);
@@ -809,19 +819,89 @@ pub fn archive_phase_files(
     let history_dir = history_dir(project_root, phase);
     std::fs::create_dir_all(&history_dir)?;
 
-    let stamp = archive_stamp();
-    if stdout_exists {
-        std::fs::rename(&stdout_src, history_dir.join(format!("{stamp}-stdout")))?;
-    }
-    if exit_exists {
-        std::fs::rename(&exit_src, history_dir.join(format!("{stamp}-exit")))?;
-    }
-    if let Some(review) = phase_review_path(evidence_root, phase) {
-        std::fs::copy(review, history_dir.join(format!("{stamp}-REVIEW.md")))?;
+    let staging_dir = history_dir.join(format!(".pending-{stamp}"));
+    std::fs::create_dir(&staging_dir)?;
+    let stdout_stage = staging_dir.join("stdout");
+    let exit_stage = staging_dir.join("exit");
+    let review_stage = staging_dir.join("REVIEW.md");
+    let stdout_dest = history_dir.join(format!("{stamp}-stdout"));
+    let exit_dest = history_dir.join(format!("{stamp}-exit"));
+    let review_dest = history_dir.join(format!("{stamp}-REVIEW.md"));
+    let review_src = phase_review_path(evidence_root, phase);
+
+    let mut stdout_staged = false;
+    let mut exit_staged = false;
+    let mut stdout_published = false;
+    let mut exit_published = false;
+    let mut review_published = false;
+
+    let archive_result = (|| -> Result<(), std::io::Error> {
+        if stdout_exists {
+            std::fs::rename(&stdout_src, &stdout_stage)?;
+            stdout_staged = true;
+        }
+        if exit_exists {
+            std::fs::rename(&exit_src, &exit_stage)?;
+            exit_staged = true;
+        }
+        if let Some(review) = &review_src {
+            std::fs::copy(review, &review_stage)?;
+        }
+
+        if stdout_exists {
+            std::fs::rename(&stdout_stage, &stdout_dest)?;
+            stdout_staged = false;
+            stdout_published = true;
+        }
+        if exit_exists {
+            std::fs::rename(&exit_stage, &exit_dest)?;
+            exit_staged = false;
+            exit_published = true;
+        }
+        if review_src.is_some() {
+            std::fs::rename(&review_stage, &review_dest)?;
+            review_published = true;
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = archive_result {
+        let mut rollback_error = None;
+        let mut restore = |from: &Path, to: &Path| {
+            if let Err(error) = std::fs::rename(from, to)
+                && rollback_error.is_none()
+            {
+                rollback_error = Some(error);
+            }
+        };
+        if stdout_published {
+            restore(&stdout_dest, &stdout_src);
+        } else if stdout_staged {
+            restore(&stdout_stage, &stdout_src);
+        }
+        if exit_published {
+            restore(&exit_dest, &exit_src);
+        } else if exit_staged {
+            restore(&exit_stage, &exit_src);
+        }
+        if review_published {
+            let _ = std::fs::remove_file(&review_dest);
+        }
+        let _ = std::fs::remove_dir_all(&staging_dir);
+
+        if let Some(rollback_error) = rollback_error {
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!("{error}; archive rollback failed: {rollback_error}"),
+            ));
+        }
+        return Err(error);
     }
 
+    let _ = std::fs::remove_dir(&staging_dir);
+
     prune_history(&history_dir, retain);
-    Ok(Some(stamp))
+    Ok(Some(stamp.to_string()))
 }
 
 fn phase_review_path(project_root: &Path, phase: u32) -> Option<PathBuf> {
@@ -1545,6 +1625,57 @@ mod tests {
             std::fs::read_to_string(stdout_path(root, 1)).unwrap(),
             "evidence"
         );
+    }
+
+    #[test]
+    fn archive_second_publish_failure_rolls_back_complete_live_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        std::fs::write(stdout_path(root, 1), "stdout evidence").unwrap();
+        std::fs::write(exit_code_path(root, 1), "17").unwrap();
+        let history = history_dir(root, 1);
+        std::fs::create_dir_all(history.join("fixed-exit/blocker")).unwrap();
+
+        assert!(archive_phase_files_with_stamp(root, root, 1, 5, "fixed").is_err());
+
+        assert_eq!(
+            std::fs::read_to_string(stdout_path(root, 1)).unwrap(),
+            "stdout evidence"
+        );
+        assert_eq!(
+            std::fs::read_to_string(exit_code_path(root, 1)).unwrap(),
+            "17"
+        );
+        assert!(!history.join("fixed-stdout").exists());
+        assert!(!history.join(".pending-fixed").exists());
+    }
+
+    #[test]
+    fn archive_review_copy_failure_rolls_back_complete_live_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let evidence_root = root.join("phase-worktree");
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        std::fs::write(stdout_path(root, 1), "stdout evidence").unwrap();
+        std::fs::write(exit_code_path(root, 1), "23").unwrap();
+        let review = evidence_root.join(".planning/phases/01-example/01-REVIEW.md");
+        std::fs::create_dir_all(&review).unwrap();
+
+        assert!(archive_phase_files_with_stamp(root, &evidence_root, 1, 5, "review-copy").is_err());
+
+        assert_eq!(
+            std::fs::read_to_string(stdout_path(root, 1)).unwrap(),
+            "stdout evidence"
+        );
+        assert_eq!(
+            std::fs::read_to_string(exit_code_path(root, 1)).unwrap(),
+            "23"
+        );
+        let history = history_dir(root, 1);
+        assert!(!history.join("review-copy-stdout").exists());
+        assert!(!history.join("review-copy-exit").exists());
+        assert!(!history.join(".pending-review-copy").exists());
     }
 
     #[test]
