@@ -6,6 +6,15 @@
 //! and DevFlow only needs the structured completion marker back.
 
 use crate::stage::Stage;
+use std::path::Path;
+
+const SHIP_REVIEW_ANGLES: &[&str] = &[
+    "doc-accuracy cross-reference (do documented claims match source?)",
+    "security / leaked-data (does anything commit secrets, session data, or telemetry?)",
+    "CI/build correctness (can a failing step still report green?)",
+    "external-state claims (does the diff claim merges, tags, or deletions that are not actually true?)",
+    "one generalist deep pass",
+];
 
 /// The completion contract every agent must honor as its final message.
 const COMPLETION_PROTOCOL: &str = "\
@@ -49,14 +58,26 @@ fn gsd_command_for(stage: Stage, phase: u32) -> String {
 /// proceeds to `/gsd-ship {N}`. The `review:` reason prefix is the
 /// ReviewFailed contract that `handle_ship_failure` matches (trimmed,
 /// case-folded) to loop back to Code with `AuditFix`.
-fn ship_stage_prompt(phase: u32) -> String {
+fn ship_stage_prompt(phase: u32, review_angles: &[String]) -> String {
     let code_review = format!("/gsd-code-review {phase}");
     let ship = format!("/gsd-ship {phase}");
+    let review_angles = review_angles
+        .iter()
+        .map(|angle| format!("- {angle}"))
+        .collect::<Vec<_>>()
+        .join("\n");
     format!(
         "Run the Ship stage in two steps:\n\
         \n\
         1. Run `{code_review}` (non-interactive). This writes a `REVIEW.md` \
-        artifact with severity-classified findings.\n\
+        artifact with severity-classified findings. Review at high depth from \
+        every angle below:\n\
+        \n\
+        {review_angles}\n\
+        \n\
+        If your harness supports parallel finder subagents, dispatch one per \
+        angle; otherwise run each angle as a focused sequential pass. Merge \
+        and deduplicate every angle's findings into one `REVIEW.md`.\n\
         2. Check `REVIEW.md` for the Critical-severity gate:\n\
         \n\
         - If `REVIEW.md` contains ANY finding at Critical severity: do NOT \
@@ -146,8 +167,29 @@ fn idempotent_stage_prompt(stage: Stage, phase: u32) -> String {
 
 /// Build the prompt for a stage of a phase.
 pub fn stage_prompt(stage: Stage, phase: u32) -> String {
+    stage_prompt_with_project(stage, phase, None)
+}
+
+/// Build a stage prompt with project-local configuration applied.
+///
+/// The CLI uses this entry point after resolving the canonical project root;
+/// library callers that have no project context keep using [`stage_prompt`]
+/// and receive built-in defaults.
+pub fn stage_prompt_for_project(stage: Stage, phase: u32, project_root: &Path) -> String {
+    stage_prompt_with_project(stage, phase, Some(project_root))
+}
+
+fn stage_prompt_with_project(stage: Stage, phase: u32, project_root: Option<&Path>) -> String {
     if stage == Stage::Ship {
-        return ship_stage_prompt(phase);
+        let review_angles = project_root
+            .and_then(crate::config::review_angles)
+            .unwrap_or_else(|| {
+                SHIP_REVIEW_ANGLES
+                    .iter()
+                    .map(|angle| (*angle).to_owned())
+                    .collect()
+            });
+        return ship_stage_prompt(phase, &review_angles);
     }
     if stage == Stage::Validate {
         return validate_stage_prompt(phase);

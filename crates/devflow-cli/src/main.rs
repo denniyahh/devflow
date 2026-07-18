@@ -617,7 +617,9 @@ fn ensure_agent_binary(program: &str) -> Result<(), CliError> {
 /// monitor calls `devflow advance` when the agent exits. An optional
 /// `prompt_override` is used for Code loop-backs (fix prompts).
 fn launch_stage(state: &State, prompt_override: Option<String>) -> Result<(), CliError> {
-    let prompt = prompt_override.unwrap_or_else(|| prompt::stage_prompt(state.stage, state.phase));
+    let prompt = prompt_override.unwrap_or_else(|| {
+        prompt::stage_prompt_for_project(state.stage, state.phase, &state.project_root)
+    });
     let adapter = agents::adapter_for(state.agent);
     // In worktree mode the agent's cwd is the linked worktree, but git
     // metadata for commits lives under the main repo's `.git/` — sandboxed
@@ -1330,7 +1332,7 @@ fn run_agent_blocking(
 ) -> Result<Option<agent_result::AgentResult>, CliError> {
     agent_result::archive_phase_files(project_root, phase, capture_retention(project_root));
     let adapter = agents::adapter_for(agent);
-    let prompt = prompt::stage_prompt(Stage::Code, phase);
+    let prompt = prompt::stage_prompt_for_project(Stage::Code, phase, project_root);
     // sequentagent always runs in a worktree — the main repo's `.git/` and
     // the worktree admin dir must stay writable for sandboxed agents to
     // commit (13-06 dogfood finding).
