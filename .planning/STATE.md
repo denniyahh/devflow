@@ -2,9 +2,9 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
-status: Phase 17 spiked - terminal Ship reconciliation pending
-stopped_at: Phase 17 spike complete; reproduce terminal Ship sequence before planning repairs
-last_updated: "2026-07-18T00:00:00Z"
+status: Phase 17 scoped and discussed - ready for planning
+stopped_at: Phase 17 context gathered
+last_updated: "2026-07-18T20:21:31.907Z"
 progress:
   total_phases: 7
   completed_phases: 5
@@ -19,13 +19,20 @@ progress:
 
 ## Active
 
-- **Phase 17 (Spiked — next):** Pipeline Dogfood Follow-Up — reconcile the
-  Phase 16 terminal Ship event evidence and scope confirmed repairs before
-  further feature work.
+- **Phase 17 (Discussed — ready for planning):** Pipeline Dogfood Follow-Up —
+  17a `Unknown` must not auto-advance, 17b typed outcomes + retry policy, 17c
+  preflight readiness gate, 17d build provenance. Terminal-Ship alarm traced to
+  a stale executable, not a live regression. All three open decision-gate
+  questions resolved in `17-CONTEXT.md` (21 decisions, D-01…D-21). Notable:
+  17a requires extending Phase 16's Layer 0 — it is Code-stage-only and treats
+  passing probes as non-evidence, so an external-only stage with zero commits
+  cannot succeed cleanly today.
+
 - **Phase 18 (Scoped):** Hermes Support — renumbered from 17 to 18
   (2026-07-18) to make room for Phase 17. HermesAgent adapter, skill-file
   rewrite, Hermes plugin. Depends on Phase 14's events.jsonl + Phase 13's
-  notify hook.
+  notify hook. Also carries 18d (doctor reconciliation) and 18e (WR-03 test
+  fix), deferred from Phase 17 on 2026-07-18.
 
 ## Completed
 
@@ -59,6 +66,7 @@ None.
 
 | Date | Decision |
 |---|---|
+| 2026-07-18 | **Phase 17 scoped to four units; P5/P6 deferred to Phase 18:** source verification against final HEAD resolved decision-gate Q2 — `Unknown` auto-advance is not an edge case but an explicit design choice (`main.rs:854` classifies only `Failed \| RateLimited` as failure; `main.rs:871`'s comment states "Success (or Unknown — advance…)"). It is also broader than the retrospective recorded: `evaluate_layer3` (`agent_result.rs:610-620`) returns `Unknown` for the zero-commit "agent process gone, no commits" case too, so a vanished agent that did nothing advances Code→Validate. Two retrospective assumptions corrected: `devflow doctor` already exists but is project-blind (`_project_root` unused), and `RateLimited` is already typed — the missing outcomes are `resource_killed` (exit 137, absent workspace-wide) and `agent_unavailable`. Provenance has no foundation at all (no `build.rs`, no `vergen`; `workflow_started` carries only agent/mode/worktree). Phase 17 keeps 17a `Unknown` non-advance, 17b typed outcomes + retry policy, 17c preflight gate, 17d build provenance. Q4 answered: focused Phase 17 repair, **not** a Phase 16 remediation — only 17d traces to the proven Phase 16 defect; the rest is capability Phase 16 never claimed. Deferred to Phase 18 as 18d/18e: doctor reconciliation (forensic tooling, depends on 17b+17d) and the WR-03 test fix (test-only debt). Q3 (universal vs. adapter-specific preflight checks) remains open for discuss-phase. |
 | 2026-07-17 | **New Phase 16 (Pipeline Reliability Hardening) inserted, Hermes Support renumbered 16→17:** dogfooding Phase 15 through DevFlow itself surfaced real pipeline gaps — two Code-stage false positives on the crates.io publish plan (Layer-2 commit-count heuristic once, an incorrect agent self-report once) and four consecutive Ship-review failures on distinct legitimate findings (leaked telemetry, incomplete gitignore fix, CI job that couldn't fail loud, a doc/behavior mismatch) that a single-pass standard-depth reviewer caught one at a time instead of together. Dir renamed `16-hermes-support` → `17-hermes-support`; new `16-pipeline-reliability-hardening` (neither had plans yet). |
 | 2026-07-18 | **New Phase 17 (Pipeline Dogfood Follow-Up) inserted, Hermes Support renumbered 17→18:** Phase 16 execution evidence may show a failed Merge followed by VersionBump, BranchCleanup, and `workflow_finished`, contradicting the phase's fail-closed terminal contract. The Phase 17 spike captures this required final-HEAD reproduction plus outcome classification, preflight readiness, state/event reconciliation, and WR-03 test stabilization. Dir renamed `17-hermes-support` → `18-hermes-support`; Hermes remains scoped and blocked on the decision gate. |
 | 2026-07-16 | **Phase 15 rescoped dogfood-first:** operator priority is a fully functional MVP for dogfooding. The MVP engine is done (13 + 14); the remaining friction is operational: gate responses required hand-writing `.devflow/gates/NN-stage.response.json`, and no accurate operator reference exists. Phase 15 now leads with 15a Dogfood Enablement (`devflow gate` list/approve/reject, OPERATIONS.md, plus pulled-forward accuracy items: `.devflow.yaml` decoy removal, IN-01 lib.rs rustdoc, `--help` snapshot test); 15b OSS packaging follows and is to be executed through DevFlow itself as the first post-MVP dogfood run. Antigravity adapter (old 15c) deferred to unscheduled backlog — serves neither priority. Phase 14 was merged to develop (431c743) before this rescope. |
@@ -141,6 +149,6 @@ None.
 
 ## Session
 
-**Last session:** 2026-07-18T02:02:52.975Z
-**Stopped at:** Phase 16 complete; ready for Phase 17
-**Resume file:** None
+**Last session:** 2026-07-18T20:21:31.889Z
+**Stopped at:** Phase 17 context gathered
+**Resume file:** .planning/phases/17-pipeline-dogfood-followup/17-CONTEXT.md

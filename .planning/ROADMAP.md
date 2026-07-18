@@ -41,6 +41,11 @@
 - **Phase 14 rescoped to Observability + Hermes Support** — residual `devflow logs`/`events.jsonl`/`status` work plus the previously unclaimed `capture_agent_output()` sync-path decision (now claimed there). Hermes work (agent adapter, skill-file rewrite, plugin) moved in from Phase 15 (2026-07-14) — the plugin's gate watcher consumes this phase's `events.jsonl`, so they ship together.
 - **Phase 15 (was 13)** — OSS readiness (docs, dev container, contributing, Antigravity adapter) plus the actual crates.io publish. Hermes items moved out to Phase 14.
 
+## Phase 17 scoping (2026-07-18)
+
+- **Phase 17 narrowed to four units** after source verification resolved the spike's decision gate: `Unknown` non-advance (17a), typed outcomes + retry policy (17b), preflight readiness gate (17c), build provenance (17d). Scoped as a focused repair phase rather than a Phase 16 remediation — only 17d traces to the proven Phase 16 defect.
+- **Phase 18 gains 18d/18e** — `devflow doctor` state/event reconciliation and the WR-03 transient-capture test fix moved out of 17. 18d depends on 17b + 17d. See the 2026-07-18 decision entry in STATE.md.
+
 ## Phase 14 split (2026-07-16)
 
 - **Phase 14 rescoped to Parallel Safety + Observability** — the 2026-07-14 move of Hermes into Phase 14 was a workload-balance call made before the CR-03 parallel-safety flaw was deferred there (2026-07-15), which made 14 the heaviest phase instead of the slimmest. Phase 14 now leads with CR-03 (per-phase state files, phase-threaded monitor advance, coarse lock for main-checkout mutations), keeps the `capture_agent_output()` sync-path decision, and builds observability (`logs`/`events.jsonl`/`status`) on the final per-phase state model — in that order, since the state-file shape dictates what `status`/`logs`/`events.jsonl` enumerate.
@@ -169,12 +174,17 @@ Plans:
 
 ### Phase 17: Pipeline Dogfood Follow-Up
 
-**Goal:** Reconcile the Phase 16 dogfood event stream with the claimed
-fail-closed terminal Ship invariant, then scope any confirmed repair alongside
-typed agent-outcome handling, preflight readiness, state/event reconciliation,
-and the existing transient-capture test fix. This phase is a spike until the
-final-HEAD reproduction distinguishes a real defect from stale telemetry.
-**Requirements:** Spike decision gate in `17-DOGFOOD-RETROSPECTIVE.md`
+**Goal:** Close the pipeline-reliability holes the Phase 16 dogfood exposed —
+`Unknown` completion must never auto-advance a stage (17a), typed agent
+outcomes with a deterministic retry policy (17b), a preflight readiness gate
+that fails before agent time is consumed (17c), and build provenance in
+`workflow_started` so a stale self-dogfood binary is detectable (17d). The
+terminal-Ship alarm was traced to a stale executable, not a live regression;
+state/event reconciliation and the WR-03 test fix were deferred to Phase 18 on
+2026-07-18.
+**Requirements:** P1–P4 in `17-DOGFOOD-RETROSPECTIVE.md`; acceptance criteria
+2, 3, 4 (criterion 1 is already covered by Phase 16's regression test — verify
+against final HEAD rather than re-plan)
 **Depends on:** Phase 16
 **Blocks:** Phase 18 Hermes Support
 **Plans:** 0 plans
@@ -186,8 +196,14 @@ Plans:
 ### Phase 18: Hermes Support
 
 **Goal:** First-class Hermes support — `HermesAgent` adapter with native-envelope completion parsing (18a), rewrite of the stale `skills/hermes/devflow/SKILL.md` against current CLI behavior (18b), and the Hermes plugin session mode with an events.jsonl-driven gate watcher (18c). Split out of Phase 14 on 2026-07-16 so personal-infrastructure work doesn't gate parallel-safety correctness or OSS readiness. Renumbered from 17 to 18 on 2026-07-18 to make room for Phase 17's dogfood follow-up.
-**Requirements**: TBD (see CONTEXT.md)
-**Depends on:** Phase 14 (consumes `events.jsonl` + the Phase 13 notify hook)
+
+Also carries two items deferred from Phase 17 on 2026-07-18 (18d, 18e). These are pipeline-reliability work, not Hermes work — they landed here to keep Phase 17 focused on invariant correctness:
+
+- **18d — project-aware `devflow doctor` reconciliation:** `doctor()` currently takes `_project_root` unused (`main.rs:2454`) and only checks external tools/PATH. Extend it to diff state vs. events vs. live PIDs vs. gates vs. branch ancestry and report a repair plan, mutating nothing by default. Consumes Phase 17's typed outcomes (17b) and provenance (17d) — sequence after them. Retrospective acceptance criterion 5.
+- **18e — WR-03 test stabilization:** `parallel_creates_two_worktrees_and_spawns_two_monitors` (`crates/devflow-cli/tests/phase7_cli.rs:184-200`) waits for live stdout captures, runs unrelated assertions, then re-asserts the same paths — a fast monitor can archive between the two. Fix by asserting the capture immediately or accepting its retained-history generation. Recorded as non-blocking debt in `16-REVIEW.md`. (Distinct from `13-REVIEW.md`'s WR-03 in `git.rs:286` — the review numbering namespaces collide.)
+
+**Requirements**: TBD (see CONTEXT.md) + 18d, 18e (deferred Phase 17 P5/P6)
+**Depends on:** Phase 14 (consumes `events.jsonl` + the Phase 13 notify hook); Phase 17 for 18d
 **Plans:** 0 plans
 
 Plans:
