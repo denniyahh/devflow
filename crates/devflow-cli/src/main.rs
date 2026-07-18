@@ -3217,6 +3217,25 @@ mod tests {
         assert!(capped.ends_with("[truncated; full output in .devflow/]"));
     }
 
+    #[test]
+    fn status_shows_pending_gate_prominently() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = format!("first line\n{}", "sensitive detail ".repeat(80));
+        Gates::write_gate(dir.path(), 16, Stage::Ship, &context).unwrap();
+        let open = Gates::list_open(dir.path());
+
+        let banner = render_pending_gate_banner(&open, u64::MAX).unwrap();
+
+        assert!(banner.contains("PENDING GATE"));
+        assert!(banner.contains("phase 16"));
+        assert!(banner.contains("ship"));
+        assert!(banner.contains("devflow gate approve 16 --stage ship"));
+        assert!(banner.contains("devflow gate reject 16 --stage ship"));
+        assert!(banner.contains("[truncated; full output in .devflow/]"));
+        assert!(!banner.contains(&context));
+        assert!(banner.contains("ESCALATED"));
+    }
+
     /// A Ship-stage AgentFailed result (no `review:` prefix) must write a
     /// gate file and block for a response — not silently return an `Err`
     /// with nothing surfaced (WR-11; the pre-Task-2 catch-all never wrote a
