@@ -331,6 +331,17 @@ mod tests {
             !prompt.contains("already exists"),
             "Code prompt should not carry the Define/Plan idempotency contract"
         );
+        assert!(prompt.contains("Advisory incremental self-review"));
+        for angle in [
+            "doc accuracy",
+            "leaked data",
+            "CI/build correctness",
+            "external-state claims",
+        ] {
+            assert!(prompt.contains(angle), "Code prompt missing angle: {angle}");
+        }
+        assert!(!prompt.contains("AskUserQuestion"));
+        assert!(!prompt.contains("request_user_input"));
     }
 
     /// 13-06 dogfood regression (Codex leg): GSD's discuss-phase demands an
