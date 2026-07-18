@@ -67,8 +67,8 @@ pub mod recover;
 pub mod ship;
 pub mod stage;
 pub mod state;
-pub mod version;
 pub mod verify;
+pub mod version;
 pub mod workflow;
 pub mod worktree;
 

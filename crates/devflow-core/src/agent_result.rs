@@ -1,8 +1,9 @@
 //! Agent completion detection — parses DEVFLOW_RESULT markers and evaluates
 //! exit codes to determine whether a coding agent succeeded or failed.
 //!
-//! Three-layer decision engine:
-//! 1. Parse DEVFLOW_RESULT from agent stdout (authoritative)
+//! Four-layer decision engine:
+//! 0. Run operator-authored external post-condition probes (authoritative failure)
+//! 1. Parse DEVFLOW_RESULT from agent stdout (authoritative for ordinary plans)
 //! 2. Exit code + commit count gate (reliable fallback)
 //! 3. Process gone + commits exist (last resort warning)
 
@@ -623,12 +624,41 @@ pub fn evaluate_layer3(
     })
 }
 
-/// Full three-layer evaluation: returns the best available AgentResult.
+/// Layer 0: run operator-authored external post-condition probes.
+///
+/// A failed probe outranks every agent-controlled signal. Successful probes
+/// defer to the existing Layer 1/2/3 cascade so ordinary completion evidence
+/// is still required. With no declarations (or when disabled), behavior is
+/// byte-for-byte the pre-Phase-16 cascade.
+fn evaluate_layer0(project_root: &Path, phase: u32) -> Option<AgentResult> {
+    if !crate::config::external_verify_enabled(project_root) {
+        return None;
+    }
+
+    crate::verify::external_verify_commands(project_root, phase)
+        .into_iter()
+        .find(|command| !crate::verify::run_external_verification(command, project_root))
+        .map(|command| AgentResult {
+            status: AgentStatus::Failed,
+            exit_code: None,
+            reason: Some(format!("external verification failed: {command}")),
+            commits: None,
+            summary: None,
+            verdict: None,
+        })
+}
+
+/// Full four-layer evaluation: returns the best available AgentResult.
 pub fn evaluate_agent_result(
     project_root: &Path,
     state: &State,
     git_flow: &GitFlowConfig,
 ) -> Result<AgentResult, ResultError> {
+    // Layer 0: operator-authored external post-condition (authoritative failure)
+    if let Some(result) = evaluate_layer0(project_root, state.phase) {
+        return Ok(result);
+    }
+
     // Layer 1: DEVFLOW_RESULT marker (authoritative)
     if let Some(result) = evaluate_layer1(project_root, state.phase) {
         return Ok(result);
@@ -751,7 +781,8 @@ fn prune_history(history_dir: &Path, retain: usize) {
         .flatten()
         .filter_map(|entry| {
             let name = entry.file_name().to_str()?.to_string();
-            name.rsplit_once('-').map(|(stamp, _suffix)| stamp.to_string())
+            name.rsplit_once('-')
+                .map(|(stamp, _suffix)| stamp.to_string())
         })
         .collect();
     stamps.sort();
@@ -1227,6 +1258,26 @@ mod tests {
                 .reason
                 .as_deref()
                 .is_some_and(|reason| reason.contains("external verification failed"))
+        );
+    }
+
+    #[test]
+    fn no_external_declaration_preserves_layer1_result() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 16),
+            "DEVFLOW_RESULT: {\"status\":\"success\",\"commits\":2,\"summary\":\"done\"}\n",
+        )
+        .unwrap();
+        let state = state_in(dir.path(), 16);
+        let layer1 = evaluate_layer1(dir.path(), 16).unwrap();
+
+        let full = evaluate_agent_result(dir.path(), &state, &GitFlowConfig::default()).unwrap();
+
+        assert_eq!(
+            serde_json::to_value(full).unwrap(),
+            serde_json::to_value(layer1).unwrap()
         );
     }
 
