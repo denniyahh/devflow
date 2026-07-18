@@ -27,6 +27,7 @@ pub enum WorkflowError {
 /// Filename prefix shared by every per-phase state file. Owned here so
 /// listing/migration never hardcode the naming scheme.
 const STATE_FILE_PREFIX: &str = "state-";
+const CORRUPT_LEGACY_STATE_HINT: &str = "devflow recover --clean";
 
 /// Return the `.devflow` directory for a project.
 pub fn devflow_dir(project_root: &Path) -> PathBuf {
@@ -54,7 +55,7 @@ fn migrate_legacy_state(project_root: &Path) {
     };
     let Ok(state) = serde_json::from_str::<State>(&contents) else {
         warn!(
-            "legacy state at {} is unparsable — leaving it in place",
+            "legacy state at {} is unparsable — leaving it in place; remove it with `{CORRUPT_LEGACY_STATE_HINT}`",
             legacy.display()
         );
         return;
@@ -182,6 +183,11 @@ pub fn clear_state(project_root: &Path, phase: u32) -> Result<(), WorkflowError>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migrate_legacy_state_warning_names_recovery_command() {
+        assert!(CORRUPT_LEGACY_STATE_HINT.contains("recover --clean"));
+    }
     use crate::mode::Mode;
     use crate::stage::Stage;
     use crate::state::AgentKind;

@@ -234,15 +234,18 @@ enum GateCmd {
     Approve {
         /// Phase whose gate to approve.
         phase: u32,
+        /// Optional stage as a positional convenience (`approve 15 ship`).
+        #[arg(value_name = "STAGE", conflicts_with = "stage_option")]
+        stage: Option<Stage>,
         /// Stage of the gate (auto-resolved when the phase has exactly one
         /// open gate).
-        #[arg(long)]
-        stage: Option<Stage>,
+        #[arg(long = "stage")]
+        stage_option: Option<Stage>,
         /// Optional free-text note recorded with the approval.
         #[arg(long)]
         note: Option<String>,
         /// Project root.
-        #[arg(default_value = ".")]
+        #[arg(long, default_value = ".")]
         project: PathBuf,
     },
     /// Reject an open gate — loops back to Code, or aborts the phase when
@@ -250,16 +253,19 @@ enum GateCmd {
     Reject {
         /// Phase whose gate to reject.
         phase: u32,
+        /// Optional stage as a positional convenience (`reject 15 ship`).
+        #[arg(value_name = "STAGE", conflicts_with = "stage_option")]
+        stage: Option<Stage>,
         /// Stage of the gate (auto-resolved when the phase has exactly one
         /// open gate).
-        #[arg(long)]
-        stage: Option<Stage>,
+        #[arg(long = "stage")]
+        stage_option: Option<Stage>,
         /// Required note explaining the rejection (include "abort" to end
         /// the phase instead of looping back to Code).
         #[arg(long)]
         note: String,
         /// Project root.
-        #[arg(default_value = ".")]
+        #[arg(long, default_value = ".")]
         project: PathBuf,
     },
 }
@@ -341,15 +347,29 @@ fn run() -> Result<(), CliError> {
             GateCmd::Approve {
                 phase,
                 stage,
+                stage_option,
                 note,
                 project,
-            } => gate_respond(&project_root(project)?, phase, stage, true, note),
+            } => gate_respond(
+                &project_root(project)?,
+                phase,
+                stage_option.or(stage),
+                true,
+                note,
+            ),
             GateCmd::Reject {
                 phase,
                 stage,
+                stage_option,
                 note,
                 project,
-            } => gate_respond(&project_root(project)?, phase, stage, false, Some(note)),
+            } => gate_respond(
+                &project_root(project)?,
+                phase,
+                stage_option.or(stage),
+                false,
+                Some(note),
+            ),
         },
         Command::Logs {
             phase,
@@ -2464,6 +2484,37 @@ mod tests {
 
         assert_eq!(stage, Some(Stage::Ship));
         assert_eq!(project, PathBuf::from("."));
+
+        let flagged =
+            Cli::try_parse_from(["devflow", "gate", "approve", "15", "--stage", "ship"]).unwrap();
+        let Command::Gate {
+            action:
+                GateCmd::Approve {
+                    stage,
+                    stage_option,
+                    ..
+                },
+        } = flagged.command
+        else {
+            panic!("expected flagged gate approve command");
+        };
+        assert_eq!(stage, None);
+        assert_eq!(stage_option, Some(Stage::Ship));
+
+        let bare = Cli::try_parse_from(["devflow", "gate", "approve", "15"]).unwrap();
+        let Command::Gate {
+            action:
+                GateCmd::Approve {
+                    stage,
+                    stage_option,
+                    ..
+                },
+        } = bare.command
+        else {
+            panic!("expected bare gate approve command");
+        };
+        assert_eq!(stage, None);
+        assert_eq!(stage_option, None);
     }
 
     #[test]
