@@ -1,0 +1,3 @@
+# Deterministic doc-check exceptions. Every entry must include a non-empty
+# reason; the cargo tests reject unexplained exceptions.
+exceptions = []
