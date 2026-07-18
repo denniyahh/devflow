@@ -112,6 +112,60 @@ pub fn load_config(project_root: &Path) -> DevflowConfig {
     }
 }
 
+/// Resolve capture retention with `DEVFLOW_CAPTURE_RETENTION` taking
+/// precedence over `devflow.toml` and the built-in default.
+pub fn capture_retention(project_root: &Path) -> usize {
+    if let Some(value) = env_value("DEVFLOW_CAPTURE_RETENTION") {
+        match value.parse() {
+            Ok(retention) => return retention,
+            Err(error) => tracing::warn!(
+                value,
+                %error,
+                "invalid DEVFLOW_CAPTURE_RETENTION; using devflow.toml or default"
+            ),
+        }
+    }
+    load_config(project_root).capture_retention
+}
+
+/// Resolve Ship review angles with `DEVFLOW_REVIEW_ANGLES` taking precedence
+/// over `devflow.toml`. The environment value is a comma-separated list.
+pub fn review_angles(project_root: &Path) -> Option<Vec<String>> {
+    if let Some(value) = env_value("DEVFLOW_REVIEW_ANGLES") {
+        let angles: Vec<_> = value
+            .split(',')
+            .map(str::trim)
+            .filter(|angle| !angle.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if !angles.is_empty() {
+            return Some(angles);
+        }
+        tracing::warn!("DEVFLOW_REVIEW_ANGLES contains no review angles; using devflow.toml");
+    }
+    load_config(project_root).review_angles
+}
+
+/// Resolve external verification with `DEVFLOW_EXTERNAL_VERIFY_ENABLED`
+/// taking precedence over `devflow.toml` and the built-in default.
+pub fn external_verify_enabled(project_root: &Path) -> bool {
+    if let Some(value) = env_value("DEVFLOW_EXTERNAL_VERIFY_ENABLED") {
+        match value.parse() {
+            Ok(enabled) => return enabled,
+            Err(error) => tracing::warn!(
+                value,
+                %error,
+                "invalid DEVFLOW_EXTERNAL_VERIFY_ENABLED; using devflow.toml or default"
+            ),
+        }
+    }
+    load_config(project_root).external_verify_enabled
+}
+
+fn env_value(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|value| !value.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
