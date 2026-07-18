@@ -644,10 +644,17 @@ pub fn evaluate_layer2(
     }))
 }
 
-/// Layer 3: Last resort — agent process is gone, commits exist.
+/// Layer 3: Last resort — agent process is gone.
 ///
-/// Returns Unknown status with a warning. This only fires when
-/// neither Layer 1 nor Layer 2 produced a definitive result.
+/// Split per D-02/D-03 case 3 (17-03): "process gone, commits exist" stays
+/// `Unknown` — unverified but there is SOMETHING to account for, and Plan
+/// 04's never-advance dispatch gates it downstream (D-04) rather than
+/// reclassifying it here. "Process gone, zero commits, nothing declared" is
+/// no longer a blanket advanceable `Unknown` — it is reclassified to
+/// `Failed` so a vanished agent that produced and declared nothing cannot
+/// masquerade as ambiguous-but-fine; the reason flags that human review is
+/// needed. This only fires when neither Layer 1 nor Layer 2 produced a
+/// definitive result.
 pub fn evaluate_layer3(
     project_root: &Path,
     phase: u32,
@@ -666,17 +673,27 @@ pub fn evaluate_layer3(
         .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
         .unwrap_or(0);
 
-    Ok(AgentResult {
-        status: AgentStatus::Unknown,
-        exit_code: None,
-        reason: if commits > 0 {
-            Some(format!(
+    let (status, reason) = if commits > 0 {
+        (
+            AgentStatus::Unknown,
+            format!(
                 "unverified — agent process is gone but {} commits exist on {}",
                 commits, branch
-            ))
-        } else {
-            Some("no work detected — agent process is gone with no commits".into())
-        },
+            ),
+        )
+    } else {
+        (
+            AgentStatus::Failed,
+            "no work accounted for — agent process is gone with no commits and no declared \
+             external post-condition; human review needed"
+                .to_string(),
+        )
+    };
+
+    Ok(AgentResult {
+        status,
+        exit_code: None,
+        reason: Some(reason),
         commits: Some(commits),
         summary: None,
         verdict: None,
