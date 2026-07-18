@@ -190,3 +190,11 @@ None - no external service configuration required.
 ---
 *Phase: 17-pipeline-dogfood-followup*
 *Completed: 2026-07-18*
+
+## Self-Check: PASSED
+
+- FOUND: crates/devflow-core/src/outcome_policy.rs
+- FOUND: .planning/phases/17-pipeline-dogfood-followup/17-01-SUMMARY.md
+- FOUND: commit ccce72e (Task 1)
+- FOUND: commit 68a1b00 (Task 2)
+- FOUND: commit f8c6403 (SUMMARY)
