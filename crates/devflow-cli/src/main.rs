@@ -2421,6 +2421,28 @@ mod tests {
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
+    fn project_root_walks_up_to_nearest_devflow_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        let nested = root.join(".worktrees/phase-16/deep");
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(project_root(nested).unwrap(), root.canonicalize().unwrap());
+
+        let idle = dir.path().join("idle/nested");
+        std::fs::create_dir_all(&idle).unwrap();
+        assert_eq!(
+            project_root(idle.clone()).unwrap(),
+            idle.canonicalize().unwrap()
+        );
+
+        let missing = dir.path().join("missing");
+        let error = project_root(missing).unwrap_err().to_string();
+        assert!(error.contains("project path does not exist"));
+    }
+
+    #[test]
     fn pairs_default_missing_agents_to_claude() {
         let pairs = parse_phase_agent_pairs("7,8", Some("codex")).unwrap();
         assert_eq!(pairs, vec![(7, AgentKind::Codex), (8, AgentKind::Claude)]);
