@@ -190,7 +190,7 @@ fn enum_variants(source: &str, enum_name: &str) -> Vec<String> {
         if depth == 1 {
             let trimmed = line.trim();
             if let Some(name) = trimmed
-                .split(|ch: char| ch == '{' || ch == ',')
+                .split(['{', ','])
                 .next()
                 .map(str::trim)
                 .filter(|name| {
@@ -244,12 +244,12 @@ fn workspace_root() -> PathBuf {
 
 fn glob_matches(pattern: &str, value: &str) -> bool {
     let mut rest = value;
-    let mut parts = pattern.split('*').peekable();
+    let parts = pattern.split('*');
     let anchored_start = !pattern.starts_with('*');
     let anchored_end = !pattern.ends_with('*');
     let mut first = true;
 
-    while let Some(part) = parts.next() {
+    for part in parts {
         if part.is_empty() {
             first = false;
             continue;
