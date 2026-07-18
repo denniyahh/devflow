@@ -225,6 +225,37 @@ mod tests {
     }
 
     #[test]
+    fn env_overrides_file_review_angles() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("devflow.toml"),
+            "review_angles = [\"file angle\"]\n",
+        )
+        .unwrap();
+        let _env = EnvOverride::set("DEVFLOW_REVIEW_ANGLES", "security, docs accuracy");
+
+        assert_eq!(
+            review_angles(dir.path()),
+            Some(vec!["security".into(), "docs accuracy".into()])
+        );
+    }
+
+    #[test]
+    fn env_overrides_file_external_verification() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("devflow.toml"),
+            "external_verify_enabled = false\n",
+        )
+        .unwrap();
+        let _env = EnvOverride::set("DEVFLOW_EXTERNAL_VERIFY_ENABLED", "true");
+
+        assert!(external_verify_enabled(dir.path()));
+    }
+
+    #[test]
     fn malformed_file_falls_back_to_defaults() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("devflow.toml"), "capture_retention =\n").unwrap();
