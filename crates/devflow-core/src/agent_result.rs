@@ -1518,11 +1518,19 @@ mod tests {
         );
     }
 
+    /// D-05 gap 1 / D-06 (17-03): Layer 0 now evaluates on every stage, not
+    /// only Code. Also covers the review-flagged worktree bug (Plan 03
+    /// MEDIUM, OpenCode): PLAN discovery must read `project_root` (where
+    /// `.planning/phases/` actually lives), while probe execution still
+    /// reads `execution_root` (the worktree) — using the worktree for
+    /// discovery would find zero commands and mis-fire the "PLAN removed"
+    /// veto.
     #[test]
-    fn external_probe_runs_only_after_code_and_reads_execution_worktree() {
+    fn external_probe_discovers_from_project_root_across_every_stage_and_executes_in_worktree() {
         let dir = tempfile::tempdir().unwrap();
         let worktree = dir.path().join("phase-worktree");
-        let phase_dir = worktree.join(".planning/phases/16-reliability");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let phase_dir = dir.path().join(".planning/phases/16-reliability");
         std::fs::create_dir_all(&phase_dir).unwrap();
         std::fs::write(
             phase_dir.join("16-01-PLAN.md"),
@@ -1540,6 +1548,11 @@ mod tests {
         state.stage = Stage::Plan;
 
         let approval = vec!["test -f implemented".to_string()];
+
+        // Layer 0 now fires on Plan too — the probe file does not yet exist
+        // in the worktree, so this must fail on the probe itself (NOT a
+        // false PLAN-removed veto, which would mean discovery silently
+        // returned zero commands).
         let plan_result = evaluate_agent_result_inner(
             dir.path(),
             &state,
@@ -1547,7 +1560,15 @@ mod tests {
             Some(&approval),
         )
         .unwrap();
-        assert_eq!(plan_result.status, AgentStatus::Success);
+        assert_eq!(plan_result.status, AgentStatus::Failed);
+        assert!(
+            plan_result
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("external verification failed")),
+            "expected a failing-probe reason, not a false PLAN-removed veto: {:?}",
+            plan_result.reason
+        );
 
         state.stage = Stage::Code;
         let code_result = evaluate_agent_result_inner(
@@ -1559,6 +1580,8 @@ mod tests {
         .unwrap();
         assert_eq!(code_result.status, AgentStatus::Failed);
 
+        // The probe still executes against execution_root (the worktree) —
+        // only PLAN discovery moved to project_root.
         std::fs::write(worktree.join("implemented"), "done").unwrap();
         let passing = evaluate_agent_result_inner(
             dir.path(),
@@ -1568,6 +1591,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(passing.status, AgentStatus::Success);
+        assert_eq!(passing.decided_by_layer, Some(0));
     }
 
     #[test]
@@ -1638,6 +1662,78 @@ mod tests {
             serde_json::to_value(full).unwrap(),
             serde_json::to_value(layer1).unwrap()
         );
+    }
+
+    /// D-05 gap 2 (17-03): a declared, operator-approved external
+    /// post-condition whose probe passes is affirmative Success evidence on
+    /// its own — even with zero commits and on a non-Code stage (Define
+    /// here). No agent stdout is written at all, so if Layer 0 did not
+    /// short-circuit, there would be nothing for Layer 1 to find and Layer 2
+    /// would fall through for lack of an exit-code file.
+    #[test]
+    fn layer0_affirmative_success_on_non_code_stage_with_zero_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase_dir = dir.path().join(".planning/phases/16-reliability");
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        std::fs::write(
+            phase_dir.join("16-01-PLAN.md"),
+            "---\nexternal_verify: \"test -f shipped\"\n---\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("shipped"), "done").unwrap();
+        let mut state = state_in(dir.path(), 16);
+        state.stage = Stage::Define;
+
+        let approval = vec!["test -f shipped".to_string()];
+        let result = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approval),
+        )
+        .unwrap();
+
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(result.decided_by_layer, Some(0));
+        assert_eq!(result.commits, None);
+    }
+
+    /// Review Plan 03 LOW (Codex+OpenCode), 16a: an approved all-passing
+    /// Layer 0 probe intentionally outranks a Layer 1 self-reported failure
+    /// marker — proven here at the cascade level (`evaluate_agent_result_inner`),
+    /// not merely in isolation on `evaluate_layer0`.
+    #[test]
+    fn layer0_affirmative_success_outranks_layer1_failure_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase_dir = dir
+            .path()
+            .join(".planning/phases/16-pipeline-reliability-hardening");
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        std::fs::write(
+            phase_dir.join("16-03-PLAN.md"),
+            "---\nphase: 16\nexternal_verify: \"test -f externally-shipped\"\n---\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("externally-shipped"), "done").unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 16),
+            "DEVFLOW_RESULT: {\"status\":\"failed\",\"reason\":\"agent self-reported failure\"}\n",
+        )
+        .unwrap();
+        let state = state_in(dir.path(), 16);
+
+        let approval = vec!["test -f externally-shipped".to_string()];
+        let result = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approval),
+        )
+        .unwrap();
+
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(result.decided_by_layer, Some(0));
     }
 
     #[test]
