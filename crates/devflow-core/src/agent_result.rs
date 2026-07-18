@@ -630,16 +630,44 @@ pub fn evaluate_layer3(
 /// defer to the existing Layer 1/2/3 cascade so ordinary completion evidence
 /// is still required. With no declarations (or when disabled), behavior is
 /// byte-for-byte the pre-Phase-16 cascade.
-fn evaluate_layer0(project_root: &Path, state: &State, trusted: bool) -> Option<AgentResult> {
-    if state.stage != Stage::Code
-        || !trusted
-        || !crate::config::external_verify_enabled(project_root)
-    {
+fn evaluate_layer0(
+    project_root: &Path,
+    state: &State,
+    approved_commands: Option<&[String]>,
+) -> Option<AgentResult> {
+    if state.stage != Stage::Code || !crate::config::external_verify_enabled(project_root) {
         return None;
     }
 
     let execution_root = state.worktree_path.as_deref().unwrap_or(project_root);
-    crate::verify::external_verify_commands(execution_root, state.phase)
+    let commands = crate::verify::external_verify_commands(execution_root, state.phase);
+    if commands.is_empty() {
+        return None;
+    }
+    let Some(approved_commands) = approved_commands else {
+        return Some(AgentResult {
+            status: AgentStatus::Failed,
+            exit_code: None,
+            reason: Some(format!(
+                "external verification is not approved; set {} to the reviewed JSON command array",
+                crate::verify::TRUST_EXTERNAL_VERIFY_ENV
+            )),
+            commits: None,
+            summary: None,
+            verdict: None,
+        });
+    };
+    if commands != approved_commands {
+        return Some(AgentResult {
+            status: AgentStatus::Failed,
+            exit_code: None,
+            reason: Some("external verification approval mismatch; PLAN commands changed".into()),
+            commits: None,
+            summary: None,
+            verdict: None,
+        });
+    }
+    commands
         .into_iter()
         .find(|command| !crate::verify::run_external_verification(command, execution_root))
         .map(|command| AgentResult {
@@ -658,22 +686,18 @@ pub fn evaluate_agent_result(
     state: &State,
     git_flow: &GitFlowConfig,
 ) -> Result<AgentResult, ResultError> {
-    evaluate_agent_result_inner(
-        project_root,
-        state,
-        git_flow,
-        crate::verify::external_verification_trusted(),
-    )
+    let approval = crate::verify::external_verification_approval();
+    evaluate_agent_result_inner(project_root, state, git_flow, approval.as_deref())
 }
 
 fn evaluate_agent_result_inner(
     project_root: &Path,
     state: &State,
     git_flow: &GitFlowConfig,
-    external_verify_trusted: bool,
+    approved_commands: Option<&[String]>,
 ) -> Result<AgentResult, ResultError> {
     // Layer 0: operator-authored external post-condition (authoritative failure)
-    if let Some(result) = evaluate_layer0(project_root, state, external_verify_trusted) {
+    if let Some(result) = evaluate_layer0(project_root, state, approved_commands) {
         return Ok(result);
     }
 
@@ -1306,9 +1330,14 @@ mod tests {
         .unwrap();
         let state = state_in(dir.path(), 16);
 
-        let result =
-            evaluate_agent_result_inner(dir.path(), &state, &GitFlowConfig::default(), true)
-                .unwrap();
+        let approval = vec!["test -f externally-shipped".to_string()];
+        let result = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approval),
+        )
+        .unwrap();
 
         assert_eq!(result.status, AgentStatus::Failed);
         assert!(
@@ -1340,22 +1369,61 @@ mod tests {
         state.worktree_path = Some(worktree.clone());
         state.stage = Stage::Plan;
 
-        let plan_result =
-            evaluate_agent_result_inner(dir.path(), &state, &GitFlowConfig::default(), true)
-                .unwrap();
+        let approval = vec!["test -f implemented".to_string()];
+        let plan_result = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approval),
+        )
+        .unwrap();
         assert_eq!(plan_result.status, AgentStatus::Success);
 
         state.stage = Stage::Code;
-        let code_result =
-            evaluate_agent_result_inner(dir.path(), &state, &GitFlowConfig::default(), true)
-                .unwrap();
+        let code_result = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approval),
+        )
+        .unwrap();
         assert_eq!(code_result.status, AgentStatus::Failed);
 
         std::fs::write(worktree.join("implemented"), "done").unwrap();
-        let passing =
-            evaluate_agent_result_inner(dir.path(), &state, &GitFlowConfig::default(), true)
-                .unwrap();
+        let passing = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approval),
+        )
+        .unwrap();
         assert_eq!(passing.status, AgentStatus::Success);
+    }
+
+    #[test]
+    fn changed_external_probe_never_inherits_prior_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase_dir = dir.path().join(".planning/phases/16-reliability");
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        std::fs::write(
+            phase_dir.join("16-01-PLAN.md"),
+            "---\nexternal_verify: \"touch escaped\"\n---\n",
+        )
+        .unwrap();
+        let state = state_in(dir.path(), 16);
+        let approved = vec!["test -f reviewed-artifact".to_string()];
+
+        let result = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approved),
+        )
+        .unwrap();
+
+        assert_eq!(result.status, AgentStatus::Failed);
+        assert!(result.reason.unwrap().contains("approval mismatch"));
+        assert!(!dir.path().join("escaped").exists());
     }
 
     #[test]

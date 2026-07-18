@@ -6,15 +6,18 @@
 
 use std::path::{Path, PathBuf};
 
-/// Explicit operator-owned trust gate for executing PLAN-declared shell.
+/// Explicit operator-owned approval for executing PLAN-declared shell.
 pub const TRUST_EXTERNAL_VERIFY_ENV: &str = "DEVFLOW_TRUST_EXTERNAL_VERIFY";
 
-/// PLAN files are agent-writable, so enabling the feature in repository
-/// configuration is not sufficient authorization to execute their shell.
-pub fn external_verification_trusted() -> bool {
-    std::env::var(TRUST_EXTERNAL_VERIFY_ENV)
-        .ok()
-        .is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true"))
+/// Return the exact command bytes approved by the operator.
+///
+/// The value is a JSON string array. Comparing it to the commands reread
+/// after Code closes the review-to-execution TOCTOU: a modified PLAN fails
+/// closed instead of inheriting a blanket boolean authorization.
+pub fn external_verification_approval() -> Option<Vec<String>> {
+    let value = std::env::var(TRUST_EXTERNAL_VERIFY_ENV).ok()?;
+    let commands = serde_json::from_str::<Vec<String>>(&value).ok()?;
+    (!commands.is_empty()).then_some(commands)
 }
 
 /// Return external verification commands declared by this phase's plans.
@@ -91,7 +94,7 @@ fn command_from_frontmatter(contents: &str) -> Option<String> {
 ///
 /// `sh -c` is intentional because probes may contain pipelines. The caller
 /// must source `cmd` from [`external_verify_commands`] and first require
-/// [`external_verification_trusted`]. Spawn failures and non-zero exits fail
+/// [`external_verification_approval`]. Spawn failures and non-zero exits fail
 /// closed.
 pub fn run_external_verification(cmd: &str, project_root: &Path) -> bool {
     std::process::Command::new("sh")

@@ -133,8 +133,9 @@ external_verify_enabled = true
 ```
 
 PLAN-declared verification shell is agent-writable and requires explicit
-operator authorization: set `DEVFLOW_TRUST_EXTERNAL_VERIFY=1` only after
-reviewing the declared commands.
+operator authorization bound to the reviewed bytes, for example
+`DEVFLOW_TRUST_EXTERNAL_VERIFY='["test -f shipped.txt"]'`. Changed commands
+fail closed without execution.
 
 Key flags:
 

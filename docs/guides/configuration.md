@@ -38,7 +38,7 @@ environment variables, not config file fields:
 | `DEVFLOW_CAPTURE_RETENTION` | 5 | Override capture generations retained per phase |
 | `DEVFLOW_REVIEW_ANGLES` | built-in list | Override Ship review angles with a comma-separated list |
 | `DEVFLOW_EXTERNAL_VERIFY_ENABLED` | true | Enable or disable PLAN-declared external probes |
-| `DEVFLOW_TRUST_EXTERNAL_VERIFY` | unset | Explicitly authorize (`1`/`true`) execution of agent-writable PLAN probe shell; required in addition to enabling probes |
+| `DEVFLOW_TRUST_EXTERNAL_VERIFY` | unset | Exact reviewed PLAN probe commands as a JSON string array; required in addition to enabling probes |
 | `RUST_LOG` | `info` | Log verbosity (stderr) |
 | `DEVFLOW_LOG_FORMAT` | plain text | Set to `json` for machine-readable log lines |
 
@@ -48,9 +48,10 @@ never interpolated into the command string — the notify command itself is
 still `sh -c`-evaluated, so treat it like any other shell command you control.
 
 PLAN files can be written by an agent. DevFlow therefore never executes an
-`external_verify` command unless the parent DevFlow process was started with
-`DEVFLOW_TRUST_EXTERNAL_VERIFY=1`; only set it after reviewing the declared
-probe commands.
+`external_verify` command unless the parent DevFlow process receives the exact
+reviewed commands, for example
+`DEVFLOW_TRUST_EXTERNAL_VERIFY='["test -f shipped.txt"]'`. If PLAN command
+bytes change after review, evaluation fails closed without executing them.
 
 ## Git-flow branch names
 

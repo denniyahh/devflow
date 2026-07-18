@@ -612,7 +612,7 @@ fn start(
             "worktree": state.worktree_path.as_ref().map(|p| p.display().to_string()),
         }),
     );
-    if let Err(err) = launch_stage(&state, None) {
+    if let Err(err) = launch_stage(&state, None, None) {
         if let Err(clear_err) = workflow::clear_state(project_root, phase) {
             eprintln!("warning: could not clear state after failed launch: {clear_err}");
         }
@@ -689,7 +689,11 @@ fn ensure_agent_binary(program: &str) -> Result<(), CliError> {
 /// Spawn the background monitor that owns the agent for `state.stage`. The
 /// monitor calls `devflow advance` when the agent exits. An optional
 /// `prompt_override` is used for Code loop-backs (fix prompts).
-fn launch_stage(state: &State, prompt_override: Option<String>) -> Result<(), CliError> {
+fn launch_stage(
+    state: &State,
+    prompt_override: Option<String>,
+    archived_stage: Option<Stage>,
+) -> Result<(), CliError> {
     let prompt = prompt_override.unwrap_or_else(|| {
         prompt::stage_prompt_for_project(state.stage, state.phase, &state.project_root)
     });
@@ -725,7 +729,11 @@ fn launch_stage(state: &State, prompt_override: Option<String>) -> Result<(), Cl
             &state.project_root,
             state.phase,
             "capture_archived",
-            serde_json::json!({"stage": state.stage.to_string(), "stamp": stamp}),
+            serde_json::json!({
+                "stage": archived_stage.unwrap_or(state.stage).to_string(),
+                "to_stage": state.stage.to_string(),
+                "stamp": stamp,
+            }),
         );
     }
     let pid = monitor::spawn_monitor(state, program, &args, &adapter.extra_env())
@@ -967,7 +975,7 @@ fn handle_stage_failure(
             // the retry cannot silently consume the prior response.
             let _ = Gates::cleanup(project_root, state.phase, stage);
             state.gate_pending = false;
-            launch_stage(state, None)
+            launch_stage(state, None, Some(stage))
         }
         GateAction::LoopBack(_) => {
             // Retry the SAME failed stage — Code is not a valid recovery
@@ -975,7 +983,7 @@ fn handle_stage_failure(
             // (Codex 13-01 MEDIUM). Only Ship's ReviewFailed path (handled
             // separately in `handle_ship_failure`) actually loops to Code.
             let _ = Gates::cleanup(project_root, state.phase, stage);
-            launch_stage(state, None)
+            launch_stage(state, None, Some(stage))
         }
         GateAction::Abort(reason) => abort(project_root, state, &reason),
     }
@@ -1116,14 +1124,15 @@ fn transition(project_root: &Path, state: &mut State, to: Stage) -> Result<(), C
             "to": to.to_string(),
         }),
     );
-    launch_stage(state, None)
+    launch_stage(state, None, Some(from))
 }
 
 /// Loop the pipeline back to Code with the given fix prompt (`GapsOnly` for a
 /// Validate rejection, `AuditFix` for a Ship `review:` rejection).
 fn loop_back_to_code(project_root: &Path, state: &mut State, fix: FixType) -> Result<(), CliError> {
+    let from = state.stage;
     let prompt = prepare_loop_back_to_code(project_root, state, fix)?;
-    launch_stage(state, Some(prompt))
+    launch_stage(state, Some(prompt), Some(from))
 }
 
 /// The state-mutating half of `loop_back_to_code`, split out so it's
@@ -1163,11 +1172,27 @@ fn prepare_loop_back_to_code(
 
 /// Run the terminal hooks (version bump + branch cleanup) and clear state.
 fn finish_workflow(project_root: &Path, state: &mut State) -> Result<(), CliError> {
-    if !run_checkout_hooks(project_root, state, &hooks::hooks_after_ship(), Stage::Ship) {
-        return Err(CliError::Message(format!(
-            "phase {} was not finalized: terminal hooks failed; state was preserved for retry",
+    loop {
+        if run_checkout_hooks(project_root, state, &hooks::hooks_after_ship(), Stage::Ship) {
+            break;
+        }
+        // The original Ship approval has already been consumed. Reopen an
+        // actionable gate and keep this monitor waiting so a terminal-hook
+        // failure cannot turn into an invisible stalled Ship state.
+        let _ = Gates::cleanup(project_root, state.phase, Stage::Ship);
+        let context = format!(
+            "[finalization failed] phase {} terminal hooks did not complete. Resolve the git/version error, then approve to retry; reject to loop back or abort.",
             state.phase
-        )));
+        );
+        match run_gate(project_root, state, Stage::Ship, &context)? {
+            GateAction::Advance => {
+                let _ = Gates::cleanup(project_root, state.phase, Stage::Ship);
+            }
+            GateAction::LoopBack(_) => {
+                return loop_back_to_code(project_root, state, FixType::AuditFix);
+            }
+            GateAction::Abort(reason) => return abort(project_root, state, &reason),
+        }
     }
     let _ = Gates::cleanup(project_root, state.phase, Stage::Validate);
     let _ = Gates::cleanup(project_root, state.phase, Stage::Ship);
@@ -3066,7 +3091,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_merge_failure_preserves_state_and_never_reports_finished() {
+    fn terminal_merge_failure_reopens_actionable_gate_and_never_reports_finished() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
@@ -3091,10 +3116,37 @@ mod tests {
         state.stage = Stage::Ship;
         workflow::save_state(&state).unwrap();
 
-        let error = finish_workflow(root, &mut state).unwrap_err().to_string();
+        let root_owned = root.to_path_buf();
+        let handle = std::thread::spawn(move || {
+            let mut state = workflow::load_state(&root_owned, 22).unwrap();
+            finish_workflow(&root_owned, &mut state)
+        });
+        let gate_path = Gates::gate_path(root, 22, Stage::Ship);
+        for _ in 0..100 {
+            if gate_path.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
 
-        assert!(error.contains("terminal hooks failed"));
-        assert!(workflow::load_state(root, 22).is_ok());
+        assert!(
+            gate_path.exists(),
+            "finalization failure must reopen Ship gate"
+        );
+        assert!(workflow::load_state(root, 22).unwrap().gate_pending);
+        Gates::respond(
+            root,
+            22,
+            Stage::Ship,
+            &GateResponse {
+                approved: false,
+                note: Some("abort after merge conflict".into()),
+                responded_by: Some("test".into()),
+            },
+        )
+        .unwrap();
+        handle.join().unwrap().unwrap();
+
         assert_ne!(
             events::last_event_for_phase(root, 22)
                 .and_then(|event| event["event"].as_str().map(str::to_owned))
