@@ -143,7 +143,7 @@ Plans:
 **Requirements**: 16a, 16b, 16c, 16d, 16e, 16f, 16g, 16h, 16i, 16j, 16k (scope items — no formal REQ-IDs; binding decisions D-01…D-09 in 16-CONTEXT.md)
 **UI hint**: no
 **Depends on:** Phase 15 (surfaced entirely by dogfooding it)
-**Plans:** 5/7 plans executed
+**Plans:** 6/7 plans executed
 
 Plans:
 
@@ -160,7 +160,7 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2: shares main.rs)*
 
-- [ ] 16-06-PLAN.md — 16f/16g: shared project-root walk-up resolver + gate positional-arg footgun fix + legacy-state WARN recover hint
+- [x] 16-06-PLAN.md — 16f/16g: shared project-root walk-up resolver + gate positional-arg footgun fix + legacy-state WARN recover hint
 
 **Wave 4** *(blocked on Wave 3: shares main.rs; correlates 16b history)*
 
