@@ -39,7 +39,7 @@ pub fn state_path(project_root: &Path, phase: u32) -> PathBuf {
 }
 
 /// Path of the legacy single-slot state file written by pre-14a binaries.
-fn legacy_state_path(project_root: &Path) -> PathBuf {
+pub(crate) fn legacy_state_path(project_root: &Path) -> PathBuf {
     devflow_dir(project_root).join("state.json")
 }
 

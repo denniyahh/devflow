@@ -71,7 +71,7 @@ pub fn cron_instructions_path(project_root: &Path, phase: u32) -> PathBuf {
 
 /// Path of the legacy single-slot record written by pre-14a binaries. Still
 /// read/deleted for compatibility; never written.
-fn legacy_cron_instructions_path(project_root: &Path) -> PathBuf {
+pub(crate) fn legacy_cron_instructions_path(project_root: &Path) -> PathBuf {
     project_root.join(".devflow").join("cron-instructions.json")
 }
 
