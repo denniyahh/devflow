@@ -1947,6 +1947,32 @@ mod tests {
         assert_eq!(result.exit_code, None);
         assert_eq!(result.commits, Some(1));
         assert!(result.reason.unwrap().contains("1 commits"));
+        assert_eq!(result.decided_by_layer, Some(3));
+    }
+
+    /// D-02/D-03 case 3 (17-03): "process gone, nothing accounted for" — zero
+    /// commits and no declared external post-condition — is a fail-closed
+    /// `Failed` outcome that flags human review, not a blanket advanceable
+    /// `Unknown`. The commits-present case above stays `Unknown` (gated
+    /// downstream by Plan 04's never-advance dispatch, D-04) — only the
+    /// zero-commit sub-case is reclassified here.
+    #[test]
+    fn evaluate_layer3_zero_commits_is_failed_and_flags_human_review() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo_with_feature_no_commit(dir.path(), 5);
+
+        let result = evaluate_layer3(dir.path(), 5, &GitFlowConfig::default()).unwrap();
+
+        assert_eq!(result.status, AgentStatus::Failed);
+        assert_eq!(result.exit_code, None);
+        assert_eq!(result.commits, Some(0));
+        assert_eq!(result.decided_by_layer, Some(3));
+        let reason = result.reason.unwrap();
+        assert!(reason.contains("no work"), "reason was: {reason}");
+        assert!(
+            reason.to_ascii_lowercase().contains("human review"),
+            "reason was: {reason}"
+        );
     }
 
     #[test]
