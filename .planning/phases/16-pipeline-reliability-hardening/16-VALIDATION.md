@@ -3,8 +3,8 @@ phase: 16
 slug: pipeline-reliability-hardening
 # status lifecycle: draft (seeded by plan-phase) → validated (set by validate-phase §6)
 # audit-milestone §5.5 distinguishes NOT-VALIDATED (draft) from PARTIAL (validated + nyquist_compliant: false) (#2117)
-status: draft
-nyquist_compliant: true
+status: validated
+nyquist_compliant: false
 wave_0_complete: false
 created: 2026-07-17
 ---
@@ -40,26 +40,25 @@ created: 2026-07-17
 
 | Task ID | Plan | Wave | Requirement | Threat Ref | Secure Behavior | Test Type | Automated Command | File Exists | Status |
 |---------|------|------|-------------|------------|-----------------|-----------|-------------------|-------------|--------|
-| 16-01-01 | 01 | 1 | 16k | T-16-01 | Terminal path truthfully merges (no false-success signal) | unit | `cargo test -p devflow-core hooks::` | ✅ extend | ⬜ pending |
-| 16-01-02 | 01 | 1 | 16k | T-16-02 | VersionBump tags post-merge develop (no wrong-checkout tamper) | integration | `cargo test -p devflow-core hooks::tests` | ✅ extend | ⬜ pending |
-| 16-01-03 | 01 | 1 | 16k | T-16-04 | Corrupted CHANGELOG/tag history removed | repo-check | `test -z "$(rg -c 'Released phase via DevFlow' CHANGELOG.md)" && git tag -l \| sort -V` | ✅ repo file | ⬜ pending |
-| 16-02-00 | 02 | 1 | 16a,16b,16d,16e | T-16-SC | Package legitimacy verified before install (supply-chain tamper) | manual | MANUAL — blocking-human: crates.io repo/age/downloads + exact pin + no typosquat (non-auto-approvable) | N/A manual | ⬜ pending |
-| 16-02-01 | 02 | 1 | 16a,16b,16d,16e | T-16-SC | toml pin confirmed; config loader fail-soft | unit | `cargo test -p devflow-core config:: && cargo clippy -p devflow-core -- -D warnings` | ✅ extend | ⬜ pending |
-| 16-02-02 | 02 | 1 | 16a,16b,16d,16e | T-16-06 | env>file>default precedence; malformed→default (no DoS abort) | unit | `cargo test -p devflow-core config::` | ✅ extend | ⬜ pending |
-| 16-03-01 | 03 | 2 | 16b | T-16-11 / T-16-12 | Capture retained not wiped + bounded (no telemetry loss / disk DoS) | unit | `cargo test -p devflow-core agent_result::` | ✅ extend/replace | ⬜ pending |
-| 16-03-02 | 03 | 2 | 16a | T-16-09 / T-16-10 | Layer-0 outranks self-report; cmd source PLAN.md-only (no injection) | unit | `cargo test -p devflow-core verify:: && cargo test -p devflow-core agent_result::evaluate` | ❌ W0 (verify.rs new) | ⬜ pending |
-| 16-04-01 | 04 | 2 | 16d | T-16-14 / T-16-15 | Multi-angle review (no missed defect); harness-agnostic | unit (snapshot) | `cargo test -p devflow-core prompt::` | ✅ extend | ⬜ pending |
-| 16-04-02 | 04 | 2 | 16e | T-16-16 | Advisory non-blocking self-review (no headless halt) | unit (snapshot) | `cargo test -p devflow-core prompt::` | ✅ extend | ⬜ pending |
-| 16-05-01 | 05 | 2 | 16i | T-16-18 | Source-derived gitignore invariant (no telemetry leak) | unit | `cargo test -p devflow-core doc_check::gitignore` | ❌ W0 (doc_check.rs new) | ⬜ pending |
-| 16-05-02 | 05 | 2 | 16c | T-16-19 / T-16-20 / T-16-21 | Doc/source drift caught; no eval of doc content; reason-required allowlist | unit | `cargo test -p devflow-core doc_check::` | ❌ W0 (doc_check.rs new) | ⬜ pending |
-| 16-06-01 | 06 | 3 | 16f | T-16-22 / T-16-24 | Walk-up returns nearest `.devflow/` ancestor (no wrong-target/loop) | unit | `cargo test -p devflow project_root` | ❌ W0 (new main.rs test) | ⬜ pending |
-| 16-06-02 | 06 | 3 | 16g | T-16-23 / T-16-25 | Gate footgun actionable (no silent swallow); WARN hints recover | unit | `cargo test -p devflow gate_approve && cargo test -p devflow-core migrate_legacy_state` | ⚠ partial (legacy test exists, footgun new) | ⬜ pending |
-| 16-07-01 | 07 | 4 | 16j | T-16-26 / T-16-27 | Persistent banner independent of notify exit; `truncate_reason` (no flood) | unit | `cargo test -p devflow status` | ⚠ partial (status tests exist, banner new) | ⬜ pending |
-| 16-07-02 | 07 | 4 | 16h | T-16-28 / T-16-29 | Cross-attempt timeline; read-only correlation (no new store) | unit | `cargo test -p devflow-core history:: && cargo build -p devflow` | ❌ W0 (history.rs new) | ⬜ pending |
+| 16-01-01 | 01 | 1 | 16k | T-16-01 | Terminal path truthfully merges (no false-success signal) | unit | `cargo test -p devflow-core hooks::` | ✅ extend | ✅ green |
+| 16-01-02 | 01 | 1 | 16k | T-16-02 | VersionBump tags post-merge develop (no wrong-checkout tamper) | integration | `cargo test -p devflow-core hooks::tests` | ✅ extend | ✅ green |
+| 16-01-03 | 01 | 1 | 16k | T-16-04 | Corrupted CHANGELOG/tag history removed | repo-check | `test -z "$(rg -c 'Released phase via DevFlow' CHANGELOG.md)" && git tag -l \| sort -V` | ✅ repo file | ✅ green |
+| 16-02-00 | 02 | 1 | 16a,16b,16d,16e | T-16-SC | Package legitimacy verified before install (supply-chain tamper) | manual | MANUAL — blocking-human: crates.io repo/age/downloads + exact pin + no typosquat (non-auto-approvable) | N/A manual | ✅ approved |
+| 16-02-01 | 02 | 1 | 16a,16b,16d,16e | T-16-SC | toml pin confirmed; config loader fail-soft | unit | `cargo test -p devflow-core config:: && cargo clippy -p devflow-core -- -D warnings` | ✅ extend | ✅ green |
+| 16-02-02 | 02 | 1 | 16a,16b,16d,16e | T-16-06 | env>file>default precedence; malformed→default (no DoS abort) | unit | `cargo test -p devflow-core config::` | ✅ extend | ✅ green |
+| 16-03-01 | 03 | 2 | 16b | T-16-11 / T-16-12 | Capture retained not wiped + bounded (no telemetry loss / disk DoS) | unit | `cargo test -p devflow-core agent_result::` | ✅ uncommitted | ⚠ partial |
+| 16-03-02 | 03 | 2 | 16a | T-16-09 / T-16-10 | Layer-0 outranks self-report; cmd source PLAN.md-only (no injection) | unit | `cargo test -p devflow-core verify:: && cargo test -p devflow-core agent_result::evaluate` | ❌ missing | ❌ red |
+| 16-04-01 | 04 | 2 | 16d | T-16-14 / T-16-15 | Multi-angle review (no missed defect); harness-agnostic | unit (snapshot) | `cargo test -p devflow-core prompt::` | ❌ behavior missing | ❌ red |
+| 16-04-02 | 04 | 2 | 16e | T-16-16 | Advisory non-blocking self-review (no headless halt) | unit (snapshot) | `cargo test -p devflow-core prompt::` | ❌ behavior missing | ❌ red |
+| 16-05-01 | 05 | 2 | 16i | T-16-18 | Source-derived gitignore invariant (no telemetry leak) | unit | `cargo test -p devflow-core doc_check::gitignore` | ❌ missing | ❌ red |
+| 16-05-02 | 05 | 2 | 16c | T-16-19 / T-16-20 / T-16-21 | Doc/source drift caught; no eval of doc content; reason-required allowlist | unit | `cargo test -p devflow-core doc_check::` | ❌ missing | ❌ red |
+| 16-06-01 | 06 | 3 | 16f | T-16-22 / T-16-24 | Walk-up returns nearest `.devflow/` ancestor (no wrong-target/loop) | unit | `cargo test -p devflow project_root` | ❌ behavior missing | ❌ red |
+| 16-06-02 | 06 | 3 | 16g | T-16-23 / T-16-25 | Gate footgun actionable (no silent swallow); WARN hints recover | unit | `cargo test -p devflow gate_approve && cargo test -p devflow-core migrate_legacy_state` | ❌ behavior missing | ❌ red |
+| 16-07-01 | 07 | 4 | 16j | T-16-26 / T-16-27 | Persistent banner independent of notify exit; `truncate_reason` (no flood) | unit | `cargo test -p devflow status` | ❌ behavior missing | ❌ red |
+| 16-07-02 | 07 | 4 | 16h | T-16-28 / T-16-29 | Cross-attempt timeline; read-only correlation (no new store) | unit | `cargo test -p devflow-core history:: && cargo build -p devflow` | ❌ missing | ❌ red |
 
-*Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
-*File Exists: ✅ = test module exists (TDD extends it) · ❌ W0 = new module/test authored in the owning task's TDD RED step · ⚠ partial = module exists, the new behavior's assertions are net-new · N/A manual = blocking-human checkpoint, no code test*
-*All code-producing tasks are `tdd="true"`; each task's RED step authors its failing test before implementation, so the "❌ W0" rows are discharged inline by their owning task, not by a separate Wave 0 plan.*
+*Status: ✅ green/approved · ⚠ partial · ❌ red*
+*File Exists: ✅ = behavioral test exists · ✅ uncommitted = test passes in the dirty worktree but delivery is incomplete · ❌ = required behavior or test module is absent · N/A manual = blocking-human checkpoint, no code test*
 
 ---
 
@@ -70,8 +69,8 @@ New test infrastructure required before the corresponding task can go green (eac
 - [ ] `crates/devflow-core/src/verify.rs` — new module + tests (16a) — 16-03 Task 2 RED
 - [ ] `crates/devflow-core/src/doc_check.rs` + `doc-check-allowlist.toml` — new module + tests + allowlist format (16c / 16i) — 16-05 Tasks 1 & 2 RED
 - [ ] `crates/devflow-core/src/history.rs` — new module + tests (16h) — 16-07 Task 2 RED
-- [ ] Extended `crates/devflow-core/src/hooks.rs` test module — merge-inclusive assertion replacing `after_ship_runs_version_and_cleanup` (16k) — 16-01
-- [ ] Extended `crates/devflow-core/src/agent_result.rs` test — retention assertion replacing the delete-on-cleanup test (16b) — 16-03 Task 1
+- [x] Extended `crates/devflow-core/src/hooks.rs` test module — merge-inclusive assertion replacing `after_ship_runs_version_and_cleanup` (16k) — 16-01
+- [x] Extended `crates/devflow-core/src/agent_result.rs` test — retention assertion replacing the delete-on-cleanup test (16b) — present and green in the dirty worktree; Plan 16-03 delivery remains incomplete
 - [ ] New `crates/devflow-cli/src/main.rs` tests — `project_root_walks_up` (16f), `gate_approve_arg_parsing` (16g), and the pending-gate banner helper (16j) — 16-06 / 16-07
 - **Framework install: none** — `cargo test` is already fully configured; CI runs it directly. No new test framework or dependency (the one new dependency, `toml`, is production code, not test infra, and is gated by 16-02's blocking-human legitimacy checkpoint).
 
@@ -81,7 +80,7 @@ New test infrastructure required before the corresponding task can go green (eac
 
 ## Manual-Only Verifications
 
-Every task's *mechanism* has automated coverage (see the map above). The following *outcomes* additionally warrant a manual smoke in a live run — the plans call for them and require the result recorded in the plan SUMMARY. They supplement, not replace, the automated tests.
+The following outcomes additionally warrant a manual smoke after their missing implementations and automated tests land. They supplement, not replace, the automated tests.
 
 | Behavior | Requirement | Why Manual | Test Instructions |
 |----------|-------------|------------|-------------------|
@@ -93,13 +92,40 @@ Every task's *mechanism* has automated coverage (see the map above). The followi
 
 ---
 
+## Escalated Validation Gaps
+
+| Requirement | State | Evidence / Required Follow-up |
+|-------------|-------|-------------------------------|
+| 16a | missing | No `verify.rs`, PLAN.md-only command parser, or Layer-0 precedence behavior; complete 16-03 Task 2. |
+| 16b | partial | Archive survival and bounded-retention tests pass, but the implementation/test edits are uncommitted and `16-03-SUMMARY.md` is absent. |
+| 16d | missing | Ship prompt remains a single general review; add multi-angle capability-conditional review plus config override snapshots in 16-04. |
+| 16e | missing | Code prompt remains the unchanged single-command template; add advisory incremental self-review coverage in 16-04. |
+| 16i | missing | Existing `gitignore_coverage.rs` hardcodes three paths and misses `.devflow/history/`; add the source-derived invariant in 16-05. |
+| 16c | missing | No deterministic bidirectional doc checker, pinned claims, or reason-required allowlist; complete 16-05. |
+| 16f | failing | Nested-directory `devflow status` resolves the nested directory and reports `idle`; implement the shared ancestor walk-up resolver in 16-06. |
+| 16g | failing | `devflow gate approve 15 ship` treats `ship` as a project path, and the legacy-state warning lacks the recover hint; complete 16-06. |
+| 16j | missing | Status only renders `gate: pending`; add the persistent escalating, truncation-safe banner in 16-07. |
+| 16h | missing | No `history.rs`, timeline correlator, or CLI history surface; complete 16-07. |
+
+---
+
 ## Validation Sign-Off
 
 - [x] All tasks have `<automated>` verify or Wave 0 dependencies — the sole exception, 16-02-00, is a blocking-human package-legitimacy checkpoint (a gate, not a code-producing task)
 - [x] Sampling continuity: no 3 consecutive tasks without automated verify — only 16-02-00 lacks one, isolated between automated tasks
-- [x] Wave 0 covers all MISSING references — no `MISSING` sentinels in any `<automated>`; the new modules (verify.rs, doc_check.rs, history.rs) are authored in their owning TDD task's RED step and listed under Wave 0 Requirements
+- [ ] Wave 0 covers all MISSING references — `verify.rs`, `doc_check.rs`, `history.rs`, and the planned CLI tests are still absent
 - [x] No watch-mode flags — every command is one-shot `cargo test`; no `--watch`
 - [x] Feedback latency < 90s — full CI-parity run incl. compile
-- [x] `nyquist_compliant: true` set in frontmatter
+- [ ] `nyquist_compliant: true` set in frontmatter — audit found unresolved gaps
 
-**Approval:** pending
+**Approval:** partial — audited 2026-07-17
+
+## Validation Audit 2026-07-17
+
+| Metric | Count |
+|--------|-------|
+| Gaps found | 10 |
+| Resolved | 1 (behavior covered; delivery incomplete) |
+| Escalated | 9 |
+
+Full-suite evidence: `cargo test --workspace` passed with 284 tests. No new test files were generated because the remaining gaps are absent implementation, not uncovered completed behavior.
