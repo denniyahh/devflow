@@ -20,7 +20,7 @@ progress:
 ## Active
 
 - **Phase 15 (15a Complete / 15b Scoped):** Dogfood Enablement + OSS Readiness — rescoped 2026-07-16 dogfood-first. 15a COMPLETE: `devflow gate list/approve/reject`, OPERATIONS.md, `.devflow.yaml` decoy removed, lib.rs examples fixed, `--help` snapshot guard; exit criterion verified live (full phase, gate answered only via CLI). 15b: OSS packaging (README/ARCHITECTURE/CONTRIBUTING/devcontainer/crates.io publish), to be run through DevFlow as the first post-MVP dogfood — `devflow start --phase 15 --agent claude --mode auto`. Antigravity adapter deferred to unscheduled backlog
-- **Phase 16 (In Progress — 1/7 plans):** Pipeline Reliability Hardening — 16-01 closed the terminal Ship false positive by merging before versioning, emitting truthful merge/no-op telemetry, and cleaning the corrupted release history. Next up: 16-02 minimal `devflow.toml` configuration foundation.
+- **Phase 16 (In Progress — 2/7 plans):** Pipeline Reliability Hardening — 16-01 closed the terminal Ship false positive; 16-02 added the minimal typed `devflow.toml` foundation with tested env > file > default resolvers. Next up: 16-03 external verification and retained capture history.
 - **Phase 17 (Scoped):** Hermes Support — renumbered from 16 to 17 (2026-07-17) to make room for Phase 16. HermesAgent adapter, skill-file rewrite, Hermes plugin. Depends on Phase 14's events.jsonl + Phase 13's notify hook
 
 ## Completed
