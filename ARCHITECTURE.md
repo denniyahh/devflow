@@ -125,7 +125,8 @@ When an agent exits, `evaluate_agent_result()`
 four layers, tried in order:
 
 0. **Layer 0 — external post-condition (authoritative failure).** Commands
-   declared as `external_verify` in operator-authored PLAN frontmatter run
+   declared as `external_verify` in PLAN frontmatter run only after exact
+   command-array approval through `DEVFLOW_TRUST_EXTERNAL_VERIFY`; they run
    before agent-controlled signals. A failure returns `Failed`; success or
    no declaration defers to the ordinary cascade.
 1. **Layer 1 — `DEVFLOW_RESULT` marker (authoritative for ordinary plans).** Parses the

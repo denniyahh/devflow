@@ -79,7 +79,7 @@ DevFlow evaluates agent output in four layers:
 
 | Layer | Method | Authority |
 |---|---|---|
-| 0. External verification | Run operator-authored `external_verify` commands declared in PLAN frontmatter | Authoritative failure |
+| 0. External verification | Run PLAN-frontmatter `external_verify` commands only when they exactly match the operator-approved JSON command array | Authoritative failure |
 | 1. Marker | Parse `DEVFLOW_RESULT` JSON from stdout | Authoritative for ordinary plans |
 | 2. Exit code + commits | Exit 0 **and** commits on the feature branch = success; otherwise failed | Fallback |
 | 3. Commit heuristic | Exit code unknown: commits exist = probable success (with warning) | Last resort |

@@ -17,7 +17,7 @@ affects: [16-05, 16-06, 16-07, completion-evaluation, operator-forensics]
 tech-stack:
   added: []
   patterns:
-    - operator-authored PLAN frontmatter as the sole shell-command trust boundary
+    - PLAN frontmatter plus exact operator-approved command bytes as the shell-command trust boundary
     - fail-closed Layer 0 before agent-controlled completion signals
     - bounded timestamped capture generations under .devflow/history
 
@@ -36,7 +36,7 @@ key-decisions:
   - "Capture generations use {unix-nanoseconds}-{process-sequence}-{stdout|exit}; the built-in retention default is 5."
 
 patterns-established:
-  - "External-only work declares external_verify: \"<shell command>\" in operator-authored PLAN frontmatter."
+  - "External-only work declares external_verify in PLAN frontmatter; execution requires an exact matching DEVFLOW_TRUST_EXTERNAL_VERIFY JSON command array."
   - "Runtime captures rotate to .devflow/history/phase-NN/ before the next stage starts."
 
 requirements-completed: [16a, 16b]
@@ -92,6 +92,7 @@ status: complete
 
 - Added `external_verify: "<shell command>"` PLAN-frontmatter discovery with an explicit PLAN-only trust boundary.
 - Prepended external verification failure as Layer 0 ahead of agent self-report, without changing ordinary-plan behavior.
+- Post-review hardening binds approval to exact command bytes, runs probes only after Code from the execution worktree, and fails closed on changed or removed declarations.
 - Replaced destructive capture cleanup with retention-configured archive rotation under `.devflow/history/phase-NN/`.
 
 ## Task Commits

@@ -93,6 +93,7 @@ status: complete
 - Reused `truncate_reason` before rendering gate context; external notify functions were not changed.
 - Added a schema-v1 event timeline correlated with timestamped capture generations and retained review artifacts.
 - Exposed the timeline as `devflow history [phase]` through the walk-up project resolver.
+- Post-review hardening emits exact archive-generation events, snapshots REVIEW.md with its generation, and refuses destructive rollover when archival fails.
 
 ## Task Commits
 
