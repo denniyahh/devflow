@@ -238,6 +238,40 @@ mod tests {
     }
 
     #[test]
+    fn ship_prompt_includes_multi_angle_conditional_review() {
+        let prompt = stage_prompt(Stage::Ship, 13);
+        for angle in [
+            "doc-accuracy cross-reference",
+            "security / leaked-data",
+            "CI/build correctness",
+            "external-state claims",
+            "generalist deep pass",
+        ] {
+            assert!(prompt.contains(angle), "Ship prompt missing angle: {angle}");
+        }
+        assert!(prompt.contains("parallel finder subagents"));
+        assert!(prompt.contains("focused sequential pass"));
+        assert!(prompt.contains("Merge and deduplicate"));
+        assert!(prompt.contains("REVIEW.md"));
+    }
+
+    #[test]
+    fn ship_prompt_uses_project_review_angle_override() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("devflow.toml"),
+            "review_angles = [\"custom release evidence\", \"custom threat boundary\"]\n",
+        )
+        .unwrap();
+
+        let prompt = stage_prompt_for_project(Stage::Ship, 13, dir.path());
+
+        assert!(prompt.contains("custom release evidence"));
+        assert!(prompt.contains("custom threat boundary"));
+        assert!(!prompt.contains("doc-accuracy cross-reference"));
+    }
+
+    #[test]
     fn code_stage_prompt_is_unchanged_single_command_template() {
         // Validate is excluded here (Task 2, 13-05): it now gets its own
         // dedicated prompt requiring a verdict — see
