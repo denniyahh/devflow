@@ -31,6 +31,7 @@ Define → Plan → Code → Validate → Ship
 | `devflow start --phase N --agent claude\|codex\|opencode --mode auto\|supervise [--force] [--no-worktree] [--dry-run]` | Begin a phase; a detached monitor owns the agent and auto-advances |
 | `devflow status` | All active phases: stage, gate state, agent liveness, elapsed, last action |
 | `devflow logs [-f] [--phase N] [--stderr]` | Print/follow a phase's captured agent output |
+| `devflow history [N]` | Show chronological events with retained capture and review evidence for a phase |
 | `devflow gate list` | Gates awaiting a response |
 | `devflow gate approve <phase> [--stage S] [--note ...]` | Approve a gate — the workflow advances |
 | `devflow gate reject <phase> --note ... [--stage S]` | Reject — loops back to Code; a note containing `abort` ends the phase |
@@ -84,6 +85,9 @@ only because a stage failed unexpectedly).
 | `DEVFLOW_GATE_NOTIFY_CMD` | unset | Shell command fired when a gate is written |
 | `DEVFLOW_GATE_TIMEOUT_SECS` | 604800 (7d) | How long a monitor waits at a gate before giving up |
 | `DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS` | 120 | Wait on the shared-checkout lock; on timeout the hook batch is skipped (loudly), never run unserialized |
+| `DEVFLOW_CAPTURE_RETENTION` | 5 | Capture generations retained per phase; overrides `devflow.toml` |
+| `DEVFLOW_REVIEW_ANGLES` | built-in five-angle list | Comma-separated Ship review angles; overrides `devflow.toml` |
+| `DEVFLOW_EXTERNAL_VERIFY_ENABLED` | true | Enable PLAN-declared external post-condition probes; overrides `devflow.toml` |
 | `RUST_LOG` | `info` | Log verbosity (stderr) |
 | `DEVFLOW_LOG_FORMAT` | plain | `json` for machine-readable log lines |
 
@@ -99,6 +103,7 @@ only because a stage failed unexpectedly).
 | `gates/NN-<stage>.json` (+ `.response.json`, `.ack.json`) | Gate request / answer / receipt |
 | `events.jsonl` | Append-only event log (schema v1, one JSON object per line, phase id on every line) — tail it from any tool |
 | `cron-instructions-NN.json` | Rate-limit resume record for a paused sequentagent run |
+| `history/phase-NN/` | Bounded archive of prior stage stdout/exit captures |
 
 Everything under `.devflow/` and `.worktrees/` is runtime state
 (git-ignored); `devflow recover --clean` is the sanctioned reset.

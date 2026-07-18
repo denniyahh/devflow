@@ -31,6 +31,7 @@ Thumbs.db
 .devflow/cron-instructions*.json
 .devflow/events.jsonl
 .devflow/gates/
+.devflow/history/
 
 # Git worktrees created by `devflow start --worktree` / `parallel` / `sequentagent`
 .worktrees/

@@ -1,8 +1,9 @@
 //! Agent completion detection — parses DEVFLOW_RESULT markers and evaluates
 //! exit codes to determine whether a coding agent succeeded or failed.
 //!
-//! Three-layer decision engine:
-//! 1. Parse DEVFLOW_RESULT from agent stdout (authoritative)
+//! Four-layer decision engine:
+//! 0. Run operator-authored external post-condition probes (authoritative failure)
+//! 1. Parse DEVFLOW_RESULT from agent stdout (authoritative for ordinary plans)
 //! 2. Exit code + commit count gate (reliable fallback)
 //! 3. Process gone + commits exist (last resort warning)
 
@@ -623,12 +624,92 @@ pub fn evaluate_layer3(
     })
 }
 
-/// Full three-layer evaluation: returns the best available AgentResult.
+/// Layer 0: run explicitly operator-approved external post-condition probes.
+///
+/// A failed probe outranks every agent-controlled signal. Successful probes
+/// defer to the existing Layer 1/2/3 cascade so ordinary completion evidence
+/// is still required. With no declarations (or when disabled), behavior is
+/// byte-for-byte the pre-Phase-16 cascade.
+fn evaluate_layer0(
+    project_root: &Path,
+    state: &State,
+    approved_commands: Option<&[String]>,
+) -> Option<AgentResult> {
+    if state.stage != Stage::Code || !crate::config::external_verify_enabled(project_root) {
+        return None;
+    }
+
+    let execution_root = state.worktree_path.as_deref().unwrap_or(project_root);
+    let commands = crate::verify::external_verify_commands(execution_root, state.phase);
+    if commands.is_empty() {
+        return approved_commands.map(|_| AgentResult {
+            status: AgentStatus::Failed,
+            exit_code: None,
+            reason: Some(
+                "external verification approval mismatch; PLAN declaration was removed".into(),
+            ),
+            commits: None,
+            summary: None,
+            verdict: None,
+        });
+    }
+    let Some(approved_commands) = approved_commands else {
+        return Some(AgentResult {
+            status: AgentStatus::Failed,
+            exit_code: None,
+            reason: Some(format!(
+                "external verification is not approved; set {} to the reviewed JSON command array",
+                crate::verify::TRUST_EXTERNAL_VERIFY_ENV
+            )),
+            commits: None,
+            summary: None,
+            verdict: None,
+        });
+    };
+    if commands != approved_commands {
+        return Some(AgentResult {
+            status: AgentStatus::Failed,
+            exit_code: None,
+            reason: Some("external verification approval mismatch; PLAN commands changed".into()),
+            commits: None,
+            summary: None,
+            verdict: None,
+        });
+    }
+    commands
+        .into_iter()
+        .find(|command| !crate::verify::run_external_verification(command, execution_root))
+        .map(|command| AgentResult {
+            status: AgentStatus::Failed,
+            exit_code: None,
+            reason: Some(format!("external verification failed: {command}")),
+            commits: None,
+            summary: None,
+            verdict: None,
+        })
+}
+
+/// Full four-layer evaluation: returns the best available AgentResult.
 pub fn evaluate_agent_result(
     project_root: &Path,
     state: &State,
     git_flow: &GitFlowConfig,
 ) -> Result<AgentResult, ResultError> {
+    let approval = crate::verify::external_verification_approval();
+    evaluate_agent_result_inner(project_root, state, git_flow, approval.as_deref())
+}
+
+fn evaluate_agent_result_inner(
+    project_root: &Path,
+    state: &State,
+    git_flow: &GitFlowConfig,
+    approved_commands: Option<&[String]>,
+) -> Result<AgentResult, ResultError> {
+    // Layer 0: operator-authored external post-condition (authoritative failure)
+    if let Some(result) = evaluate_layer0(project_root, state, approved_commands) {
+        return Ok(result);
+    }
+
     // Layer 1: DEVFLOW_RESULT marker (authoritative)
     if let Some(result) = evaluate_layer1(project_root, state.phase) {
         return Ok(result);
@@ -669,11 +750,222 @@ pub fn agent_pid_path(project_root: &Path, phase: u32) -> PathBuf {
     devflow_dir(project_root).join(format!("phase-{:02}-agent-pid", phase))
 }
 
-/// Clean up old stdout, exit code, and agent-pid files for a phase before starting.
-pub fn cleanup_phase_files(project_root: &Path, phase: u32) {
-    let _ = std::fs::remove_file(stdout_path(project_root, phase));
-    let _ = std::fs::remove_file(exit_code_path(project_root, phase));
+/// Path to the archived-capture-history directory for a phase (16b).
+///
+/// `.devflow/history/phase-NN/` holds retained per-stage capture generations
+/// so a false-positive self-report can be diagnosed after the fact. Exposed
+/// as a constructor (rather than inlined at each call site) so downstream
+/// tooling (16h in 16-07's correlation, 16i in 16-05's enumeration) always
+/// derives the path from here instead of hardcoding it.
+pub fn history_dir(project_root: &Path, phase: u32) -> PathBuf {
+    devflow_dir(project_root)
+        .join("history")
+        .join(format!("phase-{:02}", phase))
+}
+
+/// Monotonically increasing tie-breaker appended to the nanosecond timestamp
+/// used to stamp archived generations, so two archives issued within the
+/// same nanosecond (possible in a tight test loop) never collide.
+static ARCHIVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A stamp unique within this process, used to name an archived generation.
+/// The outgoing stage's name is not available at the `archive_phase_files`
+/// call site (see `launch_stage` in main.rs), so a monotonic timestamp is
+/// used instead — sufficient to order and identify generations.
+fn archive_stamp() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = ARCHIVE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{nanos}-{seq}")
+}
+
+/// Archive the prior stage's stdout/exit captures into bounded per-phase
+/// history instead of wiping them outright, so a false-positive self-report
+/// can be diagnosed after the fact (16b). Replaces the old
+/// `cleanup_phase_files`, which deleted these files unconditionally.
+///
+/// At most `retain` capture generations are kept per phase; older ones are
+/// pruned (see [`prune_history`]). The agent-pid file is still removed
+/// outright — it is process bookkeeping, not diagnostic output. When there
+/// is nothing to archive (first launch), this is a no-op success.
+pub fn archive_phase_files(
+    project_root: &Path,
+    evidence_root: &Path,
+    phase: u32,
+    retain: usize,
+) -> Result<Option<String>, std::io::Error> {
+    archive_phase_files_with_stamp(project_root, evidence_root, phase, retain, &archive_stamp())
+}
+
+fn archive_phase_files_with_stamp(
+    project_root: &Path,
+    evidence_root: &Path,
+    phase: u32,
+    retain: usize,
+    stamp: &str,
+) -> Result<Option<String>, std::io::Error> {
     let _ = std::fs::remove_file(agent_pid_path(project_root, phase));
+
+    let stdout_src = stdout_path(project_root, phase);
+    let exit_src = exit_code_path(project_root, phase);
+    let stdout_exists = stdout_src.exists();
+    let exit_exists = exit_src.exists();
+    if !stdout_exists && !exit_exists {
+        return Ok(None); // Nothing to archive — first launch.
+    }
+
+    let history_dir = history_dir(project_root, phase);
+    std::fs::create_dir_all(&history_dir)?;
+
+    let staging_dir = history_dir.join(format!(".pending-{stamp}"));
+    std::fs::create_dir(&staging_dir)?;
+    let stdout_stage = staging_dir.join("stdout");
+    let exit_stage = staging_dir.join("exit");
+    let review_stage = staging_dir.join("REVIEW.md");
+    let stdout_dest = history_dir.join(format!("{stamp}-stdout"));
+    let exit_dest = history_dir.join(format!("{stamp}-exit"));
+    let review_dest = history_dir.join(format!("{stamp}-REVIEW.md"));
+    let review_src = phase_review_path(evidence_root, phase);
+
+    let mut stdout_staged = false;
+    let mut exit_staged = false;
+    let mut stdout_published = false;
+    let mut exit_published = false;
+    let mut review_published = false;
+
+    let archive_result = (|| -> Result<(), std::io::Error> {
+        if stdout_exists {
+            std::fs::rename(&stdout_src, &stdout_stage)?;
+            stdout_staged = true;
+        }
+        if exit_exists {
+            std::fs::rename(&exit_src, &exit_stage)?;
+            exit_staged = true;
+        }
+        if let Some(review) = &review_src {
+            std::fs::copy(review, &review_stage)?;
+        }
+
+        if stdout_exists {
+            std::fs::rename(&stdout_stage, &stdout_dest)?;
+            stdout_staged = false;
+            stdout_published = true;
+        }
+        if exit_exists {
+            std::fs::rename(&exit_stage, &exit_dest)?;
+            exit_staged = false;
+            exit_published = true;
+        }
+        if review_src.is_some() {
+            std::fs::rename(&review_stage, &review_dest)?;
+            review_published = true;
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = archive_result {
+        let mut rollback_error = None;
+        let mut restore = |from: &Path, to: &Path| {
+            if let Err(error) = std::fs::rename(from, to)
+                && rollback_error.is_none()
+            {
+                rollback_error = Some(error);
+            }
+        };
+        if stdout_published {
+            restore(&stdout_dest, &stdout_src);
+        } else if stdout_staged {
+            restore(&stdout_stage, &stdout_src);
+        }
+        if exit_published {
+            restore(&exit_dest, &exit_src);
+        } else if exit_staged {
+            restore(&exit_stage, &exit_src);
+        }
+        if review_published {
+            let _ = std::fs::remove_file(&review_dest);
+        }
+        let _ = std::fs::remove_dir_all(&staging_dir);
+
+        if let Some(rollback_error) = rollback_error {
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!("{error}; archive rollback failed: {rollback_error}"),
+            ));
+        }
+        return Err(error);
+    }
+
+    let _ = std::fs::remove_dir(&staging_dir);
+
+    prune_history(&history_dir, retain);
+    Ok(Some(stamp.to_string()))
+}
+
+fn phase_review_path(project_root: &Path, phase: u32) -> Option<PathBuf> {
+    let phases = std::fs::read_dir(project_root.join(".planning/phases")).ok()?;
+    let prefix = format!("{phase:02}-");
+    for entry in phases.flatten() {
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(&prefix))
+        {
+            let review = entry.path().join(format!("{phase:02}-REVIEW.md"));
+            if review.exists() {
+                return Some(review);
+            }
+        }
+    }
+    None
+}
+
+/// Keep only the newest `retain` capture generations under `history_dir`,
+/// deleting older ones. Generations are grouped by their stamp (the shared
+/// prefix of a `{stamp}-stdout`/`{stamp}-exit` pair, split off the trailing
+/// `-stdout`/`-exit` suffix via `rsplit_once`) and ordered lexicographically,
+/// which matches numeric/chronological order for the fixed-width nanosecond
+/// stamps `archive_stamp` produces. Ordering parses both numeric components;
+/// the process-local sequence is intentionally not fixed-width.
+fn prune_history(history_dir: &Path, retain: usize) {
+    let Ok(entries) = std::fs::read_dir(history_dir) else {
+        return;
+    };
+
+    let mut stamps: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_str()?.to_string();
+            name.rsplit_once('-')
+                .map(|(stamp, _suffix)| stamp.to_string())
+        })
+        .collect();
+    stamps.sort_by_key(|stamp| {
+        let mut parts = stamp.split('-');
+        let nanos = parts
+            .next()
+            .and_then(|part| part.parse::<u128>().ok())
+            .unwrap_or(0);
+        let sequence = parts
+            .next()
+            .and_then(|part| part.parse::<u64>().ok())
+            .unwrap_or(0);
+        (nanos, sequence)
+    });
+    stamps.dedup();
+
+    if stamps.len() <= retain {
+        return;
+    }
+
+    let to_remove = stamps.len() - retain;
+    for stamp in &stamps[..to_remove] {
+        let _ = std::fs::remove_file(history_dir.join(format!("{stamp}-stdout")));
+        let _ = std::fs::remove_file(history_dir.join(format!("{stamp}-exit")));
+        let _ = std::fs::remove_file(history_dir.join(format!("{stamp}-REVIEW.md")));
+    }
 }
 
 #[cfg(test)]
@@ -1108,24 +1400,331 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_removes_phase_files() {
+    fn failing_external_probe_outranks_success_marker() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::create_dir_all(root.join(".devflow")).unwrap();
-        std::fs::write(root.join(".devflow/phase-01-stdout"), "test").unwrap();
-        std::fs::write(root.join(".devflow/phase-01-exit"), "0").unwrap();
+        let phase_dir = dir
+            .path()
+            .join(".planning/phases/16-pipeline-reliability-hardening");
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        std::fs::write(
+            phase_dir.join("16-03-PLAN.md"),
+            "---\nphase: 16\nexternal_verify: \"test -f externally-shipped\"\n---\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 16),
+            "DEVFLOW_RESULT: {\"status\":\"success\"}\n",
+        )
+        .unwrap();
+        let state = state_in(dir.path(), 16);
 
-        cleanup_phase_files(root, 1);
-        assert!(!root.join(".devflow/phase-01-stdout").exists());
-        assert!(!root.join(".devflow/phase-01-exit").exists());
+        let approval = vec!["test -f externally-shipped".to_string()];
+        let result = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approval),
+        )
+        .unwrap();
+
+        assert_eq!(result.status, AgentStatus::Failed);
+        assert!(
+            result
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("external verification failed"))
+        );
     }
 
     #[test]
-    fn cleanup_handles_missing_files() {
+    fn external_probe_runs_only_after_code_and_reads_execution_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join("phase-worktree");
+        let phase_dir = worktree.join(".planning/phases/16-reliability");
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        std::fs::write(
+            phase_dir.join("16-01-PLAN.md"),
+            "---\nexternal_verify: \"test -f implemented\"\n---\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 16),
+            "DEVFLOW_RESULT: {\"status\":\"success\"}\n",
+        )
+        .unwrap();
+        let mut state = state_in(dir.path(), 16);
+        state.worktree_path = Some(worktree.clone());
+        state.stage = Stage::Plan;
+
+        let approval = vec!["test -f implemented".to_string()];
+        let plan_result = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approval),
+        )
+        .unwrap();
+        assert_eq!(plan_result.status, AgentStatus::Success);
+
+        state.stage = Stage::Code;
+        let code_result = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approval),
+        )
+        .unwrap();
+        assert_eq!(code_result.status, AgentStatus::Failed);
+
+        std::fs::write(worktree.join("implemented"), "done").unwrap();
+        let passing = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approval),
+        )
+        .unwrap();
+        assert_eq!(passing.status, AgentStatus::Success);
+    }
+
+    #[test]
+    fn changed_external_probe_never_inherits_prior_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase_dir = dir.path().join(".planning/phases/16-reliability");
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        std::fs::write(
+            phase_dir.join("16-01-PLAN.md"),
+            "---\nexternal_verify: \"touch escaped\"\n---\n",
+        )
+        .unwrap();
+        let state = state_in(dir.path(), 16);
+        let approved = vec!["test -f reviewed-artifact".to_string()];
+
+        let result = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approved),
+        )
+        .unwrap();
+
+        assert_eq!(result.status, AgentStatus::Failed);
+        assert!(result.reason.unwrap().contains("approval mismatch"));
+        assert!(!dir.path().join("escaped").exists());
+    }
+
+    #[test]
+    fn removed_external_probe_fails_closed_against_prior_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 16),
+            "DEVFLOW_RESULT: {\"status\":\"success\"}\n",
+        )
+        .unwrap();
+        let state = state_in(dir.path(), 16);
+        let approved = vec!["test -f shipped".to_string()];
+
+        let result = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approved),
+        )
+        .unwrap();
+
+        assert_eq!(result.status, AgentStatus::Failed);
+        assert!(result.reason.unwrap().contains("declaration was removed"));
+    }
+
+    #[test]
+    fn no_external_declaration_preserves_layer1_result() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 16),
+            "DEVFLOW_RESULT: {\"status\":\"success\",\"commits\":2,\"summary\":\"done\"}\n",
+        )
+        .unwrap();
+        let state = state_in(dir.path(), 16);
+        let layer1 = evaluate_layer1(dir.path(), 16).unwrap();
+
+        let full = evaluate_agent_result(dir.path(), &state, &GitFlowConfig::default()).unwrap();
+
+        assert_eq!(
+            serde_json::to_value(full).unwrap(),
+            serde_json::to_value(layer1).unwrap()
+        );
+    }
+
+    #[test]
+    fn archive_moves_captures_into_history_and_removes_pid_file() {
+        // 16b: prior-stage captures must survive a simulated next-launch by
+        // appearing under .devflow/history/phase-NN/, not be wiped outright.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        // Should not panic when files don't exist.
-        cleanup_phase_files(root, 1);
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        std::fs::write(root.join(".devflow/phase-01-stdout"), "prior stdout").unwrap();
+        std::fs::write(root.join(".devflow/phase-01-exit"), "0").unwrap();
+        std::fs::write(root.join(".devflow/phase-01-agent-pid"), "1234").unwrap();
+
+        archive_phase_files(root, root, 1, 5).unwrap();
+
+        // The live capture paths are gone (moved, not merely deleted).
+        assert!(!root.join(".devflow/phase-01-stdout").exists());
+        assert!(!root.join(".devflow/phase-01-exit").exists());
+        // Agent-pid is bookkeeping, not diagnostic — still removed outright.
+        assert!(!root.join(".devflow/phase-01-agent-pid").exists());
+
+        let history = history_dir(root, 1);
+        let archived: Vec<_> = std::fs::read_dir(&history)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        let archived_stdout = archived
+            .iter()
+            .find(|name| name.ends_with("-stdout"))
+            .expect("stdout capture should be archived into history");
+        assert!(archived.iter().any(|name| name.ends_with("-exit")));
+        let contents = std::fs::read_to_string(history.join(archived_stdout)).unwrap();
+        assert_eq!(contents, "prior stdout");
+    }
+
+    #[test]
+    fn archive_is_noop_when_nothing_to_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Should not panic when there is nothing to archive (first launch).
+        archive_phase_files(root, root, 1, 5).unwrap();
+        assert!(!history_dir(root, 1).exists());
+    }
+
+    #[test]
+    fn archive_handles_missing_devflow_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // No .devflow dir at all — should not panic.
+        archive_phase_files(root, root, 1, 5).unwrap();
+    }
+
+    #[test]
+    fn archive_failure_preserves_live_capture_for_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        std::fs::write(stdout_path(root, 1), "evidence").unwrap();
+        // A file where the history directory must be forces create_dir_all
+        // to fail before the live capture is moved or a monitor can truncate it.
+        std::fs::write(root.join(".devflow/history"), "blocked").unwrap();
+
+        assert!(archive_phase_files(root, root, 1, 5).is_err());
+        assert_eq!(
+            std::fs::read_to_string(stdout_path(root, 1)).unwrap(),
+            "evidence"
+        );
+    }
+
+    #[test]
+    fn archive_second_publish_failure_rolls_back_complete_live_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        std::fs::write(stdout_path(root, 1), "stdout evidence").unwrap();
+        std::fs::write(exit_code_path(root, 1), "17").unwrap();
+        let history = history_dir(root, 1);
+        std::fs::create_dir_all(history.join("fixed-exit/blocker")).unwrap();
+
+        assert!(archive_phase_files_with_stamp(root, root, 1, 5, "fixed").is_err());
+
+        assert_eq!(
+            std::fs::read_to_string(stdout_path(root, 1)).unwrap(),
+            "stdout evidence"
+        );
+        assert_eq!(
+            std::fs::read_to_string(exit_code_path(root, 1)).unwrap(),
+            "17"
+        );
+        assert!(!history.join("fixed-stdout").exists());
+        assert!(!history.join(".pending-fixed").exists());
+    }
+
+    #[test]
+    fn archive_review_copy_failure_rolls_back_complete_live_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let evidence_root = root.join("phase-worktree");
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        std::fs::write(stdout_path(root, 1), "stdout evidence").unwrap();
+        std::fs::write(exit_code_path(root, 1), "23").unwrap();
+        let review = evidence_root.join(".planning/phases/01-example/01-REVIEW.md");
+        std::fs::create_dir_all(&review).unwrap();
+
+        assert!(archive_phase_files_with_stamp(root, &evidence_root, 1, 5, "review-copy").is_err());
+
+        assert_eq!(
+            std::fs::read_to_string(stdout_path(root, 1)).unwrap(),
+            "stdout evidence"
+        );
+        assert_eq!(
+            std::fs::read_to_string(exit_code_path(root, 1)).unwrap(),
+            "23"
+        );
+        let history = history_dir(root, 1);
+        assert!(!history.join("review-copy-stdout").exists());
+        assert!(!history.join("review-copy-exit").exists());
+        assert!(!history.join(".pending-review-copy").exists());
+    }
+
+    #[test]
+    fn archive_snapshots_current_review_into_same_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let evidence_root = root.join("phase-worktree");
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        std::fs::write(stdout_path(root, 1), "attempt").unwrap();
+        let phase_dir = evidence_root.join(".planning/phases/01-example");
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        std::fs::write(phase_dir.join("01-REVIEW.md"), "review one").unwrap();
+
+        let stamp = archive_phase_files(root, &evidence_root, 1, 5)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(history_dir(root, 1).join(format!("{stamp}-REVIEW.md")))
+                .unwrap(),
+            "review one"
+        );
+    }
+
+    #[test]
+    fn archive_prunes_history_to_retain_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        for i in 0..7 {
+            std::fs::write(root.join(".devflow/phase-01-stdout"), format!("gen {i}")).unwrap();
+            std::fs::write(root.join(".devflow/phase-01-exit"), "0").unwrap();
+            archive_phase_files(root, root, 1, 3).unwrap();
+        }
+
+        let history = history_dir(root, 1);
+        let stdout_count = std::fs::read_dir(&history)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with("-stdout"))
+            .count();
+        let exit_count = std::fs::read_dir(&history)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with("-exit"))
+            .count();
+        assert_eq!(stdout_count, 3, "expected at most 3 retained generations");
+        assert_eq!(exit_count, 3, "expected at most 3 retained generations");
     }
 
     #[test]

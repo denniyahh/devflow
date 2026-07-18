@@ -1,20 +1,25 @@
 use clap::{Parser, Subcommand};
 use devflow_core::agent;
-use devflow_core::config::{DEVELOP, FEATURE_PREFIX, GitFlowConfig};
-use devflow_core::gates::{self, GateAction, GateResponse, Gates};
+use devflow_core::config::{DEVELOP, FEATURE_PREFIX, GitFlowConfig, capture_retention};
+use devflow_core::gates::{self, GateAction, GateResponse, Gates, OpenGate};
 use devflow_core::git::GitFlow;
 use devflow_core::hooks::{self, HookContext};
 use devflow_core::mode::{self, Mode};
 use devflow_core::prompt::{self, FixType};
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
-use devflow_core::{agent_result, agents, events, lock, monitor, recover, worktree};
+use devflow_core::{agent_result, agents, events, history, lock, monitor, recover, worktree};
 use devflow_core::{
     agent_result::{AgentStatus, Verdict},
     workflow,
 };
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
+
+/// A pending gate becomes visually urgent after thirty minutes without an
+/// answer. The banner remains visible before and after this threshold.
+const GATE_ESCALATION_THRESHOLD_SECS: u64 = 30 * 60;
 
 /// Parse `DEVFLOW_GATE_TIMEOUT_SECS`'s raw value, falling back to 7 days on
 /// an absent or unparsable value. Pure (no env access) so it's unit-testable
@@ -117,6 +122,14 @@ enum Command {
         /// Show the agent's stderr capture instead of stdout.
         #[arg(long)]
         stderr: bool,
+        /// Project root.
+        #[arg(default_value = ".")]
+        project: PathBuf,
+    },
+    /// Show a phase's chronological events and retained attempt evidence.
+    History {
+        /// Phase to show (defaults to the single active phase).
+        phase: Option<u32>,
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
@@ -234,15 +247,22 @@ enum GateCmd {
     Approve {
         /// Phase whose gate to approve.
         phase: u32,
+        /// Optional stage or legacy project path (`approve 15 ship` or
+        /// `approve 15 /repo`).
+        #[arg(value_name = "STAGE_OR_PROJECT")]
+        stage: Option<String>,
+        /// Legacy positional project path when a stage precedes it.
+        #[arg(value_name = "PROJECT")]
+        legacy_project: Option<PathBuf>,
         /// Stage of the gate (auto-resolved when the phase has exactly one
         /// open gate).
-        #[arg(long)]
-        stage: Option<Stage>,
+        #[arg(long = "stage")]
+        stage_option: Option<Stage>,
         /// Optional free-text note recorded with the approval.
         #[arg(long)]
         note: Option<String>,
         /// Project root.
-        #[arg(default_value = ".")]
+        #[arg(long, default_value = ".")]
         project: PathBuf,
     },
     /// Reject an open gate — loops back to Code, or aborts the phase when
@@ -250,16 +270,23 @@ enum GateCmd {
     Reject {
         /// Phase whose gate to reject.
         phase: u32,
+        /// Optional stage or legacy project path (`reject 15 ship` or
+        /// `reject 15 /repo`).
+        #[arg(value_name = "STAGE_OR_PROJECT")]
+        stage: Option<String>,
+        /// Legacy positional project path when a stage precedes it.
+        #[arg(value_name = "PROJECT")]
+        legacy_project: Option<PathBuf>,
         /// Stage of the gate (auto-resolved when the phase has exactly one
         /// open gate).
-        #[arg(long)]
-        stage: Option<Stage>,
+        #[arg(long = "stage")]
+        stage_option: Option<Stage>,
         /// Required note explaining the rejection (include "abort" to end
         /// the phase instead of looping back to Code).
         #[arg(long)]
         note: String,
         /// Project root.
-        #[arg(default_value = ".")]
+        #[arg(long, default_value = ".")]
         project: PathBuf,
     },
 }
@@ -341,15 +368,27 @@ fn run() -> Result<(), CliError> {
             GateCmd::Approve {
                 phase,
                 stage,
+                legacy_project,
+                stage_option,
                 note,
                 project,
-            } => gate_respond(&project_root(project)?, phase, stage, true, note),
+            } => {
+                let (stage, project) =
+                    resolve_gate_target(stage, legacy_project, stage_option, project)?;
+                gate_respond(&project_root(project)?, phase, stage, true, note)
+            }
             GateCmd::Reject {
                 phase,
                 stage,
+                legacy_project,
+                stage_option,
                 note,
                 project,
-            } => gate_respond(&project_root(project)?, phase, stage, false, Some(note)),
+            } => {
+                let (stage, project) =
+                    resolve_gate_target(stage, legacy_project, stage_option, project)?;
+                gate_respond(&project_root(project)?, phase, stage, false, Some(note))
+            }
         },
         Command::Logs {
             phase,
@@ -357,6 +396,7 @@ fn run() -> Result<(), CliError> {
             stderr,
             project,
         } => logs(&project_root(project)?, phase, follow, stderr),
+        Command::History { phase, project } => history_cmd(&project_root(project)?, phase),
         Command::Parallel {
             phases,
             agents,
@@ -392,6 +432,39 @@ fn run() -> Result<(), CliError> {
         Command::Test { project } => test_cmd(&project_root(project)?),
         Command::Doctor { json, project } => doctor(&project_root(project)?, json),
     }
+}
+
+fn resolve_gate_target(
+    positional: Option<String>,
+    legacy_project: Option<PathBuf>,
+    stage_option: Option<Stage>,
+    project: PathBuf,
+) -> Result<(Option<Stage>, PathBuf), CliError> {
+    let Some(positional) = positional else {
+        return Ok((stage_option, project));
+    };
+    if let Ok(positional_stage) = positional.parse::<Stage>() {
+        if let Some(flagged_stage) = stage_option
+            && flagged_stage != positional_stage
+        {
+            return Err(CliError::Message(format!(
+                "conflicting stages: positional {positional_stage} and --stage {flagged_stage}"
+            )));
+        }
+        let target = legacy_project.unwrap_or(project);
+        return Ok((Some(stage_option.unwrap_or(positional_stage)), target));
+    }
+    if legacy_project.is_some() {
+        return Err(CliError::Message(format!(
+            "unsupported stage `{positional}`; expected define, plan, code, validate, or ship"
+        )));
+    }
+    if project.as_path() != Path::new(".") {
+        return Err(CliError::Message(
+            "project was supplied both positionally and with --project".into(),
+        ));
+    }
+    Ok((stage_option, PathBuf::from(positional)))
 }
 
 // ---------------------------------------------------------------------------
@@ -539,7 +612,7 @@ fn start(
             "worktree": state.worktree_path.as_ref().map(|p| p.display().to_string()),
         }),
     );
-    if let Err(err) = launch_stage(&state, None) {
+    if let Err(err) = launch_stage(&state, None, None) {
         if let Err(clear_err) = workflow::clear_state(project_root, phase) {
             eprintln!("warning: could not clear state after failed launch: {clear_err}");
         }
@@ -616,8 +689,14 @@ fn ensure_agent_binary(program: &str) -> Result<(), CliError> {
 /// Spawn the background monitor that owns the agent for `state.stage`. The
 /// monitor calls `devflow advance` when the agent exits. An optional
 /// `prompt_override` is used for Code loop-backs (fix prompts).
-fn launch_stage(state: &State, prompt_override: Option<String>) -> Result<(), CliError> {
-    let prompt = prompt_override.unwrap_or_else(|| prompt::stage_prompt(state.stage, state.phase));
+fn launch_stage(
+    state: &State,
+    prompt_override: Option<String>,
+    archived_stage: Option<Stage>,
+) -> Result<(), CliError> {
+    let prompt = prompt_override.unwrap_or_else(|| {
+        prompt::stage_prompt_for_project(state.stage, state.phase, &state.project_root)
+    });
     let adapter = agents::adapter_for(state.agent);
     // In worktree mode the agent's cwd is the linked worktree, but git
     // metadata for commits lives under the main repo's `.git/` — sandboxed
@@ -631,7 +710,32 @@ fn launch_stage(state: &State, prompt_override: Option<String>) -> Result<(), Cl
     let (program, args) = adapter.exec_command(state.phase, &prompt, &roots);
     ensure_agent_binary(program)?;
 
-    agent_result::cleanup_phase_files(&state.project_root, state.phase);
+    if let Some(stamp) = agent_result::archive_phase_files(
+        &state.project_root,
+        state
+            .worktree_path
+            .as_deref()
+            .unwrap_or(&state.project_root),
+        state.phase,
+        capture_retention(&state.project_root),
+    )
+    .map_err(|err| {
+        CliError::Message(format!(
+            "could not archive phase {} capture before rollover: {err}",
+            state.phase
+        ))
+    })? {
+        events::emit(
+            &state.project_root,
+            state.phase,
+            "capture_archived",
+            serde_json::json!({
+                "stage": archived_stage.unwrap_or(state.stage).to_string(),
+                "to_stage": state.stage.to_string(),
+                "stamp": stamp,
+            }),
+        );
+    }
     let pid = monitor::spawn_monitor(state, program, &args, &adapter.extra_env())
         .map_err(|err| CliError::Message(format!("could not spawn monitor: {err}")))?;
     events::emit(
@@ -847,12 +951,31 @@ fn handle_ship_outcome(project_root: &Path, state: &mut State) -> Result<(), Cli
 /// reached the desktop notification verbatim. Full detail stays available in
 /// `.devflow/phase-NN-stdout`; the gate only needs a readable headline.
 fn truncate_reason(reason: &str) -> String {
-    const MAX: usize = 300;
-    if reason.chars().count() <= MAX {
-        return reason.to_string();
+    render_gate_context(reason, 300)
+}
+
+/// Render agent-controlled gate text as one bounded, terminal-safe line.
+fn render_gate_context(context: &str, max_chars: usize) -> String {
+    const TRUNCATED: &str = "… [truncated; full output in .devflow/]";
+    let sanitized: String = context
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    if sanitized.chars().count() <= max_chars {
+        return sanitized;
     }
-    let head: String = reason.chars().take(MAX).collect();
-    format!("{head}… [truncated; full output in .devflow/]")
+
+    let suffix_len = TRUNCATED.chars().count().min(max_chars);
+    let head_len = max_chars.saturating_sub(suffix_len);
+    let head: String = sanitized.chars().take(head_len).collect();
+    let suffix: String = TRUNCATED.chars().take(suffix_len).collect();
+    format!("{head}{suffix}")
 }
 
 fn handle_stage_failure(
@@ -871,7 +994,7 @@ fn handle_stage_failure(
             // the retry cannot silently consume the prior response.
             let _ = Gates::cleanup(project_root, state.phase, stage);
             state.gate_pending = false;
-            launch_stage(state, None)
+            launch_stage(state, None, Some(stage))
         }
         GateAction::LoopBack(_) => {
             // Retry the SAME failed stage — Code is not a valid recovery
@@ -879,7 +1002,7 @@ fn handle_stage_failure(
             // (Codex 13-01 MEDIUM). Only Ship's ReviewFailed path (handled
             // separately in `handle_ship_failure`) actually loops to Code.
             let _ = Gates::cleanup(project_root, state.phase, stage);
-            launch_stage(state, None)
+            launch_stage(state, None, Some(stage))
         }
         GateAction::Abort(reason) => abort(project_root, state, &reason),
     }
@@ -924,11 +1047,17 @@ fn is_ship_review_failure(reason: &Option<String>) -> bool {
 /// 14-CR-02: a lock timeout SKIPS the batch instead of running it
 /// unserialized — mutating the shared checkout concurrently is the exact
 /// race this lock exists to prevent, and the hooks are individually
-/// fail-soft anyway, so skipping them preserves the phase's liveness at the
-/// cost of a loudly-reported missing docs/changelog/version-bump pass.
-fn run_checkout_hooks(project_root: &Path, state: &State, batch: &[hooks::Hook], stage: Stage) {
+/// fail-soft for ordinary transitions. The return value lets terminal
+/// completion fail closed and preserve state when the batch was skipped or
+/// a required hook failed.
+fn run_checkout_hooks(
+    project_root: &Path,
+    state: &State,
+    batch: &[hooks::Hook],
+    stage: Stage,
+) -> bool {
     if batch.is_empty() {
-        return;
+        return true;
     }
     let _checkout_lock = match lock::acquire_project_blocking(project_root, checkout_lock_timeout())
     {
@@ -957,10 +1086,12 @@ fn run_checkout_hooks(project_root: &Path, state: &State, batch: &[hooks::Hook],
                     }),
                 );
             }
-            return;
+            return false;
         }
     };
     let git_flow = GitFlowConfig::default();
+    let mut all_succeeded = true;
+    let terminal_batch = batch == hooks::hooks_after_ship().as_slice();
     for hook in batch {
         let ctx = HookContext {
             phase: state.phase,
@@ -971,6 +1102,7 @@ fn run_checkout_hooks(project_root: &Path, state: &State, batch: &[hooks::Hook],
         let outcome = hook.run(&ctx);
         if let Err(ref err) = outcome {
             println!("warning: hook {hook:?} failed: {err}");
+            all_succeeded = false;
         }
         events::emit(
             project_root,
@@ -981,13 +1113,20 @@ fn run_checkout_hooks(project_root: &Path, state: &State, batch: &[hooks::Hook],
                 "ok": outcome.is_ok(),
             }),
         );
+        // Terminal finalization is ordered and fail-fast. In particular, a
+        // failed version/tag operation must not delete the feature branch and
+        // destroy the evidence needed for a safe retry.
+        if terminal_batch && outcome.is_err() {
+            break;
+        }
     }
+    all_succeeded
 }
 
 /// Fire the hooks for `from → to`, persist the new stage, and launch its agent.
 fn transition(project_root: &Path, state: &mut State, to: Stage) -> Result<(), CliError> {
     let from = state.stage;
-    run_checkout_hooks(
+    let _ = run_checkout_hooks(
         project_root,
         state,
         &hooks::hooks_for_transition(from, to),
@@ -1006,14 +1145,15 @@ fn transition(project_root: &Path, state: &mut State, to: Stage) -> Result<(), C
             "to": to.to_string(),
         }),
     );
-    launch_stage(state, None)
+    launch_stage(state, None, Some(from))
 }
 
 /// Loop the pipeline back to Code with the given fix prompt (`GapsOnly` for a
 /// Validate rejection, `AuditFix` for a Ship `review:` rejection).
 fn loop_back_to_code(project_root: &Path, state: &mut State, fix: FixType) -> Result<(), CliError> {
+    let from = state.stage;
     let prompt = prepare_loop_back_to_code(project_root, state, fix)?;
-    launch_stage(state, Some(prompt))
+    launch_stage(state, Some(prompt), Some(from))
 }
 
 /// The state-mutating half of `loop_back_to_code`, split out so it's
@@ -1053,7 +1193,28 @@ fn prepare_loop_back_to_code(
 
 /// Run the terminal hooks (version bump + branch cleanup) and clear state.
 fn finish_workflow(project_root: &Path, state: &mut State) -> Result<(), CliError> {
-    run_checkout_hooks(project_root, state, &hooks::hooks_after_ship(), Stage::Ship);
+    loop {
+        if run_checkout_hooks(project_root, state, &hooks::hooks_after_ship(), Stage::Ship) {
+            break;
+        }
+        // The original Ship approval has already been consumed. Reopen an
+        // actionable gate and keep this monitor waiting so a terminal-hook
+        // failure cannot turn into an invisible stalled Ship state.
+        let _ = Gates::cleanup(project_root, state.phase, Stage::Ship);
+        let context = format!(
+            "[finalization failed] phase {} terminal hooks did not complete. Resolve the git/version error, then approve to retry; reject to loop back or abort.",
+            state.phase
+        );
+        match run_gate(project_root, state, Stage::Ship, &context)? {
+            GateAction::Advance => {
+                let _ = Gates::cleanup(project_root, state.phase, Stage::Ship);
+            }
+            GateAction::LoopBack(_) => {
+                return loop_back_to_code(project_root, state, FixType::AuditFix);
+            }
+            GateAction::Abort(reason) => return abort(project_root, state, &reason),
+        }
+    }
     let _ = Gates::cleanup(project_root, state.phase, Stage::Validate);
     let _ = Gates::cleanup(project_root, state.phase, Stage::Ship);
     workflow::clear_state(project_root, state.phase)?;
@@ -1324,9 +1485,26 @@ fn run_agent_blocking(
     agent: AgentKind,
     workdir: &Path,
 ) -> Result<Option<agent_result::AgentResult>, CliError> {
-    agent_result::cleanup_phase_files(project_root, phase);
+    if let Some(stamp) = agent_result::archive_phase_files(
+        project_root,
+        workdir,
+        phase,
+        capture_retention(project_root),
+    )
+    .map_err(|err| {
+        CliError::Message(format!(
+            "could not archive phase {phase} capture before rollover: {err}"
+        ))
+    })? {
+        events::emit(
+            project_root,
+            phase,
+            "capture_archived",
+            serde_json::json!({"stage": "code", "stamp": stamp}),
+        );
+    }
     let adapter = agents::adapter_for(agent);
-    let prompt = prompt::stage_prompt(Stage::Code, phase);
+    let prompt = prompt::stage_prompt_for_project(Stage::Code, phase, project_root);
     // sequentagent always runs in a worktree — the main repo's `.git/` and
     // the worktree admin dir must stay writable for sandboxed agents to
     // commit (13-06 dogfood finding).
@@ -1765,12 +1943,48 @@ fn status(project_root: &Path) -> Result<(), CliError> {
             }
         }
     }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if let Some(banner) = render_pending_gate_banner(&Gates::list_open(project_root), now) {
+        println!("\n{banner}");
+    }
     print_open_branches(project_root);
     print_worktrees(project_root, current_worktree.as_deref());
     for hint in cron_instruction_hints(project_root) {
         println!("\n{hint}");
     }
     Ok(())
+}
+
+/// Build the persistent status-side signal for gates awaiting an operator.
+/// Context is agent-controlled, so it must use the same bounded rendering as
+/// gate notifications and failure events.
+fn render_pending_gate_banner(open: &[OpenGate], now: u64) -> Option<String> {
+    if open.is_empty() {
+        return None;
+    }
+
+    let mut banner = String::from("==================== PENDING GATE ====================\n");
+    for gate in open {
+        let timestamp = gate.timestamp.parse::<u64>().ok();
+        let escalated = timestamp
+            .and_then(|timestamp| now.checked_sub(timestamp))
+            .is_some_and(|age| age >= GATE_ESCALATION_THRESHOLD_SECS);
+        let marker = if escalated { "!!! ESCALATED" } else { "!!!" };
+        let context = render_gate_context(&gate.context, 300);
+        let stage = gate.stage.to_string();
+        banner.push_str(&format!(
+            "{marker}: phase {} {stage} ({})\n  {context}\n  approve: devflow gate approve {} --stage {stage}\n  reject:  devflow gate reject {} --stage {stage} --note <reason>\n",
+            gate.phase,
+            recover::format_age(&gate.timestamp),
+            gate.phase,
+            gate.phase,
+        ));
+    }
+    banner.push_str("======================================================");
+    Some(banner)
 }
 
 /// List every gate awaiting a human response.
@@ -1782,10 +1996,7 @@ fn gate_list(project_root: &Path) -> Result<(), CliError> {
     }
     println!("{:<6} {:<9} {:<9} CONTEXT", "PHASE", "STAGE", "AGE");
     for gate in &open {
-        let mut context = gate.context.replace('\n', " ");
-        if context.chars().count() > 100 {
-            context = format!("{}…", context.chars().take(100).collect::<String>());
-        }
+        let context = render_gate_context(&gate.context, 100);
         println!(
             "{:<6} {:<9} {:<9} {context}",
             gate.phase,
@@ -1902,8 +2113,8 @@ fn logs(
     let exit_path = agent_result::exit_code_path(project_root, phase);
     loop {
         std::thread::sleep(std::time::Duration::from_millis(500));
-        // 14-CR-03: a stage transition deletes and recreates the capture
-        // file (launch_stage → cleanup_phase_files), so a shrunken file
+        // 14-CR-03: a stage transition archives and recreates the capture
+        // file (launch_stage → archive_phase_files), so a shrunken file
         // means the next stage started — reset to the top instead of
         // seeking past EOF forever and silently skipping its output.
         let base = rollover_offset(&path, offset);
@@ -1920,6 +2131,21 @@ fn logs(
         }
         offset = new_offset;
     }
+}
+
+/// Render the read-only cross-attempt view for one phase.
+fn history_cmd(project_root: &Path, phase: Option<u32>) -> Result<(), CliError> {
+    let phase = match phase {
+        Some(phase) => phase,
+        None => single_active_phase(project_root)?.ok_or_else(|| {
+            CliError::Message("no active phase — pass a phase number to `devflow history`".into())
+        })?,
+    };
+    println!(
+        "{}",
+        history::render_timeline(&history::attempt_timeline(project_root, phase))
+    );
+    Ok(())
 }
 
 /// Detect capture-file rollover for `logs --follow` (14-CR-03): a file
@@ -2091,15 +2317,25 @@ fn print_open_branches(project_root: &Path) {
 }
 
 fn project_root(project: PathBuf) -> Result<PathBuf, CliError> {
-    if project.exists() {
-        project
-            .canonicalize()
-            .map_err(|err| CliError::Message(format!("failed to resolve project path: {err}")))
-    } else {
-        Err(CliError::Message(format!(
+    if !project.exists() {
+        return Err(CliError::Message(format!(
             "project path does not exist: {}",
             project.display()
-        )))
+        )));
+    }
+
+    let start = project
+        .canonicalize()
+        .map_err(|err| CliError::Message(format!("failed to resolve project path: {err}")))?;
+    let mut probe = start.as_path();
+    loop {
+        if probe.join(".devflow").is_dir() {
+            return Ok(probe.to_path_buf());
+        }
+        match probe.parent() {
+            Some(parent) => probe = parent,
+            None => return Ok(start),
+        }
     }
 }
 
@@ -2415,6 +2651,94 @@ mod tests {
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
+    fn project_root_walks_up_to_nearest_devflow_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        let nested = root.join(".worktrees/phase-16/deep");
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(project_root(nested).unwrap(), root.canonicalize().unwrap());
+
+        let idle = dir.path().join("idle/nested");
+        std::fs::create_dir_all(&idle).unwrap();
+        assert_eq!(
+            project_root(idle.clone()).unwrap(),
+            idle.canonicalize().unwrap()
+        );
+
+        let missing = dir.path().join("missing");
+        let error = project_root(missing).unwrap_err().to_string();
+        assert!(error.contains("project path does not exist"));
+    }
+
+    #[test]
+    fn gate_approve_arg_parsing_accepts_positional_stage() {
+        let cli = Cli::try_parse_from(["devflow", "gate", "approve", "15", "ship"]).unwrap();
+        let Command::Gate {
+            action: GateCmd::Approve { stage, project, .. },
+        } = cli.command
+        else {
+            panic!("expected gate approve command");
+        };
+
+        assert_eq!(stage.as_deref(), Some("ship"));
+        assert_eq!(project, PathBuf::from("."));
+
+        let flagged =
+            Cli::try_parse_from(["devflow", "gate", "approve", "15", "--stage", "ship"]).unwrap();
+        let Command::Gate {
+            action:
+                GateCmd::Approve {
+                    stage,
+                    stage_option,
+                    ..
+                },
+        } = flagged.command
+        else {
+            panic!("expected flagged gate approve command");
+        };
+        assert_eq!(stage, None);
+        assert_eq!(stage_option, Some(Stage::Ship));
+
+        let bare = Cli::try_parse_from(["devflow", "gate", "approve", "15"]).unwrap();
+        let Command::Gate {
+            action:
+                GateCmd::Approve {
+                    stage,
+                    stage_option,
+                    ..
+                },
+        } = bare.command
+        else {
+            panic!("expected bare gate approve command");
+        };
+        assert_eq!(stage, None);
+        assert_eq!(stage_option, None);
+
+        let legacy =
+            Cli::try_parse_from(["devflow", "gate", "approve", "15", "/tmp/example-project"])
+                .unwrap();
+        let Command::Gate {
+            action:
+                GateCmd::Approve {
+                    stage,
+                    legacy_project,
+                    stage_option,
+                    project,
+                    ..
+                },
+        } = legacy.command
+        else {
+            panic!("expected legacy gate approve command");
+        };
+        let (stage, project) =
+            resolve_gate_target(stage, legacy_project, stage_option, project).unwrap();
+        assert_eq!(stage, None);
+        assert_eq!(project, PathBuf::from("/tmp/example-project"));
+    }
+
+    #[test]
     fn pairs_default_missing_agents_to_claude() {
         let pairs = parse_phase_agent_pairs("7,8", Some("codex")).unwrap();
         assert_eq!(pairs, vec![(7, AgentKind::Codex), (8, AgentKind::Claude)]);
@@ -2558,6 +2882,36 @@ mod tests {
         assert_eq!(last["event"], "hook_run");
         assert_eq!(last["ok"], false);
         assert_eq!(last["skipped"], "checkout lock timeout");
+    }
+
+    #[test]
+    fn terminal_hook_failure_stops_before_branch_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = 34;
+        let branch = "feature/phase-34";
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?} failed");
+        };
+        git(&["branch", branch, "develop"]);
+        // Force VersionBump to fail after Merge succeeds.
+        std::fs::remove_file(root.join("Cargo.toml")).unwrap();
+        std::fs::create_dir(root.join("Cargo.toml")).unwrap();
+
+        let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let succeeded = run_checkout_hooks(root, &state, &hooks::hooks_after_ship(), Stage::Ship);
+
+        assert!(!succeeded);
+        assert!(
+            GitFlow::new(root).branch_exists(branch),
+            "a failed terminal batch must preserve the branch for retry"
+        );
     }
 
     #[test]
@@ -2743,6 +3097,14 @@ mod tests {
         init_repo(root);
 
         let phase = 21;
+        let branch = format!("feature/phase-{phase:02}");
+        let branch_created = std::process::Command::new("git")
+            .args(["branch", &branch, "develop"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success();
+        assert!(branch_created);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Ship;
         workflow::save_state(&state).unwrap();
@@ -2775,6 +3137,77 @@ mod tests {
         assert!(!Gates::gate_path(root, phase, Stage::Validate).exists());
     }
 
+    #[test]
+    fn terminal_merge_failure_reopens_actionable_gate_and_never_reports_finished() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?} failed");
+        };
+        git(&["checkout", "-q", "-b", "feature/phase-22"]);
+        std::fs::write(root.join("conflict.txt"), "feature\n").unwrap();
+        git(&["add", "conflict.txt"]);
+        git(&["commit", "-q", "-m", "feature change"]);
+        git(&["checkout", "-q", "develop"]);
+        std::fs::write(root.join("conflict.txt"), "develop\n").unwrap();
+        git(&["add", "conflict.txt"]);
+        git(&["commit", "-q", "-m", "develop change"]);
+
+        let mut state = State::new(22, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Ship;
+        workflow::save_state(&state).unwrap();
+
+        let root_owned = root.to_path_buf();
+        let handle = std::thread::spawn(move || {
+            let mut state = workflow::load_state(&root_owned, 22).unwrap();
+            finish_workflow(&root_owned, &mut state)
+        });
+        let gate_path = Gates::gate_path(root, 22, Stage::Ship);
+        for _ in 0..100 {
+            if gate_path.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert!(
+            gate_path.exists(),
+            "finalization failure must reopen Ship gate"
+        );
+        assert!(workflow::load_state(root, 22).unwrap().gate_pending);
+        Gates::respond(
+            root,
+            22,
+            Stage::Ship,
+            &GateResponse {
+                approved: false,
+                note: Some("abort after merge conflict".into()),
+                responded_by: Some("test".into()),
+            },
+        )
+        .unwrap();
+        handle.join().unwrap().unwrap();
+
+        assert_ne!(
+            events::last_event_for_phase(root, 22)
+                .and_then(|event| event["event"].as_str().map(str::to_owned))
+                .as_deref(),
+            Some("workflow_finished")
+        );
+        let tags = std::process::Command::new("git")
+            .arg("tag")
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(tags.stdout.is_empty());
+    }
+
     /// 13-DEFERRED-CR-03 acceptance: two phases advancing their Ship stages
     /// CONCURRENTLY must each finish their own stage machine — per-phase
     /// state files prevent cross-phase clobbering, and the coarse checkout
@@ -2789,6 +3222,14 @@ mod tests {
 
         let phases = [31u32, 32u32];
         for &phase in &phases {
+            let branch = format!("feature/phase-{phase:02}");
+            let branch_created = std::process::Command::new("git")
+                .args(["branch", &branch, "develop"])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success();
+            assert!(branch_created);
             let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
             state.stage = Stage::Ship;
             workflow::save_state(&state).unwrap();
@@ -3110,8 +3551,39 @@ mod tests {
         assert_eq!(truncate_reason("short reason"), "short reason");
         let long = "x".repeat(5000);
         let capped = truncate_reason(&long);
-        assert!(capped.chars().count() < 400);
+        assert!(capped.chars().count() <= 300);
         assert!(capped.ends_with("[truncated; full output in .devflow/]"));
+    }
+
+    #[test]
+    fn gate_context_rendering_neutralizes_all_controls_and_obeys_limit() {
+        let rendered = render_gate_context("line 1\n\u{1b}[2J\tline 2\u{7}", 100);
+        assert!(!rendered.chars().any(char::is_control));
+        assert_eq!(rendered, "line 1  [2J line 2 ");
+
+        let bounded = render_gate_context(&"x".repeat(500), 100);
+        assert_eq!(bounded.chars().count(), 100);
+        assert!(bounded.ends_with("[truncated; full output in .devflow/]"));
+    }
+
+    #[test]
+    fn status_shows_pending_gate_prominently() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = format!("first line\n\u{1b}[2J{}", "sensitive detail ".repeat(80));
+        Gates::write_gate(dir.path(), 16, Stage::Ship, &context).unwrap();
+        let open = Gates::list_open(dir.path());
+
+        let banner = render_pending_gate_banner(&open, u64::MAX).unwrap();
+
+        assert!(banner.contains("PENDING GATE"));
+        assert!(banner.contains("phase 16"));
+        assert!(banner.contains("ship"));
+        assert!(banner.contains("devflow gate approve 16 --stage ship"));
+        assert!(banner.contains("devflow gate reject 16 --stage ship"));
+        assert!(banner.contains("[truncated; full output in .devflow/]"));
+        assert!(!banner.contains(&context));
+        assert!(!banner.contains('\u{1b}'));
+        assert!(banner.contains("ESCALATED"));
     }
 
     /// A Ship-stage AgentFailed result (no `review:` prefix) must write a

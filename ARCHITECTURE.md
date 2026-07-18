@@ -98,7 +98,8 @@ Agent backends are isolated behind a trait
   Accepted names: `claude`, `codex`, `opencode` / `open-code`.
 - `adapter_for(kind)` returns the boxed adapter for a kind
   (`ClaudeAgent`/`CodexAgent`/`OpenCodeAgent`).
-- Prompts are built per-stage by `crate::prompt::stage_prompt(stage, phase)`,
+- Prompts are built per-stage by `crate::prompt::stage_prompt(stage, phase)`
+  (or `stage_prompt_for_project` when the CLI applies project config),
   not a single shared instruction template. Every prompt hands the agent its
   GSD slash command (`Stage::gsd_command()`) plus the `DEVFLOW_RESULT`
   completion contract (`DEVFLOW_RESULT: {"status": "success"}` /
@@ -121,9 +122,14 @@ Agent backends are isolated behind a trait
 
 When an agent exits, `evaluate_agent_result()`
 (`crates/devflow-core/src/agent_result.rs`) decides success/failure with
-three layers, tried in order:
+four layers, tried in order:
 
-1. **Layer 1 — `DEVFLOW_RESULT` marker (authoritative).** Parses the
+0. **Layer 0 — external post-condition (authoritative failure).** Commands
+   declared as `external_verify` in PLAN frontmatter run only after exact
+   command-array approval through `DEVFLOW_TRUST_EXTERNAL_VERIFY`; they run
+   before agent-controlled signals. A failure returns `Failed`; success or
+   no declaration defers to the ordinary cascade.
+1. **Layer 1 — `DEVFLOW_RESULT` marker (authoritative for ordinary plans).** Parses the
    agent's native per-adapter envelope (Claude's JSON result object, or
    Codex's `--json` JSONL event stream) or scans captured stdout for the
    last `DEVFLOW_RESULT: {...}` line. An envelope `is_error: true` overrides
@@ -301,10 +307,10 @@ other stage plus a mandatory terminal gate:
 
 ## Configuration
 
-DevFlow has **no config file** and no initialization step — there is no
-YAML/TOML project config, no command that scaffolds one, and no command
-that prints a merged config — all workflow options are CLI flags to
-`devflow start` (`crates/devflow-cli/src/main.rs`, `Command::Start`):
+DevFlow has no initialization step. Workflow options remain CLI flags to
+`devflow start` (`crates/devflow-cli/src/main.rs`, `Command::Start`). An
+optional minimal `devflow.toml` contains only reliability knobs:
+`capture_retention`, `review_angles`, and `external_verify_enabled`.
 
 | Flag | Purpose |
 |---|---|
@@ -320,7 +326,9 @@ Runtime state lives under `.devflow/` (git-ignored), keyed per-phase —
 locking](#per-phase-state-and-locking)). Tunable *runtime behavior* (not
 workflow options) is read from environment variables —
 `DEVFLOW_GATE_NOTIFY_CMD`, `DEVFLOW_GATE_TIMEOUT_SECS`,
-`DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS`, `RUST_LOG`, `DEVFLOW_LOG_FORMAT` — see
+`DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS`, `DEVFLOW_CAPTURE_RETENTION`,
+`DEVFLOW_REVIEW_ANGLES`, `DEVFLOW_EXTERNAL_VERIFY_ENABLED`, `RUST_LOG`,
+`DEVFLOW_LOG_FORMAT` — see
 [OPERATIONS.md](OPERATIONS.md) for the full operator-facing reference.
 
 ## Logging

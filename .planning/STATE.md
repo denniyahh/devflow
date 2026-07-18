@@ -2,26 +2,24 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
-status: In progress
-stopped_at: "Phase 15 shipped v1.3.0 (manual merge — ship gate approval path reported success without merging; PR #7 closed by push); Phase 16 context gathered"
-last_updated: "2026-07-17T21:45:00.000Z"
+status: Phase 16 shipped - PR #8
+stopped_at: Phase 16 shipped; PR #8 open for review
+last_updated: "2026-07-18T02:02:52.975Z"
 progress:
   total_phases: 6
-  completed_phases: 3
-  total_plans: 27
-  completed_plans: 27
-  percent: 50
+  completed_phases: 5
+  total_plans: 34
+  completed_plans: 34
+  percent: 83
 ---
 
 # DevFlow — Project State
 
-> Last updated: 2026-07-16
+> Last updated: 2026-07-18
 
 ## Active
 
-- **Phase 15 (15a Complete / 15b Scoped):** Dogfood Enablement + OSS Readiness — rescoped 2026-07-16 dogfood-first. 15a COMPLETE: `devflow gate list/approve/reject`, OPERATIONS.md, `.devflow.yaml` decoy removed, lib.rs examples fixed, `--help` snapshot guard; exit criterion verified live (full phase, gate answered only via CLI). 15b: OSS packaging (README/ARCHITECTURE/CONTRIBUTING/devcontainer/crates.io publish), to be run through DevFlow as the first post-MVP dogfood — `devflow start --phase 15 --agent claude --mode auto`. Antigravity adapter deferred to unscheduled backlog
-- **Phase 16 (Scoped):** Pipeline Reliability Hardening — inserted 2026-07-17, surfaced entirely by dogfooding Phase 15 through DevFlow (two Code-stage false positives on the crates.io publish plan, four consecutive Ship-review failures on distinct legitimate findings). Depends on Phase 15. Next up: `/gsd-discuss-phase 16`
-- **Phase 17 (Scoped):** Hermes Support — renumbered from 16 to 17 (2026-07-17) to make room for Phase 16. HermesAgent adapter, skill-file rewrite, Hermes plugin. Depends on Phase 14's events.jsonl + Phase 13's notify hook
+- **Phase 17 (Scoped — next):** Hermes Support — renumbered from 16 to 17 (2026-07-17) to make room for Phase 16. HermesAgent adapter, skill-file rewrite, Hermes plugin. Depends on Phase 14's events.jsonl + Phase 13's notify hook.
 
 ## Completed
 
@@ -42,6 +40,8 @@ progress:
 | 12 | Bootstrap + Housekeeping | — | 2026-07-10 |
 | 13 | MVP Core Loop | — | 2026-07-15 |
 | 14 | Parallel Safety + Observability | — | 2026-07-16 |
+| 15 | Dogfood Enablement + OSS Readiness | — | 2026-07-17 |
+| 16 | Pipeline Reliability Hardening | — | 2026-07-17 |
 
 *Phases 8 and 10 shipped without a SUMMARY.md at the time; both were retroactively documented 2026-07-08 (see `8-SUMMARY.md`, `10-SUMMARY.md`) after reconstruction from git history. Phase 11 was reviewed and found already adequately closed out via `11-VALIDATION.md`/`11r-VALIDATION.md` (Nyquist-compliant, sign-off dated 2026-06-20) — no retroactive SUMMARY.md was needed.*
 
@@ -91,6 +91,8 @@ None.
 - [Phase 15]: 15-02: ARCHITECTURE.md full rewrite also corrected the Agent model (trait renamed `Agent`->`AgentAdapter` in 12-11; prompts are per-stage via `prompt.rs::stage_prompt`, not one shared template) and Completion evaluation's Layer 2 commit gate (scoped to Plan/Code only, not every stage) — both classified "already accurate" by 15-PATTERNS.md but found stale on direct source verification; CONTRIBUTING.md's "Adding a New Agent" section left untouched (out of files_modified scope) despite already duplicating the checklist inline with the stale trait name — flagged for a future cleanup
 - [Phase 15]: 15-03: Verified devcontainer base image tag live against registry (2.0.13-1-bookworm, not stale illustrative 1-1-bookworm) and pinned devcontainers/ci action to @v0.3; CODE_OF_CONDUCT.md spot-checked and left unmodified (contact wording current)
 - [Phase 15]: 15-04: Sourced canonical Apache-2.0 body from an already-vendored copy in the local Cargo registry cache (byte-diffed) after an initial from-memory reconstruction was self-caught with garbled Section 8/9 text; kept dual license per plan's locked resolution
+- [Phase 16]: 16-01: absent feature branches are treated as already merged so terminal retries are safe after feature_finish deletes the branch
+- [Phase 16]: 16-01: merge_result telemetry separates actual merge effects from successful no-op hook execution
 
 ## Roadmap Evolution
 
@@ -122,9 +124,16 @@ None.
 | Phase 15-oss-readiness P02 | 40min | 3 tasks | 3 files |
 | Phase 15-oss-readiness P03 | 10min | 3 tasks | 3 files |
 | Phase 15-oss-readiness P04 | 12min | 2 tasks | 1 files |
+| Phase 16-pipeline-reliability-hardening P01 | 5min | 3 tasks | 3 files |
+| Phase 16 P02 | 23min | 3 tasks | 5 files |
+| Phase 16 P03 | 4min | 2 tasks | 5 files |
+| Phase 16 P04 | 2min | 2 tasks | 2 files |
+| Phase 16 P05 | 8min | 2 tasks | 14 files |
+| Phase 16 P06 | 3min | 2 tasks | 2 files |
+| Phase 16 P07 | 4min | 2 tasks | 7 files |
 
 ## Session
 
-**Last session:** 2026-07-17T21:45:00.000Z
-**Stopped at:** Phase 15 shipped v1.3.0 (manual merge); Phase 16 context gathered
-**Resume file:** .planning/phases/16-pipeline-reliability-hardening/16-CONTEXT.md
+**Last session:** 2026-07-18T02:02:52.975Z
+**Stopped at:** Phase 16 complete; ready for Phase 17
+**Resume file:** None

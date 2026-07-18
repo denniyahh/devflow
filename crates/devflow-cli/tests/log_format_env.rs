@@ -146,7 +146,11 @@ fn rust_log_unset_still_shows_info_level_logs_by_default() {
     let dir = project_with_open_gate(15, Stage::Ship);
 
     let mut cmd = Command::new(devflow_bin());
-    cmd.arg("gate").arg("approve").arg("15").arg(dir.path());
+    cmd.arg("gate")
+        .arg("approve")
+        .arg("15")
+        .arg("--project")
+        .arg(dir.path());
     // No RUST_LOG, no DEVFLOW_LOG_FORMAT — exercise the true CLI default.
     cmd.env_remove("RUST_LOG");
     cmd.env_remove("DEVFLOW_LOG_FORMAT");

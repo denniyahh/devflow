@@ -178,13 +178,13 @@ impl Drop for LockGuard {
 /// deliberately: the same stale-holder sweep covers it.
 const LOCK_FILE_PREFIX: &str = "lock-";
 
-fn lock_path(project_root: &Path, phase: u32) -> PathBuf {
+pub(crate) fn lock_path(project_root: &Path, phase: u32) -> PathBuf {
     project_root
         .join(".devflow")
         .join(format!("{LOCK_FILE_PREFIX}{phase:02}"))
 }
 
-fn project_lock_path(project_root: &Path) -> PathBuf {
+pub(crate) fn project_lock_path(project_root: &Path) -> PathBuf {
     project_root
         .join(".devflow")
         .join(format!("{LOCK_FILE_PREFIX}project"))

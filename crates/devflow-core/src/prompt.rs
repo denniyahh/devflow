@@ -6,6 +6,15 @@
 //! and DevFlow only needs the structured completion marker back.
 
 use crate::stage::Stage;
+use std::path::Path;
+
+const SHIP_REVIEW_ANGLES: &[&str] = &[
+    "doc-accuracy cross-reference (do documented claims match source?)",
+    "security / leaked-data (does anything commit secrets, session data, or telemetry?)",
+    "CI/build correctness (can a failing step still report green?)",
+    "external-state claims (does the diff claim merges, tags, or deletions that are not actually true?)",
+    "one generalist deep pass",
+];
 
 /// The completion contract every agent must honor as its final message.
 const COMPLETION_PROTOCOL: &str = "\
@@ -49,14 +58,26 @@ fn gsd_command_for(stage: Stage, phase: u32) -> String {
 /// proceeds to `/gsd-ship {N}`. The `review:` reason prefix is the
 /// ReviewFailed contract that `handle_ship_failure` matches (trimmed,
 /// case-folded) to loop back to Code with `AuditFix`.
-fn ship_stage_prompt(phase: u32) -> String {
+fn ship_stage_prompt(phase: u32, review_angles: &[String]) -> String {
     let code_review = format!("/gsd-code-review {phase}");
     let ship = format!("/gsd-ship {phase}");
+    let review_angles = review_angles
+        .iter()
+        .map(|angle| format!("- {angle}"))
+        .collect::<Vec<_>>()
+        .join("\n");
     format!(
         "Run the Ship stage in two steps:\n\
         \n\
         1. Run `{code_review}` (non-interactive). This writes a `REVIEW.md` \
-        artifact with severity-classified findings.\n\
+        artifact with severity-classified findings. Review at high depth from \
+        every angle below:\n\
+        \n\
+        {review_angles}\n\
+        \n\
+        If your harness supports parallel finder subagents, dispatch one per \
+        angle; otherwise run each angle as a focused sequential pass. Merge \
+        and deduplicate every angle's findings into one `REVIEW.md`.\n\
         2. Check `REVIEW.md` for the Critical-severity gate:\n\
         \n\
         - If `REVIEW.md` contains ANY finding at Critical severity: do NOT \
@@ -146,8 +167,29 @@ fn idempotent_stage_prompt(stage: Stage, phase: u32) -> String {
 
 /// Build the prompt for a stage of a phase.
 pub fn stage_prompt(stage: Stage, phase: u32) -> String {
+    stage_prompt_with_project(stage, phase, None)
+}
+
+/// Build a stage prompt with project-local configuration applied.
+///
+/// The CLI uses this entry point after resolving the canonical project root;
+/// library callers that have no project context keep using [`stage_prompt`]
+/// and receive built-in defaults.
+pub fn stage_prompt_for_project(stage: Stage, phase: u32, project_root: &Path) -> String {
+    stage_prompt_with_project(stage, phase, Some(project_root))
+}
+
+fn stage_prompt_with_project(stage: Stage, phase: u32, project_root: Option<&Path>) -> String {
     if stage == Stage::Ship {
-        return ship_stage_prompt(phase);
+        let review_angles = project_root
+            .and_then(crate::config::review_angles)
+            .unwrap_or_else(|| {
+                SHIP_REVIEW_ANGLES
+                    .iter()
+                    .map(|angle| (*angle).to_owned())
+                    .collect()
+            });
+        return ship_stage_prompt(phase, &review_angles);
     }
     if stage == Stage::Validate {
         return validate_stage_prompt(phase);
@@ -156,6 +198,20 @@ pub fn stage_prompt(stage: Stage, phase: u32) -> String {
         return idempotent_stage_prompt(stage, phase);
     }
     let command = gsd_command_for(stage, phase);
+    if stage == Stage::Code {
+        return format!(
+            "Run the GSD workflow command for this stage:\n\n    {command}\n\n\
+            ## Advisory incremental self-review\n\
+            \n\
+            After each plan or wave lands, perform a quick, shallow self-check \
+            for doc accuracy, leaked data, CI/build correctness, and \
+            external-state claims. Record any drift in the working output and \
+            continue execution; the authoritative review happens during Ship. \
+            This check must not pause execution or request human input.\n\
+            \n\
+            {COMPLETION_PROTOCOL}"
+        );
+    }
     format!(
         "Run the GSD workflow command for this stage:\n\n    {command}\n\n{COMPLETION_PROTOCOL}"
     )
@@ -238,6 +294,40 @@ mod tests {
     }
 
     #[test]
+    fn ship_prompt_includes_multi_angle_conditional_review() {
+        let prompt = stage_prompt(Stage::Ship, 13);
+        for angle in [
+            "doc-accuracy cross-reference",
+            "security / leaked-data",
+            "CI/build correctness",
+            "external-state claims",
+            "generalist deep pass",
+        ] {
+            assert!(prompt.contains(angle), "Ship prompt missing angle: {angle}");
+        }
+        assert!(prompt.contains("parallel finder subagents"));
+        assert!(prompt.contains("focused sequential pass"));
+        assert!(prompt.contains("Merge and deduplicate"));
+        assert!(prompt.contains("REVIEW.md"));
+    }
+
+    #[test]
+    fn ship_prompt_uses_project_review_angle_override() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("devflow.toml"),
+            "review_angles = [\"custom release evidence\", \"custom threat boundary\"]\n",
+        )
+        .unwrap();
+
+        let prompt = stage_prompt_for_project(Stage::Ship, 13, dir.path());
+
+        assert!(prompt.contains("custom release evidence"));
+        assert!(prompt.contains("custom threat boundary"));
+        assert!(!prompt.contains("doc-accuracy cross-reference"));
+    }
+
+    #[test]
     fn code_stage_prompt_is_unchanged_single_command_template() {
         // Validate is excluded here (Task 2, 13-05): it now gets its own
         // dedicated prompt requiring a verdict — see
@@ -255,6 +345,17 @@ mod tests {
             !prompt.contains("already exists"),
             "Code prompt should not carry the Define/Plan idempotency contract"
         );
+        assert!(prompt.contains("Advisory incremental self-review"));
+        for angle in [
+            "doc accuracy",
+            "leaked data",
+            "CI/build correctness",
+            "external-state claims",
+        ] {
+            assert!(prompt.contains(angle), "Code prompt missing angle: {angle}");
+        }
+        assert!(!prompt.contains("AskUserQuestion"));
+        assert!(!prompt.contains("request_user_input"));
     }
 
     /// 13-06 dogfood regression (Codex leg): GSD's discuss-phase demands an

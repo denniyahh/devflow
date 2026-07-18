@@ -69,12 +69,39 @@ impl GitFlow {
 
     /// Merge a feature branch into develop and delete it.
     pub fn feature_finish(&self, phase: u32) -> Result<String, GitError> {
-        let branch = format!("{}phase-{:02}", self.config.feature_prefix, phase);
-        info!("finishing feature branch: {branch}");
-        self.git(["checkout", &self.config.develop])?;
-        self.git(["merge", "--no-ff", &branch])?;
+        let branch = self.merge_feature_into_develop(phase)?;
         self.git(["branch", "-d", &branch])?;
         Ok(branch)
+    }
+
+    /// Merge a feature branch into develop without deleting it.
+    ///
+    /// Default DevFlow runs keep the feature branch checked out in a linked
+    /// worktree, so deletion belongs to the later best-effort cleanup hook.
+    pub fn merge_feature_into_develop(&self, phase: u32) -> Result<String, GitError> {
+        let branch = format!("{}phase-{:02}", self.config.feature_prefix, phase);
+        info!("merging feature branch: {branch}");
+        self.git(["checkout", &self.config.develop])?;
+        self.git(["merge", "--no-ff", &branch])?;
+        Ok(branch)
+    }
+
+    /// Whether a phase feature branch has nothing left to merge into develop.
+    ///
+    /// An absent branch is not proof of a merge. Callers must fail closed
+    /// rather than treating a deleted or never-created branch as shipped.
+    pub fn is_merged_into_develop(&self, phase: u32) -> bool {
+        let branch = format!("{}phase-{:02}", self.config.feature_prefix, phase);
+        if !self.branch_exists(&branch) {
+            return false;
+        }
+
+        Command::new("git")
+            .args(["merge-base", "--is-ancestor", &branch, &self.config.develop])
+            .current_dir(&self.root)
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
     }
 
     /// Create or reset a release branch from the current `HEAD`.

@@ -100,7 +100,7 @@ fn wait_for(path: &Path) {
 
 /// Wait until a monitor-written pid file exists AND holds a parseable pid,
 /// returning it. A plain `wait_for` + one-shot read is racy: each stage
-/// transition's `cleanup_phase_files` briefly deletes the pid file before
+/// transition's `archive_phase_files` briefly deletes the pid file before
 /// the next monitor recreates it, so a read can land in the gap and hit
 /// NotFound even though the pipeline is healthy.
 fn wait_for_pid(path: &Path) -> u32 {
