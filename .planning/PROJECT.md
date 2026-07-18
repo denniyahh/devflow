@@ -32,30 +32,20 @@ mid-run crash or kill.
   data) — Phase 12
 - ✓ crates.io publish-readiness (metadata, `--dry-run`, `cargo package`) —
   Phase 12, publish itself intentionally held until Phase 15 (OSS readiness)
+- ✓ Reliable terminal finalization, reviewed external post-condition probes,
+  retained attempt evidence, deterministic doc/runtime invariants,
+  worktree-aware CLI behavior, attempt history, and persistent gates — Phase 16
 
 ### Active
 
-- Phase 13 — **MVP Core Loop** (repurposed 2026-07-14): get
-  Define→Plan→Code→Validate→Ship working end-to-end unattended on real
-  projects. Claims the `ship.rs` GSD-native rewrite; verdict-vs-ran split;
-  native Claude/Codex envelope parsing; WR-11 + gate notify hook +
-  configurable timeout; worktree-by-default; dogfood run as acceptance test
-- Phase 14 — observability + Hermes support: `devflow logs [--follow]`,
-  `events.jsonl`, richer `status`; `capture_agent_output()` sync-path
-  decision; HermesAgent adapter, Hermes skill-file rewrite, and the Hermes
-  plugin session mode (moved from 15, 2026-07-14)
-- Phase 15 (was 13) — OSS readiness: dev container, contribution docs, a
-  full README/ARCHITECTURE.md rewrite against current reality, Antigravity
-  agent adapter, actual crates.io publish
+- Phase 17 — **Hermes Support:** HermesAgent adapter, current CLI skill file,
+  and an `events.jsonl`-driven gate-watcher plugin. Phases 13–16 are complete.
 
 ### Out of Scope
 
 - Bootstrap tooling (`new-project`, `map-codebase`) — deferred to its own
   future phase; no detailed requirements exist yet (Phase 12 CONTEXT.md,
   2026-07-08)
-- `devflow.toml` / configurable pipeline — shelved 2026-07-08 (see STATE.md);
-  open to reconsidering per external review feedback, but not scoped to any
-  current phase
 
 ## Context
 
@@ -64,11 +54,10 @@ mid-run crash or kill.
   daemon (`monitor.rs`) that captures stdout/stderr/exit/pid to files and
   invokes `devflow advance` on completion. `tmux` is no longer a runtime
   dependency.
-- The CLI surface was substantially cut and rebuilt in Phase 11: `check`,
-  `verify`, `lint`, `docs`, `ship`, `confirm`, `rejectpr`, `init`, and
-  `config` subcommands were removed. Current commands: `start`, `advance`
-  (hidden, internal), `parallel`, `sequentagent`, `reference`, `cleanup`,
-  `status`, `list`, `recover`, `doctor`, `test`.
+- The CLI surface was substantially cut and rebuilt in Phase 11, then expanded
+  through Phase 16. Current operator commands include `start`, `gate`, `logs`,
+  `history`, `parallel`, `sequentagent`, `reference`, `cleanup`, `status`,
+  `list`, `recover`, `doctor`, and `test`; `advance` remains hidden/internal.
 - Workspace version is `1.2.0`. Code/docs historically over-claimed
   "v2.0.0" as current; Phase 12 corrected this — 2.0.0 is the *target*
   version for the Phase 11–15 arc, not yet shipped, and will only be bumped
@@ -95,7 +84,7 @@ mid-run crash or kill.
 | File-based gate protocol instead of a live RPC/socket | Human response can come from any interface (Hermes, manual file drop, future UI) without DevFlow depending on any one of them | ✓ Good |
 | Hold `cargo publish` until Phase 15 (OSS readiness) — after MVP loop (13) + observability (14) | Publishing is irreversible — a version can never be reused or unpublished; first public release should be reliability-hardened and documented | — Pending |
 | MVP restructure (2026-07-14): Phase 13 → MVP Core Loop, old 13 → 15 | Priority is dogfooding the core loop on real projects again; OSS packaging is worthless until the loop it packages works end-to-end | — Pending |
-| Shelve `devflow.toml` / configurable pipeline | Config was fully removed in Phase 11 for simplicity; open to reconsidering per external review feedback, but not urgent | — Pending |
+| Reintroduce a minimal `devflow.toml` | Phase 16 required typed reliability knobs while preserving hardcoded git-flow branch constants; environment variables override project values | ✓ Good |
 | Defer bootstrap (`new-project`/`map-codebase`) out of Phase 12 | Genuinely unscoped — no detailed requirements exist yet; inventing them would be speculative | — Pending |
 
 ## Key Files
@@ -107,4 +96,4 @@ mid-run crash or kill.
 | `.planning/CONCERNS.md` | Top findings from the original pre-Phase-1 codebase audit |
 
 ---
-*Last updated: 2026-07-14 after MVP restructure (Phase 13 → MVP Core Loop, old 13 → 15)*
+*Last updated: 2026-07-17 after Phase 16 completion*
