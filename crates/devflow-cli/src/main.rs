@@ -2097,15 +2097,25 @@ fn print_open_branches(project_root: &Path) {
 }
 
 fn project_root(project: PathBuf) -> Result<PathBuf, CliError> {
-    if project.exists() {
-        project
-            .canonicalize()
-            .map_err(|err| CliError::Message(format!("failed to resolve project path: {err}")))
-    } else {
-        Err(CliError::Message(format!(
+    if !project.exists() {
+        return Err(CliError::Message(format!(
             "project path does not exist: {}",
             project.display()
-        )))
+        )));
+    }
+
+    let start = project
+        .canonicalize()
+        .map_err(|err| CliError::Message(format!("failed to resolve project path: {err}")))?;
+    let mut probe = start.as_path();
+    loop {
+        if probe.join(".devflow").is_dir() {
+            return Ok(probe.to_path_buf());
+        }
+        match probe.parent() {
+            Some(parent) => probe = parent,
+            None => return Ok(start),
+        }
     }
 }
 
