@@ -1072,6 +1072,7 @@ fn run_checkout_hooks(
     };
     let git_flow = GitFlowConfig::default();
     let mut all_succeeded = true;
+    let terminal_batch = batch == hooks::hooks_after_ship().as_slice();
     for hook in batch {
         let ctx = HookContext {
             phase: state.phase,
@@ -1093,9 +1094,10 @@ fn run_checkout_hooks(
                 "ok": outcome.is_ok(),
             }),
         );
-        // Merge is the terminal truth boundary: release bookkeeping must not
-        // run against an unmerged develop branch.
-        if *hook == hooks::Hook::Merge && outcome.is_err() {
+        // Terminal finalization is ordered and fail-fast. In particular, a
+        // failed version/tag operation must not delete the feature branch and
+        // destroy the evidence needed for a safe retry.
+        if terminal_batch && outcome.is_err() {
             break;
         }
     }
@@ -2876,6 +2878,36 @@ mod tests {
     }
 
     #[test]
+    fn terminal_hook_failure_stops_before_branch_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = 34;
+        let branch = "feature/phase-34";
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?} failed");
+        };
+        git(&["branch", branch, "develop"]);
+        // Force VersionBump to fail after Merge succeeds.
+        std::fs::remove_file(root.join("Cargo.toml")).unwrap();
+        std::fs::create_dir(root.join("Cargo.toml")).unwrap();
+
+        let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let succeeded = run_checkout_hooks(root, &state, &hooks::hooks_after_ship(), Stage::Ship);
+
+        assert!(!succeeded);
+        assert!(
+            GitFlow::new(root).branch_exists(branch),
+            "a failed terminal batch must preserve the branch for retry"
+        );
+    }
+
+    #[test]
     fn default_logs_phase_prefers_single_active_state() {
         let dir = tempfile::tempdir().unwrap();
         let state = State::new(6, AgentKind::Claude, Mode::Auto, dir.path().to_path_buf());
@@ -3058,6 +3090,14 @@ mod tests {
         init_repo(root);
 
         let phase = 21;
+        let branch = format!("feature/phase-{phase:02}");
+        let branch_created = std::process::Command::new("git")
+            .args(["branch", &branch, "develop"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success();
+        assert!(branch_created);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Ship;
         workflow::save_state(&state).unwrap();
@@ -3175,6 +3215,14 @@ mod tests {
 
         let phases = [31u32, 32u32];
         for &phase in &phases {
+            let branch = format!("feature/phase-{phase:02}");
+            let branch_created = std::process::Command::new("git")
+                .args(["branch", &branch, "develop"])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success();
+            assert!(branch_created);
             let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
             state.stage = Stage::Ship;
             workflow::save_state(&state).unwrap();

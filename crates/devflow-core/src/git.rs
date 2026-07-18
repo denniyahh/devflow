@@ -88,12 +88,12 @@ impl GitFlow {
 
     /// Whether a phase feature branch has nothing left to merge into develop.
     ///
-    /// An absent branch is treated as already merged so terminal hook retries
-    /// remain idempotent after a prior merge deleted the local branch.
+    /// An absent branch is not proof of a merge. Callers must fail closed
+    /// rather than treating a deleted or never-created branch as shipped.
     pub fn is_merged_into_develop(&self, phase: u32) -> bool {
         let branch = format!("{}phase-{:02}", self.config.feature_prefix, phase);
         if !self.branch_exists(&branch) {
-            return true;
+            return false;
         }
 
         Command::new("git")

@@ -120,8 +120,14 @@ fn branch_cleanup(ctx: &HookContext) -> Result<(), HookError> {
 fn merge_feature(ctx: &HookContext) -> Result<(), HookError> {
     let git = GitFlow::new(&ctx.project_root);
     let branch = format!("{}phase-{:02}", ctx.git_flow.feature_prefix, ctx.phase);
+    if !git.branch_exists(&branch) {
+        return Err(crate::git::GitError::Command(format!(
+            "feature branch `{branch}` is missing; refusing to report an unproven merge"
+        ))
+        .into());
+    }
     if git.is_merged_into_develop(ctx.phase) {
-        info!("Merge: {branch} is already merged or absent; nothing to merge");
+        info!("Merge: {branch} is already merged; nothing to merge");
         crate::events::emit(
             &ctx.project_root,
             ctx.phase,
@@ -391,11 +397,12 @@ mod tests {
     }
 
     #[test]
-    fn merge_is_fail_soft_when_branch_absent() {
+    fn merge_fails_closed_when_branch_absent() {
         let dir = tempfile::tempdir().unwrap();
         init_repo(dir.path());
-        // No feature branch exists — merge must report a no-op and succeed.
-        Hook::Merge.run(&ctx(dir.path(), Stage::Ship)).unwrap();
+        // Branch absence cannot prove that phase work reached develop.
+        let error = Hook::Merge.run(&ctx(dir.path(), Stage::Ship)).unwrap_err();
+        assert!(error.to_string().contains("unproven merge"));
     }
 
     fn git_output(root: &Path, args: &[&str]) -> String {
