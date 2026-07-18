@@ -1,12 +1,13 @@
 {
-  "project": "devflow",
-  "version": "0.5.0",
-  "created": "2026-06-17",
+  "commit_docs": true,
   "workflow": {
     "granularity": "medium",
     "auto_mode": true,
     "commit_docs": true,
-    "subagent_timeout": 300000
+    "subagent_timeout": 300000,
+    "_auto_chain_active": false,
+    "nyquist_validation": true,
+    "ai_integration_phase": true
   },
   "git": {
     "main": "main",
@@ -14,11 +15,6 @@
     "feature_prefix": "feature/",
     "auto_branch": true,
     "auto_cleanup": true
-  },
-  "agents": {
-    "primary": "claude",
-    "fallback": "codex",
-    "installed": ["claude", "codex", "omx"]
   },
   "intel": {
     "enabled": true,

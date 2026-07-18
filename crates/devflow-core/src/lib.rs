@@ -22,8 +22,8 @@
 //! | `trace` | Full tracing subscriber internals |
 //!
 //! ```bash
-//! RUST_LOG=info devflow start --phase 3 --agent claude   # Default: shows state transitions
-//! RUST_LOG=debug devflow start --phase 3 --agent claude  # Also shows git commands and file I/O
+//! RUST_LOG=info devflow start --phase 3 --agent claude --mode auto   # Default: shows state transitions
+//! RUST_LOG=debug devflow start --phase 3 --agent claude --mode auto  # Also shows git commands and file I/O
 //! RUST_LOG=warn devflow status                           # Suppress info, show only warnings
 //! ```
 //!
@@ -55,8 +55,12 @@ pub mod agent;
 pub mod agent_result;
 pub mod agents;
 pub mod config;
+#[cfg(test)]
+mod doc_check;
+pub mod events;
 pub mod gates;
 pub mod git;
+pub mod history;
 pub mod hooks;
 pub mod lock;
 pub mod mode;
@@ -66,12 +70,12 @@ pub mod recover;
 pub mod ship;
 pub mod stage;
 pub mod state;
+pub mod verify;
 pub mod version;
 pub mod workflow;
 pub mod worktree;
 
 // Re-exports for convenience.
-pub use agent::launch_agent;
 pub use mode::Mode;
 pub use stage::Stage;
-pub use state::{Agent, AgentKind, State};
+pub use state::{AgentKind, State};

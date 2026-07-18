@@ -1,39 +1,11 @@
-//! Ship/PR bookkeeping.
+//! Ship bookkeeping.
 //!
-//! Holds the `LastShip` record written by `devflow ship` and consumed by
-//! `devflow confirm` / `devflow rejectpr`, plus PR-body generation and the
-//! pure document-finalization transforms (CHANGELOG, ROADMAP) used on confirm.
+//! Holds the Hermes cron-instructions manifest (used to resume a rate-limited
+//! DevFlow run later) plus the pure document-finalization transform
+//! (CHANGELOG) used on ship completion.
 
-use crate::config::GitFlowConfig;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use tracing::{debug, info};
-
-/// Record of the most recent `devflow ship`, enabling confirm/reject later.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct LastShip {
-    /// Phase that was shipped.
-    pub phase: u32,
-    /// Version before the bump.
-    pub version_from: String,
-    /// Version after the bump.
-    pub version_to: String,
-    /// Release branch name.
-    pub release_branch: String,
-    /// PR number, if a PR was opened.
-    pub pr_number: Option<u64>,
-    /// PR URL, if a PR was opened.
-    pub pr_url: Option<String>,
-    /// Path to the file whose version was bumped.
-    pub version_file: PathBuf,
-    /// Whether the ship has been rejected.
-    pub rejected: bool,
-    /// Why the ship was rejected, if applicable.
-    pub reject_reason: Option<String>,
-    /// Unix timestamp (seconds) when the ship was created.
-    pub created_at: String,
-}
 
 /// Manifest consumed by Hermes to resume a rate-limited DevFlow run later.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -88,46 +60,27 @@ pub enum ShipError {
     Missing,
 }
 
-/// Path to the last-ship record for a project.
-pub fn last_ship_path(project_root: &Path) -> PathBuf {
-    project_root.join(".devflow").join("last-ship.json")
+/// Path to a phase's cron-instructions record. Per-phase since 14a
+/// (13-DEFERRED-CR-03): the old single-slot `cron-instructions.json` let one
+/// phase's rate-limit record clobber another's under `devflow parallel`.
+pub fn cron_instructions_path(project_root: &Path, phase: u32) -> PathBuf {
+    project_root
+        .join(".devflow")
+        .join(format!("cron-instructions-{phase:02}.json"))
 }
 
-/// Path to the cron-instructions record for a project.
-pub fn cron_instructions_path(project_root: &Path) -> PathBuf {
+/// Path of the legacy single-slot record written by pre-14a binaries. Still
+/// read/deleted for compatibility; never written.
+pub(crate) fn legacy_cron_instructions_path(project_root: &Path) -> PathBuf {
     project_root.join(".devflow").join("cron-instructions.json")
 }
 
-/// Persist the last-ship record.
-pub fn save(project_root: &Path, record: &LastShip) -> Result<(), ShipError> {
-    let path = last_ship_path(project_root);
-    info!(
-        "saving ship record: phase={} version={} → {}",
-        record.phase, record.version_from, record.version_to
-    );
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&path, serde_json::to_string_pretty(record)?)?;
-    Ok(())
-}
-
-/// Load the last-ship record, or [`ShipError::Missing`] if absent.
-pub fn load(project_root: &Path) -> Result<LastShip, ShipError> {
-    let path = last_ship_path(project_root);
-    debug!("loading ship record from {}", path.display());
-    if !path.exists() {
-        return Err(ShipError::Missing);
-    }
-    Ok(serde_json::from_str(&std::fs::read_to_string(&path)?)?)
-}
-
-/// Persist Hermes cron instructions.
+/// Persist Hermes cron instructions for the phase recorded inside them.
 pub fn write_cron_instructions(
     project_root: &Path,
     instructions: &CronInstructions,
 ) -> Result<(), ShipError> {
-    let path = cron_instructions_path(project_root);
+    let path = cron_instructions_path(project_root, instructions.phase);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -135,30 +88,65 @@ pub fn write_cron_instructions(
     Ok(())
 }
 
-/// Load Hermes cron instructions, or [`ShipError::Missing`] if absent.
-pub fn load_cron_instructions(project_root: &Path) -> Result<CronInstructions, ShipError> {
-    let path = cron_instructions_path(project_root);
-    if !path.exists() {
-        return Err(ShipError::Missing);
+/// Load a phase's Hermes cron instructions, or [`ShipError::Missing`] if
+/// absent. Falls back to a legacy single-slot record when it names this phase.
+pub fn load_cron_instructions(
+    project_root: &Path,
+    phase: u32,
+) -> Result<CronInstructions, ShipError> {
+    let path = cron_instructions_path(project_root, phase);
+    if path.exists() {
+        return Ok(serde_json::from_str(&std::fs::read_to_string(&path)?)?);
     }
-    Ok(serde_json::from_str(&std::fs::read_to_string(&path)?)?)
+    let legacy = legacy_cron_instructions_path(project_root);
+    if legacy.exists() {
+        let instructions: CronInstructions =
+            serde_json::from_str(&std::fs::read_to_string(&legacy)?)?;
+        if instructions.phase == phase {
+            return Ok(instructions);
+        }
+    }
+    Err(ShipError::Missing)
 }
 
-/// Remove the last-ship record. Idempotent.
-pub fn delete(project_root: &Path) -> Result<(), ShipError> {
-    let path = last_ship_path(project_root);
-    if path.exists() {
-        debug!("deleting ship record at {}", path.display());
-        std::fs::remove_file(path)?;
+/// Every pending cron-instructions record (per-phase files plus a legacy
+/// single-slot one), sorted by phase. Unparsable files are skipped.
+pub fn list_cron_instructions(project_root: &Path) -> Vec<CronInstructions> {
+    let mut found = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(project_root.join(".devflow")) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !name.starts_with("cron-instructions") || !name.ends_with(".json") {
+                continue;
+            }
+            if let Ok(contents) = std::fs::read_to_string(entry.path())
+                && let Ok(instructions) = serde_json::from_str::<CronInstructions>(&contents)
+            {
+                found.push(instructions);
+            }
+        }
     }
-    Ok(())
+    found.sort_by_key(|i| i.phase);
+    found.dedup_by_key(|i| i.phase);
+    found
 }
 
-/// Remove the cron-instructions record. Idempotent.
-pub fn delete_cron_instructions(project_root: &Path) -> Result<(), ShipError> {
-    let path = cron_instructions_path(project_root);
+/// Remove a phase's cron-instructions record (and a legacy single-slot record
+/// naming the same phase). Idempotent.
+pub fn delete_cron_instructions(project_root: &Path, phase: u32) -> Result<(), ShipError> {
+    let path = cron_instructions_path(project_root, phase);
     if path.exists() {
         std::fs::remove_file(path)?;
+    }
+    let legacy = legacy_cron_instructions_path(project_root);
+    if legacy.exists()
+        && let Ok(contents) = std::fs::read_to_string(&legacy)
+        && serde_json::from_str::<CronInstructions>(&contents)
+            .map(|i| i.phase == phase)
+            .unwrap_or(true)
+    {
+        std::fs::remove_file(&legacy)?;
     }
     Ok(())
 }
@@ -188,7 +176,7 @@ pub fn build_cron_instructions(
             args,
         },
         hermes_cron: HermesCronJob {
-            schedule: cron_schedule_from_retry_after(retry_after),
+            schedule: cron_schedule_from_retry_after(retry_after).unwrap_or_default(),
             name: format!("devflow-phase-{phase:02}-resume"),
             command: format!(
                 "cd {} && devflow sequentagent --phase {phase} --agents {next_agents}",
@@ -201,104 +189,9 @@ pub fn build_cron_instructions(
 
 /// Convert a retry timestamp to `M H D M W` cron syntax, rounding up to the
 /// nearest minute. Supports RFC3339-like timestamps and Unix epoch seconds.
-pub fn cron_schedule_from_retry_after(retry_after: &str) -> String {
-    parse_retry_timestamp(retry_after)
-        .map(|ts| ts.round_up_minute().to_cron())
-        .unwrap_or_else(|| "* * * * *".to_string())
-}
-
-/// Build a Markdown PR body from the phase Goal, the diffstat, and a test count.
-///
-/// Each source is fail-soft: a missing CONTEXT.md, diff, or test output yields a
-/// placeholder rather than failing the whole body.
-pub fn build_pr_body(
-    project_root: &Path,
-    phase: u32,
-    git_flow: &GitFlowConfig,
-    verify_command: &str,
-) -> String {
-    let goal = extract_goal(project_root, phase)
-        .unwrap_or_else(|| "_No phase Goal found in CONTEXT.md._".to_string());
-    let changes = changed_files(project_root, &git_flow.develop)
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "(no diff available)".to_string());
-    let tests = test_summary(project_root, verify_command);
-
-    format!(
-        "## Summary\n\nPhase {phase}.\n\n{goal}\n\n## Changes\n\n```\n{changes}\n```\n\n## Tests\n\n{tests}\n"
-    )
-}
-
-/// Extract the `## Goal` section text from a phase's CONTEXT.md.
-pub fn extract_goal(project_root: &Path, phase: u32) -> Option<String> {
-    let phases_dir = project_root.join(".planning").join("phases");
-    let prefix = format!("{phase:02}-");
-    let entry = std::fs::read_dir(&phases_dir)
-        .ok()?
-        .flatten()
-        .find(|e| e.file_name().to_string_lossy().starts_with(&prefix))?;
-    let text = std::fs::read_to_string(entry.path().join("CONTEXT.md")).ok()?;
-    extract_section(&text, "## Goal")
-}
-
-/// Return the text of a Markdown section: everything after the `header` line up
-/// to (but excluding) the next `## ` heading or `---` rule.
-fn extract_section(text: &str, header: &str) -> Option<String> {
-    let mut lines = text.lines();
-    // Advance to the header line.
-    lines.by_ref().find(|line| line.trim() == header)?;
-
-    let mut body = Vec::new();
-    for line in lines {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("## ") || line.trim() == "---" {
-            break;
-        }
-        body.push(line);
-    }
-    let joined = body.join("\n").trim().to_string();
-    if joined.is_empty() {
-        None
-    } else {
-        Some(joined)
-    }
-}
-
-/// `git diff --stat <develop>...HEAD` run in the project root.
-fn changed_files(project_root: &Path, develop: &str) -> Option<String> {
-    let output = Command::new("git")
-        .args(["diff", "--stat", &format!("{develop}...HEAD")])
-        .current_dir(project_root)
-        .output()
-        .ok()?;
-    if output.status.success() {
-        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        None
-    }
-}
-
-/// Run the verify command and summarize the passing test count.
-fn test_summary(project_root: &Path, verify_command: &str) -> String {
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg(verify_command)
-        .current_dir(project_root)
-        .output();
-    match output {
-        Ok(out) => {
-            let combined = format!(
-                "{}{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
-            match count_passed_tests(&combined) {
-                Some(n) => format!("{n} tests passed (`{verify_command}`)."),
-                None => format!("tests: unknown (`{verify_command}` output not parseable)."),
-            }
-        }
-        Err(_) => "tests: unknown (verify command could not run).".to_string(),
-    }
+pub fn cron_schedule_from_retry_after(retry_after: &str) -> Option<String> {
+    // WR-06: never turn unparseable agent output into an every-minute cron.
+    parse_retry_timestamp(retry_after).map(|ts| ts.round_up_minute().to_cron())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -391,6 +284,12 @@ fn parse_rfc3339ish(input: &str) -> Option<RetryTimestamp> {
     };
     let utc_minutes = ts.to_epoch_minutes() - i64::from(offset_minutes);
     let mut normalized = RetryTimestamp::from_epoch_minutes(utc_minutes);
+    // `to_epoch_minutes`/`from_epoch_minutes` normalize at whole-minute
+    // granularity (the offset subtraction above only ever shifts whole
+    // minutes, since `offset_minutes` is itself an integer minute count),
+    // so `from_epoch_minutes` always zeroes `second`. A timezone offset never
+    // carries a sub-minute component, so the original `second` is
+    // timezone-invariant and safe to restore verbatim here.
     normalized.second = second;
     Some(normalized)
 }
@@ -417,10 +316,31 @@ fn split_time_and_offset(time: &str) -> (&str, i32) {
 }
 
 fn parse_offset_minutes(offset: &str) -> Option<i32> {
+    // WR-07 (13-REVIEW.md), revised: accept the three ISO-8601 offset forms
+    // — ±HH:MM, ±HHMM, and hour-only ±HH — with bound-checked values.
+    // Requiring a colon (the first WR-07 fix) silently rescheduled valid
+    // ±HH/±HHMM timestamps to UTC through the callers' `unwrap_or(0)`,
+    // firing the resume cron hours off; the original pre-WR-07 code misread
+    // ±HHMM as HHMM *hours*. Anything else (wrong digit count, out-of-range
+    // values) still fails safe as None. `retry_after` is raw agent output,
+    // so no producer guarantees one form.
+    const MAX_OFFSET_HOURS: i32 = 23;
+    const MAX_OFFSET_MINUTES: i32 = 59;
     let sign = if offset.starts_with('-') { -1 } else { 1 };
-    let mut parts = offset.get(1..)?.split(':');
-    let hours = parts.next()?.parse::<i32>().ok()?;
-    let minutes = parts.next().unwrap_or("0").parse::<i32>().ok()?;
+    let rest = offset.get(1..)?;
+    let (hours_part, minutes_part) = match rest.split_once(':') {
+        Some((hours, minutes)) => (hours, minutes),
+        None => match rest.len() {
+            2 => (rest, "0"),              // ±HH
+            4 => (&rest[..2], &rest[2..]), // ±HHMM
+            _ => return None,
+        },
+    };
+    let hours = hours_part.parse::<i32>().ok()?;
+    let minutes = minutes_part.parse::<i32>().ok()?;
+    if !(0..=MAX_OFFSET_HOURS).contains(&hours) || !(0..=MAX_OFFSET_MINUTES).contains(&minutes) {
+        return None;
+    }
     Some(sign * (hours * 60 + minutes))
 }
 
@@ -449,30 +369,20 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
 }
 
 fn shell_quote(value: &str) -> String {
-    if value
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
-    {
+    // Characters that never need quoting in a POSIX shell word: alphanumerics
+    // plus the common punctuation used in paths, versions, and identifiers
+    // (`/ . _ -`) and additional unambiguously-safe characters (`~ : @ + = %`)
+    // that have no special meaning to the shell when unquoted. Anything not
+    // in this set falls through to single-quote wrapping below, so widening
+    // this list only reduces over-quoting — it can never under-quote.
+    if value.chars().all(|c| {
+        c.is_ascii_alphanumeric()
+            || matches!(c, '/' | '.' | '_' | '-' | '~' | ':' | '@' | '+' | '=' | '%')
+    }) {
         value.to_string()
     } else {
         format!("'{}'", value.replace('\'', "'\\''"))
     }
-}
-
-/// Sum the `test result: ok. N passed` counts in cargo test output.
-pub fn count_passed_tests(output: &str) -> Option<u32> {
-    let mut total = 0u32;
-    let mut found = false;
-    for line in output.lines() {
-        if let Some(rest) = line.trim().strip_prefix("test result: ok. ")
-            && let Some(num) = rest.split_whitespace().next()
-            && let Ok(n) = num.parse::<u32>()
-        {
-            total += n;
-            found = true;
-        }
-    }
-    found.then_some(total)
 }
 
 /// Prepend a CHANGELOG entry for `version`, creating a standard header if the
@@ -495,65 +405,9 @@ pub fn prepend_changelog(existing: &str, version: &str, date: &str) -> String {
     }
 }
 
-/// Annotate a ROADMAP `## Phase N` heading as completed, matching the existing
-/// `(Priority: ... — COMPLETED vX)` style. Idempotent. Pure transform.
-pub fn mark_phase_complete(roadmap: &str, phase: u32, version: &str) -> String {
-    let needle = format!("## Phase {phase}");
-    roadmap
-        .lines()
-        .map(|line| {
-            if line.starts_with(&needle) && !line.contains("COMPLETED") {
-                format!("{} — COMPLETED v{version}", line.trim_end())
-            } else {
-                line.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
-
-    fn sample(root: &Path) -> LastShip {
-        LastShip {
-            phase: 7,
-            version_from: "0.5.1".into(),
-            version_to: "0.5.2".into(),
-            release_branch: "release/0.5.2".into(),
-            pr_number: Some(42),
-            pr_url: Some("https://example/pr/42".into()),
-            version_file: root.join("Cargo.toml"),
-            rejected: false,
-            reject_reason: None,
-            created_at: "1750000000".into(),
-        }
-    }
-
-    #[test]
-    fn save_load_round_trips() {
-        let dir = tempfile::tempdir().unwrap();
-        let record = sample(dir.path());
-        save(dir.path(), &record).unwrap();
-        assert_eq!(load(dir.path()).unwrap(), record);
-    }
-
-    #[test]
-    fn load_missing_returns_missing() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(matches!(load(dir.path()), Err(ShipError::Missing)));
-    }
-
-    #[test]
-    fn delete_is_idempotent() {
-        let dir = tempfile::tempdir().unwrap();
-        save(dir.path(), &sample(dir.path())).unwrap();
-        delete(dir.path()).unwrap();
-        assert!(!last_ship_path(dir.path()).exists());
-        delete(dir.path()).unwrap();
-    }
 
     #[test]
     fn cron_instructions_save_load_round_trips() {
@@ -562,7 +416,7 @@ mod tests {
 
         write_cron_instructions(dir.path(), &record).unwrap();
 
-        assert_eq!(load_cron_instructions(dir.path()).unwrap(), record);
+        assert_eq!(load_cron_instructions(dir.path(), 7).unwrap(), record);
     }
 
     #[test]
@@ -571,26 +425,131 @@ mod tests {
         let record = build_cron_instructions(dir.path(), 7, "2026-06-18T15:45:30Z", "codex,claude");
         write_cron_instructions(dir.path(), &record).unwrap();
 
-        delete_cron_instructions(dir.path()).unwrap();
-        assert!(!cron_instructions_path(dir.path()).exists());
-        delete_cron_instructions(dir.path()).unwrap();
+        delete_cron_instructions(dir.path(), 7).unwrap();
+        assert!(!cron_instructions_path(dir.path(), 7).exists());
+        delete_cron_instructions(dir.path(), 7).unwrap();
+    }
+
+    /// 13-DEFERRED-CR-03 re-check: two phases' rate-limit records must
+    /// coexist — the old single-slot file let one clobber the other.
+    #[test]
+    fn cron_instructions_are_per_phase() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = build_cron_instructions(dir.path(), 7, "2026-06-18T15:45:30Z", "claude,codex");
+        let b = build_cron_instructions(dir.path(), 8, "2026-06-18T16:45:30Z", "codex,claude");
+        write_cron_instructions(dir.path(), &a).unwrap();
+        write_cron_instructions(dir.path(), &b).unwrap();
+
+        assert_eq!(load_cron_instructions(dir.path(), 7).unwrap(), a);
+        assert_eq!(load_cron_instructions(dir.path(), 8).unwrap(), b);
+        let listed = list_cron_instructions(dir.path());
+        assert_eq!(listed.iter().map(|i| i.phase).collect::<Vec<_>>(), [7, 8]);
+
+        delete_cron_instructions(dir.path(), 7).unwrap();
+        assert!(load_cron_instructions(dir.path(), 7).is_err());
+        assert_eq!(load_cron_instructions(dir.path(), 8).unwrap(), b);
+    }
+
+    /// Upgrade path: a legacy single-slot `cron-instructions.json` written by
+    /// an older binary is still loadable/listable/deletable for its phase.
+    #[test]
+    fn legacy_cron_instructions_are_read_and_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = build_cron_instructions(dir.path(), 5, "2026-06-18T15:45:30Z", "claude,codex");
+        let legacy = legacy_cron_instructions_path(dir.path());
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, serde_json::to_string_pretty(&record).unwrap()).unwrap();
+
+        assert_eq!(load_cron_instructions(dir.path(), 5).unwrap(), record);
+        assert!(load_cron_instructions(dir.path(), 6).is_err());
+        assert_eq!(list_cron_instructions(dir.path()).len(), 1);
+
+        delete_cron_instructions(dir.path(), 5).unwrap();
+        assert!(!legacy.exists());
     }
 
     #[test]
     fn cron_schedule_rounds_up_to_nearest_minute() {
         assert_eq!(
             cron_schedule_from_retry_after("2026-06-18T15:45:30Z"),
-            "46 15 18 6 *"
+            Some("46 15 18 6 *".to_string())
         );
         assert_eq!(
             cron_schedule_from_retry_after("2026-06-18T15:45:00Z"),
-            "45 15 18 6 *"
+            Some("45 15 18 6 *".to_string())
         );
     }
 
     #[test]
+    fn cron_schedule_normalizes_negative_offset() {
+        // 15:45:30 local at UTC-5 → 20:45:30 UTC → round up to 20:46.
+        assert_eq!(
+            cron_schedule_from_retry_after("2026-06-18T15:45:30-05:00"),
+            Some("46 20 18 6 *".to_string())
+        );
+        // 15:45:00 local at UTC-5:30 → 21:15:00 UTC, no rounding needed.
+        assert_eq!(
+            cron_schedule_from_retry_after("2026-06-18T15:45:00-05:30"),
+            Some("15 21 18 6 *".to_string())
+        );
+    }
+
+    /// WR-07 (13-REVIEW.md), revised: all three ISO-8601 offset forms must
+    /// parse to their real value. The pre-WR-07 code misread "+0530" as 530
+    /// *hours*; the first WR-07 fix rejected everything without a colon, so
+    /// valid ±HHMM and hour-only ±HH offsets silently fell back to UTC via
+    /// `split_time_and_offset`'s `unwrap_or(0)` — scheduling the resume cron
+    /// hours away from when the rate limit actually lifts.
+    #[test]
+    fn cron_schedule_parses_all_iso8601_offset_forms() {
+        // ±HHMM: 15:45:30 at +05:30 → 10:15:30 UTC → 10:16 (seconds round up).
+        assert_eq!(
+            cron_schedule_from_retry_after("2026-06-18T15:45:30+0530"),
+            cron_schedule_from_retry_after("2026-06-18T15:45:30+05:30"),
+        );
+        // Hour-only ±HH: 15:45:30 at -05 → 20:45:30 UTC → 20:46.
+        assert_eq!(
+            cron_schedule_from_retry_after("2026-06-18T15:45:30-05"),
+            Some("46 20 18 6 *".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_offset_minutes_bounds_and_forms() {
+        assert_eq!(parse_offset_minutes("+05:30"), Some(330));
+        assert_eq!(parse_offset_minutes("+0530"), Some(330));
+        assert_eq!(parse_offset_minutes("-0530"), Some(-330));
+        assert_eq!(parse_offset_minutes("+05"), Some(300));
+        assert_eq!(parse_offset_minutes("-05"), Some(-300));
+        // Out-of-range and wrong digit counts fail safe.
+        assert_eq!(parse_offset_minutes("+24"), None);
+        assert_eq!(parse_offset_minutes("+05:60"), None);
+        assert_eq!(parse_offset_minutes("+5"), None);
+        assert_eq!(parse_offset_minutes("+530"), None);
+        assert_eq!(parse_offset_minutes("+abcd"), None);
+    }
+
+    #[test]
     fn cron_schedule_formats_unix_seconds() {
-        assert_eq!(cron_schedule_from_retry_after("1766678401"), "1 16 25 12 *");
+        assert_eq!(
+            cron_schedule_from_retry_after("1766678401"),
+            Some("1 16 25 12 *".to_string())
+        );
+    }
+
+    #[test]
+    fn shell_quote_leaves_common_safe_chars_unquoted() {
+        assert_eq!(
+            shell_quote("user@host:1.2.3+build"),
+            "user@host:1.2.3+build"
+        );
+        assert_eq!(shell_quote("~/proj/build=1_2%3"), "~/proj/build=1_2%3");
+    }
+
+    #[test]
+    fn shell_quote_quotes_unsafe_input() {
+        assert_eq!(shell_quote("a b"), "'a b'");
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
     }
 
     #[test]
@@ -613,86 +572,12 @@ mod tests {
     }
 
     #[test]
-    fn extract_section_reads_goal_until_next_heading() {
-        let text = "# Title\n\n## Goal\n\nDo the thing.\nAnd more.\n\n---\n\n## Next\nignored\n";
-        let goal = extract_section(text, "## Goal").unwrap();
-        assert_eq!(goal, "Do the thing.\nAnd more.");
-    }
-
-    #[test]
-    fn extract_section_missing_returns_none() {
-        assert!(extract_section("no headings here", "## Goal").is_none());
-    }
-
-    #[test]
-    fn extract_goal_reads_phase_context_file() {
+    fn cron_instructions_reject_unparseable_retry_time() {
         let dir = tempfile::tempdir().unwrap();
-        let phase_dir = dir.path().join(".planning/phases/07-worktrees-pr");
-        std::fs::create_dir_all(&phase_dir).unwrap();
-        std::fs::write(
-            phase_dir.join("CONTEXT.md"),
-            "# Phase 7\n\n## Goal\n\nEnable parallel agents.\n\n## Tasks\n- x\n",
-        )
-        .unwrap();
-        assert_eq!(
-            extract_goal(dir.path(), 7).unwrap(),
-            "Enable parallel agents."
-        );
-    }
+        let record = build_cron_instructions(dir.path(), 7, "unknown", "codex,claude");
 
-    #[test]
-    fn build_pr_body_contains_goal_and_sections() {
-        let dir = tempfile::tempdir().unwrap();
-        let phase_dir = dir.path().join(".planning/phases/07-x");
-        std::fs::create_dir_all(&phase_dir).unwrap();
-        std::fs::write(phase_dir.join("CONTEXT.md"), "## Goal\n\nShip it well.\n").unwrap();
-        // `true` produces no test output → "tests: unknown".
-        let body = build_pr_body(dir.path(), 7, &GitFlowConfig::default(), "true");
-        assert!(body.contains("## Summary"));
-        assert!(body.contains("Ship it well."));
-        assert!(body.contains("## Changes"));
-        assert!(body.contains("## Tests"));
-    }
-
-    #[test]
-    fn build_pr_body_without_context_uses_placeholder() {
-        let dir = tempfile::tempdir().unwrap();
-        let body = build_pr_body(dir.path(), 9, &GitFlowConfig::default(), "true");
-        assert!(body.contains("No phase Goal found"));
-        assert!(body.contains("## Tests"));
-    }
-
-    #[test]
-    fn build_pr_body_includes_real_git_diff_stat() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        git(root, &["init", "-q"]);
-        git(root, &["config", "user.email", "devflow@example.com"]);
-        git(root, &["config", "user.name", "DevFlow Tests"]);
-        git(root, &["config", "commit.gpgsign", "false"]);
-        git(root, &["config", "core.hooksPath", "/dev/null"]);
-        git(root, &["checkout", "-q", "-b", "develop"]);
-        std::fs::write(root.join("README.md"), "base\n").unwrap();
-        git(root, &["add", "."]);
-        git(root, &["commit", "-q", "-m", "base"]);
-
-        git(root, &["checkout", "-q", "-b", "feature/phase-07"]);
-        std::fs::write(root.join("src.txt"), "one\ntwo\nthree\n").unwrap();
-        git(root, &["add", "."]);
-        git(root, &["commit", "-q", "-m", "feature work"]);
-
-        let body = build_pr_body(root, 7, &GitFlowConfig::default(), "true");
-
-        assert!(body.contains("src.txt"));
-        assert!(body.contains("1 file changed"));
-    }
-
-    #[test]
-    fn count_passed_tests_sums_across_lines() {
-        let output = "test result: ok. 115 passed; 0 failed\n\
-                      test result: ok. 1 passed; 0 failed\n";
-        assert_eq!(count_passed_tests(output), Some(116));
-        assert_eq!(count_passed_tests("no test lines"), None);
+        assert_ne!(record.hermes_cron.schedule, "* * * * *");
+        assert!(record.hermes_cron.schedule.is_empty());
     }
 
     #[test]
@@ -710,28 +595,5 @@ mod tests {
         let old_idx = out.find("0.5.1").unwrap();
         assert!(new_idx < old_idx, "new entry should come before old");
         assert!(out.starts_with("# Changelog"));
-    }
-
-    #[test]
-    fn mark_phase_complete_annotates_heading_idempotently() {
-        let roadmap = "## Phase 7: Worktrees (Priority: HIGH, v1.0.0)\n\nbody\n";
-        let once = mark_phase_complete(roadmap, 7, "0.5.2");
-        assert!(once.contains("## Phase 7: Worktrees (Priority: HIGH, v1.0.0) — COMPLETED v0.5.2"));
-        // Running again does not double-annotate.
-        let twice = mark_phase_complete(&once, 7, "0.5.2");
-        assert_eq!(once, twice);
-    }
-
-    fn git(root: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(root)
-            .output()
-            .expect("spawn git");
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
     }
 }

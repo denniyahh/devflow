@@ -34,6 +34,6 @@ Security issues may include:
 When using DevFlow:
 
 - Review agent prompts before running in production
-- Do not expose `.devflow/state.json` or `.devflow/audit.log` to untrusted contexts
+- Do not expose `.devflow/state-NN.json` or `.devflow/events.jsonl` to untrusted contexts
 - Use `devflow doctor` to verify your environment
 - Use the latest release

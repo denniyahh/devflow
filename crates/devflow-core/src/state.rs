@@ -9,7 +9,6 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::agent_result::AgentResult;
 use crate::mode::Mode;
 use crate::stage::Stage;
 
@@ -21,7 +20,7 @@ pub struct State {
     /// Phase number being worked on.
     pub phase: u32,
     /// Which coding agent was launched.
-    pub agent: Agent,
+    pub agent: AgentKind,
     /// How the pipeline is driven (auto vs. supervise).
     pub mode: Mode,
     /// Whether a gate has been written and is awaiting a human response.
@@ -42,18 +41,12 @@ pub struct State {
     /// always live under the main `project_root`; only the agent's cwd changes.
     #[serde(default)]
     pub worktree_path: Option<PathBuf>,
-    /// Parsed agent completion result (from DEVFLOW_RESULT or exit code).
-    #[serde(skip)]
-    pub agent_result: Option<AgentResult>,
-    /// Path where agent stdout was saved.
-    #[serde(skip)]
-    pub agent_stdout_path: Option<PathBuf>,
 }
 
 /// Supported coding agents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Agent {
+pub enum AgentKind {
     /// Anthropic Claude Code CLI.
     Claude,
     /// OpenAI Codex CLI.
@@ -62,29 +55,25 @@ pub enum Agent {
     OpenCode,
 }
 
-/// Type alias so the agents module can reference Agent without colliding
-/// with its own Agent trait name.
-pub type AgentKind = Agent;
-
-impl fmt::Display for Agent {
+impl fmt::Display for AgentKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
-            Agent::Claude => "claude",
-            Agent::Codex => "codex",
-            Agent::OpenCode => "opencode",
+            AgentKind::Claude => "claude",
+            AgentKind::Codex => "codex",
+            AgentKind::OpenCode => "opencode",
         };
         f.write_str(name)
     }
 }
 
-impl FromStr for Agent {
+impl FromStr for AgentKind {
     type Err = AgentParseError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.to_ascii_lowercase().as_str() {
-            "claude" => Ok(Agent::Claude),
-            "codex" => Ok(Agent::Codex),
-            "opencode" | "open-code" => Ok(Agent::OpenCode),
+            "claude" => Ok(AgentKind::Claude),
+            "codex" => Ok(AgentKind::Codex),
+            "opencode" | "open-code" => Ok(AgentKind::OpenCode),
             other => Err(AgentParseError(other.to_string())),
         }
     }
@@ -97,7 +86,7 @@ pub struct AgentParseError(String);
 
 impl State {
     /// Create a new state for starting a phase at the [`Stage::Define`] stage.
-    pub fn new(phase: u32, agent: Agent, mode: Mode, project_root: PathBuf) -> Self {
+    pub fn new(phase: u32, agent: AgentKind, mode: Mode, project_root: PathBuf) -> Self {
         State {
             stage: Stage::Define,
             phase,
@@ -108,8 +97,6 @@ impl State {
             started_at: timestamp_now(),
             project_root,
             worktree_path: None,
-            agent_result: None,
-            agent_stdout_path: None,
         }
     }
 }
@@ -133,32 +120,38 @@ mod tests {
         assert_eq!(adapter_for(AgentKind::Codex).name(), "OpenAI Codex");
         assert_eq!(adapter_for(AgentKind::OpenCode).name(), "OpenCode");
 
-        assert_eq!(Agent::Claude.to_string(), "claude");
-        assert_eq!(Agent::Codex.to_string(), "codex");
-        assert_eq!(Agent::OpenCode.to_string(), "opencode");
+        assert_eq!(AgentKind::Claude.to_string(), "claude");
+        assert_eq!(AgentKind::Codex.to_string(), "codex");
+        assert_eq!(AgentKind::OpenCode.to_string(), "opencode");
     }
 
     #[test]
     fn agent_from_str_accepts_canonical_and_aliases() {
-        assert_eq!("claude".parse::<Agent>().unwrap(), Agent::Claude);
-        assert_eq!("CLAUDE".parse::<Agent>().unwrap(), Agent::Claude);
-        assert_eq!("codex".parse::<Agent>().unwrap(), Agent::Codex);
-        assert_eq!("opencode".parse::<Agent>().unwrap(), Agent::OpenCode);
-        assert_eq!("open-code".parse::<Agent>().unwrap(), Agent::OpenCode);
+        assert_eq!("claude".parse::<AgentKind>().unwrap(), AgentKind::Claude);
+        assert_eq!("CLAUDE".parse::<AgentKind>().unwrap(), AgentKind::Claude);
+        assert_eq!("codex".parse::<AgentKind>().unwrap(), AgentKind::Codex);
+        assert_eq!(
+            "opencode".parse::<AgentKind>().unwrap(),
+            AgentKind::OpenCode
+        );
+        assert_eq!(
+            "open-code".parse::<AgentKind>().unwrap(),
+            AgentKind::OpenCode
+        );
     }
 
     #[test]
     fn agent_from_str_rejects_unknown() {
-        let err = "aider".parse::<Agent>().unwrap_err();
+        let err = "aider".parse::<AgentKind>().unwrap_err();
         assert!(err.to_string().contains("aider"));
     }
 
     #[test]
     fn new_state_starts_at_define() {
-        let state = State::new(2, Agent::Claude, Mode::Auto, PathBuf::from("/repo"));
+        let state = State::new(2, AgentKind::Claude, Mode::Auto, PathBuf::from("/repo"));
         assert_eq!(state.stage, Stage::Define);
         assert_eq!(state.phase, 2);
-        assert_eq!(state.agent, Agent::Claude);
+        assert_eq!(state.agent, AgentKind::Claude);
         assert_eq!(state.mode, Mode::Auto);
         assert!(!state.gate_pending);
         assert_eq!(state.consecutive_failures, 0);
@@ -167,18 +160,18 @@ mod tests {
 
     #[test]
     fn state_serde_round_trips() {
-        let state = State::new(9, Agent::Codex, Mode::Supervise, PathBuf::from("/repo"));
+        let state = State::new(9, AgentKind::Codex, Mode::Supervise, PathBuf::from("/repo"));
         let json = serde_json::to_string(&state).unwrap();
         let back: State = serde_json::from_str(&json).unwrap();
         assert_eq!(back.phase, 9);
-        assert_eq!(back.agent, Agent::Codex);
+        assert_eq!(back.agent, AgentKind::Codex);
         assert_eq!(back.stage, Stage::Define);
         assert_eq!(back.mode, Mode::Supervise);
     }
 
     #[test]
     fn consecutive_failures_persists_across_advance_calls() {
-        let mut state = State::new(1, Agent::Claude, Mode::Auto, PathBuf::from("/repo"));
+        let mut state = State::new(1, AgentKind::Claude, Mode::Auto, PathBuf::from("/repo"));
         state.consecutive_failures = 3;
         let json = serde_json::to_string(&state).unwrap();
         assert!(

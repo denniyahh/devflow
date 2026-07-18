@@ -4,12 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Agent-agnostic development workflow state machine"
 
 [dependencies]
 libc = "0.2"
 serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

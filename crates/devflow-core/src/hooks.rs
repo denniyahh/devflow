@@ -22,6 +22,8 @@ pub enum Hook {
     BranchCleanup,
     /// Regenerate and commit docs.
     DocsUpdate,
+    /// Merge the phase feature branch into develop before release bookkeeping.
+    Merge,
     /// Append a CHANGELOG entry.
     ChangelogAppend,
     /// Compute and write the next version, then tag it.
@@ -62,6 +64,7 @@ impl Hook {
             Hook::BranchCreate => branch_create(ctx),
             Hook::BranchCleanup => branch_cleanup(ctx),
             Hook::DocsUpdate => docs_update(ctx),
+            Hook::Merge => merge_feature(ctx),
             Hook::ChangelogAppend => changelog_append(ctx),
             Hook::VersionBump => version_bump(ctx),
         }
@@ -71,7 +74,7 @@ impl Hook {
 /// Which hooks fire when moving `from` → `to`.
 ///
 /// - Validate → Ship: docs + changelog are finalized before shipping.
-/// - Ship → (done): version bump + branch cleanup.
+/// - Ship → (done): merge + version bump + branch cleanup.
 /// - everything else: none.
 pub fn hooks_for_transition(from: Stage, to: Stage) -> Vec<Hook> {
     match (from, to) {
@@ -82,7 +85,7 @@ pub fn hooks_for_transition(from: Stage, to: Stage) -> Vec<Hook> {
 
 /// Hooks that fire after Ship completes (the workflow's terminal transition).
 pub fn hooks_after_ship() -> Vec<Hook> {
-    vec![Hook::VersionBump, Hook::BranchCleanup]
+    vec![Hook::Merge, Hook::VersionBump, Hook::BranchCleanup]
 }
 
 fn branch_create(ctx: &HookContext) -> Result<(), HookError> {
@@ -96,11 +99,52 @@ fn branch_cleanup(ctx: &HookContext) -> Result<(), HookError> {
     let git = GitFlow::new(&ctx.project_root);
     let branch = format!("{}phase-{:02}", ctx.git_flow.feature_prefix, ctx.phase);
     if git.branch_exists(&branch) {
+        // Non-force cleanup is intentional: never discard unmerged work.
         match git.delete_branch(&branch, false) {
             Ok(()) => info!("BranchCleanup: deleted {branch}"),
-            Err(err) => warn!("BranchCleanup: could not delete {branch}: {err}"),
+            Err(err) => {
+                let message = err.to_string();
+                if message.contains("not fully merged") || message.contains("not yet merged") {
+                    warn!(
+                        "BranchCleanup: feature branch {branch} is not merged yet — left in place"
+                    );
+                } else {
+                    warn!("BranchCleanup: could not delete {branch}: {err}");
+                }
+            }
         }
     }
+    Ok(())
+}
+
+fn merge_feature(ctx: &HookContext) -> Result<(), HookError> {
+    let git = GitFlow::new(&ctx.project_root);
+    let branch = format!("{}phase-{:02}", ctx.git_flow.feature_prefix, ctx.phase);
+    if !git.branch_exists(&branch) {
+        return Err(crate::git::GitError::Command(format!(
+            "feature branch `{branch}` is missing; refusing to report an unproven merge"
+        ))
+        .into());
+    }
+    if git.is_merged_into_develop(ctx.phase) {
+        info!("Merge: {branch} is already merged; nothing to merge");
+        crate::events::emit(
+            &ctx.project_root,
+            ctx.phase,
+            "merge_result",
+            serde_json::json!({"merged": false, "branch": branch}),
+        );
+        return Ok(());
+    }
+
+    git.merge_feature_into_develop(ctx.phase)?;
+    info!("Merge: merged {branch} into develop");
+    crate::events::emit(
+        &ctx.project_root,
+        ctx.phase,
+        "merge_result",
+        serde_json::json!({"merged": true, "branch": branch}),
+    );
     Ok(())
 }
 
@@ -141,16 +185,16 @@ fn changelog_append(ctx: &HookContext) -> Result<(), HookError> {
 fn version_bump(ctx: &HookContext) -> Result<(), HookError> {
     let version = version::compute_version(&ctx.project_root)?;
     // Write the computed version into the version file when one exists.
-    match version::write_version(&ctx.project_root, &version) {
-        Ok(path) => info!("VersionBump: wrote {version} to {}", path.display()),
-        Err(err) => warn!("VersionBump: could not write version file: {err}"),
+    if has_version_file(&ctx.project_root) {
+        let path = version::write_version(&ctx.project_root, &version)?;
+        info!("VersionBump: wrote {version} to {}", path.display());
+    } else {
+        warn!("VersionBump: no supported version file; tagging only");
     }
     let git = GitFlow::new(&ctx.project_root);
     let tag = format!("v{version}");
-    match git.tag(&tag) {
-        Ok(()) => info!("VersionBump: tagged {tag}"),
-        Err(err) => warn!("VersionBump: could not tag {tag}: {err}"),
-    }
+    git.tag(&tag)?;
+    info!("VersionBump: tagged {tag}");
     Ok(())
 }
 
@@ -221,10 +265,24 @@ mod tests {
     }
 
     #[test]
+    fn validate_to_ship_hooks_append_changelog() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let context = ctx(dir.path(), Stage::Ship);
+
+        for hook in hooks_for_transition(Stage::Validate, Stage::Ship) {
+            hook.run(&context).unwrap();
+        }
+
+        let changelog = std::fs::read_to_string(dir.path().join("CHANGELOG.md")).unwrap();
+        assert!(changelog.contains("## "));
+    }
+
+    #[test]
     fn after_ship_runs_version_and_cleanup() {
         assert_eq!(
             hooks_after_ship(),
-            vec![Hook::VersionBump, Hook::BranchCleanup]
+            vec![Hook::Merge, Hook::VersionBump, Hook::BranchCleanup]
         );
     }
 
@@ -268,6 +326,67 @@ mod tests {
     }
 
     #[test]
+    fn terminal_hooks_version_post_merge_develop() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        git(dir.path(), &["checkout", "-q", "-b", "feature/phase-11"]);
+        std::fs::write(dir.path().join("feature.txt"), "phase work\n").unwrap();
+        git(dir.path(), &["add", "feature.txt"]);
+        git(dir.path(), &["commit", "-q", "-m", "phase work"]);
+
+        let feature_tip = git_output(dir.path(), &["rev-parse", "feature/phase-11"]);
+        let pre_merge_count = git_output(dir.path(), &["rev-list", "--count", "HEAD"]);
+
+        let context = ctx(dir.path(), Stage::Ship);
+        for hook in hooks_after_ship() {
+            hook.run(&context).unwrap();
+        }
+
+        git(
+            dir.path(),
+            &["merge-base", "--is-ancestor", &feature_tip, "develop"],
+        );
+        let post_merge_count = git_output(dir.path(), &["rev-list", "--count", "develop"]);
+        assert_ne!(pre_merge_count, post_merge_count);
+
+        let tag = git_output(dir.path(), &["tag", "--points-at", "develop"]);
+        assert_eq!(tag, format!("v2.0.{post_merge_count}"));
+        assert_ne!(tag, format!("v2.0.{pre_merge_count}"));
+    }
+
+    #[test]
+    fn merge_succeeds_while_feature_branch_is_checked_out_in_linked_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let worktree = dir.path().join("phase-worktree");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature/phase-11",
+                worktree.to_str().unwrap(),
+                "develop",
+            ],
+        );
+        std::fs::write(worktree.join("feature.txt"), "phase work\n").unwrap();
+        git(&worktree, &["add", "feature.txt"]);
+        git(&worktree, &["commit", "-q", "-m", "phase work"]);
+
+        Hook::Merge.run(&ctx(&repo, Stage::Ship)).unwrap();
+
+        git(
+            &repo,
+            &["merge-base", "--is-ancestor", "feature/phase-11", "develop"],
+        );
+        assert!(GitFlow::new(&repo).branch_exists("feature/phase-11"));
+    }
+
+    #[test]
     fn branch_cleanup_is_fail_soft_when_branch_absent() {
         let dir = tempfile::tempdir().unwrap();
         init_repo(dir.path());
@@ -275,5 +394,24 @@ mod tests {
         Hook::BranchCleanup
             .run(&ctx(dir.path(), Stage::Ship))
             .unwrap();
+    }
+
+    #[test]
+    fn merge_fails_closed_when_branch_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        // Branch absence cannot prove that phase work reached develop.
+        let error = Hook::Merge.run(&ctx(dir.path(), Stage::Ship)).unwrap_err();
+        assert!(error.to_string().contains("unproven merge"));
+    }
+
+    fn git_output(root: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?} failed");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 }
