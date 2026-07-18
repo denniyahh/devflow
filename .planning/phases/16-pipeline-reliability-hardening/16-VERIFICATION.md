@@ -1,18 +1,18 @@
 ---
 phase: 16-pipeline-reliability-hardening
-verified: 2026-07-18T02:00:03Z
+verified: 2026-07-18T11:48:45Z
 status: passed
 score: 29/29 must-haves verified
 behavior_unverified: 0
-overrides_applied: 0
+overrides_applied: 1
 ---
 
 # Phase 16: Pipeline Reliability Hardening Verification Report
 
 **Phase Goal:** Harden every reliability failure surfaced by the Phase 15 dogfood run: terminal truth, authoritative external verification, retained evidence, deeper review/config surfaces, deterministic doc/runtime invariants, worktree-aware CLI behavior, attempt history, and persistent gates.
-**Verified:** 2026-07-18T02:00:03Z
+**Verified:** 2026-07-18T11:48:45Z
 **Status:** passed
-**Re-verification:** No — initial verification
+**Re-verification:** Yes — inline execute-phase verification after advisory review fixes
 
 ## Goal Achievement
 
@@ -28,7 +28,7 @@ proof.
 |---:|---|---|---|---|
 | 1 | 01 | Ship approval merges the phase branch before version computation, or truthfully no-ops when already satisfied | VERIFIED | `hooks_after_ship()` starts with `Hook::Merge`; `finish_workflow()` runs the terminal batch before clearing state; `terminal_hooks_version_post_merge_develop` and `advance_ship_success_runs_finish_workflow` pass. |
 | 2 | 01 | Terminal ordering is Merge → VersionBump → BranchCleanup | VERIFIED | Exact vector asserted by `after_ship_runs_version_and_cleanup`; end-to-end tag test proves the version reflects post-merge `develop`. |
-| 3 | 01 | Re-running an absent/already-merged branch is a safe `merged=false` no-op | VERIFIED | `GitFlow::is_merged_into_develop` treats absence/ancestry as satisfied; `merge_feature` emits `merge_result`; absent-branch test passes. |
+| 3 | 01 | Re-running an already-merged branch is a safe `merged=false` no-op; an absent branch without proof fails closed | VERIFIED | `GitFlow::is_merged_into_develop` accepts ancestry only; `merge_feature` rejects missing branches and emits `merge_result` for proven merge/no-op outcomes; `merge_of_missing_branch_is_an_error` and `merge_fails_closed_when_branch_absent` pass. |
 | 4 | 01 | Bogus 1.2.173–1.2.176 changelog entries are gone | VERIFIED | No matching changelog text remains; live tag set is only `v1.0.1`, `v1.2.0`, `v1.3.0`. |
 | 5 | 02 | Optional minimal `devflow.toml` loads typed Phase 16 knobs with stable absent-file defaults | VERIFIED | `DevflowConfig`, serde defaults, and fail-soft `load_config` are substantive; missing/partial/malformed tests pass. |
 | 6 | 02 | Config precedence is env > file > built-in default | VERIFIED | Central resolvers for retention, review angles, and external verification read env first; all three override tests pass. |
@@ -36,7 +36,7 @@ proof.
 | 8 | 02 | Git-flow branch constants remain hardcoded | VERIFIED | `MAIN`, `DEVELOP`, `FEATURE_PREFIX`, and `GitFlowConfig::default` remain fixed and tested. |
 | 9 | 03 | A failing approved external post-condition outranks agent self-report and commit heuristics | VERIFIED | `evaluate_layer0` precedes Layers 1–3 and runs only after Code from the execution worktree; failing-probe precedence test passes. |
 | 10 | 03 | External commands come only from reviewed PLAN frontmatter, never runtime output | VERIFIED | `verify.rs` scans only the first PLAN frontmatter block; exact command-vector approval is required; changed/removed declarations fail closed without executing replacements. |
-| 11 | 03 | Completed-stage captures are archived rather than wiped | VERIFIED | `launch_stage` calls fallible `archive_phase_files` before monitor rollover; stdout/exit and same-generation REVIEW snapshots are retained; archive failure preserves live evidence. |
+| 11 | 03 | Completed-stage captures are archived rather than wiped | VERIFIED | `launch_stage` calls fallible `archive_phase_files` before monitor rollover; stdout/exit and same-generation REVIEW snapshots are retained; staged publication rolls back a complete live pair after second-publish or REVIEW-copy failure. |
 | 12 | 03 | Capture retention is bounded by the configured resolver | VERIFIED | Numeric timestamp/sequence generation pruning keeps N groups; seven-to-three retention test passes. |
 | 13 | 04 | Ship requests five high-depth review angles with conditional parallel/sequential execution and one deduplicated REVIEW.md | VERIFIED | Prompt contains all incident-derived angles, generalist pass, capability fallback, and merge/dedup instruction; snapshot tests pass. |
 | 14 | 04 | Project review-angle overrides replace built-ins | VERIFIED | CLI uses `stage_prompt_for_project`; config-fed custom-angle test passes. |
@@ -101,8 +101,8 @@ proof.
 
 | Behavior | Command | Result | Status |
 |---|---|---|---|
-| Workspace behavior | `cargo test --workspace` | 309 tests passed, 0 failed, 0 ignored | PASS |
-| Final all-target lint | `cargo clippy --workspace --all-targets -- -D warnings` | Clean at `b02a947` | PASS |
+| Workspace behavior | `cargo test --workspace --all-targets` | 313 tests passed, 0 failed, 0 ignored | PASS |
+| Final all-target lint | `cargo clippy --workspace --all-targets -- -D warnings` | Clean at `29cde82` | PASS |
 | Formatting | `cargo fmt --all --check` | Clean | PASS |
 | Final invariant module after lint-only repair | `cargo test -p devflow-core doc_check::` | 5 passed | PASS |
 | Empty history CLI | `./target/debug/devflow history 999` | `no attempts recorded for phase 999` | PASS |
@@ -150,6 +150,17 @@ live capture. Each has an active passing regression test. The old test name
 `after_ship_runs_version_and_cleanup` is narrower than its current three-hook assertion,
 but the assertion and stronger end-to-end test are correct; this is informational only.
 
+## Advisory Review Reconciliation
+
+The independent review artifact remains a historical `issues_found` report. Its three
+findings were resolved before this inline re-verification: CR-01 by `83602c7` (missing
+branches now fail closed and terminal completion reopens an actionable gate), WR-01 by
+`5fcaaa5` (shared bounded control-character sanitization), and WR-02 by `8db68bb`
+(staged archival with rollback after partial publication failures). The CR-01 correction
+intentionally overrides Plan 16-01's original absent-branch no-op wording because branch
+absence is not evidence that the feature tip reached `develop`; it strengthens the phase's
+terminal-truth goal without dropping any scoped capability.
+
 ## Human Verification
 
 None required. The must-haves are CLI/state-transition, ordering, cleanup, and rendering
@@ -166,5 +177,5 @@ pipeline-reliability goal and is ready to close.
 
 ---
 
-_Verified: 2026-07-18T02:00:03Z_
-_Verifier: generic-agent workaround acting as GSD phase verifier_
+_Verified: 2026-07-18T11:48:45Z_
+_Verifier: inline execute-phase verification (independent review lane unavailable by runtime constraint)_
