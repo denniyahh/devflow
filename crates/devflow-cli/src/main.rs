@@ -2453,6 +2453,20 @@ mod tests {
     }
 
     #[test]
+    fn gate_approve_arg_parsing_accepts_positional_stage() {
+        let cli = Cli::try_parse_from(["devflow", "gate", "approve", "15", "ship"]).unwrap();
+        let Command::Gate {
+            action: GateCmd::Approve { stage, project, .. },
+        } = cli.command
+        else {
+            panic!("expected gate approve command");
+        };
+
+        assert_eq!(stage, Some(Stage::Ship));
+        assert_eq!(project, PathBuf::from("."));
+    }
+
+    #[test]
     fn pairs_default_missing_agents_to_claude() {
         let pairs = parse_phase_agent_pairs("7,8", Some("codex")).unwrap();
         assert_eq!(pairs, vec![(7, AgentKind::Codex), (8, AgentKind::Claude)]);
