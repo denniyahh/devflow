@@ -60,6 +60,7 @@ mod doc_check;
 pub mod events;
 pub mod gates;
 pub mod git;
+pub mod history;
 pub mod hooks;
 pub mod lock;
 pub mod mode;
