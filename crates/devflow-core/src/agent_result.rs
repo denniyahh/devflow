@@ -1761,6 +1761,89 @@ mod tests {
         assert_eq!(result.decided_by_layer, Some(0));
     }
 
+    /// Ordering edge (17a): with multiple declared probes, ALL must pass for
+    /// affirmative Success — the first failing probe vetoes the outcome
+    /// regardless of which position it occupies among the declarations.
+    #[test]
+    fn multiple_declared_probes_first_failure_vetoes_regardless_of_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase_dir = dir.path().join(".planning/phases/16-reliability");
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        // 16-01 comes first alphabetically and passes; 16-02 comes second and fails.
+        std::fs::write(
+            phase_dir.join("16-01-PLAN.md"),
+            "---\nexternal_verify: \"test -f passing-artifact\"\n---\n",
+        )
+        .unwrap();
+        std::fs::write(
+            phase_dir.join("16-02-PLAN.md"),
+            "---\nexternal_verify: \"test -f never-created\"\n---\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("passing-artifact"), "done").unwrap();
+        let mut state = state_in(dir.path(), 16);
+        state.stage = Stage::Define;
+
+        let approval = vec![
+            "test -f passing-artifact".to_string(),
+            "test -f never-created".to_string(),
+        ];
+        let result_a = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approval),
+        )
+        .unwrap();
+        assert_eq!(result_a.status, AgentStatus::Failed);
+        assert!(
+            result_a
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("never-created")),
+            "unexpected reason: {:?}",
+            result_a.reason
+        );
+
+        // Swap which position fails: 16-01 now fails, 16-02 passes. The
+        // overall outcome must still veto — order of declaration must not
+        // matter.
+        std::fs::write(
+            phase_dir.join("16-01-PLAN.md"),
+            "---\nexternal_verify: \"test -f still-missing\"\n---\n",
+        )
+        .unwrap();
+        std::fs::write(
+            phase_dir.join("16-02-PLAN.md"),
+            "---\nexternal_verify: \"test -f passing-artifact\"\n---\n",
+        )
+        .unwrap();
+        let approval_swapped = vec![
+            "test -f still-missing".to_string(),
+            "test -f passing-artifact".to_string(),
+        ];
+        let result_b = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approval_swapped),
+        )
+        .unwrap();
+        assert_eq!(result_b.status, AgentStatus::Failed);
+
+        // Now make BOTH pass: only then is the outcome Success.
+        std::fs::write(dir.path().join("still-missing"), "done").unwrap();
+        let result_c = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approval_swapped),
+        )
+        .unwrap();
+        assert_eq!(result_c.status, AgentStatus::Success);
+        assert_eq!(result_c.decided_by_layer, Some(0));
+    }
+
     #[test]
     fn archive_moves_captures_into_history_and_removes_pid_file() {
         // 16b: prior-stage captures must survive a simulated next-launch by
