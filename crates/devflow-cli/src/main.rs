@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use devflow_core::agent;
 use devflow_core::config::{DEVELOP, FEATURE_PREFIX, GitFlowConfig, capture_retention};
-use devflow_core::gates::{self, GateAction, GateResponse, Gates};
+use devflow_core::gates::{self, GateAction, GateResponse, Gates, OpenGate};
 use devflow_core::git::GitFlow;
 use devflow_core::hooks::{self, HookContext};
 use devflow_core::mode::{self, Mode};
@@ -14,7 +14,12 @@ use devflow_core::{
     workflow,
 };
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
+
+/// A pending gate becomes visually urgent after thirty minutes without an
+/// answer. The banner remains visible before and after this threshold.
+const GATE_ESCALATION_THRESHOLD_SECS: u64 = 30 * 60;
 
 /// Parse `DEVFLOW_GATE_TIMEOUT_SECS`'s raw value, falling back to 7 days on
 /// an absent or unparsable value. Pure (no env access) so it's unit-testable
@@ -1791,12 +1796,48 @@ fn status(project_root: &Path) -> Result<(), CliError> {
             }
         }
     }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if let Some(banner) = render_pending_gate_banner(&Gates::list_open(project_root), now) {
+        println!("\n{banner}");
+    }
     print_open_branches(project_root);
     print_worktrees(project_root, current_worktree.as_deref());
     for hint in cron_instruction_hints(project_root) {
         println!("\n{hint}");
     }
     Ok(())
+}
+
+/// Build the persistent status-side signal for gates awaiting an operator.
+/// Context is agent-controlled, so it must use the same bounded rendering as
+/// gate notifications and failure events.
+fn render_pending_gate_banner(open: &[OpenGate], now: u64) -> Option<String> {
+    if open.is_empty() {
+        return None;
+    }
+
+    let mut banner = String::from("==================== PENDING GATE ====================\n");
+    for gate in open {
+        let timestamp = gate.timestamp.parse::<u64>().ok();
+        let escalated = timestamp
+            .and_then(|timestamp| now.checked_sub(timestamp))
+            .is_some_and(|age| age >= GATE_ESCALATION_THRESHOLD_SECS);
+        let marker = if escalated { "!!! ESCALATED" } else { "!!!" };
+        let context = truncate_reason(&gate.context).replace('\n', " ");
+        let stage = gate.stage.to_string();
+        banner.push_str(&format!(
+            "{marker}: phase {} {stage} ({})\n  {context}\n  approve: devflow gate approve {} --stage {stage}\n  reject:  devflow gate reject {} --stage {stage} --note <reason>\n",
+            gate.phase,
+            recover::format_age(&gate.timestamp),
+            gate.phase,
+            gate.phase,
+        ));
+    }
+    banner.push_str("======================================================");
+    Some(banner)
 }
 
 /// List every gate awaiting a human response.
