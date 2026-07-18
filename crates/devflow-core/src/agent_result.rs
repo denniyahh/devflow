@@ -1200,6 +1200,37 @@ mod tests {
     }
 
     #[test]
+    fn failing_external_probe_outranks_success_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase_dir = dir
+            .path()
+            .join(".planning/phases/16-pipeline-reliability-hardening");
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        std::fs::write(
+            phase_dir.join("16-03-PLAN.md"),
+            "---\nphase: 16\nexternal_verify: \"test -f externally-shipped\"\n---\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 16),
+            "DEVFLOW_RESULT: {\"status\":\"success\"}\n",
+        )
+        .unwrap();
+        let state = state_in(dir.path(), 16);
+
+        let result = evaluate_agent_result(dir.path(), &state, &GitFlowConfig::default()).unwrap();
+
+        assert_eq!(result.status, AgentStatus::Failed);
+        assert!(
+            result
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("external verification failed"))
+        );
+    }
+
+    #[test]
     fn archive_moves_captures_into_history_and_removes_pid_file() {
         // 16b: prior-stage captures must survive a simulated next-launch by
         // appearing under .devflow/history/phase-NN/, not be wiped outright.

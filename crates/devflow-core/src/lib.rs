@@ -68,6 +68,7 @@ pub mod ship;
 pub mod stage;
 pub mod state;
 pub mod version;
+pub mod verify;
 pub mod workflow;
 pub mod worktree;
 
