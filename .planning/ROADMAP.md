@@ -187,7 +187,7 @@ state/event reconciliation and the WR-03 test fix were deferred to Phase 18 on
 against final HEAD rather than re-plan)
 **Depends on:** Phase 16
 **Blocks:** Phase 18 Hermes Support
-**Plans:** 2/5 plans executed
+**Plans:** 3/5 plans executed
 
 Plans:
 
@@ -198,7 +198,7 @@ Plans:
 
 **Wave 2** *(blocked on 17-01: shares agent_result.rs)*
 
-- [ ] 17-03-PLAN.md — 17a: Layer 0 runs every stage + vouches for a passing approved probe (D-05); Layer 3 zero-commit/no-declaration → fail-closed (D-02/D-03)
+- [x] 17-03-PLAN.md — 17a: Layer 0 runs every stage + vouches for a passing approved probe (D-05); Layer 3 zero-commit/no-declaration → fail-closed (D-02/D-03)
 
 **Wave 3** *(blocked on 17-01/17-03: rewrites advance() dispatch)*
 

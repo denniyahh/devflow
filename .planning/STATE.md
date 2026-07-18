@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
 status: Phase 17 scoped and discussed - ready for planning
-stopped_at: Completed 17-02-PLAN.md
-last_updated: "2026-07-18T23:37:09.274Z"
+stopped_at: Completed 17-03-PLAN.md
+last_updated: "2026-07-18T23:58:21.909Z"
 progress:
   total_phases: 7
   completed_phases: 5
   total_plans: 39
-  completed_plans: 36
+  completed_plans: 37
   percent: 71
 ---
 
@@ -110,6 +110,7 @@ None.
 - [Phase 16]: 16-01: merge_result telemetry separates actual merge effects from successful no-op hook execution
 - [Phase 17]: 17-01: typed-outcome taxonomy + fail-closed policy table — ResourceKilled/AgentUnavailable, as_wire_str(), outcome_policy::decide_action, State.infra_failures/MAX_INFRA_FAILURES
 - [Phase 17]: 17-02: first workspace build.rs — resolves git-common-dir via `git rev-parse --git-common-dir` from CARGO_MANIFEST_DIR (not a relative `.git/HEAD`) and emits absolute rerun-if-changed paths for HEAD/refs/packed-refs; DEVFLOW_BUILD_COMMIT/DIRTY/TIMESTAMP via cargo:rustc-env, degrading gracefully with no git
+- [Phase 17]: 17-03: evaluate_layer3 zero-commit/no-declaration reclassified Unknown->Failed (D-02/D-03 case 3, human review flag); commits-present stays Unknown for Plan 04's gate. evaluate_layer0 now runs every stage (not just Code) and returns affirmative Success when all approved declared probes pass even at zero commits; PLAN discovery now reads project_root while probe execution keeps execution_root (fixes a worktree PLAN-removed false veto pre-existing since 16-01).
 
 ## Roadmap Evolution
 
@@ -150,9 +151,10 @@ None.
 | Phase 16 P07 | 4min | 2 tasks | 7 files |
 | Phase 17 P01 | 15min | 2 tasks | 6 files |
 | Phase 17 P02 | 2min | 2 tasks | 2 files |
+| Phase 17-pipeline-dogfood-followup P03 | 5min | 2 tasks | 1 files |
 
 ## Session
 
-**Last session:** 2026-07-18T23:37:09.274Z
-**Stopped at:** Completed 17-02-PLAN.md
+**Last session:** 2026-07-18T23:57:52.208Z
+**Stopped at:** Completed 17-03-PLAN.md
 **Resume file:** None
