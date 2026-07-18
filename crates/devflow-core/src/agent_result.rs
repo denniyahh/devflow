@@ -642,7 +642,16 @@ fn evaluate_layer0(
     let execution_root = state.worktree_path.as_deref().unwrap_or(project_root);
     let commands = crate::verify::external_verify_commands(execution_root, state.phase);
     if commands.is_empty() {
-        return None;
+        return approved_commands.map(|_| AgentResult {
+            status: AgentStatus::Failed,
+            exit_code: None,
+            reason: Some(
+                "external verification approval mismatch; PLAN declaration was removed".into(),
+            ),
+            commits: None,
+            summary: None,
+            verdict: None,
+        });
     }
     let Some(approved_commands) = approved_commands else {
         return Some(AgentResult {
@@ -1424,6 +1433,30 @@ mod tests {
         assert_eq!(result.status, AgentStatus::Failed);
         assert!(result.reason.unwrap().contains("approval mismatch"));
         assert!(!dir.path().join("escaped").exists());
+    }
+
+    #[test]
+    fn removed_external_probe_fails_closed_against_prior_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 16),
+            "DEVFLOW_RESULT: {\"status\":\"success\"}\n",
+        )
+        .unwrap();
+        let state = state_in(dir.path(), 16);
+        let approved = vec!["test -f shipped".to_string()];
+
+        let result = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approved),
+        )
+        .unwrap();
+
+        assert_eq!(result.status, AgentStatus::Failed);
+        assert!(result.reason.unwrap().contains("declaration was removed"));
     }
 
     #[test]
