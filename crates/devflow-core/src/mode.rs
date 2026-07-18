@@ -17,6 +17,18 @@ use std::str::FromStr;
 /// Number of consecutive Validate failures in Auto mode before a gate is forced.
 pub const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
+/// Ceiling for [`crate::state::State::infra_failures`] before an
+/// infrastructure-class fault chain (OOM/`ResourceKilled`, missing agent
+/// binary/`AgentUnavailable`) forces a terminal gate (D-08, 17-01).
+///
+/// Deliberately more lenient than [`MAX_CONSECUTIVE_FAILURES`] (3): infra
+/// faults are not the agent's fault, so a higher ceiling tolerates transient
+/// cloud outages/OOM blips that a 3-ceiling would abort prematurely, while
+/// still bounding a stuck loop to at most 5 unobserved cycles before a
+/// terminal abort. Any increment of `infra_failures` must use
+/// `saturating_add` so a long-running stuck loop cannot overflow `u32`.
+pub const MAX_INFRA_FAILURES: u32 = 5;
+
 /// How DevFlow drives the pipeline for a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

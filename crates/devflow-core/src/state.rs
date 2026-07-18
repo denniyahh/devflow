@@ -31,6 +31,14 @@ pub struct State {
     /// `devflow advance` invocations so the counter survives monitor restarts.
     #[serde(default)]
     pub consecutive_failures: u32,
+    /// Consecutive infrastructure-class faults (`ResourceKilled`,
+    /// `AgentUnavailable`) — distinct from [`Self::consecutive_failures`]
+    /// (D-08, 17-01). Gates at [`crate::mode::MAX_INFRA_FAILURES`]. Any
+    /// increment (wired in Plan 04) must use `saturating_add` so a
+    /// long-running stuck loop cannot overflow `u32`. A serde-absent value
+    /// (older persisted state) defaults to 0.
+    #[serde(default)]
+    pub infra_failures: u32,
     /// When the phase started (Unix seconds).
     pub started_at: String,
     /// Path to the project root.
@@ -94,6 +102,7 @@ impl State {
             mode,
             gate_pending: false,
             consecutive_failures: 0,
+            infra_failures: 0,
             started_at: timestamp_now(),
             project_root,
             worktree_path: None,
@@ -155,6 +164,7 @@ mod tests {
         assert_eq!(state.mode, Mode::Auto);
         assert!(!state.gate_pending);
         assert_eq!(state.consecutive_failures, 0);
+        assert_eq!(state.infra_failures, 0);
         assert!(!state.started_at.is_empty());
     }
 
@@ -183,5 +193,39 @@ mod tests {
             loaded.consecutive_failures, 3,
             "consecutive_failures must round-trip through serde"
         );
+    }
+
+    /// D-08 (17-01): a distinct infra-failure counter round-trips through
+    /// serde and its own key appears in the persisted JSON.
+    #[test]
+    fn infra_failures_round_trips_through_serde() {
+        let mut state = State::new(1, AgentKind::Claude, Mode::Auto, PathBuf::from("/repo"));
+        state.infra_failures = 4;
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(
+            json.contains("infra_failures"),
+            "infra_failures must appear in persisted JSON"
+        );
+        let loaded: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            loaded.infra_failures, 4,
+            "infra_failures must round-trip through serde"
+        );
+    }
+
+    /// A serde-absent `infra_failures` (older persisted state.json without
+    /// the field) must default to 0, not fail to deserialize.
+    #[test]
+    fn infra_failures_absent_from_json_defaults_to_zero() {
+        let json = r#"{
+            "stage": "code",
+            "phase": 1,
+            "agent": "claude",
+            "mode": "auto",
+            "started_at": "0",
+            "project_root": "/repo"
+        }"#;
+        let loaded: State = serde_json::from_str(json).unwrap();
+        assert_eq!(loaded.infra_failures, 0);
     }
 }

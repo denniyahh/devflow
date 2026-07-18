@@ -45,6 +45,7 @@ fn project_with_legacy_state() -> tempfile::TempDir {
         mode: Mode::Auto,
         gate_pending: false,
         consecutive_failures: 0,
+        infra_failures: 0,
         started_at: "0".to_string(),
         project_root: dir.path().to_path_buf(),
         worktree_path: None,
