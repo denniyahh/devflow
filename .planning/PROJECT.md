@@ -38,7 +38,9 @@ mid-run crash or kill.
 
 ### Active
 
-- Phase 17 — **Hermes Support:** HermesAgent adapter, current CLI skill file,
+- Phase 17 — **Pipeline Dogfood Follow-Up:** reconcile the terminal Ship
+  event evidence and scope confirmed reliability repairs before feature work.
+- Phase 18 — **Hermes Support:** HermesAgent adapter, current CLI skill file,
   and an `events.jsonl`-driven gate-watcher plugin. Phases 13–16 are complete.
 
 ### Out of Scope
@@ -96,4 +98,4 @@ mid-run crash or kill.
 | `.planning/CONCERNS.md` | Top findings from the original pre-Phase-1 codebase audit |
 
 ---
-*Last updated: 2026-07-17 after Phase 16 completion*
+*Last updated: 2026-07-18 after Phase 17 dogfood spike*

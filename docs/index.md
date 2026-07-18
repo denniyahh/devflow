@@ -1,30 +1,30 @@
 # DevFlow
 
-**Agent-agnostic development workflow automation.**
-
-DevFlow automates the mechanical steps of AI-assisted development — branching, monitoring, verifying, documenting, shipping — so you and your coding agents can focus on building.
+**A durable execution loop for AI-assisted development.** DevFlow runs a
+phase through planning, implementation, validation, and human-approved
+shipping while preserving the evidence needed to understand what happened.
 
 ## Pipeline Overview
 
 ```mermaid
-graph LR
-    Idle --> Branching
-    Branching --> Planning
-    Planning --> Executing
-    Executing --> Verifying
-    Verifying --> Docsing
-    Docsing --> Shipping
-    Shipping --> Cleaning
-    Cleaning --> Idle
+flowchart LR
+    D[Define] --> P[Plan] --> C[Code] --> V[Validate] --> S[Ship]
+    V -->|gaps| C
+    S -->|approved| M[Merge and tag]
+    S -->|rejected| C
 ```
+
+Define, Plan, and Code launch an agent in an isolated worktree. Validate
+requires an explicit pass verdict. Ship runs review and always pauses for a
+human decision before DevFlow performs terminal Git operations.
 
 ## Quick Links
 
-- [System Architecture](diagrams/system.md) — High-level component diagram
-- [State Machine](architecture/state-machine.md) — Workflow steps and transitions
-- [Agent Model](architecture/agent-model.md) — How agents integrate
-- [Ship Flow](diagrams/ship-flow.md) — Git-flow release process
-- [Adding an Agent](guides/adding-agent.md) — Extension guide
+- [System Architecture](diagrams/system.md) — Runtime components and boundaries
+- [State Machine](architecture/state-machine.md) — Stages, verdicts, and gates
+- [Agent Model](architecture/agent-model.md) — Adapters and completion evidence
+- [Ship Flow](diagrams/ship-flow.md) — Review, approval, and terminal hooks
+- [Quick Start](guides/quickstart.md) — Install and operate DevFlow
 
 ## Supported Agents
 
@@ -36,8 +36,8 @@ graph LR
 
 ## Key Design Decisions
 
-- **Agent-agnostic** — All agents implement the same `Agent` trait
-- **Worktree isolation** — Agents run in isolated git worktrees
-- **Monitor daemon** — Detached process owns agent lifecycle, no cron/polling
-- **Three-layer evaluation** — Agent results evaluated by marker → exit code → heuristic
-- **Shared prompts** — All agents receive identical prompt text
+- **Agent-agnostic** — Claude Code, Codex, and OpenCode implement one adapter contract.
+- **Worktree-first** — each phase runs in its own Git worktree by default.
+- **Evidence-first** — external probes, agent results, exits, and Git state are evaluated in order.
+- **Never-silent failures** — failures open an actionable gate instead of stalling invisibly.
+- **Durable operations** — phase state, captures, review artifacts, gates, and history survive restarts.

@@ -133,8 +133,9 @@ probe to execute against an external service.
 | 16j | 07 | SATISFIED | Persistent escalating, bounded pending-gate status surface. |
 | 16k | 01 + post-review fixes | SATISFIED | Merge-first terminal truth, retry gate, clean release history, and no premature finish signal. |
 
-No orphaned requirement IDs were found. Phase 17 is Hermes-specific and does not defer or
-absorb any Phase 16 gap.
+No orphaned requirement IDs were found. Phase 18 is Hermes-specific and does not defer or
+absorb any Phase 16 gap; Phase 17 separately captures post-verification dogfood evidence
+for final-HEAD reconciliation.
 
 ## Anti-Patterns and Disconfirmation Pass
 

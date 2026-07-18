@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.69 — 2026-07-18
+
+- Released phase via DevFlow.
+
+## 1.3.16 — 2026-07-17
+
+- Released phase via DevFlow.
+
 ## 1.3.0 — 2026-07-17
 
 - Phase 15: OSS readiness — README/ARCHITECTURE/guides rewritten against v2

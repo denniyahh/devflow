@@ -55,7 +55,7 @@ Post-ship review corrected log-follow rollover and status-scan efficiency issues
 
 ## Next Phase Readiness
 
-Phase 17 can consume the stable `events.jsonl` protocol for Hermes gate-watcher support.
+Phase 18 can consume the stable `events.jsonl` protocol for Hermes gate-watcher support.
 
 ---
 *Phase: 14-parallel-safety-observability*

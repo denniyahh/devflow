@@ -64,4 +64,4 @@ reading it from a config field.
 This page only covers the "what can I configure" surface. For the complete
 picture — the gate protocol, the notify hook, the `.devflow/` file
 inventory, and a worked dogfood session — see
-[OPERATIONS.md](../../OPERATIONS.md).
+[operator reference](https://github.com/denniyahh/devflow/blob/develop/OPERATIONS.md).

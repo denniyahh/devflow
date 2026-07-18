@@ -5,10 +5,7 @@ Get DevFlow running in your project.
 ## Installation
 
 ```bash
-# One-command install
-curl -fsSL https://raw.githubusercontent.com/denniyahh/devflow/main/scripts/install.sh | bash
-
-# Build from source
+# Build and install from source
 git clone https://github.com/denniyahh/devflow.git
 cd devflow
 cargo install --path crates/devflow-cli
@@ -46,8 +43,8 @@ devflow gate list
 devflow gate approve 3 --note "lgtm"
 ```
 
-See [OPERATIONS.md](../../OPERATIONS.md) for the full gate-answering
-reference.
+See the [operator reference](https://github.com/denniyahh/devflow/blob/develop/OPERATIONS.md)
+for the full gate-answering reference.
 
 ## Prerequisites
 

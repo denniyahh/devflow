@@ -2,7 +2,7 @@
 
 > Phase plan source of truth. Each phase drives a `devflow start` agent session.
 
-## v2.0.0 (Phase 11–17)
+## v2.0.0 (Phase 11–18)
 
 | Phase | Name | Status |
 |---|---|---|
@@ -11,7 +11,8 @@
 | 14 | Parallel Safety + Observability | Complete |
 | 15 | Dogfood Enablement + OSS Readiness | Complete |
 | 16 | Pipeline Reliability Hardening | Complete    |
-| 17 | Hermes Support | Scoped |
+| 17 | Pipeline Dogfood Follow-Up | Spiked |
+| 18 | Hermes Support | Scoped |
 
 ## Shipped
 
@@ -166,13 +167,29 @@ Plans:
 
 - [x] 16-07-PLAN.md — 16j/16h: persistent escalating pending-gate status banner + cross-attempt Ship/Code history view (history.rs)
 
-### Phase 17: Hermes Support
+### Phase 17: Pipeline Dogfood Follow-Up
 
-**Goal:** First-class Hermes support — `HermesAgent` adapter with native-envelope completion parsing (17a), rewrite of the stale `skills/hermes/devflow/SKILL.md` against current CLI behavior (17b), and the Hermes plugin session mode with an events.jsonl-driven gate watcher (17c). Split out of Phase 14 on 2026-07-16 so personal-infrastructure work doesn't gate parallel-safety correctness or OSS readiness. Renumbered from 16 to 17 on 2026-07-17 to make room for Phase 16 (Pipeline Reliability Hardening).
+**Goal:** Reconcile the Phase 16 dogfood event stream with the claimed
+fail-closed terminal Ship invariant, then scope any confirmed repair alongside
+typed agent-outcome handling, preflight readiness, state/event reconciliation,
+and the existing transient-capture test fix. This phase is a spike until the
+final-HEAD reproduction distinguishes a real defect from stale telemetry.
+**Requirements:** Spike decision gate in `17-DOGFOOD-RETROSPECTIVE.md`
+**Depends on:** Phase 16
+**Blocks:** Phase 18 Hermes Support
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (reproduce the terminal sequence, then run `/gsd-plan-phase 17`)
+
+### Phase 18: Hermes Support
+
+**Goal:** First-class Hermes support — `HermesAgent` adapter with native-envelope completion parsing (18a), rewrite of the stale `skills/hermes/devflow/SKILL.md` against current CLI behavior (18b), and the Hermes plugin session mode with an events.jsonl-driven gate watcher (18c). Split out of Phase 14 on 2026-07-16 so personal-infrastructure work doesn't gate parallel-safety correctness or OSS readiness. Renumbered from 17 to 18 on 2026-07-18 to make room for Phase 17's dogfood follow-up.
 **Requirements**: TBD (see CONTEXT.md)
 **Depends on:** Phase 14 (consumes `events.jsonl` + the Phase 13 notify hook)
 **Plans:** 0 plans
 
 Plans:
 
-- [ ] TBD (run /gsd-plan-phase 17 to break down)
+- [ ] TBD (run /gsd-plan-phase 18 to break down)

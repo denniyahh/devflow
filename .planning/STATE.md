@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
-status: Phase 16 shipped - PR #8
-stopped_at: Phase 16 shipped; PR #8 open for review
-last_updated: "2026-07-18T02:02:52.975Z"
+status: Phase 17 spiked - terminal Ship reconciliation pending
+stopped_at: Phase 17 spike complete; reproduce terminal Ship sequence before planning repairs
+last_updated: "2026-07-18T00:00:00Z"
 progress:
-  total_phases: 6
+  total_phases: 7
   completed_phases: 5
   total_plans: 34
   completed_plans: 34
-  percent: 83
+  percent: 71
 ---
 
 # DevFlow — Project State
@@ -19,7 +19,13 @@ progress:
 
 ## Active
 
-- **Phase 17 (Scoped — next):** Hermes Support — renumbered from 16 to 17 (2026-07-17) to make room for Phase 16. HermesAgent adapter, skill-file rewrite, Hermes plugin. Depends on Phase 14's events.jsonl + Phase 13's notify hook.
+- **Phase 17 (Spiked — next):** Pipeline Dogfood Follow-Up — reconcile the
+  Phase 16 terminal Ship event evidence and scope confirmed repairs before
+  further feature work.
+- **Phase 18 (Scoped):** Hermes Support — renumbered from 17 to 18
+  (2026-07-18) to make room for Phase 17. HermesAgent adapter, skill-file
+  rewrite, Hermes plugin. Depends on Phase 14's events.jsonl + Phase 13's
+  notify hook.
 
 ## Completed
 
@@ -54,6 +60,7 @@ None.
 | Date | Decision |
 |---|---|
 | 2026-07-17 | **New Phase 16 (Pipeline Reliability Hardening) inserted, Hermes Support renumbered 16→17:** dogfooding Phase 15 through DevFlow itself surfaced real pipeline gaps — two Code-stage false positives on the crates.io publish plan (Layer-2 commit-count heuristic once, an incorrect agent self-report once) and four consecutive Ship-review failures on distinct legitimate findings (leaked telemetry, incomplete gitignore fix, CI job that couldn't fail loud, a doc/behavior mismatch) that a single-pass standard-depth reviewer caught one at a time instead of together. Dir renamed `16-hermes-support` → `17-hermes-support`; new `16-pipeline-reliability-hardening` (neither had plans yet). |
+| 2026-07-18 | **New Phase 17 (Pipeline Dogfood Follow-Up) inserted, Hermes Support renumbered 17→18:** Phase 16 execution evidence may show a failed Merge followed by VersionBump, BranchCleanup, and `workflow_finished`, contradicting the phase's fail-closed terminal contract. The Phase 17 spike captures this required final-HEAD reproduction plus outcome classification, preflight readiness, state/event reconciliation, and WR-03 test stabilization. Dir renamed `17-hermes-support` → `18-hermes-support`; Hermes remains scoped and blocked on the decision gate. |
 | 2026-07-16 | **Phase 15 rescoped dogfood-first:** operator priority is a fully functional MVP for dogfooding. The MVP engine is done (13 + 14); the remaining friction is operational: gate responses required hand-writing `.devflow/gates/NN-stage.response.json`, and no accurate operator reference exists. Phase 15 now leads with 15a Dogfood Enablement (`devflow gate` list/approve/reject, OPERATIONS.md, plus pulled-forward accuracy items: `.devflow.yaml` decoy removal, IN-01 lib.rs rustdoc, `--help` snapshot test); 15b OSS packaging follows and is to be executed through DevFlow itself as the first post-MVP dogfood run. Antigravity adapter (old 15c) deferred to unscheduled backlog — serves neither priority. Phase 14 was merged to develop (431c743) before this rescope. |
 | 2026-07-16 | **Phase 14 post-ship code review + fixes:** independent high-effort review (8 finder angles, 1-vote verification) found 10 issues — 2 critical (recover --clean wiped live sibling phases; checkout-lock timeout ran hooks unserialized), 7 warning, 1 info — all documented in `14-REVIEW.md` and resolved in `14-REVIEW-FIX.md` (7 fixed, 2 mitigated, 1 accepted-by-design). Notable policy calls: `recover --clean` now sweeps stale phases only with `--phase N` as the explicit escape hatch; a checkout-lock timeout skips the hook batch rather than ever mutating the checkout unserialized (`DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS` tunable); agent binaries are preflighted before any monitor spawns. |
 | 2026-07-16 | **Phase 14 complete — CR-03 closed:** per-phase `state-{NN}.json` + `advance --phase N` threaded from the monitor at spawn time (no shared singleton, pre-lock read deleted), two-level locking (per-phase advance lock + seconds-scale `lock-project` around all primary-checkout git mutation), per-phase `cron-instructions-{NN}.json`, sequentagent behind a no-advance monitor holding its phase lock (sync `launch_agent`/`capture_agent_output` deleted), `events.jsonl` schema v1, `devflow logs [--follow]`, multi-phase `status`/`recover`. Legacy `state.json`/`cron-instructions.json` migrate/read-compat on first touch. Checkout-lock acquisition in the hook path is fail-soft (warn + proceed unserialized after 120s) — a wedged sibling must not abort an advance; integrate paths fail hard instead. Validated: 252 tests, clippy/fmt clean, live two-phase e2e with both Ship gates open concurrently and both version-bump tags landing. |

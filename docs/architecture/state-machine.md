@@ -1,54 +1,32 @@
 # State Machine
 
-The workflow is a deterministic sequence of steps.
-
-## Step Transitions
+DevFlow persists one state file per active phase and walks a fixed pipeline.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Idle
-    Idle --> Branching: devflow start
-    Branching --> Planning: branch created
-    Planning --> Executing: plan reviewed (or auto_plan)
-    Executing --> Verifying: agent complete
-    Verifying --> Docsing: tests pass
-    Docsing --> Shipping: docs updated
-    Shipping --> Cleaning: PR created
-    Cleaning --> Idle: cleanup complete
-    Idle --> Branching: devflow start
+    [*] --> Define: devflow start
+    Define --> Plan
+    Plan --> Code
+    Code --> Validate
+    Validate --> Ship: verdict pass
+    Validate --> Code: verdict gaps
+    Ship --> [*]: approval and terminal hooks pass
+    Ship --> Code: rejection or review failure
 ```
 
-## Step Properties
+| Stage | Primary result | Human interaction |
+|---|---|---|
+| `Define` | Context artifact | Failure opens a gate |
+| `Plan` | Plan artifacts | Failure opens a gate |
+| `Code` | Code plus configured external probes | Failure opens a gate |
+| `Validate` | `DEVFLOW_RESULT` with `verdict: "pass"` or `"gaps"` | `supervise` mode gates before advance; gaps return to Code |
+| `Ship` | Review with no Critical finding, then GSD ship work | Always pauses for merge approval |
 
-| Step | Waits On | Skippable | Config Toggle |
-|------|----------|-----------|---------------|
-| `Idle` | — | No | — |
-| `Branching` | Git branch creation | No | `auto_branch` |
-| `Planning` | User review | Yes | `auto_plan` |
-| `Executing` | Agent completion | No | — |
-| `Verifying` | Test/lint pass | Yes | `auto_verify` |
-| `Docsing` | Doc generation | Yes | `auto_docs` |
-| `Shipping` | PR creation | Yes | `auto_ship` |
-| `Cleaning` | Worktree/branch cleanup | No | `auto_cleanup` |
+## Persisted State
 
-## State Serialization
+State lives at `.devflow/state-NN.json`; an old single `.devflow/state.json`
+is migrated when read. The file records the current stage, phase, selected
+agent, mode, gate status, start time, project root, and optional worktree.
 
-State is serialized to `.devflow/state.json`:
-
-```json
-{
-  "step": "Executing",
-  "phase": 3,
-  "agent": "Claude",
-  "pids": [12345],
-  "label": "Add monitor module",
-  "project_root": "/home/user/project",
-  "worktree": null
-}
-```
-
-## Gate Modes
-
-- **`auto`** — gates advance automatically when conditions are met
-- **`manual`** — gates pause until `devflow check` is called (or user confirms)
-- **`continue_on_error`** — when true, errors are non-fatal and the pipeline continues
+`auto` gates at Ship and on unexpected failures. `supervise` adds a Validate
+gate. Neither mode can bypass the terminal Ship approval.

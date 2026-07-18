@@ -2,13 +2,18 @@
 
 DevFlow is agent-agnostic — all coding agents share the same interface.
 
-## Agent Trait
+## Adapter Contract
 
 ```rust
-pub trait Agent {
+pub trait AgentAdapter {
     fn name(&self) -> &str;
-    fn kind(&self) -> AgentKind;
-    fn exec_command(&self, phase: u32) -> (String, Vec<String>);
+    fn exec_command(
+        &self,
+        phase: u32,
+        prompt: &str,
+        extra_writable_roots: &[PathBuf],
+    ) -> (&'static str, Vec<String>);
+    fn extra_env(&self) -> Vec<(String, String)>;
     fn completion_signal_detected(&self, output: &str) -> bool;
 }
 ```
@@ -28,28 +33,26 @@ Each agent has a dedicated adapter file under `crates/devflow-core/src/agents/`:
 - `claude.rs` — Claude Code adapter
 - `codex.rs` — Codex adapter
 - `opencode.rs` — OpenCode adapter
-- `mod.rs` — `Agent` trait definition + `adapter_for()` factory
+- `mod.rs` — `AgentAdapter` trait definition + `adapter_for()` factory
 
 ## Shared Prompts
 
-All agents receive the **same prompt text** via `phase_prompt(phase)`. The prompt directs agents to:
+All agents receive the same stage-specific prompt via `stage_prompt()`. The
+adapter supplies only command-line details and narrowly scoped environment
+requirements.
 
-1. Read `CLAUDE.md`, `.planning/ROADMAP.md`, `.planning/phases/NN-*/CONTEXT.md`, and `AGENTS.md`
-2. Implement, test, lint, format
-3. Commit per sub-task
-4. Emit a `DEVFLOW_RESULT` marker
-
-The `claude_and_codex_share_identical_prompt_text` test enforces this invariant.
+The prompt asks agents to use the relevant GSD command and finish with a
+`DEVFLOW_RESULT` JSON marker. Validate additionally requires a `pass` or
+`gaps` verdict; Ship requires a review-before-ship decision.
 
 ## Completion Evaluation
 
 See [Agent Lifecycle diagram](../diagrams/agent-lifecycle.md) for the full evaluation flow.
 
-**Layer 1 — Marker (authoritative):** Scans stdout tail for `DEVFLOW_RESULT: {"status": ...}`.
-
-**Layer 2 — Exit code + commits (reliable fallback):** `exit == 0 && commits > 0` → success.
-
-**Layer 3 — Commit heuristic (last resort):** Commits on branch without exit code → probable success with warning.
+1. **External verification** — for Code plans that declare a reviewed probe, DevFlow runs it in the execution worktree first.
+2. **Native output / marker** — reads the adapter envelope or the last `DEVFLOW_RESULT` marker.
+3. **Exit code and commits** — an exit failure is final; Plan and Code also require commits when no stronger result exists.
+4. **Last-resort heuristic** — an exited process with commits may be marked `Unknown`, never silently treated as success.
 
 ## Adding a New Agent
 
