@@ -4,7 +4,7 @@ DevFlow is agent-agnostic. Adding a new agent backend is a checklist, not a myst
 
 ## Checklist
 
-1. **Add an adapter file** under `crates/devflow-core/src/agents/` implementing the `Agent` trait
+1. **Add an adapter file** under `crates/devflow-core/src/agents/` implementing the `AgentAdapter` trait
 2. **Add a variant** to the `AgentKind` enum in `state.rs`
 3. **Update the `FromStr` parser**, `Display`, and `AgentParseError` text in `state.rs`
 4. **Add a match arm** in `agents::adapter_for()`
@@ -15,10 +15,10 @@ DevFlow is agent-agnostic. Adding a new agent backend is a checklist, not a myst
 ## Agent Trait
 
 ```rust
-pub trait Agent {
+pub trait AgentAdapter {
     fn name(&self) -> &str;
-    fn kind(&self) -> AgentKind;
-    fn exec_command(&self, phase: u32) -> (String, Vec<String>);
+    fn exec_command(&self, phase: u32, prompt: &str, extra_writable_roots: &[PathBuf]) -> (String, Vec<String>);
+    fn extra_env(&self) -> Vec<(String, String)> { Vec::new() }
     fn completion_signal_detected(&self, output: &str) -> bool;
 }
 ```
@@ -28,12 +28,11 @@ pub trait Agent {
 ```rust
 pub struct MyAgent;
 
-impl Agent for MyAgent {
+impl AgentAdapter for MyAgent {
     fn name(&self) -> &str { "My Agent" }
-    fn kind(&self) -> AgentKind { AgentKind::MyAgent }
 
-    fn exec_command(&self, phase: u32) -> (String, Vec<String>) {
-        ("my-agent".into(), vec!["--phase".into(), phase.to_string()])
+    fn exec_command(&self, phase: u32, prompt: &str, _roots: &[PathBuf]) -> (String, Vec<String>) {
+        ("my-agent".into(), vec!["--phase".into(), phase.to_string(), prompt.into()])
     }
 
     fn completion_signal_detected(&self, output: &str) -> bool {
@@ -44,4 +43,4 @@ impl Agent for MyAgent {
 
 ## Prompt Sharing
 
-All agents receive the same prompt text via `phase_prompt()`. The `claude_and_codex_share_identical_prompt_text` test verifies this invariant — ensure your adapter doesn't bypass it.
+All agents receive the same prompt text via `stage_prompt()`. Adapter prompt-sharing tests verify this invariant — ensure your adapter doesn't bypass it.

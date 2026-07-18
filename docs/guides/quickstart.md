@@ -16,8 +16,9 @@ cargo install --path crates/devflow-cli
 
 ## Start a Phase
 
-No initialization step is required — DevFlow has no config file and no
-`init` command. Run `devflow start` directly from your project root:
+No initialization step or `init` command is required. The optional
+`devflow.toml` only tunes reliability behavior; run `devflow start` directly
+from your project root:
 
 ```bash
 cd your-project

@@ -1,3 +1,36 @@
 # Deterministic doc-check exceptions. Every entry must include a non-empty
 # reason; the cargo tests reject unexplained exceptions.
-exceptions = []
+[[exceptions]]
+kind = "docs_to_source"
+token = "--image"
+reason = "Distrobox option in contributor setup; not a DevFlow CLI flag."
+
+[[exceptions]]
+kind = "docs_to_source"
+token = "--name"
+reason = "Distrobox option in contributor setup; not a DevFlow CLI flag."
+
+[[exceptions]]
+kind = "docs_to_source"
+token = "--no-deps"
+reason = "cargo doc option described in architecture; not a DevFlow CLI flag."
+
+[[exceptions]]
+kind = "docs_to_source"
+token = "--no-ff"
+reason = "git merge option described in architecture; not a DevFlow CLI flag."
+
+[[exceptions]]
+kind = "docs_to_source"
+token = "--path"
+reason = "cargo install option in quickstart; not a DevFlow CLI flag."
+
+[[exceptions]]
+kind = "docs_to_source"
+token = "--release"
+reason = "cargo build option in installation docs; not a DevFlow CLI flag."
+
+[[exceptions]]
+kind = "docs_to_source"
+token = "--workspace-folder"
+reason = "Dev Containers CLI option in contributor setup; not a DevFlow CLI flag."

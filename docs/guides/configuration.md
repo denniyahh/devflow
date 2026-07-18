@@ -1,9 +1,14 @@
 # Configuration
 
-DevFlow has no project config file — there is no YAML/TOML file it reads on
-startup, and no command that scaffolds or prints one. All workflow options
-are supplied as flags to `devflow start`; runtime behavior that isn't a
-per-run workflow choice is tuned via environment variables.
+DevFlow requires no initialization step. Workflow options are supplied as
+flags to `devflow start`; an optional minimal `devflow.toml` controls only
+reliability knobs.
+
+```toml
+capture_retention = 5
+review_angles = ["doc accuracy", "security", "CI correctness", "external state"]
+external_verify_enabled = true
+```
 
 ## `devflow start` flags
 
@@ -30,6 +35,9 @@ environment variables, not config file fields:
 | `DEVFLOW_GATE_NOTIFY_CMD` | unset | Shell command fired when a gate is written (e.g. an `ntfy.sh`/desktop-notification call) |
 | `DEVFLOW_GATE_TIMEOUT_SECS` | 604800 (7 days) | How long a monitor waits at a gate before giving up |
 | `DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS` | 120 | How long to wait on the shared-checkout lock before skipping the hook batch rather than running it unserialized |
+| `DEVFLOW_CAPTURE_RETENTION` | 5 | Override capture generations retained per phase |
+| `DEVFLOW_REVIEW_ANGLES` | built-in list | Override Ship review angles with a comma-separated list |
+| `DEVFLOW_EXTERNAL_VERIFY_ENABLED` | true | Enable or disable PLAN-declared external probes |
 | `RUST_LOG` | `info` | Log verbosity (stderr) |
 | `DEVFLOW_LOG_FORMAT` | plain text | Set to `json` for machine-readable log lines |
 

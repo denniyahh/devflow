@@ -115,7 +115,7 @@ DevFlow uses [Conventional Commits](https://www.conventionalcommits.org/):
 Common types in this repo: `feat`, `fix`, `docs`, `test`, `ci`, `chore`,
 `refactor`. Scope is typically a crate/module (`cli`, `core`) or a phase/plan
 identifier (`15-05`, `phase-15`). Phase 11's per-phase branching/merge scheme
-(feature branches merged via `devflow finish`/`devflow ship`) works alongside
+(feature branches completed through the gate-driven Ship flow) works alongside
 Conventional Commits, not as a replacement for it — every commit in this
 project's own history follows the format.
 

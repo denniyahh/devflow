@@ -62,7 +62,7 @@ crates/
 - **Agent-agnostic** — Claude, Codex, and OpenCode all implement the same `AgentAdapter` trait. Adding a new agent follows a small checklist (see [ARCHITECTURE.md](ARCHITECTURE.md#extension-points--adding-an-agent)).
 - **Worktree isolation by default** — agents run in isolated git worktrees (`.worktrees/phase-NN/`) unless `--no-worktree` is passed, preventing cross-phase contamination.
 - **Monitor daemon** — optional background process detects agent completion and auto-advances the state machine. No cron, no polling, no tmux.
-- **Three-layer evaluation** — agents self-report via `DEVFLOW_RESULT` markers in stdout; fallback layers: exit code + commit count, then a commit-count heuristic.
+- **Four-layer evaluation** — operator-declared external post-conditions can fail a stage before agent-controlled signals; ordinary work then uses `DEVFLOW_RESULT`, exit code + commit count, and the final commit heuristic.
 - **Per-stage prompts** — `stage_prompt(stage, phase)` builds a dedicated prompt per pipeline stage (not one shared instruction template); the same prompt text is used across agents for a given stage, with adapter-specific logic limited to CLI launch flags, not prompt content.
 
 ## Agent Protocol
@@ -75,11 +75,12 @@ DEVFLOW_RESULT: {"status": "success", "commits": 3, "summary": "added tests"}
 
 The Validate stage additionally requires a `verdict` field (`"pass"` or `"gaps"`) — a bare `status: success` is not enough to advance to Ship; only `verdict: "pass"` is.
 
-DevFlow evaluates agent output in three layers:
+DevFlow evaluates agent output in four layers:
 
 | Layer | Method | Authority |
 |---|---|---|
-| 1. Marker | Parse `DEVFLOW_RESULT` JSON from stdout | Authoritative |
+| 0. External verification | Run operator-authored `external_verify` commands declared in PLAN frontmatter | Authoritative failure |
+| 1. Marker | Parse `DEVFLOW_RESULT` JSON from stdout | Authoritative for ordinary plans |
 | 2. Exit code + commits | Exit 0 **and** commits on the feature branch = success; otherwise failed | Fallback |
 | 3. Commit heuristic | Exit code unknown: commits exist = probable success (with warning) | Last resort |
 
@@ -122,7 +123,13 @@ Rate-limit detection: during `devflow sequentagent`, if an agent's stdout contai
 
 ## Configuration
 
-DevFlow stores runtime state per-phase in `.devflow/state-NN.json` (git-ignored). No config file or init step is required — all workflow options are supplied as CLI flags to `devflow start`.
+DevFlow stores runtime state per-phase in `.devflow/state-NN.json` (git-ignored). No init step is required. Workflow choices remain CLI flags; an optional minimal `devflow.toml` configures reliability knobs only.
+
+```toml
+capture_retention = 5
+review_angles = ["doc accuracy", "security", "CI correctness", "external state"]
+external_verify_enabled = true
+```
 
 Key flags:
 
@@ -134,6 +141,9 @@ Key flags:
 | `--no-worktree` | Run directly in the primary checkout instead of an isolated worktree (worktree is the default) |
 
 Gate responses and unattended-run notifications are file-based: a fired gate writes `.devflow/gates/{phase}-{stage}.json` and (if `DEVFLOW_GATE_NOTIFY_CMD` is set) runs that command with `DEVFLOW_GATE_PHASE`/`DEVFLOW_GATE_STAGE`/`DEVFLOW_GATE_CONTEXT` in its environment. Respond by writing `.devflow/gates/{phase}-{stage}.response.json` with `{"approved": true|false, "note": "..."}`. The poll timeout defaults to 7 days and is configurable via `DEVFLOW_GATE_TIMEOUT_SECS`.
+
+`DEVFLOW_CAPTURE_RETENTION`, `DEVFLOW_REVIEW_ANGLES`, and
+`DEVFLOW_EXTERNAL_VERIFY_ENABLED` override the corresponding TOML values.
 
 ## Supported Agents
 

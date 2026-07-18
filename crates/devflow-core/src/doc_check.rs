@@ -4,7 +4,12 @@ use std::path::{Path, PathBuf};
 
 use crate::{agent_result, events, gates::Gates, lock, ship, workflow};
 
-const SCOPED_DOCS: &[&str] = &["README.md", "ARCHITECTURE.md", "CONTRIBUTING.md", "OPERATIONS.md"];
+const SCOPED_DOCS: &[&str] = &[
+    "README.md",
+    "ARCHITECTURE.md",
+    "CONTRIBUTING.md",
+    "OPERATIONS.md",
+];
 
 #[derive(Debug, Default, serde::Deserialize)]
 struct Allowlist {
@@ -118,9 +123,67 @@ fn documented_subcommands(docs: &str) -> Vec<String> {
         .collect()
 }
 
+fn documented_flags(docs: &str) -> Vec<String> {
+    let mut flags: Vec<_> = docs
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|ch: char| {
+                matches!(
+                    ch,
+                    '`' | '[' | ']' | '(' | ')' | ',' | '.' | ':' | '|' | '"'
+                )
+            })
+        })
+        .filter(|word| {
+            word.starts_with("--")
+                && word.len() > 2
+                && word[2..]
+                    .chars()
+                    .all(|ch| ch.is_ascii_lowercase() || ch == '-')
+        })
+        .map(str::to_owned)
+        .collect();
+    flags.sort();
+    flags.dedup();
+    flags
+}
+
+fn documented_rust_identifiers(docs: &str) -> Vec<String> {
+    let mut identifiers = Vec::new();
+    for (index, span) in docs.split('`').enumerate() {
+        if index % 2 == 0 || span.chars().any(char::is_whitespace) {
+            continue;
+        }
+        let callable = span.contains('(');
+        let qualified = span.contains("::");
+        let base = span
+            .split('(')
+            .next()
+            .unwrap_or(span)
+            .trim_end_matches("()");
+        let identifier = base.rsplit("::").next().unwrap_or(base);
+        let upper_camel = identifier.chars().next().is_some_and(char::is_uppercase)
+            && identifier.chars().any(char::is_lowercase);
+        if (callable || qualified || upper_camel)
+            && !identifier.is_empty()
+            && identifier
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        {
+            identifiers.push(identifier.to_owned());
+        }
+    }
+    identifiers.sort();
+    identifiers.dedup();
+    identifiers
+}
+
 fn enum_variants(source: &str, enum_name: &str) -> Vec<String> {
     let marker = format!("enum {enum_name} {{");
-    let body = source.split_once(&marker).map(|(_, body)| body).unwrap_or("");
+    let body = source
+        .split_once(&marker)
+        .map(|(_, body)| body)
+        .unwrap_or("");
     let mut depth = 1_i32;
     let mut variants = Vec::new();
     for line in body.lines() {
@@ -129,6 +192,7 @@ fn enum_variants(source: &str, enum_name: &str) -> Vec<String> {
             if let Some(name) = trimmed
                 .split(|ch: char| ch == '{' || ch == ',')
                 .next()
+                .map(str::trim)
                 .filter(|name| {
                     !name.is_empty()
                         && name.chars().next().is_some_and(char::is_uppercase)
@@ -150,7 +214,9 @@ fn enum_variants(source: &str, enum_name: &str) -> Vec<String> {
 }
 
 fn source_read_env_vars(source: &str) -> Vec<String> {
-    let all = extract_tokens(source, "DEVFLOW_", |ch| ch.is_ascii_uppercase() || ch == '_' || ch.is_ascii_digit());
+    let all = extract_tokens(source, "DEVFLOW_", |ch| {
+        ch.is_ascii_uppercase() || ch == '_' || ch.is_ascii_digit()
+    });
     all.into_iter()
         .filter(|token| {
             source.contains(&format!("std::env::var(\"{token}\""))
@@ -305,13 +371,20 @@ fn doc_referenced_identifiers_exist_in_source() {
         );
     }
 
-    for token in extract_tokens(&docs, "--", |ch| ch.is_ascii_lowercase() || ch == '-') {
+    for token in documented_flags(&docs) {
         let field = token.trim_start_matches('-').replace('-', "_");
         assert!(
             source.contains(&token)
                 || source.contains(&format!("{field}:"))
                 || is_allowlisted(&allowlist, "docs_to_source", &token),
             "documented CLI flag `{token}` does not exist in Rust source"
+        );
+    }
+
+    for token in documented_rust_identifiers(&docs) {
+        assert!(
+            source.contains(&token) || is_allowlisted(&allowlist, "docs_to_source", &token),
+            "documented Rust identifier `{token}` does not exist in Rust source"
         );
     }
 
@@ -369,10 +442,8 @@ fn pinned_doc_claims_match_source() {
 
 #[test]
 fn allowlist_entries_require_reasons() {
-    let reasonless: Allowlist = toml::from_str(
-        "[[exceptions]]\nkind = \"docs_to_source\"\ntoken = \"example\"\n",
-    )
-    .unwrap();
+    let reasonless: Allowlist =
+        toml::from_str("[[exceptions]]\nkind = \"docs_to_source\"\ntoken = \"example\"\n").unwrap();
     assert!(validate_allowlist(&reasonless).is_err());
     validate_allowlist(&load_allowlist()).unwrap();
 }
