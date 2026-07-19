@@ -29,6 +29,7 @@ Define → Plan → Code → Validate → Ship
 | Command | Purpose |
 |---|---|
 | `devflow start --phase N --agent claude\|codex\|opencode --mode auto\|supervise [--force] [--no-worktree] [--dry-run]` | Begin a phase; a detached monitor owns the agent and auto-advances |
+| `devflow resume --phase N` | Resume a rate-limited or infra-paused phase from its saved stage (loads `state-NN.json`, does not recreate the branch/worktree or reset to Define) — the command a primary-loop rate-limit auto-resume cron invokes |
 | `devflow status` | All active phases: stage, gate state, agent liveness, elapsed, last action |
 | `devflow logs [-f] [--phase N] [--stderr]` | Print/follow a phase's captured agent output |
 | `devflow history [N]` | Show chronological events with retained capture and review evidence for a phase |
@@ -102,7 +103,7 @@ only because a stage failed unexpectedly).
 | `phase-NN-exit` / `phase-NN-agent-pid` | Exit code + PID the monitor records |
 | `gates/NN-<stage>.json` (+ `.response.json`, `.ack.json`) | Gate request / answer / receipt |
 | `events.jsonl` | Append-only event log (schema v1, one JSON object per line, phase id on every line) — tail it from any tool |
-| `cron-instructions-NN.json` | Rate-limit resume record for a paused sequentagent run |
+| `cron-instructions-NN.json` | Rate-limit resume record — `devflow resume --phase N` for a paused single-agent run, or the `sequentagent` handoff command for a paused two-agent run |
 | `history/phase-NN/` | Bounded archive of prior stage stdout/exit captures |
 
 Everything under `.devflow/` and `.worktrees/` is runtime state

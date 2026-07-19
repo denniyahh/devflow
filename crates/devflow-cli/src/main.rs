@@ -107,6 +107,20 @@ enum Command {
         #[arg(long)]
         phase: Option<u32>,
     },
+    /// Resume a phase from its saved stage after a rate limit or infrastructure pause.
+    ///
+    /// Unlike `start`, this loads the persisted per-phase state and
+    /// relaunches its saved stage — it does NOT create a new branch/worktree
+    /// or reset the workflow to Define (review consensus #5); agent and mode
+    /// come from the saved state.
+    Resume {
+        /// Phase to resume.
+        #[arg(long)]
+        phase: u32,
+        /// Project root.
+        #[arg(default_value = ".")]
+        project: PathBuf,
+    },
     /// Inspect and answer human gates (the pause points where the workflow
     /// waits for approval).
     Gate {
@@ -366,6 +380,7 @@ fn run() -> Result<(), CliError> {
             )
         }
         Command::Advance { project, phase } => advance(&project_root(project)?, phase),
+        Command::Resume { phase, project } => resume(&project_root(project)?, phase),
         Command::Gate { action } => match action {
             GateCmd::List { project } => gate_list(&project_root(project)?),
             GateCmd::Approve {
@@ -759,6 +774,27 @@ fn launch_stage(
     Ok(())
 }
 
+/// Resume a rate-limited or infra-paused phase from its saved stage (review
+/// consensus #5). Loads the persisted `.devflow/state-{NN}.json` and
+/// relaunches its saved stage via [`launch_stage`] — unlike `start`, this
+/// does NOT call `State::new`, `feature_start`, or `ensure_phase_worktree`:
+/// the branch/worktree already exist and agent/mode are read from the saved
+/// state, so neither needs to be passed as a flag and the workflow is never
+/// reset to Define.
+fn resume(project_root: &Path, phase: u32) -> Result<(), CliError> {
+    let _lock = match lock::acquire(project_root, phase) {
+        Ok(guard) => guard,
+        Err(lock::LockError::Contended { pid, path: _ }) => {
+            return Err(CliError::Message(format!(
+                "another devflow process (pid {pid}) is already running"
+            )));
+        }
+        Err(err) => return Err(CliError::Message(format!("lock error: {err}"))),
+    };
+    let state = workflow::load_state(project_root, phase)?;
+    launch_stage(&state, None, None)
+}
+
 /// The single active phase: `Ok(Some)` when exactly one is active, `Ok(None)`
 /// when none, and an error naming the candidates when several are — shared by
 /// `advance`'s legacy fallback and `logs`'s default-phase resolution so the
@@ -848,8 +884,9 @@ fn advance(project_root: &Path, phase: Option<u32>) -> Result<(), CliError> {
         "advance_evaluated",
         serde_json::json!({
             "stage": stage.to_string(),
-            "status": format!("{:?}", result.status).to_ascii_lowercase(),
+            "status": result.status.as_wire_str(),
             "verdict": result.verdict.map(|v| format!("{v:?}").to_ascii_lowercase()),
+            "decided_by_layer": result.decided_by_layer,
             "reason": result.reason.as_deref().map(truncate_reason),
         }),
     );
@@ -892,14 +929,11 @@ fn advance(project_root: &Path, phase: Option<u32>) -> Result<(), CliError> {
         // handle_validate_outcome/handle_ship_failure, which would bump
         // consecutive_failures (review consensus #4, D-08).
         Action::GateInfra => handle_infra_outcome(project_root, &mut state, stage, result.reason),
-        // RateLimited: interim routing, identical to GateReview — Task 2
-        // (D-09) replaces this arm with the primary-loop single-agent
-        // auto-resume path.
-        Action::AutoResume => match stage {
-            Stage::Validate => handle_validate_outcome(project_root, &mut state, false),
-            Stage::Ship => handle_ship_failure(project_root, &mut state, result.reason),
-            _ => handle_stage_failure(project_root, &mut state, stage, result.reason),
-        },
+        // RateLimited: auto-resume via the primary loop's single-agent cron
+        // path (D-09), bounded by the shared infra-failure ceiling (D-08).
+        Action::AutoResume => {
+            handle_rate_limited_outcome(project_root, &mut state, phase, stage, result.reason)
+        }
     }
 }
 
@@ -943,6 +977,61 @@ fn gate_or_abort_infra(
         );
     }
     handle_stage_failure(project_root, state, stage, reason)
+}
+
+/// Route a `RateLimited` outcome from the PRIMARY advance() monitor loop
+/// (D-09): writes a single-agent cron-instructions resume record (`devflow
+/// resume --phase N`) and returns without firing a blocking gate — unlike
+/// `sequentagent`'s existing rate-limit handling, this path never called the
+/// cron machinery before this plan (Pitfall 3). Shares the same
+/// `infra_failures` ceiling as [`handle_infra_outcome`] (D-08's intentional
+/// shared infra counter): once bumping would reach the ceiling, auto-resume
+/// stops and the outcome instead routes through the infra gate/abort path.
+/// Never touches `consecutive_failures`.
+fn handle_rate_limited_outcome(
+    project_root: &Path,
+    state: &mut State,
+    phase: u32,
+    stage: Stage,
+    reason: Option<String>,
+) -> Result<(), CliError> {
+    let retry_after = retry_after_from_reason(reason.as_deref());
+    let projected_infra_failures = state.infra_failures.saturating_add(1);
+    if projected_infra_failures >= mode::MAX_INFRA_FAILURES {
+        return handle_infra_outcome(project_root, state, stage, reason);
+    }
+    state.infra_failures = projected_infra_failures;
+    workflow::save_state(state)?;
+
+    let instructions =
+        devflow_core::ship::build_single_agent_cron_instructions(project_root, phase, &retry_after);
+    devflow_core::ship::write_cron_instructions(project_root, &instructions)?;
+    if instructions.hermes_cron.schedule.is_empty() {
+        println!("no parseable retry time — auto-resume cron not scheduled; resume manually");
+    } else {
+        println!(
+            "rate limited — wrote {}",
+            devflow_core::ship::cron_instructions_path(project_root, phase)
+                .strip_prefix(project_root)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| {
+                    devflow_core::ship::cron_instructions_path(project_root, phase)
+                        .display()
+                        .to_string()
+                })
+        );
+    }
+    events::emit(
+        project_root,
+        phase,
+        "rate_limit_resume_scheduled",
+        serde_json::json!({
+            "stage": stage.to_string(),
+            "retry_after": retry_after,
+            "infra_failures": state.infra_failures,
+        }),
+    );
+    Ok(())
 }
 
 /// Decide what happens after a Validate stage (passed or failed), honoring the
@@ -3726,6 +3815,121 @@ mod tests {
         );
         let err = workflow::load_state(root, phase).unwrap_err();
         assert!(matches!(err, workflow::WorkflowError::MissingState(_)));
+    }
+
+    /// D-09: a primary-loop `RateLimited` outcome writes the single-agent
+    /// cron-instructions record (`devflow resume --phase N`) and returns
+    /// without firing a blocking gate.
+    #[test]
+    fn primary_loop_rate_limited_writes_single_agent_cron_instructions() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 76;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        std::fs::write(
+            agent_result::stdout_path(root, phase),
+            r#"{"type":"result","subtype":"error_rate_limit","retry_after":"2026-06-18T15:45:30Z"}"#,
+        )
+        .unwrap();
+
+        advance(root, Some(phase)).unwrap();
+
+        let instructions = devflow_core::ship::load_cron_instructions(root, phase).unwrap();
+        assert_eq!(instructions.resume.command, "devflow");
+        assert_eq!(
+            instructions.resume.args,
+            ["resume", "--phase", &phase.to_string()]
+        );
+        assert!(
+            instructions
+                .hermes_cron
+                .command
+                .contains(&format!("devflow resume --phase {phase}"))
+        );
+
+        // No blocking gate — state persists, stage unchanged, not gate-pending.
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert_eq!(reloaded.stage, Stage::Code);
+        assert!(!reloaded.gate_pending);
+        assert_eq!(reloaded.infra_failures, 1);
+        assert_eq!(reloaded.consecutive_failures, 0);
+        assert!(!Gates::gate_path(root, phase, Stage::Code).exists());
+    }
+
+    /// D-08/D-09: the RateLimited path at `infra_failures ==
+    /// MAX_INFRA_FAILURES - 1` bumps to the ceiling and stops auto-resuming —
+    /// it routes to the infra gate/abort path instead of writing a resume
+    /// record (bounded resume, no soft-loop).
+    #[test]
+    fn rate_limited_at_infra_ceiling_stops_resuming_and_aborts() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 77;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        state.infra_failures = mode::MAX_INFRA_FAILURES - 1;
+        workflow::save_state(&state).unwrap();
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        std::fs::write(
+            agent_result::stdout_path(root, phase),
+            r#"{"type":"result","subtype":"error_rate_limit","retry_after":"2026-06-18T15:45:30Z"}"#,
+        )
+        .unwrap();
+
+        advance(root, Some(phase)).unwrap();
+
+        let err = workflow::load_state(root, phase).unwrap_err();
+        assert!(
+            matches!(err, workflow::WorkflowError::MissingState(_)),
+            "the infra ceiling must abort, clearing state"
+        );
+        assert!(
+            devflow_core::ship::load_cron_instructions(root, phase).is_err(),
+            "must not schedule an auto-resume once the infra ceiling stops resumption"
+        );
+    }
+
+    /// D-10: `advance_evaluated` emits `status` via `AgentStatus::as_wire_str()`
+    /// (never the Debug-lowercase formatter that collapses `ResourceKilled`
+    /// into `resourcekilled`) and carries the `decided_by_layer` evidence
+    /// field.
+    #[test]
+    fn advance_evaluated_emits_wire_status_and_decided_by_layer_for_resource_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 78;
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        std::fs::write(agent_result::exit_code_path(root, phase), "137").unwrap();
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Code);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        advance(root, Some(phase)).unwrap();
+
+        // advance_evaluated isn't the last event once the infra gate/abort
+        // path runs, so read the raw log and find it by name rather than
+        // using `last_event_for_phase`.
+        let contents = std::fs::read_to_string(events::events_path(root)).unwrap();
+        let event = contents
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|e| e["event"] == "advance_evaluated")
+            .expect("advance_evaluated event recorded");
+        assert_eq!(event["status"], "resource_killed");
+        assert_ne!(event["status"], "resourcekilled");
+        assert_eq!(event["decided_by_layer"], 2);
     }
 
     /// `parse_gate_timeout` is a pure function — no env mutation needed, so

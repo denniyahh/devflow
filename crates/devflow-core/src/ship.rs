@@ -187,6 +187,44 @@ pub fn build_cron_instructions(
     }
 }
 
+/// Build a Hermes cron-instructions manifest for resuming the PRIMARY
+/// single-agent `advance()` monitor loop (D-09, review consensus #5) via
+/// `devflow resume --phase N` — distinct from [`build_cron_instructions`],
+/// which resumes the two-agent `sequentagent` handoff. `agent` is
+/// intentionally omitted from the resume command: `devflow resume` loads it
+/// (along with mode and stage) from the phase's saved state.
+pub fn build_single_agent_cron_instructions(
+    project_root: &Path,
+    phase: u32,
+    retry_after: &str,
+) -> CronInstructions {
+    let project = project_root.display().to_string();
+    let args = vec![
+        "resume".to_string(),
+        "--phase".to_string(),
+        phase.to_string(),
+    ];
+    CronInstructions {
+        project: project.clone(),
+        phase,
+        status: "rate_limited".to_string(),
+        retry_after: retry_after.to_string(),
+        resume: ResumeCommand {
+            command: "devflow".to_string(),
+            args,
+        },
+        hermes_cron: HermesCronJob {
+            schedule: cron_schedule_from_retry_after(retry_after).unwrap_or_default(),
+            name: format!("devflow-phase-{phase:02}-resume"),
+            command: format!(
+                "cd {} && devflow resume --phase {phase}",
+                shell_quote(&project)
+            ),
+            once: true,
+        },
+    }
+}
+
 /// Convert a retry timestamp to `M H D M W` cron syntax, rounding up to the
 /// nearest minute. Supports RFC3339-like timestamps and Unix epoch seconds.
 pub fn cron_schedule_from_retry_after(retry_after: &str) -> Option<String> {
@@ -568,6 +606,28 @@ mod tests {
                 .command
                 .contains("devflow sequentagent --phase 7 --agents codex,claude")
         );
+        assert!(record.hermes_cron.once);
+    }
+
+    /// Review consensus #5: the single-agent resume record must invoke
+    /// `devflow resume --phase N` (which relaunches saved state), never the
+    /// unsafe `devflow start` (resets to Define) or the two-agent
+    /// `sequentagent` command.
+    #[test]
+    fn single_agent_cron_instructions_resume_command_is_devflow_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = build_single_agent_cron_instructions(dir.path(), 9, "2026-06-18T15:45:30Z");
+
+        assert_eq!(record.resume.command, "devflow");
+        assert_eq!(record.resume.args, ["resume", "--phase", "9"]);
+        assert!(
+            record
+                .hermes_cron
+                .command
+                .contains("devflow resume --phase 9")
+        );
+        assert!(!record.hermes_cron.command.contains("sequentagent"));
+        assert!(!record.hermes_cron.command.contains(" start"));
         assert!(record.hermes_cron.once);
     }
 
