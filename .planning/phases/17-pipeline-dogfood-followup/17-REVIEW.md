@@ -42,8 +42,10 @@ ship_gate: BLOCKED
 **Reviewed:** 2026-07-19 (round 2)
 **Depth:** deep (5 parallel angles, merged and deduplicated)
 **Files Reviewed:** 16
-**Status:** issues_found — **1 Critical OPEN**
-**Ship gate:** BLOCKED
+**Status:** issues_found — **0 Critical OPEN** (CR-01's root cause, WR-04, resolved by `17-12` —
+see the CR-01 and WR-04 entries below)
+**Ship gate:** BLOCKED (unchanged — Warnings WR-01, WR-02, WR-06 through WR-11 remain open;
+flipping `ship_gate` for those is an operator call, not this plan's scope)
 
 Round 1 of this review is preserved verbatim in the appendix below. This round re-ran the same
 five angles against the current branch state (63 commits ahead of `develop`, merge-base
@@ -136,6 +138,26 @@ root cause, `changelog_append()` writing an entry that `version_bump()` never ba
 was classified manual-only by that pass (it changes hook atomicity semantics and needs a design
 call). Until WR-04 closes, the next dogfood run re-emits a false heading and a Round 3 will find
 this again.
+
+**WR-04 (root cause) RESOLVED — `17-12`.** `changelog_append` is now ordered strictly after
+`version_bump` in `hooks_after_ship()` (was fired independently at the Validate→Ship transition,
+before any tag existed), and reads the version via a new `version::read_version` — never
+`compute_version`, which would see the tag `version_bump` just cut and derive a version one
+higher than the tag actually names. `changelog_append` also now commits its own write (Round 2's
+WR-04 facet below), scoped to `CHANGELOG.md` via a new `GitFlow::commit_path`, and a failed commit
+propagates as an error so the terminal batch's fail-fast stops `BranchCleanup` from running against
+an uncommitted entry. `version_bump` had the identical "write without commit" defect on its own
+version-file write — surfaced only once the regression test asserting a clean tree after the full
+batch made it visible — and is fixed the same way. Regression test
+(`hooks.rs::after_ship_batch_changelog_tag_and_version_file_agree_and_tree_is_clean`) drives the
+full `hooks_after_ship()` batch and asserts three-way agreement (changelog heading version == tag
+== version file version) plus a clean working tree with `CHANGELOG.md` in a commit. `ChangelogAppend`
+deliberately moved to the terminal batch and now targets `project_root` via `hook_context_root`
+(a release record belongs on the base branch alongside the tag), while `DocsUpdate` stays in the
+Validate→Ship batch targeting the worktree (17-10 unchanged) — a future reader should not restore
+17-10's worktree targeting to `ChangelogAppend`. The generated entry body is still the placeholder
+"Released phase via DevFlow" — a content-quality defect (also flagged `17-10-SUMMARY.md:104`)
+deliberately left out of `17-12`'s scope. No open Critical or WR-04 entry remains in this file.
 
 ---
 
@@ -744,6 +766,19 @@ the *worktree* HEAD. `commits_since_last_minor_tag` (`version.rs:110`) counts `t
 worktree (N commits ahead) yields a different patch number than `VersionBump` later computes on
 post-merge develop — the changelog heading and the git tag disagree. This is the same machinery
 that produced CR-01.
+
+**RESOLVED — `17-12` (gap closure).** Fixed both the primary defect (this entry) and its ordering
+corollary (the Secondary paragraph above) together, since they share one root cause. `ChangelogAppend`
+moved from the Validate→Ship batch into `hooks_after_ship()`, strictly after `VersionBump` and
+before `BranchCleanup`. It now reads the version via a new `version::read_version` (added this
+plan) instead of `compute_version` — read_version reports exactly what a prior `write_version` call
+wrote, with no git involved, so it can never see a tag `VersionBump` just cut and derive a
+different, larger version (the trap the Secondary paragraph names). `changelog_append` also now
+commits its own write via a new `GitFlow::commit_path`, scoped to `CHANGELOG.md` so it cannot sweep
+in unrelated dirty state; `version_bump`'s own version-file write had the identical uncommitted-write
+defect and is fixed the same way. See the live CR-01 entry above for the full disposition and the
+regression test proving three-way agreement (changelog heading version == tag == version file
+version) plus a clean working tree.
 
 ### WR-05: CI's clippy gate does not lint test code — a required check passes on code clippy rejects
 
