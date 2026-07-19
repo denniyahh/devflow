@@ -10,6 +10,7 @@ created: 2026-07-18
 audited: 2026-07-19
 reaudited: 2026-07-19
 reaudited_at_commit: cf062e6
+reaudited_2_at_commit: 636d1ab
 ---
 
 # Phase 17 — Validation Strategy
@@ -270,3 +271,59 @@ PARTIAL requirement rows to fill, which is the only work that agent does.
 CI-stalling defect rather than a latent caveat, and it belongs to the ship/version-bump concurrency
 work, not to Phase 17. This phase does not block on it; the next milestone should not ship without
 it.
+
+---
+
+## Re-Audit #2 2026-07-19 (HEAD `636d1ab`)
+
+Third independent pass. HEAD moved only by the previous re-audit's own doc commit (`cf062e6` →
+`636d1ab`), so no source changed between passes — this re-executes claims rather than re-reading them.
+
+| Metric | Count |
+|--------|-------|
+| Requirement rows re-audited | 9 |
+| `coverage:` refs in `17-01`…`17-08-SUMMARY.md` confirmed present | 48 / 48 |
+| Suite result (racy test excluded) | 361 passed / 0 failed / 0 ignored (10 targets), exit 0 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | clean (exit 0) |
+| `cargo fmt --check` | clean (exit 0) |
+| Rows green | 9 |
+| Gaps still open | 1 (GAP-2) |
+| Gaps closed by this re-audit | 0 |
+
+**Method.** Every `#test_name` in every SUMMARY `coverage:` block was extracted and matched against a
+real `fn` definition in `crates/` — 48/48, superseding the prior pass's 35-name map-only check. The
+suite was then run with `-- --skip concurrent_ship_advances_finish_both_phases_independently`, which
+isolates the GAP-2 race and makes the requirement-row evidence *deterministic* rather than ~60 %
+likely. 361 = the prior pass's 362 minus that one filtered test, so the two runs reconcile exactly.
+No auditor subagent was spawned: zero MISSING or PARTIAL rows, which is the only work that agent does.
+
+**GAP-2 reproduced live, and its mechanism is now proven rather than inferred.** The first full-suite
+run of this audit hung. While it was hung, the `devflow` bin test binary (PID 3497313, 2m14s elapsed
+against an ~11 s clean-run baseline) was inspected directly under `/proc`:
+
+| Thread | `wchan` | Interpretation |
+|--------|---------|----------------|
+| 3497313 | `futex_do_wait` | main thread blocked in `thread::scope` join |
+| 3497457 | `futex_do_wait` | sibling `advance()` thread, finished, waiting on scope |
+| 3497481 | `hrtimer_nanosleep` | **the losing phase's reopened `32-ship` gate poll, sleeping forever** |
+
+That third thread is the defect: `Gates` polls with no timeout, so the run blocks until an external
+`timeout` kills it. This is direct mechanical confirmation of the mechanism the prior audit inferred
+from timing alone. Source re-read confirms the setup — `main.rs:3785-3791` pre-seeds exactly one Ship
+gate response per phase, so the loser of the `v2.0.1` tag race has nothing to consume.
+
+Three subsequent isolated runs under a 60 s timeout all passed in 1–2 s. Cumulative across both
+re-audits: **3 hangs in 9 runs (~33 %)**, passes always 1–2 s — the bimodality holds. Notably this
+audit's hang occurred under full-suite load while the three isolated runs passed, which is weak
+evidence the race widens under CPU contention; that would make CI (parallel test targets) *more*
+exposed than isolated reproduction suggests, not less.
+
+**Nothing was corrected.** Unlike the prior pass, which fixed three stale facts, every claim in this
+document re-executed as written. GAP-2's disposition, `nyquist_compliant: true`, and the ⚠️ on the
+feedback-latency sign-off box all remain correct as recorded.
+
+**Verdict: GAPS** — unchanged and for the unchanged reason. All 9 requirement rows are green and
+deterministic once GAP-2's test is isolated, so Phase 17's own coverage is complete and this phase
+does not block. GAP-2 is a pre-existing ship/version-bump concurrency defect that Phase 17 neither
+introduced nor owns, but it is live, it stalls rather than fails CI, and it should not survive into
+the next milestone.
