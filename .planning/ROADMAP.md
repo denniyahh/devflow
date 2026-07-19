@@ -11,7 +11,7 @@
 | 14 | Parallel Safety + Observability | Complete |
 | 15 | Dogfood Enablement + OSS Readiness | Complete |
 | 16 | Pipeline Reliability Hardening | Complete    |
-| 17 | Pipeline Dogfood Follow-Up | Complete    |
+| 17 | Pipeline Dogfood Follow-Up | Complete |
 | 18 | Hermes Support | Scoped |
 
 ## Shipped
@@ -191,9 +191,12 @@ Hermes adapter, an accepted override recorded in
 `17-VERIFICATION.md`'s frontmatter (`overrides:`).
 **Depends on:** Phase 16
 **Blocks:** Phase 18 Hermes Support
-**Plans:** 6/6 plans executed
+**Plans:** 8/8 plans executed
 
 Plans:
+
+- [x] 17-07-PLAN.md
+- [x] 17-08-PLAN.md
 
 - [x] 17-06-PLAN.md
 
