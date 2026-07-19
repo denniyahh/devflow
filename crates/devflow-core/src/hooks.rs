@@ -73,19 +73,36 @@ impl Hook {
 
 /// Which hooks fire when moving `from` → `to`.
 ///
-/// - Validate → Ship: docs + changelog are finalized before shipping.
-/// - Ship → (done): merge + version bump + branch cleanup.
+/// - Validate → Ship: docs are finalized before shipping.
+/// - Ship → (done): merge + version bump + changelog + branch cleanup.
 /// - everything else: none.
+///
+/// `ChangelogAppend` deliberately does NOT run here (WR-04, 17-12): a
+/// changelog heading naming a release is only true once `VersionBump` has
+/// actually cut the tag, and `VersionBump` runs in [`hooks_after_ship`],
+/// strictly after this transition.
 pub fn hooks_for_transition(from: Stage, to: Stage) -> Vec<Hook> {
     match (from, to) {
-        (Stage::Validate, Stage::Ship) => vec![Hook::DocsUpdate, Hook::ChangelogAppend],
+        (Stage::Validate, Stage::Ship) => vec![Hook::DocsUpdate],
         _ => Vec::new(),
     }
 }
 
 /// Hooks that fire after Ship completes (the workflow's terminal transition).
+///
+/// `ChangelogAppend` runs strictly after `VersionBump` (WR-04, 17-12) — the
+/// entry must describe the version `VersionBump` actually wrote and tagged,
+/// never a version computed independently of it. It runs before
+/// `BranchCleanup` so a changelog failure still stops short of deleting the
+/// feature branch (`run_checkout_hooks`' terminal-batch fail-fast breaks on
+/// the first error in this batch).
 pub fn hooks_after_ship() -> Vec<Hook> {
-    vec![Hook::Merge, Hook::VersionBump, Hook::BranchCleanup]
+    vec![
+        Hook::Merge,
+        Hook::VersionBump,
+        Hook::ChangelogAppend,
+        Hook::BranchCleanup,
+    ]
 }
 
 fn branch_create(ctx: &HookContext) -> Result<(), HookError> {
@@ -171,27 +188,52 @@ fn docs_update(ctx: &HookContext) -> Result<(), HookError> {
 }
 
 fn changelog_append(ctx: &HookContext) -> Result<(), HookError> {
-    let version = version::compute_version(&ctx.project_root)
+    // Read back the version VersionBump (which runs immediately before this
+    // hook in hooks_after_ship()) actually wrote and tagged. Deliberately
+    // NOT version::compute_version — that recomputes MINOR from the live git
+    // tag count, which VersionBump's own tag just incremented, yielding a
+    // version one higher than the tag actually cut (WR-04, 17-12).
+    let version = version::read_version(&ctx.project_root)
         .map(|v| v.to_string())
         .unwrap_or_else(|_| "unreleased".to_string());
     let path = ctx.project_root.join("CHANGELOG.md");
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     let updated = crate::ship::prepend_changelog(&existing, &version, &today());
     std::fs::write(&path, updated)?;
-    info!("ChangelogAppend: wrote entry for {version}");
+    // Commit the write. Round 2's WR-04 finding: this hook used to write and
+    // never commit, and docs_update — the only committing hook — ran first
+    // in the old (Validate→Ship) batch order, so the entry was left dirty
+    // and lost when Merge/BranchCleanup ran. Scoped to CHANGELOG.md (not
+    // commit_all) so this hook never sweeps in unrelated dirty state. A
+    // failed commit propagates as an error so the terminal batch's fail-fast
+    // stops BranchCleanup from running against an uncommitted entry.
+    let git = GitFlow::new(&ctx.project_root);
+    git.commit_path(
+        "CHANGELOG.md",
+        &format!("docs: add changelog entry for {version}"),
+    )?;
+    info!("ChangelogAppend: wrote and committed entry for {version}");
     Ok(())
 }
 
 fn version_bump(ctx: &HookContext) -> Result<(), HookError> {
     let version = version::compute_version(&ctx.project_root)?;
-    // Write the computed version into the version file when one exists.
+    let git = GitFlow::new(&ctx.project_root);
+    // Write the computed version into the version file when one exists, and
+    // commit that write before tagging (17-12: previously left uncommitted,
+    // so the tag named a version the tagged commit itself didn't contain,
+    // and the working tree stayed dirty through the rest of the terminal
+    // batch — the same "write without committing" defect WR-04 named for
+    // ChangelogAppend, just not called out there).
     if has_version_file(&ctx.project_root) {
         let path = version::write_version(&ctx.project_root, &version)?;
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            git.commit_path(name, &format!("chore: bump version to {version}"))?;
+        }
         info!("VersionBump: wrote {version} to {}", path.display());
     } else {
         warn!("VersionBump: no supported version file; tagging only");
     }
-    let git = GitFlow::new(&ctx.project_root);
     let tag = format!("v{version}");
     git.tag(&tag)?;
     info!("VersionBump: tagged {tag}");
@@ -255,17 +297,21 @@ mod tests {
     }
 
     #[test]
-    fn transition_map_finalizes_docs_and_changelog_before_ship() {
+    fn transition_map_finalizes_docs_only_before_ship() {
+        // WR-04 (17-12): ChangelogAppend no longer fires here — a changelog
+        // heading naming a release can't be true before VersionBump (which
+        // runs in hooks_after_ship, strictly after this transition) cuts the
+        // tag it describes.
         assert_eq!(
             hooks_for_transition(Stage::Validate, Stage::Ship),
-            vec![Hook::DocsUpdate, Hook::ChangelogAppend]
+            vec![Hook::DocsUpdate]
         );
         assert!(hooks_for_transition(Stage::Define, Stage::Plan).is_empty());
         assert!(hooks_for_transition(Stage::Code, Stage::Validate).is_empty());
     }
 
     #[test]
-    fn validate_to_ship_hooks_append_changelog() {
+    fn validate_to_ship_hooks_do_not_touch_changelog() {
         let dir = tempfile::tempdir().unwrap();
         init_repo(dir.path());
         let context = ctx(dir.path(), Stage::Ship);
@@ -274,15 +320,23 @@ mod tests {
             hook.run(&context).unwrap();
         }
 
-        let changelog = std::fs::read_to_string(dir.path().join("CHANGELOG.md")).unwrap();
-        assert!(changelog.contains("## "));
+        assert!(!dir.path().join("CHANGELOG.md").exists());
     }
 
     #[test]
-    fn after_ship_runs_version_and_cleanup() {
+    fn after_ship_runs_version_changelog_then_cleanup() {
+        // WR-04 (17-12): ChangelogAppend strictly after VersionBump (so it
+        // can read back the version VersionBump just tagged), and before
+        // BranchCleanup (so a changelog failure still stops short of
+        // deleting the feature branch).
         assert_eq!(
             hooks_after_ship(),
-            vec![Hook::Merge, Hook::VersionBump, Hook::BranchCleanup]
+            vec![
+                Hook::Merge,
+                Hook::VersionBump,
+                Hook::ChangelogAppend,
+                Hook::BranchCleanup,
+            ]
         );
     }
 
@@ -305,6 +359,27 @@ mod tests {
             .unwrap();
         let changelog = std::fs::read_to_string(dir.path().join("CHANGELOG.md")).unwrap();
         assert!(changelog.contains("# Changelog"));
+    }
+
+    #[test]
+    fn changelog_append_commits_its_own_write() {
+        // WR-04 (Round 2, 17-12): changelog_append must not leave its write
+        // uncommitted — that's what let the entry get orphaned when
+        // BranchCleanup ran before it.
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        Hook::ChangelogAppend
+            .run(&ctx(dir.path(), Stage::Ship))
+            .unwrap();
+
+        let status = git_output(dir.path(), &["status", "--porcelain"]);
+        assert!(status.is_empty(), "expected clean tree, got: {status}");
+
+        let committed_files = git_output(dir.path(), &["log", "-1", "--name-only"]);
+        assert!(
+            committed_files.contains("CHANGELOG.md"),
+            "expected CHANGELOG.md in the latest commit, got: {committed_files}"
+        );
     }
 
     #[test]
@@ -349,9 +424,85 @@ mod tests {
         let post_merge_count = git_output(dir.path(), &["rev-list", "--count", "develop"]);
         assert_ne!(pre_merge_count, post_merge_count);
 
-        let tag = git_output(dir.path(), &["tag", "--points-at", "develop"]);
-        assert_eq!(tag, format!("v2.0.{post_merge_count}"));
-        assert_ne!(tag, format!("v2.0.{pre_merge_count}"));
+        // Exactly one tag was created, and it names the version VersionBump
+        // actually wrote to the version file (not a raw rev-list count,
+        // which would now also include VersionBump's own commit and
+        // ChangelogAppend's — both introduced by 17-12).
+        let all_tags = git_output(dir.path(), &["tag"]);
+        assert_eq!(all_tags.lines().count(), 1, "expected exactly one tag");
+        let tag = all_tags.trim().to_string();
+        let version_file_version = version::read_version(dir.path()).unwrap().to_string();
+        assert_eq!(tag, format!("v{version_file_version}"));
+
+        // The tag no longer points at develop's tip — ChangelogAppend's
+        // commit (17-12) lands after it.
+        let develop_tip = git_output(dir.path(), &["rev-parse", "develop"]);
+        let tag_commit = git_output(dir.path(), &["rev-parse", &format!("{tag}^{{commit}}")]);
+        assert_ne!(develop_tip, tag_commit);
+    }
+
+    #[test]
+    fn after_ship_batch_changelog_tag_and_version_file_agree_and_tree_is_clean() {
+        // Full regression for WR-04 (17-12): drives the whole hooks_after_ship
+        // batch and asserts three-way agreement between the changelog
+        // heading, the created git tag, and the version file's version —
+        // plus the Round 2 WR-04 commit requirement (clean tree, CHANGELOG.md
+        // present in a commit). Must fail against pre-17-12 main: the old
+        // batch order never ran ChangelogAppend here at all (it fired at
+        // Validate→Ship, before any tag existed), so CHANGELOG.md would not
+        // exist after running only hooks_after_ship().
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        // Merge fires events::emit, which creates .devflow/ — gitignored in
+        // every real project (WR-11); mirror that here so the clean-tree
+        // assertion below checks hook writes, not test-fixture telemetry.
+        std::fs::write(dir.path().join(".gitignore"), ".devflow/\n").unwrap();
+        git(dir.path(), &["add", ".gitignore"]);
+        git(dir.path(), &["commit", "-q", "-m", "add gitignore"]);
+        git(dir.path(), &["checkout", "-q", "-b", "feature/phase-11"]);
+        std::fs::write(dir.path().join("feature.txt"), "phase work\n").unwrap();
+        git(dir.path(), &["add", "feature.txt"]);
+        git(dir.path(), &["commit", "-q", "-m", "phase work"]);
+
+        let context = ctx(dir.path(), Stage::Ship);
+        for hook in hooks_after_ship() {
+            hook.run(&context).unwrap();
+        }
+
+        // Exactly one tag was created by this batch (init_repo creates none).
+        let all_tags = git_output(dir.path(), &["tag"]);
+        assert_eq!(all_tags.lines().count(), 1, "expected exactly one tag");
+        let tag = all_tags.trim().to_string();
+
+        let changelog = std::fs::read_to_string(dir.path().join("CHANGELOG.md")).unwrap();
+        let changelog_version = changelog
+            .lines()
+            .find(|l| l.starts_with("## "))
+            .and_then(|l| l.trim_start_matches("## ").split(' ').next())
+            .unwrap()
+            .to_string();
+
+        let version_file_version = version::read_version(dir.path()).unwrap().to_string();
+
+        assert_eq!(
+            tag,
+            format!("v{changelog_version}"),
+            "tag must match the changelog heading version"
+        );
+        assert_eq!(
+            changelog_version, version_file_version,
+            "changelog heading must match the version file's version"
+        );
+
+        // Round 2 WR-04: the changelog write must be committed, and the
+        // working tree must be clean after the full batch.
+        let status = git_output(dir.path(), &["status", "--porcelain"]);
+        assert!(status.is_empty(), "expected clean tree, got: {status}");
+        let committed_files = git_output(dir.path(), &["log", "-1", "--name-only"]);
+        assert!(
+            committed_files.contains("CHANGELOG.md"),
+            "expected CHANGELOG.md in the latest commit, got: {committed_files}"
+        );
     }
 
     #[test]
