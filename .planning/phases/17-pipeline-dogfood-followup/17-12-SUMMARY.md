@@ -292,3 +292,8 @@ None - no external service configuration required.
 ---
 *Phase: 17-pipeline-dogfood-followup*
 *Completed: 2026-07-19*
+
+## Self-Check: PASSED
+
+All modified files confirmed present on disk; all five commit hashes (`a3a1067`, `31757ef`,
+`b81ec7d`, `d9701d7`, `e89a25b`) confirmed present in `git log --oneline --all`.
