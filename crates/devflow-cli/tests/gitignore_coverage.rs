@@ -21,26 +21,50 @@ fn repo_root() -> PathBuf {
         .expect("resolve repo root")
 }
 
+/// One representative path per `.devflow/` pattern in `.gitignore`. WR-07
+/// (17-REVIEW.md): the guard previously asserted only three of these, so a
+/// rewrite could have dropped raw agent stdout — the highest-value leak
+/// surface, since it captures whatever an agent printed — and stayed green.
+const RUNTIME_PATHS: &[&str] = &[
+    ".devflow/state.json",
+    ".devflow/state-07.json",
+    ".devflow/lock-07",
+    ".devflow/lock-project",
+    ".devflow/phase-01-stdout",
+    ".devflow/phase-01-stderr.log",
+    ".devflow/phase-01-exit",
+    ".devflow/phase-01-agent-pid",
+    ".devflow/last-ship.json",
+    ".devflow/cron-instructions.json",
+    ".devflow/cron-instructions-01.json",
+    ".devflow/events.jsonl",
+    ".devflow/gates/probe.json",
+    ".devflow/history/phase-01-state.json",
+];
+
 #[test]
 fn gitignore_covers_devflow_runtime_state_paths() {
-    let output = Command::new("git")
-        .current_dir(repo_root())
-        .args([
-            "check-ignore",
-            "-v",
-            ".devflow/state.json",
-            ".devflow/events.jsonl",
-            ".devflow/gates/probe.json",
-        ])
-        .output()
-        .expect("run git check-ignore");
+    // Checked one path per invocation rather than as a single argv:
+    // `git check-ignore` exits 0 when ANY argument matches, so a batched
+    // call would stay green while individual paths silently lost coverage —
+    // precisely the regression this guard exists to catch.
+    let mut unignored = Vec::new();
+    for path in RUNTIME_PATHS {
+        let output = Command::new("git")
+            .current_dir(repo_root())
+            .args(["check-ignore", "-q", path])
+            .output()
+            .expect("run git check-ignore");
+        if !output.status.success() {
+            unignored.push(*path);
+        }
+    }
 
     assert!(
-        output.status.success(),
-        ".gitignore does not cover all required DevFlow runtime-state paths \
-         (.devflow/state.json, .devflow/events.jsonl, .devflow/gates/) — \
-         see 15-REVIEW.md CR-01.\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        unignored.is_empty(),
+        ".gitignore does not cover these DevFlow runtime-state paths, which \
+         would leak runtime telemetry into git — see 15-REVIEW.md CR-01 and \
+         17-REVIEW.md WR-07:\n  {}",
+        unignored.join("\n  ")
     );
 }
