@@ -11,6 +11,7 @@ audited: 2026-07-19
 reaudited: 2026-07-19
 reaudited_at_commit: cf062e6
 reaudited_2_at_commit: 636d1ab
+reaudited_3_at_commit: b77c13e
 ---
 
 # Phase 17 — Validation Strategy
@@ -375,6 +376,78 @@ deterministic once GAP-2's test is isolated, so Phase 17's own coverage is compl
 does not block. GAP-2 is a pre-existing ship/version-bump concurrency defect that Phase 17 neither
 introduced nor owns, but it is live, it stalls rather than fails CI, and it should not survive into
 the next milestone.
+
+---
+
+## Re-Audit #3 2026-07-19 (HEAD `b77c13e`)
+
+Fourth independent pass, and the first to run after **both** gaps were claimed closed. A `validated`
+document with two "RESOLVED" gap sections is still a self-report until someone re-executes it, so
+this pass re-ran the claims rather than re-reading them — and, for both gaps, tried to *break* the
+fix rather than merely observe it passing.
+
+| Metric | Count |
+|--------|-------|
+| Requirement rows re-audited | 9 |
+| `coverage:` refs in `17-01`…`17-09-SUMMARY.md` confirmed present | 50 / 50 |
+| Per-Task Map test names confirmed present | 36 / 36 |
+| Suite result (**unfiltered — racy test included**) | 362 passed / 0 failed / 0 ignored (10 targets), exit 0 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | clean (exit 0) |
+| `cargo fmt --check` | clean (exit 0) |
+| Rows green | 9 |
+| Gaps still open | **0** |
+| New gaps found | 0 |
+
+**Method.** Every `#test_name` in every SUMMARY `coverage:` block was extracted and matched against a
+real `fn` definition in `crates/` (50/50, now including `17-09`). The full suite was run twice
+end-to-end **without `--skip`** — the previous pass needed to filter the racy test to get
+deterministic evidence; this pass did not, which is itself the clearest signal GAP-2's wedge is gone.
+362 reconciles exactly with re-audit #1's unfiltered count.
+
+**GAP-1 re-verified by mutation, not by observation.** The two CR-01 regression tests were re-run
+against a surgically reintroduced defect (`return Ok(false)` → `Ok(true)` in `run_preflight`,
+`main.rs:820`). Both **FAILED** (`run_preflight_advance_gate_launches_agent_exactly_once` at
+`main.rs:4829`, `run_preflight_loopback_gate_launches_agent_exactly_once` at `main.rs:4891`), then
+both passed again once the source was restored (4/4 `run_preflight_*` green, tree clean). They catch
+the double-spawn for real rather than passing vacuously.
+
+**GAP-2 re-verified by independent stress, and the bound is demonstrably load-bearing.** The test was
+run **15 consecutive times in isolation** under a 120 s external `timeout`:
+
+| Metric | Count |
+|--------|-------|
+| Total isolated runs | 15 |
+| Exit code 124 (hang) | **0** |
+| Any non-zero exit / non-`1 passed` verdict | **0** |
+| Runs that hit the race collision | 4 / 15 (~27 %) |
+| Worst-case wall-clock latency | **3.15 s** |
+
+The per-run timings are cleanly bimodal in a way that proves the 2 s bound is doing the work rather
+than the race having quietly disappeared: 11 runs clustered at ~1.22–1.32 s (no collision) and 4 at
+~3.12–3.15 s (collision) — a gap of very nearly exactly the 2 s `DEVFLOW_GATE_TIMEOUT_SECS`
+override. Those 4 runs are collisions that *were* rescued by the bound; pre-fix they are the runs
+that would have hung. The ~27 % collision rate is consistent with the ~33–40 % measured by the three
+prior audits, confirming the fix bounds the *poll* and not the *race*, exactly as `17-09-PLAN.md`
+claimed.
+
+**The fix was also checked for the two ways it could have been cheating.** (1) `parse_gate_timeout`
+(`main.rs:30-33`) still falls back to `SEVEN_DAYS`, so the production default is genuinely untouched
+and a real operator gate still waits for a human. (2) The test's loser branch is not permissive: it
+asserts the error text contains `"timed out"` and *rejects any other failure mode*, then asserts
+state loads intact (not cleared), `gate_pending == true`, and the Ship gate file is still on disk.
+A silent failure or a different error would fail the test. Test binding was confirmed non-vacuous
+(`1 passed`, not `0 passed; 64 filtered out`).
+
+**Verdict: PASS.** All 9 requirement rows are covered, automated, green, and — for the first time
+across four passes — deterministic with the full suite run *unfiltered*. Both GAP-1 and GAP-2 are
+closed, and each was re-verified adversarially rather than taken on the executor's word.
+`nyquist_compliant` remains `true`, now on strictly stronger evidence than when it was first set.
+
+**One named item deliberately survives this PASS**, and it is not a validation gap: the product-level
+version-tag contention two concurrently-shipping phases hit (GAP-2's "Product-level" paragraph). The
+test now *tolerates* that race rather than eliminating it. It guards no Phase 17 requirement, Phase 17
+neither introduced nor owns it, and it is recorded as OUT OF SCOPE for the ship/version-bump
+concurrency work. Phase 17 does not block on it; a future milestone should not silently inherit it.
 
 ---
 
