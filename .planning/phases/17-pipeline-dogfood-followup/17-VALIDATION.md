@@ -4,7 +4,7 @@ slug: pipeline-dogfood-followup
 # status lifecycle: draft (seeded by plan-phase) → validated (set by validate-phase §6)
 # audit-milestone §5.5 distinguishes NOT-VALIDATED (draft) from PARTIAL (validated + nyquist_compliant: false) (#2117)
 status: validated
-nyquist_compliant: false
+nyquist_compliant: true
 wave_0_complete: true
 created: 2026-07-18
 audited: 2026-07-19
@@ -51,7 +51,7 @@ name in the tree and to run green under `cargo test --workspace`.
 | 3 | 17-01 | P2 (17b, D-07) | Exit 137 → `ResourceKilled`; exit 127 → `AgentUnavailable`; serialized names keep word boundaries | unit | `evaluate_layer2_exit_137_is_resource_killed`, `evaluate_layer2_exit_127_is_agent_unavailable`, `multi_word_variants_serialize_with_word_boundary`, `as_wire_str_matches_serde_form_for_every_variant` | ✅ green |
 | 4 | 17-01, 17-04, 17-06 | P2 (17b, D-08) | Infra outcomes never increment `consecutive_failures`; the ceiling bounds a stuck loop, not a phase lifetime | unit | `resource_killed_on_code_bumps_infra_failures_not_consecutive_failures`, `resource_killed_on_validate_bumps_infra_not_consecutive_failures`, `transition_resets_infra_failures`, `infra_ceiling_aborts_instead_of_gating` | ✅ green |
 | 5 | 17-04 | P2 (17b, D-09) | `RateLimited` in the PRIMARY `advance()` path writes cron-instructions instead of a blocking gate | unit + integration | `primary_loop_rate_limited_writes_single_agent_cron_instructions`, `rate_limited_at_infra_ceiling_stops_resuming_and_aborts`, `sequentagent_hands_off_after_rate_limit_and_writes_cron_instructions` | ✅ green |
-| 6 | 17-05 | P3 / AC-4 (17c) | A readiness failure is reported as a named preflight gate BEFORE `spawn_monitor`, never a hard exit | unit + integration | `run_preflight_failing_check_gates_and_never_reaches_spawn_monitor`, `run_preflight_adapter_hook_override_fires`, `preflight_interactivity_check_flags_auto_define_without_context_md`, `start_codex_without_context_fails_preflight`, `default_preflight_is_ok_for_built_in_adapters` | ⚠️ **PARTIAL** — see GAP-1 |
+| 6 | 17-05, 17-08 | P3 / AC-4 (17c) | A readiness failure is reported as a named preflight gate BEFORE `spawn_monitor`, never a hard exit; an Advance/LoopBack-resolved gate launches the agent exactly once, never twice (CR-01) | unit + integration | `run_preflight_failing_check_gates_and_never_reaches_spawn_monitor`, `run_preflight_adapter_hook_override_fires`, `preflight_interactivity_check_flags_auto_define_without_context_md`, `start_codex_without_context_fails_preflight`, `default_preflight_is_ok_for_built_in_adapters`, `run_preflight_advance_gate_launches_agent_exactly_once`, `run_preflight_loopback_gate_launches_agent_exactly_once` | ✅ green |
 | 7 | 17-02, 17-05 | P1 / AC-2 (17d, D-21) | `workflow_started` carries version/commit/dirty/build-timestamp/exe-path fields | unit + integration | `workflow_started_payload_carries_build_provenance`, `build_timestamp_is_a_parseable_u64`, `build_dirty_is_exactly_true_or_false`, `build_commit_is_accessible_and_does_not_panic` | ✅ green |
 | 8 | 17-05, 17-06, 17-07 | P1 / AC-2 (17d, D-17/D-19) | Stale embedded commit blocks a DevFlow-workspace launch; a *descendant* build warns instead of blocking; ordinary projects only warn | unit | `embedded_commit_is_stale_maps_ancestry_exit_codes`, `wr01_clean_tree_strict_ancestor_build_is_stale_and_hard_blocks`, `ahead_build_from_descendant_commit_warns_instead_of_blocking`, `enforce_build_staleness_blocks_self_dogfood_and_records_event_before_erroring` | ✅ green |
 | 9 | Phase 16 | AC-1 (regression) | Failed Merge leaves branch intact, blocks VersionBump/BranchCleanup, opens Ship gate | regression (existing) | `terminal_merge_failure_reopens_actionable_gate_and_never_reports_finished`, `terminal_hook_failure_stops_before_branch_cleanup` | ✅ green |
@@ -64,30 +64,39 @@ name in the tree and to run green under `cargo test --workspace`.
 
 ### GAP-1 — `run_preflight` gate-resolution branches are untested, and harbor an open Critical
 
-**Row 6 · requirement 17c · ESCALATED (impl bug — not closable by a test alone)**
+**Row 6 · requirement 17c · RESOLVED by `17-08-PLAN.md` (fix `c03498d`, regression tests `b570114`)**
 
-`run_preflight` (`crates/devflow-cli/src/main.rs:789-816`) dispatches the resolved gate three ways.
+`run_preflight` (`crates/devflow-cli/src/main.rs:789-816`) dispatched the resolved gate three ways.
 Both existing tests (`run_preflight_failing_check_gates_and_never_reaches_spawn_monitor`,
 `run_preflight_adapter_hook_override_fires`) pre-write a gate response of
-`{"approved":false,"note":"abort: …"}`, so **only the `GateAction::Abort` arm is ever executed**.
+`{"approved":false,"note":"abort: …"}`, so **only the `GateAction::Abort` arm was ever executed**.
 
-The two uncovered arms are exactly where `17-REVIEW.md`'s open Critical (CR-01) lives:
+The two previously-uncovered arms were exactly where `17-REVIEW.md`'s open Critical (CR-01) lived:
 
 ```rust
 GateAction::Advance  => { …; launch_stage(state, None, None) }   // main.rs:803-807
 GateAction::LoopBack(_) => { …; launch_stage(state, None, None) } // main.rs:808-811
 ```
 
-Each recursively calls `launch_stage`, which spawns the agent — then returns `Ok(())` into the
-*outer* `launch_stage` call site (`main.rs:1067`), which proceeds to `enforce_build_staleness` /
-`archive_phase_files` / `spawn_monitor` and **spawns the agent a second time**.
+Each recursively called `launch_stage`, which spawns the agent — then returned `Ok(())` into the
+*outer* `launch_stage` call site (`main.rs:1067`), which proceeded to `enforce_build_staleness` /
+`archive_phase_files` / `spawn_monitor` and **spawned the agent a second time**.
 
-Why this is not auto-fillable: a test asserting the correct behavior (exactly one `stage_launched`
-event per preflight-gate resolution) must fail against current `main.rs`. Closing it requires an
-implementation change, which is outside the validation auditor's mandate.
+**Fix (`c03498d`):** `run_preflight` now returns `Result<bool, CliError>` — `Ok(true)` means the
+caller should continue `launch_stage`, `Ok(false)` means a failing check was already resolved via a
+full retried launch (Advance/LoopBack) or an abort, and the caller must run no further launch
+steps. The call site now short-circuits: `if !run_preflight(&project_root, state,
+adapter.as_ref())? { return Ok(()); }`.
 
-**Disposition:** fix CR-01 via `/gsd-code-review --fix` or during Ship, then add the two missing
-branch tests as the regression proof. Phase 17 must not merge before both.
+**Regression proof (`b570114` RED → `c03498d` GREEN):** `run_preflight_advance_gate_launches_agent_exactly_once`
+and `run_preflight_loopback_gate_launches_agent_exactly_once` each drive `run_preflight` through a
+`FailOnceAdapter` (fails only on its first `preflight()` call) and assert exactly one
+`stage_launched` event across the whole phase event log. Both were confirmed to fail against
+unmodified `main.rs` (observing 2 events) before the fix landed, and pass after.
+
+**Disposition:** closed. `cargo test --workspace` (63/63 non-skipped, GAP-2's pre-existing hang
+excluded), `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --check` all
+confirmed clean at `c03498d`.
 
 ### GAP-2 — `concurrent_ship_advances_finish_both_phases_independently` is a latent race
 
@@ -111,7 +120,7 @@ concurrency work lands.
 - [x] `evaluate_layer3` (typed replacement) tests: zero-commit/no-declaration → failure outcome, not blanket `Unknown` (D-01/D-02/D-03)
 - [x] `advance()`-level test: `RateLimited` in the primary monitor loop writes cron-instructions (D-09)
 - [x] Separate-counter test: infra outcomes never touch `consecutive_failures` (D-08)
-- [~] Preflight tests: each D-14 universal check + adapter `preflight()` default-method override path (D-13) — **partial**, gate-resolution branches uncovered (GAP-1); security-artifact + reviewer-set checks deferred to Phase 18 by attributed override
+- [x] Preflight tests: each D-14 universal check + adapter `preflight()` default-method override path (D-13), plus the Advance/LoopBack gate-resolution branches (GAP-1, resolved by 17-08); security-artifact + reviewer-set checks deferred to Phase 18 by attributed override
 - [x] Provenance tests: `workflow_started` payload fields (D-21), staleness with two-commit git fixture (D-19), workspace-identity detection (D-17)
 - [x] No new test framework or config needed — only new test CASES; existing `cargo test` infrastructure covers the phase
 
@@ -141,15 +150,16 @@ with Phase 18's Hermes adapter, the first adapter with real reviewer storage.
 
 - [x] All requirements have automated verification or a recorded manual-only/override disposition
 - [x] Sampling continuity: no 3 consecutive tasks without automated verify
-- [x] Test infrastructure confirmed: `cargo test --workspace` green, `cargo clippy --workspace --all-targets -- -D warnings` clean, `cargo fmt --check` clean (2026-07-19)
+- [x] Test infrastructure confirmed: `cargo test --workspace` green, `cargo clippy --workspace --all-targets -- -D warnings` clean, `cargo fmt --check` clean (2026-07-19, re-confirmed at `c03498d`)
 - [x] No watch-mode flags
 - [x] Feedback latency < 90s (full workspace suite completes in ~11s warm)
-- [ ] `nyquist_compliant: true` — **blocked by GAP-1**
+- [x] `nyquist_compliant: true` — GAP-1 resolved by `17-08-PLAN.md` (`c03498d`)
 
-**Approval:** PARTIAL — 8 of 9 requirement rows fully automated and green. Row 6 (17c preflight) is
-partial: the `GateAction::Advance`/`LoopBack` arms of `run_preflight` are untested and contain open
-Critical CR-01 (double agent spawn). Not closable by a test alone; requires the impl fix first.
-Re-run `/gsd-validate-phase 17` after CR-01 is fixed to flip `nyquist_compliant`.
+**Approval:** PASS — 9 of 9 requirement rows fully automated and green. Row 6 (17c preflight) was
+partial pending GAP-1 (CR-01, the `GateAction::Advance`/`LoopBack` double-spawn); `17-08-PLAN.md`
+closed it with an impl fix (`c03498d`) and two RED→GREEN regression tests (`b570114` → `c03498d`).
+GAP-2 (`concurrent_ship_advances_finish_both_phases_independently`, a pre-existing race predating
+Phase 17) remains escalated and out of this phase's scope — see GAP-2 above.
 
 ---
 
@@ -174,3 +184,8 @@ only fillable artifact is a test that must fail against current `main.rs`, which
 **Note:** `17-07` has a PLAN, a landed fix (`3c2774e`), and a passing test, but **no SUMMARY.md**.
 Its coverage was mapped into row 8 manually from the plan's `must_haves` rather than from a
 `coverage:` block. Worth generating for artifact completeness.
+
+**Addendum 2026-07-19 (post `17-08-PLAN.md`):** GAP-1 (the sole ESCALATED-not-RESOLVED gap this
+audit found) is now closed — see the GAP-1 section above. `nyquist_compliant` flips to `true`; the
+counts in the table above are left as originally recorded, a point-in-time snapshot of the
+2026-07-19 audit that ran before the fix landed.

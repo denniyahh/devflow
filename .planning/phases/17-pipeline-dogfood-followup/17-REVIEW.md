@@ -137,6 +137,13 @@ if !run_preflight(&project_root, state, adapter.as_ref())? {
 
 Add a regression test that pre-seeds an `Advance` gate response for a failing preflight check and asserts exactly one `stage_launched` event (or exactly one `monitor::spawn_monitor` call, via a test seam) is recorded — the current tests only cover the `Abort` arm.
 
+**RESOLVED (`17-08-PLAN.md`, 2026-07-19):** `run_preflight` now returns `Result<bool, CliError>`
+exactly as proposed above (fix commit `c03498d`), and the call site short-circuits on `Ok(false)`.
+Two regression tests, `run_preflight_advance_gate_launches_agent_exactly_once` and
+`run_preflight_loopback_gate_launches_agent_exactly_once` (test commit `b570114`, confirmed RED
+against unmodified `main.rs` before the fix landed), assert exactly one `stage_launched` event per
+gate resolution. `17-VALIDATION.md` row 6 flipped to green and GAP-1 is closed.
+
 ## Warnings
 
 ### WR-01: `enforce_build_staleness` prints a near-universally-firing, misleading warning for every non-self-dogfood project
