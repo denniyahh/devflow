@@ -840,7 +840,6 @@ fn workflow_started_payload(state: &State) -> serde_json::Value {
         "version": env!("CARGO_PKG_VERSION"),
         "commit": env!("DEVFLOW_BUILD_COMMIT"),
         "dirty": env!("DEVFLOW_BUILD_DIRTY"),
-        "build_timestamp": env!("DEVFLOW_BUILD_TIMESTAMP"),
         "exe_path": std::env::current_exe()
             .ok()
             .map(|p| p.display().to_string()),
@@ -920,42 +919,34 @@ fn run_git_stdout(project_root: &Path, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-/// The mtime half of D-19's composite staleness: whether any TRACKED,
-/// modified source file is newer than the build timestamp — but only
-/// evaluated when the working tree is dirty (`git status --porcelain`
-/// non-empty). A clean tree needs no mtime check at all: an ancestor-of-HEAD
-/// clean tree is already covered by the ancestry arm (D-19 Open Question 2).
-/// `build_timestamp` (Unix seconds) is converted to a `SystemTime`
-/// EXPLICITLY via `UNIX_EPOCH + Duration::from_secs(..)` before comparison
-/// (review Plan 05 LOW, OpenCode) — never compared as a raw integer.
-/// Returns `None` when git itself is unavailable, so the composite check
-/// falls back to the ancestry arm alone.
-fn tracked_source_newer_than_build(project_root: &Path, build_timestamp: u64) -> Option<bool> {
+/// The live half of D-19's composite staleness (CR-02, 17-11): whether the
+/// working tree CURRENTLY has any tracked, modified file that can change
+/// the compiled binary (`affects_compiled_binary`, reused from 17-10 — not
+/// duplicated). No timestamp is available any more (`build.rs` no longer
+/// embeds one — CR-02), so this cannot itself distinguish "modified after
+/// the build" from "modified before the build, still uncommitted"; combined
+/// with the build's own `build_dirty` flag in `combined_staleness`, it
+/// distinguishes "built clean, source changed since" (definitely Stale)
+/// from "built dirty, source still dirty" (Indeterminate — cannot tell
+/// "same dirt" from "more dirt" without a timestamp, Pitfall 4). Returns
+/// `None` when git itself is unavailable, so the composite check falls back
+/// to the ancestry arm alone.
+fn tree_has_modified_build_inputs(project_root: &Path) -> Option<bool> {
     let status = run_git_stdout(project_root, &["status", "--porcelain"])?;
     if status.trim().is_empty() {
         return Some(false);
     }
     let modified = run_git_stdout(project_root, &["ls-files", "-m"])?;
-    let build_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(build_timestamp);
-    Some(
-        modified
-            .lines()
-            .filter(|rel_path| affects_compiled_binary(rel_path))
-            .any(|rel_path| {
-                std::fs::metadata(project_root.join(rel_path))
-                    .and_then(|m| m.modified())
-                    .map(|mtime| mtime > build_time)
-                    .unwrap_or(false)
-            }),
-    )
+    Some(modified.lines().any(affects_compiled_binary))
 }
 
-/// Whether a repo-relative path can change the compiled binary. The mtime arm
-/// of the staleness check must consider ONLY these: a dirty `CHANGELOG.md` or
-/// `.planning/` file says nothing about whether the binary matches its source.
+/// Whether a repo-relative path can change the compiled binary. The live
+/// dirty-tree arm of the staleness check must consider ONLY these: a dirty
+/// `CHANGELOG.md` or `.planning/` file says nothing about whether the
+/// binary matches its source.
 ///
 /// Found live — DevFlow's own `ChangelogAppend` hook dirtied `CHANGELOG.md`
-/// during the Validate→Ship transition, which the unfiltered mtime arm read as
+/// during the Validate→Ship transition, which an unfiltered check read as
 /// a stale build, hard-blocking Ship on a file the pipeline had just written.
 fn affects_compiled_binary(rel_path: &str) -> bool {
     const BUILD_AFFECTING_FILES: [&str; 4] = [
@@ -970,20 +961,25 @@ fn affects_compiled_binary(rel_path: &str) -> bool {
             .any(|name| rel_path == *name || rel_path.ends_with(&format!("/{name}")))
 }
 
-/// D-19: composite staleness — Stale iff the embedded commit is not an
-/// ancestor of `project_root`'s `HEAD`, OR its tracked-modified source (when
-/// dirty) is newer than the build timestamp. An Indeterminate ancestry
-/// result with no mtime signal stays Indeterminate — never hard-blocked.
-fn combined_staleness(
-    project_root: &Path,
-    embedded_commit: &str,
-    build_timestamp: u64,
-) -> Staleness {
+/// D-19: composite staleness (CR-02, 17-11: the dirty-flag arm replaces the
+/// old mtime arm; the ancestry arm below is unchanged). Decision table for
+/// the second signal, evaluated only once ancestry alone hasn't already
+/// settled Stale:
+///
+/// | build was dirty | tree has modified build inputs now | result |
+/// |---|---|---|
+/// | `false` | yes | **Stale** — built clean, source changed since (CR-02) |
+/// | `true` | yes | **Indeterminate** — can't distinguish "same dirt" from |
+/// |         |     | "more dirt" without a timestamp; warn, never block |
+/// |         |     | (Pitfall 4) |
+/// | either | no | fall through to the ancestry result unchanged |
+fn combined_staleness(project_root: &Path, embedded_commit: &str, build_dirty: bool) -> Staleness {
     let ancestry = embedded_commit_is_stale(project_root, embedded_commit);
     if ancestry == Staleness::Stale {
         return Staleness::Stale;
     }
-    match tracked_source_newer_than_build(project_root, build_timestamp) {
+    match tree_has_modified_build_inputs(project_root) {
+        Some(true) if build_dirty => Staleness::Indeterminate,
         Some(true) => Staleness::Stale,
         _ => ancestry,
     }
@@ -1063,9 +1059,9 @@ fn enforce_build_staleness(
     project_root: &Path,
     state: &State,
     embedded_commit: &str,
-    build_timestamp: u64,
+    build_dirty: bool,
 ) -> Result<(), CliError> {
-    let staleness = combined_staleness(project_root, embedded_commit, build_timestamp);
+    let staleness = combined_staleness(project_root, embedded_commit, build_dirty);
     let self_dogfood = is_self_dogfood_workspace(project_root);
     match staleness_outcome(self_dogfood, staleness) {
         StalenessOutcome::Block => {
@@ -1145,7 +1141,7 @@ fn launch_stage(
         &project_root,
         state,
         env!("DEVFLOW_BUILD_COMMIT"),
-        env!("DEVFLOW_BUILD_TIMESTAMP").parse().unwrap_or(0),
+        env!("DEVFLOW_BUILD_DIRTY") == "true",
     )?;
 
     if let Some(stamp) = agent_result::archive_phase_files(
@@ -5044,7 +5040,9 @@ mod tests {
     // -----------------------------------------------------------------
 
     /// D-21: the `workflow_started` payload carries every provenance field,
-    /// tested directly without spawning a real agent.
+    /// tested directly without spawning a real agent. No `build_timestamp`
+    /// field any more (CR-02, 17-11) — it was removed from `build.rs`
+    /// entirely, not just this payload.
     #[test]
     fn workflow_started_payload_carries_build_provenance() {
         let state = State::new(66, AgentKind::Claude, Mode::Auto, PathBuf::from("/repo"));
@@ -5054,7 +5052,10 @@ mod tests {
         assert!(payload["version"].as_str().is_some());
         assert!(payload["commit"].is_string());
         assert!(payload["dirty"].is_string());
-        assert!(payload["build_timestamp"].is_string());
+        assert!(
+            payload.get("build_timestamp").is_none(),
+            "build_timestamp was removed (CR-02) and must not reappear"
+        );
         assert!(payload["exe_path"].is_string() || payload["exe_path"].is_null());
     }
 
@@ -5269,7 +5270,7 @@ mod tests {
             Staleness::Stale
         );
         assert_eq!(
-            combined_staleness(root, &embedded_commit, 0),
+            combined_staleness(root, &embedded_commit, false),
             Staleness::Stale
         );
         assert!(is_self_dogfood_workspace(root));
@@ -5278,7 +5279,7 @@ mod tests {
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
 
-        let err = enforce_build_staleness(root, &state, &embedded_commit, 0).unwrap_err();
+        let err = enforce_build_staleness(root, &state, &embedded_commit, false).unwrap_err();
         assert!(
             err.to_string().contains("self-dogfood stale build blocked"),
             "{err}"
@@ -5369,20 +5370,23 @@ mod tests {
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         assert!(
-            enforce_build_staleness(root, &state, &embedded_commit, 0).is_ok(),
+            enforce_build_staleness(root, &state, &embedded_commit, false).is_ok(),
             "ahead build must not block a self-dogfood workspace"
         );
     }
 
-    /// The mtime arm must only consider files that can change the compiled
-    /// binary. Found live: DevFlow's own `ChangelogAppend` hook dirtied
-    /// `CHANGELOG.md` during the Validate->Ship transition, the mtime arm read
-    /// that as a stale build, and the self-dogfood gate hard-blocked Ship —
-    /// the pipeline blocking itself on a markdown file it had just written.
-    /// A modified `.rs` file must still flag Stale, or the gate stops catching
-    /// the real "committed, forgot to rebuild" case.
+    /// The live dirty-tree arm must only consider files that can change the
+    /// compiled binary. Found live: DevFlow's own `ChangelogAppend` hook
+    /// dirtied `CHANGELOG.md` during the Validate->Ship transition, an
+    /// unfiltered check read that as a stale build, and the self-dogfood
+    /// gate hard-blocked Ship — the pipeline blocking itself on a markdown
+    /// file it had just written. A modified `.rs` file must still flag
+    /// Stale (when the build was clean), or the gate stops catching the
+    /// real "committed, forgot to rebuild" case (CR-02, 17-11: rewritten
+    /// against the dirty-flag rule — the fixture's guarantees are
+    /// unchanged, only the timestamp mechanism is gone).
     #[test]
-    fn mtime_arm_ignores_non_build_files_but_still_flags_sources() {
+    fn dirty_flag_arm_ignores_non_build_files_but_still_flags_sources() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let git = |args: &[&str]| {
@@ -5421,8 +5425,9 @@ mod tests {
             .trim()
             .to_string();
 
-        // Build timestamp in the past so anything touched now is "newer".
-        let build_timestamp = 1_000;
+        // This binary was built from a CLEAN tree (the CR-02 incident
+        // scenario): `build_dirty` is false throughout.
+        let build_dirty = false;
 
         // Only a doc is dirty — exactly the live Ship-block condition.
         std::fs::write(root.join("CHANGELOG.md"), "# Changelog\n\n## 1.4.26\n").unwrap();
@@ -5432,12 +5437,12 @@ mod tests {
             "fixture must have exactly one dirty tracked file"
         );
         assert_eq!(
-            tracked_source_newer_than_build(root, build_timestamp),
+            tree_has_modified_build_inputs(root),
             Some(false),
             "a dirty CHANGELOG.md cannot change the compiled binary"
         );
         assert_eq!(
-            combined_staleness(root, &embedded_commit, build_timestamp),
+            combined_staleness(root, &embedded_commit, build_dirty),
             Staleness::Fresh,
             "a doc-only dirty tree must not be Stale"
         );
@@ -5446,27 +5451,28 @@ mod tests {
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Ship;
         assert!(
-            enforce_build_staleness(root, &state, &embedded_commit, build_timestamp).is_ok(),
+            enforce_build_staleness(root, &state, &embedded_commit, build_dirty).is_ok(),
             "a doc-only dirty tree must not block Ship"
         );
 
-        // Converse: a dirty source file newer than the build IS stale.
+        // Converse: a dirty source file, on a build that was clean, IS
+        // stale — the CR-02 case this whole plan exists to fix.
         std::fs::write(
             root.join("crates/devflow-cli/src/main.rs"),
             "fn main() { /* edited after build */ }\n",
         )
         .unwrap();
         assert_eq!(
-            tracked_source_newer_than_build(root, build_timestamp),
+            tree_has_modified_build_inputs(root),
             Some(true),
-            "a modified .rs newer than the build is genuine staleness"
+            "a modified .rs file is genuine staleness input"
         );
         assert_eq!(
-            combined_staleness(root, &embedded_commit, build_timestamp),
+            combined_staleness(root, &embedded_commit, build_dirty),
             Staleness::Stale
         );
         assert!(
-            enforce_build_staleness(root, &state, &embedded_commit, build_timestamp).is_err(),
+            enforce_build_staleness(root, &state, &embedded_commit, build_dirty).is_err(),
             "a stale source build must still hard-block a self-dogfood workspace"
         );
     }
@@ -5511,14 +5517,16 @@ mod tests {
     }
 
     /// D-19 composite/OR: a clean tree whose embedded commit IS an ancestor
-    /// (HEAD itself) is Fresh regardless of `build_timestamp`; but once a
-    /// TRACKED file is modified (dirty tree) with an mtime newer than the
-    /// build timestamp, the mtime arm flips the composite result to Stale
-    /// even though ancestry alone says Fresh. The epoch conversion is
-    /// explicit (`UNIX_EPOCH + Duration::from_secs`), never a raw-integer
-    /// comparison (review Plan 05 LOW, OpenCode).
+    /// (HEAD itself) is Fresh regardless of `build_dirty`; but once a
+    /// TRACKED, build-affecting file is modified (dirty tree) on a build
+    /// that was made from a CLEAN tree, the dirty-flag arm flips the
+    /// composite result to Stale even though ancestry alone says Fresh —
+    /// this is the CR-02 case itself. CR-02 (17-11): renamed and rewritten
+    /// against the dirty-flag rule (no more timestamp/mtime comparison);
+    /// the test's *intent* — a second signal can flip an ancestry-Fresh
+    /// result to Stale — survives unchanged.
     #[test]
-    fn combined_staleness_mtime_arm_flags_dirty_tree_newer_than_build() {
+    fn combined_staleness_dirty_flag_arm_flags_modified_tree_when_build_was_clean() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let git = |args: &[&str]| {
@@ -5539,9 +5547,9 @@ mod tests {
         git(&["config", "commit.gpgsign", "false"]);
         // 17-10: the dirty file must be a BUILD-AFFECTING one. This fixture
         // used `a.txt`, which encoded the over-broad mtime arm that hard-blocked
-        // Ship on a dirty CHANGELOG.md. The test's intent — mtime flips an
-        // ancestry-Fresh result to Stale — is unchanged; only the fixture is
-        // corrected to a file that can actually change the binary.
+        // Ship on a dirty CHANGELOG.md. The test's intent — a second signal
+        // flips an ancestry-Fresh result to Stale — is unchanged; only the
+        // fixture is corrected to a file that can actually change the binary.
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/lib.rs"), "// one\n").unwrap();
         git(&["add", "."]);
@@ -5556,10 +5564,78 @@ mod tests {
         };
 
         assert_eq!(embedded_commit_is_stale(root, &head), Staleness::Fresh);
-        assert_eq!(combined_staleness(root, &head, 0), Staleness::Fresh);
+        assert_eq!(combined_staleness(root, &head, false), Staleness::Fresh);
 
         std::fs::write(root.join("src/lib.rs"), "// modified after build\n").unwrap();
-        assert_eq!(combined_staleness(root, &head, 0), Staleness::Stale);
+        assert_eq!(combined_staleness(root, &head, false), Staleness::Stale);
+    }
+
+    /// The Indeterminate branch of the decision table (must_haves truth 5,
+    /// 17-11): a build made from an ALREADY-dirty tree, run against a tree
+    /// that STILL has modified build inputs, cannot tell "same dirt" from
+    /// "more dirt" without a timestamp — so it must be Indeterminate, never
+    /// Stale, even though ancestry alone says Fresh. Pitfall 4: Indeterminate
+    /// must never hard-block, even for a self-dogfood workspace.
+    #[test]
+    fn combined_staleness_dirty_flag_arm_is_indeterminate_when_build_was_already_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@e.st"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/devflow-core\", \"crates/devflow-cli\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "// one\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        let head = run_git_stdout(root, &["rev-parse", "HEAD"])
+            .expect("rev-parse HEAD")
+            .trim()
+            .to_string();
+        assert!(is_self_dogfood_workspace(root));
+
+        // The tree is dirty NOW (a build-affecting file is modified) — but
+        // the embedded build's own dirty flag says it was ALSO built from a
+        // dirty tree. Ancestry alone says Fresh (embedded_commit == HEAD).
+        std::fs::write(root.join("src/lib.rs"), "// modified\n").unwrap();
+        assert_eq!(embedded_commit_is_stale(root, &head), Staleness::Fresh);
+        assert_eq!(
+            tree_has_modified_build_inputs(root),
+            Some(true),
+            "fixture must have a dirty, build-affecting tree"
+        );
+
+        let build_was_dirty = true;
+        assert_eq!(
+            combined_staleness(root, &head, build_was_dirty),
+            Staleness::Indeterminate,
+            "cannot distinguish \"same dirt\" from \"more dirt\" without a timestamp"
+        );
+
+        let phase = 71;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        assert!(
+            enforce_build_staleness(root, &state, &head, build_was_dirty).is_ok(),
+            "Indeterminate must never hard-block, even for a self-dogfood workspace (Pitfall 4)"
+        );
     }
 
     /// D-18: a self-dogfood workspace (matching `members = [...]`) with a
@@ -5597,7 +5673,7 @@ mod tests {
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
 
-        let err = enforce_build_staleness(root, &state, &side, 0).unwrap_err();
+        let err = enforce_build_staleness(root, &state, &side, false).unwrap_err();
         assert!(
             err.to_string().contains("self-dogfood stale build blocked"),
             "{err}"
@@ -5620,7 +5696,7 @@ mod tests {
         let phase = 64;
         let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
 
-        let result = enforce_build_staleness(root, &state, &side, 0);
+        let result = enforce_build_staleness(root, &state, &side, false);
         assert!(
             result.is_ok(),
             "an ordinary project's stale build must only warn, never block"
@@ -5665,8 +5741,12 @@ mod tests {
         let phase = 65;
         let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
 
-        let result =
-            enforce_build_staleness(root, &state, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", 0);
+        let result = enforce_build_staleness(
+            root,
+            &state,
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            false,
+        );
         assert!(
             result.is_ok(),
             "an Indeterminate result must never hard-block"
