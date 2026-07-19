@@ -1,41 +1,221 @@
 ---
 phase: 17-pipeline-dogfood-followup
 reviewed: 2026-07-19T00:00:00Z
-round: 2
-depth: deep
-files_reviewed: 16
+round: 3
+depth: standard
+files_reviewed: 15
 files_reviewed_list:
-  - .github/workflows/ci.yml
-  - .github/workflows/devcontainer.yml
-  - CHANGELOG.md
-  - OPERATIONS.md
   - crates/devflow-cli/build.rs
   - crates/devflow-cli/src/main.rs
   - crates/devflow-cli/tests/build_provenance.rs
-  - crates/devflow-cli/tests/gitignore_coverage.rs
   - crates/devflow-cli/tests/log_format_env.rs
   - crates/devflow-cli/tests/snapshots/devflow-help.txt
   - crates/devflow-core/src/agent_result.rs
   - crates/devflow-core/src/agents/mod.rs
+  - crates/devflow-core/src/git.rs
+  - crates/devflow-core/src/hooks.rs
   - crates/devflow-core/src/lib.rs
   - crates/devflow-core/src/mode.rs
   - crates/devflow-core/src/outcome_policy.rs
   - crates/devflow-core/src/ship.rs
   - crates/devflow-core/src/state.rs
-review_angles:
-  - doc-accuracy-cross-reference
-  - security-leaked-data
-  - ci-build-correctness
-  - external-state-claims
-  - generalist-deep
+  - crates/devflow-core/src/version.rs
 findings:
   critical: 1
-  warning: 15
-  info: 11
-  total: 27
+  warning: 0
+  info: 0
+  total: 1
 status: issues_found
 ship_gate: BLOCKED
 ---
+
+# Phase 17: Code Review Report — Round 3
+
+**Reviewed:** 2026-07-19 (round 3)
+**Depth:** standard (per-file, focused on the plan-17-12 delta since round 2)
+**Files Reviewed:** 15
+**Status:** issues_found — **1 new Critical** found in code landed since round 2's close, and
+resolved in this same run (`39e2e65`); round 2's Warnings remain open
+**Ship gate:** BLOCKED — on round 2's still-open Warnings (WR-01, WR-02, WR-06 through WR-11)
+only. No open Critical remains.
+
+## Summary
+
+Round 2 closed its own CR-01(R2)/WR-04 (the changelog-outlives-its-tag defect) via plan `17-12`,
+which reordered `hooks_after_ship()` to `Merge → VersionBump → ChangelogAppend → BranchCleanup`,
+added `version::read_version` (a git-free reader so `ChangelogAppend` can never see a tag
+`VersionBump` just cut and recompute a higher version), and added a new `GitFlow::commit_path`
+scoped-commit helper so both `changelog_append` and `version_bump` commit their own writes instead
+of leaving them dirty for a later hook to lose.
+
+Per this round's brief, `git.rs` and `main.rs` were not in plan `17-12`'s declared
+`files_modified` — `GitFlow::commit_path` (`git.rs`) is a genuine executor deviation, and it is
+where this round's finding lives.
+
+Confirmed via `git diff a3a1067~1..b81ec7d` (the exact `17-12` commit range) that no other file in
+this round's scope changed beyond `git.rs`, `hooks.rs`, `version.rs`, and doc/test-only edits in
+`main.rs`. The other 11 files in scope (`agent_result.rs`, `agents/mod.rs`, `lib.rs`, `mode.rs`,
+`outcome_policy.rs`, `ship.rs`, `state.rs`, `build.rs`, `build_provenance.rs`, `log_format_env.rs`,
+`devflow-help.txt`) are byte-identical to their state at round 2's review commit (`92581fa`) —
+verified with `git diff --stat 92581fa..HEAD` over that file list, which returns no output. Round
+2's dispositions for those files stand unchanged and are not re-litigated here.
+
+The batch's fail-fast ordering claim was independently re-traced and holds:
+`run_checkout_hooks` (`main.rs:1700-1772`) breaks out of the loop on the first hook error only when
+`terminal_batch` is true (`main.rs:1767-1769`), and `terminal_batch` is computed by slice-equality
+against `hooks::hooks_after_ship()` (`main.rs:1741`) — unchanged by this plan, confirmed still
+correct. A failed `Merge` or `VersionBump` genuinely stops `ChangelogAppend` and `BranchCleanup`
+from running.
+
+---
+
+## Critical Issues
+
+### CR-01 (R3): `GitFlow::commit_path` does not actually scope the commit to the given path — it commits the entire index
+
+**File:** `crates/devflow-core/src/git.rs:325-334` (new in `17-12`)
+**Callers:** `crates/devflow-core/src/hooks.rs:210-214` (`changelog_append`),
+`crates/devflow-core/src/hooks.rs:229-232` (`version_bump`)
+**Insufficient test:** `crates/devflow-core/src/git.rs:646-678`
+(`commit_path_stages_only_the_given_path_leaving_other_dirt_uncommitted`)
+
+**Issue.** `commit_path`'s own doc comment states its purpose is to scope a commit to one path "for
+hooks that must not sweep in unrelated dirty state left by other hooks or the workflow" — this is
+the exact invariant Round 2's WR-04 fix depends on. The implementation:
+
+```rust
+pub fn commit_path(&self, relative_path: &str, message: &str) -> Result<(), GitError> {
+    debug!("committing {relative_path}: {message}");
+    self.git(["add", relative_path])?;
+    // --allow-empty so we don't fail when the path had no changes.
+    match self.git_raw(&["commit", "--allow-empty", "-m", message]) {
+        Ok(()) => Ok(()),
+        Err(GitError::Command(ref msg)) if msg.contains("nothing to commit") => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+```
+
+`git add relative_path` stages exactly `relative_path` — but the subsequent `git commit` call
+carries **no pathspec**, so it commits the *entire index* as it stands at that moment, not just
+what this call just staged. If anything else is already staged (but not yet committed) in the
+repository when `commit_path` runs, it is silently swept into this commit too.
+
+**Reproduced directly** (not simulated through the Rust code — raw `git`, mirroring exactly what
+`commit_path` executes):
+
+```
+$ git add unrelated.txt        # simulates pre-existing staged content
+$ git add CHANGELOG.md         # commit_path's own `git add relative_path`
+$ git commit -m "docs: add changelog entry"   # commit_path's own commit call — no pathspec
+$ git log -1 --name-only --pretty=format:
+CHANGELOG.md
+unrelated.txt                  # ← swept in, contradicting the doc comment's claim
+```
+
+**The existing regression test does not catch this.** `commit_path_stages_only_the_given_path_leaving_other_dirt_uncommitted`
+(`git.rs:646-678`) only exercises an **untracked, never-staged** file (`?? unrelated.txt` in
+porcelain output) — a file that was never `git add`ed is trivially excluded from any commit,
+staged or not, and proves nothing about the property the function's doc comment actually claims.
+It does not cover the case that matters: a file that is *already staged* (`A  unrelated.txt`) when
+`commit_path` is called. Confirmed with the fix applied that the correct behavior is achievable and
+distinguishable from the current one:
+
+```
+$ git add unrelated.txt
+$ git add CHANGELOG.md
+$ git commit -m "docs: add changelog entry" -- CHANGELOG.md   # pathspec-scoped commit
+$ git log -1 --name-only --pretty=format:
+CHANGELOG.md                   # only this
+$ git status --porcelain
+A  unrelated.txt               # correctly left staged, untouched
+```
+
+**Why this matters in production, not just in a contrived test.** `commit_path` runs against
+`project_root` — the developer's real primary checkout, not a scratch worktree (`hook_context_root`,
+`main.rs:1688-1698`, routes the terminal batch there deliberately). Nothing in `run_checkout_hooks`
+or the two callers verifies the index is clean before calling `commit_path`. If an operator has any
+staged-but-uncommitted edits in that checkout when `devflow ship`'s terminal batch runs — plausible,
+since DevFlow is documented to drive a developer's live repository, not an isolated sandbox — either
+the `chore: bump version to {version}` commit or the `docs: add changelog entry for {version}`
+commit silently absorbs that unrelated content. This is precisely the failure class Round 2's WR-04
+existed to close (a release-record commit whose actual contents don't match what its message and
+the surrounding tooling claim), reintroduced by the very helper written to prevent it.
+
+**Fix:** add a pathspec to the commit step, not just the `add` step — `git add` is still required
+to pick up brand-new/untracked files (a bare pathspec-scoped `git commit -- path` errors with
+"pathspec did not match any file(s) known to git" on a file never previously tracked or staged,
+confirmed by direct reproduction), but the commit itself must also be scoped:
+
+```rust
+pub fn commit_path(&self, relative_path: &str, message: &str) -> Result<(), GitError> {
+    debug!("committing {relative_path}: {message}");
+    self.git(["add", relative_path])?;
+    match self.git_raw(&["commit", "--allow-empty", "-m", message, "--", relative_path]) {
+        Ok(()) => Ok(()),
+        Err(GitError::Command(ref msg)) if msg.contains("nothing to commit") => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+```
+
+Verified this fix directly (raw `git`, not yet applied to the Rust source) round-trips correctly
+for both the pre-staged-unrelated-file case above and a brand-new/never-tracked target path. Also
+strengthen `commit_path_stages_only_the_given_path_leaving_other_dirt_uncommitted` (or add a sibling
+test) to stage an unrelated **tracked, modified** file (`git add unrelated.txt` before calling
+`commit_path`, not just leave it untracked) and assert it survives in `git status --porcelain` as
+still staged (`A  unrelated.txt`) — the current test's untracked-file case cannot regress this bug
+and must not be mistaken for coverage of it.
+
+**Disposition: RESOLVED** — `39e2e65`, applied by the `/gsd-execute-phase 17 --gaps-only`
+code-review gate in the same run that raised it.
+
+- `git.rs:334` now runs `["commit", "--allow-empty", "-m", message, "--", relative_path]`; the
+  preceding `git add` is retained, with a comment recording why (a pathspec-only commit errors on
+  a path git has never seen) so a future reader does not "simplify" it back out.
+- `commit_path_stages_only_the_given_path_leaving_other_dirt_uncommitted` (`git.rs:646`) now
+  `git add`s `unrelated.txt` **before** calling `commit_path` and asserts `A  unrelated.txt`
+  survives, replacing the untracked-file assertion that could not fail on this bug.
+- Confirmed RED→GREEN, not assumed: with the strengthened test in place and only the commit
+  invocation reverted to its pre-fix form, the test FAILS (`0 passed; 1 failed`); with the
+  pathspec restored it passes (`1 passed`).
+- Full gates re-run after the fix: `cargo test --workspace` 376 passed / 0 failed across 10
+  targets, `cargo clippy --workspace --all-targets -- -D warnings` clean, `cargo fmt --check` clean.
+
+---
+
+## Verified Unchanged Since Round 2 (no re-review performed)
+
+- `crates/devflow-core/src/agent_result.rs`, `crates/devflow-core/src/agents/mod.rs`,
+  `crates/devflow-core/src/lib.rs`, `crates/devflow-core/src/mode.rs`,
+  `crates/devflow-core/src/outcome_policy.rs`, `crates/devflow-core/src/ship.rs`,
+  `crates/devflow-core/src/state.rs`, `crates/devflow-cli/build.rs`,
+  `crates/devflow-cli/tests/build_provenance.rs`, `crates/devflow-cli/tests/log_format_env.rs`,
+  `crates/devflow-cli/tests/snapshots/devflow-help.txt` — `git diff --stat 92581fa..HEAD` over this
+  list returns no output. Round 2's dispositions for these files (including all open Warnings and
+  Infos attributed to them) stand as recorded below and are not re-opened.
+- `crates/devflow-core/src/hooks.rs` `hooks_for_transition`/`hooks_after_ship` ordering and the
+  terminal-batch fail-fast in `main.rs:1700-1772` were re-traced fresh this round (not merely
+  carried forward) and confirmed correct as described in Round 2's WR-04 resolution note.
+
+---
+
+## Ship Gate
+
+**BLOCKED** — but no longer on a Critical. CR-01 (R3) was raised and resolved within this same
+run (`39e2e65`); no open Critical remains in round 3. The gate stays BLOCKED solely on round 2's
+still-open Warnings (WR-01, WR-02, WR-06 through WR-11, in the Round 2 section below), which are
+unchanged and remain an operator call — per this file's own convention, clearing them is not
+something an automated gap-closure run decides on its own.
+
+---
+---
+
+# Appendix: Round 2 (2026-07-19)
+
+Preserved verbatim (including Round 2's own embedded Round 1 appendix). Round 2 frontmatter
+recorded: 1 Critical, 15 Warning, 11 Info, 27 total, `status: issues_found`, `ship_gate: BLOCKED`,
+16 files reviewed.
 
 # Phase 17: Code Review Report — Round 2
 
@@ -158,6 +338,11 @@ Validate→Ship batch targeting the worktree (17-10 unchanged) — a future read
 17-10's worktree targeting to `ChangelogAppend`. The generated entry body is still the placeholder
 "Released phase via DevFlow" — a content-quality defect (also flagged `17-10-SUMMARY.md:104`)
 deliberately left out of `17-12`'s scope. No open Critical or WR-04 entry remains in this file.
+
+**Round 3 note:** `17-12`'s new `GitFlow::commit_path` helper (the mechanism this resolution
+depends on for "changelog_append also now commits its own write") does not actually scope its
+commit to the given path — see Round 3's CR-01 above. WR-04's ordering/read-back defects are
+genuinely closed; the commit-scoping guarantee is not.
 
 ---
 
@@ -780,6 +965,10 @@ defect and is fixed the same way. See the live CR-01 entry above for the full di
 regression test proving three-way agreement (changelog heading version == tag == version file
 version) plus a clean working tree.
 
+**Round 3 note:** the "cannot sweep in unrelated dirty state" claim for `GitFlow::commit_path` does
+not hold — see Round 3's CR-01. The ordering/read-back half of this fix is sound; the commit-scoping
+half is not.
+
 ### WR-05: CI's clippy gate does not lint test code — a required check passes on code clippy rejects
 
 **File:** `.github/workflows/ci.yml:30` — `cargo clippy -- -D warnings` (no `--all-targets`)
@@ -974,8 +1163,6 @@ claims otherwise, so nothing asserts falsely — worth knowing before a ship dec
 
 ---
 
----
-
 ## Audit-Fix Addendum 2026-07-19 (`/gsd-audit-fix 17`, `--max 5 --severity medium`)
 
 Baseline at `36a5e14` re-confirmed green before any edit: 364 passed / 0 failed, exit 0.
@@ -1019,3 +1206,10 @@ lifetime, and WR-08's production default is the thing that bounds it.
 _Reviewed: 2026-07-19T17:10:00Z_
 _Reviewer: Claude (5-angle merged deep review)_
 _Depth: deep_
+
+---
+---
+
+_Reviewed: 2026-07-19 (round 3)_
+_Reviewer: Claude (gsd-code-reviewer)_
+_Depth: standard_
