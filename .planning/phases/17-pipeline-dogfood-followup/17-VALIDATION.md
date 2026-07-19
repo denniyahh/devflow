@@ -4,7 +4,7 @@ slug: pipeline-dogfood-followup
 # status lifecycle: draft (seeded by plan-phase) → validated (set by validate-phase §6)
 # audit-milestone §5.5 distinguishes NOT-VALIDATED (draft) from PARTIAL (validated + nyquist_compliant: false) (#2117)
 status: validated
-nyquist_compliant: true
+nyquist_compliant: false
 wave_0_complete: true
 created: 2026-07-18
 audited: 2026-07-19
@@ -15,6 +15,7 @@ reaudited_3_at_commit: b77c13e
 reaudited_4_at_commit: e61171f
 reaudited_5_at_commit: 46058a7
 reaudited_6_at_commit: 1070df0
+reaudited_7_at_commit: 84dc736
 ---
 
 # Phase 17 — Validation Strategy
@@ -298,6 +299,57 @@ now asserting exactly what this entry prescribes: empty (no-git build, D-20) or 
 hatch — the embedded value at that commit was `71c4ebd311272a7efadea377b29d12a2590e264b`, a real
 40-char SHA. Row 7's covering-test count is now honest.
 
+### GAP-5 — the `ChangelogAppend` → `VersionBump` ordering guarantee is unsampled, and the defect is live
+
+**Requirement 17d · OPEN · fix planned in `17-12-PLAN.md`, which is written but NOT executed**
+
+Re-audits #1–#6 audited 17d's *build provenance* facet (rows 7 and 8) and closed it adversarially.
+They never sampled 17d's *release-record* facet, because no plan had raised it yet. `17-REVIEW.md`'s
+round-2 pass (WR-04) did, and the resulting `17-12-PLAN.md` (`837016f`, extended by `84dc736`) is
+still unexecuted — there is no `17-12-SUMMARY.md`. Three defects are live in the tree at `84dc736`,
+each confirmed at source during this pass:
+
+1. **Ordering.** `hooks_for_transition(Validate, Ship)` is `vec![Hook::DocsUpdate,
+   Hook::ChangelogAppend]` (`hooks.rs:81`), while `hooks_after_ship()` is `vec![Hook::Merge,
+   Hook::VersionBump, Hook::BranchCleanup]` (`hooks.rs:87-89`). `ChangelogAppend` therefore writes a
+   dated release heading in the *transition* batch, strictly before the `VersionBump` that creates
+   the tag which would make that heading true.
+2. **Divergence, not just earliness.** `changelog_append` derives its version from
+   `version::compute_version()` (`hooks.rs:174`), whose `patch` is `commits_since_last_minor_tag()`
+   (`version.rs:148`). `Hook::Merge` runs between the two hooks and adds a merge commit, so the
+   version `VersionBump` computes and tags is strictly higher than the one already written into
+   `CHANGELOG.md`. When Ship's review loops back to Code instead — the live dogfood path — the tag is
+   never cut at all and the heading is pure fiction. `17-12-PLAN.md` records this observed twice:
+   claimed `1.4.26` then `1.4.88`, against a `Cargo.toml` sitting at `1.3.69`.
+3. **Never committed.** `changelog_append` ends at `std::fs::write` (`hooks.rs:180`) and never
+   commits. The only committing hook in the batch, `docs_update` (`hooks.rs:161`,
+   `git.commit_all(...)`), runs *before* it. The write is left uncommitted and is discarded when
+   `Merge` and `BranchCleanup` complete.
+
+**Why this is a Nyquist gap and not merely a bug already on someone's list.** The one existing test,
+`changelog_append_writes_entry` (`hooks.rs:300-308`), asserts only
+`changelog.contains("# Changelog")` — a string that `prepend_changelog` emits unconditionally. It
+passes identically whether the heading version is right, wrong, or absent, and whether or not the
+file is ever committed. That is the same vacuous-assertion class this document retired as GAP-4
+(`build_commit_is_accessible_and_does_not_panic`), and it is the reason six consecutive green
+re-audits did not surface WR-04: **the sampling rate for this property is zero.** `17-REVIEW.md`
+states the consequence plainly — the symptom fix landed but "WR-04's root cause remains open, so
+recurrence is expected."
+
+**Disposition: ESCALATE to `17-12-PLAN.md`, not fillable by the nyquist auditor.** The missing
+coverage cannot be added against current behavior: a test asserting the true guarantee (heading
+version == created tag == version file, and a clean tree after the terminal batch) is RED until the
+hooks are reordered and `changelog_append` learns to commit and to *read back* the written version
+rather than recompute it. Writing a test that passes today would mean asserting the defect. The
+auditor's standing constraint is "never modify impl files; escalate impl bugs," so this is escalated
+rather than filled — the same routing re-audit #4 applied to GAP-3, which `17-11-PLAN.md` then
+closed. `17-12-PLAN.md` already specifies exactly the two regression tests required:
+
+- three-way agreement across the full after-ship batch (changelog heading == git tag == version file)
+- working tree clean after the full after-ship batch, so an uncommitted hook write cannot recur silently
+
+**To close:** run `/gsd-execute-phase 17 --gaps-only`, then re-run `/gsd-validate-phase 17`.
+
 ---
 
 ## Wave 0 Requirements
@@ -344,6 +396,10 @@ with Phase 18's Hermes adapter, the first adapter with real reviewer storage.
   override, `17-09-PLAN.md`, fix `cb9359f`) instead of hanging. This box is now honestly checkable:
   worst-case observed latency across 25 consecutive isolated runs was ~4 s, well inside the 90 s
   budget. See GAP-2.
+- [ ] `nyquist_compliant: false` (re-audit #7, `84dc736`) — **GAP-5 is open**: 17d's release-record
+  facet (`ChangelogAppend` → `VersionBump` ordering, and the uncommitted changelog write) has zero
+  automated sampling, and the defect is live in the tree. Escalated to `17-12-PLAN.md`, written but
+  unexecuted. The bullet below remains accurate for every gap raised *before* this pass.
 - [x] `nyquist_compliant: true` (re-audit #5, `46058a7`) — every gap this document raised is now
   closed: GAP-1 by `17-08-PLAN.md` (`c03498d`), GAP-2's test-level hang by `17-09-PLAN.md`
   (`cb9359f`), **GAP-3 by `17-11-PLAN.md` (`3e39cf6`)** — 17d's build-provenance freshness is now
@@ -749,3 +805,79 @@ stays `true`, on the strongest evidence across six passes.
 version-tag contention between two concurrently-shipping phases (GAP-2's "Product-level" paragraph).
 Phase 17 neither introduced nor owns it, it guards no Phase 17 requirement, and it remains recorded
 as OUT OF SCOPE, belonging to future ship/version-bump concurrency work.
+
+---
+
+## Validation Re-Audit #7 2026-07-19 (HEAD `84dc736`)
+
+Seventh pass, triggered by re-audit #4's standing rule: **a PASS verdict does not survive its own
+commit range.** Re-audit #6 certified `1070df0`; five commits have landed since, and unlike the
+`46058a7..1070df0` range, this one is **not documentation-only** — `1de9e3c` changes
+`crates/devflow-cli/src/main.rs` (+85 lines).
+
+| Metric | Count |
+|--------|-------|
+| Requirement rows audited | 11 |
+| Suite result (**unfiltered**) | **368 passed / 0 failed / 0 ignored / 0 filtered** (10 targets), `cargo` exit 0 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | clean (exit 0) |
+| `cargo fmt --check` | clean (exit 0) |
+| Rows green | 11 |
+| Gaps open at re-audit #6 | 0 |
+| **New gaps found** | **1 (GAP-5)** |
+| `nyquist_compliant` | **`true` → `false`** |
+
+**Gates run directly, exit codes captured from `cargo` itself** — not through a pipe whose status
+belongs to `tail` (re-audit #4's recorded false-green trap).
+
+**Suite reconciliation — 367 → 368, accounted for exactly:** +1
+`is_self_dogfood_workspace_anchors_on_members_not_default_members` (WR-05's regression test, landed
+with `1de9e3c`). No test was removed. WR-03's regression is not a new test but three added assertions
+inside the existing `combined_staleness` fixture test, which is why the count moves by one and not two.
+
+**The code that landed is covered, and covered adversarially by construction.** `1de9e3c` fixes two
+staleness-gate blind spots and ships each with a test that pins the *reason*, not just the outcome:
+
+- **WR-05** — `is_self_dogfood_workspace` used a bare `contents.find("members")`, which locks onto
+  `default-members` because that key contains `members` as a substring. The fix anchors on the key by
+  rejecting matches preceded by an identifier character (`-` among them). The new test's fixture puts
+  `default-members` *ahead of* `members`, which is exactly the arrangement under which every
+  pre-existing test would still have passed while the D-18 hard block silently degraded to a warning.
+- **WR-03** — `tree_has_modified_build_inputs` enumerated via `git ls-files -m`, which compares
+  worktree-vs-**index** and therefore goes silent the moment a source edit is *staged*, letting a
+  stale binary certify itself Fresh. The fix enumerates from `--porcelain` instead. The added
+  assertions include an explicit **fixture precondition** — that `ls-files -m` is blind to the staged
+  `.rs` edit — so the test would fail loudly if the fixture ever stopped reproducing the defect
+  condition, rather than passing vacuously.
+
+Both are the standard this document has applied since re-audit #3: a test earns its row by being
+capable of going red for the right reason.
+
+**GAP-5 raised — the first new gap since re-audit #4, and it is a genuine sampling failure.** Auditing
+the *documentation* commits in this range (rather than skipping them as re-audit #6 was entitled to do
+for a docs-only range) surfaced `17-12-PLAN.md`: a `gap_closure: true` plan against requirement 17d,
+written at `837016f`, extended at `84dc736`, and **never executed** — there is no `17-12-SUMMARY.md`.
+Its subject, WR-04, is live in the tree and was confirmed at source during this pass on all three
+counts: ordering (`hooks.rs:81` vs `:87-89`), version divergence via `Merge` landing a commit between
+`changelog_append` and `version_bump` (`hooks.rs:174` → `version.rs:148`), and the uncommitted write
+(`hooks.rs:180`, with the only committing hook at `:161` running *before* it). Full disposition in the
+GAP-5 section above.
+
+**Why six green passes missed it.** The single existing test asserts
+`changelog.contains("# Changelog")` — a string emitted unconditionally — so it is green whether the
+heading version is correct, wrong, or fictional, and whether or not the entry is ever committed. The
+property's sampling rate is zero, which is the textbook Nyquist failure this document exists to catch.
+A green suite was never evidence here, for the same reason re-audit #1 recorded that "a green suite
+still is not by itself evidence for that row."
+
+**Verdict: PARTIAL.** Eleven requirement rows remain automated, green, deterministic, and unfiltered,
+and the code landing in this range is well covered. But 17d is only partly sampled: its
+build-provenance facet is earned across six adversarial passes, while its release-record facet has no
+coverage at all and a live defect. `nyquist_compliant` returns to `false` — not a regression in what
+was previously certified, but a correction to its scope. Phase 17 is not Nyquist-compliant until
+`17-12-PLAN.md` executes and its two regression tests exist and are green.
+
+**Route to close:** `/gsd-execute-phase 17 --gaps-only`, then re-run `/gsd-validate-phase 17`.
+
+**Unchanged and still not a validation gap:** GAP-2's product-level version-tag contention between
+concurrently-shipping phases remains OUT OF SCOPE, owned by future ship/version-bump concurrency work.
+Note that it and GAP-5 touch the same hook batch; closing GAP-5 does not close it.
