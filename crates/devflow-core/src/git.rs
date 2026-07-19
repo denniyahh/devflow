@@ -324,9 +324,21 @@ impl GitFlow {
     /// Returns Ok(()) whether or not the path had changes to commit.
     pub fn commit_path(&self, relative_path: &str, message: &str) -> Result<(), GitError> {
         debug!("committing {relative_path}: {message}");
+        // `add` first so a brand-new file is known to git — a pathspec-only
+        // commit errors on a path git has never seen. The trailing pathspec is
+        // what actually scopes the commit: without it, `commit` writes whatever
+        // else is already in the index, which is exactly the sweep-in this
+        // function exists to prevent.
         self.git(["add", relative_path])?;
         // --allow-empty so we don't fail when the path had no changes.
-        match self.git_raw(&["commit", "--allow-empty", "-m", message]) {
+        match self.git_raw(&[
+            "commit",
+            "--allow-empty",
+            "-m",
+            message,
+            "--",
+            relative_path,
+        ]) {
             Ok(()) => Ok(()),
             Err(GitError::Command(ref msg)) if msg.contains("nothing to commit") => Ok(()),
             Err(e) => Err(e),
@@ -652,6 +664,16 @@ mod tests {
         std::fs::write(root.join("CHANGELOG.md"), "# Changelog\n").unwrap();
         std::fs::write(root.join("unrelated.txt"), "not part of this commit\n").unwrap();
 
+        // Stage the unrelated file BEFORE calling commit_path. An untracked
+        // file is excluded by any implementation and so proves nothing; an
+        // already-staged one is the real failure mode — a bare `git commit`
+        // writes the whole index and would sweep it in.
+        Command::new("git")
+            .args(["add", "unrelated.txt"])
+            .current_dir(root)
+            .status()
+            .unwrap();
+
         flow(root)
             .commit_path("CHANGELOG.md", "docs: add changelog entry")
             .expect("commit_path");
@@ -672,8 +694,8 @@ mod tests {
             .unwrap();
         let status = String::from_utf8_lossy(&status.stdout);
         assert!(
-            status.contains("?? unrelated.txt"),
-            "unrelated.txt must remain untracked, got: {status}"
+            status.contains("A  unrelated.txt"),
+            "unrelated.txt must remain staged-but-uncommitted, got: {status}"
         );
     }
 
