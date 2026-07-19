@@ -498,6 +498,48 @@ claims otherwise, so nothing asserts falsely — worth knowing before a ship dec
 
 ---
 
+---
+
+## Audit-Fix Addendum 2026-07-19 (`/gsd-audit-fix 17`, `--max 5 --severity medium`)
+
+Baseline at `36a5e14` re-confirmed green before any edit: 364 passed / 0 failed, exit 0.
+
+| ID | Disposition | Commit |
+|---|---|---|
+| CR-01 | **Fixed** — false 1.4.26 heading removed | `5431f9e` |
+| CR-02 | **Manual-only** (reclassified) — see below | — |
+| CR-03 | **Fixed** — empty-schedule branch routes through `gate_or_abort_infra`; regression test RED→GREEN | `f531d08` |
+| WR-02 | **Fixed** — exact member-path equality; regression test RED→GREEN | `02e17dd` |
+| WR-05/06 | **Fixed** — `--all-targets` in both clippy gates | `50a6b16` |
+| WR-07 | **Fixed** — guard covers all 14 runtime paths, one `check-ignore` per path | `2a92ebe` |
+
+Suite after all fixes: **366 passed / 0 failed** (+2 regression tests), `cargo clippy --workspace
+--all-targets -- -D warnings` exit 0, `cargo fmt --check` exit 0.
+
+**CR-02 was reclassified from auto-fixable to manual-only.** `build.rs:32-35` documents the
+narrow trigger set as a deliberate decision ("Re-run only when git refs actually move — not on
+every `cargo build`", review consensus #7 / D-20). Both fixes CR-02 proposes reverse that recorded
+decision: dropping the caching intent recompiles `devflow-cli` on every build (the embedded
+timestamp changes each run, so the `rustc-env` value changes), and dropping the dirty flag and
+timestamp guts the staleness gate this phase exists to deliver. That is a design tradeoff for a
+human, not an autonomous edit. **The defect is real and still open.**
+
+**Additional weakness found while fixing WR-07, not named in the review:** `git check-ignore` exits
+0 when *any* argument is ignored (verified directly: batched call with one ignored + one unignored
+path exits 0). The original guard passed all three paths in a single invocation, so it would have
+stayed green after losing 2 of its 3 paths. Now one invocation per path.
+
+**Still open after this pass:** CR-02 (manual-only), WR-01, WR-03 (both auto-fixable, over
+`--max 5`), WR-04, WR-08, WR-09 (manual-only), and IN-01…IN-06 (below `--severity medium`).
+`status: issues_found` is therefore left unchanged.
+
+Note WR-08 interacts with the CR-03 fix: a rate-limited phase with an unparseable hint now blocks
+on `Gates::poll_response` — bounded only by the 7-day production default WR-08 flags — instead of
+exiting stalled. That is the intended never-silent semantics, but it changes monitor process
+lifetime, and WR-08's production default is the thing that bounds it.
+
+---
+
 _Reviewed: 2026-07-19T17:10:00Z_
 _Reviewer: Claude (5-angle merged deep review)_
 _Depth: deep_
