@@ -4575,6 +4575,218 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // 17-08 gap closure (CR-01): run_preflight's Advance/LoopBack arms must
+    // not spawn the agent twice.
+    // -----------------------------------------------------------------
+
+    /// TEST-ONLY adapter whose `preflight` fails on the first call only —
+    /// modeled on `AlwaysRejectAdapter` above, but with a `Cell<bool>` flag
+    /// so any SECOND call through this specific adapter reference would
+    /// pass. An adapter that fails unconditionally would make a recursive
+    /// `launch_stage` retry fail its OWN preflight check too, recursing into
+    /// a second gate this test never seeds a response for — blocking on
+    /// `poll_response` instead of asserting.
+    struct FailOnceAdapter {
+        failed_once: std::cell::Cell<bool>,
+    }
+
+    impl FailOnceAdapter {
+        fn new() -> Self {
+            Self {
+                failed_once: std::cell::Cell::new(false),
+            }
+        }
+    }
+
+    impl agents::AgentAdapter for FailOnceAdapter {
+        fn name(&self) -> &'static str {
+            "test-fail-once"
+        }
+        fn exec_command(
+            &self,
+            _phase: u32,
+            _prompt: &str,
+            _roots: &[PathBuf],
+        ) -> (&'static str, Vec<String>) {
+            ("true", Vec::new())
+        }
+        fn completion_signal_detected(&self, _output: &str) -> bool {
+            false
+        }
+        fn preflight(&self, _state: &State) -> Result<(), String> {
+            if self.failed_once.get() {
+                Ok(())
+            } else {
+                self.failed_once.set(true);
+                Err("test adapter fails on the first preflight call only".to_string())
+            }
+        }
+    }
+
+    /// Create a harmless, always-succeeding executable named `name` in a
+    /// fresh tempdir — used to satisfy `ensure_agent_binary` and let
+    /// `monitor::spawn_monitor`'s backgrounded `"$@"` exec safely resolve to
+    /// a no-op instead of a real agent CLI. This host has real
+    /// `claude`/`codex`/`opencode` binaries on PATH (the identical concern
+    /// documented on `transition_resets_infra_failures`), so any real
+    /// `launch_stage` completion here — both the recursive retry inside
+    /// `run_preflight` and this test's own simulated caller continuation —
+    /// must never resolve `state.agent`'s adapter program name to a real
+    /// CLI.
+    fn stub_agent_binary(name: &str) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name);
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        dir
+    }
+
+    /// Prefix `PATH` with `stub_dir`, keeping the rest of `original` intact
+    /// so `sh`/`git` still resolve normally — only the stubbed binary name
+    /// is shadowed (it is found first).
+    fn prepend_path(
+        stub_dir: &tempfile::TempDir,
+        original: &Option<std::ffi::OsString>,
+    ) -> std::ffi::OsString {
+        let mut dirs = vec![stub_dir.path().to_path_buf()];
+        if let Some(original) = original {
+            dirs.extend(std::env::split_paths(original));
+        }
+        std::env::join_paths(dirs).unwrap()
+    }
+
+    /// Count `stage_launched` events recorded for `phase` across the WHOLE
+    /// event log — `last_event_for_phase` only sees the most recent line and
+    /// cannot distinguish one launch from two.
+    fn stage_launched_count(root: &Path, phase: u32) -> usize {
+        std::fs::read_to_string(devflow_core::events::events_path(root))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| {
+                event.get("phase").and_then(serde_json::Value::as_u64) == Some(u64::from(phase))
+                    && event.get("event").and_then(serde_json::Value::as_str)
+                        == Some("stage_launched")
+            })
+            .count()
+    }
+
+    /// CR-01 regression (Advance arm, 17-08 gap closure): a preflight
+    /// failure resolved by `GateAction::Advance` must launch the agent
+    /// exactly once. `run_preflight`'s OLD `Result<(), CliError>` return
+    /// can't tell its caller (the call site inside `launch_stage`,
+    /// main.rs:1087) whether the recursive retry it just ran already spawned
+    /// the agent — so the caller blindly continues and spawns a SECOND,
+    /// competing agent for the same stage. The explicit `launch_stage(&mut
+    /// state, None, None)` right after `run_preflight` reproduces that blind
+    /// continuation exactly as the unmodified call site performs it.
+    #[test]
+    fn run_preflight_advance_gate_launches_agent_exactly_once() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 63;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        // Plan is unaffected by the interactivity/gh-auth generic checks
+        // (D-14) — only the injected adapter's `preflight` fails; the real
+        // Claude adapter's default (Ok) preflight passes every other check.
+        state.stage = Stage::Plan;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Plan);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(&response_path, r#"{"approved":true,"responded_by":"test"}"#).unwrap();
+
+        let stub_dir = stub_agent_binary("claude");
+        let original_path = std::env::var_os("PATH");
+        let stubbed_path = prepend_path(&stub_dir, &original_path);
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", &stubbed_path);
+        }
+
+        let adapter = FailOnceAdapter::new();
+        run_preflight(root, &mut state, &adapter).unwrap();
+        launch_stage(&mut state, None, None).unwrap();
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        let launches = stage_launched_count(root, phase);
+        assert_eq!(
+            launches, 1,
+            "a preflight failure resolved by Advance must launch the agent \
+             exactly once, not {launches}"
+        );
+    }
+
+    /// CR-01 regression (LoopBack arm, 17-08 gap closure): same defect as
+    /// the Advance arm above, but through `GateAction::LoopBack` — per
+    /// `GateAction::from_response` (gates.rs:69-78) a rejection whose note
+    /// doesn't mention "abort" yields `LoopBack(Stage::Code)`, which
+    /// `run_preflight` routes through the identical recursive-relaunch code
+    /// path as Advance.
+    #[test]
+    fn run_preflight_loopback_gate_launches_agent_exactly_once() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 64;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Plan;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Plan);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"retry","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        let stub_dir = stub_agent_binary("claude");
+        let original_path = std::env::var_os("PATH");
+        let stubbed_path = prepend_path(&stub_dir, &original_path);
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", &stubbed_path);
+        }
+
+        let adapter = FailOnceAdapter::new();
+        run_preflight(root, &mut state, &adapter).unwrap();
+        launch_stage(&mut state, None, None).unwrap();
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        let launches = stage_launched_count(root, phase);
+        assert_eq!(
+            launches, 1,
+            "a preflight failure resolved by LoopBack must launch the agent \
+             exactly once, not {launches}"
+        );
+    }
+
+    // -----------------------------------------------------------------
     // 17d: build provenance + self-dogfood staleness gate (D-17-D-21, Task 2)
     // -----------------------------------------------------------------
 
