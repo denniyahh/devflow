@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.4.26 — 2026-07-19
+
+- Released phase via DevFlow.
+
 ## 1.3.69 — 2026-07-18
 
 - Released phase via DevFlow.
