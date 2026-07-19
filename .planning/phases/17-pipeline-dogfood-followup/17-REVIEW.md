@@ -1,14 +1,18 @@
 ---
 phase: 17-pipeline-dogfood-followup
-reviewed: 2026-07-19T17:10:00Z
+reviewed: 2026-07-19T00:00:00Z
+round: 2
 depth: deep
-files_reviewed: 14
+files_reviewed: 16
 files_reviewed_list:
+  - .github/workflows/ci.yml
+  - .github/workflows/devcontainer.yml
   - CHANGELOG.md
   - OPERATIONS.md
   - crates/devflow-cli/build.rs
   - crates/devflow-cli/src/main.rs
   - crates/devflow-cli/tests/build_provenance.rs
+  - crates/devflow-cli/tests/gitignore_coverage.rs
   - crates/devflow-cli/tests/log_format_env.rs
   - crates/devflow-cli/tests/snapshots/devflow-help.txt
   - crates/devflow-core/src/agent_result.rs
@@ -25,12 +29,370 @@ review_angles:
   - external-state-claims
   - generalist-deep
 findings:
-  critical: 3
-  warning: 9
-  info: 6
-  total: 18
+  critical: 1
+  warning: 15
+  info: 11
+  total: 27
 status: issues_found
+ship_gate: BLOCKED
 ---
+
+# Phase 17: Code Review Report — Round 2
+
+**Reviewed:** 2026-07-19 (round 2)
+**Depth:** deep (5 parallel angles, merged and deduplicated)
+**Files Reviewed:** 16
+**Status:** issues_found — **1 Critical OPEN**
+**Ship gate:** BLOCKED
+
+Round 1 of this review is preserved verbatim in the appendix below. This round re-ran the same
+five angles against the current branch state (63 commits ahead of `develop`, merge-base
+`a2c314f`) plus the uncommitted working tree.
+
+## Summary
+
+Toolchain is green and the phase's headline work is genuine. Independently reproduced:
+
+- `cargo test --workspace` → **367 passed / 0 failed / 0 ignored**
+- `cargo clippy --workspace --all-targets -- -D warnings` → **exit 0**
+- `cargo fmt --check` → **exit 0**
+- GAP-3 closure is real (`build.rs:43` always-rerun sentinel; `DEVFLOW_BUILD_TIMESTAMP` survives
+  only in comments).
+- GAP-4 closure is real (`build_provenance.rs:23` now asserts SHA shape; the discarded
+  `let _ = commit.len();` is gone).
+- Round 1's CR-02 regression test does real work — it snapshots the worktree, runs
+  `git pack-refs --all`, and asserts the build script's *cached* output flips `false`→`true`.
+
+One Critical is open. It is a **regression of Round 1's CR-01**, and it regenerated precisely
+because Round 1's WR-04 — the root cause — was left open.
+
+---
+
+## Critical Issues
+
+### CR-01 (R2): `CHANGELOG.md` asserts a release (1.4.88) that does not exist — recurrence of Round 1's CR-01
+
+**File:** `CHANGELOG.md:3-5` (uncommitted working-tree change)
+**Angles:** doc-accuracy, external-state (independently found by both; verified a third time by
+the orchestrator)
+
+The working tree adds:
+
+```markdown
+## 1.4.88 — 2026-07-19
+
+- Released phase via DevFlow.
+```
+
+Verified actual state:
+
+| Claim | Reality | Command |
+|---|---|---|
+| Release 1.4.88 exists | No such tag; latest is `v1.3.69` | `git tag -l` → `v1.0.1 v1.2.0 v1.3.0 v1.3.69` |
+| ... | No such GitHub release | `gh release list` → newest is `v1.3.69 Latest` |
+| ... | Workspace still at 1.3.69 | `Cargo.toml:9` → `version = "1.3.69"` |
+| ... | Branch never pushed | `origin` has only `develop`/`main`; no `feature/phase-17` |
+| ... | No PR opened | `gh pr list --state all` tops out at PR #10 |
+
+**Why this is Critical.** Every prior heading in this file corresponds to a real tag and a real
+GitHub release — `1.3.69` included. The file's established convention is *heading == released
+version*, so a human reader or an automated release-notes consumer will reasonably treat 1.4.88
+as shipped. It is not, by five independent measures. Round 1 classified the byte-identical
+defect at version `1.4.26` as Critical and recorded it fixed via `5431f9e`; Round 1's own framing
+(`17-REVIEW.md:70`) calls this class "a false release claim that a merge would propagate into the
+project changelog."
+
+**Why it came back.** Round 1's **WR-04** documented the root cause and left it open:
+`changelog_append()` (`hooks.rs:173-183`) writes the entry without committing, and
+`version_bump()` (`hooks.rs:185-198`) — the only hook that creates a tag — never ran. So the
+hook re-emits a false heading on every dogfood run. `5431f9e` deleted the symptom, not the cause.
+`17-10-SUMMARY.md:104` independently flags the same placeholder body as a content-quality wart.
+
+**Fix (either):**
+1. Drop the heading from the working tree before shipping (what `5431f9e` did — symptom only,
+   expect a Round 3 recurrence), **or**
+2. Close WR-04: make `changelog_append` and `version_bump` atomic, so an entry cannot outlive
+   the tag it names. This is the durable fix.
+
+---
+
+## Warnings
+
+### WR-01: `run_preflight` recurses into `launch_stage` with no depth or attempt bound
+
+**File:** `crates/devflow-cli/src/main.rs:796-822`, re-entered at `:1133`
+**Angle:** generalist. **Severity note:** Round 1 rated this **Info** (IN-05); this round raises
+it to Warning. It is not raised to Critical because every cycle requires an external actor to
+re-approve the gate — a human hits an unbreakable prompt loop, not a spontaneous crash.
+
+`run_preflight` → `run_gate` → `GateAction::Advance`/`LoopBack` → `launch_stage(state, None, None)`
+→ `run_preflight`, with the *same* `state`. Nothing increments `consecutive_failures` or
+`infra_failures`, so neither `MAX_CONSECUTIVE_FAILURES` nor `MAX_INFRA_FAILURES` applies, and
+there is no depth counter. Both shipped generic checks are deterministic
+(`preflight_interactivity_check`, `preflight_gh_auth_check`), so the retry re-fails identically.
+
+The authors were aware — the `FailOnceAdapter` doc comment states that an unconditionally-failing
+adapter "would make a recursive `launch_stage` retry fail its OWN preflight check too, recursing
+into a second gate this test never seeds a response for." The hazard was worked around in the
+fixture rather than bounded in the code.
+
+**Failure scenario:** phase at `Stage::Ship`, `gh` installed but logged out. Under an unattended
+auto-approving responder (the D-15 cron mode this gate exists for), each cycle adds stack frames,
+re-fires a desktop notification, and appends to `events.jsonl` while `advance` holds the
+per-phase lock — terminating in stack exhaustion.
+
+**Fix:** increment `state.infra_failures` in the failure arm and abort past `MAX_INFRA_FAILURES`.
+`transition()` already resets the counter, so a self-clearing preflight does not leak count.
+
+### WR-02: total loss of git provenance silently downgrades the staleness hard-block, undetectably
+
+**File:** `crates/devflow-cli/build.rs:51-62`; guard at `crates/devflow-cli/tests/build_provenance.rs:32-36`
+**Angle:** ci-build
+
+`run_git` returns `None` on a missing binary, non-git dir, *or* non-zero exit, and
+`commit.unwrap_or_default()` turns that into an empty string. Downstream: empty commit →
+`embedded_commit_is_stale` = `Indeterminate` → `combined_staleness:976-986` propagates it →
+`staleness_outcome:1045` maps `(_, Indeterminate)` → `Warn`. The D-18 hard block at `:1042` can
+never fire.
+
+The GAP-4 guard accepts empty by design (`commit.is_empty() || ...`), so it cannot distinguish
+"provenance working" from "provenance entirely dead." This is not the GAP-4 defect — that is
+genuinely closed — it is the residual hole the new assertion still leaves.
+
+**Fix:** keep D-20 empty-tolerance for crates.io builds, but add a git-conditional test: when
+`git rev-parse HEAD` succeeds from `CARGO_MANIFEST_DIR`, assert `DEVFLOW_BUILD_COMMIT` is
+non-empty and equal to it.
+
+### WR-03: `tree_has_modified_build_inputs` misses staged edits
+
+**File:** `crates/devflow-cli/src/main.rs:934-940` · **Angle:** generalist
+
+Gates on `git status --porcelain` being non-empty, then enumerates with `git ls-files -m`, which
+reports worktree-vs-index only. Verified empirically: after `git add src/lib.rs`,
+`git status --porcelain` prints `M  src/lib.rs` while `git ls-files -m` prints nothing. A staged
+but uncommitted source edit yields `Some(false)` → falls through to ancestry `Fresh` → `Ok`. The
+stale binary drives its own workspace silently — the exact Phase 16 false-evidence class this
+gate exists to catch.
+
+**Fix:** derive the modified path list from `git status --porcelain` itself (handling the
+`XY<space>path` shape and ` -> ` rename entries).
+
+### WR-04: `build_dirty` and the live check disagree on what "dirty" means
+
+**File:** `crates/devflow-cli/build.rs:63` vs `crates/devflow-cli/src/main.rs:982` · **Angle:** generalist
+
+`build.rs` computes dirty from `git status --porcelain` (counts **untracked** files); the runtime
+arm uses `git ls-files -m` filtered by `affects_compiled_binary` (tracked, build-affecting only).
+So the `Some(true) if build_dirty => Indeterminate` arm fires on dirt unrelated to compiled
+inputs. An untracked `notes.txt` at the workspace root makes every subsequent genuinely-stale
+build downgrade from Block to a printed Warn. The documented "same dirt vs more dirt" tradeoff is
+supposed to be rare; this makes it the common case.
+
+**Fix:** have `build.rs` use `--untracked-files=no` and the same path predicate.
+
+### WR-05: `is_self_dogfood_workspace` matches `default-members`
+
+**File:** `crates/devflow-cli/src/main.rs:1002` · **Angle:** generalist
+
+`contents.find("members")` takes the first substring occurrence anywhere in the file.
+`"default-members"` contains `"members"`. If the root `Cargo.toml` gains a `default-members` key
+above `members`, the scanned array is wrong, `has_member("crates/devflow-core")` is false, and the
+self-dogfood hard block silently degrades to `Warn` with no test failure. Existing tests only
+cover fixtures where `members = [...]` is the first hit.
+
+**Fix:** anchor on the assignment (reject matches preceded by an identifier character) rather than
+a bare substring search.
+
+### WR-06: `start` prints a success banner and exits 0 after a preflight abort
+
+**File:** `crates/devflow-cli/src/main.rs:629-640` · **Angle:** generalist
+
+`GateAction::Abort` calls `abort(...)` (clearing state) and returns `Ok(false)`; `launch_stage`
+returns `Ok(())`, so `start`'s error branch is skipped and it prints
+`"started phase N ... monitor will auto-advance"` with exit code 0. Any wrapper keying off exit
+status believes the phase is running; `devflow logs -f --phase N` finds nothing.
+
+**Fix:** propagate the did-not-launch signal out of `launch_stage`, or have the `Abort` arm return
+`CliError::Message` after `abort()`.
+
+### WR-07: `resume` never deletes the cron-instructions record it was invoked by
+
+**File:** `crates/devflow-cli/src/main.rs:1200-1213` · **Angle:** generalist
+
+Both other consumers delete the record after acting (`:2242`, `:2342`); `resume()` does not.
+`cron_instruction_hints` (`:2844-2855`) then prints "Cron instruction pending (phase N)"
+indefinitely, and an operator following the hint re-installs a Hermes job targeting a phase whose
+state file no longer exists. `recover::clean_stale` only GCs the record once state is already
+gone, so the stale hint survives the rest of the run.
+
+### WR-08: an unschedulable cron record is still persisted and advertised
+
+**File:** `crates/devflow-cli/src/main.rs:1424`, `:1435-1442` (same pattern at `:2357-2367`) · **Angle:** generalist
+
+`write_cron_instructions` is called unconditionally, *then* the empty-schedule check diverts to
+`gate_or_abort_infra` — leaving a record with `"schedule": ""` on disk. The in-code comment at
+`:1428-1434` states an empty cron expression "would degrade into an every-minute resume," yet the
+file containing exactly that is persisted and surfaced in `devflow status`. The test
+`rate_limited_with_unparseable_retry_hint_gates_instead_of_stalling_silently` asserts the record
+loads successfully with an empty schedule — locking in the hazard rather than preventing it.
+
+**Fix:** build the instructions, check the schedule, and only write when non-empty.
+
+### WR-09: a phase gate command matches zero tests and exits 0
+
+**File:** `.planning/phases/17-pipeline-dogfood-followup/17-03-PLAN.md:119,130,156` · **Angle:** ci-build
+
+`cargo test -p devflow-core evaluate_layer0` is used as an `<automated>` gate. Actual output:
+
+```
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 276 filtered out
+EXIT=0
+```
+
+The tests are named `layer0_affirmative_success_*`, not `evaluate_layer0_*`. This is a recurrence
+of the known `cargo test <name>` false-green class. **Mitigating:** the next link in the same `&&`
+chain, `cargo test -p devflow-core agent_result::`, matches 71 tests including both `layer0_*`
+tests — so the branches *are* exercised. The damage is a false coverage claim, not an untested
+branch. All other phase gate filters verified real (`advance` → 7, `ship::` → 16,
+`agent_result::` → 71, `evaluate_layer3` → 2, two named tests → 1 each).
+
+**Fix:** correct the filter to `layer0_`, and assert on a non-zero pass count rather than exit
+status to kill the class.
+
+### WR-10: the branch tip claims a docs regeneration that changed nothing
+
+**Commit:** `8140bea` "docs: update generated docs" · **Angle:** external-state
+
+`git diff-tree --no-commit-id --name-only -r 8140bea` returns nothing — an empty commit.
+`17-10-SUMMARY.md:113-115` already documents this as known product behavior ("a hook that commits
+nothing should probably not commit at all"), so it is a recorded wart rather than a fabrication —
+but `git log` still reads as if generated docs moved.
+
+### WR-11: `.devflow/` is gitignored pattern-by-pattern, so a future runtime file kind is committable by default
+
+**File:** `.gitignore:23-34`; guard at `crates/devflow-cli/tests/gitignore_coverage.rs:28-43` · **Angle:** security
+
+Twelve specific patterns are enumerated with no `.devflow/` catch-all, and the guard mirrors that
+list exactly. It catches *removal* of an existing pattern (its WR-07/CR-01 purpose) but cannot
+catch *omission*. A later phase writing `.devflow/transcript-01.jsonl` or `.devflow/agent-session.json`
+matches no pattern, is absent from `RUNTIME_PATHS`, keeps the guard green, and gets committed by
+`git add -A`. **No leak exists today** — Phase 17 adds no new file kind.
+
+**Fix:** add a `.devflow/` catch-all with `!` re-includes, making the default deny rather than allow.
+
+### WR-12: `17-VERIFICATION.md` describes a test that no longer exists
+
+**File:** `.planning/phases/17-pipeline-dogfood-followup/17-VERIFICATION.md:129` · **Angle:** doc-accuracy
+
+Claims `build_commit_is_accessible_and_does_not_panic` "still asserts nothing
+(`let _ = commit.len();`) ... explicitly left unfixed." That symbol does not exist:
+`build_provenance.rs:23` is `build_commit_is_empty_or_a_full_hex_sha` and it does assert. Closed
+by `46058a7`, which precedes `1070df0` (when VERIFICATION.md was last written). Understates
+completeness and points readers at a nonexistent symbol.
+
+### WR-13: `17-VERIFICATION.md` claims `nyquist_compliant: false`; it is `true`
+
+**File:** `17-VERIFICATION.md:130` vs `17-VALIDATION.md:7` · **Angle:** doc-accuracy
+
+VERIFICATION.md asks for a future pass to "flip `nyquist_compliant` back to `true`" — already done
+by `3d6e6a6` and re-confirmed by `41345fc`. An auditor would open a re-validation task that is
+complete. Same root cause as WR-12: the anti-pattern table was not refreshed in `1070df0`.
+
+### WR-14: `ROADMAP.md` promises a build timestamp that 17-11 removed
+
+**File:** `.planning/ROADMAP.md:211` · **Angle:** doc-accuracy
+
+Says 17-02 delivers provenance "(commit/dirty/**timestamp**)". `DEVFLOW_BUILD_TIMESTAMP` has zero
+emission or consumption — all three remaining hits are comments. Directly contradicts
+VERIFICATION.md Truth 13, which asserts full removal. The roadmap is the shipped-state-of-record,
+so a Phase 18 planner would assume the timestamp is available.
+
+### WR-15: `PROJECT.md` cites the superseded verification score
+
+**File:** `.planning/PROJECT.md:106` · **Angle:** doc-accuracy
+
+Footer reads "verified 12/12"; `17-VERIFICATION.md:5` is `score: 14/14`, with `:15` explicitly
+recording `previous_score: 12/12` as superseded.
+
+---
+
+## Info
+
+- **IN-01** `main.rs:1650-1659` — `hook_context_root` keys on "not the terminal batch" rather than
+  "is a content hook"; correct today, but a future non-terminal hook (e.g. `BranchCreate`) would
+  silently inherit the worktree root.
+- **IN-02** `outcome_policy.rs:38` — `decide_action`'s `_stage` is an unused forward-compat stub;
+  `decide_action_is_deterministic` can only assert trivially. Pin the contract with an explicit
+  cross-stage equality assertion.
+- **IN-03** `main.rs:951-961` — `affects_compiled_binary` omits `include_str!`/`include_bytes!`
+  assets, `.cargo/config.toml`, and non-`.rs` compiled sources; also allocates per candidate. The
+  doc comment justifies exclusions but not omissions.
+- **IN-04** `build.rs:52-54` — a `git status` failure defaults the dirty flag to `false`, the
+  less-safe value. Largely mitigated by the live check at `:981`.
+- **IN-05** `17-VERIFICATION.md:10`, `17-VALIDATION.md:5` — bare `#6` / `#2117` are review-round
+  and upstream-GSD identifiers, but GitHub auto-links `#6` to an unrelated merged PR ("docs: add
+  autwicky-powered wiki"). This repo has zero issues. Qualify as `round 6` / `GSD#2117`.
+- **IN-06** commit `3d6e6a6` — body says "across 9 targets"; `17-VALIDATION.md:340` says 10. Ten
+  `test result:` lines sum to exactly 367; the tenth reports 0 tests. The headline 367 is correct.
+- **IN-07** `main.rs:843-845` — `workflow_started` records absolute `worktree` and `exe_path`,
+  disclosing the OS username. The file is gitignored, but `OPERATIONS.md:105` advertises
+  `events.jsonl` for external tailing. (Round 1 IN-03; the security angle argued Warning.)
+- **IN-08** `main.rs:1533-1558` — `truncate_reason` bounds agent output to 300 chars but does not
+  redact; a token echoed in a failure reason reaches `.devflow/gates/` and a desktop notification.
+- **IN-09** `17-REVIEW.md:178,448`, `17-VALIDATION.md:237` — the operator's home path
+  (`/var/home/<user>/...`) is committed into planning docs, permanently in git history.
+- **IN-10** `.planning/OPERATOR-OBSERVABILITY-FINDINGS.md` Finding 1 — `main.rs:2917` citation has
+  drifted ~96 lines (and was off by 2 when authored). The substantive claim verifies.
+- **IN-11** `17-VERIFICATION.md:77` — cites lines 139-202 for the CR-02 test; the attribute is at
+  `:148`. Test exists and passes.
+
+---
+
+## Verified Clean (no finding)
+
+- **build.rs embeds no machine-identifying data** — only `DEVFLOW_BUILD_COMMIT` (a SHA, not a
+  branch name) and `DEVFLOW_BUILD_DIRTY` (a bool). This phase *removed* `DEVFLOW_BUILD_TIMESTAMP`,
+  a net reduction in build-machine fingerprinting.
+- **CI workflows handle no secrets** — zero `secrets.`, no `pull_request_target`, no
+  `github.event.*` interpolation, no artifact upload. No `continue-on-error`, `|| true`, `set +e`,
+  `if: always()`, matrix, or `needs` graph. The Phase 17 diff is a strict tightening (clippy
+  widened to `--workspace --all-targets`). Bare `cargo test` in `ci.yml` covers the same 367 tests
+  as `--workspace` (virtual manifest, no `default-members`) — CI scope is not a gap.
+- **`gitignore_coverage.rs` is not vacuous** — invokes `git check-ignore -q` once per path,
+  explicitly documenting why batched argv would be unsound; both no-match (exit 1) and
+  git-unavailable (exit 128) fail the assertion.
+- **`log_format_env.rs` asserts the inverse** — log lines land on stderr and are *absent* from
+  stdout, so a regression routing logs into the agent-output stream fails.
+- **`shell_quote` (`ship.rs:409-424`) is correct** — conservative allowlist, `'\''` escaping, and
+  the interpolated `phase` is a `u32`; the cron command string is not injectable.
+- **No secrets committed** — all 18 added files are `.planning/*.md`. A full-diff scan for
+  `ghp_`/`github_pat_`/`sk-`/`AKIA`/`Bearer`/PEM headers returned only a doc line describing that
+  same scan.
+- **The SUMMARY-frontmatter vs diff mismatch is a false alarm** — `lib.rs`, `outcome_policy.rs`,
+  and `log_format_env.rs` all exist at the merge-base (`outcome_policy.rs` created in `68a1b00`,
+  an ancestor). Plans 17-01/17-02 were already merged to develop; the diff range simply does not
+  span the whole phase.
+- **No artifact claims Phase 17 was merged, tagged, or pushed** — apart from CR-01.
+- **Re-audit #6's scoping claim holds** — `git diff --stat 46058a7..1070df0` touches only
+  ROADMAP.md, STATE.md, 17-VALIDATION.md, 17-VERIFICATION.md; nothing under `crates/`.
+- **Mutation evidence corroborates GAP-3** — the build cache at `target/debug/build/devflow-*/output`
+  reads `DEVFLOW_BUILD_COMMIT=8140bea...`, matching current HEAD exactly.
+
+---
+
+## Ship Gate
+
+**BLOCKED** — 1 Critical open (CR-01 R2). Resolve the false `1.4.88` changelog heading, then
+re-run the review.
+
+---
+---
+
+# Appendix: Round 1 (2026-07-19T17:10:00Z)
+
+Preserved verbatim. Round 1 frontmatter recorded: 3 Critical (0 open at time of writing), 9
+Warning, 6 Info, 18 total, `status: issues_found`, 14 files reviewed.
+
 
 # Phase 17: Code Review Report
 
