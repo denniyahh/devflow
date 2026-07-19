@@ -855,6 +855,11 @@ fn workflow_started_payload(state: &State) -> serde_json::Value {
 enum Staleness {
     Fresh,
     Stale,
+    /// The embedded commit is a strict DESCENDANT of `project_root`'s HEAD:
+    /// the binary is newer than the source it drives. Not the "committed,
+    /// forgot to rebuild" incident this gate exists to catch, so it never
+    /// blocks — but it is still a build/source mismatch worth surfacing.
+    Ahead,
     Indeterminate,
 }
 
@@ -872,7 +877,21 @@ fn embedded_commit_is_stale(project_root: &Path, embedded_commit: &str) -> Stale
             Some(_) => Staleness::Stale,
             None => Staleness::Indeterminate,
         },
-        Ok(Some(1)) => Staleness::Stale,
+        // Exit 1 only says "not an ancestor" — which is true both for a
+        // genuinely older/divergent commit AND for a descendant. Probe the
+        // reverse direction to tell them apart, or an ahead build gets
+        // reported as stale and hard-blocked.
+        Ok(Some(1)) => {
+            let reverse = std::process::Command::new("git")
+                .args(["merge-base", "--is-ancestor", "HEAD", embedded_commit])
+                .current_dir(project_root)
+                .output();
+            match reverse.map(|o| o.status.code()) {
+                Ok(Some(0)) => Staleness::Ahead,
+                Ok(Some(1)) => Staleness::Stale,
+                _ => Staleness::Indeterminate,
+            }
+        }
         _ => Staleness::Indeterminate,
     }
 }
@@ -981,6 +1000,7 @@ fn staleness_outcome(is_self_dogfood: bool, staleness: Staleness) -> StalenessOu
     match (is_self_dogfood, staleness) {
         (true, Staleness::Stale) => StalenessOutcome::Block,
         (false, Staleness::Stale) => StalenessOutcome::Warn,
+        (_, Staleness::Ahead) => StalenessOutcome::Warn,
         (_, Staleness::Indeterminate) => StalenessOutcome::Warn,
         (_, Staleness::Fresh) => StalenessOutcome::Ok,
     }
@@ -4773,6 +4793,91 @@ mod tests {
         let last = devflow_core::events::last_event_for_phase(root, phase)
             .expect("staleness block must record an event before returning the error");
         assert_eq!(last["event"], "self_dogfood_stale_blocked");
+    }
+
+    /// A binary built from a branch AHEAD of `project_root`'s HEAD is newer
+    /// than the source it drives — the inverse of the "committed, forgot to
+    /// rebuild" incident. `merge-base --is-ancestor <embedded> HEAD` exits 1
+    /// for BOTH a descendant and a genuinely divergent/older commit, so the
+    /// bare `Ok(Some(1)) => Stale` mapping hard-blocked a fresher build. Found
+    /// live: this phase's own Validate stage was blocked by a binary built
+    /// from `feature/phase-17` while the checkout sat on `develop`.
+    #[test]
+    fn ahead_build_from_descendant_commit_warns_instead_of_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@e.st"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/devflow-core\", \"crates/devflow-cli\"]\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("a.txt"), "one").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "workspace init"]);
+        let base_commit = run_git_stdout(root, &["rev-parse", "HEAD"])
+            .expect("rev-parse HEAD")
+            .trim()
+            .to_string();
+
+        // The build is made from the LATER commit...
+        std::fs::write(root.join("b.txt"), "two").unwrap();
+        git(&["add", "."]);
+        git(&[
+            "commit",
+            "-q",
+            "-m",
+            "newer work the checkout does not have",
+        ]);
+        let embedded_commit = run_git_stdout(root, &["rev-parse", "HEAD"])
+            .expect("rev-parse HEAD")
+            .trim()
+            .to_string();
+
+        // ...while the checkout is moved BACK, leaving the embedded commit a
+        // strict descendant of HEAD on a clean tree (so the mtime arm stays
+        // out of it and ancestry is the sole signal).
+        git(&["reset", "--hard", "-q", &base_commit]);
+        let status = run_git_stdout(root, &["status", "--porcelain"]).unwrap();
+        assert!(
+            status.trim().is_empty(),
+            "fixture must have a clean working tree"
+        );
+
+        assert_eq!(
+            embedded_commit_is_stale(root, &embedded_commit),
+            Staleness::Ahead,
+            "a descendant embedded commit is newer than HEAD, not stale"
+        );
+        assert_eq!(
+            staleness_outcome(true, Staleness::Ahead),
+            StalenessOutcome::Warn,
+            "an ahead build must warn, never hard-block, even for self-dogfood"
+        );
+
+        let phase = 67;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        assert!(
+            enforce_build_staleness(root, &state, &embedded_commit, 0).is_ok(),
+            "ahead build must not block a self-dogfood workspace"
+        );
     }
 
     /// D-19 composite/OR: a clean tree whose embedded commit IS an ancestor
