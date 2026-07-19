@@ -187,7 +187,7 @@ state/event reconciliation and the WR-03 test fix were deferred to Phase 18 on
 against final HEAD rather than re-plan)
 **Depends on:** Phase 16
 **Blocks:** Phase 18 Hermes Support
-**Plans:** 4/5 plans executed
+**Plans:** 5/5 plans executed
 
 Plans:
 
@@ -206,7 +206,7 @@ Plans:
 
 **Wave 4** *(blocked on 17-02/17-04: shares main.rs)*
 
-- [ ] 17-05-PLAN.md — 17c/17d: scoped preflight readiness gate (adapter hook + generic checks) and workflow_started build provenance + self-dogfood staleness block
+- [x] 17-05-PLAN.md — 17c/17d: scoped preflight readiness gate (adapter hook + generic checks) and workflow_started build provenance + self-dogfood staleness block
 
 ### Phase 18: Hermes Support
 

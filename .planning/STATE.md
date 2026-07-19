@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
 status: Phase 17 scoped and discussed - ready for planning
-stopped_at: Completed 17-04-PLAN.md
-last_updated: "2026-07-19T00:23:15.262Z"
+stopped_at: Completed 17-05-PLAN.md
+last_updated: "2026-07-19T00:56:52.682Z"
 progress:
   total_phases: 7
-  completed_phases: 5
+  completed_phases: 6
   total_plans: 39
-  completed_plans: 38
-  percent: 71
+  completed_plans: 39
+  percent: 86
 ---
 
 # DevFlow — Project State
@@ -112,6 +112,7 @@ None.
 - [Phase 17]: 17-02: first workspace build.rs — resolves git-common-dir via `git rev-parse --git-common-dir` from CARGO_MANIFEST_DIR (not a relative `.git/HEAD`) and emits absolute rerun-if-changed paths for HEAD/refs/packed-refs; DEVFLOW_BUILD_COMMIT/DIRTY/TIMESTAMP via cargo:rustc-env, degrading gracefully with no git
 - [Phase 17]: 17-03: evaluate_layer3 zero-commit/no-declaration reclassified Unknown->Failed (D-02/D-03 case 3, human review flag); commits-present stays Unknown for Plan 04's gate. evaluate_layer0 now runs every stage (not just Code) and returns affirmative Success when all approved declared probes pass even at zero commits; PLAN discovery now reads project_root while probe execution keeps execution_root (fixes a worktree PLAN-removed false veto pre-existing since 16-01).
 - [Phase 17]: 17-04: advance() dispatches exhaustively on outcome_policy::decide_action (Unknown/Failed/RateLimited/ResourceKilled/AgentUnavailable each gate/resume/abort, never silently advance); GateInfra path (handle_infra_outcome) bumps infra_failures on every stage incl. Validate/Ship, never consecutive_failures; new devflow resume --phase N relaunches saved state (no State::new/branch/worktree reset) as the safe rate-limit auto-resume target; advance_evaluated now emits decided_by_layer + AgentStatus::as_wire_str()
+- [Phase 17]: 17-05: preflight_interactivity_check scoped to AgentKind::Codex only (not every adapter) — a blanket check broke 3 passing start() integration tests since Claude/OpenCode complete Define headlessly; launch_stage signature changed to &mut State so run_preflight/enforce_build_staleness can drive run_gate
 
 ## Roadmap Evolution
 
@@ -154,9 +155,10 @@ None.
 | Phase 17 P02 | 2min | 2 tasks | 2 files |
 | Phase 17-pipeline-dogfood-followup P03 | 5min | 2 tasks | 1 files |
 | Phase 17-pipeline-dogfood-followup P04 | 25min | 2 tasks | 4 files |
+| Phase 17-pipeline-dogfood-followup P05 | 45min | 2 tasks | 2 files |
 
 ## Session
 
-**Last session:** 2026-07-19T00:22:53.963Z
-**Stopped at:** Completed 17-04-PLAN.md
+**Last session:** 2026-07-19T00:56:52.635Z
+**Stopped at:** Completed 17-05-PLAN.md
 **Resume file:** None
