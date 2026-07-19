@@ -11,7 +11,7 @@
 | 14 | Parallel Safety + Observability | Complete |
 | 15 | Dogfood Enablement + OSS Readiness | Complete |
 | 16 | Pipeline Reliability Hardening | Complete    |
-| 17 | Pipeline Dogfood Follow-Up | In Progress|
+| 17 | Pipeline Dogfood Follow-Up | Complete    |
 | 18 | Hermes Support | Scoped |
 
 ## Shipped
