@@ -842,9 +842,15 @@ fn workflow_started_payload(state: &State) -> serde_json::Value {
 /// `project_root`'s current `HEAD` — the ancestry half of D-19's composite
 /// definition. Per git's documented exit-code contract for `merge-base
 /// --is-ancestor` (exit 0 = ancestor, exit 1 = not, other = error/unknown
-/// commit — Pitfall 4), only exit 1 is treated as definitively Stale; any
-/// other outcome (including an empty `embedded_commit` — D-20: absence of
+/// commit — Pitfall 4), exit 1 is treated as definitively Stale; any other
+/// outcome (including an empty `embedded_commit` — D-20: absence of
 /// provenance is not staleness) is Indeterminate, never a false block.
+/// WR-01 (17-06 gap closure): exit 0 alone is NOT sufficient for Fresh —
+/// `merge-base --is-ancestor` also exits 0 when `embedded_commit` is a
+/// STRICT ancestor of HEAD (HEAD moved forward since the build), which is
+/// exactly the "committed new commits, forgot to rebuild" incident class
+/// this fix closes. Only an EXACT match to the current HEAD commit is
+/// genuinely Fresh.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Staleness {
     Fresh,
@@ -861,7 +867,11 @@ fn embedded_commit_is_stale(project_root: &Path, embedded_commit: &str) -> Stale
         .current_dir(project_root)
         .output();
     match output.map(|o| o.status.code()) {
-        Ok(Some(0)) => Staleness::Fresh,
+        Ok(Some(0)) => match run_git_stdout(project_root, &["rev-parse", "HEAD"]) {
+            Some(head) if head.trim() == embedded_commit.trim() => Staleness::Fresh,
+            Some(_) => Staleness::Stale,
+            None => Staleness::Indeterminate,
+        },
         Ok(Some(1)) => Staleness::Stale,
         _ => Staleness::Indeterminate,
     }
@@ -4648,22 +4658,121 @@ mod tests {
         (base, side)
     }
 
-    /// Pitfall 4: exit 0 -> Fresh, exit 1 -> Stale, and anything else
-    /// (unknown commit, empty embedded commit) -> Indeterminate, never a
-    /// false block.
+    /// Pitfall 4 / WR-01: exit 1 -> Stale, and anything else (unknown
+    /// commit, empty embedded commit) -> Indeterminate, never a false block.
+    /// Exit 0 (merge-base --is-ancestor) splits further: a strict ancestor
+    /// of HEAD -> Stale (WR-01 fix — `base` here is an ancestor of the
+    /// fixture's final `trunk2` HEAD but is NOT HEAD itself, which is
+    /// exactly the "committed, forgot to rebuild" incident class), and only
+    /// an EXACT match to HEAD -> Fresh.
     #[test]
     fn embedded_commit_is_stale_maps_ancestry_exit_codes() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let (base, side) = init_repo_with_diverged_commit(root);
+        let head = run_git_stdout(root, &["rev-parse", "HEAD"])
+            .expect("rev-parse HEAD")
+            .trim()
+            .to_string();
 
-        assert_eq!(embedded_commit_is_stale(root, &base), Staleness::Fresh);
+        // `base` is a strict ancestor of the fixture's final `trunk2` HEAD —
+        // this previously asserted Fresh, which encoded the WR-01 bug (a
+        // clean-tree binary built from `base` would have been misclassified
+        // Fresh even though two commits landed on top of it since).
+        assert_eq!(embedded_commit_is_stale(root, &base), Staleness::Stale);
+        // The genuine Fresh case: an exact match to the current HEAD.
+        assert_eq!(embedded_commit_is_stale(root, &head), Staleness::Fresh);
         assert_eq!(embedded_commit_is_stale(root, &side), Staleness::Stale);
         assert_eq!(embedded_commit_is_stale(root, ""), Staleness::Indeterminate);
         assert_eq!(
             embedded_commit_is_stale(root, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
             Staleness::Indeterminate
         );
+    }
+
+    /// WR-01 regression (17-06 gap closure): reproduces the verifier's exact
+    /// live-reproduction narrative (17-VERIFICATION.md Gap 2 / Truth 10) — a
+    /// LINEAR, clean-tree, two-commit fixture where the embedded commit
+    /// legitimately IS an ancestor of the new HEAD, so `merge-base
+    /// --is-ancestor` exits 0 and the mtime arm never runs on a clean tree.
+    /// Before the WR-01 fix, this was misclassified Fresh; it must now be
+    /// Stale, and `enforce_build_staleness` must hard-block a self-dogfood
+    /// workspace in exactly this scenario — the Phase 16 "committed,
+    /// forgot to rebuild" incident class this gate exists to catch.
+    #[test]
+    fn wr01_clean_tree_strict_ancestor_build_is_stale_and_hard_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@e.st"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+
+        // First commit: a workspace Cargo.toml (both crate member paths) plus
+        // one other tracked file.
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/devflow-core\", \"crates/devflow-cli\"]\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("a.txt"), "one").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "workspace init"]);
+        let embedded_commit = run_git_stdout(root, &["rev-parse", "HEAD"])
+            .expect("rev-parse HEAD")
+            .trim()
+            .to_string();
+
+        // Second commit on top: an unrelated NEW file — no modifications to
+        // already-committed files, so the tree stays clean.
+        std::fs::write(root.join("b.txt"), "two").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "unrelated follow-up"]);
+
+        // Clean-tree property: this is what makes the mtime arm never run,
+        // leaving the ancestry arm as the sole signal — exactly the gap the
+        // WR-01 fix closes.
+        let status = run_git_stdout(root, &["status", "--porcelain"]).unwrap();
+        assert!(
+            status.trim().is_empty(),
+            "fixture must have a clean working tree"
+        );
+
+        assert_eq!(
+            embedded_commit_is_stale(root, &embedded_commit),
+            Staleness::Stale
+        );
+        assert_eq!(
+            combined_staleness(root, &embedded_commit, 0),
+            Staleness::Stale
+        );
+        assert!(is_self_dogfood_workspace(root));
+
+        let phase = 66;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+
+        let err = enforce_build_staleness(root, &state, &embedded_commit, 0).unwrap_err();
+        assert!(
+            err.to_string().contains("self-dogfood stale build blocked"),
+            "{err}"
+        );
+
+        let last = devflow_core::events::last_event_for_phase(root, phase)
+            .expect("staleness block must record an event before returning the error");
+        assert_eq!(last["event"], "self_dogfood_stale_blocked");
     }
 
     /// D-19 composite/OR: a clean tree whose embedded commit IS an ancestor
