@@ -153,6 +153,46 @@ pub fn compute_version(project_root: &Path) -> Result<Version, VersionError> {
     })
 }
 
+/// Read the full [`Version`] (major/minor/patch) out of whatever version file
+/// `detect_version_file` resolves, mirroring [`write_version`]'s format
+/// handling (including `[workspace.package]`).
+///
+/// Unlike [`compute_version`], this never touches git — it reports exactly
+/// what was last written to the version file, not a freshly recomputed
+/// minor/patch. Callers that need the version a prior [`write_version`] call
+/// actually wrote (e.g. after a tag was just cut) must use this instead of
+/// `compute_version`, which would see the new tag and return a different,
+/// larger version.
+pub fn read_version(project_root: &Path) -> Result<Version, VersionError> {
+    let path = detect_version_file(project_root)
+        .ok_or_else(|| VersionError::Parse("no version file found".into()))?;
+    let contents = std::fs::read_to_string(&path)?;
+    let field = field_for(&path, &contents);
+    let version_str = find_version_in_contents(&contents, field)
+        .ok_or_else(|| VersionError::Parse(format!("field `{field}` not found in {path:?}")))?;
+    parse_version_str(&version_str)
+}
+
+/// Parse a `MAJOR.MINOR.PATCH` string (optionally followed by `-`/`+`
+/// metadata) into a [`Version`].
+fn parse_version_str(version: &str) -> Result<Version, VersionError> {
+    let mut parts = version.split(['.', '+', '-']);
+    let mut next =
+        |label: &str| -> Result<u32, VersionError> {
+            parts.next().unwrap_or("0").parse::<u32>().map_err(|err| {
+                VersionError::Parse(format!("invalid {label} in `{version}`: {err}"))
+            })
+        };
+    let major = next("major")?;
+    let minor = next("minor")?;
+    let patch = next("patch")?;
+    Ok(Version {
+        major,
+        minor,
+        patch,
+    })
+}
+
 /// Write `version` into the project's auto-detected version file.
 pub fn write_version(project_root: &Path, version: &Version) -> Result<PathBuf, VersionError> {
     let path = detect_version_file(project_root)
@@ -446,5 +486,100 @@ mod tests {
             ),
             Err(VersionError::Parse(_))
         ));
+    }
+
+    #[test]
+    fn read_version_round_trips_through_write_version_in_plain_cargo_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let written = Version {
+            major: 2,
+            minor: 3,
+            patch: 4,
+        };
+        write_version(dir.path(), &written).unwrap();
+        assert_eq!(read_version(dir.path()).unwrap(), written);
+    }
+
+    #[test]
+    fn read_version_round_trips_through_write_version_in_workspace_cargo_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace.package]\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        let written = Version {
+            major: 5,
+            minor: 6,
+            patch: 7,
+        };
+        write_version(dir.path(), &written).unwrap();
+        assert_eq!(read_version(dir.path()).unwrap(), written);
+    }
+
+    #[test]
+    fn read_version_round_trips_through_write_version_in_package_json() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            "{\n  \"version\": \"0.1.0\"\n}\n",
+        )
+        .unwrap();
+        let written = Version {
+            major: 1,
+            minor: 9,
+            patch: 12,
+        };
+        write_version(dir.path(), &written).unwrap();
+        assert_eq!(read_version(dir.path()).unwrap(), written);
+    }
+
+    #[test]
+    fn read_version_errors_without_version_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            read_version(dir.path()),
+            Err(VersionError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn read_version_does_not_recompute_from_git_tags() {
+        // read_version must report exactly what's on disk, not a freshly
+        // computed minor/patch — this is the property VersionBump/
+        // ChangelogAppend ordering depends on (version.rs must never see a
+        // tag VersionBump just created and derive a different number).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        std::fs::write(root.join("Cargo.toml"), "[package]\nversion = \"2.0.0\"\n").unwrap();
+        commit(root, "a.txt");
+        write_version(
+            root,
+            &Version {
+                major: 2,
+                minor: 0,
+                patch: 0,
+            },
+        )
+        .unwrap();
+        git(root, &["tag", "v2.0.0"]);
+        commit(root, "b.txt");
+        commit(root, "c.txt");
+        // compute_version would see 1 tag + 2 commits since => 2.1.2.
+        // read_version must still report exactly what's on disk: 2.0.0.
+        assert_eq!(
+            read_version(root).unwrap(),
+            Version {
+                major: 2,
+                minor: 0,
+                patch: 0
+            }
+        );
     }
 }
