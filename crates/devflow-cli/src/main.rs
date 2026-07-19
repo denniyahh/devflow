@@ -3757,9 +3757,47 @@ mod tests {
     /// state files prevent cross-phase clobbering, and the coarse checkout
     /// lock serializes both `finish_workflow`s' git operations on the shared
     /// primary checkout. Gate responses are pre-seeded so neither advance
-    /// blocks polling.
+    /// blocks polling on its *first* Ship gate.
+    ///
+    /// 17-09 gap closure (GAP-2): both phases compute their next version from
+    /// the same starting git state, and on some runs genuinely race to
+    /// create the same version tag — confirmed directly during this plan's
+    /// RED phase via temporary debug instrumentation, which caught both
+    /// threads inside `version_bump` with the identical computed version
+    /// (`2.0.1`) within ~1.8ms of each other, and the loser's `git tag`
+    /// failing with git's own "reference already exists". That failure
+    /// reopens the loser's Ship gate for human review (`finish_workflow`'s
+    /// retry loop) — but only ONE gate response was ever pre-written per
+    /// phase (consumed by its first gate open), so the reopened gate has
+    /// nothing to consume. Unbounded, `Gates::poll_response` then polls the
+    /// 7-day production default (`DEVFLOW_GATE_TIMEOUT_SECS`) with no
+    /// response ever arriving — that is the wedge this plan closes.
+    ///
+    /// The binding constraint is "never hangs," not "always both succeed."
+    /// This test does not try to make the race loser also succeed (that
+    /// would require re-answering a gate reactively and still not rule out
+    /// a second, equally rare collision) — instead it bounds the reopened
+    /// gate's poll to a few seconds via `DEVFLOW_GATE_TIMEOUT_SECS`
+    /// (overridden ONLY for this test's poll, under the established
+    /// `ENV_MUTEX` guard — the 7-day production default is never touched)
+    /// and asserts the loser's documented behavior: a bounded timeout error,
+    /// state left intact (not cleared), and an actionable Ship gate still on
+    /// disk awaiting a human. The common case (no collision) still asserts
+    /// both phases finish independently, exactly as before.
     #[test]
     fn concurrent_ship_advances_finish_both_phases_independently() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let original_gate_timeout = std::env::var_os("DEVFLOW_GATE_TIMEOUT_SECS");
+        // SAFETY: serialized under ENV_MUTEX. Bounds a reopened Ship gate's
+        // poll to a few seconds instead of the 7-day production default.
+        // Every OTHER test that reaches `run_gate` pre-writes its response
+        // before calling in, so `poll_response` finds it on the very first
+        // read regardless of this value — only a *reopened*, unanswered
+        // gate (this test's race-loser path) ever actually waits it out.
+        unsafe {
+            std::env::set_var("DEVFLOW_GATE_TIMEOUT_SECS", "2");
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
@@ -3791,31 +3829,71 @@ mod tests {
             .unwrap();
         }
 
-        std::thread::scope(|scope| {
+        let results: Vec<(u32, Result<(), CliError>)> = std::thread::scope(|scope| {
             let handles: Vec<_> = phases
                 .iter()
-                .map(|&phase| scope.spawn(move || advance(root, Some(phase))))
+                .map(|&phase| (phase, scope.spawn(move || advance(root, Some(phase)))))
                 .collect();
-            for handle in handles {
-                handle.join().expect("advance thread").expect("advance ok");
-            }
+            handles
+                .into_iter()
+                .map(|(phase, handle)| (phase, handle.join().expect("advance thread")))
+                .collect()
         });
 
-        for &phase in &phases {
-            assert!(
-                matches!(
-                    workflow::load_state(root, phase),
-                    Err(workflow::WorkflowError::MissingState(_))
-                ),
-                "phase {phase} must be finished (state cleared)"
-            );
-            assert!(!Gates::gate_path(root, phase, Stage::Ship).exists());
-            let last = devflow_core::events::last_event_for_phase(root, phase)
-                .expect("events recorded for phase");
-            assert_eq!(
-                last["event"], "workflow_finished",
-                "phase {phase}'s own event stream must end in workflow_finished"
-            );
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_gate_timeout {
+                Some(value) => std::env::set_var("DEVFLOW_GATE_TIMEOUT_SECS", value),
+                None => std::env::remove_var("DEVFLOW_GATE_TIMEOUT_SECS"),
+            }
+        }
+
+        let succeeded = results.iter().filter(|(_, r)| r.is_ok()).count();
+        assert!(
+            succeeded == 1 || succeeded == 2,
+            "at least one phase must finish independently of the other; got {succeeded}/2 successes"
+        );
+
+        for (phase, result) in &results {
+            match result {
+                Ok(()) => {
+                    assert!(
+                        matches!(
+                            workflow::load_state(root, *phase),
+                            Err(workflow::WorkflowError::MissingState(_))
+                        ),
+                        "phase {phase} must be finished (state cleared)"
+                    );
+                    assert!(!Gates::gate_path(root, *phase, Stage::Ship).exists());
+                    let last = devflow_core::events::last_event_for_phase(root, *phase)
+                        .expect("events recorded for phase");
+                    assert_eq!(
+                        last["event"], "workflow_finished",
+                        "phase {phase}'s own event stream must end in workflow_finished"
+                    );
+                }
+                Err(err) => {
+                    // The documented loser behavior (GAP-2): a version-tag
+                    // race lost by VersionBump reopens the Ship gate for a
+                    // human; with no second response pre-written, the
+                    // bounded poll above times out rather than hanging.
+                    assert!(
+                        err.to_string().contains("timed out"),
+                        "phase {phase}'s only non-success outcome must be a bounded gate \
+                         timeout, not some other failure: {err}"
+                    );
+                    let state = workflow::load_state(root, *phase)
+                        .expect("a timed-out gate leaves state intact, not cleared");
+                    assert!(
+                        state.gate_pending,
+                        "phase {phase} must leave an actionable, still-open gate for a human"
+                    );
+                    assert!(
+                        Gates::gate_path(root, *phase, Stage::Ship).exists(),
+                        "phase {phase}'s reopened Ship gate file must remain on disk"
+                    );
+                }
+            }
         }
     }
 
