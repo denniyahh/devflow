@@ -8,6 +8,8 @@ nyquist_compliant: true
 wave_0_complete: true
 created: 2026-07-18
 audited: 2026-07-19
+reaudited: 2026-07-19
+reaudited_at_commit: cf062e6
 ---
 
 # Phase 17 — Validation Strategy
@@ -41,8 +43,8 @@ audited: 2026-07-19
 
 ## Per-Task Verification Map
 
-Audited 2026-07-19 against final HEAD (`3c2774e`). Every row's test was confirmed to exist by
-name in the tree and to run green under `cargo test --workspace`.
+Audited 2026-07-19 against HEAD `cf062e6` (re-audit; the original audit ran at `3c2774e`). Every
+row's test was confirmed to exist by name in the tree and to run green under `cargo test --workspace`.
 
 | # | Plan | Requirement | Secure Behavior | Test Type | Covering Tests | Status |
 |---|------|-------------|-----------------|-----------|----------------|--------|
@@ -117,6 +119,35 @@ This audit's `cargo test --workspace` run passed — but per `STATE.md` that is 
 evidence. Treat suite-green results for this test as non-deterministic until the ship/version-bump
 concurrency work lands.
 
+**Re-audit 2026-07-19 — the hang is now measured, not inferred.** The 2026-07-19 re-audit stressed
+the test in isolation five times under a 120 s timeout:
+
+| Run | Exit | Elapsed | Result |
+|-----|------|---------|--------|
+| 1 | 124 (timeout) | 120 s | **hung** |
+| 2 | 0 | 2 s | passed |
+| 3 | 0 | 1 s | passed |
+| 4 | 124 (timeout) | 120 s | **hung** |
+| 5 | 0 | 2 s | passed |
+
+**2 of 5 runs (~40 %) hang indefinitely** — the runs that pass do so in 1–2 s, so the hang is
+bimodal, not slow-path variance. There is no internal timeout on the reopened `32-ship` gate poll,
+so a hung run blocks until an external timeout kills it; in CI with no `timeout` wrapper this stalls
+the job rather than failing it.
+
+This has two consequences for the sign-off below:
+
+1. The "`cargo test --workspace` green" evidence is a ~60 %-likely outcome, not a reproducible
+   property. Two consecutive green full-suite runs during this re-audit are consistent with chance
+   (~36 %) and are *not* independent confirmation.
+2. The **Sampling Rate** contract's "max feedback latency: ~90 s" is violated whenever this test
+   hangs — feedback latency becomes unbounded.
+
+Requirement coverage is unaffected: this test guards no Phase 17 requirement row, and all 9 rows
+pass deterministically. `nyquist_compliant` therefore stays `true` on coverage grounds. But the
+suite is not a dependable sampling instrument until this is fixed, and that is a live defect, not a
+documentation caveat. **Disposition: open, escalated to the ship/version-bump concurrency work.**
+
 *Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
 
 ---
@@ -139,7 +170,7 @@ concurrency work lands.
 | # | Requirement | Behavior | Why manual | Status |
 |---|-------------|----------|------------|--------|
 | M-1 | 17d (17-02 D2) | `build.rs` degrades gracefully (empty commit, `dirty=false`, no `rerun-if-changed` lines) when git metadata is unavailable, and never fails the build | The build script is not linked into any test target; asserting it would require driving a full `cargo build` inside a non-git scratch tree. Disproportionate to the risk — the code path is a single `Option` fallback. Verified procedurally: `git rev-parse --git-common-dir` reproduced at exit 128 in a scratch dir, `run_git` returns `None`, which `build.rs` routes to the documented defaults. | ✅ verified (procedural) |
-| M-2 | 17d (17-07 Task 2) | The rebuilt binary self-permits — a descendant build drives the primary checkout with a warning rather than the `self-dogfood stale build blocked` error | Requires a real rebuild + live stage launch against the primary checkout; the automated equivalent (`ahead_build_from_descendant_commit_warns_instead_of_blocking`) covers the decision logic but not the live binary. | ⬜ unconfirmed — no `17-07-SUMMARY.md` on record |
+| M-2 | 17d (17-07 Task 2) | The rebuilt binary self-permits — a descendant build drives the primary checkout with a warning rather than the `self-dogfood stale build blocked` error | Requires a real rebuild + live stage launch against the primary checkout; the automated equivalent (`ahead_build_from_descendant_commit_warns_instead_of_blocking`) covers the decision logic but not the live binary. | ✅ verified (procedural) — `17-07-SUMMARY.md` §Verification, Task 2: the rebuilt binary resumed phase 17 into Validate with no `self_dogfood_stale_blocked` event |
 
 *(D-03 case 3's "notify human" is product behavior, asserted by automated tests on the gate/notify path.)*
 
@@ -158,9 +189,9 @@ with Phase 18's Hermes adapter, the first adapter with real reviewer storage.
 
 - [x] All requirements have automated verification or a recorded manual-only/override disposition
 - [x] Sampling continuity: no 3 consecutive tasks without automated verify
-- [x] Test infrastructure confirmed: `cargo test --workspace` green, `cargo clippy --workspace --all-targets -- -D warnings` clean, `cargo fmt --check` clean (2026-07-19, re-confirmed at `c03498d`)
+- [x] Test infrastructure confirmed: `cargo test --workspace` green (362 passed / 0 failed / **0 ignored** across 10 targets), `cargo clippy --workspace --all-targets -- -D warnings` clean, `cargo fmt --check` clean (re-confirmed 2026-07-19 at `cf062e6`)
 - [x] No watch-mode flags
-- [x] Feedback latency < 90s (full workspace suite completes in ~11s warm)
+- [⚠️] Feedback latency < 90s — holds on a clean run (~11s warm), but **unbounded on the ~40 % of runs where GAP-2 hangs**. See GAP-2. This box is not honestly checkable until that race is fixed.
 - [x] `nyquist_compliant: true` — GAP-1 resolved by `17-08-PLAN.md` (`c03498d`)
 
 **Approval:** PASS — 9 of 9 requirement rows fully automated and green. Row 6 (17c preflight) was
@@ -189,11 +220,53 @@ by name in `crates/`, then the full suite was executed. No auditor subagent was 
 only fillable artifact is a test that must fail against current `main.rs`, which the auditor's
 "never modify impl files" mandate routes straight to `ESCALATE`.
 
-**Note:** `17-07` has a PLAN, a landed fix (`3c2774e`), and a passing test, but **no SUMMARY.md**.
-Its coverage was mapped into row 8 manually from the plan's `must_haves` rather than from a
-`coverage:` block. Worth generating for artifact completeness.
+**Note (superseded 2026-07-19):** at original-audit time `17-07` had a PLAN, a landed fix
+(`3c2774e`), and a passing test but **no SUMMARY.md**, so its coverage was mapped into row 8
+manually from the plan's `must_haves`. `17-07-SUMMARY.md` has since been written and its
+§Verification block confirms row 8's coverage and closes manual item M-2. Note resolved.
 
 **Addendum 2026-07-19 (post `17-08-PLAN.md`):** GAP-1 (the sole ESCALATED-not-RESOLVED gap this
 audit found) is now closed — see the GAP-1 section above. `nyquist_compliant` flips to `true`; the
 counts in the table above are left as originally recorded, a point-in-time snapshot of the
 2026-07-19 audit that ran before the fix landed.
+
+---
+
+## Re-Audit 2026-07-19 (HEAD `cf062e6`)
+
+Independent re-verification of the above, run because a `validated` document is a self-report until
+someone re-executes its claims.
+
+| Metric | Count |
+|--------|-------|
+| Requirement rows re-audited | 9 |
+| Named tests confirmed present in tree | 35 / 35 |
+| Full-suite result | 362 passed / 0 failed / 0 ignored (10 targets) |
+| Rows green | 9 |
+| Gaps still open | 1 (GAP-2) |
+| Gaps closed by this re-audit | 0 |
+| Manual items promoted to verified | 1 (M-2) |
+| Stale doc claims corrected | 3 |
+
+**Method.** Every test name in the Per-Task Verification Map was grepped for a matching `fn`
+definition in `crates/` (35/35 present — no phantom coverage refs). `cargo test --workspace` was
+then run twice end-to-end, `cargo clippy --workspace --all-targets -- -D warnings` and
+`cargo fmt --check` once each. All green. No auditor subagent was spawned: there were no MISSING or
+PARTIAL requirement rows to fill, which is the only work that agent does.
+
+**What changed.**
+
+1. **GAP-2 escalated from inferred to measured.** Five isolated 120 s-timeout runs → 2 hangs, 3
+   passes in 1–2 s. The prior audit correctly suspected a lucky pass; this quantifies it at ~40 %
+   and shows the hang is bimodal. The "feedback latency < 90 s" sign-off box was downgraded to ⚠️
+   accordingly — it is not honestly checkable while this race is live.
+2. **M-2 promoted to ✅ verified.** `17-07-SUMMARY.md` now exists and its §Verification Task 2
+   records the live self-permit check the prior audit was waiting on.
+3. **Three stale facts corrected**: the audited-HEAD reference (`3c2774e` → `cf062e6`), the M-2
+   status, and the "no `17-07-SUMMARY.md`" note.
+
+**Verdict: GAPS.** Requirement coverage is complete and deterministic — all 9 rows green, so
+`nyquist_compliant` stays `true`. But GAP-2 remains open with hard evidence it is a live ~40 %
+CI-stalling defect rather than a latent caveat, and it belongs to the ship/version-bump concurrency
+work, not to Phase 17. This phase does not block on it; the next milestone should not ship without
+it.
