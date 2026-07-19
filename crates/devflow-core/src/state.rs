@@ -36,7 +36,9 @@ pub struct State {
     /// (D-08, 17-01). Gates at [`crate::mode::MAX_INFRA_FAILURES`]. Any
     /// increment (wired in Plan 04) must use `saturating_add` so a
     /// long-running stuck loop cannot overflow `u32`. A serde-absent value
-    /// (older persisted state) defaults to 0.
+    /// (older persisted state) defaults to 0. Reset to 0 on every successful
+    /// stage transition, alongside `consecutive_failures` (CR-01, 17-06 gap
+    /// closure), so the ceiling bounds a stuck loop, not a phase's lifetime.
     #[serde(default)]
     pub infra_failures: u32,
     /// When the phase started (Unix seconds).

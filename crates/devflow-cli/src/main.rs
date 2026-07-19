@@ -1610,6 +1610,14 @@ fn run_checkout_hooks(
 }
 
 /// Fire the hooks for `from → to`, persist the new stage, and launch its agent.
+///
+/// CR-01 (17-06 gap closure): resets `infra_failures` alongside
+/// `consecutive_failures` on every successful transition. Without this, an
+/// infra-fault ceiling meant to bound a *stuck loop* (D-08,
+/// [`mode::MAX_INFRA_FAILURES`]) instead accumulates across a phase's entire
+/// lifetime — several well-spaced, cleanly-resolved infra faults would
+/// falsely reach the ceiling and hard-abort a long-running but otherwise
+/// healthy phase.
 fn transition(project_root: &Path, state: &mut State, to: Stage) -> Result<(), CliError> {
     let from = state.stage;
     let _ = run_checkout_hooks(
@@ -1620,6 +1628,7 @@ fn transition(project_root: &Path, state: &mut State, to: Stage) -> Result<(), C
     );
     state.stage = to;
     state.consecutive_failures = 0;
+    state.infra_failures = 0;
     state.gate_pending = false;
     workflow::save_state(state)?;
     events::emit(
@@ -4153,6 +4162,74 @@ mod tests {
         );
         let err = workflow::load_state(root, phase).unwrap_err();
         assert!(matches!(err, workflow::WorkflowError::MissingState(_)));
+    }
+
+    /// CR-01 regression (17-06 gap closure): `transition()` resets
+    /// `infra_failures` to 0 alongside `consecutive_failures` — both in the
+    /// in-memory `State` and the persisted `state.json` — and a subsequent
+    /// infra fault after a clean transition starts counting from 1, not the
+    /// pre-transition count. PATH is cleared under `ENV_MUTEX` (pointed at a
+    /// fresh empty tempdir, not an empty string, so `agent_binary_available`'s
+    /// PATH scan has zero possible matches) before calling `transition()`,
+    /// because this host genuinely has `claude`/`codex`/`opencode` on PATH —
+    /// without clearing it, `transition()`'s downstream `launch_stage` would
+    /// try to actually spawn a real agent CLI subprocess, which this test
+    /// must never do. The resulting `Err` from `ensure_agent_binary` is
+    /// expected and ignored: the counter reset happens earlier in
+    /// `transition()` and is unaffected by that downstream failure.
+    #[test]
+    fn transition_resets_infra_failures() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 80;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        state.infra_failures = mode::MAX_INFRA_FAILURES - 1;
+        workflow::save_state(&state).unwrap();
+
+        let empty_path_dir = tempfile::tempdir().unwrap();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", empty_path_dir.path());
+        }
+
+        let _ = transition(root, &mut state, Stage::Validate);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        assert_eq!(
+            state.infra_failures, 0,
+            "transition() must reset infra_failures in-memory, not just consecutive_failures"
+        );
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert_eq!(
+            reloaded.infra_failures, 0,
+            "transition() must persist the infra_failures reset to state.json"
+        );
+
+        // A fresh infra fault after the clean transition starts counting
+        // from 1, not resuming the pre-transition MAX_INFRA_FAILURES - 1
+        // count toward a false premature abort.
+        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        handle_infra_outcome(root, &mut state, Stage::Validate, Some("killed".into())).unwrap();
+
+        assert_eq!(state.infra_failures, 1);
     }
 
     /// D-09: a primary-loop `RateLimited` outcome writes the single-agent

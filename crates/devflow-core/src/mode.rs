@@ -26,7 +26,11 @@ pub const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 /// cloud outages/OOM blips that a 3-ceiling would abort prematurely, while
 /// still bounding a stuck loop to at most 5 unobserved cycles before a
 /// terminal abort. Any increment of `infra_failures` must use
-/// `saturating_add` so a long-running stuck loop cannot overflow `u32`.
+/// `saturating_add` so a long-running stuck loop cannot overflow `u32`. The
+/// CLI's `transition()` resets `infra_failures` to 0 on every successful
+/// stage transition (CR-01, 17-06 gap closure) — this reset is what makes
+/// the "5 unobserved cycles" ceiling bound a stuck loop rather than a
+/// phase's entire lifetime.
 pub const MAX_INFRA_FAILURES: u32 = 5;
 
 /// How DevFlow drives the pipeline for a session.
