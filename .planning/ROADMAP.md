@@ -191,9 +191,11 @@ Hermes adapter, an accepted override recorded in
 `17-VERIFICATION.md`'s frontmatter (`overrides:`).
 **Depends on:** Phase 16
 **Blocks:** Phase 18 Hermes Support
-**Plans:** 5/5 plans executed
+**Plans:** 6/6 plans executed
 
 Plans:
+
+- [x] 17-06-PLAN.md
 
 **Wave 1** *(devflow-core foundations + build script, no shared files)*
 
