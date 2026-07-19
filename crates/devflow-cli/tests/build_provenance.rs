@@ -20,11 +20,20 @@ fn build_dirty_is_exactly_true_or_false() {
 }
 
 #[test]
-fn build_commit_is_accessible_and_does_not_panic() {
-    // May be empty in a no-git (crates.io) build per D-20 — accessing it
-    // must never panic either way.
+fn build_commit_is_empty_or_a_full_hex_sha() {
+    // Empty is legal in a no-git (crates.io) build per D-20 — absence of
+    // provenance is not staleness. Anything else must be a real SHA.
+    //
+    // GAP-4 (17-VALIDATION.md; 17-REVIEW.md IN-01): this previously read
+    // `let _ = commit.len();`, which discards its result and cannot panic,
+    // so it passed unconditionally regardless of what `build.rs` emitted
+    // while still being counted as one of row 7's covering tests.
     let commit = env!("DEVFLOW_BUILD_COMMIT");
-    let _ = commit.len();
+    assert!(
+        commit.is_empty() || (commit.len() == 40 && commit.chars().all(|c| c.is_ascii_hexdigit())),
+        "DEVFLOW_BUILD_COMMIT must be empty (no-git build, D-20) or a \
+         40-char hex SHA, got {commit:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
