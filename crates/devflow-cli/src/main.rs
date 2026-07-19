@@ -624,13 +624,9 @@ fn start(
         project_root,
         phase,
         "workflow_started",
-        serde_json::json!({
-            "agent": state.agent.to_string(),
-            "mode": state.mode.to_string(),
-            "worktree": state.worktree_path.as_ref().map(|p| p.display().to_string()),
-        }),
+        workflow_started_payload(&state),
     );
-    if let Err(err) = launch_stage(&state, None, None) {
+    if let Err(err) = launch_stage(&mut state, None, None) {
         if let Err(clear_err) = workflow::clear_state(project_root, phase) {
             eprintln!("warning: could not clear state after failed launch: {clear_err}");
         }
@@ -704,11 +700,337 @@ fn ensure_agent_binary(program: &str) -> Result<(), CliError> {
     )))
 }
 
+// ---------------------------------------------------------------------------
+// 17c: preflight readiness gate (D-13-D-16) — generic universal checks +
+// adapter hook, run from `launch_stage` before `monitor::spawn_monitor` so a
+// readiness failure is caught before any agent time is spent.
+// ---------------------------------------------------------------------------
+
+/// D-14 (universal, generic layer): a headless/auto Codex run cannot pass
+/// Define's discuss-phase interview — Codex's `exec` mode has no route to
+/// answer an interactive interview (`request_user_input is unavailable in
+/// Default mode`), unlike Claude/OpenCode's headless Define, which can and
+/// does complete it non-interactively (verified live, 13-06; the existing
+/// integration tests exercise exactly this: `--agent claude --mode auto`
+/// with no pre-existing CONTEXT.md succeeds). This check reuses the same
+/// `phase_artifact_on_develop` predicate as the existing pre-state Codex
+/// check in `start()`, but routes the failure through the preflight gate
+/// (D-15) instead of a hard error — closing the gap that check leaves open
+/// for non-`start()` launch paths (`resume`, gate retries, loop-backs). The
+/// pre-state Codex check itself is intentionally left unmigrated (Review
+/// dispositions, out of scope for this plan).
+fn preflight_interactivity_check(project_root: &Path, state: &State) -> Result<(), String> {
+    if state.agent == AgentKind::Codex
+        && state.mode == Mode::Auto
+        && state.stage == Stage::Define
+        && !phase_artifact_on_develop(project_root, state.phase, "-CONTEXT.md")
+    {
+        return Err(format!(
+            "phase {} has no CONTEXT.md on develop — codex cannot run Define's \
+             discuss-phase interview headlessly in auto mode",
+            state.phase
+        ));
+    }
+    Ok(())
+}
+
+/// D-14 (universal, generic layer): whether the gh-auth credential probe
+/// applies to `stage` — hardcoded to `Stage::Ship` rather than a dynamic
+/// hook-scan (review Plan 05 MEDIUM, Codex+OpenCode): Ship's terminal hooks
+/// (`hooks::hooks_after_ship()` = Merge/VersionBump/BranchCleanup,
+/// `hooks.rs:87-89`) are the only hooks that push to a remote. Split out as
+/// its own pure predicate so "does not run for a non-Ship stage" is directly
+/// unit-testable without shelling out to `gh`.
+fn gh_auth_check_applies(stage: Stage) -> bool {
+    stage == Stage::Ship
+}
+
+/// D-14 (universal, generic layer): external credential validity via `gh
+/// auth status`, run ONLY when [`gh_auth_check_applies`] (Ship). Fails soft
+/// to a warning when the `gh` binary itself is absent — a missing optional
+/// tool must not hard-fail the pipeline (T-17-14). Fails preflight only when
+/// `gh` is present and reports unauthenticated. Records only a boolean
+/// pass/fail plus a short reason string — raw `gh auth status` stdout/stderr
+/// is NEVER captured or logged (T-17-13, Information Disclosure).
+fn preflight_gh_auth_check(state: &State) -> Result<(), String> {
+    if !gh_auth_check_applies(state.stage) {
+        return Ok(());
+    }
+    match std::process::Command::new("gh")
+        .args(["auth", "status"])
+        .output()
+    {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(_) => Err("gh auth status reports not authenticated".to_string()),
+        Err(_) => {
+            println!(
+                "warning: `gh` binary not found — cannot verify GitHub credential validity \
+                 before Ship (fail-soft, not a preflight failure)"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// The generic (universal) preflight checks (D-14) — the adapter-specific
+/// hook is composed separately in [`run_preflight`].
+fn generic_preflight_checks(project_root: &Path, state: &State) -> Result<(), String> {
+    preflight_interactivity_check(project_root, state)?;
+    preflight_gh_auth_check(state)
+}
+
+/// Gate a stage launch on readiness (17c, D-13-D-16): the generic universal
+/// checks (D-14) plus the adapter-specific hook, called from `launch_stage`
+/// BEFORE `monitor::spawn_monitor` so a readiness failure is caught before
+/// any agent time is spent. A failing check is NEVER a hard exit — it
+/// surfaces as a named preflight gate + notify (WR-11 idiom, D-15), mirroring
+/// `handle_stage_failure`'s dispatch shape exactly.
+fn run_preflight(
+    project_root: &Path,
+    state: &mut State,
+    adapter: &dyn agents::AgentAdapter,
+) -> Result<(), CliError> {
+    let stage = state.stage;
+    if let Err(reason) =
+        generic_preflight_checks(project_root, state).and_then(|()| adapter.preflight(state))
+    {
+        let context = format!(
+            "[never-silent] preflight failed for stage {stage}: {} — human review needed \
+             (retry, loop-to-code, or abort)",
+            truncate_reason(&reason)
+        );
+        return match run_gate(project_root, state, stage, &context)? {
+            GateAction::Advance => {
+                let _ = Gates::cleanup(project_root, state.phase, stage);
+                state.gate_pending = false;
+                launch_stage(state, None, None)
+            }
+            GateAction::LoopBack(_) => {
+                let _ = Gates::cleanup(project_root, state.phase, stage);
+                launch_stage(state, None, None)
+            }
+            GateAction::Abort(reason) => abort(project_root, state, &reason),
+        };
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 17d: build provenance + self-dogfood staleness gate (D-17-D-21).
+// ---------------------------------------------------------------------------
+
+/// D-21: the `workflow_started` event payload, including build provenance —
+/// factored out of `start()` so the payload shape is directly unit-testable
+/// without spawning a real agent (`start()` calls `launch_stage` immediately
+/// after emitting this event).
+fn workflow_started_payload(state: &State) -> serde_json::Value {
+    serde_json::json!({
+        "agent": state.agent.to_string(),
+        "mode": state.mode.to_string(),
+        "worktree": state.worktree_path.as_ref().map(|p| p.display().to_string()),
+        "version": env!("CARGO_PKG_VERSION"),
+        "commit": env!("DEVFLOW_BUILD_COMMIT"),
+        "dirty": env!("DEVFLOW_BUILD_DIRTY"),
+        "build_timestamp": env!("DEVFLOW_BUILD_TIMESTAMP"),
+        "exe_path": std::env::current_exe()
+            .ok()
+            .map(|p| p.display().to_string()),
+    })
+}
+
+/// Whether the build embedded in `embedded_commit` is stale relative to
+/// `project_root`'s current `HEAD` — the ancestry half of D-19's composite
+/// definition. Per git's documented exit-code contract for `merge-base
+/// --is-ancestor` (exit 0 = ancestor, exit 1 = not, other = error/unknown
+/// commit — Pitfall 4), only exit 1 is treated as definitively Stale; any
+/// other outcome (including an empty `embedded_commit` — D-20: absence of
+/// provenance is not staleness) is Indeterminate, never a false block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Staleness {
+    Fresh,
+    Stale,
+    Indeterminate,
+}
+
+fn embedded_commit_is_stale(project_root: &Path, embedded_commit: &str) -> Staleness {
+    if embedded_commit.is_empty() {
+        return Staleness::Indeterminate;
+    }
+    let output = std::process::Command::new("git")
+        .args(["merge-base", "--is-ancestor", embedded_commit, "HEAD"])
+        .current_dir(project_root)
+        .output();
+    match output.map(|o| o.status.code()) {
+        Ok(Some(0)) => Staleness::Fresh,
+        Ok(Some(1)) => Staleness::Stale,
+        _ => Staleness::Indeterminate,
+    }
+}
+
+/// Shell `git` in `project_root`, returning `None` on any failure (missing
+/// binary, non-git directory, non-zero exit) — same argv-array idiom as
+/// `build.rs`'s `run_git`.
+fn run_git_stdout(project_root: &Path, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(project_root)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// The mtime half of D-19's composite staleness: whether any TRACKED,
+/// modified source file is newer than the build timestamp — but only
+/// evaluated when the working tree is dirty (`git status --porcelain`
+/// non-empty). A clean tree needs no mtime check at all: an ancestor-of-HEAD
+/// clean tree is already covered by the ancestry arm (D-19 Open Question 2).
+/// `build_timestamp` (Unix seconds) is converted to a `SystemTime`
+/// EXPLICITLY via `UNIX_EPOCH + Duration::from_secs(..)` before comparison
+/// (review Plan 05 LOW, OpenCode) — never compared as a raw integer.
+/// Returns `None` when git itself is unavailable, so the composite check
+/// falls back to the ancestry arm alone.
+fn tracked_source_newer_than_build(project_root: &Path, build_timestamp: u64) -> Option<bool> {
+    let status = run_git_stdout(project_root, &["status", "--porcelain"])?;
+    if status.trim().is_empty() {
+        return Some(false);
+    }
+    let modified = run_git_stdout(project_root, &["ls-files", "-m"])?;
+    let build_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(build_timestamp);
+    Some(modified.lines().any(|rel_path| {
+        std::fs::metadata(project_root.join(rel_path))
+            .and_then(|m| m.modified())
+            .map(|mtime| mtime > build_time)
+            .unwrap_or(false)
+    }))
+}
+
+/// D-19: composite staleness — Stale iff the embedded commit is not an
+/// ancestor of `project_root`'s `HEAD`, OR its tracked-modified source (when
+/// dirty) is newer than the build timestamp. An Indeterminate ancestry
+/// result with no mtime signal stays Indeterminate — never hard-blocked.
+fn combined_staleness(
+    project_root: &Path,
+    embedded_commit: &str,
+    build_timestamp: u64,
+) -> Staleness {
+    let ancestry = embedded_commit_is_stale(project_root, embedded_commit);
+    if ancestry == Staleness::Stale {
+        return Staleness::Stale;
+    }
+    match tracked_source_newer_than_build(project_root, build_timestamp) {
+        Some(true) => Staleness::Stale,
+        _ => ancestry,
+    }
+}
+
+/// D-17: whether `project_root` IS the DevFlow workspace itself (as opposed
+/// to some other project being driven by a devflow binary) — deterministic,
+/// offline, no config. Scans the `members = [...]` array of the root
+/// `Cargo.toml` for BOTH exact member-path strings, never a package `name`
+/// (the CLI crate's package is named `devflow`, not `devflow-cli` — a name
+/// match would never fire on the incident workspace; review consensus #2 +
+/// Plan 05 MEDIUM OpenCode). No TOML parser is used here: locating the
+/// `members` array's bounds first, then scanning within it, is the
+/// sanctioned middle ground and is unlikely to false-positive on an
+/// unrelated project.
+fn is_self_dogfood_workspace(project_root: &Path) -> bool {
+    let Ok(contents) = std::fs::read_to_string(project_root.join("Cargo.toml")) else {
+        return false;
+    };
+    let Some(members_start) = contents.find("members") else {
+        return false;
+    };
+    let rest = &contents[members_start..];
+    let Some(open_rel) = rest.find('[') else {
+        return false;
+    };
+    let after_open = &rest[open_rel + 1..];
+    let Some(close_rel) = after_open.find(']') else {
+        return false;
+    };
+    let members = &after_open[..close_rel];
+    members.contains("crates/devflow-core") && members.contains("crates/devflow-cli")
+}
+
+/// The outcome of the self-dogfood staleness gate (D-18): `Block` only when
+/// the project IS DevFlow's own workspace AND its build is confirmed Stale —
+/// everything else (an ordinary project, or an Indeterminate result on any
+/// project, Pitfall 4) only warns or is silent. Kept pure so the
+/// self-dogfood-blocks vs. ordinary-warns split is directly unit-testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StalenessOutcome {
+    Block,
+    Warn,
+    Ok,
+}
+
+fn staleness_outcome(is_self_dogfood: bool, staleness: Staleness) -> StalenessOutcome {
+    match (is_self_dogfood, staleness) {
+        (true, Staleness::Stale) => StalenessOutcome::Block,
+        (false, Staleness::Stale) => StalenessOutcome::Warn,
+        (_, Staleness::Indeterminate) => StalenessOutcome::Warn,
+        (_, Staleness::Fresh) => StalenessOutcome::Ok,
+    }
+}
+
+/// D-17/D-18/D-19 (17d): the self-dogfood build-staleness gate, called from
+/// `launch_stage` before `monitor::spawn_monitor`. A Stale build against
+/// DevFlow's OWN workspace is a hard block — deliberately NOT an approvable
+/// gate, because approving it would reintroduce the exact Phase 16
+/// false-evidence incident — but it is never SILENT: notify + an event fire
+/// before the blocking error is returned, so an unattended cron run still
+/// sees it (reconciling D-15's never-silent idiom with D-18's hard block).
+/// An ordinary project (or an Indeterminate result) only warns and proceeds.
+fn enforce_build_staleness(
+    project_root: &Path,
+    state: &State,
+    embedded_commit: &str,
+    build_timestamp: u64,
+) -> Result<(), CliError> {
+    let staleness = combined_staleness(project_root, embedded_commit, build_timestamp);
+    let self_dogfood = is_self_dogfood_workspace(project_root);
+    match staleness_outcome(self_dogfood, staleness) {
+        StalenessOutcome::Block => {
+            let message = format!(
+                "self-dogfood stale build blocked for stage {}: this devflow binary's \
+                 embedded commit is not an ancestor of {}'s current HEAD (or its tracked \
+                 source is newer than the build) — rebuild devflow before driving its own \
+                 workspace (D-18; the Phase 16 false-evidence incident)",
+                state.stage,
+                project_root.display()
+            );
+            gates::fire_gate_notify(state.phase, state.stage, &message, true);
+            events::emit(
+                project_root,
+                state.phase,
+                "self_dogfood_stale_blocked",
+                serde_json::json!({
+                    "stage": state.stage.to_string(),
+                    "reason": truncate_reason(&message),
+                }),
+            );
+            Err(CliError::Message(message))
+        }
+        StalenessOutcome::Warn => {
+            println!(
+                "warning: build provenance staleness check did not confirm a fresh build for \
+                 stage {} — proceeding (only DevFlow's own workspace is ever hard-blocked, D-18)",
+                state.stage
+            );
+            Ok(())
+        }
+        StalenessOutcome::Ok => Ok(()),
+    }
+}
+
 /// Spawn the background monitor that owns the agent for `state.stage`. The
 /// monitor calls `devflow advance` when the agent exits. An optional
 /// `prompt_override` is used for Code loop-backs (fix prompts).
 fn launch_stage(
-    state: &State,
+    state: &mut State,
     prompt_override: Option<String>,
     archived_stage: Option<Stage>,
 ) -> Result<(), CliError> {
@@ -727,6 +1049,22 @@ fn launch_stage(
         .unwrap_or_default();
     let (program, args) = adapter.exec_command(state.phase, &prompt, &roots);
     ensure_agent_binary(program)?;
+
+    // 17c (Task 1, D-13-D-16): a scoped readiness gate runs before any agent
+    // time is spent — a failing check surfaces as a named preflight gate +
+    // notify (never a hard exit, D-15), not here.
+    let project_root = state.project_root.clone();
+    run_preflight(&project_root, state, adapter.as_ref())?;
+
+    // 17d (Task 2, D-17-D-19): self-dogfood build-staleness gate — also
+    // before spawn_monitor, so a stale DevFlow-on-itself run never even
+    // reaches the agent.
+    enforce_build_staleness(
+        &project_root,
+        state,
+        env!("DEVFLOW_BUILD_COMMIT"),
+        env!("DEVFLOW_BUILD_TIMESTAMP").parse().unwrap_or(0),
+    )?;
 
     if let Some(stamp) = agent_result::archive_phase_files(
         &state.project_root,
@@ -791,8 +1129,8 @@ fn resume(project_root: &Path, phase: u32) -> Result<(), CliError> {
         }
         Err(err) => return Err(CliError::Message(format!("lock error: {err}"))),
     };
-    let state = workflow::load_state(project_root, phase)?;
-    launch_stage(&state, None, None)
+    let mut state = workflow::load_state(project_root, phase)?;
+    launch_stage(&mut state, None, None)
 }
 
 /// The single active phase: `Ok(Some)` when exactly one is active, `Ok(None)`
@@ -3976,6 +4314,436 @@ mod tests {
         // pre-flight must not block.
         let empty = tempfile::tempdir().unwrap();
         assert!(phase_artifact_on_develop(empty.path(), 3, "-CONTEXT.md"));
+    }
+
+    // -----------------------------------------------------------------
+    // 17c: preflight readiness gate (D-13-D-16, Task 1)
+    // -----------------------------------------------------------------
+
+    /// D-14 interactivity check: a headless Auto-mode Codex Define run with
+    /// no CONTEXT.md on develop is flagged; Supervise mode, a non-Define
+    /// stage, a non-Codex agent (Claude/OpenCode can complete Define
+    /// headlessly, verified live 13-06 — the existing `start_defaults_to_
+    /// worktree` integration test exercises exactly this), and a CONTEXT.md
+    /// that does exist are all unaffected.
+    #[test]
+    fn preflight_interactivity_check_flags_auto_define_without_context_md() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let mut state = State::new(60, AgentKind::Codex, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Define;
+        assert!(preflight_interactivity_check(root, &state).is_err());
+
+        state.mode = Mode::Supervise;
+        assert!(preflight_interactivity_check(root, &state).is_ok());
+
+        state.mode = Mode::Auto;
+        state.stage = Stage::Plan;
+        assert!(preflight_interactivity_check(root, &state).is_ok());
+
+        state.stage = Stage::Define;
+        state.agent = AgentKind::Claude;
+        assert!(
+            preflight_interactivity_check(root, &state).is_ok(),
+            "Claude/OpenCode can complete Define headlessly — only Codex is flagged"
+        );
+        state.agent = AgentKind::Codex;
+
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        std::fs::create_dir_all(root.join(".planning/phases/60-widget")).unwrap();
+        std::fs::write(root.join(".planning/phases/60-widget/60-CONTEXT.md"), "ctx").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "context"]);
+
+        state.stage = Stage::Define;
+        assert!(preflight_interactivity_check(root, &state).is_ok());
+    }
+
+    /// D-14 gh-auth scope: hardcoded to Stage::Ship, not a dynamic hook-scan.
+    #[test]
+    fn gh_auth_check_applies_only_to_ship_stage() {
+        assert!(gh_auth_check_applies(Stage::Ship));
+        for stage in [Stage::Define, Stage::Plan, Stage::Code, Stage::Validate] {
+            assert!(!gh_auth_check_applies(stage));
+        }
+    }
+
+    /// A failing preflight check routes through the never-silent gate and,
+    /// on Abort, never reaches `monitor::spawn_monitor` — no `stage_launched`
+    /// event is ever recorded. The Abort response is pre-seeded so
+    /// `run_gate`'s poll resolves immediately.
+    #[test]
+    fn run_preflight_failing_check_gates_and_never_reaches_spawn_monitor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 61;
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Define;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Define);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        let adapter = agents::adapter_for(AgentKind::Codex);
+        run_preflight(root, &mut state, adapter.as_ref()).unwrap();
+
+        assert!(
+            workflow::load_state(root, phase).is_err(),
+            "abort() must clear state — spawn_monitor was never reached"
+        );
+        let last = devflow_core::events::last_event_for_phase(root, phase)
+            .expect("gate_fired/gate_resolved must have been recorded");
+        assert_ne!(last["event"], "stage_launched");
+    }
+
+    /// The adapter-specific hook (D-14 adapter) is actually consulted by
+    /// `run_preflight` — a TEST-ONLY adapter that always rejects still routes
+    /// through the same gate+abort path as a generic-check failure.
+    #[test]
+    fn run_preflight_adapter_hook_override_fires() {
+        struct AlwaysRejectAdapter;
+        impl agents::AgentAdapter for AlwaysRejectAdapter {
+            fn name(&self) -> &'static str {
+                "test-reject"
+            }
+            fn exec_command(
+                &self,
+                _phase: u32,
+                _prompt: &str,
+                _roots: &[PathBuf],
+            ) -> (&'static str, Vec<String>) {
+                ("true", Vec::new())
+            }
+            fn completion_signal_detected(&self, _output: &str) -> bool {
+                false
+            }
+            fn preflight(&self, _state: &State) -> Result<(), String> {
+                Err("test adapter always rejects".to_string())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let phase = 62;
+        // Plan is unaffected by the interactivity/gh-auth generic checks, so
+        // only the adapter hook can be the source of this failure.
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Plan;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Plan);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        run_preflight(root, &mut state, &AlwaysRejectAdapter).unwrap();
+
+        assert!(workflow::load_state(root, phase).is_err());
+        let last = devflow_core::events::last_event_for_phase(root, phase).unwrap();
+        assert_eq!(last["event"], "workflow_aborted");
+    }
+
+    // -----------------------------------------------------------------
+    // 17d: build provenance + self-dogfood staleness gate (D-17-D-21, Task 2)
+    // -----------------------------------------------------------------
+
+    /// D-21: the `workflow_started` payload carries every provenance field,
+    /// tested directly without spawning a real agent.
+    #[test]
+    fn workflow_started_payload_carries_build_provenance() {
+        let state = State::new(66, AgentKind::Claude, Mode::Auto, PathBuf::from("/repo"));
+        let payload = workflow_started_payload(&state);
+        assert_eq!(payload["agent"], "claude");
+        assert_eq!(payload["mode"], "auto");
+        assert!(payload["version"].as_str().is_some());
+        assert!(payload["commit"].is_string());
+        assert!(payload["dirty"].is_string());
+        assert!(payload["build_timestamp"].is_string());
+        assert!(payload["exe_path"].is_string() || payload["exe_path"].is_null());
+    }
+
+    /// D-17: matches only when BOTH exact member paths appear inside the
+    /// `members = [...]` array — never a package `name` match.
+    #[test]
+    fn is_self_dogfood_workspace_matches_both_member_paths_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\n    \"crates/devflow-core\",\n    \"crates/devflow-cli\",\n]\n",
+        )
+        .unwrap();
+        assert!(is_self_dogfood_workspace(root));
+
+        let name_only = tempfile::tempdir().unwrap();
+        std::fs::write(
+            name_only.path().join("Cargo.toml"),
+            "[package]\nname = \"devflow-cli\"\n",
+        )
+        .unwrap();
+        assert!(
+            !is_self_dogfood_workspace(name_only.path()),
+            "a package NAME match must never fire — the CLI package is named `devflow`"
+        );
+
+        let partial = tempfile::tempdir().unwrap();
+        std::fs::write(
+            partial.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/devflow-core\"]\n",
+        )
+        .unwrap();
+        assert!(!is_self_dogfood_workspace(partial.path()));
+
+        let missing = tempfile::tempdir().unwrap();
+        assert!(!is_self_dogfood_workspace(missing.path()));
+    }
+
+    /// Build a repo with a `base` commit, a diverged `side`-branch commit
+    /// that is NOT an ancestor of the final `trunk` HEAD, then return to
+    /// `trunk` — exercises all three `embedded_commit_is_stale` outcomes
+    /// against a real git history.
+    fn init_repo_with_diverged_commit(root: &Path) -> (String, String) {
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        let rev_parse = || {
+            let out = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(root)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        git(&["init", "-q", "-b", "trunk"]);
+        git(&["config", "user.email", "t@e.st"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(root.join("a.txt"), "one").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        let base = rev_parse();
+
+        git(&["checkout", "-q", "-b", "side"]);
+        std::fs::write(root.join("side.txt"), "s").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "side"]);
+        let side = rev_parse();
+
+        git(&["checkout", "-q", "trunk"]);
+        std::fs::write(root.join("trunk2.txt"), "t2").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "trunk2"]);
+
+        (base, side)
+    }
+
+    /// Pitfall 4: exit 0 -> Fresh, exit 1 -> Stale, and anything else
+    /// (unknown commit, empty embedded commit) -> Indeterminate, never a
+    /// false block.
+    #[test]
+    fn embedded_commit_is_stale_maps_ancestry_exit_codes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (base, side) = init_repo_with_diverged_commit(root);
+
+        assert_eq!(embedded_commit_is_stale(root, &base), Staleness::Fresh);
+        assert_eq!(embedded_commit_is_stale(root, &side), Staleness::Stale);
+        assert_eq!(embedded_commit_is_stale(root, ""), Staleness::Indeterminate);
+        assert_eq!(
+            embedded_commit_is_stale(root, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
+            Staleness::Indeterminate
+        );
+    }
+
+    /// D-19 composite/OR: a clean tree whose embedded commit IS an ancestor
+    /// (HEAD itself) is Fresh regardless of `build_timestamp`; but once a
+    /// TRACKED file is modified (dirty tree) with an mtime newer than the
+    /// build timestamp, the mtime arm flips the composite result to Stale
+    /// even though ancestry alone says Fresh. The epoch conversion is
+    /// explicit (`UNIX_EPOCH + Duration::from_secs`), never a raw-integer
+    /// comparison (review Plan 05 LOW, OpenCode).
+    #[test]
+    fn combined_staleness_mtime_arm_flags_dirty_tree_newer_than_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@e.st"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(root.join("a.txt"), "one").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        let head = {
+            let out = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(root)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        assert_eq!(embedded_commit_is_stale(root, &head), Staleness::Fresh);
+        assert_eq!(combined_staleness(root, &head, 0), Staleness::Fresh);
+
+        std::fs::write(root.join("a.txt"), "modified after build").unwrap();
+        assert_eq!(combined_staleness(root, &head, 0), Staleness::Stale);
+    }
+
+    /// D-18: a self-dogfood workspace (matching `members = [...]`) with a
+    /// confirmed-Stale embedded commit is a HARD block — but never silent:
+    /// notify fires (best-effort; no `DEVFLOW_GATE_NOTIFY_CMD` is set here so
+    /// it's a no-op) and an event is recorded BEFORE the blocking error is
+    /// returned.
+    #[test]
+    fn enforce_build_staleness_blocks_self_dogfood_and_records_event_before_erroring() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (_base, side) = init_repo_with_diverged_commit(root);
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/devflow-core\", \"crates/devflow-cli\"]\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "add workspace cargo toml"]);
+        assert!(is_self_dogfood_workspace(root));
+
+        let phase = 63;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+
+        let err = enforce_build_staleness(root, &state, &side, 0).unwrap_err();
+        assert!(
+            err.to_string().contains("self-dogfood stale build blocked"),
+            "{err}"
+        );
+
+        let last = devflow_core::events::last_event_for_phase(root, phase)
+            .expect("staleness block must record an event before returning the error");
+        assert_eq!(last["event"], "self_dogfood_stale_blocked");
+    }
+
+    /// D-18: an ordinary (non-self-dogfood) project with the same confirmed-
+    /// Stale embedded commit only warns and proceeds — no event, no error.
+    #[test]
+    fn enforce_build_staleness_warns_for_ordinary_project_with_stale_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (_base, side) = init_repo_with_diverged_commit(root);
+        assert!(!is_self_dogfood_workspace(root));
+
+        let phase = 64;
+        let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+
+        let result = enforce_build_staleness(root, &state, &side, 0);
+        assert!(
+            result.is_ok(),
+            "an ordinary project's stale build must only warn, never block"
+        );
+        assert!(
+            devflow_core::events::last_event_for_phase(root, phase).is_none(),
+            "a warn-only path must not fire the self_dogfood_stale_blocked event"
+        );
+    }
+
+    /// Pitfall 4 / D-18: an Indeterminate result (unknown embedded commit)
+    /// never hard-blocks, even for a self-dogfood workspace.
+    #[test]
+    fn enforce_build_staleness_never_blocks_on_indeterminate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@e.st"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/devflow-core\", \"crates/devflow-cli\"]\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        assert!(is_self_dogfood_workspace(root));
+
+        let phase = 65;
+        let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+
+        let result =
+            enforce_build_staleness(root, &state, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", 0);
+        assert!(
+            result.is_ok(),
+            "an Indeterminate result must never hard-block"
+        );
     }
 
     /// 13-06 dogfood regression: a multi-KB parser-derived reason reached
