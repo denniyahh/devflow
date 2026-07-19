@@ -208,7 +208,7 @@ Plans:
 **Wave 1** *(devflow-core foundations + build script, no shared files)*
 
 - [x] 17-01-PLAN.md — 17b: typed outcome taxonomy (ResourceKilled/AgentUnavailable), Layer 2 exit-code classification, pure exhaustive outcome→action policy module, separate infra-failure counter
-- [x] 17-02-PLAN.md — 17d: first workspace build.rs embedding git provenance (commit/dirty/timestamp) with graceful no-git degradation
+- [x] 17-02-PLAN.md — 17d: first workspace build.rs embedding git provenance (commit/dirty) with graceful no-git degradation *(the build timestamp originally planned here was removed by 17-11 closing CR-02: a per-second value forced a devflow-cli recompile on every build once build.rs always re-runs)*
 
 **Wave 2** *(blocked on 17-01: shares agent_result.rs)*
 

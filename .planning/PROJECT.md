@@ -103,4 +103,4 @@ mid-run crash or kill.
 | `.planning/CONCERNS.md` | Top findings from the original pre-Phase-1 codebase audit |
 
 ---
-*Last updated: 2026-07-19 after Phase 17 completion (verified 12/12)*
+*Last updated: 2026-07-19 after Phase 17 completion (verified 14/14)*
