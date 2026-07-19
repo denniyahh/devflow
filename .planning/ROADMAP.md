@@ -240,3 +240,28 @@ Also carries two items deferred from Phase 17 on 2026-07-18 (18d, 18e). These ar
 Plans:
 
 - [ ] TBD (run /gsd-plan-phase 18 to break down)
+
+### Phase 19: Operator Observability + Pipeline Self-Consistency
+
+**Goal:** Make DevFlow's own supervision layer trustworthy and usable from a plain terminal. Every item below was found by dogfooding Phase 17 end-to-end on 2026-07-18/19; none is speculative, and each carries reproduction evidence in `.planning/OPERATOR-OBSERVABILITY-FINDINGS.md` or `17-REVIEW.md`.
+
+Sequence after Phase 18 — 18d (`devflow doctor` reconciliation) overlaps 19a and should land first so 19a extends it rather than duplicating it.
+
+- **19a — monitor liveness is unobservable ("who watches the watcher"):** `monitor_pid` is emitted to `events.jsonl` but never persisted to `State` and never liveness-checked. `devflow status` probes only `agent_pid`, so a dead monitor renders identically to a healthy between-stages moment. Two silent monitor deaths in the Phase 17 run cost ~4h; both were found only via `ps`. Persist `monitor_pid`, probe it, and make "stuck — needs `devflow resume`" a representable state.
+- **19b — a phase tracks exactly one process:** one `phase-N-agent-pid` file per phase leaves the monitor unrecorded and `sequentagent`'s second agent homeless. Frame as two tracked processes per phase, not a general multi-agent table. Orphaned strays (a live test-fixture agent under `/tmp`) are invisible to every devflow command.
+- **19c — the CLI assumes a reader who will parse JSONL:** gate reasons truncate to `[truncated; full output in .devflow/]` with no `devflow gate show`; rate-limit reset times exist only inside raw agent JSON; `status` reports the stage but nothing about progress inside it; recovery verbs (`advance`, `resume`) are undiscoverable from a stuck state.
+- **19d — staleness is evaluated against the wrong tree:** `enforce_build_staleness` compares the binary's embedded commit to `project_root`'s HEAD. For a worktree-based phase the code under test lives on the worktree branch, so a binary two hours behind that branch classifies as `Ahead` (warn) because it is a descendant of `develop`. This is the root cause of Round 4 CR-01: a stale binary silently ran the pre-17-12 hook batch and re-emitted a false changelog heading. Evaluate against the worktree HEAD when the phase has one.
+- **19e — `write_version` corrupts `package.json`:** `replace_version_in_contents` drops the trailing comma, producing invalid committed JSON (Round 4 CR-02). Pre-existing; unrelated to Phase 17's changes.
+- **19f — `hooks_after_ship()` desyncs the changelog from the tag with no version file:** `version_bump` takes its `else` branch ("no supported version file; tagging only") and still tags `v{compute_version()}`, while `changelog_append` calls `read_version`, errors, and falls back to the literal `"unreleased"` (Round 4 CR-03). A gap in 17-12's design: it assumed `version_bump` always writes a version file.
+- **19g — the Code↔Validate loop can never reach its own safety gate:** `transition()` unconditionally resets `consecutive_failures`, so the counter oscillates 0↔1 and `MAX_CONSECUTIVE_FAILURES = 3` is unreachable for the exact loop it bounds. Observed live across three cycles. Under `--mode auto` this loops indefinitely while `status` shows a healthy alternating pipeline. Note 17-06 added the `infra_failures` reset to the same function, which likely inherits the weakness.
+- **19h — version-tag contention on concurrent ship:** two phases compute the same next version and race to create one tag; 17-09 bounded the *test* but deliberately left the product race open. Proven real — instrumentation caught both phases inside `version_bump` with identical computed versions ~1.8ms apart.
+- **19i — a third flake class (PATH race):** a test mutating process-global `PATH` under `ENV_MUTEX` makes a sibling's `git` spawn fail with `NotFound`. Passed 3/3 isolated and green on re-run. Distinct from GAP-2's gate-poll hang.
+- **19j — `ChangelogAppend` writes placeholder content:** every generated entry is "Released phase via DevFlow", describing nothing about the phase. Repeatedly noted and deliberately deferred across 17-10 and 17-12.
+
+**Requirements**: 19a–19j (all dogfood-sourced)
+**Depends on:** Phase 18 (18d overlaps 19a)
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (run /gsd-plan-phase 19 to break down)
