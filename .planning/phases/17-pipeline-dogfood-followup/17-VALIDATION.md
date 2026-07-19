@@ -14,6 +14,7 @@ reaudited_2_at_commit: 636d1ab
 reaudited_3_at_commit: b77c13e
 reaudited_4_at_commit: e61171f
 reaudited_5_at_commit: 46058a7
+reaudited_6_at_commit: 1070df0
 ---
 
 # Phase 17 — Validation Strategy
@@ -336,7 +337,7 @@ with Phase 18's Hermes adapter, the first adapter with real reviewer storage.
 
 - [x] All requirements have automated verification or a recorded manual-only/override disposition
 - [x] Sampling continuity: no 3 consecutive tasks without automated verify
-- [x] Test infrastructure confirmed: `cargo test --workspace` green (362 passed / 0 failed / **0 ignored** across 10 targets), `cargo clippy --workspace --all-targets -- -D warnings` clean, `cargo fmt --check` clean (re-confirmed 2026-07-19 at `cf062e6`)
+- [x] Test infrastructure confirmed: `cargo test --workspace` green (**367 passed / 0 failed / 0 ignored / 0 filtered** across 10 targets), `cargo clippy --workspace --all-targets -- -D warnings` clean, `cargo fmt --check` clean (re-confirmed 2026-07-19 at `1070df0`, re-audit #6)
 - [x] No watch-mode flags
 - [x] Feedback latency < 90s — holds on a clean run (~11s warm); the ~33–40 % of runs where GAP-2's
   race manifests now resolve in a bounded ~2–4 s (via the `DEVFLOW_GATE_TIMEOUT_SECS=2` test-scoped
@@ -681,3 +682,70 @@ re-audit #4 reproduced against, that value stayed frozen at `false` across exact
 `nyquist_compliant` returns to `true` — rows 7 and 8 now sample 17d's provenance *freshness*, the
 property re-audit #4 correctly identified as the textbook Nyquist failure, and not merely its shape.
 17d's provenance guarantee is now earned rather than assumed.
+
+---
+
+## Validation Re-Audit #6 2026-07-19 (HEAD `1070df0`)
+
+Sixth pass. Re-audit #5 certified `46058a7`; two commits have landed since (`3d6e6a6`, `1070df0`)
+and **both are documentation-only** — `git diff --stat 46058a7..HEAD` touches `ROADMAP.md`,
+`STATE.md`, `17-VALIDATION.md`, and `17-VERIFICATION.md`, and no file under `crates/`. Re-audit #4's
+rule ("a PASS verdict does not survive its own commit range") therefore does not force a re-derivation
+here, but the newest claims — GAP-3 and GAP-4, closed only one pass ago — had been verified by
+observation rather than by mutation. This pass closes that.
+
+| Metric | Count |
+|--------|-------|
+| Requirement rows audited | 11 |
+| Per-Task Map covering refs confirmed present in tree | **40 / 40** |
+| `coverage:` refs across `17-01`…`17-11-SUMMARY.md` confirmed present | 49 / 51 (2 superseded names — see below) |
+| Suite result (**unfiltered**) | **367 passed / 0 failed / 0 ignored / 0 filtered** (10 targets), `cargo` exit 0 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | clean (exit 0) |
+| `cargo fmt --check` | clean (exit 0) |
+| Rows green | **11** |
+| Gaps still open | **0** |
+| New gaps found | **0** |
+
+**Gates run directly, exit codes captured from `cargo` itself** — not through a pipe whose status
+belongs to `tail` (re-audit #4's recorded false-green trap). 367 reconciles exactly with re-audit #5.
+
+**GAP-3 re-verified by mutation, not observation — the decisive addition of this pass.** Re-audit #5
+closed GAP-3 on the strength of the new test passing and a live cache observation. That shows the
+test is green; it does not show the test would go *red* if the defect returned. So `build.rs`'s
+always-rerun sentinel (`:43`) was surgically reverted to the exact pre-fix trigger set
+(`.git/HEAD`, `.git/refs`, `.git/packed-refs`) and
+`build_dirty_flips_false_to_true_across_a_working_tree_edit_after_rebuild` was re-run:
+
+| | Result |
+|---|---|
+| Against reintroduced defect | **FAILED** — `build_provenance.rs:205`, `left: "false"` / `right: "true"` |
+| After restoring `build.rs` | 3/3 green, working tree clean (`git status --porcelain` empty) |
+
+The observed `left: "false"` is precisely the frozen value re-audit #4 reproduced by hand in
+`/tmp/dfprobe`. The test catches CR-02 for real; it does not pass vacuously. This is the same
+adversarial standard re-audit #3 applied to GAP-1 and GAP-2, now extended to GAP-3.
+
+**GAP-4 confirmed to bind on its strong branch.** `build_commit_is_empty_or_a_full_hex_sha` permits
+an empty commit per D-20's no-git case, so a green result would be uninformative if the embedded
+value were empty. It is not: the build-script cache at this HEAD reads
+`DEVFLOW_BUILD_COMMIT=1070df0a7de4fd0c242b5b30dd144e0a7dbf486a` — a real 40-char SHA, so the
+`len() == 40 && all hexdigit` branch is the one actually exercised. That value also tracks current
+HEAD (re-audit #5 recorded `71c4ebd`), which is independent live evidence the build script re-runs.
+
+**Two superseded coverage refs in `17-02-SUMMARY.md` — noted, not a gap.** Lines 43 and 49 still cite
+`build_timestamp_is_a_parseable_u64` and `build_commit_is_accessible_and_does_not_panic`, neither of
+which exists in the tree: the first was retired with `DEVFLOW_BUILD_TIMESTAMP` (CR-02) and the second
+was renamed by GAP-4's closure. The behaviors are covered by their replacements, which row 7 maps
+correctly. `17-02-SUMMARY.md` is a point-in-time execution record and is left unedited, consistent
+with how this document has treated prior snapshots. Recorded here so a future automated ref-check
+reads these as superseded rather than as phantom coverage.
+
+**Verdict: PASS.** All eleven requirement rows are automated, green, deterministic, and unfiltered,
+and every gap this document ever raised (GAP-1 through GAP-4) has now been verified adversarially —
+each one re-run against a deliberately reintroduced defect and confirmed to fail. `nyquist_compliant`
+stays `true`, on the strongest evidence across six passes.
+
+**The one named item that survives is unchanged and is not a validation gap:** the product-level
+version-tag contention between two concurrently-shipping phases (GAP-2's "Product-level" paragraph).
+Phase 17 neither introduced nor owns it, it guards no Phase 17 requirement, and it remains recorded
+as OUT OF SCOPE, belonging to future ship/version-bump concurrency work.
