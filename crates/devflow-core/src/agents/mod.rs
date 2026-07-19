@@ -42,6 +42,20 @@ pub trait AgentAdapter {
 
     /// Detect an agent-specific completion signal in captured output.
     fn completion_signal_detected(&self, output: &str) -> bool;
+
+    /// Adapter-specific pre-launch readiness check (D-13/D-14 adapter hook,
+    /// Phase 17c). The default is a no-op — most adapters have nothing extra
+    /// to check, mirroring [`Self::extra_env`]'s empty-default shape. The
+    /// `Err` variant is a human-readable failure reason that flows into the
+    /// preflight gate's context (`run_preflight` in `devflow-cli/src/main.rs`).
+    /// This is the trait surface Phase 18's Hermes adapter implements to
+    /// enforce a non-empty reviewer/receiver set — no built-in adapter
+    /// (Claude/Codex/OpenCode) overrides it in Phase 17 because no
+    /// reviewer-set storage exists yet in `state.rs`/`config.rs` (review
+    /// consensus #6).
+    fn preflight(&self, _state: &crate::state::State) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Return an adapter for a configured agent kind.
@@ -155,5 +169,79 @@ mod tests {
         assert!(env.contains(&("GIT_CONFIG_KEY_1".into(), "tag.gpgsign".into())));
         assert!(adapter_for(AgentKind::Claude).extra_env().is_empty());
         assert!(adapter_for(AgentKind::OpenCode).extra_env().is_empty());
+    }
+
+    /// D-13: `preflight`'s default body is `Ok(())` for every built-in
+    /// adapter — none of Claude/Codex/OpenCode override it in Phase 17 (no
+    /// reviewer-set storage exists yet in `state.rs`/`config.rs`, review
+    /// consensus #6).
+    #[test]
+    fn default_preflight_is_ok_for_built_in_adapters() {
+        let state = crate::state::State::new(
+            1,
+            AgentKind::Claude,
+            crate::mode::Mode::Auto,
+            PathBuf::from("/repo"),
+        );
+        assert!(adapter_for(AgentKind::Claude).preflight(&state).is_ok());
+        assert!(adapter_for(AgentKind::Codex).preflight(&state).is_ok());
+        assert!(adapter_for(AgentKind::OpenCode).preflight(&state).is_ok());
+    }
+
+    /// TEST-ONLY adapter exercising the D-14 adapter-hook contract (reviewer
+    /// receiver set non-empty) without inventing production storage — this
+    /// is the adjacency boundary Phase 18's Hermes adapter will implement
+    /// for real once a reviewer field exists.
+    struct ReviewerSetTestAdapter {
+        reviewers: Vec<String>,
+    }
+
+    impl AgentAdapter for ReviewerSetTestAdapter {
+        fn name(&self) -> &'static str {
+            "test-reviewer-set"
+        }
+
+        fn exec_command(
+            &self,
+            _phase: u32,
+            _prompt: &str,
+            _extra_writable_roots: &[PathBuf],
+        ) -> (&'static str, Vec<String>) {
+            ("true", Vec::new())
+        }
+
+        fn completion_signal_detected(&self, _output: &str) -> bool {
+            false
+        }
+
+        fn preflight(&self, _state: &crate::state::State) -> Result<(), String> {
+            if self.reviewers.is_empty() {
+                Err("reviewer receiver set is empty".to_string())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// D-14 adjacency edge (17c): an empty reviewer receiver set fails
+    /// preflight; a set with one receiver passes.
+    #[test]
+    fn reviewer_set_adapter_hook_adjacency_boundary() {
+        let state = crate::state::State::new(
+            1,
+            AgentKind::Claude,
+            crate::mode::Mode::Auto,
+            PathBuf::from("/repo"),
+        );
+
+        let empty = ReviewerSetTestAdapter {
+            reviewers: Vec::new(),
+        };
+        assert!(empty.preflight(&state).is_err());
+
+        let one = ReviewerSetTestAdapter {
+            reviewers: vec!["alice".to_string()],
+        };
+        assert!(one.preflight(&state).is_ok());
     }
 }
