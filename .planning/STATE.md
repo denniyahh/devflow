@@ -2,9 +2,9 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
-status: Phase 17 scoped and discussed - ready for planning
-stopped_at: Completed 17-06-PLAN.md
-last_updated: "2026-07-19T11:47:28.084Z"
+status: Phase 17 executed and verified (12/12) - 1 open Critical (CR-01) blocks Ship
+stopped_at: Phase 17 verified passed after 17-06 gap closure; CR-01 open
+last_updated: "2026-07-19T12:10:00.000Z"
 progress:
   total_phases: 7
   completed_phases: 6
@@ -15,18 +15,9 @@ progress:
 
 # DevFlow — Project State
 
-> Last updated: 2026-07-18
+> Last updated: 2026-07-19
 
 ## Active
-
-- **Phase 17 (Discussed — ready for planning):** Pipeline Dogfood Follow-Up —
-  17a `Unknown` must not auto-advance, 17b typed outcomes + retry policy, 17c
-  preflight readiness gate, 17d build provenance. Terminal-Ship alarm traced to
-  a stale executable, not a live regression. All three open decision-gate
-  questions resolved in `17-CONTEXT.md` (21 decisions, D-01…D-21). Notable:
-  17a requires extending Phase 16's Layer 0 — it is Code-stage-only and treats
-  passing probes as non-evidence, so an external-only stage with zero commits
-  cannot succeed cleanly today.
 
 - **Phase 18 (Scoped):** Hermes Support — renumbered from 17 to 18
   (2026-07-18) to make room for Phase 17. HermesAgent adapter, skill-file
@@ -55,12 +46,39 @@ progress:
 | 14 | Parallel Safety + Observability | — | 2026-07-16 |
 | 15 | Dogfood Enablement + OSS Readiness | — | 2026-07-17 |
 | 16 | Pipeline Reliability Hardening | — | 2026-07-17 |
+| 17 | Pipeline Dogfood Follow-Up | — | 2026-07-19 |
 
 *Phases 8 and 10 shipped without a SUMMARY.md at the time; both were retroactively documented 2026-07-08 (see `8-SUMMARY.md`, `10-SUMMARY.md`) after reconstruction from git history. Phase 11 was reviewed and found already adequately closed out via `11-VALIDATION.md`/`11r-VALIDATION.md` (Nyquist-compliant, sign-off dated 2026-06-20) — no retroactive SUMMARY.md was needed.*
 
 ## Blockers
 
-None.
+- **Phase 17 — open Critical from `17-REVIEW.md` (CR-01), not covered by
+  `17-VERIFICATION.md`'s 12/12 pass.** `run_preflight`
+  (`crates/devflow-cli/src/main.rs:788-816`) recursively calls `launch_stage`
+  on a resolved `Advance`/`LoopBack` gate, then returns `Ok(())` into the
+  middle of the *outer* `launch_stage` (call site line 1067), which continues
+  on to `enforce_build_staleness` / `archive_phase_files` / `spawn_monitor` —
+  spawning the agent for that stage **twice**. Confirmed by source inspection
+  2026-07-19. The verifier missed it because truth #7 was cleared as a
+  "regression check: unchanged by this plan's diff" against plan 17-06's diff
+  only; the defect lives in 17-05's preflight code. Existing `run_preflight`
+  tests only exercise the `Abort` branch. Must be resolved during Ship (or a
+  `/gsd-code-review --fix` pass) before Phase 17 merges.
+
+- **`concurrent_ship_advances_finish_both_phases_independently` hangs
+  indefinitely — `cargo test --workspace` cannot complete.** Reproduced
+  deterministically 2026-07-19 (isolated run timed out at 180s; a full
+  workspace run sat in this one test for 22 min). Mechanism: the test ships
+  phases 31 and 32 concurrently, both `VersionBump` hooks race to create tag
+  `v2.0.1`, the loser fails (`cannot lock ref 'refs/tags/v2.0.1'`), ship
+  failure reopens the `32-ship` gate ("gate written … awaiting response"
+  appears twice), and the test only ever pre-wrote **one** response — so the
+  reopened gate polls forever with no timeout. **Not a Phase 17 regression:**
+  the same sequence reproduces at `8c653f8` (parent of 17-04's `advance()`
+  rewrite), so it predates the phase. It is a latent race, which is why it
+  intermittently passes — `17-VERIFICATION.md`'s truth #12 "`cargo test
+  --workspace` → all green" was a lucky pass and should not be relied on.
+  Fix belongs with the ship/version-bump concurrency work, not Phase 17.
 
 ## Decisions
 
