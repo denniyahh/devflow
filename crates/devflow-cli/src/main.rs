@@ -937,12 +937,37 @@ fn tracked_source_newer_than_build(project_root: &Path, build_timestamp: u64) ->
     }
     let modified = run_git_stdout(project_root, &["ls-files", "-m"])?;
     let build_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(build_timestamp);
-    Some(modified.lines().any(|rel_path| {
-        std::fs::metadata(project_root.join(rel_path))
-            .and_then(|m| m.modified())
-            .map(|mtime| mtime > build_time)
-            .unwrap_or(false)
-    }))
+    Some(
+        modified
+            .lines()
+            .filter(|rel_path| affects_compiled_binary(rel_path))
+            .any(|rel_path| {
+                std::fs::metadata(project_root.join(rel_path))
+                    .and_then(|m| m.modified())
+                    .map(|mtime| mtime > build_time)
+                    .unwrap_or(false)
+            }),
+    )
+}
+
+/// Whether a repo-relative path can change the compiled binary. The mtime arm
+/// of the staleness check must consider ONLY these: a dirty `CHANGELOG.md` or
+/// `.planning/` file says nothing about whether the binary matches its source.
+///
+/// Found live — DevFlow's own `ChangelogAppend` hook dirtied `CHANGELOG.md`
+/// during the Validate→Ship transition, which the unfiltered mtime arm read as
+/// a stale build, hard-blocking Ship on a file the pipeline had just written.
+fn affects_compiled_binary(rel_path: &str) -> bool {
+    const BUILD_AFFECTING_FILES: [&str; 4] = [
+        "Cargo.toml",
+        "Cargo.lock",
+        "build.rs",
+        "rust-toolchain.toml",
+    ];
+    rel_path.ends_with(".rs")
+        || BUILD_AFFECTING_FILES
+            .iter()
+            .any(|name| rel_path == *name || rel_path.ends_with(&format!("/{name}")))
 }
 
 /// D-19: composite staleness — Stale iff the embedded commit is not an
@@ -1582,6 +1607,35 @@ fn is_ship_review_failure(reason: &Option<String>) -> bool {
 /// fail-soft for ordinary transitions. The return value lets terminal
 /// completion fail closed and preserve state when the batch was skipped or
 /// a required hook failed.
+/// Which tree a hook batch operates on.
+///
+/// Content hooks for the Validate→Ship transition (`DocsUpdate`,
+/// `ChangelogAppend`) author material *about the branch being shipped*, so they
+/// must write into that phase's worktree — otherwise their output is stranded
+/// on the base branch, uncommitted and divorced from the commits it describes
+/// (found live: Phase 17's changelog entry landed on `develop` while every one
+/// of its commits sat on `feature/phase-17`).
+///
+/// The terminal batch (`Merge`, `VersionBump`, `BranchCleanup`) is the exact
+/// opposite: it merges the feature branch INTO the base branch, tags the base
+/// branch, and deletes the feature branch. Those are primary-checkout
+/// operations and retargeting them at the worktree would be a correctness
+/// regression.
+///
+/// Falls back to `project_root` whenever no worktree is configured, so
+/// `--no-worktree` runs are unaffected.
+fn hook_context_root(project_root: &Path, state: &State, terminal_batch: bool) -> PathBuf {
+    if terminal_batch {
+        return project_root.to_path_buf();
+    }
+    state
+        .worktree_path
+        .as_ref()
+        .filter(|path| path.exists())
+        .map(|path| path.to_path_buf())
+        .unwrap_or_else(|| project_root.to_path_buf())
+}
+
 fn run_checkout_hooks(
     project_root: &Path,
     state: &State,
@@ -1624,10 +1678,11 @@ fn run_checkout_hooks(
     let git_flow = GitFlowConfig::default();
     let mut all_succeeded = true;
     let terminal_batch = batch == hooks::hooks_after_ship().as_slice();
+    let hook_root = hook_context_root(project_root, state, terminal_batch);
     for hook in batch {
         let ctx = HookContext {
             phase: state.phase,
-            project_root: project_root.to_path_buf(),
+            project_root: hook_root.clone(),
             stage,
             git_flow: git_flow.clone(),
         };
@@ -5207,6 +5262,142 @@ mod tests {
         );
     }
 
+    /// The mtime arm must only consider files that can change the compiled
+    /// binary. Found live: DevFlow's own `ChangelogAppend` hook dirtied
+    /// `CHANGELOG.md` during the Validate->Ship transition, the mtime arm read
+    /// that as a stale build, and the self-dogfood gate hard-blocked Ship —
+    /// the pipeline blocking itself on a markdown file it had just written.
+    /// A modified `.rs` file must still flag Stale, or the gate stops catching
+    /// the real "committed, forgot to rebuild" case.
+    #[test]
+    fn mtime_arm_ignores_non_build_files_but_still_flags_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@e.st"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/devflow-core\", \"crates/devflow-cli\"]\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("CHANGELOG.md"), "# Changelog\n").unwrap();
+        std::fs::create_dir_all(root.join("crates/devflow-cli/src")).unwrap();
+        std::fs::write(
+            root.join("crates/devflow-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "workspace init"]);
+        let embedded_commit = run_git_stdout(root, &["rev-parse", "HEAD"])
+            .expect("rev-parse HEAD")
+            .trim()
+            .to_string();
+
+        // Build timestamp in the past so anything touched now is "newer".
+        let build_timestamp = 1_000;
+
+        // Only a doc is dirty — exactly the live Ship-block condition.
+        std::fs::write(root.join("CHANGELOG.md"), "# Changelog\n\n## 1.4.26\n").unwrap();
+        assert_eq!(
+            run_git_stdout(root, &["ls-files", "-m"]).unwrap().trim(),
+            "CHANGELOG.md",
+            "fixture must have exactly one dirty tracked file"
+        );
+        assert_eq!(
+            tracked_source_newer_than_build(root, build_timestamp),
+            Some(false),
+            "a dirty CHANGELOG.md cannot change the compiled binary"
+        );
+        assert_eq!(
+            combined_staleness(root, &embedded_commit, build_timestamp),
+            Staleness::Fresh,
+            "a doc-only dirty tree must not be Stale"
+        );
+
+        let phase = 68;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Ship;
+        assert!(
+            enforce_build_staleness(root, &state, &embedded_commit, build_timestamp).is_ok(),
+            "a doc-only dirty tree must not block Ship"
+        );
+
+        // Converse: a dirty source file newer than the build IS stale.
+        std::fs::write(
+            root.join("crates/devflow-cli/src/main.rs"),
+            "fn main() { /* edited after build */ }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            tracked_source_newer_than_build(root, build_timestamp),
+            Some(true),
+            "a modified .rs newer than the build is genuine staleness"
+        );
+        assert_eq!(
+            combined_staleness(root, &embedded_commit, build_timestamp),
+            Staleness::Stale
+        );
+        assert!(
+            enforce_build_staleness(root, &state, &embedded_commit, build_timestamp).is_err(),
+            "a stale source build must still hard-block a self-dogfood workspace"
+        );
+    }
+
+    /// Content hooks author material about the branch being shipped, so they
+    /// must run in that phase's worktree; the terminal batch merges/tags/deletes
+    /// against the primary checkout and must NOT be retargeted.
+    ///
+    /// Found live: `ChangelogAppend` wrote Phase 17's release note into
+    /// `develop`'s CHANGELOG.md while all of its commits sat on
+    /// `feature/phase-17`, stranding the entry on the wrong branch.
+    #[test]
+    fn content_hooks_target_the_worktree_while_terminal_hooks_stay_on_project_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let worktree = root.join(".worktrees/phase-70");
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        let mut state = State::new(70, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.worktree_path = Some(worktree.clone());
+
+        assert_eq!(
+            hook_context_root(root, &state, false),
+            worktree,
+            "content hooks must write into the phase's worktree"
+        );
+        assert_eq!(
+            hook_context_root(root, &state, true),
+            root.to_path_buf(),
+            "terminal hooks merge/tag/delete against the primary checkout"
+        );
+
+        // --no-worktree runs, and a worktree recorded but already removed,
+        // both fall back to the project root rather than writing nowhere.
+        let mut no_worktree = state.clone();
+        no_worktree.worktree_path = None;
+        assert_eq!(hook_context_root(root, &no_worktree, false), root);
+
+        let mut missing = state.clone();
+        missing.worktree_path = Some(root.join(".worktrees/gone"));
+        assert_eq!(hook_context_root(root, &missing, false), root);
+    }
+
     /// D-19 composite/OR: a clean tree whose embedded commit IS an ancestor
     /// (HEAD itself) is Fresh regardless of `build_timestamp`; but once a
     /// TRACKED file is modified (dirty tree) with an mtime newer than the
@@ -5234,7 +5425,13 @@ mod tests {
         git(&["config", "user.email", "t@e.st"]);
         git(&["config", "user.name", "t"]);
         git(&["config", "commit.gpgsign", "false"]);
-        std::fs::write(root.join("a.txt"), "one").unwrap();
+        // 17-10: the dirty file must be a BUILD-AFFECTING one. This fixture
+        // used `a.txt`, which encoded the over-broad mtime arm that hard-blocked
+        // Ship on a dirty CHANGELOG.md. The test's intent — mtime flips an
+        // ancestry-Fresh result to Stale — is unchanged; only the fixture is
+        // corrected to a file that can actually change the binary.
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "// one\n").unwrap();
         git(&["add", "."]);
         git(&["commit", "-q", "-m", "init"]);
         let head = {
@@ -5249,7 +5446,7 @@ mod tests {
         assert_eq!(embedded_commit_is_stale(root, &head), Staleness::Fresh);
         assert_eq!(combined_staleness(root, &head, 0), Staleness::Fresh);
 
-        std::fs::write(root.join("a.txt"), "modified after build").unwrap();
+        std::fs::write(root.join("src/lib.rs"), "// modified after build\n").unwrap();
         assert_eq!(combined_staleness(root, &head, 0), Staleness::Stale);
     }
 
