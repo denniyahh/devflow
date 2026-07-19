@@ -49,6 +49,17 @@ Round 1 of this review is preserved verbatim in the appendix below. This round r
 five angles against the current branch state (63 commits ahead of `develop`, merge-base
 `a2c314f`) plus the uncommitted working tree.
 
+> **Audit-fix pass 2026-07-19 (`/gsd-audit-fix 17`).** Seven findings resolved: **CR-01**
+> (symptom only — see its entry; WR-04's root cause remains open, so recurrence is expected),
+> **WR-03**, **WR-05** (`1de9e3c`, both mutation-verified), and **WR-12/13/14/15** (`ebc343f`).
+> Eleven Warnings remain open and were classified manual-only: WR-01, WR-02, WR-04, WR-06, WR-07,
+> WR-08, WR-09, WR-10, WR-11 — each changes a behavioral contract or edits a point-in-time plan
+> record, and needs a design call rather than a mechanical fix. All eleven Infos are below the
+> pass's severity threshold and untouched. **`ship_gate` is deliberately left `BLOCKED`**: the
+> Critical is closed in the tree, but WR-04 guarantees the next dogfood run re-emits it, and that
+> is an operator call to make, not an autonomous one. Frontmatter counters are found-counts and
+> are not decremented, per this file's existing convention.
+
 ## Summary
 
 Toolchain is green and the phase's headline work is genuine. Independently reproduced:
@@ -114,6 +125,18 @@ hook re-emits a false heading on every dogfood run. `5431f9e` deleted the sympto
 2. Close WR-04: make `changelog_append` and `version_bump` atomic, so an entry cannot outlive
    the tag it names. This is the durable fix.
 
+**RESOLVED (symptom only) — `/gsd-audit-fix 17`.** Option 1 applied: the four-line `1.4.88` block
+was dropped from the working tree, which now matches `HEAD` exactly (`git status --porcelain`
+empty) — no commit was needed, the change was never committed. Re-verified before removal that the
+claim was false by all five measures this entry lists (`git tag -l` tops out at `v1.3.69`,
+`Cargo.toml:9` is `1.3.69`).
+
+**This is explicitly the symptom fix, and this entry's own prediction still stands.** WR-04 — the
+root cause, `changelog_append()` writing an entry that `version_bump()` never backs with a tag —
+was classified manual-only by that pass (it changes hook atomicity semantics and needs a design
+call). Until WR-04 closes, the next dogfood run re-emits a false heading and a Round 3 will find
+this again.
+
 ---
 
 ## Warnings
@@ -177,6 +200,15 @@ gate exists to catch.
 **Fix:** derive the modified path list from `git status --porcelain` itself (handling the
 `XY<space>path` shape and ` -> ` rename entries).
 
+**RESOLVED — `/gsd-audit-fix 17` (`1de9e3c`).** Fix applied as prescribed: a new
+`porcelain_tracked_path()` helper parses the `XY<space>PATH` shape, takes the destination of
+` -> ` rename entries, strips git's quoting, and returns `None` for `??` so untracked files stay
+excluded exactly as under `ls-files -m`. The claim was reproduced independently first (`git add`
+a source file ⇒ porcelain `M  lib.rs`, `ls-files -m` empty). Coverage added to
+`dirty_flag_arm_ignores_non_build_files_but_still_flags_sources`, which now stages the same edit
+and asserts it still reads `Some(true)` / `Staleness::Stale`. Mutation-verified: restoring
+`ls-files -m` fails it at `left: Some(false) / right: Some(true)`.
+
 ### WR-04: `build_dirty` and the live check disagree on what "dirty" means
 
 **File:** `crates/devflow-cli/build.rs:63` vs `crates/devflow-cli/src/main.rs:982` · **Angle:** generalist
@@ -202,6 +234,12 @@ cover fixtures where `members = [...]` is the first hit.
 
 **Fix:** anchor on the assignment (reject matches preceded by an identifier character) rather than
 a bare substring search.
+
+**RESOLVED — `/gsd-audit-fix 17` (`1de9e3c`).** Fix applied as prescribed: `match_indices("members")`
+with the first hit not preceded by an identifier character (alphanumeric, `_`, or `-`). New test
+`is_self_dogfood_workspace_anchors_on_members_not_default_members` uses a manifest with
+`default-members` above `members`; mutation-verified — restoring `contents.find("members")` fails
+it on its named assertion.
 
 ### WR-06: `start` prints a success banner and exits 0 after a preflight abort
 
@@ -313,6 +351,16 @@ so a Phase 18 planner would assume the timestamp is available.
 
 Footer reads "verified 12/12"; `17-VERIFICATION.md:5` is `score: 14/14`, with `:15` explicitly
 recording `previous_score: 12/12` as superseded.
+
+---
+
+**WR-12 / WR-13 / WR-14 / WR-15 — all four RESOLVED by `/gsd-audit-fix 17` (`ebc343f`).** Each was
+re-verified against the tree before editing, not taken from this report: WR-12's symbol is absent
+and `build_provenance.rs:23` is the renamed assertion; WR-13's `17-VALIDATION.md:7` already reads
+`true`; WR-14's `DEVFLOW_BUILD_TIMESTAMP` has three hits in `crates/`, all comments; WR-15's
+`17-VERIFICATION.md` frontmatter is `score: 14/14`. The two `17-VERIFICATION.md` anti-pattern rows
+are struck through and marked superseded rather than deleted, consistent with how this project
+treats point-in-time execution records.
 
 ---
 
