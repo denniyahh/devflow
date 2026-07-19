@@ -8,9 +8,12 @@ use devflow_core::mode::{self, Mode};
 use devflow_core::prompt::{self, FixType};
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
-use devflow_core::{agent_result, agents, events, history, lock, monitor, recover, worktree};
+use devflow_core::{
+    agent_result, agents, events, history, lock, monitor, outcome_policy, recover, worktree,
+};
 use devflow_core::{
     agent_result::{AgentStatus, Verdict},
+    outcome_policy::Action,
     workflow,
 };
 use std::path::{Path, PathBuf};
@@ -851,39 +854,95 @@ fn advance(project_root: &Path, phase: Option<u32>) -> Result<(), CliError> {
         }),
     );
 
-    let failed = matches!(
-        result.status,
-        AgentStatus::Failed | AgentStatus::RateLimited
-    );
-    if failed {
-        return match stage {
+    // D-01/D-06: dispatch on the exhaustive outcome_policy::decide_action
+    // table (no wildcard arm upstream) so a new/unhandled AgentStatus variant
+    // is a compile error here rather than a silent advance. Replaces the old
+    // `matches!(Failed | RateLimited)` boolean, which let Unknown fall
+    // through into the success arm below.
+    match outcome_policy::decide_action(stage, result.status) {
+        Action::Advance => match stage {
+            Stage::Define => transition(project_root, &mut state, Stage::Plan),
+            Stage::Plan => transition(project_root, &mut state, Stage::Code),
+            Stage::Code => transition(project_root, &mut state, Stage::Validate),
+            Stage::Validate => {
+                // 13b verdict-vs-ran: the Validate prompt now REQUIRES a
+                // verdict, so ONLY an explicit `verdict: pass` advances to
+                // Ship. A missing verdict is a fail-safe (gate/loop), NOT a
+                // silent pass — closes the composition bug where a
+                // marker-less/verdict-less Validate could otherwise reach
+                // Ship.
+                let passed = matches!(result.verdict, Some(Verdict::Pass));
+                handle_validate_outcome(project_root, &mut state, passed)
+            }
+            Stage::Ship => handle_ship_outcome(project_root, &mut state),
+        },
+        Action::GateReview => match stage {
             // Validate failures drive the Code↔Validate loop (or a gate).
             Stage::Validate => handle_validate_outcome(project_root, &mut state, false),
             // Ship distinguishes an agent crash (AgentFailed) from a review
             // rejection (ReviewFailed, `review:`-prefixed reason).
             Stage::Ship => handle_ship_failure(project_root, &mut state, result.reason),
-            // Every other non-Validate failure is never silent (WR-11): it
-            // always fires a gate + notify instead of returning a bare error.
+            // Every other non-Validate failure (incl. Unknown, D-06) is
+            // never silent (WR-11): it always fires a gate + notify instead
+            // of returning a bare error or silently advancing.
             _ => handle_stage_failure(project_root, &mut state, stage, result.reason),
-        };
+        },
+        // ResourceKilled/AgentUnavailable: a dedicated infra path, identical
+        // for every stage (including Validate/Ship) — MUST NOT route through
+        // handle_validate_outcome/handle_ship_failure, which would bump
+        // consecutive_failures (review consensus #4, D-08).
+        Action::GateInfra => handle_infra_outcome(project_root, &mut state, stage, result.reason),
+        // RateLimited: interim routing, identical to GateReview — Task 2
+        // (D-09) replaces this arm with the primary-loop single-agent
+        // auto-resume path.
+        Action::AutoResume => match stage {
+            Stage::Validate => handle_validate_outcome(project_root, &mut state, false),
+            Stage::Ship => handle_ship_failure(project_root, &mut state, result.reason),
+            _ => handle_stage_failure(project_root, &mut state, stage, result.reason),
+        },
     }
+}
 
-    // Success (or Unknown — advance with the warning already printed above).
-    match stage {
-        Stage::Define => transition(project_root, &mut state, Stage::Plan),
-        Stage::Plan => transition(project_root, &mut state, Stage::Code),
-        Stage::Code => transition(project_root, &mut state, Stage::Validate),
-        Stage::Validate => {
-            // 13b verdict-vs-ran: the Validate prompt now REQUIRES a verdict,
-            // so ONLY an explicit `verdict: pass` advances to Ship. A missing
-            // verdict is a fail-safe (gate/loop), NOT a silent pass — closes
-            // the composition bug where a marker-less/verdict-less Validate
-            // could otherwise reach Ship.
-            let passed = matches!(result.verdict, Some(Verdict::Pass));
-            handle_validate_outcome(project_root, &mut state, passed)
-        }
-        Stage::Ship => handle_ship_outcome(project_root, &mut state),
+/// Route a `GateInfra` outcome (ResourceKilled/AgentUnavailable) — bumps
+/// `state.infra_failures` (saturating, never `consecutive_failures`),
+/// persists, then either aborts at the ceiling or fires the never-silent
+/// gate via [`handle_stage_failure`]. Deliberately never calls
+/// `handle_validate_outcome`/`handle_ship_failure` on any stage (review
+/// consensus #4) — those increment `consecutive_failures`, which would
+/// conflate an infrastructure fault with an agent-caused failure (D-08).
+fn handle_infra_outcome(
+    project_root: &Path,
+    state: &mut State,
+    stage: Stage,
+    reason: Option<String>,
+) -> Result<(), CliError> {
+    state.infra_failures = state.infra_failures.saturating_add(1);
+    workflow::save_state(state)?;
+    gate_or_abort_infra(project_root, state, stage, reason)
+}
+
+/// The ceiling check + gate-or-abort half of the infra path, shared by
+/// [`handle_infra_outcome`] and the `AutoResume` arm's infra-ceiling branch
+/// (which bumps `infra_failures` itself before calling this, so the counter
+/// is never bumped twice for the same outcome).
+fn gate_or_abort_infra(
+    project_root: &Path,
+    state: &mut State,
+    stage: Stage,
+    reason: Option<String>,
+) -> Result<(), CliError> {
+    if state.infra_failures >= mode::MAX_INFRA_FAILURES {
+        return abort(
+            project_root,
+            state,
+            &format!(
+                "infrastructure failures reached the ceiling ({} of {}) — aborting rather than gating again",
+                state.infra_failures,
+                mode::MAX_INFRA_FAILURES
+            ),
+        );
     }
+    handle_stage_failure(project_root, state, stage, reason)
 }
 
 /// Decide what happens after a Validate stage (passed or failed), honoring the
@@ -3498,6 +3557,175 @@ mod tests {
             "poll_response must not instantly resolve from a stale response after cleanup"
         );
         assert!(started.elapsed() >= std::time::Duration::from_secs(1));
+    }
+
+    /// D-01/D-06 regression: a Code-stage `Unknown` outcome (Layer 3's
+    /// "process gone but commits exist" case) must route through
+    /// `handle_stage_failure`'s never-silent gate, never
+    /// `transition(.., Stage::Validate)`. Drives a real `advance()` on a
+    /// scoped thread, polling for the Code gate file (not a Validate one) to
+    /// prove the dispatch never took the success/Advance arm.
+    #[test]
+    fn code_unknown_does_not_transition_to_validate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = 72;
+        let branch = format!("feature/phase-{phase:02}");
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        git(&["checkout", "-q", "-b", &branch, "develop"]);
+        std::fs::write(root.join("work.txt"), "wip\n").unwrap();
+        git(&["add", "work.txt"]);
+        git(&["commit", "-q", "-m", "wip commit"]);
+        git(&["checkout", "-q", "develop"]);
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+
+        let code_gate = Gates::gate_path(root, phase, Stage::Code);
+        let validate_gate = Gates::gate_path(root, phase, Stage::Validate);
+        let response_path = Gates::response_path(root, phase, Stage::Code);
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                advance(root, Some(phase)).unwrap();
+            });
+
+            let mut seen = false;
+            for _ in 0..150 {
+                if code_gate.exists() {
+                    seen = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert!(
+                seen,
+                "an Unknown Code outcome must fire a never-silent gate, not advance silently"
+            );
+            assert!(
+                !validate_gate.exists(),
+                "an Unknown Code outcome must never transition to Validate"
+            );
+
+            std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &response_path,
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap();
+        });
+    }
+
+    /// D-08/consensus #4: a `ResourceKilled` outcome on a non-Validate stage
+    /// bumps `infra_failures` and leaves `consecutive_failures` untouched —
+    /// `handle_infra_outcome` (the `GateInfra` arm) never routes through
+    /// `handle_validate_outcome`. A rejected/abort response is pre-seeded so
+    /// the never-silent gate resolves immediately without a spawn thread.
+    #[test]
+    fn resource_killed_on_code_bumps_infra_failures_not_consecutive_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 73;
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        std::fs::write(agent_result::exit_code_path(root, phase), "137").unwrap();
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        state.consecutive_failures = 1;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Code);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        advance(root, Some(phase)).unwrap();
+
+        // abort() clears state entirely — assert against the terminal error
+        // rather than a field, and confirm no Validate gate ever appeared.
+        let err = workflow::load_state(root, phase).unwrap_err();
+        assert!(matches!(err, workflow::WorkflowError::MissingState(_)));
+        assert!(!Gates::gate_path(root, phase, Stage::Validate).exists());
+    }
+
+    /// D-08/consensus #4 (Validate-stage case): a `ResourceKilled` outcome on
+    /// the VALIDATE stage still bumps `infra_failures` and leaves
+    /// `consecutive_failures` unchanged — proving `GateInfra`
+    /// (`handle_infra_outcome`) bypasses `handle_validate_outcome` even on
+    /// the one stage that normally owns `consecutive_failures`. The rejected
+    /// gate response resolves the never-silent gate to `Abort` immediately
+    /// (no spawn thread needed); `consecutive_failures` is asserted on the
+    /// in-memory `state`, which `abort()` never mutates (it only clears the
+    /// on-disk state file and gate artifacts).
+    #[test]
+    fn resource_killed_on_validate_bumps_infra_not_consecutive_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 74;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        state.consecutive_failures = 2;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        handle_infra_outcome(
+            root,
+            &mut state,
+            Stage::Validate,
+            Some("agent process was killed (exit code 137, likely OOM)".into()),
+        )
+        .unwrap();
+
+        assert_eq!(state.infra_failures, 1);
+        assert_eq!(
+            state.consecutive_failures, 2,
+            "consecutive_failures must be untouched by the infra path"
+        );
+    }
+
+    /// D-08: reaching `MAX_INFRA_FAILURES` infra outcomes aborts rather than
+    /// gating again.
+    #[test]
+    fn infra_ceiling_aborts_instead_of_gating() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 75;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        state.infra_failures = mode::MAX_INFRA_FAILURES - 1;
+        workflow::save_state(&state).unwrap();
+
+        handle_infra_outcome(root, &mut state, Stage::Code, Some("killed".into())).unwrap();
+
+        assert_eq!(state.infra_failures, mode::MAX_INFRA_FAILURES);
+        assert!(
+            !Gates::gate_path(root, phase, Stage::Code).exists(),
+            "at the ceiling, the run must abort rather than gate again"
+        );
+        let err = workflow::load_state(root, phase).unwrap_err();
+        assert!(matches!(err, workflow::WorkflowError::MissingState(_)));
     }
 
     /// `parse_gate_timeout` is a pure function — no env mutation needed, so
