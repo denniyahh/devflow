@@ -111,45 +111,86 @@ not by itself evidence for that row.
 
 ### GAP-2 — `concurrent_ship_advances_finish_both_phases_independently` is a latent race
 
-**Not a Phase 17 regression** (reproduces at `8c653f8`, the parent of 17-04's `advance()` rewrite),
-but it undermines the reliability of any "full suite green" claim. Both phases race to create tag
-`v2.0.1`; the loser's ship failure reopens the `32-ship` gate, and the test pre-wrote only one gate
-response, so the reopened gate polls forever with no timeout.
+**Not a Phase 17 regression** (reproduces at `8c653f8`, the parent of 17-04's `advance()` rewrite).
+Both phases can compute the same next version from the same starting git state and race to create
+tag `v2.0.1`; the loser's ship failure reopened the `32-ship` (or `31-ship`) gate, and the test
+pre-wrote only one gate response per phase, so the reopened gate polled forever with no timeout.
 
-This audit's `cargo test --workspace` run passed — but per `STATE.md` that is a *lucky* pass, not
-evidence. Treat suite-green results for this test as non-deterministic until the ship/version-bump
-concurrency work lands.
+**Prior measurements (superseded — history preserved for context).** Two earlier re-audits stressed
+the test in isolation and measured the hang directly rather than inferring it:
 
-**Re-audit 2026-07-19 — the hang is now measured, not inferred.** The 2026-07-19 re-audit stressed
-the test in isolation five times under a 120 s timeout:
+| Audit | Runs | Hangs | Rate | Mechanism confirmation |
+|-------|------|-------|------|------------------------|
+| Re-audit 2026-07-19 (`cf062e6`) | 5 | 2 | ~40 % | Timing-only (bimodal 1–2 s vs. 120 s timeout) |
+| Re-audit #2 2026-07-19 (`636d1ab`) | 4 (1 full-suite + 3 isolated) | 1 | — | `/proc` thread inspection: `hrtimer_nanosleep` on the reopened gate's poll thread |
+| Cumulative across both | 9 | 3 | ~33 % | — |
 
-| Run | Exit | Elapsed | Result |
-|-----|------|---------|--------|
-| 1 | 124 (timeout) | 120 s | **hung** |
-| 2 | 0 | 2 s | passed |
-| 3 | 0 | 1 s | passed |
-| 4 | 124 (timeout) | 120 s | **hung** |
-| 5 | 0 | 2 s | passed |
+Those audits correctly concluded this was a live, CI-stalling defect, not a documentation caveat,
+and escalated it as **out of Phase 17's scope** (belongs to the ship/version-bump concurrency work).
+This plan (17-09) closes the *test-level* half of that escalation — see below.
 
-**2 of 5 runs (~40 %) hang indefinitely** — the runs that pass do so in 1–2 s, so the hang is
-bimodal, not slow-path variance. There is no internal timeout on the reopened `32-ship` gate poll,
-so a hung run blocks until an external timeout kills it; in CI with no `timeout` wrapper this stalls
-the job rather than failing it.
+**RESOLVED by `17-09-PLAN.md` (fix `cb9359f`).**
 
-This has two consequences for the sign-off below:
+**RED.** Before any fix, the test was run in isolation under an external 120 s `timeout` and hung on
+the very first attempt: exit `124`, full 120 s elapsed. Temporary debug instrumentation added during
+this RED phase (removed before the fix landed) caught the mechanism directly rather than inferring
+it from timing: both phases' `version_bump()` calls were observed computing the identical version
+(`2.0.1`) within **~1.8 ms** of each other, and the loser's own `git tag` call then failed with
+git's native `fatal: cannot lock ref 'refs/tags/v2.0.1': reference already exists` — direct proof
+the two phases' terminal hooks executed concurrently on that run, not merely that they targeted the
+same version.
 
-1. The "`cargo test --workspace` green" evidence is a ~60 %-likely outcome, not a reproducible
-   property. Two consecutive green full-suite runs during this re-audit are consistent with chance
-   (~36 %) and are *not* independent confirmation.
-2. The **Sampling Rate** contract's "max feedback latency: ~90 s" is violated whenever this test
-   hangs — feedback latency becomes unbounded.
+**Fix shape.** The binding constraint is "never hangs," not "always both succeed" — per
+`17-09-PLAN.md`'s explicit framing, this is a **test-level** bound, not a change to the underlying
+contention (see Product-level note below). `DEVFLOW_GATE_TIMEOUT_SECS` is overridden to `2` seconds
+for this test's poll only, under the file's existing `ENV_MUTEX` guard (the same pattern used by
+`checkout_hooks_skip_instead_of_running_unserialized_on_lock_timeout` and
+`transition_resets_infra_failures`) — restored immediately after the run. **The 7-day production
+default (`DEVFLOW_GATE_TIMEOUT_SECS`'s fallback in `parse_gate_timeout`) is untouched**; a real
+operator gate still waits the configured 7 days for a human. The test no longer assumes both phases
+always succeed: it accepts either outcome — no collision (both phases finish independently, as
+originally written) or a bounded loser timeout (asserted explicitly: the error text contains "timed
+out", the loser's state is left intact — not cleared — with `gate_pending: true`, and its Ship gate
+file remains on disk, i.e. the documented "awaiting human" state, not a silent failure).
 
-Requirement coverage is unaffected: this test guards no Phase 17 requirement row, and all 9 rows
-pass deterministically. `nyquist_compliant` therefore stays `true` on coverage grounds. But the
-suite is not a dependable sampling instrument until this is fixed, and that is a live defect, not a
-documentation caveat. **Disposition: open, escalated to the ship/version-bump concurrency work.**
+**GREEN — re-measured evidence, replacing the "2 of 5 (~40 %)" measurement.** The test was run in
+isolation **25 consecutive times** under a 120 s external `timeout`:
 
-*Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
+| Metric | Count |
+|--------|-------|
+| Total isolated runs | 25 |
+| Exit code 124 (hang) | **0** |
+| Exit code non-zero (any failure) | **0** |
+| Verdict | 25/25 `test result: ok` (identical verdict every run) |
+| Runs that hit the race collision (loser timeout path exercised) | 9 / 25 (~36 %) |
+| Runs with no collision (both phases finished normally) | 16 / 25 |
+
+The ~36% collision rate over this sample is consistent with the prior audits' ~33–40% measurements
+— the underlying contention frequency is unchanged, as expected, since this fix bounds the *poll*,
+not the *race*. What changed is that every one of the 9 collision runs now resolves deterministically
+in ~2–4 s (bounded by the 2 s `DEVFLOW_GATE_TIMEOUT_SECS` override) instead of hanging. Full
+`cargo test --workspace` (362 passed / 0 failed / 0 ignored, 10 targets), `cargo clippy --workspace
+--all-targets -- -D warnings`, and `cargo fmt --check` are all clean with this test included
+unfiltered (no `--skip` needed).
+
+**Product-level version-tag contention — explicitly OUT OF SCOPE, unresolved.** Closing the test-level
+hang must not silently bury this: two phases shipping concurrently genuinely contend for the *same*
+computed version tag when their terminal hooks race inside the same checkout-lock critical section
+window (the ~1.8 ms overlap observed directly during RED). Whether that should serialize more tightly,
+retry with a recomputed version, or fail fast with a clearer operator-facing error is an open design
+question this plan deliberately does not decide. It belongs with the ship/version-bump concurrency
+work referenced by the prior audits, not to Phase 17 or this gap-closure plan. The bounded test now
+correctly *tolerates* the race instead of hanging on it, but the race itself — and whatever product
+guarantee (or lack of one) two concurrently-shipping phases should get around a shared version
+lineage — remains an unresolved, named question for future work.
+
+Requirement coverage is unaffected: this test guards no Phase 17 requirement row, and all 9
+requirement rows pass deterministically. `nyquist_compliant` stays `true` on coverage grounds, as
+before. **Disposition: RESOLVED (test-level, this plan). Product-level version-tag contention:
+OUT OF SCOPE, explicitly unresolved — see paragraph above.**
+
+*Status: ✅ green (bounded — the underlying contention still occurs intermittently but the test can
+no longer hang on it)*
 
 ---
 
@@ -192,14 +233,21 @@ with Phase 18's Hermes adapter, the first adapter with real reviewer storage.
 - [x] Sampling continuity: no 3 consecutive tasks without automated verify
 - [x] Test infrastructure confirmed: `cargo test --workspace` green (362 passed / 0 failed / **0 ignored** across 10 targets), `cargo clippy --workspace --all-targets -- -D warnings` clean, `cargo fmt --check` clean (re-confirmed 2026-07-19 at `cf062e6`)
 - [x] No watch-mode flags
-- [⚠️] Feedback latency < 90s — holds on a clean run (~11s warm), but **unbounded on the ~40 % of runs where GAP-2 hangs**. See GAP-2. This box is not honestly checkable until that race is fixed.
-- [x] `nyquist_compliant: true` — GAP-1 resolved by `17-08-PLAN.md` (`c03498d`)
+- [x] Feedback latency < 90s — holds on a clean run (~11s warm); the ~33–40 % of runs where GAP-2's
+  race manifests now resolve in a bounded ~2–4 s (via the `DEVFLOW_GATE_TIMEOUT_SECS=2` test-scoped
+  override, `17-09-PLAN.md`, fix `cb9359f`) instead of hanging. This box is now honestly checkable:
+  worst-case observed latency across 25 consecutive isolated runs was ~4 s, well inside the 90 s
+  budget. See GAP-2.
+- [x] `nyquist_compliant: true` — GAP-1 resolved by `17-08-PLAN.md` (`c03498d`); GAP-2's test-level
+  hang resolved by `17-09-PLAN.md` (`cb9359f`)
 
 **Approval:** PASS — 9 of 9 requirement rows fully automated and green. Row 6 (17c preflight) was
 partial pending GAP-1 (CR-01, the `GateAction::Advance`/`LoopBack` double-spawn); `17-08-PLAN.md`
 closed it with an impl fix (`c03498d`) and two RED→GREEN regression tests (`b570114` → `c03498d`).
-GAP-2 (`concurrent_ship_advances_finish_both_phases_independently`, a pre-existing race predating
-Phase 17) remains escalated and out of this phase's scope — see GAP-2 above.
+GAP-2 (`concurrent_ship_advances_finish_both_phases_independently`)'s test-level unbounded-poll wedge
+is resolved by `17-09-PLAN.md` (`cb9359f`) — see GAP-2 above. The underlying product-level
+version-tag contention that causes the race is explicitly recorded there as OUT OF SCOPE and
+unresolved, belonging to future ship/version-bump concurrency work, not to Phase 17.
 
 ---
 
@@ -327,3 +375,17 @@ deterministic once GAP-2's test is isolated, so Phase 17's own coverage is compl
 does not block. GAP-2 is a pre-existing ship/version-bump concurrency defect that Phase 17 neither
 introduced nor owns, but it is live, it stalls rather than fails CI, and it should not survive into
 the next milestone.
+
+---
+
+**Addendum 2026-07-19 (post `17-09-PLAN.md`):** GAP-2's test-level unbounded-poll wedge — the sole
+remaining open gap this audit found — is now resolved (`cb9359f`, see the GAP-2 section above and
+`17-09-SUMMARY.md`). `DEVFLOW_GATE_TIMEOUT_SECS` is bounded to 2 s for this test's poll only (the
+7-day production default is unchanged); 25 consecutive isolated runs under a 120 s external timeout
+all exited 0 with the identical verdict, 9 of which actually hit the version-tag race and resolved
+via the bounded loser-timeout path rather than hanging. The feedback-latency sign-off box flips from
+⚠️ to green accordingly. The counts and verdict recorded above are left as originally written, a
+point-in-time snapshot of this re-audit pass that ran before the fix landed. The underlying
+product-level version-tag contention this test tolerates (rather than eliminates) remains an
+explicit, named OUT-OF-SCOPE item — see the GAP-2 section's "Product-level version-tag contention"
+paragraph.
