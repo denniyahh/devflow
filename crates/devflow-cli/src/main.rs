@@ -785,11 +785,19 @@ fn generic_preflight_checks(project_root: &Path, state: &State) -> Result<(), St
 /// any agent time is spent. A failing check is NEVER a hard exit — it
 /// surfaces as a named preflight gate + notify (WR-11 idiom, D-15), mirroring
 /// `handle_stage_failure`'s dispatch shape exactly.
+///
+/// Returns `Ok(true)` when the caller should continue the rest of
+/// `launch_stage` (preflight passed). Returns `Ok(false)` when a failing
+/// check was resolved via a gate that ALREADY completed a full retried
+/// launch (Advance/LoopBack) or aborted (Abort) — the caller must not run
+/// any more launch steps for this invocation (CR-01, 17-08 gap closure: the
+/// old `Result<(), CliError>` return couldn't distinguish these two cases,
+/// so the caller always continued and spawned the agent a second time).
 fn run_preflight(
     project_root: &Path,
     state: &mut State,
     adapter: &dyn agents::AgentAdapter,
-) -> Result<(), CliError> {
+) -> Result<bool, CliError> {
     let stage = state.stage;
     if let Err(reason) =
         generic_preflight_checks(project_root, state).and_then(|()| adapter.preflight(state))
@@ -799,20 +807,21 @@ fn run_preflight(
              (retry, loop-to-code, or abort)",
             truncate_reason(&reason)
         );
-        return match run_gate(project_root, state, stage, &context)? {
+        match run_gate(project_root, state, stage, &context)? {
             GateAction::Advance => {
                 let _ = Gates::cleanup(project_root, state.phase, stage);
                 state.gate_pending = false;
-                launch_stage(state, None, None)
+                launch_stage(state, None, None)?;
             }
             GateAction::LoopBack(_) => {
                 let _ = Gates::cleanup(project_root, state.phase, stage);
-                launch_stage(state, None, None)
+                launch_stage(state, None, None)?;
             }
-            GateAction::Abort(reason) => abort(project_root, state, &reason),
-        };
+            GateAction::Abort(reason) => abort(project_root, state, &reason)?,
+        }
+        return Ok(false);
     }
-    Ok(())
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -1083,8 +1092,15 @@ fn launch_stage(
     // 17c (Task 1, D-13-D-16): a scoped readiness gate runs before any agent
     // time is spent — a failing check surfaces as a named preflight gate +
     // notify (never a hard exit, D-15), not here.
+    //
+    // CR-01 (17-08 gap closure): `run_preflight` returns `Ok(false)` when a
+    // failing check was ALREADY resolved via a full retried launch (or an
+    // abort) — this frame must not run any more launch steps in that case,
+    // or the agent gets spawned a second time for the same stage.
     let project_root = state.project_root.clone();
-    run_preflight(&project_root, state, adapter.as_ref())?;
+    if !run_preflight(&project_root, state, adapter.as_ref())? {
+        return Ok(());
+    }
 
     // 17d (Task 2, D-17-D-19): self-dogfood build-staleness gate — also
     // before spawn_monitor, so a stale DevFlow-on-itself run never even
@@ -4512,8 +4528,12 @@ mod tests {
         .unwrap();
 
         let adapter = agents::adapter_for(AgentKind::Codex);
-        run_preflight(root, &mut state, adapter.as_ref()).unwrap();
+        let should_continue = run_preflight(root, &mut state, adapter.as_ref()).unwrap();
 
+        assert!(
+            !should_continue,
+            "an aborted preflight must tell its caller not to continue launch_stage"
+        );
         assert!(
             workflow::load_state(root, phase).is_err(),
             "abort() must clear state — spawn_monitor was never reached"
@@ -4567,8 +4587,12 @@ mod tests {
         )
         .unwrap();
 
-        run_preflight(root, &mut state, &AlwaysRejectAdapter).unwrap();
+        let should_continue = run_preflight(root, &mut state, &AlwaysRejectAdapter).unwrap();
 
+        assert!(
+            !should_continue,
+            "an aborted preflight must tell its caller not to continue launch_stage"
+        );
         assert!(workflow::load_state(root, phase).is_err());
         let last = devflow_core::events::last_event_for_phase(root, phase).unwrap();
         assert_eq!(last["event"], "workflow_aborted");
@@ -4676,13 +4700,12 @@ mod tests {
 
     /// CR-01 regression (Advance arm, 17-08 gap closure): a preflight
     /// failure resolved by `GateAction::Advance` must launch the agent
-    /// exactly once. `run_preflight`'s OLD `Result<(), CliError>` return
-    /// can't tell its caller (the call site inside `launch_stage`,
-    /// main.rs:1087) whether the recursive retry it just ran already spawned
-    /// the agent — so the caller blindly continues and spawns a SECOND,
-    /// competing agent for the same stage. The explicit `launch_stage(&mut
-    /// state, None, None)` right after `run_preflight` reproduces that blind
-    /// continuation exactly as the unmodified call site performs it.
+    /// exactly once. `run_preflight` returns `Ok(false)` when the recursive
+    /// retry it just ran already spawned the agent — the call site (main.rs
+    /// call site inside `launch_stage`) must not run any more launch steps
+    /// in that case. This mirrors the call site's exact contract: only run
+    /// the explicit `launch_stage(&mut state, None, None)` continuation when
+    /// `run_preflight` says to.
     #[test]
     fn run_preflight_advance_gate_launches_agent_exactly_once() {
         let _guard = ENV_MUTEX.lock().unwrap();
@@ -4712,8 +4735,10 @@ mod tests {
         }
 
         let adapter = FailOnceAdapter::new();
-        run_preflight(root, &mut state, &adapter).unwrap();
-        launch_stage(&mut state, None, None).unwrap();
+        let should_continue = run_preflight(root, &mut state, &adapter).unwrap();
+        if should_continue {
+            launch_stage(&mut state, None, None).unwrap();
+        }
 
         // SAFETY: still serialized under ENV_MUTEX from above.
         unsafe {
@@ -4723,6 +4748,11 @@ mod tests {
             }
         }
 
+        assert!(
+            !should_continue,
+            "an Advance-resolved preflight failure must tell its caller not \
+             to continue launch_stage — the recursive retry already did"
+        );
         let launches = stage_launched_count(root, phase);
         assert_eq!(
             launches, 1,
@@ -4767,8 +4797,10 @@ mod tests {
         }
 
         let adapter = FailOnceAdapter::new();
-        run_preflight(root, &mut state, &adapter).unwrap();
-        launch_stage(&mut state, None, None).unwrap();
+        let should_continue = run_preflight(root, &mut state, &adapter).unwrap();
+        if should_continue {
+            launch_stage(&mut state, None, None).unwrap();
+        }
 
         // SAFETY: still serialized under ENV_MUTEX from above.
         unsafe {
@@ -4778,6 +4810,11 @@ mod tests {
             }
         }
 
+        assert!(
+            !should_continue,
+            "a LoopBack-resolved preflight failure must tell its caller not \
+             to continue launch_stage — the recursive retry already did"
+        );
         let launches = stage_launched_count(root, phase);
         assert_eq!(
             launches, 1,
