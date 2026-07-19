@@ -737,8 +737,8 @@ fn preflight_interactivity_check(project_root: &Path, state: &State) -> Result<(
 /// D-14 (universal, generic layer): whether the gh-auth credential probe
 /// applies to `stage` — hardcoded to `Stage::Ship` rather than a dynamic
 /// hook-scan (review Plan 05 MEDIUM, Codex+OpenCode): Ship's terminal hooks
-/// (`hooks::hooks_after_ship()` = Merge/VersionBump/BranchCleanup,
-/// `hooks.rs:87-89`) are the only hooks that push to a remote. Split out as
+/// (`hooks::hooks_after_ship()` = Merge/VersionBump/ChangelogAppend/BranchCleanup,
+/// `hooks.rs:99-106`) are the only hooks that push to a remote. Split out as
 /// its own pure predicate so "does not run for a non-Ship stage" is directly
 /// unit-testable without shelling out to `gh`.
 fn gh_auth_check_applies(stage: Stage) -> bool {
@@ -1666,18 +1666,22 @@ fn is_ship_review_failure(reason: &Option<String>) -> bool {
 /// a required hook failed.
 /// Which tree a hook batch operates on.
 ///
-/// Content hooks for the Validate→Ship transition (`DocsUpdate`,
-/// `ChangelogAppend`) author material *about the branch being shipped*, so they
-/// must write into that phase's worktree — otherwise their output is stranded
-/// on the base branch, uncommitted and divorced from the commits it describes
-/// (found live: Phase 17's changelog entry landed on `develop` while every one
-/// of its commits sat on `feature/phase-17`).
+/// The Validate→Ship transition batch (`DocsUpdate`) authors material *about
+/// the branch being shipped*, so it must write into that phase's worktree —
+/// otherwise its output is stranded on the base branch, uncommitted and
+/// divorced from the commits it describes (found live: Phase 17's changelog
+/// entry landed on `develop` while every one of its commits sat on
+/// `feature/phase-17`).
 ///
-/// The terminal batch (`Merge`, `VersionBump`, `BranchCleanup`) is the exact
-/// opposite: it merges the feature branch INTO the base branch, tags the base
-/// branch, and deletes the feature branch. Those are primary-checkout
-/// operations and retargeting them at the worktree would be a correctness
-/// regression.
+/// The terminal batch (`Merge`, `VersionBump`, `ChangelogAppend`,
+/// `BranchCleanup`) is the exact opposite: it merges the feature branch INTO
+/// the base branch, tags the base branch, and deletes the feature branch.
+/// Those are primary-checkout operations and retargeting them at the
+/// worktree would be a correctness regression. `ChangelogAppend` moved here
+/// in 17-12 (WR-04) — a release record naming a version only becomes true
+/// once `VersionBump` has tagged it, so the changelog entry belongs on the
+/// base branch alongside the tag, not in the worktree. Do not restore
+/// 17-10's worktree targeting to this hook.
 ///
 /// Falls back to `project_root` whenever no worktree is configured, so
 /// `--no-worktree` runs are unaffected.
@@ -3499,11 +3503,15 @@ mod tests {
 
     /// 14-CR-02: when the checkout lock cannot be acquired, the hook batch
     /// must be SKIPPED — never run unserialized against the shared checkout
-    /// — and the skip must be recorded in events.jsonl. ChangelogAppend
-    /// would observably create CHANGELOG.md if the batch ran. Env-mutating,
-    /// so serialized under ENV_MUTEX; the "0" timeout only affects a
-    /// concurrent test if it is actually contended, which none are (no other
-    /// test holds the project lock).
+    /// — and the skip must be recorded in events.jsonl. `ChangelogAppend`
+    /// would observably create `CHANGELOG.md` if the batch ran; it moved
+    /// from the Validate→Ship batch into `hooks_after_ship()` in 17-12
+    /// (WR-04), so this test now drives that batch instead — none of its
+    /// hooks execute here regardless (the lock check short-circuits before
+    /// the first hook runs), so no real merge/version state is needed.
+    /// Env-mutating, so serialized under ENV_MUTEX; the "0" timeout only
+    /// affects a concurrent test if it is actually contended, which none are
+    /// (no other test holds the project lock).
     #[test]
     fn checkout_hooks_skip_instead_of_running_unserialized_on_lock_timeout() {
         let _guard = ENV_MUTEX.lock().unwrap();
@@ -3517,12 +3525,7 @@ mod tests {
         }
 
         let state = State::new(33, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        run_checkout_hooks(
-            root,
-            &state,
-            &hooks::hooks_for_transition(Stage::Validate, Stage::Ship),
-            Stage::Ship,
-        );
+        run_checkout_hooks(root, &state, &hooks::hooks_after_ship(), Stage::Ship);
 
         // SAFETY: still serialized under ENV_MUTEX from above.
         unsafe {
@@ -5556,9 +5559,12 @@ mod tests {
         );
     }
 
-    /// Content hooks author material about the branch being shipped, so they
-    /// must run in that phase's worktree; the terminal batch merges/tags/deletes
-    /// against the primary checkout and must NOT be retargeted.
+    /// The Validate→Ship content hook (`DocsUpdate`) authors material about
+    /// the branch being shipped, so it must run in that phase's worktree;
+    /// the terminal batch merges/tags/deletes against the primary checkout
+    /// and must NOT be retargeted. `ChangelogAppend` moved into the terminal
+    /// batch in 17-12 (WR-04) for exactly this reason — it now targets
+    /// `project_root`, not the worktree.
     ///
     /// Found live: `ChangelogAppend` wrote Phase 17's release note into
     /// `develop`'s CHANGELOG.md while all of its commits sat on
