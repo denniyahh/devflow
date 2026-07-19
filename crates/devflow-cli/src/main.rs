@@ -1015,7 +1015,18 @@ fn is_self_dogfood_workspace(project_root: &Path) -> bool {
         return false;
     };
     let members = &after_open[..close_rel];
-    members.contains("crates/devflow-core") && members.contains("crates/devflow-cli")
+    // WR-02: compare each array element for exact equality rather than
+    // substring-matching the whole array. `str::contains` would classify a
+    // workspace whose members are `crates/devflow-core-extras` /
+    // `crates/devflow-cli-plugin` as self-dogfood, and self-dogfood + Stale
+    // hard-blocks the pipeline — the one outcome this must never inflict on
+    // an unrelated project.
+    let has_member = |wanted: &str| {
+        members
+            .split(',')
+            .any(|entry| entry.trim().trim_matches(['"', '\'']).trim() == wanted)
+    };
+    has_member("crates/devflow-core") && has_member("crates/devflow-cli")
 }
 
 /// The outcome of the self-dogfood staleness gate (D-18): `Block` only when
@@ -5081,6 +5092,35 @@ mod tests {
 
         let missing = tempfile::tempdir().unwrap();
         assert!(!is_self_dogfood_workspace(missing.path()));
+    }
+
+    /// WR-02: member paths that merely *contain* the real member names must
+    /// not classify an unrelated workspace as self-dogfood — that combination
+    /// hard-blocks the project's entire pipeline when its build reads Stale.
+    #[test]
+    fn is_self_dogfood_workspace_requires_exact_member_paths_not_substrings() {
+        let lookalike = tempfile::tempdir().unwrap();
+        std::fs::write(
+            lookalike.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\n    \"crates/devflow-core-extras\",\n    \"crates/devflow-cli-plugin\",\n]\n",
+        )
+        .unwrap();
+        assert!(
+            !is_self_dogfood_workspace(lookalike.path()),
+            "`devflow-core-extras`/`devflow-cli-plugin` are not the real members — \
+             a substring match here would hard-block an unrelated project"
+        );
+
+        let prefixed = tempfile::tempdir().unwrap();
+        std::fs::write(
+            prefixed.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\n    \"vendor/crates/devflow-core\",\n    \"vendor/crates/devflow-cli\",\n]\n",
+        )
+        .unwrap();
+        assert!(
+            !is_self_dogfood_workspace(prefixed.path()),
+            "vendored copies at a different path are not DevFlow's own workspace"
+        );
     }
 
     /// Build a repo with a `base` commit, a diverged `side`-branch commit
