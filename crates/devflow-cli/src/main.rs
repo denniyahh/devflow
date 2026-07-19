@@ -1415,21 +1415,37 @@ fn handle_rate_limited_outcome(
     let instructions =
         devflow_core::ship::build_single_agent_cron_instructions(project_root, phase, &retry_after);
     devflow_core::ship::write_cron_instructions(project_root, &instructions)?;
+    // CR-03: an unparseable retry hint (e.g. the `"usage limit"` fallback for
+    // a 429 with no retry_after) leaves the schedule empty — and it must stay
+    // empty, since an empty cron expression would degrade into an
+    // every-minute resume. That means auto-resume cannot happen, so returning
+    // here would exit the detached monitor with the phase stalled and no
+    // operator signal at all (the println below is read by nobody). Route
+    // through the same gate/notify path the infra ceiling uses so the phase is
+    // never silently stalled (WR-11/D-15). `infra_failures` is already bumped
+    // above, so `gate_or_abort_infra` — which never bumps — is the correct
+    // entry point.
     if instructions.hermes_cron.schedule.is_empty() {
-        println!("no parseable retry time — auto-resume cron not scheduled; resume manually");
-    } else {
-        println!(
-            "rate limited — wrote {}",
-            devflow_core::ship::cron_instructions_path(project_root, phase)
-                .strip_prefix(project_root)
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| {
-                    devflow_core::ship::cron_instructions_path(project_root, phase)
-                        .display()
-                        .to_string()
-                })
+        return gate_or_abort_infra(
+            project_root,
+            state,
+            stage,
+            Some(format!(
+                "rate limited with no parseable retry time ({retry_after}) — auto-resume cron not scheduled; resume manually"
+            )),
         );
     }
+    println!(
+        "rate limited — wrote {}",
+        devflow_core::ship::cron_instructions_path(project_root, phase)
+            .strip_prefix(project_root)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| {
+                devflow_core::ship::cron_instructions_path(project_root, phase)
+                    .display()
+                    .to_string()
+            })
+    );
     events::emit(
         project_root,
         phase,
@@ -4484,6 +4500,62 @@ mod tests {
             devflow_core::ship::load_cron_instructions(root, phase).is_err(),
             "must not schedule an auto-resume once the infra ceiling stops resumption"
         );
+    }
+
+    /// CR-03: a rate-limit reason whose retry hint is unparseable (e.g. the
+    /// `"usage limit"` fallback `detect_claude_rate_limit` produces for a 429
+    /// with no retry_after) yields an EMPTY cron schedule — auto-resume is
+    /// impossible. That must not return `Ok(())` silently (the detached
+    /// monitor would exit with the phase stalled and zero operator signal);
+    /// it must fire the same never-silent gate + notify the infra path uses
+    /// (WR-11/D-15), and must never invent a schedule.
+    #[test]
+    fn rate_limited_with_unparseable_retry_hint_gates_instead_of_stalling_silently() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 81;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        // Pre-seed an Abort response so `run_gate`'s poll resolves immediately.
+        let response_path = Gates::response_path(root, phase, Stage::Code);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        handle_rate_limited_outcome(
+            root,
+            &mut state,
+            phase,
+            Stage::Code,
+            Some("rate limited until usage limit".into()),
+        )
+        .unwrap();
+
+        let events =
+            std::fs::read_to_string(devflow_core::events::events_path(root)).unwrap_or_default();
+        assert!(
+            events.contains("gate_fired"),
+            "an unparseable retry hint must raise a gate, not stall the phase silently: {events}"
+        );
+        assert!(
+            events.contains("notify_fired"),
+            "the operator must be notified that a manual resume is needed: {events}"
+        );
+        assert!(
+            !events.contains("rate_limit_resume_scheduled"),
+            "nothing was scheduled — emitting a resume-scheduled event would be a false signal: {events}"
+        );
+
+        // The unparseable hint must never become a schedule (an empty cron
+        // expression would otherwise degrade into an every-minute resume).
+        let instructions = devflow_core::ship::load_cron_instructions(root, phase).unwrap();
+        assert!(instructions.hermes_cron.schedule.is_empty());
     }
 
     /// D-10: `advance_evaluated` emits `status` via `AgentStatus::as_wire_str()`
