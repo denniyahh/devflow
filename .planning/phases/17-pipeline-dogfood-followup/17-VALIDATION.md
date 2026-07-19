@@ -94,9 +94,17 @@ and `run_preflight_loopback_gate_launches_agent_exactly_once` each drive `run_pr
 `stage_launched` event across the whole phase event log. Both were confirmed to fail against
 unmodified `main.rs` (observing 2 events) before the fix landed, and pass after.
 
-**Disposition:** closed. `cargo test --workspace` (63/63 non-skipped, GAP-2's pre-existing hang
-excluded), `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --check` all
-confirmed clean at `c03498d`.
+**Disposition:** closed. Independently re-verified at `708499c` by the orchestrator, not just
+self-reported by the executor: the two regression tests were re-run against a surgically
+reintroduced defect (`return Ok(false)` → `Ok(true)` in `run_preflight`) and both failed, proving
+they actually catch CR-01 rather than passing vacuously. Full `cargo test --workspace` is green —
+64/64 in the `devflow` bin target (including both new tests) and 276/276 in `devflow-core`, **0
+ignored** — plus `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check`
+clean.
+
+GAP-2's test ran and passed in that same suite run, but it hung during 17-08's own execution. That
+divergence is direct evidence for GAP-2's nondeterminism, not against it — a green suite still is
+not by itself evidence for that row.
 
 ### GAP-2 — `concurrent_ship_advances_finish_both_phases_independently` is a latent race
 

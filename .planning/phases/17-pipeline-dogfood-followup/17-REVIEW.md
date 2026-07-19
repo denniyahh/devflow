@@ -17,10 +17,10 @@ files_reviewed_list:
   - crates/devflow-core/src/ship.rs
   - crates/devflow-core/src/state.rs
 findings:
-  critical: 1
+  critical: 0
   warning: 3
   info: 1
-  total: 5
+  total: 4
 status: issues_found
 ---
 
