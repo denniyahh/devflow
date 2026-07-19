@@ -35,13 +35,18 @@ mid-run crash or kill.
 - ✓ Reliable terminal finalization, reviewed external post-condition probes,
   retained attempt evidence, deterministic doc/runtime invariants,
   worktree-aware CLI behavior, attempt history, and persistent gates — Phase 16
+- ✓ Fail-closed outcome pipeline: typed agent outcomes incl. ResourceKilled/
+  AgentUnavailable with exhaustive outcome→action policy, `Unknown`
+  non-advance, per-loop infra-failure counter, preflight readiness gate, and
+  build provenance + self-dogfood staleness gate — Phase 17 (AC-4 narrowed:
+  security-artifact + reviewer-set preflight checks deferred to Phase 18)
 
 ### Active
 
-- Phase 17 — **Pipeline Dogfood Follow-Up:** reconcile the terminal Ship
-  event evidence and scope confirmed reliability repairs before feature work.
 - Phase 18 — **Hermes Support:** HermesAgent adapter, current CLI skill file,
-  and an `events.jsonl`-driven gate-watcher plugin. Phases 13–16 are complete.
+  and an `events.jsonl`-driven gate-watcher plugin. Also carries 18d/18e
+  (doctor reconciliation, WR-03 test fix) deferred from Phase 17.
+  Phases 13–17 are complete.
 
 ### Out of Scope
 
@@ -98,4 +103,4 @@ mid-run crash or kill.
 | `.planning/CONCERNS.md` | Top findings from the original pre-Phase-1 codebase audit |
 
 ---
-*Last updated: 2026-07-18 after Phase 17 dogfood spike*
+*Last updated: 2026-07-19 after Phase 17 completion (verified 12/12)*
