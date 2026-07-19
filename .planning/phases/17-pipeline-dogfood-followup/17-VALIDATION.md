@@ -4,7 +4,7 @@ slug: pipeline-dogfood-followup
 # status lifecycle: draft (seeded by plan-phase) → validated (set by validate-phase §6)
 # audit-milestone §5.5 distinguishes NOT-VALIDATED (draft) from PARTIAL (validated + nyquist_compliant: false) (#2117)
 status: validated
-nyquist_compliant: false
+nyquist_compliant: true
 wave_0_complete: true
 created: 2026-07-18
 audited: 2026-07-19
@@ -16,6 +16,7 @@ reaudited_4_at_commit: e61171f
 reaudited_5_at_commit: 46058a7
 reaudited_6_at_commit: 1070df0
 reaudited_7_at_commit: 84dc736
+reaudited_8_at_commit: 142cf8d
 ---
 
 # Phase 17 — Validation Strategy
@@ -65,6 +66,8 @@ row's test was confirmed to exist by name in the tree and to run green under `ca
 | 10 | 17-10, 17-11 | 17d follow-up (dogfood finding) | The second staleness arm only considers build inputs; content hooks target the worktree while terminal hooks stay on the primary checkout | unit | `dirty_flag_arm_ignores_non_build_files_but_still_flags_sources`, `content_hooks_target_the_worktree_while_terminal_hooks_stay_on_project_root` | ✅ green — arm renamed mtime→dirty-flag by `17-11` (CR-02); the original guarantee is unchanged |
 | 11 | audit-fix (`17-REVIEW.md`) | CR-03 / WR-02 / WR-07 | Unparseable retry hint gates instead of stalling silently; self-dogfood match is exact, not substring; the gitignore guard covers all 14 runtime paths, one `check-ignore` per path | unit + integration | `rate_limited_with_unparseable_retry_hint_gates_instead_of_stalling_silently`, `is_self_dogfood_workspace_requires_exact_member_paths_not_substrings`, `gitignore_covers_devflow_runtime_state_paths` | ✅ green |
 | 9 | Phase 16 | AC-1 (regression) | Failed Merge leaves branch intact, blocks VersionBump/BranchCleanup, opens Ship gate | regression (existing) | `terminal_merge_failure_reopens_actionable_gate_and_never_reports_finished`, `terminal_hook_failure_stops_before_branch_cleanup` | ✅ green |
+| 12 | 17-12 | P1 / AC-2 (17d, WR-04) | 17d's **release-record** facet: after the full after-ship batch the changelog heading, the git tag, and the version file name one and the same version, and the tree is clean — no hook write left uncommitted | unit | `after_ship_batch_changelog_tag_and_version_file_agree_and_tree_is_clean`, `changelog_append_commits_its_own_write`, `after_ship_runs_version_changelog_then_cleanup`, `transition_map_finalizes_docs_only_before_ship`, `validate_to_ship_hooks_do_not_touch_changelog`, `read_version_does_not_recompute_from_git_tags`, `read_version_errors_without_version_file`, `read_version_round_trips_through_write_version_in_plain_cargo_toml`, `read_version_round_trips_through_write_version_in_workspace_cargo_toml`, `read_version_round_trips_through_write_version_in_package_json` | ✅ green — GAP-5 closed by `17-12`; RED reconfirmed by the orchestrator at re-audit #8 |
+| 13 | 17-12 (CR-01 R3) | 17d supporting invariant | `GitFlow::commit_path` commits *only* its pathspec — an already-staged unrelated file is not swept into the hook's commit | unit | `commit_path_stages_only_the_given_path_leaving_other_dirt_uncommitted` | ✅ green — test strengthened to stage the unrelated file (an untracked one proved nothing); RED reconfirmed at re-audit #8 |
 
 *Status: ⬜ pending · ✅ green · ❌ red · ⚠️ partial · 🔴 flaky*
 
@@ -301,7 +304,31 @@ hatch — the embedded value at that commit was `71c4ebd311272a7efadea377b29d12a
 
 ### GAP-5 — the `ChangelogAppend` → `VersionBump` ordering guarantee is unsampled, and the defect is live
 
-**Requirement 17d · OPEN · fix planned in `17-12-PLAN.md`, which is written but NOT executed**
+**Requirement 17d · RESOLVED by `17-12-PLAN.md` (fixes `a3a1067`/`31757ef`/`b81ec7d`, CR-01 R3 follow-up `39e2e65`) · closed at re-audit #8 (`142cf8d`)**
+
+> **Closure (re-audit #8).** All three defects below are fixed and now sampled. `hooks_after_ship()`
+> is `[Merge, VersionBump, ChangelogAppend, BranchCleanup]` (`hooks.rs:99-105`) and
+> `hooks_for_transition(Validate, Ship)` is `[DocsUpdate]` only (`hooks.rs:86`), so the entry is
+> written strictly *after* the tag exists. `changelog_append` reads the shipped version via the new
+> `version::read_version` instead of recomputing it with `compute_version` (`hooks.rs:190-199`),
+> which removes the divergence, and it commits its own write through `GitFlow::commit_path`
+> (`hooks.rs:210-214`). `version_bump` was found during execution to carry the identical
+> uncommitted-write defect on the version file and was fixed the same way (`hooks.rs:229-232`).
+>
+> The gap's two required regression tests both exist and are non-vacuous:
+> `after_ship_batch_changelog_tag_and_version_file_agree_and_tree_is_clean` (three-way agreement +
+> clean tree + `CHANGELOG.md` present in a commit) and `changelog_append_commits_its_own_write`.
+> **RED independently reconfirmed by the orchestrator, not self-reported:** re-introducing only the
+> ordering defect (moving `ChangelogAppend` back ahead of `VersionBump`) failed the batch test on the
+> *expected* assertion — `tag must match the changelog heading version`, `left: "v2.0.5" / right:
+> "v2.0.0"` — not on a compile error. The tree was restored and the suite re-run green afterwards.
+>
+> Round 3's CR-01 (`commit_path` committed the whole index because its `git commit` carried no
+> pathspec) is the one live regression this fix introduced, and it is closed by `39e2e65` with a test
+> that was itself strengthened to stage the unrelated file rather than leave it untracked. That test
+> was also driven RED (dropping the `--`/pathspec fails `!committed_files.contains("unrelated.txt")`).
+
+**Original finding, preserved:**
 
 Re-audits #1–#6 audited 17d's *build provenance* facet (rows 7 and 8) and closed it adversarially.
 They never sampled 17d's *release-record* facet, because no plan had raised it yet. `17-REVIEW.md`'s
@@ -389,17 +416,21 @@ with Phase 18's Hermes adapter, the first adapter with real reviewer storage.
 
 - [x] All requirements have automated verification or a recorded manual-only/override disposition
 - [x] Sampling continuity: no 3 consecutive tasks without automated verify
-- [x] Test infrastructure confirmed: `cargo test --workspace` green (**367 passed / 0 failed / 0 ignored / 0 filtered** across 10 targets), `cargo clippy --workspace --all-targets -- -D warnings` clean, `cargo fmt --check` clean (re-confirmed 2026-07-19 at `1070df0`, re-audit #6)
+- [x] Test infrastructure confirmed: `cargo test --workspace` green (**376 passed / 0 failed / 0 ignored / 0 filtered** across 10 targets), `cargo clippy --workspace --all-targets -- -D warnings` clean, `cargo fmt --check` clean (re-confirmed 2026-07-19 at `142cf8d`, re-audit #8)
 - [x] No watch-mode flags
 - [x] Feedback latency < 90s — holds on a clean run (~11s warm); the ~33–40 % of runs where GAP-2's
   race manifests now resolve in a bounded ~2–4 s (via the `DEVFLOW_GATE_TIMEOUT_SECS=2` test-scoped
   override, `17-09-PLAN.md`, fix `cb9359f`) instead of hanging. This box is now honestly checkable:
   worst-case observed latency across 25 consecutive isolated runs was ~4 s, well inside the 90 s
   budget. See GAP-2.
-- [ ] `nyquist_compliant: false` (re-audit #7, `84dc736`) — **GAP-5 is open**: 17d's release-record
-  facet (`ChangelogAppend` → `VersionBump` ordering, and the uncommitted changelog write) has zero
-  automated sampling, and the defect is live in the tree. Escalated to `17-12-PLAN.md`, written but
-  unexecuted. The bullet below remains accurate for every gap raised *before* this pass.
+- [x] `nyquist_compliant: true` (re-audit #8, `142cf8d`) — **GAP-5 is closed.** `17-12-PLAN.md`
+  executed: the hook batch is reordered, `changelog_append` reads back the shipped version and
+  commits its own write, and `version_bump`'s matching uncommitted-write defect was fixed alongside.
+  Both required regression tests exist, and the batch test was driven RED by the orchestrator on the
+  *expected* assertion before being accepted. Round 3's CR-01 (`commit_path`'s missing pathspec),
+  the one regression this fix introduced, is closed by `39e2e65` with a strengthened, also-RED-proven
+  test. Every gap this document has raised is now closed.
+- [x] ~~`nyquist_compliant: false` (re-audit #7, `84dc736`)~~ — superseded by the bullet above.
 - [x] `nyquist_compliant: true` (re-audit #5, `46058a7`) — every gap this document raised is now
   closed: GAP-1 by `17-08-PLAN.md` (`c03498d`), GAP-2's test-level hang by `17-09-PLAN.md`
   (`cb9359f`), **GAP-3 by `17-11-PLAN.md` (`3e39cf6`)** — 17d's build-provenance freshness is now
@@ -881,3 +912,82 @@ was previously certified, but a correction to its scope. Phase 17 is not Nyquist
 **Unchanged and still not a validation gap:** GAP-2's product-level version-tag contention between
 concurrently-shipping phases remains OUT OF SCOPE, owned by future ship/version-bump concurrency work.
 Note that it and GAP-5 touch the same hook batch; closing GAP-5 does not close it.
+
+---
+
+## Validation Re-Audit #8 2026-07-19 (HEAD `142cf8d`)
+
+Eighth pass, triggered by re-audit #7's escalation: GAP-5 routed to `/gsd-execute-phase 17
+--gaps-only`, which has since run. Ten commits landed in `84dc736..142cf8d`, six of them touching
+`crates/`.
+
+| Metric | Count |
+|--------|-------|
+| Requirement rows audited | 13 |
+| Suite result (**unfiltered**) | **376 passed / 0 failed / 0 ignored / 0 filtered** (10 targets), `cargo` exit 0 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | clean (exit 0) |
+| `cargo fmt --check` | clean (exit 0) |
+| Rows green | 13 |
+| Gaps open at re-audit #7 | 1 (GAP-5) |
+| Resolved by this pass | 1 (GAP-5) |
+| New gaps found | 0 |
+| `nyquist_compliant` | **`false` → `true`** |
+
+**Suite reconciliation — 368 → 376, accounted for exactly (+8).** `version.rs` +5
+(`read_version_does_not_recompute_from_git_tags`, `read_version_errors_without_version_file`, and
+three `read_version_round_trips_through_write_version_in_*` cases); `hooks.rs` +2
+(`after_ship_batch_changelog_tag_and_version_file_agree_and_tree_is_clean`,
+`changelog_append_commits_its_own_write`); `git.rs` +1
+(`commit_path_stages_only_the_given_path_leaving_other_dirt_uncommitted`). Three hooks tests were
+*renamed*, not added — `after_ship_runs_version_and_cleanup` →
+`after_ship_runs_version_changelog_then_cleanup`, `transition_map_finalizes_docs_and_changelog_before_ship`
+→ `transition_map_finalizes_docs_only_before_ship`, `validate_to_ship_hooks_append_changelog` →
+`validate_to_ship_hooks_do_not_touch_changelog` — which is why the count moves by 8 and not 11. No
+test was removed. Gates were run directly with exit codes read from `cargo` itself, not through a
+pipe whose status belongs to `tail` (re-audit #4's recorded false-green trap).
+
+**GAP-5 closed, and closed against evidence rather than the executor's self-report.** This document's
+standing rule since re-audit #3 is that a test earns its row by being capable of going red for the
+right reason, so both of this range's load-bearing tests were driven RED by the orchestrator:
+
+- **Ordering (the gap proper).** Moving `Hook::ChangelogAppend` back ahead of `Hook::VersionBump` in
+  `hooks_after_ship()` — the *only* change — failed
+  `after_ship_batch_changelog_tag_and_version_file_agree_and_tree_is_clean` at `hooks.rs:487` with
+  `tag must match the changelog heading version`, `left: "v2.0.5" / right: "v2.0.0"`. That is the
+  assertion the gap names, firing for the reason the gap names — not a compile error dressed up as a
+  failing test.
+- **CR-01 (R3), the regression the fix itself introduced.** Dropping the `--`/pathspec from
+  `commit_path`'s `git commit` failed
+  `commit_path_stages_only_the_given_path_leaving_other_dirt_uncommitted` at `git.rs:686` on
+  `!committed_files.contains("unrelated.txt")`. Worth recording *why* this test now works: as shipped
+  it staged nothing and left `unrelated.txt` **untracked**, which every implementation excludes, so it
+  could not fail on the bug it was named for. `39e2e65` both scoped the commit and rewrote the fixture
+  to `git add` the unrelated file first. The vacuous-assertion class this document retired as GAP-4
+  reappeared here in a subtler form — a correct assertion over a fixture that cannot reproduce the
+  defect condition — and is the failure mode most worth watching for in future passes.
+
+The working tree was restored after each reintroduction and the full suite re-run green.
+
+**The rest of the range is covered.** `version::read_version`/`parse_version_str` ship with five
+tests spanning all three supported version files plus the negative case, and the
+"does-not-recompute-from-git-tags" case pins the exact property the fix exists for.
+`version_bump`'s own version-file commit — an in-flight deviation, not a planned task — is sampled by
+the batch test's clean-tree assertion. `commit_path`'s bare-`file_name()` argument in `version_bump`
+was checked and is sound: `detect_version_file` only ever returns `project_root/<name>`, so the name
+is always a valid project-root-relative pathspec. `main.rs`'s changes in this range are doc comments
+plus one test retargeted from the now-empty Validate→Ship batch to `hooks_after_ship()`.
+
+**Verdict: PASS.** Thirteen requirement rows, all automated, green, deterministic and unfiltered.
+Both facets of 17d are now sampled — build provenance across six adversarial passes, release record
+by this one. `nyquist_compliant: true`.
+
+**Standing caveat, restated:** a PASS verdict does not survive its own commit range. Re-run this
+audit before shipping if any commit lands on `crates/`.
+
+**Unchanged and still not a validation gap:** GAP-2's product-level version-tag contention between
+concurrently-shipping phases remains OUT OF SCOPE, owned by future ship/version-bump concurrency
+work. It and GAP-5 touch the same hook batch; closing GAP-5 did not close it.
+
+**Not a validation matter:** `17-REVIEW.md` keeps `ship_gate: BLOCKED` on round 2's eight open
+Warnings, and its `findings: critical: 1` is a *found* count by this file's convention, deliberately
+not decremented. Neither is stale; both are operator calls outside this audit's scope.
