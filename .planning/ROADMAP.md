@@ -191,9 +191,11 @@ Hermes adapter, an accepted override recorded in
 `17-VERIFICATION.md`'s frontmatter (`overrides:`).
 **Depends on:** Phase 16
 **Blocks:** Phase 18 Hermes Support
-**Plans:** 8/8 plans executed
+**Plans:** 9/9 plans executed
 
 Plans:
+
+- [x] 17-09-PLAN.md
 
 - [x] 17-07-PLAN.md
 - [x] 17-08-PLAN.md

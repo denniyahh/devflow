@@ -2,14 +2,14 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
-status: Phase 17 complete (13/13) - CR-01 resolved via 17-08, nyquist_compliant: true
-stopped_at: Completed 17-08-PLAN.md
-last_updated: "2026-07-19T19:16:24.677Z"
+status: "Phase 17 complete (14/14) - CR-01 resolved via 17-08, GAP-2 (test-level) resolved via 17-09, nyquist_compliant: true"
+stopped_at: Completed 17-09-PLAN.md
+last_updated: "2026-07-19T20:10:09.744Z"
 progress:
   total_phases: 7
   completed_phases: 6
-  total_plans: 42
-  completed_plans: 42
+  total_plans: 43
+  completed_plans: 43
   percent: 86
 ---
 
@@ -52,20 +52,30 @@ progress:
 
 ## Blockers
 
-- **`concurrent_ship_advances_finish_both_phases_independently` hangs
-  indefinitely — `cargo test --workspace` cannot complete.** Reproduced
-  deterministically 2026-07-19 (isolated run timed out at 180s; a full
-  workspace run sat in this one test for 22 min). Mechanism: the test ships
-  phases 31 and 32 concurrently, both `VersionBump` hooks race to create tag
-  `v2.0.1`, the loser fails (`cannot lock ref 'refs/tags/v2.0.1'`), ship
-  failure reopens the `32-ship` gate ("gate written … awaiting response"
-  appears twice), and the test only ever pre-wrote **one** response — so the
-  reopened gate polls forever with no timeout. **Not a Phase 17 regression:**
-  the same sequence reproduces at `8c653f8` (parent of 17-04's `advance()`
-  rewrite), so it predates the phase. It is a latent race, which is why it
-  intermittently passes — `17-VERIFICATION.md`'s truth #12 "`cargo test
-  --workspace` → all green" was a lucky pass and should not be relied on.
-  Fix belongs with the ship/version-bump concurrency work, not Phase 17.
+None currently open for Phase 17.
+
+- **RESOLVED 2026-07-19 (17-09, `cb9359f`):**
+  `concurrent_ship_advances_finish_both_phases_independently` no longer hangs.
+  Mechanism (confirmed directly via temporary debug instrumentation, not just
+  inferred from timing): the test ships phases 31 and 32 concurrently, and on
+  a genuinely intermittent race (~33-40% of isolated runs, measured across
+  three independent audits plus this fix's own 25-run verification), both
+  `VersionBump` hooks compute the identical next version and race to create
+  the same tag (`cannot lock ref 'refs/tags/...'`); the loser's ship failure
+  reopens its Ship gate, and since the test only ever pre-wrote **one**
+  response per phase, the reopened gate previously polled forever with no
+  timeout. Fix: `DEVFLOW_GATE_TIMEOUT_SECS` is bounded to 2 seconds for this
+  test's poll only (under the file's `ENV_MUTEX` guard, restored
+  immediately after) — the 7-day production default is untouched. The test
+  now asserts either legitimate outcome deterministically (no collision:
+  both phases finish; collision: the loser's bounded timeout + intact,
+  still-gated state). 25 consecutive isolated runs under a 120s external
+  timeout: 0 hangs, 9 of which hit the race and resolved via the bounded
+  path. **The underlying product-level version-tag contention (why the
+  checkout lock occasionally doesn't fully serialize the two threads'
+  terminal hooks) remains open and out of scope** — belongs to future
+  ship/version-bump concurrency work, not Phase 17 or 18. See
+  `17-VALIDATION.md` GAP-2 and `17-09-SUMMARY.md`.
 
 ## Decisions
 
@@ -120,6 +130,7 @@ progress:
 - [Phase 17]: 17-05: preflight_interactivity_check scoped to AgentKind::Codex only (not every adapter) — a blanket check broke 3 passing start() integration tests since Claude/OpenCode complete Define headlessly; launch_stage signature changed to &mut State so run_preflight/enforce_build_staleness can drive run_gate
 - [Phase 17]: 17-06: infra_failures reset scoped to transition() (forward-stage-transition path) only, not gate-driven retry branches — MAX_INFRA_FAILURES bounds a stuck loop across forward progress, not every same-stage retry
 - [Phase 17]: 17-08: run_preflight returns Result<bool, CliError> to disambiguate 'preflight passed' from 'a resolved gate already relaunched everything' (CR-01 double-agent-spawn fix, GAP-1 closed, nyquist_compliant: true); regression tests inject a Cell<bool> FailOnceAdapter directly into run_preflight and stub PATH under ENV_MUTEX so a real, completing launch_stage never risks spawning a real agent CLI
+- [Phase 17]: 17-09: GAP-2 (concurrent_ship_advances_finish_both_phases_independently unbounded wedge) resolved test-level: DEVFLOW_GATE_TIMEOUT_SECS bounded to 2s under ENV_MUTEX for the reopened loser gate's poll only, 7-day production default untouched. RED reproduced the hang under 120s external timeout; debug instrumentation caught both phases computing the identical version tag ~1.8ms apart, proving the checkout lock occasionally fails to fully serialize the two threads' terminal hooks -- recorded as an explicit OUT-OF-SCOPE product-level version-tag contention question for future ship/version-bump concurrency work, not fixed here. 25 consecutive isolated runs: 0 hangs, 9 hit the race and resolved via the bounded path.
 
 ## Roadmap Evolution
 
@@ -165,9 +176,10 @@ progress:
 | Phase 17-pipeline-dogfood-followup P05 | 45min | 2 tasks | 2 files |
 | Phase 17-pipeline-dogfood-followup P06 | 25min | 3 tasks | 5 files |
 | Phase 17-pipeline-dogfood-followup P08 | 20min | 3 tasks | 3 files |
+| Phase 17-pipeline-dogfood-followup P09 | 50min | 2 tasks | 2 files |
 
 ## Session
 
-**Last session:** 2026-07-19T19:16:24.654Z
-**Stopped at:** Completed 17-08-PLAN.md
+**Last session:** 2026-07-19T20:10:09.715Z
+**Stopped at:** Completed 17-09-PLAN.md
 **Resume file:** None
