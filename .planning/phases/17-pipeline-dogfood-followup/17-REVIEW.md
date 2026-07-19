@@ -37,7 +37,9 @@ status: issues_found
 **Reviewed:** 2026-07-19T17:10:00Z
 **Depth:** deep (5 parallel angles, merged and deduplicated)
 **Files Reviewed:** 14
-**Status:** issues_found — **3 Critical**
+**Status:** issues_found — **3 Critical found, 0 open** (CR-01 fixed via `5431f9e`, CR-03 fixed
+via `f531d08`, CR-02 fixed via `17-11` — see the CR-02 entry and the Audit-Fix Addendum below).
+Warnings/Info items remain open per the "Still open" list in the Addendum.
 
 ## Summary
 
@@ -183,6 +185,35 @@ surface it.
 (emit `cargo:rerun-if-changed=` against a non-existent sentinel, accepting one build-script run per
 build) or stop embedding a dirty flag and timestamp that the trigger set cannot honor. Add a test
 that builds twice across a working-tree edit and asserts the provenance actually changed.
+
+**RESOLVED — `17-11` (gap closure).** Reclassified manual-only below because both fixes this
+entry proposed reverse a recorded design decision (`build.rs:32-35`, D-20 / review consensus #7);
+the operator has now made that call. Chosen: **always re-run `build.rs`, and stop embedding
+`DEVFLOW_BUILD_TIMESTAMP`**, keeping `DEVFLOW_BUILD_COMMIT` + `DEVFLOW_BUILD_DIRTY`. `build.rs`
+now declares a single sentinel `rerun-if-changed` path that can never exist, forcing cargo's
+"missing input ⇒ always rerun" rule on every `cargo build`. Retiring the timestamp is what keeps
+that from recompiling `devflow-cli` on every build — it was the only embedded value that changed
+every run; only the commit/dirty flag change now, so `rustc-env` (and the recompile it triggers)
+only fires when they actually do.
+
+Retiring the timestamp also retired the mtime arm — the fixture home of 17-10's CHANGELOG
+false-positive fix — replaced with a two-signal decision: the build's own `DEVFLOW_BUILD_DIRTY`
+flag plus a live check of whether the working tree currently has modified build-affecting files
+(`combined_staleness` / `tree_has_modified_build_inputs`, `main.rs`). `(dirty=false, tree
+modified)` ⇒ Stale (this CR-02 case); `(dirty=true, tree modified)` ⇒ Indeterminate (warn, never
+block — Pitfall 4, since "same dirt" and "more dirt" can't be told apart without a timestamp). The
+ancestry arm (WR-01/17-06) and Ahead classification (17-07) are unchanged. As a byproduct,
+`DEVFLOW_BUILD_DIRTY` is now actually read by a staleness code path (WR-09's second bullet) — the
+call site at `main.rs`'s `launch_stage` passes `env!("DEVFLOW_BUILD_DIRTY") == "true"` into
+`enforce_build_staleness`; WR-09's `Ahead`/`Indeterminate` output-collapse bullet is untouched and
+remains open.
+
+Verified via the reviewer's own reproduction, automated as a regression test
+(`crates/devflow-cli/tests/build_provenance.rs::build_dirty_flips_false_to_true_across_a_working_tree_edit_after_rebuild`):
+a synthetic packed-refs checkout is built, a tracked `.rs` file is edited, it is built again, and
+the build script's own cached `output` file is asserted to show `DEVFLOW_BUILD_DIRTY` flip
+`false → true`. `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
+and `cargo fmt --check` all pass after the fix.
 
 ---
 
@@ -507,7 +538,7 @@ Baseline at `36a5e14` re-confirmed green before any edit: 364 passed / 0 failed,
 | ID | Disposition | Commit |
 |---|---|---|
 | CR-01 | **Fixed** — false 1.4.26 heading removed | `5431f9e` |
-| CR-02 | **Manual-only** (reclassified) — see below | — |
+| CR-02 | **Fixed** — `17-11` gap closure, operator decision (always-rerun `build.rs`, drop the timestamp) | `3e39cf6` |
 | CR-03 | **Fixed** — empty-schedule branch routes through `gate_or_abort_infra`; regression test RED→GREEN | `f531d08` |
 | WR-02 | **Fixed** — exact member-path equality; regression test RED→GREEN | `02e17dd` |
 | WR-05/06 | **Fixed** — `--all-targets` in both clippy gates | `50a6b16` |
@@ -516,22 +547,22 @@ Baseline at `36a5e14` re-confirmed green before any edit: 364 passed / 0 failed,
 Suite after all fixes: **366 passed / 0 failed** (+2 regression tests), `cargo clippy --workspace
 --all-targets -- -D warnings` exit 0, `cargo fmt --check` exit 0.
 
-**CR-02 was reclassified from auto-fixable to manual-only.** `build.rs:32-35` documents the
-narrow trigger set as a deliberate decision ("Re-run only when git refs actually move — not on
-every `cargo build`", review consensus #7 / D-20). Both fixes CR-02 proposes reverse that recorded
-decision: dropping the caching intent recompiles `devflow-cli` on every build (the embedded
-timestamp changes each run, so the `rustc-env` value changes), and dropping the dirty flag and
-timestamp guts the staleness gate this phase exists to deliver. That is a design tradeoff for a
-human, not an autonomous edit. **The defect is real and still open.**
+**CR-02 was reclassified from auto-fixable to manual-only at this pass.** `build.rs:32-35`
+documented the narrow trigger set as a deliberate decision ("Re-run only when git refs actually
+move — not on every `cargo build`", review consensus #7 / D-20), and both fixes this addendum
+could have applied autonomously would have reversed that recorded decision without operator
+sign-off — a design tradeoff for a human, not an autonomous edit. **The operator has since made
+that call and CR-02 is fixed — see the CR-02 entry above and the `17-11` disposition row in the
+table.**
 
 **Additional weakness found while fixing WR-07, not named in the review:** `git check-ignore` exits
 0 when *any* argument is ignored (verified directly: batched call with one ignored + one unignored
 path exits 0). The original guard passed all three paths in a single invocation, so it would have
 stayed green after losing 2 of its 3 paths. Now one invocation per path.
 
-**Still open after this pass:** CR-02 (manual-only), WR-01, WR-03 (both auto-fixable, over
-`--max 5`), WR-04, WR-08, WR-09 (manual-only), and IN-01…IN-06 (below `--severity medium`).
-`status: issues_found` is therefore left unchanged.
+**Still open after this pass:** WR-01, WR-03 (both auto-fixable, over `--max 5`), WR-04, WR-08,
+WR-09 (manual-only), and IN-01…IN-06 (below `--severity medium`). CR-02 is resolved (`17-11`);
+`status: issues_found` is left unchanged pending these remaining Warning/Info items.
 
 Note WR-08 interacts with the CR-03 fix: a rate-limited phase with an unparseable hint now blocks
 on `Gates::poll_response` — bounded only by the 7-day production default WR-08 flags — instead of
