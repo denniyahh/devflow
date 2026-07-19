@@ -936,8 +936,31 @@ fn tree_has_modified_build_inputs(project_root: &Path) -> Option<bool> {
     if status.trim().is_empty() {
         return Some(false);
     }
-    let modified = run_git_stdout(project_root, &["ls-files", "-m"])?;
-    Some(modified.lines().any(affects_compiled_binary))
+    // WR-03: enumerate from `--porcelain` itself rather than `git ls-files -m`.
+    // `ls-files -m` compares worktree-vs-INDEX, so a *staged* source edit
+    // (`git add src/lib.rs`) reports nothing while porcelain reports `M `.
+    // That fell through to the ancestry arm as Fresh, letting a stale binary
+    // drive its own workspace — the exact false-evidence class this gate exists
+    // to catch. Untracked files stay excluded, as under `ls-files -m`.
+    Some(
+        status
+            .lines()
+            .any(|line| porcelain_tracked_path(line).is_some_and(affects_compiled_binary)),
+    )
+}
+
+/// The repo-relative path a `git status --porcelain` line refers to, or `None`
+/// for untracked (`??`) entries. Porcelain v1 lines are `XY<space>PATH`, with
+/// renames/copies rendered as `ORIG -> PATH`; the destination is the path that
+/// exists in the worktree. Paths containing special characters are quoted by
+/// git, so surrounding quotes are stripped.
+fn porcelain_tracked_path(line: &str) -> Option<&str> {
+    if line.len() < 4 || line.starts_with("??") {
+        return None;
+    }
+    let path = &line[3..];
+    let path = path.rsplit(" -> ").next().unwrap_or(path);
+    Some(path.trim_matches('"'))
 }
 
 /// Whether a repo-relative path can change the compiled binary. The live
@@ -999,7 +1022,18 @@ fn is_self_dogfood_workspace(project_root: &Path) -> bool {
     let Ok(contents) = std::fs::read_to_string(project_root.join("Cargo.toml")) else {
         return false;
     };
-    let Some(members_start) = contents.find("members") else {
+    // WR-05: anchor on the `members` KEY, not the first substring hit.
+    // `default-members` contains `members`, so a bare `find` would scan that
+    // array instead and silently degrade the self-dogfood hard block to a
+    // warning the moment the root manifest gains a `default-members` key
+    // above `members`.
+    let Some(members_start) = contents.match_indices("members").find_map(|(idx, _)| {
+        let preceded_by_ident = contents[..idx]
+            .chars()
+            .next_back()
+            .is_some_and(|ch| ch.is_alphanumeric() || ch == '_' || ch == '-');
+        (!preceded_by_ident).then_some(idx)
+    }) else {
         return false;
     };
     let rest = &contents[members_start..];
@@ -5124,6 +5158,28 @@ mod tests {
         );
     }
 
+    /// WR-05: `"default-members"` contains `"members"`. A bare
+    /// `contents.find("members")` locks onto that key's array instead, so the
+    /// real member list is never scanned and the self-dogfood hard block
+    /// silently degrades to a warning — with every existing test still green,
+    /// because their fixtures all put `members = [...]` first.
+    #[test]
+    fn is_self_dogfood_workspace_anchors_on_members_not_default_members() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\n\
+             default-members = [\"crates/devflow-cli\"]\n\
+             members = [\"crates/devflow-core\", \"crates/devflow-cli\"]\n",
+        )
+        .unwrap();
+        assert!(
+            is_self_dogfood_workspace(dir.path()),
+            "a `default-members` key ahead of `members` must not hide the real \
+             member list — that turns the D-18 hard block into a warning"
+        );
+    }
+
     /// Build a repo with a `base` commit, a diverged `side`-branch commit
     /// that is NOT an ancestor of the final `trunk` HEAD, then return to
     /// `trunk` — exercises all three `embedded_commit_is_stale` outcomes
@@ -5467,6 +5523,29 @@ mod tests {
             Some(true),
             "a modified .rs file is genuine staleness input"
         );
+
+        // WR-03: the same edit, STAGED, must read identically. `git ls-files -m`
+        // compares worktree-vs-index and goes silent once the edit is staged,
+        // which let a stale binary certify itself as Fresh.
+        git(&["add", "crates/devflow-cli/src/main.rs"]);
+        assert!(
+            !run_git_stdout(root, &["ls-files", "-m"])
+                .unwrap()
+                .lines()
+                .any(|line| line.ends_with(".rs")),
+            "fixture precondition: `ls-files -m` is blind to the staged .rs edit"
+        );
+        assert_eq!(
+            tree_has_modified_build_inputs(root),
+            Some(true),
+            "a STAGED source edit is just as much a staleness input as an unstaged one"
+        );
+        assert_eq!(
+            combined_staleness(root, &embedded_commit, build_dirty),
+            Staleness::Stale,
+            "a staged, uncommitted source edit on a clean build is Stale"
+        );
+        git(&["reset", "-q"]);
         assert_eq!(
             combined_staleness(root, &embedded_commit, build_dirty),
             Staleness::Stale
