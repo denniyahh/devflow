@@ -151,5 +151,33 @@ Phase 17's goal — closing the pipeline-reliability holes the Phase 16 dogfood 
 
 ---
 
+## Addendum 2026-07-19 — plan 17-08 landed after this verification
+
+This report was written at `12:05Z` against 7 plans. An eighth plan, `17-08`, landed afterward
+(`b570114` → `708499c`) to close `17-VALIDATION.md`'s GAP-1.
+
+**The 12/12 verdict is unchanged, and 17-08 does not require re-verification.** 17-08 carries
+requirement `17c`, which this report already verified; it added no new phase requirement and
+changed no must_have. It fixed a defect *within* 17c: `run_preflight` resolved a failing-check
+gate by recursing into a full `launch_stage`, then returned `Ok(())` into the middle of the outer
+`launch_stage`, which continued and spawned a second competing agent for the same stage. The
+return type is now `Result<bool, CliError>` and the call site short-circuits on `Ok(false)`. Net
+effect on this report: 17c's "preflight reports a named gate before `spawn_monitor`" must_have is
+now true on the `Advance`/`LoopBack` gate arms too, not only the `Abort` arm.
+
+**Naming collision, for future readers:** the `CR-01` closed in the Gaps Summary above
+(`infra_failures` reset, `cb9ddab`) is a *different* finding from the `CR-01` closed by 17-08
+(preflight double spawn, `c03498d`). They come from two successive review passes that each
+numbered their findings from 1.
+
+Orchestrator-verified at `708499c`, independently of the executor's self-report: both new
+regression tests were re-run against a surgically reintroduced defect and both failed, proving
+they catch the bug rather than passing vacuously; `cargo test --workspace` green (64/64 bin +
+276/276 core, 0 ignored); `cargo clippy --workspace --all-targets -- -D warnings` and
+`cargo fmt --check` clean.
+
+---
+
 _Verified: 2026-07-19T12:05:00Z_
 _Verifier: Claude (gsd-verifier)_
+_Addendum: 2026-07-19T19:25:00Z — orchestrator (/gsd-execute-phase 17 --gaps-only)_
