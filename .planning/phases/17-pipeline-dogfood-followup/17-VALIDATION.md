@@ -4,7 +4,7 @@ slug: pipeline-dogfood-followup
 # status lifecycle: draft (seeded by plan-phase) → validated (set by validate-phase §6)
 # audit-milestone §5.5 distinguishes NOT-VALIDATED (draft) from PARTIAL (validated + nyquist_compliant: false) (#2117)
 status: validated
-nyquist_compliant: false
+nyquist_compliant: true
 wave_0_complete: true
 created: 2026-07-18
 audited: 2026-07-19
@@ -13,6 +13,7 @@ reaudited_at_commit: cf062e6
 reaudited_2_at_commit: 636d1ab
 reaudited_3_at_commit: b77c13e
 reaudited_4_at_commit: e61171f
+reaudited_5_at_commit: 46058a7
 ---
 
 # Phase 17 — Validation Strategy
@@ -57,9 +58,9 @@ row's test was confirmed to exist by name in the tree and to run green under `ca
 | 4 | 17-01, 17-04, 17-06 | P2 (17b, D-08) | Infra outcomes never increment `consecutive_failures`; the ceiling bounds a stuck loop, not a phase lifetime | unit | `resource_killed_on_code_bumps_infra_failures_not_consecutive_failures`, `resource_killed_on_validate_bumps_infra_not_consecutive_failures`, `transition_resets_infra_failures`, `infra_ceiling_aborts_instead_of_gating` | ✅ green |
 | 5 | 17-04 | P2 (17b, D-09) | `RateLimited` in the PRIMARY `advance()` path writes cron-instructions instead of a blocking gate | unit + integration | `primary_loop_rate_limited_writes_single_agent_cron_instructions`, `rate_limited_at_infra_ceiling_stops_resuming_and_aborts`, `sequentagent_hands_off_after_rate_limit_and_writes_cron_instructions` | ✅ green |
 | 6 | 17-05, 17-08 | P3 / AC-4 (17c) | A readiness failure is reported as a named preflight gate BEFORE `spawn_monitor`, never a hard exit; an Advance/LoopBack-resolved gate launches the agent exactly once, never twice (CR-01) | unit + integration | `run_preflight_failing_check_gates_and_never_reaches_spawn_monitor`, `run_preflight_adapter_hook_override_fires`, `preflight_interactivity_check_flags_auto_define_without_context_md`, `start_codex_without_context_fails_preflight`, `default_preflight_is_ok_for_built_in_adapters`, `run_preflight_advance_gate_launches_agent_exactly_once`, `run_preflight_loopback_gate_launches_agent_exactly_once` | ✅ green |
-| 7 | 17-02, 17-05 | P1 / AC-2 (17d, D-21) | `workflow_started` carries version/commit/dirty/build-timestamp/exe-path fields | unit + integration | `workflow_started_payload_carries_build_provenance`, `build_timestamp_is_a_parseable_u64`, `build_dirty_is_exactly_true_or_false`, `build_commit_is_accessible_and_does_not_panic` | ⚠️ partial — tests green, but they sample provenance *shape*, never *freshness*; see GAP-3, GAP-4 |
-| 8 | 17-05, 17-06, 17-07 | P1 / AC-2 (17d, D-17/D-19) | Stale embedded commit blocks a DevFlow-workspace launch; a *descendant* build warns instead of blocking; ordinary projects only warn | unit | `embedded_commit_is_stale_maps_ancestry_exit_codes`, `wr01_clean_tree_strict_ancestor_build_is_stale_and_hard_blocks`, `ahead_build_from_descendant_commit_warns_instead_of_blocking`, `enforce_build_staleness_blocks_self_dogfood_and_records_event_before_erroring` | ⚠️ partial — decision logic green, but its *inputs* are stale under CI conditions; see GAP-3 |
-| 10 | 17-10 | 17d follow-up (dogfood finding) | The mtime staleness arm only considers build inputs; content hooks target the worktree while terminal hooks stay on the primary checkout | unit | `mtime_arm_ignores_non_build_files_but_still_flags_sources`, `content_hooks_target_the_worktree_while_terminal_hooks_stay_on_project_root` | ✅ green |
+| 7 | 17-02, 17-05, 17-11 | P1 / AC-2 (17d, D-21) | `workflow_started` carries version/commit/dirty/exe-path fields, and the embedded provenance actually refreshes when the working tree changes | unit + integration | `workflow_started_payload_carries_build_provenance`, `build_dirty_is_exactly_true_or_false`, `build_commit_is_empty_or_a_full_hex_sha`, `build_dirty_flips_false_to_true_across_a_working_tree_edit_after_rebuild` | ✅ green — freshness now sampled (GAP-3 closed by `17-11`); vacuous test replaced (GAP-4 closed by `46058a7`). `build_timestamp_is_a_parseable_u64` retired with the timestamp itself (CR-02) |
+| 8 | 17-05, 17-06, 17-07, 17-11 | P1 / AC-2 (17d, D-17/D-19) | Stale embedded commit blocks a DevFlow-workspace launch; a *descendant* build warns instead of blocking; ordinary projects only warn | unit | `embedded_commit_is_stale_maps_ancestry_exit_codes`, `wr01_clean_tree_strict_ancestor_build_is_stale_and_hard_blocks`, `ahead_build_from_descendant_commit_warns_instead_of_blocking`, `enforce_build_staleness_blocks_self_dogfood_and_records_event_before_erroring` | ✅ green — decision logic unchanged, and its *inputs* are now current under CI conditions (GAP-3 closed by `17-11`) |
+| 10 | 17-10, 17-11 | 17d follow-up (dogfood finding) | The second staleness arm only considers build inputs; content hooks target the worktree while terminal hooks stay on the primary checkout | unit | `dirty_flag_arm_ignores_non_build_files_but_still_flags_sources`, `content_hooks_target_the_worktree_while_terminal_hooks_stay_on_project_root` | ✅ green — arm renamed mtime→dirty-flag by `17-11` (CR-02); the original guarantee is unchanged |
 | 11 | audit-fix (`17-REVIEW.md`) | CR-03 / WR-02 / WR-07 | Unparseable retry hint gates instead of stalling silently; self-dogfood match is exact, not substring; the gitignore guard covers all 14 runtime paths, one `check-ignore` per path | unit + integration | `rate_limited_with_unparseable_retry_hint_gates_instead_of_stalling_silently`, `is_self_dogfood_workspace_requires_exact_member_paths_not_substrings`, `gitignore_covers_devflow_runtime_state_paths` | ✅ green |
 | 9 | Phase 16 | AC-1 (regression) | Failed Merge leaves branch intact, blocks VersionBump/BranchCleanup, opens Ship gate | regression (existing) | `terminal_merge_failure_reopens_actionable_gate_and_never_reports_finished`, `terminal_hook_failure_stops_before_branch_cleanup` | ✅ green |
 
@@ -244,10 +245,29 @@ RED against current `build.rs` by construction, and turning it green requires ed
 which the auditor's "never modify impl files" mandate routes straight to `ESCALATE`. Writing a
 committed-RED test would also wedge CI. Escalated instead.
 
-**Disposition: OPEN.** Two separable decisions, neither of which this audit takes unilaterally:
-(1) whether to reverse the D-20 caching intent so provenance is honest, and (2) whether to add the
-double-build freshness test regardless. Recommend both, but they belong to a follow-up plan, not to
-a validation pass. Until then rows 7 and 8 are ⚠️ partial and `nyquist_compliant` is `false`.
+**Disposition: ~~OPEN~~ → CLOSED by `17-11` (`3e39cf6`).** Both decisions this audit declined to
+take unilaterally were referred to the operator, who took both:
+
+1. **Reverse the D-20 caching intent so provenance is honest** — `build.rs` now declares a single
+   never-existing sentinel path, forcing cargo's "missing input ⇒ always rerun" rule on every
+   `cargo build`. `DEVFLOW_BUILD_TIMESTAMP` was dropped entirely in the same change: it was the only
+   `rustc-env` value that changed every run, so removing it is what keeps always-rerunning the script
+   from recompiling `devflow-cli` on every build. The `SystemTime::now()` input this gap named as
+   unfingerprintable no longer exists.
+2. **Add the double-build freshness test regardless** — `build_dirty_flips_false_to_true_across_a_
+   working_tree_edit_after_rebuild` reproduces the exact table above: a synthetic checkout with
+   `pack-refs --all` forced (so the fixture matches a CI checkout, not this dev checkout's accidental
+   masking), built → tracked `.rs` edit → rebuilt. It asserts against cargo's own persisted
+   `target/debug/build/devflow-*/output` cache rather than `env!()` from the test binary's compile,
+   which is the only vantage point that can observe whether `build.rs` actually re-ran.
+
+Re-verified at `46058a7`: `cargo test --workspace` 367 passed / 0 failed / **0 ignored** across 9
+targets, `cargo clippy --workspace --all-targets -- -D warnings` clean, `cargo fmt --check` clean.
+Observed live during that run — after an edit to `build_provenance.rs`, the build-script cache read
+`DEVFLOW_BUILD_DIRTY=true`, the refresh this gap proved impossible under the old trigger set.
+
+The mtime arm this gap's inputs fed is retired with the timestamp; `combined_staleness` now compares
+the build's own dirty flag against a live `affects_compiled_binary` check. Rows 7 and 8 are ✅.
 
 ### GAP-4 — `build_commit_is_accessible_and_does_not_panic` asserts nothing
 
@@ -269,7 +289,13 @@ Left unfixed by this audit deliberately: the honest replacement (assert the comm
 per D-20's no-git case, or a 40-char hex SHA) is worth having but is a coverage change that should
 land with GAP-3's freshness test rather than as a drive-by edit during a read-only audit pass.
 
-**Disposition: OPEN (test-only, low severity).**
+**Disposition: ~~OPEN~~ → CLOSED by `46058a7`.** `17-11` landed GAP-3's freshness test, which is the
+change this gap deferred to, so the replacement landed in its designated place rather than as a
+drive-by. `build_commit_is_accessible_and_does_not_panic` → `build_commit_is_empty_or_a_full_hex_sha`,
+now asserting exactly what this entry prescribes: empty (no-git build, D-20) or 40 chars of
+`is_ascii_hexdigit`. Confirmed to assert the *strong* branch and not pass via the empty escape
+hatch — the embedded value at that commit was `71c4ebd311272a7efadea377b29d12a2590e264b`, a real
+40-char SHA. Row 7's covering-test count is now honest.
 
 ---
 
@@ -317,10 +343,12 @@ with Phase 18's Hermes adapter, the first adapter with real reviewer storage.
   override, `17-09-PLAN.md`, fix `cb9359f`) instead of hanging. This box is now honestly checkable:
   worst-case observed latency across 25 consecutive isolated runs was ~4 s, well inside the 90 s
   budget. See GAP-2.
-- [ ] `nyquist_compliant: false` (re-audit #4, `e61171f`) — GAP-1 resolved by `17-08-PLAN.md`
-  (`c03498d`) and GAP-2's test-level hang by `17-09-PLAN.md` (`cb9359f`), but **GAP-3 is open**:
-  17d's build-provenance freshness is unsampled by any test and proven wrong under CI conditions.
-  GAP-4 (a vacuous test counted as coverage) is open alongside it.
+- [x] `nyquist_compliant: true` (re-audit #5, `46058a7`) — every gap this document raised is now
+  closed: GAP-1 by `17-08-PLAN.md` (`c03498d`), GAP-2's test-level hang by `17-09-PLAN.md`
+  (`cb9359f`), **GAP-3 by `17-11-PLAN.md` (`3e39cf6`)** — 17d's build-provenance freshness is now
+  sampled by a double-build regression test and correct under CI conditions — and **GAP-4 by
+  `46058a7`**, replacing the vacuous test so row 7's covering-test count is honest. GAP-2's
+  underlying product-level version-tag contention remains explicitly OUT OF SCOPE for Phase 17.
 
 **Approval (superseded by re-audit #4 — see below):** PASS — 9 of 9 requirement rows fully automated and green. Row 6 (17c preflight) was
 partial pending GAP-1 (CR-01, the `GateAction::Advance`/`LoopBack` double-spawn); `17-08-PLAN.md`
@@ -605,3 +633,51 @@ But `nyquist_compliant` flips **`true` → `false`**: rows 7 and 8 cover 17d's d
 leaving its inputs unsampled, and that gap is not hypothetical — the defective behavior was
 reproduced at this HEAD. Phase 17's other requirements are well covered; 17d's provenance guarantee
 is not yet earned.
+
+---
+
+## Validation Re-Audit #5 2026-07-19 (`46058a7`) — gap closure
+
+| Metric | Count |
+|--------|-------|
+| Requirement rows audited | 11 |
+| Rows fully automated + green | **11** |
+| Gaps open at re-audit #4 | 2 (GAP-3, GAP-4) |
+| Gaps closed this pass | **2 (GAP-3, GAP-4)** |
+| New gaps found | **0** |
+| `nyquist_compliant` | **`false` → `true`** |
+
+**Trigger:** `/gsd-execute-phase 17 --gaps-only`, which executed `17-11-PLAN.md` — the follow-up plan
+re-audit #4's GAP-3 said the two deferred decisions "belong to."
+
+**GAP-3 closed.** Both decisions were taken by the operator and implemented: `build.rs` always
+re-runs (never-existing sentinel path), `DEVFLOW_BUILD_TIMESTAMP` is gone entirely, and the
+double-build freshness test the review named now exists and asserts against cargo's own persisted
+build-script output cache. Full disposition in the GAP-3 section above.
+
+**GAP-4 closed.** `build_commit_is_empty_or_a_full_hex_sha` replaces the discarded `.len()`. It
+landed with GAP-3's freshness test, which is exactly where re-audit #4 said it belonged.
+
+**Suite reconciliation — 366 → 367, accounted for exactly:** −1
+`build_timestamp_is_a_parseable_u64` (retired with the timestamp it asserted); +1
+`build_dirty_flips_false_to_true_across_a_working_tree_edit_after_rebuild` (GAP-3's freshness test);
++1 net from `combined_staleness_mtime_arm_flags_dirty_tree_newer_than_build` being rewritten as two
+tests, one per row of the new decision table (`…flags_modified_tree_when_build_was_clean` ⇒ Stale,
+`…is_indeterminate_when_build_was_already_dirty` ⇒ Indeterminate). Two further renames are net-zero
+(`build_commit_is_accessible_and_does_not_panic`, `mtime_arm_ignores_non_build_files_but_still_flags_sources`).
+No test was deleted to make a count work; each removal is a value that no longer exists.
+
+**Gates re-run directly, not read from a SUMMARY** (and not through a pipe whose exit status belongs
+to `tail` — re-audit #4's recorded false-green trap): `cargo test --workspace` **367 passed / 0
+failed / 0 ignored / 0 filtered across 9 targets**, `cargo clippy --workspace --all-targets --
+-D warnings` exit 0, `cargo fmt --check` exit 0.
+
+**The freshness fix was observed working live, not just asserted.** Editing
+`crates/devflow-cli/tests/build_provenance.rs` during this pass caused the build-script cache at
+`target/debug/build/devflow-*/output` to re-emit `DEVFLOW_BUILD_DIRTY=true`. Under the trigger set
+re-audit #4 reproduced against, that value stayed frozen at `false` across exactly this kind of edit.
+
+**Verdict: PASS.** All eleven requirement rows are automated, green, deterministic, and unfiltered.
+`nyquist_compliant` returns to `true` — rows 7 and 8 now sample 17d's provenance *freshness*, the
+property re-audit #4 correctly identified as the textbook Nyquist failure, and not merely its shape.
+17d's provenance guarantee is now earned rather than assumed.
