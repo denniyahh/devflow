@@ -184,7 +184,11 @@ state/event reconciliation and the WR-03 test fix were deferred to Phase 18 on
 2026-07-18.
 **Requirements:** P1–P4 in `17-DOGFOOD-RETROSPECTIVE.md`; acceptance criteria
 2, 3, 4 (criterion 1 is already covered by Phase 16's regression test — verify
-against final HEAD rather than re-plan)
+against final HEAD rather than re-plan). AC-4 is narrowed to the
+plan-interactivity and Ship-scoped `gh auth` checks only — the
+security-artifact and reviewer-set sub-checks are deferred to Phase 18's
+Hermes adapter, an accepted override recorded in
+`17-VERIFICATION.md`'s frontmatter (`overrides:`).
 **Depends on:** Phase 16
 **Blocks:** Phase 18 Hermes Support
 **Plans:** 5/5 plans executed

@@ -4,7 +4,7 @@ verified: 2026-07-19T01:15:04Z
 status: gaps_found
 score: 9/12 must-haves verified
 behavior_unverified: 0
-overrides_applied: 0
+overrides_applied: 1
 gaps:
   - truth: "Infrastructure-outcome ceiling (state.infra_failures) bounds a STUCK LOOP, not the phase's lifetime (17b, D-08)"
     status: failed
@@ -84,6 +84,11 @@ gaps:
     missing:
       - "Either implement a minimal security-artifact preflight check against a concrete artifact path/key, or record an explicit accepted-scope decision (override) narrowing AC-4 and update ROADMAP.md's Requirements line to match"
       - "A committed destination (Phase 18 or later) for real reviewer-set enforcement, if it is to remain deferred"
+overrides:
+  - must_have: "A non-interactive plan, unavailable reviewer, missing security artifact, or invalid required credential is reported before the stage launch (retrospective AC-4)"
+    reason: "D-14(b) named no concrete security-artifact path/key at planning time; cross-AI review consensus #6 deferred it and reviewer-set enforcement to Phase 18's Hermes adapter, which is the first adapter with real reviewer storage"
+    accepted_by: "Dennis Kim (gap-closure disposition, /gsd-plan-phase --gaps, phase 17)"
+    accepted_at: "2026-07-19T11:26:28Z"
 ---
 
 # Phase 17: Pipeline Dogfood Follow-Up Verification Report
