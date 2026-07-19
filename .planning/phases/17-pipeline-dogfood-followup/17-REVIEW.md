@@ -1,6 +1,6 @@
 ---
 phase: 17-pipeline-dogfood-followup
-reviewed: 2026-07-18T00:00:00Z
+reviewed: 2026-07-19T00:00:00Z
 depth: standard
 files_reviewed: 12
 files_reviewed_list:
@@ -18,119 +18,208 @@ files_reviewed_list:
   - crates/devflow-core/src/state.rs
 findings:
   critical: 1
-  warning: 2
-  info: 3
-  total: 6
+  warning: 3
+  info: 1
+  total: 5
 status: issues_found
 ---
 
 # Phase 17: Code Review Report
 
-**Reviewed:** 2026-07-18T00:00:00Z
+**Reviewed:** 2026-07-19T00:00:00Z
 **Depth:** standard
 **Files Reviewed:** 12
 **Status:** issues_found
 
 ## Summary
 
-This phase adds build-provenance embedding (`build.rs`), an outcome-policy
-dispatch table (`outcome_policy.rs`), two new `AgentStatus` variants
-(`ResourceKilled`/`AgentUnavailable`), an infra-failure counter distinct from
-`consecutive_failures`, a preflight readiness gate, a self-dogfood
-build-staleness hard-block, and a `devflow resume` command. The diff is large
-(~2,000 lines across 8 files) but heavily test-covered, and the workspace
-compiles cleanly (`cargo check --workspace`).
+This is a fresh review of the current state of Phase 17 (`pipeline-dogfood-followup`), superseding the prior review captured at commit `e526d91`. That prior review's CR-01 (infra_failures never resetting across a phase's lifetime) is confirmed fixed: `transition()` in `crates/devflow-cli/src/main.rs` now resets `state.infra_failures = 0` alongside `state.consecutive_failures = 0` on every successful stage transition (commit `cb9ddab`), and both the in-memory and persisted-JSON reset are exercised by `transition_resets_infra_failures`. The companion WR-01 gap (strict-ancestor staleness misclassified as Fresh) is also confirmed fixed: `embedded_commit_is_stale()` now only returns `Staleness::Fresh` on an EXACT match to current `HEAD`, treating any other ancestor as `Stale` (commit `f73a968`), with a dedicated regression test (`wr01_clean_tree_strict_ancestor_build_is_stale_and_hard_blocks`) reproducing the exact clean-tree, two-commit incident narrative from 17-VERIFICATION.md.
 
-The implementation is generally careful — argv-array `Command` invocation
-everywhere (no shell injection surface), `truncate_reason` applied
-consistently before agent-controlled text reaches gates/events, exhaustive
-`match` with no wildcard arm on both `decide_action` and `AgentStatus`
-dispatch, and extensive unit tests exercising the new branches. However, one
-genuine logic defect was found in the new `infra_failures` counter (never
-reset, unlike its `consecutive_failures` sibling), and the self-dogfood
-staleness gate has a real, if partially-acknowledged, coverage gap. See
-findings below.
+However, this pass found a new, previously-untested defect introduced by the 17c preflight-readiness-gate feature: `run_preflight()` recursively calls `launch_stage()` on a resolved gate (Advance/LoopBack), but is itself called from the *middle* of `launch_stage()`'s own body — so a resolved preflight-failure gate causes the agent for that stage to be launched **twice** (see CR-01 below). This is a genuine functional/resource bug that the existing tests do not catch, because both `run_preflight` tests only exercise the `Abort` gate response, never `Advance`/`LoopBack`.
+
+Three further Warnings were found in the newly added 17d build-provenance/self-dogfood staleness logic and in a stale/misleading doc comment in the 17-04 infra-outcome routing code; one Info-level note on `gh auth status` invocation context.
 
 ## Critical Issues
 
-### CR-01: `infra_failures` is never reset, unlike `consecutive_failures` — will cause premature phase aborts
+### CR-01: `run_preflight`'s recursive `launch_stage` call causes a duplicate agent spawn on gate resolution
 
-**File:** `crates/devflow-core/src/state.rs:41` (field), `crates/devflow-core/src/mode.rs:20-30` (ceiling), `crates/devflow-cli/src/main.rs:1285-1294` (`handle_infra_outcome`), `crates/devflow-cli/src/main.rs:1613-1635` (`transition`)
+**File:** `crates/devflow-cli/src/main.rs:788-816` (`run_preflight`) and `crates/devflow-cli/src/main.rs:1042-1123` (`launch_stage`)
 
-**Issue:** `state.rs:41`'s doc comment explicitly calls this field "**Consecutive** infrastructure-class faults ... Gates at `MAX_INFRA_FAILURES`," and `mode.rs:20-30` documents `MAX_INFRA_FAILURES` as "bounding a **stuck loop** to at most 5 unobserved cycles before a terminal abort" — both descriptions imply the counter should reflect a run of infra faults with no progress in between, mirroring `consecutive_failures`'s behavior.
+**Issue:**
 
-But `consecutive_failures` is explicitly reset to `0` on every successful stage transition (`main.rs:1622`, inside `transition()`), while `infra_failures` is **only ever set at `State::new()`** (`state.rs:105`) and incremented via `saturating_add` in `handle_infra_outcome` (`main.rs:1291`) and `handle_rate_limited_outcome` (`main.rs:1337-1341`). No code path anywhere in `main.rs` or `devflow-core` ever decrements or resets `infra_failures` after a successful transition, `finish_workflow`, or otherwise. I verified this with `grep -rn infra_failures` across `devflow-core/src` and `devflow-cli/src/main.rs`: it appears only in the ceiling check, the two increment sites, serde plumbing, and tests — never in `transition()`, `loop_back_to_code()`, or any success path.
-
-Consequence: `infra_failures` is a **lifetime-of-the-phase** counter, not a "stuck loop" counter. A phase that hits five separate, well-spaced, successfully-auto-resumed rate limits or OOM kills across its Define → Plan → Code → Validate → Ship lifecycle (or across several Code↔Validate loop-backs, each of which re-launches via `launch_stage` and can independently hit a transient rate limit) will hard-abort at the fifth occurrence via `gate_or_abort_infra` (`main.rs:1306-1317`), even though every single occurrence up to that point was resolved cleanly and the phase made real forward progress between them. This directly contradicts the stated purpose of D-08 ("infra faults are not the agent's fault... a higher ceiling tolerates transient cloud outages/OOM blips") — the ceiling is bypassing exactly the scenario it claims to tolerate once faults are spread across stage boundaries rather than clustered in one stuck loop.
-
-**Fix:** Reset `infra_failures` to `0` alongside `consecutive_failures` wherever forward progress is confirmed — at minimum in `transition()` (`main.rs:1622`, next to `state.consecutive_failures = 0;`):
+`run_preflight` is called from the *middle* of `launch_stage`'s body (line 1067), with more launch work (`enforce_build_staleness`, `agent_result::archive_phase_files`, `monitor::spawn_monitor`) still to run afterward:
 
 ```rust
-fn transition(project_root: &Path, state: &mut State, to: Stage) -> Result<(), CliError> {
-    let from = state.stage;
-    let _ = run_checkout_hooks(project_root, state, &hooks::hooks_for_transition(from, to), to);
-    state.stage = to;
-    state.consecutive_failures = 0;
-    state.infra_failures = 0; // reset alongside consecutive_failures: infra_failures is
-                               // documented as "consecutive" (state.rs:41) and the ceiling
-                               // is meant to bound a stuck loop, not the phase's lifetime.
-    state.gate_pending = false;
-    workflow::save_state(state)?;
-    ...
+// launch_stage (abridged)
+let project_root = state.project_root.clone();
+run_preflight(&project_root, state, adapter.as_ref())?;   // <-- line 1067
+
+enforce_build_staleness(&project_root, state, ...)?;       // <-- runs again below
+if let Some(stamp) = agent_result::archive_phase_files(...)? { ... }
+let pid = monitor::spawn_monitor(state, program, &args, &adapter.extra_env())...;
+```
+
+But when the generic/adapter preflight check fails, `run_preflight`'s failure branch resolves the gate and then recurses into a **full** `launch_stage(state, None, None)` call to retry:
+
+```rust
+return match run_gate(project_root, state, stage, &context)? {
+    GateAction::Advance => {
+        let _ = Gates::cleanup(project_root, state.phase, stage);
+        state.gate_pending = false;
+        launch_stage(state, None, None)   // <-- runs enforce_build_staleness,
+    }                                       //     archive_phase_files, AND
+    GateAction::LoopBack(_) => {             //     spawn_monitor to completion
+        let _ = Gates::cleanup(project_root, state.phase, stage);
+        launch_stage(state, None, None)
+    }
+    GateAction::Abort(reason) => abort(project_root, state, &reason),
+};
+```
+
+That nested `launch_stage` call runs the *entire* function to completion — including its own `enforce_build_staleness`, `archive_phase_files`, and `monitor::spawn_monitor` — and returns `Ok(())` once the agent is actually running. That `Ok(())` becomes `run_preflight`'s return value.
+
+Back in the **outer** `launch_stage` frame that originally called `run_preflight(...)?` at line 1067, the `?` sees `Ok(())` and — because `run_preflight`'s success case is indistinguishable from "the retry already fully launched the agent" — **execution simply continues** into `enforce_build_staleness`, `archive_phase_files`, and `monitor::spawn_monitor` a **second time**, spawning a second competing agent process for the same stage, writing a second `stage_launched` event, and racing the second `archive_phase_files`/`spawn_monitor` against the first agent's just-started, still-live stdout capture and worktree.
+
+This affects *every* call site of `launch_stage` (`start`, `resume`, `transition`, `loop_back_to_code`, and the retry arms of `handle_stage_failure`) whenever a preflight check fails and the gate resolves to `Advance` or `LoopBack` — most plausibly the realistic Ship-stage `gh auth status` check: an operator sees the preflight gate, runs `gh auth login`, approves the gate, and DevFlow launches Ship's agent twice concurrently in the same worktree.
+
+This defect is untested: `run_preflight_failing_check_gates_and_never_reaches_spawn_monitor` and `run_preflight_adapter_hook_override_fires` (main.rs:4476, 4510) both only exercise the `Abort` gate response; no test exercises `Advance`/`LoopBack` through `run_preflight`, which is exactly the path where the double-spawn occurs.
+
+Note that this pattern does *not* affect `handle_stage_failure`'s existing analogous recursive `launch_stage` calls, because `handle_stage_failure` is only ever invoked from the top-level `advance()` dispatcher (never from inside `launch_stage` itself) — there is no "more work to do" in the caller after it returns. `run_preflight` is new in this phase and is the only recursive-into-`launch_stage` helper that is itself called *from within* `launch_stage`.
+
+**Fix:** Make `run_preflight` report whether the caller should continue, instead of overloading `Ok(())` to mean two different things:
+
+```rust
+/// Returns `Ok(true)` when the caller should continue the rest of
+/// `launch_stage` (preflight passed). Returns `Ok(false)` when a failing
+/// check was resolved via a gate that ALREADY completed a full retried
+/// launch (Advance/LoopBack) or aborted (Abort) — the caller must not run
+/// any more launch steps for this invocation.
+fn run_preflight(
+    project_root: &Path,
+    state: &mut State,
+    adapter: &dyn agents::AgentAdapter,
+) -> Result<bool, CliError> {
+    let stage = state.stage;
+    if let Err(reason) =
+        generic_preflight_checks(project_root, state).and_then(|()| adapter.preflight(state))
+    {
+        let context = format!(
+            "[never-silent] preflight failed for stage {stage}: {} — human review needed \
+             (retry, loop-to-code, or abort)",
+            truncate_reason(&reason)
+        );
+        match run_gate(project_root, state, stage, &context)? {
+            GateAction::Advance => {
+                let _ = Gates::cleanup(project_root, state.phase, stage);
+                state.gate_pending = false;
+                launch_stage(state, None, None)?;
+            }
+            GateAction::LoopBack(_) => {
+                let _ = Gates::cleanup(project_root, state.phase, stage);
+                launch_stage(state, None, None)?;
+            }
+            GateAction::Abort(reason) => abort(project_root, state, &reason)?,
+        }
+        return Ok(false);
+    }
+    Ok(true)
 }
 ```
-If the intent is genuinely a lifetime budget rather than a consecutive counter, the doc comments on `state.rs:41` and `mode.rs:20-30` should be corrected instead to say so explicitly, and the field renamed away from the "consecutive" framing to avoid the next reader making the same assumption the tests/docs currently encode.
+
+And in `launch_stage`:
+
+```rust
+let project_root = state.project_root.clone();
+if !run_preflight(&project_root, state, adapter.as_ref())? {
+    return Ok(());
+}
+```
+
+Add a regression test that pre-seeds an `Advance` gate response for a failing preflight check and asserts exactly one `stage_launched` event (or exactly one `monitor::spawn_monitor` call, via a test seam) is recorded — the current tests only cover the `Abort` arm.
 
 ## Warnings
 
-### WR-01: Self-dogfood staleness ancestry check does not detect the most common "committed, forgot to rebuild" case
+### WR-01: `enforce_build_staleness` prints a near-universally-firing, misleading warning for every non-self-dogfood project
 
-**File:** `crates/devflow-cli/src/main.rs:855-927` (`embedded_commit_is_stale`, `tracked_source_newer_than_build`, `combined_staleness`)
+**File:** `crates/devflow-cli/src/main.rs:997-1037` (`enforce_build_staleness`), `crates/devflow-cli/src/main.rs:861-878` (`embedded_commit_is_stale`)
 
-**Issue:** `embedded_commit_is_stale` treats `embedded_commit` as Fresh whenever `git merge-base --is-ancestor <embedded_commit> HEAD` exits 0 — i.e., whenever the embedded commit is *any* ancestor of current HEAD, however many commits behind. `tracked_source_newer_than_build` (the composite's other arm) is only evaluated when the working tree is dirty (`status --porcelain` non-empty); a clean tree short-circuits straight to the ancestry result (`main.rs:896-899`).
+**Issue:** `embedded_commit_is_stale` shells `git merge-base --is-ancestor <DevFlow's own embedded build commit> HEAD` inside `project_root` — which, for the overwhelmingly common case (DevFlow driving *some other* project, not its own workspace), is a completely unrelated repository. `git merge-base --is-ancestor` on a commit hash that doesn't exist in that repo's object database exits `128` (verified empirically), which `embedded_commit_is_stale` correctly classifies as `Staleness::Indeterminate` — but `staleness_outcome` maps `Indeterminate` to `StalenessOutcome::Warn` for *every* project, self-dogfood or not (`main.rs:980-987`). The result: on essentially every single stage launch of every ordinary (non-DevFlow) project driven by DevFlow, this prints:
 
-Combined effect: the most common real staleness scenario — a developer commits new code on a linear/fast-forward history (no rebase, no squash-merge divergence), never rebuilds, and re-runs the old binary — is **not detected**. The embedded commit remains an ancestor of the new HEAD (ancestry says Fresh) and the tree is clean (mtime arm is skipped entirely), so `combined_staleness` reports Fresh even though the running binary is now several commits behind the checked-out source. This is exactly the "Phase 16 false-evidence incident" class this gate exists to prevent (per `17-05-PLAN.md`'s own framing), yet it slips through whenever the staleness arises from ordinary linear commits rather than a rebase/squash-merge divergence or an uncommitted dirty edit.
+```
+warning: build provenance staleness check did not confirm a fresh build for
+stage {stage} — proceeding (only DevFlow's own workspace is ever hard-blocked, D-18)
+```
 
-This gap is partially self-acknowledged in the research doc (`17-RESEARCH.md:502-511`, "D-19 Open Question 2": "an ancestor-of-HEAD clean tree is already covered by the ancestry arm") but the underlying assumption — that an ancestor-of-HEAD clean tree can't be stale — is exactly the case that's unguarded.
+This is accurate but semantically meaningless in that context (DevFlow's own commit hash was never expected to relate to an unrelated project's git history), yet it fires on effectively every stage of every phase for every ordinary user — training operators to ignore DevFlow warnings generally ("crying wolf"), which undermines the value of every *other* warning-level message the pipeline emits (including the ones from this exact codepath in the rare cases they matter).
 
-**Fix:** At minimum, document this residual gap prominently at the call site (`enforce_build_staleness`, `main.rs:987-1027`) so operators don't assume the hard-block is a complete guarantee. A stronger fix would compare `embedded_commit == HEAD` (not just ancestry) when the tree is clean, warning (not hard-blocking, to avoid the "alarms you learn to ignore" trap this design explicitly wants to avoid) whenever the two differ, so a merely-behind-by-N-commits binary is at least visible rather than silently marked Fresh.
+**Fix:** Skip the `combined_staleness` computation (and its warning) entirely for non-self-dogfood projects — the design already treats `Indeterminate`/non-self-dogfood-`Stale` as a no-op-equivalent outcome, so there's no information lost by short-circuiting:
 
-### WR-02: `infra_failures` ceiling interacts with unbounded Code↔Validate loop-backs without any visibility into which stage burned the budget
+```rust
+fn enforce_build_staleness(...) -> Result<(), CliError> {
+    if !is_self_dogfood_workspace(project_root) {
+        return Ok(()); // the gate only ever applies to DevFlow's own workspace (D-18)
+    }
+    let staleness = combined_staleness(project_root, embedded_commit, build_timestamp);
+    match staleness_outcome(true, staleness) {
+        ...
+    }
+}
+```
 
-**File:** `crates/devflow-cli/src/main.rs:1298-1373` (`gate_or_abort_infra`, `handle_rate_limited_outcome`)
+### WR-02: `is_self_dogfood_workspace` uses substring matching, which can false-positive-block an unrelated project
 
-**Issue:** Related to CR-01 but distinct: because `infra_failures` is shared across every stage and every loop-back iteration, and the abort message (`main.rs:1310-1315`) only reports the aggregate count and ceiling ("infrastructure failures reached the ceiling (N of N)"), an operator debugging a hard-aborted phase has no way to tell from the abort message alone whether the five faults were clustered (genuinely stuck) or spread across the phase's entire history (CR-01's scenario). `events.jsonl` does retain per-event `stage`/`reason` fields, so the information exists, but the terminal abort message itself doesn't point there.
+**File:** `crates/devflow-cli/src/main.rs:949-966`
 
-**Fix:** Once CR-01 is fixed (reset on transition), this becomes moot for the common case; if the counter is intentionally kept as a lifetime budget instead, the abort message should say so explicitly and point at `devflow history <phase>` for the breakdown.
+**Issue:** After locating the `members = [...]` array's text bounds, the check is:
+
+```rust
+members.contains("crates/devflow-core") && members.contains("crates/devflow-cli")
+```
+
+`str::contains` is a substring match, not an exact array-element match. A workspace with member paths like `"crates/devflow-core-extras"` and `"crates/devflow-cli-plugin"` (or any project that happens to fork/vendor/rename DevFlow's own crates with those directory names as prefixes) would satisfy both `contains` checks without literally containing the `crates/devflow-core`/`crates/devflow-cli` members, and would incorrectly be classified as `is_self_dogfood_workspace() == true`. Combined with `enforce_build_staleness`'s hard `Block` outcome for self-dogfood + `Stale`, this could hard-block an unrelated (but similarly-named) project's entire pipeline — the one outcome this whole feature set is designed never to inflict on an ordinary project.
+
+**Fix:** Match on quoted, comma/whitespace-delimited array elements rather than raw substrings, e.g. split `members` on `,` and trim/strip quotes from each element before comparing for exact equality:
+
+```rust
+let entries: Vec<&str> = members
+    .split(',')
+    .map(|s| s.trim().trim_matches('"').trim_matches('\''))
+    .collect();
+entries.contains(&"crates/devflow-core") && entries.contains(&"crates/devflow-cli")
+```
+
+### WR-03: `gate_or_abort_infra`'s doc comment misdescribes the call graph, risking a future double-increment bug
+
+**File:** `crates/devflow-cli/src/main.rs:1306-1309`
+
+**Issue:** The doc comment on `gate_or_abort_infra` states it is:
+
+> shared by [`handle_infra_outcome`] and the `AutoResume` arm's infra-ceiling branch (which bumps `infra_failures` itself before calling this, so the counter is never bumped twice for the same outcome)
+
+But `handle_rate_limited_outcome`'s ceiling branch (main.rs:1348-1350) does **not** bump `state.infra_failures` itself and does **not** call `gate_or_abort_infra` directly — it calls `handle_infra_outcome(project_root, state, stage, reason)`, which is the function that performs the increment (`state.infra_failures = state.infra_failures.saturating_add(1)`, main.rs:1301) before calling `gate_or_abort_infra`. The current behavior is correct (the counter is bumped exactly once), but the comment describes a call graph that doesn't match the code — a future maintainer trusting this comment while modifying `handle_rate_limited_outcome` could plausibly add a bump before the `handle_infra_outcome(...)` call, reintroducing a double-increment.
+
+**Fix:** Correct the doc comment to describe the actual call graph:
+
+```rust
+/// The ceiling check + gate-or-abort half of the infra path. Called only
+/// from [`handle_infra_outcome`], which performs the `saturating_add`
+/// increment before invoking this — including when reached via
+/// `handle_rate_limited_outcome`'s ceiling branch, which delegates to
+/// `handle_infra_outcome` rather than bumping the counter itself.
+```
 
 ## Info
 
-### IN-01: `is_self_dogfood_workspace` string-scan is fragile against non-literal `members` arrays
+### IN-01: `preflight_gh_auth_check` does not set `current_dir` for the `gh auth status` probe
 
-**File:** `crates/devflow-cli/src/main.rs:939-956`
+**File:** `crates/devflow-cli/src/main.rs:755-773`
 
-**Issue:** The scan locates the first `[` after the first literal occurrence of the substring `"members"` anywhere in `Cargo.toml`, then substring-matches `"crates/devflow-core"` / `"crates/devflow-cli"` inside that bracketed region. This is explicitly a documented "sanctioned middle ground" (no TOML parser dependency), but it will silently fail to detect the workspace (never block, only warn) if the real `members` array ever uses a glob (`"crates/*"`) or if `Cargo.toml` grows a comment containing the word `members` before the actual array. Neither is true of the current `Cargo.toml` (verified: explicit paths), so this is not exploitable today, but it's a latent false-negative if the workspace manifest is ever refactored.
+**Issue:** Every other git/gh-adjacent subprocess call in this file (`phase_artifact_on_develop`, `embedded_commit_is_stale`, `run_git_stdout`, `tracked_source_newer_than_build`) explicitly sets `.current_dir(project_root)`. `preflight_gh_auth_check`'s `Command::new("gh").args(["auth", "status"]).output()` does not, so it runs in the CLI process's own working directory rather than the driven project's. `gh auth status` reports host-level credential state and is largely directory-independent, so this is unlikely to matter in practice, but it's an inconsistency with the surrounding code's convention and could matter if `gh`'s auth resolution ever becomes repo-scoped (e.g. per-remote host detection).
 
-**Fix:** No action required now; consider adding a regression test that fails if `Cargo.toml`'s `members` array style changes away from explicit paths (e.g., a `cargo metadata` cross-check in CI), since this function silently degrades from "hard block" to "never fires" rather than erroring.
-
-### IN-02: `evaluate_layer0`'s stage-scope expansion means a Plan stage that authors an `external_verify` declaration gates on itself
-
-**File:** `crates/devflow-core/src/agent_result.rs:704-796`
-
-**Issue:** Per D-05/D-06, Layer 0 now evaluates on every stage rather than only Code. Combined with `external_verify_commands` (`verify.rs:29`) scanning *all* of a phase's `PLAN.md` files regardless of which stage is currently advancing, the very first stage whose plan introduces an `external_verify:` declaration will itself be blocked (`"external verification is not approved"`) until `DEVFLOW_TRUST_EXTERNAL_VERIFY` is set — including the Plan stage's own advance immediately after writing that declaration. This is very likely intentional (a human must approve any agent-declared shell command before it's ever trusted, per the security rationale in `17-CONTEXT.md`), but it's a meaningful behavior change from Phase 16 (Code-stage-only) and isn't covered by an end-to-end test that drives `advance()` through a real Plan-stage completion with a freshly-authored declaration — the existing tests all call `evaluate_agent_result_inner` directly with a manually-set `state.stage`. Worth confirming this blast radius (every stage gates on any phase-wide declaration) matches operator expectations.
-
-**Fix:** No code change proposed; recommend an integration test that drives `advance()` end-to-end for a Plan-stage completion that authors a fresh `external_verify` declaration, to pin the "gates on itself" behavior as intentional rather than accidental.
-
-### IN-03: `build_timestamp` is round-tripped as a JSON string, not a number
-
-**File:** `crates/devflow-cli/src/main.rs:826-839` (`workflow_started_payload`)
-
-**Issue:** `"build_timestamp": env!("DEVFLOW_BUILD_TIMESTAMP")` embeds the Unix-seconds value as a `&str` (via `env!`), so the `workflow_started` event's `build_timestamp` field is a JSON string (e.g. `"1771000000"`) rather than a JSON number, while `"dirty"` is similarly a string `"true"`/`"false"` rather than a JSON boolean. Any downstream consumer of `events.jsonl` doing numeric/boolean comparisons on these fields (e.g. Phase 18's reconciliation, per the `decided_by_layer` precedent set elsewhere in this same diff) will need to parse them first. Not a bug — `env!` can only produce `&'static str` — but worth flagging since the sibling field `decided_by_layer` in the same diff *is* emitted as a real JSON number (`Option<u8>`), so the payload is inconsistent in how it represents typed data.
-
-**Fix:** Consider parsing `build_timestamp`/`dirty` into `serde_json::Value::Number`/`Value::Bool` before embedding in the payload, for consistency with `decided_by_layer` and to spare downstream consumers a string-to-number/bool parse.
+**Fix:** Add `.current_dir(project_root)` (thread `project_root` into this function, or read it from `state.project_root`) for consistency with the rest of the module's subprocess calls.
 
 ---
 
-_Reviewed: 2026-07-18T00:00:00Z_
+_Reviewed: 2026-07-19T00:00:00Z_
 _Reviewer: Claude (gsd-code-reviewer)_
 _Depth: standard_
