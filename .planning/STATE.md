@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
 status: "Phase 17 complete (14/14) - CR-01 resolved via 17-08, GAP-2 (test-level) resolved via 17-09, nyquist_compliant: true"
-stopped_at: Completed 17-09-PLAN.md
-last_updated: "2026-07-19T20:10:09.744Z"
+stopped_at: Completed 17-11-PLAN.md
+last_updated: "2026-07-19T21:25:12.938Z"
 progress:
   total_phases: 7
   completed_phases: 6
-  total_plans: 43
-  completed_plans: 43
+  total_plans: 45
+  completed_plans: 45
   percent: 86
 ---
 
@@ -131,6 +131,7 @@ None currently open for Phase 17.
 - [Phase 17]: 17-06: infra_failures reset scoped to transition() (forward-stage-transition path) only, not gate-driven retry branches — MAX_INFRA_FAILURES bounds a stuck loop across forward progress, not every same-stage retry
 - [Phase 17]: 17-08: run_preflight returns Result<bool, CliError> to disambiguate 'preflight passed' from 'a resolved gate already relaunched everything' (CR-01 double-agent-spawn fix, GAP-1 closed, nyquist_compliant: true); regression tests inject a Cell<bool> FailOnceAdapter directly into run_preflight and stub PATH under ENV_MUTEX so a real, completing launch_stage never risks spawning a real agent CLI
 - [Phase 17]: 17-09: GAP-2 (concurrent_ship_advances_finish_both_phases_independently unbounded wedge) resolved test-level: DEVFLOW_GATE_TIMEOUT_SECS bounded to 2s under ENV_MUTEX for the reopened loser gate's poll only, 7-day production default untouched. RED reproduced the hang under 120s external timeout; debug instrumentation caught both phases computing the identical version tag ~1.8ms apart, proving the checkout lock occasionally fails to fully serialize the two threads' terminal hooks -- recorded as an explicit OUT-OF-SCOPE product-level version-tag contention question for future ship/version-bump concurrency work, not fixed here. 25 consecutive isolated runs: 0 hangs, 9 hit the race and resolved via the bounded path.
+- [Phase 17]: 17-11: CR-02 resolved -- build.rs always reruns via an unfingerprintable sentinel, DEVFLOW_BUILD_TIMESTAMP removed entirely, staleness's second signal replaced by a (build_dirty, tree_has_modified_build_inputs) decision table (Stale when built clean and now dirty; Indeterminate, never blocking, when built dirty and still dirty)
 
 ## Roadmap Evolution
 
@@ -177,9 +178,10 @@ None currently open for Phase 17.
 | Phase 17-pipeline-dogfood-followup P06 | 25min | 3 tasks | 5 files |
 | Phase 17-pipeline-dogfood-followup P08 | 20min | 3 tasks | 3 files |
 | Phase 17-pipeline-dogfood-followup P09 | 50min | 2 tasks | 2 files |
+| Phase 17-pipeline-dogfood-followup P11 | 40min | 3 tasks | 4 files |
 
 ## Session
 
-**Last session:** 2026-07-19T20:10:09.715Z
-**Stopped at:** Completed 17-09-PLAN.md
+**Last session:** 2026-07-19T21:25:12.917Z
+**Stopped at:** Completed 17-11-PLAN.md
 **Resume file:** None
