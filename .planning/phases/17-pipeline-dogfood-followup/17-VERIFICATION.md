@@ -36,6 +36,23 @@ reconciliation and the WR-03 test fix were deferred to Phase 18 on 2026-07-18.
 `ROADMAP.md`'s "Plans: 12/12 plans executed" line for this phase; this report is the first
 verification pass to cover the full 17-01..17-12 plan set at current HEAD.
 
+> **⚠ Coverage correction (added 2026-07-20, WR-05).** The "at current HEAD" claim above is
+> scoped to commit `f5c399a` — the last commit that touched this file. **Plan `17-13` landed
+> three `crates/` commits afterward** (`12b5b98`, `e421ebd`, `0189808`), and `ROADMAP.md` now
+> records **13/13** plans, not 12/12. This report therefore does **not** cover `17-13`, and its
+> recorded test counts are stale (284/70 here; 288/71 at the time WR-05 was written).
+>
+> This is a false *coverage* claim, not a hidden failure. `17-13`'s substance has since been
+> independently confirmed: both its fixes carry RED-proven regression tests
+> (`write_version_preserves_trailing_comma_in_package_json`,
+> `after_ship_batch_with_no_version_file_keeps_tag_and_changelog_in_sync`), and the Phase 18
+> research pass re-verified the full workspace suite green at a later HEAD.
+>
+> Annotated rather than re-run: Phase 17 is closed, shipped as v1.4.0, and merged. Re-running
+> verification on a closed phase would burn agent time to restate a conclusion already
+> established by other evidence. Recorded here so the next reader does not mistake this
+> report's scope — the exact hazard WR-06 described, one document over.
+
 ## Goal Achievement
 
 ### Observable Truths

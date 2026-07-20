@@ -332,6 +332,33 @@ Plans:
 Plans:
 - [ ] TBD (promote with /gsd-review-backlog when ready — after Phase 18 ships)
 
+### Phase 999.10: `.devflow/` Artifact Hygiene (BACKLOG — highest of the WR batch)
+
+**Goal:** Two composing 17-REVIEW.md findings, both re-verified present at HEAD 2026-07-20. **WR-01:** `docs_update` (`hooks.rs:184`) is the only remaining `commit_all` caller and runs `git add .` at the *user's* project root, so a target project whose `.gitignore` lacks `.devflow/` gets raw unredacted agent stdout swept into a commit that `Merge` then pushes — the assumption that `.devflow/` is gitignored is asserted in test fixtures but enforced nowhere, and both existing guards only cover DevFlow's own repo. **WR-02:** `main.rs:843` emits the full `current_exe()` path into `events.jsonl` on every start, i.e. the developer's absolute home directory and OS username, in a file `OPERATIONS.md` tells people to tail and paste. Together they publish PII into someone else's git history. Phase 18 does **not** fix either — its plans cite WR-02 only as a prevention constraint. Preferred WR-01 fix (`lock::ensure_devflow_dir` writes a `.devflow/.gitignore` containing `*`) closes it for every constructor at once.
+**Requirements:** TBD — see CONTEXT.md
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (promote with /gsd-review-backlog when ready — before any wider release push)
+
+### Phase 999.11: `commit_path` Empty Commits (BACKLOG)
+
+**Goal:** 17-REVIEW.md WR-03, re-verified at HEAD 2026-07-20. `commit_path`'s `--allow-empty` does not *skip* when a path is unchanged — it **commits**, contradicting the function's own doc comment ("Ok(()) whether or not the path had changes") and rendering its `nothing to commit` guard arm dead code that reads like the skip path. If `version_bump` re-runs after a fail-fast terminal-batch retry and `write_version` produces byte-identical content, an empty `chore: bump version to X` commit lands on develop and **the release tag is placed on a commit containing nothing**. Reachable, since Phase 16 made terminal-batch retry a designed path. Fix: drop `--allow-empty` and let the existing arm become the genuine no-op.
+**Requirements:** TBD — see CONTEXT.md
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.12: Layer 0 Unapproved-Probe Veto Coverage (BACKLOG)
+
+**Goal:** 17-REVIEW.md WR-04 — coverage debt on a *deliberate* trade, not a defect. 17-03 removed `evaluate_layer0`'s `Stage::Code` guard by design (D-05 gap 1), so a forgotten `DEVFLOW_TRUST_EXTERNAL_VERIFY` now vetoes at all five stages instead of one, a 5× blast-radius increase. Two verified gaps at HEAD: (a) of the three veto arms, only "approval mismatch" is tested (`agent_result.rs:1644`) — the "not approved" arm a forgotten env var actually hits has no test at any stage; (b) `docs/guides/configuration.md` states the requirement for "the parent DevFlow process" but never that the **detached monitor subprocess must inherit it**, which is where the failure manifests. Deliberately not folded into Phase 18's 18-05 (same file) — that plan had already passed the checker clean, and adding coverage debt to a verified bug-fix plan is scope creep.
+**Requirements:** TBD — see CONTEXT.md
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (promote with /gsd-review-backlog when ready — ideally soon after Phase 18 ships, while 18-05 is fresh)
+
 ### Phase 999.9: Dependency Update Review (BACKLOG)
 
 **Goal:** Triggered 2026-07-20 by a GitHub Actions annotation on the first all-branch CI run — `actions/checkout@v4` targets deprecated Node.js 20 and is being force-run on Node 24. Warning only, all jobs green, but it appears on 4 job definitions across both workflow files, so the eventual break lands everywhere at once. Broader than a one-line bump: the dependency surface is inconsistently pinned — `dtolnay/rust-toolchain@stable` and `rust-toolchain.toml`'s `channel = "stable"` float entirely (CI can break from upstream with no commit here, a reproducibility gap for a project premised on trustworthy pipelines), `devcontainers/ci@v0.3` is pre-1.0, the devcontainer base image pin was last verified in Phase 15, and neither `cargo audit` nor `cargo deny` runs in CI. Deliberately not folded into Phase 18 — a dependency bump mid-phase would confound that phase's test signal.
