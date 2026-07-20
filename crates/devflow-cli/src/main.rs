@@ -4513,15 +4513,25 @@ mod tests {
     /// `infra_failures` to 0 alongside `consecutive_failures` — both in the
     /// in-memory `State` and the persisted `state.json` — and a subsequent
     /// infra fault after a clean transition starts counting from 1, not the
-    /// pre-transition count. PATH is cleared under `ENV_MUTEX` (pointed at a
-    /// fresh empty tempdir, not an empty string, so `agent_binary_available`'s
-    /// PATH scan has zero possible matches) before calling `transition()`,
-    /// because this host genuinely has `claude`/`codex`/`opencode` on PATH —
-    /// without clearing it, `transition()`'s downstream `launch_stage` would
-    /// try to actually spawn a real agent CLI subprocess, which this test
-    /// must never do. The resulting `Err` from `ensure_agent_binary` is
-    /// expected and ignored: the counter reset happens earlier in
-    /// `transition()` and is unaffected by that downstream failure.
+    /// pre-transition count. PATH is neutralized under `ENV_MUTEX` (pointed
+    /// at a directory containing ONLY a `git` symlink, so
+    /// `agent_binary_available`'s PATH scan has zero possible matches) before
+    /// calling `transition()`, because this host genuinely has
+    /// `claude`/`codex`/`opencode` on PATH — without neutralizing it,
+    /// `transition()`'s downstream `launch_stage` would try to actually spawn
+    /// a real agent CLI subprocess, which this test must never do. The
+    /// resulting `Err` from `ensure_agent_binary` is expected and ignored:
+    /// the counter reset happens earlier in `transition()` and is unaffected
+    /// by that downstream failure.
+    ///
+    /// 19i: PATH must NOT be pointed at an empty directory. `set_var`
+    /// mutates the whole process's environment, and Rust's default test
+    /// runner executes tests in parallel threads within that one process —
+    /// an empty PATH here previously made every OTHER concurrently running,
+    /// unguarded git-spawning test fail with `Os { NotFound }` (confirmed
+    /// live: both duplicate CI runs for the same commit hit this race).
+    /// `agent_free_git_only_path_dir` keeps `git` resolvable for every other
+    /// thread while still hiding agent CLIs from this one.
     #[test]
     fn transition_resets_infra_failures() {
         let _guard = ENV_MUTEX.lock().unwrap();
@@ -4534,11 +4544,11 @@ mod tests {
         state.infra_failures = mode::MAX_INFRA_FAILURES - 1;
         workflow::save_state(&state).unwrap();
 
-        let empty_path_dir = tempfile::tempdir().unwrap();
+        let neutral_path_dir = agent_free_git_only_path_dir();
         let original_path = std::env::var_os("PATH");
         // SAFETY: serialized under ENV_MUTEX.
         unsafe {
-            std::env::set_var("PATH", empty_path_dir.path());
+            std::env::set_var("PATH", neutral_path_dir.path());
         }
 
         let _ = transition(root, &mut state, Stage::Validate);
@@ -5012,6 +5022,28 @@ mod tests {
     /// `run_preflight` and this test's own simulated caller continuation —
     /// must never resolve `state.agent`'s adapter program name to a real
     /// CLI.
+    /// A PATH directory containing ONLY a `git` symlink — no agent CLIs.
+    ///
+    /// For tests that must guarantee `launch_stage` can never find and spawn
+    /// a real `claude`/`codex`/`opencode` binary, without also making `git`
+    /// unresolvable process-wide (19i). Unlike `prepend_path`, which layers a
+    /// stub on top of the real PATH, this REPLACES PATH entirely — the real
+    /// PATH's entries (which contain the agent CLIs on a dev host) must not
+    /// be searched at all, only this curated directory.
+    fn agent_free_git_only_path_dir() -> tempfile::TempDir {
+        let real_git = std::env::var_os("PATH")
+            .and_then(|paths| {
+                std::env::split_paths(&paths).find_map(|dir| {
+                    let candidate = dir.join("git");
+                    candidate.is_file().then_some(candidate)
+                })
+            })
+            .expect("git must be resolvable on PATH to run this test");
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(&real_git, dir.path().join("git")).unwrap();
+        dir
+    }
+
     fn stub_agent_binary(name: &str) -> tempfile::TempDir {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
