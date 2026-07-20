@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Mirrors the required CI checks (see .github/workflows/ci.yml) so a broken
+# push never has to wait for a runner to say so.
+set -euo pipefail
+
+echo "pre-push: cargo fmt --check"
+cargo fmt --check
+
+echo "pre-push: cargo clippy --workspace --all-targets -- -D warnings"
+cargo clippy --workspace --all-targets -- -D warnings
+
+echo "pre-push: cargo test --workspace"
+cargo test --workspace

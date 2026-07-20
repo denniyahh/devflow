@@ -11,6 +11,15 @@ cargo build
 cargo test
 ```
 
+### Pre-push hook (optional, recommended)
+
+A tracked hook at [`scripts/hooks/pre-push`](scripts/hooks/pre-push) runs the
+same fmt/clippy/test checks CI requires, before the push leaves your machine:
+
+```bash
+git config core.hooksPath scripts/hooks
+```
+
 ### Distrobox (optional)
 
 If you use [distrobox](https://github.com/89luca89/distrobox), you can create an isolated environment:
