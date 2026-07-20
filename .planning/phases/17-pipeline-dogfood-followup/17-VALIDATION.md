@@ -67,7 +67,7 @@ row's test was confirmed to exist by name in the tree and to run green under `ca
 | 10 | 17-10, 17-11 | 17d follow-up (dogfood finding) | The second staleness arm only considers build inputs; content hooks target the worktree while terminal hooks stay on the primary checkout | unit | `dirty_flag_arm_ignores_non_build_files_but_still_flags_sources`, `content_hooks_target_the_worktree_while_terminal_hooks_stay_on_project_root` | ✅ green — arm renamed mtime→dirty-flag by `17-11` (CR-02); the original guarantee is unchanged |
 | 11 | audit-fix (`17-REVIEW.md`) | CR-03 / WR-02 / WR-07 | Unparseable retry hint gates instead of stalling silently; self-dogfood match is exact, not substring; the gitignore guard covers all 14 runtime paths, one `check-ignore` per path | unit + integration | `rate_limited_with_unparseable_retry_hint_gates_instead_of_stalling_silently`, `is_self_dogfood_workspace_requires_exact_member_paths_not_substrings`, `gitignore_covers_devflow_runtime_state_paths` | ✅ green |
 | 9 | Phase 16 | AC-1 (regression) | Failed Merge leaves branch intact, blocks VersionBump/BranchCleanup, opens Ship gate | regression (existing) | `terminal_merge_failure_reopens_actionable_gate_and_never_reports_finished`, `terminal_hook_failure_stops_before_branch_cleanup` | ✅ green |
-| 12 | 17-12 | P1 / AC-2 (17d, WR-04) | 17d's **release-record** facet: after the full after-ship batch the changelog heading, the git tag, and the version file name one and the same version, and the tree is clean — no hook write left uncommitted | unit | `after_ship_batch_changelog_tag_and_version_file_agree_and_tree_is_clean`, `changelog_append_commits_its_own_write`, `after_ship_runs_version_changelog_then_cleanup`, `transition_map_finalizes_docs_only_before_ship`, `validate_to_ship_hooks_do_not_touch_changelog`, `read_version_does_not_recompute_from_git_tags`, `read_version_errors_without_version_file`, `read_version_round_trips_through_write_version_in_plain_cargo_toml`, `read_version_round_trips_through_write_version_in_workspace_cargo_toml`, `read_version_round_trips_through_write_version_in_package_json` | ⚠️ **partial (re-audit #9)** — GAP-5's ordering facet stays closed and RED-proven, but two of this row's tests are vacuous against live defects: the `package.json` round-trip cannot fail on GAP-6, and the batch test's `init_repo` cannot reach GAP-7. See GAP-6, GAP-7 |
+| 12 | 17-12, 17-13 | P1 / AC-2 (17d, WR-04) | 17d's **release-record** facet: after the full after-ship batch the changelog heading, the git tag, and the version file name one and the same version, and the tree is clean — no hook write left uncommitted. `write_version` also preserves whatever followed the version token on the matched line (JSON trailing comma, TOML trailing comment), and the batch keeps the tag and changelog in sync even with no version file present | unit | `after_ship_batch_changelog_tag_and_version_file_agree_and_tree_is_clean`, `changelog_append_commits_its_own_write`, `after_ship_runs_version_changelog_then_cleanup`, `transition_map_finalizes_docs_only_before_ship`, `validate_to_ship_hooks_do_not_touch_changelog`, `read_version_does_not_recompute_from_git_tags`, `read_version_errors_without_version_file`, `read_version_round_trips_through_write_version_in_plain_cargo_toml`, `read_version_round_trips_through_write_version_in_workspace_cargo_toml`, `read_version_round_trips_through_write_version_in_package_json`, `write_version_preserves_trailing_comma_in_package_json` (17-13, GAP-6), `write_version_preserves_trailing_comment_in_toml` (17-13, GAP-6), `after_ship_batch_with_no_version_file_keeps_tag_and_changelog_in_sync` (17-13, GAP-7) | ✅ green (17-13) — GAP-6 and GAP-7 closed; both new tests were RED-proven against the unfixed implementation before their fixes landed. See GAP-6, GAP-7 |
 | 13 | 17-12 (CR-01 R3) | 17d supporting invariant | `GitFlow::commit_path` commits *only* its pathspec — an already-staged unrelated file is not swept into the hook's commit | unit | `commit_path_stages_only_the_given_path_leaving_other_dirt_uncommitted` | ✅ green — test strengthened to stage the unrelated file (an untracked one proved nothing); RED reconfirmed at re-audit #8 |
 
 *Status: ⬜ pending · ✅ green · ❌ red · ⚠️ partial · 🔴 flaky*
@@ -382,6 +382,14 @@ closed. `17-12-PLAN.md` already specifies exactly the two regression tests requi
 
 ### GAP-6 — `write_version` corrupts `package.json`, and row 12's round-trip fixture cannot fail on it
 
+**Closed:** `17-13-PLAN.md` Task 1, commit `12b5b98`. RED-proof: `write_version_preserves_trailing_comma_in_package_json`
+and `write_version_preserves_trailing_comment_in_toml` both failed against the unfixed
+`replace_version_in_contents` before the fix landed — the JSON case raised a `serde_json` parse
+error (`expected ',' or '}'`) with the trailing comma dropped, and the TOML case lost its trailing
+`# pinned` comment. `replace_version_in_contents` now captures the remainder of the matched line
+after the version token (quote-close for quoted values, first whitespace/`,`/`#` for unquoted) and
+re-emits it after the new value. Fix commit: `12b5b98`.
+
 **Opened:** re-audit #9 (`04a5e55`). **Source:** round-4 review CR-02, independently reproduced here.
 **Impl:** `crates/devflow-core/src/version.rs:253-297` (`replace_version_in_contents`)
 **Test with the blind spot:** `read_version_round_trips_through_write_version_in_package_json` (`version.rs:525`)
@@ -422,6 +430,20 @@ trailing-comment case. Test must be driven RED before acceptance.
 ---
 
 ### GAP-7 — the after-ship batch desyncs tag from CHANGELOG with no version file, and `init_repo` cannot reach it
+
+**Closed:** `17-13-PLAN.md` Task 2, commit `e421ebd`. RED-proof:
+`after_ship_batch_with_no_version_file_keeps_tag_and_changelog_in_sync` (fixture reached via new
+`init_repo_with_options(root, write_version_file: bool)`, with `init_repo` delegating `true` so its
+own behavior is unchanged) failed against the unfixed batch — the assertion `changelog_version !=
+"unreleased"` failed with `left: "unreleased", right: "unreleased"`, reproducing the exact desync.
+Fix: `HookContext` gained `shipped_version: Option<String>`; `version_bump` sets it after a
+successful `git.tag()` on both the version-file and no-version-file branches; `changelog_append`
+now prefers `ctx.shipped_version`, falling back to `version::read_version`, then to the
+`"unreleased"` literal. `Hook::run` takes `&mut HookContext`; `run_checkout_hooks` in
+`crates/devflow-cli/src/main.rs` hoists the `HookContext` construction above the batch loop
+(fields were already loop-invariant) instead of rebuilding a fresh, state-discarding context per
+hook. The terminal-batch fail-fast (`terminal_batch && outcome.is_err()`) is unchanged. Fix
+commit: `e421ebd`.
 
 **Opened:** re-audit #9 (`04a5e55`). **Source:** round-4 review CR-03, confirmed against the tree.
 **Impl:** `crates/devflow-core/src/hooks.rs:228-241` (`version_bump`) and `:190-198` (`changelog_append`)
