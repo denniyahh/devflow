@@ -4,7 +4,7 @@ slug: pipeline-dogfood-followup
 # status lifecycle: draft (seeded by plan-phase) → validated (set by validate-phase §6)
 # audit-milestone §5.5 distinguishes NOT-VALIDATED (draft) from PARTIAL (validated + nyquist_compliant: false) (#2117)
 status: validated
-nyquist_compliant: true
+nyquist_compliant: false
 wave_0_complete: true
 created: 2026-07-18
 audited: 2026-07-19
@@ -17,6 +17,7 @@ reaudited_5_at_commit: 46058a7
 reaudited_6_at_commit: 1070df0
 reaudited_7_at_commit: 84dc736
 reaudited_8_at_commit: 142cf8d
+reaudited_9_at_commit: 04a5e55
 ---
 
 # Phase 17 — Validation Strategy
@@ -66,7 +67,7 @@ row's test was confirmed to exist by name in the tree and to run green under `ca
 | 10 | 17-10, 17-11 | 17d follow-up (dogfood finding) | The second staleness arm only considers build inputs; content hooks target the worktree while terminal hooks stay on the primary checkout | unit | `dirty_flag_arm_ignores_non_build_files_but_still_flags_sources`, `content_hooks_target_the_worktree_while_terminal_hooks_stay_on_project_root` | ✅ green — arm renamed mtime→dirty-flag by `17-11` (CR-02); the original guarantee is unchanged |
 | 11 | audit-fix (`17-REVIEW.md`) | CR-03 / WR-02 / WR-07 | Unparseable retry hint gates instead of stalling silently; self-dogfood match is exact, not substring; the gitignore guard covers all 14 runtime paths, one `check-ignore` per path | unit + integration | `rate_limited_with_unparseable_retry_hint_gates_instead_of_stalling_silently`, `is_self_dogfood_workspace_requires_exact_member_paths_not_substrings`, `gitignore_covers_devflow_runtime_state_paths` | ✅ green |
 | 9 | Phase 16 | AC-1 (regression) | Failed Merge leaves branch intact, blocks VersionBump/BranchCleanup, opens Ship gate | regression (existing) | `terminal_merge_failure_reopens_actionable_gate_and_never_reports_finished`, `terminal_hook_failure_stops_before_branch_cleanup` | ✅ green |
-| 12 | 17-12 | P1 / AC-2 (17d, WR-04) | 17d's **release-record** facet: after the full after-ship batch the changelog heading, the git tag, and the version file name one and the same version, and the tree is clean — no hook write left uncommitted | unit | `after_ship_batch_changelog_tag_and_version_file_agree_and_tree_is_clean`, `changelog_append_commits_its_own_write`, `after_ship_runs_version_changelog_then_cleanup`, `transition_map_finalizes_docs_only_before_ship`, `validate_to_ship_hooks_do_not_touch_changelog`, `read_version_does_not_recompute_from_git_tags`, `read_version_errors_without_version_file`, `read_version_round_trips_through_write_version_in_plain_cargo_toml`, `read_version_round_trips_through_write_version_in_workspace_cargo_toml`, `read_version_round_trips_through_write_version_in_package_json` | ✅ green — GAP-5 closed by `17-12`; RED reconfirmed by the orchestrator at re-audit #8 |
+| 12 | 17-12 | P1 / AC-2 (17d, WR-04) | 17d's **release-record** facet: after the full after-ship batch the changelog heading, the git tag, and the version file name one and the same version, and the tree is clean — no hook write left uncommitted | unit | `after_ship_batch_changelog_tag_and_version_file_agree_and_tree_is_clean`, `changelog_append_commits_its_own_write`, `after_ship_runs_version_changelog_then_cleanup`, `transition_map_finalizes_docs_only_before_ship`, `validate_to_ship_hooks_do_not_touch_changelog`, `read_version_does_not_recompute_from_git_tags`, `read_version_errors_without_version_file`, `read_version_round_trips_through_write_version_in_plain_cargo_toml`, `read_version_round_trips_through_write_version_in_workspace_cargo_toml`, `read_version_round_trips_through_write_version_in_package_json` | ⚠️ **partial (re-audit #9)** — GAP-5's ordering facet stays closed and RED-proven, but two of this row's tests are vacuous against live defects: the `package.json` round-trip cannot fail on GAP-6, and the batch test's `init_repo` cannot reach GAP-7. See GAP-6, GAP-7 |
 | 13 | 17-12 (CR-01 R3) | 17d supporting invariant | `GitFlow::commit_path` commits *only* its pathspec — an already-staged unrelated file is not swept into the hook's commit | unit | `commit_path_stages_only_the_given_path_leaving_other_dirt_uncommitted` | ✅ green — test strengthened to stage the unrelated file (an untracked one proved nothing); RED reconfirmed at re-audit #8 |
 
 *Status: ⬜ pending · ✅ green · ❌ red · ⚠️ partial · 🔴 flaky*
@@ -379,6 +380,80 @@ closed. `17-12-PLAN.md` already specifies exactly the two regression tests requi
 
 ---
 
+### GAP-6 — `write_version` corrupts `package.json`, and row 12's round-trip fixture cannot fail on it
+
+**Opened:** re-audit #9 (`04a5e55`). **Source:** round-4 review CR-02, independently reproduced here.
+**Impl:** `crates/devflow-core/src/version.rs:253-297` (`replace_version_in_contents`)
+**Test with the blind spot:** `read_version_round_trips_through_write_version_in_package_json` (`version.rs:525`)
+
+`replace_version_in_contents` reassembles the matched line as
+`left.trim_end() + separator + quoted_version + '\n'`. The remainder of `value` after the version
+token is **never re-emitted** — which discards JSON's mandatory trailing `,` and, in TOML, any
+trailing comment.
+
+Reproduced by executing the emission logic standalone against a realistic fixture (not read off the
+review):
+
+```
+in : {"name":"x", "version":"0.1.0", "private":true}
+out:   "version": "2.3.4"          <-- comma dropped
+       → python3 json.load → JSONDecodeError: Expecting ',' delimiter (line 4 col 3)
+```
+
+**Why the existing test passes anyway — the vacuous-fixture class again.** The fixture is
+`{\n  "version": "0.1.0"\n}\n`: a *single-key* object where `version` is last, so there is no
+trailing comma to drop. The assertion (`read_version` round-trips) is correct; the fixture simply
+cannot reach the defect condition. This is precisely the failure mode re-audit #8 named as "the one
+most worth watching for in future passes" after CR-01 (R3) — a correct assertion over a fixture that
+cannot reproduce the defect. It recurred in the very next pass.
+
+**Reachable in product:** `Hook::VersionBump` → `version::write_version` on any Node project where
+`version` is not the last key — essentially every real `package.json`. `version_bump` then
+`commit_path`s the corrupted file and tags it, landing the corruption in history.
+
+**Why not auto-filled:** the fillable artifact is a test that must fail against current `version.rs`.
+The auditor's "never modify impl files" mandate routes this straight to `ESCALATE` — the same reason
+no auditor was spawned for GAP-1. **ESCALATED.**
+
+**To close:** preserve the line remainder after the value token (or emit `package.json` through a
+real JSON writer), then add a fixture with a key *following* `version`, plus a TOML
+trailing-comment case. Test must be driven RED before acceptance.
+
+---
+
+### GAP-7 — the after-ship batch desyncs tag from CHANGELOG with no version file, and `init_repo` cannot reach it
+
+**Opened:** re-audit #9 (`04a5e55`). **Source:** round-4 review CR-03, confirmed against the tree.
+**Impl:** `crates/devflow-core/src/hooks.rs:228-241` (`version_bump`) and `:190-198` (`changelog_append`)
+**Test with the blind spot:** `after_ship_batch_changelog_tag_and_version_file_agree_and_tree_is_clean` (`hooks.rs:445`)
+
+On a project with no `Cargo.toml`/`pyproject.toml`/`package.json`, `version_bump` takes the `else`
+branch (`warn!("no supported version file; tagging only")`, `hooks.rs:235`) and **still tags**
+`v{compute_version()}`. `changelog_append` runs next, calls `version::read_version`, which errors,
+and falls back to the literal `"unreleased"` (`hooks.rs:198`). Result:
+
+```
+TAG       = v0.0.3
+CHANGELOG = ## unreleased — 2026-07-19
+```
+
+That is exactly the three-way tag ↔ changelog ↔ version-file agreement row 12 exists to assert.
+
+**Why the batch test cannot catch it:** its `init_repo` helper unconditionally writes
+`Cargo.toml` (`hooks.rs:283`), so the `else` branch is never entered. Confirmed unsampled —
+`rg 'no_version_file|without_version_file|tagging_only' crates/devflow-core/src/hooks.rs` returns
+nothing. Row 12's `read_version_errors_without_version_file` covers the *reader* in isolation but
+never the batch composition, which is where the desync appears.
+
+**Why not auto-filled:** requires threading the tagged version out of `version_bump` into
+`changelog_append` — an impl change. **ESCALATED.**
+
+**To close:** have `version_bump` return the version it actually tagged and pass it to
+`changelog_append` rather than round-tripping through a file that may not exist; add a
+no-version-file case to the after-ship batch test.
+
+---
+
 ## Wave 0 Requirements
 
 - [x] `evaluate_layer0` tests: non-Code stage + declared/approved/all-passing probe → affirmative success (D-05)
@@ -423,7 +498,13 @@ with Phase 18's Hermes adapter, the first adapter with real reviewer storage.
   override, `17-09-PLAN.md`, fix `cb9359f`) instead of hanging. This box is now honestly checkable:
   worst-case observed latency across 25 consecutive isolated runs was ~4 s, well inside the 90 s
   budget. See GAP-2.
-- [x] `nyquist_compliant: true` (re-audit #8, `142cf8d`) — **GAP-5 is closed.** `17-12-PLAN.md`
+- [ ] **`nyquist_compliant: false` (re-audit #9, `04a5e55`)** — GAP-6 and GAP-7 are open. No commit
+  touched `crates/` since re-audit #8 and the suite is unchanged and green (376/376), so nothing
+  *regressed*; what changed is that round-4's five-angle review surfaced two live defects whose
+  covering tests in row 12 are vacuous against them. Coverage was weaker than re-audit #8 could see,
+  not weakened since. Both are impl bugs → ESCALATED, not auto-fillable.
+- [x] ~~`nyquist_compliant: true` (re-audit #8, `142cf8d`)~~ — superseded by the bullet above; its
+  GAP-5 ordering finding stands and remains RED-proven. **GAP-5 is closed.** `17-12-PLAN.md`
   executed: the hook batch is reordered, `changelog_append` reads back the shipped version and
   commits its own write, and `version_bump`'s matching uncommitted-write defect was fixed alongside.
   Both required regression tests exist, and the batch test was driven RED by the orchestrator on the
@@ -991,3 +1072,74 @@ work. It and GAP-5 touch the same hook batch; closing GAP-5 did not close it.
 **Not a validation matter:** `17-REVIEW.md` keeps `ship_gate: BLOCKED` on round 2's eight open
 Warnings, and its `findings: critical: 1` is a *found* count by this file's convention, deliberately
 not decremented. Neither is stale; both are operator calls outside this audit's scope.
+
+---
+
+## Validation Re-Audit #9 2026-07-20 (HEAD `04a5e55`)
+
+Ninth pass, triggered by this document's standing rule ("a PASS verdict does not survive its own
+commit range"). Seven commits landed in `142cf8d..04a5e55` — **none touching `crates/`**, all docs
+and planning. The suite is therefore expected to be unchanged, and is.
+
+| Metric | Count |
+|--------|-------|
+| Requirement rows audited | 13 |
+| Suite result (**unfiltered**) | **376 passed / 0 failed / 0 ignored / 0 filtered** (10 targets), `cargo` exit 0 |
+| `crates/` commits since re-audit #8 | 0 |
+| Rows green | 12 |
+| Rows downgraded to partial | 1 (row 12) |
+| Gaps open at re-audit #8 | 0 |
+| New gaps found | 2 (GAP-6, GAP-7) |
+| Resolved by this pass | 0 |
+| Escalated (impl bug) | 2 |
+| `nyquist_compliant` | **`true` → `false`** |
+
+**The suite did not regress; the audit's confidence did.** Exit code was read from `cargo` directly,
+not through a pipe (re-audit #4's false-green trap), and the 376 total was recomputed by summing
+per-target `test result: ok. N passed` lines rather than trusting a single line. Identical to
+re-audit #8, as a zero-`crates/` range demands.
+
+**What this pass adds is not a new commit range but a new source of evidence.** `53327e9` landed
+`17-REVIEW.md`'s round-4 five-angle deep review *after* re-audit #8 signed off. It raises three
+Criticals. Each was checked against the tree here rather than accepted on the review's authority:
+
+- **CR-01 (false `1.4.106` release heading) — not a gap, already resolved.** Working tree is clean;
+  `CHANGELOG.md` tops out at `1.3.69`, which agrees with `git tag -l` (`v1.3.69`) and
+  `Cargo.toml` (`1.3.69`). The uncommitted hunk the review flagged is gone. No action.
+- **CR-02 → GAP-6 — confirmed, and reproduced independently.** Rather than reading the traced
+  example out of the review, the emission logic of `replace_version_in_contents` was extracted and
+  executed standalone against `{"name":"x","version":"0.1.0","private":true}`. It emitted
+  `"version": "2.3.4"` with the trailing comma dropped, and `python3 json.load` rejected the output
+  with `Expecting ',' delimiter`. The defect is real and the row-12 fixture provably cannot reach it.
+- **CR-03 → GAP-7 — confirmed by direct code read.** `hooks.rs:235` tags on the no-version-file
+  `else` branch; `hooks.rs:198` falls back to `"unreleased"`. `init_repo` (`hooks.rs:283`) always
+  writes `Cargo.toml`, and a targeted `rg` confirms *zero* tests exercise the no-version-file batch
+  path.
+
+**Row 12 is the casualty, and that is the finding worth stating plainly.** Row 12 is the row that
+closed GAP-5 and flipped `nyquist_compliant` to `true` one pass ago. Two of its ten covering tests
+turn out to be vacuous against live defects in the very code they cover. Re-audit #8 closed with the
+observation that "a correct assertion over a fixture that cannot reproduce the defect condition… is
+the failure mode most worth watching for in future passes." It recurred immediately, twice, in the
+same row — which suggests the class is systemic to this codebase's fixture helpers (`init_repo`,
+single-key JSON) rather than incidental. **Counting covering tests is not the same as sampling
+behavior, and this document has now been wrong about that three times (GAP-4, CR-01 R3, GAP-6/7).**
+
+**No auditor subagent was spawned.** Both gaps' only fillable artifact is a test that must fail
+against current `version.rs` / `hooks.rs`. The `gsd-nyquist-auditor` mandate forbids modifying impl
+files, which routes both to `ESCALATE` on arrival — the documented precedent set at GAP-1 and
+re-affirmed at GAP-5. Spawning would burn a subagent to be told what is already established.
+
+**Verdict: PARTIAL.** Twelve of thirteen rows automated, green, deterministic and unfiltered. Row 12
+is partial pending GAP-6 and GAP-7. `nyquist_compliant: false`. Phase 17's ordering and
+release-record work is not undone — GAP-5 stays closed — but 17d's release-record facet is not
+honestly sampled until a `package.json` with a following key and a no-version-file batch case both
+exist and have been driven RED.
+
+**To close:** run `/gsd-execute-phase 17 --gaps-only`, then re-run `/gsd-validate-phase 17`.
+
+**Standing caveat, restated:** re-run this audit before shipping if any commit lands on `crates/`.
+
+**Unchanged and still not a validation gap:** GAP-2's product-level version-tag contention remains
+OUT OF SCOPE. AC-4's security-artifact and reviewer-set sub-checks remain deferred to Phase 18 by
+attributed override.
