@@ -320,3 +320,14 @@ Plans:
 
 Plans:
 - [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.8: Split `main.rs` (BACKLOG — blocked on Phase 18)
+
+**Goal:** `crates/devflow-cli/src/main.rs` is 6,239 lines (3,307 production + a 2,931-line test module with 71 tests) — 2.6x the next largest file, and now the binding constraint on execution parallelism, since the same-wave zero-file-overlap rule keys on file path. Phase 18 was forced into 6 near-serial waves for 7 plans purely because 6 of them touch `main.rs`. The production half already decomposes cleanly into 7 clusters (preflight / staleness / pipeline state machine / commands / parallel / dispatch / config — measured boundaries in CONTEXT.md); splitting would take those 6 waves to 3.
+
+**Deliberately sequenced AFTER Phase 18, not before.** The primary risk is `ENV_MUTEX` (22 sites in `main.rs`) — redistributing 71 tests across module boundaries while preserving process-global serialization is exactly the failure class with the worst track record here (19i hit 2/2 in CI while passing locally; GAP-2 at 33–40%; 999.4 caught only by instrumentation). Phase 18's 18a/18b are what make that class observable, and 18e/18f reshape the very functions that determine the seams. Must be a pure-move refactor with zero behavioral change, verified on a branch with CI — local-green is explicitly insufficient.
+**Requirements:** TBD — see CONTEXT.md
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (promote with /gsd-review-backlog when ready — after Phase 18 ships)
