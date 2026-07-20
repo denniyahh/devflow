@@ -628,6 +628,34 @@ mod tests {
     }
 
     #[test]
+    fn write_version_preserves_trailing_comment_in_single_quoted_toml() {
+        // GAP-6, TOML literal-string variant (17-13 review IN-03): the
+        // remainder scan keys off the OPENING quote character, so the
+        // single-quote branch is a distinct path from the double-quote case
+        // above and needs its own fixture.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nversion = '0.1.0'  # pinned\n",
+        )
+        .unwrap();
+        write_version(
+            dir.path(),
+            &Version {
+                major: 2,
+                minor: 3,
+                patch: 4,
+            },
+        )
+        .unwrap();
+        let contents = std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
+        assert!(
+            contents.contains("version = '2.3.4'  # pinned"),
+            "expected single-quoted value and trailing comment to survive, got: {contents}"
+        );
+    }
+
+    #[test]
     fn read_version_does_not_recompute_from_git_tags() {
         // read_version must report exactly what's on disk, not a freshly
         // computed minor/patch — this is the property VersionBump/
