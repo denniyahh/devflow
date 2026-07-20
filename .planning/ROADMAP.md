@@ -11,7 +11,7 @@
 | 14 | Parallel Safety + Observability | Complete |
 | 15 | Dogfood Enablement + OSS Readiness | Complete |
 | 16 | Pipeline Reliability Hardening | Complete    |
-| 17 | Pipeline Dogfood Follow-Up | In Progress|
+| 17 | Pipeline Dogfood Follow-Up | Complete    |
 | 18 | Dogfood Reliability Hardening | Scoped |
 
 ## Shipped
@@ -291,6 +291,24 @@ Plans:
 ### Phase 999.5: ChangelogAppend Placeholder Content (BACKLOG)
 
 **Goal:** Every generated changelog entry reads "Released phase via DevFlow" — deferred twice already (17-10, 17-12). *(was 19j)*
+**Requirements:** TBD — see CONTEXT.md
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.6: Plan-Only Pipeline Mode (BACKLOG)
+
+**Goal:** `devflow start --until <stage>` to halt cleanly after a named stage. Today `start` always runs Define→Plan→Code→Validate→Ship and `--mode supervise` only moves the gates, so "just do the planning" is inexpressible — the only stop is killing the monitor, which strands state and orphans a worktree. Blocks cheap, frequent dogfood runs. Found 2026-07-20 attempting to plan Phase 18 through devflow itself.
+**Requirements:** TBD — see CONTEXT.md
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.7: Manual Ship Override (BACKLOG)
+
+**Goal:** Let an operator drive a phase through Ship by hand when the pipeline is unhealthy. `devflow gate approve` does not cover this: it refuses when no gate is open (`gates.rs:186`), and when one is open it only writes a response file that a *live monitor* must consume — so a dead monitor (invisible today, see 18b) leaves the approval unconsumed forever. Must not bypass the fail-closed terminal Ship invariant. Operator request 2026-07-20.
 **Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
 
