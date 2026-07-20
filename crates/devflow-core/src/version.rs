@@ -270,12 +270,31 @@ fn replace_version_in_contents(contents: &str, field: &str, new_version: &str) -
             let left_key = left.trim().trim_matches('"').trim_matches('\'');
             if left_key == key && !value.trim().starts_with('{') {
                 let separator: &str = if trimmed.contains('=') { " = " } else { ": " };
-                let quote_char: &str = if value.trim().starts_with('\'') {
+                let trimmed_value = value.trim();
+                let needs_quote = trimmed_value.starts_with('"') || trimmed_value.starts_with('\'');
+                let quote_char: &str = if trimmed_value.starts_with('\'') {
                     "'"
                 } else {
                     "\""
                 };
-                let needs_quote = value.trim().starts_with('"') || value.trim().starts_with('\'');
+                // Capture whatever follows the version token itself (a
+                // trailing `,` in JSON, a trailing `# comment` in TOML) so it
+                // survives the rewrite instead of being silently dropped
+                // (GAP-6).
+                let remainder = if needs_quote {
+                    // Token ends at the closing quote; skip the opening
+                    // quote and scan for the matching close.
+                    trimmed_value[1..]
+                        .find(quote_char)
+                        .map(|end| &trimmed_value[end + 2..])
+                        .unwrap_or("")
+                } else {
+                    // Unquoted: token ends at the first whitespace, `,`, or `#`.
+                    let end = trimmed_value
+                        .find([' ', '\t', ',', '#'])
+                        .unwrap_or(trimmed_value.len());
+                    &trimmed_value[end..]
+                };
                 output.push_str(left.trim_end());
                 output.push_str(separator);
                 if needs_quote {
@@ -285,6 +304,7 @@ fn replace_version_in_contents(contents: &str, field: &str, new_version: &str) -
                 } else {
                     output.push_str(new_version);
                 }
+                output.push_str(remainder.trim_end());
                 output.push('\n');
                 changed = true;
                 continue;
@@ -546,6 +566,64 @@ mod tests {
             read_version(dir.path()),
             Err(VersionError::Parse(_))
         ));
+    }
+
+    #[test]
+    fn write_version_preserves_trailing_comma_in_package_json() {
+        // GAP-6: replace_version_in_contents reassembles the matched line as
+        // `left.trim_end() + separator + quoted_version + '\n'`, discarding
+        // everything in `value` after the version token. For a real
+        // package.json where `version` is not the last key, that eats the
+        // mandatory trailing comma and produces invalid JSON. Parsing is the
+        // assertion that matters here — a substring check would be a
+        // vacuous fixture that can't reach this defect.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            "{\n  \"name\": \"x\",\n  \"version\": \"0.1.0\",\n  \"private\": true\n}\n",
+        )
+        .unwrap();
+        write_version(
+            dir.path(),
+            &Version {
+                major: 2,
+                minor: 3,
+                patch: 4,
+            },
+        )
+        .unwrap();
+        let contents = std::fs::read_to_string(dir.path().join("package.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&contents)
+            .unwrap_or_else(|err| panic!("package.json no longer parses as JSON: {err}\n{contents}"));
+        assert_eq!(parsed["name"], "x");
+        assert_eq!(parsed["private"], true);
+        assert_eq!(parsed["version"], "2.3.4");
+    }
+
+    #[test]
+    fn write_version_preserves_trailing_comment_in_toml() {
+        // GAP-6, TOML variant: a trailing `# comment` after the quoted
+        // version is discarded by the same line-reassembly defect.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nversion = \"0.1.0\"  # pinned\n",
+        )
+        .unwrap();
+        write_version(
+            dir.path(),
+            &Version {
+                major: 2,
+                minor: 3,
+                patch: 4,
+            },
+        )
+        .unwrap();
+        let contents = std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
+        assert!(
+            contents.contains("version = \"2.3.4\"  # pinned"),
+            "expected trailing comment to survive, got: {contents}"
+        );
     }
 
     #[test]
