@@ -15,15 +15,27 @@ progress:
 
 # DevFlow — Project State
 
-> Last updated: 2026-07-19
+> Last updated: 2026-07-20
 
 ## Active
 
-- **Phase 18 (Scoped):** Hermes Support — renumbered from 17 to 18
-  (2026-07-18) to make room for Phase 17. HermesAgent adapter, skill-file
-  rewrite, Hermes plugin. Depends on Phase 14's events.jsonl + Phase 13's
-  notify hook. Also carries 18d (doctor reconciliation) and 18e (WR-03 test
-  fix), deferred from Phase 17 on 2026-07-18.
+- **Phase 18 (Scoped):** Dogfood Reliability Hardening — reprioritized
+  2026-07-20 from Hermes Support. `devflow doctor` reconciliation (18a),
+  monitor liveness (18b), worktree-aware staleness enforcement (18c),
+  Code↔Validate safety-gate reachability (18d), Layer 0/Validate verdict
+  fix (18e), preflight-gate re-run wedge fix (18f), WR-03 test
+  stabilization (18g). Replaces the fixed Phase 19 roadmap entry — see
+  `## Backlog` in ROADMAP.md for the items not pulled into 18. Depends on
+  Phase 17 (typed outcomes, build provenance).
+
+## Backlog
+
+Five unsequenced items live in `.planning/phases/999.N-*/` and the
+`## Backlog` section of ROADMAP.md: Hermes Support (999.1, held Phase 18's
+slot until this reprioritization), phase-process tracking model (999.2, was
+19b), CLI operator discoverability (999.3, was 19c), version-tag contention
+on concurrent ship (999.4, was 19h), changelog placeholder content (999.5,
+was 19j). Promote with `/gsd-review-backlog`.
 
 ## Completed
 
@@ -81,6 +93,7 @@ None currently open for Phase 17.
 
 | Date | Decision |
 |---|---|
+| 2026-07-20 | **Phase 18 reprioritized to Dogfood Reliability Hardening; fixed Phase 19 eliminated in favor of a backlog:** operator call — dogfooding has repeatedly surfaced legitimate functional bugs that tax every subsequent run, so pipeline-self-correctness work (18a–18g, was 18d/18e + 19a/19d/19g/19k/19l) takes Phase 18's slot ahead of Hermes. Auditing the move surfaced two stale-documentation bugs of its own: 19e and 19f were already closed by 17-13 (`12b5b98`, `e421ebd` — RED-proven regression tests exist) but ROADMAP.md still described them as open; `17-REVIEW.md` WR-06 had already flagged this. Not carried forward. 19i was already resolved (`96411eb`/`40dade3`) before this restructure. Rather than open a new fixed Phase 19, the remaining real-but-lower-priority items (Hermes, 19b, 19c, 19h, 19j) moved to a GSD-native 999.x backlog (`## Backlog` in ROADMAP.md, `/gsd-review-backlog` to promote) — every prior phase renumbering in this project's history exists because "the next phase" kept absorbing newly-discovered work; the backlog gives that work a home that isn't a phase number. Dir renames: `18-hermes-support` → `999.1-hermes-support`; new `18-dogfood-reliability-hardening`, `999.2-phase-process-tracking-model`, `999.3-cli-operator-discoverability`, `999.4-version-tag-contention-concurrent-ship`, `999.5-changelog-placeholder-content`. `17-REVIEW.md`'s WR-07 (build_provenance test flake, no CI job timeout) and WR-01/02/03/04/08/09/10/11 were noticed during this audit but not triaged here — flagged for a follow-up review pass, not assumed resolved or added to the backlog sight-unseen. |
 | 2026-07-18 | **Phase 17 scoped to four units; P5/P6 deferred to Phase 18:** source verification against final HEAD resolved decision-gate Q2 — `Unknown` auto-advance is not an edge case but an explicit design choice (`main.rs:854` classifies only `Failed \| RateLimited` as failure; `main.rs:871`'s comment states "Success (or Unknown — advance…)"). It is also broader than the retrospective recorded: `evaluate_layer3` (`agent_result.rs:610-620`) returns `Unknown` for the zero-commit "agent process gone, no commits" case too, so a vanished agent that did nothing advances Code→Validate. Two retrospective assumptions corrected: `devflow doctor` already exists but is project-blind (`_project_root` unused), and `RateLimited` is already typed — the missing outcomes are `resource_killed` (exit 137, absent workspace-wide) and `agent_unavailable`. Provenance has no foundation at all (no `build.rs`, no `vergen`; `workflow_started` carries only agent/mode/worktree). Phase 17 keeps 17a `Unknown` non-advance, 17b typed outcomes + retry policy, 17c preflight gate, 17d build provenance. Q4 answered: focused Phase 17 repair, **not** a Phase 16 remediation — only 17d traces to the proven Phase 16 defect; the rest is capability Phase 16 never claimed. Deferred to Phase 18 as 18d/18e: doctor reconciliation (forensic tooling, depends on 17b+17d) and the WR-03 test fix (test-only debt). Q3 (universal vs. adapter-specific preflight checks) remains open for discuss-phase. |
 | 2026-07-17 | **New Phase 16 (Pipeline Reliability Hardening) inserted, Hermes Support renumbered 16→17:** dogfooding Phase 15 through DevFlow itself surfaced real pipeline gaps — two Code-stage false positives on the crates.io publish plan (Layer-2 commit-count heuristic once, an incorrect agent self-report once) and four consecutive Ship-review failures on distinct legitimate findings (leaked telemetry, incomplete gitignore fix, CI job that couldn't fail loud, a doc/behavior mismatch) that a single-pass standard-depth reviewer caught one at a time instead of together. Dir renamed `16-hermes-support` → `17-hermes-support`; new `16-pipeline-reliability-hardening` (neither had plans yet). |
 | 2026-07-18 | **New Phase 17 (Pipeline Dogfood Follow-Up) inserted, Hermes Support renumbered 17→18:** Phase 16 execution evidence may show a failed Merge followed by VersionBump, BranchCleanup, and `workflow_finished`, contradicting the phase's fail-closed terminal contract. The Phase 17 spike captures this required final-HEAD reproduction plus outcome classification, preflight readiness, state/event reconciliation, and WR-03 test stabilization. Dir renamed `17-hermes-support` → `18-hermes-support`; Hermes remains scoped and blocked on the decision gate. |
@@ -137,6 +150,7 @@ None currently open for Phase 17.
 
 ## Roadmap Evolution
 
+- Phase 18 reprioritized, fixed Phase 19 eliminated (2026-07-20): Dogfood Reliability Hardening (dir `18-dogfood-reliability-hardening`) takes Phase 18's slot from Hermes Support (dir renamed to `999.1-hermes-support`); the fixed "Phase 19: Operator Observability" entry is replaced entirely — its content is absorbed into 18, confirmed already fixed, or moved to backlog dirs `999.2`–`999.5`. See 2026-07-20 decision entry.
 - Phase 14 split (2026-07-16): Hermes work (adapter, skill rewrite, plugin) moved out of 14 to new Phase 16 (`16-hermes-support`); 14 retitled Parallel Safety + Observability (dir `14-parallel-safety-observability`), leading with the deferred CR-03 flaw. See 2026-07-16 decision entry.
 - MVP restructure (2026-07-14): Phase 13 repurposed as MVP Core Loop (dir `13-mvp-core-loop`); old Phase 13 OSS/Hermes content moved to new Phase 15; Phase 14 rescoped to observability. Later same day: Hermes work moved 15 → 14 (now `14-observability-hermes`), 15 slimmed to OSS Readiness (`15-oss-readiness`). See 2026-07-14 decision entries.
 - Phase 14 added: Reliability & Observability Hardening — verdict-vs-ran split in completion protocol, native per-agent JSON envelope parsing, worktree-isolation-by-default for `start`, observability (`devflow logs`, `events.jsonl`, gate notify hook, configurable gate timeout). Scoped from external code review (2026-07-08). Extended 2026-07-08 with WR-11 (silent halt on non-Validate stage failure, from Phase 11 code review).
