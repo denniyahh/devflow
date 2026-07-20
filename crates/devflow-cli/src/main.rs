@@ -3081,7 +3081,10 @@ fn recover_cmd(project_root: &Path, do_clean: bool, phase: Option<u32>) -> Resul
 fn test_cmd(project_root: &Path) -> Result<(), CliError> {
     let checks = [
         ("cargo test", "cargo test"),
-        ("cargo clippy", "cargo clippy -- -D warnings"),
+        (
+            "cargo clippy",
+            "cargo clippy --workspace --all-targets -- -D warnings",
+        ),
         ("cargo fmt --check", "cargo fmt --check"),
     ];
     let mut failures = Vec::new();

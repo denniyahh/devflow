@@ -48,11 +48,11 @@ cargo build
 # Run all tests
 cargo test
 
-# Lint
-cargo clippy -- -D warnings
+# Lint (must include --all-targets, or test code goes unlinted)
+cargo clippy --workspace --all-targets -- -D warnings
 
 # Format check
-cargo fmt -- --check
+cargo fmt --check
 
 # Run a specific command
 cargo run -- status
@@ -99,7 +99,7 @@ crates/
 1. Fork the repo
 2. Create a feature branch: `git checkout -b feature/my-feature`
 3. Write code, add tests
-4. Ensure `cargo test` passes and `cargo clippy -- -D warnings` is clean
+4. Ensure `cargo test` passes and `cargo clippy --workspace --all-targets -- -D warnings` is clean
 5. `cargo fmt`
 6. Submit a PR against `develop`
 7. CI runs tests + clippy + format check
@@ -108,8 +108,15 @@ crates/
 (mirrors [`.github/workflows/ci.yml`](.github/workflows/ci.yml)):
 
 - `cargo test`
-- `cargo clippy -- -D warnings`
+- `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo fmt --check`
+
+`devflow test` runs these same three checks locally, and
+[`scripts/hooks/pre-push`](scripts/hooks/pre-push) runs them before a push.
+The `--all-targets` scope is load-bearing: the narrower `cargo clippy -- -D
+warnings` does not compile test targets, so lints inside `#[cfg(test)]`
+modules pass it and then fail CI. Regression guards for this live in
+`crates/devflow-cli/tests/devcontainer_ci_failfast.rs`.
 
 Ordinary code contributions need no agent credentials or API keys — the build
 and the full test suite run offline. Agent CLIs (Claude, Codex, OpenCode) are

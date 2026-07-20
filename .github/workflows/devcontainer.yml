@@ -13,6 +13,7 @@ jobs:
   devcontainer:
     name: Build + test in devcontainer
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - name: Build devcontainer and run CI-parity checks
