@@ -11,7 +11,7 @@
 | 14 | Parallel Safety + Observability | Complete |
 | 15 | Dogfood Enablement + OSS Readiness | Complete |
 | 16 | Pipeline Reliability Hardening | Complete    |
-| 17 | Pipeline Dogfood Follow-Up | In Progress|
+| 17 | Pipeline Dogfood Follow-Up | Complete    |
 | 18 | Hermes Support | Scoped |
 
 ## Shipped
@@ -253,6 +253,7 @@ Sequence after Phase 18 — 18d (`devflow doctor` reconciliation) overlaps 19a a
 - **19d — staleness is evaluated against the wrong tree:** `enforce_build_staleness` compares the binary's embedded commit to `project_root`'s HEAD. For a worktree-based phase the code under test lives on the worktree branch, so a binary two hours behind that branch classifies as `Ahead` (warn) because it is a descendant of `develop`. This is the root cause of Round 4 CR-01: a stale binary silently ran the pre-17-12 hook batch and re-emitted a false changelog heading. Evaluate against the worktree HEAD when the phase has one, and **block** (not warn) a self-dogfood binary that is behind it.
 
   This item is the enforcement mechanism for a standing dogfood rule: when a live bug is fixed mid-run and the pipeline is sent back to re-validate, the binary MUST be rebuilt and reinstalled at `<project_root>/target/debug/devflow` before resuming. The monitor resolves its binary via `current_exe()` at spawn and its wrapper hardcodes the primary path, so running a worktree binary directly does not propagate to spawned monitors, and `cargo run` from the primary checkout silently reinstalls a pre-fix build. Until 19d ships this rule is manual; after 19d the gate enforces it.
+
 - **19e — `write_version` corrupts `package.json`:** `replace_version_in_contents` drops the trailing comma, producing invalid committed JSON (Round 4 CR-02). Pre-existing; unrelated to Phase 17's changes.
 - **19f — `hooks_after_ship()` desyncs the changelog from the tag with no version file:** `version_bump` takes its `else` branch ("no supported version file; tagging only") and still tags `v{compute_version()}`, while `changelog_append` calls `read_version`, errors, and falls back to the literal `"unreleased"` (Round 4 CR-03). A gap in 17-12's design: it assumed `version_bump` always writes a version file.
 - **19g — the Code↔Validate loop can never reach its own safety gate:** `transition()` unconditionally resets `consecutive_failures`, so the counter oscillates 0↔1 and `MAX_CONSECUTIVE_FAILURES = 3` is unreachable for the exact loop it bounds. Observed live across three cycles. Under `--mode auto` this loops indefinitely while `status` shows a healthy alternating pipeline. Note 17-06 added the `infra_failures` reset to the same function, which likely inherits the weakness.
