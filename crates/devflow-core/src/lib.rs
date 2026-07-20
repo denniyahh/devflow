@@ -65,6 +65,7 @@ pub mod hooks;
 pub mod lock;
 pub mod mode;
 pub mod monitor;
+pub mod outcome_policy;
 pub mod prompt;
 pub mod recover;
 pub mod ship;

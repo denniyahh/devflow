@@ -8,9 +8,12 @@ use devflow_core::mode::{self, Mode};
 use devflow_core::prompt::{self, FixType};
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
-use devflow_core::{agent_result, agents, events, history, lock, monitor, recover, worktree};
+use devflow_core::{
+    agent_result, agents, events, history, lock, monitor, outcome_policy, recover, worktree,
+};
 use devflow_core::{
     agent_result::{AgentStatus, Verdict},
+    outcome_policy::Action,
     workflow,
 };
 use std::path::{Path, PathBuf};
@@ -103,6 +106,20 @@ enum Command {
         /// spawn time so advance never depends on a shared state singleton.
         #[arg(long)]
         phase: Option<u32>,
+    },
+    /// Resume a phase from its saved stage after a rate limit or infrastructure pause.
+    ///
+    /// Unlike `start`, this loads the persisted per-phase state and
+    /// relaunches its saved stage — it does NOT create a new branch/worktree
+    /// or reset the workflow to Define (review consensus #5); agent and mode
+    /// come from the saved state.
+    Resume {
+        /// Phase to resume.
+        #[arg(long)]
+        phase: u32,
+        /// Project root.
+        #[arg(default_value = ".")]
+        project: PathBuf,
     },
     /// Inspect and answer human gates (the pause points where the workflow
     /// waits for approval).
@@ -363,6 +380,7 @@ fn run() -> Result<(), CliError> {
             )
         }
         Command::Advance { project, phase } => advance(&project_root(project)?, phase),
+        Command::Resume { phase, project } => resume(&project_root(project)?, phase),
         Command::Gate { action } => match action {
             GateCmd::List { project } => gate_list(&project_root(project)?),
             GateCmd::Approve {
@@ -606,13 +624,9 @@ fn start(
         project_root,
         phase,
         "workflow_started",
-        serde_json::json!({
-            "agent": state.agent.to_string(),
-            "mode": state.mode.to_string(),
-            "worktree": state.worktree_path.as_ref().map(|p| p.display().to_string()),
-        }),
+        workflow_started_payload(&state),
     );
-    if let Err(err) = launch_stage(&state, None, None) {
+    if let Err(err) = launch_stage(&mut state, None, None) {
         if let Err(clear_err) = workflow::clear_state(project_root, phase) {
             eprintln!("warning: could not clear state after failed launch: {clear_err}");
         }
@@ -686,11 +700,442 @@ fn ensure_agent_binary(program: &str) -> Result<(), CliError> {
     )))
 }
 
+// ---------------------------------------------------------------------------
+// 17c: preflight readiness gate (D-13-D-16) — generic universal checks +
+// adapter hook, run from `launch_stage` before `monitor::spawn_monitor` so a
+// readiness failure is caught before any agent time is spent.
+// ---------------------------------------------------------------------------
+
+/// D-14 (universal, generic layer): a headless/auto Codex run cannot pass
+/// Define's discuss-phase interview — Codex's `exec` mode has no route to
+/// answer an interactive interview (`request_user_input is unavailable in
+/// Default mode`), unlike Claude/OpenCode's headless Define, which can and
+/// does complete it non-interactively (verified live, 13-06; the existing
+/// integration tests exercise exactly this: `--agent claude --mode auto`
+/// with no pre-existing CONTEXT.md succeeds). This check reuses the same
+/// `phase_artifact_on_develop` predicate as the existing pre-state Codex
+/// check in `start()`, but routes the failure through the preflight gate
+/// (D-15) instead of a hard error — closing the gap that check leaves open
+/// for non-`start()` launch paths (`resume`, gate retries, loop-backs). The
+/// pre-state Codex check itself is intentionally left unmigrated (Review
+/// dispositions, out of scope for this plan).
+fn preflight_interactivity_check(project_root: &Path, state: &State) -> Result<(), String> {
+    if state.agent == AgentKind::Codex
+        && state.mode == Mode::Auto
+        && state.stage == Stage::Define
+        && !phase_artifact_on_develop(project_root, state.phase, "-CONTEXT.md")
+    {
+        return Err(format!(
+            "phase {} has no CONTEXT.md on develop — codex cannot run Define's \
+             discuss-phase interview headlessly in auto mode",
+            state.phase
+        ));
+    }
+    Ok(())
+}
+
+/// D-14 (universal, generic layer): whether the gh-auth credential probe
+/// applies to `stage` — hardcoded to `Stage::Ship` rather than a dynamic
+/// hook-scan (review Plan 05 MEDIUM, Codex+OpenCode): Ship's terminal hooks
+/// (`hooks::hooks_after_ship()` = Merge/VersionBump/ChangelogAppend/BranchCleanup,
+/// `hooks.rs:99-106`) are the only hooks that push to a remote. Split out as
+/// its own pure predicate so "does not run for a non-Ship stage" is directly
+/// unit-testable without shelling out to `gh`.
+fn gh_auth_check_applies(stage: Stage) -> bool {
+    stage == Stage::Ship
+}
+
+/// D-14 (universal, generic layer): external credential validity via `gh
+/// auth status`, run ONLY when [`gh_auth_check_applies`] (Ship). Fails soft
+/// to a warning when the `gh` binary itself is absent — a missing optional
+/// tool must not hard-fail the pipeline (T-17-14). Fails preflight only when
+/// `gh` is present and reports unauthenticated. Records only a boolean
+/// pass/fail plus a short reason string — raw `gh auth status` stdout/stderr
+/// is NEVER captured or logged (T-17-13, Information Disclosure).
+fn preflight_gh_auth_check(state: &State) -> Result<(), String> {
+    if !gh_auth_check_applies(state.stage) {
+        return Ok(());
+    }
+    match std::process::Command::new("gh")
+        .args(["auth", "status"])
+        .output()
+    {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(_) => Err("gh auth status reports not authenticated".to_string()),
+        Err(_) => {
+            println!(
+                "warning: `gh` binary not found — cannot verify GitHub credential validity \
+                 before Ship (fail-soft, not a preflight failure)"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// The generic (universal) preflight checks (D-14) — the adapter-specific
+/// hook is composed separately in [`run_preflight`].
+fn generic_preflight_checks(project_root: &Path, state: &State) -> Result<(), String> {
+    preflight_interactivity_check(project_root, state)?;
+    preflight_gh_auth_check(state)
+}
+
+/// Gate a stage launch on readiness (17c, D-13-D-16): the generic universal
+/// checks (D-14) plus the adapter-specific hook, called from `launch_stage`
+/// BEFORE `monitor::spawn_monitor` so a readiness failure is caught before
+/// any agent time is spent. A failing check is NEVER a hard exit — it
+/// surfaces as a named preflight gate + notify (WR-11 idiom, D-15), mirroring
+/// `handle_stage_failure`'s dispatch shape exactly.
+///
+/// Returns `Ok(true)` when the caller should continue the rest of
+/// `launch_stage` (preflight passed). Returns `Ok(false)` when a failing
+/// check was resolved via a gate that ALREADY completed a full retried
+/// launch (Advance/LoopBack) or aborted (Abort) — the caller must not run
+/// any more launch steps for this invocation (CR-01, 17-08 gap closure: the
+/// old `Result<(), CliError>` return couldn't distinguish these two cases,
+/// so the caller always continued and spawned the agent a second time).
+fn run_preflight(
+    project_root: &Path,
+    state: &mut State,
+    adapter: &dyn agents::AgentAdapter,
+) -> Result<bool, CliError> {
+    let stage = state.stage;
+    if let Err(reason) =
+        generic_preflight_checks(project_root, state).and_then(|()| adapter.preflight(state))
+    {
+        let context = format!(
+            "[never-silent] preflight failed for stage {stage}: {} — human review needed \
+             (retry, loop-to-code, or abort)",
+            truncate_reason(&reason)
+        );
+        match run_gate(project_root, state, stage, &context)? {
+            GateAction::Advance => {
+                let _ = Gates::cleanup(project_root, state.phase, stage);
+                state.gate_pending = false;
+                launch_stage(state, None, None)?;
+            }
+            GateAction::LoopBack(_) => {
+                let _ = Gates::cleanup(project_root, state.phase, stage);
+                launch_stage(state, None, None)?;
+            }
+            GateAction::Abort(reason) => abort(project_root, state, &reason)?,
+        }
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+// ---------------------------------------------------------------------------
+// 17d: build provenance + self-dogfood staleness gate (D-17-D-21).
+// ---------------------------------------------------------------------------
+
+/// D-21: the `workflow_started` event payload, including build provenance —
+/// factored out of `start()` so the payload shape is directly unit-testable
+/// without spawning a real agent (`start()` calls `launch_stage` immediately
+/// after emitting this event).
+fn workflow_started_payload(state: &State) -> serde_json::Value {
+    serde_json::json!({
+        "agent": state.agent.to_string(),
+        "mode": state.mode.to_string(),
+        "worktree": state.worktree_path.as_ref().map(|p| p.display().to_string()),
+        "version": env!("CARGO_PKG_VERSION"),
+        "commit": env!("DEVFLOW_BUILD_COMMIT"),
+        "dirty": env!("DEVFLOW_BUILD_DIRTY"),
+        "exe_path": std::env::current_exe()
+            .ok()
+            .map(|p| p.display().to_string()),
+    })
+}
+
+/// Whether the build embedded in `embedded_commit` is stale relative to
+/// `project_root`'s current `HEAD` — the ancestry half of D-19's composite
+/// definition. Per git's documented exit-code contract for `merge-base
+/// --is-ancestor` (exit 0 = ancestor, exit 1 = not, other = error/unknown
+/// commit — Pitfall 4), exit 1 is treated as definitively Stale; any other
+/// outcome (including an empty `embedded_commit` — D-20: absence of
+/// provenance is not staleness) is Indeterminate, never a false block.
+/// WR-01 (17-06 gap closure): exit 0 alone is NOT sufficient for Fresh —
+/// `merge-base --is-ancestor` also exits 0 when `embedded_commit` is a
+/// STRICT ancestor of HEAD (HEAD moved forward since the build), which is
+/// exactly the "committed new commits, forgot to rebuild" incident class
+/// this fix closes. Only an EXACT match to the current HEAD commit is
+/// genuinely Fresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Staleness {
+    Fresh,
+    Stale,
+    /// The embedded commit is a strict DESCENDANT of `project_root`'s HEAD:
+    /// the binary is newer than the source it drives. Not the "committed,
+    /// forgot to rebuild" incident this gate exists to catch, so it never
+    /// blocks — but it is still a build/source mismatch worth surfacing.
+    Ahead,
+    Indeterminate,
+}
+
+fn embedded_commit_is_stale(project_root: &Path, embedded_commit: &str) -> Staleness {
+    if embedded_commit.is_empty() {
+        return Staleness::Indeterminate;
+    }
+    let output = std::process::Command::new("git")
+        .args(["merge-base", "--is-ancestor", embedded_commit, "HEAD"])
+        .current_dir(project_root)
+        .output();
+    match output.map(|o| o.status.code()) {
+        Ok(Some(0)) => match run_git_stdout(project_root, &["rev-parse", "HEAD"]) {
+            Some(head) if head.trim() == embedded_commit.trim() => Staleness::Fresh,
+            Some(_) => Staleness::Stale,
+            None => Staleness::Indeterminate,
+        },
+        // Exit 1 only says "not an ancestor" — which is true both for a
+        // genuinely older/divergent commit AND for a descendant. Probe the
+        // reverse direction to tell them apart, or an ahead build gets
+        // reported as stale and hard-blocked.
+        Ok(Some(1)) => {
+            let reverse = std::process::Command::new("git")
+                .args(["merge-base", "--is-ancestor", "HEAD", embedded_commit])
+                .current_dir(project_root)
+                .output();
+            match reverse.map(|o| o.status.code()) {
+                Ok(Some(0)) => Staleness::Ahead,
+                Ok(Some(1)) => Staleness::Stale,
+                _ => Staleness::Indeterminate,
+            }
+        }
+        _ => Staleness::Indeterminate,
+    }
+}
+
+/// Shell `git` in `project_root`, returning `None` on any failure (missing
+/// binary, non-git directory, non-zero exit) — same argv-array idiom as
+/// `build.rs`'s `run_git`.
+fn run_git_stdout(project_root: &Path, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(project_root)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// The live half of D-19's composite staleness (CR-02, 17-11): whether the
+/// working tree CURRENTLY has any tracked, modified file that can change
+/// the compiled binary (`affects_compiled_binary`, reused from 17-10 — not
+/// duplicated). No timestamp is available any more (`build.rs` no longer
+/// embeds one — CR-02), so this cannot itself distinguish "modified after
+/// the build" from "modified before the build, still uncommitted"; combined
+/// with the build's own `build_dirty` flag in `combined_staleness`, it
+/// distinguishes "built clean, source changed since" (definitely Stale)
+/// from "built dirty, source still dirty" (Indeterminate — cannot tell
+/// "same dirt" from "more dirt" without a timestamp, Pitfall 4). Returns
+/// `None` when git itself is unavailable, so the composite check falls back
+/// to the ancestry arm alone.
+fn tree_has_modified_build_inputs(project_root: &Path) -> Option<bool> {
+    let status = run_git_stdout(project_root, &["status", "--porcelain"])?;
+    if status.trim().is_empty() {
+        return Some(false);
+    }
+    // WR-03: enumerate from `--porcelain` itself rather than `git ls-files -m`.
+    // `ls-files -m` compares worktree-vs-INDEX, so a *staged* source edit
+    // (`git add src/lib.rs`) reports nothing while porcelain reports `M `.
+    // That fell through to the ancestry arm as Fresh, letting a stale binary
+    // drive its own workspace — the exact false-evidence class this gate exists
+    // to catch. Untracked files stay excluded, as under `ls-files -m`.
+    Some(
+        status
+            .lines()
+            .any(|line| porcelain_tracked_path(line).is_some_and(affects_compiled_binary)),
+    )
+}
+
+/// The repo-relative path a `git status --porcelain` line refers to, or `None`
+/// for untracked (`??`) entries. Porcelain v1 lines are `XY<space>PATH`, with
+/// renames/copies rendered as `ORIG -> PATH`; the destination is the path that
+/// exists in the worktree. Paths containing special characters are quoted by
+/// git, so surrounding quotes are stripped.
+fn porcelain_tracked_path(line: &str) -> Option<&str> {
+    if line.len() < 4 || line.starts_with("??") {
+        return None;
+    }
+    let path = &line[3..];
+    let path = path.rsplit(" -> ").next().unwrap_or(path);
+    Some(path.trim_matches('"'))
+}
+
+/// Whether a repo-relative path can change the compiled binary. The live
+/// dirty-tree arm of the staleness check must consider ONLY these: a dirty
+/// `CHANGELOG.md` or `.planning/` file says nothing about whether the
+/// binary matches its source.
+///
+/// Found live — DevFlow's own `ChangelogAppend` hook dirtied `CHANGELOG.md`
+/// during the Validate→Ship transition, which an unfiltered check read as
+/// a stale build, hard-blocking Ship on a file the pipeline had just written.
+fn affects_compiled_binary(rel_path: &str) -> bool {
+    const BUILD_AFFECTING_FILES: [&str; 4] = [
+        "Cargo.toml",
+        "Cargo.lock",
+        "build.rs",
+        "rust-toolchain.toml",
+    ];
+    rel_path.ends_with(".rs")
+        || BUILD_AFFECTING_FILES
+            .iter()
+            .any(|name| rel_path == *name || rel_path.ends_with(&format!("/{name}")))
+}
+
+/// D-19: composite staleness (CR-02, 17-11: the dirty-flag arm replaces the
+/// old mtime arm; the ancestry arm below is unchanged). Decision table for
+/// the second signal, evaluated only once ancestry alone hasn't already
+/// settled Stale:
+///
+/// | build was dirty | tree has modified build inputs now | result |
+/// |---|---|---|
+/// | `false` | yes | **Stale** — built clean, source changed since (CR-02) |
+/// | `true` | yes | **Indeterminate** — can't distinguish "same dirt" from |
+/// |         |     | "more dirt" without a timestamp; warn, never block |
+/// |         |     | (Pitfall 4) |
+/// | either | no | fall through to the ancestry result unchanged |
+fn combined_staleness(project_root: &Path, embedded_commit: &str, build_dirty: bool) -> Staleness {
+    let ancestry = embedded_commit_is_stale(project_root, embedded_commit);
+    if ancestry == Staleness::Stale {
+        return Staleness::Stale;
+    }
+    match tree_has_modified_build_inputs(project_root) {
+        Some(true) if build_dirty => Staleness::Indeterminate,
+        Some(true) => Staleness::Stale,
+        _ => ancestry,
+    }
+}
+
+/// D-17: whether `project_root` IS the DevFlow workspace itself (as opposed
+/// to some other project being driven by a devflow binary) — deterministic,
+/// offline, no config. Scans the `members = [...]` array of the root
+/// `Cargo.toml` for BOTH exact member-path strings, never a package `name`
+/// (the CLI crate's package is named `devflow`, not `devflow-cli` — a name
+/// match would never fire on the incident workspace; review consensus #2 +
+/// Plan 05 MEDIUM OpenCode). No TOML parser is used here: locating the
+/// `members` array's bounds first, then scanning within it, is the
+/// sanctioned middle ground and is unlikely to false-positive on an
+/// unrelated project.
+fn is_self_dogfood_workspace(project_root: &Path) -> bool {
+    let Ok(contents) = std::fs::read_to_string(project_root.join("Cargo.toml")) else {
+        return false;
+    };
+    // WR-05: anchor on the `members` KEY, not the first substring hit.
+    // `default-members` contains `members`, so a bare `find` would scan that
+    // array instead and silently degrade the self-dogfood hard block to a
+    // warning the moment the root manifest gains a `default-members` key
+    // above `members`.
+    let Some(members_start) = contents.match_indices("members").find_map(|(idx, _)| {
+        let preceded_by_ident = contents[..idx]
+            .chars()
+            .next_back()
+            .is_some_and(|ch| ch.is_alphanumeric() || ch == '_' || ch == '-');
+        (!preceded_by_ident).then_some(idx)
+    }) else {
+        return false;
+    };
+    let rest = &contents[members_start..];
+    let Some(open_rel) = rest.find('[') else {
+        return false;
+    };
+    let after_open = &rest[open_rel + 1..];
+    let Some(close_rel) = after_open.find(']') else {
+        return false;
+    };
+    let members = &after_open[..close_rel];
+    // WR-02: compare each array element for exact equality rather than
+    // substring-matching the whole array. `str::contains` would classify a
+    // workspace whose members are `crates/devflow-core-extras` /
+    // `crates/devflow-cli-plugin` as self-dogfood, and self-dogfood + Stale
+    // hard-blocks the pipeline — the one outcome this must never inflict on
+    // an unrelated project.
+    let has_member = |wanted: &str| {
+        members
+            .split(',')
+            .any(|entry| entry.trim().trim_matches(['"', '\'']).trim() == wanted)
+    };
+    has_member("crates/devflow-core") && has_member("crates/devflow-cli")
+}
+
+/// The outcome of the self-dogfood staleness gate (D-18): `Block` only when
+/// the project IS DevFlow's own workspace AND its build is confirmed Stale —
+/// everything else (an ordinary project, or an Indeterminate result on any
+/// project, Pitfall 4) only warns or is silent. Kept pure so the
+/// self-dogfood-blocks vs. ordinary-warns split is directly unit-testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StalenessOutcome {
+    Block,
+    Warn,
+    Ok,
+}
+
+fn staleness_outcome(is_self_dogfood: bool, staleness: Staleness) -> StalenessOutcome {
+    match (is_self_dogfood, staleness) {
+        (true, Staleness::Stale) => StalenessOutcome::Block,
+        (false, Staleness::Stale) => StalenessOutcome::Warn,
+        (_, Staleness::Ahead) => StalenessOutcome::Warn,
+        (_, Staleness::Indeterminate) => StalenessOutcome::Warn,
+        (_, Staleness::Fresh) => StalenessOutcome::Ok,
+    }
+}
+
+/// D-17/D-18/D-19 (17d): the self-dogfood build-staleness gate, called from
+/// `launch_stage` before `monitor::spawn_monitor`. A Stale build against
+/// DevFlow's OWN workspace is a hard block — deliberately NOT an approvable
+/// gate, because approving it would reintroduce the exact Phase 16
+/// false-evidence incident — but it is never SILENT: notify + an event fire
+/// before the blocking error is returned, so an unattended cron run still
+/// sees it (reconciling D-15's never-silent idiom with D-18's hard block).
+/// An ordinary project (or an Indeterminate result) only warns and proceeds.
+fn enforce_build_staleness(
+    project_root: &Path,
+    state: &State,
+    embedded_commit: &str,
+    build_dirty: bool,
+) -> Result<(), CliError> {
+    let staleness = combined_staleness(project_root, embedded_commit, build_dirty);
+    let self_dogfood = is_self_dogfood_workspace(project_root);
+    match staleness_outcome(self_dogfood, staleness) {
+        StalenessOutcome::Block => {
+            let message = format!(
+                "self-dogfood stale build blocked for stage {}: this devflow binary's \
+                 embedded commit is not an ancestor of {}'s current HEAD (or its tracked \
+                 source is newer than the build) — rebuild devflow before driving its own \
+                 workspace (D-18; the Phase 16 false-evidence incident)",
+                state.stage,
+                project_root.display()
+            );
+            gates::fire_gate_notify(state.phase, state.stage, &message, true);
+            events::emit(
+                project_root,
+                state.phase,
+                "self_dogfood_stale_blocked",
+                serde_json::json!({
+                    "stage": state.stage.to_string(),
+                    "reason": truncate_reason(&message),
+                }),
+            );
+            Err(CliError::Message(message))
+        }
+        StalenessOutcome::Warn => {
+            println!(
+                "warning: build provenance staleness check did not confirm a fresh build for \
+                 stage {} — proceeding (only DevFlow's own workspace is ever hard-blocked, D-18)",
+                state.stage
+            );
+            Ok(())
+        }
+        StalenessOutcome::Ok => Ok(()),
+    }
+}
+
 /// Spawn the background monitor that owns the agent for `state.stage`. The
 /// monitor calls `devflow advance` when the agent exits. An optional
 /// `prompt_override` is used for Code loop-backs (fix prompts).
 fn launch_stage(
-    state: &State,
+    state: &mut State,
     prompt_override: Option<String>,
     archived_stage: Option<Stage>,
 ) -> Result<(), CliError> {
@@ -709,6 +1154,29 @@ fn launch_stage(
         .unwrap_or_default();
     let (program, args) = adapter.exec_command(state.phase, &prompt, &roots);
     ensure_agent_binary(program)?;
+
+    // 17c (Task 1, D-13-D-16): a scoped readiness gate runs before any agent
+    // time is spent — a failing check surfaces as a named preflight gate +
+    // notify (never a hard exit, D-15), not here.
+    //
+    // CR-01 (17-08 gap closure): `run_preflight` returns `Ok(false)` when a
+    // failing check was ALREADY resolved via a full retried launch (or an
+    // abort) — this frame must not run any more launch steps in that case,
+    // or the agent gets spawned a second time for the same stage.
+    let project_root = state.project_root.clone();
+    if !run_preflight(&project_root, state, adapter.as_ref())? {
+        return Ok(());
+    }
+
+    // 17d (Task 2, D-17-D-19): self-dogfood build-staleness gate — also
+    // before spawn_monitor, so a stale DevFlow-on-itself run never even
+    // reaches the agent.
+    enforce_build_staleness(
+        &project_root,
+        state,
+        env!("DEVFLOW_BUILD_COMMIT"),
+        env!("DEVFLOW_BUILD_DIRTY") == "true",
+    )?;
 
     if let Some(stamp) = agent_result::archive_phase_files(
         &state.project_root,
@@ -754,6 +1222,27 @@ fn launch_stage(
         adapter.name()
     );
     Ok(())
+}
+
+/// Resume a rate-limited or infra-paused phase from its saved stage (review
+/// consensus #5). Loads the persisted `.devflow/state-{NN}.json` and
+/// relaunches its saved stage via [`launch_stage`] — unlike `start`, this
+/// does NOT call `State::new`, `feature_start`, or `ensure_phase_worktree`:
+/// the branch/worktree already exist and agent/mode are read from the saved
+/// state, so neither needs to be passed as a flag and the workflow is never
+/// reset to Define.
+fn resume(project_root: &Path, phase: u32) -> Result<(), CliError> {
+    let _lock = match lock::acquire(project_root, phase) {
+        Ok(guard) => guard,
+        Err(lock::LockError::Contended { pid, path: _ }) => {
+            return Err(CliError::Message(format!(
+                "another devflow process (pid {pid}) is already running"
+            )));
+        }
+        Err(err) => return Err(CliError::Message(format!("lock error: {err}"))),
+    };
+    let mut state = workflow::load_state(project_root, phase)?;
+    launch_stage(&mut state, None, None)
 }
 
 /// The single active phase: `Ok(Some)` when exactly one is active, `Ok(None)`
@@ -845,45 +1334,170 @@ fn advance(project_root: &Path, phase: Option<u32>) -> Result<(), CliError> {
         "advance_evaluated",
         serde_json::json!({
             "stage": stage.to_string(),
-            "status": format!("{:?}", result.status).to_ascii_lowercase(),
+            "status": result.status.as_wire_str(),
             "verdict": result.verdict.map(|v| format!("{v:?}").to_ascii_lowercase()),
+            "decided_by_layer": result.decided_by_layer,
             "reason": result.reason.as_deref().map(truncate_reason),
         }),
     );
 
-    let failed = matches!(
-        result.status,
-        AgentStatus::Failed | AgentStatus::RateLimited
-    );
-    if failed {
-        return match stage {
+    // D-01/D-06: dispatch on the exhaustive outcome_policy::decide_action
+    // table (no wildcard arm upstream) so a new/unhandled AgentStatus variant
+    // is a compile error here rather than a silent advance. Replaces the old
+    // `matches!(Failed | RateLimited)` boolean, which let Unknown fall
+    // through into the success arm below.
+    match outcome_policy::decide_action(stage, result.status) {
+        Action::Advance => match stage {
+            Stage::Define => transition(project_root, &mut state, Stage::Plan),
+            Stage::Plan => transition(project_root, &mut state, Stage::Code),
+            Stage::Code => transition(project_root, &mut state, Stage::Validate),
+            Stage::Validate => {
+                // 13b verdict-vs-ran: the Validate prompt now REQUIRES a
+                // verdict, so ONLY an explicit `verdict: pass` advances to
+                // Ship. A missing verdict is a fail-safe (gate/loop), NOT a
+                // silent pass — closes the composition bug where a
+                // marker-less/verdict-less Validate could otherwise reach
+                // Ship.
+                let passed = matches!(result.verdict, Some(Verdict::Pass));
+                handle_validate_outcome(project_root, &mut state, passed)
+            }
+            Stage::Ship => handle_ship_outcome(project_root, &mut state),
+        },
+        Action::GateReview => match stage {
             // Validate failures drive the Code↔Validate loop (or a gate).
             Stage::Validate => handle_validate_outcome(project_root, &mut state, false),
             // Ship distinguishes an agent crash (AgentFailed) from a review
             // rejection (ReviewFailed, `review:`-prefixed reason).
             Stage::Ship => handle_ship_failure(project_root, &mut state, result.reason),
-            // Every other non-Validate failure is never silent (WR-11): it
-            // always fires a gate + notify instead of returning a bare error.
+            // Every other non-Validate failure (incl. Unknown, D-06) is
+            // never silent (WR-11): it always fires a gate + notify instead
+            // of returning a bare error or silently advancing.
             _ => handle_stage_failure(project_root, &mut state, stage, result.reason),
-        };
-    }
-
-    // Success (or Unknown — advance with the warning already printed above).
-    match stage {
-        Stage::Define => transition(project_root, &mut state, Stage::Plan),
-        Stage::Plan => transition(project_root, &mut state, Stage::Code),
-        Stage::Code => transition(project_root, &mut state, Stage::Validate),
-        Stage::Validate => {
-            // 13b verdict-vs-ran: the Validate prompt now REQUIRES a verdict,
-            // so ONLY an explicit `verdict: pass` advances to Ship. A missing
-            // verdict is a fail-safe (gate/loop), NOT a silent pass — closes
-            // the composition bug where a marker-less/verdict-less Validate
-            // could otherwise reach Ship.
-            let passed = matches!(result.verdict, Some(Verdict::Pass));
-            handle_validate_outcome(project_root, &mut state, passed)
+        },
+        // ResourceKilled/AgentUnavailable: a dedicated infra path, identical
+        // for every stage (including Validate/Ship) — MUST NOT route through
+        // handle_validate_outcome/handle_ship_failure, which would bump
+        // consecutive_failures (review consensus #4, D-08).
+        Action::GateInfra => handle_infra_outcome(project_root, &mut state, stage, result.reason),
+        // RateLimited: auto-resume via the primary loop's single-agent cron
+        // path (D-09), bounded by the shared infra-failure ceiling (D-08).
+        Action::AutoResume => {
+            handle_rate_limited_outcome(project_root, &mut state, phase, stage, result.reason)
         }
-        Stage::Ship => handle_ship_outcome(project_root, &mut state),
     }
+}
+
+/// Route a `GateInfra` outcome (ResourceKilled/AgentUnavailable) — bumps
+/// `state.infra_failures` (saturating, never `consecutive_failures`),
+/// persists, then either aborts at the ceiling or fires the never-silent
+/// gate via [`handle_stage_failure`]. Deliberately never calls
+/// `handle_validate_outcome`/`handle_ship_failure` on any stage (review
+/// consensus #4) — those increment `consecutive_failures`, which would
+/// conflate an infrastructure fault with an agent-caused failure (D-08).
+fn handle_infra_outcome(
+    project_root: &Path,
+    state: &mut State,
+    stage: Stage,
+    reason: Option<String>,
+) -> Result<(), CliError> {
+    state.infra_failures = state.infra_failures.saturating_add(1);
+    workflow::save_state(state)?;
+    gate_or_abort_infra(project_root, state, stage, reason)
+}
+
+/// The ceiling check + gate-or-abort half of the infra path, shared by
+/// [`handle_infra_outcome`] and the `AutoResume` arm's infra-ceiling branch
+/// (which bumps `infra_failures` itself before calling this, so the counter
+/// is never bumped twice for the same outcome).
+fn gate_or_abort_infra(
+    project_root: &Path,
+    state: &mut State,
+    stage: Stage,
+    reason: Option<String>,
+) -> Result<(), CliError> {
+    if state.infra_failures >= mode::MAX_INFRA_FAILURES {
+        return abort(
+            project_root,
+            state,
+            &format!(
+                "infrastructure failures reached the ceiling ({} of {}) — aborting rather than gating again",
+                state.infra_failures,
+                mode::MAX_INFRA_FAILURES
+            ),
+        );
+    }
+    handle_stage_failure(project_root, state, stage, reason)
+}
+
+/// Route a `RateLimited` outcome from the PRIMARY advance() monitor loop
+/// (D-09): writes a single-agent cron-instructions resume record (`devflow
+/// resume --phase N`) and returns without firing a blocking gate — unlike
+/// `sequentagent`'s existing rate-limit handling, this path never called the
+/// cron machinery before this plan (Pitfall 3). Shares the same
+/// `infra_failures` ceiling as [`handle_infra_outcome`] (D-08's intentional
+/// shared infra counter): once bumping would reach the ceiling, auto-resume
+/// stops and the outcome instead routes through the infra gate/abort path.
+/// Never touches `consecutive_failures`.
+fn handle_rate_limited_outcome(
+    project_root: &Path,
+    state: &mut State,
+    phase: u32,
+    stage: Stage,
+    reason: Option<String>,
+) -> Result<(), CliError> {
+    let retry_after = retry_after_from_reason(reason.as_deref());
+    let projected_infra_failures = state.infra_failures.saturating_add(1);
+    if projected_infra_failures >= mode::MAX_INFRA_FAILURES {
+        return handle_infra_outcome(project_root, state, stage, reason);
+    }
+    state.infra_failures = projected_infra_failures;
+    workflow::save_state(state)?;
+
+    let instructions =
+        devflow_core::ship::build_single_agent_cron_instructions(project_root, phase, &retry_after);
+    devflow_core::ship::write_cron_instructions(project_root, &instructions)?;
+    // CR-03: an unparseable retry hint (e.g. the `"usage limit"` fallback for
+    // a 429 with no retry_after) leaves the schedule empty — and it must stay
+    // empty, since an empty cron expression would degrade into an
+    // every-minute resume. That means auto-resume cannot happen, so returning
+    // here would exit the detached monitor with the phase stalled and no
+    // operator signal at all (the println below is read by nobody). Route
+    // through the same gate/notify path the infra ceiling uses so the phase is
+    // never silently stalled (WR-11/D-15). `infra_failures` is already bumped
+    // above, so `gate_or_abort_infra` — which never bumps — is the correct
+    // entry point.
+    if instructions.hermes_cron.schedule.is_empty() {
+        return gate_or_abort_infra(
+            project_root,
+            state,
+            stage,
+            Some(format!(
+                "rate limited with no parseable retry time ({retry_after}) — auto-resume cron not scheduled; resume manually"
+            )),
+        );
+    }
+    println!(
+        "rate limited — wrote {}",
+        devflow_core::ship::cron_instructions_path(project_root, phase)
+            .strip_prefix(project_root)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| {
+                devflow_core::ship::cron_instructions_path(project_root, phase)
+                    .display()
+                    .to_string()
+            })
+    );
+    events::emit(
+        project_root,
+        phase,
+        "rate_limit_resume_scheduled",
+        serde_json::json!({
+            "stage": stage.to_string(),
+            "retry_after": retry_after,
+            "infra_failures": state.infra_failures,
+        }),
+    );
+    Ok(())
 }
 
 /// Decide what happens after a Validate stage (passed or failed), honoring the
@@ -1050,6 +1664,39 @@ fn is_ship_review_failure(reason: &Option<String>) -> bool {
 /// fail-soft for ordinary transitions. The return value lets terminal
 /// completion fail closed and preserve state when the batch was skipped or
 /// a required hook failed.
+/// Which tree a hook batch operates on.
+///
+/// The Validate→Ship transition batch (`DocsUpdate`) authors material *about
+/// the branch being shipped*, so it must write into that phase's worktree —
+/// otherwise its output is stranded on the base branch, uncommitted and
+/// divorced from the commits it describes (found live: Phase 17's changelog
+/// entry landed on `develop` while every one of its commits sat on
+/// `feature/phase-17`).
+///
+/// The terminal batch (`Merge`, `VersionBump`, `ChangelogAppend`,
+/// `BranchCleanup`) is the exact opposite: it merges the feature branch INTO
+/// the base branch, tags the base branch, and deletes the feature branch.
+/// Those are primary-checkout operations and retargeting them at the
+/// worktree would be a correctness regression. `ChangelogAppend` moved here
+/// in 17-12 (WR-04) — a release record naming a version only becomes true
+/// once `VersionBump` has tagged it, so the changelog entry belongs on the
+/// base branch alongside the tag, not in the worktree. Do not restore
+/// 17-10's worktree targeting to this hook.
+///
+/// Falls back to `project_root` whenever no worktree is configured, so
+/// `--no-worktree` runs are unaffected.
+fn hook_context_root(project_root: &Path, state: &State, terminal_batch: bool) -> PathBuf {
+    if terminal_batch {
+        return project_root.to_path_buf();
+    }
+    state
+        .worktree_path
+        .as_ref()
+        .filter(|path| path.exists())
+        .map(|path| path.to_path_buf())
+        .unwrap_or_else(|| project_root.to_path_buf())
+}
+
 fn run_checkout_hooks(
     project_root: &Path,
     state: &State,
@@ -1092,14 +1739,20 @@ fn run_checkout_hooks(
     let git_flow = GitFlowConfig::default();
     let mut all_succeeded = true;
     let terminal_batch = batch == hooks::hooks_after_ship().as_slice();
+    let hook_root = hook_context_root(project_root, state, terminal_batch);
+    // Hoisted out of the loop (GAP-7): these fields are loop-invariant, and
+    // VersionBump needs to hand shipped_version forward to ChangelogAppend
+    // within the same batch run, which a fresh per-iteration context would
+    // discard.
+    let mut ctx = HookContext {
+        phase: state.phase,
+        project_root: hook_root.clone(),
+        stage,
+        git_flow: git_flow.clone(),
+        shipped_version: None,
+    };
     for hook in batch {
-        let ctx = HookContext {
-            phase: state.phase,
-            project_root: project_root.to_path_buf(),
-            stage,
-            git_flow: git_flow.clone(),
-        };
-        let outcome = hook.run(&ctx);
+        let outcome = hook.run(&mut ctx);
         if let Err(ref err) = outcome {
             println!("warning: hook {hook:?} failed: {err}");
             all_succeeded = false;
@@ -1124,6 +1777,14 @@ fn run_checkout_hooks(
 }
 
 /// Fire the hooks for `from → to`, persist the new stage, and launch its agent.
+///
+/// CR-01 (17-06 gap closure): resets `infra_failures` alongside
+/// `consecutive_failures` on every successful transition. Without this, an
+/// infra-fault ceiling meant to bound a *stuck loop* (D-08,
+/// [`mode::MAX_INFRA_FAILURES`]) instead accumulates across a phase's entire
+/// lifetime — several well-spaced, cleanly-resolved infra faults would
+/// falsely reach the ceiling and hard-abort a long-running but otherwise
+/// healthy phase.
 fn transition(project_root: &Path, state: &mut State, to: Stage) -> Result<(), CliError> {
     let from = state.stage;
     let _ = run_checkout_hooks(
@@ -1134,6 +1795,7 @@ fn transition(project_root: &Path, state: &mut State, to: Stage) -> Result<(), C
     );
     state.stage = to;
     state.consecutive_failures = 0;
+    state.infra_failures = 0;
     state.gate_pending = false;
     workflow::save_state(state)?;
     events::emit(
@@ -1557,6 +2219,9 @@ fn run_agent_blocking(
             commits: None,
             summary: None,
             verdict: None,
+            // Mirrors Layer 2's exit-code gate per this block's own comment
+            // (review consensus #3).
+            decided_by_layer: Some(2),
         }));
     }
     Ok(result)
@@ -2843,11 +3508,15 @@ mod tests {
 
     /// 14-CR-02: when the checkout lock cannot be acquired, the hook batch
     /// must be SKIPPED — never run unserialized against the shared checkout
-    /// — and the skip must be recorded in events.jsonl. ChangelogAppend
-    /// would observably create CHANGELOG.md if the batch ran. Env-mutating,
-    /// so serialized under ENV_MUTEX; the "0" timeout only affects a
-    /// concurrent test if it is actually contended, which none are (no other
-    /// test holds the project lock).
+    /// — and the skip must be recorded in events.jsonl. `ChangelogAppend`
+    /// would observably create `CHANGELOG.md` if the batch ran; it moved
+    /// from the Validate→Ship batch into `hooks_after_ship()` in 17-12
+    /// (WR-04), so this test now drives that batch instead — none of its
+    /// hooks execute here regardless (the lock check short-circuits before
+    /// the first hook runs), so no real merge/version state is needed.
+    /// Env-mutating, so serialized under ENV_MUTEX; the "0" timeout only
+    /// affects a concurrent test if it is actually contended, which none are
+    /// (no other test holds the project lock).
     #[test]
     fn checkout_hooks_skip_instead_of_running_unserialized_on_lock_timeout() {
         let _guard = ENV_MUTEX.lock().unwrap();
@@ -2861,12 +3530,7 @@ mod tests {
         }
 
         let state = State::new(33, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        run_checkout_hooks(
-            root,
-            &state,
-            &hooks::hooks_for_transition(Stage::Validate, Stage::Ship),
-            Stage::Ship,
-        );
+        run_checkout_hooks(root, &state, &hooks::hooks_after_ship(), Stage::Ship);
 
         // SAFETY: still serialized under ENV_MUTEX from above.
         unsafe {
@@ -2911,6 +3575,107 @@ mod tests {
         assert!(
             GitFlow::new(root).branch_exists(branch),
             "a failed terminal batch must preserve the branch for retry"
+        );
+    }
+
+    /// Same as [`init_repo`], but without a committed `Cargo.toml`, so
+    /// `version_bump` takes its no-version-file branch. Mirrors
+    /// `devflow_core::hooks`' `init_repo_with_options(root, false)`.
+    fn init_repo_no_version_file(root: &Path) {
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "devflow@example.com"]);
+        git(&["config", "user.name", "DevFlow Tests"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        git(&["config", "tag.gpgsign", "false"]);
+        git(&["config", "core.hooksPath", "/dev/null"]);
+        std::fs::write(root.join("README.md"), "no version file in this repo\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        git(&["branch", "-M", "main"]);
+        git(&["checkout", "-q", "-b", "develop"]);
+    }
+
+    /// GAP-8 (17-VALIDATION.md): GAP-7 fixed `HookContext.shipped_version`
+    /// forwarding `hooks_after_ship`'s `VersionBump` tag to `ChangelogAppend`
+    /// within the same batch — but only the `devflow-core::hooks` unit tests
+    /// exercised it directly by hand-rolling their own context and looping
+    /// over `hooks_after_ship()`. `run_checkout_hooks` is the ONLY production
+    /// caller of that batch, and it must construct the `HookContext` once,
+    /// above the hook loop, for the forwarding to survive into production.
+    /// This test drives `run_checkout_hooks` itself (not a hand-rolled loop)
+    /// against a repo with no version file, and asserts the changelog
+    /// heading names the actual tagged version rather than falling back to
+    /// the "unreleased" literal.
+    #[test]
+    fn run_checkout_hooks_keeps_changelog_in_sync_with_tag_when_no_version_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo_no_version_file(root);
+
+        let phase = 47;
+        let branch = format!("feature/phase-{phase:02}");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?} failed");
+        };
+        git(&["branch", &branch, "develop"]);
+        std::fs::write(root.join(".gitignore"), ".devflow/\n").unwrap();
+        git(&["checkout", &branch]);
+        std::fs::write(root.join("feature.txt"), "phase work\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "phase work"]);
+        git(&["checkout", "develop"]);
+
+        let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let succeeded = run_checkout_hooks(root, &state, &hooks::hooks_after_ship(), Stage::Ship);
+        assert!(
+            succeeded,
+            "after-ship batch must succeed against a clean repo"
+        );
+
+        let all_tags = std::process::Command::new("git")
+            .arg("tag")
+            .current_dir(root)
+            .output()
+            .unwrap();
+        let all_tags = String::from_utf8_lossy(&all_tags.stdout);
+        assert_eq!(all_tags.lines().count(), 1, "expected exactly one tag");
+        let tag = all_tags.trim().to_string();
+        let tag_version = tag
+            .strip_prefix('v')
+            .expect("tag should be prefixed with v")
+            .to_string();
+
+        let changelog = std::fs::read_to_string(root.join("CHANGELOG.md")).unwrap();
+        let changelog_version = changelog
+            .lines()
+            .find(|l| l.starts_with("## "))
+            .and_then(|l| l.trim_start_matches("## ").split(' ').next())
+            .unwrap()
+            .to_string();
+
+        assert_ne!(
+            changelog_version, "unreleased",
+            "changelog heading must name the tagged version, not fall back to the literal"
+        );
+        assert_eq!(
+            changelog_version, tag_version,
+            "changelog heading must match the git tag ({tag}) produced by the same \
+             run_checkout_hooks call, even with no version file"
         );
     }
 
@@ -3213,9 +3978,47 @@ mod tests {
     /// state files prevent cross-phase clobbering, and the coarse checkout
     /// lock serializes both `finish_workflow`s' git operations on the shared
     /// primary checkout. Gate responses are pre-seeded so neither advance
-    /// blocks polling.
+    /// blocks polling on its *first* Ship gate.
+    ///
+    /// 17-09 gap closure (GAP-2): both phases compute their next version from
+    /// the same starting git state, and on some runs genuinely race to
+    /// create the same version tag — confirmed directly during this plan's
+    /// RED phase via temporary debug instrumentation, which caught both
+    /// threads inside `version_bump` with the identical computed version
+    /// (`2.0.1`) within ~1.8ms of each other, and the loser's `git tag`
+    /// failing with git's own "reference already exists". That failure
+    /// reopens the loser's Ship gate for human review (`finish_workflow`'s
+    /// retry loop) — but only ONE gate response was ever pre-written per
+    /// phase (consumed by its first gate open), so the reopened gate has
+    /// nothing to consume. Unbounded, `Gates::poll_response` then polls the
+    /// 7-day production default (`DEVFLOW_GATE_TIMEOUT_SECS`) with no
+    /// response ever arriving — that is the wedge this plan closes.
+    ///
+    /// The binding constraint is "never hangs," not "always both succeed."
+    /// This test does not try to make the race loser also succeed (that
+    /// would require re-answering a gate reactively and still not rule out
+    /// a second, equally rare collision) — instead it bounds the reopened
+    /// gate's poll to a few seconds via `DEVFLOW_GATE_TIMEOUT_SECS`
+    /// (overridden ONLY for this test's poll, under the established
+    /// `ENV_MUTEX` guard — the 7-day production default is never touched)
+    /// and asserts the loser's documented behavior: a bounded timeout error,
+    /// state left intact (not cleared), and an actionable Ship gate still on
+    /// disk awaiting a human. The common case (no collision) still asserts
+    /// both phases finish independently, exactly as before.
     #[test]
     fn concurrent_ship_advances_finish_both_phases_independently() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let original_gate_timeout = std::env::var_os("DEVFLOW_GATE_TIMEOUT_SECS");
+        // SAFETY: serialized under ENV_MUTEX. Bounds a reopened Ship gate's
+        // poll to a few seconds instead of the 7-day production default.
+        // Every OTHER test that reaches `run_gate` pre-writes its response
+        // before calling in, so `poll_response` finds it on the very first
+        // read regardless of this value — only a *reopened*, unanswered
+        // gate (this test's race-loser path) ever actually waits it out.
+        unsafe {
+            std::env::set_var("DEVFLOW_GATE_TIMEOUT_SECS", "2");
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
@@ -3247,31 +4050,71 @@ mod tests {
             .unwrap();
         }
 
-        std::thread::scope(|scope| {
+        let results: Vec<(u32, Result<(), CliError>)> = std::thread::scope(|scope| {
             let handles: Vec<_> = phases
                 .iter()
-                .map(|&phase| scope.spawn(move || advance(root, Some(phase))))
+                .map(|&phase| (phase, scope.spawn(move || advance(root, Some(phase)))))
                 .collect();
-            for handle in handles {
-                handle.join().expect("advance thread").expect("advance ok");
-            }
+            handles
+                .into_iter()
+                .map(|(phase, handle)| (phase, handle.join().expect("advance thread")))
+                .collect()
         });
 
-        for &phase in &phases {
-            assert!(
-                matches!(
-                    workflow::load_state(root, phase),
-                    Err(workflow::WorkflowError::MissingState(_))
-                ),
-                "phase {phase} must be finished (state cleared)"
-            );
-            assert!(!Gates::gate_path(root, phase, Stage::Ship).exists());
-            let last = devflow_core::events::last_event_for_phase(root, phase)
-                .expect("events recorded for phase");
-            assert_eq!(
-                last["event"], "workflow_finished",
-                "phase {phase}'s own event stream must end in workflow_finished"
-            );
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_gate_timeout {
+                Some(value) => std::env::set_var("DEVFLOW_GATE_TIMEOUT_SECS", value),
+                None => std::env::remove_var("DEVFLOW_GATE_TIMEOUT_SECS"),
+            }
+        }
+
+        let succeeded = results.iter().filter(|(_, r)| r.is_ok()).count();
+        assert!(
+            succeeded == 1 || succeeded == 2,
+            "at least one phase must finish independently of the other; got {succeeded}/2 successes"
+        );
+
+        for (phase, result) in &results {
+            match result {
+                Ok(()) => {
+                    assert!(
+                        matches!(
+                            workflow::load_state(root, *phase),
+                            Err(workflow::WorkflowError::MissingState(_))
+                        ),
+                        "phase {phase} must be finished (state cleared)"
+                    );
+                    assert!(!Gates::gate_path(root, *phase, Stage::Ship).exists());
+                    let last = devflow_core::events::last_event_for_phase(root, *phase)
+                        .expect("events recorded for phase");
+                    assert_eq!(
+                        last["event"], "workflow_finished",
+                        "phase {phase}'s own event stream must end in workflow_finished"
+                    );
+                }
+                Err(err) => {
+                    // The documented loser behavior (GAP-2): a version-tag
+                    // race lost by VersionBump reopens the Ship gate for a
+                    // human; with no second response pre-written, the
+                    // bounded poll above times out rather than hanging.
+                    assert!(
+                        err.to_string().contains("timed out"),
+                        "phase {phase}'s only non-success outcome must be a bounded gate \
+                         timeout, not some other failure: {err}"
+                    );
+                    let state = workflow::load_state(root, *phase)
+                        .expect("a timed-out gate leaves state intact, not cleared");
+                    assert!(
+                        state.gate_pending,
+                        "phase {phase} must leave an actionable, still-open gate for a human"
+                    );
+                    assert!(
+                        Gates::gate_path(root, *phase, Stage::Ship).exists(),
+                        "phase {phase}'s reopened Ship gate file must remain on disk"
+                    );
+                }
+            }
         }
     }
 
@@ -3497,6 +4340,424 @@ mod tests {
         assert!(started.elapsed() >= std::time::Duration::from_secs(1));
     }
 
+    /// D-01/D-06 regression: a Code-stage `Unknown` outcome (Layer 3's
+    /// "process gone but commits exist" case) must route through
+    /// `handle_stage_failure`'s never-silent gate, never
+    /// `transition(.., Stage::Validate)`. Drives a real `advance()` on a
+    /// scoped thread, polling for the Code gate file (not a Validate one) to
+    /// prove the dispatch never took the success/Advance arm.
+    #[test]
+    fn code_unknown_does_not_transition_to_validate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let phase = 72;
+        let branch = format!("feature/phase-{phase:02}");
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        git(&["checkout", "-q", "-b", &branch, "develop"]);
+        std::fs::write(root.join("work.txt"), "wip\n").unwrap();
+        git(&["add", "work.txt"]);
+        git(&["commit", "-q", "-m", "wip commit"]);
+        git(&["checkout", "-q", "develop"]);
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+
+        let code_gate = Gates::gate_path(root, phase, Stage::Code);
+        let validate_gate = Gates::gate_path(root, phase, Stage::Validate);
+        let response_path = Gates::response_path(root, phase, Stage::Code);
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                advance(root, Some(phase)).unwrap();
+            });
+
+            let mut seen = false;
+            for _ in 0..150 {
+                if code_gate.exists() {
+                    seen = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert!(
+                seen,
+                "an Unknown Code outcome must fire a never-silent gate, not advance silently"
+            );
+            assert!(
+                !validate_gate.exists(),
+                "an Unknown Code outcome must never transition to Validate"
+            );
+
+            std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &response_path,
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap();
+        });
+    }
+
+    /// D-08/consensus #4: a `ResourceKilled` outcome on a non-Validate stage
+    /// bumps `infra_failures` and leaves `consecutive_failures` untouched —
+    /// `handle_infra_outcome` (the `GateInfra` arm) never routes through
+    /// `handle_validate_outcome`. A rejected/abort response is pre-seeded so
+    /// the never-silent gate resolves immediately without a spawn thread.
+    #[test]
+    fn resource_killed_on_code_bumps_infra_failures_not_consecutive_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 73;
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        std::fs::write(agent_result::exit_code_path(root, phase), "137").unwrap();
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        state.consecutive_failures = 1;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Code);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        advance(root, Some(phase)).unwrap();
+
+        // abort() clears state entirely — assert against the terminal error
+        // rather than a field, and confirm no Validate gate ever appeared.
+        let err = workflow::load_state(root, phase).unwrap_err();
+        assert!(matches!(err, workflow::WorkflowError::MissingState(_)));
+        assert!(!Gates::gate_path(root, phase, Stage::Validate).exists());
+    }
+
+    /// D-08/consensus #4 (Validate-stage case): a `ResourceKilled` outcome on
+    /// the VALIDATE stage still bumps `infra_failures` and leaves
+    /// `consecutive_failures` unchanged — proving `GateInfra`
+    /// (`handle_infra_outcome`) bypasses `handle_validate_outcome` even on
+    /// the one stage that normally owns `consecutive_failures`. The rejected
+    /// gate response resolves the never-silent gate to `Abort` immediately
+    /// (no spawn thread needed); `consecutive_failures` is asserted on the
+    /// in-memory `state`, which `abort()` never mutates (it only clears the
+    /// on-disk state file and gate artifacts).
+    #[test]
+    fn resource_killed_on_validate_bumps_infra_not_consecutive_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 74;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        state.consecutive_failures = 2;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        handle_infra_outcome(
+            root,
+            &mut state,
+            Stage::Validate,
+            Some("agent process was killed (exit code 137, likely OOM)".into()),
+        )
+        .unwrap();
+
+        assert_eq!(state.infra_failures, 1);
+        assert_eq!(
+            state.consecutive_failures, 2,
+            "consecutive_failures must be untouched by the infra path"
+        );
+    }
+
+    /// D-08: reaching `MAX_INFRA_FAILURES` infra outcomes aborts rather than
+    /// gating again.
+    #[test]
+    fn infra_ceiling_aborts_instead_of_gating() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 75;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        state.infra_failures = mode::MAX_INFRA_FAILURES - 1;
+        workflow::save_state(&state).unwrap();
+
+        handle_infra_outcome(root, &mut state, Stage::Code, Some("killed".into())).unwrap();
+
+        assert_eq!(state.infra_failures, mode::MAX_INFRA_FAILURES);
+        assert!(
+            !Gates::gate_path(root, phase, Stage::Code).exists(),
+            "at the ceiling, the run must abort rather than gate again"
+        );
+        let err = workflow::load_state(root, phase).unwrap_err();
+        assert!(matches!(err, workflow::WorkflowError::MissingState(_)));
+    }
+
+    /// CR-01 regression (17-06 gap closure): `transition()` resets
+    /// `infra_failures` to 0 alongside `consecutive_failures` — both in the
+    /// in-memory `State` and the persisted `state.json` — and a subsequent
+    /// infra fault after a clean transition starts counting from 1, not the
+    /// pre-transition count. PATH is neutralized under `ENV_MUTEX` (pointed
+    /// at a directory containing ONLY a `git` symlink, so
+    /// `agent_binary_available`'s PATH scan has zero possible matches) before
+    /// calling `transition()`, because this host genuinely has
+    /// `claude`/`codex`/`opencode` on PATH — without neutralizing it,
+    /// `transition()`'s downstream `launch_stage` would try to actually spawn
+    /// a real agent CLI subprocess, which this test must never do. The
+    /// resulting `Err` from `ensure_agent_binary` is expected and ignored:
+    /// the counter reset happens earlier in `transition()` and is unaffected
+    /// by that downstream failure.
+    ///
+    /// 19i: PATH must NOT be pointed at an empty directory. `set_var`
+    /// mutates the whole process's environment, and Rust's default test
+    /// runner executes tests in parallel threads within that one process —
+    /// an empty PATH here previously made every OTHER concurrently running,
+    /// unguarded git-spawning test fail with `Os { NotFound }` (confirmed
+    /// live: both duplicate CI runs for the same commit hit this race).
+    /// `agent_free_git_only_path_dir` keeps `git` resolvable for every other
+    /// thread while still hiding agent CLIs from this one.
+    #[test]
+    fn transition_resets_infra_failures() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 80;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        state.infra_failures = mode::MAX_INFRA_FAILURES - 1;
+        workflow::save_state(&state).unwrap();
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        let _ = transition(root, &mut state, Stage::Validate);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        assert_eq!(
+            state.infra_failures, 0,
+            "transition() must reset infra_failures in-memory, not just consecutive_failures"
+        );
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert_eq!(
+            reloaded.infra_failures, 0,
+            "transition() must persist the infra_failures reset to state.json"
+        );
+
+        // A fresh infra fault after the clean transition starts counting
+        // from 1, not resuming the pre-transition MAX_INFRA_FAILURES - 1
+        // count toward a false premature abort.
+        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        handle_infra_outcome(root, &mut state, Stage::Validate, Some("killed".into())).unwrap();
+
+        assert_eq!(state.infra_failures, 1);
+    }
+
+    /// D-09: a primary-loop `RateLimited` outcome writes the single-agent
+    /// cron-instructions record (`devflow resume --phase N`) and returns
+    /// without firing a blocking gate.
+    #[test]
+    fn primary_loop_rate_limited_writes_single_agent_cron_instructions() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 76;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        std::fs::write(
+            agent_result::stdout_path(root, phase),
+            r#"{"type":"result","subtype":"error_rate_limit","retry_after":"2026-06-18T15:45:30Z"}"#,
+        )
+        .unwrap();
+
+        advance(root, Some(phase)).unwrap();
+
+        let instructions = devflow_core::ship::load_cron_instructions(root, phase).unwrap();
+        assert_eq!(instructions.resume.command, "devflow");
+        assert_eq!(
+            instructions.resume.args,
+            ["resume", "--phase", &phase.to_string()]
+        );
+        assert!(
+            instructions
+                .hermes_cron
+                .command
+                .contains(&format!("devflow resume --phase {phase}"))
+        );
+
+        // No blocking gate — state persists, stage unchanged, not gate-pending.
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert_eq!(reloaded.stage, Stage::Code);
+        assert!(!reloaded.gate_pending);
+        assert_eq!(reloaded.infra_failures, 1);
+        assert_eq!(reloaded.consecutive_failures, 0);
+        assert!(!Gates::gate_path(root, phase, Stage::Code).exists());
+    }
+
+    /// D-08/D-09: the RateLimited path at `infra_failures ==
+    /// MAX_INFRA_FAILURES - 1` bumps to the ceiling and stops auto-resuming —
+    /// it routes to the infra gate/abort path instead of writing a resume
+    /// record (bounded resume, no soft-loop).
+    #[test]
+    fn rate_limited_at_infra_ceiling_stops_resuming_and_aborts() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 77;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        state.infra_failures = mode::MAX_INFRA_FAILURES - 1;
+        workflow::save_state(&state).unwrap();
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        std::fs::write(
+            agent_result::stdout_path(root, phase),
+            r#"{"type":"result","subtype":"error_rate_limit","retry_after":"2026-06-18T15:45:30Z"}"#,
+        )
+        .unwrap();
+
+        advance(root, Some(phase)).unwrap();
+
+        let err = workflow::load_state(root, phase).unwrap_err();
+        assert!(
+            matches!(err, workflow::WorkflowError::MissingState(_)),
+            "the infra ceiling must abort, clearing state"
+        );
+        assert!(
+            devflow_core::ship::load_cron_instructions(root, phase).is_err(),
+            "must not schedule an auto-resume once the infra ceiling stops resumption"
+        );
+    }
+
+    /// CR-03: a rate-limit reason whose retry hint is unparseable (e.g. the
+    /// `"usage limit"` fallback `detect_claude_rate_limit` produces for a 429
+    /// with no retry_after) yields an EMPTY cron schedule — auto-resume is
+    /// impossible. That must not return `Ok(())` silently (the detached
+    /// monitor would exit with the phase stalled and zero operator signal);
+    /// it must fire the same never-silent gate + notify the infra path uses
+    /// (WR-11/D-15), and must never invent a schedule.
+    #[test]
+    fn rate_limited_with_unparseable_retry_hint_gates_instead_of_stalling_silently() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 81;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        // Pre-seed an Abort response so `run_gate`'s poll resolves immediately.
+        let response_path = Gates::response_path(root, phase, Stage::Code);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        handle_rate_limited_outcome(
+            root,
+            &mut state,
+            phase,
+            Stage::Code,
+            Some("rate limited until usage limit".into()),
+        )
+        .unwrap();
+
+        let events =
+            std::fs::read_to_string(devflow_core::events::events_path(root)).unwrap_or_default();
+        assert!(
+            events.contains("gate_fired"),
+            "an unparseable retry hint must raise a gate, not stall the phase silently: {events}"
+        );
+        assert!(
+            events.contains("notify_fired"),
+            "the operator must be notified that a manual resume is needed: {events}"
+        );
+        assert!(
+            !events.contains("rate_limit_resume_scheduled"),
+            "nothing was scheduled — emitting a resume-scheduled event would be a false signal: {events}"
+        );
+
+        // The unparseable hint must never become a schedule (an empty cron
+        // expression would otherwise degrade into an every-minute resume).
+        let instructions = devflow_core::ship::load_cron_instructions(root, phase).unwrap();
+        assert!(instructions.hermes_cron.schedule.is_empty());
+    }
+
+    /// D-10: `advance_evaluated` emits `status` via `AgentStatus::as_wire_str()`
+    /// (never the Debug-lowercase formatter that collapses `ResourceKilled`
+    /// into `resourcekilled`) and carries the `decided_by_layer` evidence
+    /// field.
+    #[test]
+    fn advance_evaluated_emits_wire_status_and_decided_by_layer_for_resource_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 78;
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        std::fs::write(agent_result::exit_code_path(root, phase), "137").unwrap();
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Code);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        advance(root, Some(phase)).unwrap();
+
+        // advance_evaluated isn't the last event once the infra gate/abort
+        // path runs, so read the raw log and find it by name rather than
+        // using `last_event_for_phase`.
+        let contents = std::fs::read_to_string(events::events_path(root)).unwrap();
+        let event = contents
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|e| e["event"] == "advance_evaluated")
+            .expect("advance_evaluated event recorded");
+        assert_eq!(event["status"], "resource_killed");
+        assert_ne!(event["status"], "resourcekilled");
+        assert_eq!(event["decided_by_layer"], 2);
+    }
+
     /// `parse_gate_timeout` is a pure function — no env mutation needed, so
     /// this test cannot race any other test.
     #[test]
@@ -3541,6 +4802,1178 @@ mod tests {
         // pre-flight must not block.
         let empty = tempfile::tempdir().unwrap();
         assert!(phase_artifact_on_develop(empty.path(), 3, "-CONTEXT.md"));
+    }
+
+    // -----------------------------------------------------------------
+    // 17c: preflight readiness gate (D-13-D-16, Task 1)
+    // -----------------------------------------------------------------
+
+    /// D-14 interactivity check: a headless Auto-mode Codex Define run with
+    /// no CONTEXT.md on develop is flagged; Supervise mode, a non-Define
+    /// stage, a non-Codex agent (Claude/OpenCode can complete Define
+    /// headlessly, verified live 13-06 — the existing `start_defaults_to_
+    /// worktree` integration test exercises exactly this), and a CONTEXT.md
+    /// that does exist are all unaffected.
+    #[test]
+    fn preflight_interactivity_check_flags_auto_define_without_context_md() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let mut state = State::new(60, AgentKind::Codex, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Define;
+        assert!(preflight_interactivity_check(root, &state).is_err());
+
+        state.mode = Mode::Supervise;
+        assert!(preflight_interactivity_check(root, &state).is_ok());
+
+        state.mode = Mode::Auto;
+        state.stage = Stage::Plan;
+        assert!(preflight_interactivity_check(root, &state).is_ok());
+
+        state.stage = Stage::Define;
+        state.agent = AgentKind::Claude;
+        assert!(
+            preflight_interactivity_check(root, &state).is_ok(),
+            "Claude/OpenCode can complete Define headlessly — only Codex is flagged"
+        );
+        state.agent = AgentKind::Codex;
+
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        std::fs::create_dir_all(root.join(".planning/phases/60-widget")).unwrap();
+        std::fs::write(root.join(".planning/phases/60-widget/60-CONTEXT.md"), "ctx").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "context"]);
+
+        state.stage = Stage::Define;
+        assert!(preflight_interactivity_check(root, &state).is_ok());
+    }
+
+    /// D-14 gh-auth scope: hardcoded to Stage::Ship, not a dynamic hook-scan.
+    #[test]
+    fn gh_auth_check_applies_only_to_ship_stage() {
+        assert!(gh_auth_check_applies(Stage::Ship));
+        for stage in [Stage::Define, Stage::Plan, Stage::Code, Stage::Validate] {
+            assert!(!gh_auth_check_applies(stage));
+        }
+    }
+
+    /// A failing preflight check routes through the never-silent gate and,
+    /// on Abort, never reaches `monitor::spawn_monitor` — no `stage_launched`
+    /// event is ever recorded. The Abort response is pre-seeded so
+    /// `run_gate`'s poll resolves immediately.
+    #[test]
+    fn run_preflight_failing_check_gates_and_never_reaches_spawn_monitor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 61;
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Define;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Define);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        let adapter = agents::adapter_for(AgentKind::Codex);
+        let should_continue = run_preflight(root, &mut state, adapter.as_ref()).unwrap();
+
+        assert!(
+            !should_continue,
+            "an aborted preflight must tell its caller not to continue launch_stage"
+        );
+        assert!(
+            workflow::load_state(root, phase).is_err(),
+            "abort() must clear state — spawn_monitor was never reached"
+        );
+        let last = devflow_core::events::last_event_for_phase(root, phase)
+            .expect("gate_fired/gate_resolved must have been recorded");
+        assert_ne!(last["event"], "stage_launched");
+    }
+
+    /// The adapter-specific hook (D-14 adapter) is actually consulted by
+    /// `run_preflight` — a TEST-ONLY adapter that always rejects still routes
+    /// through the same gate+abort path as a generic-check failure.
+    #[test]
+    fn run_preflight_adapter_hook_override_fires() {
+        struct AlwaysRejectAdapter;
+        impl agents::AgentAdapter for AlwaysRejectAdapter {
+            fn name(&self) -> &'static str {
+                "test-reject"
+            }
+            fn exec_command(
+                &self,
+                _phase: u32,
+                _prompt: &str,
+                _roots: &[PathBuf],
+            ) -> (&'static str, Vec<String>) {
+                ("true", Vec::new())
+            }
+            fn completion_signal_detected(&self, _output: &str) -> bool {
+                false
+            }
+            fn preflight(&self, _state: &State) -> Result<(), String> {
+                Err("test adapter always rejects".to_string())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let phase = 62;
+        // Plan is unaffected by the interactivity/gh-auth generic checks, so
+        // only the adapter hook can be the source of this failure.
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Plan;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Plan);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        let should_continue = run_preflight(root, &mut state, &AlwaysRejectAdapter).unwrap();
+
+        assert!(
+            !should_continue,
+            "an aborted preflight must tell its caller not to continue launch_stage"
+        );
+        assert!(workflow::load_state(root, phase).is_err());
+        let last = devflow_core::events::last_event_for_phase(root, phase).unwrap();
+        assert_eq!(last["event"], "workflow_aborted");
+    }
+
+    // -----------------------------------------------------------------
+    // 17-08 gap closure (CR-01): run_preflight's Advance/LoopBack arms must
+    // not spawn the agent twice.
+    // -----------------------------------------------------------------
+
+    /// TEST-ONLY adapter whose `preflight` fails on the first call only —
+    /// modeled on `AlwaysRejectAdapter` above, but with a `Cell<bool>` flag
+    /// so any SECOND call through this specific adapter reference would
+    /// pass. An adapter that fails unconditionally would make a recursive
+    /// `launch_stage` retry fail its OWN preflight check too, recursing into
+    /// a second gate this test never seeds a response for — blocking on
+    /// `poll_response` instead of asserting.
+    struct FailOnceAdapter {
+        failed_once: std::cell::Cell<bool>,
+    }
+
+    impl FailOnceAdapter {
+        fn new() -> Self {
+            Self {
+                failed_once: std::cell::Cell::new(false),
+            }
+        }
+    }
+
+    impl agents::AgentAdapter for FailOnceAdapter {
+        fn name(&self) -> &'static str {
+            "test-fail-once"
+        }
+        fn exec_command(
+            &self,
+            _phase: u32,
+            _prompt: &str,
+            _roots: &[PathBuf],
+        ) -> (&'static str, Vec<String>) {
+            ("true", Vec::new())
+        }
+        fn completion_signal_detected(&self, _output: &str) -> bool {
+            false
+        }
+        fn preflight(&self, _state: &State) -> Result<(), String> {
+            if self.failed_once.get() {
+                Ok(())
+            } else {
+                self.failed_once.set(true);
+                Err("test adapter fails on the first preflight call only".to_string())
+            }
+        }
+    }
+
+    /// Create a harmless, always-succeeding executable named `name` in a
+    /// fresh tempdir — used to satisfy `ensure_agent_binary` and let
+    /// `monitor::spawn_monitor`'s backgrounded `"$@"` exec safely resolve to
+    /// a no-op instead of a real agent CLI. This host has real
+    /// `claude`/`codex`/`opencode` binaries on PATH (the identical concern
+    /// documented on `transition_resets_infra_failures`), so any real
+    /// `launch_stage` completion here — both the recursive retry inside
+    /// `run_preflight` and this test's own simulated caller continuation —
+    /// must never resolve `state.agent`'s adapter program name to a real
+    /// CLI.
+    /// A PATH directory containing ONLY a `git` symlink — no agent CLIs.
+    ///
+    /// For tests that must guarantee `launch_stage` can never find and spawn
+    /// a real `claude`/`codex`/`opencode` binary, without also making `git`
+    /// unresolvable process-wide (19i). Unlike `prepend_path`, which layers a
+    /// stub on top of the real PATH, this REPLACES PATH entirely — the real
+    /// PATH's entries (which contain the agent CLIs on a dev host) must not
+    /// be searched at all, only this curated directory.
+    fn agent_free_git_only_path_dir() -> tempfile::TempDir {
+        let real_git = std::env::var_os("PATH")
+            .and_then(|paths| {
+                std::env::split_paths(&paths).find_map(|dir| {
+                    let candidate = dir.join("git");
+                    candidate.is_file().then_some(candidate)
+                })
+            })
+            .expect("git must be resolvable on PATH to run this test");
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(&real_git, dir.path().join("git")).unwrap();
+        dir
+    }
+
+    fn stub_agent_binary(name: &str) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name);
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        dir
+    }
+
+    /// Prefix `PATH` with `stub_dir`, keeping the rest of `original` intact
+    /// so `sh`/`git` still resolve normally — only the stubbed binary name
+    /// is shadowed (it is found first).
+    fn prepend_path(
+        stub_dir: &tempfile::TempDir,
+        original: &Option<std::ffi::OsString>,
+    ) -> std::ffi::OsString {
+        let mut dirs = vec![stub_dir.path().to_path_buf()];
+        if let Some(original) = original {
+            dirs.extend(std::env::split_paths(original));
+        }
+        std::env::join_paths(dirs).unwrap()
+    }
+
+    /// Count `stage_launched` events recorded for `phase` across the WHOLE
+    /// event log — `last_event_for_phase` only sees the most recent line and
+    /// cannot distinguish one launch from two.
+    fn stage_launched_count(root: &Path, phase: u32) -> usize {
+        std::fs::read_to_string(devflow_core::events::events_path(root))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| {
+                event.get("phase").and_then(serde_json::Value::as_u64) == Some(u64::from(phase))
+                    && event.get("event").and_then(serde_json::Value::as_str)
+                        == Some("stage_launched")
+            })
+            .count()
+    }
+
+    /// CR-01 regression (Advance arm, 17-08 gap closure): a preflight
+    /// failure resolved by `GateAction::Advance` must launch the agent
+    /// exactly once. `run_preflight` returns `Ok(false)` when the recursive
+    /// retry it just ran already spawned the agent — the call site (main.rs
+    /// call site inside `launch_stage`) must not run any more launch steps
+    /// in that case. This mirrors the call site's exact contract: only run
+    /// the explicit `launch_stage(&mut state, None, None)` continuation when
+    /// `run_preflight` says to.
+    #[test]
+    fn run_preflight_advance_gate_launches_agent_exactly_once() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 63;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        // Plan is unaffected by the interactivity/gh-auth generic checks
+        // (D-14) — only the injected adapter's `preflight` fails; the real
+        // Claude adapter's default (Ok) preflight passes every other check.
+        state.stage = Stage::Plan;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Plan);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(&response_path, r#"{"approved":true,"responded_by":"test"}"#).unwrap();
+
+        let stub_dir = stub_agent_binary("claude");
+        let original_path = std::env::var_os("PATH");
+        let stubbed_path = prepend_path(&stub_dir, &original_path);
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", &stubbed_path);
+        }
+
+        let adapter = FailOnceAdapter::new();
+        let should_continue = run_preflight(root, &mut state, &adapter).unwrap();
+        if should_continue {
+            launch_stage(&mut state, None, None).unwrap();
+        }
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        assert!(
+            !should_continue,
+            "an Advance-resolved preflight failure must tell its caller not \
+             to continue launch_stage — the recursive retry already did"
+        );
+        let launches = stage_launched_count(root, phase);
+        assert_eq!(
+            launches, 1,
+            "a preflight failure resolved by Advance must launch the agent \
+             exactly once, not {launches}"
+        );
+    }
+
+    /// CR-01 regression (LoopBack arm, 17-08 gap closure): same defect as
+    /// the Advance arm above, but through `GateAction::LoopBack` — per
+    /// `GateAction::from_response` (gates.rs:69-78) a rejection whose note
+    /// doesn't mention "abort" yields `LoopBack(Stage::Code)`, which
+    /// `run_preflight` routes through the identical recursive-relaunch code
+    /// path as Advance.
+    #[test]
+    fn run_preflight_loopback_gate_launches_agent_exactly_once() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 64;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Plan;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Plan);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"retry","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        let stub_dir = stub_agent_binary("claude");
+        let original_path = std::env::var_os("PATH");
+        let stubbed_path = prepend_path(&stub_dir, &original_path);
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", &stubbed_path);
+        }
+
+        let adapter = FailOnceAdapter::new();
+        let should_continue = run_preflight(root, &mut state, &adapter).unwrap();
+        if should_continue {
+            launch_stage(&mut state, None, None).unwrap();
+        }
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        assert!(
+            !should_continue,
+            "a LoopBack-resolved preflight failure must tell its caller not \
+             to continue launch_stage — the recursive retry already did"
+        );
+        let launches = stage_launched_count(root, phase);
+        assert_eq!(
+            launches, 1,
+            "a preflight failure resolved by LoopBack must launch the agent \
+             exactly once, not {launches}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // 17d: build provenance + self-dogfood staleness gate (D-17-D-21, Task 2)
+    // -----------------------------------------------------------------
+
+    /// D-21: the `workflow_started` payload carries every provenance field,
+    /// tested directly without spawning a real agent. No `build_timestamp`
+    /// field any more (CR-02, 17-11) — it was removed from `build.rs`
+    /// entirely, not just this payload.
+    #[test]
+    fn workflow_started_payload_carries_build_provenance() {
+        let state = State::new(66, AgentKind::Claude, Mode::Auto, PathBuf::from("/repo"));
+        let payload = workflow_started_payload(&state);
+        assert_eq!(payload["agent"], "claude");
+        assert_eq!(payload["mode"], "auto");
+        assert!(payload["version"].as_str().is_some());
+        assert!(payload["commit"].is_string());
+        assert!(payload["dirty"].is_string());
+        assert!(
+            payload.get("build_timestamp").is_none(),
+            "build_timestamp was removed (CR-02) and must not reappear"
+        );
+        assert!(payload["exe_path"].is_string() || payload["exe_path"].is_null());
+    }
+
+    /// D-17: matches only when BOTH exact member paths appear inside the
+    /// `members = [...]` array — never a package `name` match.
+    #[test]
+    fn is_self_dogfood_workspace_matches_both_member_paths_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\n    \"crates/devflow-core\",\n    \"crates/devflow-cli\",\n]\n",
+        )
+        .unwrap();
+        assert!(is_self_dogfood_workspace(root));
+
+        let name_only = tempfile::tempdir().unwrap();
+        std::fs::write(
+            name_only.path().join("Cargo.toml"),
+            "[package]\nname = \"devflow-cli\"\n",
+        )
+        .unwrap();
+        assert!(
+            !is_self_dogfood_workspace(name_only.path()),
+            "a package NAME match must never fire — the CLI package is named `devflow`"
+        );
+
+        let partial = tempfile::tempdir().unwrap();
+        std::fs::write(
+            partial.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/devflow-core\"]\n",
+        )
+        .unwrap();
+        assert!(!is_self_dogfood_workspace(partial.path()));
+
+        let missing = tempfile::tempdir().unwrap();
+        assert!(!is_self_dogfood_workspace(missing.path()));
+    }
+
+    /// WR-02: member paths that merely *contain* the real member names must
+    /// not classify an unrelated workspace as self-dogfood — that combination
+    /// hard-blocks the project's entire pipeline when its build reads Stale.
+    #[test]
+    fn is_self_dogfood_workspace_requires_exact_member_paths_not_substrings() {
+        let lookalike = tempfile::tempdir().unwrap();
+        std::fs::write(
+            lookalike.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\n    \"crates/devflow-core-extras\",\n    \"crates/devflow-cli-plugin\",\n]\n",
+        )
+        .unwrap();
+        assert!(
+            !is_self_dogfood_workspace(lookalike.path()),
+            "`devflow-core-extras`/`devflow-cli-plugin` are not the real members — \
+             a substring match here would hard-block an unrelated project"
+        );
+
+        let prefixed = tempfile::tempdir().unwrap();
+        std::fs::write(
+            prefixed.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\n    \"vendor/crates/devflow-core\",\n    \"vendor/crates/devflow-cli\",\n]\n",
+        )
+        .unwrap();
+        assert!(
+            !is_self_dogfood_workspace(prefixed.path()),
+            "vendored copies at a different path are not DevFlow's own workspace"
+        );
+    }
+
+    /// WR-05: `"default-members"` contains `"members"`. A bare
+    /// `contents.find("members")` locks onto that key's array instead, so the
+    /// real member list is never scanned and the self-dogfood hard block
+    /// silently degrades to a warning — with every existing test still green,
+    /// because their fixtures all put `members = [...]` first.
+    #[test]
+    fn is_self_dogfood_workspace_anchors_on_members_not_default_members() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\n\
+             default-members = [\"crates/devflow-cli\"]\n\
+             members = [\"crates/devflow-core\", \"crates/devflow-cli\"]\n",
+        )
+        .unwrap();
+        assert!(
+            is_self_dogfood_workspace(dir.path()),
+            "a `default-members` key ahead of `members` must not hide the real \
+             member list — that turns the D-18 hard block into a warning"
+        );
+    }
+
+    /// Build a repo with a `base` commit, a diverged `side`-branch commit
+    /// that is NOT an ancestor of the final `trunk` HEAD, then return to
+    /// `trunk` — exercises all three `embedded_commit_is_stale` outcomes
+    /// against a real git history.
+    fn init_repo_with_diverged_commit(root: &Path) -> (String, String) {
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        let rev_parse = || {
+            let out = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(root)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        git(&["init", "-q", "-b", "trunk"]);
+        git(&["config", "user.email", "t@e.st"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(root.join("a.txt"), "one").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        let base = rev_parse();
+
+        git(&["checkout", "-q", "-b", "side"]);
+        std::fs::write(root.join("side.txt"), "s").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "side"]);
+        let side = rev_parse();
+
+        git(&["checkout", "-q", "trunk"]);
+        std::fs::write(root.join("trunk2.txt"), "t2").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "trunk2"]);
+
+        (base, side)
+    }
+
+    /// Pitfall 4 / WR-01: exit 1 -> Stale, and anything else (unknown
+    /// commit, empty embedded commit) -> Indeterminate, never a false block.
+    /// Exit 0 (merge-base --is-ancestor) splits further: a strict ancestor
+    /// of HEAD -> Stale (WR-01 fix — `base` here is an ancestor of the
+    /// fixture's final `trunk2` HEAD but is NOT HEAD itself, which is
+    /// exactly the "committed, forgot to rebuild" incident class), and only
+    /// an EXACT match to HEAD -> Fresh.
+    #[test]
+    fn embedded_commit_is_stale_maps_ancestry_exit_codes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (base, side) = init_repo_with_diverged_commit(root);
+        let head = run_git_stdout(root, &["rev-parse", "HEAD"])
+            .expect("rev-parse HEAD")
+            .trim()
+            .to_string();
+
+        // `base` is a strict ancestor of the fixture's final `trunk2` HEAD —
+        // this previously asserted Fresh, which encoded the WR-01 bug (a
+        // clean-tree binary built from `base` would have been misclassified
+        // Fresh even though two commits landed on top of it since).
+        assert_eq!(embedded_commit_is_stale(root, &base), Staleness::Stale);
+        // The genuine Fresh case: an exact match to the current HEAD.
+        assert_eq!(embedded_commit_is_stale(root, &head), Staleness::Fresh);
+        assert_eq!(embedded_commit_is_stale(root, &side), Staleness::Stale);
+        assert_eq!(embedded_commit_is_stale(root, ""), Staleness::Indeterminate);
+        assert_eq!(
+            embedded_commit_is_stale(root, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
+            Staleness::Indeterminate
+        );
+    }
+
+    /// WR-01 regression (17-06 gap closure): reproduces the verifier's exact
+    /// live-reproduction narrative (17-VERIFICATION.md Gap 2 / Truth 10) — a
+    /// LINEAR, clean-tree, two-commit fixture where the embedded commit
+    /// legitimately IS an ancestor of the new HEAD, so `merge-base
+    /// --is-ancestor` exits 0 and the mtime arm never runs on a clean tree.
+    /// Before the WR-01 fix, this was misclassified Fresh; it must now be
+    /// Stale, and `enforce_build_staleness` must hard-block a self-dogfood
+    /// workspace in exactly this scenario — the Phase 16 "committed,
+    /// forgot to rebuild" incident class this gate exists to catch.
+    #[test]
+    fn wr01_clean_tree_strict_ancestor_build_is_stale_and_hard_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@e.st"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+
+        // First commit: a workspace Cargo.toml (both crate member paths) plus
+        // one other tracked file.
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/devflow-core\", \"crates/devflow-cli\"]\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("a.txt"), "one").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "workspace init"]);
+        let embedded_commit = run_git_stdout(root, &["rev-parse", "HEAD"])
+            .expect("rev-parse HEAD")
+            .trim()
+            .to_string();
+
+        // Second commit on top: an unrelated NEW file — no modifications to
+        // already-committed files, so the tree stays clean.
+        std::fs::write(root.join("b.txt"), "two").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "unrelated follow-up"]);
+
+        // Clean-tree property: this is what makes the mtime arm never run,
+        // leaving the ancestry arm as the sole signal — exactly the gap the
+        // WR-01 fix closes.
+        let status = run_git_stdout(root, &["status", "--porcelain"]).unwrap();
+        assert!(
+            status.trim().is_empty(),
+            "fixture must have a clean working tree"
+        );
+
+        assert_eq!(
+            embedded_commit_is_stale(root, &embedded_commit),
+            Staleness::Stale
+        );
+        assert_eq!(
+            combined_staleness(root, &embedded_commit, false),
+            Staleness::Stale
+        );
+        assert!(is_self_dogfood_workspace(root));
+
+        let phase = 66;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+
+        let err = enforce_build_staleness(root, &state, &embedded_commit, false).unwrap_err();
+        assert!(
+            err.to_string().contains("self-dogfood stale build blocked"),
+            "{err}"
+        );
+
+        let last = devflow_core::events::last_event_for_phase(root, phase)
+            .expect("staleness block must record an event before returning the error");
+        assert_eq!(last["event"], "self_dogfood_stale_blocked");
+    }
+
+    /// A binary built from a branch AHEAD of `project_root`'s HEAD is newer
+    /// than the source it drives — the inverse of the "committed, forgot to
+    /// rebuild" incident. `merge-base --is-ancestor <embedded> HEAD` exits 1
+    /// for BOTH a descendant and a genuinely divergent/older commit, so the
+    /// bare `Ok(Some(1)) => Stale` mapping hard-blocked a fresher build. Found
+    /// live: this phase's own Validate stage was blocked by a binary built
+    /// from `feature/phase-17` while the checkout sat on `develop`.
+    #[test]
+    fn ahead_build_from_descendant_commit_warns_instead_of_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@e.st"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/devflow-core\", \"crates/devflow-cli\"]\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("a.txt"), "one").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "workspace init"]);
+        let base_commit = run_git_stdout(root, &["rev-parse", "HEAD"])
+            .expect("rev-parse HEAD")
+            .trim()
+            .to_string();
+
+        // The build is made from the LATER commit...
+        std::fs::write(root.join("b.txt"), "two").unwrap();
+        git(&["add", "."]);
+        git(&[
+            "commit",
+            "-q",
+            "-m",
+            "newer work the checkout does not have",
+        ]);
+        let embedded_commit = run_git_stdout(root, &["rev-parse", "HEAD"])
+            .expect("rev-parse HEAD")
+            .trim()
+            .to_string();
+
+        // ...while the checkout is moved BACK, leaving the embedded commit a
+        // strict descendant of HEAD on a clean tree (so the mtime arm stays
+        // out of it and ancestry is the sole signal).
+        git(&["reset", "--hard", "-q", &base_commit]);
+        let status = run_git_stdout(root, &["status", "--porcelain"]).unwrap();
+        assert!(
+            status.trim().is_empty(),
+            "fixture must have a clean working tree"
+        );
+
+        assert_eq!(
+            embedded_commit_is_stale(root, &embedded_commit),
+            Staleness::Ahead,
+            "a descendant embedded commit is newer than HEAD, not stale"
+        );
+        assert_eq!(
+            staleness_outcome(true, Staleness::Ahead),
+            StalenessOutcome::Warn,
+            "an ahead build must warn, never hard-block, even for self-dogfood"
+        );
+
+        let phase = 67;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        assert!(
+            enforce_build_staleness(root, &state, &embedded_commit, false).is_ok(),
+            "ahead build must not block a self-dogfood workspace"
+        );
+    }
+
+    /// The live dirty-tree arm must only consider files that can change the
+    /// compiled binary. Found live: DevFlow's own `ChangelogAppend` hook
+    /// dirtied `CHANGELOG.md` during the Validate->Ship transition, an
+    /// unfiltered check read that as a stale build, and the self-dogfood
+    /// gate hard-blocked Ship — the pipeline blocking itself on a markdown
+    /// file it had just written. A modified `.rs` file must still flag
+    /// Stale (when the build was clean), or the gate stops catching the
+    /// real "committed, forgot to rebuild" case (CR-02, 17-11: rewritten
+    /// against the dirty-flag rule — the fixture's guarantees are
+    /// unchanged, only the timestamp mechanism is gone).
+    #[test]
+    fn dirty_flag_arm_ignores_non_build_files_but_still_flags_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@e.st"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/devflow-core\", \"crates/devflow-cli\"]\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("CHANGELOG.md"), "# Changelog\n").unwrap();
+        std::fs::create_dir_all(root.join("crates/devflow-cli/src")).unwrap();
+        std::fs::write(
+            root.join("crates/devflow-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "workspace init"]);
+        let embedded_commit = run_git_stdout(root, &["rev-parse", "HEAD"])
+            .expect("rev-parse HEAD")
+            .trim()
+            .to_string();
+
+        // This binary was built from a CLEAN tree (the CR-02 incident
+        // scenario): `build_dirty` is false throughout.
+        let build_dirty = false;
+
+        // Only a doc is dirty — exactly the live Ship-block condition.
+        std::fs::write(root.join("CHANGELOG.md"), "# Changelog\n\n## 1.4.26\n").unwrap();
+        assert_eq!(
+            run_git_stdout(root, &["ls-files", "-m"]).unwrap().trim(),
+            "CHANGELOG.md",
+            "fixture must have exactly one dirty tracked file"
+        );
+        assert_eq!(
+            tree_has_modified_build_inputs(root),
+            Some(false),
+            "a dirty CHANGELOG.md cannot change the compiled binary"
+        );
+        assert_eq!(
+            combined_staleness(root, &embedded_commit, build_dirty),
+            Staleness::Fresh,
+            "a doc-only dirty tree must not be Stale"
+        );
+
+        let phase = 68;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Ship;
+        assert!(
+            enforce_build_staleness(root, &state, &embedded_commit, build_dirty).is_ok(),
+            "a doc-only dirty tree must not block Ship"
+        );
+
+        // Converse: a dirty source file, on a build that was clean, IS
+        // stale — the CR-02 case this whole plan exists to fix.
+        std::fs::write(
+            root.join("crates/devflow-cli/src/main.rs"),
+            "fn main() { /* edited after build */ }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            tree_has_modified_build_inputs(root),
+            Some(true),
+            "a modified .rs file is genuine staleness input"
+        );
+
+        // WR-03: the same edit, STAGED, must read identically. `git ls-files -m`
+        // compares worktree-vs-index and goes silent once the edit is staged,
+        // which let a stale binary certify itself as Fresh.
+        git(&["add", "crates/devflow-cli/src/main.rs"]);
+        assert!(
+            !run_git_stdout(root, &["ls-files", "-m"])
+                .unwrap()
+                .lines()
+                .any(|line| line.ends_with(".rs")),
+            "fixture precondition: `ls-files -m` is blind to the staged .rs edit"
+        );
+        assert_eq!(
+            tree_has_modified_build_inputs(root),
+            Some(true),
+            "a STAGED source edit is just as much a staleness input as an unstaged one"
+        );
+        assert_eq!(
+            combined_staleness(root, &embedded_commit, build_dirty),
+            Staleness::Stale,
+            "a staged, uncommitted source edit on a clean build is Stale"
+        );
+        git(&["reset", "-q"]);
+        assert_eq!(
+            combined_staleness(root, &embedded_commit, build_dirty),
+            Staleness::Stale
+        );
+        assert!(
+            enforce_build_staleness(root, &state, &embedded_commit, build_dirty).is_err(),
+            "a stale source build must still hard-block a self-dogfood workspace"
+        );
+    }
+
+    /// The Validate→Ship content hook (`DocsUpdate`) authors material about
+    /// the branch being shipped, so it must run in that phase's worktree;
+    /// the terminal batch merges/tags/deletes against the primary checkout
+    /// and must NOT be retargeted. `ChangelogAppend` moved into the terminal
+    /// batch in 17-12 (WR-04) for exactly this reason — it now targets
+    /// `project_root`, not the worktree.
+    ///
+    /// Found live: `ChangelogAppend` wrote Phase 17's release note into
+    /// `develop`'s CHANGELOG.md while all of its commits sat on
+    /// `feature/phase-17`, stranding the entry on the wrong branch.
+    #[test]
+    fn content_hooks_target_the_worktree_while_terminal_hooks_stay_on_project_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let worktree = root.join(".worktrees/phase-70");
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        let mut state = State::new(70, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.worktree_path = Some(worktree.clone());
+
+        assert_eq!(
+            hook_context_root(root, &state, false),
+            worktree,
+            "content hooks must write into the phase's worktree"
+        );
+        assert_eq!(
+            hook_context_root(root, &state, true),
+            root.to_path_buf(),
+            "terminal hooks merge/tag/delete against the primary checkout"
+        );
+
+        // --no-worktree runs, and a worktree recorded but already removed,
+        // both fall back to the project root rather than writing nowhere.
+        let mut no_worktree = state.clone();
+        no_worktree.worktree_path = None;
+        assert_eq!(hook_context_root(root, &no_worktree, false), root);
+
+        let mut missing = state.clone();
+        missing.worktree_path = Some(root.join(".worktrees/gone"));
+        assert_eq!(hook_context_root(root, &missing, false), root);
+    }
+
+    /// D-19 composite/OR: a clean tree whose embedded commit IS an ancestor
+    /// (HEAD itself) is Fresh regardless of `build_dirty`; but once a
+    /// TRACKED, build-affecting file is modified (dirty tree) on a build
+    /// that was made from a CLEAN tree, the dirty-flag arm flips the
+    /// composite result to Stale even though ancestry alone says Fresh —
+    /// this is the CR-02 case itself. CR-02 (17-11): renamed and rewritten
+    /// against the dirty-flag rule (no more timestamp/mtime comparison);
+    /// the test's *intent* — a second signal can flip an ancestry-Fresh
+    /// result to Stale — survives unchanged.
+    #[test]
+    fn combined_staleness_dirty_flag_arm_flags_modified_tree_when_build_was_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@e.st"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        // 17-10: the dirty file must be a BUILD-AFFECTING one. This fixture
+        // used `a.txt`, which encoded the over-broad mtime arm that hard-blocked
+        // Ship on a dirty CHANGELOG.md. The test's intent — a second signal
+        // flips an ancestry-Fresh result to Stale — is unchanged; only the
+        // fixture is corrected to a file that can actually change the binary.
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "// one\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        let head = {
+            let out = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(root)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        assert_eq!(embedded_commit_is_stale(root, &head), Staleness::Fresh);
+        assert_eq!(combined_staleness(root, &head, false), Staleness::Fresh);
+
+        std::fs::write(root.join("src/lib.rs"), "// modified after build\n").unwrap();
+        assert_eq!(combined_staleness(root, &head, false), Staleness::Stale);
+    }
+
+    /// The Indeterminate branch of the decision table (must_haves truth 5,
+    /// 17-11): a build made from an ALREADY-dirty tree, run against a tree
+    /// that STILL has modified build inputs, cannot tell "same dirt" from
+    /// "more dirt" without a timestamp — so it must be Indeterminate, never
+    /// Stale, even though ancestry alone says Fresh. Pitfall 4: Indeterminate
+    /// must never hard-block, even for a self-dogfood workspace.
+    #[test]
+    fn combined_staleness_dirty_flag_arm_is_indeterminate_when_build_was_already_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@e.st"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/devflow-core\", \"crates/devflow-cli\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "// one\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        let head = run_git_stdout(root, &["rev-parse", "HEAD"])
+            .expect("rev-parse HEAD")
+            .trim()
+            .to_string();
+        assert!(is_self_dogfood_workspace(root));
+
+        // The tree is dirty NOW (a build-affecting file is modified) — but
+        // the embedded build's own dirty flag says it was ALSO built from a
+        // dirty tree. Ancestry alone says Fresh (embedded_commit == HEAD).
+        std::fs::write(root.join("src/lib.rs"), "// modified\n").unwrap();
+        assert_eq!(embedded_commit_is_stale(root, &head), Staleness::Fresh);
+        assert_eq!(
+            tree_has_modified_build_inputs(root),
+            Some(true),
+            "fixture must have a dirty, build-affecting tree"
+        );
+
+        let build_was_dirty = true;
+        assert_eq!(
+            combined_staleness(root, &head, build_was_dirty),
+            Staleness::Indeterminate,
+            "cannot distinguish \"same dirt\" from \"more dirt\" without a timestamp"
+        );
+
+        let phase = 71;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        assert!(
+            enforce_build_staleness(root, &state, &head, build_was_dirty).is_ok(),
+            "Indeterminate must never hard-block, even for a self-dogfood workspace (Pitfall 4)"
+        );
+    }
+
+    /// D-18: a self-dogfood workspace (matching `members = [...]`) with a
+    /// confirmed-Stale embedded commit is a HARD block — but never silent:
+    /// notify fires (best-effort; no `DEVFLOW_GATE_NOTIFY_CMD` is set here so
+    /// it's a no-op) and an event is recorded BEFORE the blocking error is
+    /// returned.
+    #[test]
+    fn enforce_build_staleness_blocks_self_dogfood_and_records_event_before_erroring() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (_base, side) = init_repo_with_diverged_commit(root);
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/devflow-core\", \"crates/devflow-cli\"]\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "add workspace cargo toml"]);
+        assert!(is_self_dogfood_workspace(root));
+
+        let phase = 63;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+
+        let err = enforce_build_staleness(root, &state, &side, false).unwrap_err();
+        assert!(
+            err.to_string().contains("self-dogfood stale build blocked"),
+            "{err}"
+        );
+
+        let last = devflow_core::events::last_event_for_phase(root, phase)
+            .expect("staleness block must record an event before returning the error");
+        assert_eq!(last["event"], "self_dogfood_stale_blocked");
+    }
+
+    /// D-18: an ordinary (non-self-dogfood) project with the same confirmed-
+    /// Stale embedded commit only warns and proceeds — no event, no error.
+    #[test]
+    fn enforce_build_staleness_warns_for_ordinary_project_with_stale_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (_base, side) = init_repo_with_diverged_commit(root);
+        assert!(!is_self_dogfood_workspace(root));
+
+        let phase = 64;
+        let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+
+        let result = enforce_build_staleness(root, &state, &side, false);
+        assert!(
+            result.is_ok(),
+            "an ordinary project's stale build must only warn, never block"
+        );
+        assert!(
+            devflow_core::events::last_event_for_phase(root, phase).is_none(),
+            "a warn-only path must not fire the self_dogfood_stale_blocked event"
+        );
+    }
+
+    /// Pitfall 4 / D-18: an Indeterminate result (unknown embedded commit)
+    /// never hard-blocks, even for a self-dogfood workspace.
+    #[test]
+    fn enforce_build_staleness_never_blocks_on_indeterminate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@e.st"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/devflow-core\", \"crates/devflow-cli\"]\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        assert!(is_self_dogfood_workspace(root));
+
+        let phase = 65;
+        let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+
+        let result = enforce_build_staleness(
+            root,
+            &state,
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            false,
+        );
+        assert!(
+            result.is_ok(),
+            "an Indeterminate result must never hard-block"
+        );
     }
 
     /// 13-06 dogfood regression: a multi-KB parser-derived reason reached

@@ -33,6 +33,11 @@ pub struct AgentResult {
     /// silently drop a valid `status` to Layer 2.
     #[serde(default, deserialize_with = "deserialize_verdict_lenient")]
     pub verdict: Option<Verdict>,
+    /// Which evaluation layer (0-3) produced this result (D-10, 17-01). Set by
+    /// every constructor in this module; `None` is reserved for test-only
+    /// fixture literals that don't route through the real cascade.
+    #[serde(default)]
+    pub decided_by_layer: Option<u8>,
 }
 
 /// Agent completion status determined by DevFlow.
@@ -47,6 +52,34 @@ pub enum AgentStatus {
     RateLimited,
     /// No signal received — fallback to exit code / commit heuristic.
     Unknown,
+    /// Layer 2 classified the process as killed for resource exhaustion
+    /// (exit code 137, typically SIGKILL from an OOM killer) (D-07, 17b).
+    #[serde(rename = "resource_killed")]
+    ResourceKilled,
+    /// Layer 2 classified the process as unable to start (exit code 127,
+    /// typically "command not found") (D-07, 17b).
+    #[serde(rename = "agent_unavailable")]
+    AgentUnavailable,
+}
+
+impl AgentStatus {
+    /// The wire-format name for this variant, pinned equal to
+    /// `serde_json::to_string(&self)` with the surrounding quotes stripped
+    /// (see the `as_wire_str_matches_serde_form` test). Exhaustive match with
+    /// NO wildcard arm — adding a variant without updating this is a compile
+    /// error. This is the sanctioned replacement for
+    /// `format!("{:?}", status).to_ascii_lowercase()`, which collapses word
+    /// boundaries on multi-word variants (review consensus #1).
+    pub fn as_wire_str(&self) -> &'static str {
+        match self {
+            AgentStatus::Success => "success",
+            AgentStatus::Failed => "failed",
+            AgentStatus::RateLimited => "ratelimited",
+            AgentStatus::Unknown => "unknown",
+            AgentStatus::ResourceKilled => "resource_killed",
+            AgentStatus::AgentUnavailable => "agent_unavailable",
+        }
+    }
 }
 
 /// The Validate stage's self-reported verdict (13b verdict-vs-ran split).
@@ -321,6 +354,7 @@ fn detect_claude_envelope_failure(stdout: &str) -> Option<AgentResult> {
         commits: None,
         summary: None,
         verdict: None,
+        decided_by_layer: Some(1),
     })
 }
 
@@ -414,6 +448,7 @@ fn parse_codex_event_result(stdout: &str) -> Option<AgentResult> {
         commits: None,
         summary: None,
         verdict: None,
+        decided_by_layer: Some(1),
     })
 }
 
@@ -489,6 +524,7 @@ fn rate_limited_result(retry: String) -> AgentResult {
         commits: None,
         summary: None,
         verdict: None,
+        decided_by_layer: Some(1),
     }
 }
 
@@ -505,7 +541,9 @@ fn rate_limited_result(retry: String) -> AgentResult {
 /// stage-scoped.
 ///
 /// Decision matrix:
-///   exit≠0                                              → Failed (ALL stages)
+///   exit=137                                             → ResourceKilled (ALL stages, D-07)
+///   exit=127                                             → AgentUnavailable (ALL stages, D-07)
+///   exit≠0 (excluding 137/127)                           → Failed (ALL stages)
 ///   exit=0, stage in {Plan, Code}, commits=0             → Failed ("no work done")
 ///   exit=0, stage in {Plan, Code}, commits>0             → Success
 ///   exit=0, stage NOT in {Plan, Code} (Define/Validate/Ship), commits=0 → Success
@@ -556,14 +594,34 @@ pub fn evaluate_layer2(
     let commit_gated = matches!(stage, Stage::Plan | Stage::Code);
     let no_work_done = commit_gated && commits == 0;
 
+    // 137 (SIGKILL, typically OOM) and 127 (command not found) are classified
+    // BEFORE the generic `exit_code != 0 -> Failed` catch-all, using the same
+    // trusted plain-i32 already parsed above from the monitor-written exit
+    // file (D-07, 17b — no ExitStatusExt/signal API per Pitfall 1a).
+    let status = if exit_code == 137 {
+        AgentStatus::ResourceKilled
+    } else if exit_code == 127 {
+        AgentStatus::AgentUnavailable
+    } else if exit_code != 0 || no_work_done {
+        AgentStatus::Failed
+    } else {
+        AgentStatus::Success
+    };
+
     Ok(Some(AgentResult {
-        status: if exit_code != 0 || no_work_done {
-            AgentStatus::Failed
-        } else {
-            AgentStatus::Success
-        },
+        status,
         exit_code: Some(exit_code),
-        reason: if exit_code != 0 {
+        reason: if exit_code == 137 {
+            Some(format!(
+                "agent process was killed (exit code 137, likely OOM) ({} commits on {})",
+                commits, branch
+            ))
+        } else if exit_code == 127 {
+            Some(format!(
+                "agent command was unavailable (exit code 127, command not found) ({} commits on {})",
+                commits, branch
+            ))
+        } else if exit_code != 0 {
             Some(format!(
                 "agent exited with code {} ({} commits on {})",
                 exit_code, commits, branch
@@ -582,13 +640,21 @@ pub fn evaluate_layer2(
         commits: Some(commits),
         summary: None,
         verdict: None,
+        decided_by_layer: Some(2),
     }))
 }
 
-/// Layer 3: Last resort — agent process is gone, commits exist.
+/// Layer 3: Last resort — agent process is gone.
 ///
-/// Returns Unknown status with a warning. This only fires when
-/// neither Layer 1 nor Layer 2 produced a definitive result.
+/// Split per D-02/D-03 case 3 (17-03): "process gone, commits exist" stays
+/// `Unknown` — unverified but there is SOMETHING to account for, and Plan
+/// 04's never-advance dispatch gates it downstream (D-04) rather than
+/// reclassifying it here. "Process gone, zero commits, nothing declared" is
+/// no longer a blanket advanceable `Unknown` — it is reclassified to
+/// `Failed` so a vanished agent that produced and declared nothing cannot
+/// masquerade as ambiguous-but-fine; the reason flags that human review is
+/// needed. This only fires when neither Layer 1 nor Layer 2 produced a
+/// definitive result.
 pub fn evaluate_layer3(
     project_root: &Path,
     phase: u32,
@@ -607,40 +673,61 @@ pub fn evaluate_layer3(
         .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
         .unwrap_or(0);
 
-    Ok(AgentResult {
-        status: AgentStatus::Unknown,
-        exit_code: None,
-        reason: if commits > 0 {
-            Some(format!(
+    let (status, reason) = if commits > 0 {
+        (
+            AgentStatus::Unknown,
+            format!(
                 "unverified — agent process is gone but {} commits exist on {}",
                 commits, branch
-            ))
-        } else {
-            Some("no work detected — agent process is gone with no commits".into())
-        },
+            ),
+        )
+    } else {
+        (
+            AgentStatus::Failed,
+            "no work accounted for — agent process is gone with no commits and no declared \
+             external post-condition; human review needed"
+                .to_string(),
+        )
+    };
+
+    Ok(AgentResult {
+        status,
+        exit_code: None,
+        reason: Some(reason),
         commits: Some(commits),
         summary: None,
         verdict: None,
+        decided_by_layer: Some(3),
     })
 }
 
 /// Layer 0: run explicitly operator-approved external post-condition probes.
 ///
-/// A failed probe outranks every agent-controlled signal. Successful probes
-/// defer to the existing Layer 1/2/3 cascade so ordinary completion evidence
-/// is still required. With no declarations (or when disabled), behavior is
-/// byte-for-byte the pre-Phase-16 cascade.
+/// A failed probe outranks every agent-controlled signal. An approved,
+/// all-passing set of declared probes is itself affirmative completion
+/// evidence — `Success` — so a legitimately external-only stage with zero
+/// commits can still complete cleanly (D-05 gap 2). Evaluated for EVERY
+/// stage, not only Code (D-05 gap 1 / D-06). With no declarations (or when
+/// disabled), behavior is byte-for-byte the pre-Phase-16 cascade.
+///
+/// Two roots are intentionally kept distinct (review Plan 03 MEDIUM,
+/// OpenCode): `project_root` is used to DISCOVER the PLAN's declared
+/// commands (`.planning/phases/` lives there, not in a worktree checkout),
+/// while `execution_root` — the worktree, when one is set — is where probes
+/// actually RUN. Conflating the two previously meant a worktree-based phase
+/// could not find its own declaration and silently mis-hit the
+/// "PLAN removed" veto below.
 fn evaluate_layer0(
     project_root: &Path,
     state: &State,
     approved_commands: Option<&[String]>,
 ) -> Option<AgentResult> {
-    if state.stage != Stage::Code || !crate::config::external_verify_enabled(project_root) {
+    if !crate::config::external_verify_enabled(project_root) {
         return None;
     }
 
     let execution_root = state.worktree_path.as_deref().unwrap_or(project_root);
-    let commands = crate::verify::external_verify_commands(execution_root, state.phase);
+    let commands = crate::verify::external_verify_commands(project_root, state.phase);
     if commands.is_empty() {
         return approved_commands.map(|_| AgentResult {
             status: AgentStatus::Failed,
@@ -651,6 +738,7 @@ fn evaluate_layer0(
             commits: None,
             summary: None,
             verdict: None,
+            decided_by_layer: Some(0),
         });
     }
     let Some(approved_commands) = approved_commands else {
@@ -664,6 +752,7 @@ fn evaluate_layer0(
             commits: None,
             summary: None,
             verdict: None,
+            decided_by_layer: Some(0),
         });
     };
     if commands != approved_commands {
@@ -674,19 +763,36 @@ fn evaluate_layer0(
             commits: None,
             summary: None,
             verdict: None,
+            decided_by_layer: Some(0),
         });
     }
-    commands
+    match commands
         .into_iter()
         .find(|command| !crate::verify::run_external_verification(command, execution_root))
-        .map(|command| AgentResult {
+    {
+        Some(command) => Some(AgentResult {
             status: AgentStatus::Failed,
             exit_code: None,
             reason: Some(format!("external verification failed: {command}")),
             commits: None,
             summary: None,
             verdict: None,
-        })
+            decided_by_layer: Some(0),
+        }),
+        // Every declared, approved probe passed — affirmative completion
+        // evidence on its own (D-05 gap 2), even with zero commits.
+        None => Some(AgentResult {
+            status: AgentStatus::Success,
+            exit_code: None,
+            reason: Some(
+                "external verification passed — all declared, approved probes succeeded".into(),
+            ),
+            commits: None,
+            summary: None,
+            verdict: None,
+            decided_by_layer: Some(0),
+        }),
+    }
 }
 
 /// Full four-layer evaluation: returns the best available AgentResult.
@@ -1437,11 +1543,19 @@ mod tests {
         );
     }
 
+    /// D-05 gap 1 / D-06 (17-03): Layer 0 now evaluates on every stage, not
+    /// only Code. Also covers the review-flagged worktree bug (Plan 03
+    /// MEDIUM, OpenCode): PLAN discovery must read `project_root` (where
+    /// `.planning/phases/` actually lives), while probe execution still
+    /// reads `execution_root` (the worktree) — using the worktree for
+    /// discovery would find zero commands and mis-fire the "PLAN removed"
+    /// veto.
     #[test]
-    fn external_probe_runs_only_after_code_and_reads_execution_worktree() {
+    fn external_probe_discovers_from_project_root_across_every_stage_and_executes_in_worktree() {
         let dir = tempfile::tempdir().unwrap();
         let worktree = dir.path().join("phase-worktree");
-        let phase_dir = worktree.join(".planning/phases/16-reliability");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let phase_dir = dir.path().join(".planning/phases/16-reliability");
         std::fs::create_dir_all(&phase_dir).unwrap();
         std::fs::write(
             phase_dir.join("16-01-PLAN.md"),
@@ -1459,6 +1573,11 @@ mod tests {
         state.stage = Stage::Plan;
 
         let approval = vec!["test -f implemented".to_string()];
+
+        // Layer 0 now fires on Plan too — the probe file does not yet exist
+        // in the worktree, so this must fail on the probe itself (NOT a
+        // false PLAN-removed veto, which would mean discovery silently
+        // returned zero commands).
         let plan_result = evaluate_agent_result_inner(
             dir.path(),
             &state,
@@ -1466,7 +1585,15 @@ mod tests {
             Some(&approval),
         )
         .unwrap();
-        assert_eq!(plan_result.status, AgentStatus::Success);
+        assert_eq!(plan_result.status, AgentStatus::Failed);
+        assert!(
+            plan_result
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("external verification failed")),
+            "expected a failing-probe reason, not a false PLAN-removed veto: {:?}",
+            plan_result.reason
+        );
 
         state.stage = Stage::Code;
         let code_result = evaluate_agent_result_inner(
@@ -1478,6 +1605,8 @@ mod tests {
         .unwrap();
         assert_eq!(code_result.status, AgentStatus::Failed);
 
+        // The probe still executes against execution_root (the worktree) —
+        // only PLAN discovery moved to project_root.
         std::fs::write(worktree.join("implemented"), "done").unwrap();
         let passing = evaluate_agent_result_inner(
             dir.path(),
@@ -1487,6 +1616,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(passing.status, AgentStatus::Success);
+        assert_eq!(passing.decided_by_layer, Some(0));
     }
 
     #[test]
@@ -1557,6 +1687,161 @@ mod tests {
             serde_json::to_value(full).unwrap(),
             serde_json::to_value(layer1).unwrap()
         );
+    }
+
+    /// D-05 gap 2 (17-03): a declared, operator-approved external
+    /// post-condition whose probe passes is affirmative Success evidence on
+    /// its own — even with zero commits and on a non-Code stage (Define
+    /// here). No agent stdout is written at all, so if Layer 0 did not
+    /// short-circuit, there would be nothing for Layer 1 to find and Layer 2
+    /// would fall through for lack of an exit-code file.
+    #[test]
+    fn layer0_affirmative_success_on_non_code_stage_with_zero_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase_dir = dir.path().join(".planning/phases/16-reliability");
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        std::fs::write(
+            phase_dir.join("16-01-PLAN.md"),
+            "---\nexternal_verify: \"test -f shipped\"\n---\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("shipped"), "done").unwrap();
+        let mut state = state_in(dir.path(), 16);
+        state.stage = Stage::Define;
+
+        let approval = vec!["test -f shipped".to_string()];
+        let result = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approval),
+        )
+        .unwrap();
+
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(result.decided_by_layer, Some(0));
+        assert_eq!(result.commits, None);
+    }
+
+    /// Review Plan 03 LOW (Codex+OpenCode), 16a: an approved all-passing
+    /// Layer 0 probe intentionally outranks a Layer 1 self-reported failure
+    /// marker — proven here at the cascade level (`evaluate_agent_result_inner`),
+    /// not merely in isolation on `evaluate_layer0`.
+    #[test]
+    fn layer0_affirmative_success_outranks_layer1_failure_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase_dir = dir
+            .path()
+            .join(".planning/phases/16-pipeline-reliability-hardening");
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        std::fs::write(
+            phase_dir.join("16-03-PLAN.md"),
+            "---\nphase: 16\nexternal_verify: \"test -f externally-shipped\"\n---\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("externally-shipped"), "done").unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 16),
+            "DEVFLOW_RESULT: {\"status\":\"failed\",\"reason\":\"agent self-reported failure\"}\n",
+        )
+        .unwrap();
+        let state = state_in(dir.path(), 16);
+
+        let approval = vec!["test -f externally-shipped".to_string()];
+        let result = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approval),
+        )
+        .unwrap();
+
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(result.decided_by_layer, Some(0));
+    }
+
+    /// Ordering edge (17a): with multiple declared probes, ALL must pass for
+    /// affirmative Success — the first failing probe vetoes the outcome
+    /// regardless of which position it occupies among the declarations.
+    #[test]
+    fn multiple_declared_probes_first_failure_vetoes_regardless_of_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase_dir = dir.path().join(".planning/phases/16-reliability");
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        // 16-01 comes first alphabetically and passes; 16-02 comes second and fails.
+        std::fs::write(
+            phase_dir.join("16-01-PLAN.md"),
+            "---\nexternal_verify: \"test -f passing-artifact\"\n---\n",
+        )
+        .unwrap();
+        std::fs::write(
+            phase_dir.join("16-02-PLAN.md"),
+            "---\nexternal_verify: \"test -f never-created\"\n---\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("passing-artifact"), "done").unwrap();
+        let mut state = state_in(dir.path(), 16);
+        state.stage = Stage::Define;
+
+        let approval = vec![
+            "test -f passing-artifact".to_string(),
+            "test -f never-created".to_string(),
+        ];
+        let result_a = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approval),
+        )
+        .unwrap();
+        assert_eq!(result_a.status, AgentStatus::Failed);
+        assert!(
+            result_a
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("never-created")),
+            "unexpected reason: {:?}",
+            result_a.reason
+        );
+
+        // Swap which position fails: 16-01 now fails, 16-02 passes. The
+        // overall outcome must still veto — order of declaration must not
+        // matter.
+        std::fs::write(
+            phase_dir.join("16-01-PLAN.md"),
+            "---\nexternal_verify: \"test -f still-missing\"\n---\n",
+        )
+        .unwrap();
+        std::fs::write(
+            phase_dir.join("16-02-PLAN.md"),
+            "---\nexternal_verify: \"test -f passing-artifact\"\n---\n",
+        )
+        .unwrap();
+        let approval_swapped = vec![
+            "test -f still-missing".to_string(),
+            "test -f passing-artifact".to_string(),
+        ];
+        let result_b = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approval_swapped),
+        )
+        .unwrap();
+        assert_eq!(result_b.status, AgentStatus::Failed);
+
+        // Now make BOTH pass: only then is the outcome Success.
+        std::fs::write(dir.path().join("still-missing"), "done").unwrap();
+        let result_c = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approval_swapped),
+        )
+        .unwrap();
+        assert_eq!(result_c.status, AgentStatus::Success);
+        assert_eq!(result_c.decided_by_layer, Some(0));
     }
 
     #[test]
@@ -1883,6 +2168,32 @@ mod tests {
         assert_eq!(result.exit_code, None);
         assert_eq!(result.commits, Some(1));
         assert!(result.reason.unwrap().contains("1 commits"));
+        assert_eq!(result.decided_by_layer, Some(3));
+    }
+
+    /// D-02/D-03 case 3 (17-03): "process gone, nothing accounted for" — zero
+    /// commits and no declared external post-condition — is a fail-closed
+    /// `Failed` outcome that flags human review, not a blanket advanceable
+    /// `Unknown`. The commits-present case above stays `Unknown` (gated
+    /// downstream by Plan 04's never-advance dispatch, D-04) — only the
+    /// zero-commit sub-case is reclassified here.
+    #[test]
+    fn evaluate_layer3_zero_commits_is_failed_and_flags_human_review() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo_with_feature_no_commit(dir.path(), 5);
+
+        let result = evaluate_layer3(dir.path(), 5, &GitFlowConfig::default()).unwrap();
+
+        assert_eq!(result.status, AgentStatus::Failed);
+        assert_eq!(result.exit_code, None);
+        assert_eq!(result.commits, Some(0));
+        assert_eq!(result.decided_by_layer, Some(3));
+        let reason = result.reason.unwrap();
+        assert!(reason.contains("no work"), "reason was: {reason}");
+        assert!(
+            reason.to_ascii_lowercase().contains("human review"),
+            "reason was: {reason}"
+        );
     }
 
     #[test]
@@ -1947,5 +2258,140 @@ mod tests {
         let result = parse_devflow_result(object_verdict).unwrap();
         assert_eq!(result.status, AgentStatus::Success);
         assert_eq!(result.verdict, None);
+    }
+
+    /// D-07 (17-01): the two new multi-word variants must serialize with
+    /// their word boundary preserved — `#[serde(rename_all = "lowercase")]`
+    /// alone would collapse `ResourceKilled` to `"resourcekilled"` (Pitfall 1).
+    #[test]
+    fn multi_word_variants_serialize_with_word_boundary() {
+        assert_eq!(
+            serde_json::to_string(&AgentStatus::ResourceKilled).unwrap(),
+            "\"resource_killed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentStatus::AgentUnavailable).unwrap(),
+            "\"agent_unavailable\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentStatus>("\"resource_killed\"").unwrap(),
+            AgentStatus::ResourceKilled
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentStatus>("\"agent_unavailable\"").unwrap(),
+            AgentStatus::AgentUnavailable
+        );
+    }
+
+    /// Existing variants must keep their pre-existing lowercase wire form
+    /// unchanged by the two new variants' additions.
+    #[test]
+    fn existing_variants_keep_wire_form() {
+        assert_eq!(
+            serde_json::to_string(&AgentStatus::Success).unwrap(),
+            "\"success\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentStatus::Failed).unwrap(),
+            "\"failed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentStatus::RateLimited).unwrap(),
+            "\"ratelimited\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentStatus::Unknown).unwrap(),
+            "\"unknown\""
+        );
+    }
+
+    /// review consensus #1: `as_wire_str()` must never diverge from the serde
+    /// form for ANY variant — pin it for all six via a single round-trip
+    /// assertion (quotes stripped).
+    #[test]
+    fn as_wire_str_matches_serde_form_for_every_variant() {
+        for variant in [
+            AgentStatus::Success,
+            AgentStatus::Failed,
+            AgentStatus::RateLimited,
+            AgentStatus::Unknown,
+            AgentStatus::ResourceKilled,
+            AgentStatus::AgentUnavailable,
+        ] {
+            let serde_form = serde_json::to_string(&variant).unwrap();
+            let stripped = serde_form.trim_matches('"');
+            assert_eq!(
+                variant.as_wire_str(),
+                stripped,
+                "as_wire_str() diverged from serde form for {variant:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn evaluate_layer2_exit_137_is_resource_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo_with_feature_commit(dir.path(), 20);
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(exit_code_path(dir.path(), 20), "137").unwrap();
+        let state = state_in(dir.path(), 20);
+
+        let result = evaluate_layer2(dir.path(), 20, &GitFlowConfig::default(), state.stage)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result.status, AgentStatus::ResourceKilled);
+        assert_eq!(result.exit_code, Some(137));
+    }
+
+    #[test]
+    fn evaluate_layer2_exit_127_is_agent_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo_with_feature_commit(dir.path(), 21);
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(exit_code_path(dir.path(), 21), "127").unwrap();
+        let state = state_in(dir.path(), 21);
+
+        let result = evaluate_layer2(dir.path(), 21, &GitFlowConfig::default(), state.stage)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result.status, AgentStatus::AgentUnavailable);
+        assert_eq!(result.exit_code, Some(127));
+    }
+
+    /// Unchanged-behavior guard: exit 0 with zero commits on a commit-gated
+    /// stage is still Failed (the pre-existing "no work done" branch, not
+    /// reclassified by the new 137/127 checks).
+    #[test]
+    fn evaluate_layer2_exit_0_zero_commits_still_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo_with_feature_no_commit(dir.path(), 22);
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(exit_code_path(dir.path(), 22), "0").unwrap();
+        let state = state_in(dir.path(), 22);
+
+        let result = evaluate_layer2(dir.path(), 22, &GitFlowConfig::default(), state.stage)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result.status, AgentStatus::Failed);
+    }
+
+    /// Unchanged-behavior guard: exit 1 is still Failed (not misclassified
+    /// as ResourceKilled/AgentUnavailable).
+    #[test]
+    fn evaluate_layer2_exit_1_still_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo_with_feature_commit(dir.path(), 23);
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(exit_code_path(dir.path(), 23), "1").unwrap();
+        let state = state_in(dir.path(), 23);
+
+        let result = evaluate_layer2(dir.path(), 23, &GitFlowConfig::default(), state.stage)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result.status, AgentStatus::Failed);
     }
 }

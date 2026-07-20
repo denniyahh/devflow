@@ -318,6 +318,33 @@ impl GitFlow {
         }
     }
 
+    /// Stage a single relative path and commit with the given message.
+    /// Mirrors `commit_all`, but scoped to one path, for hooks that must not
+    /// sweep in unrelated dirty state left by other hooks or the workflow.
+    /// Returns Ok(()) whether or not the path had changes to commit.
+    pub fn commit_path(&self, relative_path: &str, message: &str) -> Result<(), GitError> {
+        debug!("committing {relative_path}: {message}");
+        // `add` first so a brand-new file is known to git — a pathspec-only
+        // commit errors on a path git has never seen. The trailing pathspec is
+        // what actually scopes the commit: without it, `commit` writes whatever
+        // else is already in the index, which is exactly the sweep-in this
+        // function exists to prevent.
+        self.git(["add", relative_path])?;
+        // --allow-empty so we don't fail when the path had no changes.
+        match self.git_raw(&[
+            "commit",
+            "--allow-empty",
+            "-m",
+            message,
+            "--",
+            relative_path,
+        ]) {
+            Ok(()) => Ok(()),
+            Err(GitError::Command(ref msg)) if msg.contains("nothing to commit") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Return divergence from develop: (ahead, behind) commit counts.
     ///
     /// If currently on the develop branch, returns (0, 0).
@@ -624,6 +651,51 @@ mod tests {
             String::from_utf8_lossy(&obj_type.stdout).trim(),
             "commit",
             "tag() must stay lightweight even when tag.gpgsign=true"
+        );
+    }
+
+    #[test]
+    fn commit_path_stages_only_the_given_path_leaving_other_dirt_uncommitted() {
+        // The property that distinguishes commit_path from commit_all
+        // (17-12, Task 2b): a hook using commit_path must never sweep in
+        // unrelated dirty state.
+        let repo = init_repo();
+        let root = repo.path();
+        std::fs::write(root.join("CHANGELOG.md"), "# Changelog\n").unwrap();
+        std::fs::write(root.join("unrelated.txt"), "not part of this commit\n").unwrap();
+
+        // Stage the unrelated file BEFORE calling commit_path. An untracked
+        // file is excluded by any implementation and so proves nothing; an
+        // already-staged one is the real failure mode — a bare `git commit`
+        // writes the whole index and would sweep it in.
+        Command::new("git")
+            .args(["add", "unrelated.txt"])
+            .current_dir(root)
+            .status()
+            .unwrap();
+
+        flow(root)
+            .commit_path("CHANGELOG.md", "docs: add changelog entry")
+            .expect("commit_path");
+
+        let committed = Command::new("git")
+            .args(["log", "-1", "--name-only", "--pretty=format:"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        let committed_files = String::from_utf8_lossy(&committed.stdout);
+        assert!(committed_files.contains("CHANGELOG.md"));
+        assert!(!committed_files.contains("unrelated.txt"));
+
+        let status = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        let status = String::from_utf8_lossy(&status.stdout);
+        assert!(
+            status.contains("A  unrelated.txt"),
+            "unrelated.txt must remain staged-but-uncommitted, got: {status}"
         );
     }
 

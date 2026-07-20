@@ -2,30 +2,28 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
-status: Phase 17 spiked - terminal Ship reconciliation pending
-stopped_at: Phase 17 spike complete; reproduce terminal Ship sequence before planning repairs
-last_updated: "2026-07-18T00:00:00Z"
+status: "Phase 17 executed (13/13 plans, 15/15 must-haves) - validated at re-audit #10 (eda94cd): GAP-6/GAP-7 closed via 17-13 and RED-proven; GAP-8 (unsampled CLI wiring of GAP-7's fix) found and auto-filled; all 14 rows green, nyquist_compliant: true"
+stopped_at: Completed 17-13-PLAN.md
+last_updated: "2026-07-20T08:47:18.804Z"
 progress:
-  total_phases: 7
-  completed_phases: 5
-  total_plans: 34
-  completed_plans: 34
-  percent: 71
+  total_phases: 8
+  completed_phases: 6
+  total_plans: 47
+  completed_plans: 47
+  percent: 75
 ---
 
 # DevFlow — Project State
 
-> Last updated: 2026-07-18
+> Last updated: 2026-07-19
 
 ## Active
 
-- **Phase 17 (Spiked — next):** Pipeline Dogfood Follow-Up — reconcile the
-  Phase 16 terminal Ship event evidence and scope confirmed repairs before
-  further feature work.
 - **Phase 18 (Scoped):** Hermes Support — renumbered from 17 to 18
   (2026-07-18) to make room for Phase 17. HermesAgent adapter, skill-file
   rewrite, Hermes plugin. Depends on Phase 14's events.jsonl + Phase 13's
-  notify hook.
+  notify hook. Also carries 18d (doctor reconciliation) and 18e (WR-03 test
+  fix), deferred from Phase 17 on 2026-07-18.
 
 ## Completed
 
@@ -48,17 +46,42 @@ progress:
 | 14 | Parallel Safety + Observability | — | 2026-07-16 |
 | 15 | Dogfood Enablement + OSS Readiness | — | 2026-07-17 |
 | 16 | Pipeline Reliability Hardening | — | 2026-07-17 |
+| 17 | Pipeline Dogfood Follow-Up | — | 2026-07-19 |
 
 *Phases 8 and 10 shipped without a SUMMARY.md at the time; both were retroactively documented 2026-07-08 (see `8-SUMMARY.md`, `10-SUMMARY.md`) after reconstruction from git history. Phase 11 was reviewed and found already adequately closed out via `11-VALIDATION.md`/`11r-VALIDATION.md` (Nyquist-compliant, sign-off dated 2026-06-20) — no retroactive SUMMARY.md was needed.*
 
 ## Blockers
 
-None.
+None currently open for Phase 17.
+
+- **RESOLVED 2026-07-19 (17-09, `cb9359f`):**
+  `concurrent_ship_advances_finish_both_phases_independently` no longer hangs.
+  Mechanism (confirmed directly via temporary debug instrumentation, not just
+  inferred from timing): the test ships phases 31 and 32 concurrently, and on
+  a genuinely intermittent race (~33-40% of isolated runs, measured across
+  three independent audits plus this fix's own 25-run verification), both
+  `VersionBump` hooks compute the identical next version and race to create
+  the same tag (`cannot lock ref 'refs/tags/...'`); the loser's ship failure
+  reopens its Ship gate, and since the test only ever pre-wrote **one**
+  response per phase, the reopened gate previously polled forever with no
+  timeout. Fix: `DEVFLOW_GATE_TIMEOUT_SECS` is bounded to 2 seconds for this
+  test's poll only (under the file's `ENV_MUTEX` guard, restored
+  immediately after) — the 7-day production default is untouched. The test
+  now asserts either legitimate outcome deterministically (no collision:
+  both phases finish; collision: the loser's bounded timeout + intact,
+  still-gated state). 25 consecutive isolated runs under a 120s external
+  timeout: 0 hangs, 9 of which hit the race and resolved via the bounded
+  path. **The underlying product-level version-tag contention (why the
+  checkout lock occasionally doesn't fully serialize the two threads'
+  terminal hooks) remains open and out of scope** — belongs to future
+  ship/version-bump concurrency work, not Phase 17 or 18. See
+  `17-VALIDATION.md` GAP-2 and `17-09-SUMMARY.md`.
 
 ## Decisions
 
 | Date | Decision |
 |---|---|
+| 2026-07-18 | **Phase 17 scoped to four units; P5/P6 deferred to Phase 18:** source verification against final HEAD resolved decision-gate Q2 — `Unknown` auto-advance is not an edge case but an explicit design choice (`main.rs:854` classifies only `Failed \| RateLimited` as failure; `main.rs:871`'s comment states "Success (or Unknown — advance…)"). It is also broader than the retrospective recorded: `evaluate_layer3` (`agent_result.rs:610-620`) returns `Unknown` for the zero-commit "agent process gone, no commits" case too, so a vanished agent that did nothing advances Code→Validate. Two retrospective assumptions corrected: `devflow doctor` already exists but is project-blind (`_project_root` unused), and `RateLimited` is already typed — the missing outcomes are `resource_killed` (exit 137, absent workspace-wide) and `agent_unavailable`. Provenance has no foundation at all (no `build.rs`, no `vergen`; `workflow_started` carries only agent/mode/worktree). Phase 17 keeps 17a `Unknown` non-advance, 17b typed outcomes + retry policy, 17c preflight gate, 17d build provenance. Q4 answered: focused Phase 17 repair, **not** a Phase 16 remediation — only 17d traces to the proven Phase 16 defect; the rest is capability Phase 16 never claimed. Deferred to Phase 18 as 18d/18e: doctor reconciliation (forensic tooling, depends on 17b+17d) and the WR-03 test fix (test-only debt). Q3 (universal vs. adapter-specific preflight checks) remains open for discuss-phase. |
 | 2026-07-17 | **New Phase 16 (Pipeline Reliability Hardening) inserted, Hermes Support renumbered 16→17:** dogfooding Phase 15 through DevFlow itself surfaced real pipeline gaps — two Code-stage false positives on the crates.io publish plan (Layer-2 commit-count heuristic once, an incorrect agent self-report once) and four consecutive Ship-review failures on distinct legitimate findings (leaked telemetry, incomplete gitignore fix, CI job that couldn't fail loud, a doc/behavior mismatch) that a single-pass standard-depth reviewer caught one at a time instead of together. Dir renamed `16-hermes-support` → `17-hermes-support`; new `16-pipeline-reliability-hardening` (neither had plans yet). |
 | 2026-07-18 | **New Phase 17 (Pipeline Dogfood Follow-Up) inserted, Hermes Support renumbered 17→18:** Phase 16 execution evidence may show a failed Merge followed by VersionBump, BranchCleanup, and `workflow_finished`, contradicting the phase's fail-closed terminal contract. The Phase 17 spike captures this required final-HEAD reproduction plus outcome classification, preflight readiness, state/event reconciliation, and WR-03 test stabilization. Dir renamed `17-hermes-support` → `18-hermes-support`; Hermes remains scoped and blocked on the decision gate. |
 | 2026-07-16 | **Phase 15 rescoped dogfood-first:** operator priority is a fully functional MVP for dogfooding. The MVP engine is done (13 + 14); the remaining friction is operational: gate responses required hand-writing `.devflow/gates/NN-stage.response.json`, and no accurate operator reference exists. Phase 15 now leads with 15a Dogfood Enablement (`devflow gate` list/approve/reject, OPERATIONS.md, plus pulled-forward accuracy items: `.devflow.yaml` decoy removal, IN-01 lib.rs rustdoc, `--help` snapshot test); 15b OSS packaging follows and is to be executed through DevFlow itself as the first post-MVP dogfood run. Antigravity adapter (old 15c) deferred to unscheduled backlog — serves neither priority. Phase 14 was merged to develop (431c743) before this rescope. |
@@ -100,6 +123,17 @@ None.
 - [Phase 15]: 15-04: Sourced canonical Apache-2.0 body from an already-vendored copy in the local Cargo registry cache (byte-diffed) after an initial from-memory reconstruction was self-caught with garbled Section 8/9 text; kept dual license per plan's locked resolution
 - [Phase 16]: 16-01: absent feature branches are treated as already merged so terminal retries are safe after feature_finish deletes the branch
 - [Phase 16]: 16-01: merge_result telemetry separates actual merge effects from successful no-op hook execution
+- [Phase 17]: 17-01: typed-outcome taxonomy + fail-closed policy table — ResourceKilled/AgentUnavailable, as_wire_str(), outcome_policy::decide_action, State.infra_failures/MAX_INFRA_FAILURES
+- [Phase 17]: 17-02: first workspace build.rs — resolves git-common-dir via `git rev-parse --git-common-dir` from CARGO_MANIFEST_DIR (not a relative `.git/HEAD`) and emits absolute rerun-if-changed paths for HEAD/refs/packed-refs; DEVFLOW_BUILD_COMMIT/DIRTY/TIMESTAMP via cargo:rustc-env, degrading gracefully with no git
+- [Phase 17]: 17-03: evaluate_layer3 zero-commit/no-declaration reclassified Unknown->Failed (D-02/D-03 case 3, human review flag); commits-present stays Unknown for Plan 04's gate. evaluate_layer0 now runs every stage (not just Code) and returns affirmative Success when all approved declared probes pass even at zero commits; PLAN discovery now reads project_root while probe execution keeps execution_root (fixes a worktree PLAN-removed false veto pre-existing since 16-01).
+- [Phase 17]: 17-04: advance() dispatches exhaustively on outcome_policy::decide_action (Unknown/Failed/RateLimited/ResourceKilled/AgentUnavailable each gate/resume/abort, never silently advance); GateInfra path (handle_infra_outcome) bumps infra_failures on every stage incl. Validate/Ship, never consecutive_failures; new devflow resume --phase N relaunches saved state (no State::new/branch/worktree reset) as the safe rate-limit auto-resume target; advance_evaluated now emits decided_by_layer + AgentStatus::as_wire_str()
+- [Phase 17]: 17-05: preflight_interactivity_check scoped to AgentKind::Codex only (not every adapter) — a blanket check broke 3 passing start() integration tests since Claude/OpenCode complete Define headlessly; launch_stage signature changed to &mut State so run_preflight/enforce_build_staleness can drive run_gate
+- [Phase 17]: 17-06: infra_failures reset scoped to transition() (forward-stage-transition path) only, not gate-driven retry branches — MAX_INFRA_FAILURES bounds a stuck loop across forward progress, not every same-stage retry
+- [Phase 17]: 17-08: run_preflight returns Result<bool, CliError> to disambiguate 'preflight passed' from 'a resolved gate already relaunched everything' (CR-01 double-agent-spawn fix, GAP-1 closed, nyquist_compliant: true); regression tests inject a Cell<bool> FailOnceAdapter directly into run_preflight and stub PATH under ENV_MUTEX so a real, completing launch_stage never risks spawning a real agent CLI
+- [Phase 17]: 17-09: GAP-2 (concurrent_ship_advances_finish_both_phases_independently unbounded wedge) resolved test-level: DEVFLOW_GATE_TIMEOUT_SECS bounded to 2s under ENV_MUTEX for the reopened loser gate's poll only, 7-day production default untouched. RED reproduced the hang under 120s external timeout; debug instrumentation caught both phases computing the identical version tag ~1.8ms apart, proving the checkout lock occasionally fails to fully serialize the two threads' terminal hooks -- recorded as an explicit OUT-OF-SCOPE product-level version-tag contention question for future ship/version-bump concurrency work, not fixed here. 25 consecutive isolated runs: 0 hangs, 9 hit the race and resolved via the bounded path.
+- [Phase 17]: 17-11: CR-02 resolved -- build.rs always reruns via an unfingerprintable sentinel, DEVFLOW_BUILD_TIMESTAMP removed entirely, staleness's second signal replaced by a (build_dirty, tree_has_modified_build_inputs) decision table (Stale when built clean and now dirty; Indeterminate, never blocking, when built dirty and still dirty)
+- [Phase 17]: 17-12: WR-04 resolved -- ChangelogAppend reordered strictly after VersionBump in hooks_after_ship() (removed from the Validate->Ship transition), reads version::read_version (new, git-free) instead of compute_version to avoid deriving a version one higher than the tag VersionBump just cut, and commits its own write via a new GitFlow::commit_path; version_bump had the identical uncommitted-write defect on its own version-file write and is fixed the same way
+- [Phase 17]: 17-13: GAP-6/GAP-7 closed via write_version remainder-preservation fix and HookContext.shipped_version threading; row 12 restored to green
 
 ## Roadmap Evolution
 
@@ -138,9 +172,20 @@ None.
 | Phase 16 P05 | 8min | 2 tasks | 14 files |
 | Phase 16 P06 | 3min | 2 tasks | 2 files |
 | Phase 16 P07 | 4min | 2 tasks | 7 files |
+| Phase 17 P01 | 15min | 2 tasks | 6 files |
+| Phase 17 P02 | 2min | 2 tasks | 2 files |
+| Phase 17-pipeline-dogfood-followup P03 | 5min | 2 tasks | 1 files |
+| Phase 17-pipeline-dogfood-followup P04 | 25min | 2 tasks | 4 files |
+| Phase 17-pipeline-dogfood-followup P05 | 45min | 2 tasks | 2 files |
+| Phase 17-pipeline-dogfood-followup P06 | 25min | 3 tasks | 5 files |
+| Phase 17-pipeline-dogfood-followup P08 | 20min | 3 tasks | 3 files |
+| Phase 17-pipeline-dogfood-followup P09 | 50min | 2 tasks | 2 files |
+| Phase 17-pipeline-dogfood-followup P11 | 40min | 3 tasks | 4 files |
+| Phase 17-pipeline-dogfood-followup P12 | 20min | 3 tasks | 5 files |
+| Phase 17-pipeline-dogfood-followup P13 | 15min | 3 tasks | 4 files |
 
 ## Session
 
-**Last session:** 2026-07-18T02:02:52.975Z
-**Stopped at:** Phase 16 complete; ready for Phase 17
+**Last session:** 2026-07-20T08:47:18.782Z
+**Stopped at:** Completed 17-13-PLAN.md
 **Resume file:** None

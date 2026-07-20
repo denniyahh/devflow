@@ -153,6 +153,46 @@ pub fn compute_version(project_root: &Path) -> Result<Version, VersionError> {
     })
 }
 
+/// Read the full [`Version`] (major/minor/patch) out of whatever version file
+/// `detect_version_file` resolves, mirroring [`write_version`]'s format
+/// handling (including `[workspace.package]`).
+///
+/// Unlike [`compute_version`], this never touches git — it reports exactly
+/// what was last written to the version file, not a freshly recomputed
+/// minor/patch. Callers that need the version a prior [`write_version`] call
+/// actually wrote (e.g. after a tag was just cut) must use this instead of
+/// `compute_version`, which would see the new tag and return a different,
+/// larger version.
+pub fn read_version(project_root: &Path) -> Result<Version, VersionError> {
+    let path = detect_version_file(project_root)
+        .ok_or_else(|| VersionError::Parse("no version file found".into()))?;
+    let contents = std::fs::read_to_string(&path)?;
+    let field = field_for(&path, &contents);
+    let version_str = find_version_in_contents(&contents, field)
+        .ok_or_else(|| VersionError::Parse(format!("field `{field}` not found in {path:?}")))?;
+    parse_version_str(&version_str)
+}
+
+/// Parse a `MAJOR.MINOR.PATCH` string (optionally followed by `-`/`+`
+/// metadata) into a [`Version`].
+fn parse_version_str(version: &str) -> Result<Version, VersionError> {
+    let mut parts = version.split(['.', '+', '-']);
+    let mut next =
+        |label: &str| -> Result<u32, VersionError> {
+            parts.next().unwrap_or("0").parse::<u32>().map_err(|err| {
+                VersionError::Parse(format!("invalid {label} in `{version}`: {err}"))
+            })
+        };
+    let major = next("major")?;
+    let minor = next("minor")?;
+    let patch = next("patch")?;
+    Ok(Version {
+        major,
+        minor,
+        patch,
+    })
+}
+
 /// Write `version` into the project's auto-detected version file.
 pub fn write_version(project_root: &Path, version: &Version) -> Result<PathBuf, VersionError> {
     let path = detect_version_file(project_root)
@@ -230,12 +270,31 @@ fn replace_version_in_contents(contents: &str, field: &str, new_version: &str) -
             let left_key = left.trim().trim_matches('"').trim_matches('\'');
             if left_key == key && !value.trim().starts_with('{') {
                 let separator: &str = if trimmed.contains('=') { " = " } else { ": " };
-                let quote_char: &str = if value.trim().starts_with('\'') {
+                let trimmed_value = value.trim();
+                let needs_quote = trimmed_value.starts_with('"') || trimmed_value.starts_with('\'');
+                let quote_char: &str = if trimmed_value.starts_with('\'') {
                     "'"
                 } else {
                     "\""
                 };
-                let needs_quote = value.trim().starts_with('"') || value.trim().starts_with('\'');
+                // Capture whatever follows the version token itself (a
+                // trailing `,` in JSON, a trailing `# comment` in TOML) so it
+                // survives the rewrite instead of being silently dropped
+                // (GAP-6).
+                let remainder = if needs_quote {
+                    // Token ends at the closing quote; skip the opening
+                    // quote and scan for the matching close.
+                    trimmed_value[1..]
+                        .find(quote_char)
+                        .map(|end| &trimmed_value[end + 2..])
+                        .unwrap_or("")
+                } else {
+                    // Unquoted: token ends at the first whitespace, `,`, or `#`.
+                    let end = trimmed_value
+                        .find([' ', '\t', ',', '#'])
+                        .unwrap_or(trimmed_value.len());
+                    &trimmed_value[end..]
+                };
                 output.push_str(left.trim_end());
                 output.push_str(separator);
                 if needs_quote {
@@ -245,6 +304,7 @@ fn replace_version_in_contents(contents: &str, field: &str, new_version: &str) -
                 } else {
                     output.push_str(new_version);
                 }
+                output.push_str(remainder.trim_end());
                 output.push('\n');
                 changed = true;
                 continue;
@@ -446,5 +506,187 @@ mod tests {
             ),
             Err(VersionError::Parse(_))
         ));
+    }
+
+    #[test]
+    fn read_version_round_trips_through_write_version_in_plain_cargo_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let written = Version {
+            major: 2,
+            minor: 3,
+            patch: 4,
+        };
+        write_version(dir.path(), &written).unwrap();
+        assert_eq!(read_version(dir.path()).unwrap(), written);
+    }
+
+    #[test]
+    fn read_version_round_trips_through_write_version_in_workspace_cargo_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace.package]\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        let written = Version {
+            major: 5,
+            minor: 6,
+            patch: 7,
+        };
+        write_version(dir.path(), &written).unwrap();
+        assert_eq!(read_version(dir.path()).unwrap(), written);
+    }
+
+    #[test]
+    fn read_version_round_trips_through_write_version_in_package_json() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            "{\n  \"version\": \"0.1.0\"\n}\n",
+        )
+        .unwrap();
+        let written = Version {
+            major: 1,
+            minor: 9,
+            patch: 12,
+        };
+        write_version(dir.path(), &written).unwrap();
+        assert_eq!(read_version(dir.path()).unwrap(), written);
+    }
+
+    #[test]
+    fn read_version_errors_without_version_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            read_version(dir.path()),
+            Err(VersionError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn write_version_preserves_trailing_comma_in_package_json() {
+        // GAP-6: replace_version_in_contents reassembles the matched line as
+        // `left.trim_end() + separator + quoted_version + '\n'`, discarding
+        // everything in `value` after the version token. For a real
+        // package.json where `version` is not the last key, that eats the
+        // mandatory trailing comma and produces invalid JSON. Parsing is the
+        // assertion that matters here — a substring check would be a
+        // vacuous fixture that can't reach this defect.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            "{\n  \"name\": \"x\",\n  \"version\": \"0.1.0\",\n  \"private\": true\n}\n",
+        )
+        .unwrap();
+        write_version(
+            dir.path(),
+            &Version {
+                major: 2,
+                minor: 3,
+                patch: 4,
+            },
+        )
+        .unwrap();
+        let contents = std::fs::read_to_string(dir.path().join("package.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap_or_else(|err| {
+            panic!("package.json no longer parses as JSON: {err}\n{contents}")
+        });
+        assert_eq!(parsed["name"], "x");
+        assert_eq!(parsed["private"], true);
+        assert_eq!(parsed["version"], "2.3.4");
+    }
+
+    #[test]
+    fn write_version_preserves_trailing_comment_in_toml() {
+        // GAP-6, TOML variant: a trailing `# comment` after the quoted
+        // version is discarded by the same line-reassembly defect.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nversion = \"0.1.0\"  # pinned\n",
+        )
+        .unwrap();
+        write_version(
+            dir.path(),
+            &Version {
+                major: 2,
+                minor: 3,
+                patch: 4,
+            },
+        )
+        .unwrap();
+        let contents = std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
+        assert!(
+            contents.contains("version = \"2.3.4\"  # pinned"),
+            "expected trailing comment to survive, got: {contents}"
+        );
+    }
+
+    #[test]
+    fn write_version_preserves_trailing_comment_in_single_quoted_toml() {
+        // GAP-6, TOML literal-string variant (17-13 review IN-03): the
+        // remainder scan keys off the OPENING quote character, so the
+        // single-quote branch is a distinct path from the double-quote case
+        // above and needs its own fixture.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nversion = '0.1.0'  # pinned\n",
+        )
+        .unwrap();
+        write_version(
+            dir.path(),
+            &Version {
+                major: 2,
+                minor: 3,
+                patch: 4,
+            },
+        )
+        .unwrap();
+        let contents = std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
+        assert!(
+            contents.contains("version = '2.3.4'  # pinned"),
+            "expected single-quoted value and trailing comment to survive, got: {contents}"
+        );
+    }
+
+    #[test]
+    fn read_version_does_not_recompute_from_git_tags() {
+        // read_version must report exactly what's on disk, not a freshly
+        // computed minor/patch — this is the property VersionBump/
+        // ChangelogAppend ordering depends on (version.rs must never see a
+        // tag VersionBump just created and derive a different number).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        std::fs::write(root.join("Cargo.toml"), "[package]\nversion = \"2.0.0\"\n").unwrap();
+        commit(root, "a.txt");
+        write_version(
+            root,
+            &Version {
+                major: 2,
+                minor: 0,
+                patch: 0,
+            },
+        )
+        .unwrap();
+        git(root, &["tag", "v2.0.0"]);
+        commit(root, "b.txt");
+        commit(root, "c.txt");
+        // compute_version would see 1 tag + 2 commits since => 2.1.2.
+        // read_version must still report exactly what's on disk: 2.0.0.
+        assert_eq!(
+            read_version(root).unwrap(),
+            Version {
+                major: 2,
+                minor: 0,
+                patch: 0
+            }
+        );
     }
 }

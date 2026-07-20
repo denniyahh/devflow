@@ -11,7 +11,7 @@
 | 14 | Parallel Safety + Observability | Complete |
 | 15 | Dogfood Enablement + OSS Readiness | Complete |
 | 16 | Pipeline Reliability Hardening | Complete    |
-| 17 | Pipeline Dogfood Follow-Up | Spiked |
+| 17 | Pipeline Dogfood Follow-Up | In Progress|
 | 18 | Hermes Support | Scoped |
 
 ## Shipped
@@ -40,6 +40,11 @@
 - **Phase 13 repurposed as MVP Core Loop** — priority is getting Define→Plan→Code→Validate→Ship working end-to-end unattended (Claude + Codex, gates via notify hook) so DevFlow can be dogfooded on real projects again. Claims the previously unclaimed `ship.rs` GSD-native rewrite; absorbs the reliability items from old Phase 14 (verdict-vs-ran, native envelope parsing, WR-11, notify hook, gate timeout, worktree default).
 - **Phase 14 rescoped to Observability + Hermes Support** — residual `devflow logs`/`events.jsonl`/`status` work plus the previously unclaimed `capture_agent_output()` sync-path decision (now claimed there). Hermes work (agent adapter, skill-file rewrite, plugin) moved in from Phase 15 (2026-07-14) — the plugin's gate watcher consumes this phase's `events.jsonl`, so they ship together.
 - **Phase 15 (was 13)** — OSS readiness (docs, dev container, contributing, Antigravity adapter) plus the actual crates.io publish. Hermes items moved out to Phase 14.
+
+## Phase 17 scoping (2026-07-18)
+
+- **Phase 17 narrowed to four units** after source verification resolved the spike's decision gate: `Unknown` non-advance (17a), typed outcomes + retry policy (17b), preflight readiness gate (17c), build provenance (17d). Scoped as a focused repair phase rather than a Phase 16 remediation — only 17d traces to the proven Phase 16 defect.
+- **Phase 18 gains 18d/18e** — `devflow doctor` state/event reconciliation and the WR-03 transient-capture test fix moved out of 17. 18d depends on 17b + 17d. See the 2026-07-18 decision entry in STATE.md.
 
 ## Phase 14 split (2026-07-16)
 
@@ -169,27 +174,106 @@ Plans:
 
 ### Phase 17: Pipeline Dogfood Follow-Up
 
-**Goal:** Reconcile the Phase 16 dogfood event stream with the claimed
-fail-closed terminal Ship invariant, then scope any confirmed repair alongside
-typed agent-outcome handling, preflight readiness, state/event reconciliation,
-and the existing transient-capture test fix. This phase is a spike until the
-final-HEAD reproduction distinguishes a real defect from stale telemetry.
-**Requirements:** Spike decision gate in `17-DOGFOOD-RETROSPECTIVE.md`
+**Goal:** Close the pipeline-reliability holes the Phase 16 dogfood exposed —
+`Unknown` completion must never auto-advance a stage (17a), typed agent
+outcomes with a deterministic retry policy (17b), a preflight readiness gate
+that fails before agent time is consumed (17c), and build provenance in
+`workflow_started` so a stale self-dogfood binary is detectable (17d). The
+terminal-Ship alarm was traced to a stale executable, not a live regression;
+state/event reconciliation and the WR-03 test fix were deferred to Phase 18 on
+2026-07-18.
+**Requirements:** P1–P4 in `17-DOGFOOD-RETROSPECTIVE.md`; acceptance criteria
+2, 3, 4 (criterion 1 is already covered by Phase 16's regression test — verify
+against final HEAD rather than re-plan). AC-4 is narrowed to the
+plan-interactivity and Ship-scoped `gh auth` checks only — the
+security-artifact and reviewer-set sub-checks are deferred to Phase 18's
+Hermes adapter, an accepted override recorded in
+`17-VERIFICATION.md`'s frontmatter (`overrides:`).
 **Depends on:** Phase 16
 **Blocks:** Phase 18 Hermes Support
-**Plans:** 0 plans
+**Plans:** 13/13 plans executed
 
 Plans:
 
-- [ ] TBD (reproduce the terminal sequence, then run `/gsd-plan-phase 17`)
+- [x] 17-13-PLAN.md
+
+- [x] 17-12-PLAN.md
+
+- [x] 17-10-PLAN.md
+- [x] 17-11-PLAN.md
+
+- [x] 17-09-PLAN.md
+
+- [x] 17-07-PLAN.md
+- [x] 17-08-PLAN.md
+
+- [x] 17-06-PLAN.md
+
+**Wave 1** *(devflow-core foundations + build script, no shared files)*
+
+- [x] 17-01-PLAN.md — 17b: typed outcome taxonomy (ResourceKilled/AgentUnavailable), Layer 2 exit-code classification, pure exhaustive outcome→action policy module, separate infra-failure counter
+- [x] 17-02-PLAN.md — 17d: first workspace build.rs embedding git provenance (commit/dirty) with graceful no-git degradation *(the build timestamp originally planned here was removed by 17-11 closing CR-02: a per-second value forced a devflow-cli recompile on every build once build.rs always re-runs)*
+
+**Wave 2** *(blocked on 17-01: shares agent_result.rs)*
+
+- [x] 17-03-PLAN.md — 17a: Layer 0 runs every stage + vouches for a passing approved probe (D-05); Layer 3 zero-commit/no-declaration → fail-closed (D-02/D-03)
+
+**Wave 3** *(blocked on 17-01/17-03: rewrites advance() dispatch)*
+
+- [x] 17-04-PLAN.md — 17a/17b: exhaustive decide_action dispatch (Unknown never advances), primary-loop rate-limit auto-resume, infra-counter gating, structured advance_evaluated evidence
+
+**Wave 4** *(blocked on 17-02/17-04: shares main.rs)*
+
+- [x] 17-05-PLAN.md — 17c/17d: scoped preflight readiness gate (adapter hook + generic checks) and workflow_started build provenance + self-dogfood staleness block
 
 ### Phase 18: Hermes Support
 
 **Goal:** First-class Hermes support — `HermesAgent` adapter with native-envelope completion parsing (18a), rewrite of the stale `skills/hermes/devflow/SKILL.md` against current CLI behavior (18b), and the Hermes plugin session mode with an events.jsonl-driven gate watcher (18c). Split out of Phase 14 on 2026-07-16 so personal-infrastructure work doesn't gate parallel-safety correctness or OSS readiness. Renumbered from 17 to 18 on 2026-07-18 to make room for Phase 17's dogfood follow-up.
-**Requirements**: TBD (see CONTEXT.md)
-**Depends on:** Phase 14 (consumes `events.jsonl` + the Phase 13 notify hook)
+
+Also carries two items deferred from Phase 17 on 2026-07-18 (18d, 18e). These are pipeline-reliability work, not Hermes work — they landed here to keep Phase 17 focused on invariant correctness:
+
+- **18d — project-aware `devflow doctor` reconciliation:** `doctor()` currently takes `_project_root` unused (`main.rs:2454`) and only checks external tools/PATH. Extend it to diff state vs. events vs. live PIDs vs. gates vs. branch ancestry and report a repair plan, mutating nothing by default. Consumes Phase 17's typed outcomes (17b) and provenance (17d) — sequence after them. Retrospective acceptance criterion 5.
+- **18e — WR-03 test stabilization:** `parallel_creates_two_worktrees_and_spawns_two_monitors` (`crates/devflow-cli/tests/phase7_cli.rs:184-200`) waits for live stdout captures, runs unrelated assertions, then re-asserts the same paths — a fast monitor can archive between the two. Fix by asserting the capture immediately or accepting its retained-history generation. Recorded as non-blocking debt in `16-REVIEW.md`. (Distinct from `13-REVIEW.md`'s WR-03 in `git.rs:286` — the review numbering namespaces collide.)
+
+**Requirements**: TBD (see CONTEXT.md) + 18d, 18e (deferred Phase 17 P5/P6)
+**Depends on:** Phase 14 (consumes `events.jsonl` + the Phase 13 notify hook); Phase 17 for 18d
 **Plans:** 0 plans
 
 Plans:
 
 - [ ] TBD (run /gsd-plan-phase 18 to break down)
+
+### Phase 19: Operator Observability + Pipeline Self-Consistency
+
+**Goal:** Make DevFlow's own supervision layer trustworthy and usable from a plain terminal. Every item below was found by dogfooding Phase 17 end-to-end on 2026-07-18/19; none is speculative, and each carries reproduction evidence in `.planning/OPERATOR-OBSERVABILITY-FINDINGS.md` or `17-REVIEW.md`.
+
+Sequence after Phase 18 — 18d (`devflow doctor` reconciliation) overlaps 19a and should land first so 19a extends it rather than duplicating it.
+
+- **19a — monitor liveness is unobservable ("who watches the watcher"):** `monitor_pid` is emitted to `events.jsonl` but never persisted to `State` and never liveness-checked. `devflow status` probes only `agent_pid`, so a dead monitor renders identically to a healthy between-stages moment. Two silent monitor deaths in the Phase 17 run cost ~4h; both were found only via `ps`. Persist `monitor_pid`, probe it, and make "stuck — needs `devflow resume`" a representable state.
+- **19b — a phase tracks exactly one process:** one `phase-N-agent-pid` file per phase leaves the monitor unrecorded and `sequentagent`'s second agent homeless. Frame as two tracked processes per phase, not a general multi-agent table. Orphaned strays (a live test-fixture agent under `/tmp`) are invisible to every devflow command.
+- **19c — the CLI assumes a reader who will parse JSONL:** gate reasons truncate to `[truncated; full output in .devflow/]` with no `devflow gate show`; rate-limit reset times exist only inside raw agent JSON; `status` reports the stage but nothing about progress inside it; recovery verbs (`advance`, `resume`) are undiscoverable from a stuck state.
+- **19d — staleness is evaluated against the wrong tree:** `enforce_build_staleness` compares the binary's embedded commit to `project_root`'s HEAD. For a worktree-based phase the code under test lives on the worktree branch, so a binary two hours behind that branch classifies as `Ahead` (warn) because it is a descendant of `develop`. This is the root cause of Round 4 CR-01: a stale binary silently ran the pre-17-12 hook batch and re-emitted a false changelog heading. Evaluate against the worktree HEAD when the phase has one, and **block** (not warn) a self-dogfood binary that is behind it.
+
+  This item is the enforcement mechanism for a standing dogfood rule: when a live bug is fixed mid-run and the pipeline is sent back to re-validate, the binary MUST be rebuilt and reinstalled at `<project_root>/target/debug/devflow` before resuming. The monitor resolves its binary via `current_exe()` at spawn and its wrapper hardcodes the primary path, so running a worktree binary directly does not propagate to spawned monitors, and `cargo run` from the primary checkout silently reinstalls a pre-fix build. Until 19d ships this rule is manual; after 19d the gate enforces it.
+
+- **19e — `write_version` corrupts `package.json`:** `replace_version_in_contents` drops the trailing comma, producing invalid committed JSON (Round 4 CR-02). Pre-existing; unrelated to Phase 17's changes.
+- **19f — `hooks_after_ship()` desyncs the changelog from the tag with no version file:** `version_bump` takes its `else` branch ("no supported version file; tagging only") and still tags `v{compute_version()}`, while `changelog_append` calls `read_version`, errors, and falls back to the literal `"unreleased"` (Round 4 CR-03). A gap in 17-12's design: it assumed `version_bump` always writes a version file.
+- **19g — the Code↔Validate loop can never reach its own safety gate:** `transition()` unconditionally resets `consecutive_failures`, so the counter oscillates 0↔1 and `MAX_CONSECUTIVE_FAILURES = 3` is unreachable for the exact loop it bounds. Observed live across three cycles. Under `--mode auto` this loops indefinitely while `status` shows a healthy alternating pipeline. Note 17-06 added the `infra_failures` reset to the same function, which likely inherits the weakness.
+- **19h — version-tag contention on concurrent ship:** two phases compute the same next version and race to create one tag; 17-09 bounded the *test* but deliberately left the product race open. Proven real — instrumentation caught both phases inside `version_bump` with identical computed versions ~1.8ms apart.
+- **19i — RESOLVED (`96411eb`) — a third flake class (PATH race):** `transition_resets_infra_failures` pointed `PATH` at an empty directory to hide agent CLIs from `launch_stage`, but `set_var` mutates the whole process, so it raced every other unguarded git-spawning test in the same run. Hit 2/2 in CI on the v1.4.0 release PR (identical commit, `push` + `pull_request` duplicate runs) after passing locally most of the time — CI's shared/throttled runners appear to widen the race window relative to a dedicated workstation. Root-caused and fixed: `agent_free_git_only_path_dir()` curates a PATH containing only a `git` symlink instead of nothing, preserving the no-agent-binary guarantee while leaving `git` resolvable for concurrent tests. Verified 8/8 clean isolated runs (vs 2/2 CI failures before) plus full workspace suite, clippy, fmt. Distinct from GAP-2's gate-poll hang, which remains open per 19h.
+- **19j — `ChangelogAppend` writes placeholder content:** every generated entry is "Released phase via DevFlow", describing nothing about the phase. Repeatedly noted and deliberately deferred across 17-10 and 17-12.
+
+- **19k — Layer 0 short-circuit makes Validate unpassable when `external_verify` is declared:** 17-03 removed `evaluate_layer0`'s `stage != Code` guard and added an affirmative-success arm returning `verdict: None` (`agent_result.rs:784-796`). `evaluate_agent_result_inner` returns immediately, so Layer 1 — the only carrier of a verdict — is never read, and `advance()` computes `passed = false` at Validate (`main.rs:1354-1361`). Reproduced: an agent's explicit `verdict: pass` is discarded. Auto mode then loops Code↔Validate **unbounded**, because 19g's counter reset defeats `MAX_CONSECUTIVE_FAILURES`. Masked today only because no PLAN in this repo declares `external_verify` (`config::external_verify_enabled` defaults to `true`, so only the PLAN declaration is opt-in), and both existing Layer 0 cascade tests assert `status`/`decided_by_layer`/`commits` but never `verdict`, and never at `Stage::Validate`. Fix: defer to Layer 1 at Validate, or set `verdict: Some(Pass)` on the affirmative arm; pin `verdict` at Validate in a cascade test. **Regression introduced by this phase's own 17-03.**
+
+  **Decision (2026-07-20, operator):** gate only when ambiguous, not on every declared `external_verify`. Advance automatically when the probe passes AND the agent's `DEVFLOW_RESULT` carries `verdict: pass` — two independent signals agreeing. Gate for a human when they disagree, or when the probe passes but no verdict arrived at all. Rejected: always gating on any declared `external_verify` (correct but removes unattended operation for the exact PLANs that declared a probe *in order to* run unattended).
+- **19l — approving a preflight gate re-runs the identical failing check and wedges for 7 days:** in `run_preflight` (`main.rs:796-828`), both `GateAction::Advance` and `LoopBack` call `launch_stage` again, which re-runs `run_preflight`. Both production checks are deterministic, idempotent predicates a gate approval cannot change (`preflight_interactivity_check`, `preflight_gh_auth_check`). `Gates::cleanup` deletes the operator's response first, so the second identical failure writes a new gate and polls `gate_timeout_secs()` — 7 days — then returns an error leaving `gate_pending: true` persisted. The codebase already documents the wedge in `FailOnceAdapter`'s doc comment, and the two passing recursion tests only pass because that fixture returns `Ok(())` on its second call; no test drives an idempotently-failing check. Distinct from the double-launch bug 17-08 fixed. Fix: thread a "preflight already adjudicated" flag through `launch_stage`, or treat Advance on a preflight gate as an explicit skip; at minimum bound the recursion so a second identical failure aborts rather than re-polling.
+
+  **Decision (2026-07-20, operator):** confirmed the failure scenario is exactly "human approves proceeding anyway, and the check re-runs and fails identically." Resolution: treat `GateAction::Advance` on a preflight gate as an explicit override that SKIPS `run_preflight` entirely — the check has already been adjudicated by the human. `GateAction::LoopBack` keeps re-running the check, since that path means "I will fix it, then retry" and the state may genuinely have changed. Bound the recursion regardless as a backstop.
+
+**Requirements**: 19a–19l (all dogfood-sourced)
+**Depends on:** Phase 18 (18d overlaps 19a)
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (run /gsd-plan-phase 19 to break down)

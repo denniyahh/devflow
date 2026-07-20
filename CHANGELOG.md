@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.4.0 — 2026-07-20
+
+Pipeline reliability: a completion cascade that cannot silently advance, build
+provenance the binary can prove, and pre-launch readiness gates. Phase 17.
+
+### Added
+- Typed agent outcomes `ResourceKilled` (exit 137) and `AgentUnavailable` (exit 127), classified in Layer 2 alongside a `decided_by_layer` field recording which layer reached the verdict
+- `outcome_policy::decide_action` — a pure, exhaustively-matched outcome-to-action function, so the never-advance guarantee is enforced by the compiler rather than by convention
+- `devflow resume --phase N` — relaunches a phase from its saved stage after a rate limit or infrastructure pause, without resetting the workflow to Define or recreating the branch
+- Build provenance: the binary embeds the commit it was built from and whether that tree was dirty, degrading gracefully when git metadata is unavailable
+- Self-dogfood staleness gate — refuses to drive DevFlow's own workspace from a stale build, the Phase 16 false-evidence incident class
+- Preflight readiness checks before every stage launch (plan interactivity, credential validity), reported as a named gate rather than a hard exit
+- Separate infrastructure-failure counter, so transient rate limits and OOM kills no longer consume the functional-failure budget that gates a genuinely broken phase
+
+### Changed
+- `advance()` dispatches on an exhaustive match over typed outcomes instead of a two-value boolean; an `Unknown` outcome can no longer advance a stage
+- Layer 3 splits the former blanket `Unknown`: a vanished process with zero commits and no declaration is now a `Failed` outcome that notifies a human, while commits-exist remains `Unknown` and stays gated
+- Layer 0 runs for every stage and treats an approved, all-passing external post-condition as affirmative success, without relaxing the approval-mismatch security property
+- Rate-limited outcomes route to the auto-resume machinery instead of being counted as functional failures
+- `ChangelogAppend` moved after `VersionBump` and now commits its own write, so a changelog heading can never outlive the tag it claims
+- Stage-advance events carry a structured evidence record in place of `reason: null`
+
+### Fixed
+- `write_version` no longer drops a trailing comma when rewriting `package.json`, which produced invalid committed JSON
+- The release changelog and the git tag can no longer disagree: the shipped version is threaded through the hook context rather than recomputed after tagging
+- Build-staleness checks ignore files that cannot affect a compiled binary, so a modified changelog or planning document no longer reports the binary as stale
+- A build made from a commit ahead of the checkout is classified as ahead rather than stale
+- The concurrent-ship test can no longer wedge the suite indefinitely on an unbounded gate poll
+
 ## 1.3.69 — 2026-07-18
 
 - Released phase via DevFlow.

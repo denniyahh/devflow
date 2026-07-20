@@ -4,6 +4,7 @@ Usage: devflow <COMMAND>
 
 Commands:
   start         Begin the workflow for a phase: Define → Plan → Code → Validate → Ship
+  resume        Resume a phase from its saved stage after a rate limit or infrastructure pause
   gate          Inspect and answer human gates (the pause points where the workflow waits for approval)
   logs          Print or follow an agent's captured output for a phase
   history       Show a phase's chronological events and retained attempt evidence
