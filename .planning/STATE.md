@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
 status: "Phase 17 complete (15/15) - CR-01 resolved via 17-08, GAP-2 (test-level) resolved via 17-09, nyquist_compliant: true"
-stopped_at: Completed 17-12-PLAN.md
-last_updated: "2026-07-20T08:21:04.769Z"
+stopped_at: Completed 17-13-PLAN.md
+last_updated: "2026-07-20T08:47:18.804Z"
 progress:
   total_phases: 8
   completed_phases: 6
-  total_plans: 46
-  completed_plans: 46
+  total_plans: 47
+  completed_plans: 47
   percent: 75
 ---
 
@@ -133,6 +133,7 @@ None currently open for Phase 17.
 - [Phase 17]: 17-09: GAP-2 (concurrent_ship_advances_finish_both_phases_independently unbounded wedge) resolved test-level: DEVFLOW_GATE_TIMEOUT_SECS bounded to 2s under ENV_MUTEX for the reopened loser gate's poll only, 7-day production default untouched. RED reproduced the hang under 120s external timeout; debug instrumentation caught both phases computing the identical version tag ~1.8ms apart, proving the checkout lock occasionally fails to fully serialize the two threads' terminal hooks -- recorded as an explicit OUT-OF-SCOPE product-level version-tag contention question for future ship/version-bump concurrency work, not fixed here. 25 consecutive isolated runs: 0 hangs, 9 hit the race and resolved via the bounded path.
 - [Phase 17]: 17-11: CR-02 resolved -- build.rs always reruns via an unfingerprintable sentinel, DEVFLOW_BUILD_TIMESTAMP removed entirely, staleness's second signal replaced by a (build_dirty, tree_has_modified_build_inputs) decision table (Stale when built clean and now dirty; Indeterminate, never blocking, when built dirty and still dirty)
 - [Phase 17]: 17-12: WR-04 resolved -- ChangelogAppend reordered strictly after VersionBump in hooks_after_ship() (removed from the Validate->Ship transition), reads version::read_version (new, git-free) instead of compute_version to avoid deriving a version one higher than the tag VersionBump just cut, and commits its own write via a new GitFlow::commit_path; version_bump had the identical uncommitted-write defect on its own version-file write and is fixed the same way
+- [Phase 17]: 17-13: GAP-6/GAP-7 closed via write_version remainder-preservation fix and HookContext.shipped_version threading; row 12 restored to green
 
 ## Roadmap Evolution
 
@@ -181,9 +182,10 @@ None currently open for Phase 17.
 | Phase 17-pipeline-dogfood-followup P09 | 50min | 2 tasks | 2 files |
 | Phase 17-pipeline-dogfood-followup P11 | 40min | 3 tasks | 4 files |
 | Phase 17-pipeline-dogfood-followup P12 | 20min | 3 tasks | 5 files |
+| Phase 17-pipeline-dogfood-followup P13 | 15min | 3 tasks | 4 files |
 
 ## Session
 
-**Last session:** 2026-07-19T22:41:31.251Z
-**Stopped at:** Completed 17-12-PLAN.md
+**Last session:** 2026-07-20T08:47:18.782Z
+**Stopped at:** Completed 17-13-PLAN.md
 **Resume file:** None
