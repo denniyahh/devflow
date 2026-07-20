@@ -41,6 +41,12 @@ pub struct HookContext {
     pub stage: Stage,
     /// Git-flow branch model.
     pub git_flow: GitFlowConfig,
+    /// The version `VersionBump` actually tagged, set once it runs (GAP-7).
+    /// `ChangelogAppend` reads this instead of re-deriving the version from
+    /// disk, so the changelog heading and the git tag never desync — in
+    /// particular when there is no version file and `version::read_version`
+    /// would otherwise error and fall back to the `unreleased` literal.
+    pub shipped_version: Option<String>,
 }
 
 /// Errors produced by hooks.
@@ -59,7 +65,7 @@ pub enum HookError {
 
 impl Hook {
     /// Run this hook against the given context.
-    pub fn run(&self, ctx: &HookContext) -> Result<(), HookError> {
+    pub fn run(&self, ctx: &mut HookContext) -> Result<(), HookError> {
         match self {
             Hook::BranchCreate => branch_create(ctx),
             Hook::BranchCleanup => branch_cleanup(ctx),
@@ -187,15 +193,20 @@ fn docs_update(ctx: &HookContext) -> Result<(), HookError> {
     Ok(())
 }
 
-fn changelog_append(ctx: &HookContext) -> Result<(), HookError> {
-    // Read back the version VersionBump (which runs immediately before this
-    // hook in hooks_after_ship()) actually wrote and tagged. Deliberately
-    // NOT version::compute_version — that recomputes MINOR from the live git
-    // tag count, which VersionBump's own tag just incremented, yielding a
-    // version one higher than the tag actually cut (WR-04, 17-12).
-    let version = version::read_version(&ctx.project_root)
-        .map(|v| v.to_string())
-        .unwrap_or_else(|_| "unreleased".to_string());
+fn changelog_append(ctx: &mut HookContext) -> Result<(), HookError> {
+    // Prefer the version VersionBump (which runs immediately before this
+    // hook in hooks_after_ship()) actually tagged, handed through
+    // batch-scoped context state (GAP-7) — this is the only source that's
+    // correct with no version file present. Fall back to
+    // version::read_version (deliberately NOT version::compute_version,
+    // which recomputes MINOR from the live git tag count that VersionBump's
+    // own tag just incremented, yielding a version one higher than the tag
+    // actually cut — WR-04, 17-12), then to the `unreleased` literal.
+    let version = ctx.shipped_version.clone().unwrap_or_else(|| {
+        version::read_version(&ctx.project_root)
+            .map(|v| v.to_string())
+            .unwrap_or_else(|_| "unreleased".to_string())
+    });
     let path = ctx.project_root.join("CHANGELOG.md");
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     let updated = crate::ship::prepend_changelog(&existing, &version, &today());
@@ -216,7 +227,7 @@ fn changelog_append(ctx: &HookContext) -> Result<(), HookError> {
     Ok(())
 }
 
-fn version_bump(ctx: &HookContext) -> Result<(), HookError> {
+fn version_bump(ctx: &mut HookContext) -> Result<(), HookError> {
     let version = version::compute_version(&ctx.project_root)?;
     let git = GitFlow::new(&ctx.project_root);
     // Write the computed version into the version file when one exists, and
@@ -236,6 +247,12 @@ fn version_bump(ctx: &HookContext) -> Result<(), HookError> {
     }
     let tag = format!("v{version}");
     git.tag(&tag)?;
+    // Hand the tagged version to ChangelogAppend via batch-scoped context
+    // state (GAP-7) — on both branches above, since both tag. Without this,
+    // ChangelogAppend re-derives the version from disk and, with no version
+    // file, falls back to the `unreleased` literal while the tag names a
+    // real version.
+    ctx.shipped_version = Some(version.to_string());
     info!("VersionBump: tagged {tag}");
     Ok(())
 }
@@ -274,13 +291,27 @@ mod tests {
     }
 
     fn init_repo(root: &Path) {
+        init_repo_with_options(root, true);
+    }
+
+    /// Same as [`init_repo`], but lets a test choose whether a version file
+    /// gets written. `init_repo` unconditionally wrote `Cargo.toml`, which
+    /// made `version_bump`'s no-version-file `else` branch unreachable from
+    /// the batch tests (GAP-7). `init_repo` delegates here with `true`, so
+    /// its observable effect for every existing test is unchanged byte for
+    /// byte.
+    fn init_repo_with_options(root: &Path, write_version_file: bool) {
         git(root, &["init", "-q"]);
         git(root, &["config", "user.email", "test@example.com"]);
         git(root, &["config", "user.name", "Test"]);
         git(root, &["config", "commit.gpgsign", "false"]);
         git(root, &["config", "tag.gpgsign", "false"]);
         git(root, &["config", "core.hooksPath", "/dev/null"]);
-        std::fs::write(root.join("Cargo.toml"), "[package]\nversion = \"2.0.0\"\n").unwrap();
+        if write_version_file {
+            std::fs::write(root.join("Cargo.toml"), "[package]\nversion = \"2.0.0\"\n").unwrap();
+        } else {
+            std::fs::write(root.join("README.md"), "no version file in this repo\n").unwrap();
+        }
         git(root, &["add", "."]);
         git(root, &["commit", "-q", "-m", "init"]);
         git(root, &["branch", "-M", "main"]);
@@ -293,6 +324,7 @@ mod tests {
             project_root: root.to_path_buf(),
             stage,
             git_flow: GitFlowConfig::default(),
+            shipped_version: None,
         }
     }
 
@@ -314,10 +346,10 @@ mod tests {
     fn validate_to_ship_hooks_do_not_touch_changelog() {
         let dir = tempfile::tempdir().unwrap();
         init_repo(dir.path());
-        let context = ctx(dir.path(), Stage::Ship);
+        let mut context = ctx(dir.path(), Stage::Ship);
 
         for hook in hooks_for_transition(Stage::Validate, Stage::Ship) {
-            hook.run(&context).unwrap();
+            hook.run(&mut context).unwrap();
         }
 
         assert!(!dir.path().join("CHANGELOG.md").exists());
@@ -345,7 +377,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         init_repo(dir.path());
         Hook::BranchCreate
-            .run(&ctx(dir.path(), Stage::Define))
+            .run(&mut ctx(dir.path(), Stage::Define))
             .unwrap();
         assert!(GitFlow::new(dir.path()).branch_exists("feature/phase-11"));
     }
@@ -355,7 +387,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         init_repo(dir.path());
         Hook::ChangelogAppend
-            .run(&ctx(dir.path(), Stage::Ship))
+            .run(&mut ctx(dir.path(), Stage::Ship))
             .unwrap();
         let changelog = std::fs::read_to_string(dir.path().join("CHANGELOG.md")).unwrap();
         assert!(changelog.contains("# Changelog"));
@@ -369,7 +401,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         init_repo(dir.path());
         Hook::ChangelogAppend
-            .run(&ctx(dir.path(), Stage::Ship))
+            .run(&mut ctx(dir.path(), Stage::Ship))
             .unwrap();
 
         let status = git_output(dir.path(), &["status", "--porcelain"]);
@@ -390,7 +422,7 @@ mod tests {
         // the commit count since the last tag — one `init` commit → v2.0.1.
         let expected = format!("v{}", version::compute_version(dir.path()).unwrap());
         Hook::VersionBump
-            .run(&ctx(dir.path(), Stage::Ship))
+            .run(&mut ctx(dir.path(), Stage::Ship))
             .unwrap();
         let tags = Command::new("git")
             .arg("tag")
@@ -412,9 +444,9 @@ mod tests {
         let feature_tip = git_output(dir.path(), &["rev-parse", "feature/phase-11"]);
         let pre_merge_count = git_output(dir.path(), &["rev-list", "--count", "HEAD"]);
 
-        let context = ctx(dir.path(), Stage::Ship);
+        let mut context = ctx(dir.path(), Stage::Ship);
         for hook in hooks_after_ship() {
-            hook.run(&context).unwrap();
+            hook.run(&mut context).unwrap();
         }
 
         git(
@@ -464,9 +496,9 @@ mod tests {
         git(dir.path(), &["add", "feature.txt"]);
         git(dir.path(), &["commit", "-q", "-m", "phase work"]);
 
-        let context = ctx(dir.path(), Stage::Ship);
+        let mut context = ctx(dir.path(), Stage::Ship);
         for hook in hooks_after_ship() {
-            hook.run(&context).unwrap();
+            hook.run(&mut context).unwrap();
         }
 
         // Exactly one tag was created by this batch (init_repo creates none).
@@ -506,6 +538,59 @@ mod tests {
     }
 
     #[test]
+    fn after_ship_batch_with_no_version_file_keeps_tag_and_changelog_in_sync() {
+        // GAP-7: with no version file, version_bump takes the `else` branch
+        // (warns, tags only) and still tags v{compute_version()}.
+        // changelog_append then calls version::read_version, which errors
+        // with no version file present, and falls back to the literal
+        // "unreleased" -- desyncing the tag from the changelog heading.
+        // init_repo unconditionally writes Cargo.toml, so this branch is
+        // unreachable from the other batch tests; init_repo_with_options
+        // reaches it without changing init_repo's own behavior.
+        let dir = tempfile::tempdir().unwrap();
+        init_repo_with_options(dir.path(), false);
+        // Mirror the existing batch test's .gitignore / feature-branch setup
+        // so the run is comparable.
+        std::fs::write(dir.path().join(".gitignore"), ".devflow/\n").unwrap();
+        git(dir.path(), &["add", ".gitignore"]);
+        git(dir.path(), &["commit", "-q", "-m", "add gitignore"]);
+        git(dir.path(), &["checkout", "-q", "-b", "feature/phase-11"]);
+        std::fs::write(dir.path().join("feature.txt"), "phase work\n").unwrap();
+        git(dir.path(), &["add", "feature.txt"]);
+        git(dir.path(), &["commit", "-q", "-m", "phase work"]);
+
+        let mut context = ctx(dir.path(), Stage::Ship);
+        for hook in hooks_after_ship() {
+            hook.run(&mut context).unwrap();
+        }
+
+        let all_tags = git_output(dir.path(), &["tag"]);
+        assert_eq!(all_tags.lines().count(), 1, "expected exactly one tag");
+        let tag = all_tags.trim().to_string();
+        let tag_version = tag
+            .strip_prefix('v')
+            .expect("tag should be prefixed with v")
+            .to_string();
+
+        let changelog = std::fs::read_to_string(dir.path().join("CHANGELOG.md")).unwrap();
+        let changelog_version = changelog
+            .lines()
+            .find(|l| l.starts_with("## "))
+            .and_then(|l| l.trim_start_matches("## ").split(' ').next())
+            .unwrap()
+            .to_string();
+
+        assert_ne!(
+            changelog_version, "unreleased",
+            "changelog heading must name the tagged version, not fall back to the literal"
+        );
+        assert_eq!(
+            changelog_version, tag_version,
+            "changelog heading must match the git tag ({tag}) even with no version file"
+        );
+    }
+
+    #[test]
     fn merge_succeeds_while_feature_branch_is_checked_out_in_linked_worktree() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
@@ -528,7 +613,7 @@ mod tests {
         git(&worktree, &["add", "feature.txt"]);
         git(&worktree, &["commit", "-q", "-m", "phase work"]);
 
-        Hook::Merge.run(&ctx(&repo, Stage::Ship)).unwrap();
+        Hook::Merge.run(&mut ctx(&repo, Stage::Ship)).unwrap();
 
         git(
             &repo,
@@ -543,7 +628,7 @@ mod tests {
         init_repo(dir.path());
         // No feature branch exists — cleanup must still succeed.
         Hook::BranchCleanup
-            .run(&ctx(dir.path(), Stage::Ship))
+            .run(&mut ctx(dir.path(), Stage::Ship))
             .unwrap();
     }
 
@@ -552,7 +637,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         init_repo(dir.path());
         // Branch absence cannot prove that phase work reached develop.
-        let error = Hook::Merge.run(&ctx(dir.path(), Stage::Ship)).unwrap_err();
+        let error = Hook::Merge
+            .run(&mut ctx(dir.path(), Stage::Ship))
+            .unwrap_err();
         assert!(error.to_string().contains("unproven merge"));
     }
 

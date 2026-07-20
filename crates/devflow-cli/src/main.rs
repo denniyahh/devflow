@@ -1740,14 +1740,19 @@ fn run_checkout_hooks(
     let mut all_succeeded = true;
     let terminal_batch = batch == hooks::hooks_after_ship().as_slice();
     let hook_root = hook_context_root(project_root, state, terminal_batch);
+    // Hoisted out of the loop (GAP-7): these fields are loop-invariant, and
+    // VersionBump needs to hand shipped_version forward to ChangelogAppend
+    // within the same batch run, which a fresh per-iteration context would
+    // discard.
+    let mut ctx = HookContext {
+        phase: state.phase,
+        project_root: hook_root.clone(),
+        stage,
+        git_flow: git_flow.clone(),
+        shipped_version: None,
+    };
     for hook in batch {
-        let ctx = HookContext {
-            phase: state.phase,
-            project_root: hook_root.clone(),
-            stage,
-            git_flow: git_flow.clone(),
-        };
-        let outcome = hook.run(&ctx);
+        let outcome = hook.run(&mut ctx);
         if let Err(ref err) = outcome {
             println!("warning: hook {hook:?} failed: {err}");
             all_succeeded = false;

@@ -593,8 +593,9 @@ mod tests {
         )
         .unwrap();
         let contents = std::fs::read_to_string(dir.path().join("package.json")).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&contents)
-            .unwrap_or_else(|err| panic!("package.json no longer parses as JSON: {err}\n{contents}"));
+        let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap_or_else(|err| {
+            panic!("package.json no longer parses as JSON: {err}\n{contents}")
+        });
         assert_eq!(parsed["name"], "x");
         assert_eq!(parsed["private"], true);
         assert_eq!(parsed["version"], "2.3.4");
