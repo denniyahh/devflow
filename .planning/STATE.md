@@ -2,7 +2,7 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
-status: "Phase 17 complete (15/15) - CR-01 resolved via 17-08, GAP-2 (test-level) resolved via 17-09, nyquist_compliant: true"
+status: "Phase 17 executed (13/13 plans, 15/15 must-haves) - GAP-6/GAP-7 closed via 17-13; nyquist_compliant currently false (re-audit #9), pending re-audit by /gsd-validate-phase 17"
 stopped_at: Completed 17-13-PLAN.md
 last_updated: "2026-07-20T08:47:18.804Z"
 progress:
