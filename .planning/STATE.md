@@ -19,14 +19,22 @@ progress:
 
 ## Active
 
-- **Phase 18 (Scoped):** Dogfood Reliability Hardening — reprioritized
-  2026-07-20 from Hermes Support. `devflow doctor` reconciliation (18a),
-  monitor liveness (18b), worktree-aware staleness enforcement (18c),
-  Code↔Validate safety-gate reachability (18d), Layer 0/Validate verdict
-  fix (18e), preflight-gate re-run wedge fix (18f), WR-03 test
-  stabilization (18g). Replaces the fixed Phase 19 roadmap entry — see
-  `## Backlog` in ROADMAP.md for the items not pulled into 18. Depends on
-  Phase 17 (typed outcomes, build provenance).
+- **Phase 18 (Planned — 7 plans, 17 tasks):** Dogfood Reliability Hardening
+  — reprioritized 2026-07-20 from Hermes Support. `devflow doctor`
+  reconciliation (18a), monitor liveness (18b), worktree-aware staleness
+  enforcement (18c), Code↔Validate safety-gate reachability (18d), Layer
+  0/Validate verdict fix (18e), preflight-gate re-run wedge fix (18f),
+  WR-03 test stabilization (18g). Replaces the fixed Phase 19 roadmap
+  entry — see `## Backlog` in ROADMAP.md for the items not pulled into 18.
+  Depends on Phase 17 (typed outcomes, build provenance).
+
+  Planned 2026-07-20: research (HIGH confidence, all 7 defects re-verified
+  as still reproducing at HEAD), VALIDATION.md (Nyquist), 7 plans, and a
+  plan-checker pass that returned VERIFICATION PASSED with zero blockers
+  and zero warnings on the first iteration. Waves are near-serial by
+  necessity, not choice — six of seven fixes touch `main.rs` (6,239
+  lines), and the same-wave zero-file-overlap rule forces one `main.rs`
+  plan per wave. Next: `/gsd-execute-phase 18`.
 
 ## Backlog
 
