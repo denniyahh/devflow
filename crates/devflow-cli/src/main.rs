@@ -3578,6 +3578,107 @@ mod tests {
         );
     }
 
+    /// Same as [`init_repo`], but without a committed `Cargo.toml`, so
+    /// `version_bump` takes its no-version-file branch. Mirrors
+    /// `devflow_core::hooks`' `init_repo_with_options(root, false)`.
+    fn init_repo_no_version_file(root: &Path) {
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "devflow@example.com"]);
+        git(&["config", "user.name", "DevFlow Tests"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        git(&["config", "tag.gpgsign", "false"]);
+        git(&["config", "core.hooksPath", "/dev/null"]);
+        std::fs::write(root.join("README.md"), "no version file in this repo\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        git(&["branch", "-M", "main"]);
+        git(&["checkout", "-q", "-b", "develop"]);
+    }
+
+    /// GAP-8 (17-VALIDATION.md): GAP-7 fixed `HookContext.shipped_version`
+    /// forwarding `hooks_after_ship`'s `VersionBump` tag to `ChangelogAppend`
+    /// within the same batch — but only the `devflow-core::hooks` unit tests
+    /// exercised it directly by hand-rolling their own context and looping
+    /// over `hooks_after_ship()`. `run_checkout_hooks` is the ONLY production
+    /// caller of that batch, and it must construct the `HookContext` once,
+    /// above the hook loop, for the forwarding to survive into production.
+    /// This test drives `run_checkout_hooks` itself (not a hand-rolled loop)
+    /// against a repo with no version file, and asserts the changelog
+    /// heading names the actual tagged version rather than falling back to
+    /// the "unreleased" literal.
+    #[test]
+    fn run_checkout_hooks_keeps_changelog_in_sync_with_tag_when_no_version_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo_no_version_file(root);
+
+        let phase = 47;
+        let branch = format!("feature/phase-{phase:02}");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?} failed");
+        };
+        git(&["branch", &branch, "develop"]);
+        std::fs::write(root.join(".gitignore"), ".devflow/\n").unwrap();
+        git(&["checkout", &branch]);
+        std::fs::write(root.join("feature.txt"), "phase work\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "phase work"]);
+        git(&["checkout", "develop"]);
+
+        let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let succeeded = run_checkout_hooks(root, &state, &hooks::hooks_after_ship(), Stage::Ship);
+        assert!(
+            succeeded,
+            "after-ship batch must succeed against a clean repo"
+        );
+
+        let all_tags = std::process::Command::new("git")
+            .arg("tag")
+            .current_dir(root)
+            .output()
+            .unwrap();
+        let all_tags = String::from_utf8_lossy(&all_tags.stdout);
+        assert_eq!(all_tags.lines().count(), 1, "expected exactly one tag");
+        let tag = all_tags.trim().to_string();
+        let tag_version = tag
+            .strip_prefix('v')
+            .expect("tag should be prefixed with v")
+            .to_string();
+
+        let changelog = std::fs::read_to_string(root.join("CHANGELOG.md")).unwrap();
+        let changelog_version = changelog
+            .lines()
+            .find(|l| l.starts_with("## "))
+            .and_then(|l| l.trim_start_matches("## ").split(' ').next())
+            .unwrap()
+            .to_string();
+
+        assert_ne!(
+            changelog_version, "unreleased",
+            "changelog heading must name the tagged version, not fall back to the literal"
+        );
+        assert_eq!(
+            changelog_version, tag_version,
+            "changelog heading must match the git tag ({tag}) produced by the same \
+             run_checkout_hooks call, even with no version file"
+        );
+    }
+
     #[test]
     fn default_logs_phase_prefers_single_active_state() {
         let dir = tempfile::tempdir().unwrap();
