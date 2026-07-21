@@ -123,6 +123,33 @@ and the full test suite run offline. Agent CLIs (Claude, Codex, OpenCode) are
 only needed to exercise `devflow start` against a live agent, not to build,
 test, or pass CI.
 
+## Cutting a Release
+
+1. On `develop`: bump `version` in the root `Cargo.toml`, run `cargo build`
+   to sync `Cargo.lock`, add a new top `## X.Y.Z` section to `CHANGELOG.md`.
+2. Open a PR from `develop` into `main` titled
+   `release: vX.Y.Z — <short description>`.
+3. Once CI is green, squash-merge it (this repo's branch settings only
+   allow squash merges into `main` — real merge commits are disabled).
+4. Tag the resulting commit on `main`: `git tag -a vX.Y.Z <commit> -m "..."`,
+   then `git push origin vX.Y.Z`.
+5. **Immediately run `scripts/sync-main-to-develop.sh`** from a clean
+   `develop` checkout, then `git push origin develop`.
+
+Step 5 is not optional. Because `main` only accepts squash merges, its new
+release commit has no parent relationship back to `develop` — skip this
+step and the *next* release PR will conflict against a stale merge-base
+(this happened going into v1.5.0: main and develop had silently diverged
+since v1.4.0, producing conflicts across 11 files including core Rust
+source). The script performs a content-preserving `-X ours` merge — it
+verifies the resulting tree is byte-identical to develop's before allowing
+itself to proceed — so it only ever links history, never changes content.
+
+To publish to crates.io after tagging: `cargo publish -p devflow-core`
+first (it must be live on the registry before the next step, since
+`devflow`'s manifest depends on it by version, not by path, once
+packaged), then `cargo publish -p devflow`.
+
 ## Commit Conventions
 
 DevFlow uses [Conventional Commits](https://www.conventionalcommits.org/):
