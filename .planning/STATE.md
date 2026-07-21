@@ -19,14 +19,34 @@ progress:
 
 ## Active
 
-- **Phase 18 (Complete — 7/7 plans):** Dogfood Reliability Hardening
-  — reprioritized 2026-07-20 from Hermes Support. `devflow doctor`
-  reconciliation (18a), monitor liveness (18b), worktree-aware staleness
-  enforcement (18c), Code↔Validate safety-gate reachability (18d), Layer
-  0/Validate verdict fix (18e), preflight-gate re-run wedge fix (18f),
-  WR-03 test stabilization (18g). Replaces the fixed Phase 19 roadmap
-  entry — see `## Backlog` in ROADMAP.md for the items not pulled into 18.
-  Depends on Phase 17 (typed outcomes, build provenance).
+- **Phase 18 (Complete + Verified + review-fixed — 7/7 plans):** Dogfood
+  Reliability Hardening — reprioritized 2026-07-20 from Hermes Support.
+  `devflow doctor` reconciliation (18a), monitor liveness (18b),
+  worktree-aware staleness enforcement (18c), Code↔Validate safety-gate
+  reachability (18d), Layer 0/Validate verdict fix (18e), preflight-gate
+  re-run wedge fix (18f), WR-03 test stabilization (18g). Replaces the
+  fixed Phase 19 roadmap entry — see `## Backlog` in ROADMAP.md for the
+  items not pulled into 18. Depends on Phase 17 (typed outcomes, build
+  provenance).
+
+  **Verified + reviewed 2026-07-21.** `gsd-verifier`: 7/7 must-haves,
+  each traced to source plus an independently-executed passing test;
+  both binding operator decisions (18e, 18f) confirmed exactly
+  implemented (`18-VERIFICATION.md`, status passed). `gsd-code-reviewer`:
+  0 critical / 4 warning (`18-REVIEW.md`). All findings dispositioned in
+  a `18-fix` batch (6 commits `f635adf`..`4ff6b37`): WR-01 `doctor --json`
+  now emits one JSON object `{environment, reconciliation}` (was two
+  concatenated arrays = invalid single-doc JSON; proven fixed against the
+  live binary); WR-04 `launch_stage_inner` clears `monitor_pid` before any
+  fallible step so a failed relaunch no longer false-reports "Stuck";
+  WR-03 the `unreachable!()` in `handle_validate_outcome` eliminated by
+  construction (`ValidateResult` two-variant enum); WR-02 the
+  `self_dogfood_stale_blocked` event now persists a path-free reason (third
+  instance of that leak class — noted closed in `999.10`, the two original
+  instances remain); and the new 18c worktree-staleness test hardened under
+  `ENV_MUTEX` against the 19i PATH-race flake the verifier caught. Final
+  gates: 426 tests / 0 failed, clippy `--workspace --all-targets` clean,
+  fmt clean, all on `develop`. **Not yet merged to main / released.**
 
   Planned 2026-07-20: research (HIGH confidence, all 7 defects re-verified
   as still reproducing at HEAD), VALIDATION.md (Nyquist), 7 plans, and a
