@@ -280,7 +280,7 @@ Plans:
 
 Plans:
 
-- [ ] TBD (run /gsd-discuss-phase 19, then /gsd-plan-phase 19 to break down)
+- [ ] TBD (run /gsd-plan-phase 19 to break down)
 
 ## Backlog
 

@@ -2,7 +2,7 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
-status: "Phase 18 complete and released as v1.5.0 (2026-07-21, tag v1.5.0, crates.io published); develop synced back from main. Phase 19 (Release Integrity + main.rs Decomposition) scoped and promoted from backlog 2026-07-21 via /gsd-review-backlog: 999.10 (.devflow/ artifact hygiene, Urgent), 999.11 (commit_path empty commits), 999.8 (split main.rs, pure move), 999.16 (AI change acceptance contract). Targets v1.6.0. Not yet discussed or planned - next step is /gsd-discuss-phase 19. Milestone label corrected: v2.0.0 was never released (project shipped 1.2.0 to 1.5.0); the milestone now runs Phase 11-20 and closes at v2.0.0 with Phase 20."
+status: "Phase 18 complete and released as v1.5.0 (2026-07-21, tag v1.5.0, crates.io published); develop synced back from main. Phase 19 (Release Integrity + main.rs Decomposition) scoped and promoted from backlog 2026-07-21 via /gsd-review-backlog: 999.10 (.devflow/ artifact hygiene, Urgent), 999.11 (commit_path empty commits), 999.8 (split main.rs, pure move), 999.16 (AI change acceptance contract). Targets v1.6.0. Discussed 2026-07-21 (19-CONTEXT.md, 21 decisions across 5 areas) - next step is /gsd-plan-phase 19. Milestone label corrected: v2.0.0 was never released (project shipped 1.2.0 to 1.5.0); the milestone now runs Phase 11-20 and closes at v2.0.0 with Phase 20."
 stopped_at: Phase 19 context gathered
 last_updated: "2026-07-21T21:44:38.548Z"
 progress:
@@ -52,7 +52,24 @@ progress:
   tests) — **+35%** since 999.8 was written at 6,239, so its recorded cluster
   line ranges are stale and must be re-measured at plan time.
 
-  **Next step:** `/gsd-discuss-phase 19`.
+  **Discussed 2026-07-21** (`19-CONTEXT.md`, 21 decisions across 5 areas;
+  alternatives preserved in `19-DISCUSSION-LOG.md`). Two decisions were made
+  against evidence gathered during scouting rather than preference:
+
+  - **`ENV_MUTEX` is not one mutex.** Three independent `static Mutex<()>`
+    definitions exist (`main.rs:4034`, `gates.rs:348`, `config.rs:174`), sound
+    today only because each guards a disjoint variable set — an accident,
+    documented nowhere. `PATH` is mutated 36 times across 12 lock regions
+    spanning 3+ target clusters, so per-module mutexes would silently break the
+    exact serialization 19i raced on. **Decision: hoist one shared mutex into a
+    test-support module.**
+  - **The bottleneck is the pipeline state machine, not commands.** Mapping
+    Phase 18's plans onto clusters: pipeline absorbed 3 of 7 plans (~1,040
+    lines), commands only 2. A `commands/` subdirectory buys zero wave
+    reduction. **Decision: flat siblings + split `pipeline.rs` at its natural
+    seams**, which is what takes Phase 18's shape from 3 waves to 2.
+
+  **Next step:** `/gsd-plan-phase 19`.
 
 ## Recently Shipped
 
