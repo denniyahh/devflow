@@ -789,10 +789,27 @@ fn generic_preflight_checks(project_root: &Path, state: &State) -> Result<(), St
 /// Returns `Ok(true)` when the caller should continue the rest of
 /// `launch_stage` (preflight passed). Returns `Ok(false)` when a failing
 /// check was resolved via a gate that ALREADY completed a full retried
-/// launch (Advance/LoopBack) or aborted (Abort) — the caller must not run
-/// any more launch steps for this invocation (CR-01, 17-08 gap closure: the
-/// old `Result<(), CliError>` return couldn't distinguish these two cases,
-/// so the caller always continued and spawned the agent a second time).
+/// launch (Advance/LoopBack), reached the retry ceiling, or aborted —
+/// the caller must not run any more launch steps for this invocation
+/// (CR-01, 17-08 gap closure: the old `Result<(), CliError>` return
+/// couldn't distinguish these cases, so the caller always continued and
+/// spawned the agent a second time).
+///
+/// 18f (D-18f): `GateAction::Advance` on a preflight gate is an explicit
+/// override — the check has already been adjudicated by a human, both
+/// production checks (`preflight_interactivity_check`,
+/// `preflight_gh_auth_check`) are deterministic idempotent predicates a
+/// gate approval cannot change, so re-running them is guaranteed to fail
+/// identically. The `Advance` arm therefore relaunches via
+/// [`launch_stage_inner`] directly, SKIPPING this function entirely on the
+/// retry. `GateAction::LoopBack` still calls the full [`launch_stage`]
+/// (re-entering this function), because that path means the operator will
+/// fix the condition and retry, and the state may genuinely have changed.
+/// Either arm's recursion is bounded by `state.preflight_retries` /
+/// [`mode::MAX_PREFLIGHT_RETRIES`]: the ceiling is checked BEFORE writing
+/// another gate, so reaching it aborts with a logged
+/// `preflight_retry_ceiling_reached` event instead of polling a second
+/// 7-day gate timeout nobody will ever answer (T-18-27, T-18-30).
 fn run_preflight(
     project_root: &Path,
     state: &mut State,
@@ -802,6 +819,31 @@ fn run_preflight(
     if let Err(reason) =
         generic_preflight_checks(project_root, state).and_then(|()| adapter.preflight(state))
     {
+        // Check the ceiling BEFORE writing another gate — writing the gate
+        // first would let the ceiling case open yet another gate nobody
+        // will answer (T-18-27).
+        if state.preflight_retries >= mode::MAX_PREFLIGHT_RETRIES {
+            let ceiling_reason = format!(
+                "preflight retry ceiling ({}) reached for stage {stage}: {}",
+                mode::MAX_PREFLIGHT_RETRIES,
+                truncate_reason(&reason)
+            );
+            events::emit(
+                project_root,
+                state.phase,
+                "preflight_retry_ceiling_reached",
+                serde_json::json!({
+                    "stage": stage.to_string(),
+                    "reason": truncate_reason(&reason),
+                    "ceiling": mode::MAX_PREFLIGHT_RETRIES,
+                }),
+            );
+            abort(project_root, state, &ceiling_reason)?;
+            return Ok(false);
+        }
+        state.preflight_retries = state.preflight_retries.saturating_add(1);
+        workflow::save_state(state)?;
+
         let context = format!(
             "[never-silent] preflight failed for stage {stage}: {} — human review needed \
              (retry, loop-to-code, or abort)",
@@ -809,17 +851,34 @@ fn run_preflight(
         );
         match run_gate(project_root, state, stage, &context)? {
             GateAction::Advance => {
+                // D-18f: approval is an explicit override — skip the
+                // just-adjudicated check on the retry (see the function
+                // doc comment above).
                 let _ = Gates::cleanup(project_root, state.phase, stage);
                 state.gate_pending = false;
-                launch_stage(state, None, None)?;
+                state.preflight_retries = 0;
+                workflow::save_state(state)?;
+                launch_stage_inner(state, None, None)?;
             }
             GateAction::LoopBack(_) => {
+                // D-18f: "I will fix it, then retry" — re-check deliberately,
+                // bounded by the ceiling above.
                 let _ = Gates::cleanup(project_root, state.phase, stage);
                 launch_stage(state, None, None)?;
             }
             GateAction::Abort(reason) => abort(project_root, state, &reason)?,
         }
         return Ok(false);
+    }
+
+    // Preflight passed: reset the retry counter, persisted (the wedge this
+    // counter bounds spans separate `devflow` invocations, so an in-memory
+    // reset alone would not survive a monitor restart). Guarded so a
+    // passing preflight on an already-zero counter does not rewrite state
+    // on every single launch.
+    if state.preflight_retries != 0 {
+        state.preflight_retries = 0;
+        workflow::save_state(state)?;
     }
     Ok(true)
 }
@@ -1165,10 +1224,22 @@ fn enforce_build_staleness(
     }
 }
 
-/// Spawn the background monitor that owns the agent for `state.stage`. The
-/// monitor calls `devflow advance` when the agent exits. An optional
-/// `prompt_override` is used for Code loop-backs (fix prompts).
-fn launch_stage(
+/// The post-preflight body of [`launch_stage`]: self-dogfood build-staleness
+/// enforcement, capture archival/rollover, and spawning the monitor.
+/// Extracted (18f, D-18f) so `run_preflight`'s `Advance` arm can call it
+/// directly and skip the just-adjudicated preflight check, while every
+/// other caller keeps going through [`launch_stage`]'s full path (readiness
+/// resolution, `ensure_agent_binary`, then `run_preflight`).
+///
+/// Recomputes `prompt`/`adapter`/`roots`/`program`/`args` from `state` and
+/// `prompt_override` — deliberately NOT threaded through as parameters.
+/// They are pure functions of `state` and the prompt override; recomputing
+/// them here (rather than widening `run_preflight`'s signature to carry
+/// them from `launch_stage`'s earlier resolution) keeps this function
+/// callable entirely on its own, which is exactly what `run_preflight`'s
+/// `Advance` arm needs. This does not duplicate `worktree_writable_roots`'s
+/// logic — both call sites call the same shared helper.
+fn launch_stage_inner(
     state: &mut State,
     prompt_override: Option<String>,
     archived_stage: Option<Stage>,
@@ -1189,18 +1260,7 @@ fn launch_stage(
     let (program, args) = adapter.exec_command(state.phase, &prompt, &roots);
     ensure_agent_binary(program)?;
 
-    // 17c (Task 1, D-13-D-16): a scoped readiness gate runs before any agent
-    // time is spent — a failing check surfaces as a named preflight gate +
-    // notify (never a hard exit, D-15), not here.
-    //
-    // CR-01 (17-08 gap closure): `run_preflight` returns `Ok(false)` when a
-    // failing check was ALREADY resolved via a full retried launch (or an
-    // abort) — this frame must not run any more launch steps in that case,
-    // or the agent gets spawned a second time for the same stage.
     let project_root = state.project_root.clone();
-    if !run_preflight(&project_root, state, adapter.as_ref())? {
-        return Ok(());
-    }
 
     // 17d (Task 2, D-17-D-19): self-dogfood build-staleness gate — also
     // before spawn_monitor, so a stale DevFlow-on-itself run never even
@@ -1261,6 +1321,52 @@ fn launch_stage(
         adapter.name()
     );
     Ok(())
+}
+
+/// Spawn the background monitor that owns the agent for `state.stage`. The
+/// monitor calls `devflow advance` when the agent exits. An optional
+/// `prompt_override` is used for Code loop-backs (fix prompts).
+///
+/// Resolves the prompt/adapter/roots/program, validates the agent binary,
+/// then runs the readiness gate ([`run_preflight`]) before delegating to
+/// [`launch_stage_inner`] for the actual spawn. Every EXISTING caller of
+/// this function keeps getting the full path including preflight — the
+/// ONLY caller of `launch_stage_inner` directly is `run_preflight`'s own
+/// `Advance` arm (18f, D-18f), which is skipping a check it just
+/// adjudicated for this one relaunch, not granting a standing bypass
+/// (T-18-28: the skip must never leak beyond the single stage a human
+/// approved).
+fn launch_stage(
+    state: &mut State,
+    prompt_override: Option<String>,
+    archived_stage: Option<Stage>,
+) -> Result<(), CliError> {
+    let adapter = agents::adapter_for(state.agent);
+    let prompt = prompt_override.clone().unwrap_or_else(|| {
+        prompt::stage_prompt_for_project(state.stage, state.phase, &state.project_root)
+    });
+    let roots = state
+        .worktree_path
+        .as_deref()
+        .map(|wt| worktree_writable_roots(&state.project_root, wt))
+        .unwrap_or_default();
+    let (program, _args) = adapter.exec_command(state.phase, &prompt, &roots);
+    ensure_agent_binary(program)?;
+
+    // 17c (Task 1, D-13-D-16): a scoped readiness gate runs before any agent
+    // time is spent — a failing check surfaces as a named preflight gate +
+    // notify (never a hard exit, D-15), not here.
+    //
+    // CR-01 (17-08 gap closure): `run_preflight` returns `Ok(false)` when a
+    // failing check was ALREADY resolved via a full retried launch (or an
+    // abort) — this frame must not run any more launch steps in that case,
+    // or the agent gets spawned a second time for the same stage.
+    let project_root = state.project_root.clone();
+    if !run_preflight(&project_root, state, adapter.as_ref())? {
+        return Ok(());
+    }
+
+    launch_stage_inner(state, prompt_override, archived_stage)
 }
 
 /// Resume a rate-limited or infra-paused phase from its saved stage (review
