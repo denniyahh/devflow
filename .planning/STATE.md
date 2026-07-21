@@ -2,14 +2,14 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
-status: "Phase 17 executed (13/13 plans, 15/15 must-haves) - validated at re-audit #10 (eda94cd): GAP-6/GAP-7 closed via 17-13 and RED-proven; GAP-8 (unsampled CLI wiring of GAP-7's fix) found and auto-filled; all 14 rows green, nyquist_compliant: true. Phase 18 in progress: 18-01 (18a doctor reconciliation) complete."
-stopped_at: Completed 18-02-PLAN.md
-last_updated: "2026-07-21T03:37:39.610Z"
+status: "Phase 17 executed (13/13 plans, 15/15 must-haves) - validated at re-audit #10 (eda94cd): GAP-6/GAP-7 closed via 17-13 and RED-proven; GAP-8 (unsampled CLI wiring of GAP-7's fix) found and auto-filled; all 14 rows green, nyquist_compliant: true. Phase 18 in progress: 18-01 (18a doctor reconciliation), 18-02 (18g WR-03 test stabilization), 18-03 (18b monitor liveness) complete."
+stopped_at: Completed 18-03-PLAN.md
+last_updated: "2026-07-21T03:58:54.078Z"
 progress:
   total_phases: 7
   completed_phases: 6
   total_plans: 54
-  completed_plans: 49
+  completed_plans: 50
   percent: 86
 ---
 
@@ -19,7 +19,7 @@ progress:
 
 ## Active
 
-- **Phase 18 (In Progress — 2/7 plans):** Dogfood Reliability Hardening
+- **Phase 18 (In Progress — 3/7 plans):** Dogfood Reliability Hardening
   — reprioritized 2026-07-20 from Hermes Support. `devflow doctor`
   reconciliation (18a), monitor liveness (18b), worktree-aware staleness
   enforcement (18c), Code↔Validate safety-gate reachability (18d), Layer
@@ -55,6 +55,24 @@ progress:
   the fix; `cargo test --workspace` 0 failed, `build_provenance` (WR-07,
   still open, out of scope) passed cleanly. See `18-02-SUMMARY.md`. Next:
   18-03 (wave 2).
+
+  Executed 2026-07-21: **18-03 complete** (`9f33b75`, `05556a2`, `dbbff40`,
+  `e60271d`) — monitor liveness (18b), "who watches the watcher."
+  `State.monitor_pid: Option<u32>` persisted by `launch_stage` immediately
+  after `monitor::spawn_monitor` returns (re-saved because `transition()`
+  saves state before `launch_stage` runs, or the pid is lost); pure
+  `liveness()` predicate (`Healthy`/`BetweenStages`/`Stuck`/`Unknown`,
+  `None` matched first so an unrecorded monitor can never render `Stuck`)
+  shared verbatim by `devflow status`'s new `monitor_pid`/`liveness` lines
+  and `doctor`'s new `check_dead_monitor` finding, extending 18-01's
+  `reconcile_phase` array right after `check_dead_agent`. 9 new tests;
+  `cargo test --workspace` 405/405 (0 failed), clippy/fmt clean.
+  Manually verified end-to-end against a synthetic dead-monitor fixture —
+  `status` and `doctor` both correctly report `stuck — needs devflow
+  resume` with a `devflow resume --phase N` repair, no filesystem paths
+  or usernames leaked (WR-02 class). See `18-03-SUMMARY.md`. Next: 18-04
+  (wave 3, 18d — make `MAX_CONSECUTIVE_FAILURES` reachable for the
+  Code↔Validate loop).
 
 ## Backlog
 
@@ -180,6 +198,7 @@ None currently open for Phase 17.
 - [Phase 17]: 17-13: GAP-6/GAP-7 closed via write_version remainder-preservation fix and HookContext.shipped_version threading; row 12 restored to green
 - [Phase 18]: 18-01: 18a doctor project-aware reconciliation -- pure PhaseFacts/PhaseFinding/reconcile_phase core (5 named checks: gate-pending-without-gate, orphan-gate, dead-agent, stage/event drift, missing branch) wired into doctor()'s text and --json output via collect_phase_facts/render_reconciliation; proven read-only by a twice-run fixture asserting state-file size/mtime and events.jsonl line count are unchanged
 - [Phase 18]: 18-02: WR-03 test stabilization -- `parallel_creates_two_worktrees_and_spawns_two_monitors` asserts each stdout capture inside its own `wait_for` window (mirrors `wait_for_pid`'s already-fixed archive-timing pattern); plan's literal combined-assertion instruction was itself racy (25x loop reproduced it at run 15/25), corrected to interleaved per-wait assertions matching the plan's own must_haves.truths
+- [Phase 18]: 18-03: monitor liveness (18b) — State.monitor_pid persisted at spawn (launch_stage re-saves after spawn_monitor, since transition() saves before launch_stage runs), pure liveness() predicate (None-first match so an unrecorded monitor can never render Stuck) shared verbatim by devflow status's new monitor row and doctor's new check_dead_monitor finding, spliced into reconcile_phase immediately after check_dead_agent per 18-01's extend-not-reorder contract. Manually verified end-to-end against a synthetic dead-monitor fixture: status prints stuck — needs devflow resume, doctor prints a matching finding with a devflow resume --phase N repair, neither leaks a filesystem path or username (WR-02 class).
 
 ## Roadmap Evolution
 
@@ -232,9 +251,10 @@ None currently open for Phase 17.
 | Phase 17-pipeline-dogfood-followup P13 | 15min | 3 tasks | 4 files |
 | Phase 18-dogfood-reliability-hardening P01 | 35min | 2 tasks | 1 files |
 | Phase 18 P02 | 15min | 2 tasks | 1 files |
+| Phase 18 P03 | 30min | 3 tasks | 3 files |
 
 ## Session
 
-**Last session:** 2026-07-21T03:37:39.578Z
-**Stopped at:** Completed 18-02-PLAN.md
+**Last session:** 2026-07-21T03:57:47.894Z
+**Stopped at:** Completed 18-03-PLAN.md
 **Resume file:** None
