@@ -6996,8 +6996,18 @@ mod tests {
     /// real entry point, `enforce_build_staleness`, evaluated against the
     /// wrong root) lives in
     /// `enforce_build_staleness_blocks_self_dogfood_behind_worktree_head`.
+    ///
+    /// (18-fix) `worktree_staleness_fixture` spawns real `git` subprocesses
+    /// unguarded — under concurrent load this raced this file's
+    /// PATH-mutating tests (the same `ENV_MUTEX`/19i flake class as
+    /// `transition_resets_infra_failures`), reproduced at roughly 1-in-8 to
+    /// 1-in-10. Guarded under `ENV_MUTEX` so it never runs concurrently with
+    /// a PATH mutator, mirroring the established pattern rather than
+    /// inventing a new one.
     #[test]
     fn embedded_commit_is_stale_uses_worktree_head() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
         let (outer, worktree_path, embedded_commit) = worktree_staleness_fixture();
         let project_root = outer.path().join("project");
 
@@ -7021,8 +7031,14 @@ mod tests {
     /// evaluated against `project_root` alone classified `Ahead` (warn
     /// only) because the embedded commit was still a descendant of
     /// `develop`.
+    ///
+    /// (18-fix) Guarded under `ENV_MUTEX`, same rationale as
+    /// `embedded_commit_is_stale_uses_worktree_head` — this test also drives
+    /// `worktree_staleness_fixture`'s unguarded real `git` subprocesses.
     #[test]
     fn enforce_build_staleness_blocks_self_dogfood_behind_worktree_head() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
         let (outer, worktree_path, embedded_commit) = worktree_staleness_fixture();
         let project_root = outer.path().join("project");
         std::fs::write(
@@ -7054,8 +7070,14 @@ mod tests {
     /// back to `project_root` and produce `Ok` — proving the
     /// `unwrap_or(project_root)` fallback preserves existing behavior for
     /// non-worktree phases and that this fix cannot start blocking them.
+    ///
+    /// (18-fix) Guarded under `ENV_MUTEX`, same rationale as
+    /// `embedded_commit_is_stale_uses_worktree_head` — this test also drives
+    /// `worktree_staleness_fixture`'s unguarded real `git` subprocesses.
     #[test]
     fn staleness_without_worktree_is_unchanged() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
         let (outer, _worktree_path, embedded_commit) = worktree_staleness_fixture();
         let project_root = outer.path().join("project");
         std::fs::write(
