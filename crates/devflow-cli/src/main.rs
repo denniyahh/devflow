@@ -6063,27 +6063,6 @@ mod tests {
     /// through the same gate+abort path as a generic-check failure.
     #[test]
     fn run_preflight_adapter_hook_override_fires() {
-        struct AlwaysRejectAdapter;
-        impl agents::AgentAdapter for AlwaysRejectAdapter {
-            fn name(&self) -> &'static str {
-                "test-reject"
-            }
-            fn exec_command(
-                &self,
-                _phase: u32,
-                _prompt: &str,
-                _roots: &[PathBuf],
-            ) -> (&'static str, Vec<String>) {
-                ("true", Vec::new())
-            }
-            fn completion_signal_detected(&self, _output: &str) -> bool {
-                false
-            }
-            fn preflight(&self, _state: &State) -> Result<(), String> {
-                Err("test adapter always rejects".to_string())
-            }
-        }
-
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
@@ -6102,7 +6081,7 @@ mod tests {
         )
         .unwrap();
 
-        let should_continue = run_preflight(root, &mut state, &AlwaysRejectAdapter).unwrap();
+        let should_continue = run_preflight(root, &mut state, &AlwaysFailAdapter).unwrap();
 
         assert!(
             !should_continue,
@@ -6113,13 +6092,50 @@ mod tests {
         assert_eq!(last["event"], "workflow_aborted");
     }
 
+    /// TEST-ONLY adapter (module-scope so any test can reach it — hoisted
+    /// from a test-function-local `AlwaysRejectAdapter`, 18f Task 1) whose
+    /// `preflight` fails unconditionally, with no interior mutability. Two
+    /// module-scope fixtures that both mean "always fails preflight" would
+    /// drift, so this is the single one; `run_preflight_adapter_hook_override_fires`
+    /// (above) and 18f's new wedge-reproduction tests (below) both use it.
+    ///
+    /// `FailOnceAdapter`, just below, explicitly documents that an
+    /// unconditionally-failing adapter would recurse into a second gate no
+    /// pre-18f test seeds a response for (CR-01, 17-08). That is no longer
+    /// true here: 18f's persisted `preflight_retries` ceiling
+    /// (`mode::MAX_PREFLIGHT_RETRIES`) bounds the recursion regardless, so
+    /// an unconditionally-failing preflight now terminates in a logged
+    /// `abort` instead of blocking forever on a second gate's
+    /// `poll_response`.
+    struct AlwaysFailAdapter;
+
+    impl agents::AgentAdapter for AlwaysFailAdapter {
+        fn name(&self) -> &'static str {
+            "test-always-fail"
+        }
+        fn exec_command(
+            &self,
+            _phase: u32,
+            _prompt: &str,
+            _roots: &[PathBuf],
+        ) -> (&'static str, Vec<String>) {
+            ("true", Vec::new())
+        }
+        fn completion_signal_detected(&self, _output: &str) -> bool {
+            false
+        }
+        fn preflight(&self, _state: &State) -> Result<(), String> {
+            Err("test adapter always rejects".to_string())
+        }
+    }
+
     // -----------------------------------------------------------------
     // 17-08 gap closure (CR-01): run_preflight's Advance/LoopBack arms must
     // not spawn the agent twice.
     // -----------------------------------------------------------------
 
     /// TEST-ONLY adapter whose `preflight` fails on the first call only —
-    /// modeled on `AlwaysRejectAdapter` above, but with a `Cell<bool>` flag
+    /// modeled on `AlwaysFailAdapter` above, but with a `Cell<bool>` flag
     /// so any SECOND call through this specific adapter reference would
     /// pass. An adapter that fails unconditionally would make a recursive
     /// `launch_stage` retry fail its OWN preflight check too, recursing into

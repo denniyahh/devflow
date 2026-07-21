@@ -36,6 +36,18 @@ pub const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 /// share a single reset condition (18d, WR-11).
 pub const MAX_INFRA_FAILURES: u32 = 5;
 
+/// Ceiling for [`crate::state::State::preflight_retries`] before a
+/// preflight gate's `GateAction::LoopBack` recursion aborts rather than
+/// polling another 7-day gate timeout (18f, D-18f backstop). A failing
+/// preflight is a readiness problem the operator is actively being asked
+/// about right now, not a transient infrastructure blip, so this takes the
+/// tighter [`MAX_CONSECUTIVE_FAILURES`]-style ceiling rather than the more
+/// lenient [`MAX_INFRA_FAILURES`]. Unlike those two counters, this one is
+/// NOT reset by `transition()` — it is reset by preflight success and by
+/// human approval (`GateAction::Advance`), both inside `run_preflight`
+/// (`devflow-cli/src/main.rs`).
+pub const MAX_PREFLIGHT_RETRIES: u32 = 3;
+
 /// Whether `transition()` should zero
 /// [`crate::state::State::consecutive_failures`] when moving from `from` to
 /// `to`.
