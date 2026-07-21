@@ -2,14 +2,14 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
-status: "Phase 17 executed (13/13 plans, 15/15 must-haves) - validated at re-audit #10 (eda94cd): GAP-6/GAP-7 closed via 17-13 and RED-proven; GAP-8 (unsampled CLI wiring of GAP-7's fix) found and auto-filled; all 14 rows green, nyquist_compliant: true. Phase 18 in progress: 18-01 (18a doctor reconciliation), 18-02 (18g WR-03 test stabilization), 18-03 (18b monitor liveness) complete."
-stopped_at: Completed 18-03-PLAN.md
-last_updated: "2026-07-21T03:58:54.078Z"
+status: "Phase 17 executed (13/13 plans, 15/15 must-haves) - validated at re-audit #10 (eda94cd): GAP-6/GAP-7 closed via 17-13 and RED-proven; GAP-8 (unsampled CLI wiring of GAP-7's fix) found and auto-filled; all 14 rows green, nyquist_compliant: true. Phase 18 in progress: 18-01 (18a doctor reconciliation), 18-02 (18g WR-03 test stabilization), 18-03 (18b monitor liveness), 18-04 (18d Code-Validate safety-gate reachability) complete."
+stopped_at: Completed 18-04-PLAN.md
+last_updated: "2026-07-21T04:18:40.308Z"
 progress:
   total_phases: 7
   completed_phases: 6
   total_plans: 54
-  completed_plans: 50
+  completed_plans: 51
   percent: 86
 ---
 
@@ -19,7 +19,7 @@ progress:
 
 ## Active
 
-- **Phase 18 (In Progress — 3/7 plans):** Dogfood Reliability Hardening
+- **Phase 18 (In Progress — 4/7 plans):** Dogfood Reliability Hardening
   — reprioritized 2026-07-20 from Hermes Support. `devflow doctor`
   reconciliation (18a), monitor liveness (18b), worktree-aware staleness
   enforcement (18c), Code↔Validate safety-gate reachability (18d), Layer
@@ -73,6 +73,24 @@ progress:
   or usernames leaked (WR-02 class). See `18-03-SUMMARY.md`. Next: 18-04
   (wave 3, 18d — make `MAX_CONSECUTIVE_FAILURES` reachable for the
   Code↔Validate loop).
+
+  Executed 2026-07-21: **18-04 complete** (`37b74ac`, `3036927`) —
+  Code↔Validate safety-gate reachability (18d). New pure `mode.rs`
+  predicate `transition_resets_consecutive_failures(from, to)` — `false`
+  only for `(Code, Validate)`, the mid-cycle hop that previously defeated
+  the counter — consulted by `transition()` instead of an unconditional
+  reset; `infra_failures`' unconditional reset is untouched, and the
+  frozen regression test `transition_resets_infra_failures` passes
+  byte-for-byte unchanged, proving 18d neither widened nor narrowed the
+  infra counter's scope. `handle_validate_outcome`'s increment switched to
+  `saturating_add`. RED-then-GREEN proven live:
+  `consecutive_failures_reaches_ceiling_across_cycles` failed
+  (`left: 0, right: 3`) against the unfixed `transition()`, passes after
+  the fix. 6 new tests (2 in `mode.rs`, 4 in `main.rs` covering ceiling,
+  saturation, idempotency, cross-phase independence); `cargo test
+  --workspace` 411/411 (0 failed, up from 405), clippy/fmt clean. See
+  `18-04-SUMMARY.md`. Next: 18-05 (wave 4, 18e — Layer 0/Validate verdict
+  fix, causally entangled with 18d per 18-RESEARCH.md Pitfall 1).
 
 ## Backlog
 
@@ -199,6 +217,7 @@ None currently open for Phase 17.
 - [Phase 18]: 18-01: 18a doctor project-aware reconciliation -- pure PhaseFacts/PhaseFinding/reconcile_phase core (5 named checks: gate-pending-without-gate, orphan-gate, dead-agent, stage/event drift, missing branch) wired into doctor()'s text and --json output via collect_phase_facts/render_reconciliation; proven read-only by a twice-run fixture asserting state-file size/mtime and events.jsonl line count are unchanged
 - [Phase 18]: 18-02: WR-03 test stabilization -- `parallel_creates_two_worktrees_and_spawns_two_monitors` asserts each stdout capture inside its own `wait_for` window (mirrors `wait_for_pid`'s already-fixed archive-timing pattern); plan's literal combined-assertion instruction was itself racy (25x loop reproduced it at run 15/25), corrected to interleaved per-wait assertions matching the plan's own must_haves.truths
 - [Phase 18]: 18-03: monitor liveness (18b) — State.monitor_pid persisted at spawn (launch_stage re-saves after spawn_monitor, since transition() saves before launch_stage runs), pure liveness() predicate (None-first match so an unrecorded monitor can never render Stuck) shared verbatim by devflow status's new monitor row and doctor's new check_dead_monitor finding, spliced into reconcile_phase immediately after check_dead_agent per 18-01's extend-not-reorder contract. Manually verified end-to-end against a synthetic dead-monitor fixture: status prints stuck — needs devflow resume, doctor prints a matching finding with a devflow resume --phase N repair, neither leaks a filesystem path or username (WR-02 class).
+- [Phase 18]: 18-04: transition_resets_consecutive_failures added as a pure mode.rs predicate (not a Mode method) resolving Open Question 1 -- false only for (Code, Validate), making MAX_CONSECUTIVE_FAILURES reachable; infra_failures' unconditional reset is untouched (transition_resets_infra_failures passes byte-for-byte unchanged); handle_validate_outcome's increment switched to saturating_add to close the overflow-wrap reintroduction risk
 
 ## Roadmap Evolution
 
@@ -252,9 +271,10 @@ None currently open for Phase 17.
 | Phase 18-dogfood-reliability-hardening P01 | 35min | 2 tasks | 1 files |
 | Phase 18 P02 | 15min | 2 tasks | 1 files |
 | Phase 18 P03 | 30min | 3 tasks | 3 files |
+| Phase 18 P04 | 35min | 2 tasks | 2 files |
 
 ## Session
 
-**Last session:** 2026-07-21T03:57:47.894Z
-**Stopped at:** Completed 18-03-PLAN.md
+**Last session:** 2026-07-21T04:18:40.283Z
+**Stopped at:** Completed 18-04-PLAN.md
 **Resume file:** None

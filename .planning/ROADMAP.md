@@ -240,14 +240,14 @@ Plans:
 
 **Requirements**: 18a–18g (see CONTEXT.md)
 **Depends on:** Phase 17 (typed outcomes, build provenance)
-**Plans:** 3/7 plans executed
+**Plans:** 4/7 plans executed
 
 Plans:
 
 - [x] 18-01-PLAN.md — 18a: `devflow doctor` project-aware reconciliation (wave 1)
 - [x] 18-02-PLAN.md — 18g: WR-03 test stabilization, assertion placement (wave 1)
 - [x] 18-03-PLAN.md — 18b: persist and probe `monitor_pid`, representable "stuck" state (wave 2)
-- [ ] 18-04-PLAN.md — 18d: make `MAX_CONSECUTIVE_FAILURES` reachable for the Code↔Validate loop (wave 3)
+- [x] 18-04-PLAN.md — 18d: make `MAX_CONSECUTIVE_FAILURES` reachable for the Code↔Validate loop (wave 3)
 - [ ] 18-05-PLAN.md — 18e: Layer 0/Validate verdict reconciliation + three-way outcome (wave 4)
 - [ ] 18-06-PLAN.md — 18c: evaluate build staleness against the worktree HEAD (wave 5)
 - [ ] 18-07-PLAN.md — 18f: preflight gate approval skips the adjudicated check, bounded (wave 6)
