@@ -246,8 +246,9 @@ empty commits (High, DEN-36), 999.8 split `main.rs` (High, DEN-33), 999.16
 AI change acceptance contract (High, DEN-41). Their accumulated context was
 consolidated into
 `.planning/phases/19-release-integrity-main-rs-decomposition/CONTEXT.md`
-as units 19a/19b/19c–19f/19g. **Linear still shows these four as backlog —
-they need moving to the Phase 19 milestone.**
+as units 19a/19b/19c–19f/19g. Linear synced 2026-07-21: all four moved to the
+`Phase 19: Release Integrity + main.rs Decomposition` project milestone,
+retitled to their unit IDs, and set to Todo.
 
 **Earmarked for Phase 20 (v2.0.0):** 999.6, 999.7, 999.13, likely 999.3 —
 all four land in `main.rs`, which is why Phase 19's split precedes them.
