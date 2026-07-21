@@ -1712,6 +1712,21 @@ fn classify_validate_outcome(result: &agent_result::AgentResult) -> ValidateOutc
     }
 }
 
+/// The two ordinary Validate outcomes left once `ValidateOutcome::Ambiguous`
+/// has been handled and returned on its own (WR-03, 18-fix). Deliberately a
+/// distinct, two-variant type: matching on THIS below is exhaustive without
+/// a third, panic-capable arm — the compiler enforces that
+/// `handle_validate_outcome`'s tail can never see an ambiguous outcome,
+/// instead of that invariant being proven by hand-tracing control flow (the
+/// pre-fix shape's `unreachable!()`, which was sound but fragile: a future
+/// edit to either the `forced` computation or the early-return `if` could
+/// have silently reintroduced reachability).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValidateResult {
+    Passed,
+    Failed,
+}
+
 /// Decide what happens after a Validate stage, honoring the active mode's
 /// gate policy, the consecutive-failure threshold, and (18e) the immediate
 /// gate an ambiguous `external_verify` outcome forces regardless of either.
@@ -1720,7 +1735,31 @@ fn handle_validate_outcome(
     state: &mut State,
     outcome: ValidateOutcome,
 ) -> Result<(), CliError> {
-    if outcome == ValidateOutcome::Failed {
+    // 18e / T-18-19: an ambiguous outcome must gate IMMEDIATELY — it is
+    // being adjudicated right now, not retried, so it must never fall
+    // through to the counter-based `should_gate` check below and must never
+    // touch `consecutive_failures`. Handled in its own arm, up front, and
+    // converted to `ValidateResult` for the two variants that share the
+    // rest of this function's logic (WR-03).
+    let result = match outcome {
+        ValidateOutcome::Ambiguous(detail) => {
+            let context = format!(
+                "[never-silent] validate ambiguous: {}",
+                truncate_reason(&detail)
+            );
+            return match run_gate(project_root, state, Stage::Validate, &context)? {
+                GateAction::Advance => transition(project_root, state, Stage::Ship),
+                GateAction::LoopBack(_) => {
+                    loop_back_to_code(project_root, state, FixType::GapsOnly)
+                }
+                GateAction::Abort(reason) => abort(project_root, state, &reason),
+            };
+        }
+        ValidateOutcome::Passed => ValidateResult::Passed,
+        ValidateOutcome::Failed => ValidateResult::Failed,
+    };
+
+    if result == ValidateResult::Failed {
         // Now that the counter genuinely accumulates (18d), an unbounded
         // loop could otherwise overflow it and wrap to 0, silently
         // restoring the unreachable-ceiling bug in a slower form.
@@ -1728,28 +1767,16 @@ fn handle_validate_outcome(
         workflow::save_state(state)?;
     }
 
-    // 18e / T-18-19: an ambiguous outcome must gate IMMEDIATELY — it is
-    // being adjudicated right now, not retried, so it must never fall
-    // through to the counter-based `should_gate` check above and must never
-    // touch `consecutive_failures`.
-    let forced = matches!(outcome, ValidateOutcome::Ambiguous(_));
-    if forced
-        || state
-            .mode
-            .should_gate(Stage::Validate, state.consecutive_failures)
+    if state
+        .mode
+        .should_gate(Stage::Validate, state.consecutive_failures)
     {
-        let context = match &outcome {
-            ValidateOutcome::Passed => "Validation passed — approve to ship?".to_string(),
-            ValidateOutcome::Failed => format!(
+        let context = match result {
+            ValidateResult::Passed => "Validation passed — approve to ship?".to_string(),
+            ValidateResult::Failed => format!(
                 "Validation failed {} time(s) — human review needed.",
                 state.consecutive_failures
             ),
-            ValidateOutcome::Ambiguous(detail) => {
-                format!(
-                    "[never-silent] validate ambiguous: {}",
-                    truncate_reason(detail)
-                )
-            }
         };
         return match run_gate(project_root, state, Stage::Validate, &context)? {
             GateAction::Advance => transition(project_root, state, Stage::Ship),
@@ -1758,12 +1785,9 @@ fn handle_validate_outcome(
         };
     }
 
-    match outcome {
-        ValidateOutcome::Passed => transition(project_root, state, Stage::Ship),
-        ValidateOutcome::Failed => loop_back_to_code(project_root, state, FixType::GapsOnly),
-        ValidateOutcome::Ambiguous(_) => {
-            unreachable!("Ambiguous always sets forced=true and returns via the gate branch above")
-        }
+    match result {
+        ValidateResult::Passed => transition(project_root, state, Stage::Ship),
+        ValidateResult::Failed => loop_back_to_code(project_root, state, FixType::GapsOnly),
     }
 }
 
