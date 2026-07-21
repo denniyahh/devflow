@@ -447,3 +447,47 @@ fn allowlist_entries_require_reasons() {
     assert!(validate_allowlist(&reasonless).is_err());
     validate_allowlist(&load_allowlist()).unwrap();
 }
+
+#[derive(serde::Deserialize)]
+struct RootCargoToml {
+    workspace: RootWorkspaceSection,
+}
+
+#[derive(serde::Deserialize)]
+struct RootWorkspaceSection {
+    package: RootWorkspacePackage,
+    dependencies: RootWorkspaceDependencies,
+}
+
+#[derive(serde::Deserialize)]
+struct RootWorkspacePackage {
+    version: String,
+}
+
+#[derive(serde::Deserialize)]
+struct RootWorkspaceDependencies {
+    #[serde(rename = "devflow-core")]
+    devflow_core: DevflowCoreDependency,
+}
+
+#[derive(serde::Deserialize)]
+struct DevflowCoreDependency {
+    version: String,
+}
+
+/// `devflow-core`'s pinned `version` in `[workspace.dependencies]` must equal
+/// `[workspace.package].version` (a path dependency's `version` field does not
+/// auto-inherit from the workspace, unlike ordinary `.workspace = true`
+/// fields). This drifted twice by hand before the pin was consolidated into
+/// a single root-Cargo.toml location — this test is the guard against a
+/// third occurrence.
+#[test]
+fn devflow_core_dependency_pin_matches_workspace_version() {
+    let contents = std::fs::read_to_string(workspace_root().join("Cargo.toml"))
+        .expect("root Cargo.toml must be readable");
+    let parsed: RootCargoToml = toml::from_str(&contents).expect("root Cargo.toml must parse");
+    assert_eq!(
+        parsed.workspace.dependencies.devflow_core.version, parsed.workspace.package.version,
+        "workspace.dependencies.devflow-core's pinned version must match workspace.package.version"
+    );
+}
