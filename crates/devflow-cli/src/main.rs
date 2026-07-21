@@ -1513,7 +1513,10 @@ fn handle_validate_outcome(
     passed: bool,
 ) -> Result<(), CliError> {
     if !passed {
-        state.consecutive_failures += 1;
+        // Now that the counter genuinely accumulates (18d), an unbounded
+        // loop could otherwise overflow it and wrap to 0, silently
+        // restoring the unreachable-ceiling bug in a slower form.
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
         workflow::save_state(state)?;
     }
 
@@ -1783,13 +1786,19 @@ fn run_checkout_hooks(
 
 /// Fire the hooks for `from → to`, persist the new stage, and launch its agent.
 ///
-/// CR-01 (17-06 gap closure): resets `infra_failures` alongside
-/// `consecutive_failures` on every successful transition. Without this, an
-/// infra-fault ceiling meant to bound a *stuck loop* (D-08,
-/// [`mode::MAX_INFRA_FAILURES`]) instead accumulates across a phase's entire
-/// lifetime — several well-spaced, cleanly-resolved infra faults would
-/// falsely reach the ceiling and hard-abort a long-running but otherwise
-/// healthy phase.
+/// `infra_failures` resets unconditionally on every successful transition
+/// (CR-01, 17-06 gap closure). Without this, an infra-fault ceiling meant to
+/// bound a *stuck loop* (D-08, [`mode::MAX_INFRA_FAILURES`]) instead
+/// accumulates across a phase's entire lifetime — several well-spaced,
+/// cleanly-resolved infra faults would falsely reach the ceiling and
+/// hard-abort a long-running but otherwise healthy phase.
+///
+/// `consecutive_failures` clears on every transition EXCEPT Code→Validate
+/// (18d, [`mode::transition_resets_consecutive_failures`]): that hop is
+/// crossed on every single Code↔Validate retry cycle, so unconditionally
+/// clearing it there made [`mode::MAX_CONSECUTIVE_FAILURES`] unreachable for
+/// the exact loop it bounds. The two counters deliberately no longer share a
+/// single reset condition.
 fn transition(project_root: &Path, state: &mut State, to: Stage) -> Result<(), CliError> {
     let from = state.stage;
     let _ = run_checkout_hooks(
@@ -1799,7 +1808,9 @@ fn transition(project_root: &Path, state: &mut State, to: Stage) -> Result<(), C
         to,
     );
     state.stage = to;
-    state.consecutive_failures = 0;
+    if mode::transition_resets_consecutive_failures(from, to) {
+        state.consecutive_failures = 0;
+    }
     state.infra_failures = 0;
     state.gate_pending = false;
     workflow::save_state(state)?;
@@ -5169,6 +5180,203 @@ mod tests {
         handle_infra_outcome(root, &mut state, Stage::Validate, Some("killed".into())).unwrap();
 
         assert_eq!(state.infra_failures, 1);
+    }
+
+    /// 18d — the RED-then-GREEN core of the Code↔Validate safety-gate
+    /// reachability fix. Drives `MAX_CONSECUTIVE_FAILURES` real
+    /// fail/Code→Validate cycles via `handle_validate_outcome` (the +1) and
+    /// `transition()` (previously an unconditional reset to 0). Before the
+    /// fix, `consecutive_failures` oscillates 0/1 and never reaches the
+    /// ceiling; after the fix it accumulates and forces the gate.
+    ///
+    /// `state.stage` is forced back to `Stage::Code` before every
+    /// `transition()` call so each loop iteration exercises the exact
+    /// `(Code, Validate)` hop under test, independent of which internal
+    /// branch `handle_validate_outcome` took on that cycle (ordinary
+    /// loop-back vs. the forced gate on the final cycle) — mirrors what
+    /// `prepare_loop_back_to_code` does for real on every retry.
+    ///
+    /// A gate response is re-seeded at the top of every loop iteration (not
+    /// just once before the loop) so it survives `prepare_loop_back_to_code`'s
+    /// `Gates::cleanup(.., Stage::Validate)` — which fires on every ordinary
+    /// loop-back cycle once `state.stage` is `Validate` and would otherwise
+    /// delete a response written only once up front before the final,
+    /// gate-triggering cycle ever gets to read it. With it re-seeded every
+    /// iteration, the forced gate on the final cycle resolves immediately via
+    /// `Gates::poll_response` finding an already-written file, instead of
+    /// waiting out the (default 7-day) gate timeout. PATH is neutralized
+    /// under `ENV_MUTEX` so neither `handle_validate_outcome`'s loop-back nor
+    /// `transition()`'s own `launch_stage` call risk spawning a real agent
+    /// CLI, following `transition_resets_infra_failures`' established
+    /// approach.
+    #[test]
+    fn consecutive_failures_reaches_ceiling_across_cycles() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 81;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        for _ in 0..mode::MAX_CONSECUTIVE_FAILURES {
+            std::fs::write(
+                &response_path,
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap();
+            let _ = handle_validate_outcome(root, &mut state, false);
+            state.stage = Stage::Code;
+            let _ = transition(root, &mut state, Stage::Validate);
+        }
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        assert_eq!(state.consecutive_failures, mode::MAX_CONSECUTIVE_FAILURES);
+        assert!(
+            state
+                .mode
+                .should_gate(Stage::Validate, state.consecutive_failures),
+            "reaching the ceiling must force the Auto-mode Validate gate"
+        );
+        assert_eq!(
+            state.infra_failures, 0,
+            "infra_failures must still reset unconditionally on the same hop the consecutive reset now skips"
+        );
+    }
+
+    /// 18d precision edge: `consecutive_failures` must saturate at `u32::MAX`
+    /// rather than wrap to 0 on overflow, so a long-running stuck loop can't
+    /// silently restore the unreachable-ceiling bug in a slower, harder-to-
+    /// diagnose form. At `u32::MAX`, `should_gate` is already true, so the
+    /// failure resolves via the forced-gate path — pre-seed a response so
+    /// `run_gate`'s poll doesn't wait out the timeout.
+    #[test]
+    fn consecutive_failures_increment_saturates() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 82;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        state.consecutive_failures = u32::MAX;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        handle_validate_outcome(root, &mut state, false).unwrap();
+
+        assert_eq!(state.consecutive_failures, u32::MAX);
+    }
+
+    /// 18d idempotency edge: a repeated Code→Validate transition leaves
+    /// `consecutive_failures` unchanged rather than zeroing it. `state.stage`
+    /// is reset to `Code` before each call so both calls exercise the exact
+    /// hop under test.
+    #[test]
+    fn repeated_code_to_validate_transition_is_idempotent_on_the_counter() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 83;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        state.consecutive_failures = 2;
+        workflow::save_state(&state).unwrap();
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        let _ = transition(root, &mut state, Stage::Validate);
+        state.stage = Stage::Code;
+        let _ = transition(root, &mut state, Stage::Validate);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        assert_eq!(state.consecutive_failures, 2);
+    }
+
+    /// 18d concurrency edge: two concurrently-active phases' `consecutive_failures`
+    /// counters are independent — a Code→Validate hop on one phase must not
+    /// reset a sibling phase's counter.
+    #[test]
+    fn consecutive_failures_are_independent_across_phases() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let mut state_a = State::new(84, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state_a.stage = Stage::Code;
+        state_a.consecutive_failures = 1;
+        workflow::save_state(&state_a).unwrap();
+
+        let mut state_b = State::new(85, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state_b.stage = Stage::Code;
+        state_b.consecutive_failures = 2;
+        workflow::save_state(&state_b).unwrap();
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        let _ = transition(root, &mut state_a, Stage::Validate);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        let reloaded_a = workflow::load_state(root, 84).unwrap();
+        let reloaded_b = workflow::load_state(root, 85).unwrap();
+
+        assert_eq!(
+            reloaded_a.consecutive_failures, 1,
+            "the Code->Validate hop must not reset consecutive_failures"
+        );
+        assert_eq!(
+            reloaded_b.consecutive_failures, 2,
+            "an untouched sibling phase's counter must be unaffected"
+        );
     }
 
     /// D-09: a primary-loop `RateLimited` outcome writes the single-agent
