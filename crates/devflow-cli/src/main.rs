@@ -3417,16 +3417,21 @@ fn test_cmd(project_root: &Path) -> Result<(), CliError> {
 // doctor
 // ---------------------------------------------------------------------------
 
+/// One tool/environment check from `doctor`'s pre-existing audit (git,
+/// cargo, agent CLIs, `RUST_LOG`, ...). Module-level (WR-01, 18-fix) so
+/// `checks_json_value` and `doctor_json_body` can compose it into
+/// `doctor --json`'s single output document without living inside `doctor`
+/// itself.
+struct Check {
+    name: String,
+    status: String,
+    version: Option<String>,
+    install_hint: Option<String>,
+}
+
 /// Audit the environment and report what's installed, missing, or broken.
 fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
     use std::process::Command;
-
-    struct Check {
-        name: String,
-        status: String,
-        version: Option<String>,
-        install_hint: Option<String>,
-    }
 
     fn cmd_check(name: &str, cmd: &str, version_arg: &str, install_hint: &str) -> Check {
         match Command::new(cmd).arg(version_arg).output() {
@@ -3560,30 +3565,21 @@ fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
         },
     ];
 
+    let facts = collect_phase_facts(project_root);
+
     if json {
-        let mut out = String::from("[\n");
-        for (i, c) in checks.iter().enumerate() {
-            out.push_str("  {\n");
-            out.push_str(&format!("    \"name\": {:?},\n", c.name));
-            out.push_str(&format!("    \"status\": {:?},\n", c.status));
-            if let Some(v) = &c.version {
-                out.push_str(&format!("    \"version\": {:?},\n", v));
-            } else {
-                out.push_str("    \"version\": null,\n");
-            }
-            if let Some(h) = &c.install_hint {
-                out.push_str(&format!("    \"install_hint\": {:?}\n", h));
-            } else {
-                out.push_str("    \"install_hint\": null\n");
-            }
-            out.push('}');
-            if i + 1 < checks.len() {
-                out.push(',');
-            }
-            out.push('\n');
-        }
-        out.push_str("]\n");
-        print!("{out}");
+        // WR-01 (18-fix): a single top-level JSON document — `{"environment":
+        // [...], "reconciliation": [...]}` — instead of the pre-fix
+        // behavior of printing the tool checks as one top-level `[...]`
+        // array and then printing a SECOND, independent top-level array
+        // right after it. That concatenation is not valid single-document
+        // JSON for any parser that isn't NDJSON-aware (`json.load` raised
+        // "Extra data").
+        let body = doctor_json_body(&checks, &facts);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&body).expect("doctor --json body must serialize")
+        );
     } else {
         for c in &checks {
             let icon = match c.status.as_str() {
@@ -3602,10 +3598,8 @@ fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
             }
             println!();
         }
+        print!("{}", render_reconciliation_text(&facts));
     }
-
-    let facts = collect_phase_facts(project_root);
-    render_reconciliation(&facts, json);
 
     Ok(())
 }
@@ -3900,21 +3894,11 @@ fn findings_for_display(facts: &PhaseFacts) -> Vec<PhaseFinding> {
     }]
 }
 
-/// Render `doctor`'s per-phase reconciliation section (after the existing
+/// Build `doctor`'s per-phase reconciliation section (after the existing
 /// tool/env checks), read-only: it never calls `workflow::save_state`,
 /// `events::emit`, `Gates::cleanup`/`Gates::write`, or any `recover::clean*`
-/// function (T-18-02).
-fn render_reconciliation(facts: &[PhaseFacts], json: bool) {
-    if json {
-        print!("{}", render_reconciliation_json(facts));
-    } else {
-        print!("{}", render_reconciliation_text(facts));
-    }
-}
-
-/// Build the human-readable reconciliation section. A pure string builder
-/// (not a direct `println!`) so it's directly assertable in tests without
-/// capturing process stdout.
+/// function (T-18-02). A pure string builder (not a direct `println!`) so
+/// it's directly assertable in tests without capturing process stdout.
 fn render_reconciliation_text(facts: &[PhaseFacts]) -> String {
     let mut out = String::from("\nreconciliation:\n");
     if facts.is_empty() {
@@ -3932,41 +3916,67 @@ fn render_reconciliation_text(facts: &[PhaseFacts]) -> String {
     out
 }
 
-/// Build the `--json` reconciliation array, using the same manual
-/// string-building style as the `checks` array above (not a new
-/// serialization approach).
-fn render_reconciliation_json(facts: &[PhaseFacts]) -> String {
+/// Build the `--json` reconciliation array as a `serde_json::Value` (WR-01,
+/// 18-fix). No longer prints its own top-level `[...]` document — `doctor()`
+/// nests this under `"reconciliation"` in the single object
+/// `doctor_json_body` composes alongside `checks_json_value`'s
+/// `"environment"` array.
+fn render_reconciliation_json(facts: &[PhaseFacts]) -> serde_json::Value {
     // Pair each finding with its originating phase's last recorded event, so
     // a `--json` consumer gets that context without re-reading events.jsonl.
     let findings: Vec<(&PhaseFacts, PhaseFinding)> = facts
         .iter()
         .flat_map(|pf| findings_for_display(pf).into_iter().map(move |f| (pf, f)))
         .collect();
-    let mut out = String::from("[\n");
-    for (i, (phase_facts, finding)) in findings.iter().enumerate() {
-        out.push_str("  {\n");
-        out.push_str(&format!("    \"phase\": {},\n", finding.phase));
-        out.push_str(&format!(
-            "    \"severity\": {:?},\n",
-            finding.severity.label()
-        ));
-        out.push_str(&format!("    \"detail\": {:?},\n", finding.detail));
-        match &finding.repair {
-            Some(repair) => out.push_str(&format!("    \"repair\": {repair:?},\n")),
-            None => out.push_str("    \"repair\": null,\n"),
-        }
-        match &phase_facts.last_event {
-            Some(event) => out.push_str(&format!("    \"last_event\": {event:?}\n")),
-            None => out.push_str("    \"last_event\": null\n"),
-        }
-        out.push('}');
-        if i + 1 < findings.len() {
-            out.push(',');
-        }
-        out.push('\n');
-    }
-    out.push_str("]\n");
-    out
+    serde_json::Value::Array(
+        findings
+            .iter()
+            .map(|(phase_facts, finding)| {
+                serde_json::json!({
+                    "phase": finding.phase,
+                    "severity": finding.severity.label(),
+                    "detail": finding.detail,
+                    "repair": finding.repair,
+                    "last_event": phase_facts.last_event,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Build `doctor --json`'s `"environment"` array from the pre-existing
+/// tool/env checks (WR-01, 18-fix). Extracted so it can be composed with
+/// `render_reconciliation_json`'s array into ONE JSON document instead of
+/// being printed as its own top-level array.
+fn checks_json_value(checks: &[Check]) -> serde_json::Value {
+    serde_json::Value::Array(
+        checks
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "name": c.name,
+                    "status": c.status,
+                    "version": c.version,
+                    "install_hint": c.install_hint,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Compose `doctor --json`'s single JSON document (WR-01, 18-fix). Pre-fix,
+/// `doctor()` printed the tool checks as one top-level `[...]` array and
+/// then printed `render_reconciliation_json`'s array as a SECOND,
+/// independent top-level array right after it — invalid single-document
+/// JSON for any parser that isn't NDJSON-aware (`json.load` raised "Extra
+/// data" against a live fixture with one active phase). There is now
+/// exactly one top-level value: `{"environment": [...], "reconciliation":
+/// [...]}`.
+fn doctor_json_body(checks: &[Check], facts: &[PhaseFacts]) -> serde_json::Value {
+    serde_json::json!({
+        "environment": checks_json_value(checks),
+        "reconciliation": render_reconciliation_json(facts),
+    })
 }
 
 #[cfg(test)]
@@ -8262,6 +8272,61 @@ mod tests {
             let text = render_reconciliation_text(&facts);
             assert!(text.contains(&format!("phase {phase}: gate_pending is true")));
             assert!(text.contains(&format!("repair: devflow resume --phase {phase}")));
+        }
+
+        /// WR-01 (18-fix): `doctor --json` must emit ONE JSON document, not
+        /// two concatenated top-level arrays. Exercises the exact
+        /// composition `doctor()`'s `--json` path uses (`doctor_json_body`),
+        /// then round-trips it through `serde_json::to_string`/`from_str` —
+        /// the failure mode this reproduces (pre-fix) is a single-document
+        /// parser (`json.load`, `JSON.parse`) raising "Extra data" on the
+        /// old two-array output; `jq` tolerated it (NDJSON-style streaming),
+        /// which is why it went unnoticed.
+        #[test]
+        fn doctor_json_is_a_single_object_with_environment_and_reconciliation() {
+            let checks = vec![Check {
+                name: "git".into(),
+                status: "ok".into(),
+                version: Some("2.40.0".into()),
+                install_hint: None,
+            }];
+
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = 92;
+            let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+            state.stage = Stage::Validate;
+            state.gate_pending = true; // mismatched: no gate file — produces a finding
+            workflow::save_state(&state).unwrap();
+            let facts = collect_phase_facts(root);
+
+            let body = doctor_json_body(&checks, &facts);
+            let serialized = serde_json::to_string(&body).unwrap();
+            let reparsed: serde_json::Value = serde_json::from_str(&serialized)
+                .expect("doctor --json must be single-document JSON, not two concatenated arrays");
+
+            assert!(
+                reparsed.get("environment").is_some(),
+                "must carry the tool checks under \"environment\": {reparsed}"
+            );
+            assert!(
+                reparsed.get("reconciliation").is_some(),
+                "must carry the reconciliation findings under \"reconciliation\": {reparsed}"
+            );
+            assert!(reparsed["environment"].is_array());
+            assert!(reparsed["reconciliation"].is_array());
+            let reconciliation = reparsed["reconciliation"].as_array().unwrap();
+            assert!(
+                !reconciliation.is_empty(),
+                "the mismatched gate_pending fixture must produce at least one finding"
+            );
+            assert!(
+                reconciliation.iter().any(|f| f["detail"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("gate_pending is true")),
+                "must carry the gate_pending finding: {reconciliation:?}"
+            );
         }
 
         /// T-18-02: running `doctor` twice against a mismatched fixture must
