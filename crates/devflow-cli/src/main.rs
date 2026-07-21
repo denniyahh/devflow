@@ -1244,6 +1244,18 @@ fn launch_stage_inner(
     prompt_override: Option<String>,
     archived_stage: Option<Stage>,
 ) -> Result<(), CliError> {
+    // WR-04 (18-fix): clear the prior stage's monitor pid up front, before
+    // any fallible step below (`ensure_agent_binary`, `enforce_build_staleness`)
+    // can return early via `?`. Without this, a failed relaunch left
+    // `state.stage` already advanced (by `transition()`, before this
+    // function was ever called) alongside a stale `monitor_pid` still
+    // naming the PREVIOUS stage's (now-dead) monitor — `liveness()` then
+    // misreports `Stuck → devflow resume`, even when the real remedy is
+    // unrelated (e.g. rebuild after a staleness block). The real pid is
+    // set again below once `monitor::spawn_monitor` actually succeeds.
+    state.monitor_pid = None;
+    workflow::save_state(state)?;
+
     let prompt = prompt_override.unwrap_or_else(|| {
         prompt::stage_prompt_for_project(state.stage, state.phase, &state.project_root)
     });
@@ -5534,6 +5546,63 @@ mod tests {
         handle_infra_outcome(root, &mut state, Stage::Validate, Some("killed".into())).unwrap();
 
         assert_eq!(state.infra_failures, 1);
+    }
+
+    /// WR-04 (18-fix): an early failure in `launch_stage_inner` — before
+    /// `monitor::spawn_monitor` ever runs — must not leave a stale
+    /// `monitor_pid` behind. Pre-fix, `state.monitor_pid` still named the
+    /// PREVIOUS stage's (now-dead) monitor after `ensure_agent_binary`
+    /// returned early via `?`, and `liveness()`/`doctor` then misreported
+    /// `Stuck → devflow resume` — the wrong remedy for what's actually an
+    /// agent-binary/staleness failure. PATH is neutralized to a `git`-only
+    /// directory under `ENV_MUTEX`, mirroring `transition_resets_infra_failures`,
+    /// so `ensure_agent_binary("claude")` reliably fails without touching a
+    /// real agent CLI and without racing other PATH-mutating tests.
+    #[test]
+    fn launch_stage_inner_clears_monitor_pid_on_early_failure() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 93;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        // A stale pid from a prior stage's now-dead monitor — this is what
+        // must be cleared, not carried forward into the new stage.
+        state.monitor_pid = Some(999_999);
+        workflow::save_state(&state).unwrap();
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        let result = launch_stage_inner(&mut state, None, None);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        assert!(
+            result.is_err(),
+            "ensure_agent_binary must fail against the neutralized, agent-free PATH"
+        );
+        assert_eq!(
+            state.monitor_pid, None,
+            "an early launch failure must clear the stale monitor_pid in-memory, not carry it \
+             forward from the previous stage"
+        );
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert_eq!(
+            reloaded.monitor_pid, None,
+            "the monitor_pid clear must be persisted to state.json, not just in-memory"
+        );
     }
 
     /// 18d — the RED-then-GREEN core of the Code↔Validate safety-gate
