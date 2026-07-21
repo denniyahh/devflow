@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
-status: "Phase 17 executed (13/13 plans, 15/15 must-haves) - validated at re-audit #10 (eda94cd): GAP-6/GAP-7 closed via 17-13 and RED-proven; GAP-8 (unsampled CLI wiring of GAP-7's fix) found and auto-filled; all 14 rows green, nyquist_compliant: true. Phase 18 in progress: 18-01 (18a doctor reconciliation), 18-02 (18g WR-03 test stabilization), 18-03 (18b monitor liveness), 18-04 (18d Code-Validate safety-gate reachability), 18-05 (18e Layer 0/Validate verdict fix), 18-06 (18c worktree-aware staleness enforcement) complete."
-stopped_at: Completed 18-06-PLAN.md
-last_updated: "2026-07-21T04:58:42.529Z"
+status: "Phase 17 executed (13/13 plans, 15/15 must-haves) - validated at re-audit #10 (eda94cd): GAP-6/GAP-7 closed via 17-13 and RED-proven; GAP-8 (unsampled CLI wiring of GAP-7's fix) found and auto-filled; all 14 rows green, nyquist_compliant: true. Phase 18 complete (7/7 plans): 18-01 (18a doctor reconciliation), 18-02 (18g WR-03 test stabilization), 18-03 (18b monitor liveness), 18-04 (18d Code-Validate safety-gate reachability), 18-05 (18e Layer 0/Validate verdict fix), 18-06 (18c worktree-aware staleness enforcement), 18-07 (18f preflight-gate re-run wedge fix)."
+stopped_at: Completed 18-07-PLAN.md
+last_updated: "2026-07-21T05:32:24.982Z"
 progress:
   total_phases: 7
-  completed_phases: 6
+  completed_phases: 7
   total_plans: 54
-  completed_plans: 53
-  percent: 86
+  completed_plans: 54
+  percent: 100
 ---
 
 # DevFlow — Project State
@@ -19,7 +19,7 @@ progress:
 
 ## Active
 
-- **Phase 18 (In Progress — 6/7 plans):** Dogfood Reliability Hardening
+- **Phase 18 (Complete — 7/7 plans):** Dogfood Reliability Hardening
   — reprioritized 2026-07-20 from Hermes Support. `devflow doctor`
   reconciliation (18a), monitor liveness (18b), worktree-aware staleness
   enforcement (18c), Code↔Validate safety-gate reachability (18d), Layer
@@ -136,6 +136,36 @@ progress:
   test --workspace` 420/420 (0 failed, up from 417), clippy/fmt clean. See
   `18-06-SUMMARY.md`. Next: 18-07 (wave 6, 18f — preflight-gate re-run
   wedge fix).
+
+  Executed 2026-07-21: **18-07 complete** (`a397d46`, `950a358`,
+  `1ca79dd`) — preflight-gate re-run wedge fix (18f), the final plan of
+  Phase 18. `launch_stage` split into itself (resolution + the
+  `run_preflight` guard) and a new `launch_stage_inner` (everything after
+  the guard); `run_preflight`'s `GateAction::Advance` arm now calls
+  `launch_stage_inner` directly — skipping the just-adjudicated check
+  entirely, per the binding 2026-07-20 operator decision (D-18f) — while
+  `GateAction::LoopBack` still calls the full `launch_stage` (deliberately
+  re-checking, since the operator may have fixed the condition). Either
+  arm's recursion is bounded by a new persisted `State.preflight_retries: u32`
+  against `mode::MAX_PREFLIGHT_RETRIES = 3`, checked BEFORE any new gate is
+  written; reaching the ceiling emits `preflight_retry_ceiling_reached` and
+  aborts instead of polling a second 7-day gate timeout. The counter resets
+  to 0, persisted, on both a passing preflight and a human Advance. RED-
+  then-GREEN proven live: manually reverted the Advance arm back to calling
+  `launch_stage` and reproduced the documented wedge exactly (two gates
+  written, then a bounded `"gate for stage define timed out awaiting a
+  response"` error), then restored the fix and confirmed green. Deviated
+  from the plan's literal Task 3 test setup (`Stage::Plan` +
+  `AlwaysFailAdapter`) after confirming empirically it cannot reproduce a
+  failure that survives a relaunch — `launch_stage`'s recursion always
+  re-resolves the REAL production adapter via `agents::adapter_for`,
+  discarding whatever adapter was passed into the outer `run_preflight`
+  call — and used `preflight_interactivity_check` (a pure function of
+  state, so it fails identically on retry) instead, the check CONTEXT.md
+  actually attributes the wedge to. 4 new tests (1 in `state.rs`, 3 in
+  `main.rs`); `cargo test --workspace` 424/424 (0 failed, up from 420),
+  clippy/fmt clean. See `18-07-SUMMARY.md`. **Phase 18 (7/7 plans, 18a–18g)
+  complete.**
 
 ## Backlog
 
@@ -265,6 +295,8 @@ None currently open for Phase 17.
 - [Phase 18]: 18-04: transition_resets_consecutive_failures added as a pure mode.rs predicate (not a Mode method) resolving Open Question 1 -- false only for (Code, Validate), making MAX_CONSECUTIVE_FAILURES reachable; infra_failures' unconditional reset is untouched (transition_resets_infra_failures passes byte-for-byte unchanged); handle_validate_outcome's increment switched to saturating_add to close the overflow-wrap reintroduction risk
 - [Phase 18]: 18-05: classify_validate_outcome checks Some(Verdict::Pass) first (ordinary Validate verdict:pass still advances directly, unchanged from pre-18e); the combined 18d+18e test is one #[test] fn calling two ~30-line helpers to satisfy both the exact-name acceptance criterion and the function-length convention; ValidateOutcome::Ambiguous's final match arm is unreachable!() rather than silently folded into Failed, since forced=true always returns via the gate branch above
 - [Phase 18]: 18-06: enforce_build_staleness derives execution_root = state.worktree_path.unwrap_or(project_root); is_self_dogfood_workspace stays project_root-scoped (Assumption A3)
+- [Phase 18]: 18-07: launch_stage split into launch_stage (resolution + run_preflight guard) + launch_stage_inner (everything after); run_preflight's Advance arm calls launch_stage_inner directly (skip), LoopBack still calls full launch_stage (re-check), either bounded by persisted State.preflight_retries / mode::MAX_PREFLIGHT_RETRIES=3 checked before any new gate is written; counter resets to 0 (persisted) on preflight pass and human Advance. Phase 18 (18a-18g) complete.
+- [Phase 18]: 18-07: AlwaysFailAdapter cannot reproduce a preflight failure that survives a relaunch (launch_stage always re-resolves the REAL production adapter via agents::adapter_for, discarding whatever was passed into the outer run_preflight call) -- used preflight_interactivity_check (a pure function of state) as the deterministic wedge-reproduction trigger for the three new tests instead; verified empirically both ways (unfixed code + literal plan setup = no observable difference; unfixed code + interactivity-check setup = reproduces the exact documented wedge).
 
 ## Roadmap Evolution
 
@@ -321,9 +353,10 @@ None currently open for Phase 17.
 | Phase 18 P04 | 35min | 2 tasks | 2 files |
 | Phase 18 P05 | 50min | 3 tasks | 2 files |
 | Phase 18 P06 | 21min | 2 tasks | 1 files |
+| Phase 18 P07 | 25min | 3 tasks | 4 files |
 
 ## Session
 
-**Last session:** 2026-07-21T04:58:42.507Z
-**Stopped at:** Completed 18-06-PLAN.md
+**Last session:** 2026-07-21T05:29:59.988Z
+**Stopped at:** Completed 18-07-PLAN.md
 **Resume file:** None
