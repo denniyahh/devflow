@@ -23,7 +23,6 @@
   },
   "review": {
     "default_reviewers": [
-      "claude",
       "codex",
       "cursor",
       "opencode",
