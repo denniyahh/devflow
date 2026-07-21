@@ -419,3 +419,69 @@ Plans:
 Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.15: Hermetic Tests for Shell Entry Points (BACKLOG)
+
+**Goal:** `scripts/install.sh`, `scripts/sync-main-to-develop.sh`, and `scripts/deploy.sh` have user-facing, side-effecting behavior (network downloads, git history mutation, docs deployment) with no direct behavioral tests — only source-text inspection. From `TEST-SUITE-QA-REVIEW.md` (Codex, 2026-07-21).
+**Priority:** High | **Size:** L — re-scoped 2026-07-21 (Claude review): the source document treated all three scripts as equally P0; `deploy.sh` only touches `gh-pages` (docs), meaningfully lower blast radius than `install.sh` (every new user's first run) or `sync-main-to-develop.sh` (mutates real branch history). Demoted `deploy.sh` within this item rather than splitting it out. Linear: DEN-40.
+**Requirements:** TBD — see CONTEXT.md
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.16: AI Change Acceptance Contract (BACKLOG)
+
+**Goal:** Require every AI-generated behavioral change to include a pre-failing regression test, at least one assertion at a public/stable boundary, evidence the test fails for the right reason, full affected-package verification, and independent review — rejecting tests that only assert constants, reproduce the production algorithm, or compare a function call with itself. From `TEST-SUITE-QA-REVIEW.md` (Codex, 2026-07-21), directly motivated by defect classes found and removed in that same review (the fake `ReviewerSetTestAdapter`).
+**Priority:** High | **Size:** M — needs to be wired into `/gsd-code-review`'s actual criteria to have teeth, not just added as `CONTRIBUTING.md` prose. Linear: DEN-41.
+**Requirements:** TBD — see CONTEXT.md
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.17: Mutation Testing (`cargo-mutants`) (BACKLOG)
+
+**Goal:** Introduce `cargo-mutants` as a scheduled/manual gate (not a blocking PR check — too slow at this codebase's size), scoped initially to `verify.rs`, `outcome_policy::decide_action`, `agent_result.rs`'s Layer 0–3 evaluators, and git safety logic (`commit_path`/tag functions). Track surviving mutants rather than treating line coverage as the primary quality score. From `TEST-SUITE-QA-REVIEW.md` (Codex, 2026-07-21).
+**Priority:** Medium | **Size:** M — initial scope re-prioritized 2026-07-21 (Claude review): `verify.rs` first, since this session's own QA review found a real fail-open bug there, making it the highest-confidence-return target in the codebase. `main.rs`'s display/dispatch code deliberately excluded from initial scope. Linear: DEN-42.
+**Requirements:** TBD — see CONTEXT.md
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.18: Property and Fuzz Testing for Protocol Parsers (BACKLOG)
+
+**Goal:** DevFlow parses agent markers, JSON event streams, rate-limit responses, YAML frontmatter, shell commands, and git output with extensive example-based tests but no fuzzing/property testing for malformed or adversarial input. From `TEST-SUITE-QA-REVIEW.md` (Codex, 2026-07-21).
+**Priority:** Medium | **Size:** M — re-scoped 2026-07-21 (Claude review): the source document listed six targets needing both `proptest` and `cargo-fuzz` undifferentiated. Most (agent markers, JSON envelopes, frontmatter, event logs, git porcelain) are format-aware business logic better suited to `proptest`; only `shell_quote` is a genuine byte-level adversarial `cargo-fuzz` target (command-injection-adjacent). Fuzzing the full original list would be more investment than the risk justifies. Linear: DEN-43.
+**Requirements:** TBD — see CONTEXT.md
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.19: Fast and Slow Validation Lanes (BACKLOG)
+
+**Goal:** Keep deterministic unit/integration tests in the fast PR lane; move nested-build provenance tests (`build_provenance.rs`, which dominates suite runtime today), mutation testing (999.17), and fuzz smoke runs (999.18) into explicit slow/scheduled lanes that stay visible and required at an appropriate release boundary. From `TEST-SUITE-QA-REVIEW.md` (Codex, 2026-07-21).
+**Priority:** Medium | **Size:** S — mostly mechanical CI-workflow restructuring once 999.17/999.18 exist to route into a slow lane; not much to put there yet beyond `build_provenance.rs`. Linear: DEN-44.
+**Requirements:** TBD — see CONTEXT.md
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.20: Differential Coverage Enforcement (BACKLOG)
+
+**Goal:** Enforce high coverage on changed lines rather than optimizing for a global percentage (currently 92.81%), requiring a written justification when new branches are intentionally left uncovered. Coverage should support review, not replace behavioral inspection or mutation-testing results. From `TEST-SUITE-QA-REVIEW.md` (Codex, 2026-07-21).
+**Priority:** Medium | **Size:** M — real risk if implemented naively: blocking merges on any uncovered line (including legitimately-hard-to-test OS-failure paths) creates friction without catching defects. Keep the written-justification escape hatch. Linear: DEN-45.
+**Requirements:** TBD — see CONTEXT.md
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)

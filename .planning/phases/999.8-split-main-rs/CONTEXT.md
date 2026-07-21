@@ -104,4 +104,10 @@ cleanly. If they can't be preserved without a structural change to how tests
 serialize env mutation, that's a finding worth surfacing on its own, not something
 to patch around silently mid-refactor.
 
+**Addendum (2026-07-21, TEST-SUITE-QA-REVIEW.md P2):** `.planning/codebase/TESTING.md`
+is already stale (still cites the now-deleted `devflow_ignores_stray_devflow_yaml`
+as its example test for `main.rs`). Regenerate or update it as a mechanical
+follow-up once this split lands — not worth a separate backlog number, but don't
+let it slide past this phase's own completion.
+
 Promote with `/gsd-review-backlog` when ready — **after Phase 18 ships**.

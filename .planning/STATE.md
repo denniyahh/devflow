@@ -192,20 +192,30 @@ progress:
 
 ## Backlog
 
-14 unsequenced items live in `.planning/phases/999.N-*/` and the
+20 unsequenced items live in `.planning/phases/999.N-*/` and the
 `## Backlog` section of ROADMAP.md, reviewed/prioritized/sized 2026-07-21
-(mirrored in Linear as `DEN-26`..`DEN-39`): Hermes Support (999.1, Low),
+(mirrored in Linear as `DEN-26`..`DEN-45`): Hermes Support (999.1, Low),
 phase-process tracking model (999.2, Medium — half-addressed by 18b's
 `monitor_pid`), CLI operator discoverability (999.3, Low), version-tag
 contention on concurrent ship (999.4, Medium), changelog placeholder content
 (999.5, Low), plan-only pipeline mode (999.6, High), manual ship override
 (999.7, High), split `main.rs` (999.8, High — now unblocked), dependency
 update review (999.9, Medium), `.devflow/` artifact hygiene (999.10, Urgent —
-PII leak into downstream repos), `commit_path` empty commits (999.11, High),
-Layer 0 veto test coverage (999.12, Medium), release-cut automation (999.13,
-High — new 2026-07-21, born from the v1.5.0 release), doctor reconciliation
-for planning-doc staleness (999.14, Medium — new 2026-07-21). Promote with
+PII leak into downstream repos), `commit_path` empty commits (999.11, High —
+still open, unrelated to the verify.rs fix below), Layer 0 veto test coverage
+(999.12, Medium), release-cut automation (999.13, High), doctor reconciliation
+for planning-doc staleness (999.14, Medium). Six more added 2026-07-21 from
+`TEST-SUITE-QA-REVIEW.md` (Codex's test-suite QA pass, reviewed by Claude same
+day): shell-entrypoint hermetic tests (999.15, High), AI change acceptance
+contract (999.16, High), mutation testing (999.17, Medium), property/fuzz
+testing for parsers (999.18, Medium), fast/slow CI lanes (999.19, Medium),
+differential coverage enforcement (999.20, Medium). Promote with
 `/gsd-review-backlog`.
+
+Note: that same QA pass independently found and fixed an *unrelated* defect
+in `verify.rs` (external-verification approval/frontmatter parsing accepted
+empty commands, which `sh -c ""` silently passes) — not part of any backlog
+item, already fixed and committed (`b1dcec7`), not a promotion candidate.
 
 ## Completed
 
