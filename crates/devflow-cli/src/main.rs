@@ -3308,6 +3308,192 @@ fn doctor(_project_root: &Path, json: bool) -> Result<(), CliError> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// doctor reconciliation (18a)
+// ---------------------------------------------------------------------------
+
+/// Severity of a reconciliation finding, matching the existing `Check.status`
+/// convention (lowercase strings) so both `doctor` renderers stay consistent.
+///
+/// `#[allow(dead_code)]`: this pure core lands one task ahead of the `doctor`
+/// wiring that constructs `Severity::Ok` and calls `label()` (Task 2 of
+/// 18-01-PLAN.md) — removed once that wiring lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum Severity {
+    Ok,
+    Warn,
+    Problem,
+}
+
+impl Severity {
+    #[allow(dead_code)]
+    fn label(self) -> &'static str {
+        match self {
+            Severity::Ok => "ok",
+            Severity::Warn => "warn",
+            Severity::Problem => "problem",
+        }
+    }
+}
+
+/// The read-only facts `doctor` gathers for one active phase before
+/// reconciling them. Collected by `collect_phase_facts` (Task 2, all I/O);
+/// consumed with zero I/O by `reconcile_phase`.
+///
+/// `#[allow(dead_code)]`: `collect_phase_facts` (Task 2) is this struct's
+/// only constructor and `phase`/`last_event` are read only by that task's
+/// renderer — removed once Task 2 lands.
+#[allow(dead_code)]
+struct PhaseFacts {
+    phase: u32,
+    stage: Stage,
+    gate_pending: bool,
+    agent_pid: Option<u32>,
+    agent_alive: bool,
+    /// The most recent event's `event` field value, for display context.
+    last_event: Option<String>,
+    /// The `stage` field of the most recent `stage_launched` event; `None`
+    /// when the last event recorded for this phase is not a launch.
+    last_launched_stage: Option<Stage>,
+    open_gate_stages: Vec<Stage>,
+    feature_branch_exists: bool,
+}
+
+/// One diagnostic finding for a phase, with a copy-pasteable repair command
+/// when one exists. Never carries a filesystem path or username (T-18-01) —
+/// only phase numbers, stage names, and pids identify the disagreement.
+///
+/// `#[allow(dead_code)]`: `phase` is read only by Task 2's renderer —
+/// removed once Task 2 lands.
+#[allow(dead_code)]
+struct PhaseFinding {
+    phase: u32,
+    severity: Severity,
+    detail: String,
+    repair: Option<String>,
+}
+
+/// `gate_pending` is set but no gate file is open for this phase — the gate
+/// answer path is stuck. `doctor` only reports this; it never repairs it
+/// (T-18-02).
+#[allow(dead_code)]
+fn check_gate_pending_without_gate(facts: &PhaseFacts) -> Option<PhaseFinding> {
+    if !facts.gate_pending || !facts.open_gate_stages.is_empty() {
+        return None;
+    }
+    Some(PhaseFinding {
+        phase: facts.phase,
+        severity: Severity::Problem,
+        detail: format!(
+            "phase {}: gate_pending is true at stage {} but no gate file is open",
+            facts.phase, facts.stage
+        ),
+        repair: Some(format!("devflow resume --phase {}", facts.phase)),
+    })
+}
+
+/// An open gate file exists but `gate_pending` is false — an unanswered
+/// operator question that `status`/`doctor` isn't surfacing as pending.
+#[allow(dead_code)]
+fn check_orphan_gate(facts: &PhaseFacts) -> Option<PhaseFinding> {
+    if facts.gate_pending || facts.open_gate_stages.is_empty() {
+        return None;
+    }
+    let gate_stage = facts.open_gate_stages[0];
+    Some(PhaseFinding {
+        phase: facts.phase,
+        severity: Severity::Problem,
+        detail: format!(
+            "phase {}: gate open for stage {} but state.gate_pending is false",
+            facts.phase, gate_stage
+        ),
+        repair: Some(format!(
+            "devflow gate approve {} --stage {}",
+            facts.phase, gate_stage
+        )),
+    })
+}
+
+/// The recorded agent pid is not alive while the phase sits at an
+/// agent-driven stage — the "who watches the watcher" class of silent death
+/// CONTEXT.md cites (two incidents, ~4h lost, found only via `ps`).
+#[allow(dead_code)]
+fn check_dead_agent(facts: &PhaseFacts) -> Option<PhaseFinding> {
+    let pid = facts.agent_pid?;
+    if facts.agent_alive || !facts.stage.is_agent_stage() {
+        return None;
+    }
+    Some(PhaseFinding {
+        phase: facts.phase,
+        severity: Severity::Problem,
+        detail: format!(
+            "phase {}: agent pid {pid} recorded but not running at stage {}",
+            facts.phase, facts.stage
+        ),
+        repair: Some(format!("devflow resume --phase {}", facts.phase)),
+    })
+}
+
+/// The last `stage_launched` event named a different stage than
+/// `state.stage`. A `Warn`, not a `Problem` — a healthy pipeline legitimately
+/// has one stage in flight between the launch event and the next
+/// transition; exact equality is agreement, never an off-by-one mismatch.
+#[allow(dead_code)]
+fn check_stage_event_drift(facts: &PhaseFacts) -> Option<PhaseFinding> {
+    let launched = facts.last_launched_stage?;
+    if launched == facts.stage {
+        return None;
+    }
+    Some(PhaseFinding {
+        phase: facts.phase,
+        severity: Severity::Warn,
+        detail: format!(
+            "phase {}: last stage_launched event named {launched} but state.stage is {}",
+            facts.phase, facts.stage
+        ),
+        repair: None,
+    })
+}
+
+/// The phase's feature branch does not exist even though its stage is past
+/// `Define`. A `Warn` — a not-yet-pushed or manually deleted branch is
+/// recoverable without state surgery.
+#[allow(dead_code)]
+fn check_missing_branch(facts: &PhaseFacts) -> Option<PhaseFinding> {
+    if facts.feature_branch_exists || facts.stage == Stage::Define {
+        return None;
+    }
+    Some(PhaseFinding {
+        phase: facts.phase,
+        severity: Severity::Warn,
+        detail: format!(
+            "phase {}: feature/phase-{:02} does not exist but stage is {}",
+            facts.phase, facts.phase, facts.stage
+        ),
+        repair: None,
+    })
+}
+
+/// Pure reconciliation core: diffs `state.stage` against the latest event,
+/// live agent pid, open gates, and branch existence, evaluating checks in a
+/// fixed order so the returned findings never depend on how `facts` was
+/// assembled (ordering edge). Takes no path, performs no I/O, and mutates
+/// nothing (T-18-02) — directly unit-testable without a repository.
+#[allow(dead_code)]
+fn reconcile_phase(facts: &PhaseFacts) -> Vec<PhaseFinding> {
+    [
+        check_gate_pending_without_gate(facts),
+        check_orphan_gate(facts),
+        check_dead_agent(facts),
+        check_stage_event_drift(facts),
+        check_missing_branch(facts),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6238,5 +6424,155 @@ mod tests {
             "poll_response must not instantly resolve from a stale response after cleanup"
         );
         assert!(started.elapsed() >= std::time::Duration::from_secs(1));
+    }
+
+    /// Unit tests for the pure `doctor` reconciliation core (18a). Each test
+    /// builds a `PhaseFacts` directly — no repository, no I/O — proving
+    /// `reconcile_phase` is a predicate over facts alone.
+    #[cfg(test)]
+    mod doctor_reconciliation {
+        use super::*;
+
+        /// A fully-agreeing baseline: `reconcile_phase` over this returns
+        /// zero findings. Each test overrides only the field(s) needed to
+        /// trigger the one check it's proving.
+        fn agreeing_facts(phase: u32) -> PhaseFacts {
+            PhaseFacts {
+                phase,
+                stage: Stage::Code,
+                gate_pending: false,
+                agent_pid: Some(4242),
+                agent_alive: true,
+                last_event: Some("stage_launched".into()),
+                last_launched_stage: Some(Stage::Code),
+                open_gate_stages: Vec::new(),
+                feature_branch_exists: true,
+            }
+        }
+
+        #[test]
+        fn reconcile_phase_returns_no_findings_when_all_agree() {
+            let facts = agreeing_facts(1);
+            assert!(reconcile_phase(&facts).is_empty());
+        }
+
+        #[test]
+        fn reconcile_phase_flags_gate_pending_without_open_gate() {
+            let facts = PhaseFacts {
+                gate_pending: true,
+                open_gate_stages: Vec::new(),
+                ..agreeing_facts(2)
+            };
+            let findings = reconcile_phase(&facts);
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].severity, Severity::Problem);
+            assert!(findings[0].detail.contains("gate_pending is true"));
+            assert_eq!(
+                findings[0].repair.as_deref(),
+                Some("devflow resume --phase 2")
+            );
+        }
+
+        #[test]
+        fn reconcile_phase_flags_orphan_open_gate() {
+            let facts = PhaseFacts {
+                gate_pending: false,
+                open_gate_stages: vec![Stage::Validate],
+                ..agreeing_facts(3)
+            };
+            let findings = reconcile_phase(&facts);
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].severity, Severity::Problem);
+            assert!(findings[0].detail.contains("gate open for stage validate"));
+            assert_eq!(
+                findings[0].repair.as_deref(),
+                Some("devflow gate approve 3 --stage validate")
+            );
+        }
+
+        #[test]
+        fn reconcile_phase_flags_dead_agent_at_agent_stage() {
+            let facts = PhaseFacts {
+                agent_pid: Some(999_999),
+                agent_alive: false,
+                ..agreeing_facts(4)
+            };
+            let findings = reconcile_phase(&facts);
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].severity, Severity::Problem);
+            assert!(findings[0].detail.contains("agent pid 999999"));
+            assert_eq!(
+                findings[0].repair.as_deref(),
+                Some("devflow resume --phase 4")
+            );
+        }
+
+        #[test]
+        fn reconcile_phase_flags_stage_event_drift() {
+            let facts = PhaseFacts {
+                stage: Stage::Validate,
+                last_launched_stage: Some(Stage::Code),
+                ..agreeing_facts(5)
+            };
+            let findings = reconcile_phase(&facts);
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].severity, Severity::Warn);
+            assert!(
+                findings[0]
+                    .detail
+                    .contains("last stage_launched event named code")
+            );
+            assert!(findings[0].repair.is_none());
+        }
+
+        #[test]
+        fn reconcile_phase_flags_missing_feature_branch() {
+            let facts = PhaseFacts {
+                stage: Stage::Plan,
+                last_launched_stage: Some(Stage::Plan),
+                feature_branch_exists: false,
+                ..agreeing_facts(6)
+            };
+            let findings = reconcile_phase(&facts);
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].severity, Severity::Warn);
+            assert!(findings[0].detail.contains("feature/phase-06"));
+            assert!(findings[0].repair.is_none());
+        }
+
+        /// Several checks trigger simultaneously; the returned findings must
+        /// come back in the fixed order `reconcile_phase` evaluates checks
+        /// in, not in whatever order the facts happen to be populated.
+        #[test]
+        fn reconcile_phase_ordering_is_input_order_independent() {
+            let facts = PhaseFacts {
+                gate_pending: true,
+                agent_pid: Some(999_999),
+                agent_alive: false,
+                last_launched_stage: Some(Stage::Validate),
+                open_gate_stages: Vec::new(),
+                feature_branch_exists: false,
+                ..agreeing_facts(7)
+            };
+            let findings = reconcile_phase(&facts);
+            let severities: Vec<Severity> = findings.iter().map(|f| f.severity).collect();
+            assert_eq!(
+                severities,
+                vec![
+                    Severity::Problem, // check_gate_pending_without_gate
+                    Severity::Problem, // check_dead_agent
+                    Severity::Warn,    // check_stage_event_drift
+                    Severity::Warn,    // check_missing_branch
+                ]
+            );
+            assert!(findings[0].detail.contains("gate_pending is true"));
+            assert!(findings[1].detail.contains("agent pid 999999"));
+            assert!(
+                findings[2]
+                    .detail
+                    .contains("last stage_launched event named validate")
+            );
+            assert!(findings[3].detail.contains("feature/phase-07"));
+        }
     }
 }
