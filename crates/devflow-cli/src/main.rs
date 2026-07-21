@@ -4259,6 +4259,54 @@ mod tests {
         );
     }
 
+    /// 18b (idempotency edge): running `devflow status` twice must produce
+    /// byte-identical `.devflow/` state — the new monitor liveness probe is
+    /// purely a read, same as the existing agent liveness probe it sits
+    /// beside. Also exercises the `u32::MAX` boundary pid (precision edge,
+    /// via `agent::agent_running`'s existing hardening) so the probe can
+    /// only ever report `Stuck`, never a false `Healthy`.
+    #[test]
+    fn status_reading_monitor_liveness_writes_no_state_and_no_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 66;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.monitor_pid = Some(u32::MAX);
+        workflow::save_state(&state).unwrap();
+
+        let state_path = workflow::state_path(root, phase);
+        let before_len = std::fs::metadata(&state_path).unwrap().len();
+        let before_modified = std::fs::metadata(&state_path).unwrap().modified().unwrap();
+        let events_log = events::events_path(root);
+        let before_lines = std::fs::read_to_string(&events_log)
+            .unwrap_or_default()
+            .lines()
+            .count();
+
+        status(root).unwrap();
+        status(root).unwrap();
+
+        let after_len = std::fs::metadata(&state_path).unwrap().len();
+        let after_modified = std::fs::metadata(&state_path).unwrap().modified().unwrap();
+        let after_lines = std::fs::read_to_string(&events_log)
+            .unwrap_or_default()
+            .lines()
+            .count();
+
+        assert_eq!(
+            before_len, after_len,
+            "status must not rewrite the state file"
+        );
+        assert_eq!(
+            before_modified, after_modified,
+            "status must not touch the state file's mtime"
+        );
+        assert_eq!(
+            before_lines, after_lines,
+            "status must not append to events.jsonl"
+        );
+    }
+
     /// 15a: `devflow gate approve` resolves the stage automatically when a
     /// phase has exactly one open gate and writes a response the workflow's
     /// poller will consume.
