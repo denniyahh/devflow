@@ -98,12 +98,43 @@ split. Those are Phase 20 (v2.0.0).
 
 - **D-13: Apply both fixes; either alone leaves half the problem open.** WR-02
   stops the sensitive data being written; WR-01 stops the file being published.
-- **D-14: WR-01 — `lock::ensure_devflow_dir` writes a `.devflow/.gitignore`
-  containing `*` on creation.** Self-ignoring, needs no change to the user's
-  root `.gitignore`, and closes the hole for **every** constructor at once.
-  Rejected the narrower alternative (scoping `docs_update` through
-  `commit_path`) — it fixes one call site and leaves `.devflow/` committable, so
-  the next broad `git add` reopens it.
+- **D-14 (CORRECTED 2026-07-21 at plan time — original premise was false):**
+  WR-01 is fixed by a **new** `workflow::ensure_devflow_dir()` that creates the
+  directory and writes a `.devflow/.gitignore` containing `*`, with **all 7
+  existing `create_dir_all` sites converted to call it**, plus a **regression
+  test proving every `.devflow/`-writing path produces the `.gitignore`**.
+  Self-ignoring, needs no change to the user's root `.gitignore`, closes the
+  hole for every constructor, and the test stops the next new writer silently
+  reopening it. Rejected the narrower alternative (scoping `docs_update`
+  through `commit_path`) — it fixes one call site and leaves `.devflow/`
+  committable.
+
+  **Why corrected.** The original decision named `lock::ensure_devflow_dir`,
+  taken from the backlog dossier. **That function does not exist** — zero
+  matches in `crates/`, confirmed at HEAD. `.devflow/` is instead created from
+  **7 independent `create_dir_all` sites**: `workflow.rs:95`, `gates.rs:325`,
+  `monitor.rs:98`, `agent_result.rs:964`, `events.rs:58`, `ship.rs:85`,
+  `lock.rs:82`.
+
+  **Why not `save_state` (19-RESEARCH.md's proposed chokepoint).** Verified
+  false at plan time: `run_agent_blocking` (`main.rs:2417`) — the
+  `sequentagent`/`parallel` path — writes `.devflow/` content via
+  `archive_phase_files` and `spawn_monitor_no_advance` on state the source
+  itself calls *"Synthetic, never-persisted state… sequentagent does not
+  participate in the stage machine."* It never calls `save_state`, so that
+  chokepoint would leave the entire parallel path leaking. This was
+  RESEARCH.md's own open question #3; the grep was run and the assumption
+  (A2) does not hold.
+
+  **Also reconcile:** `devflow_dir()` is defined **twice** —
+  `workflow.rs:33` (public, 7 uses) and `agent_result.rs:872` (private
+  duplicate, 9 uses). Any single chokepoint must account for both.
+
+  **Rejected — making `workflow::devflow_dir()` itself create and write.**
+  Fewest call-site edits, but it turns a pure path accessor called 17 times
+  (including read-only paths like `doctor`/`status` and in tests) into a
+  side-effecting function — exactly the class of behavioral change this phase
+  exists to avoid.
 - **D-15: WR-02 — emit only `current_exe().file_name()`, not the full path.**
   Keeps a useful binary-name signal; `DEVFLOW_BUILD_COMMIT`/`DEVFLOW_BUILD_DIRTY`
   already carry the real diagnostic value. Rejected dropping the field entirely
