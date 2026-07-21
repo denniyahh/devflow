@@ -2,20 +2,53 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
-status: "Phase 17 executed (13/13 plans, 15/15 must-haves) - validated at re-audit #10 (eda94cd): GAP-6/GAP-7 closed via 17-13 and RED-proven; GAP-8 (unsampled CLI wiring of GAP-7's fix) found and auto-filled; all 14 rows green, nyquist_compliant: true. Phase 18 complete (7/7 plans): 18-01 (18a doctor reconciliation), 18-02 (18g WR-03 test stabilization), 18-03 (18b monitor liveness), 18-04 (18d Code-Validate safety-gate reachability), 18-05 (18e Layer 0/Validate verdict fix), 18-06 (18c worktree-aware staleness enforcement), 18-07 (18f preflight-gate re-run wedge fix). Merged to main and released as v1.5.0 (2026-07-21, tag v1.5.0, crates.io published); develop synced back from main via scripts/sync-main-to-develop.sh. v2.0.0 milestone (Phase 11-18) is now fully shipped; no phase currently active."
-stopped_at: Completed 18-07-PLAN.md
-last_updated: "2026-07-21T05:32:24.982Z"
+status: "Phase 18 complete and released as v1.5.0 (2026-07-21, tag v1.5.0, crates.io published); develop synced back from main. Phase 19 (Release Integrity + main.rs Decomposition) scoped and promoted from backlog 2026-07-21 via /gsd-review-backlog: 999.10 (.devflow/ artifact hygiene, Urgent), 999.11 (commit_path empty commits), 999.8 (split main.rs, pure move), 999.16 (AI change acceptance contract). Targets v1.6.0. Not yet discussed or planned - next step is /gsd-discuss-phase 19. Milestone label corrected: v2.0.0 was never released (project shipped 1.2.0 to 1.5.0); the milestone now runs Phase 11-20 and closes at v2.0.0 with Phase 20."
+stopped_at: Phase 19 promoted from backlog — awaiting /gsd-discuss-phase 19
+last_updated: "2026-07-21T17:10:00.000Z"
 progress:
-  total_phases: 7
+  total_phases: 8
   completed_phases: 7
   total_plans: 54
   completed_plans: 54
-  percent: 100
+  percent: 88
 ---
 
 # DevFlow — Project State
 
 > Last updated: 2026-07-20
+
+## Active Phase
+
+- **Phase 19 — Release Integrity + `main.rs` Decomposition (scoped, not yet
+  planned).** Targets **v1.6.0**. Promoted from backlog 2026-07-21 via
+  `/gsd-review-backlog` as four units:
+  - **19a** — 999.10 `.devflow/` artifact hygiene (Urgent/S). The only item
+    whose blast radius reaches other people's repositories: `hooks.rs:184`'s
+    `commit_all` sweeps unredacted agent stdout into a *user's* commit, and
+    `main.rs:902` writes the operator's absolute home path and OS username
+    into `events.jsonl`.
+  - **19b** — 999.11 `commit_path` empty commits (High/S). `--allow-empty`
+    means a release tag can sit on a commit containing nothing.
+  - **19c–19f** — 999.8 split `main.rs` (High/L). Pure move, zero behavioral
+    change. Now unblocked by Phase 18.
+  - **19g** — 999.16 AI change acceptance contract (High/M). No Rust source;
+    fully parallel track.
+
+  Sequencing is load-bearing: 19a/19b land *before* the split so they are
+  small diffs against the familiar file, not against seven new modules.
+
+  **Principal risk — `ENV_MUTEX`** (18 `.lock()` sites / 63 refs in
+  `main.rs`): a repeat root cause across 19i, GAP-2 and 999.4. If its
+  serialization guarantees cannot survive distribution across module
+  boundaries, that is a finding to surface, not to patch around. Verification
+  must be CI-on-branch — local-green is explicitly insufficient.
+
+  **Re-verified at promotion time:** all four source claims still hold at
+  HEAD. `main.rs` is now **8,467 lines** (4,025 production + 4,442 test, 106
+  tests) — **+35%** since 999.8 was written at 6,239, so its recorded cluster
+  line ranges are stale and must be re-measured at plan time.
+
+  **Next step:** `/gsd-discuss-phase 19`.
 
 ## Recently Shipped
 
@@ -192,25 +225,32 @@ progress:
 
 ## Backlog
 
-20 unsequenced items live in `.planning/phases/999.N-*/` and the
+**16 unsequenced items** remain in `.planning/phases/999.N-*/` and the
 `## Backlog` section of ROADMAP.md, reviewed/prioritized/sized 2026-07-21
 (mirrored in Linear as `DEN-26`..`DEN-45`): Hermes Support (999.1, Low),
 phase-process tracking model (999.2, Medium — half-addressed by 18b's
 `monitor_pid`), CLI operator discoverability (999.3, Low), version-tag
 contention on concurrent ship (999.4, Medium), changelog placeholder content
 (999.5, Low), plan-only pipeline mode (999.6, High), manual ship override
-(999.7, High), split `main.rs` (999.8, High — now unblocked), dependency
-update review (999.9, Medium), `.devflow/` artifact hygiene (999.10, Urgent —
-PII leak into downstream repos), `commit_path` empty commits (999.11, High —
-still open, unrelated to the verify.rs fix below), Layer 0 veto test coverage
-(999.12, Medium), release-cut automation (999.13, High), doctor reconciliation
-for planning-doc staleness (999.14, Medium). Six more added 2026-07-21 from
-`TEST-SUITE-QA-REVIEW.md` (Codex's test-suite QA pass, reviewed by Claude same
-day): shell-entrypoint hermetic tests (999.15, High), AI change acceptance
-contract (999.16, High), mutation testing (999.17, Medium), property/fuzz
-testing for parsers (999.18, Medium), fast/slow CI lanes (999.19, Medium),
-differential coverage enforcement (999.20, Medium). Promote with
-`/gsd-review-backlog`.
+(999.7, High), dependency update review (999.9, Medium), Layer 0 veto test
+coverage (999.12, Medium), release-cut automation (999.13, High), doctor
+reconciliation for planning-doc staleness (999.14, Medium), shell-entrypoint
+hermetic tests (999.15, High), mutation testing (999.17, Medium),
+property/fuzz testing for parsers (999.18, Medium), fast/slow CI lanes
+(999.19, Medium), differential coverage enforcement (999.20, Medium).
+Promote with `/gsd-review-backlog`.
+
+**Promoted into Phase 19 on 2026-07-21** (removed from the backlog):
+999.10 `.devflow/` artifact hygiene (Urgent, DEN-35), 999.11 `commit_path`
+empty commits (High, DEN-36), 999.8 split `main.rs` (High, DEN-33), 999.16
+AI change acceptance contract (High, DEN-41). Their accumulated context was
+consolidated into
+`.planning/phases/19-release-integrity-main-rs-decomposition/CONTEXT.md`
+as units 19a/19b/19c–19f/19g. **Linear still shows these four as backlog —
+they need moving to the Phase 19 milestone.**
+
+**Earmarked for Phase 20 (v2.0.0):** 999.6, 999.7, 999.13, likely 999.3 —
+all four land in `main.rs`, which is why Phase 19's split precedes them.
 
 Note: that same QA pass independently found and fixed an *unrelated* defect
 in `verify.rs` (external-verification approval/frontmatter parsing accepted

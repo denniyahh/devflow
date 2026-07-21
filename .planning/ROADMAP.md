@@ -2,17 +2,19 @@
 
 > Phase plan source of truth. Each phase drives a `devflow start` agent session.
 
-## v2.0.0 (Phase 11–18)
+## v2.0.0 (Phase 11–20)
 
-| Phase | Name | Status |
-|---|---|---|
-| 12 | Bootstrap + Housekeeping | Complete |
-| 13 | MVP Core Loop | Complete    |
-| 14 | Parallel Safety + Observability | Complete |
-| 15 | Dogfood Enablement + OSS Readiness | Complete |
-| 16 | Pipeline Reliability Hardening | Complete    |
-| 17 | Pipeline Dogfood Follow-Up | Complete    |
-| 18 | Dogfood Reliability Hardening | Complete    |
+| Phase | Name | Status | Version |
+|---|---|---|---|
+| 12 | Bootstrap + Housekeeping | Complete | — |
+| 13 | MVP Core Loop | Complete    | — |
+| 14 | Parallel Safety + Observability | Complete | — |
+| 15 | Dogfood Enablement + OSS Readiness | Complete | — |
+| 16 | Pipeline Reliability Hardening | Complete    | — |
+| 17 | Pipeline Dogfood Follow-Up | Complete    | — |
+| 18 | Dogfood Reliability Hardening | Complete    | 1.5.0 |
+| 19 | Release Integrity + `main.rs` Decomposition | **Active** | 1.6.0 |
+| 20 | *(unscoped — operator-facing set)* | Planned | 2.0.0 |
 
 ## Shipped
 
@@ -46,6 +48,14 @@
 
 - **Phase 17 narrowed to four units** after source verification resolved the spike's decision gate: `Unknown` non-advance (17a), typed outcomes + retry policy (17b), preflight readiness gate (17c), build provenance (17d). Scoped as a focused repair phase rather than a Phase 16 remediation — only 17d traces to the proven Phase 16 defect.
 - **Phase 18 gains 18d/18e** — `devflow doctor` state/event reconciliation and the WR-03 transient-capture test fix moved out of 17. 18d depends on 17b + 17d. See the 2026-07-18 decision entry in STATE.md.
+
+## Phase 19 scoping (2026-07-21)
+
+- **Milestone label corrected.** `v2.0.0` had been carried as the milestone name since Phase 11 while the project actually shipped 1.2.0 → 1.5.0. No v2.0.0 was ever released. The milestone now runs Phase 11–20 and genuinely closes at v2.0.0.
+- **Phase 19 = four promoted backlog items**, in sequence: 999.10 (`.devflow/` artifact hygiene, Urgent/S), 999.11 (`commit_path` empty commits, High/S), 999.8 (split `main.rs`, High/L), 999.16 (AI change acceptance contract, High/M, parallel track). Promoted via `/gsd-review-backlog`; all four source claims re-verified present at HEAD during promotion.
+- **Cuts v1.6.0, not v2.0.0.** Nothing in the phase is breaking and — apart from the PII fix — almost nothing is user-visible. Tagging a pure-move refactor as a major release would oversell the changeset and burn the 2.0 slot.
+- **999.8 is near-alone by necessity.** It conflicts with every other high-priority candidate: 999.6 (`--until`), 999.7 (manual ship override) and 999.3 (`gate show`) all land in `main.rs`. Every phase run before the split makes the split harder and re-pays the serialization tax — Phase 18 burned 6 near-serial waves on 7 plans for exactly this reason, and the file has grown +35% (6,239 → 8,467 lines) since that was logged.
+- **Phase 20 gets the deferred set** — 999.6, 999.7, 999.13, likely 999.3 — and is what the split makes plannable as one phase in ~3 waves rather than two phases at 6.
 
 ## Phase 14 split (2026-07-16)
 
@@ -255,6 +265,23 @@ Plans:
 
 **Verified** 2026-07-21 (`18-VERIFICATION.md`, 7/7 must-haves, each traced to source + an independently-executed passing test; both binding operator decisions confirmed). **Code-reviewed** (`18-REVIEW.md`, 0 critical / 4 warning) and **review-fixed** in a `18-fix` batch (6 commits): `doctor --json` single-object output (WR-01), stale-`monitor_pid` false-"Stuck" (WR-04), path-free staleness event (WR-02, third instance — see `999.10`), the `unreachable!()` eliminated by construction (WR-03), and the new 18c worktree test hardened against the 19i PATH-race flake. Final: 426 tests, clippy `--workspace --all-targets` clean, fmt clean. **Merged to main and released as v1.5.0** (2026-07-21, PR #12, signed tag `v1.5.0`, published to crates.io).
 
+### Phase 19: Release Integrity + `main.rs` Decomposition
+
+**Goal:** Close the two release-integrity defects whose blast radius reaches outside this repository (999.10's `.devflow/` PII leak into *users'* git history, 999.11's empty commit under a release tag), then decompose the 8,467-line `crates/devflow-cli/src/main.rs` as a pure-move refactor so later phases stop paying the near-serial wave tax. Adds the AI change acceptance contract (999.16) on a parallel, source-conflict-free track.
+**Targets:** v1.6.0 — nothing here is breaking and, apart from the PII fix, almost nothing is user-visible. The v2.0.0 milestone closes at Phase 20, which carries the operator-facing set this split makes plannable as one phase.
+**Promoted from backlog** 2026-07-21: 999.10 (DEN-35), 999.11 (DEN-36), 999.8 (DEN-33), 999.16 (DEN-41).
+**Requirements:** 19a, 19b, 19c–19f, 19g (see CONTEXT.md — no formal REQ-IDs)
+**Depends on:** Phase 18 — 999.8 was deliberately blocked on it; 18a/18b are the instrumentation that makes an `ENV_MUTEX` regression observable, and 18e/18f reshaped the functions that determine the module seams.
+**Plans:** 0 plans
+
+**Sequencing is load-bearing:** 19a and 19b land *before* the split, so they are small diffs against the file everyone knows rather than against seven new modules. 19g has no source overlap and can run in any wave.
+
+**Principal risk — `ENV_MUTEX`:** 18 `.lock()` sites / 63 references in `main.rs`, and a repeat root cause across three expensive-to-diagnose failures (19i, GAP-2, 999.4). If its serialization guarantees cannot survive distribution across module boundaries, that is a finding to surface, not to patch around. Verification must be CI-on-branch; local-green is explicitly insufficient.
+
+Plans:
+
+- [ ] TBD (run /gsd-discuss-phase 19, then /gsd-plan-phase 19 to break down)
+
 ## Backlog
 
 Unsequenced items — not part of the active phase sequence. Promote with
@@ -338,44 +365,6 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.8: Split `main.rs` (BACKLOG — blocked on Phase 18)
-
-**Goal:** `crates/devflow-cli/src/main.rs` is 6,239 lines (3,307 production + a 2,931-line test module with 71 tests) — 2.6x the next largest file, and now the binding constraint on execution parallelism, since the same-wave zero-file-overlap rule keys on file path. Phase 18 was forced into 6 near-serial waves for 7 plans purely because 6 of them touch `main.rs`. The production half already decomposes cleanly into 7 clusters (preflight / staleness / pipeline state machine / commands / parallel / dispatch / config — measured boundaries in CONTEXT.md); splitting would take those 6 waves to 3.
-
-**Priority:** High | **Size:** L — reviewed 2026-07-21: now unblocked (Phase 18 shipped in v1.5.0) and the premise has gotten worse, not better — `main.rs` has grown to 8,442 lines (+35%) since this was logged. Highest-risk item in the backlog: 22 `ENV_MUTEX` sites to preserve across a module split. Linear: DEN-33.
-
-**Observation (2026-07-21):** this is bigger than a file-size problem. The `ENV_MUTEX` process-global-state pattern is a *repeat* root cause across three separate expensive-to-diagnose failures now: 19i (`PATH` race, hit 2/2 in CI after mostly passing locally), GAP-2 (concurrent-ship gate-poll hang, ~33–40% of isolated runs), and 999.4 (version-tag contention, caught only by instrumentation). When this item is picked up, the scrutiny should be on whether `ENV_MUTEX`'s serialization guarantees can survive the split at all — not just on relocating code. If they can't be preserved cleanly, that's itself a finding worth surfacing, not something to patch around silently.
-
-**Deliberately sequenced AFTER Phase 18, not before.** The primary risk is `ENV_MUTEX` (22 sites in `main.rs`) — redistributing 71 tests across module boundaries while preserving process-global serialization is exactly the failure class with the worst track record here (19i hit 2/2 in CI while passing locally; GAP-2 at 33–40%; 999.4 caught only by instrumentation). Phase 18's 18a/18b are what make that class observable, and 18e/18f reshape the very functions that determine the seams. Must be a pure-move refactor with zero behavioral change, verified on a branch with CI — local-green is explicitly insufficient.
-**Requirements:** TBD — see CONTEXT.md
-**Plans:** 0 plans
-
-Plans:
-
-- [ ] TBD (promote with /gsd-review-backlog when ready — after Phase 18 ships)
-
-### Phase 999.10: `.devflow/` Artifact Hygiene (BACKLOG — highest of the WR batch)
-
-**Goal:** Two composing 17-REVIEW.md findings, both re-verified present at HEAD 2026-07-20. **WR-01:** `docs_update` (`hooks.rs:184`) is the only remaining `commit_all` caller and runs `git add .` at the *user's* project root, so a target project whose `.gitignore` lacks `.devflow/` gets raw unredacted agent stdout swept into a commit that `Merge` then pushes — the assumption that `.devflow/` is gitignored is asserted in test fixtures but enforced nowhere, and both existing guards only cover DevFlow's own repo. **WR-02:** `main.rs:843` emits the full `current_exe()` path into `events.jsonl` on every start, i.e. the developer's absolute home directory and OS username, in a file `OPERATIONS.md` tells people to tail and paste. Together they publish PII into someone else's git history. Phase 18 does **not** fix either — its plans cite WR-02 only as a prevention constraint. Preferred WR-01 fix (`lock::ensure_devflow_dir` writes a `.devflow/.gitignore` containing `*`) closes it for every constructor at once.
-**Priority:** Urgent | **Size:** S — reviewed 2026-07-21: confirmed still present (`hooks.rs:184`, `main.rs:902`). Only backlog item whose blast radius extends into other people's repositories (PII leak). Both fixes are cheap and well-scoped. Linear: DEN-35.
-**Requirements:** TBD — see CONTEXT.md
-**Plans:** 0 plans
-
-Plans:
-
-- [ ] TBD (promote with /gsd-review-backlog when ready — before any wider release push)
-
-### Phase 999.11: `commit_path` Empty Commits (BACKLOG)
-
-**Goal:** 17-REVIEW.md WR-03, re-verified at HEAD 2026-07-20. `commit_path`'s `--allow-empty` does not *skip* when a path is unchanged — it **commits**, contradicting the function's own doc comment ("Ok(()) whether or not the path had changes") and rendering its `nothing to commit` guard arm dead code that reads like the skip path. If `version_bump` re-runs after a fail-fast terminal-batch retry and `write_version` produces byte-identical content, an empty `chore: bump version to X` commit lands on develop and **the release tag is placed on a commit containing nothing**. Reachable, since Phase 16 made terminal-batch retry a designed path. Fix: drop `--allow-empty` and let the existing arm become the genuine no-op.
-**Priority:** High | **Size:** S — reviewed 2026-07-21: confirmed still present (`git.rs:312,336`). Real release-integrity defect (an empty commit could underlie a tag), narrow reachable trigger, small well-scoped fix. Linear: DEN-36.
-**Requirements:** TBD — see CONTEXT.md
-**Plans:** 0 plans
-
-Plans:
-
-- [ ] TBD (promote with /gsd-review-backlog when ready)
-
 ### Phase 999.12: Layer 0 Unapproved-Probe Veto Coverage (BACKLOG)
 
 **Goal:** 17-REVIEW.md WR-04 — coverage debt on a *deliberate* trade, not a defect. 17-03 removed `evaluate_layer0`'s `Stage::Code` guard by design (D-05 gap 1), so a forgotten `DEVFLOW_TRUST_EXTERNAL_VERIFY` now vetoes at all five stages instead of one, a 5× blast-radius increase. Two verified gaps at HEAD: (a) of the three veto arms, only "approval mismatch" is tested (`agent_result.rs:1644`) — the "not approved" arm a forgotten env var actually hits has no test at any stage; (b) `docs/guides/configuration.md` states the requirement for "the parent DevFlow process" but never that the **detached monitor subprocess must inherit it**, which is where the failure manifests. Deliberately not folded into Phase 18's 18-05 (same file) — that plan had already passed the checker clean, and adding coverage debt to a verified bug-fix plan is scope creep.
@@ -424,17 +413,6 @@ Plans:
 
 **Goal:** `scripts/install.sh`, `scripts/sync-main-to-develop.sh`, and `scripts/deploy.sh` have user-facing, side-effecting behavior (network downloads, git history mutation, docs deployment) with no direct behavioral tests — only source-text inspection. From `TEST-SUITE-QA-REVIEW.md` (Codex, 2026-07-21).
 **Priority:** High | **Size:** L — re-scoped 2026-07-21 (Claude review): the source document treated all three scripts as equally P0; `deploy.sh` only touches `gh-pages` (docs), meaningfully lower blast radius than `install.sh` (every new user's first run) or `sync-main-to-develop.sh` (mutates real branch history). Demoted `deploy.sh` within this item rather than splitting it out. Linear: DEN-40.
-**Requirements:** TBD — see CONTEXT.md
-**Plans:** 0 plans
-
-Plans:
-
-- [ ] TBD (promote with /gsd-review-backlog when ready)
-
-### Phase 999.16: AI Change Acceptance Contract (BACKLOG)
-
-**Goal:** Require every AI-generated behavioral change to include a pre-failing regression test, at least one assertion at a public/stable boundary, evidence the test fails for the right reason, full affected-package verification, and independent review — rejecting tests that only assert constants, reproduce the production algorithm, or compare a function call with itself. From `TEST-SUITE-QA-REVIEW.md` (Codex, 2026-07-21), directly motivated by defect classes found and removed in that same review (the fake `ReviewerSetTestAdapter`).
-**Priority:** High | **Size:** M — needs to be wired into `/gsd-code-review`'s actual criteria to have teeth, not just added as `CONTRIBUTING.md` prose. Linear: DEN-41.
 **Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
 
