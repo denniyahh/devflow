@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
 status: "Phase 17 executed (13/13 plans, 15/15 must-haves) - validated at re-audit #10 (eda94cd): GAP-6/GAP-7 closed via 17-13 and RED-proven; GAP-8 (unsampled CLI wiring of GAP-7's fix) found and auto-filled; all 14 rows green, nyquist_compliant: true. Phase 18 in progress: 18-01 (18a doctor reconciliation) complete."
-stopped_at: Completed 18-01-PLAN.md
-last_updated: "2026-07-21T03:23:32.865Z"
+stopped_at: Completed 18-02-PLAN.md
+last_updated: "2026-07-21T03:37:39.610Z"
 progress:
-  total_phases: 8
+  total_phases: 7
   completed_phases: 6
-  total_plans: 47
-  completed_plans: 47
-  percent: 75
+  total_plans: 54
+  completed_plans: 49
+  percent: 86
 ---
 
 # DevFlow — Project State
@@ -19,7 +19,7 @@ progress:
 
 ## Active
 
-- **Phase 18 (In Progress — 1/7 plans):** Dogfood Reliability Hardening
+- **Phase 18 (In Progress — 2/7 plans):** Dogfood Reliability Hardening
   — reprioritized 2026-07-20 from Hermes Support. `devflow doctor`
   reconciliation (18a), monitor liveness (18b), worktree-aware staleness
   enforcement (18c), Code↔Validate safety-gate reachability (18d), Layer
@@ -43,8 +43,18 @@ progress:
   text and `--json` output; 5 named checks (gate-pending-without-gate,
   orphan-gate, dead-agent, stage/event drift, missing feature branch), 10
   new tests, proven read-only by a twice-run fixture. See
-  `18-01-SUMMARY.md`. Next: 18-02 (18g, WR-03 test stabilization, wave 1,
-  independent of 18-01).
+  `18-01-SUMMARY.md`.
+
+  Executed 2026-07-21: **18-02 complete** (`84afc3b`, `8dcc9ef`) — WR-03
+  test stabilization (18g). `parallel_creates_two_worktrees_and_spawns_two_monitors`
+  now asserts each stdout capture inside its own `wait_for` window instead
+  of after a later, unrelated re-check. The plan's literal combined-assertion
+  instruction was itself still racy — the mandated 25x loop reproduced a
+  real failure at run 15/25 — so it was corrected to interleaved per-wait
+  assertions, matching the plan's own must_haves.truths. 25/25 clean after
+  the fix; `cargo test --workspace` 0 failed, `build_provenance` (WR-07,
+  still open, out of scope) passed cleanly. See `18-02-SUMMARY.md`. Next:
+  18-03 (wave 2).
 
 ## Backlog
 
@@ -169,6 +179,7 @@ None currently open for Phase 17.
 - [Phase 17]: 17-12: WR-04 resolved -- ChangelogAppend reordered strictly after VersionBump in hooks_after_ship() (removed from the Validate->Ship transition), reads version::read_version (new, git-free) instead of compute_version to avoid deriving a version one higher than the tag VersionBump just cut, and commits its own write via a new GitFlow::commit_path; version_bump had the identical uncommitted-write defect on its own version-file write and is fixed the same way
 - [Phase 17]: 17-13: GAP-6/GAP-7 closed via write_version remainder-preservation fix and HookContext.shipped_version threading; row 12 restored to green
 - [Phase 18]: 18-01: 18a doctor project-aware reconciliation -- pure PhaseFacts/PhaseFinding/reconcile_phase core (5 named checks: gate-pending-without-gate, orphan-gate, dead-agent, stage/event drift, missing branch) wired into doctor()'s text and --json output via collect_phase_facts/render_reconciliation; proven read-only by a twice-run fixture asserting state-file size/mtime and events.jsonl line count are unchanged
+- [Phase 18]: 18-02: WR-03 test stabilization -- `parallel_creates_two_worktrees_and_spawns_two_monitors` asserts each stdout capture inside its own `wait_for` window (mirrors `wait_for_pid`'s already-fixed archive-timing pattern); plan's literal combined-assertion instruction was itself racy (25x loop reproduced it at run 15/25), corrected to interleaved per-wait assertions matching the plan's own must_haves.truths
 
 ## Roadmap Evolution
 
@@ -220,9 +231,10 @@ None currently open for Phase 17.
 | Phase 17-pipeline-dogfood-followup P12 | 20min | 3 tasks | 5 files |
 | Phase 17-pipeline-dogfood-followup P13 | 15min | 3 tasks | 4 files |
 | Phase 18-dogfood-reliability-hardening P01 | 35min | 2 tasks | 1 files |
+| Phase 18 P02 | 15min | 2 tasks | 1 files |
 
 ## Session
 
-**Last session:** 2026-07-21T03:23:32.865Z
-**Stopped at:** Completed 18-01-PLAN.md
+**Last session:** 2026-07-21T03:37:39.578Z
+**Stopped at:** Completed 18-02-PLAN.md
 **Resume file:** None
