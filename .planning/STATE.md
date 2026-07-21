@@ -3,8 +3,8 @@ gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
 status: "Phase 18 complete and released as v1.5.0 (2026-07-21, tag v1.5.0, crates.io published); develop synced back from main. Phase 19 (Release Integrity + main.rs Decomposition) scoped and promoted from backlog 2026-07-21 via /gsd-review-backlog: 999.10 (.devflow/ artifact hygiene, Urgent), 999.11 (commit_path empty commits), 999.8 (split main.rs, pure move), 999.16 (AI change acceptance contract). Targets v1.6.0. Not yet discussed or planned - next step is /gsd-discuss-phase 19. Milestone label corrected: v2.0.0 was never released (project shipped 1.2.0 to 1.5.0); the milestone now runs Phase 11-20 and closes at v2.0.0 with Phase 20."
-stopped_at: Phase 19 promoted from backlog — awaiting /gsd-discuss-phase 19
-last_updated: "2026-07-21T17:10:00.000Z"
+stopped_at: Phase 19 context gathered
+last_updated: "2026-07-21T21:44:38.548Z"
 progress:
   total_phases: 8
   completed_phases: 7
@@ -22,15 +22,19 @@ progress:
 - **Phase 19 — Release Integrity + `main.rs` Decomposition (scoped, not yet
   planned).** Targets **v1.6.0**. Promoted from backlog 2026-07-21 via
   `/gsd-review-backlog` as four units:
+
   - **19a** — 999.10 `.devflow/` artifact hygiene (Urgent/S). The only item
     whose blast radius reaches other people's repositories: `hooks.rs:184`'s
     `commit_all` sweeps unredacted agent stdout into a *user's* commit, and
     `main.rs:902` writes the operator's absolute home path and OS username
     into `events.jsonl`.
+
   - **19b** — 999.11 `commit_path` empty commits (High/S). `--allow-empty`
     means a release tag can sit on a commit containing nothing.
+
   - **19c–19f** — 999.8 split `main.rs` (High/L). Pure move, zero behavioral
     change. Now unblocked by Phase 18.
+
   - **19g** — 999.16 AI change acceptance contract (High/M). No Rust source;
     fully parallel track.
 
@@ -440,6 +444,6 @@ None currently open for Phase 17.
 
 ## Session
 
-**Last session:** 2026-07-21T05:29:59.988Z
-**Stopped at:** Completed 18-07-PLAN.md
-**Resume file:** None
+**Last session:** 2026-07-21T21:44:38.524Z
+**Stopped at:** Phase 19 context gathered
+**Resume file:** .planning/phases/19-release-integrity-main-rs-decomposition/19-CONTEXT.md
