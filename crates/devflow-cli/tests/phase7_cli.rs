@@ -183,16 +183,18 @@ fn parallel_creates_two_worktrees_and_spawns_two_monitors() {
 
     let phase7_stdout = root.join(".devflow/phase-07-stdout");
     let phase8_stdout = root.join(".devflow/phase-08-stdout");
+    // WR-03: assert each capture immediately after the `wait_for` call that
+    // established it, not after both waits complete. Same mechanism as
+    // `wait_for_pid` above: each stage transition's `archive_phase_files`
+    // briefly deletes the capture before the next monitor recreates it. A
+    // combined assertion placed after both `wait_for` calls is still racy —
+    // the second `wait_for`'s own polling loop gives a fast monitor enough
+    // time to archive the first capture in the interim (observed directly:
+    // this exact ordering flaked at run 15/25 during 18-02 verification).
+    // Asserting inside each capture's own wait window closes that gap.
     wait_for(&phase7_stdout);
-    wait_for(&phase8_stdout);
-
-    // WR-03: assert both captures immediately after their own `wait_for` call,
-    // before any unrelated assertion runs. Same mechanism as `wait_for_pid`
-    // above: each stage transition's `archive_phase_files` briefly deletes the
-    // capture before the next monitor recreates it, so a check placed after
-    // unrelated assertions (e.g. the state loads below) can land in that
-    // archival gap on a fast monitor and flake on timing, not behavior.
     assert!(phase7_stdout.exists());
+    wait_for(&phase8_stdout);
     assert!(phase8_stdout.exists());
 
     // 13-DEFERRED-CR-03: each parallel phase persists its own state file —
