@@ -1206,6 +1206,11 @@ fn launch_stage(
     }
     let pid = monitor::spawn_monitor(state, program, &args, &adapter.extra_env())
         .map_err(|err| CliError::Message(format!("could not spawn monitor: {err}")))?;
+    // `transition()` calls `workflow::save_state` BEFORE `launch_stage`, so a
+    // pid recorded only in memory here is lost unless it is written again
+    // (18b).
+    state.monitor_pid = Some(pid);
+    workflow::save_state(state)?;
     events::emit(
         &state.project_root,
         state.phase,
@@ -2544,6 +2549,51 @@ fn cleanup(project_root: &Path, force: bool) -> Result<(), CliError> {
     Ok(())
 }
 
+/// A phase's monitor/agent liveness, distinguishing a dead monitor (nothing
+/// will call `devflow advance` when the agent exits) from a normal
+/// between-stages moment (18b — "who watches the watcher").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Liveness {
+    /// Monitor and agent are both alive — the stage is actively running.
+    Healthy,
+    /// Monitor is alive, agent has exited — normal between-stages moment;
+    /// the monitor will advance the phase shortly.
+    BetweenStages,
+    /// The recorded monitor is dead. Whether or not the agent is also dead,
+    /// nothing will call `devflow advance` for this phase — it needs a
+    /// manual `devflow resume`.
+    Stuck,
+    /// No monitor PID has been recorded for this state — either none has
+    /// been spawned yet, or the state was written by a binary predating
+    /// this field. Never reported as a problem.
+    Unknown,
+}
+
+impl Liveness {
+    fn describe(self) -> &'static str {
+        match self {
+            Liveness::Healthy => "healthy",
+            Liveness::BetweenStages => "between stages",
+            Liveness::Stuck => "stuck — needs devflow resume",
+            Liveness::Unknown => "unknown (no monitor recorded)",
+        }
+    }
+}
+
+/// Pure liveness predicate — no I/O. `monitor_pid` is matched `None` first
+/// so a state written by a pre-18b binary (carrying no `monitor_pid`) can
+/// never be misclassified as `Stuck` (T-18-11).
+fn liveness(monitor_pid: Option<u32>, monitor_alive: bool, agent_alive: bool) -> Liveness {
+    match monitor_pid {
+        None => Liveness::Unknown,
+        Some(_) => match (monitor_alive, agent_alive) {
+            (true, true) => Liveness::Healthy,
+            (true, false) => Liveness::BetweenStages,
+            (false, _) => Liveness::Stuck,
+        },
+    }
+}
+
 fn status(project_root: &Path) -> Result<(), CliError> {
     // 13-DEFERRED-CR-03 acceptance: enumerate every active phase, not just
     // the last one started.
@@ -2589,7 +2639,8 @@ fn status(project_root: &Path) -> Result<(), CliError> {
                 println!("  worktree: {}", wt.display());
             }
             current_worktree = current_worktree.or_else(|| state.worktree_path.clone());
-            match agent_pid_from_file(project_root, state.phase) {
+            let agent_pid = agent_pid_from_file(project_root, state.phase);
+            match agent_pid {
                 Some(pid) => {
                     println!(
                         "  agent_pid: {pid} (running: {})",
@@ -2597,6 +2648,22 @@ fn status(project_root: &Path) -> Result<(), CliError> {
                     );
                 }
                 None => println!("  agent_pid: none"),
+            }
+            match state.monitor_pid {
+                Some(pid) => {
+                    println!(
+                        "  monitor_pid: {pid} (running: {})",
+                        agent::agent_running(pid)
+                    );
+                }
+                None => println!("  monitor_pid: none"),
+            }
+            let agent_alive = agent_pid.is_some_and(agent::agent_running);
+            let monitor_alive = state.monitor_pid.is_some_and(agent::agent_running);
+            let phase_liveness = liveness(state.monitor_pid, monitor_alive, agent_alive);
+            println!("  liveness: {}", phase_liveness.describe());
+            if phase_liveness == Liveness::Stuck {
+                println!("    → devflow resume --phase {}", state.phase);
             }
             if let Some(event) = last_events.remove(&state.phase) {
                 let ago = event
@@ -4053,6 +4120,110 @@ mod tests {
     fn default_logs_phase_errors_with_nothing_to_show() {
         let dir = tempfile::tempdir().unwrap();
         assert!(default_logs_phase(dir.path()).is_err());
+    }
+
+    /// 18b: a state with no recorded monitor is never reported as stuck,
+    /// regardless of the (unreliable, since no monitor was ever recorded)
+    /// liveness bits passed alongside it.
+    #[test]
+    fn liveness_unknown_when_no_monitor_recorded() {
+        assert_eq!(liveness(None, false, false), Liveness::Unknown);
+        assert_eq!(liveness(None, false, true), Liveness::Unknown);
+        assert_eq!(liveness(None, true, false), Liveness::Unknown);
+        assert_eq!(liveness(None, true, true), Liveness::Unknown);
+    }
+
+    /// 18b: the full four-row matrix for a recorded monitor pid. A dead
+    /// agent with a dead monitor OR a live monitor with a dead agent are
+    /// different states — only the former is `Stuck` (nothing will call
+    /// `devflow advance`); the latter is a normal between-stages moment. An
+    /// agent that outlived its monitor is also `Stuck` — orphaned, since
+    /// nothing will advance it when it exits either.
+    #[test]
+    fn liveness_matrix_covers_all_four_rows() {
+        let pid = Some(4242);
+        assert_eq!(liveness(pid, true, true), Liveness::Healthy);
+        assert_eq!(liveness(pid, true, false), Liveness::BetweenStages);
+        assert_eq!(liveness(pid, false, false), Liveness::Stuck);
+        assert_eq!(liveness(pid, false, true), Liveness::Stuck);
+    }
+
+    /// 18b: a corrupt pid (0, or above `i32::MAX`) must never read as alive
+    /// — `liveness` relies entirely on `agent::agent_running`'s existing
+    /// hardening (no second probe is written), so it can only ever produce
+    /// `Stuck` or `Unknown` for a corrupt pid, never a false `Healthy`.
+    #[test]
+    fn liveness_treats_zero_and_overflow_pids_as_dead() {
+        assert!(!agent::agent_running(0));
+        assert!(!agent::agent_running(u32::MAX));
+    }
+
+    /// 18b: persisting `monitor_pid` for one phase must not disturb a
+    /// concurrently-active sibling phase's `monitor_pid` (concurrency edge).
+    #[test]
+    fn monitor_pid_persisted_for_one_phase_does_not_disturb_a_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let mut phase7 = State::new(7, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        phase7.monitor_pid = Some(111);
+        workflow::save_state(&phase7).unwrap();
+
+        let mut phase8 = State::new(8, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        phase8.monitor_pid = Some(222);
+        workflow::save_state(&phase8).unwrap();
+
+        let reloaded7 = workflow::load_state(root, 7).unwrap();
+        let reloaded8 = workflow::load_state(root, 8).unwrap();
+        assert_eq!(reloaded7.monitor_pid, Some(111));
+        assert_eq!(reloaded8.monitor_pid, Some(222));
+    }
+
+    /// 18b: after `launch_stage` spawns a monitor, the persisted state file
+    /// for that phase carries the monitor's pid — `transition()` saves state
+    /// BEFORE calling `launch_stage`, so the pid must be saved again inside
+    /// `launch_stage` or it is lost.
+    #[test]
+    fn launch_stage_persists_monitor_pid_for_reload() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 65;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        workflow::save_state(&state).unwrap();
+
+        let stub_dir = stub_agent_binary("claude");
+        let original_path = std::env::var_os("PATH");
+        let stubbed_path = prepend_path(&stub_dir, &original_path);
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", &stubbed_path);
+        }
+
+        let result = launch_stage(&mut state, None, None);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        result.unwrap();
+
+        assert!(
+            state.monitor_pid.is_some(),
+            "launch_stage must record the monitor pid on the in-memory state"
+        );
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert_eq!(
+            reloaded.monitor_pid, state.monitor_pid,
+            "the monitor pid recorded by launch_stage must be persisted to disk, \
+             since transition() saves state before launch_stage runs"
+        );
     }
 
     /// 15a: `devflow gate approve` resolves the stage automatically when a
