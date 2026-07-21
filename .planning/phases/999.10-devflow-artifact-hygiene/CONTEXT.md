@@ -71,6 +71,18 @@ message is distinct. That is correct scoping; it means the existing emission at
 Note `main.rs:5237` has a test asserting `payload["exe_path"].is_string() ||
 .is_null()`, which will need updating alongside the fix.
 
+**Update (18-fix, Phase 18 review-fix batch):** a THIRD WR-02 instance —
+`enforce_build_staleness`'s `self_dogfood_stale_blocked` event, which
+persisted `truncate_reason(&message)` (the full staleness-block message,
+including `execution_root.display()`) into `events.jsonl` — was found and
+fixed in Phase 18's code-review-fix pass. It now persists a bare
+`"stale_build_blocked"` label plus a path-free `stage`/`worktree` payload;
+the full path-bearing message is unchanged everywhere else (terminal notify,
+returned `CliError`). That instance is closed and out of this backlog's
+scope. The two instances documented above — `exe_path` in `workflow_started`
+and `docs_update`'s `git add .` sweep — are the ORIGINAL findings and remain
+this phase's scope; they are unaffected by the 18-fix change.
+
 ## Notes
 
 Do this before any wider release push — it is the only finding in the WR batch
