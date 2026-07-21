@@ -3119,7 +3119,7 @@ fn test_cmd(project_root: &Path) -> Result<(), CliError> {
 // ---------------------------------------------------------------------------
 
 /// Audit the environment and report what's installed, missing, or broken.
-fn doctor(_project_root: &Path, json: bool) -> Result<(), CliError> {
+fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
     use std::process::Command;
 
     struct Check {
@@ -3305,6 +3305,9 @@ fn doctor(_project_root: &Path, json: bool) -> Result<(), CliError> {
         }
     }
 
+    let facts = collect_phase_facts(project_root);
+    render_reconciliation(&facts, json);
+
     Ok(())
 }
 
@@ -3314,12 +3317,7 @@ fn doctor(_project_root: &Path, json: bool) -> Result<(), CliError> {
 
 /// Severity of a reconciliation finding, matching the existing `Check.status`
 /// convention (lowercase strings) so both `doctor` renderers stay consistent.
-///
-/// `#[allow(dead_code)]`: this pure core lands one task ahead of the `doctor`
-/// wiring that constructs `Severity::Ok` and calls `label()` (Task 2 of
-/// 18-01-PLAN.md) — removed once that wiring lands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 enum Severity {
     Ok,
     Warn,
@@ -3327,7 +3325,6 @@ enum Severity {
 }
 
 impl Severity {
-    #[allow(dead_code)]
     fn label(self) -> &'static str {
         match self {
             Severity::Ok => "ok",
@@ -3338,13 +3335,8 @@ impl Severity {
 }
 
 /// The read-only facts `doctor` gathers for one active phase before
-/// reconciling them. Collected by `collect_phase_facts` (Task 2, all I/O);
-/// consumed with zero I/O by `reconcile_phase`.
-///
-/// `#[allow(dead_code)]`: `collect_phase_facts` (Task 2) is this struct's
-/// only constructor and `phase`/`last_event` are read only by that task's
-/// renderer — removed once Task 2 lands.
-#[allow(dead_code)]
+/// reconciling them. Collected by `collect_phase_facts` (all I/O); consumed
+/// with zero I/O by `reconcile_phase`.
 struct PhaseFacts {
     phase: u32,
     stage: Stage,
@@ -3363,10 +3355,6 @@ struct PhaseFacts {
 /// One diagnostic finding for a phase, with a copy-pasteable repair command
 /// when one exists. Never carries a filesystem path or username (T-18-01) —
 /// only phase numbers, stage names, and pids identify the disagreement.
-///
-/// `#[allow(dead_code)]`: `phase` is read only by Task 2's renderer —
-/// removed once Task 2 lands.
-#[allow(dead_code)]
 struct PhaseFinding {
     phase: u32,
     severity: Severity,
@@ -3377,7 +3365,6 @@ struct PhaseFinding {
 /// `gate_pending` is set but no gate file is open for this phase — the gate
 /// answer path is stuck. `doctor` only reports this; it never repairs it
 /// (T-18-02).
-#[allow(dead_code)]
 fn check_gate_pending_without_gate(facts: &PhaseFacts) -> Option<PhaseFinding> {
     if !facts.gate_pending || !facts.open_gate_stages.is_empty() {
         return None;
@@ -3395,7 +3382,6 @@ fn check_gate_pending_without_gate(facts: &PhaseFacts) -> Option<PhaseFinding> {
 
 /// An open gate file exists but `gate_pending` is false — an unanswered
 /// operator question that `status`/`doctor` isn't surfacing as pending.
-#[allow(dead_code)]
 fn check_orphan_gate(facts: &PhaseFacts) -> Option<PhaseFinding> {
     if facts.gate_pending || facts.open_gate_stages.is_empty() {
         return None;
@@ -3418,7 +3404,6 @@ fn check_orphan_gate(facts: &PhaseFacts) -> Option<PhaseFinding> {
 /// The recorded agent pid is not alive while the phase sits at an
 /// agent-driven stage — the "who watches the watcher" class of silent death
 /// CONTEXT.md cites (two incidents, ~4h lost, found only via `ps`).
-#[allow(dead_code)]
 fn check_dead_agent(facts: &PhaseFacts) -> Option<PhaseFinding> {
     let pid = facts.agent_pid?;
     if facts.agent_alive || !facts.stage.is_agent_stage() {
@@ -3439,7 +3424,6 @@ fn check_dead_agent(facts: &PhaseFacts) -> Option<PhaseFinding> {
 /// `state.stage`. A `Warn`, not a `Problem` — a healthy pipeline legitimately
 /// has one stage in flight between the launch event and the next
 /// transition; exact equality is agreement, never an off-by-one mismatch.
-#[allow(dead_code)]
 fn check_stage_event_drift(facts: &PhaseFacts) -> Option<PhaseFinding> {
     let launched = facts.last_launched_stage?;
     if launched == facts.stage {
@@ -3459,7 +3443,6 @@ fn check_stage_event_drift(facts: &PhaseFacts) -> Option<PhaseFinding> {
 /// The phase's feature branch does not exist even though its stage is past
 /// `Define`. A `Warn` — a not-yet-pushed or manually deleted branch is
 /// recoverable without state surgery.
-#[allow(dead_code)]
 fn check_missing_branch(facts: &PhaseFacts) -> Option<PhaseFinding> {
     if facts.feature_branch_exists || facts.stage == Stage::Define {
         return None;
@@ -3480,7 +3463,6 @@ fn check_missing_branch(facts: &PhaseFacts) -> Option<PhaseFinding> {
 /// fixed order so the returned findings never depend on how `facts` was
 /// assembled (ordering edge). Takes no path, performs no I/O, and mutates
 /// nothing (T-18-02) — directly unit-testable without a repository.
-#[allow(dead_code)]
 fn reconcile_phase(facts: &PhaseFacts) -> Vec<PhaseFinding> {
     [
         check_gate_pending_without_gate(facts),
@@ -3492,6 +3474,167 @@ fn reconcile_phase(facts: &PhaseFacts) -> Vec<PhaseFinding> {
     .into_iter()
     .flatten()
     .collect()
+}
+
+/// Gather the read-only facts `reconcile_phase` needs for every active
+/// phase, sorted by phase ascending so output ordering never depends on
+/// directory-read order (ordering edge). Every call here is a read-only
+/// primitive already used elsewhere (`status`, `recover::inspect_all`) —
+/// none of it is reimplemented.
+fn collect_phase_facts(project_root: &Path) -> Vec<PhaseFacts> {
+    let states = workflow::list_states(project_root);
+    // 14-CR-10: one pass over events.jsonl for every phase's last event,
+    // matching status()'s optimization, not a per-phase rescan.
+    let mut last_events = events::last_events_by_phase(project_root);
+    let open_gates = Gates::list_open(project_root);
+
+    let mut facts: Vec<PhaseFacts> = states
+        .into_iter()
+        .map(|state| build_phase_facts(project_root, state, &mut last_events, &open_gates))
+        .collect();
+
+    facts.sort_by_key(|f| f.phase);
+    facts
+}
+
+/// Build one phase's [`PhaseFacts`] from already-fetched state, events, and
+/// gates — the per-phase half of `collect_phase_facts`, split out to keep
+/// that function short.
+fn build_phase_facts(
+    project_root: &Path,
+    state: State,
+    last_events: &mut std::collections::HashMap<u32, serde_json::Value>,
+    open_gates: &[OpenGate],
+) -> PhaseFacts {
+    let phase = state.phase;
+    let agent_pid = agent_pid_from_file(project_root, phase);
+    let agent_alive = agent_pid.is_some_and(agent::agent_running);
+    let last_event = last_events.remove(&phase);
+    let last_launched_stage = last_event.as_ref().and_then(last_launched_stage_from_event);
+    let last_event_name = last_event
+        .as_ref()
+        .and_then(|e| e.get("event"))
+        .and_then(|e| e.as_str())
+        .map(str::to_string);
+    let open_gate_stages = open_gates
+        .iter()
+        .filter(|g| g.phase == phase)
+        .map(|g| g.stage)
+        .collect();
+    let branch_ref = format!("refs/heads/feature/phase-{phase:02}");
+    let feature_branch_exists =
+        run_git_stdout(project_root, &["rev-parse", "--verify", &branch_ref]).is_some();
+
+    PhaseFacts {
+        phase,
+        stage: state.stage,
+        gate_pending: state.gate_pending,
+        agent_pid,
+        agent_alive,
+        last_event: last_event_name,
+        last_launched_stage,
+        open_gate_stages,
+        feature_branch_exists,
+    }
+}
+
+/// Derive the stage named by an event's `stage` field, but only when the
+/// event's `event` field is `"stage_launched"` — any other event kind (or
+/// an unparsable stage name) yields `None`, never a panic.
+fn last_launched_stage_from_event(event: &serde_json::Value) -> Option<Stage> {
+    if event.get("event").and_then(|e| e.as_str()) != Some("stage_launched") {
+        return None;
+    }
+    event
+        .get("stage")
+        .and_then(|s| s.as_str())
+        .and_then(|s| s.parse::<Stage>().ok())
+}
+
+/// The findings to display for one phase: real findings when any exist,
+/// otherwise a single synthetic `ok` finding — the display-only counterpart
+/// to `reconcile_phase`'s "zero findings" agreement case, shared by both
+/// the text and `--json` renderers.
+fn findings_for_display(facts: &PhaseFacts) -> Vec<PhaseFinding> {
+    let findings = reconcile_phase(facts);
+    if !findings.is_empty() {
+        return findings;
+    }
+    vec![PhaseFinding {
+        phase: facts.phase,
+        severity: Severity::Ok,
+        detail: format!("phase {}: ok", facts.phase),
+        repair: None,
+    }]
+}
+
+/// Render `doctor`'s per-phase reconciliation section (after the existing
+/// tool/env checks), read-only: it never calls `workflow::save_state`,
+/// `events::emit`, `Gates::cleanup`/`Gates::write`, or any `recover::clean*`
+/// function (T-18-02).
+fn render_reconciliation(facts: &[PhaseFacts], json: bool) {
+    if json {
+        print!("{}", render_reconciliation_json(facts));
+    } else {
+        print!("{}", render_reconciliation_text(facts));
+    }
+}
+
+/// Build the human-readable reconciliation section. A pure string builder
+/// (not a direct `println!`) so it's directly assertable in tests without
+/// capturing process stdout.
+fn render_reconciliation_text(facts: &[PhaseFacts]) -> String {
+    let mut out = String::from("\nreconciliation:\n");
+    if facts.is_empty() {
+        out.push_str("  no active phases — nothing to reconcile\n");
+        return out;
+    }
+    for phase_facts in facts {
+        for finding in findings_for_display(phase_facts) {
+            out.push_str(&format!("  {}\n", finding.detail));
+            if let Some(repair) = &finding.repair {
+                out.push_str(&format!("    repair: {repair}\n"));
+            }
+        }
+    }
+    out
+}
+
+/// Build the `--json` reconciliation array, using the same manual
+/// string-building style as the `checks` array above (not a new
+/// serialization approach).
+fn render_reconciliation_json(facts: &[PhaseFacts]) -> String {
+    // Pair each finding with its originating phase's last recorded event, so
+    // a `--json` consumer gets that context without re-reading events.jsonl.
+    let findings: Vec<(&PhaseFacts, PhaseFinding)> = facts
+        .iter()
+        .flat_map(|pf| findings_for_display(pf).into_iter().map(move |f| (pf, f)))
+        .collect();
+    let mut out = String::from("[\n");
+    for (i, (phase_facts, finding)) in findings.iter().enumerate() {
+        out.push_str("  {\n");
+        out.push_str(&format!("    \"phase\": {},\n", finding.phase));
+        out.push_str(&format!(
+            "    \"severity\": {:?},\n",
+            finding.severity.label()
+        ));
+        out.push_str(&format!("    \"detail\": {:?},\n", finding.detail));
+        match &finding.repair {
+            Some(repair) => out.push_str(&format!("    \"repair\": {repair:?},\n")),
+            None => out.push_str("    \"repair\": null,\n"),
+        }
+        match &phase_facts.last_event {
+            Some(event) => out.push_str(&format!("    \"last_event\": {event:?}\n")),
+            None => out.push_str("    \"last_event\": null\n"),
+        }
+        out.push('}');
+        if i + 1 < findings.len() {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    out.push_str("]\n");
+    out
 }
 
 #[cfg(test)]
@@ -6573,6 +6716,89 @@ mod tests {
                     .contains("last stage_launched event named validate")
             );
             assert!(findings[3].detail.contains("feature/phase-07"));
+        }
+
+        /// `doctor`'s idle-project path (Task 2, 18a): the exact code path
+        /// `doctor(root, false)` runs for its reconciliation section is
+        /// `collect_phase_facts` + `render_reconciliation_text` — asserted
+        /// directly here rather than capturing process stdout, since this
+        /// codebase has no stdout-capture dependency and this phase adds no
+        /// new ones (18-RESEARCH.md).
+        #[test]
+        fn doctor_reports_no_active_phases_when_idle() {
+            let dir = tempfile::tempdir().unwrap();
+            let facts = collect_phase_facts(dir.path());
+            assert!(facts.is_empty());
+            assert!(render_reconciliation_text(&facts).contains("no active phases"));
+        }
+
+        #[test]
+        fn doctor_reports_gate_pending_without_gate_file() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = 90;
+            let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+            state.stage = Stage::Validate;
+            state.gate_pending = true;
+            workflow::save_state(&state).unwrap();
+
+            let facts = collect_phase_facts(root);
+            assert_eq!(facts.len(), 1);
+            let text = render_reconciliation_text(&facts);
+            assert!(text.contains(&format!("phase {phase}: gate_pending is true")));
+            assert!(text.contains(&format!("repair: devflow resume --phase {phase}")));
+        }
+
+        /// T-18-02: running `doctor` twice against a mismatched fixture must
+        /// leave `.devflow/` byte-identical — no state rewrite, no event
+        /// append, no gate file appears or disappears.
+        #[test]
+        fn doctor_is_read_only_on_a_mismatched_project() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = 91;
+            let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+            state.stage = Stage::Validate;
+            state.gate_pending = true; // mismatched: no gate file will exist
+            workflow::save_state(&state).unwrap();
+            events::emit(
+                root,
+                phase,
+                "stage_launched",
+                serde_json::json!({"stage": "code"}),
+            );
+
+            let state_path = workflow::state_path(root, phase);
+            let before_len = std::fs::metadata(&state_path).unwrap().len();
+            let before_modified = std::fs::metadata(&state_path).unwrap().modified().unwrap();
+            let events_log = events::events_path(root);
+            let before_lines = std::fs::read_to_string(&events_log)
+                .unwrap()
+                .lines()
+                .count();
+
+            doctor(root, false).unwrap();
+            doctor(root, false).unwrap();
+
+            let after_len = std::fs::metadata(&state_path).unwrap().len();
+            let after_modified = std::fs::metadata(&state_path).unwrap().modified().unwrap();
+            let after_lines = std::fs::read_to_string(&events_log)
+                .unwrap()
+                .lines()
+                .count();
+
+            assert_eq!(
+                before_len, after_len,
+                "doctor must not rewrite the state file"
+            );
+            assert_eq!(
+                before_modified, after_modified,
+                "doctor must not touch the state file's mtime"
+            );
+            assert_eq!(
+                before_lines, after_lines,
+                "doctor must not append to events.jsonl"
+            );
         }
     }
 }
