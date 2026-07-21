@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
-status: "Phase 18 complete and released as v1.5.0 (2026-07-21, tag v1.5.0, crates.io published); develop synced back from main. Phase 19 (Release Integrity + main.rs Decomposition) scoped and promoted from backlog 2026-07-21 via /gsd-review-backlog: 999.10 (.devflow/ artifact hygiene, Urgent), 999.11 (commit_path empty commits), 999.8 (split main.rs, pure move), 999.16 (AI change acceptance contract). Targets v1.6.0. Discussed 2026-07-21 (19-CONTEXT.md, 21 decisions across 5 areas) - next step is /gsd-plan-phase 19. Milestone label corrected: v2.0.0 was never released (project shipped 1.2.0 to 1.5.0); the milestone now runs Phase 11-20 and closes at v2.0.0 with Phase 20."
-stopped_at: Phase 19 context gathered
-last_updated: "2026-07-21T21:44:38.548Z"
+status: "Phase 18 complete and released as v1.5.0 (2026-07-21, tag v1.5.0, crates.io published); develop synced back from main. Phase 19 (Release Integrity + main.rs Decomposition) scoped and promoted from backlog 2026-07-21 via /gsd-review-backlog: 999.10 (.devflow/ artifact hygiene, Urgent), 999.11 (commit_path empty commits), 999.8 (split main.rs, pure move), 999.16 (AI change acceptance contract). Targets v1.6.0. Discussed and PLANNED 2026-07-21: 11 plans across 6 waves, plan-checker VERIFICATION PASSED (0 blockers, 0 warnings, first iteration). Next step is /gsd-execute-phase 19. Milestone label corrected: v2.0.0 was never released (project shipped 1.2.0 to 1.5.0); the milestone now runs Phase 11-20 and closes at v2.0.0 with Phase 20."
+stopped_at: Phase 19 planned (11 plans, 6 waves) — ready to execute
+last_updated: "2026-07-21T22:30:00.000Z"
 progress:
   total_phases: 8
   completed_phases: 7
-  total_plans: 54
+  total_plans: 65
   completed_plans: 54
-  percent: 88
+  percent: 83
 ---
 
 # DevFlow — Project State
@@ -69,7 +69,30 @@ progress:
     reduction. **Decision: flat siblings + split `pipeline.rs` at its natural
     seams**, which is what takes Phase 18's shape from 3 waves to 2.
 
-  **Next step:** `/gsd-plan-phase 19`.
+  **Planned 2026-07-21 — 11 plans across 6 waves.** Research (HIGH confidence),
+  pattern map, and VALIDATION.md all produced; `gsd-plan-checker` returned
+  **VERIFICATION PASSED with 0 blockers and 0 warnings on the first
+  iteration**. Wave 1 runs four plans in parallel (19a/19b/19g, disjoint file
+  sets); waves 3–5 are one plan each by construction, since every split plan
+  edits `main.rs`.
+
+  **Two locked decisions were corrected against live source during planning:**
+
+  - **D-14's named target does not exist.** `lock::ensure_devflow_dir` has zero
+    matches in `crates/`; `.devflow/` is created from **7 independent
+    `create_dir_all` sites**. RESEARCH.md's proposed `save_state` chokepoint was
+    also verified **wrong** — `run_agent_blocking` (`main.rs:2417`), the
+    `sequentagent`/`parallel` path, writes `.devflow/` on *"synthetic,
+    never-persisted state"* and never calls `save_state`, so that chokepoint
+    would leave the whole parallel path leaking. Corrected design: a new
+    `workflow::ensure_devflow_dir()`, all 7 sites converted, plus a coverage
+    test. Also reconciles the **duplicate `devflow_dir()`** (`workflow.rs:33`
+    public, `agent_result.rs:872` private).
+  - **D-20 was implemented but uncited**, so the blocking decision-coverage gate
+    failed at 20/21. Now cited explicitly in 19-06 (the first split plan) with a
+    halt-and-report branch if any 19a/19b work is still open when it starts.
+
+  **Next step:** `/gsd-execute-phase 19`.
 
 ## Recently Shipped
 

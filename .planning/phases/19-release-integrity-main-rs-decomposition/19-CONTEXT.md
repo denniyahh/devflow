@@ -57,8 +57,8 @@ split. Those are Phase 20 (v2.0.0).
 - **D-05: Flat sibling modules, all staying in `devflow-cli`.** `preflight.rs`,
   `staleness.rs`, `commands.rs`, `parallel.rs`, `config_parse.rs`, plus a thin
   `main.rs` retaining only `main`, `run`, and arg routing.
-- **D-06: Split the pipeline state machine further — it is the actual
-  bottleneck.** Measured at HEAD: pipeline holds ~1,040 lines and absorbed **3
+- **D-06: Split the pipeline state machine further — it is the bottleneck.**
+  Measured at HEAD: pipeline holds ~1,040 lines and absorbed **3
   of Phase 18's 7 plans** (18-04, 18-05, 18-07), more than any other cluster.
   Natural seams: `launch_stage`/`advance`/`transition`, the `handle_*_outcome`
   family, and `run_gate`/`finish_workflow`. This is what takes Phase 18's shape
@@ -89,8 +89,8 @@ split. Those are Phase 20 (v2.0.0).
 - **D-11: Verify on a branch with CI. Local-green is explicitly insufficient.**
   19i is direct evidence that CI's shared runners widen race windows relative to
   this workstation (hit 2/2 in CI after passing locally most of the time).
-- **D-12: A partially-completed split with the `ENV_MUTEX` question surfaced is
-  an acceptable outcome.** If serialization cannot be preserved without a
+- **D-12: A partial split with the `ENV_MUTEX` question surfaced is OK.**
+  A partially-completed split is an acceptable outcome. If serialization cannot be preserved without a
   structural change to how tests serialize env mutation, that is a finding to
   raise — not something to patch around silently mid-refactor.
 
@@ -142,19 +142,19 @@ split. Those are Phase 20 (v2.0.0).
 
 ### 19b — `commit_path` empty commits
 
-- **D-16: Drop `--allow-empty` from `commit_path` and let the existing
-  `nothing to commit` arm become the genuine no-op.** Restores the doc comment's
+- **D-16: Drop `--allow-empty` from `commit_path`.** Let the existing
+  `nothing to commit` arm become the genuine no-op. Restores the doc comment's
   stated contract and revives what is currently dead code.
-- **D-17: `commit_all` at `git.rs:312` is OUT of scope — but check and record
-  why.** Its empty-commit behavior may be load-bearing somewhere. Determine the
+- **D-17: `commit_all` at `git.rs:312` is OUT of scope — check and record why.**
+  Its empty-commit behavior may be load-bearing somewhere. Determine the
   answer and write it down; do not change it in the same pass as a
   release-integrity fix. It is also the call site 19a modifies, so changing it
   here would collide the two units.
 
 ### 19g — AI change acceptance contract
 
-- **D-18: Wire the contract into `/gsd-code-review`'s actual criteria, plus
-  prose in `CONTRIBUTING.md`.** The review already runs before Ship and already
+- **D-18: Wire the contract into `/gsd-code-review`'s actual criteria.**
+  Plus prose in `CONTRIBUTING.md`. The review already runs before Ship and already
   refuses to ship on Critical findings — that is where enforcement exists.
   Rejected a net-new mechanical lint pass: it is additional tooling in a phase
   already carrying an L-sized refactor.
