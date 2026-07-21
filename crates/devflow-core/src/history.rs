@@ -314,4 +314,35 @@ mod tests {
             "no attempts recorded for phase 42"
         );
     }
+
+    #[test]
+    fn orphaned_capture_and_review_artifacts_remain_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let captures = agent_result::history_dir(dir.path(), 16);
+        std::fs::create_dir_all(&captures).unwrap();
+        let archived_capture = captures.join("20000000000-2-stdout");
+        let archived_review = captures.join("20000000000-2-REVIEW.md");
+        std::fs::write(&archived_capture, "attempt output").unwrap();
+        std::fs::write(&archived_review, "archived review").unwrap();
+
+        let live_review = dir
+            .path()
+            .join(".planning/phases/16-example/nested/16-REVIEW.md");
+        std::fs::create_dir_all(live_review.parent().unwrap()).unwrap();
+        std::fs::write(&live_review, "current review").unwrap();
+
+        let timeline = attempt_timeline(dir.path(), 16);
+
+        assert_eq!(timeline.entries.len(), 1);
+        let entry = &timeline.entries[0];
+        assert!(entry.event.is_none());
+        assert_eq!(entry.capture_files, vec![archived_capture.clone()]);
+        assert!(entry.review_files.contains(&archived_review));
+        assert!(entry.review_files.contains(&live_review));
+
+        let rendered = render_timeline(&timeline);
+        assert!(rendered.contains("retained artifact"));
+        assert!(rendered.contains(&archived_capture.display().to_string()));
+        assert!(rendered.contains(&live_review.display().to_string()));
+    }
 }

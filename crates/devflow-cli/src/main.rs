@@ -3163,7 +3163,16 @@ fn rollover_offset(path: &Path, offset: u64) -> u64 {
 /// Print the capture file's contents from `offset`, returning the new offset.
 /// A missing file is treated as empty (it may not exist yet under --follow).
 fn print_capture_from(path: &Path, offset: u64) -> Result<u64, CliError> {
-    use std::io::{Read, Seek, SeekFrom, Write};
+    let stdout = std::io::stdout();
+    write_capture_from(path, offset, &mut stdout.lock())
+}
+
+fn write_capture_from(
+    path: &Path,
+    offset: u64,
+    output: &mut impl std::io::Write,
+) -> Result<u64, CliError> {
+    use std::io::{Read, Seek, SeekFrom};
     let Ok(mut file) = std::fs::File::open(path) else {
         return Ok(offset);
     };
@@ -3173,9 +3182,8 @@ fn print_capture_from(path: &Path, offset: u64) -> Result<u64, CliError> {
     file.read_to_end(&mut buf)
         .map_err(|err| CliError::Message(format!("could not read capture file: {err}")))?;
     if !buf.is_empty() {
-        let mut stdout = std::io::stdout().lock();
-        let _ = stdout.write_all(&buf);
-        let _ = stdout.flush();
+        let _ = output.write_all(&buf);
+        let _ = output.flush();
     }
     Ok(offset + buf.len() as u64)
 }
@@ -4664,11 +4672,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("capture");
         std::fs::write(&path, "hello ").unwrap();
+        let mut output = Vec::new();
 
-        let offset = print_capture_from(&path, 0).unwrap();
+        let offset = write_capture_from(&path, 0, &mut output).unwrap();
         assert_eq!(offset, 6);
+        assert_eq!(output, b"hello ");
+
         // Nothing new: offset unchanged.
-        assert_eq!(print_capture_from(&path, offset).unwrap(), 6);
+        output.clear();
+        assert_eq!(write_capture_from(&path, offset, &mut output).unwrap(), 6);
+        assert!(output.is_empty());
 
         use std::io::Write as _;
         let mut f = std::fs::OpenOptions::new()
@@ -4677,12 +4690,16 @@ mod tests {
             .unwrap();
         f.write_all(b"world").unwrap();
         drop(f);
-        assert_eq!(print_capture_from(&path, offset).unwrap(), 11);
+        assert_eq!(write_capture_from(&path, offset, &mut output).unwrap(), 11);
+        assert_eq!(output, b"world");
+
         // Missing file is treated as "no new bytes yet".
+        output.clear();
         assert_eq!(
-            print_capture_from(Path::new("/nonexistent/x"), 4).unwrap(),
+            write_capture_from(Path::new("/nonexistent/x"), 4, &mut output).unwrap(),
             4
         );
+        assert!(output.is_empty());
     }
 
     /// Build a real git repo (main + develop, with a Cargo.toml committed) so
@@ -6992,6 +7009,7 @@ mod tests {
         git(&["config", "user.email", "t@e.st"], &project_root);
         git(&["config", "user.name", "t"], &project_root);
         git(&["config", "commit.gpgsign", "false"], &project_root);
+        git(&["config", "core.hooksPath", "/dev/null"], &project_root);
         std::fs::create_dir_all(project_root.join("src")).unwrap();
         std::fs::write(project_root.join("src/lib.rs"), "// base\n").unwrap();
         git(&["add", "."], &project_root);
@@ -7184,6 +7202,7 @@ mod tests {
         git(&["config", "user.email", "t@e.st"]);
         git(&["config", "user.name", "t"]);
         git(&["config", "commit.gpgsign", "false"]);
+        git(&["config", "core.hooksPath", "/dev/null"]);
         std::fs::write(root.join("a.txt"), "one").unwrap();
         git(&["add", "."]);
         git(&["commit", "-q", "-m", "base"]);
@@ -7264,6 +7283,7 @@ mod tests {
         git(&["config", "user.email", "t@e.st"]);
         git(&["config", "user.name", "t"]);
         git(&["config", "commit.gpgsign", "false"]);
+        git(&["config", "core.hooksPath", "/dev/null"]);
 
         // First commit: a workspace Cargo.toml (both crate member paths) plus
         // one other tracked file.
@@ -7347,6 +7367,7 @@ mod tests {
         git(&["config", "user.email", "t@e.st"]);
         git(&["config", "user.name", "t"]);
         git(&["config", "commit.gpgsign", "false"]);
+        git(&["config", "core.hooksPath", "/dev/null"]);
 
         std::fs::write(
             root.join("Cargo.toml"),
@@ -7435,6 +7456,7 @@ mod tests {
         git(&["config", "user.email", "t@e.st"]);
         git(&["config", "user.name", "t"]);
         git(&["config", "commit.gpgsign", "false"]);
+        git(&["config", "core.hooksPath", "/dev/null"]);
 
         std::fs::write(
             root.join("Cargo.toml"),
@@ -7601,6 +7623,7 @@ mod tests {
         git(&["config", "user.email", "t@e.st"]);
         git(&["config", "user.name", "t"]);
         git(&["config", "commit.gpgsign", "false"]);
+        git(&["config", "core.hooksPath", "/dev/null"]);
         // 17-10: the dirty file must be a BUILD-AFFECTING one. This fixture
         // used `a.txt`, which encoded the over-broad mtime arm that hard-blocked
         // Ship on a dirty CHANGELOG.md. The test's intent — a second signal
@@ -7652,6 +7675,7 @@ mod tests {
         git(&["config", "user.email", "t@e.st"]);
         git(&["config", "user.name", "t"]);
         git(&["config", "commit.gpgsign", "false"]);
+        git(&["config", "core.hooksPath", "/dev/null"]);
         std::fs::write(
             root.join("Cargo.toml"),
             "[workspace]\nmembers = [\"crates/devflow-core\", \"crates/devflow-cli\"]\n",
@@ -7800,6 +7824,7 @@ mod tests {
         git(&["config", "user.email", "t@e.st"]);
         git(&["config", "user.name", "t"]);
         git(&["config", "commit.gpgsign", "false"]);
+        git(&["config", "core.hooksPath", "/dev/null"]);
         std::fs::write(
             root.join("Cargo.toml"),
             "[workspace]\nmembers = [\"crates/devflow-core\", \"crates/devflow-cli\"]\n",

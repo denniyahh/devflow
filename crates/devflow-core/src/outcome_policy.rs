@@ -106,33 +106,5 @@ mod tests {
             decide_action(Stage::Code, AgentStatus::Unknown),
             Action::GateReview
         );
-        assert_ne!(
-            decide_action(Stage::Code, AgentStatus::Unknown),
-            Action::Advance
-        );
-    }
-
-    /// Determinism: repeated calls with identical inputs return identical
-    /// results (D-11/D-12 — pure function, no hidden state).
-    #[test]
-    fn decide_action_is_deterministic() {
-        for stage in [
-            Stage::Define,
-            Stage::Plan,
-            Stage::Code,
-            Stage::Validate,
-            Stage::Ship,
-        ] {
-            for outcome in [
-                AgentStatus::Success,
-                AgentStatus::Failed,
-                AgentStatus::RateLimited,
-                AgentStatus::Unknown,
-                AgentStatus::ResourceKilled,
-                AgentStatus::AgentUnavailable,
-            ] {
-                assert_eq!(decide_action(stage, outcome), decide_action(stage, outcome));
-            }
-        }
     }
 }

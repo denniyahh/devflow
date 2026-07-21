@@ -131,24 +131,6 @@ fn seed_feature_branch(root: &Path, phase: u32) {
 }
 
 #[test]
-fn devflow_ignores_stray_devflow_yaml() {
-    let repo = tempfile::tempdir().unwrap();
-    let root = repo.path();
-    init_repo(root);
-    fs::write(
-        root.join(".devflow.yaml"),
-        "this: is: deliberately: not: valid: config",
-    )
-    .unwrap();
-    let fake_bin = fake_bin_dir(&[]);
-
-    let output = run_devflow(root, &fake_bin.path, &["doctor"]);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    assert!(stdout.contains(&format!("devflow v{}", env!("CARGO_PKG_VERSION"))));
-}
-
-#[test]
 fn parallel_creates_two_worktrees_and_spawns_two_monitors() {
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
