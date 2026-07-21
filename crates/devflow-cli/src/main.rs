@@ -3410,6 +3410,11 @@ struct PhaseFacts {
     gate_pending: bool,
     agent_pid: Option<u32>,
     agent_alive: bool,
+    /// The monitor pid recorded in `State.monitor_pid` (18b). `None` means
+    /// no monitor has been spawned for this state yet, or the state was
+    /// written by a binary predating the field — never treated as a problem.
+    monitor_pid: Option<u32>,
+    monitor_alive: bool,
     /// The most recent event's `event` field value, for display context.
     last_event: Option<String>,
     /// The `stage` field of the most recent `stage_launched` event; `None`
@@ -3487,6 +3492,29 @@ fn check_dead_agent(facts: &PhaseFacts) -> Option<PhaseFinding> {
     })
 }
 
+/// The recorded monitor pid is dead — nothing will call `devflow advance`
+/// for this phase, whether or not the agent is also dead (an agent that
+/// outlived its monitor is orphaned too, since nothing will advance it when
+/// it exits either). Reuses `liveness` rather than re-deriving the matrix,
+/// so the two copies can never drift (18b, T-18-11's `Unknown` guard applies
+/// here transitively — an unrecorded monitor is silently `Unknown`, never a
+/// finding).
+fn check_dead_monitor(facts: &PhaseFacts) -> Option<PhaseFinding> {
+    if liveness(facts.monitor_pid, facts.monitor_alive, facts.agent_alive) != Liveness::Stuck {
+        return None;
+    }
+    let pid = facts.monitor_pid?;
+    Some(PhaseFinding {
+        phase: facts.phase,
+        severity: Severity::Problem,
+        detail: format!(
+            "phase {}: monitor pid {pid} recorded but not running at stage {}",
+            facts.phase, facts.stage
+        ),
+        repair: Some(format!("devflow resume --phase {}", facts.phase)),
+    })
+}
+
 /// The last `stage_launched` event named a different stage than
 /// `state.stage`. A `Warn`, not a `Problem` — a healthy pipeline legitimately
 /// has one stage in flight between the launch event and the next
@@ -3535,6 +3563,7 @@ fn reconcile_phase(facts: &PhaseFacts) -> Vec<PhaseFinding> {
         check_gate_pending_without_gate(facts),
         check_orphan_gate(facts),
         check_dead_agent(facts),
+        check_dead_monitor(facts),
         check_stage_event_drift(facts),
         check_missing_branch(facts),
     ]
@@ -3576,6 +3605,8 @@ fn build_phase_facts(
     let phase = state.phase;
     let agent_pid = agent_pid_from_file(project_root, phase);
     let agent_alive = agent_pid.is_some_and(agent::agent_running);
+    let monitor_pid = state.monitor_pid;
+    let monitor_alive = monitor_pid.is_some_and(agent::agent_running);
     let last_event = last_events.remove(&phase);
     let last_launched_stage = last_event.as_ref().and_then(last_launched_stage_from_event);
     let last_event_name = last_event
@@ -3598,6 +3629,8 @@ fn build_phase_facts(
         gate_pending: state.gate_pending,
         agent_pid,
         agent_alive,
+        monitor_pid,
+        monitor_alive,
         last_event: last_event_name,
         last_launched_stage,
         open_gate_stages,
@@ -6757,6 +6790,8 @@ mod tests {
                 gate_pending: false,
                 agent_pid: Some(4242),
                 agent_alive: true,
+                monitor_pid: Some(4343),
+                monitor_alive: true,
                 last_event: Some("stage_launched".into()),
                 last_launched_stage: Some(Stage::Code),
                 open_gate_stages: Vec::new(),
@@ -6854,6 +6889,67 @@ mod tests {
             assert!(findings[0].repair.is_none());
         }
 
+        /// 18b: a dead monitor with a dead agent is `Stuck` — nothing will
+        /// call `devflow advance` for this phase — and reports a `Problem`
+        /// finding with a `devflow resume --phase N` repair.
+        #[test]
+        fn reconcile_reports_stuck_when_monitor_and_agent_are_both_dead() {
+            let facts = PhaseFacts {
+                monitor_pid: Some(5150),
+                monitor_alive: false,
+                agent_pid: Some(4242),
+                agent_alive: false,
+                ..agreeing_facts(8)
+            };
+            let findings = reconcile_phase(&facts);
+            let monitor_finding = findings
+                .iter()
+                .find(|f| f.detail.contains("monitor pid"))
+                .expect("expected a monitor finding when monitor and agent are both dead");
+            assert_eq!(monitor_finding.severity, Severity::Problem);
+            assert!(monitor_finding.detail.contains("monitor pid 5150"));
+            assert_eq!(
+                monitor_finding.repair.as_deref(),
+                Some("devflow resume --phase 8")
+            );
+        }
+
+        /// 18b (T-18-11): an unrecorded monitor is unknown, not a problem —
+        /// a state file written by a pre-18b binary must never render as
+        /// stuck.
+        #[test]
+        fn reconcile_is_silent_when_monitor_pid_is_unrecorded() {
+            let facts = PhaseFacts {
+                monitor_pid: None,
+                monitor_alive: false,
+                ..agreeing_facts(9)
+            };
+            assert!(
+                reconcile_phase(&facts).is_empty(),
+                "an unrecorded monitor must never produce a finding"
+            );
+        }
+
+        /// 18b: a live monitor with a dead agent is a normal between-stages
+        /// moment (the monitor hasn't advanced the phase yet), not a monitor
+        /// finding. `check_dead_agent`'s own pre-existing finding for the
+        /// dead agent pid is unrelated to this check and out of this plan's
+        /// scope.
+        #[test]
+        fn reconcile_is_silent_when_monitor_alive_and_agent_dead() {
+            let facts = PhaseFacts {
+                monitor_pid: Some(5150),
+                monitor_alive: true,
+                agent_alive: false,
+                ..agreeing_facts(10)
+            };
+            let findings = reconcile_phase(&facts);
+            assert!(
+                findings.iter().all(|f| !f.detail.contains("monitor pid")),
+                "a live monitor with a dead agent must not produce a monitor finding"
+            );
+        }
+
         /// Several checks trigger simultaneously; the returned findings must
         /// come back in the fixed order `reconcile_phase` evaluates checks
         /// in, not in whatever order the facts happen to be populated.
@@ -6863,6 +6959,8 @@ mod tests {
                 gate_pending: true,
                 agent_pid: Some(999_999),
                 agent_alive: false,
+                monitor_pid: Some(999_998),
+                monitor_alive: false,
                 last_launched_stage: Some(Stage::Validate),
                 open_gate_stages: Vec::new(),
                 feature_branch_exists: false,
@@ -6875,18 +6973,20 @@ mod tests {
                 vec![
                     Severity::Problem, // check_gate_pending_without_gate
                     Severity::Problem, // check_dead_agent
+                    Severity::Problem, // check_dead_monitor
                     Severity::Warn,    // check_stage_event_drift
                     Severity::Warn,    // check_missing_branch
                 ]
             );
             assert!(findings[0].detail.contains("gate_pending is true"));
             assert!(findings[1].detail.contains("agent pid 999999"));
+            assert!(findings[2].detail.contains("monitor pid 999998"));
             assert!(
-                findings[2]
+                findings[3]
                     .detail
                     .contains("last stage_launched event named validate")
             );
-            assert!(findings[3].detail.contains("feature/phase-07"));
+            assert!(findings[4].detail.contains("feature/phase-07"));
         }
 
         /// `doctor`'s idle-project path (Task 2, 18a): the exact code path
