@@ -5476,6 +5476,116 @@ mod tests {
         );
     }
 
+    /// Combined 18d+18e scenario (18-RESEARCH.md Pitfall 1) — the only test
+    /// that proves both fixes hold TOGETHER, not each in isolation: 18e's
+    /// Layer-0 discard is what makes an `external_verify` Validate fail for
+    /// the wrong reason, and 18d's counter reset is what made that failure
+    /// loop unbounded — fixing either alone leaves the other's failure mode
+    /// partially masked. Arm A (18e dominates) proves an `Ambiguous` outcome
+    /// gates on the FIRST cycle, never touching `consecutive_failures`. Arm
+    /// B (18d dominates) proves a genuine, non-ambiguous failure still
+    /// reaches `MAX_CONSECUTIVE_FAILURES` and forces the gate — the case
+    /// that, before 18d, ran forever.
+    #[test]
+    fn external_verify_cycles_reach_ceiling_without_unbounded_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Arm A: an Ambiguous outcome gates on cycle one, never touching
+        // consecutive_failures. Arm B: a genuine failure still reaches
+        // MAX_CONSECUTIVE_FAILURES and forces the gate.
+        arm_a_ambiguous_outcome_gates_on_cycle_one(root, 93);
+        arm_b_genuine_failures_reach_the_ceiling(root, 94);
+    }
+
+    /// Arm A (18e dominates): an ambiguous `external_verify` outcome gates
+    /// immediately — no Code↔Validate loop ever starts, so 18d's counter is
+    /// irrelevant here and must stay untouched. Asserting that prevents a
+    /// future refactor from quietly routing ambiguity back through the
+    /// counter-based auto-loop.
+    fn arm_a_ambiguous_outcome_gates_on_cycle_one(root: &Path, phase: u32) {
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        workflow::save_state(&state).unwrap();
+
+        let result = agent_result::AgentResult {
+            status: AgentStatus::Success,
+            exit_code: None,
+            reason: None,
+            commits: None,
+            summary: None,
+            verdict: Some(Verdict::Gaps),
+            decided_by_layer: Some(0),
+        };
+        let outcome = classify_validate_outcome(&result);
+        assert!(matches!(outcome, ValidateOutcome::Ambiguous(_)));
+
+        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        handle_validate_outcome(root, &mut state, outcome).unwrap();
+
+        assert_eq!(
+            state.consecutive_failures, 0,
+            "18e's ambiguous gate must fire on cycle one, never touching 18d's counter"
+        );
+    }
+
+    /// Arm B (18d dominates): a genuine, non-ambiguous `ValidateOutcome::Failed`
+    /// driven through repeated Code↔Validate cycles reaches
+    /// `MAX_CONSECUTIVE_FAILURES` and forces the gate. PATH is neutralized
+    /// under `ENV_MUTEX` (matching `consecutive_failures_reaches_ceiling_across_cycles`)
+    /// so neither `handle_validate_outcome`'s loop-back nor `transition`'s
+    /// own `launch_stage` risk spawning a real agent CLI.
+    fn arm_b_genuine_failures_reach_the_ceiling(root: &Path, phase: u32) {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        for _ in 0..mode::MAX_CONSECUTIVE_FAILURES {
+            std::fs::write(
+                &response_path,
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap();
+            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+            state.stage = Stage::Code;
+            let _ = transition(root, &mut state, Stage::Validate);
+        }
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        assert_eq!(state.consecutive_failures, mode::MAX_CONSECUTIVE_FAILURES);
+        assert!(
+            state
+                .mode
+                .should_gate(Stage::Validate, state.consecutive_failures),
+            "a genuine repeated failure must still reach the reachable ceiling (18d)"
+        );
+    }
+
     /// 18d precision edge: `consecutive_failures` must saturate at `u32::MAX`
     /// rather than wrap to 0 on overflow, so a long-running stuck loop can't
     /// silently restore the unreachable-ceiling bug in a slower, harder-to-
