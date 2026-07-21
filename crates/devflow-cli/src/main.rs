@@ -6437,6 +6437,117 @@ mod tests {
         );
     }
 
+    /// Build a real `git worktree add` fixture for the 18c wrong-tree defect
+    /// (Round 4 CR-01): a `develop` branch with one commit (the "embedded"
+    /// commit, recorded before the worktree diverges) at
+    /// `<tempdir>/project`, and a feature-branch worktree checked out from
+    /// it as a SIBLING directory at `<tempdir>/worktree` — deliberately NOT
+    /// nested under `project`, so a test can assert unambiguously on which
+    /// of the two paths a message names (a nested worktree path would
+    /// contain `project_root`'s path as a string prefix, making "worktree
+    /// path present" and "project_root path absent" mutually exclusive
+    /// assertions). Two further commits are made INSIDE the worktree, each
+    /// touching a `.rs` file (build-affecting), so `project_root`'s HEAD
+    /// never moves and the worktree's HEAD advances two commits past the
+    /// recorded hash. Mirrors
+    /// `worktree::tests::add_creates_worktree_on_new_branch`'s construction
+    /// (`git worktree add -b <branch> <path> <start_point>`) — the closest
+    /// existing precedent for a real worktree fixture.
+    ///
+    /// Returns `(tempdir_guard, worktree_path, embedded_commit)`.
+    /// `project_root` is `tempdir_guard.path().join("project")`. The guard
+    /// must be kept alive for the duration of the test.
+    fn worktree_staleness_fixture() -> (tempfile::TempDir, PathBuf, String) {
+        let outer = tempfile::tempdir().unwrap();
+        let project_root = outer.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let worktree_path = outer.path().join("worktree");
+
+        let git = |args: &[&str], cwd: &Path| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(cwd)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} in {cwd:?} failed"
+            );
+        };
+
+        git(&["init", "-q", "-b", "develop"], &project_root);
+        git(&["config", "user.email", "t@e.st"], &project_root);
+        git(&["config", "user.name", "t"], &project_root);
+        git(&["config", "commit.gpgsign", "false"], &project_root);
+        std::fs::create_dir_all(project_root.join("src")).unwrap();
+        std::fs::write(project_root.join("src/lib.rs"), "// base\n").unwrap();
+        git(&["add", "."], &project_root);
+        git(&["commit", "-q", "-m", "base"], &project_root);
+        let embedded_commit = run_git_stdout(&project_root, &["rev-parse", "HEAD"])
+            .expect("rev-parse HEAD")
+            .trim()
+            .to_string();
+
+        git(
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/phase-90",
+                worktree_path.to_str().unwrap(),
+                "develop",
+            ],
+            &project_root,
+        );
+
+        // Two build-affecting commits, made ONLY inside the worktree —
+        // project_root's HEAD (develop) never moves. This asymmetry (Fresh
+        // against project_root, Stale against the worktree) is exactly the
+        // Round 4 CR-01 mechanism.
+        std::fs::write(worktree_path.join("src/lib.rs"), "// wt commit 1\n").unwrap();
+        git(&["add", "."], &worktree_path);
+        git(&["commit", "-q", "-m", "wt commit 1"], &worktree_path);
+        std::fs::write(worktree_path.join("src/lib.rs"), "// wt commit 2\n").unwrap();
+        git(&["add", "."], &worktree_path);
+        git(&["commit", "-q", "-m", "wt commit 2"], &worktree_path);
+
+        (outer, worktree_path, embedded_commit)
+    }
+
+    /// 18c (Round 4 CR-01 root cause): the SAME embedded commit is
+    /// simultaneously `Fresh` against `project_root` and `Stale` against the
+    /// worktree HEAD. Evaluating a worktree-based phase against
+    /// `project_root` alone is exactly the bug — a binary two commits behind
+    /// the worktree branch reads as if it were built from the current
+    /// source. Both halves are asserted in one test: a single assertion
+    /// would pass for the wrong reason if the fixture were built
+    /// incorrectly.
+    ///
+    /// This test is already GREEN pre-fix — both calls are already
+    /// parameterized by a root, so this proves the fixture is correct, not
+    /// that the defect is fixed. The RED proof of the actual defect (the
+    /// real entry point, `enforce_build_staleness`, evaluated against the
+    /// wrong root) lives in
+    /// `enforce_build_staleness_blocks_self_dogfood_behind_worktree_head`.
+    #[test]
+    fn embedded_commit_is_stale_uses_worktree_head() {
+        let (outer, worktree_path, embedded_commit) = worktree_staleness_fixture();
+        let project_root = outer.path().join("project");
+
+        assert_eq!(
+            embedded_commit_is_stale(&project_root, &embedded_commit),
+            Staleness::Fresh,
+            "project_root's HEAD never moved, so the embedded commit is still an exact match"
+        );
+        assert_eq!(
+            embedded_commit_is_stale(&worktree_path, &embedded_commit),
+            Staleness::Stale,
+            "the worktree branch advanced two commits past the embedded commit — Round 4 \
+             CR-01's mechanism: evaluated against the wrong tree, this same commit reads Fresh"
+        );
+    }
+
     /// Build a repo with a `base` commit, a diverged `side`-branch commit
     /// that is NOT an ancestor of the final `trunk` HEAD, then return to
     /// `trunk` — exercises all three `embedded_commit_is_stale` outcomes
