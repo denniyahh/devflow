@@ -795,6 +795,44 @@ fn evaluate_layer0(
     }
 }
 
+/// Reconciles Layer 0's affirmative-success result with Layer 1's
+/// self-reported verdict at `Stage::Validate` (18e).
+///
+/// Layer 0's affirmative-success arm above short-circuits the cascade before
+/// Layer 1 ever runs (`evaluate_agent_result_inner` returns immediately on
+/// any `Some(..)` from Layer 0), but Layer 1 is the ONLY carrier of a
+/// `verdict` — `status` reports whether the stage's task ran; `verdict`
+/// reports whether validation itself passed (see `AgentResult::verdict`'s
+/// doc comment). At `Stage::Validate` that meant an agent's explicit
+/// `verdict: pass` was silently discarded and `advance()` computed a failure
+/// from it — a regression introduced by this project's own 17-03, fixed
+/// here.
+///
+/// `decided_by_layer` deliberately stays `Some(0)` — Layer 0 still DECIDED
+/// the `status`; Layer 1 only supplies the `verdict`. The CLI relies on that
+/// value to tell an `external_verify` Validate apart from an ordinary one
+/// (`classify_validate_outcome`, 18e).
+///
+/// Scoped to `Stage::Validate` only (flagged assumption in 18-05-PLAN.md): at
+/// every other stage an affirmative Layer 0 success keeps `verdict: None`,
+/// unchanged from current behavior. A Layer 0 FAILURE is never passed here —
+/// only its affirmative-success arm is, so a failed probe still outranks
+/// every agent-controlled signal.
+fn reconcile_layer0_verdict(
+    project_root: &Path,
+    state: &State,
+    result: AgentResult,
+) -> AgentResult {
+    if state.stage != Stage::Validate
+        || result.status != AgentStatus::Success
+        || result.decided_by_layer != Some(0)
+    {
+        return result;
+    }
+    let verdict = evaluate_layer1(project_root, state.phase).and_then(|layer1| layer1.verdict);
+    AgentResult { verdict, ..result }
+}
+
 /// Full four-layer evaluation: returns the best available AgentResult.
 pub fn evaluate_agent_result(
     project_root: &Path,
@@ -813,7 +851,7 @@ fn evaluate_agent_result_inner(
 ) -> Result<AgentResult, ResultError> {
     // Layer 0: operator-authored external post-condition (authoritative failure)
     if let Some(result) = evaluate_layer0(project_root, state, approved_commands) {
-        return Ok(result);
+        return Ok(reconcile_layer0_verdict(project_root, state, result));
     }
 
     // Layer 1: DEVFLOW_RESULT marker (authoritative)
@@ -1721,6 +1759,8 @@ mod tests {
         assert_eq!(result.status, AgentStatus::Success);
         assert_eq!(result.decided_by_layer, Some(0));
         assert_eq!(result.commits, None);
+        // Off-Validate stage: verdict reconciliation does not apply (18e).
+        assert_eq!(result.verdict, None);
     }
 
     /// Review Plan 03 LOW (Codex+OpenCode), 16a: an approved all-passing
@@ -1759,6 +1799,107 @@ mod tests {
 
         assert_eq!(result.status, AgentStatus::Success);
         assert_eq!(result.decided_by_layer, Some(0));
+        // Off-Validate stage (Code): verdict reconciliation does not apply,
+        // even though Layer 1's marker here reports a (failure) status (18e).
+        assert_eq!(result.verdict, None);
+    }
+
+    /// D-05/18e: Layer 0's affirmative-success arm at `Stage::Validate` must
+    /// consult Layer 1's verdict rather than discard it — the two-signal
+    /// reconciliation `reconcile_layer0_verdict` adds. Covers all three
+    /// verdict states Layer 1 can produce: pass, gaps, and no marker at all.
+    #[test]
+    fn layer0_affirmative_success_consults_layer1_verdict_at_validate() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase_dir = dir.path().join(".planning/phases/16-reliability");
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        std::fs::write(
+            phase_dir.join("16-01-PLAN.md"),
+            "---\nexternal_verify: \"test -f shipped\"\n---\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("shipped"), "done").unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        let mut state = state_in(dir.path(), 16);
+        state.stage = Stage::Validate;
+        let approval = vec!["test -f shipped".to_string()];
+
+        std::fs::write(
+            stdout_path(dir.path(), 16),
+            "DEVFLOW_RESULT: {\"status\":\"success\",\"verdict\":\"pass\"}\n",
+        )
+        .unwrap();
+        let result = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approval),
+        )
+        .unwrap();
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(result.decided_by_layer, Some(0));
+        assert_eq!(result.verdict, Some(Verdict::Pass));
+
+        std::fs::write(
+            stdout_path(dir.path(), 16),
+            "DEVFLOW_RESULT: {\"status\":\"success\",\"verdict\":\"gaps\"}\n",
+        )
+        .unwrap();
+        let result = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approval),
+        )
+        .unwrap();
+        assert_eq!(result.verdict, Some(Verdict::Gaps));
+
+        std::fs::remove_file(stdout_path(dir.path(), 16)).unwrap();
+        let result = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approval),
+        )
+        .unwrap();
+        assert_eq!(result.verdict, None);
+    }
+
+    /// 18e's reconciliation is scoped to `Stage::Validate` only (flagged
+    /// assumption in 18-05-PLAN.md): at every other stage an affirmative
+    /// Layer 0 success must keep `verdict: None`, even when Layer 1's marker
+    /// carries an explicit verdict.
+    #[test]
+    fn layer0_affirmative_success_keeps_none_verdict_off_validate() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase_dir = dir.path().join(".planning/phases/16-reliability");
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        std::fs::write(
+            phase_dir.join("16-01-PLAN.md"),
+            "---\nexternal_verify: \"test -f shipped\"\n---\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("shipped"), "done").unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 16),
+            "DEVFLOW_RESULT: {\"status\":\"success\",\"verdict\":\"pass\"}\n",
+        )
+        .unwrap();
+        let state = state_in(dir.path(), 16); // Stage::Code by default
+        let approval = vec!["test -f shipped".to_string()];
+
+        let result = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approval),
+        )
+        .unwrap();
+
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(result.decided_by_layer, Some(0));
+        assert_eq!(result.verdict, None);
     }
 
     /// Ordering edge (17a): with multiple declared probes, ALL must pass for
