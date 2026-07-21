@@ -155,3 +155,11 @@ None - no external service configuration required.
 ---
 *Phase: 18-dogfood-reliability-hardening*
 *Completed: 2026-07-21*
+
+## Self-Check: PASSED
+
+- FOUND: crates/devflow-cli/src/main.rs
+- FOUND: .planning/phases/18-dogfood-reliability-hardening/18-06-SUMMARY.md
+- FOUND commit: a80079f (test(18-06): add real git-worktree staleness fixture)
+- FOUND commit: 10730ea (fix(18-06): evaluate staleness against worktree HEAD)
+- FOUND commit: 9b5e011 (docs(18-06): add plan summary)

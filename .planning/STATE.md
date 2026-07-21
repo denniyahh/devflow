@@ -2,14 +2,14 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
-status: "Phase 17 executed (13/13 plans, 15/15 must-haves) - validated at re-audit #10 (eda94cd): GAP-6/GAP-7 closed via 17-13 and RED-proven; GAP-8 (unsampled CLI wiring of GAP-7's fix) found and auto-filled; all 14 rows green, nyquist_compliant: true. Phase 18 in progress: 18-01 (18a doctor reconciliation), 18-02 (18g WR-03 test stabilization), 18-03 (18b monitor liveness), 18-04 (18d Code-Validate safety-gate reachability), 18-05 (18e Layer 0/Validate verdict fix) complete."
-stopped_at: Completed 18-05-PLAN.md
-last_updated: "2026-07-21T04:39:52.429Z"
+status: "Phase 17 executed (13/13 plans, 15/15 must-haves) - validated at re-audit #10 (eda94cd): GAP-6/GAP-7 closed via 17-13 and RED-proven; GAP-8 (unsampled CLI wiring of GAP-7's fix) found and auto-filled; all 14 rows green, nyquist_compliant: true. Phase 18 in progress: 18-01 (18a doctor reconciliation), 18-02 (18g WR-03 test stabilization), 18-03 (18b monitor liveness), 18-04 (18d Code-Validate safety-gate reachability), 18-05 (18e Layer 0/Validate verdict fix), 18-06 (18c worktree-aware staleness enforcement) complete."
+stopped_at: Completed 18-06-PLAN.md
+last_updated: "2026-07-21T04:58:42.529Z"
 progress:
   total_phases: 7
   completed_phases: 6
   total_plans: 54
-  completed_plans: 52
+  completed_plans: 53
   percent: 86
 ---
 
@@ -19,7 +19,7 @@ progress:
 
 ## Active
 
-- **Phase 18 (In Progress — 5/7 plans):** Dogfood Reliability Hardening
+- **Phase 18 (In Progress — 6/7 plans):** Dogfood Reliability Hardening
   — reprioritized 2026-07-20 from Hermes Support. `devflow doctor`
   reconciliation (18a), monitor liveness (18b), worktree-aware staleness
   enforcement (18c), Code↔Validate safety-gate reachability (18d), Layer
@@ -111,7 +111,30 @@ progress:
   a genuine repeated failure still reaches the now-reachable ceiling. 6
   new tests (2 in `agent_result.rs`, 4 in `main.rs`); `cargo test
   --workspace` 417/417 (0 failed, up from 411), clippy/fmt clean. See
-  `18-05-SUMMARY.md`. Next: 18-06 (wave 5, 18f — preflight-gate re-run
+  `18-05-SUMMARY.md`. Next: 18-06 (wave 5, 18c — worktree-aware staleness
+  enforcement).
+
+  Executed 2026-07-21: **18-06 complete** (`a80079f`, `10730ea`) —
+  worktree-aware build staleness enforcement (18c), closing Round 4 CR-01.
+  `enforce_build_staleness` now derives
+  `execution_root = state.worktree_path.as_deref().unwrap_or(project_root)`
+  (the same idiom `evaluate_layer0` already uses in `agent_result.rs`) and
+  threads it through `embedded_commit_is_stale`/
+  `tree_has_modified_build_inputs`/`combined_staleness` (parameter rename +
+  call-site change only; ancestry exit-code contract untouched).
+  `is_self_dogfood_workspace` and `events::emit` stay `project_root`-scoped
+  (Assumption A3, documented in source) since they answer workspace-identity
+  and bookkeeping-location questions, not staleness. Block message now names
+  `execution_root` and states whether a worktree was in play. New
+  `worktree_staleness_fixture` builds a real `git worktree add` fixture
+  (sibling, not nested, directories — a nested worktree path would contain
+  `project_root`'s path as a string prefix, making "message contains
+  worktree path" and "message does not contain project_root path" mutually
+  exclusive assertions). RED-then-GREEN proven live: manually reverted
+  `execution_root` to `project_root` and confirmed the fix's own regression
+  test fails, then restored and confirmed it passes. 3 new tests; `cargo
+  test --workspace` 420/420 (0 failed, up from 417), clippy/fmt clean. See
+  `18-06-SUMMARY.md`. Next: 18-07 (wave 6, 18f — preflight-gate re-run
   wedge fix).
 
 ## Backlog
@@ -241,6 +264,7 @@ None currently open for Phase 17.
 - [Phase 18]: 18-03: monitor liveness (18b) — State.monitor_pid persisted at spawn (launch_stage re-saves after spawn_monitor, since transition() saves before launch_stage runs), pure liveness() predicate (None-first match so an unrecorded monitor can never render Stuck) shared verbatim by devflow status's new monitor row and doctor's new check_dead_monitor finding, spliced into reconcile_phase immediately after check_dead_agent per 18-01's extend-not-reorder contract. Manually verified end-to-end against a synthetic dead-monitor fixture: status prints stuck — needs devflow resume, doctor prints a matching finding with a devflow resume --phase N repair, neither leaks a filesystem path or username (WR-02 class).
 - [Phase 18]: 18-04: transition_resets_consecutive_failures added as a pure mode.rs predicate (not a Mode method) resolving Open Question 1 -- false only for (Code, Validate), making MAX_CONSECUTIVE_FAILURES reachable; infra_failures' unconditional reset is untouched (transition_resets_infra_failures passes byte-for-byte unchanged); handle_validate_outcome's increment switched to saturating_add to close the overflow-wrap reintroduction risk
 - [Phase 18]: 18-05: classify_validate_outcome checks Some(Verdict::Pass) first (ordinary Validate verdict:pass still advances directly, unchanged from pre-18e); the combined 18d+18e test is one #[test] fn calling two ~30-line helpers to satisfy both the exact-name acceptance criterion and the function-length convention; ValidateOutcome::Ambiguous's final match arm is unreachable!() rather than silently folded into Failed, since forced=true always returns via the gate branch above
+- [Phase 18]: 18-06: enforce_build_staleness derives execution_root = state.worktree_path.unwrap_or(project_root); is_self_dogfood_workspace stays project_root-scoped (Assumption A3)
 
 ## Roadmap Evolution
 
@@ -296,9 +320,10 @@ None currently open for Phase 17.
 | Phase 18 P03 | 30min | 3 tasks | 3 files |
 | Phase 18 P04 | 35min | 2 tasks | 2 files |
 | Phase 18 P05 | 50min | 3 tasks | 2 files |
+| Phase 18 P06 | 21min | 2 tasks | 1 files |
 
 ## Session
 
-**Last session:** 2026-07-21T04:39:31.137Z
-**Stopped at:** Completed 18-05-PLAN.md
+**Last session:** 2026-07-21T04:58:42.507Z
+**Stopped at:** Completed 18-06-PLAN.md
 **Resume file:** None
