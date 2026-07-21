@@ -169,3 +169,12 @@ None - no external service configuration required.
 ---
 *Phase: 18-dogfood-reliability-hardening*
 *Completed: 2026-07-21*
+
+## Self-Check: PASSED
+
+- FOUND: crates/devflow-core/src/mode.rs
+- FOUND: crates/devflow-cli/src/main.rs
+- FOUND: .planning/phases/18-dogfood-reliability-hardening/18-04-SUMMARY.md
+- FOUND: 37b74ac (Task 1 commit)
+- FOUND: 3036927 (Task 2 commit)
+- FOUND: ae29b66 (summary commit)
