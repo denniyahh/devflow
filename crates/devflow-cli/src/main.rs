@@ -6316,6 +6316,38 @@ mod tests {
         dir
     }
 
+    /// [`agent_free_git_only_path_dir`], extended with a real `sh` symlink
+    /// (needed by `monitor::spawn_monitor`'s backgrounding script) and a
+    /// harmless no-op stub for `program` (needed by `ensure_agent_binary`),
+    /// so a preflight-resolved relaunch through `launch_stage`/
+    /// `launch_stage_inner` can run to completion under a REPLACED PATH
+    /// instead of merely failing at `ensure_agent_binary`. 18f's
+    /// wedge-reproduction tests need the relaunch to actually happen (to
+    /// prove the fix), not merely to error out before reaching it —
+    /// `program` is always the STUBBED binary, never the real
+    /// `claude`/`codex`/`opencode` CLI, since PATH still never includes the
+    /// real system directories that hold it (19i's replace-not-prepend
+    /// requirement is preserved).
+    fn agent_free_dir_with_agent_stub(program: &str) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = agent_free_git_only_path_dir();
+        let real_sh = std::env::var_os("PATH")
+            .and_then(|paths| {
+                std::env::split_paths(&paths).find_map(|d| {
+                    let candidate = d.join("sh");
+                    candidate.is_file().then_some(candidate)
+                })
+            })
+            .expect("sh must be resolvable on PATH to run this test");
+        std::os::unix::fs::symlink(&real_sh, dir.path().join("sh")).unwrap();
+        let path = dir.path().join(program);
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        dir
+    }
+
     fn stub_agent_binary(name: &str) -> tempfile::TempDir {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
@@ -6479,6 +6511,215 @@ mod tests {
             launches, 1,
             "a preflight failure resolved by LoopBack must launch the agent \
              exactly once, not {launches}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // 18f (D-18f): approving a preflight gate must not re-run the just-
+    // adjudicated check, LoopBack's re-check must be bounded, and the
+    // bound's reset must persist.
+    //
+    // These three tests deliberately fail via `preflight_interactivity_check`
+    // (Codex + Auto + Define + no CONTEXT.md on develop), NOT via
+    // `AlwaysFailAdapter`'s adapter hook. `AlwaysFailAdapter` is still
+    // passed as the `adapter` argument (defense in depth — it would also
+    // fail were it ever reached), but it structurally CANNOT be what
+    // reproduces the wedge across a relaunch: `launch_stage`'s internal
+    // recursion always re-resolves the REAL production adapter via
+    // `agents::adapter_for(state.agent)`, discarding whatever adapter
+    // reference was passed into the OUTER `run_preflight` call (confirmed
+    // by `run_preflight_advance_gate_launches_agent_exactly_once`'s own
+    // comment above: "the real Claude adapter's default (Ok) preflight
+    // passes every other check"). The generic checks, by contrast, are a
+    // pure function of `state` alone and so fail IDENTICALLY on every
+    // invocation — exactly the property CONTEXT.md attributes to
+    // `preflight_interactivity_check`/`preflight_gh_auth_check` in its
+    // description of the wedge.
+    // -----------------------------------------------------------------
+
+    /// D-18f: `GateAction::Advance` must skip the just-adjudicated check
+    /// entirely — with the pre-18f code (full `launch_stage` recursion),
+    /// the SAME deterministic `preflight_interactivity_check` failure would
+    /// fire again on the retry, write a SECOND gate nobody answers (only
+    /// one response is ever seeded here), and `run_preflight` would return
+    /// `Err` (a bounded gate-timeout error) instead of `Ok(false)` — that
+    /// bounded `Err` is the RED signal this test would observe pre-fix,
+    /// confirmed manually before restoring the fix. `DEVFLOW_GATE_TIMEOUT_SECS`
+    /// is bounded under `ENV_MUTEX` so a regression here fails fast instead
+    /// of hanging the suite for 7 days.
+    #[test]
+    fn run_preflight_advance_skips_recheck_on_idempotently_failing_check() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let original_gate_timeout = std::env::var_os("DEVFLOW_GATE_TIMEOUT_SECS");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("DEVFLOW_GATE_TIMEOUT_SECS", "2");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 620;
+        // Codex + Auto + Define + no `.planning/phases/620-*/620-CONTEXT.md`
+        // on `develop` deterministically fails `preflight_interactivity_check`
+        // — see the section doc comment above for why this (not the adapter
+        // hook) is what actually reproduces the wedge across a relaunch.
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Define;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Define);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(&response_path, r#"{"approved":true,"responded_by":"test"}"#).unwrap();
+
+        let agent_dir = agent_free_dir_with_agent_stub("codex");
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", agent_dir.path());
+        }
+
+        let result = run_preflight(root, &mut state, &AlwaysFailAdapter);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+            match &original_gate_timeout {
+                Some(value) => std::env::set_var("DEVFLOW_GATE_TIMEOUT_SECS", value),
+                None => std::env::remove_var("DEVFLOW_GATE_TIMEOUT_SECS"),
+            }
+        }
+
+        assert!(
+            matches!(result, Ok(false)),
+            "Advance on a preflight gate must skip the just-adjudicated \
+             check and return Ok(false), not {result:?}"
+        );
+        assert!(
+            !Gates::gate_path(root, phase, Stage::Define).exists(),
+            "no second gate should ever be written once Advance skips the recheck"
+        );
+        assert_eq!(
+            state.preflight_retries, 0,
+            "a human Advance must reset the retry counter"
+        );
+    }
+
+    /// D-18f backstop: `GateAction::LoopBack` deliberately keeps re-running
+    /// the check (unlike Advance), so the recursion must be bounded
+    /// separately. `state.preflight_retries` starts one below the ceiling —
+    /// exercising the bound via a REAL recursive `run_preflight` call
+    /// (through `launch_stage`) rather than simulating multiple cycles: with
+    /// only ONE gate response ever seeded, and `Gates::poll_response`
+    /// blocking synchronously in this same thread, nothing could seed a
+    /// SECOND response file mid-recursion inside one call stack — deferring
+    /// to the ceiling on the very next cycle instead genuinely exercises
+    /// "one retry short of the ceiling" → "ceiling reached" without a racy
+    /// background writer.
+    #[test]
+    fn run_preflight_loopback_bounds_recursion() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let original_gate_timeout = std::env::var_os("DEVFLOW_GATE_TIMEOUT_SECS");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("DEVFLOW_GATE_TIMEOUT_SECS", "2");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 621;
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Define;
+        state.preflight_retries = mode::MAX_PREFLIGHT_RETRIES - 1;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Define);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"retry","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        let agent_dir = agent_free_dir_with_agent_stub("codex");
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", agent_dir.path());
+        }
+
+        let result = run_preflight(root, &mut state, &AlwaysFailAdapter);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+            match &original_gate_timeout {
+                Some(value) => std::env::set_var("DEVFLOW_GATE_TIMEOUT_SECS", value),
+                None => std::env::remove_var("DEVFLOW_GATE_TIMEOUT_SECS"),
+            }
+        }
+
+        assert!(
+            matches!(result, Ok(false)),
+            "the ceiling must abort cleanly, not error out, got {result:?}"
+        );
+        assert!(
+            workflow::load_state(root, phase).is_err(),
+            "the ceiling must abort() and clear state, not leave it gate_pending forever"
+        );
+        let last = devflow_core::events::last_event_for_phase(root, phase)
+            .expect("a ceiling or abort event must have been recorded");
+        assert!(
+            last["event"] == "preflight_retry_ceiling_reached"
+                || last["event"] == "workflow_aborted",
+            "expected a ceiling or abort event, got {last:?}"
+        );
+    }
+
+    /// D-18f (assumption_delta, Open Question 2): the reset on a passing
+    /// preflight must be PERSISTED, not merely in-memory — the wedge this
+    /// counter bounds spans separate `devflow` invocations (a monitor
+    /// restart reloads state from disk), so an in-memory-only reset would
+    /// not survive one.
+    #[test]
+    fn preflight_retries_reset_on_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let phase = 622;
+        // Plan + Claude bypasses the generic checks and the real Claude
+        // adapter's default preflight passes — the same "unaffected" shape
+        // used by `run_preflight_adapter_hook_override_fires` above.
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Plan;
+        state.preflight_retries = 2;
+        workflow::save_state(&state).unwrap();
+
+        let adapter = agents::adapter_for(AgentKind::Claude);
+        let result = run_preflight(root, &mut state, adapter.as_ref());
+
+        assert!(
+            matches!(result, Ok(true)),
+            "a passing preflight must return Ok(true), got {result:?}"
+        );
+        assert_eq!(
+            state.preflight_retries, 0,
+            "the in-memory counter must reset immediately on a pass"
+        );
+
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert_eq!(
+            reloaded.preflight_retries, 0,
+            "the reset must be persisted to disk, not just held in memory"
         );
     }
 
