@@ -18,6 +18,7 @@
 
 | Phase | Name | Version |
 |---|---|---|
+| 18 | Dogfood Reliability Hardening | 1.5.0 |
 | 11 | GSD-Native Architecture + Remediation | 1.2.0 |
 | 10 | Logging + Planning Step | — |
 | 9 | Open-Source Polish | 1.2.0 |
@@ -252,7 +253,7 @@ Plans:
 - [x] 18-06-PLAN.md — 18c: evaluate build staleness against the worktree HEAD (wave 5)
 - [x] 18-07-PLAN.md — 18f: preflight gate approval skips the adjudicated check, bounded (wave 6)
 
-**Verified** 2026-07-21 (`18-VERIFICATION.md`, 7/7 must-haves, each traced to source + an independently-executed passing test; both binding operator decisions confirmed). **Code-reviewed** (`18-REVIEW.md`, 0 critical / 4 warning) and **review-fixed** in a `18-fix` batch (6 commits): `doctor --json` single-object output (WR-01), stale-`monitor_pid` false-"Stuck" (WR-04), path-free staleness event (WR-02, third instance — see `999.10`), the `unreachable!()` eliminated by construction (WR-03), and the new 18c worktree test hardened against the 19i PATH-race flake. Final: 426 tests, clippy `--workspace --all-targets` clean, fmt clean. Not yet merged to main / released.
+**Verified** 2026-07-21 (`18-VERIFICATION.md`, 7/7 must-haves, each traced to source + an independently-executed passing test; both binding operator decisions confirmed). **Code-reviewed** (`18-REVIEW.md`, 0 critical / 4 warning) and **review-fixed** in a `18-fix` batch (6 commits): `doctor --json` single-object output (WR-01), stale-`monitor_pid` false-"Stuck" (WR-04), path-free staleness event (WR-02, third instance — see `999.10`), the `unreachable!()` eliminated by construction (WR-03), and the new 18c worktree test hardened against the 19i PATH-race flake. Final: 426 tests, clippy `--workspace --all-targets` clean, fmt clean. **Merged to main and released as v1.5.0** (2026-07-21, PR #12, signed tag `v1.5.0`, published to crates.io).
 
 ## Backlog
 

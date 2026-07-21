@@ -2,7 +2,7 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
-status: "Phase 17 executed (13/13 plans, 15/15 must-haves) - validated at re-audit #10 (eda94cd): GAP-6/GAP-7 closed via 17-13 and RED-proven; GAP-8 (unsampled CLI wiring of GAP-7's fix) found and auto-filled; all 14 rows green, nyquist_compliant: true. Phase 18 complete (7/7 plans): 18-01 (18a doctor reconciliation), 18-02 (18g WR-03 test stabilization), 18-03 (18b monitor liveness), 18-04 (18d Code-Validate safety-gate reachability), 18-05 (18e Layer 0/Validate verdict fix), 18-06 (18c worktree-aware staleness enforcement), 18-07 (18f preflight-gate re-run wedge fix)."
+status: "Phase 17 executed (13/13 plans, 15/15 must-haves) - validated at re-audit #10 (eda94cd): GAP-6/GAP-7 closed via 17-13 and RED-proven; GAP-8 (unsampled CLI wiring of GAP-7's fix) found and auto-filled; all 14 rows green, nyquist_compliant: true. Phase 18 complete (7/7 plans): 18-01 (18a doctor reconciliation), 18-02 (18g WR-03 test stabilization), 18-03 (18b monitor liveness), 18-04 (18d Code-Validate safety-gate reachability), 18-05 (18e Layer 0/Validate verdict fix), 18-06 (18c worktree-aware staleness enforcement), 18-07 (18f preflight-gate re-run wedge fix). Merged to main and released as v1.5.0 (2026-07-21, tag v1.5.0, crates.io published); develop synced back from main via scripts/sync-main-to-develop.sh. v2.0.0 milestone (Phase 11-18) is now fully shipped; no phase currently active."
 stopped_at: Completed 18-07-PLAN.md
 last_updated: "2026-07-21T05:32:24.982Z"
 progress:
@@ -17,9 +17,9 @@ progress:
 
 > Last updated: 2026-07-20
 
-## Active
+## Recently Shipped
 
-- **Phase 18 (Complete + Verified + review-fixed — 7/7 plans):** Dogfood
+- **Phase 18 (Complete + Verified + review-fixed + Released as v1.5.0 — 7/7 plans):** Dogfood
   Reliability Hardening — reprioritized 2026-07-20 from Hermes Support.
   `devflow doctor` reconciliation (18a), monitor liveness (18b),
   worktree-aware staleness enforcement (18c), Code↔Validate safety-gate
@@ -46,7 +46,10 @@ progress:
   instances remain); and the new 18c worktree-staleness test hardened under
   `ENV_MUTEX` against the 19i PATH-race flake the verifier caught. Final
   gates: 426 tests / 0 failed, clippy `--workspace --all-targets` clean,
-  fmt clean, all on `develop`. **Not yet merged to main / released.**
+  fmt clean, all on `develop`. **Merged to main and released as v1.5.0**
+  (2026-07-21, PR #12 squash-merged to `main`, signed tag `v1.5.0`,
+  `devflow-core` + `devflow` published to crates.io). `develop` synced
+  back from `main` post-release via `scripts/sync-main-to-develop.sh`.
 
   Planned 2026-07-20: research (HIGH confidence, all 7 defects re-verified
   as still reproducing at HEAD), VALIDATION.md (Nyquist), 7 plans, and a
@@ -218,6 +221,7 @@ was 19j). Promote with `/gsd-review-backlog`.
 | 15 | Dogfood Enablement + OSS Readiness | — | 2026-07-17 |
 | 16 | Pipeline Reliability Hardening | — | 2026-07-17 |
 | 17 | Pipeline Dogfood Follow-Up | — | 2026-07-19 |
+| 18 | Dogfood Reliability Hardening | v1.5.0 | 2026-07-21 |
 
 *Phases 8 and 10 shipped without a SUMMARY.md at the time; both were retroactively documented 2026-07-08 (see `8-SUMMARY.md`, `10-SUMMARY.md`) after reconstruction from git history. Phase 11 was reviewed and found already adequately closed out via `11-VALIDATION.md`/`11r-VALIDATION.md` (Nyquist-compliant, sign-off dated 2026-06-20) — no retroactive SUMMARY.md was needed.*
 
