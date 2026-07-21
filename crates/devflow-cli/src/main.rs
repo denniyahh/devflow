@@ -1357,20 +1357,27 @@ fn advance(project_root: &Path, phase: Option<u32>) -> Result<(), CliError> {
             Stage::Plan => transition(project_root, &mut state, Stage::Code),
             Stage::Code => transition(project_root, &mut state, Stage::Validate),
             Stage::Validate => {
-                // 13b verdict-vs-ran: the Validate prompt now REQUIRES a
-                // verdict, so ONLY an explicit `verdict: pass` advances to
+                // 13b verdict-vs-ran + 18e: the Validate prompt now REQUIRES
+                // a verdict, so ONLY an explicit `verdict: pass` advances to
                 // Ship. A missing verdict is a fail-safe (gate/loop), NOT a
                 // silent pass — closes the composition bug where a
                 // marker-less/verdict-less Validate could otherwise reach
-                // Ship.
-                let passed = matches!(result.verdict, Some(Verdict::Pass));
-                handle_validate_outcome(project_root, &mut state, passed)
+                // Ship. `classify_validate_outcome` additionally resolves
+                // the `external_verify` three-way matrix (D-18e): agreement
+                // advances, disagreement/no-verdict gates immediately.
+                handle_validate_outcome(
+                    project_root,
+                    &mut state,
+                    classify_validate_outcome(&result),
+                )
             }
             Stage::Ship => handle_ship_outcome(project_root, &mut state),
         },
         Action::GateReview => match stage {
             // Validate failures drive the Code↔Validate loop (or a gate).
-            Stage::Validate => handle_validate_outcome(project_root, &mut state, false),
+            Stage::Validate => {
+                handle_validate_outcome(project_root, &mut state, ValidateOutcome::Failed)
+            }
             // Ship distinguishes an agent crash (AgentFailed) from a review
             // rejection (ReviewFailed, `review:`-prefixed reason).
             Stage::Ship => handle_ship_failure(project_root, &mut state, result.reason),
@@ -1505,14 +1512,63 @@ fn handle_rate_limited_outcome(
     Ok(())
 }
 
-/// Decide what happens after a Validate stage (passed or failed), honoring the
-/// active mode's gate policy and the consecutive-failure threshold.
+/// The three-way outcome of a Validate stage evaluation (18e, D-18e).
+///
+/// Distinct from a plain `bool`: an `external_verify`-declared Validate has
+/// THREE distinguishable outcomes, not two — the probe and the agent's
+/// self-reported verdict can independently agree, disagree, or leave one
+/// signal missing. Collapsing disagreement or "no verdict at all" onto
+/// `Failed` would route them through the counter-based auto-loop, a DELAYED
+/// gate indistinguishable from an ordinary retry to the operator watching
+/// it — the binding operator decision requires an IMMEDIATE one instead
+/// (T-18-19).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ValidateOutcome {
+    /// The two independent signals agree (or no `external_verify` is
+    /// declared and the agent reported `verdict: pass`): advance to Ship.
+    Passed,
+    /// An ordinary Validate failure — the pre-existing fail-safe, unchanged:
+    /// loop back to Code, or gate once `consecutive_failures` reaches the
+    /// ceiling.
+    Failed,
+    /// The probe passed but the agent's verdict disagrees, or no verdict
+    /// arrived at all. Gates for a human IMMEDIATELY, never touching
+    /// `consecutive_failures`. The payload names which two signals
+    /// disagreed, for the `[never-silent]` gate context.
+    Ambiguous(String),
+}
+
+/// Classify a Validate-stage `AgentResult` into its three-way outcome
+/// (D-18e, the binding operator decision reproduced in 18-05-PLAN.md).
+///
+/// Pure function over `&AgentResult` — no I/O — so the whole decision
+/// matrix is directly unit-testable. `Some(Verdict::Pass)` is matched FIRST
+/// and wins regardless of which layer decided the result: it is the "two
+/// independent signals agreeing" arm and must not be shadowed by the
+/// external-verify-specific arms below it.
+fn classify_validate_outcome(result: &agent_result::AgentResult) -> ValidateOutcome {
+    let external = result.decided_by_layer == Some(0) && result.status == AgentStatus::Success;
+    match (external, result.verdict) {
+        (_, Some(Verdict::Pass)) => ValidateOutcome::Passed,
+        (true, Some(Verdict::Gaps)) => ValidateOutcome::Ambiguous(
+            "external verification passed but the agent reported gaps".to_string(),
+        ),
+        (true, None) => ValidateOutcome::Ambiguous(
+            "external verification passed but no agent verdict arrived".to_string(),
+        ),
+        _ => ValidateOutcome::Failed,
+    }
+}
+
+/// Decide what happens after a Validate stage, honoring the active mode's
+/// gate policy, the consecutive-failure threshold, and (18e) the immediate
+/// gate an ambiguous `external_verify` outcome forces regardless of either.
 fn handle_validate_outcome(
     project_root: &Path,
     state: &mut State,
-    passed: bool,
+    outcome: ValidateOutcome,
 ) -> Result<(), CliError> {
-    if !passed {
+    if outcome == ValidateOutcome::Failed {
         // Now that the counter genuinely accumulates (18d), an unbounded
         // loop could otherwise overflow it and wrap to 0, silently
         // restoring the unreachable-ceiling bug in a slower form.
@@ -1520,17 +1576,28 @@ fn handle_validate_outcome(
         workflow::save_state(state)?;
     }
 
-    if state
-        .mode
-        .should_gate(Stage::Validate, state.consecutive_failures)
+    // 18e / T-18-19: an ambiguous outcome must gate IMMEDIATELY — it is
+    // being adjudicated right now, not retried, so it must never fall
+    // through to the counter-based `should_gate` check above and must never
+    // touch `consecutive_failures`.
+    let forced = matches!(outcome, ValidateOutcome::Ambiguous(_));
+    if forced
+        || state
+            .mode
+            .should_gate(Stage::Validate, state.consecutive_failures)
     {
-        let context = if passed {
-            "Validation passed — approve to ship?".to_string()
-        } else {
-            format!(
+        let context = match &outcome {
+            ValidateOutcome::Passed => "Validation passed — approve to ship?".to_string(),
+            ValidateOutcome::Failed => format!(
                 "Validation failed {} time(s) — human review needed.",
                 state.consecutive_failures
-            )
+            ),
+            ValidateOutcome::Ambiguous(detail) => {
+                format!(
+                    "[never-silent] validate ambiguous: {}",
+                    truncate_reason(detail)
+                )
+            }
         };
         return match run_gate(project_root, state, Stage::Validate, &context)? {
             GateAction::Advance => transition(project_root, state, Stage::Ship),
@@ -1539,10 +1606,12 @@ fn handle_validate_outcome(
         };
     }
 
-    if passed {
-        transition(project_root, state, Stage::Ship)
-    } else {
-        loop_back_to_code(project_root, state, FixType::GapsOnly)
+    match outcome {
+        ValidateOutcome::Passed => transition(project_root, state, Stage::Ship),
+        ValidateOutcome::Failed => loop_back_to_code(project_root, state, FixType::GapsOnly),
+        ValidateOutcome::Ambiguous(_) => {
+            unreachable!("Ambiguous always sets forced=true and returns via the gate branch above")
+        }
     }
 }
 
@@ -4740,7 +4809,7 @@ mod tests {
         )
         .unwrap();
 
-        handle_validate_outcome(root, &mut state, false).unwrap();
+        handle_validate_outcome(root, &mut state, ValidateOutcome::Failed).unwrap();
 
         assert_eq!(state.consecutive_failures, mode::MAX_CONSECUTIVE_FAILURES);
         // CR-01: the forced gate's request file (along with its response and
@@ -4909,7 +4978,7 @@ mod tests {
         )
         .unwrap();
 
-        handle_validate_outcome(root, &mut state, false).unwrap();
+        handle_validate_outcome(root, &mut state, ValidateOutcome::Failed).unwrap();
 
         // The gate, response, and ack files for the stage the gate fired on
         // (Validate) must all be gone after the Abort path runs.
@@ -4933,6 +5002,151 @@ mod tests {
             "poll_response must not instantly resolve from a stale response after cleanup"
         );
         assert!(started.elapsed() >= std::time::Duration::from_secs(1));
+    }
+
+    /// D-18e's "two independent signals agreeing" arm: a probe pass plus an
+    /// explicit `verdict: pass` classify as `ValidateOutcome::Passed` and
+    /// drive straight through to Ship — no forced gate (Auto mode,
+    /// `consecutive_failures == 0`), no counter touched. PATH is
+    /// neutralized under `ENV_MUTEX` (matching
+    /// `consecutive_failures_reaches_ceiling_across_cycles`) so
+    /// `transition`'s own `launch_stage` call cannot spawn a real agent CLI;
+    /// its resulting `Err` (agent binary not found) is discarded, since
+    /// `transition` mutates `state.stage` to `Ship` before that call and the
+    /// mutation survives regardless of the launch outcome.
+    #[test]
+    fn external_verify_agreement_advances_to_ship() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 90;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        workflow::save_state(&state).unwrap();
+
+        let result = agent_result::AgentResult {
+            status: AgentStatus::Success,
+            exit_code: None,
+            reason: None,
+            commits: None,
+            summary: None,
+            verdict: Some(Verdict::Pass),
+            decided_by_layer: Some(0),
+        };
+        let outcome = classify_validate_outcome(&result);
+        assert_eq!(outcome, ValidateOutcome::Passed);
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        let _ = handle_validate_outcome(root, &mut state, outcome);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        assert_eq!(state.stage, Stage::Ship);
+        assert_eq!(
+            state.consecutive_failures, 0,
+            "an agreeing outcome must never touch the failure counter"
+        );
+    }
+
+    /// D-18e's disagreement arm: the probe passes but the agent reports
+    /// `verdict: gaps`. Must classify `Ambiguous` and gate IMMEDIATELY on
+    /// the FIRST cycle — never touching `consecutive_failures` — which is
+    /// what distinguishes this from `Failed`'s counter-based delayed gate
+    /// and is the precise thing the binding operator decision (D-18e,
+    /// T-18-19) requires. Resolved via an Abort response so no agent is
+    /// ever launched.
+    #[test]
+    fn external_verify_disagreement_gates_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 91;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        workflow::save_state(&state).unwrap();
+
+        let result = agent_result::AgentResult {
+            status: AgentStatus::Success,
+            exit_code: None,
+            reason: None,
+            commits: None,
+            summary: None,
+            verdict: Some(Verdict::Gaps),
+            decided_by_layer: Some(0),
+        };
+        let outcome = classify_validate_outcome(&result);
+        assert!(matches!(outcome, ValidateOutcome::Ambiguous(_)));
+
+        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        handle_validate_outcome(root, &mut state, outcome).unwrap();
+
+        assert_eq!(
+            state.consecutive_failures, 0,
+            "an ambiguous outcome must gate on cycle one without touching the counter"
+        );
+        assert!(
+            !Gates::gate_path(root, phase, Stage::Validate).exists(),
+            "the immediate gate must resolve (and clean up) via the same abort path as any other gate"
+        );
+    }
+
+    /// D-18e's ambiguous arm: the probe passes but NO agent verdict arrived
+    /// at all. Same immediate-gate contract as the disagreement case above
+    /// — `consecutive_failures` must stay 0.
+    #[test]
+    fn external_verify_no_verdict_gates_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 92;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        workflow::save_state(&state).unwrap();
+
+        let result = agent_result::AgentResult {
+            status: AgentStatus::Success,
+            exit_code: None,
+            reason: None,
+            commits: None,
+            summary: None,
+            verdict: None,
+            decided_by_layer: Some(0),
+        };
+        let outcome = classify_validate_outcome(&result);
+        assert!(matches!(outcome, ValidateOutcome::Ambiguous(_)));
+
+        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        handle_validate_outcome(root, &mut state, outcome).unwrap();
+
+        assert_eq!(
+            state.consecutive_failures, 0,
+            "an ambiguous outcome must gate on cycle one without touching the counter"
+        );
     }
 
     /// D-01/D-06 regression: a Code-stage `Unknown` outcome (Layer 3's
@@ -5236,7 +5450,7 @@ mod tests {
                 r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
             )
             .unwrap();
-            let _ = handle_validate_outcome(root, &mut state, false);
+            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
             state.stage = Stage::Code;
             let _ = transition(root, &mut state, Stage::Validate);
         }
@@ -5286,7 +5500,7 @@ mod tests {
         )
         .unwrap();
 
-        handle_validate_outcome(root, &mut state, false).unwrap();
+        handle_validate_outcome(root, &mut state, ValidateOutcome::Failed).unwrap();
 
         assert_eq!(state.consecutive_failures, u32::MAX);
     }
