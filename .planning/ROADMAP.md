@@ -264,6 +264,7 @@ own `phases/999.N-*/CONTEXT.md`.
 ### Phase 999.1: Hermes Support (BACKLOG)
 
 **Goal:** `HermesAgent` adapter with native-envelope completion parsing, rewrite of the stale `skills/hermes/devflow/SKILL.md`, and the Hermes plugin session mode with an events.jsonl-driven gate watcher. Held Phase 18's slot until 2026-07-20, when pipeline-reliability work took priority — personal-infrastructure work that doesn't gate anything else.
+**Priority:** Low | **Size:** L — reviewed 2026-07-21: structurally lowest (gates nothing else), operator confirmed still low priority. Linear: DEN-26.
 **Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
 
@@ -274,6 +275,7 @@ Plans:
 ### Phase 999.2: A Phase Tracks Exactly One Process (BACKLOG)
 
 **Goal:** One `phase-N-agent-pid` file per phase leaves the monitor unrecorded and `sequentagent`'s second agent homeless. Frame as two tracked processes per phase. *(was 19b)*
+**Priority:** Medium | **Size:** M — reviewed 2026-07-21: the "monitor unrecorded" half is now fixed by Phase 18's 18b (`State.monitor_pid` shipped in v1.5.0); remaining scope is narrower — `sequentagent`'s orphaned second process only. Re-scope before promoting. Linear: DEN-27.
 **Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
 
@@ -284,6 +286,7 @@ Plans:
 ### Phase 999.3: CLI Operator Discoverability (BACKLOG)
 
 **Goal:** Gate reasons truncate with no `devflow gate show`; rate-limit reset times buried in raw JSON; `status` lacks in-stage progress; recovery verbs undiscoverable from a stuck state. *(was 19c)*
+**Priority:** Low | **Size:** L — reviewed 2026-07-21: confirmed still true at HEAD (no `gate show` command exists). Self-scoped as UX, safe behind correctness work; bundles 4 distinct gaps — split into smaller issues when promoted. Linear: DEN-28.
 **Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
 
@@ -294,6 +297,7 @@ Plans:
 ### Phase 999.4: Version-Tag Contention on Concurrent Ship (BACKLOG)
 
 **Goal:** Two phases computing the same next version race to create one tag. 17-09 bounded the test-level symptom (2s gate-timeout poll under `ENV_MUTEX`); the product-level race is proven (instrumentation caught both phases ~1.8ms apart) but still open. *(was 19h)*
+**Priority:** Medium | **Size:** M — reviewed 2026-07-21: confirmed still open (no new checkout-lock serialization since 17-09). Real but low-frequency (needs two concurrent ships landing on the identical computed version); sizing skews up on verification difficulty, not code volume. Linear: DEN-29.
 **Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
 
@@ -304,6 +308,7 @@ Plans:
 ### Phase 999.5: ChangelogAppend Placeholder Content (BACKLOG)
 
 **Goal:** Every generated changelog entry reads "Released phase via DevFlow" — deferred twice already (17-10, 17-12). *(was 19j)*
+**Priority:** Low | **Size:** M — reviewed 2026-07-21: confirmed still generic (`ship.rs:431`). Cosmetic by its own admission, but sized M not S — needs a real content source designed (plan diffs? SUMMARY.md extraction?) before implementation, which is why it's been deferred 3 times already. Linear: DEN-30.
 **Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
 
@@ -314,6 +319,7 @@ Plans:
 ### Phase 999.6: Plan-Only Pipeline Mode (BACKLOG)
 
 **Goal:** `devflow start --until <stage>` to halt cleanly after a named stage. Today `start` always runs Define→Plan→Code→Validate→Ship and `--mode supervise` only moves the gates, so "just do the planning" is inexpressible — the only stop is killing the monitor, which strands state and orphans a worktree. Blocks cheap, frequent dogfood runs. Found 2026-07-20 attempting to plan Phase 18 through devflow itself.
+**Priority:** High | **Size:** M — reviewed 2026-07-21: confirmed still missing (no `--until`/`stop_after`/`plan_only` anywhere in `crates/`). Ranked above pure UX since it multiplies future dogfooding — this project's highest-yield bug source — not just convenience. Linear: DEN-31.
 **Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
 
@@ -324,6 +330,7 @@ Plans:
 ### Phase 999.7: Manual Ship Override (BACKLOG)
 
 **Goal:** Let an operator drive a phase through Ship by hand when the pipeline is unhealthy. `devflow gate approve` does not cover this: it refuses when no gate is open (`gates.rs:186`), and when one is open it only writes a response file that a *live monitor* must consume — so a dead monitor (invisible today, see 18b) leaves the approval unconsumed forever. Must not bypass the fail-closed terminal Ship invariant. Operator request 2026-07-20.
+**Priority:** High | **Size:** L — reviewed 2026-07-21: confirmed no force-ship path exists (only `gate approve`, which requires an open gate + live monitor). Now unblocked (18a/18b's reconciliation shipped in v1.5.0). Has open design questions (share a mechanism with 18f's preflight-override?) — run a discuss-phase pass before sizing tightens further. Linear: DEN-32.
 **Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
 
@@ -334,6 +341,8 @@ Plans:
 ### Phase 999.8: Split `main.rs` (BACKLOG — blocked on Phase 18)
 
 **Goal:** `crates/devflow-cli/src/main.rs` is 6,239 lines (3,307 production + a 2,931-line test module with 71 tests) — 2.6x the next largest file, and now the binding constraint on execution parallelism, since the same-wave zero-file-overlap rule keys on file path. Phase 18 was forced into 6 near-serial waves for 7 plans purely because 6 of them touch `main.rs`. The production half already decomposes cleanly into 7 clusters (preflight / staleness / pipeline state machine / commands / parallel / dispatch / config — measured boundaries in CONTEXT.md); splitting would take those 6 waves to 3.
+
+**Priority:** High | **Size:** L — reviewed 2026-07-21: now unblocked (Phase 18 shipped in v1.5.0) and the premise has gotten worse, not better — `main.rs` has grown to 8,442 lines (+35%) since this was logged. Highest-risk item in the backlog: 22 `ENV_MUTEX` sites to preserve across a module split. Linear: DEN-33.
 
 **Deliberately sequenced AFTER Phase 18, not before.** The primary risk is `ENV_MUTEX` (22 sites in `main.rs`) — redistributing 71 tests across module boundaries while preserving process-global serialization is exactly the failure class with the worst track record here (19i hit 2/2 in CI while passing locally; GAP-2 at 33–40%; 999.4 caught only by instrumentation). Phase 18's 18a/18b are what make that class observable, and 18e/18f reshape the very functions that determine the seams. Must be a pure-move refactor with zero behavioral change, verified on a branch with CI — local-green is explicitly insufficient.
 **Requirements:** TBD — see CONTEXT.md
@@ -346,6 +355,7 @@ Plans:
 ### Phase 999.10: `.devflow/` Artifact Hygiene (BACKLOG — highest of the WR batch)
 
 **Goal:** Two composing 17-REVIEW.md findings, both re-verified present at HEAD 2026-07-20. **WR-01:** `docs_update` (`hooks.rs:184`) is the only remaining `commit_all` caller and runs `git add .` at the *user's* project root, so a target project whose `.gitignore` lacks `.devflow/` gets raw unredacted agent stdout swept into a commit that `Merge` then pushes — the assumption that `.devflow/` is gitignored is asserted in test fixtures but enforced nowhere, and both existing guards only cover DevFlow's own repo. **WR-02:** `main.rs:843` emits the full `current_exe()` path into `events.jsonl` on every start, i.e. the developer's absolute home directory and OS username, in a file `OPERATIONS.md` tells people to tail and paste. Together they publish PII into someone else's git history. Phase 18 does **not** fix either — its plans cite WR-02 only as a prevention constraint. Preferred WR-01 fix (`lock::ensure_devflow_dir` writes a `.devflow/.gitignore` containing `*`) closes it for every constructor at once.
+**Priority:** Urgent | **Size:** S — reviewed 2026-07-21: confirmed still present (`hooks.rs:184`, `main.rs:902`). Only backlog item whose blast radius extends into other people's repositories (PII leak). Both fixes are cheap and well-scoped. Linear: DEN-35.
 **Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
 
@@ -356,6 +366,7 @@ Plans:
 ### Phase 999.11: `commit_path` Empty Commits (BACKLOG)
 
 **Goal:** 17-REVIEW.md WR-03, re-verified at HEAD 2026-07-20. `commit_path`'s `--allow-empty` does not *skip* when a path is unchanged — it **commits**, contradicting the function's own doc comment ("Ok(()) whether or not the path had changes") and rendering its `nothing to commit` guard arm dead code that reads like the skip path. If `version_bump` re-runs after a fail-fast terminal-batch retry and `write_version` produces byte-identical content, an empty `chore: bump version to X` commit lands on develop and **the release tag is placed on a commit containing nothing**. Reachable, since Phase 16 made terminal-batch retry a designed path. Fix: drop `--allow-empty` and let the existing arm become the genuine no-op.
+**Priority:** High | **Size:** S — reviewed 2026-07-21: confirmed still present (`git.rs:312,336`). Real release-integrity defect (an empty commit could underlie a tag), narrow reachable trigger, small well-scoped fix. Linear: DEN-36.
 **Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
 
@@ -366,6 +377,7 @@ Plans:
 ### Phase 999.12: Layer 0 Unapproved-Probe Veto Coverage (BACKLOG)
 
 **Goal:** 17-REVIEW.md WR-04 — coverage debt on a *deliberate* trade, not a defect. 17-03 removed `evaluate_layer0`'s `Stage::Code` guard by design (D-05 gap 1), so a forgotten `DEVFLOW_TRUST_EXTERNAL_VERIFY` now vetoes at all five stages instead of one, a 5× blast-radius increase. Two verified gaps at HEAD: (a) of the three veto arms, only "approval mismatch" is tested (`agent_result.rs:1644`) — the "not approved" arm a forgotten env var actually hits has no test at any stage; (b) `docs/guides/configuration.md` states the requirement for "the parent DevFlow process" but never that the **detached monitor subprocess must inherit it**, which is where the failure manifests. Deliberately not folded into Phase 18's 18-05 (same file) — that plan had already passed the checker clean, and adding coverage debt to a verified bug-fix plan is scope creep.
+**Priority:** Medium | **Size:** S — reviewed 2026-07-21: confirmed still only "approval mismatch" tested at `agent_result.rs`. Test/doc debt on an already-shipped, intentional decision, not a live bug. Linear: DEN-37.
 **Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
 
@@ -376,6 +388,7 @@ Plans:
 ### Phase 999.9: Dependency Update Review (BACKLOG)
 
 **Goal:** Triggered 2026-07-20 by a GitHub Actions annotation on the first all-branch CI run — `actions/checkout@v4` targets deprecated Node.js 20 and is being force-run on Node 24. Warning only, all jobs green, but it appears on 4 job definitions across both workflow files, so the eventual break lands everywhere at once. Broader than a one-line bump: the dependency surface is inconsistently pinned — `dtolnay/rust-toolchain@stable` and `rust-toolchain.toml`'s `channel = "stable"` float entirely (CI can break from upstream with no commit here, a reproducibility gap for a project premised on trustworthy pipelines), `devcontainers/ci@v0.3` is pre-1.0, the devcontainer base image pin was last verified in Phase 15, and neither `cargo audit` nor `cargo deny` runs in CI. Deliberately not folded into Phase 18 — a dependency bump mid-phase would confound that phase's test signal.
+**Priority:** Medium | **Size:** M — reviewed 2026-07-21: confirmed `actions/checkout@v4` still current pin. Nothing failing today; most of the scope is policy decisions (pin vs. float) rather than code. Linear: DEN-34.
 **Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
 
