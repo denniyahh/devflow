@@ -847,15 +847,17 @@ fn workflow_started_payload(state: &State) -> serde_json::Value {
 }
 
 /// Whether the build embedded in `embedded_commit` is stale relative to
-/// `project_root`'s current `HEAD` — the ancestry half of D-19's composite
-/// definition. Per git's documented exit-code contract for `merge-base
-/// --is-ancestor` (exit 0 = ancestor, exit 1 = not, other = error/unknown
-/// commit — Pitfall 4), exit 1 is treated as definitively Stale; any other
-/// outcome (including an empty `embedded_commit` — D-20: absence of
-/// provenance is not staleness) is Indeterminate, never a false block.
-/// WR-01 (17-06 gap closure): exit 0 alone is NOT sufficient for Fresh —
-/// `merge-base --is-ancestor` also exits 0 when `embedded_commit` is a
-/// STRICT ancestor of HEAD (HEAD moved forward since the build), which is
+/// `execution_root`'s current `HEAD` — the tree where the code under test
+/// actually lives (18c: the phase's worktree when one is set, else
+/// `project_root` — see `enforce_build_staleness`) — the ancestry half of
+/// D-19's composite definition. Per git's documented exit-code contract for
+/// `merge-base --is-ancestor` (exit 0 = ancestor, exit 1 = not, other =
+/// error/unknown commit — Pitfall 4), exit 1 is treated as definitively
+/// Stale; any other outcome (including an empty `embedded_commit` — D-20:
+/// absence of provenance is not staleness) is Indeterminate, never a false
+/// block. WR-01 (17-06 gap closure): exit 0 alone is NOT sufficient for
+/// Fresh — `merge-base --is-ancestor` also exits 0 when `embedded_commit` is
+/// a STRICT ancestor of HEAD (HEAD moved forward since the build), which is
 /// exactly the "committed new commits, forgot to rebuild" incident class
 /// this fix closes. Only an EXACT match to the current HEAD commit is
 /// genuinely Fresh.
@@ -863,24 +865,25 @@ fn workflow_started_payload(state: &State) -> serde_json::Value {
 enum Staleness {
     Fresh,
     Stale,
-    /// The embedded commit is a strict DESCENDANT of `project_root`'s HEAD:
-    /// the binary is newer than the source it drives. Not the "committed,
-    /// forgot to rebuild" incident this gate exists to catch, so it never
-    /// blocks — but it is still a build/source mismatch worth surfacing.
+    /// The embedded commit is a strict DESCENDANT of `execution_root`'s
+    /// HEAD: the binary is newer than the source it drives. Not the
+    /// "committed, forgot to rebuild" incident this gate exists to catch,
+    /// so it never blocks — but it is still a build/source mismatch worth
+    /// surfacing.
     Ahead,
     Indeterminate,
 }
 
-fn embedded_commit_is_stale(project_root: &Path, embedded_commit: &str) -> Staleness {
+fn embedded_commit_is_stale(execution_root: &Path, embedded_commit: &str) -> Staleness {
     if embedded_commit.is_empty() {
         return Staleness::Indeterminate;
     }
     let output = std::process::Command::new("git")
         .args(["merge-base", "--is-ancestor", embedded_commit, "HEAD"])
-        .current_dir(project_root)
+        .current_dir(execution_root)
         .output();
     match output.map(|o| o.status.code()) {
-        Ok(Some(0)) => match run_git_stdout(project_root, &["rev-parse", "HEAD"]) {
+        Ok(Some(0)) => match run_git_stdout(execution_root, &["rev-parse", "HEAD"]) {
             Some(head) if head.trim() == embedded_commit.trim() => Staleness::Fresh,
             Some(_) => Staleness::Stale,
             None => Staleness::Indeterminate,
@@ -892,7 +895,7 @@ fn embedded_commit_is_stale(project_root: &Path, embedded_commit: &str) -> Stale
         Ok(Some(1)) => {
             let reverse = std::process::Command::new("git")
                 .args(["merge-base", "--is-ancestor", "HEAD", embedded_commit])
-                .current_dir(project_root)
+                .current_dir(execution_root)
                 .output();
             match reverse.map(|o| o.status.code()) {
                 Ok(Some(0)) => Staleness::Ahead,
@@ -919,20 +922,21 @@ fn run_git_stdout(project_root: &Path, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-/// The live half of D-19's composite staleness (CR-02, 17-11): whether the
-/// working tree CURRENTLY has any tracked, modified file that can change
-/// the compiled binary (`affects_compiled_binary`, reused from 17-10 — not
-/// duplicated). No timestamp is available any more (`build.rs` no longer
-/// embeds one — CR-02), so this cannot itself distinguish "modified after
-/// the build" from "modified before the build, still uncommitted"; combined
-/// with the build's own `build_dirty` flag in `combined_staleness`, it
-/// distinguishes "built clean, source changed since" (definitely Stale)
-/// from "built dirty, source still dirty" (Indeterminate — cannot tell
-/// "same dirt" from "more dirt" without a timestamp, Pitfall 4). Returns
-/// `None` when git itself is unavailable, so the composite check falls back
-/// to the ancestry arm alone.
-fn tree_has_modified_build_inputs(project_root: &Path) -> Option<bool> {
-    let status = run_git_stdout(project_root, &["status", "--porcelain"])?;
+/// The live half of D-19's composite staleness (CR-02, 17-11): whether
+/// `execution_root`'s working tree — the tree where the code under test
+/// actually lives (18c) — CURRENTLY has any tracked, modified file that can
+/// change the compiled binary (`affects_compiled_binary`, reused from
+/// 17-10 — not duplicated). No timestamp is available any more (`build.rs`
+/// no longer embeds one — CR-02), so this cannot itself distinguish
+/// "modified after the build" from "modified before the build, still
+/// uncommitted"; combined with the build's own `build_dirty` flag in
+/// `combined_staleness`, it distinguishes "built clean, source changed
+/// since" (definitely Stale) from "built dirty, source still dirty"
+/// (Indeterminate — cannot tell "same dirt" from "more dirt" without a
+/// timestamp, Pitfall 4). Returns `None` when git itself is unavailable, so
+/// the composite check falls back to the ancestry arm alone.
+fn tree_has_modified_build_inputs(execution_root: &Path) -> Option<bool> {
+    let status = run_git_stdout(execution_root, &["status", "--porcelain"])?;
     if status.trim().is_empty() {
         return Some(false);
     }
@@ -985,9 +989,10 @@ fn affects_compiled_binary(rel_path: &str) -> bool {
 }
 
 /// D-19: composite staleness (CR-02, 17-11: the dirty-flag arm replaces the
-/// old mtime arm; the ancestry arm below is unchanged). Decision table for
-/// the second signal, evaluated only once ancestry alone hasn't already
-/// settled Stale:
+/// old mtime arm; the ancestry arm below is unchanged). Evaluates
+/// `execution_root` — the tree where the code under test actually lives
+/// (18c). Decision table for the second signal, evaluated only once
+/// ancestry alone hasn't already settled Stale:
 ///
 /// | build was dirty | tree has modified build inputs now | result |
 /// |---|---|---|
@@ -996,12 +1001,16 @@ fn affects_compiled_binary(rel_path: &str) -> bool {
 /// |         |     | "more dirt" without a timestamp; warn, never block |
 /// |         |     | (Pitfall 4) |
 /// | either | no | fall through to the ancestry result unchanged |
-fn combined_staleness(project_root: &Path, embedded_commit: &str, build_dirty: bool) -> Staleness {
-    let ancestry = embedded_commit_is_stale(project_root, embedded_commit);
+fn combined_staleness(
+    execution_root: &Path,
+    embedded_commit: &str,
+    build_dirty: bool,
+) -> Staleness {
+    let ancestry = embedded_commit_is_stale(execution_root, embedded_commit);
     if ancestry == Staleness::Stale {
         return Staleness::Stale;
     }
-    match tree_has_modified_build_inputs(project_root) {
+    match tree_has_modified_build_inputs(execution_root) {
         Some(true) if build_dirty => Staleness::Indeterminate,
         Some(true) => Staleness::Stale,
         _ => ancestry,
@@ -1081,21 +1090,40 @@ fn staleness_outcome(is_self_dogfood: bool, staleness: Staleness) -> StalenessOu
     }
 }
 
-/// D-17/D-18/D-19 (17d): the self-dogfood build-staleness gate, called from
-/// `launch_stage` before `monitor::spawn_monitor`. A Stale build against
-/// DevFlow's OWN workspace is a hard block — deliberately NOT an approvable
-/// gate, because approving it would reintroduce the exact Phase 16
-/// false-evidence incident — but it is never SILENT: notify + an event fire
-/// before the blocking error is returned, so an unattended cron run still
-/// sees it (reconciling D-15's never-silent idiom with D-18's hard block).
-/// An ordinary project (or an Indeterminate result) only warns and proceeds.
+/// D-17/D-18/D-19 (17d), execution_root (18c): the self-dogfood
+/// build-staleness gate, called from `launch_stage` before
+/// `monitor::spawn_monitor`. A Stale build against DevFlow's OWN workspace
+/// is a hard block — deliberately NOT an approvable gate, because approving
+/// it would reintroduce the exact Phase 16 false-evidence incident — but it
+/// is never SILENT: notify + an event fire before the blocking error is
+/// returned, so an unattended cron run still sees it (reconciling D-15's
+/// never-silent idiom with D-18's hard block). An ordinary project (or an
+/// Indeterminate result) only warns and proceeds.
+///
+/// 18c: ancestry/dirty-tree checks run against `execution_root` — the
+/// phase's worktree when `state.worktree_path` is set, else `project_root`
+/// — because that is the tree where the code under test actually lives.
+/// Evaluating a worktree-based phase against `project_root` alone is Round
+/// 4 CR-01's root cause: a binary behind the worktree branch can still be a
+/// descendant of `project_root`'s HEAD and misclassify `Ahead` (warn only).
+///
+/// `is_self_dogfood_workspace` deliberately stays anchored on `project_root`
+/// (Assumption A3, 18-RESEARCH.md Pitfall 4): it answers "is this workspace
+/// DevFlow's own repo at all", not "is the binary stale relative to tree X"
+/// — DevFlow's bookkeeping (`.planning/`, `.devflow/`) always lives in the
+/// main checkout even when execution does not, and `events::emit` keeps
+/// writing there too. A git worktree shares the same tracked files as the
+/// commit it is checked out to, so in practice both roots agree; the
+/// residual risk is a PLAN that modified the root `Cargo.toml`'s `members`
+/// array on the feature branch mid-flight, making the two roots disagree.
 fn enforce_build_staleness(
     project_root: &Path,
     state: &State,
     embedded_commit: &str,
     build_dirty: bool,
 ) -> Result<(), CliError> {
-    let staleness = combined_staleness(project_root, embedded_commit, build_dirty);
+    let execution_root = state.worktree_path.as_deref().unwrap_or(project_root);
+    let staleness = combined_staleness(execution_root, embedded_commit, build_dirty);
     let self_dogfood = is_self_dogfood_workspace(project_root);
     match staleness_outcome(self_dogfood, staleness) {
         StalenessOutcome::Block => {
@@ -1103,9 +1131,15 @@ fn enforce_build_staleness(
                 "self-dogfood stale build blocked for stage {}: this devflow binary's \
                  embedded commit is not an ancestor of {}'s current HEAD (or its tracked \
                  source is newer than the build) — rebuild devflow before driving its own \
-                 workspace (D-18; the Phase 16 false-evidence incident)",
+                 workspace (D-18; the Phase 16 false-evidence incident){}",
                 state.stage,
-                project_root.display()
+                execution_root.display(),
+                if state.worktree_path.is_some() {
+                    " — evaluated against this phase's WORKTREE HEAD, not the main checkout; \
+                     rebuild and reinstall the binary before resuming"
+                } else {
+                    ""
+                }
             );
             gates::fire_gate_notify(state.phase, state.stage, &message, true);
             events::emit(
@@ -6545,6 +6579,71 @@ mod tests {
             Staleness::Stale,
             "the worktree branch advanced two commits past the embedded commit — Round 4 \
              CR-01's mechanism: evaluated against the wrong tree, this same commit reads Fresh"
+        );
+    }
+
+    /// 18c GREEN: `enforce_build_staleness` now evaluates ancestry against
+    /// the worktree HEAD (via `execution_root`) rather than `project_root`,
+    /// so a self-dogfood binary behind the worktree branch is a hard
+    /// BLOCK — closing Round 4 CR-01, where the identical scenario
+    /// evaluated against `project_root` alone classified `Ahead` (warn
+    /// only) because the embedded commit was still a descendant of
+    /// `develop`.
+    #[test]
+    fn enforce_build_staleness_blocks_self_dogfood_behind_worktree_head() {
+        let (outer, worktree_path, embedded_commit) = worktree_staleness_fixture();
+        let project_root = outer.path().join("project");
+        std::fs::write(
+            project_root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/devflow-core\", \"crates/devflow-cli\"]\n",
+        )
+        .unwrap();
+        assert!(is_self_dogfood_workspace(&project_root));
+
+        let phase = 90;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, project_root.clone());
+        state.stage = Stage::Code;
+        state.worktree_path = Some(worktree_path.clone());
+
+        let err =
+            enforce_build_staleness(&project_root, &state, &embedded_commit, false).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains(&worktree_path.display().to_string()),
+            "block message must name the worktree that was actually evaluated: {message}"
+        );
+        assert!(
+            !message.contains(&project_root.display().to_string()),
+            "block message must not name project_root when a worktree was evaluated: {message}"
+        );
+    }
+
+    /// 18c (T-18-26): the SAME fixture with `worktree_path: None` must fall
+    /// back to `project_root` and produce `Ok` — proving the
+    /// `unwrap_or(project_root)` fallback preserves existing behavior for
+    /// non-worktree phases and that this fix cannot start blocking them.
+    #[test]
+    fn staleness_without_worktree_is_unchanged() {
+        let (outer, _worktree_path, embedded_commit) = worktree_staleness_fixture();
+        let project_root = outer.path().join("project");
+        std::fs::write(
+            project_root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/devflow-core\", \"crates/devflow-cli\"]\n",
+        )
+        .unwrap();
+
+        let phase = 91;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, project_root.clone());
+        state.stage = Stage::Code;
+        assert!(
+            state.worktree_path.is_none(),
+            "fixture precondition: no worktree recorded on this state"
+        );
+
+        assert!(
+            enforce_build_staleness(&project_root, &state, &embedded_commit, false).is_ok(),
+            "no worktree recorded must fall back to project_root, which the fixture never \
+             advances past embedded_commit"
         );
     }
 
