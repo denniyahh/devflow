@@ -2,9 +2,9 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
-status: "Phase 17 executed (13/13 plans, 15/15 must-haves) - validated at re-audit #10 (eda94cd): GAP-6/GAP-7 closed via 17-13 and RED-proven; GAP-8 (unsampled CLI wiring of GAP-7's fix) found and auto-filled; all 14 rows green, nyquist_compliant: true"
-stopped_at: Completed 17-13-PLAN.md
-last_updated: "2026-07-20T08:47:18.804Z"
+status: "Phase 17 executed (13/13 plans, 15/15 must-haves) - validated at re-audit #10 (eda94cd): GAP-6/GAP-7 closed via 17-13 and RED-proven; GAP-8 (unsampled CLI wiring of GAP-7's fix) found and auto-filled; all 14 rows green, nyquist_compliant: true. Phase 18 in progress: 18-01 (18a doctor reconciliation) complete."
+stopped_at: Completed 18-01-PLAN.md
+last_updated: "2026-07-21T03:23:32.865Z"
 progress:
   total_phases: 8
   completed_phases: 6
@@ -19,7 +19,7 @@ progress:
 
 ## Active
 
-- **Phase 18 (Planned — 7 plans, 17 tasks):** Dogfood Reliability Hardening
+- **Phase 18 (In Progress — 1/7 plans):** Dogfood Reliability Hardening
   — reprioritized 2026-07-20 from Hermes Support. `devflow doctor`
   reconciliation (18a), monitor liveness (18b), worktree-aware staleness
   enforcement (18c), Code↔Validate safety-gate reachability (18d), Layer
@@ -34,7 +34,17 @@ progress:
   and zero warnings on the first iteration. Waves are near-serial by
   necessity, not choice — six of seven fixes touch `main.rs` (6,239
   lines), and the same-wave zero-file-overlap rule forces one `main.rs`
-  plan per wave. Next: `/gsd-execute-phase 18`.
+  plan per wave.
+
+  Executed 2026-07-20: **18-01 complete** (`8fdbd8a`, `3ce77a1`) —
+  `devflow doctor` project-aware reconciliation (18a). `Severity`/
+  `PhaseFacts`/`PhaseFinding`/`reconcile_phase` pure core plus
+  `collect_phase_facts`/`render_reconciliation` wiring into `doctor()`'s
+  text and `--json` output; 5 named checks (gate-pending-without-gate,
+  orphan-gate, dead-agent, stage/event drift, missing feature branch), 10
+  new tests, proven read-only by a twice-run fixture. See
+  `18-01-SUMMARY.md`. Next: 18-02 (18g, WR-03 test stabilization, wave 1,
+  independent of 18-01).
 
 ## Backlog
 
@@ -101,6 +111,8 @@ None currently open for Phase 17.
 
 | Date | Decision |
 |---|---|
+| 2026-07-20 | **18-01: `cargo test -p devflow --lib` does not work on this crate — corrected in verification, not source.** 18-01-PLAN.md's own `<verify>`/`<acceptance_criteria>` blocks (and 18-RESEARCH.md's Validation Architecture table) specify `cargo test -p devflow --lib <name>`, but `devflow` (the `devflow-cli` package) is binary-only (no `[lib]` target), so `--lib` hard-errors (`no library targets found`, exit 101) rather than filtering tests. Used the working equivalent, `cargo test -p devflow <name>` (no `--lib`), for all verification in this plan and going forward. Flag this in future 18-0N plans' verify blocks so the same false-error isn't hit again. |
+| 2026-07-20 | **18-01: two-task pure-core/wiring split requires staged `#[allow(dead_code)]` on a binary-only crate.** `crates/devflow-cli` has no `[lib]` target, so `cargo clippy --workspace --all-targets -- -D warnings` compiles the plain `bin` target *without* `#[cfg(test)]` — unit-test-only usage of a not-yet-wired item does not satisfy that build's dead-code check. Task 1 (pure `reconcile_phase` core) added `#[allow(dead_code)]` to its new items with a comment naming the exact commit that removes them; Task 2 removed every one once `doctor()` became the real caller. Verified clean independently after each commit (not just at the end). Pattern to reuse for any future plan that splits a pure-core commit from its wiring commit in this crate. |
 | 2026-07-20 | **17-REVIEW.md WR backlog triaged to completion; four fixed, five backlogged, one annotated.** The 2026-07-20 Phase 18 restructure flagged WR-01/02/03/04/07/08/09/10/11 as never triaged into the roadmap. All were re-verified against HEAD rather than trusted from the review text (the WR-06 lesson). **Fixed immediately in `234f080`** as one quality-gate-integrity bundle: WR-10 (`devflow test` ran the narrow `cargo clippy -- -D warnings`, which does not compile test targets — a live false-green generator directly in Phase 18's path, since that phase adds substantial `#[cfg(test)]` code), WR-08 (no regression guard on clippy scope in either workflow; added guards over both workflow files plus `devflow test`, each RED-proven by reverting to the narrow form and confirming the intended diagnostic), WR-07 (no job timeouts — sharper after `f25c670` enabled all-branch CI, since a hung `build_provenance` would burn GitHub's 6-hour default), WR-09 (`CONTRIBUTING.md` still advertised the narrow clippy form). **Backlogged:** WR-01+WR-02 → `999.10` (grouped — WR-02 puts the developer's home path and OS username in `events.jsonl`, WR-01 commits it into the *user's* repo; highest severity of the batch since blast radius extends to other people's repositories, and Phase 18 fixes neither, citing WR-02 only as a prevention constraint), WR-03 → `999.11` (`--allow-empty` commits rather than skips, so a terminal-batch retry can tag a release on an empty commit), WR-04 → `999.12` (coverage debt on a deliberate trade). **Annotated in place:** WR-05 — `17-VERIFICATION.md`'s "at current HEAD" claim is scoped to `f5c399a` and does not cover 17-13's three commits; corrected with a scope note rather than re-running verification on a closed, shipped, merged phase, since 17-13's substance is independently confirmed by RED-proven regression tests and the Phase 18 research pass. **Already closed before triage:** WR-06 (by the roadmap restructure), WR-11 (is Phase 18's 18d). WR-04 was deliberately NOT folded into plan 18-05 despite touching the same file — 18-05 had passed the plan-checker clean, and growing a verified plan with adjacent debt is the scope-creep pattern that made prior phases balloon. |
 | 2026-07-20 | **Phase 18 reprioritized to Dogfood Reliability Hardening; fixed Phase 19 eliminated in favor of a backlog:** operator call — dogfooding has repeatedly surfaced legitimate functional bugs that tax every subsequent run, so pipeline-self-correctness work (18a–18g, was 18d/18e + 19a/19d/19g/19k/19l) takes Phase 18's slot ahead of Hermes. Auditing the move surfaced two stale-documentation bugs of its own: 19e and 19f were already closed by 17-13 (`12b5b98`, `e421ebd` — RED-proven regression tests exist) but ROADMAP.md still described them as open; `17-REVIEW.md` WR-06 had already flagged this. Not carried forward. 19i was already resolved (`96411eb`/`40dade3`) before this restructure. Rather than open a new fixed Phase 19, the remaining real-but-lower-priority items (Hermes, 19b, 19c, 19h, 19j) moved to a GSD-native 999.x backlog (`## Backlog` in ROADMAP.md, `/gsd-review-backlog` to promote) — every prior phase renumbering in this project's history exists because "the next phase" kept absorbing newly-discovered work; the backlog gives that work a home that isn't a phase number. Dir renames: `18-hermes-support` → `999.1-hermes-support`; new `18-dogfood-reliability-hardening`, `999.2-phase-process-tracking-model`, `999.3-cli-operator-discoverability`, `999.4-version-tag-contention-concurrent-ship`, `999.5-changelog-placeholder-content`. `17-REVIEW.md`'s WR-07 (build_provenance test flake, no CI job timeout) and WR-01/02/03/04/08/09/10/11 were noticed during this audit but not triaged here — flagged for a follow-up review pass, not assumed resolved or added to the backlog sight-unseen. |
 | 2026-07-18 | **Phase 17 scoped to four units; P5/P6 deferred to Phase 18:** source verification against final HEAD resolved decision-gate Q2 — `Unknown` auto-advance is not an edge case but an explicit design choice (`main.rs:854` classifies only `Failed \| RateLimited` as failure; `main.rs:871`'s comment states "Success (or Unknown — advance…)"). It is also broader than the retrospective recorded: `evaluate_layer3` (`agent_result.rs:610-620`) returns `Unknown` for the zero-commit "agent process gone, no commits" case too, so a vanished agent that did nothing advances Code→Validate. Two retrospective assumptions corrected: `devflow doctor` already exists but is project-blind (`_project_root` unused), and `RateLimited` is already typed — the missing outcomes are `resource_killed` (exit 137, absent workspace-wide) and `agent_unavailable`. Provenance has no foundation at all (no `build.rs`, no `vergen`; `workflow_started` carries only agent/mode/worktree). Phase 17 keeps 17a `Unknown` non-advance, 17b typed outcomes + retry policy, 17c preflight gate, 17d build provenance. Q4 answered: focused Phase 17 repair, **not** a Phase 16 remediation — only 17d traces to the proven Phase 16 defect; the rest is capability Phase 16 never claimed. Deferred to Phase 18 as 18d/18e: doctor reconciliation (forensic tooling, depends on 17b+17d) and the WR-03 test fix (test-only debt). Q3 (universal vs. adapter-specific preflight checks) remains open for discuss-phase. |
@@ -156,6 +168,7 @@ None currently open for Phase 17.
 - [Phase 17]: 17-11: CR-02 resolved -- build.rs always reruns via an unfingerprintable sentinel, DEVFLOW_BUILD_TIMESTAMP removed entirely, staleness's second signal replaced by a (build_dirty, tree_has_modified_build_inputs) decision table (Stale when built clean and now dirty; Indeterminate, never blocking, when built dirty and still dirty)
 - [Phase 17]: 17-12: WR-04 resolved -- ChangelogAppend reordered strictly after VersionBump in hooks_after_ship() (removed from the Validate->Ship transition), reads version::read_version (new, git-free) instead of compute_version to avoid deriving a version one higher than the tag VersionBump just cut, and commits its own write via a new GitFlow::commit_path; version_bump had the identical uncommitted-write defect on its own version-file write and is fixed the same way
 - [Phase 17]: 17-13: GAP-6/GAP-7 closed via write_version remainder-preservation fix and HookContext.shipped_version threading; row 12 restored to green
+- [Phase 18]: 18-01: 18a doctor project-aware reconciliation -- pure PhaseFacts/PhaseFinding/reconcile_phase core (5 named checks: gate-pending-without-gate, orphan-gate, dead-agent, stage/event drift, missing branch) wired into doctor()'s text and --json output via collect_phase_facts/render_reconciliation; proven read-only by a twice-run fixture asserting state-file size/mtime and events.jsonl line count are unchanged
 
 ## Roadmap Evolution
 
@@ -206,9 +219,10 @@ None currently open for Phase 17.
 | Phase 17-pipeline-dogfood-followup P11 | 40min | 3 tasks | 4 files |
 | Phase 17-pipeline-dogfood-followup P12 | 20min | 3 tasks | 5 files |
 | Phase 17-pipeline-dogfood-followup P13 | 15min | 3 tasks | 4 files |
+| Phase 18-dogfood-reliability-hardening P01 | 35min | 2 tasks | 1 files |
 
 ## Session
 
-**Last session:** 2026-07-20T08:47:18.782Z
-**Stopped at:** Completed 17-13-PLAN.md
+**Last session:** 2026-07-21T03:23:32.865Z
+**Stopped at:** Completed 18-01-PLAN.md
 **Resume file:** None

@@ -12,7 +12,7 @@
 | 15 | Dogfood Enablement + OSS Readiness | Complete |
 | 16 | Pipeline Reliability Hardening | Complete    |
 | 17 | Pipeline Dogfood Follow-Up | Complete    |
-| 18 | Dogfood Reliability Hardening | Scoped |
+| 18 | Dogfood Reliability Hardening | In Progress|
 
 ## Shipped
 
@@ -240,11 +240,11 @@ Plans:
 
 **Requirements**: 18a–18g (see CONTEXT.md)
 **Depends on:** Phase 17 (typed outcomes, build provenance)
-**Plans:** 7 plans
+**Plans:** 1/7 plans executed
 
 Plans:
 
-- [ ] 18-01-PLAN.md — 18a: `devflow doctor` project-aware reconciliation (wave 1)
+- [x] 18-01-PLAN.md — 18a: `devflow doctor` project-aware reconciliation (wave 1)
 - [ ] 18-02-PLAN.md — 18g: WR-03 test stabilization, assertion placement (wave 1)
 - [ ] 18-03-PLAN.md — 18b: persist and probe `monitor_pid`, representable "stuck" state (wave 2)
 - [ ] 18-04-PLAN.md — 18d: make `MAX_CONSECUTIVE_FAILURES` reachable for the Code↔Validate loop (wave 3)
@@ -265,6 +265,7 @@ own `phases/999.N-*/CONTEXT.md`.
 **Plans:** 0 plans
 
 Plans:
+
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
 ### Phase 999.2: A Phase Tracks Exactly One Process (BACKLOG)
@@ -274,6 +275,7 @@ Plans:
 **Plans:** 0 plans
 
 Plans:
+
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
 ### Phase 999.3: CLI Operator Discoverability (BACKLOG)
@@ -283,6 +285,7 @@ Plans:
 **Plans:** 0 plans
 
 Plans:
+
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
 ### Phase 999.4: Version-Tag Contention on Concurrent Ship (BACKLOG)
@@ -292,6 +295,7 @@ Plans:
 **Plans:** 0 plans
 
 Plans:
+
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
 ### Phase 999.5: ChangelogAppend Placeholder Content (BACKLOG)
@@ -301,6 +305,7 @@ Plans:
 **Plans:** 0 plans
 
 Plans:
+
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
 ### Phase 999.6: Plan-Only Pipeline Mode (BACKLOG)
@@ -310,6 +315,7 @@ Plans:
 **Plans:** 0 plans
 
 Plans:
+
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
 ### Phase 999.7: Manual Ship Override (BACKLOG)
@@ -319,6 +325,7 @@ Plans:
 **Plans:** 0 plans
 
 Plans:
+
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
 ### Phase 999.8: Split `main.rs` (BACKLOG — blocked on Phase 18)
@@ -330,6 +337,7 @@ Plans:
 **Plans:** 0 plans
 
 Plans:
+
 - [ ] TBD (promote with /gsd-review-backlog when ready — after Phase 18 ships)
 
 ### Phase 999.10: `.devflow/` Artifact Hygiene (BACKLOG — highest of the WR batch)
@@ -339,6 +347,7 @@ Plans:
 **Plans:** 0 plans
 
 Plans:
+
 - [ ] TBD (promote with /gsd-review-backlog when ready — before any wider release push)
 
 ### Phase 999.11: `commit_path` Empty Commits (BACKLOG)
@@ -348,6 +357,7 @@ Plans:
 **Plans:** 0 plans
 
 Plans:
+
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
 ### Phase 999.12: Layer 0 Unapproved-Probe Veto Coverage (BACKLOG)
@@ -357,6 +367,7 @@ Plans:
 **Plans:** 0 plans
 
 Plans:
+
 - [ ] TBD (promote with /gsd-review-backlog when ready — ideally soon after Phase 18 ships, while 18-05 is fresh)
 
 ### Phase 999.9: Dependency Update Review (BACKLOG)
@@ -366,4 +377,5 @@ Plans:
 **Plans:** 0 plans
 
 Plans:
+
 - [ ] TBD (promote with /gsd-review-backlog when ready)
