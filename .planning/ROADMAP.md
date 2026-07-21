@@ -344,6 +344,8 @@ Plans:
 
 **Priority:** High | **Size:** L — reviewed 2026-07-21: now unblocked (Phase 18 shipped in v1.5.0) and the premise has gotten worse, not better — `main.rs` has grown to 8,442 lines (+35%) since this was logged. Highest-risk item in the backlog: 22 `ENV_MUTEX` sites to preserve across a module split. Linear: DEN-33.
 
+**Observation (2026-07-21):** this is bigger than a file-size problem. The `ENV_MUTEX` process-global-state pattern is a *repeat* root cause across three separate expensive-to-diagnose failures now: 19i (`PATH` race, hit 2/2 in CI after mostly passing locally), GAP-2 (concurrent-ship gate-poll hang, ~33–40% of isolated runs), and 999.4 (version-tag contention, caught only by instrumentation). When this item is picked up, the scrutiny should be on whether `ENV_MUTEX`'s serialization guarantees can survive the split at all — not just on relocating code. If they can't be preserved cleanly, that's itself a finding worth surfacing, not something to patch around silently.
+
 **Deliberately sequenced AFTER Phase 18, not before.** The primary risk is `ENV_MUTEX` (22 sites in `main.rs`) — redistributing 71 tests across module boundaries while preserving process-global serialization is exactly the failure class with the worst track record here (19i hit 2/2 in CI while passing locally; GAP-2 at 33–40%; 999.4 caught only by instrumentation). Phase 18's 18a/18b are what make that class observable, and 18e/18f reshape the very functions that determine the seams. Must be a pure-move refactor with zero behavioral change, verified on a branch with CI — local-green is explicitly insufficient.
 **Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
@@ -389,6 +391,28 @@ Plans:
 
 **Goal:** Triggered 2026-07-20 by a GitHub Actions annotation on the first all-branch CI run — `actions/checkout@v4` targets deprecated Node.js 20 and is being force-run on Node 24. Warning only, all jobs green, but it appears on 4 job definitions across both workflow files, so the eventual break lands everywhere at once. Broader than a one-line bump: the dependency surface is inconsistently pinned — `dtolnay/rust-toolchain@stable` and `rust-toolchain.toml`'s `channel = "stable"` float entirely (CI can break from upstream with no commit here, a reproducibility gap for a project premised on trustworthy pipelines), `devcontainers/ci@v0.3` is pre-1.0, the devcontainer base image pin was last verified in Phase 15, and neither `cargo audit` nor `cargo deny` runs in CI. Deliberately not folded into Phase 18 — a dependency bump mid-phase would confound that phase's test signal.
 **Priority:** Medium | **Size:** M — reviewed 2026-07-21: confirmed `actions/checkout@v4` still current pin. Nothing failing today; most of the scope is policy decisions (pin vs. float) rather than code. Linear: DEN-34.
+**Requirements:** TBD — see CONTEXT.md
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.13: Release-Cut Automation / `devflow release --check` (BACKLOG)
+
+**Goal:** DevFlow automates the phase pipeline thoroughly but the release-cut process (version-bump PR → merge → tag → develop-sync → crates.io publish) is a fully manual checklist. Cutting v1.5.0 (2026-07-21) hit three separate failures from this gap in one release: the `devflow-core` version pin drifted for the *second* time (PR #10 fixed the same drift once before), `develop` had silently diverged from `main` for a full release cycle (11 file conflicts on the next PR), and crates.io's publish ordering constraint was undocumented until hit by trial and error. A fourth, related gap: the official signed release tag has no preflight for signing viability, unlike DevFlow's own automated version-bump tags (`git.rs::tag()`, which already scopes off `tag.gpgsign` per-invocation).
+**Priority:** High | **Size:** L — added 2026-07-21, born directly from that session's release. Multiple distinct checks plus one open design question (should it also cut the tag, or just preflight?) — see CONTEXT.md. Linear: DEN-38.
+**Requirements:** TBD — see CONTEXT.md
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.14: Doctor Reconciliation for Planning-Doc Staleness (BACKLOG)
+
+**Goal:** `devflow doctor`'s 18a reconciliation checks phase state against events/PIDs/gates/branches, but nothing checks whether `ROADMAP.md`/`STATE.md`'s own narrative still matches reality once a phase's outcome is decided by a manual, out-of-band action (merge, tag, publish). Found 2026-07-21: `STATE.md`/`ROADMAP.md` claimed Phase 18 was "not yet merged / released" after v1.5.0 had already shipped — the same class of bug `17-REVIEW.md` WR-06 already named once (19e/19f marked open after `17-13` had already closed them).
+**Priority:** Medium | **Size:** M — added 2026-07-21. Detection-only scope (flag stale version claims against git tags), deliberately not auto-correcting prose. Linear: DEN-39.
 **Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
 

@@ -91,4 +91,17 @@ Two secondary reasons, not decisive alone:
   crate. Moving them changes the public API surface and is a larger decision than
   the file split itself; may warrant deferring to keep this a pure move.
 
+## Addendum (2026-07-21)
+
+Worth treating this as bigger than a file-size problem when picked up. `ENV_MUTEX`
+is now a *repeat* root cause across three separate expensive-to-diagnose failures:
+19i (`PATH` race, hit 2/2 in CI after mostly passing locally), GAP-2
+(concurrent-ship gate-poll hang, ~33–40% of isolated runs), and 999.4
+(version-tag contention, caught only by instrumentation). The scrutiny during this
+split should be on whether `ENV_MUTEX`'s serialization guarantees can actually
+survive being distributed across module boundaries — not just on relocating code
+cleanly. If they can't be preserved without a structural change to how tests
+serialize env mutation, that's a finding worth surfacing on its own, not something
+to patch around silently mid-refactor.
+
 Promote with `/gsd-review-backlog` when ready — **after Phase 18 ships**.

@@ -192,12 +192,20 @@ progress:
 
 ## Backlog
 
-Five unsequenced items live in `.planning/phases/999.N-*/` and the
-`## Backlog` section of ROADMAP.md: Hermes Support (999.1, held Phase 18's
-slot until this reprioritization), phase-process tracking model (999.2, was
-19b), CLI operator discoverability (999.3, was 19c), version-tag contention
-on concurrent ship (999.4, was 19h), changelog placeholder content (999.5,
-was 19j). Promote with `/gsd-review-backlog`.
+14 unsequenced items live in `.planning/phases/999.N-*/` and the
+`## Backlog` section of ROADMAP.md, reviewed/prioritized/sized 2026-07-21
+(mirrored in Linear as `DEN-26`..`DEN-39`): Hermes Support (999.1, Low),
+phase-process tracking model (999.2, Medium — half-addressed by 18b's
+`monitor_pid`), CLI operator discoverability (999.3, Low), version-tag
+contention on concurrent ship (999.4, Medium), changelog placeholder content
+(999.5, Low), plan-only pipeline mode (999.6, High), manual ship override
+(999.7, High), split `main.rs` (999.8, High — now unblocked), dependency
+update review (999.9, Medium), `.devflow/` artifact hygiene (999.10, Urgent —
+PII leak into downstream repos), `commit_path` empty commits (999.11, High),
+Layer 0 veto test coverage (999.12, Medium), release-cut automation (999.13,
+High — new 2026-07-21, born from the v1.5.0 release), doctor reconciliation
+for planning-doc staleness (999.14, Medium — new 2026-07-21). Promote with
+`/gsd-review-backlog`.
 
 ## Completed
 
