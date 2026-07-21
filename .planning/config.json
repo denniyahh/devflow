@@ -20,5 +20,14 @@
     "enabled": true,
     "last_mapped": "2026-06-17",
     "head_sha": "bbb9fb4"
+  },
+  "review": {
+    "default_reviewers": [
+      "claude",
+      "codex",
+      "cursor",
+      "opencode",
+      "antigravity"
+    ]
   }
 }
