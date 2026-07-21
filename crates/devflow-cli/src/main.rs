@@ -1201,13 +1201,25 @@ fn enforce_build_staleness(
                 }
             );
             gates::fire_gate_notify(state.phase, state.stage, &message, true);
+            // WR-02 (18-fix): `message` embeds `execution_root.display()` —
+            // an absolute filesystem path (and, on a typical Linux/macOS
+            // path, the operator's OS username). `fire_gate_notify` and the
+            // returned `Err` below are the only places that path-bearing
+            // string is allowed to reach — `events::emit` persists to
+            // `.devflow/events.jsonl`, which `OPERATIONS.md` advertises as
+            // safe to "tail from any tool", so it must never carry a path.
+            // A bare, path-free label plus the two structured facts an
+            // operator actually needs (which stage, and whether a worktree
+            // was involved) are enough to explain the event without leaking
+            // anything.
             events::emit(
                 project_root,
                 state.phase,
                 "self_dogfood_stale_blocked",
                 serde_json::json!({
                     "stage": state.stage.to_string(),
-                    "reason": truncate_reason(&message),
+                    "reason": "stale_build_blocked",
+                    "worktree": state.worktree_path.is_some(),
                 }),
             );
             Err(CliError::Message(message))
@@ -7098,6 +7110,13 @@ mod tests {
             !message.contains(&project_root.display().to_string()),
             "block message must not name project_root when a worktree was evaluated: {message}"
         );
+
+        // WR-02 (18-fix): the persisted event's `worktree` flag mirrors
+        // `state.worktree_path.is_some()`, path-free.
+        let last = devflow_core::events::last_event_for_phase(&project_root, phase)
+            .expect("staleness block must record an event before returning the error");
+        assert_eq!(last["reason"], "stale_build_blocked");
+        assert_eq!(last["worktree"], true);
     }
 
     /// 18c (T-18-26): the SAME fixture with `worktree_path: None` must fall
@@ -7711,14 +7730,29 @@ mod tests {
         state.stage = Stage::Code;
 
         let err = enforce_build_staleness(root, &state, &side, false).unwrap_err();
+        let message = err.to_string();
         assert!(
-            err.to_string().contains("self-dogfood stale build blocked"),
-            "{err}"
+            message.contains("self-dogfood stale build blocked"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&root.display().to_string()),
+            "the returned CliError (terminal-only) must still name the path: {message}"
         );
 
         let last = devflow_core::events::last_event_for_phase(root, phase)
             .expect("staleness block must record an event before returning the error");
         assert_eq!(last["event"], "self_dogfood_stale_blocked");
+        // WR-02 (18-fix): the persisted event's reason must be a bare,
+        // path-free label — the full path-bearing message is for
+        // fire_gate_notify/the returned Err only, never events.jsonl.
+        assert_eq!(last["reason"], "stale_build_blocked");
+        assert_eq!(last["worktree"], false);
+        let reason_str = last["reason"].as_str().unwrap();
+        assert!(
+            !reason_str.contains(&root.display().to_string()),
+            "persisted reason must never carry the project root path: {reason_str}"
+        );
     }
 
     /// D-18: an ordinary (non-self-dogfood) project with the same confirmed-
