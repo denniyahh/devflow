@@ -789,10 +789,27 @@ fn generic_preflight_checks(project_root: &Path, state: &State) -> Result<(), St
 /// Returns `Ok(true)` when the caller should continue the rest of
 /// `launch_stage` (preflight passed). Returns `Ok(false)` when a failing
 /// check was resolved via a gate that ALREADY completed a full retried
-/// launch (Advance/LoopBack) or aborted (Abort) — the caller must not run
-/// any more launch steps for this invocation (CR-01, 17-08 gap closure: the
-/// old `Result<(), CliError>` return couldn't distinguish these two cases,
-/// so the caller always continued and spawned the agent a second time).
+/// launch (Advance/LoopBack), reached the retry ceiling, or aborted —
+/// the caller must not run any more launch steps for this invocation
+/// (CR-01, 17-08 gap closure: the old `Result<(), CliError>` return
+/// couldn't distinguish these cases, so the caller always continued and
+/// spawned the agent a second time).
+///
+/// 18f (D-18f): `GateAction::Advance` on a preflight gate is an explicit
+/// override — the check has already been adjudicated by a human, both
+/// production checks (`preflight_interactivity_check`,
+/// `preflight_gh_auth_check`) are deterministic idempotent predicates a
+/// gate approval cannot change, so re-running them is guaranteed to fail
+/// identically. The `Advance` arm therefore relaunches via
+/// [`launch_stage_inner`] directly, SKIPPING this function entirely on the
+/// retry. `GateAction::LoopBack` still calls the full [`launch_stage`]
+/// (re-entering this function), because that path means the operator will
+/// fix the condition and retry, and the state may genuinely have changed.
+/// Either arm's recursion is bounded by `state.preflight_retries` /
+/// [`mode::MAX_PREFLIGHT_RETRIES`]: the ceiling is checked BEFORE writing
+/// another gate, so reaching it aborts with a logged
+/// `preflight_retry_ceiling_reached` event instead of polling a second
+/// 7-day gate timeout nobody will ever answer (T-18-27, T-18-30).
 fn run_preflight(
     project_root: &Path,
     state: &mut State,
@@ -802,6 +819,31 @@ fn run_preflight(
     if let Err(reason) =
         generic_preflight_checks(project_root, state).and_then(|()| adapter.preflight(state))
     {
+        // Check the ceiling BEFORE writing another gate — writing the gate
+        // first would let the ceiling case open yet another gate nobody
+        // will answer (T-18-27).
+        if state.preflight_retries >= mode::MAX_PREFLIGHT_RETRIES {
+            let ceiling_reason = format!(
+                "preflight retry ceiling ({}) reached for stage {stage}: {}",
+                mode::MAX_PREFLIGHT_RETRIES,
+                truncate_reason(&reason)
+            );
+            events::emit(
+                project_root,
+                state.phase,
+                "preflight_retry_ceiling_reached",
+                serde_json::json!({
+                    "stage": stage.to_string(),
+                    "reason": truncate_reason(&reason),
+                    "ceiling": mode::MAX_PREFLIGHT_RETRIES,
+                }),
+            );
+            abort(project_root, state, &ceiling_reason)?;
+            return Ok(false);
+        }
+        state.preflight_retries = state.preflight_retries.saturating_add(1);
+        workflow::save_state(state)?;
+
         let context = format!(
             "[never-silent] preflight failed for stage {stage}: {} — human review needed \
              (retry, loop-to-code, or abort)",
@@ -809,17 +851,34 @@ fn run_preflight(
         );
         match run_gate(project_root, state, stage, &context)? {
             GateAction::Advance => {
+                // D-18f: approval is an explicit override — skip the
+                // just-adjudicated check on the retry (see the function
+                // doc comment above).
                 let _ = Gates::cleanup(project_root, state.phase, stage);
                 state.gate_pending = false;
-                launch_stage(state, None, None)?;
+                state.preflight_retries = 0;
+                workflow::save_state(state)?;
+                launch_stage_inner(state, None, None)?;
             }
             GateAction::LoopBack(_) => {
+                // D-18f: "I will fix it, then retry" — re-check deliberately,
+                // bounded by the ceiling above.
                 let _ = Gates::cleanup(project_root, state.phase, stage);
                 launch_stage(state, None, None)?;
             }
             GateAction::Abort(reason) => abort(project_root, state, &reason)?,
         }
         return Ok(false);
+    }
+
+    // Preflight passed: reset the retry counter, persisted (the wedge this
+    // counter bounds spans separate `devflow` invocations, so an in-memory
+    // reset alone would not survive a monitor restart). Guarded so a
+    // passing preflight on an already-zero counter does not rewrite state
+    // on every single launch.
+    if state.preflight_retries != 0 {
+        state.preflight_retries = 0;
+        workflow::save_state(state)?;
     }
     Ok(true)
 }
@@ -847,15 +906,17 @@ fn workflow_started_payload(state: &State) -> serde_json::Value {
 }
 
 /// Whether the build embedded in `embedded_commit` is stale relative to
-/// `project_root`'s current `HEAD` — the ancestry half of D-19's composite
-/// definition. Per git's documented exit-code contract for `merge-base
-/// --is-ancestor` (exit 0 = ancestor, exit 1 = not, other = error/unknown
-/// commit — Pitfall 4), exit 1 is treated as definitively Stale; any other
-/// outcome (including an empty `embedded_commit` — D-20: absence of
-/// provenance is not staleness) is Indeterminate, never a false block.
-/// WR-01 (17-06 gap closure): exit 0 alone is NOT sufficient for Fresh —
-/// `merge-base --is-ancestor` also exits 0 when `embedded_commit` is a
-/// STRICT ancestor of HEAD (HEAD moved forward since the build), which is
+/// `execution_root`'s current `HEAD` — the tree where the code under test
+/// actually lives (18c: the phase's worktree when one is set, else
+/// `project_root` — see `enforce_build_staleness`) — the ancestry half of
+/// D-19's composite definition. Per git's documented exit-code contract for
+/// `merge-base --is-ancestor` (exit 0 = ancestor, exit 1 = not, other =
+/// error/unknown commit — Pitfall 4), exit 1 is treated as definitively
+/// Stale; any other outcome (including an empty `embedded_commit` — D-20:
+/// absence of provenance is not staleness) is Indeterminate, never a false
+/// block. WR-01 (17-06 gap closure): exit 0 alone is NOT sufficient for
+/// Fresh — `merge-base --is-ancestor` also exits 0 when `embedded_commit` is
+/// a STRICT ancestor of HEAD (HEAD moved forward since the build), which is
 /// exactly the "committed new commits, forgot to rebuild" incident class
 /// this fix closes. Only an EXACT match to the current HEAD commit is
 /// genuinely Fresh.
@@ -863,24 +924,25 @@ fn workflow_started_payload(state: &State) -> serde_json::Value {
 enum Staleness {
     Fresh,
     Stale,
-    /// The embedded commit is a strict DESCENDANT of `project_root`'s HEAD:
-    /// the binary is newer than the source it drives. Not the "committed,
-    /// forgot to rebuild" incident this gate exists to catch, so it never
-    /// blocks — but it is still a build/source mismatch worth surfacing.
+    /// The embedded commit is a strict DESCENDANT of `execution_root`'s
+    /// HEAD: the binary is newer than the source it drives. Not the
+    /// "committed, forgot to rebuild" incident this gate exists to catch,
+    /// so it never blocks — but it is still a build/source mismatch worth
+    /// surfacing.
     Ahead,
     Indeterminate,
 }
 
-fn embedded_commit_is_stale(project_root: &Path, embedded_commit: &str) -> Staleness {
+fn embedded_commit_is_stale(execution_root: &Path, embedded_commit: &str) -> Staleness {
     if embedded_commit.is_empty() {
         return Staleness::Indeterminate;
     }
     let output = std::process::Command::new("git")
         .args(["merge-base", "--is-ancestor", embedded_commit, "HEAD"])
-        .current_dir(project_root)
+        .current_dir(execution_root)
         .output();
     match output.map(|o| o.status.code()) {
-        Ok(Some(0)) => match run_git_stdout(project_root, &["rev-parse", "HEAD"]) {
+        Ok(Some(0)) => match run_git_stdout(execution_root, &["rev-parse", "HEAD"]) {
             Some(head) if head.trim() == embedded_commit.trim() => Staleness::Fresh,
             Some(_) => Staleness::Stale,
             None => Staleness::Indeterminate,
@@ -892,7 +954,7 @@ fn embedded_commit_is_stale(project_root: &Path, embedded_commit: &str) -> Stale
         Ok(Some(1)) => {
             let reverse = std::process::Command::new("git")
                 .args(["merge-base", "--is-ancestor", "HEAD", embedded_commit])
-                .current_dir(project_root)
+                .current_dir(execution_root)
                 .output();
             match reverse.map(|o| o.status.code()) {
                 Ok(Some(0)) => Staleness::Ahead,
@@ -919,20 +981,21 @@ fn run_git_stdout(project_root: &Path, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-/// The live half of D-19's composite staleness (CR-02, 17-11): whether the
-/// working tree CURRENTLY has any tracked, modified file that can change
-/// the compiled binary (`affects_compiled_binary`, reused from 17-10 — not
-/// duplicated). No timestamp is available any more (`build.rs` no longer
-/// embeds one — CR-02), so this cannot itself distinguish "modified after
-/// the build" from "modified before the build, still uncommitted"; combined
-/// with the build's own `build_dirty` flag in `combined_staleness`, it
-/// distinguishes "built clean, source changed since" (definitely Stale)
-/// from "built dirty, source still dirty" (Indeterminate — cannot tell
-/// "same dirt" from "more dirt" without a timestamp, Pitfall 4). Returns
-/// `None` when git itself is unavailable, so the composite check falls back
-/// to the ancestry arm alone.
-fn tree_has_modified_build_inputs(project_root: &Path) -> Option<bool> {
-    let status = run_git_stdout(project_root, &["status", "--porcelain"])?;
+/// The live half of D-19's composite staleness (CR-02, 17-11): whether
+/// `execution_root`'s working tree — the tree where the code under test
+/// actually lives (18c) — CURRENTLY has any tracked, modified file that can
+/// change the compiled binary (`affects_compiled_binary`, reused from
+/// 17-10 — not duplicated). No timestamp is available any more (`build.rs`
+/// no longer embeds one — CR-02), so this cannot itself distinguish
+/// "modified after the build" from "modified before the build, still
+/// uncommitted"; combined with the build's own `build_dirty` flag in
+/// `combined_staleness`, it distinguishes "built clean, source changed
+/// since" (definitely Stale) from "built dirty, source still dirty"
+/// (Indeterminate — cannot tell "same dirt" from "more dirt" without a
+/// timestamp, Pitfall 4). Returns `None` when git itself is unavailable, so
+/// the composite check falls back to the ancestry arm alone.
+fn tree_has_modified_build_inputs(execution_root: &Path) -> Option<bool> {
+    let status = run_git_stdout(execution_root, &["status", "--porcelain"])?;
     if status.trim().is_empty() {
         return Some(false);
     }
@@ -985,9 +1048,10 @@ fn affects_compiled_binary(rel_path: &str) -> bool {
 }
 
 /// D-19: composite staleness (CR-02, 17-11: the dirty-flag arm replaces the
-/// old mtime arm; the ancestry arm below is unchanged). Decision table for
-/// the second signal, evaluated only once ancestry alone hasn't already
-/// settled Stale:
+/// old mtime arm; the ancestry arm below is unchanged). Evaluates
+/// `execution_root` — the tree where the code under test actually lives
+/// (18c). Decision table for the second signal, evaluated only once
+/// ancestry alone hasn't already settled Stale:
 ///
 /// | build was dirty | tree has modified build inputs now | result |
 /// |---|---|---|
@@ -996,12 +1060,16 @@ fn affects_compiled_binary(rel_path: &str) -> bool {
 /// |         |     | "more dirt" without a timestamp; warn, never block |
 /// |         |     | (Pitfall 4) |
 /// | either | no | fall through to the ancestry result unchanged |
-fn combined_staleness(project_root: &Path, embedded_commit: &str, build_dirty: bool) -> Staleness {
-    let ancestry = embedded_commit_is_stale(project_root, embedded_commit);
+fn combined_staleness(
+    execution_root: &Path,
+    embedded_commit: &str,
+    build_dirty: bool,
+) -> Staleness {
+    let ancestry = embedded_commit_is_stale(execution_root, embedded_commit);
     if ancestry == Staleness::Stale {
         return Staleness::Stale;
     }
-    match tree_has_modified_build_inputs(project_root) {
+    match tree_has_modified_build_inputs(execution_root) {
         Some(true) if build_dirty => Staleness::Indeterminate,
         Some(true) => Staleness::Stale,
         _ => ancestry,
@@ -1081,21 +1149,40 @@ fn staleness_outcome(is_self_dogfood: bool, staleness: Staleness) -> StalenessOu
     }
 }
 
-/// D-17/D-18/D-19 (17d): the self-dogfood build-staleness gate, called from
-/// `launch_stage` before `monitor::spawn_monitor`. A Stale build against
-/// DevFlow's OWN workspace is a hard block — deliberately NOT an approvable
-/// gate, because approving it would reintroduce the exact Phase 16
-/// false-evidence incident — but it is never SILENT: notify + an event fire
-/// before the blocking error is returned, so an unattended cron run still
-/// sees it (reconciling D-15's never-silent idiom with D-18's hard block).
-/// An ordinary project (or an Indeterminate result) only warns and proceeds.
+/// D-17/D-18/D-19 (17d), execution_root (18c): the self-dogfood
+/// build-staleness gate, called from `launch_stage` before
+/// `monitor::spawn_monitor`. A Stale build against DevFlow's OWN workspace
+/// is a hard block — deliberately NOT an approvable gate, because approving
+/// it would reintroduce the exact Phase 16 false-evidence incident — but it
+/// is never SILENT: notify + an event fire before the blocking error is
+/// returned, so an unattended cron run still sees it (reconciling D-15's
+/// never-silent idiom with D-18's hard block). An ordinary project (or an
+/// Indeterminate result) only warns and proceeds.
+///
+/// 18c: ancestry/dirty-tree checks run against `execution_root` — the
+/// phase's worktree when `state.worktree_path` is set, else `project_root`
+/// — because that is the tree where the code under test actually lives.
+/// Evaluating a worktree-based phase against `project_root` alone is Round
+/// 4 CR-01's root cause: a binary behind the worktree branch can still be a
+/// descendant of `project_root`'s HEAD and misclassify `Ahead` (warn only).
+///
+/// `is_self_dogfood_workspace` deliberately stays anchored on `project_root`
+/// (Assumption A3, 18-RESEARCH.md Pitfall 4): it answers "is this workspace
+/// DevFlow's own repo at all", not "is the binary stale relative to tree X"
+/// — DevFlow's bookkeeping (`.planning/`, `.devflow/`) always lives in the
+/// main checkout even when execution does not, and `events::emit` keeps
+/// writing there too. A git worktree shares the same tracked files as the
+/// commit it is checked out to, so in practice both roots agree; the
+/// residual risk is a PLAN that modified the root `Cargo.toml`'s `members`
+/// array on the feature branch mid-flight, making the two roots disagree.
 fn enforce_build_staleness(
     project_root: &Path,
     state: &State,
     embedded_commit: &str,
     build_dirty: bool,
 ) -> Result<(), CliError> {
-    let staleness = combined_staleness(project_root, embedded_commit, build_dirty);
+    let execution_root = state.worktree_path.as_deref().unwrap_or(project_root);
+    let staleness = combined_staleness(execution_root, embedded_commit, build_dirty);
     let self_dogfood = is_self_dogfood_workspace(project_root);
     match staleness_outcome(self_dogfood, staleness) {
         StalenessOutcome::Block => {
@@ -1103,18 +1190,36 @@ fn enforce_build_staleness(
                 "self-dogfood stale build blocked for stage {}: this devflow binary's \
                  embedded commit is not an ancestor of {}'s current HEAD (or its tracked \
                  source is newer than the build) — rebuild devflow before driving its own \
-                 workspace (D-18; the Phase 16 false-evidence incident)",
+                 workspace (D-18; the Phase 16 false-evidence incident){}",
                 state.stage,
-                project_root.display()
+                execution_root.display(),
+                if state.worktree_path.is_some() {
+                    " — evaluated against this phase's WORKTREE HEAD, not the main checkout; \
+                     rebuild and reinstall the binary before resuming"
+                } else {
+                    ""
+                }
             );
             gates::fire_gate_notify(state.phase, state.stage, &message, true);
+            // WR-02 (18-fix): `message` embeds `execution_root.display()` —
+            // an absolute filesystem path (and, on a typical Linux/macOS
+            // path, the operator's OS username). `fire_gate_notify` and the
+            // returned `Err` below are the only places that path-bearing
+            // string is allowed to reach — `events::emit` persists to
+            // `.devflow/events.jsonl`, which `OPERATIONS.md` advertises as
+            // safe to "tail from any tool", so it must never carry a path.
+            // A bare, path-free label plus the two structured facts an
+            // operator actually needs (which stage, and whether a worktree
+            // was involved) are enough to explain the event without leaking
+            // anything.
             events::emit(
                 project_root,
                 state.phase,
                 "self_dogfood_stale_blocked",
                 serde_json::json!({
                     "stage": state.stage.to_string(),
-                    "reason": truncate_reason(&message),
+                    "reason": "stale_build_blocked",
+                    "worktree": state.worktree_path.is_some(),
                 }),
             );
             Err(CliError::Message(message))
@@ -1131,14 +1236,38 @@ fn enforce_build_staleness(
     }
 }
 
-/// Spawn the background monitor that owns the agent for `state.stage`. The
-/// monitor calls `devflow advance` when the agent exits. An optional
-/// `prompt_override` is used for Code loop-backs (fix prompts).
-fn launch_stage(
+/// The post-preflight body of [`launch_stage`]: self-dogfood build-staleness
+/// enforcement, capture archival/rollover, and spawning the monitor.
+/// Extracted (18f, D-18f) so `run_preflight`'s `Advance` arm can call it
+/// directly and skip the just-adjudicated preflight check, while every
+/// other caller keeps going through [`launch_stage`]'s full path (readiness
+/// resolution, `ensure_agent_binary`, then `run_preflight`).
+///
+/// Recomputes `prompt`/`adapter`/`roots`/`program`/`args` from `state` and
+/// `prompt_override` — deliberately NOT threaded through as parameters.
+/// They are pure functions of `state` and the prompt override; recomputing
+/// them here (rather than widening `run_preflight`'s signature to carry
+/// them from `launch_stage`'s earlier resolution) keeps this function
+/// callable entirely on its own, which is exactly what `run_preflight`'s
+/// `Advance` arm needs. This does not duplicate `worktree_writable_roots`'s
+/// logic — both call sites call the same shared helper.
+fn launch_stage_inner(
     state: &mut State,
     prompt_override: Option<String>,
     archived_stage: Option<Stage>,
 ) -> Result<(), CliError> {
+    // WR-04 (18-fix): clear the prior stage's monitor pid up front, before
+    // any fallible step below (`ensure_agent_binary`, `enforce_build_staleness`)
+    // can return early via `?`. Without this, a failed relaunch left
+    // `state.stage` already advanced (by `transition()`, before this
+    // function was ever called) alongside a stale `monitor_pid` still
+    // naming the PREVIOUS stage's (now-dead) monitor — `liveness()` then
+    // misreports `Stuck → devflow resume`, even when the real remedy is
+    // unrelated (e.g. rebuild after a staleness block). The real pid is
+    // set again below once `monitor::spawn_monitor` actually succeeds.
+    state.monitor_pid = None;
+    workflow::save_state(state)?;
+
     let prompt = prompt_override.unwrap_or_else(|| {
         prompt::stage_prompt_for_project(state.stage, state.phase, &state.project_root)
     });
@@ -1155,18 +1284,7 @@ fn launch_stage(
     let (program, args) = adapter.exec_command(state.phase, &prompt, &roots);
     ensure_agent_binary(program)?;
 
-    // 17c (Task 1, D-13-D-16): a scoped readiness gate runs before any agent
-    // time is spent — a failing check surfaces as a named preflight gate +
-    // notify (never a hard exit, D-15), not here.
-    //
-    // CR-01 (17-08 gap closure): `run_preflight` returns `Ok(false)` when a
-    // failing check was ALREADY resolved via a full retried launch (or an
-    // abort) — this frame must not run any more launch steps in that case,
-    // or the agent gets spawned a second time for the same stage.
     let project_root = state.project_root.clone();
-    if !run_preflight(&project_root, state, adapter.as_ref())? {
-        return Ok(());
-    }
 
     // 17d (Task 2, D-17-D-19): self-dogfood build-staleness gate — also
     // before spawn_monitor, so a stale DevFlow-on-itself run never even
@@ -1206,6 +1324,11 @@ fn launch_stage(
     }
     let pid = monitor::spawn_monitor(state, program, &args, &adapter.extra_env())
         .map_err(|err| CliError::Message(format!("could not spawn monitor: {err}")))?;
+    // `transition()` calls `workflow::save_state` BEFORE `launch_stage`, so a
+    // pid recorded only in memory here is lost unless it is written again
+    // (18b).
+    state.monitor_pid = Some(pid);
+    workflow::save_state(state)?;
     events::emit(
         &state.project_root,
         state.phase,
@@ -1222,6 +1345,52 @@ fn launch_stage(
         adapter.name()
     );
     Ok(())
+}
+
+/// Spawn the background monitor that owns the agent for `state.stage`. The
+/// monitor calls `devflow advance` when the agent exits. An optional
+/// `prompt_override` is used for Code loop-backs (fix prompts).
+///
+/// Resolves the prompt/adapter/roots/program, validates the agent binary,
+/// then runs the readiness gate ([`run_preflight`]) before delegating to
+/// [`launch_stage_inner`] for the actual spawn. Every EXISTING caller of
+/// this function keeps getting the full path including preflight — the
+/// ONLY caller of `launch_stage_inner` directly is `run_preflight`'s own
+/// `Advance` arm (18f, D-18f), which is skipping a check it just
+/// adjudicated for this one relaunch, not granting a standing bypass
+/// (T-18-28: the skip must never leak beyond the single stage a human
+/// approved).
+fn launch_stage(
+    state: &mut State,
+    prompt_override: Option<String>,
+    archived_stage: Option<Stage>,
+) -> Result<(), CliError> {
+    let adapter = agents::adapter_for(state.agent);
+    let prompt = prompt_override.clone().unwrap_or_else(|| {
+        prompt::stage_prompt_for_project(state.stage, state.phase, &state.project_root)
+    });
+    let roots = state
+        .worktree_path
+        .as_deref()
+        .map(|wt| worktree_writable_roots(&state.project_root, wt))
+        .unwrap_or_default();
+    let (program, _args) = adapter.exec_command(state.phase, &prompt, &roots);
+    ensure_agent_binary(program)?;
+
+    // 17c (Task 1, D-13-D-16): a scoped readiness gate runs before any agent
+    // time is spent — a failing check surfaces as a named preflight gate +
+    // notify (never a hard exit, D-15), not here.
+    //
+    // CR-01 (17-08 gap closure): `run_preflight` returns `Ok(false)` when a
+    // failing check was ALREADY resolved via a full retried launch (or an
+    // abort) — this frame must not run any more launch steps in that case,
+    // or the agent gets spawned a second time for the same stage.
+    let project_root = state.project_root.clone();
+    if !run_preflight(&project_root, state, adapter.as_ref())? {
+        return Ok(());
+    }
+
+    launch_stage_inner(state, prompt_override, archived_stage)
 }
 
 /// Resume a rate-limited or infra-paused phase from its saved stage (review
@@ -1352,20 +1521,27 @@ fn advance(project_root: &Path, phase: Option<u32>) -> Result<(), CliError> {
             Stage::Plan => transition(project_root, &mut state, Stage::Code),
             Stage::Code => transition(project_root, &mut state, Stage::Validate),
             Stage::Validate => {
-                // 13b verdict-vs-ran: the Validate prompt now REQUIRES a
-                // verdict, so ONLY an explicit `verdict: pass` advances to
+                // 13b verdict-vs-ran + 18e: the Validate prompt now REQUIRES
+                // a verdict, so ONLY an explicit `verdict: pass` advances to
                 // Ship. A missing verdict is a fail-safe (gate/loop), NOT a
                 // silent pass — closes the composition bug where a
                 // marker-less/verdict-less Validate could otherwise reach
-                // Ship.
-                let passed = matches!(result.verdict, Some(Verdict::Pass));
-                handle_validate_outcome(project_root, &mut state, passed)
+                // Ship. `classify_validate_outcome` additionally resolves
+                // the `external_verify` three-way matrix (D-18e): agreement
+                // advances, disagreement/no-verdict gates immediately.
+                handle_validate_outcome(
+                    project_root,
+                    &mut state,
+                    classify_validate_outcome(&result),
+                )
             }
             Stage::Ship => handle_ship_outcome(project_root, &mut state),
         },
         Action::GateReview => match stage {
             // Validate failures drive the Code↔Validate loop (or a gate).
-            Stage::Validate => handle_validate_outcome(project_root, &mut state, false),
+            Stage::Validate => {
+                handle_validate_outcome(project_root, &mut state, ValidateOutcome::Failed)
+            }
             // Ship distinguishes an agent crash (AgentFailed) from a review
             // rejection (ReviewFailed, `review:`-prefixed reason).
             Stage::Ship => handle_ship_failure(project_root, &mut state, result.reason),
@@ -1500,15 +1676,106 @@ fn handle_rate_limited_outcome(
     Ok(())
 }
 
-/// Decide what happens after a Validate stage (passed or failed), honoring the
-/// active mode's gate policy and the consecutive-failure threshold.
+/// The three-way outcome of a Validate stage evaluation (18e, D-18e).
+///
+/// Distinct from a plain `bool`: an `external_verify`-declared Validate has
+/// THREE distinguishable outcomes, not two — the probe and the agent's
+/// self-reported verdict can independently agree, disagree, or leave one
+/// signal missing. Collapsing disagreement or "no verdict at all" onto
+/// `Failed` would route them through the counter-based auto-loop, a DELAYED
+/// gate indistinguishable from an ordinary retry to the operator watching
+/// it — the binding operator decision requires an IMMEDIATE one instead
+/// (T-18-19).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ValidateOutcome {
+    /// The two independent signals agree (or no `external_verify` is
+    /// declared and the agent reported `verdict: pass`): advance to Ship.
+    Passed,
+    /// An ordinary Validate failure — the pre-existing fail-safe, unchanged:
+    /// loop back to Code, or gate once `consecutive_failures` reaches the
+    /// ceiling.
+    Failed,
+    /// The probe passed but the agent's verdict disagrees, or no verdict
+    /// arrived at all. Gates for a human IMMEDIATELY, never touching
+    /// `consecutive_failures`. The payload names which two signals
+    /// disagreed, for the `[never-silent]` gate context.
+    Ambiguous(String),
+}
+
+/// Classify a Validate-stage `AgentResult` into its three-way outcome
+/// (D-18e, the binding operator decision reproduced in 18-05-PLAN.md).
+///
+/// Pure function over `&AgentResult` — no I/O — so the whole decision
+/// matrix is directly unit-testable. `Some(Verdict::Pass)` is matched FIRST
+/// and wins regardless of which layer decided the result: it is the "two
+/// independent signals agreeing" arm and must not be shadowed by the
+/// external-verify-specific arms below it.
+fn classify_validate_outcome(result: &agent_result::AgentResult) -> ValidateOutcome {
+    let external = result.decided_by_layer == Some(0) && result.status == AgentStatus::Success;
+    match (external, result.verdict) {
+        (_, Some(Verdict::Pass)) => ValidateOutcome::Passed,
+        (true, Some(Verdict::Gaps)) => ValidateOutcome::Ambiguous(
+            "external verification passed but the agent reported gaps".to_string(),
+        ),
+        (true, None) => ValidateOutcome::Ambiguous(
+            "external verification passed but no agent verdict arrived".to_string(),
+        ),
+        _ => ValidateOutcome::Failed,
+    }
+}
+
+/// The two ordinary Validate outcomes left once `ValidateOutcome::Ambiguous`
+/// has been handled and returned on its own (WR-03, 18-fix). Deliberately a
+/// distinct, two-variant type: matching on THIS below is exhaustive without
+/// a third, panic-capable arm — the compiler enforces that
+/// `handle_validate_outcome`'s tail can never see an ambiguous outcome,
+/// instead of that invariant being proven by hand-tracing control flow (the
+/// pre-fix shape's `unreachable!()`, which was sound but fragile: a future
+/// edit to either the `forced` computation or the early-return `if` could
+/// have silently reintroduced reachability).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValidateResult {
+    Passed,
+    Failed,
+}
+
+/// Decide what happens after a Validate stage, honoring the active mode's
+/// gate policy, the consecutive-failure threshold, and (18e) the immediate
+/// gate an ambiguous `external_verify` outcome forces regardless of either.
 fn handle_validate_outcome(
     project_root: &Path,
     state: &mut State,
-    passed: bool,
+    outcome: ValidateOutcome,
 ) -> Result<(), CliError> {
-    if !passed {
-        state.consecutive_failures += 1;
+    // 18e / T-18-19: an ambiguous outcome must gate IMMEDIATELY — it is
+    // being adjudicated right now, not retried, so it must never fall
+    // through to the counter-based `should_gate` check below and must never
+    // touch `consecutive_failures`. Handled in its own arm, up front, and
+    // converted to `ValidateResult` for the two variants that share the
+    // rest of this function's logic (WR-03).
+    let result = match outcome {
+        ValidateOutcome::Ambiguous(detail) => {
+            let context = format!(
+                "[never-silent] validate ambiguous: {}",
+                truncate_reason(&detail)
+            );
+            return match run_gate(project_root, state, Stage::Validate, &context)? {
+                GateAction::Advance => transition(project_root, state, Stage::Ship),
+                GateAction::LoopBack(_) => {
+                    loop_back_to_code(project_root, state, FixType::GapsOnly)
+                }
+                GateAction::Abort(reason) => abort(project_root, state, &reason),
+            };
+        }
+        ValidateOutcome::Passed => ValidateResult::Passed,
+        ValidateOutcome::Failed => ValidateResult::Failed,
+    };
+
+    if result == ValidateResult::Failed {
+        // Now that the counter genuinely accumulates (18d), an unbounded
+        // loop could otherwise overflow it and wrap to 0, silently
+        // restoring the unreachable-ceiling bug in a slower form.
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
         workflow::save_state(state)?;
     }
 
@@ -1516,13 +1783,12 @@ fn handle_validate_outcome(
         .mode
         .should_gate(Stage::Validate, state.consecutive_failures)
     {
-        let context = if passed {
-            "Validation passed — approve to ship?".to_string()
-        } else {
-            format!(
+        let context = match result {
+            ValidateResult::Passed => "Validation passed — approve to ship?".to_string(),
+            ValidateResult::Failed => format!(
                 "Validation failed {} time(s) — human review needed.",
                 state.consecutive_failures
-            )
+            ),
         };
         return match run_gate(project_root, state, Stage::Validate, &context)? {
             GateAction::Advance => transition(project_root, state, Stage::Ship),
@@ -1531,10 +1797,9 @@ fn handle_validate_outcome(
         };
     }
 
-    if passed {
-        transition(project_root, state, Stage::Ship)
-    } else {
-        loop_back_to_code(project_root, state, FixType::GapsOnly)
+    match result {
+        ValidateResult::Passed => transition(project_root, state, Stage::Ship),
+        ValidateResult::Failed => loop_back_to_code(project_root, state, FixType::GapsOnly),
     }
 }
 
@@ -1778,13 +2043,19 @@ fn run_checkout_hooks(
 
 /// Fire the hooks for `from → to`, persist the new stage, and launch its agent.
 ///
-/// CR-01 (17-06 gap closure): resets `infra_failures` alongside
-/// `consecutive_failures` on every successful transition. Without this, an
-/// infra-fault ceiling meant to bound a *stuck loop* (D-08,
-/// [`mode::MAX_INFRA_FAILURES`]) instead accumulates across a phase's entire
-/// lifetime — several well-spaced, cleanly-resolved infra faults would
-/// falsely reach the ceiling and hard-abort a long-running but otherwise
-/// healthy phase.
+/// `infra_failures` resets unconditionally on every successful transition
+/// (CR-01, 17-06 gap closure). Without this, an infra-fault ceiling meant to
+/// bound a *stuck loop* (D-08, [`mode::MAX_INFRA_FAILURES`]) instead
+/// accumulates across a phase's entire lifetime — several well-spaced,
+/// cleanly-resolved infra faults would falsely reach the ceiling and
+/// hard-abort a long-running but otherwise healthy phase.
+///
+/// `consecutive_failures` clears on every transition EXCEPT Code→Validate
+/// (18d, [`mode::transition_resets_consecutive_failures`]): that hop is
+/// crossed on every single Code↔Validate retry cycle, so unconditionally
+/// clearing it there made [`mode::MAX_CONSECUTIVE_FAILURES`] unreachable for
+/// the exact loop it bounds. The two counters deliberately no longer share a
+/// single reset condition.
 fn transition(project_root: &Path, state: &mut State, to: Stage) -> Result<(), CliError> {
     let from = state.stage;
     let _ = run_checkout_hooks(
@@ -1794,7 +2065,9 @@ fn transition(project_root: &Path, state: &mut State, to: Stage) -> Result<(), C
         to,
     );
     state.stage = to;
-    state.consecutive_failures = 0;
+    if mode::transition_resets_consecutive_failures(from, to) {
+        state.consecutive_failures = 0;
+    }
     state.infra_failures = 0;
     state.gate_pending = false;
     workflow::save_state(state)?;
@@ -2544,6 +2817,51 @@ fn cleanup(project_root: &Path, force: bool) -> Result<(), CliError> {
     Ok(())
 }
 
+/// A phase's monitor/agent liveness, distinguishing a dead monitor (nothing
+/// will call `devflow advance` when the agent exits) from a normal
+/// between-stages moment (18b — "who watches the watcher").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Liveness {
+    /// Monitor and agent are both alive — the stage is actively running.
+    Healthy,
+    /// Monitor is alive, agent has exited — normal between-stages moment;
+    /// the monitor will advance the phase shortly.
+    BetweenStages,
+    /// The recorded monitor is dead. Whether or not the agent is also dead,
+    /// nothing will call `devflow advance` for this phase — it needs a
+    /// manual `devflow resume`.
+    Stuck,
+    /// No monitor PID has been recorded for this state — either none has
+    /// been spawned yet, or the state was written by a binary predating
+    /// this field. Never reported as a problem.
+    Unknown,
+}
+
+impl Liveness {
+    fn describe(self) -> &'static str {
+        match self {
+            Liveness::Healthy => "healthy",
+            Liveness::BetweenStages => "between stages",
+            Liveness::Stuck => "stuck — needs devflow resume",
+            Liveness::Unknown => "unknown (no monitor recorded)",
+        }
+    }
+}
+
+/// Pure liveness predicate — no I/O. `monitor_pid` is matched `None` first
+/// so a state written by a pre-18b binary (carrying no `monitor_pid`) can
+/// never be misclassified as `Stuck` (T-18-11).
+fn liveness(monitor_pid: Option<u32>, monitor_alive: bool, agent_alive: bool) -> Liveness {
+    match monitor_pid {
+        None => Liveness::Unknown,
+        Some(_) => match (monitor_alive, agent_alive) {
+            (true, true) => Liveness::Healthy,
+            (true, false) => Liveness::BetweenStages,
+            (false, _) => Liveness::Stuck,
+        },
+    }
+}
+
 fn status(project_root: &Path) -> Result<(), CliError> {
     // 13-DEFERRED-CR-03 acceptance: enumerate every active phase, not just
     // the last one started.
@@ -2589,7 +2907,8 @@ fn status(project_root: &Path) -> Result<(), CliError> {
                 println!("  worktree: {}", wt.display());
             }
             current_worktree = current_worktree.or_else(|| state.worktree_path.clone());
-            match agent_pid_from_file(project_root, state.phase) {
+            let agent_pid = agent_pid_from_file(project_root, state.phase);
+            match agent_pid {
                 Some(pid) => {
                     println!(
                         "  agent_pid: {pid} (running: {})",
@@ -2597,6 +2916,22 @@ fn status(project_root: &Path) -> Result<(), CliError> {
                     );
                 }
                 None => println!("  agent_pid: none"),
+            }
+            match state.monitor_pid {
+                Some(pid) => {
+                    println!(
+                        "  monitor_pid: {pid} (running: {})",
+                        agent::agent_running(pid)
+                    );
+                }
+                None => println!("  monitor_pid: none"),
+            }
+            let agent_alive = agent_pid.is_some_and(agent::agent_running);
+            let monitor_alive = state.monitor_pid.is_some_and(agent::agent_running);
+            let phase_liveness = liveness(state.monitor_pid, monitor_alive, agent_alive);
+            println!("  liveness: {}", phase_liveness.describe());
+            if phase_liveness == Liveness::Stuck {
+                println!("    → devflow resume --phase {}", state.phase);
             }
             if let Some(event) = last_events.remove(&state.phase) {
                 let ago = event
@@ -3081,7 +3416,10 @@ fn recover_cmd(project_root: &Path, do_clean: bool, phase: Option<u32>) -> Resul
 fn test_cmd(project_root: &Path) -> Result<(), CliError> {
     let checks = [
         ("cargo test", "cargo test"),
-        ("cargo clippy", "cargo clippy -- -D warnings"),
+        (
+            "cargo clippy",
+            "cargo clippy --workspace --all-targets -- -D warnings",
+        ),
         ("cargo fmt --check", "cargo fmt --check"),
     ];
     let mut failures = Vec::new();
@@ -3115,16 +3453,21 @@ fn test_cmd(project_root: &Path) -> Result<(), CliError> {
 // doctor
 // ---------------------------------------------------------------------------
 
-/// Audit the environment and report what's installed, missing, or broken.
-fn doctor(_project_root: &Path, json: bool) -> Result<(), CliError> {
-    use std::process::Command;
+/// One tool/environment check from `doctor`'s pre-existing audit (git,
+/// cargo, agent CLIs, `RUST_LOG`, ...). Module-level (WR-01, 18-fix) so
+/// `checks_json_value` and `doctor_json_body` can compose it into
+/// `doctor --json`'s single output document without living inside `doctor`
+/// itself.
+struct Check {
+    name: String,
+    status: String,
+    version: Option<String>,
+    install_hint: Option<String>,
+}
 
-    struct Check {
-        name: String,
-        status: String,
-        version: Option<String>,
-        install_hint: Option<String>,
-    }
+/// Audit the environment and report what's installed, missing, or broken.
+fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
+    use std::process::Command;
 
     fn cmd_check(name: &str, cmd: &str, version_arg: &str, install_hint: &str) -> Check {
         match Command::new(cmd).arg(version_arg).output() {
@@ -3258,30 +3601,21 @@ fn doctor(_project_root: &Path, json: bool) -> Result<(), CliError> {
         },
     ];
 
+    let facts = collect_phase_facts(project_root);
+
     if json {
-        let mut out = String::from("[\n");
-        for (i, c) in checks.iter().enumerate() {
-            out.push_str("  {\n");
-            out.push_str(&format!("    \"name\": {:?},\n", c.name));
-            out.push_str(&format!("    \"status\": {:?},\n", c.status));
-            if let Some(v) = &c.version {
-                out.push_str(&format!("    \"version\": {:?},\n", v));
-            } else {
-                out.push_str("    \"version\": null,\n");
-            }
-            if let Some(h) = &c.install_hint {
-                out.push_str(&format!("    \"install_hint\": {:?}\n", h));
-            } else {
-                out.push_str("    \"install_hint\": null\n");
-            }
-            out.push('}');
-            if i + 1 < checks.len() {
-                out.push(',');
-            }
-            out.push('\n');
-        }
-        out.push_str("]\n");
-        print!("{out}");
+        // WR-01 (18-fix): a single top-level JSON document — `{"environment":
+        // [...], "reconciliation": [...]}` — instead of the pre-fix
+        // behavior of printing the tool checks as one top-level `[...]`
+        // array and then printing a SECOND, independent top-level array
+        // right after it. That concatenation is not valid single-document
+        // JSON for any parser that isn't NDJSON-aware (`json.load` raised
+        // "Extra data").
+        let body = doctor_json_body(&checks, &facts);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&body).expect("doctor --json body must serialize")
+        );
     } else {
         for c in &checks {
             let icon = match c.status.as_str() {
@@ -3300,9 +3634,385 @@ fn doctor(_project_root: &Path, json: bool) -> Result<(), CliError> {
             }
             println!();
         }
+        print!("{}", render_reconciliation_text(&facts));
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// doctor reconciliation (18a)
+// ---------------------------------------------------------------------------
+
+/// Severity of a reconciliation finding, matching the existing `Check.status`
+/// convention (lowercase strings) so both `doctor` renderers stay consistent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Severity {
+    Ok,
+    Warn,
+    Problem,
+}
+
+impl Severity {
+    fn label(self) -> &'static str {
+        match self {
+            Severity::Ok => "ok",
+            Severity::Warn => "warn",
+            Severity::Problem => "problem",
+        }
+    }
+}
+
+/// The read-only facts `doctor` gathers for one active phase before
+/// reconciling them. Collected by `collect_phase_facts` (all I/O); consumed
+/// with zero I/O by `reconcile_phase`.
+struct PhaseFacts {
+    phase: u32,
+    stage: Stage,
+    gate_pending: bool,
+    agent_pid: Option<u32>,
+    agent_alive: bool,
+    /// The monitor pid recorded in `State.monitor_pid` (18b). `None` means
+    /// no monitor has been spawned for this state yet, or the state was
+    /// written by a binary predating the field — never treated as a problem.
+    monitor_pid: Option<u32>,
+    monitor_alive: bool,
+    /// The most recent event's `event` field value, for display context.
+    last_event: Option<String>,
+    /// The `stage` field of the most recent `stage_launched` event; `None`
+    /// when the last event recorded for this phase is not a launch.
+    last_launched_stage: Option<Stage>,
+    open_gate_stages: Vec<Stage>,
+    feature_branch_exists: bool,
+}
+
+/// One diagnostic finding for a phase, with a copy-pasteable repair command
+/// when one exists. Never carries a filesystem path or username (T-18-01) —
+/// only phase numbers, stage names, and pids identify the disagreement.
+struct PhaseFinding {
+    phase: u32,
+    severity: Severity,
+    detail: String,
+    repair: Option<String>,
+}
+
+/// `gate_pending` is set but no gate file is open for this phase — the gate
+/// answer path is stuck. `doctor` only reports this; it never repairs it
+/// (T-18-02).
+fn check_gate_pending_without_gate(facts: &PhaseFacts) -> Option<PhaseFinding> {
+    if !facts.gate_pending || !facts.open_gate_stages.is_empty() {
+        return None;
+    }
+    Some(PhaseFinding {
+        phase: facts.phase,
+        severity: Severity::Problem,
+        detail: format!(
+            "phase {}: gate_pending is true at stage {} but no gate file is open",
+            facts.phase, facts.stage
+        ),
+        repair: Some(format!("devflow resume --phase {}", facts.phase)),
+    })
+}
+
+/// An open gate file exists but `gate_pending` is false — an unanswered
+/// operator question that `status`/`doctor` isn't surfacing as pending.
+fn check_orphan_gate(facts: &PhaseFacts) -> Option<PhaseFinding> {
+    if facts.gate_pending || facts.open_gate_stages.is_empty() {
+        return None;
+    }
+    let gate_stage = facts.open_gate_stages[0];
+    Some(PhaseFinding {
+        phase: facts.phase,
+        severity: Severity::Problem,
+        detail: format!(
+            "phase {}: gate open for stage {} but state.gate_pending is false",
+            facts.phase, gate_stage
+        ),
+        repair: Some(format!(
+            "devflow gate approve {} --stage {}",
+            facts.phase, gate_stage
+        )),
+    })
+}
+
+/// The recorded agent pid is not alive while the phase sits at an
+/// agent-driven stage — the "who watches the watcher" class of silent death
+/// CONTEXT.md cites (two incidents, ~4h lost, found only via `ps`).
+fn check_dead_agent(facts: &PhaseFacts) -> Option<PhaseFinding> {
+    let pid = facts.agent_pid?;
+    if facts.agent_alive || !facts.stage.is_agent_stage() {
+        return None;
+    }
+    Some(PhaseFinding {
+        phase: facts.phase,
+        severity: Severity::Problem,
+        detail: format!(
+            "phase {}: agent pid {pid} recorded but not running at stage {}",
+            facts.phase, facts.stage
+        ),
+        repair: Some(format!("devflow resume --phase {}", facts.phase)),
+    })
+}
+
+/// The recorded monitor pid is dead — nothing will call `devflow advance`
+/// for this phase, whether or not the agent is also dead (an agent that
+/// outlived its monitor is orphaned too, since nothing will advance it when
+/// it exits either). Reuses `liveness` rather than re-deriving the matrix,
+/// so the two copies can never drift (18b, T-18-11's `Unknown` guard applies
+/// here transitively — an unrecorded monitor is silently `Unknown`, never a
+/// finding).
+fn check_dead_monitor(facts: &PhaseFacts) -> Option<PhaseFinding> {
+    if liveness(facts.monitor_pid, facts.monitor_alive, facts.agent_alive) != Liveness::Stuck {
+        return None;
+    }
+    let pid = facts.monitor_pid?;
+    Some(PhaseFinding {
+        phase: facts.phase,
+        severity: Severity::Problem,
+        detail: format!(
+            "phase {}: monitor pid {pid} recorded but not running at stage {}",
+            facts.phase, facts.stage
+        ),
+        repair: Some(format!("devflow resume --phase {}", facts.phase)),
+    })
+}
+
+/// The last `stage_launched` event named a different stage than
+/// `state.stage`. A `Warn`, not a `Problem` — a healthy pipeline legitimately
+/// has one stage in flight between the launch event and the next
+/// transition; exact equality is agreement, never an off-by-one mismatch.
+fn check_stage_event_drift(facts: &PhaseFacts) -> Option<PhaseFinding> {
+    let launched = facts.last_launched_stage?;
+    if launched == facts.stage {
+        return None;
+    }
+    Some(PhaseFinding {
+        phase: facts.phase,
+        severity: Severity::Warn,
+        detail: format!(
+            "phase {}: last stage_launched event named {launched} but state.stage is {}",
+            facts.phase, facts.stage
+        ),
+        repair: None,
+    })
+}
+
+/// The phase's feature branch does not exist even though its stage is past
+/// `Define`. A `Warn` — a not-yet-pushed or manually deleted branch is
+/// recoverable without state surgery.
+fn check_missing_branch(facts: &PhaseFacts) -> Option<PhaseFinding> {
+    if facts.feature_branch_exists || facts.stage == Stage::Define {
+        return None;
+    }
+    Some(PhaseFinding {
+        phase: facts.phase,
+        severity: Severity::Warn,
+        detail: format!(
+            "phase {}: feature/phase-{:02} does not exist but stage is {}",
+            facts.phase, facts.phase, facts.stage
+        ),
+        repair: None,
+    })
+}
+
+/// Pure reconciliation core: diffs `state.stage` against the latest event,
+/// live agent pid, open gates, and branch existence, evaluating checks in a
+/// fixed order so the returned findings never depend on how `facts` was
+/// assembled (ordering edge). Takes no path, performs no I/O, and mutates
+/// nothing (T-18-02) — directly unit-testable without a repository.
+fn reconcile_phase(facts: &PhaseFacts) -> Vec<PhaseFinding> {
+    [
+        check_gate_pending_without_gate(facts),
+        check_orphan_gate(facts),
+        check_dead_agent(facts),
+        check_dead_monitor(facts),
+        check_stage_event_drift(facts),
+        check_missing_branch(facts),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// Gather the read-only facts `reconcile_phase` needs for every active
+/// phase, sorted by phase ascending so output ordering never depends on
+/// directory-read order (ordering edge). Every call here is a read-only
+/// primitive already used elsewhere (`status`, `recover::inspect_all`) —
+/// none of it is reimplemented.
+fn collect_phase_facts(project_root: &Path) -> Vec<PhaseFacts> {
+    let states = workflow::list_states(project_root);
+    // 14-CR-10: one pass over events.jsonl for every phase's last event,
+    // matching status()'s optimization, not a per-phase rescan.
+    let mut last_events = events::last_events_by_phase(project_root);
+    let open_gates = Gates::list_open(project_root);
+
+    let mut facts: Vec<PhaseFacts> = states
+        .into_iter()
+        .map(|state| build_phase_facts(project_root, state, &mut last_events, &open_gates))
+        .collect();
+
+    facts.sort_by_key(|f| f.phase);
+    facts
+}
+
+/// Build one phase's [`PhaseFacts`] from already-fetched state, events, and
+/// gates — the per-phase half of `collect_phase_facts`, split out to keep
+/// that function short.
+fn build_phase_facts(
+    project_root: &Path,
+    state: State,
+    last_events: &mut std::collections::HashMap<u32, serde_json::Value>,
+    open_gates: &[OpenGate],
+) -> PhaseFacts {
+    let phase = state.phase;
+    let agent_pid = agent_pid_from_file(project_root, phase);
+    let agent_alive = agent_pid.is_some_and(agent::agent_running);
+    let monitor_pid = state.monitor_pid;
+    let monitor_alive = monitor_pid.is_some_and(agent::agent_running);
+    let last_event = last_events.remove(&phase);
+    let last_launched_stage = last_event.as_ref().and_then(last_launched_stage_from_event);
+    let last_event_name = last_event
+        .as_ref()
+        .and_then(|e| e.get("event"))
+        .and_then(|e| e.as_str())
+        .map(str::to_string);
+    let open_gate_stages = open_gates
+        .iter()
+        .filter(|g| g.phase == phase)
+        .map(|g| g.stage)
+        .collect();
+    let branch_ref = format!("refs/heads/feature/phase-{phase:02}");
+    let feature_branch_exists =
+        run_git_stdout(project_root, &["rev-parse", "--verify", &branch_ref]).is_some();
+
+    PhaseFacts {
+        phase,
+        stage: state.stage,
+        gate_pending: state.gate_pending,
+        agent_pid,
+        agent_alive,
+        monitor_pid,
+        monitor_alive,
+        last_event: last_event_name,
+        last_launched_stage,
+        open_gate_stages,
+        feature_branch_exists,
+    }
+}
+
+/// Derive the stage named by an event's `stage` field, but only when the
+/// event's `event` field is `"stage_launched"` — any other event kind (or
+/// an unparsable stage name) yields `None`, never a panic.
+fn last_launched_stage_from_event(event: &serde_json::Value) -> Option<Stage> {
+    if event.get("event").and_then(|e| e.as_str()) != Some("stage_launched") {
+        return None;
+    }
+    event
+        .get("stage")
+        .and_then(|s| s.as_str())
+        .and_then(|s| s.parse::<Stage>().ok())
+}
+
+/// The findings to display for one phase: real findings when any exist,
+/// otherwise a single synthetic `ok` finding — the display-only counterpart
+/// to `reconcile_phase`'s "zero findings" agreement case, shared by both
+/// the text and `--json` renderers.
+fn findings_for_display(facts: &PhaseFacts) -> Vec<PhaseFinding> {
+    let findings = reconcile_phase(facts);
+    if !findings.is_empty() {
+        return findings;
+    }
+    vec![PhaseFinding {
+        phase: facts.phase,
+        severity: Severity::Ok,
+        detail: format!("phase {}: ok", facts.phase),
+        repair: None,
+    }]
+}
+
+/// Build `doctor`'s per-phase reconciliation section (after the existing
+/// tool/env checks), read-only: it never calls `workflow::save_state`,
+/// `events::emit`, `Gates::cleanup`/`Gates::write`, or any `recover::clean*`
+/// function (T-18-02). A pure string builder (not a direct `println!`) so
+/// it's directly assertable in tests without capturing process stdout.
+fn render_reconciliation_text(facts: &[PhaseFacts]) -> String {
+    let mut out = String::from("\nreconciliation:\n");
+    if facts.is_empty() {
+        out.push_str("  no active phases — nothing to reconcile\n");
+        return out;
+    }
+    for phase_facts in facts {
+        for finding in findings_for_display(phase_facts) {
+            out.push_str(&format!("  {}\n", finding.detail));
+            if let Some(repair) = &finding.repair {
+                out.push_str(&format!("    repair: {repair}\n"));
+            }
+        }
+    }
+    out
+}
+
+/// Build the `--json` reconciliation array as a `serde_json::Value` (WR-01,
+/// 18-fix). No longer prints its own top-level `[...]` document — `doctor()`
+/// nests this under `"reconciliation"` in the single object
+/// `doctor_json_body` composes alongside `checks_json_value`'s
+/// `"environment"` array.
+fn render_reconciliation_json(facts: &[PhaseFacts]) -> serde_json::Value {
+    // Pair each finding with its originating phase's last recorded event, so
+    // a `--json` consumer gets that context without re-reading events.jsonl.
+    let findings: Vec<(&PhaseFacts, PhaseFinding)> = facts
+        .iter()
+        .flat_map(|pf| findings_for_display(pf).into_iter().map(move |f| (pf, f)))
+        .collect();
+    serde_json::Value::Array(
+        findings
+            .iter()
+            .map(|(phase_facts, finding)| {
+                serde_json::json!({
+                    "phase": finding.phase,
+                    "severity": finding.severity.label(),
+                    "detail": finding.detail,
+                    "repair": finding.repair,
+                    "last_event": phase_facts.last_event,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Build `doctor --json`'s `"environment"` array from the pre-existing
+/// tool/env checks (WR-01, 18-fix). Extracted so it can be composed with
+/// `render_reconciliation_json`'s array into ONE JSON document instead of
+/// being printed as its own top-level array.
+fn checks_json_value(checks: &[Check]) -> serde_json::Value {
+    serde_json::Value::Array(
+        checks
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "name": c.name,
+                    "status": c.status,
+                    "version": c.version,
+                    "install_hint": c.install_hint,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Compose `doctor --json`'s single JSON document (WR-01, 18-fix). Pre-fix,
+/// `doctor()` printed the tool checks as one top-level `[...]` array and
+/// then printed `render_reconciliation_json`'s array as a SECOND,
+/// independent top-level array right after it — invalid single-document
+/// JSON for any parser that isn't NDJSON-aware (`json.load` raised "Extra
+/// data" against a live fixture with one active phase). There is now
+/// exactly one top-level value: `{"environment": [...], "reconciliation":
+/// [...]}`.
+fn doctor_json_body(checks: &[Check], facts: &[PhaseFacts]) -> serde_json::Value {
+    serde_json::json!({
+        "environment": checks_json_value(checks),
+        "reconciliation": render_reconciliation_json(facts),
+    })
 }
 
 #[cfg(test)]
@@ -3721,6 +4431,158 @@ mod tests {
     fn default_logs_phase_errors_with_nothing_to_show() {
         let dir = tempfile::tempdir().unwrap();
         assert!(default_logs_phase(dir.path()).is_err());
+    }
+
+    /// 18b: a state with no recorded monitor is never reported as stuck,
+    /// regardless of the (unreliable, since no monitor was ever recorded)
+    /// liveness bits passed alongside it.
+    #[test]
+    fn liveness_unknown_when_no_monitor_recorded() {
+        assert_eq!(liveness(None, false, false), Liveness::Unknown);
+        assert_eq!(liveness(None, false, true), Liveness::Unknown);
+        assert_eq!(liveness(None, true, false), Liveness::Unknown);
+        assert_eq!(liveness(None, true, true), Liveness::Unknown);
+    }
+
+    /// 18b: the full four-row matrix for a recorded monitor pid. A dead
+    /// agent with a dead monitor OR a live monitor with a dead agent are
+    /// different states — only the former is `Stuck` (nothing will call
+    /// `devflow advance`); the latter is a normal between-stages moment. An
+    /// agent that outlived its monitor is also `Stuck` — orphaned, since
+    /// nothing will advance it when it exits either.
+    #[test]
+    fn liveness_matrix_covers_all_four_rows() {
+        let pid = Some(4242);
+        assert_eq!(liveness(pid, true, true), Liveness::Healthy);
+        assert_eq!(liveness(pid, true, false), Liveness::BetweenStages);
+        assert_eq!(liveness(pid, false, false), Liveness::Stuck);
+        assert_eq!(liveness(pid, false, true), Liveness::Stuck);
+    }
+
+    /// 18b: a corrupt pid (0, or above `i32::MAX`) must never read as alive
+    /// — `liveness` relies entirely on `agent::agent_running`'s existing
+    /// hardening (no second probe is written), so it can only ever produce
+    /// `Stuck` or `Unknown` for a corrupt pid, never a false `Healthy`.
+    #[test]
+    fn liveness_treats_zero_and_overflow_pids_as_dead() {
+        assert!(!agent::agent_running(0));
+        assert!(!agent::agent_running(u32::MAX));
+    }
+
+    /// 18b: persisting `monitor_pid` for one phase must not disturb a
+    /// concurrently-active sibling phase's `monitor_pid` (concurrency edge).
+    #[test]
+    fn monitor_pid_persisted_for_one_phase_does_not_disturb_a_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let mut phase7 = State::new(7, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        phase7.monitor_pid = Some(111);
+        workflow::save_state(&phase7).unwrap();
+
+        let mut phase8 = State::new(8, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        phase8.monitor_pid = Some(222);
+        workflow::save_state(&phase8).unwrap();
+
+        let reloaded7 = workflow::load_state(root, 7).unwrap();
+        let reloaded8 = workflow::load_state(root, 8).unwrap();
+        assert_eq!(reloaded7.monitor_pid, Some(111));
+        assert_eq!(reloaded8.monitor_pid, Some(222));
+    }
+
+    /// 18b: after `launch_stage` spawns a monitor, the persisted state file
+    /// for that phase carries the monitor's pid — `transition()` saves state
+    /// BEFORE calling `launch_stage`, so the pid must be saved again inside
+    /// `launch_stage` or it is lost.
+    #[test]
+    fn launch_stage_persists_monitor_pid_for_reload() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 65;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        workflow::save_state(&state).unwrap();
+
+        let stub_dir = stub_agent_binary("claude");
+        let original_path = std::env::var_os("PATH");
+        let stubbed_path = prepend_path(&stub_dir, &original_path);
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", &stubbed_path);
+        }
+
+        let result = launch_stage(&mut state, None, None);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        result.unwrap();
+
+        assert!(
+            state.monitor_pid.is_some(),
+            "launch_stage must record the monitor pid on the in-memory state"
+        );
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert_eq!(
+            reloaded.monitor_pid, state.monitor_pid,
+            "the monitor pid recorded by launch_stage must be persisted to disk, \
+             since transition() saves state before launch_stage runs"
+        );
+    }
+
+    /// 18b (idempotency edge): running `devflow status` twice must produce
+    /// byte-identical `.devflow/` state — the new monitor liveness probe is
+    /// purely a read, same as the existing agent liveness probe it sits
+    /// beside. Also exercises the `u32::MAX` boundary pid (precision edge,
+    /// via `agent::agent_running`'s existing hardening) so the probe can
+    /// only ever report `Stuck`, never a false `Healthy`.
+    #[test]
+    fn status_reading_monitor_liveness_writes_no_state_and_no_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 66;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.monitor_pid = Some(u32::MAX);
+        workflow::save_state(&state).unwrap();
+
+        let state_path = workflow::state_path(root, phase);
+        let before_len = std::fs::metadata(&state_path).unwrap().len();
+        let before_modified = std::fs::metadata(&state_path).unwrap().modified().unwrap();
+        let events_log = events::events_path(root);
+        let before_lines = std::fs::read_to_string(&events_log)
+            .unwrap_or_default()
+            .lines()
+            .count();
+
+        status(root).unwrap();
+        status(root).unwrap();
+
+        let after_len = std::fs::metadata(&state_path).unwrap().len();
+        let after_modified = std::fs::metadata(&state_path).unwrap().modified().unwrap();
+        let after_lines = std::fs::read_to_string(&events_log)
+            .unwrap_or_default()
+            .lines()
+            .count();
+
+        assert_eq!(
+            before_len, after_len,
+            "status must not rewrite the state file"
+        );
+        assert_eq!(
+            before_modified, after_modified,
+            "status must not touch the state file's mtime"
+        );
+        assert_eq!(
+            before_lines, after_lines,
+            "status must not append to events.jsonl"
+        );
     }
 
     /// 15a: `devflow gate approve` resolves the stage automatically when a
@@ -4145,7 +5007,7 @@ mod tests {
         )
         .unwrap();
 
-        handle_validate_outcome(root, &mut state, false).unwrap();
+        handle_validate_outcome(root, &mut state, ValidateOutcome::Failed).unwrap();
 
         assert_eq!(state.consecutive_failures, mode::MAX_CONSECUTIVE_FAILURES);
         // CR-01: the forced gate's request file (along with its response and
@@ -4314,7 +5176,7 @@ mod tests {
         )
         .unwrap();
 
-        handle_validate_outcome(root, &mut state, false).unwrap();
+        handle_validate_outcome(root, &mut state, ValidateOutcome::Failed).unwrap();
 
         // The gate, response, and ack files for the stage the gate fired on
         // (Validate) must all be gone after the Abort path runs.
@@ -4338,6 +5200,151 @@ mod tests {
             "poll_response must not instantly resolve from a stale response after cleanup"
         );
         assert!(started.elapsed() >= std::time::Duration::from_secs(1));
+    }
+
+    /// D-18e's "two independent signals agreeing" arm: a probe pass plus an
+    /// explicit `verdict: pass` classify as `ValidateOutcome::Passed` and
+    /// drive straight through to Ship — no forced gate (Auto mode,
+    /// `consecutive_failures == 0`), no counter touched. PATH is
+    /// neutralized under `ENV_MUTEX` (matching
+    /// `consecutive_failures_reaches_ceiling_across_cycles`) so
+    /// `transition`'s own `launch_stage` call cannot spawn a real agent CLI;
+    /// its resulting `Err` (agent binary not found) is discarded, since
+    /// `transition` mutates `state.stage` to `Ship` before that call and the
+    /// mutation survives regardless of the launch outcome.
+    #[test]
+    fn external_verify_agreement_advances_to_ship() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 90;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        workflow::save_state(&state).unwrap();
+
+        let result = agent_result::AgentResult {
+            status: AgentStatus::Success,
+            exit_code: None,
+            reason: None,
+            commits: None,
+            summary: None,
+            verdict: Some(Verdict::Pass),
+            decided_by_layer: Some(0),
+        };
+        let outcome = classify_validate_outcome(&result);
+        assert_eq!(outcome, ValidateOutcome::Passed);
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        let _ = handle_validate_outcome(root, &mut state, outcome);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        assert_eq!(state.stage, Stage::Ship);
+        assert_eq!(
+            state.consecutive_failures, 0,
+            "an agreeing outcome must never touch the failure counter"
+        );
+    }
+
+    /// D-18e's disagreement arm: the probe passes but the agent reports
+    /// `verdict: gaps`. Must classify `Ambiguous` and gate IMMEDIATELY on
+    /// the FIRST cycle — never touching `consecutive_failures` — which is
+    /// what distinguishes this from `Failed`'s counter-based delayed gate
+    /// and is the precise thing the binding operator decision (D-18e,
+    /// T-18-19) requires. Resolved via an Abort response so no agent is
+    /// ever launched.
+    #[test]
+    fn external_verify_disagreement_gates_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 91;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        workflow::save_state(&state).unwrap();
+
+        let result = agent_result::AgentResult {
+            status: AgentStatus::Success,
+            exit_code: None,
+            reason: None,
+            commits: None,
+            summary: None,
+            verdict: Some(Verdict::Gaps),
+            decided_by_layer: Some(0),
+        };
+        let outcome = classify_validate_outcome(&result);
+        assert!(matches!(outcome, ValidateOutcome::Ambiguous(_)));
+
+        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        handle_validate_outcome(root, &mut state, outcome).unwrap();
+
+        assert_eq!(
+            state.consecutive_failures, 0,
+            "an ambiguous outcome must gate on cycle one without touching the counter"
+        );
+        assert!(
+            !Gates::gate_path(root, phase, Stage::Validate).exists(),
+            "the immediate gate must resolve (and clean up) via the same abort path as any other gate"
+        );
+    }
+
+    /// D-18e's ambiguous arm: the probe passes but NO agent verdict arrived
+    /// at all. Same immediate-gate contract as the disagreement case above
+    /// — `consecutive_failures` must stay 0.
+    #[test]
+    fn external_verify_no_verdict_gates_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 92;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        workflow::save_state(&state).unwrap();
+
+        let result = agent_result::AgentResult {
+            status: AgentStatus::Success,
+            exit_code: None,
+            reason: None,
+            commits: None,
+            summary: None,
+            verdict: None,
+            decided_by_layer: Some(0),
+        };
+        let outcome = classify_validate_outcome(&result);
+        assert!(matches!(outcome, ValidateOutcome::Ambiguous(_)));
+
+        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        handle_validate_outcome(root, &mut state, outcome).unwrap();
+
+        assert_eq!(
+            state.consecutive_failures, 0,
+            "an ambiguous outcome must gate on cycle one without touching the counter"
+        );
     }
 
     /// D-01/D-06 regression: a Code-stage `Unknown` outcome (Layer 3's
@@ -4585,6 +5592,370 @@ mod tests {
         handle_infra_outcome(root, &mut state, Stage::Validate, Some("killed".into())).unwrap();
 
         assert_eq!(state.infra_failures, 1);
+    }
+
+    /// WR-04 (18-fix): an early failure in `launch_stage_inner` — before
+    /// `monitor::spawn_monitor` ever runs — must not leave a stale
+    /// `monitor_pid` behind. Pre-fix, `state.monitor_pid` still named the
+    /// PREVIOUS stage's (now-dead) monitor after `ensure_agent_binary`
+    /// returned early via `?`, and `liveness()`/`doctor` then misreported
+    /// `Stuck → devflow resume` — the wrong remedy for what's actually an
+    /// agent-binary/staleness failure. PATH is neutralized to a `git`-only
+    /// directory under `ENV_MUTEX`, mirroring `transition_resets_infra_failures`,
+    /// so `ensure_agent_binary("claude")` reliably fails without touching a
+    /// real agent CLI and without racing other PATH-mutating tests.
+    #[test]
+    fn launch_stage_inner_clears_monitor_pid_on_early_failure() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 93;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        // A stale pid from a prior stage's now-dead monitor — this is what
+        // must be cleared, not carried forward into the new stage.
+        state.monitor_pid = Some(999_999);
+        workflow::save_state(&state).unwrap();
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        let result = launch_stage_inner(&mut state, None, None);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        assert!(
+            result.is_err(),
+            "ensure_agent_binary must fail against the neutralized, agent-free PATH"
+        );
+        assert_eq!(
+            state.monitor_pid, None,
+            "an early launch failure must clear the stale monitor_pid in-memory, not carry it \
+             forward from the previous stage"
+        );
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert_eq!(
+            reloaded.monitor_pid, None,
+            "the monitor_pid clear must be persisted to state.json, not just in-memory"
+        );
+    }
+
+    /// 18d — the RED-then-GREEN core of the Code↔Validate safety-gate
+    /// reachability fix. Drives `MAX_CONSECUTIVE_FAILURES` real
+    /// fail/Code→Validate cycles via `handle_validate_outcome` (the +1) and
+    /// `transition()` (previously an unconditional reset to 0). Before the
+    /// fix, `consecutive_failures` oscillates 0/1 and never reaches the
+    /// ceiling; after the fix it accumulates and forces the gate.
+    ///
+    /// `state.stage` is forced back to `Stage::Code` before every
+    /// `transition()` call so each loop iteration exercises the exact
+    /// `(Code, Validate)` hop under test, independent of which internal
+    /// branch `handle_validate_outcome` took on that cycle (ordinary
+    /// loop-back vs. the forced gate on the final cycle) — mirrors what
+    /// `prepare_loop_back_to_code` does for real on every retry.
+    ///
+    /// A gate response is re-seeded at the top of every loop iteration (not
+    /// just once before the loop) so it survives `prepare_loop_back_to_code`'s
+    /// `Gates::cleanup(.., Stage::Validate)` — which fires on every ordinary
+    /// loop-back cycle once `state.stage` is `Validate` and would otherwise
+    /// delete a response written only once up front before the final,
+    /// gate-triggering cycle ever gets to read it. With it re-seeded every
+    /// iteration, the forced gate on the final cycle resolves immediately via
+    /// `Gates::poll_response` finding an already-written file, instead of
+    /// waiting out the (default 7-day) gate timeout. PATH is neutralized
+    /// under `ENV_MUTEX` so neither `handle_validate_outcome`'s loop-back nor
+    /// `transition()`'s own `launch_stage` call risk spawning a real agent
+    /// CLI, following `transition_resets_infra_failures`' established
+    /// approach.
+    #[test]
+    fn consecutive_failures_reaches_ceiling_across_cycles() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 81;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        for _ in 0..mode::MAX_CONSECUTIVE_FAILURES {
+            std::fs::write(
+                &response_path,
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap();
+            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+            state.stage = Stage::Code;
+            let _ = transition(root, &mut state, Stage::Validate);
+        }
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        assert_eq!(state.consecutive_failures, mode::MAX_CONSECUTIVE_FAILURES);
+        assert!(
+            state
+                .mode
+                .should_gate(Stage::Validate, state.consecutive_failures),
+            "reaching the ceiling must force the Auto-mode Validate gate"
+        );
+        assert_eq!(
+            state.infra_failures, 0,
+            "infra_failures must still reset unconditionally on the same hop the consecutive reset now skips"
+        );
+    }
+
+    /// Combined 18d+18e scenario (18-RESEARCH.md Pitfall 1) — the only test
+    /// that proves both fixes hold TOGETHER, not each in isolation: 18e's
+    /// Layer-0 discard is what makes an `external_verify` Validate fail for
+    /// the wrong reason, and 18d's counter reset is what made that failure
+    /// loop unbounded — fixing either alone leaves the other's failure mode
+    /// partially masked. Arm A (18e dominates) proves an `Ambiguous` outcome
+    /// gates on the FIRST cycle, never touching `consecutive_failures`. Arm
+    /// B (18d dominates) proves a genuine, non-ambiguous failure still
+    /// reaches `MAX_CONSECUTIVE_FAILURES` and forces the gate — the case
+    /// that, before 18d, ran forever.
+    #[test]
+    fn external_verify_cycles_reach_ceiling_without_unbounded_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Arm A: an Ambiguous outcome gates on cycle one, never touching
+        // consecutive_failures. Arm B: a genuine failure still reaches
+        // MAX_CONSECUTIVE_FAILURES and forces the gate.
+        arm_a_ambiguous_outcome_gates_on_cycle_one(root, 93);
+        arm_b_genuine_failures_reach_the_ceiling(root, 94);
+    }
+
+    /// Arm A (18e dominates): an ambiguous `external_verify` outcome gates
+    /// immediately — no Code↔Validate loop ever starts, so 18d's counter is
+    /// irrelevant here and must stay untouched. Asserting that prevents a
+    /// future refactor from quietly routing ambiguity back through the
+    /// counter-based auto-loop.
+    fn arm_a_ambiguous_outcome_gates_on_cycle_one(root: &Path, phase: u32) {
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        workflow::save_state(&state).unwrap();
+
+        let result = agent_result::AgentResult {
+            status: AgentStatus::Success,
+            exit_code: None,
+            reason: None,
+            commits: None,
+            summary: None,
+            verdict: Some(Verdict::Gaps),
+            decided_by_layer: Some(0),
+        };
+        let outcome = classify_validate_outcome(&result);
+        assert!(matches!(outcome, ValidateOutcome::Ambiguous(_)));
+
+        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        handle_validate_outcome(root, &mut state, outcome).unwrap();
+
+        assert_eq!(
+            state.consecutive_failures, 0,
+            "18e's ambiguous gate must fire on cycle one, never touching 18d's counter"
+        );
+    }
+
+    /// Arm B (18d dominates): a genuine, non-ambiguous `ValidateOutcome::Failed`
+    /// driven through repeated Code↔Validate cycles reaches
+    /// `MAX_CONSECUTIVE_FAILURES` and forces the gate. PATH is neutralized
+    /// under `ENV_MUTEX` (matching `consecutive_failures_reaches_ceiling_across_cycles`)
+    /// so neither `handle_validate_outcome`'s loop-back nor `transition`'s
+    /// own `launch_stage` risk spawning a real agent CLI.
+    fn arm_b_genuine_failures_reach_the_ceiling(root: &Path, phase: u32) {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        for _ in 0..mode::MAX_CONSECUTIVE_FAILURES {
+            std::fs::write(
+                &response_path,
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap();
+            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+            state.stage = Stage::Code;
+            let _ = transition(root, &mut state, Stage::Validate);
+        }
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        assert_eq!(state.consecutive_failures, mode::MAX_CONSECUTIVE_FAILURES);
+        assert!(
+            state
+                .mode
+                .should_gate(Stage::Validate, state.consecutive_failures),
+            "a genuine repeated failure must still reach the reachable ceiling (18d)"
+        );
+    }
+
+    /// 18d precision edge: `consecutive_failures` must saturate at `u32::MAX`
+    /// rather than wrap to 0 on overflow, so a long-running stuck loop can't
+    /// silently restore the unreachable-ceiling bug in a slower, harder-to-
+    /// diagnose form. At `u32::MAX`, `should_gate` is already true, so the
+    /// failure resolves via the forced-gate path — pre-seed a response so
+    /// `run_gate`'s poll doesn't wait out the timeout.
+    #[test]
+    fn consecutive_failures_increment_saturates() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 82;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        state.consecutive_failures = u32::MAX;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        handle_validate_outcome(root, &mut state, ValidateOutcome::Failed).unwrap();
+
+        assert_eq!(state.consecutive_failures, u32::MAX);
+    }
+
+    /// 18d idempotency edge: a repeated Code→Validate transition leaves
+    /// `consecutive_failures` unchanged rather than zeroing it. `state.stage`
+    /// is reset to `Code` before each call so both calls exercise the exact
+    /// hop under test.
+    #[test]
+    fn repeated_code_to_validate_transition_is_idempotent_on_the_counter() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 83;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        state.consecutive_failures = 2;
+        workflow::save_state(&state).unwrap();
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        let _ = transition(root, &mut state, Stage::Validate);
+        state.stage = Stage::Code;
+        let _ = transition(root, &mut state, Stage::Validate);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        assert_eq!(state.consecutive_failures, 2);
+    }
+
+    /// 18d concurrency edge: two concurrently-active phases' `consecutive_failures`
+    /// counters are independent — a Code→Validate hop on one phase must not
+    /// reset a sibling phase's counter.
+    #[test]
+    fn consecutive_failures_are_independent_across_phases() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let mut state_a = State::new(84, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state_a.stage = Stage::Code;
+        state_a.consecutive_failures = 1;
+        workflow::save_state(&state_a).unwrap();
+
+        let mut state_b = State::new(85, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state_b.stage = Stage::Code;
+        state_b.consecutive_failures = 2;
+        workflow::save_state(&state_b).unwrap();
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        let _ = transition(root, &mut state_a, Stage::Validate);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        let reloaded_a = workflow::load_state(root, 84).unwrap();
+        let reloaded_b = workflow::load_state(root, 85).unwrap();
+
+        assert_eq!(
+            reloaded_a.consecutive_failures, 1,
+            "the Code->Validate hop must not reset consecutive_failures"
+        );
+        assert_eq!(
+            reloaded_b.consecutive_failures, 2,
+            "an untouched sibling phase's counter must be unaffected"
+        );
     }
 
     /// D-09: a primary-loop `RateLimited` outcome writes the single-agent
@@ -4913,27 +6284,6 @@ mod tests {
     /// through the same gate+abort path as a generic-check failure.
     #[test]
     fn run_preflight_adapter_hook_override_fires() {
-        struct AlwaysRejectAdapter;
-        impl agents::AgentAdapter for AlwaysRejectAdapter {
-            fn name(&self) -> &'static str {
-                "test-reject"
-            }
-            fn exec_command(
-                &self,
-                _phase: u32,
-                _prompt: &str,
-                _roots: &[PathBuf],
-            ) -> (&'static str, Vec<String>) {
-                ("true", Vec::new())
-            }
-            fn completion_signal_detected(&self, _output: &str) -> bool {
-                false
-            }
-            fn preflight(&self, _state: &State) -> Result<(), String> {
-                Err("test adapter always rejects".to_string())
-            }
-        }
-
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
@@ -4952,7 +6302,7 @@ mod tests {
         )
         .unwrap();
 
-        let should_continue = run_preflight(root, &mut state, &AlwaysRejectAdapter).unwrap();
+        let should_continue = run_preflight(root, &mut state, &AlwaysFailAdapter).unwrap();
 
         assert!(
             !should_continue,
@@ -4963,13 +6313,50 @@ mod tests {
         assert_eq!(last["event"], "workflow_aborted");
     }
 
+    /// TEST-ONLY adapter (module-scope so any test can reach it — hoisted
+    /// from a test-function-local `AlwaysRejectAdapter`, 18f Task 1) whose
+    /// `preflight` fails unconditionally, with no interior mutability. Two
+    /// module-scope fixtures that both mean "always fails preflight" would
+    /// drift, so this is the single one; `run_preflight_adapter_hook_override_fires`
+    /// (above) and 18f's new wedge-reproduction tests (below) both use it.
+    ///
+    /// `FailOnceAdapter`, just below, explicitly documents that an
+    /// unconditionally-failing adapter would recurse into a second gate no
+    /// pre-18f test seeds a response for (CR-01, 17-08). That is no longer
+    /// true here: 18f's persisted `preflight_retries` ceiling
+    /// (`mode::MAX_PREFLIGHT_RETRIES`) bounds the recursion regardless, so
+    /// an unconditionally-failing preflight now terminates in a logged
+    /// `abort` instead of blocking forever on a second gate's
+    /// `poll_response`.
+    struct AlwaysFailAdapter;
+
+    impl agents::AgentAdapter for AlwaysFailAdapter {
+        fn name(&self) -> &'static str {
+            "test-always-fail"
+        }
+        fn exec_command(
+            &self,
+            _phase: u32,
+            _prompt: &str,
+            _roots: &[PathBuf],
+        ) -> (&'static str, Vec<String>) {
+            ("true", Vec::new())
+        }
+        fn completion_signal_detected(&self, _output: &str) -> bool {
+            false
+        }
+        fn preflight(&self, _state: &State) -> Result<(), String> {
+            Err("test adapter always rejects".to_string())
+        }
+    }
+
     // -----------------------------------------------------------------
     // 17-08 gap closure (CR-01): run_preflight's Advance/LoopBack arms must
     // not spawn the agent twice.
     // -----------------------------------------------------------------
 
     /// TEST-ONLY adapter whose `preflight` fails on the first call only —
-    /// modeled on `AlwaysRejectAdapter` above, but with a `Cell<bool>` flag
+    /// modeled on `AlwaysFailAdapter` above, but with a `Cell<bool>` flag
     /// so any SECOND call through this specific adapter reference would
     /// pass. An adapter that fails unconditionally would make a recursive
     /// `launch_stage` retry fail its OWN preflight check too, recursing into
@@ -5041,6 +6428,38 @@ mod tests {
             .expect("git must be resolvable on PATH to run this test");
         let dir = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(&real_git, dir.path().join("git")).unwrap();
+        dir
+    }
+
+    /// [`agent_free_git_only_path_dir`], extended with a real `sh` symlink
+    /// (needed by `monitor::spawn_monitor`'s backgrounding script) and a
+    /// harmless no-op stub for `program` (needed by `ensure_agent_binary`),
+    /// so a preflight-resolved relaunch through `launch_stage`/
+    /// `launch_stage_inner` can run to completion under a REPLACED PATH
+    /// instead of merely failing at `ensure_agent_binary`. 18f's
+    /// wedge-reproduction tests need the relaunch to actually happen (to
+    /// prove the fix), not merely to error out before reaching it —
+    /// `program` is always the STUBBED binary, never the real
+    /// `claude`/`codex`/`opencode` CLI, since PATH still never includes the
+    /// real system directories that hold it (19i's replace-not-prepend
+    /// requirement is preserved).
+    fn agent_free_dir_with_agent_stub(program: &str) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = agent_free_git_only_path_dir();
+        let real_sh = std::env::var_os("PATH")
+            .and_then(|paths| {
+                std::env::split_paths(&paths).find_map(|d| {
+                    let candidate = d.join("sh");
+                    candidate.is_file().then_some(candidate)
+                })
+            })
+            .expect("sh must be resolvable on PATH to run this test");
+        std::os::unix::fs::symlink(&real_sh, dir.path().join("sh")).unwrap();
+        let path = dir.path().join(program);
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
         dir
     }
 
@@ -5211,6 +6630,215 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // 18f (D-18f): approving a preflight gate must not re-run the just-
+    // adjudicated check, LoopBack's re-check must be bounded, and the
+    // bound's reset must persist.
+    //
+    // These three tests deliberately fail via `preflight_interactivity_check`
+    // (Codex + Auto + Define + no CONTEXT.md on develop), NOT via
+    // `AlwaysFailAdapter`'s adapter hook. `AlwaysFailAdapter` is still
+    // passed as the `adapter` argument (defense in depth — it would also
+    // fail were it ever reached), but it structurally CANNOT be what
+    // reproduces the wedge across a relaunch: `launch_stage`'s internal
+    // recursion always re-resolves the REAL production adapter via
+    // `agents::adapter_for(state.agent)`, discarding whatever adapter
+    // reference was passed into the OUTER `run_preflight` call (confirmed
+    // by `run_preflight_advance_gate_launches_agent_exactly_once`'s own
+    // comment above: "the real Claude adapter's default (Ok) preflight
+    // passes every other check"). The generic checks, by contrast, are a
+    // pure function of `state` alone and so fail IDENTICALLY on every
+    // invocation — exactly the property CONTEXT.md attributes to
+    // `preflight_interactivity_check`/`preflight_gh_auth_check` in its
+    // description of the wedge.
+    // -----------------------------------------------------------------
+
+    /// D-18f: `GateAction::Advance` must skip the just-adjudicated check
+    /// entirely — with the pre-18f code (full `launch_stage` recursion),
+    /// the SAME deterministic `preflight_interactivity_check` failure would
+    /// fire again on the retry, write a SECOND gate nobody answers (only
+    /// one response is ever seeded here), and `run_preflight` would return
+    /// `Err` (a bounded gate-timeout error) instead of `Ok(false)` — that
+    /// bounded `Err` is the RED signal this test would observe pre-fix,
+    /// confirmed manually before restoring the fix. `DEVFLOW_GATE_TIMEOUT_SECS`
+    /// is bounded under `ENV_MUTEX` so a regression here fails fast instead
+    /// of hanging the suite for 7 days.
+    #[test]
+    fn run_preflight_advance_skips_recheck_on_idempotently_failing_check() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let original_gate_timeout = std::env::var_os("DEVFLOW_GATE_TIMEOUT_SECS");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("DEVFLOW_GATE_TIMEOUT_SECS", "2");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 620;
+        // Codex + Auto + Define + no `.planning/phases/620-*/620-CONTEXT.md`
+        // on `develop` deterministically fails `preflight_interactivity_check`
+        // — see the section doc comment above for why this (not the adapter
+        // hook) is what actually reproduces the wedge across a relaunch.
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Define;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Define);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(&response_path, r#"{"approved":true,"responded_by":"test"}"#).unwrap();
+
+        let agent_dir = agent_free_dir_with_agent_stub("codex");
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", agent_dir.path());
+        }
+
+        let result = run_preflight(root, &mut state, &AlwaysFailAdapter);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+            match &original_gate_timeout {
+                Some(value) => std::env::set_var("DEVFLOW_GATE_TIMEOUT_SECS", value),
+                None => std::env::remove_var("DEVFLOW_GATE_TIMEOUT_SECS"),
+            }
+        }
+
+        assert!(
+            matches!(result, Ok(false)),
+            "Advance on a preflight gate must skip the just-adjudicated \
+             check and return Ok(false), not {result:?}"
+        );
+        assert!(
+            !Gates::gate_path(root, phase, Stage::Define).exists(),
+            "no second gate should ever be written once Advance skips the recheck"
+        );
+        assert_eq!(
+            state.preflight_retries, 0,
+            "a human Advance must reset the retry counter"
+        );
+    }
+
+    /// D-18f backstop: `GateAction::LoopBack` deliberately keeps re-running
+    /// the check (unlike Advance), so the recursion must be bounded
+    /// separately. `state.preflight_retries` starts one below the ceiling —
+    /// exercising the bound via a REAL recursive `run_preflight` call
+    /// (through `launch_stage`) rather than simulating multiple cycles: with
+    /// only ONE gate response ever seeded, and `Gates::poll_response`
+    /// blocking synchronously in this same thread, nothing could seed a
+    /// SECOND response file mid-recursion inside one call stack — deferring
+    /// to the ceiling on the very next cycle instead genuinely exercises
+    /// "one retry short of the ceiling" → "ceiling reached" without a racy
+    /// background writer.
+    #[test]
+    fn run_preflight_loopback_bounds_recursion() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let original_gate_timeout = std::env::var_os("DEVFLOW_GATE_TIMEOUT_SECS");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("DEVFLOW_GATE_TIMEOUT_SECS", "2");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 621;
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Define;
+        state.preflight_retries = mode::MAX_PREFLIGHT_RETRIES - 1;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Define);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"retry","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        let agent_dir = agent_free_dir_with_agent_stub("codex");
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", agent_dir.path());
+        }
+
+        let result = run_preflight(root, &mut state, &AlwaysFailAdapter);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+            match &original_gate_timeout {
+                Some(value) => std::env::set_var("DEVFLOW_GATE_TIMEOUT_SECS", value),
+                None => std::env::remove_var("DEVFLOW_GATE_TIMEOUT_SECS"),
+            }
+        }
+
+        assert!(
+            matches!(result, Ok(false)),
+            "the ceiling must abort cleanly, not error out, got {result:?}"
+        );
+        assert!(
+            workflow::load_state(root, phase).is_err(),
+            "the ceiling must abort() and clear state, not leave it gate_pending forever"
+        );
+        let last = devflow_core::events::last_event_for_phase(root, phase)
+            .expect("a ceiling or abort event must have been recorded");
+        assert!(
+            last["event"] == "preflight_retry_ceiling_reached"
+                || last["event"] == "workflow_aborted",
+            "expected a ceiling or abort event, got {last:?}"
+        );
+    }
+
+    /// D-18f (assumption_delta, Open Question 2): the reset on a passing
+    /// preflight must be PERSISTED, not merely in-memory — the wedge this
+    /// counter bounds spans separate `devflow` invocations (a monitor
+    /// restart reloads state from disk), so an in-memory-only reset would
+    /// not survive one.
+    #[test]
+    fn preflight_retries_reset_on_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let phase = 622;
+        // Plan + Claude bypasses the generic checks and the real Claude
+        // adapter's default preflight passes — the same "unaffected" shape
+        // used by `run_preflight_adapter_hook_override_fires` above.
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Plan;
+        state.preflight_retries = 2;
+        workflow::save_state(&state).unwrap();
+
+        let adapter = agents::adapter_for(AgentKind::Claude);
+        let result = run_preflight(root, &mut state, adapter.as_ref());
+
+        assert!(
+            matches!(result, Ok(true)),
+            "a passing preflight must return Ok(true), got {result:?}"
+        );
+        assert_eq!(
+            state.preflight_retries, 0,
+            "the in-memory counter must reset immediately on a pass"
+        );
+
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert_eq!(
+            reloaded.preflight_retries, 0,
+            "the reset must be persisted to disk, not just held in memory"
+        );
+    }
+
+    // -----------------------------------------------------------------
     // 17d: build provenance + self-dogfood staleness gate (D-17-D-21, Task 2)
     // -----------------------------------------------------------------
 
@@ -5318,6 +6946,211 @@ mod tests {
             is_self_dogfood_workspace(dir.path()),
             "a `default-members` key ahead of `members` must not hide the real \
              member list — that turns the D-18 hard block into a warning"
+        );
+    }
+
+    /// Build a real `git worktree add` fixture for the 18c wrong-tree defect
+    /// (Round 4 CR-01): a `develop` branch with one commit (the "embedded"
+    /// commit, recorded before the worktree diverges) at
+    /// `<tempdir>/project`, and a feature-branch worktree checked out from
+    /// it as a SIBLING directory at `<tempdir>/worktree` — deliberately NOT
+    /// nested under `project`, so a test can assert unambiguously on which
+    /// of the two paths a message names (a nested worktree path would
+    /// contain `project_root`'s path as a string prefix, making "worktree
+    /// path present" and "project_root path absent" mutually exclusive
+    /// assertions). Two further commits are made INSIDE the worktree, each
+    /// touching a `.rs` file (build-affecting), so `project_root`'s HEAD
+    /// never moves and the worktree's HEAD advances two commits past the
+    /// recorded hash. Mirrors
+    /// `worktree::tests::add_creates_worktree_on_new_branch`'s construction
+    /// (`git worktree add -b <branch> <path> <start_point>`) — the closest
+    /// existing precedent for a real worktree fixture.
+    ///
+    /// Returns `(tempdir_guard, worktree_path, embedded_commit)`.
+    /// `project_root` is `tempdir_guard.path().join("project")`. The guard
+    /// must be kept alive for the duration of the test.
+    fn worktree_staleness_fixture() -> (tempfile::TempDir, PathBuf, String) {
+        let outer = tempfile::tempdir().unwrap();
+        let project_root = outer.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let worktree_path = outer.path().join("worktree");
+
+        let git = |args: &[&str], cwd: &Path| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(cwd)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} in {cwd:?} failed"
+            );
+        };
+
+        git(&["init", "-q", "-b", "develop"], &project_root);
+        git(&["config", "user.email", "t@e.st"], &project_root);
+        git(&["config", "user.name", "t"], &project_root);
+        git(&["config", "commit.gpgsign", "false"], &project_root);
+        std::fs::create_dir_all(project_root.join("src")).unwrap();
+        std::fs::write(project_root.join("src/lib.rs"), "// base\n").unwrap();
+        git(&["add", "."], &project_root);
+        git(&["commit", "-q", "-m", "base"], &project_root);
+        let embedded_commit = run_git_stdout(&project_root, &["rev-parse", "HEAD"])
+            .expect("rev-parse HEAD")
+            .trim()
+            .to_string();
+
+        git(
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/phase-90",
+                worktree_path.to_str().unwrap(),
+                "develop",
+            ],
+            &project_root,
+        );
+
+        // Two build-affecting commits, made ONLY inside the worktree —
+        // project_root's HEAD (develop) never moves. This asymmetry (Fresh
+        // against project_root, Stale against the worktree) is exactly the
+        // Round 4 CR-01 mechanism.
+        std::fs::write(worktree_path.join("src/lib.rs"), "// wt commit 1\n").unwrap();
+        git(&["add", "."], &worktree_path);
+        git(&["commit", "-q", "-m", "wt commit 1"], &worktree_path);
+        std::fs::write(worktree_path.join("src/lib.rs"), "// wt commit 2\n").unwrap();
+        git(&["add", "."], &worktree_path);
+        git(&["commit", "-q", "-m", "wt commit 2"], &worktree_path);
+
+        (outer, worktree_path, embedded_commit)
+    }
+
+    /// 18c (Round 4 CR-01 root cause): the SAME embedded commit is
+    /// simultaneously `Fresh` against `project_root` and `Stale` against the
+    /// worktree HEAD. Evaluating a worktree-based phase against
+    /// `project_root` alone is exactly the bug — a binary two commits behind
+    /// the worktree branch reads as if it were built from the current
+    /// source. Both halves are asserted in one test: a single assertion
+    /// would pass for the wrong reason if the fixture were built
+    /// incorrectly.
+    ///
+    /// This test is already GREEN pre-fix — both calls are already
+    /// parameterized by a root, so this proves the fixture is correct, not
+    /// that the defect is fixed. The RED proof of the actual defect (the
+    /// real entry point, `enforce_build_staleness`, evaluated against the
+    /// wrong root) lives in
+    /// `enforce_build_staleness_blocks_self_dogfood_behind_worktree_head`.
+    ///
+    /// (18-fix) `worktree_staleness_fixture` spawns real `git` subprocesses
+    /// unguarded — under concurrent load this raced this file's
+    /// PATH-mutating tests (the same `ENV_MUTEX`/19i flake class as
+    /// `transition_resets_infra_failures`), reproduced at roughly 1-in-8 to
+    /// 1-in-10. Guarded under `ENV_MUTEX` so it never runs concurrently with
+    /// a PATH mutator, mirroring the established pattern rather than
+    /// inventing a new one.
+    #[test]
+    fn embedded_commit_is_stale_uses_worktree_head() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let (outer, worktree_path, embedded_commit) = worktree_staleness_fixture();
+        let project_root = outer.path().join("project");
+
+        assert_eq!(
+            embedded_commit_is_stale(&project_root, &embedded_commit),
+            Staleness::Fresh,
+            "project_root's HEAD never moved, so the embedded commit is still an exact match"
+        );
+        assert_eq!(
+            embedded_commit_is_stale(&worktree_path, &embedded_commit),
+            Staleness::Stale,
+            "the worktree branch advanced two commits past the embedded commit — Round 4 \
+             CR-01's mechanism: evaluated against the wrong tree, this same commit reads Fresh"
+        );
+    }
+
+    /// 18c GREEN: `enforce_build_staleness` now evaluates ancestry against
+    /// the worktree HEAD (via `execution_root`) rather than `project_root`,
+    /// so a self-dogfood binary behind the worktree branch is a hard
+    /// BLOCK — closing Round 4 CR-01, where the identical scenario
+    /// evaluated against `project_root` alone classified `Ahead` (warn
+    /// only) because the embedded commit was still a descendant of
+    /// `develop`.
+    ///
+    /// (18-fix) Guarded under `ENV_MUTEX`, same rationale as
+    /// `embedded_commit_is_stale_uses_worktree_head` — this test also drives
+    /// `worktree_staleness_fixture`'s unguarded real `git` subprocesses.
+    #[test]
+    fn enforce_build_staleness_blocks_self_dogfood_behind_worktree_head() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let (outer, worktree_path, embedded_commit) = worktree_staleness_fixture();
+        let project_root = outer.path().join("project");
+        std::fs::write(
+            project_root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/devflow-core\", \"crates/devflow-cli\"]\n",
+        )
+        .unwrap();
+        assert!(is_self_dogfood_workspace(&project_root));
+
+        let phase = 90;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, project_root.clone());
+        state.stage = Stage::Code;
+        state.worktree_path = Some(worktree_path.clone());
+
+        let err =
+            enforce_build_staleness(&project_root, &state, &embedded_commit, false).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains(&worktree_path.display().to_string()),
+            "block message must name the worktree that was actually evaluated: {message}"
+        );
+        assert!(
+            !message.contains(&project_root.display().to_string()),
+            "block message must not name project_root when a worktree was evaluated: {message}"
+        );
+
+        // WR-02 (18-fix): the persisted event's `worktree` flag mirrors
+        // `state.worktree_path.is_some()`, path-free.
+        let last = devflow_core::events::last_event_for_phase(&project_root, phase)
+            .expect("staleness block must record an event before returning the error");
+        assert_eq!(last["reason"], "stale_build_blocked");
+        assert_eq!(last["worktree"], true);
+    }
+
+    /// 18c (T-18-26): the SAME fixture with `worktree_path: None` must fall
+    /// back to `project_root` and produce `Ok` — proving the
+    /// `unwrap_or(project_root)` fallback preserves existing behavior for
+    /// non-worktree phases and that this fix cannot start blocking them.
+    ///
+    /// (18-fix) Guarded under `ENV_MUTEX`, same rationale as
+    /// `embedded_commit_is_stale_uses_worktree_head` — this test also drives
+    /// `worktree_staleness_fixture`'s unguarded real `git` subprocesses.
+    #[test]
+    fn staleness_without_worktree_is_unchanged() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let (outer, _worktree_path, embedded_commit) = worktree_staleness_fixture();
+        let project_root = outer.path().join("project");
+        std::fs::write(
+            project_root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/devflow-core\", \"crates/devflow-cli\"]\n",
+        )
+        .unwrap();
+
+        let phase = 91;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, project_root.clone());
+        state.stage = Stage::Code;
+        assert!(
+            state.worktree_path.is_none(),
+            "fixture precondition: no worktree recorded on this state"
+        );
+
+        assert!(
+            enforce_build_staleness(&project_root, &state, &embedded_commit, false).is_ok(),
+            "no worktree recorded must fall back to project_root, which the fixture never \
+             advances past embedded_commit"
         );
     }
 
@@ -5897,14 +7730,29 @@ mod tests {
         state.stage = Stage::Code;
 
         let err = enforce_build_staleness(root, &state, &side, false).unwrap_err();
+        let message = err.to_string();
         assert!(
-            err.to_string().contains("self-dogfood stale build blocked"),
-            "{err}"
+            message.contains("self-dogfood stale build blocked"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&root.display().to_string()),
+            "the returned CliError (terminal-only) must still name the path: {message}"
         );
 
         let last = devflow_core::events::last_event_for_phase(root, phase)
             .expect("staleness block must record an event before returning the error");
         assert_eq!(last["event"], "self_dogfood_stale_blocked");
+        // WR-02 (18-fix): the persisted event's reason must be a bare,
+        // path-free label — the full path-bearing message is for
+        // fire_gate_notify/the returned Err only, never events.jsonl.
+        assert_eq!(last["reason"], "stale_build_blocked");
+        assert_eq!(last["worktree"], false);
+        let reason_str = last["reason"].as_str().unwrap();
+        assert!(
+            !reason_str.contains(&root.display().to_string()),
+            "persisted reason must never carry the project root path: {reason_str}"
+        );
     }
 
     /// D-18: an ordinary (non-self-dogfood) project with the same confirmed-
@@ -6235,5 +8083,360 @@ mod tests {
             "poll_response must not instantly resolve from a stale response after cleanup"
         );
         assert!(started.elapsed() >= std::time::Duration::from_secs(1));
+    }
+
+    /// Unit tests for the pure `doctor` reconciliation core (18a). Each test
+    /// builds a `PhaseFacts` directly — no repository, no I/O — proving
+    /// `reconcile_phase` is a predicate over facts alone.
+    #[cfg(test)]
+    mod doctor_reconciliation {
+        use super::*;
+
+        /// A fully-agreeing baseline: `reconcile_phase` over this returns
+        /// zero findings. Each test overrides only the field(s) needed to
+        /// trigger the one check it's proving.
+        fn agreeing_facts(phase: u32) -> PhaseFacts {
+            PhaseFacts {
+                phase,
+                stage: Stage::Code,
+                gate_pending: false,
+                agent_pid: Some(4242),
+                agent_alive: true,
+                monitor_pid: Some(4343),
+                monitor_alive: true,
+                last_event: Some("stage_launched".into()),
+                last_launched_stage: Some(Stage::Code),
+                open_gate_stages: Vec::new(),
+                feature_branch_exists: true,
+            }
+        }
+
+        #[test]
+        fn reconcile_phase_returns_no_findings_when_all_agree() {
+            let facts = agreeing_facts(1);
+            assert!(reconcile_phase(&facts).is_empty());
+        }
+
+        #[test]
+        fn reconcile_phase_flags_gate_pending_without_open_gate() {
+            let facts = PhaseFacts {
+                gate_pending: true,
+                open_gate_stages: Vec::new(),
+                ..agreeing_facts(2)
+            };
+            let findings = reconcile_phase(&facts);
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].severity, Severity::Problem);
+            assert!(findings[0].detail.contains("gate_pending is true"));
+            assert_eq!(
+                findings[0].repair.as_deref(),
+                Some("devflow resume --phase 2")
+            );
+        }
+
+        #[test]
+        fn reconcile_phase_flags_orphan_open_gate() {
+            let facts = PhaseFacts {
+                gate_pending: false,
+                open_gate_stages: vec![Stage::Validate],
+                ..agreeing_facts(3)
+            };
+            let findings = reconcile_phase(&facts);
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].severity, Severity::Problem);
+            assert!(findings[0].detail.contains("gate open for stage validate"));
+            assert_eq!(
+                findings[0].repair.as_deref(),
+                Some("devflow gate approve 3 --stage validate")
+            );
+        }
+
+        #[test]
+        fn reconcile_phase_flags_dead_agent_at_agent_stage() {
+            let facts = PhaseFacts {
+                agent_pid: Some(999_999),
+                agent_alive: false,
+                ..agreeing_facts(4)
+            };
+            let findings = reconcile_phase(&facts);
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].severity, Severity::Problem);
+            assert!(findings[0].detail.contains("agent pid 999999"));
+            assert_eq!(
+                findings[0].repair.as_deref(),
+                Some("devflow resume --phase 4")
+            );
+        }
+
+        #[test]
+        fn reconcile_phase_flags_stage_event_drift() {
+            let facts = PhaseFacts {
+                stage: Stage::Validate,
+                last_launched_stage: Some(Stage::Code),
+                ..agreeing_facts(5)
+            };
+            let findings = reconcile_phase(&facts);
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].severity, Severity::Warn);
+            assert!(
+                findings[0]
+                    .detail
+                    .contains("last stage_launched event named code")
+            );
+            assert!(findings[0].repair.is_none());
+        }
+
+        #[test]
+        fn reconcile_phase_flags_missing_feature_branch() {
+            let facts = PhaseFacts {
+                stage: Stage::Plan,
+                last_launched_stage: Some(Stage::Plan),
+                feature_branch_exists: false,
+                ..agreeing_facts(6)
+            };
+            let findings = reconcile_phase(&facts);
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].severity, Severity::Warn);
+            assert!(findings[0].detail.contains("feature/phase-06"));
+            assert!(findings[0].repair.is_none());
+        }
+
+        /// 18b: a dead monitor with a dead agent is `Stuck` — nothing will
+        /// call `devflow advance` for this phase — and reports a `Problem`
+        /// finding with a `devflow resume --phase N` repair.
+        #[test]
+        fn reconcile_reports_stuck_when_monitor_and_agent_are_both_dead() {
+            let facts = PhaseFacts {
+                monitor_pid: Some(5150),
+                monitor_alive: false,
+                agent_pid: Some(4242),
+                agent_alive: false,
+                ..agreeing_facts(8)
+            };
+            let findings = reconcile_phase(&facts);
+            let monitor_finding = findings
+                .iter()
+                .find(|f| f.detail.contains("monitor pid"))
+                .expect("expected a monitor finding when monitor and agent are both dead");
+            assert_eq!(monitor_finding.severity, Severity::Problem);
+            assert!(monitor_finding.detail.contains("monitor pid 5150"));
+            assert_eq!(
+                monitor_finding.repair.as_deref(),
+                Some("devflow resume --phase 8")
+            );
+        }
+
+        /// 18b (T-18-11): an unrecorded monitor is unknown, not a problem —
+        /// a state file written by a pre-18b binary must never render as
+        /// stuck.
+        #[test]
+        fn reconcile_is_silent_when_monitor_pid_is_unrecorded() {
+            let facts = PhaseFacts {
+                monitor_pid: None,
+                monitor_alive: false,
+                ..agreeing_facts(9)
+            };
+            assert!(
+                reconcile_phase(&facts).is_empty(),
+                "an unrecorded monitor must never produce a finding"
+            );
+        }
+
+        /// 18b: a live monitor with a dead agent is a normal between-stages
+        /// moment (the monitor hasn't advanced the phase yet), not a monitor
+        /// finding. `check_dead_agent`'s own pre-existing finding for the
+        /// dead agent pid is unrelated to this check and out of this plan's
+        /// scope.
+        #[test]
+        fn reconcile_is_silent_when_monitor_alive_and_agent_dead() {
+            let facts = PhaseFacts {
+                monitor_pid: Some(5150),
+                monitor_alive: true,
+                agent_alive: false,
+                ..agreeing_facts(10)
+            };
+            let findings = reconcile_phase(&facts);
+            assert!(
+                findings.iter().all(|f| !f.detail.contains("monitor pid")),
+                "a live monitor with a dead agent must not produce a monitor finding"
+            );
+        }
+
+        /// Several checks trigger simultaneously; the returned findings must
+        /// come back in the fixed order `reconcile_phase` evaluates checks
+        /// in, not in whatever order the facts happen to be populated.
+        #[test]
+        fn reconcile_phase_ordering_is_input_order_independent() {
+            let facts = PhaseFacts {
+                gate_pending: true,
+                agent_pid: Some(999_999),
+                agent_alive: false,
+                monitor_pid: Some(999_998),
+                monitor_alive: false,
+                last_launched_stage: Some(Stage::Validate),
+                open_gate_stages: Vec::new(),
+                feature_branch_exists: false,
+                ..agreeing_facts(7)
+            };
+            let findings = reconcile_phase(&facts);
+            let severities: Vec<Severity> = findings.iter().map(|f| f.severity).collect();
+            assert_eq!(
+                severities,
+                vec![
+                    Severity::Problem, // check_gate_pending_without_gate
+                    Severity::Problem, // check_dead_agent
+                    Severity::Problem, // check_dead_monitor
+                    Severity::Warn,    // check_stage_event_drift
+                    Severity::Warn,    // check_missing_branch
+                ]
+            );
+            assert!(findings[0].detail.contains("gate_pending is true"));
+            assert!(findings[1].detail.contains("agent pid 999999"));
+            assert!(findings[2].detail.contains("monitor pid 999998"));
+            assert!(
+                findings[3]
+                    .detail
+                    .contains("last stage_launched event named validate")
+            );
+            assert!(findings[4].detail.contains("feature/phase-07"));
+        }
+
+        /// `doctor`'s idle-project path (Task 2, 18a): the exact code path
+        /// `doctor(root, false)` runs for its reconciliation section is
+        /// `collect_phase_facts` + `render_reconciliation_text` — asserted
+        /// directly here rather than capturing process stdout, since this
+        /// codebase has no stdout-capture dependency and this phase adds no
+        /// new ones (18-RESEARCH.md).
+        #[test]
+        fn doctor_reports_no_active_phases_when_idle() {
+            let dir = tempfile::tempdir().unwrap();
+            let facts = collect_phase_facts(dir.path());
+            assert!(facts.is_empty());
+            assert!(render_reconciliation_text(&facts).contains("no active phases"));
+        }
+
+        #[test]
+        fn doctor_reports_gate_pending_without_gate_file() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = 90;
+            let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+            state.stage = Stage::Validate;
+            state.gate_pending = true;
+            workflow::save_state(&state).unwrap();
+
+            let facts = collect_phase_facts(root);
+            assert_eq!(facts.len(), 1);
+            let text = render_reconciliation_text(&facts);
+            assert!(text.contains(&format!("phase {phase}: gate_pending is true")));
+            assert!(text.contains(&format!("repair: devflow resume --phase {phase}")));
+        }
+
+        /// WR-01 (18-fix): `doctor --json` must emit ONE JSON document, not
+        /// two concatenated top-level arrays. Exercises the exact
+        /// composition `doctor()`'s `--json` path uses (`doctor_json_body`),
+        /// then round-trips it through `serde_json::to_string`/`from_str` —
+        /// the failure mode this reproduces (pre-fix) is a single-document
+        /// parser (`json.load`, `JSON.parse`) raising "Extra data" on the
+        /// old two-array output; `jq` tolerated it (NDJSON-style streaming),
+        /// which is why it went unnoticed.
+        #[test]
+        fn doctor_json_is_a_single_object_with_environment_and_reconciliation() {
+            let checks = vec![Check {
+                name: "git".into(),
+                status: "ok".into(),
+                version: Some("2.40.0".into()),
+                install_hint: None,
+            }];
+
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = 92;
+            let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+            state.stage = Stage::Validate;
+            state.gate_pending = true; // mismatched: no gate file — produces a finding
+            workflow::save_state(&state).unwrap();
+            let facts = collect_phase_facts(root);
+
+            let body = doctor_json_body(&checks, &facts);
+            let serialized = serde_json::to_string(&body).unwrap();
+            let reparsed: serde_json::Value = serde_json::from_str(&serialized)
+                .expect("doctor --json must be single-document JSON, not two concatenated arrays");
+
+            assert!(
+                reparsed.get("environment").is_some(),
+                "must carry the tool checks under \"environment\": {reparsed}"
+            );
+            assert!(
+                reparsed.get("reconciliation").is_some(),
+                "must carry the reconciliation findings under \"reconciliation\": {reparsed}"
+            );
+            assert!(reparsed["environment"].is_array());
+            assert!(reparsed["reconciliation"].is_array());
+            let reconciliation = reparsed["reconciliation"].as_array().unwrap();
+            assert!(
+                !reconciliation.is_empty(),
+                "the mismatched gate_pending fixture must produce at least one finding"
+            );
+            assert!(
+                reconciliation.iter().any(|f| f["detail"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("gate_pending is true")),
+                "must carry the gate_pending finding: {reconciliation:?}"
+            );
+        }
+
+        /// T-18-02: running `doctor` twice against a mismatched fixture must
+        /// leave `.devflow/` byte-identical — no state rewrite, no event
+        /// append, no gate file appears or disappears.
+        #[test]
+        fn doctor_is_read_only_on_a_mismatched_project() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = 91;
+            let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+            state.stage = Stage::Validate;
+            state.gate_pending = true; // mismatched: no gate file will exist
+            workflow::save_state(&state).unwrap();
+            events::emit(
+                root,
+                phase,
+                "stage_launched",
+                serde_json::json!({"stage": "code"}),
+            );
+
+            let state_path = workflow::state_path(root, phase);
+            let before_len = std::fs::metadata(&state_path).unwrap().len();
+            let before_modified = std::fs::metadata(&state_path).unwrap().modified().unwrap();
+            let events_log = events::events_path(root);
+            let before_lines = std::fs::read_to_string(&events_log)
+                .unwrap()
+                .lines()
+                .count();
+
+            doctor(root, false).unwrap();
+            doctor(root, false).unwrap();
+
+            let after_len = std::fs::metadata(&state_path).unwrap().len();
+            let after_modified = std::fs::metadata(&state_path).unwrap().modified().unwrap();
+            let after_lines = std::fs::read_to_string(&events_log)
+                .unwrap()
+                .lines()
+                .count();
+
+            assert_eq!(
+                before_len, after_len,
+                "doctor must not rewrite the state file"
+            );
+            assert_eq!(
+                before_modified, after_modified,
+                "doctor must not touch the state file's mtime"
+            );
+            assert_eq!(
+                before_lines, after_lines,
+                "doctor must not append to events.jsonl"
+            );
+        }
     }
 }

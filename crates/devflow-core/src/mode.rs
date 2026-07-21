@@ -27,11 +27,54 @@ pub const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 /// still bounding a stuck loop to at most 5 unobserved cycles before a
 /// terminal abort. Any increment of `infra_failures` must use
 /// `saturating_add` so a long-running stuck loop cannot overflow `u32`. The
-/// CLI's `transition()` resets `infra_failures` to 0 on every successful
-/// stage transition (CR-01, 17-06 gap closure) — this reset is what makes
-/// the "5 unobserved cycles" ceiling bound a stuck loop rather than a
-/// phase's entire lifetime.
+/// CLI's `transition()` resets `infra_failures` to 0 unconditionally on
+/// every successful stage transition (CR-01, 17-06 gap closure) — this
+/// reset is what makes the "5 unobserved cycles" ceiling bound a stuck loop
+/// rather than a phase's entire lifetime. Unlike `infra_failures`,
+/// `consecutive_failures`' reset is conditional — see
+/// [`transition_resets_consecutive_failures`] — the two counters no longer
+/// share a single reset condition (18d, WR-11).
 pub const MAX_INFRA_FAILURES: u32 = 5;
+
+/// Ceiling for [`crate::state::State::preflight_retries`] before a
+/// preflight gate's `GateAction::LoopBack` recursion aborts rather than
+/// polling another 7-day gate timeout (18f, D-18f backstop). A failing
+/// preflight is a readiness problem the operator is actively being asked
+/// about right now, not a transient infrastructure blip, so this takes the
+/// tighter [`MAX_CONSECUTIVE_FAILURES`]-style ceiling rather than the more
+/// lenient [`MAX_INFRA_FAILURES`]. Unlike those two counters, this one is
+/// NOT reset by `transition()` — it is reset by preflight success and by
+/// human approval (`GateAction::Advance`), both inside `run_preflight`
+/// (`devflow-cli/src/main.rs`).
+pub const MAX_PREFLIGHT_RETRIES: u32 = 3;
+
+/// Whether `transition()` should zero
+/// [`crate::state::State::consecutive_failures`] when moving from `from` to
+/// `to`.
+///
+/// `consecutive_failures` is meant to count repeated Code↔Validate CYCLES —
+/// each cycle is a full loop through Code, then Validate, then (on failure)
+/// back to Code again. But the Code→Validate hop is crossed on *every
+/// single cycle*, including the ones that are about to fail. Resetting the
+/// counter on that specific hop means it can never accumulate past 1, so
+/// [`MAX_CONSECUTIVE_FAILURES`] — the ceiling that exists specifically to
+/// bound this loop — is unreachable (18d). Every other transition is
+/// genuine forward progress out of the Code↔Validate loop (or the initial
+/// Define→Plan→Code entry into it) and correctly clears the counter.
+///
+/// This rule deliberately does NOT apply to
+/// [`crate::state::State::infra_failures`], whose unconditional reset in
+/// `transition()` is correct for its own semantics: infra faults accumulate
+/// within a single stage's repeated failures and are routed through
+/// `handle_infra_outcome` → `gate_or_abort_infra` → `handle_stage_failure`,
+/// whose retry arms call `launch_stage` directly and never cross
+/// `transition()` at all. Widening this predicate's shape onto
+/// `infra_failures` would silently convert [`MAX_INFRA_FAILURES`] from a
+/// stuck-loop bound into a phase-lifetime bound — the exact regression
+/// 17-06 was written to prevent.
+pub fn transition_resets_consecutive_failures(from: Stage, to: Stage) -> bool {
+    !matches!((from, to), (Stage::Code, Stage::Validate))
+}
 
 /// How DevFlow drives the pipeline for a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,5 +196,32 @@ mod tests {
         for mode in [Mode::Auto, Mode::Supervise] {
             assert_eq!(mode.to_string().parse::<Mode>().unwrap(), mode);
         }
+    }
+
+    #[test]
+    fn consecutive_reset_skips_the_code_to_validate_hop() {
+        assert!(!transition_resets_consecutive_failures(
+            Stage::Code,
+            Stage::Validate
+        ));
+    }
+
+    #[test]
+    fn consecutive_reset_fires_on_every_other_transition() {
+        // Enumerated explicitly (not a negation of the skip case above) so a
+        // future Stage variant added to the linear chain doesn't silently
+        // fall through un-asserted.
+        assert!(transition_resets_consecutive_failures(
+            Stage::Define,
+            Stage::Plan
+        ));
+        assert!(transition_resets_consecutive_failures(
+            Stage::Plan,
+            Stage::Code
+        ));
+        assert!(transition_resets_consecutive_failures(
+            Stage::Validate,
+            Stage::Ship
+        ));
     }
 }

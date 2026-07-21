@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.5.0 — 2026-07-21
+
+Dogfood reliability hardening: make DevFlow's own supervision layer trustworthy
+and legible from a plain terminal, and close the state-machine correctness gaps
+that let a broken run look healthy. Phase 18.
+
+### Added
+- `devflow doctor` is now project-aware: it reconciles the persisted state against the event log, live process IDs, open gates, and branch ancestry, and reports a repair plan — read-only by default, mutating nothing
+- Monitor liveness is observable: `monitor_pid` is persisted and probed, so `status` and `doctor` render a distinct "stuck — needs `devflow resume`" state instead of a dead monitor looking identical to a healthy between-stages pause
+- Worktree-aware build-staleness: a self-dogfood build behind the worktree branch it is meant to be testing is now detected and blocked
+
+### Changed
+- `devflow doctor --json` emits a single JSON document — `{ "environment": [...], "reconciliation": [...] }` — instead of two concatenated top-level arrays, so ordinary JSON parsers can read the full `--json` output
+- Build-staleness for a worktree-based phase is evaluated against the worktree branch HEAD rather than the project root, and a stale self-dogfood binary is now blocked rather than warned — the false-evidence class where a two-hours-behind binary re-ran an old hook batch
+- The self-dogfood staleness-block event no longer records an absolute filesystem path in `events.jsonl`; the full path stays in the terminal message only
+
+### Fixed
+- The Code↔Validate failure loop can now reach its `MAX_CONSECUTIVE_FAILURES` ceiling: the counter was being reset on every stage transition, making the bound unreachable and the loop effectively unbounded under `--mode auto`
+- Validate is passable again when an external post-condition is declared: the Layer 0 affirmative-success path now consults the agent's verdict instead of discarding it, advancing automatically only when the probe and the verdict agree, and gating for a human when they disagree or no verdict arrived
+- Approving a preflight gate no longer re-runs the identical deterministic check and wedges on a multi-day poll: approval is an explicit override that skips the already-adjudicated check, with a bounded retry backstop; a loop-back still re-checks
+- A failed stage relaunch no longer leaves a stale `monitor_pid` that `status`/`doctor` would misreport as "stuck"
+- Stabilized a flaky parallel-worktree capture test that could race the monitor's capture archival
+
 ## 1.4.0 — 2026-07-20
 
 Pipeline reliability: a completion cascade that cannot silently advance, build

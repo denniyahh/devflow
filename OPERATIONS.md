@@ -43,7 +43,7 @@ Define → Plan → Code → Validate → Ship
 | `devflow cleanup [--force]` | Remove phase worktrees + their feature branches |
 | `devflow recover [--clean] [--phase N]` | Inspect state; `--clean` sweeps stale phases only; `--clean --phase N` clears one phase unconditionally |
 | `devflow test` | cargo test + clippy + fmt --check |
-| `devflow doctor [--json]` | Environment audit (agents installed, versions, RUST_LOG) |
+| `devflow doctor [--json]` | Environment audit (agents installed, versions, RUST_LOG) plus per-phase reconciliation; `--json` emits one object `{"environment": [...], "reconciliation": [...]}` |
 
 (`devflow advance` is internal — invoked by monitors with `--phase N`.)
 

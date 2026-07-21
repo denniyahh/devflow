@@ -41,6 +41,18 @@ pub struct State {
     /// closure), so the ceiling bounds a stuck loop, not a phase's lifetime.
     #[serde(default)]
     pub infra_failures: u32,
+    /// How many times a preflight gate has been resolved and retried for
+    /// this phase (18f). Bounded by [`crate::mode::MAX_PREFLIGHT_RETRIES`].
+    /// Persisted rather than recursion-scoped because the documented wedge
+    /// spanned separate `devflow` invocations after a monitor death — an
+    /// in-process recursion-depth counter would reset to zero on every new
+    /// process and fail to bound the exact incident it exists to prevent.
+    /// Reset to 0 whenever preflight passes and whenever a human explicitly
+    /// approves (`GateAction::Advance`), both inside `run_preflight`. Unlike
+    /// [`Self::consecutive_failures`] and [`Self::infra_failures`], this
+    /// counter is NOT touched by `transition()`.
+    #[serde(default)]
+    pub preflight_retries: u32,
     /// When the phase started (Unix seconds).
     pub started_at: String,
     /// Path to the project root.
@@ -51,6 +63,13 @@ pub struct State {
     /// always live under the main `project_root`; only the agent's cwd changes.
     #[serde(default)]
     pub worktree_path: Option<PathBuf>,
+    /// PID of the detached monitor process that owns the agent for the
+    /// current stage, recorded by `launch_stage` at spawn time. `None` means
+    /// no monitor has been spawned for this state yet, OR the state was
+    /// written by a binary predating this field — in both cases the
+    /// liveness probe reports Unknown, never Stuck.
+    #[serde(default)]
+    pub monitor_pid: Option<u32>,
 }
 
 /// Supported coding agents.
@@ -105,9 +124,11 @@ impl State {
             gate_pending: false,
             consecutive_failures: 0,
             infra_failures: 0,
+            preflight_retries: 0,
             started_at: timestamp_now(),
             project_root,
             worktree_path: None,
+            monitor_pid: None,
         }
     }
 }
@@ -167,7 +188,9 @@ mod tests {
         assert!(!state.gate_pending);
         assert_eq!(state.consecutive_failures, 0);
         assert_eq!(state.infra_failures, 0);
+        assert_eq!(state.preflight_retries, 0);
         assert!(!state.started_at.is_empty());
+        assert_eq!(state.monitor_pid, None);
     }
 
     #[test]
@@ -229,5 +252,72 @@ mod tests {
         }"#;
         let loaded: State = serde_json::from_str(json).unwrap();
         assert_eq!(loaded.infra_failures, 0);
+    }
+
+    /// D-18f: `preflight_retries` round-trips through serde (its own key
+    /// appears in the persisted JSON) — the wedge this counter bounds spans
+    /// separate `devflow` invocations, so it must survive a save/load
+    /// cycle, not just live in memory — and a serde-absent value (state
+    /// written by a pre-18f binary) deserializes to 0, not a hard error.
+    #[test]
+    fn preflight_retries_round_trips_through_serde() {
+        let mut state = State::new(1, AgentKind::Claude, Mode::Auto, PathBuf::from("/repo"));
+        state.preflight_retries = 2;
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(
+            json.contains("preflight_retries"),
+            "preflight_retries must appear in persisted JSON"
+        );
+        let loaded: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            loaded.preflight_retries, 2,
+            "preflight_retries must round-trip through serde"
+        );
+
+        let absent_json = r#"{
+            "stage": "code",
+            "phase": 1,
+            "agent": "claude",
+            "mode": "auto",
+            "started_at": "0",
+            "project_root": "/repo"
+        }"#;
+        let loaded_absent: State = serde_json::from_str(absent_json).unwrap();
+        assert_eq!(loaded_absent.preflight_retries, 0);
+    }
+
+    /// `monitor_pid` round-trips through serde as an exact `u32` (18b).
+    #[test]
+    fn monitor_pid_round_trips_through_serde() {
+        let mut state = State::new(1, AgentKind::Claude, Mode::Auto, PathBuf::from("/repo"));
+        state.monitor_pid = Some(4242);
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(
+            json.contains("monitor_pid"),
+            "monitor_pid must appear in persisted JSON"
+        );
+        let loaded: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            loaded.monitor_pid,
+            Some(4242),
+            "monitor_pid must round-trip through serde"
+        );
+    }
+
+    /// A serde-absent `monitor_pid` (state written by a pre-18b binary) must
+    /// deserialize to `None`, not `Some(0)` — a `Some(0)` default would let a
+    /// pre-18b state file render as a monitor at pid 0.
+    #[test]
+    fn monitor_pid_absent_from_json_defaults_to_none() {
+        let json = r#"{
+            "stage": "code",
+            "phase": 1,
+            "agent": "claude",
+            "mode": "auto",
+            "started_at": "0",
+            "project_root": "/repo"
+        }"#;
+        let loaded: State = serde_json::from_str(json).unwrap();
+        assert_eq!(loaded.monitor_pid, None);
     }
 }

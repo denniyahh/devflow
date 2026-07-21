@@ -183,8 +183,19 @@ fn parallel_creates_two_worktrees_and_spawns_two_monitors() {
 
     let phase7_stdout = root.join(".devflow/phase-07-stdout");
     let phase8_stdout = root.join(".devflow/phase-08-stdout");
+    // WR-03: assert each capture immediately after the `wait_for` call that
+    // established it, not after both waits complete. Same mechanism as
+    // `wait_for_pid` above: each stage transition's `archive_phase_files`
+    // briefly deletes the capture before the next monitor recreates it. A
+    // combined assertion placed after both `wait_for` calls is still racy —
+    // the second `wait_for`'s own polling loop gives a fast monitor enough
+    // time to archive the first capture in the interim (observed directly:
+    // this exact ordering flaked at run 15/25 during 18-02 verification).
+    // Asserting inside each capture's own wait window closes that gap.
     wait_for(&phase7_stdout);
+    assert!(phase7_stdout.exists());
     wait_for(&phase8_stdout);
+    assert!(phase8_stdout.exists());
 
     // 13-DEFERRED-CR-03: each parallel phase persists its own state file —
     // the second start no longer clobbers the first phase's state.
@@ -196,8 +207,6 @@ fn parallel_creates_two_worktrees_and_spawns_two_monitors() {
         !root.join(".devflow/state.json").exists(),
         "legacy single-slot state.json must not be written anymore"
     );
-    assert!(phase7_stdout.exists());
-    assert!(phase8_stdout.exists());
 }
 
 #[test]

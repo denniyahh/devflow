@@ -2,28 +2,199 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
-status: "Phase 17 executed (13/13 plans, 15/15 must-haves) - validated at re-audit #10 (eda94cd): GAP-6/GAP-7 closed via 17-13 and RED-proven; GAP-8 (unsampled CLI wiring of GAP-7's fix) found and auto-filled; all 14 rows green, nyquist_compliant: true"
-stopped_at: Completed 17-13-PLAN.md
-last_updated: "2026-07-20T08:47:18.804Z"
+status: "Phase 17 executed (13/13 plans, 15/15 must-haves) - validated at re-audit #10 (eda94cd): GAP-6/GAP-7 closed via 17-13 and RED-proven; GAP-8 (unsampled CLI wiring of GAP-7's fix) found and auto-filled; all 14 rows green, nyquist_compliant: true. Phase 18 complete (7/7 plans): 18-01 (18a doctor reconciliation), 18-02 (18g WR-03 test stabilization), 18-03 (18b monitor liveness), 18-04 (18d Code-Validate safety-gate reachability), 18-05 (18e Layer 0/Validate verdict fix), 18-06 (18c worktree-aware staleness enforcement), 18-07 (18f preflight-gate re-run wedge fix)."
+stopped_at: Completed 18-07-PLAN.md
+last_updated: "2026-07-21T05:32:24.982Z"
 progress:
-  total_phases: 8
-  completed_phases: 6
-  total_plans: 47
-  completed_plans: 47
-  percent: 75
+  total_phases: 7
+  completed_phases: 7
+  total_plans: 54
+  completed_plans: 54
+  percent: 100
 ---
 
 # DevFlow — Project State
 
-> Last updated: 2026-07-19
+> Last updated: 2026-07-20
 
 ## Active
 
-- **Phase 18 (Scoped):** Hermes Support — renumbered from 17 to 18
-  (2026-07-18) to make room for Phase 17. HermesAgent adapter, skill-file
-  rewrite, Hermes plugin. Depends on Phase 14's events.jsonl + Phase 13's
-  notify hook. Also carries 18d (doctor reconciliation) and 18e (WR-03 test
-  fix), deferred from Phase 17 on 2026-07-18.
+- **Phase 18 (Complete + Verified + review-fixed — 7/7 plans):** Dogfood
+  Reliability Hardening — reprioritized 2026-07-20 from Hermes Support.
+  `devflow doctor` reconciliation (18a), monitor liveness (18b),
+  worktree-aware staleness enforcement (18c), Code↔Validate safety-gate
+  reachability (18d), Layer 0/Validate verdict fix (18e), preflight-gate
+  re-run wedge fix (18f), WR-03 test stabilization (18g). Replaces the
+  fixed Phase 19 roadmap entry — see `## Backlog` in ROADMAP.md for the
+  items not pulled into 18. Depends on Phase 17 (typed outcomes, build
+  provenance).
+
+  **Verified + reviewed 2026-07-21.** `gsd-verifier`: 7/7 must-haves,
+  each traced to source plus an independently-executed passing test;
+  both binding operator decisions (18e, 18f) confirmed exactly
+  implemented (`18-VERIFICATION.md`, status passed). `gsd-code-reviewer`:
+  0 critical / 4 warning (`18-REVIEW.md`). All findings dispositioned in
+  a `18-fix` batch (6 commits `f635adf`..`4ff6b37`): WR-01 `doctor --json`
+  now emits one JSON object `{environment, reconciliation}` (was two
+  concatenated arrays = invalid single-doc JSON; proven fixed against the
+  live binary); WR-04 `launch_stage_inner` clears `monitor_pid` before any
+  fallible step so a failed relaunch no longer false-reports "Stuck";
+  WR-03 the `unreachable!()` in `handle_validate_outcome` eliminated by
+  construction (`ValidateResult` two-variant enum); WR-02 the
+  `self_dogfood_stale_blocked` event now persists a path-free reason (third
+  instance of that leak class — noted closed in `999.10`, the two original
+  instances remain); and the new 18c worktree-staleness test hardened under
+  `ENV_MUTEX` against the 19i PATH-race flake the verifier caught. Final
+  gates: 426 tests / 0 failed, clippy `--workspace --all-targets` clean,
+  fmt clean, all on `develop`. **Not yet merged to main / released.**
+
+  Planned 2026-07-20: research (HIGH confidence, all 7 defects re-verified
+  as still reproducing at HEAD), VALIDATION.md (Nyquist), 7 plans, and a
+  plan-checker pass that returned VERIFICATION PASSED with zero blockers
+  and zero warnings on the first iteration. Waves are near-serial by
+  necessity, not choice — six of seven fixes touch `main.rs` (6,239
+  lines), and the same-wave zero-file-overlap rule forces one `main.rs`
+  plan per wave.
+
+  Executed 2026-07-20: **18-01 complete** (`8fdbd8a`, `3ce77a1`) —
+  `devflow doctor` project-aware reconciliation (18a). `Severity`/
+  `PhaseFacts`/`PhaseFinding`/`reconcile_phase` pure core plus
+  `collect_phase_facts`/`render_reconciliation` wiring into `doctor()`'s
+  text and `--json` output; 5 named checks (gate-pending-without-gate,
+  orphan-gate, dead-agent, stage/event drift, missing feature branch), 10
+  new tests, proven read-only by a twice-run fixture. See
+  `18-01-SUMMARY.md`.
+
+  Executed 2026-07-21: **18-02 complete** (`84afc3b`, `8dcc9ef`) — WR-03
+  test stabilization (18g). `parallel_creates_two_worktrees_and_spawns_two_monitors`
+  now asserts each stdout capture inside its own `wait_for` window instead
+  of after a later, unrelated re-check. The plan's literal combined-assertion
+  instruction was itself still racy — the mandated 25x loop reproduced a
+  real failure at run 15/25 — so it was corrected to interleaved per-wait
+  assertions, matching the plan's own must_haves.truths. 25/25 clean after
+  the fix; `cargo test --workspace` 0 failed, `build_provenance` (WR-07,
+  still open, out of scope) passed cleanly. See `18-02-SUMMARY.md`. Next:
+  18-03 (wave 2).
+
+  Executed 2026-07-21: **18-03 complete** (`9f33b75`, `05556a2`, `dbbff40`,
+  `e60271d`) — monitor liveness (18b), "who watches the watcher."
+  `State.monitor_pid: Option<u32>` persisted by `launch_stage` immediately
+  after `monitor::spawn_monitor` returns (re-saved because `transition()`
+  saves state before `launch_stage` runs, or the pid is lost); pure
+  `liveness()` predicate (`Healthy`/`BetweenStages`/`Stuck`/`Unknown`,
+  `None` matched first so an unrecorded monitor can never render `Stuck`)
+  shared verbatim by `devflow status`'s new `monitor_pid`/`liveness` lines
+  and `doctor`'s new `check_dead_monitor` finding, extending 18-01's
+  `reconcile_phase` array right after `check_dead_agent`. 9 new tests;
+  `cargo test --workspace` 405/405 (0 failed), clippy/fmt clean.
+  Manually verified end-to-end against a synthetic dead-monitor fixture —
+  `status` and `doctor` both correctly report `stuck — needs devflow
+  resume` with a `devflow resume --phase N` repair, no filesystem paths
+  or usernames leaked (WR-02 class). See `18-03-SUMMARY.md`. Next: 18-04
+  (wave 3, 18d — make `MAX_CONSECUTIVE_FAILURES` reachable for the
+  Code↔Validate loop).
+
+  Executed 2026-07-21: **18-04 complete** (`37b74ac`, `3036927`) —
+  Code↔Validate safety-gate reachability (18d). New pure `mode.rs`
+  predicate `transition_resets_consecutive_failures(from, to)` — `false`
+  only for `(Code, Validate)`, the mid-cycle hop that previously defeated
+  the counter — consulted by `transition()` instead of an unconditional
+  reset; `infra_failures`' unconditional reset is untouched, and the
+  frozen regression test `transition_resets_infra_failures` passes
+  byte-for-byte unchanged, proving 18d neither widened nor narrowed the
+  infra counter's scope. `handle_validate_outcome`'s increment switched to
+  `saturating_add`. RED-then-GREEN proven live:
+  `consecutive_failures_reaches_ceiling_across_cycles` failed
+  (`left: 0, right: 3`) against the unfixed `transition()`, passes after
+  the fix. 6 new tests (2 in `mode.rs`, 4 in `main.rs` covering ceiling,
+  saturation, idempotency, cross-phase independence); `cargo test
+  --workspace` 411/411 (0 failed, up from 405), clippy/fmt clean. See
+  `18-04-SUMMARY.md`. Next: 18-05 (wave 4, 18e — Layer 0/Validate verdict
+  fix, causally entangled with 18d per 18-RESEARCH.md Pitfall 1).
+
+  Executed 2026-07-21: **18-05 complete** (`1313ef9`, `e3eda07`,
+  `1157d35`) — Layer 0/Validate verdict reconciliation (18e). New
+  `reconcile_layer0_verdict` in `agent_result.rs` consults Layer 1's
+  verdict when Layer 0 affirmatively succeeds at `Stage::Validate`
+  instead of discarding it (copies ONLY `verdict`; `status`/
+  `decided_by_layer`/etc. stay exactly as Layer 0 set them). New
+  `ValidateOutcome` enum (`Passed`/`Failed`/`Ambiguous(String)`) and pure
+  `classify_validate_outcome` in `main.rs` replace `handle_validate_outcome`'s
+  old `passed: bool` — `Some(Verdict::Pass)` wins first (ordinary Validate
+  unchanged), `(probe-pass, gaps)` and `(probe-pass, no-verdict)` classify
+  `Ambiguous` and force an immediate `[never-silent]` gate that never
+  touches `consecutive_failures` and never consults `Mode::should_gate`,
+  per the binding 2026-07-20 operator decision (D-18e). Combined
+  integration test `external_verify_cycles_reach_ceiling_without_unbounded_loop`
+  proves 18d and 18e hold TOGETHER (18-RESEARCH.md Pitfall 1): an
+  ambiguous outcome gates on cycle one without touching the counter, and
+  a genuine repeated failure still reaches the now-reachable ceiling. 6
+  new tests (2 in `agent_result.rs`, 4 in `main.rs`); `cargo test
+  --workspace` 417/417 (0 failed, up from 411), clippy/fmt clean. See
+  `18-05-SUMMARY.md`. Next: 18-06 (wave 5, 18c — worktree-aware staleness
+  enforcement).
+
+  Executed 2026-07-21: **18-06 complete** (`a80079f`, `10730ea`) —
+  worktree-aware build staleness enforcement (18c), closing Round 4 CR-01.
+  `enforce_build_staleness` now derives
+  `execution_root = state.worktree_path.as_deref().unwrap_or(project_root)`
+  (the same idiom `evaluate_layer0` already uses in `agent_result.rs`) and
+  threads it through `embedded_commit_is_stale`/
+  `tree_has_modified_build_inputs`/`combined_staleness` (parameter rename +
+  call-site change only; ancestry exit-code contract untouched).
+  `is_self_dogfood_workspace` and `events::emit` stay `project_root`-scoped
+  (Assumption A3, documented in source) since they answer workspace-identity
+  and bookkeeping-location questions, not staleness. Block message now names
+  `execution_root` and states whether a worktree was in play. New
+  `worktree_staleness_fixture` builds a real `git worktree add` fixture
+  (sibling, not nested, directories — a nested worktree path would contain
+  `project_root`'s path as a string prefix, making "message contains
+  worktree path" and "message does not contain project_root path" mutually
+  exclusive assertions). RED-then-GREEN proven live: manually reverted
+  `execution_root` to `project_root` and confirmed the fix's own regression
+  test fails, then restored and confirmed it passes. 3 new tests; `cargo
+  test --workspace` 420/420 (0 failed, up from 417), clippy/fmt clean. See
+  `18-06-SUMMARY.md`. Next: 18-07 (wave 6, 18f — preflight-gate re-run
+  wedge fix).
+
+  Executed 2026-07-21: **18-07 complete** (`a397d46`, `950a358`,
+  `1ca79dd`) — preflight-gate re-run wedge fix (18f), the final plan of
+  Phase 18. `launch_stage` split into itself (resolution + the
+  `run_preflight` guard) and a new `launch_stage_inner` (everything after
+  the guard); `run_preflight`'s `GateAction::Advance` arm now calls
+  `launch_stage_inner` directly — skipping the just-adjudicated check
+  entirely, per the binding 2026-07-20 operator decision (D-18f) — while
+  `GateAction::LoopBack` still calls the full `launch_stage` (deliberately
+  re-checking, since the operator may have fixed the condition). Either
+  arm's recursion is bounded by a new persisted `State.preflight_retries: u32`
+  against `mode::MAX_PREFLIGHT_RETRIES = 3`, checked BEFORE any new gate is
+  written; reaching the ceiling emits `preflight_retry_ceiling_reached` and
+  aborts instead of polling a second 7-day gate timeout. The counter resets
+  to 0, persisted, on both a passing preflight and a human Advance. RED-
+  then-GREEN proven live: manually reverted the Advance arm back to calling
+  `launch_stage` and reproduced the documented wedge exactly (two gates
+  written, then a bounded `"gate for stage define timed out awaiting a
+  response"` error), then restored the fix and confirmed green. Deviated
+  from the plan's literal Task 3 test setup (`Stage::Plan` +
+  `AlwaysFailAdapter`) after confirming empirically it cannot reproduce a
+  failure that survives a relaunch — `launch_stage`'s recursion always
+  re-resolves the REAL production adapter via `agents::adapter_for`,
+  discarding whatever adapter was passed into the outer `run_preflight`
+  call — and used `preflight_interactivity_check` (a pure function of
+  state, so it fails identically on retry) instead, the check CONTEXT.md
+  actually attributes the wedge to. 4 new tests (1 in `state.rs`, 3 in
+  `main.rs`); `cargo test --workspace` 424/424 (0 failed, up from 420),
+  clippy/fmt clean. See `18-07-SUMMARY.md`. **Phase 18 (7/7 plans, 18a–18g)
+  complete.**
+
+## Backlog
+
+Five unsequenced items live in `.planning/phases/999.N-*/` and the
+`## Backlog` section of ROADMAP.md: Hermes Support (999.1, held Phase 18's
+slot until this reprioritization), phase-process tracking model (999.2, was
+19b), CLI operator discoverability (999.3, was 19c), version-tag contention
+on concurrent ship (999.4, was 19h), changelog placeholder content (999.5,
+was 19j). Promote with `/gsd-review-backlog`.
 
 ## Completed
 
@@ -81,6 +252,10 @@ None currently open for Phase 17.
 
 | Date | Decision |
 |---|---|
+| 2026-07-20 | **18-01: `cargo test -p devflow --lib` does not work on this crate — corrected in verification, not source.** 18-01-PLAN.md's own `<verify>`/`<acceptance_criteria>` blocks (and 18-RESEARCH.md's Validation Architecture table) specify `cargo test -p devflow --lib <name>`, but `devflow` (the `devflow-cli` package) is binary-only (no `[lib]` target), so `--lib` hard-errors (`no library targets found`, exit 101) rather than filtering tests. Used the working equivalent, `cargo test -p devflow <name>` (no `--lib`), for all verification in this plan and going forward. Flag this in future 18-0N plans' verify blocks so the same false-error isn't hit again. |
+| 2026-07-20 | **18-01: two-task pure-core/wiring split requires staged `#[allow(dead_code)]` on a binary-only crate.** `crates/devflow-cli` has no `[lib]` target, so `cargo clippy --workspace --all-targets -- -D warnings` compiles the plain `bin` target *without* `#[cfg(test)]` — unit-test-only usage of a not-yet-wired item does not satisfy that build's dead-code check. Task 1 (pure `reconcile_phase` core) added `#[allow(dead_code)]` to its new items with a comment naming the exact commit that removes them; Task 2 removed every one once `doctor()` became the real caller. Verified clean independently after each commit (not just at the end). Pattern to reuse for any future plan that splits a pure-core commit from its wiring commit in this crate. |
+| 2026-07-20 | **17-REVIEW.md WR backlog triaged to completion; four fixed, five backlogged, one annotated.** The 2026-07-20 Phase 18 restructure flagged WR-01/02/03/04/07/08/09/10/11 as never triaged into the roadmap. All were re-verified against HEAD rather than trusted from the review text (the WR-06 lesson). **Fixed immediately in `234f080`** as one quality-gate-integrity bundle: WR-10 (`devflow test` ran the narrow `cargo clippy -- -D warnings`, which does not compile test targets — a live false-green generator directly in Phase 18's path, since that phase adds substantial `#[cfg(test)]` code), WR-08 (no regression guard on clippy scope in either workflow; added guards over both workflow files plus `devflow test`, each RED-proven by reverting to the narrow form and confirming the intended diagnostic), WR-07 (no job timeouts — sharper after `f25c670` enabled all-branch CI, since a hung `build_provenance` would burn GitHub's 6-hour default), WR-09 (`CONTRIBUTING.md` still advertised the narrow clippy form). **Backlogged:** WR-01+WR-02 → `999.10` (grouped — WR-02 puts the developer's home path and OS username in `events.jsonl`, WR-01 commits it into the *user's* repo; highest severity of the batch since blast radius extends to other people's repositories, and Phase 18 fixes neither, citing WR-02 only as a prevention constraint), WR-03 → `999.11` (`--allow-empty` commits rather than skips, so a terminal-batch retry can tag a release on an empty commit), WR-04 → `999.12` (coverage debt on a deliberate trade). **Annotated in place:** WR-05 — `17-VERIFICATION.md`'s "at current HEAD" claim is scoped to `f5c399a` and does not cover 17-13's three commits; corrected with a scope note rather than re-running verification on a closed, shipped, merged phase, since 17-13's substance is independently confirmed by RED-proven regression tests and the Phase 18 research pass. **Already closed before triage:** WR-06 (by the roadmap restructure), WR-11 (is Phase 18's 18d). WR-04 was deliberately NOT folded into plan 18-05 despite touching the same file — 18-05 had passed the plan-checker clean, and growing a verified plan with adjacent debt is the scope-creep pattern that made prior phases balloon. |
+| 2026-07-20 | **Phase 18 reprioritized to Dogfood Reliability Hardening; fixed Phase 19 eliminated in favor of a backlog:** operator call — dogfooding has repeatedly surfaced legitimate functional bugs that tax every subsequent run, so pipeline-self-correctness work (18a–18g, was 18d/18e + 19a/19d/19g/19k/19l) takes Phase 18's slot ahead of Hermes. Auditing the move surfaced two stale-documentation bugs of its own: 19e and 19f were already closed by 17-13 (`12b5b98`, `e421ebd` — RED-proven regression tests exist) but ROADMAP.md still described them as open; `17-REVIEW.md` WR-06 had already flagged this. Not carried forward. 19i was already resolved (`96411eb`/`40dade3`) before this restructure. Rather than open a new fixed Phase 19, the remaining real-but-lower-priority items (Hermes, 19b, 19c, 19h, 19j) moved to a GSD-native 999.x backlog (`## Backlog` in ROADMAP.md, `/gsd-review-backlog` to promote) — every prior phase renumbering in this project's history exists because "the next phase" kept absorbing newly-discovered work; the backlog gives that work a home that isn't a phase number. Dir renames: `18-hermes-support` → `999.1-hermes-support`; new `18-dogfood-reliability-hardening`, `999.2-phase-process-tracking-model`, `999.3-cli-operator-discoverability`, `999.4-version-tag-contention-concurrent-ship`, `999.5-changelog-placeholder-content`. `17-REVIEW.md`'s WR-07 (build_provenance test flake, no CI job timeout) and WR-01/02/03/04/08/09/10/11 were noticed during this audit but not triaged here — flagged for a follow-up review pass, not assumed resolved or added to the backlog sight-unseen. |
 | 2026-07-18 | **Phase 17 scoped to four units; P5/P6 deferred to Phase 18:** source verification against final HEAD resolved decision-gate Q2 — `Unknown` auto-advance is not an edge case but an explicit design choice (`main.rs:854` classifies only `Failed \| RateLimited` as failure; `main.rs:871`'s comment states "Success (or Unknown — advance…)"). It is also broader than the retrospective recorded: `evaluate_layer3` (`agent_result.rs:610-620`) returns `Unknown` for the zero-commit "agent process gone, no commits" case too, so a vanished agent that did nothing advances Code→Validate. Two retrospective assumptions corrected: `devflow doctor` already exists but is project-blind (`_project_root` unused), and `RateLimited` is already typed — the missing outcomes are `resource_killed` (exit 137, absent workspace-wide) and `agent_unavailable`. Provenance has no foundation at all (no `build.rs`, no `vergen`; `workflow_started` carries only agent/mode/worktree). Phase 17 keeps 17a `Unknown` non-advance, 17b typed outcomes + retry policy, 17c preflight gate, 17d build provenance. Q4 answered: focused Phase 17 repair, **not** a Phase 16 remediation — only 17d traces to the proven Phase 16 defect; the rest is capability Phase 16 never claimed. Deferred to Phase 18 as 18d/18e: doctor reconciliation (forensic tooling, depends on 17b+17d) and the WR-03 test fix (test-only debt). Q3 (universal vs. adapter-specific preflight checks) remains open for discuss-phase. |
 | 2026-07-17 | **New Phase 16 (Pipeline Reliability Hardening) inserted, Hermes Support renumbered 16→17:** dogfooding Phase 15 through DevFlow itself surfaced real pipeline gaps — two Code-stage false positives on the crates.io publish plan (Layer-2 commit-count heuristic once, an incorrect agent self-report once) and four consecutive Ship-review failures on distinct legitimate findings (leaked telemetry, incomplete gitignore fix, CI job that couldn't fail loud, a doc/behavior mismatch) that a single-pass standard-depth reviewer caught one at a time instead of together. Dir renamed `16-hermes-support` → `17-hermes-support`; new `16-pipeline-reliability-hardening` (neither had plans yet). |
 | 2026-07-18 | **New Phase 17 (Pipeline Dogfood Follow-Up) inserted, Hermes Support renumbered 17→18:** Phase 16 execution evidence may show a failed Merge followed by VersionBump, BranchCleanup, and `workflow_finished`, contradicting the phase's fail-closed terminal contract. The Phase 17 spike captures this required final-HEAD reproduction plus outcome classification, preflight readiness, state/event reconciliation, and WR-03 test stabilization. Dir renamed `17-hermes-support` → `18-hermes-support`; Hermes remains scoped and blocked on the decision gate. |
@@ -134,9 +309,18 @@ None currently open for Phase 17.
 - [Phase 17]: 17-11: CR-02 resolved -- build.rs always reruns via an unfingerprintable sentinel, DEVFLOW_BUILD_TIMESTAMP removed entirely, staleness's second signal replaced by a (build_dirty, tree_has_modified_build_inputs) decision table (Stale when built clean and now dirty; Indeterminate, never blocking, when built dirty and still dirty)
 - [Phase 17]: 17-12: WR-04 resolved -- ChangelogAppend reordered strictly after VersionBump in hooks_after_ship() (removed from the Validate->Ship transition), reads version::read_version (new, git-free) instead of compute_version to avoid deriving a version one higher than the tag VersionBump just cut, and commits its own write via a new GitFlow::commit_path; version_bump had the identical uncommitted-write defect on its own version-file write and is fixed the same way
 - [Phase 17]: 17-13: GAP-6/GAP-7 closed via write_version remainder-preservation fix and HookContext.shipped_version threading; row 12 restored to green
+- [Phase 18]: 18-01: 18a doctor project-aware reconciliation -- pure PhaseFacts/PhaseFinding/reconcile_phase core (5 named checks: gate-pending-without-gate, orphan-gate, dead-agent, stage/event drift, missing branch) wired into doctor()'s text and --json output via collect_phase_facts/render_reconciliation; proven read-only by a twice-run fixture asserting state-file size/mtime and events.jsonl line count are unchanged
+- [Phase 18]: 18-02: WR-03 test stabilization -- `parallel_creates_two_worktrees_and_spawns_two_monitors` asserts each stdout capture inside its own `wait_for` window (mirrors `wait_for_pid`'s already-fixed archive-timing pattern); plan's literal combined-assertion instruction was itself racy (25x loop reproduced it at run 15/25), corrected to interleaved per-wait assertions matching the plan's own must_haves.truths
+- [Phase 18]: 18-03: monitor liveness (18b) — State.monitor_pid persisted at spawn (launch_stage re-saves after spawn_monitor, since transition() saves before launch_stage runs), pure liveness() predicate (None-first match so an unrecorded monitor can never render Stuck) shared verbatim by devflow status's new monitor row and doctor's new check_dead_monitor finding, spliced into reconcile_phase immediately after check_dead_agent per 18-01's extend-not-reorder contract. Manually verified end-to-end against a synthetic dead-monitor fixture: status prints stuck — needs devflow resume, doctor prints a matching finding with a devflow resume --phase N repair, neither leaks a filesystem path or username (WR-02 class).
+- [Phase 18]: 18-04: transition_resets_consecutive_failures added as a pure mode.rs predicate (not a Mode method) resolving Open Question 1 -- false only for (Code, Validate), making MAX_CONSECUTIVE_FAILURES reachable; infra_failures' unconditional reset is untouched (transition_resets_infra_failures passes byte-for-byte unchanged); handle_validate_outcome's increment switched to saturating_add to close the overflow-wrap reintroduction risk
+- [Phase 18]: 18-05: classify_validate_outcome checks Some(Verdict::Pass) first (ordinary Validate verdict:pass still advances directly, unchanged from pre-18e); the combined 18d+18e test is one #[test] fn calling two ~30-line helpers to satisfy both the exact-name acceptance criterion and the function-length convention; ValidateOutcome::Ambiguous's final match arm is unreachable!() rather than silently folded into Failed, since forced=true always returns via the gate branch above
+- [Phase 18]: 18-06: enforce_build_staleness derives execution_root = state.worktree_path.unwrap_or(project_root); is_self_dogfood_workspace stays project_root-scoped (Assumption A3)
+- [Phase 18]: 18-07: launch_stage split into launch_stage (resolution + run_preflight guard) + launch_stage_inner (everything after); run_preflight's Advance arm calls launch_stage_inner directly (skip), LoopBack still calls full launch_stage (re-check), either bounded by persisted State.preflight_retries / mode::MAX_PREFLIGHT_RETRIES=3 checked before any new gate is written; counter resets to 0 (persisted) on preflight pass and human Advance. Phase 18 (18a-18g) complete.
+- [Phase 18]: 18-07: AlwaysFailAdapter cannot reproduce a preflight failure that survives a relaunch (launch_stage always re-resolves the REAL production adapter via agents::adapter_for, discarding whatever was passed into the outer run_preflight call) -- used preflight_interactivity_check (a pure function of state) as the deterministic wedge-reproduction trigger for the three new tests instead; verified empirically both ways (unfixed code + literal plan setup = no observable difference; unfixed code + interactivity-check setup = reproduces the exact documented wedge).
 
 ## Roadmap Evolution
 
+- Phase 18 reprioritized, fixed Phase 19 eliminated (2026-07-20): Dogfood Reliability Hardening (dir `18-dogfood-reliability-hardening`) takes Phase 18's slot from Hermes Support (dir renamed to `999.1-hermes-support`); the fixed "Phase 19: Operator Observability" entry is replaced entirely — its content is absorbed into 18, confirmed already fixed, or moved to backlog dirs `999.2`–`999.5`. See 2026-07-20 decision entry.
 - Phase 14 split (2026-07-16): Hermes work (adapter, skill rewrite, plugin) moved out of 14 to new Phase 16 (`16-hermes-support`); 14 retitled Parallel Safety + Observability (dir `14-parallel-safety-observability`), leading with the deferred CR-03 flaw. See 2026-07-16 decision entry.
 - MVP restructure (2026-07-14): Phase 13 repurposed as MVP Core Loop (dir `13-mvp-core-loop`); old Phase 13 OSS/Hermes content moved to new Phase 15; Phase 14 rescoped to observability. Later same day: Hermes work moved 15 → 14 (now `14-observability-hermes`), 15 slimmed to OSS Readiness (`15-oss-readiness`). See 2026-07-14 decision entries.
 - Phase 14 added: Reliability & Observability Hardening — verdict-vs-ran split in completion protocol, native per-agent JSON envelope parsing, worktree-isolation-by-default for `start`, observability (`devflow logs`, `events.jsonl`, gate notify hook, configurable gate timeout). Scoped from external code review (2026-07-08). Extended 2026-07-08 with WR-11 (silent halt on non-Validate stage failure, from Phase 11 code review).
@@ -183,9 +367,16 @@ None currently open for Phase 17.
 | Phase 17-pipeline-dogfood-followup P11 | 40min | 3 tasks | 4 files |
 | Phase 17-pipeline-dogfood-followup P12 | 20min | 3 tasks | 5 files |
 | Phase 17-pipeline-dogfood-followup P13 | 15min | 3 tasks | 4 files |
+| Phase 18-dogfood-reliability-hardening P01 | 35min | 2 tasks | 1 files |
+| Phase 18 P02 | 15min | 2 tasks | 1 files |
+| Phase 18 P03 | 30min | 3 tasks | 3 files |
+| Phase 18 P04 | 35min | 2 tasks | 2 files |
+| Phase 18 P05 | 50min | 3 tasks | 2 files |
+| Phase 18 P06 | 21min | 2 tasks | 1 files |
+| Phase 18 P07 | 25min | 3 tasks | 4 files |
 
 ## Session
 
-**Last session:** 2026-07-20T08:47:18.782Z
-**Stopped at:** Completed 17-13-PLAN.md
+**Last session:** 2026-07-21T05:29:59.988Z
+**Stopped at:** Completed 18-07-PLAN.md
 **Resume file:** None

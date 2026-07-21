@@ -1,14 +1,22 @@
-# Phase 18: Hermes Support
+---
+status: backlog
+source: originally scoped as Phase 18; moved to backlog on 2026-07-20 so
+  dogfooding-reliability work (now Phase 18) doesn't wait on
+  personal-infrastructure work
+---
 
-**Status:** Scoped | **Priority:** MEDIUM | **Target:** TBD
+# Backlog: Hermes Support
 
 > Split out of Phase 14 on 2026-07-16 — Phase 14 had absorbed both the
 > Hermes work (moved in from Phase 15 on 2026-07-14 for workload balance)
 > and, a day later, the deferred CR-03 parallel-safety flaw, making it the
 > heaviest phase. Hermes is personal-infrastructure and should not gate
-> parallel-safety correctness, so it moves to its own phase after Phase 15
+> parallel-safety correctness, so it moved to its own phase after Phase 15
 > (OSS Readiness). Content below carried over from Phase 14's 14c/14d/14e
-> unchanged apart from renumbering.
+> unchanged apart from renumbering. Moved to the backlog on 2026-07-20
+> (operator decision) — Phase 18's slot went to pipeline-reliability work
+> instead, since dogfooding has repeatedly found real functional bugs that
+> tax every subsequent run, and Hermes doesn't gate anything else.
 
 ## Goal
 
@@ -16,8 +24,9 @@ Add first-class Hermes support: `HermesAgent` adapter (18a), skill-file
 rewrite (18b), and the Hermes plugin session mode (18c).
 
 **Depends on:** Phase 14 — the plugin's gate watcher and status display
-consume Phase 14's `events.jsonl` and Phase 13's gate notify hook. Phase 15
-(OSS Readiness) precedes this phase in roadmap order.
+consume Phase 14's `events.jsonl` and Phase 13's gate notify hook.
+
+Promote with `/gsd-review-backlog` when ready.
 
 ---
 
