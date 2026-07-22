@@ -2,9 +2,11 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
-status: "Phase 19 complete and verified on 2026-07-22: 11/11 plans, 7/7 observable truths, 438 tests, and three green CI attempts on pushed SHA aa95873. Phase 20 remains unscoped and must be defined before planning."
+status: executing
 stopped_at: context exhaustion at 100% (2026-07-22)
-last_updated: "2026-07-22T18:40:57.956Z"
+last_updated: "2026-07-22T19:38:53.219Z"
+last_activity: 2026-07-22
+last_activity_desc: Phase null execution started
 progress:
   total_phases: 8
   completed_phases: 8
@@ -22,6 +24,21 @@ progress:
 - **Phase 20 remains unscoped.** The roadmap reserves it for the
   operator-facing set targeting v2.0.0, but it has no detailed phase entry yet.
   Scope it before discussion or planning.
+
+## Current Position
+
+Phase: null — EXECUTING
+Plan: 1 of ?
+Status: Executing Phase null
+Last activity: 2026-07-22 — Phase null execution started
+
+Progress: [████████████████████] 100%
+
+*(Machine-readable fields for `gsd-tools state begin-phase` / `advance-plan` —
+this project historically tracked position only in the narrative "Active
+Phase" section above, which `advance-plan` cannot parse (backlog 12,
+`deferred-items.md`). This section restores the standard fields so
+`begin-phase` can seed real Plan/Status values once Phase 20 starts.)*
 
 ## Recently Shipped
 
