@@ -6862,7 +6862,10 @@ mod tests {
     /// D-21: the `workflow_started` payload carries every provenance field,
     /// tested directly without spawning a real agent. No `build_timestamp`
     /// field any more (CR-02, 17-11) — it was removed from `build.rs`
-    /// entirely, not just this payload.
+    /// entirely, not just this payload. Also pins the WR-02 redaction: the
+    /// `exe_path` field must never carry a directory component (the
+    /// operator's home directory / OS username), since `OPERATIONS.md`
+    /// documents `events.jsonl` as a file that's safe to tail and paste.
     #[test]
     fn workflow_started_payload_carries_build_provenance() {
         let state = State::new(66, AgentKind::Claude, Mode::Auto, PathBuf::from("/repo"));
@@ -6876,7 +6879,21 @@ mod tests {
             payload.get("build_timestamp").is_none(),
             "build_timestamp was removed (CR-02) and must not reappear"
         );
+        assert!(
+            payload.get("exe_path").is_some(),
+            "WR-02: exe_path key must still exist — a future refactor must not \
+             satisfy the redaction assertion by deleting the field"
+        );
         assert!(payload["exe_path"].is_string() || payload["exe_path"].is_null());
+        if let Some(exe_path) = payload["exe_path"].as_str() {
+            assert!(
+                !exe_path.contains('/') && !exe_path.contains('\\'),
+                "WR-02: exe_path must be a bare filename with no directory \
+                 separator — OPERATIONS.md documents events.jsonl as safe to \
+                 tail and paste, so a full absolute path here leaks the \
+                 operator's home directory and OS username; got {exe_path:?}"
+            );
+        }
     }
 
     /// D-17: matches only when BOTH exact member paths appear inside the
