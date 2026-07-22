@@ -13,7 +13,7 @@
 | 16 | Pipeline Reliability Hardening | Complete    | — |
 | 17 | Pipeline Dogfood Follow-Up | Complete    | — |
 | 18 | Dogfood Reliability Hardening | Complete    | 1.5.0 |
-| 19 | Release Integrity + `main.rs` Decomposition | **Active** | 1.6.0 |
+| 19 | Release Integrity + `main.rs` Decomposition | In Progress| 1.6.0 |
 | 20 | *(unscoped — operator-facing set)* | Planned | 2.0.0 |
 
 ## Shipped
@@ -272,7 +272,7 @@ Plans:
 **Promoted from backlog** 2026-07-21: 999.10 (DEN-35), 999.11 (DEN-36), 999.8 (DEN-33), 999.16 (DEN-41).
 **Requirements:** 19a, 19b, 19c–19f, 19g (see CONTEXT.md — no formal REQ-IDs)
 **Depends on:** Phase 18 — 999.8 was deliberately blocked on it; 18a/18b are the instrumentation that makes an `ENV_MUTEX` regression observable, and 18e/18f reshaped the functions that determine the module seams.
-**Plans:** 11 plans across 6 waves
+**Plans:** 1/11 plans executed
 
 **Sequencing is load-bearing:** 19a and 19b land *before* the split, so they are small diffs against the file everyone knows rather than against seven new modules. 19g has no source overlap and can run in any wave.
 
@@ -282,7 +282,7 @@ Plans:
 
 **Wave 1** *(19a/19b/19g — all pre-split, zero file overlap)*
 
-- [ ] 19-01-PLAN.md — 19a-WR01: new `workflow::ensure_devflow_dir` writing a self-ignoring `.devflow/.gitignore`, all 7 constructors converted, coverage + scratch-repo tests
+- [x] 19-01-PLAN.md — 19a-WR01: new `workflow::ensure_devflow_dir` writing a self-ignoring `.devflow/.gitignore`, all 7 constructors converted, coverage + scratch-repo tests
 - [ ] 19-02-PLAN.md — 19a-WR02: redact `exe_path` in `events.jsonl` to the binary filename only
 - [ ] 19-03-PLAN.md — 19b: `commit_path` no longer forces an empty commit (RED-first); D-17 `commit_all` finding recorded
 - [ ] 19-04-PLAN.md — 19g: `.claude/skills/ai-change-acceptance/` + `CONTRIBUTING.md` prose

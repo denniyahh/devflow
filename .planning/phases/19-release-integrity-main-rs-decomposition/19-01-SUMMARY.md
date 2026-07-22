@@ -199,3 +199,9 @@ None - no external service configuration required.
 ---
 *Phase: 19-release-integrity-main-rs-decomposition*
 *Completed: 2026-07-21*
+
+## Self-Check: PASSED
+
+All 8 claimed files verified present on disk (7 modified `devflow-core` source
+files + 1 new integration test file). All 4 claimed commit hashes
+(`3281810`, `85aaecf`, `0b2604f`, `3505246`) verified present in `git log`.

@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
 status: "Phase 18 complete and released as v1.5.0 (2026-07-21, tag v1.5.0, crates.io published); develop synced back from main. Phase 19 (Release Integrity + main.rs Decomposition) scoped and promoted from backlog 2026-07-21 via /gsd-review-backlog: 999.10 (.devflow/ artifact hygiene, Urgent), 999.11 (commit_path empty commits), 999.8 (split main.rs, pure move), 999.16 (AI change acceptance contract). Targets v1.6.0. Discussed and PLANNED 2026-07-21: 11 plans across 6 waves, plan-checker VERIFICATION PASSED (0 blockers, 0 warnings, first iteration). Cross-AI reviewed same day (Codex, OpenCode, Antigravity via agycli; Cursor failed on account quota) - REVIEWS.md found 2 MEDIUM findings (baseline durability, depends_on metadata) plus several LOW findings, all incorporated via /gsd-plan-phase 19 --reviews (9 of 11 plans revised, re-verified VERIFICATION PASSED 0 blockers first iteration, zero regression to the reviewer-confirmed core design). Next step is /gsd-execute-phase 19. Milestone label corrected: v2.0.0 was never released (project shipped 1.2.0 to 1.5.0); the milestone now runs Phase 11-20 and closes at v2.0.0 with Phase 20."
-stopped_at: Phase 19 planned (11 plans, 6 waves) — ready to execute
-last_updated: "2026-07-21T20:15:00.000Z"
+stopped_at: Completed 19-01-PLAN.md (.devflow/ artifact hygiene, 19a)
+last_updated: "2026-07-22T00:44:20.062Z"
 progress:
   total_phases: 8
   completed_phases: 7
   total_plans: 65
-  completed_plans: 54
-  percent: 83
+  completed_plans: 55
+  percent: 85
 ---
 
 # DevFlow — Project State
@@ -63,6 +63,7 @@ progress:
     spanning 3+ target clusters, so per-module mutexes would silently break the
     exact serialization 19i raced on. **Decision: hoist one shared mutex into a
     test-support module.**
+
   - **The bottleneck is the pipeline state machine, not commands.** Mapping
     Phase 18's plans onto clusters: pipeline absorbed 3 of 7 plans (~1,040
     lines), commands only 2. A `commands/` subdirectory buys zero wave
@@ -88,6 +89,7 @@ progress:
     `workflow::ensure_devflow_dir()`, all 7 sites converted, plus a coverage
     test. Also reconciles the **duplicate `devflow_dir()`** (`workflow.rs:33`
     public, `agent_result.rs:872` private).
+
   - **D-20 was implemented but uncited**, so the blocking decision-coverage gate
     failed at 20/21. Now cited explicitly in 19-06 (the first split plan) with a
     halt-and-report branch if any 19a/19b work is still open when it starts.
@@ -105,13 +107,16 @@ progress:
   **Incorporated via `/gsd-plan-phase 19 --reviews`** the same day — 9 of 11
   plans revised (19-04, 19-10 untouched), re-verified `VERIFICATION PASSED`
   with 0 blockers on the first iteration:
+
   - Baseline durability (Codex + OpenCode, MEDIUM): 19-06 now writes a
     **committed** `19-SPLIT-BASELINE-names.txt`; 19-07/08/09/11 diff against
     it instead of an ephemeral `/tmp` file.
+
   - `depends_on` metadata (Codex, downgraded HIGH\->MEDIUM after checking
     `execute-phase.md` — wave-number gating already enforces order
     regardless of `depends_on` content): 19-06 and 19-11's `depends_on`
     arrays corrected to match their stated prerequisites.
+
   - Five more LOW/MEDIUM fixes: CI-wording precision (19-11), monitor-process
     cleanup (19-01), a second dogfood anti-pattern shape (19-05), a
     deleted-`.gitignore` doc gap (19-01), locale-independent git string
@@ -450,6 +455,7 @@ None currently open for Phase 17.
 - [Phase 18]: 18-06: enforce_build_staleness derives execution_root = state.worktree_path.unwrap_or(project_root); is_self_dogfood_workspace stays project_root-scoped (Assumption A3)
 - [Phase 18]: 18-07: launch_stage split into launch_stage (resolution + run_preflight guard) + launch_stage_inner (everything after); run_preflight's Advance arm calls launch_stage_inner directly (skip), LoopBack still calls full launch_stage (re-check), either bounded by persisted State.preflight_retries / mode::MAX_PREFLIGHT_RETRIES=3 checked before any new gate is written; counter resets to 0 (persisted) on preflight pass and human Advance. Phase 18 (18a-18g) complete.
 - [Phase 18]: 18-07: AlwaysFailAdapter cannot reproduce a preflight failure that survives a relaunch (launch_stage always re-resolves the REAL production adapter via agents::adapter_for, discarding whatever was passed into the outer run_preflight call) -- used preflight_interactivity_check (a pure function of state) as the deterministic wedge-reproduction trigger for the three new tests instead; verified empirically both ways (unfixed code + literal plan setup = no observable difference; unfixed code + interactivity-check setup = reproduces the exact documented wedge).
+- [Phase 19]: 19-01: ensure_devflow_dir(dir) returns std::io::Result (not a crate error enum) so ? converts at all 7 sites across 6 error enums with zero signature churn; marker resolution walks dir.components() (not ancestors()) so relative .devflow-leaf paths resolve correctly
 
 ## Roadmap Evolution
 
@@ -507,9 +513,10 @@ None currently open for Phase 17.
 | Phase 18 P05 | 50min | 3 tasks | 2 files |
 | Phase 18 P06 | 21min | 2 tasks | 1 files |
 | Phase 18 P07 | 25min | 3 tasks | 4 files |
+| Phase 19-release-integrity-main-rs-decomposition P01 | 55min | 3 tasks | 8 files |
 
 ## Session
 
-**Last session:** 2026-07-21T21:44:38.524Z
-**Stopped at:** Phase 19 context gathered
-**Resume file:** .planning/phases/19-release-integrity-main-rs-decomposition/19-CONTEXT.md
+**Last session:** 2026-07-22T00:44:19.962Z
+**Stopped at:** Completed 19-01-PLAN.md (.devflow/ artifact hygiene, 19a)
+**Resume file:** None
