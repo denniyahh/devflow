@@ -325,7 +325,7 @@ Plans:
 **Promoted from backlog** 2026-07-22: 999.24 (DEN-49), 999.23 (DEN-48), 999.6 (DEN-31), 999.13 (DEN-38), 999.7 (DEN-32).
 **Requirements:** 20a, 20b, 20c, 20d, 20e (see CONTEXT.md — no formal REQ-IDs)
 **Depends on:** Phase 19 — the `main.rs` split is what makes 999.6, 999.7 and 999.13 plannable as one phase in ~3 waves; all three previously conflicted in a single 8,467-line file. 999.7 also depends on 18a/18b (shipped v1.5.0), which are what tell an operator *why* the pipeline is stuck.
-**Plans:** 0 plans — needs discuss-phase before planning (999.7's override mechanism should be shared with 18f's preflight-override, not reinvented)
+**Plans:** 5 plans (one per unit)
 
 **Sequencing is load-bearing:** 20a and 20b land first so this phase's own CI and release cut are trustworthy while the rest is in flight. 20d blocks on 20a — its primary check asserts 20a's invariant and must not encode today's manual patch as the expected state. 20e sequences last: it needs a design pass and it touches the Ship/outcome path 20d reasons about.
 
@@ -333,17 +333,17 @@ Plans:
 
 **Wave 1** *(20a/20b — no file overlap; both gate this phase's own release cut)*
 
-- [ ] TBD — 20a: `version::write_version` also rewrites `[workspace.dependencies]` entries whose `path` points at a workspace member
-- [ ] TBD — 20b: `phase7_cli.rs` fixture reliability — the `cleanup --force` worktree race (product-side if a real user can hit it) and the object-store durability flake
+- [ ] 20-01-PLAN.md — 20a: `version::write_version` also rewrites `[workspace.dependencies]` local-path self-pins (additive inline-table pass; PR #17 guard becomes no-op-by-construction)
+- [ ] 20-02-PLAN.md — 20b: `cleanup --force` liveness guard + bounded-backoff retry (product fix for the worktree race) and `phase7_cli.rs` fixture durability (instance 2, fixture-side per D-08)
 
-**Wave 2** *(20c/20d — 20d blocked on 20a)*
+**Wave 2** *(20c/20d — 20d blocked on 20a; 20c/20d share the CLI dispatch surface, sequenced within the review wave)*
 
-- [ ] TBD — 20c: `devflow start --until <stage>` halts cleanly, no orphaned monitor or worktree
-- [ ] TBD — 20d: `devflow release --check` preflight — self-pin, `develop`/`main` divergence, publish order, tag-signing viability
+- [ ] 20-03-PLAN.md — 20c: `devflow start --until <stage>` halts cleanly (new `State` stop marker, `transition` interception, `check_dead_agent` stop-awareness), `--until ship` rejected
+- [ ] 20-04-PLAN.md — 20d: `devflow release --check` read-only preflight — self-pin (asserts 20a), `develop`/`main` divergence, publish order, `gpg.format`-aware signing viability
 
-**Wave 3** *(20e — blocked on discuss-phase design pass)*
+**Wave 3** *(20e — sequenced last; inherits 20a's self-pin fix via VersionBump)*
 
-- [ ] TBD — 20e: manual ship override honoring the fail-closed terminal Ship invariant
+- [ ] 20-05-PLAN.md — 20e: `devflow ship --phase N [--force]` manual override — second consumer of the on-disk Ship response, reuses `finish_workflow` (D-01), `--force` scoped to Ship (D-02)
 
 ## Backlog
 
