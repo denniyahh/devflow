@@ -17,11 +17,12 @@
 //! should expect to see this file's diff alongside `pipeline_launch.rs` for
 //! any future change to either side of the pair.
 
+use crate::CliError;
+use crate::commands::phase_artifact_on_develop;
 use crate::pipeline_gate::{abort, run_gate};
 use crate::pipeline_launch::launch_stage;
 use crate::pipeline_launch::launch_stage_inner;
 use crate::pipeline_outcomes::truncate_reason;
-use crate::{CliError, phase_artifact_on_develop};
 use devflow_core::gates::{GateAction, Gates};
 use devflow_core::mode::{self, Mode};
 use devflow_core::stage::Stage;

@@ -20,15 +20,15 @@
 //! see `pipeline_gate`'s module doc comment for the explicit caveat that
 //! this cycle is NOT a wave-parallelism promise for future pipeline work.
 
+use crate::CliError;
 use crate::pipeline_gate::transition;
 use crate::pipeline_outcomes::{
     ValidateOutcome, classify_validate_outcome, handle_infra_outcome, handle_rate_limited_outcome,
     handle_ship_failure, handle_ship_outcome, handle_stage_failure, handle_validate_outcome,
     truncate_reason,
 };
-use crate::preflight::{run_preflight, worktree_writable_roots};
+use crate::preflight::{ensure_agent_binary, run_preflight, worktree_writable_roots};
 use crate::staleness::enforce_build_staleness;
-use crate::{CliError, ensure_agent_binary};
 use devflow_core::config::{GitFlowConfig, capture_retention};
 use devflow_core::outcome_policy::{self, Action};
 use devflow_core::prompt;
