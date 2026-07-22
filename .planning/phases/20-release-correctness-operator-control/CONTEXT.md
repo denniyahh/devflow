@@ -1,7 +1,7 @@
 # Phase 20: Release Correctness + Operator Control - Context
 
 **Gathered:** 2026-07-22
-**Status:** Promoted from backlog — needs discuss-phase before planning
+**Status:** Ready for planning — discuss-phase complete
 
 <domain>
 ## Phase Boundary
@@ -59,26 +59,61 @@ about. Sequenced last deliberately: a manual override is most valuable once
 reconciliation (18a/18b, shipped in v1.5.0) can already tell the operator *why*
 the pipeline is stuck.
 
-## Open questions for discuss-phase
+## Resolved during discuss-phase (2026-07-22)
 
-- **20e mechanism sharing.** 18f's preflight-override and 20e's ship override
-  are both "a human has adjudicated this, stop re-asking" semantics. They should
-  share one mechanism rather than inventing two. Decide before planning 20e.
-- **20e scope of force.** Require the phase to actually be *at* Ship, or allow
-  forcing from an earlier stage? Leaning: require Ship, with `--force` as a
-  documented escape hatch — silently skipping Validate is how false greens
-  happen. Must not become a bypass of the terminal Ship invariant Phase 16
-  established and Phase 17 verified.
-- **20d's ceiling.** `--check` alone would have caught 3 of the 4 v1.5.0 release
-  failures. Whether a full `devflow release` that *executes* the checklist (and
-  cuts the tag) belongs in this phase is a separate, larger design question.
-  Default: `--check` only, and record the executor as a follow-up.
-- **20b: product fix or fixture fix, per instance.** Instance 1 — determine
-  whether a real user running `devflow cleanup --force` can hit the same
-  `Directory not empty` race; if yes, fix it at the product level and let the
-  test go green as a consequence. Instance 2 (object-store corruption) has no
-  obvious product analog and is probably fixture durability. Do **not** paper
-  over either test-side if the CLI has the same hole.
+- **D-01 — 20e mechanism sharing.** `run_preflight`'s 18f override only works
+  because the pipeline process (`devflow start`) is still alive inside
+  `run_gate`'s blocking `Gates::poll_response` loop (`pipeline_gate.rs:168`) —
+  approving just tells that live loop "don't re-run the check next time
+  around." 20e's whole premise is that this process is dead, so a response
+  file alone is inert.
+
+  **Decision:** keep one on-disk adjudication record — the same gate-response
+  file/schema (`Gates::respond` / `NN-{stage}.response.json`) both paths
+  already use. 18f's live poll loop keeps consuming it in-process
+  (unchanged). 20e's new `devflow ship --phase N` command is a second,
+  out-of-process consumer of the *same* record: it reads the already-written
+  Ship response directly and, on `GateAction::Advance`, calls the same
+  `finish_workflow()` → `hooks::hooks_after_ship()` batch that `run_gate`
+  would have driven (`pipeline_gate.rs:130`) — not a reimplementation of what
+  approving Ship means, just a second trigger for the one existing effect.
+  — **Reversibility:** costly — inverting this later means untangling a
+  second command from a code path (`finish_workflow`) that Phase 16/17 already
+  hardened and tested; not undoable as a one-line revert.
+
+- **D-02 — 20e scope of force.** `devflow ship --phase N [--force]` requires
+  `state.stage == Stage::Ship` (a Ship gate already written, unconsumed by a
+  dead process). It is a recovery for "the approval is stuck," not a shortcut
+  past Validate. Any earlier stage returns an error directing the operator to
+  resolve that stage first — `--force` never skips Validate. This preserves
+  the terminal Ship invariant Phase 16 established and Phase 17 verified
+  untouched.
+
+- **D-03 — 20d's ceiling.** `devflow release --check` ships as a read-only
+  preflight only in this phase — no executor that runs the actual
+  merge/tag/sync/publish sequence. **A backlog item for the future executor
+  must be filed** (new `999.N`, mirrored to Linear per this project's backlog
+  convention) so the "separate, larger design question" doesn't get lost —
+  see Deferred below.
+
+- **D-04 — 20b instance 1 (worktree removal race).** Not locked to a fix
+  shape yet. Before planning commits to "retry + `git worktree prune`
+  fallback in `cleanup --force`," the phase-researcher must first verify
+  whether a real `devflow cleanup --force` run can reach the same
+  `Directory not empty` race (not just the `phase7_cli.rs:534` fixture).
+  Confirmed-reachable → product fix, test goes green as a consequence.
+  Not reachable → fixture-only fix, and say so explicitly rather than
+  silently defaulting to a product change.
+
+- **D-05 — 20b instance 2 (object-store corruption).** Also not locked.
+  CONTEXT.md's original lean ("no obvious product analog, probably fixture
+  durability") stands as the *default*, but the phase-researcher must still
+  check whether DevFlow's own git operations (not just the
+  `phase7_cli.rs:236` 60-commit-loop fixture) could hit the same
+  index/object-store race under real concurrent load before locking this as
+  fixture-only. If no product path is found, fix is fsync settings
+  (`core.fsyncObjectFiles`/`core.fsync`) on fixture repos and/or shrinking the
+  loop's window where it isn't needed for the `>50` threshold.
 
 </decisions>
 
@@ -350,6 +385,41 @@ a guard only — `write_version` is unchanged by it.
 
 </verification>
 
+<canonical_refs>
+## Canonical References
+
+**Downstream agents (researcher, planner) MUST read these before planning or
+implementing 20e in particular — they ground D-01/D-02 above.**
+
+### 20e — gate/ship mechanism
+- `crates/devflow-core/src/gates.rs` — `respond()` (`:179`), `NoOpenGate`
+  (`:93`); the on-disk adjudication record 20e must reuse, not reinvent.
+- `crates/devflow-cli/src/pipeline_gate.rs` — `run_gate()` (`:168`, the live
+  blocking poll 18f depends on and 20e cannot depend on),
+  `finish_workflow()` (`:130`, the after-ship hook batch 20e must call
+  directly).
+- `crates/devflow-cli/src/preflight.rs` — 18f's `GateAction::Advance`
+  override (`:188`, `:243`) — the sibling mechanism 20e's design note (D-01)
+  explicitly builds on rather than duplicates.
+- `crates/devflow-cli/src/pipeline_outcomes.rs` — `handle_ship_outcome()`
+  (`:275`), showing the Ship gate is always-gated regardless of mode; 20e
+  must reach the same terminal state through its second entry point.
+
+### 20a — version self-pin
+- `crates/devflow-cli/src/version.rs` — `write_version` / `field_for()`
+  (lines ~198–205 per the verification table above).
+- `crates/devflow-cli/tests/workspace_version_pin.rs` (PR #17) — the existing
+  RED-proven guard; 20a's fix must turn this from a guard into a no-op-by-
+  construction, not replace it.
+
+### 20b — flaky fixtures
+- `crates/devflow-cli/tests/phase7_cli.rs:534` — instance 1
+  (`reference_and_cleanup_worktree_cli_flow`).
+- `crates/devflow-cli/tests/phase7_cli.rs:236` (60-commit loop at `:246`) —
+  instance 2 (`start_worktree_mode_ignores_main_checkout_divergence`).
+
+</canonical_refs>
+
 <deferred>
 ## Deferred
 
@@ -361,7 +431,12 @@ discoverability). Split it into smaller issues before promoting; it should not
 ride along as the largest, lowest-value unit in a phase that already carries two
 L-sized items.
 
-**A `devflow release` that executes** (rather than just `--check`) — see open
-questions under 20d.
+**A `devflow release` that executes** (rather than just `--check`) — locked as
+out of scope per D-03. **Action required before/at ship:** file a new backlog
+item (next `999.N`, mirrored to Linear per `reference-linear-devflow-project`
+convention) for "release-cut executor: merge PR → tag → sync develop → publish"
+so this doesn't silently disappear once 20d's `--check` ships. Not filed yet —
+this phase's `git_commit`/`update_state` steps do not create Linear issues;
+raise it explicitly during `/gsd-review-backlog` or at Phase 20 ship time.
 
 </deferred>
