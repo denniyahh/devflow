@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
 status: "Phase 18 complete and released as v1.5.0 (2026-07-21, tag v1.5.0, crates.io published); develop synced back from main. Phase 19 (Release Integrity + main.rs Decomposition) scoped and promoted from backlog 2026-07-21 via /gsd-review-backlog: 999.10 (.devflow/ artifact hygiene, Urgent), 999.11 (commit_path empty commits), 999.8 (split main.rs, pure move), 999.16 (AI change acceptance contract). Targets v1.6.0. Discussed and PLANNED 2026-07-21: 11 plans across 6 waves, plan-checker VERIFICATION PASSED (0 blockers, 0 warnings, first iteration). Cross-AI reviewed same day (Codex, OpenCode, Antigravity via agycli; Cursor failed on account quota) - REVIEWS.md found 2 MEDIUM findings (baseline durability, depends_on metadata) plus several LOW findings, all incorporated via /gsd-plan-phase 19 --reviews (9 of 11 plans revised, re-verified VERIFICATION PASSED 0 blockers first iteration, zero regression to the reviewer-confirmed core design). Next step is /gsd-execute-phase 19. Milestone label corrected: v2.0.0 was never released (project shipped 1.2.0 to 1.5.0); the milestone now runs Phase 11-20 and closes at v2.0.0 with Phase 20."
-stopped_at: "Completed 19-05-PLAN.md (dogfood the AI change acceptance contract, 19g — checkpoint approved)"
-last_updated: "2026-07-22T02:06:43.593Z"
+stopped_at: "Completed 19-07-PLAN.md (staleness + preflight cluster extraction, 19c/19d)"
+last_updated: "2026-07-22T11:45:00.000Z"
 progress:
   total_phases: 8
   completed_phases: 7
   total_plans: 65
-  completed_plans: 60
+  completed_plans: 61
   percent: 88
 ---
 
@@ -461,6 +461,7 @@ None currently open for Phase 17.
 - [Phase 19]: 19-04: ai-change-acceptance project skill (D-19's 5 requirements + 4 rejection patterns) plus a CONTRIBUTING.md section, wired into /gsd-code-review per D-18; also fixed .gitignore's blanket .claude/ ignore (carved out !.claude/skills/**, mirroring the existing .codex/* pattern) since it would otherwise have silently prevented the new skill from ever being committed
 - [Phase 19]: 19-06: no D-12 ENV_MUTEX finding — three consecutive cargo test -p devflow runs post-hoist stable, 0 failed each time
 - [Phase 19]: 19-05: dogfood checkpoint for 19g approved on combined evidence — an in-session five-diff run (same agent authored and reviewed, so it could not prove isolated wiring by itself) plus an independently-spawned, context-isolated gsd-code-reviewer subagent that caught both anti-pattern shapes cold. Recorded gap for later triage: the isolated reviewer's generic judgment agreed but did not cite the ai-change-acceptance contract by name unless the dispatch explicitly loaded it — review-dispatch prompts should load the skill explicitly, and part of that wiring surface lives outside this repository.
+- [Phase 19]: 19-07: staleness + preflight clusters extracted into staleness.rs/preflight.rs (shakedown run for the mechanical extraction procedure ahead of 19-08/19-09's larger clusters); 438/438 tests unchanged, every moved function diffs clean against the 19-06 baseline SHA modulo pub(crate); preflight <-> pipeline bidirectional call preserved as direct calls, not abstracted. Two findings recorded for 19-08/19-09: a wider-than-estimated pub(crate) surface (worktree_writable_roots, ensure_agent_binary, agent_program, phase_artifact_on_develop all needed it beyond the plan's run_preflight/launch_stage_inner estimate), and a bug in the plan's own literal name-set extraction command (`rg '::tests::' | sed 's/.*::tests:://'` silently drops main.rs's own top-level mod tests entries; corrected to `sed 's/.*:://'`).
 
 ## Roadmap Evolution
 
@@ -524,9 +525,10 @@ None currently open for Phase 17.
 | Phase 19-release-integrity-main-rs-decomposition P04 | 20min | 2 tasks | 5 files |
 | Phase 19 P06 | 22min | 3 tasks | 6 files |
 | Phase 19 P05 | n/a | 1 tasks | 0 files |
+| Phase 19 P07 | 71min | 2 tasks | 3 files |
 
 ## Session
 
-**Last session:** 2026-07-22T02:06:43.593Z
-**Stopped at:** Completed 19-05-PLAN.md (dogfood the AI change acceptance contract, 19g — checkpoint approved)
+**Last session:** 2026-07-22T11:45:00.000Z
+**Stopped at:** Completed 19-07-PLAN.md (staleness + preflight cluster extraction, 19c/19d)
 **Resume file:** None
