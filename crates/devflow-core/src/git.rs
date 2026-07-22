@@ -699,6 +699,103 @@ mod tests {
         );
     }
 
+    /// `git rev-list --count HEAD`, parsed. Shared by the three tests below
+    /// so a failure reports both counts instead of a bare assertion.
+    fn rev_list_count(root: &Path) -> u32 {
+        let output = Command::new("git")
+            .args(["rev-list", "--count", "HEAD"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git rev-list --count HEAD failed");
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<u32>()
+            .expect("rev-list --count HEAD must print an integer")
+    }
+
+    /// 19b/D-16: `hooks::version_bump` (hooks.rs:242) calls `commit_path` and
+    /// then tags whatever commit it last produced (hooks.rs:249). If a
+    /// terminal-batch retry calls `commit_path` again with byte-identical
+    /// content (the file untouched since the first call), a forced commit
+    /// here means the release tag can end up naming a commit that contains
+    /// nothing new. This pins the exact retry scenario: two calls, unchanged
+    /// content, `git rev-list --count HEAD` must not move between them.
+    #[test]
+    fn commit_path_twice_with_identical_content_creates_only_one_commit() {
+        let repo = init_repo();
+        let root = repo.path();
+        std::fs::write(root.join("CHANGELOG.md"), "# Changelog\n").unwrap();
+
+        flow(root)
+            .commit_path("CHANGELOG.md", "docs: add changelog entry")
+            .expect("first commit_path call");
+        let n1 = rev_list_count(root);
+
+        // The file is not touched again -- this is the retry scenario, not
+        // a second genuine change.
+        flow(root)
+            .commit_path("CHANGELOG.md", "docs: add changelog entry")
+            .expect("second commit_path call");
+        let n2 = rev_list_count(root);
+
+        assert_eq!(
+            n2, n1,
+            "a repeat commit_path call on unchanged content must not add a \
+             commit: n1={n1}, n2={n2}"
+        );
+    }
+
+    /// 19b/D-16, T-19-11: separates the "no commit" claim from the "no
+    /// error" claim so a future change can't satisfy one by breaking the
+    /// other. `hooks.rs` propagates `commit_path`'s `Result` with `?` at both
+    /// call sites (changelog_append:225, version_bump:242) -- turning a
+    /// genuine no-op into `Err` would stall the terminal hook batch (see
+    /// T-19-11 in this plan's threat model), so both properties must hold
+    /// simultaneously.
+    #[test]
+    fn commit_path_with_no_changes_returns_ok_without_committing() {
+        let repo = init_repo();
+        let root = repo.path();
+        std::fs::write(root.join("CHANGELOG.md"), "# Changelog\n").unwrap();
+        flow(root)
+            .commit_path("CHANGELOG.md", "docs: add changelog entry")
+            .expect("initial commit_path");
+        let n1 = rev_list_count(root);
+
+        // CHANGELOG.md is already committed and unmodified -- a single call
+        // here has nothing to commit.
+        let result = flow(root).commit_path("CHANGELOG.md", "docs: add changelog entry");
+        let n2 = rev_list_count(root);
+
+        assert!(
+            result.is_ok(),
+            "no-op call must return Ok(()), got: {result:?}"
+        );
+        assert_eq!(
+            n2, n1,
+            "no-op call must not create a commit: n1={n1}, n2={n2}"
+        );
+    }
+
+    /// Edge case the fix must NOT change: `commit_path` on a path that does
+    /// not exist on disk still errors at the staging step (`git add` fails
+    /// on an unknown pathspec). Asserted explicitly so the fix for the
+    /// no-change case above cannot be over-applied into "commit_path never
+    /// fails".
+    #[test]
+    fn commit_path_on_nonexistent_path_still_errors() {
+        let repo = init_repo();
+        let root = repo.path();
+
+        let result = flow(root).commit_path("does-not-exist.md", "docs: add changelog entry");
+
+        assert!(
+            result.is_err(),
+            "commit_path on an unknown pathspec must still error, got: {result:?}"
+        );
+    }
+
     #[test]
     fn release_start_branches_from_current_head_not_develop() {
         let repo = init_repo();
