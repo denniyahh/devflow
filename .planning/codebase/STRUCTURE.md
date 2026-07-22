@@ -1,224 +1,159 @@
 # Codebase Structure
 
-**Analysis Date:** 2026-07-17
+**Analysis Date:** 2026-07-22
 
 ## Directory Layout
 
-```
-devflow/                                # Project root
+```text
+devflow/
 ├── crates/
-│   ├── devflow-core/                   # Core library: state machine, adapters, git, versioning
+│   ├── devflow-core/                    # Public library: workflow state, adapters, git, gates, hooks
 │   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── lib.rs                  # Module re-exports, logging setup docs
-│   │       ├── agent.rs                # Agent process helpers (PID checking)
-│   │       ├── agent_result.rs         # Three-layer result parsing (DEVFLOW_RESULT, exit code, heuristic)
-│   │       ├── config.rs               # Git-flow constants (main, develop, feature/ prefix)
-│   │       ├── events.rs               # Event emission (currently empty/unused)
-│   │       ├── gates.rs                # Gate request/response/ack file protocol
-│   │       ├── git.rs                  # GitFlow helper: feature/release/tag operations
-│   │       ├── hooks.rs                # Git hook integration (not yet implemented)
-│   │       ├── lock.rs                 # Per-phase + project-wide file-based locks
-│   │       ├── mode.rs                 # Mode enum: Auto vs. Supervise
-│   │       ├── monitor.rs              # Background daemon spawning (agent owner)
-│   │       ├── prompt.rs               # Stage-specific agent prompts + DEVFLOW_RESULT contract
-│   │       ├── recover.rs              # Inspect/cleanup stale workflow state
-│   │       ├── ship.rs                 # Cron instructions (rate-limit resumption)
-│   │       ├── stage.rs                # Stage enum: Define/Plan/Code/Validate/Ship
-│   │       ├── state.rs                # State struct (persisted to .devflow/state-NN.json)
-│   │       ├── version.rs              # Version file I/O
-│   │       ├── workflow.rs             # State persistence (I/O, migration)
-│   │       ├── worktree.rs             # Git worktree operations
-│   │       ├── agents/
-│   │       │   ├── mod.rs              # AgentAdapter trait + adapter factory
-│   │       │   ├── claude.rs           # Claude Code CLI adapter
-│   │       │   ├── codex.rs            # OpenAI Codex CLI adapter
-│   │       │   └── opencode.rs         # OpenCode CLI adapter
-│   │       └── tests/
-│   │           └── monitor_e2e.rs      # E2E monitor tests
-│   │
-│   └── devflow-cli/                    # Binary: CLI wrapper around core
+│   │   ├── src/
+│   │   │   ├── lib.rs                   # Public module declarations and logging setup
+│   │   │   ├── agent.rs                 # Agent process helpers
+│   │   │   ├── agent_result.rs          # Layered agent-result evaluation
+│   │   │   ├── config.rs                # Git-flow and runtime configuration
+│   │   │   ├── events.rs                # Structured event emission
+│   │   │   ├── gates.rs                 # Gate request/response/ack protocol
+│   │   │   ├── git.rs                   # GitFlow operations
+│   │   │   ├── hooks.rs                 # Pipeline hook execution
+│   │   │   ├── lock.rs                  # Per-phase and project checkout locks
+│   │   │   ├── mode.rs                  # Pipeline modes and retry policy
+│   │   │   ├── monitor.rs               # Detached monitor spawning and capture
+│   │   │   ├── outcome_policy.rs        # Agent outcome to pipeline action policy
+│   │   │   ├── prompt.rs                # Stage prompts and completion contract
+│   │   │   ├── recover.rs               # Stale-state inspection and cleanup
+│   │   │   ├── ship.rs                  # Rate-limit cron instructions
+│   │   │   ├── stage.rs                 # Define/Plan/Code/Validate/Ship model
+│   │   │   ├── state.rs                 # Per-phase persisted State
+│   │   │   ├── verify.rs                # Validation verdict parsing
+│   │   │   ├── version.rs               # Version file I/O
+│   │   │   ├── workflow.rs              # State persistence and .devflow setup
+│   │   │   ├── worktree.rs              # Git worktree operations
+│   │   │   └── agents/                  # AgentAdapter implementations and factory
+│   │   └── tests/                    # Core integration tests
+│   └── devflow-cli/                     # Binary crate: clap routing and orchestration
 │       ├── Cargo.toml
-│       └── src/
-│           ├── main.rs                 # CLI command dispatcher (Start, Advance, Gate, Logs, Parallel, Sequentagent)
-│           └── tests/
-│               ├── help_snapshot.rs    # Snapshot test for --help output
-│               ├── devcontainer_ci_failfast.rs
-│               ├── gitignore_coverage.rs
-│               ├── log_format_env.rs    # Tests for DEVFLOW_LOG_FORMAT=json
-│               └── phase7_cli.rs        # Integration tests for Phase 7
-│
-├── .devflow/                            # Runtime state directory (git-ignored)
-│   ├── state-NN.json                   # Per-phase workflow state (YAML-like structure)
-│   ├── lock-NN                         # Per-phase lock file (contains PID)
-│   ├── lock-project                    # Project-wide lock (short-held)
-│   ├── phase-NN-stdout                 # Agent stdout capture
-│   ├── phase-NN-stderr.log             # Agent stderr capture
-│   ├── phase-NN-exit                   # Agent exit code (0 or non-zero)
-│   ├── phase-NN-agent-pid              # Agent process ID (for recovery)
-│   ├── cron-instructions-NN.json       # Rate-limit resumption manifest
-│   ├── gates/
-│   │   ├── NN-stage.json               # Gate request (written by workflow)
-│   │   ├── NN-stage.response.json      # Gate response (written by human/Hermes)
-│   │   └── NN-stage.ack.json           # Gate receipt (written by workflow)
-│   └── events.jsonl                    # Structured event log
-│
-├── .worktrees/                          # Git worktree directory (git-ignored)
-│   ├── phase-NN/                       # Worktree checked out at feature/phase-NN
-│   └── phase-NN-agent/                 # For multi-agent runs (sequentagent, parallel)
-│
-├── docs/
-│   ├── ARCHITECTURE.md                 # System design
-│   ├── OPERATIONS.md                   # Operator reference (.devflow/ file inventory, env vars)
-│   ├── DEPENDENCIES.md                 # Tool + agent dependency matrix
-│   └── CONTRIBUTING.md
-│
-└── scripts/
-    └── install.sh                      # Installation script (curl -fsSL ... | bash)
+│       ├── build.rs                   # Build provenance environment values
+│       ├── src/
+│       │   ├── main.rs               # 478 lines: argument types, CliError, dispatch, project_root
+│       │   ├── commands.rs           # 2,326 lines: handlers, display, doctor reconciliation
+│       │   ├── pipeline_launch.rs    # 585 lines: launch/resume/advance seam
+│       │   ├── pipeline_outcomes.rs  # 1,719 lines: outcome handling and checkout hooks
+│       │   ├── pipeline_gate.rs      # 789 lines: transitions, gates, finish, abort
+│       │   ├── preflight.rs          # 772 lines: pre-launch readiness checks
+│       │   ├── staleness.rs          # 1,284 lines: build provenance/staleness enforcement
+│       │   ├── parallel.rs           # 530 lines: parallel and sequentagent orchestration
+│       │   ├── config_parse.rs       # 75 lines: timeout parsing and escalation threshold
+│       │   └── test_support.rs       # 288 lines: shared CLI test fixtures and ENV_MUTEX
+│       └── tests/                    # CLI integration tests and snapshots
+├── .devflow/                             # Generated, git-ignored runtime state
+├── .worktrees/                           # Generated phase worktrees
+├── docs/                                 # MkDocs source under guides/, architecture/, diagrams/
+├── scripts/                              # Install, deploy, and branch-sync shell entrypoints
+├── ARCHITECTURE.md                       # Root architecture overview
+├── CONTRIBUTING.md                       # Contributor workflow and review rules
+├── DEPENDENCIES.md                       # Dependency matrix
+└── OPERATIONS.md                         # Operator reference
 ```
 
 ## Directory Purposes
 
 **`crates/devflow-core/`:**
-- Purpose: Core library encapsulating the workflow state machine, agent adapters, and git operations
-- Contains: Public API types (State, Stage, Mode, AgentAdapter), error types, helper functions
-- Key files: `lib.rs` (module re-exports), `stage.rs` (5-stage pipeline), `state.rs` (persisted state)
+- Public library for persisted workflow state, policies, adapters, git operations, gates, hooks, monitoring, and worktrees.
+- Its API has external crate consumers, so intentional exports use `pub`.
 
 **`crates/devflow-cli/`:**
-- Purpose: Thin CLI wrapper; translates user commands to core library calls
-- Contains: Command-line argument parsing (clap), error formatting, output rendering
-- Key files: `main.rs` (single 1000+ line file with all commands)
+- Binary crate that parses commands and coordinates `devflow-core`.
+- `main.rs` is a thin crate root; operational code belongs in the flat sibling module that owns the behavior.
+- Cross-module CLI items use `pub(crate)`, never unrestricted `pub`, because the binary crate has no external API consumers.
 
 **`.devflow/`:**
-- Purpose: Persistent workflow state directory (always `.devflow` at project root, never configurable)
-- Contains: State files, locks, capture files, gates, cron instructions
-- Git-ignored: Yes (added to `.gitignore`)
-- Committed: No
+- Generated project-local state, locks, captures, gate files, cron instructions, and `events.jsonl`.
+- The directory writes its own `.gitignore` marker and must never enter repository history.
 
 **`.worktrees/`:**
-- Purpose: Isolated git worktrees for each phase (linked checkouts sharing the main `.git`)
-- Contains: One subdirectory per active phase (`phase-NN/`)
-- Git-ignored: No (worktrees are git-native; `.git/worktrees/` metadata lives in the main repo)
-- Committed: No
+- Generated linked checkouts for phase and multi-agent isolation.
+- Git worktree metadata lives under the repository's common Git directory.
 
 ## Key File Locations
 
-**Entry Points:**
-- `crates/devflow-cli/src/main.rs`: Single entry point; parse CLI args, dispatch to command handlers
+**Entry and Commands:**
+- `crates/devflow-cli/src/main.rs`: clap argument types, top-level dispatch, `CliError`, and project-root resolution.
+- `crates/devflow-cli/src/commands.rs`: command handlers, output rendering, and doctor reconciliation.
+- `crates/devflow-cli/src/parallel.rs`: parallel phase startup and the blocking sequentagent handoff.
+- `crates/devflow-cli/src/config_parse.rs`: environment-backed timeout parsing.
 
-**Configuration:**
-- No config file required (all options are CLI flags to `devflow start`)
-- `crates/devflow-core/src/config.rs`: Hardcoded git-flow constants (main=main, develop=develop, feature_prefix=feature/)
+**Pipeline:**
+- `crates/devflow-cli/src/pipeline_launch.rs`: launch, resume, and evaluated-result dispatch.
+- `crates/devflow-cli/src/pipeline_outcomes.rs`: typed result handling, checkout hooks, and gate-context rendering.
+- `crates/devflow-cli/src/pipeline_gate.rs`: transitions, loop-backs, gates, completion, and abort.
+- `crates/devflow-cli/src/preflight.rs`: readiness checks before monitor spawn.
+- `crates/devflow-cli/src/staleness.rs`: build provenance and self-dogfood staleness enforcement.
 
-**Core Logic:**
-- `crates/devflow-core/src/stage.rs`: Stage enum and pipeline logic (Define → Plan → Code → Validate → Ship)
-- `crates/devflow-core/src/state.rs`: State struct (agent, phase, stage, mode, gate_pending, consecutive_failures, worktree_path)
-- `crates/devflow-core/src/workflow.rs`: State persistence (read/write `.devflow/state-{N:02}.json`)
-- `crates/devflow-core/src/monitor.rs`: Background daemon spawning and agent ownership
-- `crates/devflow-core/src/agents/mod.rs`: AgentAdapter trait; factory function `adapter_for()`
+**Core State and Protocols:**
+- `crates/devflow-core/src/state.rs`: persisted `State`.
+- `crates/devflow-core/src/stage.rs`: `Stage` and stage progression.
+- `crates/devflow-core/src/workflow.rs`: per-phase state files and `.devflow` creation.
+- `crates/devflow-core/src/gates.rs`: gate protocol.
+- `crates/devflow-core/src/agents/mod.rs`: `AgentAdapter` and `adapter_for`.
 
 **Testing:**
-- `crates/devflow-core/tests/monitor_e2e.rs`: E2E monitor tests
-- `crates/devflow-cli/tests/`: Integration tests (help snapshot, log format, phase 7 CLI)
-
-**Runtime Files:**
-- `.devflow/state-{NN:02}.json`: Per-phase workflow state (read/write by `workflow.rs`)
-- `.devflow/lock-{NN:02}`: Per-phase lock (created/released by `lock.rs`)
-- `.devflow/phase-{NN:02}-stdout`: Agent stdout capture (written by monitor shell script)
-- `.devflow/phase-{NN:02}-exit`: Agent exit code (written by monitor shell script)
-- `.devflow/gates/{NN:02}-{stage}.json`: Gate request (written by `gates.rs`)
-- `.devflow/gates/{NN:02}-{stage}.response.json`: Human response (written by user/Hermes)
+- `crates/devflow-cli/src/test_support.rs`: shared CLI unit-test fixtures and the crate-wide `ENV_MUTEX`.
+- `crates/devflow-cli/tests/`: binary integration tests and the help snapshot.
+- `crates/devflow-core/tests/`: core integration tests.
 
 ## Naming Conventions
 
-**Files:**
-- State: `.devflow/state-{phase:02d}.json` (zero-padded 2-digit phase number)
-- Locks: `.devflow/lock-{phase:02d}` (same padding)
-- Capture: `.devflow/phase-{phase:02d}-stdout` (stdout), `-stderr.log` (stderr), `-exit` (exit code), `-agent-pid` (PID)
-- Gates: `.devflow/gates/{phase:02d}-{stage}.json` (request), `.response.json` (response), `.ack.json` (receipt)
-- Worktrees: `.worktrees/phase-{phase:02d}/` (basic), `.worktrees/phase-{phase:02d}-{agent}/` (multi-agent)
-- Cron instructions: `.devflow/cron-instructions-{phase:02d}.json`
+**Runtime files:**
+- State: `.devflow/state-{phase:02}.json`
+- Phase lock: `.devflow/lock-{phase:02}`
+- Project checkout lock: `.devflow/lock-project`
+- Captures: `.devflow/phase-{phase:02}-stdout`, `-stderr.log`, `-exit`, `-agent-pid`
+- Gates: `.devflow/gates/{phase:02}-{stage}.json`, `.response.json`, `.ack.json`
+- Cron instructions: `.devflow/cron-instructions-{phase:02}.json`
+- Worktrees: `.worktrees/phase-{phase:02}/` and `.worktrees/phase-{phase:02}-{agent}/`
 
-**Directories:**
-- Phases use lowercase: `phase-NN`, `feature/phase-NN`
-- Stages use lowercase: `define`, `plan`, `code`, `validate`, `ship`
-- Agents use lowercase: `claude`, `codex`, `opencode`
-
-**Functions:**
-- Paths: `*_path()` (returns PathBuf)
-- Operations: verb + noun, snake_case (e.g., `feature_start()`, `gate_approve()`)
-- Predicates: `is_*()` or `should_*()` (e.g., `is_gate()`, `should_gate()`)
-- Factories: `*_for()` (e.g., `adapter_for()`)
-
-**Modules:**
-- Trait + implementations in same file (e.g., `agent.rs` for `agent_running()`)
-- Adapter implementations in submodule (e.g., `agents/claude.rs` for `ClaudeAgent`)
-- Error types co-located with responsibility (e.g., `GitError` in `git.rs`)
+**Rust:**
+- Paths use `*_path`; operations use verb-noun snake case; predicates use `is_*` or `should_*`; factories use `*_for`.
+- Unit tests live at the bottom of the module whose production function they exercise.
+- CLI sibling APIs are `pub(crate)`. Core library exports may be `pub` when consumed outside their module or crate.
 
 ## Where to Add New Code
 
-**New Stage or Pipeline Logic:**
-- Primary: `crates/devflow-core/src/stage.rs` (update Stage enum, next() method, is_gate(), is_agent_stage())
-- Secondary: `crates/devflow-core/src/prompt.rs` (add stage-specific prompt function)
-- Tertiary: `crates/devflow-cli/src/main.rs` (add Advance command arm for new stage)
+**New command:**
+- Add clap argument shape and routing in `crates/devflow-cli/src/main.rs`.
+- Put the handler and display helpers in `crates/devflow-cli/src/commands.rs`.
+- Put reusable state, protocol, or git behavior in the owning `crates/devflow-core/src/` module.
 
-**New Agent Adapter:**
-- Implementation: `crates/devflow-core/src/agents/{agent_name}.rs` (implement AgentAdapter trait)
-- Registration: `crates/devflow-core/src/agents/mod.rs` (add to `adapter_for()` match arm)
-- CLI: `crates/devflow-cli/src/main.rs` (add variant to `--agent` arg value parsing)
-- Tests: Add snapshot/integration tests in `crates/devflow-cli/tests/`
+**Pipeline behavior:**
+- Start from the owning seam: launch/resume in `pipeline_launch.rs`, result handling in `pipeline_outcomes.rs`, or transitions/gates in `pipeline_gate.rs`.
+- The three pipeline modules are mutually cyclic by design. A pipeline change is likely to touch two or three together; the split provides reviewable `pub(crate)` boundaries, not pipeline-internal wave parallelism.
+- `preflight.rs` and `pipeline_launch.rs` are also bidirectionally coupled: launch invokes preflight, while an approved preflight advance invokes `launch_stage_inner`. Plan changes to either with both files in view.
 
-**New Git Operation:**
-- Implementation: `crates/devflow-core/src/git.rs` (add method to GitFlow impl block)
-- Usage: Call from `crates/devflow-cli/src/main.rs` (Start, Advance, or Cleanup command)
-- Tests: Add unit tests at bottom of git.rs file
+**Independent CLI behavior:**
+- Commands/display, staleness, parallel orchestration, and config parsing are separate clusters and can usually be planned independently of the pipeline and of each other. This is the main wave-parallelism benefit of the split.
 
-**New Gate or Gate Decision Logic:**
-- Gate protocol: `crates/devflow-core/src/gates.rs` (gate request/response/ack structures, decision logic)
-- Advance integration: `crates/devflow-cli/src/main.rs` (Advance command arm for the stage)
-- Tests: Add tests in gates.rs; integration tests in CLI tests
+**New agent adapter:**
+- Add the implementation under `crates/devflow-core/src/agents/` and register it in `crates/devflow-core/src/agents/mod.rs`.
+- Extend CLI parsing only if the adapter needs a new `AgentKind` value.
 
-**New Command:**
-- CLI enum: Add variant to `Command` enum in `crates/devflow-cli/src/main.rs`
-- Handler: Implement command handler in main.rs (or split to a submodule if complex)
-- Core logic: Implement in `crates/devflow-core/` (new module or extend existing)
-- Tests: Add integration tests in `crates/devflow-cli/tests/`
-
-**New Logging or Observability:**
-- Tracing integration: Already set up in `crates/devflow-core/src/lib.rs` (RUST_LOG, DEVFLOW_LOG_FORMAT)
-- Events: Add structured event emission via `tracing::info!()` in relevant modules
-- Tests: Add test in `crates/devflow-cli/tests/log_format_env.rs`
-
-**Error Handling:**
-- Error types: Define per-module (e.g., `GitError`, `WorkflowError`, `LockError`)
-- Pattern: Use `#[from]` attributes for automatic conversion in `Result<T, E>` contexts
-- No panics: Use `.map_err()` and `?` operator; never `.unwrap()` in production code
+**New git, gate, or persistence behavior:**
+- Git operations belong in `crates/devflow-core/src/git.rs`.
+- Gate protocol behavior belongs in `crates/devflow-core/src/gates.rs`; pipeline integration belongs in the appropriate pipeline seam.
+- Runtime path construction and state I/O belong in `crates/devflow-core/src/workflow.rs`.
 
 ## Special Directories
 
-**`.devflow/` (Runtime State):**
-- Purpose: Persistent per-phase workflow state and gate protocol files
-- Generated: Yes (created by CLI on first use)
-- Committed: No (git-ignored)
-- Cleanup: `devflow cleanup` removes phase worktrees and branches; leaves state/capture files for audit
+**`.devflow/`:** Generated runtime evidence. Cleanup is deliberately conservative so captures and events remain available for diagnosis.
 
-**`.worktrees/` (Git Worktrees):**
-- Purpose: Isolated git worktrees per phase, each with its own working directory but shared `.git` object database
-- Generated: Yes (created by `git worktree add`)
-- Committed: No (not git-tracked; worktree metadata lives in main `.git/worktrees/`)
-- Cleanup: `devflow cleanup` removes worktree directories; `git worktree remove` cleans git metadata
+**`.worktrees/`:** Generated linked worktrees. Use Git worktree operations for removal so shared metadata remains consistent.
 
-**`docs/` (Documentation):**
-- ARCHITECTURE.md — system design (you're reading this codebase map, which corresponds to ARCHITECTURE.md at the project level)
-- OPERATIONS.md — operator reference (gate protocol, env vars, .devflow/ file inventory)
-- DEPENDENCIES.md — tool and agent dependency matrix
-- CONTRIBUTING.md — how to contribute
+**`docs/`:** MkDocs content. Root operator and contributor documents remain `OPERATIONS.md`, `ARCHITECTURE.md`, `DEPENDENCIES.md`, and `CONTRIBUTING.md`.
 
-**`crates/devflow-cli/tests/` (Integration Tests):**
-- Not unit tests (which live in their respective modules)
-- Integration tests that spawn the full CLI and check behavior
-- Examples: help snapshot, log format (JSON vs. text), phase 7 CLI walkthrough
+**`crates/devflow-cli/tests/` and `crates/devflow-core/tests/`:** Integration-test binaries. Unit tests stay beside their production modules.
 
 ---
 
-*Structure analysis: 2026-07-17*
+*Structure analysis: 2026-07-22*
