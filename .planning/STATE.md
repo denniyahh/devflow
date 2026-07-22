@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
 status: "Phase 18 complete and released as v1.5.0 (2026-07-21, tag v1.5.0, crates.io published); develop synced back from main. Phase 19 (Release Integrity + main.rs Decomposition) scoped and promoted from backlog 2026-07-21 via /gsd-review-backlog: 999.10 (.devflow/ artifact hygiene, Urgent), 999.11 (commit_path empty commits), 999.8 (split main.rs, pure move), 999.16 (AI change acceptance contract). Targets v1.6.0. Discussed and PLANNED 2026-07-21: 11 plans across 6 waves, plan-checker VERIFICATION PASSED (0 blockers, 0 warnings, first iteration). Cross-AI reviewed same day (Codex, OpenCode, Antigravity via agycli; Cursor failed on account quota) - REVIEWS.md found 2 MEDIUM findings (baseline durability, depends_on metadata) plus several LOW findings, all incorporated via /gsd-plan-phase 19 --reviews (9 of 11 plans revised, re-verified VERIFICATION PASSED 0 blockers first iteration, zero regression to the reviewer-confirmed core design). Next step is /gsd-execute-phase 19. Milestone label corrected: v2.0.0 was never released (project shipped 1.2.0 to 1.5.0); the milestone now runs Phase 11-20 and closes at v2.0.0 with Phase 20."
-stopped_at: Completed 19-01-PLAN.md (.devflow/ artifact hygiene, 19a)
-last_updated: "2026-07-22T00:44:20.062Z"
+stopped_at: Completed 19-02-PLAN.md (exe_path redaction, WR-02)
+last_updated: "2026-07-22T00:58:00.000Z"
 progress:
   total_phases: 8
   completed_phases: 7
   total_plans: 65
-  completed_plans: 55
-  percent: 85
+  completed_plans: 56
+  percent: 86
 ---
 
 # DevFlow — Project State
@@ -456,6 +456,7 @@ None currently open for Phase 17.
 - [Phase 18]: 18-07: launch_stage split into launch_stage (resolution + run_preflight guard) + launch_stage_inner (everything after); run_preflight's Advance arm calls launch_stage_inner directly (skip), LoopBack still calls full launch_stage (re-check), either bounded by persisted State.preflight_retries / mode::MAX_PREFLIGHT_RETRIES=3 checked before any new gate is written; counter resets to 0 (persisted) on preflight pass and human Advance. Phase 18 (18a-18g) complete.
 - [Phase 18]: 18-07: AlwaysFailAdapter cannot reproduce a preflight failure that survives a relaunch (launch_stage always re-resolves the REAL production adapter via agents::adapter_for, discarding whatever was passed into the outer run_preflight call) -- used preflight_interactivity_check (a pure function of state) as the deterministic wedge-reproduction trigger for the three new tests instead; verified empirically both ways (unfixed code + literal plan setup = no observable difference; unfixed code + interactivity-check setup = reproduces the exact documented wedge).
 - [Phase 19]: 19-01: ensure_devflow_dir(dir) returns std::io::Result (not a crate error enum) so ? converts at all 7 sites across 6 error enums with zero signature churn; marker resolution walks dir.components() (not ancestors()) so relative .devflow-leaf paths resolve correctly
+- [Phase 19]: 19-02: exe_path in workflow_started_payload redacted via .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())) (WR-02); to_string_lossy (not to_str) keeps non-UTF-8 names as a string, preserving null as the distinct "could not resolve" signal; worktree field's own full-path exposure (T-19-09) left untouched and surfaced, not fixed, per D-15's scope
 
 ## Roadmap Evolution
 
@@ -514,9 +515,10 @@ None currently open for Phase 17.
 | Phase 18 P06 | 21min | 2 tasks | 1 files |
 | Phase 18 P07 | 25min | 3 tasks | 4 files |
 | Phase 19-release-integrity-main-rs-decomposition P01 | 55min | 3 tasks | 8 files |
+| Phase 19-release-integrity-main-rs-decomposition P02 | 12min | 1 tasks | 1 files |
 
 ## Session
 
-**Last session:** 2026-07-22T00:44:19.962Z
-**Stopped at:** Completed 19-01-PLAN.md (.devflow/ artifact hygiene, 19a)
+**Last session:** 2026-07-22T00:58:00.000Z
+**Stopped at:** Completed 19-02-PLAN.md (exe_path redaction, WR-02)
 **Resume file:** None
