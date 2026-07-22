@@ -321,7 +321,11 @@ impl GitFlow {
     /// Stage a single relative path and commit with the given message.
     /// Mirrors `commit_all`, but scoped to one path, for hooks that must not
     /// sweep in unrelated dirty state left by other hooks or the workflow.
-    /// Returns Ok(()) whether or not the path had changes to commit.
+    /// Returns Ok(()) whether or not the path had changes to commit. Unlike
+    /// `commit_all`, a path with no changes produces **no commit** — it is a
+    /// genuine no-op, not a forced empty commit, so a caller such as
+    /// `hooks::version_bump` can never tag a release on a commit containing
+    /// nothing (19b/D-16).
     pub fn commit_path(&self, relative_path: &str, message: &str) -> Result<(), GitError> {
         debug!("committing {relative_path}: {message}");
         // `add` first so a brand-new file is known to git — a pathspec-only
@@ -330,16 +334,12 @@ impl GitFlow {
         // else is already in the index, which is exactly the sweep-in this
         // function exists to prevent.
         self.git(["add", relative_path])?;
-        // --allow-empty so we don't fail when the path had no changes.
-        match self.git_raw(&[
-            "commit",
-            "--allow-empty",
-            "-m",
-            message,
-            "--",
-            relative_path,
-        ]) {
+        match self.git_raw_combined(&["commit", "-m", message, "--", relative_path]) {
             Ok(()) => Ok(()),
+            // No forcing flag above, so this arm is now the live no-op path:
+            // a path with nothing staged makes git exit non-zero with
+            // "nothing to commit", and we convert that back to Ok(()) rather
+            // than let it propagate as an error (19b/D-16, T-19-11).
             Err(GitError::Command(ref msg)) if msg.contains("nothing to commit") => Ok(()),
             Err(e) => Err(e),
         }
@@ -414,14 +414,57 @@ impl GitFlow {
 
     fn git_raw(&self, args: &[&str]) -> Result<(), GitError> {
         debug!("git {}", args.join(" "));
+        // Pin the subprocess locale to C (Antigravity review, 19b): commit_path's
+        // "nothing to commit" match arm above compares against git's own
+        // English-locale output, which a non-English LC_ALL/LANG would
+        // localize, silently defeating the match and reopening 19b under a
+        // localized environment (T-19-14). Scoped to this one call path only.
         let output = Command::new("git")
             .args(args)
+            .env("LC_ALL", "C")
+            .env("LANG", "C")
             .current_dir(&self.root)
             .output()?;
         if output.status.success() {
             Ok(())
         } else {
             Err(GitError::Command(stderr_or_status(&output)))
+        }
+    }
+
+    /// Like [`git_raw`](Self::git_raw), but the error text combines stdout
+    /// with stderr instead of inspecting stderr alone.
+    ///
+    /// Discovered empirically while implementing 19b: `git commit`'s
+    /// "nothing to commit, working tree clean" message is written to
+    /// **stdout**, not stderr. `stderr_or_status` only ever inspects
+    /// `output.stderr`, so a plain `git_raw` error can never contain that
+    /// text — `commit_path`'s `nothing to commit` match arm (immediately
+    /// above its call site) would never fire, no matter how the arm itself
+    /// is written. This sibling exists solely so `commit_path` can see it;
+    /// `commit_all` keeps calling `git_raw` unchanged (D-17 out of scope),
+    /// and `git_raw`'s own error-mapping branch is untouched by this
+    /// addition.
+    fn git_raw_combined(&self, args: &[&str]) -> Result<(), GitError> {
+        debug!("git {}", args.join(" "));
+        let output = Command::new("git")
+            .args(args)
+            .env("LC_ALL", "C")
+            .env("LANG", "C")
+            .current_dir(&self.root)
+            .output()?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let combined = match (stderr.is_empty(), stdout.is_empty()) {
+                (false, false) => format!("{stderr}\n{stdout}"),
+                (false, true) => stderr,
+                (true, false) => stdout,
+                (true, true) => format!("exited with {}", output.status),
+            };
+            Err(GitError::Command(combined))
         }
     }
 
