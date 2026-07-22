@@ -309,7 +309,7 @@ enum GateCmd {
 }
 
 #[derive(Debug, thiserror::Error)]
-enum CliError {
+pub(crate) enum CliError {
     #[error(transparent)]
     Workflow(#[from] devflow_core::workflow::WorkflowError),
     #[error(transparent)]
@@ -924,7 +924,7 @@ fn workflow_started_payload(state: &State) -> serde_json::Value {
 /// this fix closes. Only an EXACT match to the current HEAD commit is
 /// genuinely Fresh.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Staleness {
+pub(crate) enum Staleness {
     Fresh,
     Stale,
     /// The embedded commit is a strict DESCENDANT of `execution_root`'s
@@ -1136,7 +1136,7 @@ fn is_self_dogfood_workspace(project_root: &Path) -> bool {
 /// project, Pitfall 4) only warns or is silent. Kept pure so the
 /// self-dogfood-blocks vs. ordinary-warns split is directly unit-testable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StalenessOutcome {
+pub(crate) enum StalenessOutcome {
     Block,
     Warn,
     Ok,
@@ -1690,7 +1690,7 @@ fn handle_rate_limited_outcome(
 /// it — the binding operator decision requires an IMMEDIATE one instead
 /// (T-18-19).
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ValidateOutcome {
+pub(crate) enum ValidateOutcome {
     /// The two independent signals agree (or no `external_verify` is
     /// declared and the agent reported `verdict: pass`): advance to Ship.
     Passed,
@@ -1737,7 +1737,7 @@ fn classify_validate_outcome(result: &agent_result::AgentResult) -> ValidateOutc
 /// edit to either the `forced` computation or the early-return `if` could
 /// have silently reintroduced reachability).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ValidateResult {
+pub(crate) enum ValidateResult {
     Passed,
     Failed,
 }
@@ -2824,7 +2824,7 @@ fn cleanup(project_root: &Path, force: bool) -> Result<(), CliError> {
 /// will call `devflow advance` when the agent exits) from a normal
 /// between-stages moment (18b — "who watches the watcher").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Liveness {
+pub(crate) enum Liveness {
     /// Monitor and agent are both alive — the stage is actively running.
     Healthy,
     /// Monitor is alive, agent has exited — normal between-stages moment;
@@ -2841,7 +2841,7 @@ enum Liveness {
 }
 
 impl Liveness {
-    fn describe(self) -> &'static str {
+    pub(crate) fn describe(self) -> &'static str {
         match self {
             Liveness::Healthy => "healthy",
             Liveness::BetweenStages => "between stages",
@@ -3469,11 +3469,11 @@ fn test_cmd(project_root: &Path) -> Result<(), CliError> {
 /// `checks_json_value` and `doctor_json_body` can compose it into
 /// `doctor --json`'s single output document without living inside `doctor`
 /// itself.
-struct Check {
-    name: String,
-    status: String,
-    version: Option<String>,
-    install_hint: Option<String>,
+pub(crate) struct Check {
+    pub(crate) name: String,
+    pub(crate) status: String,
+    pub(crate) version: Option<String>,
+    pub(crate) install_hint: Option<String>,
 }
 
 /// Audit the environment and report what's installed, missing, or broken.
@@ -3658,14 +3658,14 @@ fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
 /// Severity of a reconciliation finding, matching the existing `Check.status`
 /// convention (lowercase strings) so both `doctor` renderers stay consistent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Severity {
+pub(crate) enum Severity {
     Ok,
     Warn,
     Problem,
 }
 
 impl Severity {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Severity::Ok => "ok",
             Severity::Warn => "warn",
@@ -3677,34 +3677,34 @@ impl Severity {
 /// The read-only facts `doctor` gathers for one active phase before
 /// reconciling them. Collected by `collect_phase_facts` (all I/O); consumed
 /// with zero I/O by `reconcile_phase`.
-struct PhaseFacts {
-    phase: u32,
-    stage: Stage,
-    gate_pending: bool,
-    agent_pid: Option<u32>,
-    agent_alive: bool,
+pub(crate) struct PhaseFacts {
+    pub(crate) phase: u32,
+    pub(crate) stage: Stage,
+    pub(crate) gate_pending: bool,
+    pub(crate) agent_pid: Option<u32>,
+    pub(crate) agent_alive: bool,
     /// The monitor pid recorded in `State.monitor_pid` (18b). `None` means
     /// no monitor has been spawned for this state yet, or the state was
     /// written by a binary predating the field — never treated as a problem.
-    monitor_pid: Option<u32>,
-    monitor_alive: bool,
+    pub(crate) monitor_pid: Option<u32>,
+    pub(crate) monitor_alive: bool,
     /// The most recent event's `event` field value, for display context.
-    last_event: Option<String>,
+    pub(crate) last_event: Option<String>,
     /// The `stage` field of the most recent `stage_launched` event; `None`
     /// when the last event recorded for this phase is not a launch.
-    last_launched_stage: Option<Stage>,
-    open_gate_stages: Vec<Stage>,
-    feature_branch_exists: bool,
+    pub(crate) last_launched_stage: Option<Stage>,
+    pub(crate) open_gate_stages: Vec<Stage>,
+    pub(crate) feature_branch_exists: bool,
 }
 
 /// One diagnostic finding for a phase, with a copy-pasteable repair command
 /// when one exists. Never carries a filesystem path or username (T-18-01) —
 /// only phase numbers, stage names, and pids identify the disagreement.
-struct PhaseFinding {
-    phase: u32,
-    severity: Severity,
-    detail: String,
-    repair: Option<String>,
+pub(crate) struct PhaseFinding {
+    pub(crate) phase: u32,
+    pub(crate) severity: Severity,
+    pub(crate) detail: String,
+    pub(crate) repair: Option<String>,
 }
 
 /// `gate_pending` is set but no gate file is open for this phase — the gate
