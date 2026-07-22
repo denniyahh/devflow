@@ -115,6 +115,60 @@ the pipeline is stuck.
   (`core.fsyncObjectFiles`/`core.fsync`) on fixture repos and/or shrinking the
   loop's window where it isn't needed for the `>50` threshold.
 
+## Resolved post-research (2026-07-22, after 20-RESEARCH.md)
+
+- **D-06 — 20b instance 1 fix confirmed (resolves D-04).** Research confirmed
+  the race is **product-reachable**: `commands::cleanup`
+  (`commands.rs:292–335`) removes worktrees unconditionally, never loading
+  `workflow::list_states`, never checking `monitor_pid`, never calling the
+  existing `liveness()` predicate (`commands.rs:371`, built in 18b for exactly
+  this). **Decision:** `cleanup` gains a **hard-refuse** liveness guard — when
+  `liveness()` reports `Healthy`/`BetweenStages` for a phase whose worktree it
+  is about to remove, refuse and direct the operator to `devflow resume`/wait;
+  **no new override flag** (`cleanup --force` already means "also remove the
+  reference worktree" per `commands.rs:304` — do not overload it with a second
+  meaning). For genuinely-dead phases, add **bounded-backoff retry** on `git
+  worktree remove --force`. Do **not** fall back to `git worktree prune` as the
+  primary recovery — research confirmed `prune` only removes metadata for
+  already-absent directories; it does not delete leftover files, so it would
+  orphan files on disk while git believes the worktree is gone.
+  — **Reversibility:** reversible — a guard added to one command's path.
+
+- **D-07 — 20c `--until` value range.** Accept the **full `Stage` enum** for
+  consistency with how `Stage` is parsed elsewhere, but **explicitly reject
+  `--until ship`** with a clear error — research showed it is a semantic no-op
+  (`handle_ship_outcome` calls `finish_workflow` directly, never `transition`,
+  so the pipeline already stops at Ship). Interception point is
+  `pipeline_gate::transition` (`pipeline_gate.rs:51–80`) — the single funnel
+  for every stage advance that matters; do **not** intercept
+  `loop_back_to_code` (a Validate-failure retry is not "advancing").
+
+- **D-08 — 20b instance 2 `devflow parallel` concern → backlog.** Fix instance
+  2 as fixture-durability in this phase (per CONTEXT.md's standing lean).
+  Research could not confirm a product analog but flagged `devflow parallel`'s
+  concurrent per-worktree commits as *plausible* (no DevFlow-level lock
+  serializes them; assumption A1, unconfirmed). **File a new backlog item /
+  Linear issue** for that `parallel` object-store concern — same treatment
+  D-03 gave the release-cut executor — rather than expanding 20b's scope to
+  chase a low-likelihood/high-severity unknown. See Deferred below.
+
+- **D-09 — 20c stop-marker design (researcher recommendation, not user-gated).**
+  Follow research Pattern 3 / Assumption A2: a new `State` field (e.g.
+  `stopped: bool` + `stop_reason: Option<String>`) with `#[serde(default)]`,
+  matching every prior `State` addition (`consecutive_failures`,
+  `infra_failures`, `preflight_retries`, `monitor_pid`) — **not** a full
+  `workflow::clear_state` (which loses the "stopped at stage X" record
+  CONTEXT.md's "persist a terminal-but-not-failed state" phrasing wants).
+  **`doctor` reconciliation gap the plan MUST close** (new research finding,
+  not in original CONTEXT.md): `check_dead_agent` (`commands.rs:1247–1261`)
+  fires `Severity::Problem` for any `is_agent_stage()` phase with a dead agent
+  pid — so a `--until plan`-stopped phase (sits at `Stage::Plan`, dead agent
+  pid on disk) would be misreported as crashed unless `reconcile_phase` is
+  taught to recognize the new stop marker. Without this, the "clean stop
+  point" goal is not actually met. — **Reversibility:** costly — a persisted
+  `State` field is a serialized on-disk contract; removing it later needs a
+  `#[serde(default)]`-compatible migration, same as any prior field.
+
 </decisions>
 
 <units>
@@ -406,8 +460,10 @@ implementing 20e in particular — they ground D-01/D-02 above.**
   must reach the same terminal state through its second entry point.
 
 ### 20a — version self-pin
-- `crates/devflow-cli/src/version.rs` — `write_version` / `field_for()`
-  (lines ~198–205 per the verification table above).
+- `crates/devflow-core/src/version.rs` — `write_version` / `field_for()`
+  (lines ~198–205 per the verification table above). **Path corrected
+  2026-07-22 during research:** discuss-phase wrote `devflow-cli` here; the
+  file lives in `devflow-core`. Verified with `find crates -name version.rs`.
 - `crates/devflow-cli/tests/workspace_version_pin.rs` (PR #17) — the existing
   RED-proven guard; 20a's fix must turn this from a guard into a no-op-by-
   construction, not replace it.
@@ -438,5 +494,13 @@ convention) for "release-cut executor: merge PR → tag → sync develop → pub
 so this doesn't silently disappear once 20d's `--check` ships. Not filed yet —
 this phase's `git_commit`/`update_state` steps do not create Linear issues;
 raise it explicitly during `/gsd-review-backlog` or at Phase 20 ship time.
+
+**`devflow parallel` object-store race** (per D-08) — file a new backlog item /
+Linear issue for "confirm-or-refute whether `devflow parallel`'s concurrent
+per-worktree commits can hit the same git object-store corruption as 20b
+instance 2 (no DevFlow-level lock serializes them; research assumption A1,
+unconfirmed)." Low likelihood, high severity if real. Out of scope for Phase 20
+— instance 2 is fixed fixture-side here; this is the separate product-side
+follow-up. Not filed yet — same caveat as the release-cut executor above.
 
 </deferred>
