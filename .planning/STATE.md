@@ -2,9 +2,9 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
-status: "Phase 18 complete and released as v1.5.0 (2026-07-21, tag v1.5.0, crates.io published); develop synced back from main. Phase 19 (Release Integrity + main.rs Decomposition) scoped and promoted from backlog 2026-07-21 via /gsd-review-backlog: 999.10 (.devflow/ artifact hygiene, Urgent), 999.11 (commit_path empty commits), 999.8 (split main.rs, pure move), 999.16 (AI change acceptance contract). Targets v1.6.0. Discussed and PLANNED 2026-07-21: 11 plans across 6 waves, plan-checker VERIFICATION PASSED (0 blockers, 0 warnings, first iteration). Next step is /gsd-execute-phase 19. Milestone label corrected: v2.0.0 was never released (project shipped 1.2.0 to 1.5.0); the milestone now runs Phase 11-20 and closes at v2.0.0 with Phase 20."
+status: "Phase 18 complete and released as v1.5.0 (2026-07-21, tag v1.5.0, crates.io published); develop synced back from main. Phase 19 (Release Integrity + main.rs Decomposition) scoped and promoted from backlog 2026-07-21 via /gsd-review-backlog: 999.10 (.devflow/ artifact hygiene, Urgent), 999.11 (commit_path empty commits), 999.8 (split main.rs, pure move), 999.16 (AI change acceptance contract). Targets v1.6.0. Discussed and PLANNED 2026-07-21: 11 plans across 6 waves, plan-checker VERIFICATION PASSED (0 blockers, 0 warnings, first iteration). Cross-AI reviewed same day (Codex, OpenCode, Antigravity via agycli; Cursor failed on account quota) - REVIEWS.md found 2 MEDIUM findings (baseline durability, depends_on metadata) plus several LOW findings, all incorporated via /gsd-plan-phase 19 --reviews (9 of 11 plans revised, re-verified VERIFICATION PASSED 0 blockers first iteration, zero regression to the reviewer-confirmed core design). Next step is /gsd-execute-phase 19. Milestone label corrected: v2.0.0 was never released (project shipped 1.2.0 to 1.5.0); the milestone now runs Phase 11-20 and closes at v2.0.0 with Phase 20."
 stopped_at: Phase 19 planned (11 plans, 6 waves) — ready to execute
-last_updated: "2026-07-21T22:30:00.000Z"
+last_updated: "2026-07-21T20:15:00.000Z"
 progress:
   total_phases: 8
   completed_phases: 7
@@ -19,8 +19,8 @@ progress:
 
 ## Active Phase
 
-- **Phase 19 — Release Integrity + `main.rs` Decomposition (scoped, not yet
-  planned).** Targets **v1.6.0**. Promoted from backlog 2026-07-21 via
+- **Phase 19 — Release Integrity + `main.rs` Decomposition (planned + cross-AI
+  reviewed, ready to execute).** Targets **v1.6.0**. Promoted from backlog 2026-07-21 via
   `/gsd-review-backlog` as four units:
 
   - **19a** — 999.10 `.devflow/` artifact hygiene (Urgent/S). The only item
@@ -91,6 +91,32 @@ progress:
   - **D-20 was implemented but uncited**, so the blocking decision-coverage gate
     failed at 20/21. Now cited explicitly in 19-06 (the first split plan) with a
     halt-and-report branch if any 19a/19b work is still open when it starts.
+
+  **Cross-AI reviewed 2026-07-21** (`19-REVIEWS.md`: Codex, OpenCode
+  [`deepseek/deepseek-v4-pro`], Antigravity [via `agycli` — the working
+  `antigravity-cli` binary, not the broken `agy`-\>GUI wrapper]; Cursor
+  failed on an account usage limit, not a plan defect). All three completing
+  reviewers independently re-derived and confirmed the phase's core source
+  claims (the 7 `create_dir_all` sites, `ENV_MUTEX`'s single-mutex design,
+  the `commit_path` dead-arm). One HIGH-severity claim (OpenCode: a 19g
+  reference file "doesn't exist") was checked and refuted — the file exists;
+  likely an OpenCode sandbox read-access artifact.
+
+  **Incorporated via `/gsd-plan-phase 19 --reviews`** the same day — 9 of 11
+  plans revised (19-04, 19-10 untouched), re-verified `VERIFICATION PASSED`
+  with 0 blockers on the first iteration:
+  - Baseline durability (Codex + OpenCode, MEDIUM): 19-06 now writes a
+    **committed** `19-SPLIT-BASELINE-names.txt`; 19-07/08/09/11 diff against
+    it instead of an ephemeral `/tmp` file.
+  - `depends_on` metadata (Codex, downgraded HIGH\->MEDIUM after checking
+    `execute-phase.md` — wave-number gating already enforces order
+    regardless of `depends_on` content): 19-06 and 19-11's `depends_on`
+    arrays corrected to match their stated prerequisites.
+  - Five more LOW/MEDIUM fixes: CI-wording precision (19-11), monitor-process
+    cleanup (19-01), a second dogfood anti-pattern shape (19-05), a
+    deleted-`.gitignore` doc gap (19-01), locale-independent git string
+    matching (19-03), and an `ensure_devflow_dir` relative-path edge case
+    (19-01).
 
   **Next step:** `/gsd-execute-phase 19`.
 
