@@ -19,6 +19,7 @@ jobs:
       - name: Build devcontainer and run CI-parity checks
         uses: devcontainers/ci@v0.3
         with:
+          push: never
           runCmd: |
             set -e
             cargo build --workspace
