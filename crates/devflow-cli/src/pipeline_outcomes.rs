@@ -8,17 +8,13 @@
 //! **This module sits in the middle of the pipeline's three-way module
 //! cycle (19-RESEARCH.md Pattern 1):** it is called by
 //! [`crate::pipeline_launch::advance`] once an agent result has been
-//! classified, and it calls onward into `pipeline_gate`'s `transition`,
-//! `loop_back_to_code`, `finish_workflow`, and `abort` to actually move the
-//! state machine. (19-08 Task 2: `transition`/`loop_back_to_code`/
-//! `finish_workflow`/`abort` still live in `main.rs` at this point; Task 3
-//! repoints these imports as that seam moves out.)
+//! classified, and it calls onward into [`crate::pipeline_gate`]'s
+//! `transition`, `loop_back_to_code`, `finish_workflow`, and `abort` to
+//! actually move the state machine.
 
+use crate::pipeline_gate::{abort, finish_workflow, loop_back_to_code, run_gate, transition};
 use crate::pipeline_launch::launch_stage;
-use crate::{
-    CliError, abort, checkout_lock_timeout, finish_workflow, loop_back_to_code,
-    retry_after_from_reason, run_gate, transition,
-};
+use crate::{CliError, checkout_lock_timeout, retry_after_from_reason};
 use devflow_core::config::GitFlowConfig;
 use devflow_core::gates::{GateAction, Gates};
 use devflow_core::hooks::{self, HookContext};
@@ -518,8 +514,8 @@ pub(crate) fn run_checkout_hooks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline_gate::prepare_loop_back_to_code;
     use crate::pipeline_launch::advance;
-    use crate::prepare_loop_back_to_code;
     use crate::test_support::*;
     use devflow_core::git::GitFlow;
     use devflow_core::mode::Mode;

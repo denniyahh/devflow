@@ -16,12 +16,11 @@
 //! transition, and is the edge that closes `launch → outcomes → gate →
 //! launch` back to this module. Rust permits cyclic module references
 //! (only the crate dependency graph must be acyclic), so this compiles
-//! cleanly. (19-08 Task 1: `handle_*_outcome`/`transition` still live in
-//! `main.rs` at this point; Tasks 2/3 repoint these imports as those seams
-//! move out.) (19-08 Task 2: `handle_*_outcome`/`ValidateOutcome`/
-//! `classify_validate_outcome`/`truncate_reason` now import from
-//! `pipeline_outcomes`; `transition` still lives in `main.rs` until Task 3.)
+//! cleanly. All three pipeline modules import from each other directly —
+//! see `pipeline_gate`'s module doc comment for the explicit caveat that
+//! this cycle is NOT a wave-parallelism promise for future pipeline work.
 
+use crate::pipeline_gate::transition;
 use crate::pipeline_outcomes::{
     ValidateOutcome, classify_validate_outcome, handle_infra_outcome, handle_rate_limited_outcome,
     handle_ship_failure, handle_ship_outcome, handle_stage_failure, handle_validate_outcome,
@@ -29,7 +28,7 @@ use crate::pipeline_outcomes::{
 };
 use crate::preflight::{run_preflight, worktree_writable_roots};
 use crate::staleness::enforce_build_staleness;
-use crate::{CliError, ensure_agent_binary, transition};
+use crate::{CliError, ensure_agent_binary};
 use devflow_core::config::{GitFlowConfig, capture_retention};
 use devflow_core::outcome_policy::{self, Action};
 use devflow_core::prompt;
