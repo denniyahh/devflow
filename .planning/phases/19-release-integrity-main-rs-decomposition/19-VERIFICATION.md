@@ -93,9 +93,34 @@ The Phase 19 Rust source set contains no `TBD`, `FIXME`, or `XXX` debt marker. N
 
 Known non-blocking findings remain recorded rather than hidden:
 
-- CI uses plain `cargo test` and does not execute the symbol/name scripts. The explicit override above records the user-approved disposition.
-- GitHub annotates `actions/checkout@v4` for Node.js 20 deprecation; Phase 999.9 tracks dependency review.
-- Plan 19-05 found that an isolated reviewer applies the contract's judgment but does not cite the project contract unless dispatched to load it.
+- CI does not execute the symbol/name scripts. The explicit override above records the user-approved disposition. **Tracked as backlog item 999.22** (filed 2026-07-22).
+- ~~GitHub annotates `actions/checkout@v4` for Node.js 20 deprecation~~ — **resolved after this verification was written** by commit `a12a617`, which bumped all three workflows to `actions/checkout@v7` (verified to exist: v7.0.1) and made the CI test job's workspace scope explicit (`cargo test --workspace`). CI is green on the resulting HEAD.
+- Plan 19-05 found that an isolated reviewer applies the contract's judgment but does not cite the project contract unless dispatched to load it. **Tracked as backlog item 999.21** (filed 2026-07-22).
+
+## Post-Verification Addendum (2026-07-22, independent review)
+
+This verification was written at pushed SHA `aa95873`. Three further commits landed
+afterward (`ef3ac49`, `e1a33e6` docs/tracking; `a12a617`, `1e2ddbb` CI config). An
+independent review at HEAD `1e2ddbb` re-confirmed the phase's core claims from source
+rather than from SUMMARY prose:
+
+| Re-check | Method | Result |
+|---|---|---|
+| Pure-move equivalence | Symbol set of baseline `f35d6c1:main.rs` vs union of all nine current CLI modules | 231 vs 231, zero lost, zero added |
+| Body-level equivalence | Normalized line-multiset diff (visibility keywords and imports stripped) | Only 63 differing lines, all rustfmt re-wraps of signatures pushed past 100 chars by `pub(crate)`, plus 9 expected `#[cfg(test)]` attrs. Zero logic changes |
+| 19a chokepoint completeness | Production-only `create_dir_all` scan across the workspace | Exactly one production call site, inside `ensure_devflow_dir` itself — no bypass |
+| `ENV_MUTEX` singularity | Static and lock-site census in `devflow-cli` | One `pub(crate) static` in `test_support.rs`, 18 lock sites across 5 modules, all resolving to it |
+| Gates at HEAD | `cargo build` / `clippy --workspace --all-targets -D warnings` / `fmt --check` / `test --workspace` | All clean; 438 passed, 0 failed |
+| CI at HEAD | GitHub Actions runs `29934143450` (CI) and `29934146203` (Devcontainer) on `1e2ddbb` | Both success |
+
+One correction to the record: the CI change from `cargo test` to `cargo test --workspace`
+is explicitness, not a coverage fix — the root manifest is virtual, so both forms already
+collect the same 438 tests (measured both ways). The commit message overstates it slightly;
+no behavior is affected.
+
+Note that `devflow_dir` remains duplicated (`workflow.rs:34` public, `agent_result.rs:872`
+private). Both only compute a path and neither creates a directory, so the 19a chokepoint is
+unaffected; this is cosmetic duplication, not a defect.
 
 ## Requirement Coverage
 

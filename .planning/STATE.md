@@ -309,9 +309,18 @@ progress:
 
 ## Backlog
 
-**16 unsequenced items** remain in `.planning/phases/999.N-*/` and the
-`## Backlog` section of ROADMAP.md, reviewed/prioritized/sized 2026-07-21
-(mirrored in Linear as `DEN-26`..`DEN-45`): Hermes Support (999.1, Low),
+**18 unsequenced items** remain in `.planning/phases/999.N-*/` and the
+`## Backlog` section of ROADMAP.md. The first 16 were
+reviewed/prioritized/sized 2026-07-21 (mirrored in Linear as
+`DEN-26`..`DEN-45`); 999.21 and 999.22 were filed 2026-07-22 from Phase 19's
+two retained non-blocking findings and are **not yet mirrored in Linear**:
+acceptance-contract review wiring (999.21, High — 19-05's dogfood found the
+contract's wording works but its wiring doesn't: an isolated reviewer reaches
+the right verdicts without citing the contract or grading at its blocking
+severity) and refactor equivalence guard in CI (999.22, Medium — the
+symbol/name-set equivalence proof that validated the `main.rs` split runs only
+locally; Phase 19 shipped with an explicit accepted override for exactly this).
+The 2026-07-21 sixteen: Hermes Support (999.1, Low),
 phase-process tracking model (999.2, Medium — half-addressed by 18b's
 `monitor_pid`), CLI operator discoverability (999.3, Low), version-tag
 contention on concurrent ship (999.4, Medium), changelog placeholder content
