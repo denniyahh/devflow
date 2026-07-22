@@ -2,25 +2,31 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
-status: "Phase 18 complete and released as v1.5.0 (2026-07-21, tag v1.5.0, crates.io published); develop synced back from main. Phase 19 (Release Integrity + main.rs Decomposition) scoped and promoted from backlog 2026-07-21 via /gsd-review-backlog: 999.10 (.devflow/ artifact hygiene, Urgent), 999.11 (commit_path empty commits), 999.8 (split main.rs, pure move), 999.16 (AI change acceptance contract). Targets v1.6.0. Discussed and PLANNED 2026-07-21: 11 plans across 6 waves, plan-checker VERIFICATION PASSED (0 blockers, 0 warnings, first iteration). Cross-AI reviewed same day (Codex, OpenCode, Antigravity via agycli; Cursor failed on account quota) - REVIEWS.md found 2 MEDIUM findings (baseline durability, depends_on metadata) plus several LOW findings, all incorporated via /gsd-plan-phase 19 --reviews (9 of 11 plans revised, re-verified VERIFICATION PASSED 0 blockers first iteration, zero regression to the reviewer-confirmed core design). Next step is /gsd-execute-phase 19. Milestone label corrected: v2.0.0 was never released (project shipped 1.2.0 to 1.5.0); the milestone now runs Phase 11-20 and closes at v2.0.0 with Phase 20."
-stopped_at: Completed 19-08-PLAN.md (pipeline state machine split, seams A/B/C, 19d/19e)
-last_updated: "2026-07-22T12:25:05.468Z"
+status: "Phase 19 complete and verified on 2026-07-22: 11/11 plans, 7/7 observable truths, 438 tests, and three green CI attempts on pushed SHA aa95873. Phase 20 remains unscoped and must be defined before planning."
+stopped_at: Phase 19 complete and verified; Phase 20 remains unscoped
+last_updated: "2026-07-22T10:34:28-04:00"
 progress:
   total_phases: 8
-  completed_phases: 7
+  completed_phases: 8
   total_plans: 65
-  completed_plans: 62
-  percent: 88
+  completed_plans: 65
+  percent: 100
 ---
 
 # DevFlow — Project State
 
-> Last updated: 2026-07-20
+> Last updated: 2026-07-22
 
 ## Active Phase
 
-- **Phase 19 — Release Integrity + `main.rs` Decomposition (planned + cross-AI
-  reviewed, ready to execute).** Targets **v1.6.0**. Promoted from backlog 2026-07-21 via
+- **Phase 20 remains unscoped.** The roadmap reserves it for the
+  operator-facing set targeting v2.0.0, but it has no detailed phase entry yet.
+  Scope it before discussion or planning.
+
+## Recently Shipped
+
+- **Phase 19 — Release Integrity + `main.rs` Decomposition (Complete + Verified
+  2026-07-22 — 11/11 plans).** Targets **v1.6.0**. Promoted from backlog 2026-07-21 via
   `/gsd-review-backlog` as four units:
 
   - **19a** — 999.10 `.devflow/` artifact hygiene (Urgent/S). The only item
@@ -123,9 +129,12 @@ progress:
     matching (19-03), and an `ensure_devflow_dir` relative-path edge case
     (19-01).
 
-  **Next step:** `/gsd-execute-phase 19`.
-
-## Recently Shipped
+  **Completed and verified 2026-07-22.** The verifier passed 7/7 observable
+  truths. The final proof matched all 438 test names and per-target counts,
+  preserved the single CLI `ENV_MUTEX`, and passed three CI attempts on pushed
+  SHA `aa95873`. The approved checkpoint records that symbol and name-set proofs
+  ran locally against that exact SHA because the existing CI workflow does not
+  contain those jobs.
 
 - **Phase 18 (Complete + Verified + review-fixed + Released as v1.5.0 — 7/7 plans):** Dogfood
   Reliability Hardening — reprioritized 2026-07-20 from Hermes Support.
@@ -531,6 +540,6 @@ None currently open for Phase 17.
 
 ## Session
 
-**Last session:** 2026-07-22T12:25:05.437Z
-**Stopped at:** Completed 19-08-PLAN.md (pipeline state machine split, seams A/B/C, 19d/19e)
+**Last session:** 2026-07-22T10:34:28-04:00
+**Stopped at:** Phase 19 complete and verified; Phase 20 remains unscoped
 **Resume file:** None

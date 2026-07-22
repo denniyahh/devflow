@@ -13,7 +13,7 @@
 | 16 | Pipeline Reliability Hardening | Complete    | — |
 | 17 | Pipeline Dogfood Follow-Up | Complete    | — |
 | 18 | Dogfood Reliability Hardening | Complete    | 1.5.0 |
-| 19 | Release Integrity + `main.rs` Decomposition | In Progress| 1.6.0 |
+| 19 | Release Integrity + `main.rs` Decomposition | Complete    | 1.6.0 |
 | 20 | *(unscoped — operator-facing set)* | Planned | 2.0.0 |
 
 ## Shipped
