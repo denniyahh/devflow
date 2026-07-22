@@ -523,3 +523,14 @@ Plans:
 Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.24: VersionBump Must Rewrite Workspace Member Self-Pins (BACKLOG)
+
+**Goal:** `version::write_version` rewrites only `[workspace.package] version`, but a published Cargo workspace states its version twice — the second being the `[workspace.dependencies]` self-pin, which can't use `version.workspace = true` (no Cargo interpolation for dependency versions) and can't be omitted (a path dep of a published crate needs an explicit version). So `VersionBump` silently leaves the pin on the previous release. Fix: also rewrite every `[workspace.dependencies]` entry whose `path` points at a workspace member.
+**Priority:** High | **Size:** S — shipped broken two for two (v1.5.0 patched by `7ad260c`, v1.6.0 by PR #15). Invisible until the last step of a release: builds, tests, and clippy are all clean because a `path` dep ignores the `version` field locally, then `cargo publish` rejects it as a duplicate — on release day, after the tag is cut. A **product** bug, not a repo chore: any user with a published Cargo workspace hits it identically. A RED-proven guard (`tests/workspace_version_pin.rs`) already makes it loud pre-merge, but is not the fix. Linear: DEN-49.
+**Requirements:** TBD — see CONTEXT.md
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
