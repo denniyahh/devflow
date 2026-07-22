@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
 status: "Phase 18 complete and released as v1.5.0 (2026-07-21, tag v1.5.0, crates.io published); develop synced back from main. Phase 19 (Release Integrity + main.rs Decomposition) scoped and promoted from backlog 2026-07-21 via /gsd-review-backlog: 999.10 (.devflow/ artifact hygiene, Urgent), 999.11 (commit_path empty commits), 999.8 (split main.rs, pure move), 999.16 (AI change acceptance contract). Targets v1.6.0. Discussed and PLANNED 2026-07-21: 11 plans across 6 waves, plan-checker VERIFICATION PASSED (0 blockers, 0 warnings, first iteration). Cross-AI reviewed same day (Codex, OpenCode, Antigravity via agycli; Cursor failed on account quota) - REVIEWS.md found 2 MEDIUM findings (baseline durability, depends_on metadata) plus several LOW findings, all incorporated via /gsd-plan-phase 19 --reviews (9 of 11 plans revised, re-verified VERIFICATION PASSED 0 blockers first iteration, zero regression to the reviewer-confirmed core design). Next step is /gsd-execute-phase 19. Milestone label corrected: v2.0.0 was never released (project shipped 1.2.0 to 1.5.0); the milestone now runs Phase 11-20 and closes at v2.0.0 with Phase 20."
-stopped_at: Completed 19-04-PLAN.md (AI change acceptance contract, 19g)
-last_updated: "2026-07-22T01:10:12.569Z"
+stopped_at: "Completed 19-06-PLAN.md (main.rs split foundation: baseline, pub(crate) pass, ENV_MUTEX hoist)"
+last_updated: "2026-07-22T01:37:51.821Z"
 progress:
   total_phases: 8
   completed_phases: 7
   total_plans: 65
-  completed_plans: 58
+  completed_plans: 59
   percent: 88
 ---
 
@@ -459,6 +459,7 @@ None currently open for Phase 17.
 - [Phase 19]: 19-02: exe_path in workflow_started_payload redacted via .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())) (WR-02); to_string_lossy (not to_str) keeps non-UTF-8 names as a string, preserving null as the distinct "could not resolve" signal; worktree field's own full-path exposure (T-19-09) left untouched and surfaced, not fixed, per D-15's scope
 - [Phase 19]: 19-03: commit_path no longer passes --allow-empty, closing 19b/D-16 (a repeat call with unchanged content now creates zero commits, not a forced empty one); discovered mid-fix that git's "nothing to commit" message is on stdout not stderr, so the plan's literal reuse of git_raw's stderr-only error mapping could never surface it -- added a sibling git_raw_combined helper (stdout+stderr) used only by commit_path, leaving git_raw's own error-mapping branch and commit_all byte-identical; git_raw and git_raw_combined both pin LC_ALL=C/LANG=C (T-19-14); D-17 finding: commit_all's empty-commit behavior is not load-bearing (its only caller, docs_update, already treats a commit failure as non-fatal, and no test asserts a commit exists after it runs) -- commit_all left unmodified regardless
 - [Phase 19]: 19-04: ai-change-acceptance project skill (D-19's 5 requirements + 4 rejection patterns) plus a CONTRIBUTING.md section, wired into /gsd-code-review per D-18; also fixed .gitignore's blanket .claude/ ignore (carved out !.claude/skills/**, mirroring the existing .codex/* pattern) since it would otherwise have silently prevented the new skill from ever being committed
+- [Phase 19]: 19-06: no D-12 ENV_MUTEX finding — three consecutive cargo test -p devflow runs post-hoist stable, 0 failed each time
 
 ## Roadmap Evolution
 
@@ -520,9 +521,10 @@ None currently open for Phase 17.
 | Phase 19-release-integrity-main-rs-decomposition P02 | 12min | 1 tasks | 1 files |
 | Phase 19 P03 | 20min | 2 tasks | 1 files |
 | Phase 19-release-integrity-main-rs-decomposition P04 | 20min | 2 tasks | 5 files |
+| Phase 19 P06 | 22min | 3 tasks | 6 files |
 
 ## Session
 
-**Last session:** 2026-07-22T01:10:12.521Z
-**Stopped at:** Completed 19-04-PLAN.md (AI change acceptance contract, 19g)
+**Last session:** 2026-07-22T01:37:51.787Z
+**Stopped at:** Completed 19-06-PLAN.md (main.rs split foundation: baseline, pub(crate) pass, ENV_MUTEX hoist)
 **Resume file:** None
