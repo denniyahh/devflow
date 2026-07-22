@@ -55,7 +55,7 @@ pub fn emit(project_root: &Path, phase: u32, event: &str, fields: serde_json::Va
     }
     let path = events_path(project_root);
     if let Some(parent) = path.parent()
-        && let Err(err) = std::fs::create_dir_all(parent)
+        && let Err(err) = crate::workflow::ensure_devflow_dir(parent)
     {
         warn!("could not create events dir: {err}");
         return;

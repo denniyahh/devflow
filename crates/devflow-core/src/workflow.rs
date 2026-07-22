@@ -7,6 +7,7 @@
 //! older binary is migrated to its per-phase name on first read.
 
 use crate::state::State;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
@@ -32,6 +33,93 @@ const CORRUPT_LEGACY_STATE_HINT: &str = "devflow recover --clean";
 /// Return the `.devflow` directory for a project.
 pub fn devflow_dir(project_root: &Path) -> PathBuf {
     project_root.join(".devflow")
+}
+
+/// Locate the shallowest `.devflow` path component within `dir`, if any, and
+/// return the path up to and including it.
+///
+/// Walking `dir`'s path *components* — rather than string-matching each of
+/// `dir.ancestors()`'s paths — is what makes this resolve a **relative**
+/// `dir` whose `.devflow` is the leaf or near-leaf component (e.g.
+/// `.devflow/captures`, or the bare `.devflow`) correctly: the ancestor-tail
+/// approach hits an empty final ancestor `""` on those inputs and mishandles
+/// the leaf-is-`.devflow` case, whereas component-walking handles both
+/// cleanly. Shallowest-first (the first match while walking root-to-leaf) is
+/// the deterministic tie-break if `.devflow` appears twice in the path.
+fn find_devflow_marker(dir: &Path) -> Option<PathBuf> {
+    let mut acc = PathBuf::new();
+    for component in dir.components() {
+        acc.push(component.as_os_str());
+        if component.as_os_str() == std::ffi::OsStr::new(".devflow") {
+            return Some(acc);
+        }
+    }
+    None
+}
+
+/// Create `dir` (and any missing parents), then self-protect any `.devflow`
+/// directory found in its path by writing `<that-dir>/.gitignore` containing
+/// `*` — so a downstream user's routine `git add . && git commit` never
+/// sweeps DevFlow's runtime artifacts (agent stdout, gate context, state)
+/// into their repository, independent of whether their own root
+/// `.gitignore` mentions `.devflow` at all (closes 19a-WR-01,
+/// 19-CONTEXT.md D-14).
+///
+/// This is deliberately a different function from the pure path accessor
+/// [`devflow_dir`] above: `devflow_dir(project_root)` takes a **project
+/// root** and returns `project_root/.devflow` with zero filesystem I/O — it
+/// is invoked from read-only paths (`doctor`, `status`) and from tests that
+/// assert on the returned path, so giving *it* side effects would be exactly
+/// the class of behavioral change this phase exists to avoid. This function,
+/// `ensure_devflow_dir(dir)`, instead takes the **directory to create**,
+/// which may itself be `.devflow`, a subdirectory of it, or something with no
+/// `.devflow` ancestor at all. Do not confuse the two.
+///
+/// Contract:
+/// 1. `create_dir_all(dir)` — create `dir` and all missing parents.
+/// 2. Find the shallowest `.devflow` path component (see
+///    [`find_devflow_marker`]).
+/// 3. If found, write `<marker>/.gitignore` with the bytes `*\n`, using
+///    `create_new(true)` so an existing file — whatever its content — is left
+///    untouched; a lost race against a concurrent creator surfaces as
+///    `AlreadyExists`, which this function maps to `Ok(())`. Any other I/O
+///    error propagates via `?`.
+/// 4. If no `.devflow` component exists, this function is exactly equivalent
+///    to `create_dir_all`.
+///
+/// Returns `std::io::Result<()>`, not a crate-specific error enum: this
+/// plan's seven conversion sites each live in a different module with their
+/// own error enum (`WorkflowError`, `GateError`, `MonitorError`,
+/// `ResultError`, `ShipError`, `LockError`), and every one already carries an
+/// `Io(#[from] std::io::Error)` variant, so `?` converts at every call site
+/// with zero signature churn.
+///
+/// **Deleted-marker note:** if `.devflow/.gitignore` is deleted after
+/// creation, subsequent calls will not recreate it — the protection is
+/// established once per directory lifetime. Recreating a deleted marker
+/// would violate the rule that this function must never overwrite an
+/// existing `.gitignore` a user or another tool may own, and it cannot
+/// distinguish "user deleted it" from "never created."
+pub fn ensure_devflow_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+
+    let Some(marker_dir) = find_devflow_marker(dir) else {
+        return Ok(());
+    };
+
+    let gitignore = marker_dir.join(".gitignore");
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&gitignore)
+    {
+        Ok(mut f) => {
+            f.write_all(b"*\n")?;
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 /// Return the persisted state path for a phase of a project.
@@ -92,7 +180,7 @@ pub fn save_state(state: &State) -> Result<(), WorkflowError> {
 /// truncated or partially written state file.
 fn write_state_atomic(path: &Path, contents: &str) -> Result<(), WorkflowError> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        ensure_devflow_dir(parent)?;
     }
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, contents)?;
@@ -188,6 +276,119 @@ mod tests {
     fn migrate_legacy_state_warning_names_recovery_command() {
         assert!(CORRUPT_LEGACY_STATE_HINT.contains("recover --clean"));
     }
+
+    #[test]
+    fn ensure_devflow_dir_writes_star_gitignore() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(".devflow");
+        ensure_devflow_dir(&target).expect("ensure_devflow_dir");
+        assert!(target.is_dir());
+        let contents = std::fs::read_to_string(target.join(".gitignore")).unwrap();
+        assert_eq!(contents.trim(), "*");
+    }
+
+    #[test]
+    fn ensure_devflow_dir_is_idempotent_and_preserves_existing_gitignore() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(".devflow");
+        ensure_devflow_dir(&target).expect("first call");
+        let first = std::fs::read(target.join(".gitignore")).unwrap();
+
+        ensure_devflow_dir(&target).expect("second call");
+        let second = std::fs::read(target.join(".gitignore")).unwrap();
+        assert_eq!(
+            first, second,
+            "second call must leave the file byte-identical"
+        );
+    }
+
+    #[test]
+    fn ensure_devflow_dir_preserves_foreign_gitignore_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(".devflow");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join(".gitignore"), "# owned by something else\n").unwrap();
+
+        ensure_devflow_dir(&target).expect("must not fail on a foreign .gitignore");
+
+        let contents = std::fs::read_to_string(target.join(".gitignore")).unwrap();
+        assert_eq!(contents, "# owned by something else\n");
+    }
+
+    #[test]
+    fn ensure_devflow_dir_on_nested_subpath_marks_the_devflow_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(".devflow").join("history").join("phase-01");
+        ensure_devflow_dir(&target).expect("nested ensure_devflow_dir");
+
+        assert!(target.is_dir());
+        let marker = dir.path().join(".devflow").join(".gitignore");
+        assert!(
+            marker.is_file(),
+            "gitignore must land at the .devflow ancestor"
+        );
+        assert!(
+            !target.join(".gitignore").exists(),
+            "gitignore must not land at the leaf directory"
+        );
+    }
+
+    /// Antigravity review edge case: a relative path whose `.devflow` is the
+    /// leaf or near-leaf component. Exercises the component-detection logic
+    /// directly rather than a real filesystem call, so the assertion does not
+    /// depend on the test process's (global, shared-across-threads) cwd.
+    #[test]
+    fn ensure_devflow_dir_on_relative_devflow_leaf_path_marks_it() {
+        assert_eq!(
+            find_devflow_marker(Path::new(".devflow/captures")),
+            Some(PathBuf::from(".devflow")),
+            "leaf-adjacent relative path must mark .devflow, not captures/"
+        );
+        assert_eq!(
+            find_devflow_marker(Path::new(".devflow")),
+            Some(PathBuf::from(".devflow")),
+            "bare relative .devflow path must mark itself"
+        );
+    }
+
+    #[test]
+    fn ensure_devflow_dir_without_a_devflow_ancestor_only_creates_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("plain").join("sub");
+        ensure_devflow_dir(&target).expect("ensure_devflow_dir");
+
+        assert!(target.is_dir());
+        assert!(!dir.path().join(".gitignore").exists());
+        assert!(!dir.path().join("plain").join(".gitignore").exists());
+        assert!(!target.join(".gitignore").exists());
+    }
+
+    #[test]
+    fn ensure_devflow_dir_concurrent_calls_both_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(".devflow");
+
+        let t1 = {
+            let target = target.clone();
+            std::thread::spawn(move || ensure_devflow_dir(&target))
+        };
+        let t2 = {
+            let target = target.clone();
+            std::thread::spawn(move || ensure_devflow_dir(&target))
+        };
+        assert!(
+            t1.join().unwrap().is_ok(),
+            "first concurrent call must succeed"
+        );
+        assert!(
+            t2.join().unwrap().is_ok(),
+            "second concurrent call must succeed"
+        );
+
+        let contents = std::fs::read_to_string(target.join(".gitignore")).unwrap();
+        assert_eq!(contents.trim(), "*");
+    }
+
     use crate::mode::Mode;
     use crate::stage::Stage;
     use crate::state::AgentKind;

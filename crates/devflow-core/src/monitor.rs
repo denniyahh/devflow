@@ -95,7 +95,7 @@ fn spawn_monitor_inner(
 
     // Ensure the capture directory exists before the detached process runs.
     if let Some(parent) = stdout_file.parent() {
-        std::fs::create_dir_all(parent)?;
+        crate::workflow::ensure_devflow_dir(parent)?;
     }
 
     let stdout_file = stdout_file.to_str().ok_or(MonitorError::NonUtf8Path)?;

@@ -159,7 +159,10 @@ fn devcontainer_workflow_clippy_lints_test_targets() {
 /// a local green weaker than a CI green — a false-green generator.
 #[test]
 fn devflow_test_clippy_matches_ci_scope() {
-    let path = repo_root().join("crates/devflow-cli/src/main.rs");
+    // 19-09: `test_cmd` (the `devflow test` handler) moved from `main.rs`
+    // into `commands.rs` as part of the main.rs decomposition — this
+    // regression guard's target path moved with it.
+    let path = repo_root().join("crates/devflow-cli/src/commands.rs");
     let src =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
 

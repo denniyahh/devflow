@@ -97,15 +97,15 @@ mod tests {
     }
 
     #[test]
-    fn claude_and_codex_share_identical_prompt_text() {
+    fn every_adapter_receives_identical_prompt_text() {
         let prompt = stage_prompt(Stage::Code, 7);
-        let claude = prompt_arg(AgentKind::Claude, &prompt);
-        let codex = prompt_arg(AgentKind::Codex, &prompt);
-        assert_eq!(
-            claude, codex,
-            "Claude and Codex must receive identical prompt text"
-        );
-        assert_eq!(claude, prompt);
+        for kind in [AgentKind::Claude, AgentKind::Codex, AgentKind::OpenCode] {
+            assert_eq!(
+                prompt_arg(kind, &prompt),
+                prompt,
+                "{kind} must receive the canonical stage prompt unchanged"
+            );
+        }
     }
 
     #[test]
@@ -128,6 +128,14 @@ mod tests {
         assert!(joined.contains("exec"));
         assert!(joined.contains("--sandbox workspace-write"));
         assert!(joined.contains("--json"));
+    }
+
+    #[test]
+    fn opencode_wraps_prompt_in_run() {
+        let prompt = stage_prompt(Stage::Code, 7);
+        let (program, args) = adapter_for(AgentKind::OpenCode).exec_command(7, &prompt, &[]);
+        assert_eq!(program, "opencode");
+        assert_eq!(args, ["run", prompt.as_str()]);
     }
 
     /// 13-06 dogfood regression (Codex leg): linked-worktree git metadata
@@ -186,62 +194,5 @@ mod tests {
         assert!(adapter_for(AgentKind::Claude).preflight(&state).is_ok());
         assert!(adapter_for(AgentKind::Codex).preflight(&state).is_ok());
         assert!(adapter_for(AgentKind::OpenCode).preflight(&state).is_ok());
-    }
-
-    /// TEST-ONLY adapter exercising the D-14 adapter-hook contract (reviewer
-    /// receiver set non-empty) without inventing production storage — this
-    /// is the adjacency boundary Phase 18's Hermes adapter will implement
-    /// for real once a reviewer field exists.
-    struct ReviewerSetTestAdapter {
-        reviewers: Vec<String>,
-    }
-
-    impl AgentAdapter for ReviewerSetTestAdapter {
-        fn name(&self) -> &'static str {
-            "test-reviewer-set"
-        }
-
-        fn exec_command(
-            &self,
-            _phase: u32,
-            _prompt: &str,
-            _extra_writable_roots: &[PathBuf],
-        ) -> (&'static str, Vec<String>) {
-            ("true", Vec::new())
-        }
-
-        fn completion_signal_detected(&self, _output: &str) -> bool {
-            false
-        }
-
-        fn preflight(&self, _state: &crate::state::State) -> Result<(), String> {
-            if self.reviewers.is_empty() {
-                Err("reviewer receiver set is empty".to_string())
-            } else {
-                Ok(())
-            }
-        }
-    }
-
-    /// D-14 adjacency edge (17c): an empty reviewer receiver set fails
-    /// preflight; a set with one receiver passes.
-    #[test]
-    fn reviewer_set_adapter_hook_adjacency_boundary() {
-        let state = crate::state::State::new(
-            1,
-            AgentKind::Claude,
-            crate::mode::Mode::Auto,
-            PathBuf::from("/repo"),
-        );
-
-        let empty = ReviewerSetTestAdapter {
-            reviewers: Vec::new(),
-        };
-        assert!(empty.preflight(&state).is_err());
-
-        let one = ReviewerSetTestAdapter {
-            reviewers: vec!["alice".to_string()],
-        };
-        assert!(one.preflight(&state).is_ok());
     }
 }

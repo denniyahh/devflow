@@ -15,7 +15,9 @@ Thumbs.db
 
 # Agent runtimes (local state, not project code)
 .omx/
-.claude/
+.claude/*
+!.claude/skills/
+!.claude/skills/**
 .opencode/
 .gemini/
 

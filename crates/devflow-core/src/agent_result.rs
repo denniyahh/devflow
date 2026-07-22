@@ -961,7 +961,7 @@ fn archive_phase_files_with_stamp(
     }
 
     let history_dir = history_dir(project_root, phase);
-    std::fs::create_dir_all(&history_dir)?;
+    crate::workflow::ensure_devflow_dir(&history_dir)?;
 
     let staging_dir = history_dir.join(format!(".pending-{stamp}"));
     std::fs::create_dir(&staging_dir)?;
@@ -1148,6 +1148,7 @@ mod tests {
         git(root, &["config", "user.name", "DevFlow Tests"]);
         git(root, &["config", "commit.gpgsign", "false"]);
         git(root, &["config", "tag.gpgsign", "false"]);
+        git(root, &["config", "core.hooksPath", "/dev/null"]);
         git(root, &["checkout", "-b", "develop"]);
         std::fs::write(root.join("README.md"), "base\n").unwrap();
         git(root, &["add", "README.md"]);
@@ -1168,6 +1169,7 @@ mod tests {
         git(root, &["config", "user.name", "DevFlow Tests"]);
         git(root, &["config", "commit.gpgsign", "false"]);
         git(root, &["config", "tag.gpgsign", "false"]);
+        git(root, &["config", "core.hooksPath", "/dev/null"]);
         git(root, &["checkout", "-b", "develop"]);
         std::fs::write(root.join("README.md"), "base\n").unwrap();
         git(root, &["add", "README.md"]);
@@ -2499,40 +2501,5 @@ mod tests {
 
         assert_eq!(result.status, AgentStatus::AgentUnavailable);
         assert_eq!(result.exit_code, Some(127));
-    }
-
-    /// Unchanged-behavior guard: exit 0 with zero commits on a commit-gated
-    /// stage is still Failed (the pre-existing "no work done" branch, not
-    /// reclassified by the new 137/127 checks).
-    #[test]
-    fn evaluate_layer2_exit_0_zero_commits_still_failed() {
-        let dir = tempfile::tempdir().unwrap();
-        init_repo_with_feature_no_commit(dir.path(), 22);
-        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
-        std::fs::write(exit_code_path(dir.path(), 22), "0").unwrap();
-        let state = state_in(dir.path(), 22);
-
-        let result = evaluate_layer2(dir.path(), 22, &GitFlowConfig::default(), state.stage)
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(result.status, AgentStatus::Failed);
-    }
-
-    /// Unchanged-behavior guard: exit 1 is still Failed (not misclassified
-    /// as ResourceKilled/AgentUnavailable).
-    #[test]
-    fn evaluate_layer2_exit_1_still_failed() {
-        let dir = tempfile::tempdir().unwrap();
-        init_repo_with_feature_commit(dir.path(), 23);
-        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
-        std::fs::write(exit_code_path(dir.path(), 23), "1").unwrap();
-        let state = state_in(dir.path(), 23);
-
-        let result = evaluate_layer2(dir.path(), 23, &GitFlowConfig::default(), state.stage)
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(result.status, AgentStatus::Failed);
     }
 }

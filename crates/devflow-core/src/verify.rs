@@ -16,8 +16,13 @@ pub const TRUST_EXTERNAL_VERIFY_ENV: &str = "DEVFLOW_TRUST_EXTERNAL_VERIFY";
 /// closed instead of inheriting a blanket boolean authorization.
 pub fn external_verification_approval() -> Option<Vec<String>> {
     let value = std::env::var(TRUST_EXTERNAL_VERIFY_ENV).ok()?;
-    let commands = serde_json::from_str::<Vec<String>>(&value).ok()?;
-    (!commands.is_empty()).then_some(commands)
+    parse_external_verification_approval(&value)
+}
+
+fn parse_external_verification_approval(value: &str) -> Option<Vec<String>> {
+    let commands = serde_json::from_str::<Vec<String>>(value).ok()?;
+    (!commands.is_empty() && commands.iter().all(|command| !command.trim().is_empty()))
+        .then_some(commands)
 }
 
 /// Return external verification commands declared by this phase's plans.
@@ -79,13 +84,14 @@ fn command_from_frontmatter(contents: &str) -> Option<String> {
         if value.is_empty() {
             return None;
         }
-        if value.starts_with('"') {
-            return serde_json::from_str::<String>(value).ok();
-        }
-        if value.starts_with('\'') && value.ends_with('\'') && value.len() >= 2 {
-            return Some(value[1..value.len() - 1].replace("''", "'"));
-        }
-        return Some(value.to_owned());
+        let command = if value.starts_with('"') {
+            serde_json::from_str::<String>(value).ok()
+        } else if value.starts_with('\'') && value.ends_with('\'') && value.len() >= 2 {
+            Some(value[1..value.len() - 1].replace("''", "'"))
+        } else {
+            Some(value.to_owned())
+        };
+        return command.filter(|command| !command.trim().is_empty());
     }
     None
 }
@@ -117,6 +123,29 @@ mod tests {
     }
 
     #[test]
+    fn approval_parser_accepts_only_nonempty_json_command_arrays() {
+        assert_eq!(
+            parse_external_verification_approval(r#"["test -f shipped", "cargo test"]"#),
+            Some(vec!["test -f shipped".into(), "cargo test".into()])
+        );
+        for invalid in [
+            "",
+            "true",
+            "{}",
+            "[]",
+            r#"[""]"#,
+            r#"["   "]"#,
+            r#"["ok", 1]"#,
+        ] {
+            assert_eq!(
+                parse_external_verification_approval(invalid),
+                None,
+                "approval must fail closed for {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
     fn reads_external_verify_only_from_plan_frontmatter() {
         let dir = tempfile::tempdir().unwrap();
         write_plan(
@@ -145,6 +174,21 @@ mod tests {
         );
 
         assert!(external_verify_commands(dir.path(), 16).is_empty());
+    }
+
+    #[test]
+    fn ignores_empty_external_verify_commands() {
+        for value in [r#""""#, "''"] {
+            let dir = tempfile::tempdir().unwrap();
+            write_plan(
+                dir.path(),
+                &format!("---\nphase: 16\nexternal_verify: {value}\n---\n"),
+            );
+            assert!(
+                external_verify_commands(dir.path(), 16).is_empty(),
+                "empty command {value:?} must not count as affirmative verification"
+            );
+        }
     }
 
     #[test]

@@ -79,7 +79,7 @@ fn acquire_path(path: PathBuf) -> Result<LockGuard, LockError> {
             "lock path has no parent directory",
         )
     })?;
-    fs::create_dir_all(parent)?;
+    crate::workflow::ensure_devflow_dir(parent)?;
 
     match File::create_new(&path) {
         Ok(mut f) => {

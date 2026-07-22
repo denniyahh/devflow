@@ -2,24 +2,141 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
-status: "Phase 17 executed (13/13 plans, 15/15 must-haves) - validated at re-audit #10 (eda94cd): GAP-6/GAP-7 closed via 17-13 and RED-proven; GAP-8 (unsampled CLI wiring of GAP-7's fix) found and auto-filled; all 14 rows green, nyquist_compliant: true. Phase 18 complete (7/7 plans): 18-01 (18a doctor reconciliation), 18-02 (18g WR-03 test stabilization), 18-03 (18b monitor liveness), 18-04 (18d Code-Validate safety-gate reachability), 18-05 (18e Layer 0/Validate verdict fix), 18-06 (18c worktree-aware staleness enforcement), 18-07 (18f preflight-gate re-run wedge fix)."
-stopped_at: Completed 18-07-PLAN.md
-last_updated: "2026-07-21T05:32:24.982Z"
+status: "Phase 19 complete and verified on 2026-07-22: 11/11 plans, 7/7 observable truths, 438 tests, and three green CI attempts on pushed SHA aa95873. Phase 20 remains unscoped and must be defined before planning."
+stopped_at: Phase 19 complete and verified; Phase 20 remains unscoped
+last_updated: "2026-07-22T10:34:28-04:00"
 progress:
-  total_phases: 7
-  completed_phases: 7
-  total_plans: 54
-  completed_plans: 54
+  total_phases: 8
+  completed_phases: 8
+  total_plans: 65
+  completed_plans: 65
   percent: 100
 ---
 
 # DevFlow — Project State
 
-> Last updated: 2026-07-20
+> Last updated: 2026-07-22
 
-## Active
+## Active Phase
 
-- **Phase 18 (Complete + Verified + review-fixed — 7/7 plans):** Dogfood
+- **Phase 20 remains unscoped.** The roadmap reserves it for the
+  operator-facing set targeting v2.0.0, but it has no detailed phase entry yet.
+  Scope it before discussion or planning.
+
+## Recently Shipped
+
+- **Phase 19 — Release Integrity + `main.rs` Decomposition (Complete + Verified
+  2026-07-22 — 11/11 plans).** Targets **v1.6.0**. Promoted from backlog 2026-07-21 via
+  `/gsd-review-backlog` as four units:
+
+  - **19a** — 999.10 `.devflow/` artifact hygiene (Urgent/S). The only item
+    whose blast radius reaches other people's repositories: `hooks.rs:184`'s
+    `commit_all` sweeps unredacted agent stdout into a *user's* commit, and
+    `main.rs:902` writes the operator's absolute home path and OS username
+    into `events.jsonl`.
+
+  - **19b** — 999.11 `commit_path` empty commits (High/S). `--allow-empty`
+    means a release tag can sit on a commit containing nothing.
+
+  - **19c–19f** — 999.8 split `main.rs` (High/L). Pure move, zero behavioral
+    change. Now unblocked by Phase 18.
+
+  - **19g** — 999.16 AI change acceptance contract (High/M). No Rust source;
+    fully parallel track.
+
+  Sequencing is load-bearing: 19a/19b land *before* the split so they are
+  small diffs against the familiar file, not against seven new modules.
+
+  **Principal risk — `ENV_MUTEX`** (18 `.lock()` sites / 63 refs in
+  `main.rs`): a repeat root cause across 19i, GAP-2 and 999.4. If its
+  serialization guarantees cannot survive distribution across module
+  boundaries, that is a finding to surface, not to patch around. Verification
+  must be CI-on-branch — local-green is explicitly insufficient.
+
+  **Re-verified at promotion time:** all four source claims still hold at
+  HEAD. `main.rs` is now **8,467 lines** (4,025 production + 4,442 test, 106
+  tests) — **+35%** since 999.8 was written at 6,239, so its recorded cluster
+  line ranges are stale and must be re-measured at plan time.
+
+  **Discussed 2026-07-21** (`19-CONTEXT.md`, 21 decisions across 5 areas;
+  alternatives preserved in `19-DISCUSSION-LOG.md`). Two decisions were made
+  against evidence gathered during scouting rather than preference:
+
+  - **`ENV_MUTEX` is not one mutex.** Three independent `static Mutex<()>`
+    definitions exist (`main.rs:4034`, `gates.rs:348`, `config.rs:174`), sound
+    today only because each guards a disjoint variable set — an accident,
+    documented nowhere. `PATH` is mutated 36 times across 12 lock regions
+    spanning 3+ target clusters, so per-module mutexes would silently break the
+    exact serialization 19i raced on. **Decision: hoist one shared mutex into a
+    test-support module.**
+
+  - **The bottleneck is the pipeline state machine, not commands.** Mapping
+    Phase 18's plans onto clusters: pipeline absorbed 3 of 7 plans (~1,040
+    lines), commands only 2. A `commands/` subdirectory buys zero wave
+    reduction. **Decision: flat siblings + split `pipeline.rs` at its natural
+    seams**, which is what takes Phase 18's shape from 3 waves to 2.
+
+  **Planned 2026-07-21 — 11 plans across 6 waves.** Research (HIGH confidence),
+  pattern map, and VALIDATION.md all produced; `gsd-plan-checker` returned
+  **VERIFICATION PASSED with 0 blockers and 0 warnings on the first
+  iteration**. Wave 1 runs four plans in parallel (19a/19b/19g, disjoint file
+  sets); waves 3–5 are one plan each by construction, since every split plan
+  edits `main.rs`.
+
+  **Two locked decisions were corrected against live source during planning:**
+
+  - **D-14's named target does not exist.** `lock::ensure_devflow_dir` has zero
+    matches in `crates/`; `.devflow/` is created from **7 independent
+    `create_dir_all` sites**. RESEARCH.md's proposed `save_state` chokepoint was
+    also verified **wrong** — `run_agent_blocking` (`main.rs:2417`), the
+    `sequentagent`/`parallel` path, writes `.devflow/` on *"synthetic,
+    never-persisted state"* and never calls `save_state`, so that chokepoint
+    would leave the whole parallel path leaking. Corrected design: a new
+    `workflow::ensure_devflow_dir()`, all 7 sites converted, plus a coverage
+    test. Also reconciles the **duplicate `devflow_dir()`** (`workflow.rs:33`
+    public, `agent_result.rs:872` private).
+
+  - **D-20 was implemented but uncited**, so the blocking decision-coverage gate
+    failed at 20/21. Now cited explicitly in 19-06 (the first split plan) with a
+    halt-and-report branch if any 19a/19b work is still open when it starts.
+
+  **Cross-AI reviewed 2026-07-21** (`19-REVIEWS.md`: Codex, OpenCode
+  [`deepseek/deepseek-v4-pro`], Antigravity [via `agycli` — the working
+  `antigravity-cli` binary, not the broken `agy`-\>GUI wrapper]; Cursor
+  failed on an account usage limit, not a plan defect). All three completing
+  reviewers independently re-derived and confirmed the phase's core source
+  claims (the 7 `create_dir_all` sites, `ENV_MUTEX`'s single-mutex design,
+  the `commit_path` dead-arm). One HIGH-severity claim (OpenCode: a 19g
+  reference file "doesn't exist") was checked and refuted — the file exists;
+  likely an OpenCode sandbox read-access artifact.
+
+  **Incorporated via `/gsd-plan-phase 19 --reviews`** the same day — 9 of 11
+  plans revised (19-04, 19-10 untouched), re-verified `VERIFICATION PASSED`
+  with 0 blockers on the first iteration:
+
+  - Baseline durability (Codex + OpenCode, MEDIUM): 19-06 now writes a
+    **committed** `19-SPLIT-BASELINE-names.txt`; 19-07/08/09/11 diff against
+    it instead of an ephemeral `/tmp` file.
+
+  - `depends_on` metadata (Codex, downgraded HIGH\->MEDIUM after checking
+    `execute-phase.md` — wave-number gating already enforces order
+    regardless of `depends_on` content): 19-06 and 19-11's `depends_on`
+    arrays corrected to match their stated prerequisites.
+
+  - Five more LOW/MEDIUM fixes: CI-wording precision (19-11), monitor-process
+    cleanup (19-01), a second dogfood anti-pattern shape (19-05), a
+    deleted-`.gitignore` doc gap (19-01), locale-independent git string
+    matching (19-03), and an `ensure_devflow_dir` relative-path edge case
+    (19-01).
+
+  **Completed and verified 2026-07-22.** The verifier passed 7/7 observable
+  truths. The final proof matched all 438 test names and per-target counts,
+  preserved the single CLI `ENV_MUTEX`, and passed three CI attempts on pushed
+  SHA `aa95873`. The approved checkpoint records that symbol and name-set proofs
+  ran locally against that exact SHA because the existing CI workflow does not
+  contain those jobs.
+
+- **Phase 18 (Complete + Verified + review-fixed + Released as v1.5.0 — 7/7 plans):** Dogfood
   Reliability Hardening — reprioritized 2026-07-20 from Hermes Support.
   `devflow doctor` reconciliation (18a), monitor liveness (18b),
   worktree-aware staleness enforcement (18c), Code↔Validate safety-gate
@@ -46,7 +163,10 @@ progress:
   instances remain); and the new 18c worktree-staleness test hardened under
   `ENV_MUTEX` against the 19i PATH-race flake the verifier caught. Final
   gates: 426 tests / 0 failed, clippy `--workspace --all-targets` clean,
-  fmt clean, all on `develop`. **Not yet merged to main / released.**
+  fmt clean, all on `develop`. **Merged to main and released as v1.5.0**
+  (2026-07-21, PR #12 squash-merged to `main`, signed tag `v1.5.0`,
+  `devflow-core` + `devflow` published to crates.io). `develop` synced
+  back from `main` post-release via `scripts/sync-main-to-develop.sh`.
 
   Planned 2026-07-20: research (HIGH confidence, all 7 defects re-verified
   as still reproducing at HEAD), VALIDATION.md (Nyquist), 7 plans, and a
@@ -189,12 +309,50 @@ progress:
 
 ## Backlog
 
-Five unsequenced items live in `.planning/phases/999.N-*/` and the
-`## Backlog` section of ROADMAP.md: Hermes Support (999.1, held Phase 18's
-slot until this reprioritization), phase-process tracking model (999.2, was
-19b), CLI operator discoverability (999.3, was 19c), version-tag contention
-on concurrent ship (999.4, was 19h), changelog placeholder content (999.5,
-was 19j). Promote with `/gsd-review-backlog`.
+**19 unsequenced items** remain in `.planning/phases/999.N-*/` and the
+`## Backlog` section of ROADMAP.md. The first 16 were
+reviewed/prioritized/sized 2026-07-21 (mirrored in Linear as
+`DEN-26`..`DEN-45`); 999.21 and 999.22 were filed 2026-07-22 from Phase 19's
+two retained non-blocking findings and mirrored as `DEN-46`/`DEN-47`:
+acceptance-contract review wiring (999.21, High, DEN-46 — 19-05's dogfood found the
+contract's wording works but its wiring doesn't: an isolated reviewer reaches
+the right verdicts without citing the contract or grading at its blocking
+severity) and refactor equivalence guard in CI (999.22, Medium, DEN-47 — the
+symbol/name-set equivalence proof that validated the `main.rs` split runs only
+locally; Phase 19 shipped with an explicit accepted override for exactly this).
+999.23 (High, DEN-48) was filed the same day from the v1.6.0 release PR: a
+flaky worktree-cleanup test in the release gate, proven a flake rather than a
+regression.
+The 2026-07-21 sixteen: Hermes Support (999.1, Low),
+phase-process tracking model (999.2, Medium — half-addressed by 18b's
+`monitor_pid`), CLI operator discoverability (999.3, Low), version-tag
+contention on concurrent ship (999.4, Medium), changelog placeholder content
+(999.5, Low), plan-only pipeline mode (999.6, High), manual ship override
+(999.7, High), dependency update review (999.9, Medium), Layer 0 veto test
+coverage (999.12, Medium), release-cut automation (999.13, High), doctor
+reconciliation for planning-doc staleness (999.14, Medium), shell-entrypoint
+hermetic tests (999.15, High), mutation testing (999.17, Medium),
+property/fuzz testing for parsers (999.18, Medium), fast/slow CI lanes
+(999.19, Medium), differential coverage enforcement (999.20, Medium).
+Promote with `/gsd-review-backlog`.
+
+**Promoted into Phase 19 on 2026-07-21** (removed from the backlog):
+999.10 `.devflow/` artifact hygiene (Urgent, DEN-35), 999.11 `commit_path`
+empty commits (High, DEN-36), 999.8 split `main.rs` (High, DEN-33), 999.16
+AI change acceptance contract (High, DEN-41). Their accumulated context was
+consolidated into
+`.planning/phases/19-release-integrity-main-rs-decomposition/CONTEXT.md`
+as units 19a/19b/19c–19f/19g. Linear synced 2026-07-21: all four moved to the
+`Phase 19: Release Integrity + main.rs Decomposition` project milestone,
+retitled to their unit IDs, and set to Todo.
+
+**Earmarked for Phase 20 (v2.0.0):** 999.6, 999.7, 999.13, likely 999.3 —
+all four land in `main.rs`, which is why Phase 19's split precedes them.
+
+Note: that same QA pass independently found and fixed an *unrelated* defect
+in `verify.rs` (external-verification approval/frontmatter parsing accepted
+empty commands, which `sh -c ""` silently passes) — not part of any backlog
+item, already fixed and committed (`b1dcec7`), not a promotion candidate.
 
 ## Completed
 
@@ -218,6 +376,7 @@ was 19j). Promote with `/gsd-review-backlog`.
 | 15 | Dogfood Enablement + OSS Readiness | — | 2026-07-17 |
 | 16 | Pipeline Reliability Hardening | — | 2026-07-17 |
 | 17 | Pipeline Dogfood Follow-Up | — | 2026-07-19 |
+| 18 | Dogfood Reliability Hardening | v1.5.0 | 2026-07-21 |
 
 *Phases 8 and 10 shipped without a SUMMARY.md at the time; both were retroactively documented 2026-07-08 (see `8-SUMMARY.md`, `10-SUMMARY.md`) after reconstruction from git history. Phase 11 was reviewed and found already adequately closed out via `11-VALIDATION.md`/`11r-VALIDATION.md` (Nyquist-compliant, sign-off dated 2026-06-20) — no retroactive SUMMARY.md was needed.*
 
@@ -317,6 +476,14 @@ None currently open for Phase 17.
 - [Phase 18]: 18-06: enforce_build_staleness derives execution_root = state.worktree_path.unwrap_or(project_root); is_self_dogfood_workspace stays project_root-scoped (Assumption A3)
 - [Phase 18]: 18-07: launch_stage split into launch_stage (resolution + run_preflight guard) + launch_stage_inner (everything after); run_preflight's Advance arm calls launch_stage_inner directly (skip), LoopBack still calls full launch_stage (re-check), either bounded by persisted State.preflight_retries / mode::MAX_PREFLIGHT_RETRIES=3 checked before any new gate is written; counter resets to 0 (persisted) on preflight pass and human Advance. Phase 18 (18a-18g) complete.
 - [Phase 18]: 18-07: AlwaysFailAdapter cannot reproduce a preflight failure that survives a relaunch (launch_stage always re-resolves the REAL production adapter via agents::adapter_for, discarding whatever was passed into the outer run_preflight call) -- used preflight_interactivity_check (a pure function of state) as the deterministic wedge-reproduction trigger for the three new tests instead; verified empirically both ways (unfixed code + literal plan setup = no observable difference; unfixed code + interactivity-check setup = reproduces the exact documented wedge).
+- [Phase 19]: 19-01: ensure_devflow_dir(dir) returns std::io::Result (not a crate error enum) so ? converts at all 7 sites across 6 error enums with zero signature churn; marker resolution walks dir.components() (not ancestors()) so relative .devflow-leaf paths resolve correctly
+- [Phase 19]: 19-02: exe_path in workflow_started_payload redacted via .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())) (WR-02); to_string_lossy (not to_str) keeps non-UTF-8 names as a string, preserving null as the distinct "could not resolve" signal; worktree field's own full-path exposure (T-19-09) left untouched and surfaced, not fixed, per D-15's scope
+- [Phase 19]: 19-03: commit_path no longer passes --allow-empty, closing 19b/D-16 (a repeat call with unchanged content now creates zero commits, not a forced empty one); discovered mid-fix that git's "nothing to commit" message is on stdout not stderr, so the plan's literal reuse of git_raw's stderr-only error mapping could never surface it -- added a sibling git_raw_combined helper (stdout+stderr) used only by commit_path, leaving git_raw's own error-mapping branch and commit_all byte-identical; git_raw and git_raw_combined both pin LC_ALL=C/LANG=C (T-19-14); D-17 finding: commit_all's empty-commit behavior is not load-bearing (its only caller, docs_update, already treats a commit failure as non-fatal, and no test asserts a commit exists after it runs) -- commit_all left unmodified regardless
+- [Phase 19]: 19-04: ai-change-acceptance project skill (D-19's 5 requirements + 4 rejection patterns) plus a CONTRIBUTING.md section, wired into /gsd-code-review per D-18; also fixed .gitignore's blanket .claude/ ignore (carved out !.claude/skills/**, mirroring the existing .codex/* pattern) since it would otherwise have silently prevented the new skill from ever being committed
+- [Phase 19]: 19-06: no D-12 ENV_MUTEX finding — three consecutive cargo test -p devflow runs post-hoist stable, 0 failed each time
+- [Phase 19]: 19-05: dogfood checkpoint for 19g approved on combined evidence — an in-session five-diff run (same agent authored and reviewed, so it could not prove isolated wiring by itself) plus an independently-spawned, context-isolated gsd-code-reviewer subagent that caught both anti-pattern shapes cold. Recorded gap for later triage: the isolated reviewer's generic judgment agreed but did not cite the ai-change-acceptance contract by name unless the dispatch explicitly loaded it — review-dispatch prompts should load the skill explicitly, and part of that wiring surface lives outside this repository.
+- [Phase 19]: 19-07: staleness + preflight clusters extracted into staleness.rs/preflight.rs (shakedown run for the mechanical extraction procedure ahead of 19-08/19-09's larger clusters); 438/438 tests unchanged, every moved function diffs clean against the 19-06 baseline SHA modulo pub(crate); preflight <-> pipeline bidirectional call preserved as direct calls, not abstracted. Two findings recorded for 19-08/19-09: a wider-than-estimated pub(crate) surface (worktree_writable_roots, ensure_agent_binary, agent_program, phase_artifact_on_develop all needed it beyond the plan's run_preflight/launch_stage_inner estimate), and a bug in the plan's own literal name-set extraction command (`rg '::tests::' | sed 's/.*::tests:://'` silently drops main.rs's own top-level mod tests entries; corrected to `sed 's/.*:://'`).
+- [Phase 19]: 19-08: pipeline state machine split into pipeline_launch.rs/pipeline_outcomes.rs/pipeline_gate.rs (D-06 seams A/B/C), main.rs down to 3,313 lines from phase-start 8,467; three-way module cycle preserved as direct pub(crate) calls, zero unexplained diffs against baseline
 
 ## Roadmap Evolution
 
@@ -374,9 +541,17 @@ None currently open for Phase 17.
 | Phase 18 P05 | 50min | 3 tasks | 2 files |
 | Phase 18 P06 | 21min | 2 tasks | 1 files |
 | Phase 18 P07 | 25min | 3 tasks | 4 files |
+| Phase 19-release-integrity-main-rs-decomposition P01 | 55min | 3 tasks | 8 files |
+| Phase 19-release-integrity-main-rs-decomposition P02 | 12min | 1 tasks | 1 files |
+| Phase 19 P03 | 20min | 2 tasks | 1 files |
+| Phase 19-release-integrity-main-rs-decomposition P04 | 20min | 2 tasks | 5 files |
+| Phase 19 P06 | 22min | 3 tasks | 6 files |
+| Phase 19 P05 | n/a | 1 tasks | 0 files |
+| Phase 19 P07 | 71min | 2 tasks | 3 files |
+| Phase 19 P08 | 37min | 3 tasks | 5 files |
 
 ## Session
 
-**Last session:** 2026-07-21T05:29:59.988Z
-**Stopped at:** Completed 18-07-PLAN.md
+**Last session:** 2026-07-22T10:34:28-04:00
+**Stopped at:** Phase 19 complete and verified; Phase 20 remains unscoped
 **Resume file:** None

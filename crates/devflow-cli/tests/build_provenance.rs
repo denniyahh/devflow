@@ -168,6 +168,11 @@ fn build_dirty_flips_false_to_true_across_a_working_tree_edit_after_rebuild() {
         "git",
         &["config", "commit.gpgsign", "false"],
     );
+    run(
+        clone_dir.path(),
+        "git",
+        &["config", "core.hooksPath", "/dev/null"],
+    );
     run(clone_dir.path(), "git", &["add", "-A"]);
     run(clone_dir.path(), "git", &["commit", "-q", "-m", "snapshot"]);
     // `packed-refs` is required to reproduce CR-02: it does not exist in an

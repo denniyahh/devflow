@@ -82,7 +82,7 @@ pub fn write_cron_instructions(
 ) -> Result<(), ShipError> {
     let path = cron_instructions_path(project_root, instructions.phase);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        crate::workflow::ensure_devflow_dir(parent)?;
     }
     std::fs::write(&path, serde_json::to_string_pretty(instructions)?)?;
     Ok(())

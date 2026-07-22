@@ -12,7 +12,7 @@
 //! transition itself.
 
 use devflow_core::agent_result::{
-    self, AgentStatus, agent_pid_path, evaluate_agent_result, exit_code_path, stdout_path,
+    AgentStatus, agent_pid_path, evaluate_agent_result, exit_code_path, stdout_path,
 };
 use devflow_core::config::GitFlowConfig;
 use devflow_core::mode::Mode;
@@ -110,12 +110,6 @@ fn monitor_owns_fake_agent_and_records_devflow_result() {
     // Success — exactly what `devflow check` would act on to advance state.
     let result = evaluate_agent_result(root, &state, &GitFlowConfig::default()).unwrap();
     assert_eq!(result.status, AgentStatus::Success);
-
-    // Sanity: the capture path helpers agree with what the monitor wrote.
-    assert_eq!(
-        stdout_path(root, phase),
-        agent_result::stdout_path(root, phase)
-    );
 }
 
 #[test]

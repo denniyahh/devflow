@@ -2,22 +2,25 @@
 
 > Phase plan source of truth. Each phase drives a `devflow start` agent session.
 
-## v2.0.0 (Phase 11–18)
+## v2.0.0 (Phase 11–20)
 
-| Phase | Name | Status |
-|---|---|---|
-| 12 | Bootstrap + Housekeeping | Complete |
-| 13 | MVP Core Loop | Complete    |
-| 14 | Parallel Safety + Observability | Complete |
-| 15 | Dogfood Enablement + OSS Readiness | Complete |
-| 16 | Pipeline Reliability Hardening | Complete    |
-| 17 | Pipeline Dogfood Follow-Up | Complete    |
-| 18 | Dogfood Reliability Hardening | Complete    |
+| Phase | Name | Status | Version |
+|---|---|---|---|
+| 12 | Bootstrap + Housekeeping | Complete | — |
+| 13 | MVP Core Loop | Complete    | — |
+| 14 | Parallel Safety + Observability | Complete | — |
+| 15 | Dogfood Enablement + OSS Readiness | Complete | — |
+| 16 | Pipeline Reliability Hardening | Complete    | — |
+| 17 | Pipeline Dogfood Follow-Up | Complete    | — |
+| 18 | Dogfood Reliability Hardening | Complete    | 1.5.0 |
+| 19 | Release Integrity + `main.rs` Decomposition | Complete    | 1.6.0 |
+| 20 | *(unscoped — operator-facing set)* | Planned | 2.0.0 |
 
 ## Shipped
 
 | Phase | Name | Version |
 |---|---|---|
+| 18 | Dogfood Reliability Hardening | 1.5.0 |
 | 11 | GSD-Native Architecture + Remediation | 1.2.0 |
 | 10 | Logging + Planning Step | — |
 | 9 | Open-Source Polish | 1.2.0 |
@@ -45,6 +48,14 @@
 
 - **Phase 17 narrowed to four units** after source verification resolved the spike's decision gate: `Unknown` non-advance (17a), typed outcomes + retry policy (17b), preflight readiness gate (17c), build provenance (17d). Scoped as a focused repair phase rather than a Phase 16 remediation — only 17d traces to the proven Phase 16 defect.
 - **Phase 18 gains 18d/18e** — `devflow doctor` state/event reconciliation and the WR-03 transient-capture test fix moved out of 17. 18d depends on 17b + 17d. See the 2026-07-18 decision entry in STATE.md.
+
+## Phase 19 scoping (2026-07-21)
+
+- **Milestone label corrected.** `v2.0.0` had been carried as the milestone name since Phase 11 while the project actually shipped 1.2.0 → 1.5.0. No v2.0.0 was ever released. The milestone now runs Phase 11–20 and genuinely closes at v2.0.0.
+- **Phase 19 = four promoted backlog items**, in sequence: 999.10 (`.devflow/` artifact hygiene, Urgent/S), 999.11 (`commit_path` empty commits, High/S), 999.8 (split `main.rs`, High/L), 999.16 (AI change acceptance contract, High/M, parallel track). Promoted via `/gsd-review-backlog`; all four source claims re-verified present at HEAD during promotion.
+- **Cuts v1.6.0, not v2.0.0.** Nothing in the phase is breaking and — apart from the PII fix — almost nothing is user-visible. Tagging a pure-move refactor as a major release would oversell the changeset and burn the 2.0 slot.
+- **999.8 is near-alone by necessity.** It conflicts with every other high-priority candidate: 999.6 (`--until`), 999.7 (manual ship override) and 999.3 (`gate show`) all land in `main.rs`. Every phase run before the split makes the split harder and re-pays the serialization tax — Phase 18 burned 6 near-serial waves on 7 plans for exactly this reason, and the file has grown +35% (6,239 → 8,467 lines) since that was logged.
+- **Phase 20 gets the deferred set** — 999.6, 999.7, 999.13, likely 999.3 — and is what the split makes plannable as one phase in ~3 waves rather than two phases at 6.
 
 ## Phase 14 split (2026-07-16)
 
@@ -252,7 +263,51 @@ Plans:
 - [x] 18-06-PLAN.md — 18c: evaluate build staleness against the worktree HEAD (wave 5)
 - [x] 18-07-PLAN.md — 18f: preflight gate approval skips the adjudicated check, bounded (wave 6)
 
-**Verified** 2026-07-21 (`18-VERIFICATION.md`, 7/7 must-haves, each traced to source + an independently-executed passing test; both binding operator decisions confirmed). **Code-reviewed** (`18-REVIEW.md`, 0 critical / 4 warning) and **review-fixed** in a `18-fix` batch (6 commits): `doctor --json` single-object output (WR-01), stale-`monitor_pid` false-"Stuck" (WR-04), path-free staleness event (WR-02, third instance — see `999.10`), the `unreachable!()` eliminated by construction (WR-03), and the new 18c worktree test hardened against the 19i PATH-race flake. Final: 426 tests, clippy `--workspace --all-targets` clean, fmt clean. Not yet merged to main / released.
+**Verified** 2026-07-21 (`18-VERIFICATION.md`, 7/7 must-haves, each traced to source + an independently-executed passing test; both binding operator decisions confirmed). **Code-reviewed** (`18-REVIEW.md`, 0 critical / 4 warning) and **review-fixed** in a `18-fix` batch (6 commits): `doctor --json` single-object output (WR-01), stale-`monitor_pid` false-"Stuck" (WR-04), path-free staleness event (WR-02, third instance — see `999.10`), the `unreachable!()` eliminated by construction (WR-03), and the new 18c worktree test hardened against the 19i PATH-race flake. Final: 426 tests, clippy `--workspace --all-targets` clean, fmt clean. **Merged to main and released as v1.5.0** (2026-07-21, PR #12, signed tag `v1.5.0`, published to crates.io).
+
+### Phase 19: Release Integrity + `main.rs` Decomposition
+
+**Goal:** Close the two release-integrity defects whose blast radius reaches outside this repository (999.10's `.devflow/` PII leak into *users'* git history, 999.11's empty commit under a release tag), then decompose the 8,467-line `crates/devflow-cli/src/main.rs` as a pure-move refactor so later phases stop paying the near-serial wave tax. Adds the AI change acceptance contract (999.16) on a parallel, source-conflict-free track.
+**Targets:** v1.6.0 — nothing here is breaking and, apart from the PII fix, almost nothing is user-visible. The v2.0.0 milestone closes at Phase 20, which carries the operator-facing set this split makes plannable as one phase.
+**Promoted from backlog** 2026-07-21: 999.10 (DEN-35), 999.11 (DEN-36), 999.8 (DEN-33), 999.16 (DEN-41).
+**Requirements:** 19a, 19b, 19c–19f, 19g (see CONTEXT.md — no formal REQ-IDs)
+**Depends on:** Phase 18 — 999.8 was deliberately blocked on it; 18a/18b are the instrumentation that makes an `ENV_MUTEX` regression observable, and 18e/18f reshaped the functions that determine the module seams.
+**Plans:** 11/11 plans executed
+
+**Sequencing is load-bearing:** 19a and 19b land *before* the split, so they are small diffs against the file everyone knows rather than against seven new modules. 19g has no source overlap and can run in any wave.
+
+**Principal risk — `ENV_MUTEX`:** 18 `.lock()` sites / 63 references in `main.rs`, and a repeat root cause across three expensive-to-diagnose failures (19i, GAP-2, 999.4). If its serialization guarantees cannot survive distribution across module boundaries, that is a finding to surface, not to patch around. Verification must be CI-on-branch; local-green is explicitly insufficient.
+
+Plans:
+
+**Wave 1** *(19a/19b/19g — all pre-split, zero file overlap)*
+
+- [x] 19-01-PLAN.md — 19a-WR01: new `workflow::ensure_devflow_dir` writing a self-ignoring `.devflow/.gitignore`, all 7 constructors converted, coverage + scratch-repo tests
+- [x] 19-02-PLAN.md — 19a-WR02: redact `exe_path` in `events.jsonl` to the binary filename only
+- [x] 19-03-PLAN.md — 19b: `commit_path` no longer forces an empty commit (RED-first); D-17 `commit_all` finding recorded
+- [x] 19-04-PLAN.md — 19g: `.claude/skills/ai-change-acceptance/` + `CONTRIBUTING.md` prose
+
+**Wave 2** *(blocked on wave 1)*
+
+- [x] 19-05-PLAN.md — 19g dogfood checkpoint: run `/gsd-code-review` against a non-compliant diff and a compliant control
+- [x] 19-06-PLAN.md — split foundation: committed pre-split baseline, `pub(crate)` pass on cross-cluster types, `ENV_MUTEX` hoist into `test_support.rs`
+
+**Wave 3** *(blocked on 19-06)*
+
+- [x] 19-07-PLAN.md — extract `staleness.rs` + `preflight.rs` (procedure shakedown; preflight↔pipeline coupling documented)
+
+**Wave 4** *(blocked on 19-07)*
+
+- [x] 19-08-PLAN.md — pipeline sub-split at the D-06 seams: `pipeline_launch.rs`, `pipeline_outcomes.rs`, `pipeline_gate.rs`
+
+**Wave 5** *(blocked on 19-08)*
+
+- [x] 19-09-PLAN.md — extract `parallel.rs`, `commands.rs`, `config_parse.rs`; reduce `main.rs` to a thin crate root
+
+**Wave 6** *(blocked on 19-09)*
+
+- [x] 19-10-PLAN.md — regenerate `.planning/codebase/STRUCTURE.md` + `TESTING.md`, reconcile this ROADMAP entry
+- [x] 19-11-PLAN.md — phase gate: three-part equivalence proof on CI-on-branch (D-11), `ENV_MUTEX` disposition (D-12), scratch-repo 19a reproduction, requirement roll-call
 
 ## Backlog
 
@@ -263,6 +318,7 @@ own `phases/999.N-*/CONTEXT.md`.
 ### Phase 999.1: Hermes Support (BACKLOG)
 
 **Goal:** `HermesAgent` adapter with native-envelope completion parsing, rewrite of the stale `skills/hermes/devflow/SKILL.md`, and the Hermes plugin session mode with an events.jsonl-driven gate watcher. Held Phase 18's slot until 2026-07-20, when pipeline-reliability work took priority — personal-infrastructure work that doesn't gate anything else.
+**Priority:** Low | **Size:** L — reviewed 2026-07-21: structurally lowest (gates nothing else), operator confirmed still low priority. Linear: DEN-26.
 **Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
 
@@ -273,6 +329,7 @@ Plans:
 ### Phase 999.2: A Phase Tracks Exactly One Process (BACKLOG)
 
 **Goal:** One `phase-N-agent-pid` file per phase leaves the monitor unrecorded and `sequentagent`'s second agent homeless. Frame as two tracked processes per phase. *(was 19b)*
+**Priority:** Medium | **Size:** M — reviewed 2026-07-21: the "monitor unrecorded" half is now fixed by Phase 18's 18b (`State.monitor_pid` shipped in v1.5.0); remaining scope is narrower — `sequentagent`'s orphaned second process only. Re-scope before promoting. Linear: DEN-27.
 **Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
 
@@ -283,6 +340,7 @@ Plans:
 ### Phase 999.3: CLI Operator Discoverability (BACKLOG)
 
 **Goal:** Gate reasons truncate with no `devflow gate show`; rate-limit reset times buried in raw JSON; `status` lacks in-stage progress; recovery verbs undiscoverable from a stuck state. *(was 19c)*
+**Priority:** Low | **Size:** L — reviewed 2026-07-21: confirmed still true at HEAD (no `gate show` command exists). Self-scoped as UX, safe behind correctness work; bundles 4 distinct gaps — split into smaller issues when promoted. Linear: DEN-28.
 **Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
 
@@ -293,6 +351,7 @@ Plans:
 ### Phase 999.4: Version-Tag Contention on Concurrent Ship (BACKLOG)
 
 **Goal:** Two phases computing the same next version race to create one tag. 17-09 bounded the test-level symptom (2s gate-timeout poll under `ENV_MUTEX`); the product-level race is proven (instrumentation caught both phases ~1.8ms apart) but still open. *(was 19h)*
+**Priority:** Medium | **Size:** M — reviewed 2026-07-21: confirmed still open (no new checkout-lock serialization since 17-09). Real but low-frequency (needs two concurrent ships landing on the identical computed version); sizing skews up on verification difficulty, not code volume. Linear: DEN-29.
 **Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
 
@@ -303,6 +362,7 @@ Plans:
 ### Phase 999.5: ChangelogAppend Placeholder Content (BACKLOG)
 
 **Goal:** Every generated changelog entry reads "Released phase via DevFlow" — deferred twice already (17-10, 17-12). *(was 19j)*
+**Priority:** Low | **Size:** M — reviewed 2026-07-21: confirmed still generic (`ship.rs:431`). Cosmetic by its own admission, but sized M not S — needs a real content source designed (plan diffs? SUMMARY.md extraction?) before implementation, which is why it's been deferred 3 times already. Linear: DEN-30.
 **Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
 
@@ -313,6 +373,7 @@ Plans:
 ### Phase 999.6: Plan-Only Pipeline Mode (BACKLOG)
 
 **Goal:** `devflow start --until <stage>` to halt cleanly after a named stage. Today `start` always runs Define→Plan→Code→Validate→Ship and `--mode supervise` only moves the gates, so "just do the planning" is inexpressible — the only stop is killing the monitor, which strands state and orphans a worktree. Blocks cheap, frequent dogfood runs. Found 2026-07-20 attempting to plan Phase 18 through devflow itself.
+**Priority:** High | **Size:** M — reviewed 2026-07-21: confirmed still missing (no `--until`/`stop_after`/`plan_only` anywhere in `crates/`). Ranked above pure UX since it multiplies future dogfooding — this project's highest-yield bug source — not just convenience. Linear: DEN-31.
 **Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
 
@@ -323,38 +384,7 @@ Plans:
 ### Phase 999.7: Manual Ship Override (BACKLOG)
 
 **Goal:** Let an operator drive a phase through Ship by hand when the pipeline is unhealthy. `devflow gate approve` does not cover this: it refuses when no gate is open (`gates.rs:186`), and when one is open it only writes a response file that a *live monitor* must consume — so a dead monitor (invisible today, see 18b) leaves the approval unconsumed forever. Must not bypass the fail-closed terminal Ship invariant. Operator request 2026-07-20.
-**Requirements:** TBD — see CONTEXT.md
-**Plans:** 0 plans
-
-Plans:
-
-- [ ] TBD (promote with /gsd-review-backlog when ready)
-
-### Phase 999.8: Split `main.rs` (BACKLOG — blocked on Phase 18)
-
-**Goal:** `crates/devflow-cli/src/main.rs` is 6,239 lines (3,307 production + a 2,931-line test module with 71 tests) — 2.6x the next largest file, and now the binding constraint on execution parallelism, since the same-wave zero-file-overlap rule keys on file path. Phase 18 was forced into 6 near-serial waves for 7 plans purely because 6 of them touch `main.rs`. The production half already decomposes cleanly into 7 clusters (preflight / staleness / pipeline state machine / commands / parallel / dispatch / config — measured boundaries in CONTEXT.md); splitting would take those 6 waves to 3.
-
-**Deliberately sequenced AFTER Phase 18, not before.** The primary risk is `ENV_MUTEX` (22 sites in `main.rs`) — redistributing 71 tests across module boundaries while preserving process-global serialization is exactly the failure class with the worst track record here (19i hit 2/2 in CI while passing locally; GAP-2 at 33–40%; 999.4 caught only by instrumentation). Phase 18's 18a/18b are what make that class observable, and 18e/18f reshape the very functions that determine the seams. Must be a pure-move refactor with zero behavioral change, verified on a branch with CI — local-green is explicitly insufficient.
-**Requirements:** TBD — see CONTEXT.md
-**Plans:** 0 plans
-
-Plans:
-
-- [ ] TBD (promote with /gsd-review-backlog when ready — after Phase 18 ships)
-
-### Phase 999.10: `.devflow/` Artifact Hygiene (BACKLOG — highest of the WR batch)
-
-**Goal:** Two composing 17-REVIEW.md findings, both re-verified present at HEAD 2026-07-20. **WR-01:** `docs_update` (`hooks.rs:184`) is the only remaining `commit_all` caller and runs `git add .` at the *user's* project root, so a target project whose `.gitignore` lacks `.devflow/` gets raw unredacted agent stdout swept into a commit that `Merge` then pushes — the assumption that `.devflow/` is gitignored is asserted in test fixtures but enforced nowhere, and both existing guards only cover DevFlow's own repo. **WR-02:** `main.rs:843` emits the full `current_exe()` path into `events.jsonl` on every start, i.e. the developer's absolute home directory and OS username, in a file `OPERATIONS.md` tells people to tail and paste. Together they publish PII into someone else's git history. Phase 18 does **not** fix either — its plans cite WR-02 only as a prevention constraint. Preferred WR-01 fix (`lock::ensure_devflow_dir` writes a `.devflow/.gitignore` containing `*`) closes it for every constructor at once.
-**Requirements:** TBD — see CONTEXT.md
-**Plans:** 0 plans
-
-Plans:
-
-- [ ] TBD (promote with /gsd-review-backlog when ready — before any wider release push)
-
-### Phase 999.11: `commit_path` Empty Commits (BACKLOG)
-
-**Goal:** 17-REVIEW.md WR-03, re-verified at HEAD 2026-07-20. `commit_path`'s `--allow-empty` does not *skip* when a path is unchanged — it **commits**, contradicting the function's own doc comment ("Ok(()) whether or not the path had changes") and rendering its `nothing to commit` guard arm dead code that reads like the skip path. If `version_bump` re-runs after a fail-fast terminal-batch retry and `write_version` produces byte-identical content, an empty `chore: bump version to X` commit lands on develop and **the release tag is placed on a commit containing nothing**. Reachable, since Phase 16 made terminal-batch retry a designed path. Fix: drop `--allow-empty` and let the existing arm become the genuine no-op.
+**Priority:** High | **Size:** L — reviewed 2026-07-21: confirmed no force-ship path exists (only `gate approve`, which requires an open gate + live monitor). Now unblocked (18a/18b's reconciliation shipped in v1.5.0). Has open design questions (share a mechanism with 18f's preflight-override?) — run a discuss-phase pass before sizing tightens further. Linear: DEN-32.
 **Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
 
@@ -365,6 +395,7 @@ Plans:
 ### Phase 999.12: Layer 0 Unapproved-Probe Veto Coverage (BACKLOG)
 
 **Goal:** 17-REVIEW.md WR-04 — coverage debt on a *deliberate* trade, not a defect. 17-03 removed `evaluate_layer0`'s `Stage::Code` guard by design (D-05 gap 1), so a forgotten `DEVFLOW_TRUST_EXTERNAL_VERIFY` now vetoes at all five stages instead of one, a 5× blast-radius increase. Two verified gaps at HEAD: (a) of the three veto arms, only "approval mismatch" is tested (`agent_result.rs:1644`) — the "not approved" arm a forgotten env var actually hits has no test at any stage; (b) `docs/guides/configuration.md` states the requirement for "the parent DevFlow process" but never that the **detached monitor subprocess must inherit it**, which is where the failure manifests. Deliberately not folded into Phase 18's 18-05 (same file) — that plan had already passed the checker clean, and adding coverage debt to a verified bug-fix plan is scope creep.
+**Priority:** Medium | **Size:** S — reviewed 2026-07-21: confirmed still only "approval mismatch" tested at `agent_result.rs`. Test/doc debt on an already-shipped, intentional decision, not a live bug. Linear: DEN-37.
 **Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
 
@@ -375,6 +406,117 @@ Plans:
 ### Phase 999.9: Dependency Update Review (BACKLOG)
 
 **Goal:** Triggered 2026-07-20 by a GitHub Actions annotation on the first all-branch CI run — `actions/checkout@v4` targets deprecated Node.js 20 and is being force-run on Node 24. Warning only, all jobs green, but it appears on 4 job definitions across both workflow files, so the eventual break lands everywhere at once. Broader than a one-line bump: the dependency surface is inconsistently pinned — `dtolnay/rust-toolchain@stable` and `rust-toolchain.toml`'s `channel = "stable"` float entirely (CI can break from upstream with no commit here, a reproducibility gap for a project premised on trustworthy pipelines), `devcontainers/ci@v0.3` is pre-1.0, the devcontainer base image pin was last verified in Phase 15, and neither `cargo audit` nor `cargo deny` runs in CI. Deliberately not folded into Phase 18 — a dependency bump mid-phase would confound that phase's test signal.
+**Priority:** Medium | **Size:** M — reviewed 2026-07-21: confirmed `actions/checkout@v4` still current pin. Nothing failing today; most of the scope is policy decisions (pin vs. float) rather than code. Linear: DEN-34.
+**Requirements:** TBD — see CONTEXT.md
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.13: Release-Cut Automation / `devflow release --check` (BACKLOG)
+
+**Goal:** DevFlow automates the phase pipeline thoroughly but the release-cut process (version-bump PR → merge → tag → develop-sync → crates.io publish) is a fully manual checklist. Cutting v1.5.0 (2026-07-21) hit three separate failures from this gap in one release: the `devflow-core` version pin drifted for the *second* time (PR #10 fixed the same drift once before), `develop` had silently diverged from `main` for a full release cycle (11 file conflicts on the next PR), and crates.io's publish ordering constraint was undocumented until hit by trial and error. A fourth, related gap: the official signed release tag has no preflight for signing viability, unlike DevFlow's own automated version-bump tags (`git.rs::tag()`, which already scopes off `tag.gpgsign` per-invocation).
+**Priority:** High | **Size:** L — added 2026-07-21, born directly from that session's release. Multiple distinct checks plus one open design question (should it also cut the tag, or just preflight?) — see CONTEXT.md. Linear: DEN-38.
+**Requirements:** TBD — see CONTEXT.md
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.14: Doctor Reconciliation for Planning-Doc Staleness (BACKLOG)
+
+**Goal:** `devflow doctor`'s 18a reconciliation checks phase state against events/PIDs/gates/branches, but nothing checks whether `ROADMAP.md`/`STATE.md`'s own narrative still matches reality once a phase's outcome is decided by a manual, out-of-band action (merge, tag, publish). Found 2026-07-21: `STATE.md`/`ROADMAP.md` claimed Phase 18 was "not yet merged / released" after v1.5.0 had already shipped — the same class of bug `17-REVIEW.md` WR-06 already named once (19e/19f marked open after `17-13` had already closed them).
+**Priority:** Medium | **Size:** M — added 2026-07-21. Detection-only scope (flag stale version claims against git tags), deliberately not auto-correcting prose. Linear: DEN-39.
+**Requirements:** TBD — see CONTEXT.md
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.15: Hermetic Tests for Shell Entry Points (BACKLOG)
+
+**Goal:** `scripts/install.sh`, `scripts/sync-main-to-develop.sh`, and `scripts/deploy.sh` have user-facing, side-effecting behavior (network downloads, git history mutation, docs deployment) with no direct behavioral tests — only source-text inspection. From `TEST-SUITE-QA-REVIEW.md` (Codex, 2026-07-21).
+**Priority:** High | **Size:** L — re-scoped 2026-07-21 (Claude review): the source document treated all three scripts as equally P0; `deploy.sh` only touches `gh-pages` (docs), meaningfully lower blast radius than `install.sh` (every new user's first run) or `sync-main-to-develop.sh` (mutates real branch history). Demoted `deploy.sh` within this item rather than splitting it out. Linear: DEN-40.
+**Requirements:** TBD — see CONTEXT.md
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.17: Mutation Testing (`cargo-mutants`) (BACKLOG)
+
+**Goal:** Introduce `cargo-mutants` as a scheduled/manual gate (not a blocking PR check — too slow at this codebase's size), scoped initially to `verify.rs`, `outcome_policy::decide_action`, `agent_result.rs`'s Layer 0–3 evaluators, and git safety logic (`commit_path`/tag functions). Track surviving mutants rather than treating line coverage as the primary quality score. From `TEST-SUITE-QA-REVIEW.md` (Codex, 2026-07-21).
+**Priority:** Medium | **Size:** M — initial scope re-prioritized 2026-07-21 (Claude review): `verify.rs` first, since this session's own QA review found a real fail-open bug there, making it the highest-confidence-return target in the codebase. `main.rs`'s display/dispatch code deliberately excluded from initial scope. Linear: DEN-42.
+**Requirements:** TBD — see CONTEXT.md
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.18: Property and Fuzz Testing for Protocol Parsers (BACKLOG)
+
+**Goal:** DevFlow parses agent markers, JSON event streams, rate-limit responses, YAML frontmatter, shell commands, and git output with extensive example-based tests but no fuzzing/property testing for malformed or adversarial input. From `TEST-SUITE-QA-REVIEW.md` (Codex, 2026-07-21).
+**Priority:** Medium | **Size:** M — re-scoped 2026-07-21 (Claude review): the source document listed six targets needing both `proptest` and `cargo-fuzz` undifferentiated. Most (agent markers, JSON envelopes, frontmatter, event logs, git porcelain) are format-aware business logic better suited to `proptest`; only `shell_quote` is a genuine byte-level adversarial `cargo-fuzz` target (command-injection-adjacent). Fuzzing the full original list would be more investment than the risk justifies. Linear: DEN-43.
+**Requirements:** TBD — see CONTEXT.md
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.19: Fast and Slow Validation Lanes (BACKLOG)
+
+**Goal:** Keep deterministic unit/integration tests in the fast PR lane; move nested-build provenance tests (`build_provenance.rs`, which dominates suite runtime today), mutation testing (999.17), and fuzz smoke runs (999.18) into explicit slow/scheduled lanes that stay visible and required at an appropriate release boundary. From `TEST-SUITE-QA-REVIEW.md` (Codex, 2026-07-21).
+**Priority:** Medium | **Size:** S — mostly mechanical CI-workflow restructuring once 999.17/999.18 exist to route into a slow lane; not much to put there yet beyond `build_provenance.rs`. Linear: DEN-44.
+**Requirements:** TBD — see CONTEXT.md
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.20: Differential Coverage Enforcement (BACKLOG)
+
+**Goal:** Enforce high coverage on changed lines rather than optimizing for a global percentage (currently 92.81%), requiring a written justification when new branches are intentionally left uncovered. Coverage should support review, not replace behavioral inspection or mutation-testing results. From `TEST-SUITE-QA-REVIEW.md` (Codex, 2026-07-21).
+**Priority:** Medium | **Size:** M — real risk if implemented naively: blocking merges on any uncovered line (including legitimately-hard-to-test OS-failure paths) creates friction without catching defects. Keep the written-justification escape hatch. Linear: DEN-45.
+**Requirements:** TBD — see CONTEXT.md
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.21: AI Change Acceptance Contract — Review Wiring (BACKLOG)
+
+**Goal:** Make the `.claude/skills/ai-change-acceptance/` contract actually govern AI change review rather than only existing in the repo. Phase 19's 19-05 dogfood proved the contract's *wording* discriminates correctly (every non-compliant diff flagged, compliant control untouched) but found its *wiring* incomplete: a context-isolated reviewer independently reached the same verdicts yet never cited the project contract as its authority, and graded the findings `warning`/`info` rather than acceptance-blocking. Today the contract binds only when the dispatcher already knows to load it.
+**Priority:** High | **Size:** M — the contract exists precisely because a green suite isn't evidence; if it only applies when explicitly invoked, it doesn't close the unattended-AI-change case it was written for. Note part of the wiring surface lives in the GSD code-review workflow *outside this repo*, so an in-repo fix may not fully close it. Linear: DEN-46.
+**Requirements:** TBD — see CONTEXT.md
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.22: Refactor Equivalence Guard in CI (BACKLOG)
+
+**Goal:** Give pure-move refactors an automated equivalence check on CI. Phase 19 proved its 8,487-line `main.rs` split behavior-preserving via symbol reconciliation, test name-set identity against a committed baseline, and per-target pass counts — but all three ran locally by hand. CI runs only `cargo test --workspace`, clippy, and fmt, so Phase 19 shipped with an explicit user-accepted verification override recording this gap.
+**Priority:** Medium | **Size:** M — a green suite doesn't prove a refactor preserved behavior: a move that silently drops a test still shows green, just with a quietly smaller count. Scope to refactor-shaped changes only; a name-set check on ordinary feature work would fail constantly and get disabled. Phase 19 also found the plan's literal `rg '::tests::'` extraction was itself buggy, so any committed script needs its own test. Relates to 999.19, 999.20. Linear: DEN-47.
+**Requirements:** TBD — see CONTEXT.md
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.23: Flaky `reference_and_cleanup_worktree_cli_flow` (BACKLOG)
+
+**Goal:** `reference_and_cleanup_worktree_cli_flow` (`crates/devflow-cli/tests/phase7_cli.rs:82`) intermittently fails on GitHub Actions with `failed to delete '.git/worktrees/phase-08': Directory not empty` — a `git worktree remove` filesystem race. Caught on the v1.6.0 release PR; proven a flake, not a regression (the SHA's code was byte-identical to a run that passed minutes earlier, the test is untouched by Phase 19, it passed 5/5 locally, and a bare re-run went green).
+**Priority:** High | **Size:** S — it sits in the release gate, and a coin-flip test trains the reader to re-run red CI instead of investigating it. Fourth instance of this family (WR-03/18-02, 17-09 GAP-2, 19i), so treat it as a structural weakness in worktree-touching tests. Check whether `cleanup --force` has the same hole for a real user before fixing it test-side only. Linear: DEN-48.
 **Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
 
