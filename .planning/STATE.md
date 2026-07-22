@@ -2,9 +2,10 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
+current_phase: 20
 status: "Phase 19 complete and released as v1.6.0. Phase 20 (Release Correctness + Operator Control) scoped and promoted from backlog 2026-07-22 via /gsd-review-backlog: 999.24 (VersionBump workspace self-pins, High/S), 999.23 (phase7_cli.rs git-fixture reliability, High/M — re-sized from S after a second, unrelated flake surfaced in the same file), 999.6 (--until plan-only mode, High/M), 999.13 (release-cut preflight, High/L), 999.7 (manual ship override, High/L). 999.3 deliberately left in backlog. Next step is /gsd-discuss-phase 20 — 999.7's override mechanism needs a design pass and should share one mechanism with 18f's preflight-override. Milestone target v2.0.0 is TO BE CONFIRMED at ship time: nothing in the five units is inherently breaking."
-stopped_at: Phase 20 promoted from backlog — awaiting /gsd-discuss-phase 20
-last_updated: "2026-07-22T20:15:00.000Z"
+stopped_at: Phase 20 context gathered — discuss-phase resolved 20e mechanism/scope, 20d ceiling, 20b product-vs-fixture
+last_updated: "2026-07-22T21:55:59.975Z"
 last_activity: 2026-07-22
 last_activity_desc: Phase 20 scoped from backlog (5 items promoted)
 progress:
@@ -603,6 +604,6 @@ None currently open for Phase 17.
 
 ## Session
 
-**Last session:** 2026-07-22T18:40:57.923Z
-**Stopped at:** context exhaustion at 100% (2026-07-22)
-**Resume file:** None
+**Last session:** 2026-07-22T21:55:59.943Z
+**Stopped at:** Phase 20 context gathered — discuss-phase resolved 20e mechanism/scope, 20d ceiling, 20b product-vs-fixture
+**Resume file:** .planning/phases/20-release-correctness-operator-control/CONTEXT.md
