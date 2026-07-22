@@ -512,3 +512,14 @@ Plans:
 Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.23: Flaky `reference_and_cleanup_worktree_cli_flow` (BACKLOG)
+
+**Goal:** `reference_and_cleanup_worktree_cli_flow` (`crates/devflow-cli/tests/phase7_cli.rs:82`) intermittently fails on GitHub Actions with `failed to delete '.git/worktrees/phase-08': Directory not empty` — a `git worktree remove` filesystem race. Caught on the v1.6.0 release PR; proven a flake, not a regression (the SHA's code was byte-identical to a run that passed minutes earlier, the test is untouched by Phase 19, it passed 5/5 locally, and a bare re-run went green).
+**Priority:** High | **Size:** S — it sits in the release gate, and a coin-flip test trains the reader to re-run red CI instead of investigating it. Fourth instance of this family (WR-03/18-02, 17-09 GAP-2, 19i), so treat it as a structural weakness in worktree-touching tests. Check whether `cleanup --force` has the same hole for a real user before fixing it test-side only. Linear: DEN-48.
+**Requirements:** TBD — see CONTEXT.md
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)

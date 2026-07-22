@@ -309,7 +309,7 @@ progress:
 
 ## Backlog
 
-**18 unsequenced items** remain in `.planning/phases/999.N-*/` and the
+**19 unsequenced items** remain in `.planning/phases/999.N-*/` and the
 `## Backlog` section of ROADMAP.md. The first 16 were
 reviewed/prioritized/sized 2026-07-21 (mirrored in Linear as
 `DEN-26`..`DEN-45`); 999.21 and 999.22 were filed 2026-07-22 from Phase 19's
@@ -320,6 +320,9 @@ the right verdicts without citing the contract or grading at its blocking
 severity) and refactor equivalence guard in CI (999.22, Medium, DEN-47 — the
 symbol/name-set equivalence proof that validated the `main.rs` split runs only
 locally; Phase 19 shipped with an explicit accepted override for exactly this).
+999.23 (High, DEN-48) was filed the same day from the v1.6.0 release PR: a
+flaky worktree-cleanup test in the release gate, proven a flake rather than a
+regression.
 The 2026-07-21 sixteen: Hermes Support (999.1, Low),
 phase-process tracking model (999.2, Medium — half-addressed by 18b's
 `monitor_pid`), CLI operator discoverability (999.3, Low), version-tag
