@@ -1,25 +1,25 @@
 //! Agent preflight readiness gate (17c, D-13-D-16, shaped by 18-06/18f):
 //! generic universal checks (interactivity, `gh auth`) plus an adapter-
-//! specific hook, run from [`crate::launch_stage`] before
+//! specific hook, run from [`crate::pipeline_launch::launch_stage`] before
 //! `monitor::spawn_monitor` so a readiness failure is caught before any
 //! agent time is spent. Extracted mechanically (19-07, D-09 pure move) out
 //! of `main.rs` — every function below is byte-identical to its pre-move
 //! body modulo an added `pub(crate)` and adjusted `use` paths.
 //!
-//! **This module and `main.rs`'s pipeline functions call each other
-//! directly, and that is intentional (D-18f, 18-07):** [`run_preflight`]'s
-//! `GateAction::Advance` arm calls [`crate::launch_stage_inner`] directly so
-//! it skips the just-adjudicated check on the retry, while
-//! [`crate::launch_stage`] calls [`run_preflight`] on the way in. Rust
-//! permits cyclic module references (only the crate dependency graph must
-//! be acyclic), so this compiles cleanly; a reviewer should expect to see
-//! this file's diff alongside `main.rs`'s pipeline functions for any future
-//! change to either side of the pair.
+//! **This module and `pipeline_launch`'s functions call each other
+//! directly, and that is intentional (D-18f, 18-07, repointed 19-08):**
+//! [`run_preflight`]'s `GateAction::Advance` arm calls
+//! [`crate::pipeline_launch::launch_stage_inner`] directly so it skips the
+//! just-adjudicated check on the retry, while
+//! [`crate::pipeline_launch::launch_stage`] calls [`run_preflight`] on the
+//! way in. Rust permits cyclic module references (only the crate
+//! dependency graph must be acyclic), so this compiles cleanly; a reviewer
+//! should expect to see this file's diff alongside `pipeline_launch.rs` for
+//! any future change to either side of the pair.
 
-use crate::{
-    CliError, abort, launch_stage, launch_stage_inner, phase_artifact_on_develop, run_gate,
-    truncate_reason,
-};
+use crate::pipeline_launch::launch_stage;
+use crate::pipeline_launch::launch_stage_inner;
+use crate::{CliError, abort, phase_artifact_on_develop, run_gate, truncate_reason};
 use devflow_core::gates::{GateAction, Gates};
 use devflow_core::mode::{self, Mode};
 use devflow_core::stage::Stage;
