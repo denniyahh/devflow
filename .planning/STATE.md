@@ -59,10 +59,10 @@ progress:
 
 ## Current Position
 
-Phase: 20 — SCOPED (not started)
-Plan: 0 of 0 (no plans yet — run /gsd-discuss-phase 20, then /gsd-plan-phase 20)
-Status: Phase 20 scoped from backlog; awaiting discussion
-Last activity: 2026-07-22 — Phase 20 scoped from backlog (5 items promoted)
+Phase: 20 — PLANNED (ready to execute)
+Plan: 0 of 5 (20-01..20-05 written; discuss + research + plan complete)
+Status: Phase 20 planned — run /gsd-execute-phase 20 (Wave 1: 20-01 + 20-02 parallel, disjoint files)
+Last activity: 2026-07-22 — Phase 20 discussed, researched, and planned (5 plans, 3 waves)
 
 Progress: [█████████████████░░░] 89%
 
