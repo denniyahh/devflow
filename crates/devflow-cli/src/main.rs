@@ -899,9 +899,12 @@ fn workflow_started_payload(state: &State) -> serde_json::Value {
         "version": env!("CARGO_PKG_VERSION"),
         "commit": env!("DEVFLOW_BUILD_COMMIT"),
         "dirty": env!("DEVFLOW_BUILD_DIRTY"),
+        // WR-02: filename only, never the full path (leaks home dir/username
+        // into OPERATIONS.md's tail-and-paste file); to_string_lossy (not
+        // to_str) so non-UTF-8 names still yield a string, not null.
         "exe_path": std::env::current_exe()
             .ok()
-            .map(|p| p.display().to_string()),
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())),
     })
 }
 
