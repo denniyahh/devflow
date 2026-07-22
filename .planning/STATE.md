@@ -2,17 +2,17 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
-status: executing
-stopped_at: context exhaustion at 100% (2026-07-22)
-last_updated: "2026-07-22T19:38:53.219Z"
+status: "Phase 19 complete and released as v1.6.0. Phase 20 (Release Correctness + Operator Control) scoped and promoted from backlog 2026-07-22 via /gsd-review-backlog: 999.24 (VersionBump workspace self-pins, High/S), 999.23 (phase7_cli.rs git-fixture reliability, High/M — re-sized from S after a second, unrelated flake surfaced in the same file), 999.6 (--until plan-only mode, High/M), 999.13 (release-cut preflight, High/L), 999.7 (manual ship override, High/L). 999.3 deliberately left in backlog. Next step is /gsd-discuss-phase 20 — 999.7's override mechanism needs a design pass and should share one mechanism with 18f's preflight-override. Milestone target v2.0.0 is TO BE CONFIRMED at ship time: nothing in the five units is inherently breaking."
+stopped_at: Phase 20 promoted from backlog — awaiting /gsd-discuss-phase 20
+last_updated: "2026-07-22T20:15:00.000Z"
 last_activity: 2026-07-22
-last_activity_desc: Phase null execution started
+last_activity_desc: Phase 20 scoped from backlog (5 items promoted)
 progress:
-  total_phases: 8
+  total_phases: 9
   completed_phases: 8
   total_plans: 65
   completed_plans: 65
-  percent: 100
+  percent: 89
 ---
 
 # DevFlow — Project State
@@ -21,18 +21,49 @@ progress:
 
 ## Active Phase
 
-- **Phase 20 remains unscoped.** The roadmap reserves it for the
-  operator-facing set targeting v2.0.0, but it has no detailed phase entry yet.
-  Scope it before discussion or planning.
+- **Phase 20 — Release Correctness + Operator Control (scoped 2026-07-22, not
+  started).** Promoted from backlog via `/gsd-review-backlog` as five units:
+
+  - **20a** — 999.24 `VersionBump` workspace member self-pins (High/S, DEN-49).
+    `version::write_version` rewrites only `[workspace.package] version`, leaving
+    the `[workspace.dependencies]` self-pin on the previous release. Shipped
+    broken two for two; invisible until `cargo publish` rejects it on release
+    day. A **product** bug — any user with a published Cargo workspace hits it.
+
+  - **20b** — 999.23 `phase7_cli.rs` git fixtures unreliable under CI (High/M,
+    DEN-48). Two distinct flakes on release-path PRs in one day: a
+    `git worktree remove` race (`:534`) and git object-store corruption
+    (`:236`). Re-sized S → M at promotion — the repo's 999.23 entry described
+    only the first. Check whether `cleanup --force` has the same hole for a real
+    user before fixing it test-side.
+
+  - **20c** — 999.6 `devflow start --until <stage>` (High/M, DEN-31). Halts
+    cleanly after a named stage instead of stranding state and orphaning a
+    worktree. Unblocks cheap, frequent dogfood runs.
+
+  - **20d** — 999.13 `devflow release --check` preflight (High/L, DEN-38).
+    Self-pin, `develop`/`main` divergence, crates.io publish order, tag-signing
+    viability. **Blocks on 20a.**
+
+  - **20e** — 999.7 manual ship override (High/L, DEN-32). Drive a phase through
+    Ship when the monitor is dead, honoring the fail-closed terminal Ship
+    invariant. Needs a discuss-phase design pass.
+
+- **Next step: `/gsd-discuss-phase 20`.** The phase is scoped, not designed —
+  20e in particular has open questions (shared mechanism with 18f's
+  preflight-override, whether `--force` may skip Validate).
+
+- **v2.0.0 is not yet earned.** The milestone reserves 2.0.0 for this phase, but
+  nothing in the five units is inherently breaking. Decide at ship time.
 
 ## Current Position
 
-Phase: null — EXECUTING
-Plan: 1 of ?
-Status: Executing Phase null
-Last activity: 2026-07-22 — Phase null execution started
+Phase: 20 — SCOPED (not started)
+Plan: 0 of 0 (no plans yet — run /gsd-discuss-phase 20, then /gsd-plan-phase 20)
+Status: Phase 20 scoped from backlog; awaiting discussion
+Last activity: 2026-07-22 — Phase 20 scoped from backlog (5 items promoted)
 
-Progress: [████████████████████] 100%
+Progress: [█████████████████░░░] 89%
 
 *(Machine-readable fields for `gsd-tools state begin-phase` / `advance-plan` —
 this project historically tracked position only in the narrative "Active
