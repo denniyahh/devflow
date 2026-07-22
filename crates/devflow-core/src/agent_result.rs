@@ -961,7 +961,7 @@ fn archive_phase_files_with_stamp(
     }
 
     let history_dir = history_dir(project_root, phase);
-    std::fs::create_dir_all(&history_dir)?;
+    crate::workflow::ensure_devflow_dir(&history_dir)?;
 
     let staging_dir = history_dir.join(format!(".pending-{stamp}"));
     std::fs::create_dir(&staging_dir)?;

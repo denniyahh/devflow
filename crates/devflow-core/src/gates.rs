@@ -322,7 +322,7 @@ fn run_notify_command(cmd: &str, phase: u32, stage: Stage, context: &str, unexpe
 /// directory, then rename over the target so readers never see a partial write.
 fn write_atomic(path: &Path, contents: &str) -> Result<(), GateError> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        crate::workflow::ensure_devflow_dir(parent)?;
     }
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, contents)?;

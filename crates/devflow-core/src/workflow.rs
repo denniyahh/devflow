@@ -180,7 +180,7 @@ pub fn save_state(state: &State) -> Result<(), WorkflowError> {
 /// truncated or partially written state file.
 fn write_state_atomic(path: &Path, contents: &str) -> Result<(), WorkflowError> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        ensure_devflow_dir(parent)?;
     }
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, contents)?;
@@ -296,7 +296,10 @@ mod tests {
 
         ensure_devflow_dir(&target).expect("second call");
         let second = std::fs::read(target.join(".gitignore")).unwrap();
-        assert_eq!(first, second, "second call must leave the file byte-identical");
+        assert_eq!(
+            first, second,
+            "second call must leave the file byte-identical"
+        );
     }
 
     #[test]
@@ -320,7 +323,10 @@ mod tests {
 
         assert!(target.is_dir());
         let marker = dir.path().join(".devflow").join(".gitignore");
-        assert!(marker.is_file(), "gitignore must land at the .devflow ancestor");
+        assert!(
+            marker.is_file(),
+            "gitignore must land at the .devflow ancestor"
+        );
         assert!(
             !target.join(".gitignore").exists(),
             "gitignore must not land at the leaf directory"
@@ -370,8 +376,14 @@ mod tests {
             let target = target.clone();
             std::thread::spawn(move || ensure_devflow_dir(&target))
         };
-        assert!(t1.join().unwrap().is_ok(), "first concurrent call must succeed");
-        assert!(t2.join().unwrap().is_ok(), "second concurrent call must succeed");
+        assert!(
+            t1.join().unwrap().is_ok(),
+            "first concurrent call must succeed"
+        );
+        assert!(
+            t2.join().unwrap().is_ok(),
+            "second concurrent call must succeed"
+        );
 
         let contents = std::fs::read_to_string(target.join(".gitignore")).unwrap();
         assert_eq!(contents.trim(), "*");
