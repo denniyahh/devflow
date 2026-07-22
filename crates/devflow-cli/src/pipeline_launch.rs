@@ -18,15 +18,18 @@
 //! (only the crate dependency graph must be acyclic), so this compiles
 //! cleanly. (19-08 Task 1: `handle_*_outcome`/`transition` still live in
 //! `main.rs` at this point; Tasks 2/3 repoint these imports as those seams
-//! move out.)
+//! move out.) (19-08 Task 2: `handle_*_outcome`/`ValidateOutcome`/
+//! `classify_validate_outcome`/`truncate_reason` now import from
+//! `pipeline_outcomes`; `transition` still lives in `main.rs` until Task 3.)
 
+use crate::pipeline_outcomes::{
+    ValidateOutcome, classify_validate_outcome, handle_infra_outcome, handle_rate_limited_outcome,
+    handle_ship_failure, handle_ship_outcome, handle_stage_failure, handle_validate_outcome,
+    truncate_reason,
+};
 use crate::preflight::{run_preflight, worktree_writable_roots};
 use crate::staleness::enforce_build_staleness;
-use crate::{
-    CliError, ValidateOutcome, classify_validate_outcome, ensure_agent_binary,
-    handle_infra_outcome, handle_rate_limited_outcome, handle_ship_failure, handle_ship_outcome,
-    handle_stage_failure, handle_validate_outcome, transition, truncate_reason,
-};
+use crate::{CliError, ensure_agent_binary, transition};
 use devflow_core::config::{GitFlowConfig, capture_retention};
 use devflow_core::outcome_policy::{self, Action};
 use devflow_core::prompt;
