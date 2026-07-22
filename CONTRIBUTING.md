@@ -70,6 +70,9 @@ git config commit.gpgsign false
 git config tag.gpgsign false
 ```
 
+See [§ AI Change Acceptance](#ai-change-acceptance) for what a test must
+demonstrate to be accepted, and which test shapes are rejected outright.
+
 ## Phase Plans (`.planning/`)
 
 DevFlow drives agents from per-phase plans under `.planning/`. The launch prompt
@@ -122,6 +125,47 @@ Ordinary code contributions need no agent credentials or API keys — the build
 and the full test suite run offline. Agent CLIs (Claude, Codex, OpenCode) are
 only needed to exercise `devflow start` against a live agent, not to build,
 test, or pass CI.
+
+## AI Change Acceptance
+
+Effectively every change to this repository is authored or substantially
+modified by an AI agent — that is the default, not a special case — so the
+acceptance bar for a change is written down here rather than assumed.
+
+A change is accepted only when it demonstrates all five of the following:
+
+1. A regression test that fails before the change.
+2. At least one assertion at a public or otherwise stable boundary, not only
+   a private helper.
+3. Evidence the test fails for the intended reason — not a setup error, a
+   compile failure, or an unrelated panic.
+4. Full affected-package tests, `cargo clippy --workspace --all-targets -- -D
+   warnings`, and `cargo fmt --check`, all clean.
+5. Independent review of both the implementation and the test signal — a
+   correct-looking implementation reviewed alone is exactly how a test that
+   cannot fail gets through.
+
+A test is rejected outright, regardless of whether it currently passes, if it
+does any of the following:
+
+1. Asserts only constants, never an implementation's actual output.
+2. Reproduces the production algorithm inside the test body, so the test and
+   the code fail together and pass together.
+3. Compares a function call with itself.
+4. Greps implementation text as a substitute for a runtime contract that
+   could have been asserted directly.
+
+Enforcement lives at the existing review-before-Ship gate:
+`/gsd-code-review` runs before Ship and refuses to ship on Critical findings
+— this contract is applied there, not aspirational.
+
+The single source of truth for this contract is
+[`.claude/skills/ai-change-acceptance/`](.claude/skills/ai-change-acceptance/),
+which spells out the check a reviewer performs and the failure signature for
+each requirement and rejection pattern above, plus worked examples drawn from
+this repository's own history. If this section and the skill ever disagree,
+**the skill wins** — this section is prose for a human contributor, not a
+second copy of the contract.
 
 ## Cutting a Release
 
