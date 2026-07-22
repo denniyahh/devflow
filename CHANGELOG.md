@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.6.0 — 2026-07-22
+
+Release integrity and `main.rs` decomposition: close the two defects whose blast
+radius reaches outside this repository, then decompose the 8,487-line CLI entry
+point as a pure-move refactor. Phase 19.
+
+### Fixed
+- DevFlow's runtime artifacts can no longer end up in **your** commits. Every `.devflow/` directory now self-protects with a `.gitignore` containing `*` at creation time, so a routine `git add . && git commit` in a project DevFlow is running against no longer sweeps agent stdout, gate context, and workflow state into that project's history. This held regardless of whether the project's own root `.gitignore` mentioned `.devflow` — it usually didn't
+- The `workflow_started` event no longer records the absolute path of the DevFlow binary, which leaked the operator's home directory and OS username into `events.jsonl`
+- A release tag can no longer land on an empty commit: `commit_path` no longer forces `--allow-empty`, and is now idempotent when the file it is asked to commit is unchanged
+
+### Changed
+- `crates/devflow-cli/src/main.rs` went from 8,487 lines to 478, split into nine flat sibling modules (`staleness`, `preflight`, `pipeline_launch`, `pipeline_outcomes`, `pipeline_gate`, `parallel`, `commands`, `config_parse`, `test_support`). `main.rs` now holds only the Clap types, `CliError`, dispatch, `main`, `run`, and `project_root`. This is a pure move with no behavioral change — verified by symbol reconciliation (231 functions before and after, none lost or added), a normalized body diff showing zero logic-line changes, and a test name-set identical to a committed pre-split baseline (438/438)
+- The CLI's test environment lock is now a single shared mutex rather than three independent ones that were sound only by accident. Distributing `PATH`-mutating tests across five modules would otherwise have broken the serialization they depend on
+- CI uses `actions/checkout@v7`, retiring the Node 20 deprecation warning
+
+### Added
+- An AI change acceptance contract (`.claude/skills/ai-change-acceptance/`, plus a `CONTRIBUTING.md` section) stating what evidence a change must carry before it is accepted, and which test shapes are rejected as false signal
+
 ## 1.5.0 — 2026-07-21
 
 Dogfood reliability hardening: make DevFlow's own supervision layer trustworthy
