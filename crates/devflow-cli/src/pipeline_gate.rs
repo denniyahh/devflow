@@ -19,9 +19,10 @@
 //! *other* clusters, not pipeline-internal parallelism (19-RESEARCH.md
 //! Pitfall 1).
 
+use crate::CliError;
+use crate::config_parse::gate_timeout_secs;
 use crate::pipeline_launch::launch_stage;
 use crate::pipeline_outcomes::{run_checkout_hooks, truncate_reason};
-use crate::{CliError, gate_timeout_secs};
 use devflow_core::gates::{self, GateAction, Gates};
 use devflow_core::hooks;
 use devflow_core::mode;

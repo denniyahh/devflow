@@ -20,8 +20,10 @@ use devflow_core::state::{AgentKind, State};
 use devflow_core::worktree;
 use std::path::{Path, PathBuf};
 
+use crate::CliError;
+use crate::commands::start;
+use crate::config_parse::checkout_lock_timeout;
 use crate::preflight::{agent_program, ensure_agent_binary, worktree_writable_roots};
-use crate::{CliError, checkout_lock_timeout, start};
 
 /// Create the phase worktree at `.worktrees/phase-NN/` on `feature/phase-NN`.
 pub(crate) fn ensure_phase_worktree(

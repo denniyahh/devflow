@@ -10,13 +10,14 @@
 //! keeps flat into a `common.rs`, recreating exactly the contention the
 //! split is meant to remove.
 
+use crate::CliError;
+use crate::config_parse::GATE_ESCALATION_THRESHOLD_SECS;
 use crate::parallel::ensure_phase_worktree;
 use crate::pipeline_gate::print_dry_run;
 use crate::pipeline_launch::{launch_stage, single_active_phase};
 use crate::pipeline_outcomes::render_gate_context;
 use crate::preflight::{agent_program, ensure_agent_binary};
 use crate::staleness::run_git_stdout;
-use crate::{CliError, GATE_ESCALATION_THRESHOLD_SECS};
 use devflow_core::agent;
 use devflow_core::agent_result;
 use devflow_core::agents;

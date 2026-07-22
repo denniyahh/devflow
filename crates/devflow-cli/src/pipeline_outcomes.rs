@@ -12,10 +12,11 @@
 //! `transition`, `loop_back_to_code`, `finish_workflow`, and `abort` to
 //! actually move the state machine.
 
+use crate::CliError;
+use crate::config_parse::checkout_lock_timeout;
 use crate::parallel::retry_after_from_reason;
 use crate::pipeline_gate::{abort, finish_workflow, loop_back_to_code, run_gate, transition};
 use crate::pipeline_launch::launch_stage;
-use crate::{CliError, checkout_lock_timeout};
 use devflow_core::config::GitFlowConfig;
 use devflow_core::gates::{GateAction, Gates};
 use devflow_core::hooks::{self, HookContext};
