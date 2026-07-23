@@ -14,7 +14,7 @@
 | 17 | Pipeline Dogfood Follow-Up | Complete    | — |
 | 18 | Dogfood Reliability Hardening | Complete    | 1.5.0 |
 | 19 | Release Integrity + `main.rs` Decomposition | Complete    | 1.6.0 |
-| 20 | Release Correctness + Operator Control | In Progress| 2.0.0 (TBC) |
+| 20 | Release Correctness + Operator Control | Complete    | 2.0.0 (TBC) |
 
 ## Shipped
 
