@@ -5,7 +5,7 @@ milestone_name: milestone (open — no fixed closing phase)
 current_phase: 20
 current_phase_name: release-correctness-operator-control
 status: shipped
-stopped_at: Phase 20 shipped as v1.7.0 (2026-07-23) — PR #20 squash-merged to develop (e78bc82). The v2.0.0 milestone stays open (does not close at Phase 20 or any fixed phase); numbering continues forward. No phase currently in flight — next step is discussing/planning whichever phase or backlog promotion comes next.
+stopped_at: Phase 20 fully released as v1.7.0 (2026-07-23) — PR #20 (feat) + #21 (version bump) squash-merged to develop, PR #22 (release: v1.7.0) squash-merged to main (5c7259a), signed tag v1.7.0 pushed, GitHub Release published, devflow-core + devflow published to crates.io, develop re-synced from main. The v2.0.0 milestone stays open (does not close at Phase 20 or any fixed phase); numbering continues forward. No phase currently in flight — next step is discussing/planning whichever phase or backlog promotion comes next.
 last_updated: "2026-07-23T11:25:00.000Z"
 last_activity: 2026-07-23
 last_activity_desc: Phase 20 shipped as v1.7.0; milestone stays open
@@ -89,6 +89,19 @@ Phase" section above, which `advance-plan` cannot parse (backlog 12,
   v2.0.0** — decided at ship time: nothing across the five units is
   breaking, and the v2.0.0 milestone stays open rather than closing here
   (see ROADMAP.md "Milestone stays open," 2026-07-23).
+
+  **Fully released 2026-07-23.** `sync-main-to-develop.sh` run first (had
+  not been run after v1.6.0 — `origin/main` had diverged from `develop`;
+  caught by this phase's own new `devflow release --check` tool, then
+  fixed the standard way). Version bump PR #21 (`chore/release-v1.7.0`,
+  `Cargo.toml`/`Cargo.lock`/`CHANGELOG.md`) squash-merged to `develop`
+  (`d1cf508`). Release PR #22 (`release: v1.7.0`, `develop → main`)
+  squash-merged to `main` (`5c7259a`). Signed tag `v1.7.0` pushed
+  (ED25519, verified). [GitHub Release](https://github.com/denniyahh/devflow/releases/tag/v1.7.0)
+  published. `devflow-core` then `devflow` published to crates.io
+  (`cargo search` confirms both at `1.7.0`). `develop` re-synced from
+  `main` post-release. `devflow release --check` — the tool this very
+  phase built — passed clean at every stage of the cut.
 
 - **Phase 19 — Release Integrity + `main.rs` Decomposition (Complete + Verified
   2026-07-22 — 11/11 plans).** Targets **v1.6.0**. Promoted from backlog 2026-07-21 via
