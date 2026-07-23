@@ -120,6 +120,16 @@ None - no external service configuration required.
 - Threat register: all four `mitigate`-dispositioned threats (T-21c-01 info disclosure, T-21c-02 stale-pid spoofing, T-21c-03 state-corruption tampering, T-21c-04 parser DoS) have a corresponding implemented mitigation and/or test (path-free assertion test, `agent_running(pid)`-derived liveness, no new `save_state` call, defensive `None`-on-any-error parsing).
 - No new threat surface introduced beyond what the plan's `<threat_model>` already declared — no new network endpoints, auth paths, or schema changes.
 
+## Self-Check: PASSED
+
+- FOUND: crates/devflow-core/src/agent_result.rs
+- FOUND: crates/devflow-cli/src/parallel.rs
+- FOUND: crates/devflow-cli/src/commands.rs
+- FOUND: .planning/phases/21-operator-usability-release-execution/21-04-SUMMARY.md
+- FOUND commit: 66c1983 (Task 1)
+- FOUND commit: 6cb4a6b (Task 2)
+- FOUND commit: 231d8b3 (SUMMARY)
+
 ---
 *Phase: 21-operator-usability-release-execution*
 *Completed: 2026-07-23*
