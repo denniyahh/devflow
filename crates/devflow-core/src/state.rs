@@ -343,4 +343,52 @@ mod tests {
         let loaded: State = serde_json::from_str(json).unwrap();
         assert_eq!(loaded.monitor_pid, None);
     }
+
+    /// 20c: `stop_until`/`stopped`/`stop_reason` all round-trip through
+    /// serde — each field's own key appears in the persisted JSON, and a
+    /// fresh deserialize recovers the exact values set.
+    #[test]
+    fn stop_fields_round_trip_through_serde() {
+        let mut state = State::new(1, AgentKind::Claude, Mode::Auto, PathBuf::from("/repo"));
+        state.stop_until = Some(Stage::Plan);
+        state.stopped = true;
+        state.stop_reason = Some("stopped after plan completed (--until plan)".to_string());
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(
+            json.contains("stop_until") && json.contains("stopped") && json.contains("stop_reason"),
+            "all three stop fields must appear in persisted JSON: {json}"
+        );
+        let loaded: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            loaded.stop_until,
+            Some(Stage::Plan),
+            "stop_until must round-trip through serde"
+        );
+        assert!(loaded.stopped, "stopped must round-trip through serde");
+        assert_eq!(
+            loaded.stop_reason.as_deref(),
+            Some("stopped after plan completed (--until plan)"),
+            "stop_reason must round-trip through serde"
+        );
+    }
+
+    /// A serde-absent `stop_until`/`stopped`/`stop_reason` (state written by
+    /// a pre-20c binary) must default to `None`/`false`/`None`, not fail to
+    /// deserialize — the same backward-compat pattern as every other
+    /// `#[serde(default)]` field added since 17-01.
+    #[test]
+    fn stop_fields_absent_from_json_default() {
+        let json = r#"{
+            "stage": "code",
+            "phase": 1,
+            "agent": "claude",
+            "mode": "auto",
+            "started_at": "0",
+            "project_root": "/repo"
+        }"#;
+        let loaded: State = serde_json::from_str(json).unwrap();
+        assert_eq!(loaded.stop_until, None);
+        assert!(!loaded.stopped);
+        assert_eq!(loaded.stop_reason, None);
+    }
 }

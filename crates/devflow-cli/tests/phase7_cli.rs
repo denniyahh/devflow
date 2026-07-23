@@ -393,6 +393,80 @@ fn start_until_plan_halts_cleanly() {
     );
 }
 
+/// 20c (D-07): `--until ship` is a semantic no-op — Ship never calls
+/// `transition` (`handle_ship_outcome` calls `finish_workflow` directly), so
+/// the full pipeline already stops there today. It must be rejected before
+/// any stage runs, not silently accepted as if it intercepted anything.
+#[test]
+fn start_until_ship_is_rejected() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let fake_bin = fake_bin_dir(&[(
+        "claude",
+        "#!/bin/sh\nprintf 'DEVFLOW_RESULT: {\"status\":\"success\"}\\n'\n",
+    )]);
+
+    let output = Command::new(devflow_bin())
+        .args([
+            "start", "--phase", "45", "--agent", "claude", "--mode", "auto", "--until", "ship",
+        ])
+        .arg(root)
+        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .current_dir(root)
+        .output()
+        .expect("run devflow");
+
+    assert!(
+        !output.status.success(),
+        "--until ship must be rejected, not silently accepted"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("ship") && stderr.contains("no-op"),
+        "the rejection must explain Ship is already terminal\nstderr: {stderr}"
+    );
+    assert!(
+        !root.join(".worktrees/phase-45").exists(),
+        "a rejected --until ship must not run any stage or create a worktree"
+    );
+}
+
+/// 20c edge-probe (20c/empty): `--until bogus` needs no new parsing surface —
+/// it is rejected by the existing `Stage: FromStr` parser (via clap) before
+/// `start` is ever dispatched.
+#[test]
+fn start_until_unknown_stage_is_rejected_by_clap() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let fake_bin = fake_bin_dir(&[(
+        "claude",
+        "#!/bin/sh\nprintf 'DEVFLOW_RESULT: {\"status\":\"success\"}\\n'\n",
+    )]);
+
+    let output = Command::new(devflow_bin())
+        .args([
+            "start", "--phase", "46", "--agent", "claude", "--mode", "auto", "--until", "bogus",
+        ])
+        .arg(root)
+        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .current_dir(root)
+        .output()
+        .expect("run devflow");
+
+    assert!(
+        !output.status.success(),
+        "--until bogus must be rejected by the existing Stage parser"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("bogus"),
+        "clap's error must name the unrecognized value\nstderr: {stderr}"
+    );
+    assert!(!root.join(".worktrees/phase-46").exists());
+}
+
 #[test]
 fn sequentagent_integrates_agent_a_then_rebases_agent_b() {
     let repo = tempfile::tempdir().unwrap();

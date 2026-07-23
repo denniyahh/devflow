@@ -351,6 +351,18 @@ fn run() -> Result<(), CliError> {
             // an intentionally ignored no-op (see field doc comment above).
             // `--no-worktree` is the only switch that changes behavior.
             let worktree = !no_worktree;
+            // D-07: `--until ship` is a semantic no-op — `handle_ship_outcome`
+            // calls `finish_workflow` directly and never calls `transition`,
+            // so the pipeline already stops at Ship today regardless of this
+            // flag. Reject before any stage runs rather than silently
+            // accepting a flag that would never actually intercept anything.
+            if until == Some(Stage::Ship) {
+                return Err(CliError::Message(
+                    "--until ship is a no-op: Ship is already the pipeline's terminal \
+                     stage and never advances further"
+                        .to_string(),
+                ));
+            }
             start(
                 &project_root(project)?,
                 phase,
