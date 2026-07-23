@@ -144,3 +144,11 @@ None - no external service configuration required.
 ---
 *Phase: 20-release-correctness-operator-control*
 *Completed: 2026-07-23*
+
+## Self-Check: PASSED
+
+- FOUND: `.planning/phases/20-release-correctness-operator-control/20-02-SUMMARY.md`
+- FOUND: `ef11958` (test: RED cleanup liveness refusal)
+- FOUND: `599d238` (feat: liveness-gated removal + bounded retry)
+- FOUND: `6a582ca` (test: fixture durability + idempotency)
+- FOUND: `785450b` (docs: complete plan)
