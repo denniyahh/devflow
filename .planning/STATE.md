@@ -5,10 +5,10 @@ milestone_name: milestone
 current_phase: 20
 current_phase_name: release-correctness-operator-control
 status: executing
-stopped_at: Phase 20 context gathered — discuss-phase resolved 20e mechanism/scope, 20d ceiling, 20b product-vs-fixture
-last_updated: "2026-07-23T08:18:06.797Z"
+stopped_at: Phase 20 executed 5/5 on feat/phase-20-release-correctness-operator-control; verifier 37/37 (human_needed); code-review blockers+warnings fixed inline; awaiting /gsd-verify-work 20 + PR to develop
+last_updated: "2026-07-23T10:28:37.724Z"
 last_activity: 2026-07-23
-last_activity_desc: Phase 20 execution started
+last_activity_desc: Phase 20 executed + code-review-fixed; awaiting human verification
 progress:
   total_phases: 9
   completed_phases: 8
@@ -60,10 +60,10 @@ progress:
 
 ## Current Position
 
-Phase: 20 (release-correctness-operator-control) — EXECUTING
-Plan: 1 of 5
-Status: Executing Phase 20
-Last activity: 2026-07-23 — Phase 20 execution started
+Phase: 20 (release-correctness-operator-control) — EXECUTED (human-verify pending)
+Plan: 5 of 5 (all SUMMARYs written; verifier passed 37/37 must-haves, status human_needed)
+Status: All 5 plans executed on branch feat/phase-20-release-correctness-operator-control (parallel worktrees, wave 1 = 20-01+20-02); code review found 2 blockers + 3 warnings, all fixed inline (CR-01/CR-02/WR-01/WR-02/WR-03, +11 regression tests), INF-01 → backlog 999.27. Full suite 491/0, clippy/fmt clean. NOT complete: 2 human-verify items in 20-UAT.md (real ssh-agent signing check; CI-on-branch flake sign-off). Next: /gsd-verify-work 20, then PR feat → develop.
+Last activity: 2026-07-23 — Phase 20 executed + code-review-fixed; awaiting human verification
 
 Progress: [█████████████████░░░] 89%
 
