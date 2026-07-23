@@ -143,3 +143,11 @@ None - no external service configuration required.
 ---
 *Phase: 21-operator-usability-release-execution*
 *Completed: 2026-07-23*
+
+## Self-Check: PASSED
+
+- FOUND: `.planning/phases/21-operator-usability-release-execution/21-01-SUMMARY.md`
+- FOUND: `crates/devflow-cli/src/staleness.rs`
+- FOUND: commit `24519d7` (Task 1)
+- FOUND: commit `cf0214a` (Task 2)
+- FOUND: commit `f0cf5af` (this SUMMARY)
