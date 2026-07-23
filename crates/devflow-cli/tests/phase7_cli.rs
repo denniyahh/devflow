@@ -945,6 +945,116 @@ fn cleanup_force_refuses_on_dead_monitor_live_agent() {
     );
 }
 
+/// CR-02 (phase 20 review): a phase halted via `devflow start --until
+/// <stage>` clears `monitor_pid` and its agent has already exited by
+/// design — `Liveness::Unknown` with `agent_alive == false` sails straight
+/// through the live-agent refusal, so an ordinary `devflow cleanup` (no
+/// `--force`) must not delete the worktree of a phase the operator parked
+/// for a later `devflow resume`. `doctor`'s `check_dead_agent`/
+/// `check_dead_monitor` were already taught about `facts.stopped` in this
+/// same phase; `cleanup` must recognize `state.stopped` too.
+#[test]
+fn cleanup_keeps_worktree_for_until_stopped_phase_without_force() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let phase = 11;
+    let branch = format!("feature/phase-{phase:02}");
+    seed_feature_branch(root, phase);
+
+    let wt_path = root.join(".worktrees").join(format!("phase-{phase:02}"));
+    devflow_core::worktree::add(root, &wt_path, &branch, &branch, false).unwrap();
+
+    // No agent pid file (the stage's agent has already exited normally) and
+    // monitor_pid = None (cleared by the --until stop path) — Unknown
+    // liveness, agent_alive == false. Only `state.stopped` distinguishes
+    // this from a genuinely dead, safe-to-remove phase.
+    let mut state = devflow_core::state::State::new(
+        phase,
+        devflow_core::state::AgentKind::Claude,
+        devflow_core::mode::Mode::Auto,
+        root.to_path_buf(),
+    );
+    state.worktree_path = Some(wt_path.clone());
+    state.stopped = true;
+    state.stop_reason = Some("stopped after plan completed (--until plan)".to_string());
+    devflow_core::workflow::save_state(&state).unwrap();
+
+    let fake_bin = fake_bin_dir(&[]);
+    let output = Command::new(devflow_bin())
+        .args(["cleanup"])
+        .arg(root)
+        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .current_dir(root)
+        .output()
+        .expect("run devflow cleanup");
+
+    assert!(
+        output.status.success(),
+        "cleanup must not error on a stopped phase — it should skip it, not fail\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("devflow resume") && combined.contains("--force"),
+        "the kept-worktree message must name `devflow resume` and `--force` as the paths \
+         forward, got:\n{combined}"
+    );
+    assert!(
+        wt_path.is_dir(),
+        "worktree for a --until-stopped phase must NOT be removed by a bare `devflow cleanup`"
+    );
+}
+
+/// CR-02 counterpart: `--force` is the documented escape hatch — it must
+/// still be able to discard a stopped phase's worktree.
+#[test]
+fn cleanup_force_removes_worktree_for_until_stopped_phase() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let phase = 13;
+    let branch = format!("feature/phase-{phase:02}");
+    seed_feature_branch(root, phase);
+
+    let wt_path = root.join(".worktrees").join(format!("phase-{phase:02}"));
+    devflow_core::worktree::add(root, &wt_path, &branch, &branch, false).unwrap();
+
+    let mut state = devflow_core::state::State::new(
+        phase,
+        devflow_core::state::AgentKind::Claude,
+        devflow_core::mode::Mode::Auto,
+        root.to_path_buf(),
+    );
+    state.worktree_path = Some(wt_path.clone());
+    state.stopped = true;
+    state.stop_reason = Some("stopped after plan completed (--until plan)".to_string());
+    devflow_core::workflow::save_state(&state).unwrap();
+
+    let fake_bin = fake_bin_dir(&[]);
+    let output = Command::new(devflow_bin())
+        .args(["cleanup", "--force"])
+        .arg(root)
+        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .current_dir(root)
+        .output()
+        .expect("run devflow cleanup --force");
+
+    assert!(
+        output.status.success(),
+        "cleanup --force must succeed on a stopped phase\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !wt_path.is_dir(),
+        "cleanup --force must remove a --until-stopped phase's worktree"
+    );
+}
+
 /// 20b instance 1 (probe 20b/idempotency): `cleanup` run twice succeeds —
 /// the second run finds the worktree already gone and does not error.
 #[test]

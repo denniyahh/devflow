@@ -406,6 +406,27 @@ pub(crate) fn cleanup(project_root: &Path, force: bool) -> Result<(), CliError> 
         let monitor_alive = monitor_pid.is_some_and(agent::agent_running);
         let phase_liveness = liveness(monitor_pid, monitor_alive, agent_alive);
 
+        // A phase halted via `devflow start --until <stage>` (20c) clears
+        // `monitor_pid` and its agent has already exited by design — that
+        // reads as `Liveness::Unknown` with `agent_alive == false`, which
+        // would otherwise sail straight through the live-agent refusal
+        // below. Treat it the same way `doctor`'s `check_dead_agent`/
+        // `check_dead_monitor` were taught about `facts.stopped` in this
+        // same phase: an intentionally-parked worktree is never implicitly
+        // safe to remove — require `--force`, mirroring the `reference`
+        // worktree's own precedent above.
+        let stopped = matched_state.is_some_and(|s| s.stopped);
+        if stopped && !force {
+            let phase_label = phase
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            println!(
+                "keeping worktree {} for phase {phase_label} — halted via --until; run `devflow resume --phase {phase_label}` first, or pass --force to discard it",
+                wt.path.display()
+            );
+            continue;
+        }
+
         // Fail-closed on a live agent: refuse whenever the agent is alive
         // (regardless of monitor liveness — Unknown/Stuck included) OR the
         // monitor is actively running the stage (Healthy/BetweenStages).
