@@ -5,10 +5,10 @@ milestone_name: milestone (open — no fixed closing phase)
 current_phase: 21
 current_phase_name: operator-legibility-observability
 status: planned
-stopped_at: "Phase 21 planned — 4 plans (21-01 21d, 21-02 21a, 21-03 21b, 21-04 21c), plan-checker passed (0 blockers); ready for /gsd-execute-phase 21"
-last_updated: "2026-07-23T19:15:00.000Z"
+stopped_at: "Phase 21 planned + cross-AI-reviewed + replanned(--reviews) — 4 plans, plan-checker PASSED (0 blockers) both passes; ready for /gsd-execute-phase 21"
+last_updated: "2026-07-23T19:45:00.000Z"
 last_activity: 2026-07-23
-last_activity_desc: "Phase 21 planned via manual GSD (research→validation→patterns→plan→check); 4 plans, 2 checker warnings resolved; ready to execute"
+last_activity_desc: "Phase 21 replanned via /gsd-plan-phase --reviews incorporating 3-reviewer cross-AI feedback (Codex/OpenCode/Hermes-deepseek); 2 unanimous MUST-FIXes (21-02 stage-age, 21-04 slot-clear) + 21-03 numeric-semver fixed, main-reachability refuted, cross-table deferred; plan-checker reviews-mode PASSED"
 progress:
   total_phases: 12
   completed_phases: 9
