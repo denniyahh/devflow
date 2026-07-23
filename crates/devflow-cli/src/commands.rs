@@ -2010,6 +2010,175 @@ fn doctor_json_body(checks: &[Check], facts: &[PhaseFacts]) -> serde_json::Value
     })
 }
 
+// ---------------------------------------------------------------------------
+// doctor planning-doc staleness reconciliation (21b, D-04/D-05)
+// ---------------------------------------------------------------------------
+
+/// The `v1.5.0` numeric-tuple cutoff (RESEARCH Pitfall #2): the first phase
+/// whose version claim was consistently tagged. A claimed version at or
+/// after this cutoff with no matching/reachable git tag is a real
+/// `Severity::Problem`; a claim before it is legacy history and downgrades
+/// to `Severity::Warn` — otherwise a naive per-row check floods `doctor`
+/// with pre-Phase-18 noise, the exact alert-fatigue class 999.14 exists to
+/// prevent. Compared as a NUMERIC `(major, minor, patch)` tuple, never a
+/// string, so a real future `v1.10.0` is correctly treated as post-cutoff
+/// (a lexicographic `"1.10.0" < "1.5.0"` would wrongly sort it as legacy).
+const PLANNING_DOC_STALENESS_CUTOFF: (u32, u32, u32) = (1, 5, 0);
+
+/// One detection-only finding produced by reconciling a `ROADMAP.md`/
+/// `STATE.md` version claim against the repo's git tags. A sibling of
+/// `PhaseFinding`, not a reuse of it: most claims here are about
+/// already-shipped phases with no active `state-NN.json`/`PhaseFacts`
+/// (RESEARCH Open Q1). `repair` is always `None` — D-04 forbids any
+/// auto-correction of planning-doc prose; nothing in this module has a
+/// write path to either file. Never carries a filesystem path or username
+/// (T-18-01 discipline) — only the source label, the claimed version, and
+/// a git tag name.
+pub(crate) struct PlanningDocFinding {
+    pub(crate) source: String,
+    pub(crate) claim: String,
+    pub(crate) severity: Severity,
+    pub(crate) detail: String,
+    pub(crate) repair: Option<String>,
+}
+
+/// Parse a table cell as a bare `(major, minor, patch)` semver tuple,
+/// stripping an optional leading `v`. Returns `None` for anything that
+/// isn't EXACTLY three dot-separated numeric components — this is what
+/// keeps version ranges (`0.1.0–0.6.0`), em-dash placeholders (`—`), and
+/// any other non-semver cell out of every downstream finding (RESEARCH
+/// Pitfall #2), without needing a regex crate: the range's `–` makes its
+/// middle component fail `str::parse::<u32>`, and the em-dash fails
+/// outright.
+pub(crate) fn parse_semver(cell: &str) -> Option<(u32, u32, u32)> {
+    let cell = cell.strip_prefix('v').unwrap_or(cell);
+    let mut parts = cell.split('.');
+    let major = parts.next()?.trim().parse().ok()?;
+    let minor = parts.next()?.trim().parse().ok()?;
+    let patch = parts.next()?.trim().parse().ok()?;
+    if parts.next().is_some() {
+        return None; // more than three `.`-separated components
+    }
+    Some((major, minor, patch))
+}
+
+/// Scan a `## Shipped`/`## Completed`-shaped markdown table for `(label,
+/// version)` rows whose version cell is a bare or `v`-prefixed single
+/// semver. Hand-scans lines split on `|` rather than pulling in a
+/// markdown-table parser crate — the `is_self_dogfood_workspace` (D-17)
+/// convention this codebase already follows for small, fixed-shape
+/// structured text. Skips the header row, the `|---|---|` separator row,
+/// and any cell that isn't a bare semver (ranges, em-dashes, anything
+/// else) outright; never panics on a malformed row (T-21b-03 — parse
+/// defensively, degrade rather than die). `source` (e.g. `"ROADMAP.md"`)
+/// is folded into the returned label so a caller that concatenates rows
+/// from multiple documents can still tell them apart downstream.
+pub(crate) fn parse_planning_doc_versions(text: &str, source: &str) -> Vec<(String, String)> {
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('|') {
+            continue;
+        }
+        let cells: Vec<&str> = trimmed
+            .trim_matches('|')
+            .split('|')
+            .map(str::trim)
+            .collect();
+        if cells.len() < 2 {
+            continue;
+        }
+        let label = cells[0];
+        // Header row (`Phase | Name | Version`) and the `|---|---|---|`
+        // separator row both have a first cell that is never a real phase
+        // label — skip both rather than trying to special-case each shape.
+        if label.is_empty()
+            || label.eq_ignore_ascii_case("phase")
+            || label.chars().all(|c| c == '-')
+        {
+            continue;
+        }
+        // The version column's position differs between ROADMAP.md's
+        // `## Shipped` table (Phase | Name | Version) and STATE.md's
+        // `## Completed` table (Phase | Description | Version | Date) —
+        // scan every non-label cell and keep whichever ones parse as a
+        // bare semver, rather than hardcoding a column index.
+        for cell in &cells[1..] {
+            if parse_semver(cell).is_some() {
+                rows.push((format!("{source} phase {label}"), (*cell).to_string()));
+            }
+        }
+    }
+    rows
+}
+
+/// Whether `tag` exists in `project_root` AND is reachable from
+/// `base_branch` — argv-array `git` shelling only (T-21b-02: tag strings
+/// passed in here are already validated `^v?\d+\.\d+\.\d+$` cells, never
+/// free-form; no `sh -c`). Two separate invocations, mirroring
+/// `staleness::run_git_stdout`'s idiom: existence first, so a missing tag
+/// short-circuits before the (more expensive) ancestry check.
+pub(crate) fn tag_exists_and_reachable(project_root: &Path, tag: &str, base_branch: &str) -> bool {
+    let exists = std::process::Command::new("git")
+        .args(["rev-parse", "--verify", &format!("refs/tags/{tag}")])
+        .current_dir(project_root)
+        .output()
+        .is_ok_and(|o| o.status.success());
+    exists
+        && std::process::Command::new("git")
+            .args(["merge-base", "--is-ancestor", tag, base_branch])
+            .current_dir(project_root)
+            .output()
+            .is_ok_and(|o| o.status.success())
+}
+
+/// Pure reconciliation core: for each `(label, version_cell)` row, ask the
+/// caller-supplied `tag_lookup` closure whether a `v`-normalized tag exists
+/// and is reachable — kept injectable (rather than calling
+/// `tag_exists_and_reachable` directly) so this is unit-testable without a
+/// real repository, mirroring `reconcile_phase`'s zero-I/O discipline. A
+/// miss becomes a `PlanningDocFinding` at `Severity::Problem` when the
+/// claimed version is at or after the `v1.5.0` cutoff — compared as a
+/// NUMERIC tuple via `parse_semver`, never lexicographically — else
+/// `Severity::Warn` (RESEARCH Pitfall #2). `repair` is always `None` (D-04:
+/// detection-only). Skips any row whose cell doesn't parse as a semver,
+/// defensively — `parse_planning_doc_versions` already filters these out,
+/// but this must never panic even if called with a stray malformed row.
+pub(crate) fn reconcile_planning_docs(
+    rows: &[(String, String)],
+    tag_lookup: &mut impl FnMut(&str) -> bool,
+) -> Vec<PlanningDocFinding> {
+    let mut findings = Vec::new();
+    for (label, version_cell) in rows {
+        let Some(parsed) = parse_semver(version_cell) else {
+            continue;
+        };
+        let tag = if version_cell.starts_with('v') {
+            version_cell.clone()
+        } else {
+            format!("v{version_cell}")
+        };
+        if tag_lookup(&tag) {
+            continue;
+        }
+        let severity = if parsed >= PLANNING_DOC_STALENESS_CUTOFF {
+            Severity::Problem
+        } else {
+            Severity::Warn
+        };
+        findings.push(PlanningDocFinding {
+            source: label.clone(),
+            claim: format!("{label} claims {tag}"),
+            severity,
+            detail: format!(
+                "{label} claims {tag}, but no git tag `{tag}` exists (or it isn't reachable from the base branch)"
+            ),
+            repair: None,
+        });
+    }
+    findings
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3071,6 +3240,208 @@ mod tests {
                 before_lines, after_lines,
                 "doctor must not append to events.jsonl"
             );
+        }
+    }
+
+    /// Unit tests for the pure planning-doc staleness core (21b, D-04/D-05).
+    /// `reconcile_planning_docs` takes an injected `tag_lookup` closure, so
+    /// every test here runs with zero I/O and no real repository — mirrors
+    /// `doctor_reconciliation`'s zero-I/O discipline above.
+    #[cfg(test)]
+    mod planning_doc_staleness {
+        use super::*;
+
+        const SAMPLE_TABLE: &str = "\
+| Phase | Name | Version |
+|---|---|---|
+| 20 | Release Correctness | 1.7.0 |
+| 10 | Logging | — |
+| 1–5 | Core workflow | 0.1.0–0.6.0 |
+| 9 | OSS Polish | 1.2.0 |
+| 11 | GSD-Native | 1.2.0 |
+";
+
+        #[test]
+        fn parse_planning_doc_versions_skips_non_semver_cells() {
+            let rows = parse_planning_doc_versions(SAMPLE_TABLE, "ROADMAP.md");
+            assert_eq!(
+                rows,
+                vec![
+                    ("ROADMAP.md phase 20".to_string(), "1.7.0".to_string()),
+                    ("ROADMAP.md phase 9".to_string(), "1.2.0".to_string()),
+                    ("ROADMAP.md phase 11".to_string(), "1.2.0".to_string()),
+                ],
+                "em-dash and range cells must be skipped; duplicate versions across \
+                 phases (9 and 11 both claim 1.2.0) must both still parse"
+            );
+        }
+
+        #[test]
+        fn parse_planning_doc_versions_accepts_v_prefixed_cells() {
+            let text = "| Phase | Description | Version | Date |\n\
+                         |---|---|---|---|\n\
+                         | 18 | Dogfood Hardening | v1.5.0 | 2026-07-21 |\n";
+            let rows = parse_planning_doc_versions(text, "STATE.md");
+            assert_eq!(
+                rows,
+                vec![("STATE.md phase 18".to_string(), "v1.5.0".to_string())]
+            );
+        }
+
+        #[test]
+        fn parse_semver_rejects_ranges_and_em_dash() {
+            assert_eq!(parse_semver("1.7.0"), Some((1, 7, 0)));
+            assert_eq!(parse_semver("v1.7.0"), Some((1, 7, 0)));
+            assert_eq!(parse_semver("0.1.0–0.6.0"), None);
+            assert_eq!(parse_semver("—"), None);
+            assert_eq!(parse_semver("1.7"), None);
+            assert_eq!(parse_semver("1.7.0.1"), None);
+        }
+
+        #[test]
+        fn reconcile_planning_docs_flags_problem_for_unreachable_post_cutoff_version() {
+            let rows = vec![("ROADMAP.md phase 20".to_string(), "1.7.0".to_string())];
+            let mut lookup = |_tag: &str| false; // no tag exists / unreachable
+            let findings = reconcile_planning_docs(&rows, &mut lookup);
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].severity, Severity::Problem);
+            assert!(
+                findings[0].repair.is_none(),
+                "D-04: detection-only, no repair"
+            );
+            assert!(findings[0].detail.contains("v1.7.0"));
+        }
+
+        #[test]
+        fn reconcile_planning_docs_downgrades_pre_cutoff_mismatch_to_warn() {
+            // Phase 7 claims 1.0.0 in this repo's real ROADMAP.md/STATE.md,
+            // but no v1.0.0 tag exists (tags start at v1.0.1) — must never
+            // surface as Problem (RESEARCH Pitfall #2).
+            let rows = vec![("ROADMAP.md phase 7".to_string(), "1.0.0".to_string())];
+            let mut lookup = |_tag: &str| false;
+            let findings = reconcile_planning_docs(&rows, &mut lookup);
+            assert_eq!(findings.len(), 1);
+            assert_eq!(
+                findings[0].severity,
+                Severity::Warn,
+                "pre-v1.5.0 mismatches must downgrade to Warn, never Problem"
+            );
+            assert!(findings[0].repair.is_none());
+        }
+
+        #[test]
+        fn reconcile_planning_docs_numeric_cutoff_is_not_lexicographic() {
+            // A lexicographic string compare would sort "1.10.0" < "1.5.0"
+            // and wrongly downgrade a real future release to Warn (Codex
+            // MEDIUM, cross-AI review). The cutoff must compare
+            // parse_semver's numeric tuple instead.
+            let rows = vec![
+                ("label A".to_string(), "1.10.0".to_string()),
+                ("label B".to_string(), "1.4.0".to_string()),
+            ];
+            let mut lookup = |_tag: &str| false;
+            let findings = reconcile_planning_docs(&rows, &mut lookup);
+            assert_eq!(findings.len(), 2);
+            assert_eq!(
+                findings[0].severity,
+                Severity::Problem,
+                "1.10.0 is numerically >= v1.5.0 (post-cutoff), even though \
+                 \"1.10.0\" < \"1.5.0\" as a string"
+            );
+            assert_eq!(
+                findings[1].severity,
+                Severity::Warn,
+                "1.4.0 is numerically < v1.5.0 (pre-cutoff)"
+            );
+        }
+
+        #[test]
+        fn reconcile_planning_docs_produces_no_finding_when_tag_is_reachable() {
+            let rows = vec![("ROADMAP.md phase 20".to_string(), "1.7.0".to_string())];
+            let mut lookup = |_tag: &str| true; // tag exists and is reachable
+            let findings = reconcile_planning_docs(&rows, &mut lookup);
+            assert!(findings.is_empty());
+        }
+
+        #[test]
+        fn reconcile_planning_docs_normalizes_bare_cell_to_v_prefixed_tag() {
+            let rows = vec![("ROADMAP.md phase 20".to_string(), "1.7.0".to_string())];
+            let mut seen_tag = None;
+            let mut lookup = |tag: &str| {
+                seen_tag = Some(tag.to_string());
+                true
+            };
+            reconcile_planning_docs(&rows, &mut lookup);
+            assert_eq!(seen_tag.as_deref(), Some("v1.7.0"));
+        }
+
+        #[test]
+        fn reconcile_planning_docs_skips_a_malformed_row_defensively() {
+            // Defensive path: reconcile must never panic even if handed a
+            // row whose version cell isn't a semver (parse_planning_doc_versions
+            // already filters this upstream, but reconcile must degrade, not die).
+            let rows = vec![("bad row".to_string(), "not-a-version".to_string())];
+            let mut lookup = |_tag: &str| false;
+            let findings = reconcile_planning_docs(&rows, &mut lookup);
+            assert!(findings.is_empty());
+        }
+
+        /// Fixture-backed proof of `tag_exists_and_reachable`'s two-check
+        /// contract, mirroring `staleness::init_repo_with_diverged_commit`'s
+        /// idiom: a real tempdir git repo with a tagged, reachable commit,
+        /// an untagged commit, and a commit on a diverged, unreachable branch.
+        fn init_tagged_repo(root: &Path) {
+            let git = |args: &[&str]| {
+                assert!(
+                    std::process::Command::new("git")
+                        .args(args)
+                        .current_dir(root)
+                        .output()
+                        .unwrap()
+                        .status
+                        .success(),
+                    "git {args:?} failed"
+                );
+            };
+            git(&["init", "-q", "-b", "main"]);
+            git(&["config", "user.email", "t@e.st"]);
+            git(&["config", "user.name", "t"]);
+            git(&["config", "commit.gpgsign", "false"]);
+            git(&["config", "tag.gpgsign", "false"]);
+            git(&["config", "core.hooksPath", "/dev/null"]);
+            std::fs::write(root.join("a.txt"), "one").unwrap();
+            git(&["add", "."]);
+            git(&["commit", "-q", "-m", "base"]);
+            git(&["tag", "v1.7.0"]);
+
+            git(&["checkout", "-q", "-b", "side"]);
+            std::fs::write(root.join("side.txt"), "s").unwrap();
+            git(&["add", "."]);
+            git(&["commit", "-q", "-m", "side"]);
+            git(&["tag", "v9.9.9"]); // tagged, but only reachable from `side`, not `main`
+
+            git(&["checkout", "-q", "main"]);
+        }
+
+        #[test]
+        fn tag_exists_and_reachable_true_for_a_tagged_ancestor() {
+            let dir = tempfile::tempdir().unwrap();
+            init_tagged_repo(dir.path());
+            assert!(tag_exists_and_reachable(dir.path(), "v1.7.0", "main"));
+        }
+
+        #[test]
+        fn tag_exists_and_reachable_false_for_a_missing_tag() {
+            let dir = tempfile::tempdir().unwrap();
+            init_tagged_repo(dir.path());
+            assert!(!tag_exists_and_reachable(dir.path(), "v0.0.1", "main"));
+        }
+
+        #[test]
+        fn tag_exists_and_reachable_false_for_a_tag_unreachable_from_base() {
+            let dir = tempfile::tempdir().unwrap();
+            init_tagged_repo(dir.path());
+            assert!(!tag_exists_and_reachable(dir.path(), "v9.9.9", "main"));
         }
     }
 }
