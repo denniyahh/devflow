@@ -35,6 +35,14 @@ fn init_repo(root: &Path) {
     git(root, &["config", "commit.gpgsign", "false"]);
     git(root, &["config", "tag.gpgsign", "false"]);
     git(root, &["config", "core.hooksPath", "/dev/null"]);
+    // 20b instance 2 (D-08, fixture-side only): a loose object write must be
+    // durable before the very next index read, or a tight commit loop can
+    // race a torn/partial object onto disk (the
+    // start_worktree_mode_ignores_main_checkout_divergence flake). Applied
+    // to every fixture repo here rather than only the flaky tests' own
+    // helpers, since this is the single repo-init path both of them share.
+    git(root, &["config", "core.fsyncObjectFiles", "true"]);
+    git(root, &["config", "core.fsync", "all"]);
     git(root, &["checkout", "-q", "-b", "develop"]);
     fs::write(root.join("README.md"), "base\n").unwrap();
     // Pre-baked GSD context for every phase these tests launch — the
@@ -254,12 +262,15 @@ fn start_worktree_mode_ignores_main_checkout_divergence() {
     let root = repo.path();
     init_repo(root);
 
-    // Branch off develop, then leave develop far ahead (60 commits — past
-    // the `behind > 50` hard-fail threshold) while the main checkout stays
-    // on the stale branch.
+    // Branch off develop, then leave develop far ahead — past the
+    // `behind > 50` hard-fail threshold (commands.rs:158) — while the main
+    // checkout stays on the stale branch. 51 is the smallest count that
+    // still crosses `> 50` (20b/D-08: shrinking the window narrows the
+    // object-store corruption race this loop otherwise widens for no
+    // functional reason).
     git(root, &["checkout", "-q", "-b", "ancient", "develop"]);
     git(root, &["checkout", "-q", "develop"]);
-    for i in 0..60 {
+    for i in 0..51 {
         fs::write(root.join(format!("f{i}.txt")), i.to_string()).unwrap();
         git(root, &["add", "."]);
         git(root, &["commit", "-q", "-m", &format!("commit {i}")]);
@@ -273,7 +284,7 @@ fn start_worktree_mode_ignores_main_checkout_divergence() {
 
     // Worktree mode is the default — no --no-worktree flag. This must
     // succeed (run_devflow asserts a zero exit status) despite the main
-    // checkout being 60 commits behind develop.
+    // checkout being 51 commits behind develop.
     run_devflow(
         root,
         &fake_bin.path,
@@ -799,5 +810,60 @@ fn cleanup_force_refuses_on_dead_monitor_live_agent() {
     assert!(
         wt_path.is_dir(),
         "worktree must NOT have been removed while the agent is alive"
+    );
+}
+
+/// 20b instance 1 (probe 20b/idempotency): `cleanup` run twice succeeds —
+/// the second run finds the worktree already gone and does not error.
+#[test]
+fn cleanup_is_idempotent_when_worktree_already_removed() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let phase = 10;
+    let branch = format!("feature/phase-{phase:02}");
+    seed_feature_branch(root, phase);
+
+    let wt_path = root.join(".worktrees").join(format!("phase-{phase:02}"));
+    devflow_core::worktree::add(root, &wt_path, &branch, &branch, false).unwrap();
+
+    // Dead agent, dead monitor (Stuck liveness) — a genuinely dead phase,
+    // safe for cleanup to proceed.
+    let mut state = devflow_core::state::State::new(
+        phase,
+        devflow_core::state::AgentKind::Claude,
+        devflow_core::mode::Mode::Auto,
+        root.to_path_buf(),
+    );
+    state.worktree_path = Some(wt_path.clone());
+    state.monitor_pid = Some(0x7FFF_FFFE);
+    devflow_core::workflow::save_state(&state).unwrap();
+
+    let fake_bin = fake_bin_dir(&[]);
+    let first = Command::new(devflow_bin())
+        .args(["cleanup", "--force"])
+        .arg(root)
+        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .current_dir(root)
+        .output()
+        .expect("run devflow cleanup (first)");
+    assert!(
+        first.status.success(),
+        "first cleanup of a genuinely-dead phase must succeed\nstderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(!wt_path.is_dir(), "worktree must be removed on first run");
+
+    let second = Command::new(devflow_bin())
+        .args(["cleanup", "--force"])
+        .arg(root)
+        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .current_dir(root)
+        .output()
+        .expect("run devflow cleanup (second)");
+    assert!(
+        second.status.success(),
+        "second cleanup run must find the worktree already gone and not error\nstderr: {}",
+        String::from_utf8_lossy(&second.stderr)
     );
 }
