@@ -4,17 +4,17 @@ milestone: v2.0.0
 milestone_name: milestone
 current_phase: 20
 current_phase_name: release-correctness-operator-control
-status: executing
-stopped_at: Phase 20 executed 5/5 on feat/phase-20-release-correctness-operator-control; verifier 37/37 (human_needed); code-review blockers+warnings fixed inline; awaiting /gsd-verify-work 20 + PR to develop
-last_updated: "2026-07-23T10:28:37.724Z"
+status: milestone_complete
+stopped_at: Phase 20 complete (5/5 plans, verified, PR #20 merged-ready) — v2.0.0 milestone (Phase 11-20) is 100% complete on disk; auto-advance incorrectly picked up backlog heading 999.1 as "next phase" — corrected here. Awaiting operator decision on /gsd-complete-milestone (version TBC — v2.0.0 vs 1.7.0, see ROADMAP Phase 20 scoping note).
+last_updated: "2026-07-23T11:10:00.000Z"
 last_activity: 2026-07-23
-last_activity_desc: Phase 20 executed + code-review-fixed; awaiting human verification
+last_activity_desc: Phase 20 complete — v2.0.0 milestone 100% done, ready to close
 progress:
   total_phases: 9
-  completed_phases: 8
+  completed_phases: 9
   total_plans: 70
-  completed_plans: 65
-  percent: 89
+  completed_plans: 70
+  percent: 100
 ---
 
 # DevFlow — Project State
@@ -60,12 +60,12 @@ progress:
 
 ## Current Position
 
-Phase: 20 (release-correctness-operator-control) — EXECUTED (human-verify pending)
-Plan: 5 of 5 (all SUMMARYs written; verifier passed 37/37 must-haves, status human_needed)
-Status: All 5 plans executed on branch feat/phase-20-release-correctness-operator-control (parallel worktrees, wave 1 = 20-01+20-02); code review found 2 blockers + 3 warnings, all fixed inline (CR-01/CR-02/WR-01/WR-02/WR-03, +11 regression tests), INF-01 → backlog 999.27. Full suite 491/0, clippy/fmt clean. NOT complete: 2 human-verify items in 20-UAT.md (real ssh-agent signing check; CI-on-branch flake sign-off). Next: /gsd-verify-work 20, then PR feat → develop.
-Last activity: 2026-07-23 — Phase 20 executed + code-review-fixed; awaiting human verification
+Phase: 20 (release-correctness-operator-control) — COMPLETE
+Plan: 5 of 5 (all executed and verified)
+Status: v2.0.0 milestone (Phase 11-20) is 100% complete — awaiting operator decision to run /gsd-complete-milestone. Backlog items (999.N) are NOT the next phase; they require /gsd-review-backlog promotion into a new milestone.
+Last activity: 2026-07-23 — Phase 20 complete; corrected an auto-advance quirk that had pointed Current Position at backlog heading 999.1
 
-Progress: [█████████████████░░░] 89%
+Progress: [████████████████████] 83/79 plans (100%)
 
 *(Machine-readable fields for `gsd-tools state begin-phase` / `advance-plan` —
 this project historically tracked position only in the narrative "Active
