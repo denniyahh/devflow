@@ -689,4 +689,46 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn write_version_rewrites_workspace_dependency_self_pin() {
+        // 20a / DEN-49: a published Cargo workspace states its version twice —
+        // once in [workspace.package] version, and again as an explicit
+        // `version` pin on every [workspace.dependencies] entry that points
+        // at a workspace member by `path` (Cargo has no interpolation for
+        // dependency versions, and a path dependency of a *published* crate
+        // requires an explicit version). write_version must rewrite BOTH in
+        // one write, or the self-pin ships stale and `cargo publish` rejects
+        // the upload as a duplicate on release day (shipped broken twice:
+        // v1.5.0 by 7ad260c, v1.6.0 by PR #15).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace.package]\nversion = \"1.6.0\"\nedition = \"2024\"\n\n\
+             [workspace.dependencies]\n\
+             devflow-core = { path = \"crates/devflow-core\", version = \"1.6.0\" }\n",
+        )
+        .unwrap();
+        write_version(
+            dir.path(),
+            &Version {
+                major: 1,
+                minor: 7,
+                patch: 0,
+            },
+        )
+        .unwrap();
+        let contents = std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
+        assert!(
+            contents.contains("[workspace.package]\nversion = \"1.7.0\""),
+            "expected [workspace.package] version to be rewritten, got: {contents}"
+        );
+        assert!(
+            contents.contains(
+                "devflow-core = { path = \"crates/devflow-core\", version = \"1.7.0\" }"
+            ),
+            "expected the [workspace.dependencies] self-pin to be rewritten to 1.7.0 \
+             alongside [workspace.package] version, got: {contents}"
+        );
+    }
 }
