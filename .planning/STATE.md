@@ -4,11 +4,11 @@ milestone: v2.0.0
 milestone_name: milestone (open — no fixed closing phase)
 current_phase: 21
 current_phase_name: operator-legibility-observability
-status: planning
-stopped_at: "Phase 21 CONTEXT complete (operator-recut, consolidated to develop); ready for /gsd-plan-phase 21"
-last_updated: "2026-07-23T18:20:00.000Z"
+status: planned
+stopped_at: "Phase 21 planned — 4 plans (21-01 21d, 21-02 21a, 21-03 21b, 21-04 21c), plan-checker passed (0 blockers); ready for /gsd-execute-phase 21"
+last_updated: "2026-07-23T19:15:00.000Z"
 last_activity: 2026-07-23
-last_activity_desc: "Phase 21 scope recut to Operator Legibility & Observability (21a 999.3, 21b 999.14, 21c 999.2, 21d 999.29, opt 21e 999.5); dogfood retired, work consolidated to develop"
+last_activity_desc: "Phase 21 planned via manual GSD (research→validation→patterns→plan→check); 4 plans, 2 checker warnings resolved; ready to execute"
 progress:
   total_phases: 12
   completed_phases: 9
