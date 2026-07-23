@@ -957,14 +957,31 @@ fn agent_pid_from_file(project_root: &Path, phase: u32) -> Option<u32> {
 fn cron_instruction_hints(project_root: &Path) -> Vec<String> {
     devflow_core::ship::list_cron_instructions(project_root)
         .iter()
-        .map(|instructions| {
-            format!(
-                "Cron instruction pending (phase {}): hermes cron create --from-devflow {}",
-                instructions.phase,
-                project_root.display()
-            )
-        })
+        .map(|instructions| cron_hint_line(instructions, project_root))
         .collect()
+}
+
+/// Build one cron-instruction hint line, appending a sanitized rate-limit
+/// reset segment when `instructions.retry_after` is non-empty (21a, D-03) —
+/// the reset time is already computed and persisted (`CronInstructions.
+/// retry_after`, ship.rs), this only presents it; no new detection logic.
+/// Pure so it's unit-testable without capturing process stdout.
+fn cron_hint_line(
+    instructions: &devflow_core::ship::CronInstructions,
+    project_root: &Path,
+) -> String {
+    let base = format!(
+        "Cron instruction pending (phase {}): hermes cron create --from-devflow {}",
+        instructions.phase,
+        project_root.display()
+    );
+    let retry_after = instructions.retry_after.trim();
+    if retry_after.is_empty() {
+        base
+    } else {
+        let reset = render_gate_context(retry_after, 100);
+        format!("{base} (rate-limit resets: {reset})")
+    }
 }
 
 /// Print active phase worktrees with branch and inferred phase/agent.
@@ -2130,8 +2147,7 @@ mod tests {
     #[test]
     fn cron_hint_line_omits_reset_fragment_when_retry_after_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let instructions =
-            devflow_core::ship::build_cron_instructions(dir.path(), 7, "", "claude");
+        let instructions = devflow_core::ship::build_cron_instructions(dir.path(), 7, "", "claude");
 
         let hint = cron_hint_line(&instructions, dir.path());
 
