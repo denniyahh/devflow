@@ -924,7 +924,11 @@ mod tests {
     fn read_version_extracts_clean_value_without_trailing_comment() {
         // Bare `version = "1.7.0"` (no comment) must still work.
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nversion = \"1.7.0\"\n").unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nversion = \"1.7.0\"\n",
+        )
+        .unwrap();
         assert_eq!(
             read_version(dir.path()).unwrap(),
             Version {

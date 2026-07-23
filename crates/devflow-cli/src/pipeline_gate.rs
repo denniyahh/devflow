@@ -196,8 +196,13 @@ pub(crate) fn finish_workflow_with_gate_timeout(
             "[finalization failed] phase {} terminal hooks did not complete. Resolve the git/version error, then approve to retry; reject to loop back or abort.",
             state.phase
         );
-        match run_gate_with_timeout(project_root, state, Stage::Ship, &context, gate_timeout_secs)?
-        {
+        match run_gate_with_timeout(
+            project_root,
+            state,
+            Stage::Ship,
+            &context,
+            gate_timeout_secs,
+        )? {
             GateAction::Advance => {
                 let _ = Gates::cleanup(project_root, state.phase, Stage::Ship);
             }
@@ -1000,8 +1005,7 @@ mod tests {
     #[test]
     fn ship_override_bounds_foreground_wait_on_terminal_hook_failure() {
         let _guard = ENV_MUTEX.lock().unwrap();
-        let original_foreground_timeout =
-            std::env::var_os("DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS");
+        let original_foreground_timeout = std::env::var_os("DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS");
         // SAFETY: serialized under ENV_MUTEX. Bounds ONLY the foreground
         // knob — DEVFLOW_GATE_TIMEOUT_SECS (the background default) is
         // never touched by this test, so a regression that made

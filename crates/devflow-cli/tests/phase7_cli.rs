@@ -479,7 +479,15 @@ fn start_dry_run_annotates_until_stage() {
 
     let output = Command::new(devflow_bin())
         .args([
-            "start", "--phase", "47", "--agent", "claude", "--mode", "auto", "--until", "plan",
+            "start",
+            "--phase",
+            "47",
+            "--agent",
+            "claude",
+            "--mode",
+            "auto",
+            "--until",
+            "plan",
             "--dry-run",
         ])
         .arg(root)
@@ -521,7 +529,14 @@ fn start_dry_run_without_until_has_no_stop_annotation() {
 
     let output = Command::new(devflow_bin())
         .args([
-            "start", "--phase", "48", "--agent", "claude", "--mode", "auto", "--dry-run",
+            "start",
+            "--phase",
+            "48",
+            "--agent",
+            "claude",
+            "--mode",
+            "auto",
+            "--dry-run",
         ])
         .arg(root)
         .env("PATH", path_with_fake_bin(&fake_bin.path))
