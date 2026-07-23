@@ -579,12 +579,20 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 21: Operator Usability & Release Execution
+### Phase 21: Operator Legibility & Observability
 
-**Goal:** [To be planned]
-**Requirements**: TBD
+**Goal:** Make DevFlow's operator surface **legible** and its self-reported state **trustworthy** — every unit single-writer, operator-facing, reversible or detection-only, and testable without any irreversible side effect. Scope recut from the original "Operator Usability & Release Execution" (operator decision, 2026-07-23): the release-cut executor (999.25) and `--base` (999.28) were removed (→ own phase / Phase 22 respectively) and the phase backfilled with legibility/observability units. Not `/gsd-review-backlog`-promoted; scope is operator-decided — see `phases/21-*/21-CONTEXT.md`.
+**Requirements**: TBD (no REQ-IDs)
 **Depends on:** Phase 20
 **Plans:** 0 plans
+
+Units (operator-decided; committed unless marked optional):
+
+- **21a** — Operator discoverability (999.3 / DEN-28): `gate show`, rate-limit reset surfacing, in-stage `status` progress, recovery-verb hints. Sequence early.
+- **21b** — Doctor planning-doc staleness reconciliation (999.14 / DEN-39): flag stale ROADMAP/STATE narrative vs git tags; detection-only.
+- **21c** — sequentagent second-process tracking (999.2 / DEN-27): narrowed — monitor half shipped v1.5.0.
+- **21d** — Dogfood staleness guard content-awareness (999.29 / DEN-54): stop docs-only false-blocks. **Sequence first** (unblocks this phase's own stages).
+- **21e** *(optional/stretch)* — ChangelogAppend real content (999.5 / DEN-30): blocked on choosing a content source.
 
 Plans:
 

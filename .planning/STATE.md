@@ -2,13 +2,13 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone (open — no fixed closing phase)
-current_phase: 20
-current_phase_name: release-correctness-operator-control
-status: shipped
-stopped_at: Phase 21 context gathered
-last_updated: "2026-07-23T17:20:24.337Z"
+current_phase: 21
+current_phase_name: operator-legibility-observability
+status: planning
+stopped_at: "Phase 21 CONTEXT complete (operator-recut, consolidated to develop); ready for /gsd-plan-phase 21"
+last_updated: "2026-07-23T18:20:00.000Z"
 last_activity: 2026-07-23
-last_activity_desc: "Phase 20 shipped as v1.7.0; PR #20 squash-merged to develop (e78bc82)"
+last_activity_desc: "Phase 21 scope recut to Operator Legibility & Observability (21a 999.3, 21b 999.14, 21c 999.2, 21d 999.29, opt 21e 999.5); dogfood retired, work consolidated to develop"
 progress:
   total_phases: 12
   completed_phases: 9
@@ -23,21 +23,27 @@ progress:
 
 ## Active Phase
 
-*(none currently in flight. Phase 20 shipped as v1.7.0, 2026-07-23 — see
-Recently Shipped below. The v2.0.0 milestone stays open: it does not close
-at Phase 20 or any fixed phase; numbering continues forward (21, 22, …)
-until a genuinely breaking change earns the 2.0 slot. Backlog items
-(999.N) are NOT automatically next — they require `/gsd-review-backlog`
-promotion.)*
+**Phase 21 — Operator Legibility & Observability** (planning). CONTEXT gathered
+and operator-recut 2026-07-23; scope is operator-decided (not
+`/gsd-review-backlog`-promoted). Units: 21a discoverability (999.3), 21b doctor
+staleness reconciliation (999.14), 21c sequentagent second-process tracking
+(999.2), 21d dogfood staleness content-awareness (999.29, sequence first),
+optional 21e changelog content (999.5). The v2.0.0 milestone stays open (no fixed
+closing phase); numbering continues forward until a breaking change earns 2.0.
+
+> **Workflow note:** Phase 21 began as a devflow dogfood run (headless Define in a
+> `feature/phase-21` worktree), then moved to **manual GSD**: the worktree/branch
+> were retired and all define artifacts consolidated onto `develop`. Next step is
+> a manual `/gsd-plan-phase 21`.
 
 ## Current Position
 
-Phase: 20 (release-correctness-operator-control) — SHIPPED as v1.7.0
-Plan: 5 of 5 (all executed, verified, code-reviewed, shipped)
-Status: No phase currently active. Milestone v2.0.0 stays open (no fixed closing phase) — next phase/backlog promotion not yet decided.
-Last activity: 2026-07-23 — Phase 20 shipped as v1.7.0; PR #20 squash-merged to develop (e78bc82)
+Phase: 21 (operator-legibility-observability) — PLANNING
+Plan: 0 of N (CONTEXT complete; not yet broken down)
+Status: Ready for `/gsd-plan-phase 21`. Define complete (`21-CONTEXT.md`); discuss re-run intentionally skipped — CONTEXT is operator-complete.
+Last activity: 2026-07-23 — scope recut + consolidated to develop; 999.28/999.29 filed and mirrored to Linear (DEN-53/DEN-54)
 
-Progress: [████████████████████] 83/79 plans (100%)
+Progress: Phase 20 shipped v1.7.0 (100%); Phase 21 in planning.
 
 *(Machine-readable fields for `gsd-tools state begin-phase` / `advance-plan` —
 this project historically tracked position only in the narrative "Active
