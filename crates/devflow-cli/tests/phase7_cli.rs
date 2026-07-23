@@ -139,6 +139,21 @@ fn wait_for_state_cleared(root: &Path, phase: u32) {
     panic!("timed out waiting for phase {phase} state to clear (pipeline never finished)");
 }
 
+/// Wait until a phase's persisted state has `stopped == true` (20c: a
+/// `--until`-halted phase). Polls rather than reading once, since the fake
+/// agent + monitor chain advances asynchronously.
+fn wait_for_stopped(root: &Path, phase: u32) -> devflow_core::state::State {
+    for _ in 0..400 {
+        if let Ok(state) = devflow_core::workflow::load_state(root, phase)
+            && state.stopped
+        {
+            return state;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("timed out waiting for phase {phase} state to report stopped == true");
+}
+
 fn git_stdout(root: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&git(root, args).stdout)
         .trim()
@@ -333,6 +348,123 @@ fn start_no_worktree_uses_feature_branch() {
         "expected worktree_path to be None with --no-worktree, got {:?}",
         state.worktree_path
     );
+}
+
+/// 20c (D-09 + review: Codex HIGH off-by-one): `devflow start --until plan`
+/// must run Define AND Plan to completion, then halt BEFORE advancing to
+/// Code — not stop before Plan ever runs. The fake `claude` script always
+/// reports success, so the monitor chain runs Define→advance→Plan→advance;
+/// the second `advance` calls `transition(.., Stage::Code)` with
+/// `state.stage == Plan`, which is exactly the `stop_until == Some(from)`
+/// case this plan adds.
+#[test]
+fn start_until_plan_halts_cleanly() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let fake_bin = fake_bin_dir(&[(
+        "claude",
+        "#!/bin/sh\nprintf 'DEVFLOW_RESULT: {\"status\":\"success\"}\\n'\n",
+    )]);
+
+    run_devflow(
+        root,
+        &fake_bin.path,
+        &[
+            "start", "--phase", "44", "--agent", "claude", "--mode", "auto", "--until", "plan",
+        ],
+    );
+
+    let state = wait_for_stopped(root, 44);
+    assert_eq!(
+        state.stage,
+        devflow_core::stage::Stage::Plan,
+        "the persisted stage must be the COMPLETED target (Plan), proving Plan ran \
+         before the halt — not that the pipeline stopped before Plan ever launched"
+    );
+    assert!(state.stopped, "stop marker must be set");
+    assert_eq!(
+        state.monitor_pid, None,
+        "the stop path must clear monitor_pid so no monitor is left behind"
+    );
+    assert!(
+        state.stop_reason.is_some(),
+        "a human-readable stop_reason must be recorded"
+    );
+}
+
+/// 20c (D-07): `--until ship` is a semantic no-op — Ship never calls
+/// `transition` (`handle_ship_outcome` calls `finish_workflow` directly), so
+/// the full pipeline already stops there today. It must be rejected before
+/// any stage runs, not silently accepted as if it intercepted anything.
+#[test]
+fn start_until_ship_is_rejected() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let fake_bin = fake_bin_dir(&[(
+        "claude",
+        "#!/bin/sh\nprintf 'DEVFLOW_RESULT: {\"status\":\"success\"}\\n'\n",
+    )]);
+
+    let output = Command::new(devflow_bin())
+        .args([
+            "start", "--phase", "45", "--agent", "claude", "--mode", "auto", "--until", "ship",
+        ])
+        .arg(root)
+        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .current_dir(root)
+        .output()
+        .expect("run devflow");
+
+    assert!(
+        !output.status.success(),
+        "--until ship must be rejected, not silently accepted"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("ship") && stderr.contains("no-op"),
+        "the rejection must explain Ship is already terminal\nstderr: {stderr}"
+    );
+    assert!(
+        !root.join(".worktrees/phase-45").exists(),
+        "a rejected --until ship must not run any stage or create a worktree"
+    );
+}
+
+/// 20c edge-probe (20c/empty): `--until bogus` needs no new parsing surface —
+/// it is rejected by the existing `Stage: FromStr` parser (via clap) before
+/// `start` is ever dispatched.
+#[test]
+fn start_until_unknown_stage_is_rejected_by_clap() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let fake_bin = fake_bin_dir(&[(
+        "claude",
+        "#!/bin/sh\nprintf 'DEVFLOW_RESULT: {\"status\":\"success\"}\\n'\n",
+    )]);
+
+    let output = Command::new(devflow_bin())
+        .args([
+            "start", "--phase", "46", "--agent", "claude", "--mode", "auto", "--until", "bogus",
+        ])
+        .arg(root)
+        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .current_dir(root)
+        .output()
+        .expect("run devflow");
+
+    assert!(
+        !output.status.success(),
+        "--until bogus must be rejected by the existing Stage parser"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("bogus"),
+        "clap's error must name the unrecognized value\nstderr: {stderr}"
+    );
+    assert!(!root.join(".worktrees/phase-46").exists());
 }
 
 #[test]

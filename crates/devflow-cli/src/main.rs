@@ -67,6 +67,12 @@ enum Command {
         /// Print the pipeline that would run without launching anything.
         #[arg(long)]
         dry_run: bool,
+        /// Run the pipeline through `<stage>` and halt cleanly before
+        /// advancing further (e.g. `--until plan` runs Define+Plan then
+        /// stops before Code). `ship` is rejected — the pipeline already
+        /// stops there.
+        #[arg(long)]
+        until: Option<Stage>,
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
@@ -338,12 +344,25 @@ fn run() -> Result<(), CliError> {
             worktree: _worktree,
             no_worktree,
             dry_run,
+            until,
             project,
         } => {
             // Worktree is now the default; the deprecated `--worktree` flag is
             // an intentionally ignored no-op (see field doc comment above).
             // `--no-worktree` is the only switch that changes behavior.
             let worktree = !no_worktree;
+            // D-07: `--until ship` is a semantic no-op — `handle_ship_outcome`
+            // calls `finish_workflow` directly and never calls `transition`,
+            // so the pipeline already stops at Ship today regardless of this
+            // flag. Reject before any stage runs rather than silently
+            // accepting a flag that would never actually intercept anything.
+            if until == Some(Stage::Ship) {
+                return Err(CliError::Message(
+                    "--until ship is a no-op: Ship is already the pipeline's terminal \
+                     stage and never advances further"
+                        .to_string(),
+                ));
+            }
             start(
                 &project_root(project)?,
                 phase,
@@ -352,6 +371,7 @@ fn run() -> Result<(), CliError> {
                 force,
                 worktree,
                 dry_run,
+                until,
             )
         }
         Command::Advance { project, phase } => advance(&project_root(project)?, phase),

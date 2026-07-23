@@ -54,6 +54,37 @@ pub(crate) fn transition(
     to: Stage,
 ) -> Result<(), CliError> {
     let from = state.stage;
+
+    // 20c: `devflow start --until <stage>` halts cleanly once the requested
+    // stage has completed — checked here, at the TOP, before anything else
+    // runs. `stop_until == Some(from)` means the JUST-COMPLETED stage (the
+    // one whose outcome triggered this call) is the requested stop point;
+    // checking `to` instead would halt BEFORE the target stage ever ran
+    // (review: Codex HIGH off-by-one). This bypasses the from→to checkout
+    // hooks, `state.stage = to`, the normal `"transition"` event, and
+    // `launch_stage` — no new monitor is spawned, and `loop_back_to_code`
+    // (a retry, not an advance) is untouched by this check.
+    if state.stop_until == Some(from) {
+        state.stopped = true;
+        state.stop_reason = Some(format!("stopped after {from} completed (--until {from})"));
+        // T-20-03b / doctor gap (D-09): clear monitor_pid/gate_pending so
+        // neither check_dead_agent nor check_dead_monitor misreports this
+        // intentional stop as a crashed agent or dead monitor.
+        state.monitor_pid = None;
+        state.gate_pending = false;
+        workflow::save_state(state)?;
+        events::emit(
+            project_root,
+            state.phase,
+            "workflow_finished",
+            serde_json::json!({
+                "reason": "stopped_at",
+                "stage": from.to_string(),
+            }),
+        );
+        return Ok(());
+    }
+
     let _ = run_checkout_hooks(
         project_root,
         state,

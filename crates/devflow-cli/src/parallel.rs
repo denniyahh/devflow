@@ -117,7 +117,7 @@ pub(crate) fn parallel(
     for (phase, agent) in pairs {
         println!("\n=== phase {phase} ({agent}) ===");
         // Worktree mode keeps each run isolated so the phases run together.
-        start(project_root, phase, agent, mode, force, true, false)?;
+        start(project_root, phase, agent, mode, force, true, false, None)?;
     }
     Ok(())
 }
