@@ -151,3 +151,11 @@ None - no external service configuration required.
 ---
 *Phase: 21-operator-usability-release-execution*
 *Completed: 2026-07-23*
+
+## Self-Check: PASSED
+
+- FOUND: `crates/devflow-cli/src/commands.rs`
+- FOUND: `.planning/phases/21-operator-usability-release-execution/21-03-SUMMARY.md`
+- FOUND commit: `d1b77c0` (Task 1)
+- FOUND commit: `5b65103` (Task 2)
+- FOUND commit: `8a76841` (docs: SUMMARY)
