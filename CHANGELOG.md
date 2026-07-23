@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.7.0 — 2026-07-23
+
+Release correctness and operator control: close the two defects that made
+DevFlow's own release cut unreliable, then add the operator controls the
+pipeline never had. Phase 20.
+
+### Fixed
+- `VersionBump` now rewrites every workspace-member `[workspace.dependencies]` self-pin, not just `[workspace.package] version` — previously left the self-pin on the prior release, causing `cargo publish` to reject the upload as a duplicate (shipped broken two releases running)
+- `devflow cleanup --force` is now fail-closed on worktree removal: it refuses whenever the recorded agent process is alive or the monitor is active — including `Unknown` (no recorded monitor) and `Stuck` (dead monitor) liveness states — with bounded-backoff retry for genuinely-dead phases and a descriptive warning if retries exhaust. Closes a real race behind two CI flakes in `phase7_cli.rs`
+- `cleanup` no longer deletes the worktree of a phase intentionally parked via `devflow start --until <stage>` — it now recognizes the stop marker the same way `doctor` does, and requires `--force` to discard a parked phase
+
+### Added
+- `devflow start --until <stage>` halts the pipeline cleanly at a named stage instead of stranding state or orphaning a worktree — `--until ship` is rejected as a semantic no-op. `doctor` and `resume` are both aware of the stop marker
+- `devflow release --check`: a read-only, network-independent release-cut preflight — workspace self-pin invariant, `develop`/`main` divergence (no `git fetch`), crates.io publish order, and `gpg.format`-aware signing viability (reports only a public-key fingerprint, never key material or a filesystem path)
+- `devflow ship --phase N [--force]`: drives a phase through Ship when the monitor that would have consumed its already-written gate response is dead — reuses the existing fail-closed `finish_workflow` path verbatim, guarded by a per-phase lock and ack-file check so it cannot race a live monitor or double-run the terminal hook batch
+
+### Changed
+- `find_version_in_contents`'s TOML value parser now anchors on the opening quote and scans forward for the matching close, so a trailing inline comment (e.g. `version = "1.7.0"  # pinned`) no longer corrupts the parsed value — brings the read path back in line with the comment-preserving write path
+- `member_depends_on` now recognizes long-form `[dependencies.NAME]` TOML sections in addition to inline tables, so `release --check`'s publish-order topo-sort no longer silently misses that dependency edge
+
 ## 1.6.0 — 2026-07-22
 
 Release integrity and `main.rs` decomposition: close the two defects whose blast
