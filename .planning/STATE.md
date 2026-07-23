@@ -5,16 +5,16 @@ milestone_name: milestone (open — no fixed closing phase)
 current_phase: 20
 current_phase_name: release-correctness-operator-control
 status: shipped
-stopped_at: Phase 20 fully released as v1.7.0 (2026-07-23) — PR #20 (feat) + #21 (version bump) squash-merged to develop, PR #22 (release: v1.7.0) squash-merged to main (5c7259a), signed tag v1.7.0 pushed, GitHub Release published, devflow-core + devflow published to crates.io, develop re-synced from main. The v2.0.0 milestone stays open (does not close at Phase 20 or any fixed phase); numbering continues forward. No phase currently in flight — next step is discussing/planning whichever phase or backlog promotion comes next.
-last_updated: "2026-07-23T11:25:00.000Z"
+stopped_at: Phase 21 context gathered
+last_updated: "2026-07-23T17:20:24.337Z"
 last_activity: 2026-07-23
-last_activity_desc: Phase 20 shipped as v1.7.0; milestone stays open
+last_activity_desc: "Phase 20 shipped as v1.7.0; PR #20 squash-merged to develop (e78bc82)"
 progress:
-  total_phases: 9
+  total_phases: 12
   completed_phases: 9
   total_plans: 70
   completed_plans: 70
-  percent: 100
+  percent: 75
 ---
 
 # DevFlow — Project State
@@ -636,6 +636,6 @@ None currently open for Phase 17.
 
 ## Session
 
-**Last session:** 2026-07-22T21:55:59.943Z
-**Stopped at:** Phase 20 context gathered — discuss-phase resolved 20e mechanism/scope, 20d ceiling, 20b product-vs-fixture
-**Resume file:** .planning/phases/20-release-correctness-operator-control/CONTEXT.md
+**Last session:** 2026-07-23T17:20:24.303Z
+**Stopped at:** Phase 21 context gathered
+**Resume file:** .planning/phases/21-operator-usability-release-execution/21-CONTEXT.md
