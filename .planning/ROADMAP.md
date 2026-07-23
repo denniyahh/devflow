@@ -584,7 +584,7 @@ Plans:
 **Goal:** Make DevFlow's operator surface **legible** and its self-reported state **trustworthy** — every unit single-writer, operator-facing, reversible or detection-only, and testable without any irreversible side effect. Scope recut from the original "Operator Usability & Release Execution" (operator decision, 2026-07-23): the release-cut executor (999.25) and `--base` (999.28) were removed (→ own phase / Phase 22 respectively) and the phase backfilled with legibility/observability units. Not `/gsd-review-backlog`-promoted; scope is operator-decided — see `phases/21-*/21-CONTEXT.md`.
 **Requirements**: TBD (no REQ-IDs — units 21a–21d map to CONTEXT decisions D-03..D-07)
 **Depends on:** Phase 20
-**Plans:** 3/4 plans executed
+**Plans:** 4/4 plans executed
 
 **Sequencing is load-bearing:** 21d (staleness content-awareness) leads in Wave 1
 per D-07 — the dogfood staleness guard hard-blocks this phase's own stages after
@@ -618,7 +618,7 @@ Plans:
 
 **Wave 4** *(blocked on 21-03; shares commands.rs)*
 
-- [ ] 21-04-PLAN.md — 21c: sequentagent second-process record (path-free slot A/B + AgentKind, not routed through State) surfaced in `status` (agent_result.rs, parallel.rs, commands.rs)
+- [x] 21-04-PLAN.md — 21c: sequentagent second-process record (path-free slot A/B + AgentKind, not routed through State) surfaced in `status` (agent_result.rs, parallel.rs, commands.rs)
 
 ### Phase 22: Concurrency & Governance Correctness
 
