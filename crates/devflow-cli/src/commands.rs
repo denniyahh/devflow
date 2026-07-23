@@ -672,6 +672,9 @@ pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
     if let Some(banner) = render_pending_gate_banner(&Gates::list_open(project_root), now) {
         println!("\n{banner}");
     }
+    if let Some(section) = render_sequentagent_status(project_root) {
+        println!("\n{section}");
+    }
     print_open_branches(project_root);
     print_worktrees(project_root, current_worktree.as_deref());
     for hint in cron_instruction_hints(project_root) {
@@ -1011,6 +1014,74 @@ fn default_logs_phase(project_root: &Path) -> Result<u32, CliError> {
 fn agent_pid_from_file(project_root: &Path, phase: u32) -> Option<u32> {
     let path = agent_result::agent_pid_path(project_root, phase);
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// Enumerate every recorded `sequentagent` slot and render one status line
+/// per phase, naming the running agent slot (A/B), its `AgentKind`, and
+/// liveness (21c, D-06) — a sequentagent phase has no entry in
+/// `workflow::list_states`, so without this the second agent is otherwise
+/// entirely invisible to `status`. Pure and read-only: no writes, no
+/// `save_state`/`transition` call.
+///
+/// Scans `.devflow/phase-*-sequentagent` (mirroring `default_logs_phase`'s
+/// `read_dir` + `strip_prefix`/`strip_suffix` idiom) since there is no
+/// `State` to enumerate this from.
+///
+/// Liveness is distinguished by cross-referencing the slot record against
+/// the existing agent-pid file (`agent_pid_from_file` + `agent::agent_running`):
+/// - `running` — the agent-pid file exists and the process is alive.
+/// - `starting` — the slot record exists but the agent-pid file has not
+///   appeared yet (the monitor writes it asynchronously, after the slot
+///   record — cross-AI review LOW pid-race); an honest transient rather than
+///   a misleading "dead" agent.
+/// - `not running` — the agent-pid file exists but the process is dead (a
+///   stale record never renders a false-live agent, T-21c-02).
+///
+/// `doctor` integration is intentionally out of scope for this plan: `status`
+/// is the live-observability command, while `doctor` reconciles persisted
+/// `State` — surfacing this in `doctor` without a matching `--json` key would
+/// reintroduce the WR-01 human/json split (21-04-PLAN.md Review
+/// Incorporation).
+fn render_sequentagent_status(project_root: &Path) -> Option<String> {
+    let devflow = workflow::devflow_dir(project_root);
+    let mut phases: Vec<u32> = std::fs::read_dir(&devflow)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            name.to_str()?
+                .strip_prefix("phase-")?
+                .strip_suffix("-sequentagent")?
+                .parse::<u32>()
+                .ok()
+        })
+        .collect();
+    phases.sort_unstable();
+    phases.dedup();
+
+    let lines: Vec<String> = phases
+        .into_iter()
+        .filter_map(|phase| {
+            let slot = agent_result::read_sequentagent_slot(project_root, phase)?;
+            let pid = agent_pid_from_file(project_root, phase);
+            let (state, pid_suffix) = match pid {
+                Some(pid) if agent::agent_running(pid) => ("running", format!(" (pid {pid})")),
+                Some(pid) => ("not running", format!(" (pid {pid})")),
+                None => ("starting", String::new()),
+            };
+            Some(format!(
+                "sequentagent phase {phase}: agent {} ({}) {state}{pid_suffix}",
+                slot.slot, slot.agent
+            ))
+        })
+        .collect();
+
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
 }
 
 fn cron_instruction_hints(project_root: &Path) -> Vec<String> {
@@ -2543,6 +2614,84 @@ mod tests {
     fn liveness_treats_zero_and_overflow_pids_as_dead() {
         assert!(!agent::agent_running(0));
         assert!(!agent::agent_running(u32::MAX));
+    }
+
+    /// A live slot renders `agent B (codex) running`, cross-referencing the
+    /// agent-pid file the monitor already writes (21c, D-06).
+    #[test]
+    fn sequentagent_status_renders_running_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        agent_result::write_sequentagent_slot(
+            root,
+            7,
+            agent_result::SequentagentSlotKind::B,
+            AgentKind::Codex,
+        )
+        .unwrap();
+        std::fs::write(
+            agent_result::agent_pid_path(root, 7),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+
+        let rendered = render_sequentagent_status(root).unwrap();
+
+        assert!(rendered.contains("sequentagent"));
+        assert!(rendered.contains("agent B"));
+        assert!(rendered.contains("codex"));
+        assert!(rendered.contains("running"));
+        assert!(!rendered.contains("not running"));
+    }
+
+    /// A slot record whose agent-pid file names a dead process renders
+    /// "not running" — a stale record never claims a live agent (T-21c-02).
+    #[test]
+    fn sequentagent_status_renders_dead_pid_as_not_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        agent_result::write_sequentagent_slot(
+            root,
+            8,
+            agent_result::SequentagentSlotKind::A,
+            AgentKind::Claude,
+        )
+        .unwrap();
+        std::fs::write(agent_result::agent_pid_path(root, 8), "0").unwrap();
+
+        let rendered = render_sequentagent_status(root).unwrap();
+
+        assert!(rendered.contains("not running"));
+    }
+
+    /// A slot record present but with no agent-pid file yet (the monitor
+    /// writes it asynchronously — the launch/pid-write race) renders
+    /// "starting", not "not running" — an honest transient state
+    /// (cross-AI review LOW pid-race).
+    #[test]
+    fn sequentagent_status_renders_starting_when_pid_file_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        agent_result::write_sequentagent_slot(
+            root,
+            9,
+            agent_result::SequentagentSlotKind::A,
+            AgentKind::Claude,
+        )
+        .unwrap();
+
+        let rendered = render_sequentagent_status(root).unwrap();
+
+        assert!(rendered.contains("starting"));
+        assert!(!rendered.contains("not running"));
+    }
+
+    /// No slot records at all → `None`, so `status` prints nothing extra for
+    /// the common (non-sequentagent) case.
+    #[test]
+    fn sequentagent_status_none_when_no_records() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(render_sequentagent_status(dir.path()).is_none());
     }
 
     /// 18b: persisting `monitor_pid` for one phase must not disturb a
