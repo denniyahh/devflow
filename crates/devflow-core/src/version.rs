@@ -889,4 +889,148 @@ mod tests {
              alongside [workspace.package] version, got: {contents}"
         );
     }
+
+    #[test]
+    fn write_version_no_ops_on_missing_workspace_dependencies_section() {
+        // 20a/empty: a workspace Cargo.toml with no [workspace.dependencies]
+        // section at all must not panic — the additive pass simply never
+        // matches and the file is otherwise rewritten normally.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace.package]\nversion = \"1.6.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        write_version(
+            dir.path(),
+            &Version {
+                major: 1,
+                minor: 7,
+                patch: 0,
+            },
+        )
+        .unwrap();
+        let contents = std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
+        assert_eq!(
+            contents,
+            "[workspace.package]\nversion = \"1.7.0\"\nedition = \"2024\"\n"
+        );
+    }
+
+    #[test]
+    fn write_version_no_ops_on_member_with_no_version_key() {
+        // 20a/empty: a [workspace.dependencies] entry with a local `path`
+        // but no `version` key at all is left unchanged — nothing to
+        // rewrite, and no panic.
+        let dir = tempfile::tempdir().unwrap();
+        let toml = "[workspace.package]\nversion = \"1.6.0\"\nedition = \"2024\"\n\n\
+             [workspace.dependencies]\n\
+             devflow-core = { path = \"crates/devflow-core\" }\n";
+        std::fs::write(dir.path().join("Cargo.toml"), toml).unwrap();
+        write_version(
+            dir.path(),
+            &Version {
+                major: 1,
+                minor: 7,
+                patch: 0,
+            },
+        )
+        .unwrap();
+        let contents = std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
+        assert!(
+            contents.contains("devflow-core = { path = \"crates/devflow-core\" }"),
+            "expected the version-less path member to be left byte-identical, got: {contents}"
+        );
+    }
+
+    #[test]
+    fn write_version_leaves_third_party_version_only_dep_untouched() {
+        // 20a/adjacency: a third-party version-only dep sitting adjacent to
+        // a local path member is left byte-for-byte unchanged — only the
+        // path member's version sub-value is rewritten.
+        let dir = tempfile::tempdir().unwrap();
+        let third_party_line = "serde = { version = \"1\", features = [\"derive\"] }";
+        let toml = format!(
+            "[workspace.package]\nversion = \"1.6.0\"\nedition = \"2024\"\n\n\
+             [workspace.dependencies]\n\
+             devflow-core = {{ path = \"crates/devflow-core\", version = \"1.6.0\" }}\n\
+             {third_party_line}\n"
+        );
+        std::fs::write(dir.path().join("Cargo.toml"), &toml).unwrap();
+        write_version(
+            dir.path(),
+            &Version {
+                major: 1,
+                minor: 7,
+                patch: 0,
+            },
+        )
+        .unwrap();
+        let contents = std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
+        assert!(
+            contents
+                .contains("devflow-core = { path = \"crates/devflow-core\", version = \"1.7.0\" }"),
+            "expected the local path member's version to be rewritten, got: {contents}"
+        );
+        assert!(
+            contents.contains(third_party_line),
+            "expected the third-party version-only dep to be byte-identical, got: {contents}"
+        );
+    }
+
+    #[test]
+    fn write_version_preserves_comment_and_quote_in_workspace_dependency_pin() {
+        // GAP-6, inline-table variant: a self-pin line with a trailing
+        // comment and single-quoted values keeps its comment and quote
+        // style after rewrite.
+        let dir = tempfile::tempdir().unwrap();
+        let toml = "[workspace.package]\nversion = \"1.6.0\"\nedition = \"2024\"\n\n\
+             [workspace.dependencies]\n\
+             devflow-core = { path = 'crates/devflow-core', version = '1.6.0' }  # pinned\n";
+        std::fs::write(dir.path().join("Cargo.toml"), toml).unwrap();
+        write_version(
+            dir.path(),
+            &Version {
+                major: 1,
+                minor: 7,
+                patch: 0,
+            },
+        )
+        .unwrap();
+        let contents = std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
+        assert!(
+            contents.contains(
+                "devflow-core = { path = 'crates/devflow-core', version = '1.7.0' }  # pinned"
+            ),
+            "expected single-quote style and trailing comment to survive the rewrite, got: {contents}"
+        );
+    }
+
+    #[test]
+    fn write_version_rewrites_self_pin_regardless_of_key_order() {
+        // review: inline-table key-order — the version sub-value is
+        // rewritten whether it appears BEFORE or AFTER path in the inline
+        // table; the replacement is anchored strictly to the path=/
+        // version= tokens, not a column offset.
+        let dir = tempfile::tempdir().unwrap();
+        let toml = "[workspace.package]\nversion = \"1.6.0\"\nedition = \"2024\"\n\n\
+             [workspace.dependencies]\n\
+             devflow-core = { version = \"1.6.0\", path = \"crates/devflow-core\" }\n";
+        std::fs::write(dir.path().join("Cargo.toml"), toml).unwrap();
+        write_version(
+            dir.path(),
+            &Version {
+                major: 1,
+                minor: 7,
+                patch: 0,
+            },
+        )
+        .unwrap();
+        let contents = std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
+        assert!(
+            contents
+                .contains("devflow-core = { version = \"1.7.0\", path = \"crates/devflow-core\" }"),
+            "expected version to be rewritten regardless of key order, got: {contents}"
+        );
+    }
 }
