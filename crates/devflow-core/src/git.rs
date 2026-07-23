@@ -675,6 +675,187 @@ fn topo_sort(names: Vec<String>, edges: Vec<(String, String)>) -> Vec<String> {
     result
 }
 
+// ---------------------------------------------------------------------------
+// tag-signing viability (20d, Pattern 4)
+// ---------------------------------------------------------------------------
+
+/// Pure classification of `ssh-add -l`'s exit code into an actionable
+/// signing-viability status. Isolated from any I/O so it can be
+/// unit-tested for all three documented exit codes without a live agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SigningStatus {
+    /// Exit 2 — no ssh-agent reachable (`SSH_AUTH_SOCK` unset or dead).
+    NoAgent,
+    /// Exit 1 — agent reachable but has no identities loaded.
+    AgentEmpty,
+    /// Exit 0 — agent has at least one key loaded (caller still must check
+    /// whether it's THIS key, via a fingerprint match).
+    KeysListed,
+    /// Any other exit code — genuinely unexpected; degrade rather than
+    /// crash or silently misclassify.
+    Unknown(i32),
+}
+
+/// Map `ssh-add -l`'s exit code to a [`SigningStatus`] (Pattern 4: exit
+/// 2 = no agent, 1 = agent-but-empty, 0 = keys listed).
+pub fn classify_ssh_add_status(exit_code: i32) -> SigningStatus {
+    match exit_code {
+        2 => SigningStatus::NoAgent,
+        1 => SigningStatus::AgentEmpty,
+        0 => SigningStatus::KeysListed,
+        other => SigningStatus::Unknown(other),
+    }
+}
+
+/// Outcome of the tag-signing viability check. Carries only a boolean-ish
+/// status plus an optional PUBLIC key fingerprint — never private key
+/// material or a full filesystem path (T-20-04, ASVS V6 / WR-02 — mirrors
+/// the existing "no path/username" discipline this project already applies
+/// elsewhere, e.g. `PhaseFinding`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SigningViability {
+    /// Signing is viable. `fingerprint` is the matched public key's
+    /// `SHA256:...` fingerprint, when one could be extracted.
+    Viable { fingerprint: Option<String> },
+    /// Not viable, with an actionable (never key-leaking) reason.
+    NotViable { reason: String },
+    /// Could not be determined — tool absent, format unset with no key,
+    /// etc. Fail-soft: never a crash.
+    Unknown { reason: String },
+}
+
+/// `git config --get <key>`, scoped to `project_root`. `None` if unset or
+/// the command fails (missing `git`, not a repo, etc.) — never panics.
+fn git_config(project_root: &Path, key: &str) -> Option<String> {
+    let output = Command::new("git")
+        .args(["config", "--get", key])
+        .current_dir(project_root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+/// `ssh-keygen -lf <pub_key_path>`'s fingerprint (`SHA256:...`) — reads only
+/// the PUBLIC key file, never a private key, and returns only the hash
+/// token, never a filesystem path.
+fn public_key_fingerprint(pub_key_path: &Path) -> Option<String> {
+    let path_str = pub_key_path.to_str()?;
+    let output = Command::new("ssh-keygen")
+        .args(["-lf", path_str])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    // Format: "<bits> SHA256:<hash> <comment> (<type>)"
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .nth(1)
+        .map(str::to_string)
+}
+
+/// `gpg.format == "ssh"` branch (Pattern 4): `user.signingkey` must be set
+/// and the key file must exist, then `ssh-add -l`'s exit code determines
+/// viability. On a match, only the PUBLIC key's fingerprint is reported —
+/// never the configured key's filesystem path.
+fn check_ssh_signing_viability(project_root: &Path) -> SigningViability {
+    let Some(signingkey) = git_config(project_root, "user.signingkey") else {
+        return SigningViability::NotViable {
+            reason: "gpg.format=ssh but user.signingkey is not set".into(),
+        };
+    };
+    let key_path = Path::new(&signingkey);
+    if !key_path.exists() {
+        return SigningViability::NotViable {
+            reason: "user.signingkey is set but the key file does not exist".into(),
+        };
+    }
+
+    let output = match Command::new("ssh-add").arg("-l").output() {
+        Ok(out) => out,
+        Err(_) => {
+            return SigningViability::Unknown {
+                reason: "cannot verify signing viability — ssh-add not found".into(),
+            };
+        }
+    };
+    let exit_code = output.status.code().unwrap_or(-1);
+    match classify_ssh_add_status(exit_code) {
+        SigningStatus::NoAgent => SigningViability::NotViable {
+            reason: "no ssh-agent reachable (SSH_AUTH_SOCK unset or dead)".into(),
+        },
+        SigningStatus::AgentEmpty => SigningViability::NotViable {
+            reason: "ssh-agent reachable but has no identities loaded".into(),
+        },
+        SigningStatus::KeysListed => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            match public_key_fingerprint(key_path) {
+                Some(fingerprint) if stdout.contains(&fingerprint) => SigningViability::Viable {
+                    fingerprint: Some(fingerprint),
+                },
+                Some(_) => SigningViability::NotViable {
+                    reason: "ssh-agent has keys loaded, but not the configured signing key".into(),
+                },
+                None => SigningViability::Unknown {
+                    reason: "cannot verify signing viability — ssh-keygen not found or the key \
+                             is unreadable"
+                        .into(),
+                },
+            }
+        }
+        SigningStatus::Unknown(code) => SigningViability::Unknown {
+            reason: format!("ssh-add -l exited with an unexpected code {code}"),
+        },
+    }
+}
+
+/// `gpg.format` unset or `"openpgp"` branch (Pattern 4): verify a secret
+/// key exists for `user.signingkey` via `gpg --list-secret-keys`.
+fn check_gpg_signing_viability(project_root: &Path) -> SigningViability {
+    let Some(signingkey) = git_config(project_root, "user.signingkey") else {
+        return SigningViability::Unknown {
+            reason: "cannot verify signing viability — user.signingkey is not set".into(),
+        };
+    };
+    let output = match Command::new("gpg")
+        .args(["--list-secret-keys", &signingkey])
+        .output()
+    {
+        Ok(out) => out,
+        Err(_) => {
+            return SigningViability::Unknown {
+                reason: "cannot verify signing viability — gpg not found".into(),
+            };
+        }
+    };
+    if output.status.success() {
+        SigningViability::Viable {
+            fingerprint: Some(signingkey),
+        }
+    } else {
+        SigningViability::NotViable {
+            reason: "no secret key found for the configured user.signingkey".into(),
+        }
+    }
+}
+
+/// Tag-signing viability check (20d): branches on `git config gpg.format`
+/// since the check is a genuinely different code path per format — a
+/// GPG-only check would miss the `ssh_askpass` failure this project's own
+/// release actually hit (Pattern 4). Fail-soft throughout: an absent tool
+/// or unset config degrades to an actionable [`SigningViability::Unknown`],
+/// never a crash.
+pub fn check_signing_viability(project_root: &Path) -> SigningViability {
+    match git_config(project_root, "gpg.format").as_deref() {
+        Some("ssh") => check_ssh_signing_viability(project_root),
+        _ => check_gpg_signing_viability(project_root),
+    }
+}
+
 /// Run a git command in an arbitrary directory (e.g. a worktree).
 fn git_in(dir: &Path, args: &[&str]) -> Result<(), GitError> {
     debug!("git (in {}) {}", dir.display(), args.join(" "));
@@ -1408,5 +1589,57 @@ mod tests {
         let head_sha = String::from_utf8_lossy(&head.stdout).trim().to_string();
         git(root, &["update-ref", "refs/remotes/origin/main", &head_sha]);
         assert_eq!(origin_main_ancestor_status(root), AncestorStatus::Ancestor);
+    }
+
+    // -----------------------------------------------------------------
+    // 20d: signing-viability helpers
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn classify_ssh_add_status_maps_all_three_documented_exit_codes() {
+        assert_eq!(classify_ssh_add_status(2), SigningStatus::NoAgent);
+        assert_eq!(classify_ssh_add_status(1), SigningStatus::AgentEmpty);
+        assert_eq!(classify_ssh_add_status(0), SigningStatus::KeysListed);
+        assert_eq!(classify_ssh_add_status(7), SigningStatus::Unknown(7));
+    }
+
+    /// Guards tests that temporarily override the process-global `HOME`
+    /// env var (same idiom as `config.rs`'s test-local `ENV_MUTEX`) — this
+    /// project's own dev machine sets `gpg.format=ssh` / `user.signingkey`
+    /// GLOBALLY (the exact Pattern 4 research finding), so a hermetic test
+    /// of the "unset" branch must isolate `$HOME/.gitconfig`, not just the
+    /// repo-local config.
+    static HOME_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn check_signing_viability_degrades_when_gpg_format_unset_and_no_signingkey() {
+        // 20d/empty: no gpg.format, no user.signingkey — must degrade to an
+        // actionable message, never panic.
+        let _lock = HOME_ENV_MUTEX.lock().unwrap();
+        let repo = init_repo();
+        let root = repo.path();
+        let fake_home = tempfile::tempdir().unwrap();
+        let original_home = std::env::var_os("HOME");
+        // SAFETY: serialized under HOME_ENV_MUTEX; restored below before
+        // the guard drops.
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+        let result = check_signing_viability(root);
+
+        // SAFETY: still serialized under HOME_ENV_MUTEX.
+        match original_home {
+            Some(home) => unsafe { std::env::set_var("HOME", home) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        match result {
+            SigningViability::Unknown { reason } => {
+                assert!(
+                    reason.contains("user.signingkey"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("expected Unknown (fail-soft), got: {other:?}"),
+        }
     }
 }

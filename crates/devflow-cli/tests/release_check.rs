@@ -11,11 +11,23 @@ fn devflow_bin() -> &'static str {
     env!("CARGO_BIN_EXE_devflow")
 }
 
+/// Runs `devflow release <args> <project>` with an ISOLATED `HOME` (a fresh
+/// empty directory, no `.gitconfig`) and no inherited `SSH_AUTH_SOCK`/
+/// `SSH_AGENT_PID` — the signing-viability check (Task 3) reads
+/// `git config gpg.format`/`user.signingkey`, which git resolves through
+/// the OPERATOR's global `~/.gitconfig` even inside a throwaway fixture
+/// repo. Without this isolation, these tests would be non-deterministic on
+/// any machine whose global config sets `gpg.format=ssh` (this project's
+/// own dev machine does — the exact Pattern 4 research finding).
 fn run_release(project: &Path, args: &[&str]) -> Output {
+    let isolated_home = tempfile::tempdir().unwrap();
     Command::new(devflow_bin())
         .arg("release")
         .args(args)
         .arg(project)
+        .env("HOME", isolated_home.path())
+        .env_remove("SSH_AUTH_SOCK")
+        .env_remove("SSH_AGENT_PID")
         .output()
         .expect("spawn devflow release")
 }
@@ -230,5 +242,118 @@ fn release_check_states_publish_order() {
         stdout.contains("devflow-core -> devflow") && !stdout.contains("devflow -> devflow-core"),
         "expected the publish order to state devflow-core before devflow, got: {stdout}\nstderr: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Task 3 (T-20-04, ASVS V6 / WR-02): the signing-viability check's
+/// rendered output must never contain private-key material or a full
+/// filesystem path — a REAL disposable ed25519 keypair (private + public)
+/// is written directly inside the fixture, proving the check never echoes
+/// either, regardless of what's sitting alongside the public key on disk.
+/// `SSH_AUTH_SOCK` is removed (via `run_release`'s isolation) so this
+/// resolves deterministically to the "no ssh-agent reachable" branch
+/// rather than depending on any locally running agent.
+#[test]
+fn release_check_signing_output_leaks_no_key_material_or_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_repo(root);
+    commit(root, "base.txt");
+    git(root, &["config", "gpg.format", "ssh"]);
+
+    let key_path = root.join("release-signing-key");
+    let keygen = Command::new("ssh-keygen")
+        .args([
+            "-t",
+            "ed25519",
+            "-f",
+            key_path.to_str().unwrap(),
+            "-N",
+            "",
+            "-q",
+        ])
+        .output()
+        .expect("spawn ssh-keygen");
+    assert!(
+        keygen.status.success(),
+        "ssh-keygen fixture setup failed: {}",
+        String::from_utf8_lossy(&keygen.stderr)
+    );
+    let pub_key_path = root.join("release-signing-key.pub");
+    git(
+        root,
+        &["config", "user.signingkey", pub_key_path.to_str().unwrap()],
+    );
+
+    let output = run_release(root, &["--check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        !stdout.contains("PRIVATE KEY"),
+        "signing check output must never contain private key material, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains(root.to_str().unwrap()),
+        "signing check output must never contain a full filesystem path, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("panicked"),
+        "signing check must never panic, got: {stdout}"
+    );
+}
+
+/// A `PATH` containing ONLY a symlink to the real `git` binary — unlike a
+/// bare directory restriction (e.g. `/usr/bin`), this guarantees `ssh-add`/
+/// `ssh-keygen` are genuinely absent regardless of the host (some distros,
+/// including this one, ship both alongside `git` in `/usr/bin`).
+fn git_only_path() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let which = Command::new("which")
+        .arg("git")
+        .output()
+        .expect("locate git via `which`");
+    assert!(which.status.success(), "`which git` failed");
+    let real_git = String::from_utf8_lossy(&which.stdout).trim().to_string();
+    std::os::unix::fs::symlink(real_git, dir.path().join("git"))
+        .expect("symlink git into the minimal PATH fixture");
+    dir
+}
+
+/// Task 3 fail-soft edge (20d/empty): `ssh-add` itself is unavailable. The
+/// check must degrade to an actionable message, never crash.
+#[test]
+fn release_check_signing_degrades_when_ssh_add_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_repo(root);
+    commit(root, "base.txt");
+    git(root, &["config", "gpg.format", "ssh"]);
+    let key_path = root.join("fake-signing-key.pub");
+    std::fs::write(&key_path, "ssh-ed25519 AAAAfixture placeholder\n").unwrap();
+    git(
+        root,
+        &["config", "user.signingkey", key_path.to_str().unwrap()],
+    );
+
+    let isolated_home = tempfile::tempdir().unwrap();
+    let path_dir = git_only_path();
+    let output = Command::new(devflow_bin())
+        .arg("release")
+        .arg("--check")
+        .arg(root)
+        .env("HOME", isolated_home.path())
+        .env("PATH", path_dir.path())
+        .output()
+        .expect("spawn devflow release");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("ssh-add not found"),
+        "expected a fail-soft 'tool not found' message, got: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !stdout.contains("panicked"),
+        "must not panic, got: {stdout}"
     );
 }

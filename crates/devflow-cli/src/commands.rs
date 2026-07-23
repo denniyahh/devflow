@@ -1285,6 +1285,7 @@ pub(crate) fn release_check(project_root: &Path) -> Result<(), CliError> {
         check_self_pin(project_root),
         check_divergence(project_root),
         check_publish_order(project_root),
+        check_signing(project_root),
     ];
 
     let mut failed = false;
@@ -1428,6 +1429,37 @@ fn check_publish_order(project_root: &Path) -> Check {
         status: "ok".into(),
         version: Some(format!("publish in order: {}", order.join(" -> "))),
         install_hint: None,
+    }
+}
+
+/// Tag-signing viability check (20d, Pattern 4): `gpg.format`-aware,
+/// fail-soft, and reports only boolean viability + an optional PUBLIC key
+/// fingerprint — never private key material or a full filesystem path
+/// (T-20-04, ASVS V6 / WR-02).
+fn check_signing(project_root: &Path) -> Check {
+    const NAME: &str = "tag-signing viability";
+    match devflow_core::git::check_signing_viability(project_root) {
+        devflow_core::git::SigningViability::Viable { fingerprint } => Check {
+            name: NAME.into(),
+            status: "ok".into(),
+            version: Some(match fingerprint {
+                Some(fp) => format!("signing viable ({fp})"),
+                None => "signing viable".into(),
+            }),
+            install_hint: None,
+        },
+        devflow_core::git::SigningViability::NotViable { reason } => Check {
+            name: NAME.into(),
+            status: "fail".into(),
+            version: Some(reason),
+            install_hint: Some("resolve before attempting the signed release tag".into()),
+        },
+        devflow_core::git::SigningViability::Unknown { reason } => Check {
+            name: NAME.into(),
+            status: "warn".into(),
+            version: Some(reason),
+            install_hint: None,
+        },
     }
 }
 

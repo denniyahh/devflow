@@ -232,10 +232,11 @@ enum Command {
         project: PathBuf,
     },
     /// Read-only release-cut preflight: self-pin, develop/main divergence,
-    /// crates.io publish order, and tag-signing viability (20d). Ceiling is
-    /// `--check` only — this command never runs the actual merge/tag/sync/
-    /// publish sequence, which is a deferred, not-yet-built executor
-    /// (DEN-50).
+    /// crates.io publish order, and tag-signing viability.
+    ///
+    /// Ceiling is `--check` only (20d) — this command never runs the actual
+    /// merge/tag/sync/publish sequence, which is a deferred, not-yet-built
+    /// executor (DEN-50).
     Release {
         /// Run the read-only preflight checks. Required: a bare `devflow
         /// release` (omitted `--check`) is rejected rather than silently
