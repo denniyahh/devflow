@@ -1,6 +1,7 @@
 ---
 phase: 21
-reviewers: [codex, opencode]
+reviewers: [codex, opencode, hermes]
+hermes_model: deepseek-v4-pro
 dropped_reviewers: [cursor, antigravity]
 reviewed_at: "2026-07-23"
 plans_reviewed: [21-01-PLAN.md, 21-02-PLAN.md, 21-03-PLAN.md, 21-04-PLAN.md]
@@ -336,35 +337,191 @@ The plans achieve the phase goal: every unit is operator-facing, reversible or d
 
 ---
 
-## Consensus Summary
+## Hermes Review (deepseek-v4-pro)
 
-Two independent source-grounded reviewers (Codex, OpenCode) both traced every claim to `file:line` and both rate the phase **overall LOW–MEDIUM risk with zero blockers** — the plans are executable. `21-03` is the plan both weight highest-risk; `21-02` and `21-04` each carry one real design gap they independently found.
+> Third independent lane, run via the Hermes review adapter (`hermes chat -Q -q`). Backed by **deepseek-v4-pro** — a distinct model family from Codex (OpenAI) and OpenCode (Copilot), so a genuinely independent third voice, not a same-family echo.
 
-### Agreed Strengths (2+ reviewers)
+deepseek.
+Now I have all the source-verified evidence. Here's the review:
 
-- **21-01 is precise and correct.** Both confirmed against source: the change is the single strict-ancestor line (`staleness.rs:56`), `affects_compiled_binary` is the right predicate to reuse, and **both** regressing fixtures (`wr01`'s `b.txt`, `init_repo_with_diverged_commit`'s `trunk2.txt`) are real and correctly flagged. The block-message reword is warranted.
-- **21-02's `gate show` + rate-limit surfacing are correct and presentation-only** — `gate_respond`'s auto-resolve is the right analog; `CronInstructions.retry_after` (`ship.rs:20`) is already populated and just unprinted.
-- **21-03's core design is right** — third `doctor --json` key (WR-01 preserved), a new `PlanningDocFinding` sibling type (shipped phases have no active `PhaseFacts`), and the pre-v1.5.0 noise-scoping — the single most important 21b decision — is explicit, not hand-waved.
-- **21-04 correctly avoids `State`/`save_state`** (D-14, source-backed at `parallel.rs:4-7`), follows the `agent_result.rs` path convention, and enforces WR-02 path-free records.
-- **Wave sequencing (21d→21a→21b→21c) is load-bearing and correctly reasoned** — 21d leads to unblock the phase's own stages; the other three serialize on `commands.rs`.
+---
 
-### Agreed Concerns (2+ reviewers — highest priority)
+# Cross-AI Plan Review: Phase 21 — Operator Legibility & Observability
 
-1. **[21-02, MEDIUM] In-stage progress uses `started_at`, which is phase-start, not stage-entry.** Both flagged it (Codex MEDIUM, OpenCode LOW). `State.started_at` is set once in `State::new` and never reset on `transition`, so "elapsed-in-stage" would actually display phase age — misleading. **Fix:** label it "phase age", or derive real stage age from the latest `stage_launched` event.
-2. **[21-04, MEDIUM] Slot record is only cleared on the success path.** Both flagged it. `sequentagent`'s agent-A/B failure returns bypass the clear call, so a failed run leaves a stale "agent B running" record that `status` then reports as live. **Fix:** clear on **all** terminal paths (a `Drop`/cleanup guard before the early returns).
-3. **[21-03, MEDIUM→HIGH] The detector is too narrow / has a fragile reachability ref** — the highest-risk item, flagged by both on different axes:
-   - *Codex (HIGH):* it only reads ROADMAP `## Shipped` + STATE `## Completed`, so it misses cross-document drift — e.g. the ROADMAP milestone table lists Phase 19 @ 1.6.0 while `## Shipped` omits Phase 19; a tag check over only present rows reports "consistent."
-   - *Codex (MEDIUM):* the v1.5.0 cutoff must be **numeric semver**, not string compare (`v1.10.0` breaks lexicographically).
-   - *OpenCode (MEDIUM):* reachability is checked against `main`, which may be origin-only; `doctor` deliberately avoids network, so `git merge-base --is-ancestor <tag> main` could spuriously report every tag "unreachable." Use `develop`, or degrade gracefully.
+**Reviewer:** Hermes (deepseek-v4-pro)
+**Date:** 2026-07-23
+**Source verification:** Every claim below traced against actual source at `/var/home/denniyahh/Github/devflow` HEAD.
 
-### Divergent / single-reviewer (worth folding in)
+---
 
-- **[21-01, LOW — OpenCode]** the "fail-closed to Stale on git error" behavior is stated but untested — add a git-failure-smoke test. (Codex independently suggested the same fail-closed default, so partial agreement.)
-- **[21-04, MEDIUM — Codex only]** pid-race: the monitor writes the agent pid file asynchronously, so a just-launched agent can briefly show "not running"; use `monitor::wait_for_agent_pid` or render a `starting` state.
-- **[21-04, LOW — Codex only]** use `workflow::ensure_devflow_dir` (which handles `.gitignore` hygiene) rather than `agent_result`'s private `devflow_dir` path-only helper.
-- **[21-04, LOW — both, mild]** type the slot as an enum (`A`/`B`) instead of `&str` to remove typo risk at the two call sites.
-- **[21-02, LOW]** assert the new `gate show` call site uses `usize::MAX` (not just that `gate_list` still uses `100`).
+## Overall Assessment
+
+**Verdict: APPROVE with one MEDIUM concern on 21-02 and a LOW-MEDIUM concern on 21-04.**
+
+The four plans form a coherent, well-scoped phase. Wave ordering (21d→21a→21b→21c) is sound and load-bearing: 21d's dogfood guard must land first or this phase's own Plan/Code/Validate stages will hard-block after every `.planning/` commit. The zero-file-overlap constraint on `commands.rs` (21-02, 21-03, 21-04) is correctly enforced via wave serialization. Every plan stays within D-02's reversible/detection-only boundary. The RESEARCH.md's three critical pitfalls are all correctly addressed in the respective plans.
+
+**Two issues need attention before execution:**
+1. 21-02's in-stage progress line will mislead — `State.started_at` is phase-level, not stage-level.
+2. 21-04's slot record is not cleared on five error-exit paths in `sequentagent`.
+
+---
+
+## 21-01-PLAN.md — Content-aware staleness guard (21d)
+
+### Summary
+Narrows `embedded_commit_is_stale`'s strict-ancestor arm to be content-aware: runs `git diff --name-only <embedded> HEAD`, filters through the existing `affects_compiled_binary`, returns `Fresh` for docs-only ranges, `Stale` only when a build input changed. Two tasks: (1) core narrowing + `docs_only_range_is_fresh` test, (2) repair two now-broken fixtures + `mixed_range_docs_and_source_is_stale` test + block-message reword.
+
+### Strengths
+- **Precise surgical scope.** The plan targets the EXACT single line to change: `staleness.rs:56` (`Some(_) => Staleness::Stale`) inside the `Ok(Some(0))` arm. I verified the surrounding code — the `Ok(Some(1))` reverse-probe arm (lines 63-72) and `Indeterminate` fallbacks are in separate match branches and remain byte-identical.
+- **Both regression fixtures correctly identified.** `wr01_clean_tree_strict_ancestor_build_is_stale_and_hard_blocks` at line 780 writes `b.txt` (non-build file → flips to `Fresh`). `init_repo_with_diverged_commit` at line 693 writes `trunk2.txt` (non-build file → the `base → Stale` assertion at line 721 flips). Both are named and their exact repair (retarget to `.rs` file) is specified.
+- **`affects_compiled_binary` reuse** is explicit and correct. I verified the predicate at `staleness.rs:146` matches `.rs`, `Cargo.toml`, `Cargo.lock`, `build.rs`, `rust-toolchain.toml` — `b.txt` and `trunk2.txt` are correctly excluded.
+- **Fail-toward-Stale semantics** on git error: the `ancestry_range_affects_build` helper returns `true` on any git failure, so a transient error never yields a false `Fresh`. Correct safety posture.
+
+### Concerns
+- **None.** The plan is the most precise and well-verified of the four. RESEARCH Pitfall #1's warning about the WR-01 fixture flip is addressed down to the exact line numbers.
+
+### Suggestions
+- The `enforce_build_staleness` block-message reword is described but no specific text is proposed. Given the plan says "describe instead that a build-relevant file changed since the build (or the commit is not an ancestor at all)", the implementer should ensure both branches of the message (ancestor-with-build-change vs non-ancestor) are distinct. The current message asserts "is not an ancestor" unconditionally — the new message needs a conditional or two branches.
+
+### Risk: LOW
+The change is a one-line logic gate + a helper function + fixture edits. Every affected line is named. Fallback safety (fail toward `Stale`) preserves the existing hard-block guarantee.
+
+---
+
+## 21-02-PLAN.md — Operator discoverability (21a)
+
+### Summary
+Four additive UX gaps: `gate show <phase>`, rate-limit reset time in `status`, in-stage progress line, recovery-verb hints from stuck state. Three tasks over `main.rs` and `commands.rs`.
+
+### Strengths
+- **Flag surface decision is correct.** Positional `phase` + `--stage` mirrors `GateCmd::Approve`'s existing convention (line 285: `phase: u32`). The plan simplifies by omitting `Approve`'s legacy `stage`/`legacy_project` positional ambiguity. Clean.
+- **`gate_respond` auto-resolve pattern reuse** (lines 686-710) is verified as the correct precedent — it already handles `[]`/`[one]`/`many` gate resolution.
+- **`render_gate_context` sanitization** (line 305 in `pipeline_outcomes.rs`) handles control characters — using `usize::MAX` gives untruncated-but-safe output. Correct.
+- **Zero new rate-limit detection.** `CronInstructions.retry_after` (ship.rs:20) is already populated. `cron_instruction_hints` at commands.rs:893 ignores it — the plan correctly identifies this as a presentation-only fix.
+- **`recovery_hints` extraction** into a pure, testable function: `gate_pending` → `advance` hint; `Stuck` → always `resume` hint; `Healthy` → empty. Reasonable design.
+
+### Concerns
+
+- **MEDIUM: In-stage progress line is misleading.** The plan says "elapsed time in the current stage" and proposes reusing `format_age(&state.started_at)`. But `State.started_at` (line 57, documented as "When the phase started (Unix seconds)") is **phase-level**, not stage-level. There is no `stage_started_at` field. The displayed time will be "elapsed since phase start", not "elapsed in current stage" — potentially hours off for a long-running phase. Adding a per-stage timestamp would require a new `#[serde(default)]` field in `State` plus a write in `transition()`. The plan does not acknowledge this gap.
+  - **Recommendation:** Either (a) add a `stage_started_at: Option<String>` field to `State` (set in `transition()`, default `None` for backward compat) and use that, or (b) label the line honestly: "elapsed: {age}" rather than "in stage {stage}: {age}". Option (b) is simpler and still improves legibility.
+
+### Suggestions
+- `recovery_hints` only checks `state.gate_pending` for the `advance` hint. A stuck phase at Preflight/Plan has no gate pending — `advance` is still the correct verb but won't be shown. This is defensible (the gate-pending case is the main footgun), but flagging it for operator awareness.
+
+### Risk: MEDIUM
+The stage-progress issue could erode trust in `status` output if operators notice the counter doesn't reset on stage transitions. Fixable by relabeling the line or adding a minimal state field.
+
+---
+
+## 21-03-PLAN.md — Doctor planning-doc staleness (21b)
+
+### Summary
+Adds a detection-only `doctor` check comparing `ROADMAP.md`/`STATE.md` version claims against git tag existence + reachability from `main`. Two tasks: (1) detection core (parse, tag lookup, finding production), (2) wiring into `doctor()` text + `doctor_json_body()` third key.
+
+### Strengths
+- **`doctor_json_body` extension** is correct: third top-level key `planning_doc_staleness` in the existing single-object JSON (line 1866: `{\"environment\", \"reconciliation\"}`). No second array. WR-01 discipline preserved.
+- **Legacy noise mitigation** (RESEARCH Pitfall #2) is fully addressed: regex `^v?\d+\.\d+\.\d+$` filters out ranges/em-dashes; pre-v1.5.0 mismatches downgraded to `Warn`; unparseable rows skipped. This is the exact correct scope.
+- **`main` branch exists locally** — verified via `git branch -a`. Tag reachability check (`merge-base --is-ancestor <tag> main`) is valid.
+- **Tag normalization** (`1.7.0` → `v1.7.0`): verified that real git tags carry `v` prefix (e.g. `v1.7.0`) while table cells are bare. The plan's "add `v` prefix if missing" is correct and conditional (no double-prefix).
+- **New sibling `PlanningDocFinding` type** (not `PhaseFinding`) is the right call per RESEARCH Open Q1: shipped phases have no active `PhaseFacts`. Separate key under `doctor_json_body` avoids forcing document-level facts through the per-phase reconciliation pipeline.
+
+### Concerns
+- **LOW: `git merge-base --is-ancestor <tag> main`** — if `main` is ever force-pushed, a previously-reachable tag could become orphaned. The check would correctly flag this (unreachable → finding), which is what it SHOULD do for a detection-only tool. Not a bug, just noting the behavior is correct for the stated goal.
+- **LOW: The plan says the cutoff is "fixed `v1.5.0`"** which is the first consistently-tagged release. This is reasonable but will need updating if the project's release discipline changes. Document the assumption in a code comment.
+
+### Suggestions
+- Consider testing the case where `main` is NOT checked out locally (e.g., detached HEAD). `git merge-base --is-ancestor v1.7.0 main` works regardless of current checkout as long as the `main` ref exists.
+
+### Risk: LOW
+Well-scoped, noise-mitigated, detection-only. The parse design handles all known edge cases in the real `ROADMAP.md`/`STATE.md` tables.
+
+---
+
+## 21-04-PLAN.md — sequentagent second-process tracking (21c)
+
+### Summary
+Gives `sequentagent`'s agents a slot record (A/B + AgentKind) in a per-phase file, surfaced in `status`. Two tasks: (1) data model + write/clear wiring in `agent_result.rs` and `parallel.rs`, (2) status surfacing in `commands.rs`.
+
+### Strengths
+- **Correct avoidance of State/save_state.** Phase 19 D-14 (synthetic, never-persisted state) is explicitly honored. The slot record is a standalone sibling file at `.devflow/phase-NN-sequentagent`, not routed through `workflow::save_state`.
+- **Path-naming convention** follows `agent_pid_path` (agent_result.rs:893): `devflow_dir(project_root).join(format!("phase-{:02}-sequentagent", phase))`. Consistent.
+- **WR-02 compliance:** record stores only slot letter + agent kind — no paths/usernames. Verified the plan explicitly prohibits this.
+- **Narrow reading documented.** The plan states the tradeoff: status-only (not `doctor`), agent A is incidentally covered by the slot labeling, and the decision is flagged at plan time per D-06.
+- **Stale-record safety:** `render_sequentagent_status` cross-references liveness via `agent::agent_running(pid)`. A stuck slot record with a dead pid renders "not running", never a false live agent. Correct.
+
+### Concerns
+
+- **LOW-MEDIUM: Slot record not cleared on error-exit paths.** I traced `sequentagent` (parallel.rs:278-401) and found five early-return paths where the slot record is written but never cleared:
+
+  1. **Agent A Failed** (line 340-345): `return Err(...)` — slot A written, not cleared.
+  2. **Agent A RateLimited, zero commits** (line 350-355): `return Ok(())` — slot A written, not cleared.
+  3. **Rebase B onto base fails** (line 365-371): `?` propagates — slot A written, slot B never written, slot A not cleared.
+  4. **Agent B Failed/RateLimited** (line 376-391): `return Err(...)` — slot B written, not cleared.
+  5. **Agent B integrate fails** (line 392): `?` propagates — slot B written, not cleared.
+
+  The plan only places `clear_sequentagent_slot` at the success path (next to `delete_cron_instructions` at line 396). While the liveness check in `status` makes stale records *harmless* (dead pid → "not running"), they accumulate in `.devflow/` until the phase is re-run. This is a cleanliness/operator-confusion concern, not a correctness bug.
+
+  - **Recommendation:** At minimum, add a comment in the plan acknowledging stale records on error paths are acceptable (liveness-verified). Better: add `clear_sequentagent_slot` calls to the error-return paths, or move the clear into a defer/drop-style pattern.
+
+### Suggestions
+- The plan says "surface in `status` (the live-observability command); `doctor` integration is deliberately NOT included." The rationale (WR-01 human/json consistency) is sound. Consider adding a code comment at the `doctor` call site explaining the deliberate omission so a future contributor doesn't "fix" it.
+
+### Risk: LOW-MEDIUM
+The error-path slot leakage is a real gap, but mitigated by liveness verification in status rendering. The core design (path-free record, no State involvement, slot-overwrite semantics) is solid.
+
+---
+
+## Cross-Cutting Observations
+
+### Wave ordering: SOUND
+21d first (unblocks this phase's own stages), then 21a/21b/21c serialized on `commands.rs` zero-file-overlap. RESEARCH D-07 sequencing is correctly encoded.
+
+### Scope fence: CLEAN
+No plan touches 999.25 (release executor), 999.28 (`--base`), or 21e (changelog content). All four plans stay within D-02's reversible/detection-only boundary.
+
+### Test coverage: ADEQUATE
+Every plan includes TDD tasks with specific test names, acceptance criteria, and verification commands. The RESEARCH Pitfall #1 warning (WR-01 fixture must be edited, not left as-is) is explicitly addressed in 21-01 Task 2. RESEARCH Pitfall #2 (legacy row noise) is explicitly addressed in 21-03 Task 1.
+
+### Dependency verification: NO NEW DEPS
+All four plans use only existing workspace dependencies. Verified against `crates/devflow-core/Cargo.toml` and `crates/devflow-cli/Cargo.toml`.
+
+---
+
+## Summary Table
+
+| Plan | Unit | Risk | Key Concern |
+|------|------|------|-------------|
+| 21-01 | 21d — staleness content-awareness | **LOW** | None — precise, well-verified |
+| 21-02 | 21a — operator discoverability | **MEDIUM** | `State.started_at` is phase-level, not stage-level; progress line will mislead |
+| 21-03 | 21b — doctor planning-doc staleness | **LOW** | Tag reachability ref against `main` is correct; noise mitigation verified |
+| 21-04 | 21c — sequentagent slot tracking | **LOW-MEDIUM** | Slot record leaked on 5 error-exit paths; harmless but accumulates |
+
+**Bottom line:** Approve for execution. Fix the 21-02 progress-line labeling (or add `stage_started_at` to `State`). Document the 21-04 error-path slot leakage as acceptable (liveness-verified) or add cleanup.
+
+---
+
+## Consensus Summary (3 independent reviewers)
+
+Three source-grounded reviews from three distinct model families — **Codex (OpenAI), OpenCode (Copilot), Hermes (deepseek-v4-pro)**. All three traced claims to `file:line`; all three return **0 blockers** and approve for execution. The third lane did more than add a vote: combined with source re-verification, it **resolved the phase's highest-rated risk** and clarified a severity.
+
+### Unanimous strengths (3/3)
+- **21-01 is precise/correct** — the single-line change at `staleness.rs:56`, `affects_compiled_binary` reuse, both regression fixtures (`b.txt`, `trunk2.txt`) correctly flagged, fail-toward-Stale on git error. All three rate it LOW, no concerns.
+- **Wave ordering 21d→21a→21b→21c** is load-bearing and correctly reasoned (21d unblocks the phase's own stages; 21a/b/c serialize on `commands.rs`).
+- **Scope fence clean** — no 999.25/999.28/21e; all reversible/detection-only; no new dependencies.
+- **21-03 core shape right** — third `doctor --json` key (WR-01), `PlanningDocFinding` sibling type, pre-v1.5.0 noise scoping.
+- **21-04 correctly avoids `State`/`save_state`** (D-14), path-free record (WR-02), `agent_result.rs` naming convention.
+
+### Unanimous concerns (3/3 — the actual fix list)
+1. **[21-02, MEDIUM] In-stage progress uses `State.started_at`, which is phase-level, not stage-level.** Flagged by all three. It would render phase age labeled as stage progress. **Fix:** relabel to "phase age", or add a `stage_started_at` to `State` / derive stage age from the latest `stage_launched` event.
+2. **[21-04, LOW–MEDIUM] Slot record not cleared on `sequentagent`'s error-exit paths.** All three flagged it; Hermes enumerated **five** (agent-A fail; agent-A rate-limit/zero-commit; rebase-B fail; agent-B fail/rate-limit; integrate-B fail). **Severity clarified by Hermes + source:** the plan's `status` rendering already probes `agent::agent_running(pid)` (`21-04-PLAN.md:120,150`), so a stale record with a dead pid renders "not running" — **not** a false "live agent" (Codex/OpenCode's original framing). The real issue is **clutter accumulation in `.devflow/`**, not false liveness. **Fix:** clear on all terminal paths (Drop/cleanup guard), or document the leak as acceptable.
+
+### Divergence on 21-03 — RESOLVED by the third review + source check
+The two-reviewer pass rated 21-03 the phase's highest risk. The third lane, plus source verification, flipped that:
+- **OpenCode (MEDIUM): "reachability against `main` may be origin-only → every `doctor` run spuriously flags tags unreachable." → REFUTED.** `main` **is** a local branch here (`git branch --list main`), and `git merge-base --is-ancestor v1.7.0 main` succeeds offline. Hermes independently verified it. Dismissed — this was the scariest concern (a spurious-flood on every run) and it does not apply.
+- **Codex (MEDIUM): "v1.5.0 cutoff needs numeric semver, not string compare (`v1.10.0` breaks lexicographically)." → STANDS.** The plan states "≥ v1.5.0" without specifying numeric-tuple comparison (`21-03-PLAN.md:88`). One-line fix.
+- **Codex (HIGH): "detector reads only `## Shipped` + `## Completed`, missing the ROADMAP milestone table." → STANDS as a coverage enhancement, not a live bug.** Confirmed the plan scopes only those two tables (`21-03-PLAN.md:24,38,65`); it wouldn't catch drift appearing only in the milestone table. No current drift there, so it's a breadth improvement, not urgent.
+- **Hermes (LOW):** rates 21-03 well-scoped and noise-mitigated.
+- **Net:** 21-03 is **lower risk than the two-reviewer consensus implied.** The spurious-flood concern is refuted; what remains is a numeric-semver nicety and an optional cross-table breadth improvement.
 
 ### Verdict
-
-**No blockers. Proceed — but a targeted revision on 21-03 (and secondarily 21-04) is worthwhile before execution.** The consensus items map cleanly onto a `/gsd-plan-phase 21 --reviews` pass: broaden 21-03's detector to compare across all three version tables + numeric-semver cutoff + `develop`/graceful reachability; clear 21-04's slot on all exit paths; relabel/rederive 21-02's progress; add 21-01's git-error test. None expand scope or touch the phase's reversible/detection-only boundary.
+**No blockers; approve for execution.** The genuine must-fix set is two cheap items — 21-02's progress label and 21-04's error-path slot clear (or a documented-acceptable note). 21-03's remaining items (numeric semver; optional cross-table scope) are nice-to-haves. All map onto a light `/gsd-plan-phase 21 --reviews` pass; none touch the phase's reversible/detection-only boundary.
