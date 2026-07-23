@@ -894,6 +894,99 @@ pub fn agent_pid_path(project_root: &Path, phase: u32) -> PathBuf {
     devflow_dir(project_root).join(format!("phase-{:02}-agent-pid", phase))
 }
 
+/// Which slot of `sequentagent`'s two-agent handoff is currently running.
+///
+/// Typed rather than a stringly-typed `&str` so the two `sequentagent` call
+/// sites (agent A, agent B in `parallel.rs`) cannot typo the slot (cross-AI
+/// review LOW).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SequentagentSlotKind {
+    /// The first agent of the handoff.
+    A,
+    /// The second agent of the handoff.
+    B,
+}
+
+impl SequentagentSlotKind {
+    /// The wire-format slot letter written into the record file
+    /// (`"A"`/`"B"`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SequentagentSlotKind::A => "A",
+            SequentagentSlotKind::B => "B",
+        }
+    }
+}
+
+/// A `sequentagent` slot record: which slot (A/B) is currently running, and
+/// which [`crate::state::AgentKind`] occupies it. Path-free by construction
+/// (WR-02) — only the slot letter and agent kind are ever written, never a
+/// filesystem path or OS username.
+///
+/// `slot` stays a plain `String` (not [`SequentagentSlotKind`]) so
+/// [`read_sequentagent_slot`] can parse a hand-edited or otherwise unexpected
+/// record defensively instead of failing the whole read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SequentagentSlot {
+    pub slot: String,
+    pub agent: String,
+}
+
+/// Path to the `sequentagent` slot record for a given phase — mirrors
+/// [`agent_pid_path`]'s naming convention.
+///
+/// NOT routed through `State`/`save_state`: `sequentagent` persists no
+/// `State` (Phase 19 D-14; "Synthetic, never-persisted state" in
+/// `parallel.rs`) — this is a standalone sibling file, not a `State` field.
+pub fn sequentagent_slot_path(project_root: &Path, phase: u32) -> PathBuf {
+    devflow_dir(project_root).join(format!("phase-{:02}-sequentagent", phase))
+}
+
+/// Write the `sequentagent` slot record for `phase`, naming the currently
+/// running agent slot (A/B) and its [`crate::state::AgentKind`].
+///
+/// Creates `.devflow/` via [`crate::workflow::ensure_devflow_dir`] first
+/// (mirroring [`history_dir`]'s writer) so a fresh project root with no
+/// pre-existing `.devflow/` still writes successfully, and the directory
+/// carries the `*` `.gitignore` for artifact hygiene (WR-02). The written
+/// content is a path-free two-line text file: the slot letter, then the
+/// agent kind.
+pub fn write_sequentagent_slot(
+    project_root: &Path,
+    phase: u32,
+    slot: SequentagentSlotKind,
+    agent: crate::state::AgentKind,
+) -> std::io::Result<()> {
+    crate::workflow::ensure_devflow_dir(&devflow_dir(project_root))?;
+    let content = format!("{}\n{}\n", slot.as_str(), agent);
+    std::fs::write(sequentagent_slot_path(project_root, phase), content)
+}
+
+/// Read the `sequentagent` slot record for `phase`, if present.
+///
+/// Parses defensively: any I/O error or unexpected content (missing lines,
+/// blank fields) returns `None` rather than propagating an error — a
+/// malformed record must never crash a caller such as `devflow status`
+/// (T-21c-04).
+pub fn read_sequentagent_slot(project_root: &Path, phase: u32) -> Option<SequentagentSlot> {
+    let content = std::fs::read_to_string(sequentagent_slot_path(project_root, phase)).ok()?;
+    let mut lines = content.lines();
+    let slot = lines.next()?.trim().to_string();
+    let agent = lines.next()?.trim().to_string();
+    if slot.is_empty() || agent.is_empty() {
+        return None;
+    }
+    Some(SequentagentSlot { slot, agent })
+}
+
+/// Best-effort removal of the `sequentagent` slot record for `phase`. A
+/// missing file is not an error — this is called unconditionally by
+/// `SequentagentSlotGuard`'s `Drop` impl in `parallel.rs`, on every
+/// `sequentagent` exit path.
+pub fn clear_sequentagent_slot(project_root: &Path, phase: u32) {
+    let _ = std::fs::remove_file(sequentagent_slot_path(project_root, phase));
+}
+
 /// Path to the archived-capture-history directory for a phase (16b).
 ///
 /// `.devflow/history/phase-NN/` holds retained per-stage capture generations
@@ -2501,5 +2594,78 @@ mod tests {
 
         assert_eq!(result.status, AgentStatus::AgentUnavailable);
         assert_eq!(result.exit_code, Some(127));
+    }
+
+    #[test]
+    fn sequentagent_slot_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+
+        write_sequentagent_slot(
+            dir.path(),
+            7,
+            SequentagentSlotKind::B,
+            crate::state::AgentKind::Codex,
+        )
+        .unwrap();
+        let record = read_sequentagent_slot(dir.path(), 7).unwrap();
+        assert_eq!(record.slot, "B");
+        assert_eq!(record.agent, "codex");
+
+        clear_sequentagent_slot(dir.path(), 7);
+        assert!(read_sequentagent_slot(dir.path(), 7).is_none());
+    }
+
+    #[test]
+    fn sequentagent_slot_is_path_free() {
+        let dir = tempfile::tempdir().unwrap();
+
+        write_sequentagent_slot(
+            dir.path(),
+            9,
+            SequentagentSlotKind::A,
+            crate::state::AgentKind::Claude,
+        )
+        .unwrap();
+
+        let raw = std::fs::read_to_string(sequentagent_slot_path(dir.path(), 9)).unwrap();
+        let dir_str = dir.path().display().to_string();
+        assert!(
+            !raw.contains(&dir_str),
+            "slot record leaked the project root path: {raw:?}"
+        );
+        assert!(!raw.contains('/'), "slot record contains a path: {raw:?}");
+        if let Ok(home) = std::env::var("HOME") {
+            assert!(!raw.contains(&home), "slot record leaked $HOME: {raw:?}");
+        }
+    }
+
+    #[test]
+    fn sequentagent_slot_write_creates_devflow_dir_and_gitignore() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!dir.path().join(".devflow").exists());
+
+        write_sequentagent_slot(
+            dir.path(),
+            11,
+            SequentagentSlotKind::A,
+            crate::state::AgentKind::Claude,
+        )
+        .unwrap();
+
+        assert!(dir.path().join(".devflow").is_dir());
+        let gitignore = std::fs::read_to_string(dir.path().join(".devflow/.gitignore")).unwrap();
+        assert_eq!(gitignore, "*\n");
+    }
+
+    #[test]
+    fn sequentagent_slot_missing_record_reads_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_sequentagent_slot(dir.path(), 13).is_none());
+    }
+
+    #[test]
+    fn sequentagent_slot_kind_as_str() {
+        assert_eq!(SequentagentSlotKind::A.as_str(), "A");
+        assert_eq!(SequentagentSlotKind::B.as_str(), "B");
     }
 }
