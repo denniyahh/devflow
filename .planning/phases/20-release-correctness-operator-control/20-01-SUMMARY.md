@@ -134,3 +134,13 @@ None - no external service configuration required.
 ---
 *Phase: 20-release-correctness-operator-control*
 *Completed: 2026-07-23*
+
+## Self-Check: PASSED
+
+- FOUND: crates/devflow-core/src/version.rs
+- FOUND: crates/devflow-cli/tests/workspace_version_pin.rs
+- FOUND: .planning/phases/20-release-correctness-operator-control/20-01-SUMMARY.md
+- FOUND commit: 4b8bbbe (test: RED)
+- FOUND commit: 2a9a5f3 (feat: additive rewrite pass)
+- FOUND commit: bc32d5a (test: edge coverage)
+- FOUND commit: 6a7d2d6 (docs: summary)
