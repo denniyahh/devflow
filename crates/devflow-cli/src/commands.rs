@@ -2501,6 +2501,112 @@ mod tests {
         assert!(banner.contains("ESCALATED"));
     }
 
+    /// 21a: `recovery_hints` returns a `resume` hint for a stuck phase,
+    /// additionally an `advance` hint when the phase is gate-pending
+    /// (answer the gate, then advance), and nothing for a non-stuck phase.
+    #[test]
+    fn recovery_hints_includes_resume_for_stuck() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::new(7, AgentKind::Claude, Mode::Auto, dir.path().to_path_buf());
+
+        let hints = recovery_hints(&state, Liveness::Stuck);
+
+        assert_eq!(hints, vec!["devflow resume --phase 7".to_string()]);
+    }
+
+    #[test]
+    fn recovery_hints_includes_advance_when_stuck_and_gate_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::new(7, AgentKind::Claude, Mode::Auto, dir.path().to_path_buf());
+        state.gate_pending = true;
+
+        let hints = recovery_hints(&state, Liveness::Stuck);
+
+        assert_eq!(
+            hints,
+            vec![
+                "devflow resume --phase 7".to_string(),
+                "devflow advance --phase 7".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn recovery_hints_empty_for_healthy() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::new(7, AgentKind::Claude, Mode::Auto, dir.path().to_path_buf());
+
+        assert!(recovery_hints(&state, Liveness::Healthy).is_empty());
+    }
+
+    /// 21a: `latest_stage_launched_ts` scans the event log for the LAST
+    /// `stage_launched` event's `ts` — the real stage-entry time — and is
+    /// `None` without one, never falling back to any other field.
+    #[test]
+    fn latest_stage_launched_ts_none_without_event() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(latest_stage_launched_ts(dir.path(), 7), None);
+    }
+
+    /// The closing proof for the 3/3 cross-AI review MEDIUM
+    /// (21-REVIEWS.md): a phase whose latest `stage_launched` event is ~90s
+    /// old but whose phase-level `started_at` is ~30m old must report the
+    /// ~90s stage age — `latest_stage_launched_ts` must never be sourced
+    /// from `state.started_at`.
+    #[test]
+    fn latest_stage_launched_ts_reflects_event_age_not_phase_started_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let stage_ts = now - 90;
+        let phase_started_at = now - 30 * 60;
+
+        let mut state = State::new(7, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.started_at = phase_started_at.to_string();
+        workflow::save_state(&state).unwrap();
+
+        events::emit(
+            root,
+            7,
+            "stage_launched",
+            serde_json::json!({"stage": "code", "agent": "claude", "monitor_pid": 1}),
+        );
+        // events::emit always stamps `ts` with the current time; rewrite it
+        // to a fixed, known-past value so the assertion is deterministic
+        // instead of racing the live clock.
+        let events_path = devflow_core::events::events_path(root);
+        let rewritten: String = std::fs::read_to_string(&events_path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+                value["ts"] = serde_json::json!(stage_ts);
+                value.to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&events_path, rewritten).unwrap();
+
+        let ts = latest_stage_launched_ts(root, 7);
+        assert_eq!(ts, Some(stage_ts));
+
+        let line = render_stage_progress_line(Stage::Code, ts);
+        assert!(line.contains("1m ago"), "expected ~90s age, got: {line}");
+        assert!(
+            !line.contains("30m ago"),
+            "must not render phase-level started_at age: {line}"
+        );
+    }
+
+    #[test]
+    fn render_stage_progress_line_omits_age_without_stage_launched_event() {
+        assert_eq!(render_stage_progress_line(Stage::Plan, None), "  in stage plan");
+    }
+
     /// Unit tests for the pure `doctor` reconciliation core (18a). Each test
     /// builds a `PhaseFacts` directly — no repository, no I/O — proving
     /// `reconcile_phase` is a predicate over facts alone.
