@@ -70,3 +70,14 @@ The headless proposal was reviewed and revised by the operator:
 - **Renamed** phase "Operator Usability & Release Execution" → "Operator
   Legibility & Observability." Final set: 21a 999.3, 21b 999.14, 21c 999.2,
   optional 21d 999.5. CONTEXT.md rewritten to match.
+
+## Folded in 999.29 (2026-07-23, operator)
+
+The Phase 21 launch hit `enforce_build_staleness`'s ancestry arm hard-blocking on
+docs-only commits (root cause verified: strict-ancestor HEAD → `Stale` regardless
+of whether build inputs changed). Filed as backlog 999.29, then **folded into
+Phase 21 as a committed unit (21d)** at operator request — it fits the legibility
+theme (the tool must not block its own workflow spuriously) and taxes this very
+phase's remaining stages. Branch rebased onto develop to bring the 999.29 dossier
+onto it. 999.5 moved to optional 21e. Recommended sequencing: 21d first, so the
+guard fix (once rebuilt) stops re-arming the block for Plan/Code/Validate.

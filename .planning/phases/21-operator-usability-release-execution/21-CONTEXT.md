@@ -56,10 +56,17 @@ confirm sizing at plan/review time.
   unrecorded. The monitor half of the original item already shipped in v1.5.0
   (18b, `State.monitor_pid`), so this is **narrowed** to sequentagent's orphaned
   second process only — re-scope precisely at plan time.
+- **21d — Dogfood staleness guard content-awareness (999.29).** `devflow`'s
+  self-dogfood build-staleness gate hard-blocks a run when HEAD has advanced past
+  the binary's embedded commit, **even when the delta is `.planning/` docs only** —
+  observed live during *this* phase's own launch. The dirty-tree arm already
+  filters `affects_compiled_binary` (17-10); the ancestry arm does not. Make the
+  ancestry arm content-aware. Full design in the dossier. **Sequence this early**
+  (see D-07): it taxes every remaining stage of Phase 21 itself.
 
-**Optional / stretch (include only if 21a–c leave capacity):**
+**Optional / stretch (include only if 21a–d leave capacity):**
 
-- **21d — `ChangelogAppend` real content (999.5).** Every generated entry reads
+- **21e — `ChangelogAppend` real content (999.5).** Every generated entry reads
   `- Released phase via DevFlow.` (`ship.rs:431`). Cosmetic, deferred three
   times already, and **blocked on choosing a content source** (SUMMARY.md
   extraction vs plan diffs) — which is why it is stretch-only, not a committed
@@ -112,9 +119,23 @@ Ratings follow `gsd-core/references/planner-reversibility.md`.
   `sequentagent`-specific record?) as the first plan step. — **Reversibility:**
   reversible.
 
-### 21d — ChangelogAppend content (stretch)
+### 21d — Dogfood staleness guard content-awareness
 
-- **D-07:** Stretch-only. Blocked on choosing a per-phase content source; if
+- **D-07:** Make `embedded_commit_is_stale`'s strict-ancestor arm content-aware:
+  when `<embedded>` is behind HEAD, run `git diff --name-only <embedded> HEAD`
+  and filter through the existing `affects_compiled_binary`; return `Fresh` if no
+  build input changed, `Stale` only if one did. Reuse `affects_compiled_binary`
+  verbatim (do not fork the predicate). Add a mixed-range test (docs + a `.rs`
+  change → still `Stale`) so the Phase 16 false-evidence protection is preserved,
+  and fix the block message's "is not an ancestor" wording. **Sequence 21d first
+  (or early)** — the guard hard-blocks Phase 21's own Plan/Code/Validate stages
+  after every `.planning/` commit, so fixing it first removes the no-op-rebuild
+  tax for the rest of this phase. — **Reversibility:** reversible; narrows a
+  guard without weakening its real-change detection.
+
+### 21e — ChangelogAppend content (stretch)
+
+- **D-08:** Stretch-only. Blocked on choosing a per-phase content source; if
   pulled in, that choice (SUMMARY.md extraction vs plan-diff summary) is a
   design decision the planner must make explicit, not assume.
 
@@ -122,7 +143,8 @@ Ratings follow `gsd-core/references/planner-reversibility.md`.
 - Exact CLI flag surface for `gate show` (positional vs `--phase`), progress
   representation in `status`, and whether 21a ships as one plan or splits by
   sub-gap — planner's call.
-- Precise re-scope of 999.2 and whether 21d is folded in at all.
+- Precise re-scope of 999.2, whether 21d should be its own wave-0 plan, and
+  whether 21e is folded in at all.
 </decisions>
 
 <canonical_refs>
@@ -137,8 +159,11 @@ Ratings follow `gsd-core/references/planner-reversibility.md`.
   21b: the staleness-detection gap and the "detect, don't auto-correct" scope.
 - `.planning/phases/999.2-phase-process-tracking-model/CONTEXT.md` — 21c: the
   two-processes-per-phase framing; note the monitor half is already shipped.
+- `.planning/phases/999.29-dogfood-staleness-docs-commit-false-positive/CONTEXT.md`
+  — 21d: the verified root cause, the 17-10 precedent, and the exact fix +
+  test-shape. **Read before touching `staleness.rs`.**
 - `.planning/phases/999.5-changelog-placeholder-content/CONTEXT.md` — optional
-  21d, and the open "where does real per-phase content come from" question.
+  21e, and the open "where does real per-phase content come from" question.
 
 ### Code the units extend (not rediscover)
 - `crates/devflow-cli/src/commands.rs:1121` (`doctor`) + `:1866`
@@ -146,7 +171,11 @@ Ratings follow `gsd-core/references/planner-reversibility.md`.
 - `crates/devflow-cli/src/parallel.rs` (sequentagent handoff; comments at
   `:5`/`:181`/`:192` state it does not participate in the stage machine) and
   `agent_result::agent_pid_path` (used at `commands.rs:889`) — 21c's surface.
-- `crates/devflow-core/src/ship.rs:431` — the `ChangelogAppend` placeholder 21d
+- `crates/devflow-cli/src/staleness.rs` — 21d: `embedded_commit_is_stale` (the
+  strict-ancestor arm to narrow), `combined_staleness`, `tree_has_modified_build_inputs`
+  + `affects_compiled_binary` (the predicate to reuse), `enforce_build_staleness`
+  (the block message to fix).
+- `crates/devflow-core/src/ship.rs:431` — the `ChangelogAppend` placeholder 21e
   would replace.
 - `devflow gate` / `devflow status` output paths (`commands.rs`, `main.rs`) —
   21a surfacing.
