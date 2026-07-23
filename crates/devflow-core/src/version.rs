@@ -201,8 +201,167 @@ pub fn write_version(project_root: &Path, version: &Version) -> Result<PathBuf, 
     let field = field_for(&path, &contents);
     let replaced = replace_version_in_contents(&contents, field, &version.to_string())
         .ok_or_else(|| VersionError::Parse(format!("field `{field}` not found")))?;
+    // 20a / DEN-49: a workspace Cargo.toml states its version twice — once in
+    // [workspace.package] version (just rewritten above), and again as an
+    // explicit `version` pin on every [workspace.dependencies] entry that
+    // points at a workspace member by `path`. This second pass is additive,
+    // not a modification of `replace_version_in_contents`'s single-field
+    // logic — pyproject.toml/package.json/plain Cargo.toml callers never
+    // reach it.
+    let replaced = if field == "workspace.package.version" {
+        rewrite_workspace_member_pins(&replaced, &version.to_string())
+    } else {
+        replaced
+    };
     std::fs::write(&path, replaced)?;
     Ok(path)
+}
+
+/// Additive pass (20a / DEN-49): rewrite the `version` sub-value of every
+/// SINGLE-LINE `[workspace.dependencies]` inline-table entry that pins a
+/// local workspace member by `path` (e.g. `devflow-core = { path =
+/// "crates/devflow-core", version = "1.6.0" }`).
+///
+/// This is deliberately additive to `replace_version_in_contents` rather than
+/// a modification of it — that function's `starts_with('{')` guard exists so
+/// single-field callers (`field_for` for pyproject.toml/package.json/plain
+/// Cargo.toml) never touch an inline table, and stays intact.
+///
+/// Scope, by construction:
+/// - Only entries with a local `path` key (one starting with `crates/`) are
+///   rewritten. A `version`-only third-party dependency (`serde = { version
+///   = "1" }`) is left untouched — a dependency on a crate INSIDE this
+///   workspace carries this workspace's version; anything else does not.
+/// - Only SINGLE-LINE inline tables are handled (opening and closing `}` on
+///   the same line as `path`/`version`). A multi-line inline table is a
+///   documented out-of-scope limitation (review: Antigravity/Hermes MEDIUM)
+///   — this repo's own self-pins are single-line (Cargo.toml:20), and the
+///   line-level `starts_with('{')` guard in `find_version_in_contents`/
+///   `replace_version_in_contents` could not see into one anyway.
+/// - The `version = "..."` sub-value is located and replaced independent of
+///   its position relative to `path` within the line (key-order-independent,
+///   anchored to the `version =` token itself, not a column offset) — a
+///   self-pin written `{ version = "1.6.0", path = "crates/..." }` is
+///   rewritten identically to the `path`-before-`version` case.
+/// - Whitespace, quote style, and any trailing comma/comment after the
+///   `version` token are preserved exactly (GAP-6).
+fn rewrite_workspace_member_pins(contents: &str, new_version: &str) -> String {
+    let mut current = String::new();
+    let mut output = String::new();
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if let Some(header) = parse_section_header(trimmed) {
+            current = header.to_string();
+            output.push_str(line);
+            output.push('\n');
+            continue;
+        }
+        if current == "workspace.dependencies"
+            && trimmed.contains('{')
+            && trimmed.contains('}')
+            && workspace_dependency_has_local_path(trimmed)
+            && let Some(rewritten) = rewrite_inline_table_version(line, new_version)
+        {
+            output.push_str(&rewritten);
+            output.push('\n');
+            continue;
+        }
+        output.push_str(line);
+        output.push('\n');
+    }
+    output
+}
+
+/// Split a single-line inline table's interior (`{ ... }`, braces excluded)
+/// into its top-level `key = value` fragments, alongside each fragment's
+/// absolute byte offset within `line`. Fragments are separated on `,` — this
+/// is a hand-rolled, single-line-only split (see `rewrite_workspace_member_pins`
+/// doc comment), not a general TOML parser.
+fn inline_table_fragments(line: &str) -> Option<Vec<(usize, &str)>> {
+    let brace_start = line.find('{')?;
+    let brace_end = line.rfind('}')?;
+    if brace_end <= brace_start {
+        return None;
+    }
+    let inner = &line[brace_start + 1..brace_end];
+    let mut fragments = Vec::new();
+    let mut offset = brace_start + 1;
+    for fragment in inner.split(',') {
+        fragments.push((offset, fragment));
+        offset += fragment.len() + 1; // +1 for the consumed comma
+    }
+    Some(fragments)
+}
+
+/// Whether a `[workspace.dependencies]` inline-table line carries a `path`
+/// key whose value points at a local workspace member (starts with
+/// `crates/`).
+fn workspace_dependency_has_local_path(line: &str) -> bool {
+    let Some(fragments) = inline_table_fragments(line) else {
+        return false;
+    };
+    for (_, fragment) in fragments {
+        let trimmed = fragment.trim();
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "path" {
+            continue;
+        }
+        let value = value.trim();
+        let Some(quote) = value.chars().next() else {
+            return false;
+        };
+        if quote != '"' && quote != '\'' {
+            return false;
+        }
+        let inner_value = &value[1..value.len().saturating_sub(1)];
+        return inner_value.starts_with("crates/");
+    }
+    false
+}
+
+/// Rewrite the `version = "..."` sub-value on a single-line inline-table
+/// line, preserving everything else on the line byte-for-byte. Returns
+/// `None` if the line has no `version` fragment to anchor to (e.g. a
+/// `path`-only member with no explicit version — nothing to rewrite).
+fn rewrite_inline_table_version(line: &str, new_version: &str) -> Option<String> {
+    let fragments = inline_table_fragments(line)?;
+    for (frag_start, fragment) in fragments {
+        let trimmed = fragment.trim();
+        let Some((key, _value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "version" {
+            continue;
+        }
+        // Locate `=` in the ORIGINAL (untrimmed) fragment to compute an
+        // absolute offset into `line`.
+        let eq_rel = fragment.find('=')?;
+        let eq_abs = frag_start + eq_rel;
+        let after_eq = eq_abs + 1;
+        let rest = &line[after_eq..];
+        let ws_len = rest.len() - rest.trim_start().len();
+        let value_start = after_eq + ws_len;
+        let value_rest = &line[value_start..];
+        let quote_char = value_rest.chars().next()?;
+        if quote_char != '"' && quote_char != '\'' {
+            return None;
+        }
+        let after_quote = &value_rest[1..];
+        let end_rel = after_quote.find(quote_char)?;
+        let value_end = value_start + 1 + end_rel + 1;
+        let remainder = &line[value_end..];
+
+        let mut rewritten = String::with_capacity(line.len() + new_version.len());
+        rewritten.push_str(&line[..value_start]);
+        rewritten.push(quote_char);
+        rewritten.push_str(new_version);
+        rewritten.push(quote_char);
+        rewritten.push_str(remainder);
+        return Some(rewritten);
+    }
+    None
 }
 
 /// Split a dotted field path into its TOML section path and the final key.
@@ -687,6 +846,191 @@ mod tests {
                 minor: 0,
                 patch: 0
             }
+        );
+    }
+
+    #[test]
+    fn write_version_rewrites_workspace_dependency_self_pin() {
+        // 20a / DEN-49: a published Cargo workspace states its version twice —
+        // once in [workspace.package] version, and again as an explicit
+        // `version` pin on every [workspace.dependencies] entry that points
+        // at a workspace member by `path` (Cargo has no interpolation for
+        // dependency versions, and a path dependency of a *published* crate
+        // requires an explicit version). write_version must rewrite BOTH in
+        // one write, or the self-pin ships stale and `cargo publish` rejects
+        // the upload as a duplicate on release day (shipped broken twice:
+        // v1.5.0 by 7ad260c, v1.6.0 by PR #15).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace.package]\nversion = \"1.6.0\"\nedition = \"2024\"\n\n\
+             [workspace.dependencies]\n\
+             devflow-core = { path = \"crates/devflow-core\", version = \"1.6.0\" }\n",
+        )
+        .unwrap();
+        write_version(
+            dir.path(),
+            &Version {
+                major: 1,
+                minor: 7,
+                patch: 0,
+            },
+        )
+        .unwrap();
+        let contents = std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
+        assert!(
+            contents.contains("[workspace.package]\nversion = \"1.7.0\""),
+            "expected [workspace.package] version to be rewritten, got: {contents}"
+        );
+        assert!(
+            contents
+                .contains("devflow-core = { path = \"crates/devflow-core\", version = \"1.7.0\" }"),
+            "expected the [workspace.dependencies] self-pin to be rewritten to 1.7.0 \
+             alongside [workspace.package] version, got: {contents}"
+        );
+    }
+
+    #[test]
+    fn write_version_no_ops_on_missing_workspace_dependencies_section() {
+        // 20a/empty: a workspace Cargo.toml with no [workspace.dependencies]
+        // section at all must not panic — the additive pass simply never
+        // matches and the file is otherwise rewritten normally.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace.package]\nversion = \"1.6.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        write_version(
+            dir.path(),
+            &Version {
+                major: 1,
+                minor: 7,
+                patch: 0,
+            },
+        )
+        .unwrap();
+        let contents = std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
+        assert_eq!(
+            contents,
+            "[workspace.package]\nversion = \"1.7.0\"\nedition = \"2024\"\n"
+        );
+    }
+
+    #[test]
+    fn write_version_no_ops_on_member_with_no_version_key() {
+        // 20a/empty: a [workspace.dependencies] entry with a local `path`
+        // but no `version` key at all is left unchanged — nothing to
+        // rewrite, and no panic.
+        let dir = tempfile::tempdir().unwrap();
+        let toml = "[workspace.package]\nversion = \"1.6.0\"\nedition = \"2024\"\n\n\
+             [workspace.dependencies]\n\
+             devflow-core = { path = \"crates/devflow-core\" }\n";
+        std::fs::write(dir.path().join("Cargo.toml"), toml).unwrap();
+        write_version(
+            dir.path(),
+            &Version {
+                major: 1,
+                minor: 7,
+                patch: 0,
+            },
+        )
+        .unwrap();
+        let contents = std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
+        assert!(
+            contents.contains("devflow-core = { path = \"crates/devflow-core\" }"),
+            "expected the version-less path member to be left byte-identical, got: {contents}"
+        );
+    }
+
+    #[test]
+    fn write_version_leaves_third_party_version_only_dep_untouched() {
+        // 20a/adjacency: a third-party version-only dep sitting adjacent to
+        // a local path member is left byte-for-byte unchanged — only the
+        // path member's version sub-value is rewritten.
+        let dir = tempfile::tempdir().unwrap();
+        let third_party_line = "serde = { version = \"1\", features = [\"derive\"] }";
+        let toml = format!(
+            "[workspace.package]\nversion = \"1.6.0\"\nedition = \"2024\"\n\n\
+             [workspace.dependencies]\n\
+             devflow-core = {{ path = \"crates/devflow-core\", version = \"1.6.0\" }}\n\
+             {third_party_line}\n"
+        );
+        std::fs::write(dir.path().join("Cargo.toml"), &toml).unwrap();
+        write_version(
+            dir.path(),
+            &Version {
+                major: 1,
+                minor: 7,
+                patch: 0,
+            },
+        )
+        .unwrap();
+        let contents = std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
+        assert!(
+            contents
+                .contains("devflow-core = { path = \"crates/devflow-core\", version = \"1.7.0\" }"),
+            "expected the local path member's version to be rewritten, got: {contents}"
+        );
+        assert!(
+            contents.contains(third_party_line),
+            "expected the third-party version-only dep to be byte-identical, got: {contents}"
+        );
+    }
+
+    #[test]
+    fn write_version_preserves_comment_and_quote_in_workspace_dependency_pin() {
+        // GAP-6, inline-table variant: a self-pin line with a trailing
+        // comment and single-quoted values keeps its comment and quote
+        // style after rewrite.
+        let dir = tempfile::tempdir().unwrap();
+        let toml = "[workspace.package]\nversion = \"1.6.0\"\nedition = \"2024\"\n\n\
+             [workspace.dependencies]\n\
+             devflow-core = { path = 'crates/devflow-core', version = '1.6.0' }  # pinned\n";
+        std::fs::write(dir.path().join("Cargo.toml"), toml).unwrap();
+        write_version(
+            dir.path(),
+            &Version {
+                major: 1,
+                minor: 7,
+                patch: 0,
+            },
+        )
+        .unwrap();
+        let contents = std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
+        assert!(
+            contents.contains(
+                "devflow-core = { path = 'crates/devflow-core', version = '1.7.0' }  # pinned"
+            ),
+            "expected single-quote style and trailing comment to survive the rewrite, got: {contents}"
+        );
+    }
+
+    #[test]
+    fn write_version_rewrites_self_pin_regardless_of_key_order() {
+        // review: inline-table key-order — the version sub-value is
+        // rewritten whether it appears BEFORE or AFTER path in the inline
+        // table; the replacement is anchored strictly to the path=/
+        // version= tokens, not a column offset.
+        let dir = tempfile::tempdir().unwrap();
+        let toml = "[workspace.package]\nversion = \"1.6.0\"\nedition = \"2024\"\n\n\
+             [workspace.dependencies]\n\
+             devflow-core = { version = \"1.6.0\", path = \"crates/devflow-core\" }\n";
+        std::fs::write(dir.path().join("Cargo.toml"), toml).unwrap();
+        write_version(
+            dir.path(),
+            &Version {
+                major: 1,
+                minor: 7,
+                patch: 0,
+            },
+        )
+        .unwrap();
+        let contents = std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
+        assert!(
+            contents
+                .contains("devflow-core = { version = \"1.7.0\", path = \"crates/devflow-core\" }"),
+            "expected version to be rewritten regardless of key order, got: {contents}"
         );
     }
 }
