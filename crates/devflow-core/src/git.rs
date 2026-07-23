@@ -494,6 +494,187 @@ impl GitFlow {
     }
 }
 
+/// Result of checking whether `origin/main` is already an ancestor of
+/// `HEAD` — i.e. whether `scripts/sync-main-to-develop.sh` would be a no-op
+/// — WITHOUT issuing any `git fetch` (20d, review: Codex HIGH — a
+/// "read-only" preflight must not depend on the network).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AncestorStatus {
+    /// `origin/main` is an ancestor of `HEAD` — sync would be a no-op.
+    Ancestor,
+    /// `origin/main` resolves locally but is NOT an ancestor of `HEAD` —
+    /// develop has diverged and `scripts/sync-main-to-develop.sh` should be
+    /// run before cutting the next release.
+    Diverged,
+    /// `origin/main` does not resolve locally at all (never fetched, or no
+    /// remote configured). Distinct from [`Diverged`](Self::Diverged) so
+    /// the caller can degrade to an actionable "run `git fetch` first"
+    /// message instead of reporting a false divergence.
+    RefAbsent,
+}
+
+/// Check whether `origin/main` is an ancestor of `HEAD`, against
+/// ALREADY-FETCHED local refs — issues NO `git fetch`. Mirrors
+/// `scripts/sync-main-to-develop.sh`'s own `git merge-base --is-ancestor
+/// origin/main HEAD` invocation (`:41`), minus the preceding `git fetch`
+/// (`:38`), which mutates `.git/FETCH_HEAD`/tracking refs and would make a
+/// "read-only" preflight false (20d, review: Codex HIGH).
+pub fn origin_main_ancestor_status(project_root: &Path) -> AncestorStatus {
+    let ref_exists = Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", "origin/main"])
+        .current_dir(project_root)
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    if !ref_exists {
+        return AncestorStatus::RefAbsent;
+    }
+    let is_ancestor = Command::new("git")
+        .args(["merge-base", "--is-ancestor", "origin/main", "HEAD"])
+        .current_dir(project_root)
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    if is_ancestor {
+        AncestorStatus::Ancestor
+    } else {
+        AncestorStatus::Diverged
+    }
+}
+
+/// Derive the crates.io publish order for a workspace's local-path members
+/// (e.g. `devflow-core` before `devflow`) — sourced from the workspace's own
+/// `[workspace] members` list and each member's own `[dependencies]`
+/// section (which member depends on which), never a hardcoded prose string
+/// (20d). Read-only; returns an empty `Vec` (never panics) if the workspace
+/// Cargo.toml or a member manifest cannot be read.
+pub fn publish_order(project_root: &Path) -> Vec<String> {
+    let Ok(root_contents) = std::fs::read_to_string(project_root.join("Cargo.toml")) else {
+        return Vec::new();
+    };
+    let member_paths = workspace_member_paths(&root_contents);
+
+    let mut members: Vec<(String, String)> = Vec::new();
+    for path in &member_paths {
+        let manifest = project_root.join(path).join("Cargo.toml");
+        let Ok(contents) = std::fs::read_to_string(&manifest) else {
+            continue;
+        };
+        let name = package_name(&contents).unwrap_or_else(|| path.clone());
+        members.push((name, contents));
+    }
+
+    let names: Vec<String> = members.iter().map(|(name, _)| name.clone()).collect();
+    let mut edges: Vec<(String, String)> = Vec::new();
+    for (name, contents) in &members {
+        for other in &names {
+            if other != name && member_depends_on(contents, other) {
+                edges.push((name.clone(), other.clone()));
+            }
+        }
+    }
+    topo_sort(names, edges)
+}
+
+/// Extract the `[workspace] members = [...]` array's quoted path entries.
+/// Hand-rolled, single-array-only scan (this project deliberately avoids a
+/// TOML parser dependency for its version/workspace tooling — see
+/// `version.rs`).
+fn workspace_member_paths(contents: &str) -> Vec<String> {
+    let Some(start) = contents.find("members") else {
+        return Vec::new();
+    };
+    let rest = &contents[start..];
+    let Some(open) = rest.find('[') else {
+        return Vec::new();
+    };
+    let Some(close) = rest[open..].find(']') else {
+        return Vec::new();
+    };
+    let inner = &rest[open + 1..open + close];
+    inner
+        .split(',')
+        .filter_map(|fragment| {
+            let fragment = fragment.trim();
+            let fragment = fragment.strip_prefix('"')?.strip_suffix('"')?;
+            (!fragment.is_empty()).then(|| fragment.to_string())
+        })
+        .collect()
+}
+
+/// Extract a member manifest's `[package] name`.
+fn package_name(contents: &str) -> Option<String> {
+    let mut current = String::new();
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if let Some(inner) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            current = inner.trim().to_string();
+            continue;
+        }
+        if current == "package"
+            && let Some((key, value)) = trimmed.split_once('=')
+            && key.trim() == "name"
+        {
+            return Some(value.trim().trim_matches('"').to_string());
+        }
+    }
+    None
+}
+
+/// Whether a member manifest's `[dependencies]` section references
+/// `dep_name` — either `dep_name.workspace = true` or `dep_name = { ... }`.
+fn member_depends_on(contents: &str, dep_name: &str) -> bool {
+    let mut current = String::new();
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if let Some(inner) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            current = inner.trim().to_string();
+            continue;
+        }
+        if current != "dependencies" {
+            continue;
+        }
+        let key = trimmed.split(['.', '=']).next().unwrap_or("").trim();
+        if key == dep_name {
+            return true;
+        }
+    }
+    false
+}
+
+/// Kahn's-algorithm topological sort: `edges` are `(dependent, dependency)`
+/// pairs, meaning `dependent` must be published AFTER `dependency`. Falls
+/// back to appending whatever remains (rather than looping forever) if a
+/// cycle is present — a genuine cyclic Cargo dependency would already fail
+/// `cargo build` long before this check runs.
+fn topo_sort(names: Vec<String>, edges: Vec<(String, String)>) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut published: Vec<String> = Vec::new();
+    let mut remaining = names;
+    while !remaining.is_empty() {
+        let ready: Vec<String> = remaining
+            .iter()
+            .filter(|name| {
+                edges
+                    .iter()
+                    .filter(|(dependent, _)| dependent == *name)
+                    .all(|(_, dep)| published.contains(dep))
+            })
+            .cloned()
+            .collect();
+        if ready.is_empty() {
+            result.extend(remaining);
+            break;
+        }
+        for name in &ready {
+            published.push(name.clone());
+            result.push(name.clone());
+        }
+        remaining.retain(|name| !ready.contains(name));
+    }
+    result
+}
+
 /// Run a git command in an arbitrary directory (e.g. a worktree).
 fn git_in(dir: &Path, args: &[&str]) -> Result<(), GitError> {
     debug!("git (in {}) {}", dir.display(), args.join(" "));
@@ -1122,5 +1303,110 @@ mod tests {
         // succeeds, but merging the nonexistent feature branch fails.
         let err = flow(root).feature_finish(99).unwrap_err();
         assert!(matches!(err, GitError::Command(_)));
+    }
+
+    // -----------------------------------------------------------------
+    // 20d: publish-order helpers (pure, no I/O)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn workspace_member_paths_parses_multiline_array() {
+        let contents = "[workspace]\nresolver = \"2\"\nmembers = [\n    \"crates/devflow-core\",\n    \"crates/devflow-cli\",\n]\n";
+        assert_eq!(
+            workspace_member_paths(contents),
+            vec![
+                "crates/devflow-core".to_string(),
+                "crates/devflow-cli".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn package_name_reads_the_package_section() {
+        let contents = "[package]\nname = \"devflow-core\"\nversion.workspace = true\n";
+        assert_eq!(package_name(contents), Some("devflow-core".to_string()));
+    }
+
+    #[test]
+    fn member_depends_on_matches_dotted_workspace_shorthand() {
+        let contents = "[package]\nname = \"devflow\"\n\n[dependencies]\ndevflow-core.workspace = true\nclap.workspace = true\n";
+        assert!(member_depends_on(contents, "devflow-core"));
+        assert!(!member_depends_on(contents, "serde"));
+    }
+
+    #[test]
+    fn topo_sort_orders_dependency_before_dependent() {
+        let names = vec!["devflow".to_string(), "devflow-core".to_string()];
+        let edges = vec![("devflow".to_string(), "devflow-core".to_string())];
+        assert_eq!(
+            topo_sort(names, edges),
+            vec!["devflow-core".to_string(), "devflow".to_string()]
+        );
+    }
+
+    #[test]
+    fn topo_sort_falls_back_to_input_order_on_a_cycle() {
+        // A genuine cyclic dependency would already fail `cargo build`
+        // long before this check runs — this just proves no infinite loop.
+        let names = vec!["a".to_string(), "b".to_string()];
+        let edges = vec![
+            ("a".to_string(), "b".to_string()),
+            ("b".to_string(), "a".to_string()),
+        ];
+        let result = topo_sort(names, edges);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn publish_order_derives_core_before_cli_from_a_fixture_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\n    \"crates/devflow-core\",\n    \"crates/devflow-cli\",\n]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("crates/devflow-core")).unwrap();
+        std::fs::write(
+            root.join("crates/devflow-core/Cargo.toml"),
+            "[package]\nname = \"devflow-core\"\n\n[dependencies]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("crates/devflow-cli")).unwrap();
+        std::fs::write(
+            root.join("crates/devflow-cli/Cargo.toml"),
+            "[package]\nname = \"devflow\"\n\n[dependencies]\ndevflow-core.workspace = true\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            publish_order(root),
+            vec!["devflow-core".to_string(), "devflow".to_string()]
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // 20d: origin/main ancestor check (no fetch)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn origin_main_ancestor_status_is_ref_absent_without_a_remote() {
+        let repo = init_repo();
+        let root = repo.path();
+        assert_eq!(origin_main_ancestor_status(root), AncestorStatus::RefAbsent);
+    }
+
+    #[test]
+    fn origin_main_ancestor_status_is_ancestor_when_head_is_up_to_date() {
+        let repo = init_repo();
+        let root = repo.path();
+        let head = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        let head_sha = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        git(root, &["update-ref", "refs/remotes/origin/main", &head_sha]);
+        assert_eq!(origin_main_ancestor_status(root), AncestorStatus::Ancestor);
     }
 }

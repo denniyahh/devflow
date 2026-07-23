@@ -1281,7 +1281,11 @@ pub(crate) fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
 /// Follows `doctor`'s `Check`-list-then-report shape (reuses the same
 /// `Check` struct) so the two commands stay visually consistent.
 pub(crate) fn release_check(project_root: &Path) -> Result<(), CliError> {
-    let checks: Vec<Check> = vec![check_self_pin(project_root)];
+    let checks: Vec<Check> = vec![
+        check_self_pin(project_root),
+        check_divergence(project_root),
+        check_publish_order(project_root),
+    ];
 
     let mut failed = false;
     for c in &checks {
@@ -1370,6 +1374,60 @@ fn check_self_pin(project_root: &Path) -> Check {
                  see 20a/DEN-49"
             )),
         }
+    }
+}
+
+/// Divergence check: whether `origin/main` is an ancestor of `HEAD` — i.e.
+/// whether `scripts/sync-main-to-develop.sh` would be a no-op — read
+/// against ALREADY-FETCHED local refs, issuing NO `git fetch` (review:
+/// Codex HIGH — a "read-only" preflight must not depend on the network).
+fn check_divergence(project_root: &Path) -> Check {
+    const NAME: &str = "develop/main divergence (origin/main ancestor)";
+    match devflow_core::git::origin_main_ancestor_status(project_root) {
+        devflow_core::git::AncestorStatus::Ancestor => Check {
+            name: NAME.into(),
+            status: "ok".into(),
+            version: Some("origin/main is an ancestor of HEAD — sync would be a no-op".into()),
+            install_hint: None,
+        },
+        devflow_core::git::AncestorStatus::Diverged => Check {
+            name: NAME.into(),
+            status: "fail".into(),
+            version: Some("origin/main is NOT an ancestor of HEAD — develop has diverged".into()),
+            install_hint: Some(
+                "run scripts/sync-main-to-develop.sh before cutting the next release PR".into(),
+            ),
+        },
+        devflow_core::git::AncestorStatus::RefAbsent => Check {
+            name: NAME.into(),
+            status: "warn".into(),
+            version: Some("origin/main not fetched — cannot determine divergence".into()),
+            install_hint: Some("run `git fetch` first, then re-run this check".into()),
+        },
+    }
+}
+
+/// Publish-order check: crates.io requires `devflow-core` to be live before
+/// `devflow` (path-dependency `--dry-run`/verify resolves against the
+/// *published* registry version, not local source). Sourced from the
+/// workspace's own members/dependency graph, never a hardcoded prose
+/// string.
+fn check_publish_order(project_root: &Path) -> Check {
+    const NAME: &str = "crates.io publish order";
+    let order = devflow_core::git::publish_order(project_root);
+    if order.is_empty() {
+        return Check {
+            name: NAME.into(),
+            status: "warn".into(),
+            version: Some("could not determine workspace publish order".into()),
+            install_hint: None,
+        };
+    }
+    Check {
+        name: NAME.into(),
+        status: "ok".into(),
+        version: Some(format!("publish in order: {}", order.join(" -> "))),
+        install_hint: None,
     }
 }
 
