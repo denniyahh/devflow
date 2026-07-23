@@ -321,10 +321,11 @@ pub(crate) fn enforce_build_staleness(
     match staleness_outcome(self_dogfood, staleness) {
         StalenessOutcome::Block => {
             let message = format!(
-                "self-dogfood stale build blocked for stage {}: this devflow binary's \
-                 embedded commit is not an ancestor of {}'s current HEAD (or its tracked \
-                 source is newer than the build) — rebuild devflow before driving its own \
-                 workspace (D-18; the Phase 16 false-evidence incident){}",
+                "self-dogfood stale build blocked for stage {}: a build-relevant file \
+                 (.rs/Cargo.toml/Cargo.lock/build.rs/rust-toolchain.toml) changed in {}'s \
+                 tracked source since this devflow binary was built, or its embedded commit \
+                 is not an ancestor of current HEAD at all — rebuild devflow before driving \
+                 its own workspace (D-18; the Phase 16 false-evidence incident){}",
                 state.stage,
                 execution_root.display(),
                 if state.worktree_path.is_some() {
@@ -715,7 +716,12 @@ mod tests {
         let side = rev_parse();
 
         git(&["checkout", "-q", "trunk"]);
-        std::fs::write(root.join("trunk2.txt"), "t2").unwrap();
+        // 21d/D-07: a build-affecting `.rs` file, not a bare `.txt` — `base`
+        // must stay a build-affecting strict ancestor of the final HEAD, or
+        // the content-aware ancestry arm would (correctly) reclassify
+        // `base -> Stale` as Fresh, breaking
+        // `embedded_commit_is_stale_maps_ancestry_exit_codes`'s assertion.
+        std::fs::write(root.join("trunk2.rs"), "// t2\n").unwrap();
         git(&["add", "."]);
         git(&["commit", "-q", "-m", "trunk2"]);
 
@@ -800,9 +806,13 @@ mod tests {
             .trim()
             .to_string();
 
-        // Second commit on top: an unrelated NEW file — no modifications to
-        // already-committed files, so the tree stays clean.
-        std::fs::write(root.join("b.txt"), "two").unwrap();
+        // Second commit on top: a NEW build-affecting `.rs` file — no
+        // modifications to already-committed files, so the tree stays clean.
+        // 21d/D-07: this must stay a genuine code change after the build, or
+        // the content-aware ancestry arm would (correctly) reclassify this
+        // fixture Fresh, breaking this test's Stale/hard-block intent.
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
         git(&["add", "."]);
         git(&["commit", "-q", "-m", "unrelated follow-up"]);
 
@@ -1160,6 +1170,156 @@ mod tests {
         assert_eq!(
             combined_staleness(root, &embedded_commit, false),
             Staleness::Fresh
+        );
+    }
+
+    /// 21d/D-07: real-change protection preserved — a mixed range that
+    /// touches BOTH a doc (`.planning/x.md`) AND a NESTED `.rs` file
+    /// (`crates/devflow-cli/src/main.rs`, proving nested-path routing
+    /// through `affects_compiled_binary`, not just a top-level `.rs`) must
+    /// still read `Stale` (Phase 16 false-evidence protection preserved).
+    #[test]
+    fn mixed_range_docs_and_source_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@e.st"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        git(&["config", "core.hooksPath", "/dev/null"]);
+
+        std::fs::create_dir_all(root.join("crates/devflow-cli/src")).unwrap();
+        std::fs::write(
+            root.join("crates/devflow-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        let embedded_commit = run_git_stdout(root, &["rev-parse", "HEAD"])
+            .expect("rev-parse HEAD")
+            .trim()
+            .to_string();
+
+        // One intervening commit touches BOTH a doc and a nested .rs file.
+        std::fs::create_dir_all(root.join(".planning")).unwrap();
+        std::fs::write(root.join(".planning/x.md"), "docs\n").unwrap();
+        std::fs::write(
+            root.join("crates/devflow-cli/src/main.rs"),
+            "fn main() { /* changed */ }\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "docs + nested source"]);
+
+        assert_eq!(
+            embedded_commit_is_stale(root, &embedded_commit),
+            Staleness::Stale,
+            "a mixed docs+source range must still hard-block (real-change protection preserved)"
+        );
+        assert_eq!(
+            combined_staleness(root, &embedded_commit, false),
+            Staleness::Stale
+        );
+    }
+
+    /// 21d/D-07 (Codex + OpenCode LOW): the stated-but-previously-untested
+    /// fail-toward-Stale safety posture. Forces `git diff --name-only` to
+    /// fail over the ancestry range while leaving `git merge-base
+    /// --is-ancestor` (pure commit-graph traversal, no tree access) able to
+    /// succeed: the embedded commit's root TREE object is deleted from the
+    /// local object store while its COMMIT object stays intact. A git
+    /// failure in the ancestry arm must never read as a false `Fresh`.
+    #[test]
+    fn git_error_range_fails_toward_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@e.st"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        git(&["config", "core.hooksPath", "/dev/null"]);
+
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "// base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        let embedded_commit = run_git_stdout(root, &["rev-parse", "HEAD"])
+            .expect("rev-parse HEAD")
+            .trim()
+            .to_string();
+        let embedded_tree =
+            run_git_stdout(root, &["rev-parse", &format!("{embedded_commit}^{{tree}}")])
+                .expect("rev-parse tree")
+                .trim()
+                .to_string();
+
+        // Advance HEAD so the embedded commit is a strict ancestor.
+        std::fs::write(root.join("src/lib.rs"), "// second\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "second"]);
+
+        assert!(
+            std::process::Command::new("git")
+                .args(["merge-base", "--is-ancestor", &embedded_commit, "HEAD"])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success(),
+            "fixture precondition: embedded commit must be a strict ancestor of HEAD"
+        );
+
+        // Delete the embedded commit's root tree object — its commit object
+        // stays intact (merge-base keeps working, needing only commit
+        // objects) but `git diff --name-only` can no longer read the tree it
+        // needs to enumerate changed paths.
+        let object_path = root
+            .join(".git/objects")
+            .join(&embedded_tree[..2])
+            .join(&embedded_tree[2..]);
+        assert!(
+            object_path.exists(),
+            "fixture precondition: tree object must exist as a loose object at {object_path:?}"
+        );
+        std::fs::remove_file(&object_path).unwrap();
+
+        assert!(
+            run_git_stdout(root, &["diff", "--name-only", &embedded_commit, "HEAD"]).is_none(),
+            "fixture precondition: git diff must fail once the embedded commit's tree object is gone"
+        );
+
+        assert!(
+            ancestry_range_affects_build(root, &embedded_commit),
+            "a git failure in the ancestry arm must fail toward Stale (true), never a false Fresh"
+        );
+        assert_eq!(
+            embedded_commit_is_stale(root, &embedded_commit),
+            Staleness::Stale,
+            "a git diff failure over the ancestry range must never yield a false Fresh"
         );
     }
 
