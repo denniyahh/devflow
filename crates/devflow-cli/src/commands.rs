@@ -1394,16 +1394,19 @@ pub(crate) fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
     ];
 
     let facts = collect_phase_facts(project_root);
+    let doc_findings = collect_planning_doc_findings(project_root);
 
     if json {
-        // WR-01 (18-fix): a single top-level JSON document — `{"environment":
-        // [...], "reconciliation": [...]}` — instead of the pre-fix
+        // WR-01 (18-fix): a single top-level JSON document —
+        // `{"environment": [...], "reconciliation": [...],
+        // "planning_doc_staleness": [...]}` — instead of the pre-fix
         // behavior of printing the tool checks as one top-level `[...]`
         // array and then printing a SECOND, independent top-level array
         // right after it. That concatenation is not valid single-document
         // JSON for any parser that isn't NDJSON-aware (`json.load` raised
-        // "Extra data").
-        let body = doctor_json_body(&checks, &facts);
+        // "Extra data"). 21b's planning-doc check (D-05) extends this SAME
+        // object with a third key rather than forking a second array.
+        let body = doctor_json_body(&checks, &facts, &doc_findings);
         println!(
             "{}",
             serde_json::to_string_pretty(&body).expect("doctor --json body must serialize")
@@ -1427,6 +1430,7 @@ pub(crate) fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
             println!();
         }
         print!("{}", render_reconciliation_text(&facts));
+        print!("{}", render_planning_doc_text(&doc_findings));
     }
 
     Ok(())
@@ -2002,12 +2006,253 @@ fn checks_json_value(checks: &[Check]) -> serde_json::Value {
 /// JSON for any parser that isn't NDJSON-aware (`json.load` raised "Extra
 /// data" against a live fixture with one active phase). There is now
 /// exactly one top-level value: `{"environment": [...], "reconciliation":
-/// [...]}`.
-fn doctor_json_body(checks: &[Check], facts: &[PhaseFacts]) -> serde_json::Value {
+/// [...], "planning_doc_staleness": [...]}` — 21b's addition (D-05) extends
+/// this SAME object with a third key rather than forking a second reporter
+/// or printing a second top-level array.
+fn doctor_json_body(
+    checks: &[Check],
+    facts: &[PhaseFacts],
+    doc_findings: &[PlanningDocFinding],
+) -> serde_json::Value {
     serde_json::json!({
         "environment": checks_json_value(checks),
         "reconciliation": render_reconciliation_json(facts),
+        "planning_doc_staleness": render_planning_doc_findings_json(doc_findings),
     })
+}
+
+// ---------------------------------------------------------------------------
+// doctor planning-doc staleness reconciliation (21b, D-04/D-05)
+// ---------------------------------------------------------------------------
+
+/// The `v1.5.0` numeric-tuple cutoff (RESEARCH Pitfall #2): the first phase
+/// whose version claim was consistently tagged. A claimed version at or
+/// after this cutoff with no matching/reachable git tag is a real
+/// `Severity::Problem`; a claim before it is legacy history and downgrades
+/// to `Severity::Warn` — otherwise a naive per-row check floods `doctor`
+/// with pre-Phase-18 noise, the exact alert-fatigue class 999.14 exists to
+/// prevent. Compared as a NUMERIC `(major, minor, patch)` tuple, never a
+/// string, so a real future `v1.10.0` is correctly treated as post-cutoff
+/// (a lexicographic `"1.10.0" < "1.5.0"` would wrongly sort it as legacy).
+const PLANNING_DOC_STALENESS_CUTOFF: (u32, u32, u32) = (1, 5, 0);
+
+/// One detection-only finding produced by reconciling a `ROADMAP.md`/
+/// `STATE.md` version claim against the repo's git tags. A sibling of
+/// `PhaseFinding`, not a reuse of it: most claims here are about
+/// already-shipped phases with no active `state-NN.json`/`PhaseFacts`
+/// (RESEARCH Open Q1). `repair` is always `None` — D-04 forbids any
+/// auto-correction of planning-doc prose; nothing in this module has a
+/// write path to either file. Never carries a filesystem path or username
+/// (T-18-01 discipline) — only the source label, the claimed version, and
+/// a git tag name.
+pub(crate) struct PlanningDocFinding {
+    pub(crate) source: String,
+    pub(crate) claim: String,
+    pub(crate) severity: Severity,
+    pub(crate) detail: String,
+    pub(crate) repair: Option<String>,
+}
+
+/// Parse a table cell as a bare `(major, minor, patch)` semver tuple,
+/// stripping an optional leading `v`. Returns `None` for anything that
+/// isn't EXACTLY three dot-separated numeric components — this is what
+/// keeps version ranges (`0.1.0–0.6.0`), em-dash placeholders (`—`), and
+/// any other non-semver cell out of every downstream finding (RESEARCH
+/// Pitfall #2), without needing a regex crate: the range's `–` makes its
+/// middle component fail `str::parse::<u32>`, and the em-dash fails
+/// outright.
+pub(crate) fn parse_semver(cell: &str) -> Option<(u32, u32, u32)> {
+    let cell = cell.strip_prefix('v').unwrap_or(cell);
+    let mut parts = cell.split('.');
+    let major = parts.next()?.trim().parse().ok()?;
+    let minor = parts.next()?.trim().parse().ok()?;
+    let patch = parts.next()?.trim().parse().ok()?;
+    if parts.next().is_some() {
+        return None; // more than three `.`-separated components
+    }
+    Some((major, minor, patch))
+}
+
+/// Scan a `## Shipped`/`## Completed`-shaped markdown table for `(label,
+/// version)` rows whose version cell is a bare or `v`-prefixed single
+/// semver. Hand-scans lines split on `|` rather than pulling in a
+/// markdown-table parser crate — the `is_self_dogfood_workspace` (D-17)
+/// convention this codebase already follows for small, fixed-shape
+/// structured text. Skips the header row, the `|---|---|` separator row,
+/// and any cell that isn't a bare semver (ranges, em-dashes, anything
+/// else) outright; never panics on a malformed row (T-21b-03 — parse
+/// defensively, degrade rather than die). `source` (e.g. `"ROADMAP.md"`)
+/// is folded into the returned label so a caller that concatenates rows
+/// from multiple documents can still tell them apart downstream.
+pub(crate) fn parse_planning_doc_versions(text: &str, source: &str) -> Vec<(String, String)> {
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('|') {
+            continue;
+        }
+        let cells: Vec<&str> = trimmed
+            .trim_matches('|')
+            .split('|')
+            .map(str::trim)
+            .collect();
+        if cells.len() < 2 {
+            continue;
+        }
+        let label = cells[0];
+        // Header row (`Phase | Name | Version`) and the `|---|---|---|`
+        // separator row both have a first cell that is never a real phase
+        // label — skip both rather than trying to special-case each shape.
+        if label.is_empty()
+            || label.eq_ignore_ascii_case("phase")
+            || label.chars().all(|c| c == '-')
+        {
+            continue;
+        }
+        // The version column's position differs between ROADMAP.md's
+        // `## Shipped` table (Phase | Name | Version) and STATE.md's
+        // `## Completed` table (Phase | Description | Version | Date) —
+        // scan every non-label cell and keep whichever ones parse as a
+        // bare semver, rather than hardcoding a column index.
+        for cell in &cells[1..] {
+            if parse_semver(cell).is_some() {
+                rows.push((format!("{source} phase {label}"), (*cell).to_string()));
+            }
+        }
+    }
+    rows
+}
+
+/// Whether `tag` exists in `project_root` AND is reachable from
+/// `base_branch` — argv-array `git` shelling only (T-21b-02: tag strings
+/// passed in here are already validated `^v?\d+\.\d+\.\d+$` cells, never
+/// free-form; no `sh -c`). Two separate invocations, mirroring
+/// `staleness::run_git_stdout`'s idiom: existence first, so a missing tag
+/// short-circuits before the (more expensive) ancestry check.
+pub(crate) fn tag_exists_and_reachable(project_root: &Path, tag: &str, base_branch: &str) -> bool {
+    let exists = std::process::Command::new("git")
+        .args(["rev-parse", "--verify", &format!("refs/tags/{tag}")])
+        .current_dir(project_root)
+        .output()
+        .is_ok_and(|o| o.status.success());
+    exists
+        && std::process::Command::new("git")
+            .args(["merge-base", "--is-ancestor", tag, base_branch])
+            .current_dir(project_root)
+            .output()
+            .is_ok_and(|o| o.status.success())
+}
+
+/// Pure reconciliation core: for each `(label, version_cell)` row, ask the
+/// caller-supplied `tag_lookup` closure whether a `v`-normalized tag exists
+/// and is reachable — kept injectable (rather than calling
+/// `tag_exists_and_reachable` directly) so this is unit-testable without a
+/// real repository, mirroring `reconcile_phase`'s zero-I/O discipline. A
+/// miss becomes a `PlanningDocFinding` at `Severity::Problem` when the
+/// claimed version is at or after the `v1.5.0` cutoff — compared as a
+/// NUMERIC tuple via `parse_semver`, never lexicographically — else
+/// `Severity::Warn` (RESEARCH Pitfall #2). `repair` is always `None` (D-04:
+/// detection-only). Skips any row whose cell doesn't parse as a semver,
+/// defensively — `parse_planning_doc_versions` already filters these out,
+/// but this must never panic even if called with a stray malformed row.
+pub(crate) fn reconcile_planning_docs(
+    rows: &[(String, String)],
+    tag_lookup: &mut impl FnMut(&str) -> bool,
+) -> Vec<PlanningDocFinding> {
+    let mut findings = Vec::new();
+    for (label, version_cell) in rows {
+        let Some(parsed) = parse_semver(version_cell) else {
+            continue;
+        };
+        let tag = if version_cell.starts_with('v') {
+            version_cell.clone()
+        } else {
+            format!("v{version_cell}")
+        };
+        if tag_lookup(&tag) {
+            continue;
+        }
+        let severity = if parsed >= PLANNING_DOC_STALENESS_CUTOFF {
+            Severity::Problem
+        } else {
+            Severity::Warn
+        };
+        findings.push(PlanningDocFinding {
+            source: label.clone(),
+            claim: format!("{label} claims {tag}"),
+            severity,
+            detail: format!(
+                "{label} claims {tag}, but no git tag `{tag}` exists (or it isn't reachable from the base branch)"
+            ),
+            repair: None,
+        });
+    }
+    findings
+}
+
+/// Read `.planning/ROADMAP.md`'s `## Shipped` table and `.planning/STATE.md`'s
+/// `## Completed` table (best-effort — a MISSING file yields no rows for
+/// that document, never an error; `doctor` must not fabricate a `Problem`
+/// from an absent doc), parse both, and reconcile every row against the
+/// repo's git tags via `tag_exists_and_reachable(project_root, tag,
+/// "main")`. `"main"` is a LOCAL branch in this repo (verified: `git
+/// branch --list main`; `git merge-base --is-ancestor v1.7.0 main`
+/// succeeds offline) — deliberately not `origin/main` (no network
+/// dependency in `doctor`'s read-only contract) and not `develop` (wrong
+/// base). The only I/O here is two `std::fs::read_to_string` calls plus
+/// `tag_exists_and_reachable`'s `git` subprocesses — `doctor` stays
+/// read-only (no write path to either file).
+fn collect_planning_doc_findings(project_root: &Path) -> Vec<PlanningDocFinding> {
+    let roadmap =
+        std::fs::read_to_string(project_root.join(".planning/ROADMAP.md")).unwrap_or_default();
+    let state =
+        std::fs::read_to_string(project_root.join(".planning/STATE.md")).unwrap_or_default();
+
+    let mut rows = parse_planning_doc_versions(&roadmap, "ROADMAP.md");
+    rows.extend(parse_planning_doc_versions(&state, "STATE.md"));
+
+    let mut lookup = |tag: &str| tag_exists_and_reachable(project_root, tag, "main");
+    reconcile_planning_docs(&rows, &mut lookup)
+}
+
+/// Build `doctor --json`'s `"planning_doc_staleness"` array (D-05, Pattern
+/// 2), mirroring `render_reconciliation_json`'s array-building idiom.
+fn render_planning_doc_findings_json(findings: &[PlanningDocFinding]) -> serde_json::Value {
+    serde_json::Value::Array(
+        findings
+            .iter()
+            .map(|f| {
+                serde_json::json!({
+                    "source": f.source,
+                    "claim": f.claim,
+                    "severity": f.severity.label(),
+                    "detail": f.detail,
+                    "repair": f.repair,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Build `doctor`'s text planning-docs section, printed after the
+/// reconciliation section. A pure string builder (not a direct
+/// `println!`), mirroring `render_reconciliation_text`'s shape so it's
+/// directly assertable in tests without capturing process stdout. No
+/// findings prints a single `"planning docs: consistent with git tags"`
+/// line, matching the action spec.
+fn render_planning_doc_text(findings: &[PlanningDocFinding]) -> String {
+    if findings.is_empty() {
+        return "\nplanning docs: consistent with git tags\n".to_string();
+    }
+    let mut out = String::from("\nplanning docs:\n");
+    for finding in findings {
+        out.push_str(&format!(
+            "  [{}] {}\n",
+            finding.severity.label(),
+            finding.detail
+        ));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -2992,7 +3237,7 @@ mod tests {
             workflow::save_state(&state).unwrap();
             let facts = collect_phase_facts(root);
 
-            let body = doctor_json_body(&checks, &facts);
+            let body = doctor_json_body(&checks, &facts, &[]);
             let serialized = serde_json::to_string(&body).unwrap();
             let reparsed: serde_json::Value = serde_json::from_str(&serialized)
                 .expect("doctor --json must be single-document JSON, not two concatenated arrays");
@@ -3005,8 +3250,19 @@ mod tests {
                 reparsed.get("reconciliation").is_some(),
                 "must carry the reconciliation findings under \"reconciliation\": {reparsed}"
             );
+            assert!(
+                reparsed.get("planning_doc_staleness").is_some(),
+                "21b: must carry the planning-doc findings under a THIRD key, \
+                 never a second concatenated array: {reparsed}"
+            );
+            assert_eq!(
+                reparsed.as_object().unwrap().len(),
+                3,
+                "doctor --json must have exactly three top-level keys: {reparsed}"
+            );
             assert!(reparsed["environment"].is_array());
             assert!(reparsed["reconciliation"].is_array());
+            assert!(reparsed["planning_doc_staleness"].is_array());
             let reconciliation = reparsed["reconciliation"].as_array().unwrap();
             assert!(
                 !reconciliation.is_empty(),
@@ -3071,6 +3327,291 @@ mod tests {
                 before_lines, after_lines,
                 "doctor must not append to events.jsonl"
             );
+        }
+    }
+
+    /// Unit tests for the pure planning-doc staleness core (21b, D-04/D-05).
+    /// `reconcile_planning_docs` takes an injected `tag_lookup` closure, so
+    /// every test here runs with zero I/O and no real repository — mirrors
+    /// `doctor_reconciliation`'s zero-I/O discipline above.
+    #[cfg(test)]
+    mod planning_doc_staleness {
+        use super::*;
+
+        const SAMPLE_TABLE: &str = "\
+| Phase | Name | Version |
+|---|---|---|
+| 20 | Release Correctness | 1.7.0 |
+| 10 | Logging | — |
+| 1–5 | Core workflow | 0.1.0–0.6.0 |
+| 9 | OSS Polish | 1.2.0 |
+| 11 | GSD-Native | 1.2.0 |
+";
+
+        #[test]
+        fn parse_planning_doc_versions_skips_non_semver_cells() {
+            let rows = parse_planning_doc_versions(SAMPLE_TABLE, "ROADMAP.md");
+            assert_eq!(
+                rows,
+                vec![
+                    ("ROADMAP.md phase 20".to_string(), "1.7.0".to_string()),
+                    ("ROADMAP.md phase 9".to_string(), "1.2.0".to_string()),
+                    ("ROADMAP.md phase 11".to_string(), "1.2.0".to_string()),
+                ],
+                "em-dash and range cells must be skipped; duplicate versions across \
+                 phases (9 and 11 both claim 1.2.0) must both still parse"
+            );
+        }
+
+        #[test]
+        fn parse_planning_doc_versions_accepts_v_prefixed_cells() {
+            let text = "| Phase | Description | Version | Date |\n\
+                         |---|---|---|---|\n\
+                         | 18 | Dogfood Hardening | v1.5.0 | 2026-07-21 |\n";
+            let rows = parse_planning_doc_versions(text, "STATE.md");
+            assert_eq!(
+                rows,
+                vec![("STATE.md phase 18".to_string(), "v1.5.0".to_string())]
+            );
+        }
+
+        #[test]
+        fn parse_semver_rejects_ranges_and_em_dash() {
+            assert_eq!(parse_semver("1.7.0"), Some((1, 7, 0)));
+            assert_eq!(parse_semver("v1.7.0"), Some((1, 7, 0)));
+            assert_eq!(parse_semver("0.1.0–0.6.0"), None);
+            assert_eq!(parse_semver("—"), None);
+            assert_eq!(parse_semver("1.7"), None);
+            assert_eq!(parse_semver("1.7.0.1"), None);
+        }
+
+        #[test]
+        fn reconcile_planning_docs_flags_problem_for_unreachable_post_cutoff_version() {
+            let rows = vec![("ROADMAP.md phase 20".to_string(), "1.7.0".to_string())];
+            let mut lookup = |_tag: &str| false; // no tag exists / unreachable
+            let findings = reconcile_planning_docs(&rows, &mut lookup);
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].severity, Severity::Problem);
+            assert!(
+                findings[0].repair.is_none(),
+                "D-04: detection-only, no repair"
+            );
+            assert!(findings[0].detail.contains("v1.7.0"));
+        }
+
+        #[test]
+        fn reconcile_planning_docs_downgrades_pre_cutoff_mismatch_to_warn() {
+            // Phase 7 claims 1.0.0 in this repo's real ROADMAP.md/STATE.md,
+            // but no v1.0.0 tag exists (tags start at v1.0.1) — must never
+            // surface as Problem (RESEARCH Pitfall #2).
+            let rows = vec![("ROADMAP.md phase 7".to_string(), "1.0.0".to_string())];
+            let mut lookup = |_tag: &str| false;
+            let findings = reconcile_planning_docs(&rows, &mut lookup);
+            assert_eq!(findings.len(), 1);
+            assert_eq!(
+                findings[0].severity,
+                Severity::Warn,
+                "pre-v1.5.0 mismatches must downgrade to Warn, never Problem"
+            );
+            assert!(findings[0].repair.is_none());
+        }
+
+        #[test]
+        fn reconcile_planning_docs_numeric_cutoff_is_not_lexicographic() {
+            // A lexicographic string compare would sort "1.10.0" < "1.5.0"
+            // and wrongly downgrade a real future release to Warn (Codex
+            // MEDIUM, cross-AI review). The cutoff must compare
+            // parse_semver's numeric tuple instead.
+            let rows = vec![
+                ("label A".to_string(), "1.10.0".to_string()),
+                ("label B".to_string(), "1.4.0".to_string()),
+            ];
+            let mut lookup = |_tag: &str| false;
+            let findings = reconcile_planning_docs(&rows, &mut lookup);
+            assert_eq!(findings.len(), 2);
+            assert_eq!(
+                findings[0].severity,
+                Severity::Problem,
+                "1.10.0 is numerically >= v1.5.0 (post-cutoff), even though \
+                 \"1.10.0\" < \"1.5.0\" as a string"
+            );
+            assert_eq!(
+                findings[1].severity,
+                Severity::Warn,
+                "1.4.0 is numerically < v1.5.0 (pre-cutoff)"
+            );
+        }
+
+        #[test]
+        fn reconcile_planning_docs_produces_no_finding_when_tag_is_reachable() {
+            let rows = vec![("ROADMAP.md phase 20".to_string(), "1.7.0".to_string())];
+            let mut lookup = |_tag: &str| true; // tag exists and is reachable
+            let findings = reconcile_planning_docs(&rows, &mut lookup);
+            assert!(findings.is_empty());
+        }
+
+        #[test]
+        fn reconcile_planning_docs_normalizes_bare_cell_to_v_prefixed_tag() {
+            let rows = vec![("ROADMAP.md phase 20".to_string(), "1.7.0".to_string())];
+            let mut seen_tag = None;
+            let mut lookup = |tag: &str| {
+                seen_tag = Some(tag.to_string());
+                true
+            };
+            reconcile_planning_docs(&rows, &mut lookup);
+            assert_eq!(seen_tag.as_deref(), Some("v1.7.0"));
+        }
+
+        #[test]
+        fn reconcile_planning_docs_skips_a_malformed_row_defensively() {
+            // Defensive path: reconcile must never panic even if handed a
+            // row whose version cell isn't a semver (parse_planning_doc_versions
+            // already filters this upstream, but reconcile must degrade, not die).
+            let rows = vec![("bad row".to_string(), "not-a-version".to_string())];
+            let mut lookup = |_tag: &str| false;
+            let findings = reconcile_planning_docs(&rows, &mut lookup);
+            assert!(findings.is_empty());
+        }
+
+        /// Fixture-backed proof of `tag_exists_and_reachable`'s two-check
+        /// contract, mirroring `staleness::init_repo_with_diverged_commit`'s
+        /// idiom: a real tempdir git repo with a tagged, reachable commit,
+        /// an untagged commit, and a commit on a diverged, unreachable branch.
+        fn init_tagged_repo(root: &Path) {
+            let git = |args: &[&str]| {
+                assert!(
+                    std::process::Command::new("git")
+                        .args(args)
+                        .current_dir(root)
+                        .output()
+                        .unwrap()
+                        .status
+                        .success(),
+                    "git {args:?} failed"
+                );
+            };
+            git(&["init", "-q", "-b", "main"]);
+            git(&["config", "user.email", "t@e.st"]);
+            git(&["config", "user.name", "t"]);
+            git(&["config", "commit.gpgsign", "false"]);
+            git(&["config", "tag.gpgsign", "false"]);
+            git(&["config", "core.hooksPath", "/dev/null"]);
+            std::fs::write(root.join("a.txt"), "one").unwrap();
+            git(&["add", "."]);
+            git(&["commit", "-q", "-m", "base"]);
+            git(&["tag", "v1.7.0"]);
+
+            git(&["checkout", "-q", "-b", "side"]);
+            std::fs::write(root.join("side.txt"), "s").unwrap();
+            git(&["add", "."]);
+            git(&["commit", "-q", "-m", "side"]);
+            git(&["tag", "v9.9.9"]); // tagged, but only reachable from `side`, not `main`
+
+            git(&["checkout", "-q", "main"]);
+        }
+
+        #[test]
+        fn tag_exists_and_reachable_true_for_a_tagged_ancestor() {
+            let dir = tempfile::tempdir().unwrap();
+            init_tagged_repo(dir.path());
+            assert!(tag_exists_and_reachable(dir.path(), "v1.7.0", "main"));
+        }
+
+        #[test]
+        fn tag_exists_and_reachable_false_for_a_missing_tag() {
+            let dir = tempfile::tempdir().unwrap();
+            init_tagged_repo(dir.path());
+            assert!(!tag_exists_and_reachable(dir.path(), "v0.0.1", "main"));
+        }
+
+        #[test]
+        fn tag_exists_and_reachable_false_for_a_tag_unreachable_from_base() {
+            let dir = tempfile::tempdir().unwrap();
+            init_tagged_repo(dir.path());
+            assert!(!tag_exists_and_reachable(dir.path(), "v9.9.9", "main"));
+        }
+
+        /// D-05/D-04: a MISSING `.planning/ROADMAP.md`/`STATE.md` must yield
+        /// no findings and never an error — `doctor` must not fabricate a
+        /// `Problem` from an absent doc. Proven against a tempdir with no
+        /// `.planning/` directory at all, not just asserted.
+        #[test]
+        fn collect_planning_doc_findings_missing_files_yield_no_findings_not_error() {
+            let dir = tempfile::tempdir().unwrap();
+            let findings = collect_planning_doc_findings(dir.path());
+            assert!(
+                findings.is_empty(),
+                "a project with no .planning/ dir at all must yield zero findings, not an error"
+            );
+        }
+
+        #[test]
+        fn render_planning_doc_text_reports_consistent_when_no_findings() {
+            assert_eq!(
+                render_planning_doc_text(&[]),
+                "\nplanning docs: consistent with git tags\n"
+            );
+        }
+
+        #[test]
+        fn render_planning_doc_text_lists_each_finding_detail() {
+            let findings = vec![PlanningDocFinding {
+                source: "ROADMAP.md phase 20".to_string(),
+                claim: "ROADMAP.md phase 20 claims v1.7.0".to_string(),
+                severity: Severity::Problem,
+                detail: "ROADMAP.md phase 20 claims v1.7.0, but no git tag `v1.7.0` exists"
+                    .to_string(),
+                repair: None,
+            }];
+            let text = render_planning_doc_text(&findings);
+            assert!(text.contains("[problem]"));
+            assert!(text.contains("ROADMAP.md phase 20 claims v1.7.0"));
+        }
+
+        #[test]
+        fn render_planning_doc_findings_json_is_an_array_of_objects() {
+            let findings = vec![PlanningDocFinding {
+                source: "ROADMAP.md phase 20".to_string(),
+                claim: "ROADMAP.md phase 20 claims v1.7.0".to_string(),
+                severity: Severity::Problem,
+                detail: "detail text".to_string(),
+                repair: None,
+            }];
+            let value = render_planning_doc_findings_json(&findings);
+            assert!(value.is_array());
+            let arr = value.as_array().unwrap();
+            assert_eq!(arr.len(), 1);
+            assert_eq!(arr[0]["severity"], "problem");
+            assert_eq!(arr[0]["source"], "ROADMAP.md phase 20");
+            assert_eq!(arr[0]["repair"], serde_json::Value::Null);
+        }
+
+        /// D-05/Pattern 2: `doctor --json` must stay a SINGLE JSON object
+        /// with `planning_doc_staleness` as a THIRD key, never a second
+        /// top-level array — the exact WR-01 regression class this phase
+        /// must not reintroduce.
+        #[test]
+        fn doctor_json_body_carries_planning_doc_staleness_as_a_third_key() {
+            let checks: Vec<Check> = Vec::new();
+            let facts: Vec<PhaseFacts> = Vec::new();
+            let doc_findings = vec![PlanningDocFinding {
+                source: "ROADMAP.md phase 20".to_string(),
+                claim: "claim".to_string(),
+                severity: Severity::Problem,
+                detail: "detail".to_string(),
+                repair: None,
+            }];
+            let body = doctor_json_body(&checks, &facts, &doc_findings);
+            let obj = body.as_object().unwrap();
+            assert_eq!(
+                obj.len(),
+                3,
+                "must be exactly {{environment, reconciliation, planning_doc_staleness}}: {body}"
+            );
+            assert!(obj.contains_key("environment"));
+            assert!(obj.contains_key("reconciliation"));
+            let staleness = obj["planning_doc_staleness"].as_array().unwrap();
+            assert_eq!(staleness.len(), 1);
         }
     }
 }
