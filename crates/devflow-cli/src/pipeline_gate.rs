@@ -921,6 +921,46 @@ mod tests {
         assert_eq!(last["event"], "workflow_finished");
     }
 
+    /// 20e Task 3: an `Abort`-routing Ship response (a rejection whose note
+    /// says "abort") must reach the SAME shared `abort` helper the live
+    /// `handle_ship_outcome` path uses — no special-cased branch inside
+    /// `ship_override`. Asserts the shared path's own effects: state
+    /// cleared, gate files cleaned up, `workflow_aborted` emitted.
+    #[test]
+    fn ship_override_abort_routes_through_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 95;
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Ship;
+        workflow::save_state(&state).unwrap();
+
+        Gates::write_gate(root, phase, Stage::Ship, "Ship complete — approve merge?").unwrap();
+        Gates::respond(
+            root,
+            phase,
+            Stage::Ship,
+            &GateResponse {
+                approved: false,
+                note: Some("abort: found a blocking regression during manual review".into()),
+                responded_by: Some("test".into()),
+            },
+        )
+        .unwrap();
+
+        ship_override(root, phase, false).unwrap();
+
+        let err = workflow::load_state(root, phase).unwrap_err();
+        assert!(matches!(err, workflow::WorkflowError::MissingState(_)));
+        assert!(!Gates::gate_path(root, phase, Stage::Ship).exists());
+        assert!(!Gates::response_path(root, phase, Stage::Ship).exists());
+        assert!(!Gates::ack_path(root, phase, Stage::Ship).exists());
+        let last = devflow_core::events::last_event_for_phase(root, phase)
+            .expect("events recorded for phase");
+        assert_eq!(last["event"], "workflow_aborted");
+    }
+
     /// 20e Task 2 (D-02, EoP regression): `--force` must never let
     /// `ship_override` reach `finish_workflow` from a non-Ship stage. Checked
     /// for every earlier `Stage` with `--force` both true and false.
