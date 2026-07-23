@@ -743,6 +743,70 @@ pub(crate) fn gate_respond(
     Ok(())
 }
 
+/// Print an open gate's full, untruncated (but sanitized) context — the
+/// discoverability counterpart to `gate_list`'s 100-char table truncation
+/// (21a, D-03). Mirrors `gate_respond`'s stage auto-resolve-single-open-gate
+/// logic (`[]` → error pointing at `devflow gate list`; `[one]` → that
+/// stage; `many` → error listing stages and asking for `--stage`) so the two
+/// commands' gate-resolution behavior can never drift.
+pub(crate) fn gate_show(
+    project_root: &Path,
+    phase: u32,
+    stage: Option<Stage>,
+) -> Result<(), CliError> {
+    let stage = match stage {
+        Some(stage) => stage,
+        None => {
+            let open: Vec<_> = Gates::list_open(project_root)
+                .into_iter()
+                .filter(|g| g.phase == phase)
+                .collect();
+            match open.as_slice() {
+                [] => {
+                    return Err(CliError::Message(format!(
+                        "no open gate for phase {phase} — see `devflow gate list`"
+                    )));
+                }
+                [one] => one.stage,
+                many => {
+                    return Err(CliError::Message(format!(
+                        "phase {phase} has several open gates ({}) — pass --stage",
+                        many.iter()
+                            .map(|g| g.stage.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )));
+                }
+            }
+        }
+    };
+    let gate = Gates::list_open(project_root)
+        .into_iter()
+        .find(|g| g.phase == phase && g.stage == stage)
+        .ok_or_else(|| {
+            CliError::Message(format!(
+                "no open gate for phase {phase} stage {stage} — see `devflow gate list`"
+            ))
+        })?;
+    println!("{}", render_gate_show(&gate));
+    Ok(())
+}
+
+/// Pure render for `gate_show`'s output block — the FULL context via
+/// `render_gate_context(.., usize::MAX)` (sanitize, never truncate; contrast
+/// `gate_list`'s `render_gate_context(.., 100)`). Factored out of `gate_show`
+/// so the untruncated-context guarantee is unit-testable without capturing
+/// process stdout.
+fn render_gate_show(gate: &OpenGate) -> String {
+    format!(
+        "phase {} {} ({})\n{}",
+        gate.phase,
+        gate.stage,
+        recover::format_age(&gate.timestamp),
+        render_gate_context(&gate.context, usize::MAX),
+    )
+}
+
 /// Print (or follow) a phase's captured agent output.
 pub(crate) fn logs(
     project_root: &Path,
