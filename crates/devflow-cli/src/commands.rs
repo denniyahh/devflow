@@ -2086,13 +2086,12 @@ mod tests {
     #[test]
     fn cron_instruction_hints_include_hermes_command_per_phase() {
         let dir = tempfile::tempdir().unwrap();
+        // Empty retry_after here so the exact-match assertion below isolates
+        // the base hermes-command hint from 21a's reset-time fragment
+        // (covered separately by cron_hint_line_* below).
         for phase in [7, 9] {
-            let instructions = devflow_core::ship::build_cron_instructions(
-                dir.path(),
-                phase,
-                "2026-06-18T15:45:30Z",
-                "claude,codex",
-            );
+            let instructions =
+                devflow_core::ship::build_cron_instructions(dir.path(), phase, "", "claude,codex");
             devflow_core::ship::write_cron_instructions(dir.path(), &instructions).unwrap();
         }
 
@@ -2107,6 +2106,43 @@ mod tests {
             )
         );
         assert!(hints[1].contains("(phase 9)"));
+    }
+
+    #[test]
+    fn cron_hint_line_appends_sanitized_reset_when_retry_after_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let instructions = devflow_core::ship::build_cron_instructions(
+            dir.path(),
+            7,
+            "2026-06-18T15:45:30Z",
+            "claude,codex",
+        );
+
+        let hint = cron_hint_line(&instructions, dir.path());
+
+        assert!(hint.starts_with(&format!(
+            "Cron instruction pending (phase 7): hermes cron create --from-devflow {}",
+            dir.path().display()
+        )));
+        assert!(hint.contains("(rate-limit resets: 2026-06-18T15:45:30Z)"));
+    }
+
+    #[test]
+    fn cron_hint_line_omits_reset_fragment_when_retry_after_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let instructions =
+            devflow_core::ship::build_cron_instructions(dir.path(), 7, "", "claude");
+
+        let hint = cron_hint_line(&instructions, dir.path());
+
+        assert_eq!(
+            hint,
+            format!(
+                "Cron instruction pending (phase 7): hermes cron create --from-devflow {}",
+                dir.path().display()
+            )
+        );
+        assert!(!hint.contains("resets"));
     }
 
     #[test]
