@@ -24,8 +24,8 @@ use parallel::{parallel, sequentagent};
 
 mod commands;
 use commands::{
-    cleanup, doctor, gate_list, gate_respond, history_cmd, list, logs, recover_cmd, reference,
-    release_check, resolve_gate_target, start, status, test_cmd,
+    cleanup, doctor, gate_list, gate_respond, gate_show, history_cmd, list, logs, recover_cmd,
+    reference, release_check, resolve_gate_target, start, status, test_cmd,
 };
 
 mod config_parse;
@@ -325,6 +325,20 @@ enum GateCmd {
         #[arg(long, default_value = ".")]
         project: PathBuf,
     },
+    /// Print an open gate's full, untruncated context (21a) — `gate list`
+    /// truncates context to 100 chars for the table view; this reads it in
+    /// full, control-char sanitized.
+    Show {
+        /// Phase whose gate to show.
+        phase: u32,
+        /// Stage of the gate (auto-resolved when the phase has exactly one
+        /// open gate).
+        #[arg(long = "stage")]
+        stage: Option<Stage>,
+        /// Project root.
+        #[arg(default_value = ".")]
+        project: PathBuf,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -440,6 +454,11 @@ fn run() -> Result<(), CliError> {
                     resolve_gate_target(stage, legacy_project, stage_option, project)?;
                 gate_respond(&project_root(project)?, phase, stage, false, Some(note))
             }
+            GateCmd::Show {
+                phase,
+                stage,
+                project,
+            } => gate_show(&project_root(project)?, phase, stage),
         },
         Command::Logs {
             phase,

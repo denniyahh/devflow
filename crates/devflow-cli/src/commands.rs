@@ -1943,6 +1943,73 @@ mod tests {
     }
 
     #[test]
+    fn gate_show_arg_parsing_accepts_phase_and_optional_stage() {
+        let bare = Cli::try_parse_from(["devflow", "gate", "show", "15"]).unwrap();
+        let Command::Gate {
+            action: GateCmd::Show { phase, stage, .. },
+        } = bare.command
+        else {
+            panic!("expected gate show command");
+        };
+        assert_eq!(phase, 15);
+        assert_eq!(stage, None);
+
+        let flagged =
+            Cli::try_parse_from(["devflow", "gate", "show", "15", "--stage", "ship"]).unwrap();
+        let Command::Gate {
+            action: GateCmd::Show { phase, stage, .. },
+        } = flagged.command
+        else {
+            panic!("expected gate show command with stage");
+        };
+        assert_eq!(phase, 15);
+        assert_eq!(stage, Some(Stage::Ship));
+    }
+
+    #[test]
+    fn gate_show_renders_full_untruncated_sanitized_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = format!("first line\n\u{1b}[2J{}", "x".repeat(150));
+        Gates::write_gate(dir.path(), 15, Stage::Ship, &context).unwrap();
+        let gate = Gates::list_open(dir.path())
+            .into_iter()
+            .find(|g| g.phase == 15)
+            .unwrap();
+
+        let rendered = render_gate_show(&gate);
+
+        assert!(rendered.contains(&"x".repeat(150)));
+        assert!(!rendered.contains("[truncated"));
+        assert!(!rendered.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn gate_show_errors_naming_gate_list_when_no_open_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = gate_show(dir.path(), 15, None).unwrap_err();
+        assert!(err.to_string().contains("devflow gate list"));
+    }
+
+    #[test]
+    fn gate_show_errors_asking_for_stage_with_several_open_gates() {
+        let dir = tempfile::tempdir().unwrap();
+        Gates::write_gate(dir.path(), 15, Stage::Ship, "ctx1").unwrap();
+        Gates::write_gate(dir.path(), 15, Stage::Validate, "ctx2").unwrap();
+
+        let err = gate_show(dir.path(), 15, None).unwrap_err();
+
+        assert!(err.to_string().contains("--stage"));
+    }
+
+    #[test]
+    fn gate_show_auto_resolves_single_open_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        Gates::write_gate(dir.path(), 15, Stage::Ship, "the only open gate").unwrap();
+
+        assert!(gate_show(dir.path(), 15, None).is_ok());
+    }
+
+    #[test]
     fn describe_worktree_dir_infers_phase_and_agent() {
         assert_eq!(
             describe_worktree_dir("phase-07-claude"),
