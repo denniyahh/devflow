@@ -1394,16 +1394,19 @@ pub(crate) fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
     ];
 
     let facts = collect_phase_facts(project_root);
+    let doc_findings = collect_planning_doc_findings(project_root);
 
     if json {
-        // WR-01 (18-fix): a single top-level JSON document — `{"environment":
-        // [...], "reconciliation": [...]}` — instead of the pre-fix
+        // WR-01 (18-fix): a single top-level JSON document —
+        // `{"environment": [...], "reconciliation": [...],
+        // "planning_doc_staleness": [...]}` — instead of the pre-fix
         // behavior of printing the tool checks as one top-level `[...]`
         // array and then printing a SECOND, independent top-level array
         // right after it. That concatenation is not valid single-document
         // JSON for any parser that isn't NDJSON-aware (`json.load` raised
-        // "Extra data").
-        let body = doctor_json_body(&checks, &facts);
+        // "Extra data"). 21b's planning-doc check (D-05) extends this SAME
+        // object with a third key rather than forking a second array.
+        let body = doctor_json_body(&checks, &facts, &doc_findings);
         println!(
             "{}",
             serde_json::to_string_pretty(&body).expect("doctor --json body must serialize")
@@ -1427,6 +1430,7 @@ pub(crate) fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
             println!();
         }
         print!("{}", render_reconciliation_text(&facts));
+        print!("{}", render_planning_doc_text(&doc_findings));
     }
 
     Ok(())
@@ -2002,11 +2006,18 @@ fn checks_json_value(checks: &[Check]) -> serde_json::Value {
 /// JSON for any parser that isn't NDJSON-aware (`json.load` raised "Extra
 /// data" against a live fixture with one active phase). There is now
 /// exactly one top-level value: `{"environment": [...], "reconciliation":
-/// [...]}`.
-fn doctor_json_body(checks: &[Check], facts: &[PhaseFacts]) -> serde_json::Value {
+/// [...], "planning_doc_staleness": [...]}` — 21b's addition (D-05) extends
+/// this SAME object with a third key rather than forking a second reporter
+/// or printing a second top-level array.
+fn doctor_json_body(
+    checks: &[Check],
+    facts: &[PhaseFacts],
+    doc_findings: &[PlanningDocFinding],
+) -> serde_json::Value {
     serde_json::json!({
         "environment": checks_json_value(checks),
         "reconciliation": render_reconciliation_json(facts),
+        "planning_doc_staleness": render_planning_doc_findings_json(doc_findings),
     })
 }
 
@@ -2177,6 +2188,71 @@ pub(crate) fn reconcile_planning_docs(
         });
     }
     findings
+}
+
+/// Read `.planning/ROADMAP.md`'s `## Shipped` table and `.planning/STATE.md`'s
+/// `## Completed` table (best-effort — a MISSING file yields no rows for
+/// that document, never an error; `doctor` must not fabricate a `Problem`
+/// from an absent doc), parse both, and reconcile every row against the
+/// repo's git tags via `tag_exists_and_reachable(project_root, tag,
+/// "main")`. `"main"` is a LOCAL branch in this repo (verified: `git
+/// branch --list main`; `git merge-base --is-ancestor v1.7.0 main`
+/// succeeds offline) — deliberately not `origin/main` (no network
+/// dependency in `doctor`'s read-only contract) and not `develop` (wrong
+/// base). The only I/O here is two `std::fs::read_to_string` calls plus
+/// `tag_exists_and_reachable`'s `git` subprocesses — `doctor` stays
+/// read-only (no write path to either file).
+fn collect_planning_doc_findings(project_root: &Path) -> Vec<PlanningDocFinding> {
+    let roadmap =
+        std::fs::read_to_string(project_root.join(".planning/ROADMAP.md")).unwrap_or_default();
+    let state =
+        std::fs::read_to_string(project_root.join(".planning/STATE.md")).unwrap_or_default();
+
+    let mut rows = parse_planning_doc_versions(&roadmap, "ROADMAP.md");
+    rows.extend(parse_planning_doc_versions(&state, "STATE.md"));
+
+    let mut lookup = |tag: &str| tag_exists_and_reachable(project_root, tag, "main");
+    reconcile_planning_docs(&rows, &mut lookup)
+}
+
+/// Build `doctor --json`'s `"planning_doc_staleness"` array (D-05, Pattern
+/// 2), mirroring `render_reconciliation_json`'s array-building idiom.
+fn render_planning_doc_findings_json(findings: &[PlanningDocFinding]) -> serde_json::Value {
+    serde_json::Value::Array(
+        findings
+            .iter()
+            .map(|f| {
+                serde_json::json!({
+                    "source": f.source,
+                    "claim": f.claim,
+                    "severity": f.severity.label(),
+                    "detail": f.detail,
+                    "repair": f.repair,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Build `doctor`'s text planning-docs section, printed after the
+/// reconciliation section. A pure string builder (not a direct
+/// `println!`), mirroring `render_reconciliation_text`'s shape so it's
+/// directly assertable in tests without capturing process stdout. No
+/// findings prints a single `"planning docs: consistent with git tags"`
+/// line, matching the action spec.
+fn render_planning_doc_text(findings: &[PlanningDocFinding]) -> String {
+    if findings.is_empty() {
+        return "\nplanning docs: consistent with git tags\n".to_string();
+    }
+    let mut out = String::from("\nplanning docs:\n");
+    for finding in findings {
+        out.push_str(&format!(
+            "  [{}] {}\n",
+            finding.severity.label(),
+            finding.detail
+        ));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -3161,7 +3237,7 @@ mod tests {
             workflow::save_state(&state).unwrap();
             let facts = collect_phase_facts(root);
 
-            let body = doctor_json_body(&checks, &facts);
+            let body = doctor_json_body(&checks, &facts, &[]);
             let serialized = serde_json::to_string(&body).unwrap();
             let reparsed: serde_json::Value = serde_json::from_str(&serialized)
                 .expect("doctor --json must be single-document JSON, not two concatenated arrays");
@@ -3174,8 +3250,19 @@ mod tests {
                 reparsed.get("reconciliation").is_some(),
                 "must carry the reconciliation findings under \"reconciliation\": {reparsed}"
             );
+            assert!(
+                reparsed.get("planning_doc_staleness").is_some(),
+                "21b: must carry the planning-doc findings under a THIRD key, \
+                 never a second concatenated array: {reparsed}"
+            );
+            assert_eq!(
+                reparsed.as_object().unwrap().len(),
+                3,
+                "doctor --json must have exactly three top-level keys: {reparsed}"
+            );
             assert!(reparsed["environment"].is_array());
             assert!(reparsed["reconciliation"].is_array());
+            assert!(reparsed["planning_doc_staleness"].is_array());
             let reconciliation = reparsed["reconciliation"].as_array().unwrap();
             assert!(
                 !reconciliation.is_empty(),
@@ -3442,6 +3529,89 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             init_tagged_repo(dir.path());
             assert!(!tag_exists_and_reachable(dir.path(), "v9.9.9", "main"));
+        }
+
+        /// D-05/D-04: a MISSING `.planning/ROADMAP.md`/`STATE.md` must yield
+        /// no findings and never an error — `doctor` must not fabricate a
+        /// `Problem` from an absent doc. Proven against a tempdir with no
+        /// `.planning/` directory at all, not just asserted.
+        #[test]
+        fn collect_planning_doc_findings_missing_files_yield_no_findings_not_error() {
+            let dir = tempfile::tempdir().unwrap();
+            let findings = collect_planning_doc_findings(dir.path());
+            assert!(
+                findings.is_empty(),
+                "a project with no .planning/ dir at all must yield zero findings, not an error"
+            );
+        }
+
+        #[test]
+        fn render_planning_doc_text_reports_consistent_when_no_findings() {
+            assert_eq!(
+                render_planning_doc_text(&[]),
+                "\nplanning docs: consistent with git tags\n"
+            );
+        }
+
+        #[test]
+        fn render_planning_doc_text_lists_each_finding_detail() {
+            let findings = vec![PlanningDocFinding {
+                source: "ROADMAP.md phase 20".to_string(),
+                claim: "ROADMAP.md phase 20 claims v1.7.0".to_string(),
+                severity: Severity::Problem,
+                detail: "ROADMAP.md phase 20 claims v1.7.0, but no git tag `v1.7.0` exists"
+                    .to_string(),
+                repair: None,
+            }];
+            let text = render_planning_doc_text(&findings);
+            assert!(text.contains("[problem]"));
+            assert!(text.contains("ROADMAP.md phase 20 claims v1.7.0"));
+        }
+
+        #[test]
+        fn render_planning_doc_findings_json_is_an_array_of_objects() {
+            let findings = vec![PlanningDocFinding {
+                source: "ROADMAP.md phase 20".to_string(),
+                claim: "ROADMAP.md phase 20 claims v1.7.0".to_string(),
+                severity: Severity::Problem,
+                detail: "detail text".to_string(),
+                repair: None,
+            }];
+            let value = render_planning_doc_findings_json(&findings);
+            assert!(value.is_array());
+            let arr = value.as_array().unwrap();
+            assert_eq!(arr.len(), 1);
+            assert_eq!(arr[0]["severity"], "problem");
+            assert_eq!(arr[0]["source"], "ROADMAP.md phase 20");
+            assert_eq!(arr[0]["repair"], serde_json::Value::Null);
+        }
+
+        /// D-05/Pattern 2: `doctor --json` must stay a SINGLE JSON object
+        /// with `planning_doc_staleness` as a THIRD key, never a second
+        /// top-level array — the exact WR-01 regression class this phase
+        /// must not reintroduce.
+        #[test]
+        fn doctor_json_body_carries_planning_doc_staleness_as_a_third_key() {
+            let checks: Vec<Check> = Vec::new();
+            let facts: Vec<PhaseFacts> = Vec::new();
+            let doc_findings = vec![PlanningDocFinding {
+                source: "ROADMAP.md phase 20".to_string(),
+                claim: "claim".to_string(),
+                severity: Severity::Problem,
+                detail: "detail".to_string(),
+                repair: None,
+            }];
+            let body = doctor_json_body(&checks, &facts, &doc_findings);
+            let obj = body.as_object().unwrap();
+            assert_eq!(
+                obj.len(),
+                3,
+                "must be exactly {{environment, reconciliation, planning_doc_staleness}}: {body}"
+            );
+            assert!(obj.contains_key("environment"));
+            assert!(obj.contains_key("reconciliation"));
+            let staleness = obj["planning_doc_staleness"].as_array().unwrap();
+            assert_eq!(staleness.len(), 1);
         }
     }
 }
