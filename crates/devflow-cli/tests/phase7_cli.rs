@@ -631,3 +631,70 @@ fn start_codex_without_context_fails_preflight() {
         "pre-flight failure must not create a worktree"
     );
 }
+
+/// 20b instance 1 (D-06, review: Codex HIGH fail-closed-on-live-agent):
+/// `cleanup --force` must refuse to remove a worktree whose agent pid is
+/// genuinely alive, even when the persisted `State` carries `monitor_pid =
+/// None` — a classification `liveness()` reports as `Unknown`, NOT `Healthy`.
+/// A guard that only refuses on `Healthy`/`BetweenStages` would still delete
+/// this worktree out from under a live agent. Against unmodified `cleanup`
+/// (no liveness check at all today) this test FAILS: cleanup removes the
+/// worktree unconditionally and exits 0.
+#[test]
+fn cleanup_force_refuses_on_live_agent_unknown_monitor() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let phase = 8;
+    let branch = format!("feature/phase-{phase:02}");
+    seed_feature_branch(root, phase);
+
+    let wt_path = root.join(".worktrees").join(format!("phase-{phase:02}"));
+    devflow_core::worktree::add(root, &wt_path, &branch, &branch, false).unwrap();
+
+    // The agent pid file holds a genuinely alive pid — the test process
+    // itself, trivially alive for the test's duration.
+    let pid_path = devflow_core::agent_result::agent_pid_path(root, phase);
+    fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
+    fs::write(&pid_path, std::process::id().to_string()).unwrap();
+
+    // Persist a State with monitor_pid = None (Unknown liveness) and
+    // worktree_path pointing at the created worktree (the worktree->phase
+    // join key, review: Codex MEDIUM).
+    let mut state = devflow_core::state::State::new(
+        phase,
+        devflow_core::state::AgentKind::Claude,
+        devflow_core::mode::Mode::Auto,
+        root.to_path_buf(),
+    );
+    state.worktree_path = Some(wt_path.clone());
+    devflow_core::workflow::save_state(&state).unwrap();
+
+    let fake_bin = fake_bin_dir(&[]);
+    let output = Command::new(devflow_bin())
+        .args(["cleanup", "--force"])
+        .arg(root)
+        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .current_dir(root)
+        .output()
+        .expect("run devflow cleanup");
+
+    assert!(
+        !output.status.success(),
+        "cleanup --force must refuse to remove a live agent's worktree even \
+         under Unknown liveness (monitor_pid = None)"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("devflow resume"),
+        "refusal must name `devflow resume` as the unblocking action, got:\n{combined}"
+    );
+    assert!(
+        wt_path.is_dir(),
+        "worktree must NOT have been removed while the agent is alive"
+    );
+}
