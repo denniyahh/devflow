@@ -622,13 +622,26 @@ fn package_name(contents: &str) -> Option<String> {
 }
 
 /// Whether a member manifest's `[dependencies]` section references
-/// `dep_name` — either `dep_name.workspace = true` or `dep_name = { ... }`.
+/// `dep_name` — either `dep_name.workspace = true` or `dep_name = { ... }`
+/// under an inline `[dependencies]` table, OR the equally-valid expanded
+/// long-form section `[dependencies.dep_name]` (WR-03, phase 20 review): a
+/// manifest may spell a dependency out as its own section (e.g.
+/// `[dependencies.devflow-core]\nworkspace = true`), which parses to a
+/// section header of `"dependencies.devflow-core"` — never equal to the
+/// plain `"dependencies"` the inline-table branch below checks against, so
+/// that edge was previously dropped from `publish_order`'s topo-sort
+/// entirely.
 fn member_depends_on(contents: &str, dep_name: &str) -> bool {
     let mut current = String::new();
     for line in contents.lines() {
         let trimmed = line.trim();
         if let Some(inner) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
             current = inner.trim().to_string();
+            if let Some(name) = current.strip_prefix("dependencies.")
+                && name == dep_name
+            {
+                return true;
+            }
             continue;
         }
         if current != "dependencies" {
@@ -1515,6 +1528,19 @@ mod tests {
         assert!(!member_depends_on(contents, "serde"));
     }
 
+    /// WR-03 (phase 20 review): the equally-valid expanded long-form TOML
+    /// section syntax (`[dependencies.NAME]`) parses to a section header of
+    /// `"dependencies.NAME"`, never equal to the plain `"dependencies"` the
+    /// inline-table branch checks against — this must still be recognized
+    /// as a dependency edge.
+    #[test]
+    fn member_depends_on_matches_long_form_dependency_section() {
+        let contents = "[package]\nname = \"devflow\"\n\n[dependencies.devflow-core]\nworkspace = true\n\n[dependencies.clap]\nversion = \"4\"\n";
+        assert!(member_depends_on(contents, "devflow-core"));
+        assert!(member_depends_on(contents, "clap"));
+        assert!(!member_depends_on(contents, "serde"));
+    }
+
     #[test]
     fn topo_sort_orders_dependency_before_dependent() {
         let names = vec!["devflow".to_string(), "devflow-core".to_string()];
@@ -1563,6 +1589,41 @@ mod tests {
         assert_eq!(
             publish_order(root),
             vec!["devflow-core".to_string(), "devflow".to_string()]
+        );
+    }
+
+    /// WR-03 (phase 20 review): a workspace member manifest written with
+    /// the long-form `[dependencies.devflow-core]` section (rather than the
+    /// inline `[dependencies]\ndevflow-core.workspace = true` form) must
+    /// still contribute its dependency edge to `publish_order`'s topo-sort
+    /// — the release-safety-critical crates.io publish order this
+    /// self-pin regression would otherwise silently get wrong.
+    #[test]
+    fn publish_order_recognizes_long_form_dependency_section_self_dependency() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\n    \"crates/devflow-core\",\n    \"crates/devflow-cli\",\n]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("crates/devflow-core")).unwrap();
+        std::fs::write(
+            root.join("crates/devflow-core/Cargo.toml"),
+            "[package]\nname = \"devflow-core\"\n\n[dependencies]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("crates/devflow-cli")).unwrap();
+        std::fs::write(
+            root.join("crates/devflow-cli/Cargo.toml"),
+            "[package]\nname = \"devflow\"\n\n[dependencies.devflow-core]\nworkspace = true\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            publish_order(root),
+            vec!["devflow-core".to_string(), "devflow".to_string()],
+            "the long-form dependency section must still order devflow-core before devflow"
         );
     }
 
