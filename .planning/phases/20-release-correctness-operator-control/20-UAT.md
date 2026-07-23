@@ -1,9 +1,9 @@
 ---
-status: partial
+status: complete
 phase: 20-release-correctness-operator-control
 source: [20-VERIFICATION.md]
 started: 2026-07-23T10:28:37.724Z
-updated: 2026-07-23T10:45:00.000Z
+updated: 2026-07-23T11:02:00.000Z
 ---
 
 ## Current Test
@@ -31,19 +31,26 @@ evidence: |
 
 ### 2. CI-on-branch sign-off for the two ex-flaky fixtures (20b)
 expected: Push the phase-20 branch (or open its PR) and confirm `cargo test --workspace` is green on a real CI runner — specifically `reference_and_cleanup_worktree_cli_flow` and `start_worktree_mode_ignores_main_checkout_divergence` (the CI-concurrency-dependent flakes 20b fixes). 0 failed on the pushed CI run. Local 5x-green is necessary but not sufficient per the phase's own VALIDATION.md (Phase 19 ENV_MUTEX precedent).
-result: blocked
-blocked_by: release-build
-reason: "Requires a pushed CI run — closes when the PR (feat/phase-20-release-correctness-operator-control → develop) runs CI green. Local suite is 491/0 (incl. both fixtures 13/13 across 5 runs), but per 20-VALIDATION.md local-green is necessary-not-sufficient for this CI-concurrency-dependent flake class. Not a code issue — a prerequisite gate on opening the PR."
+result: pass
+source: agent-verified (2026-07-23, PR #20)
+evidence: |
+  PR https://github.com/denniyahh/devflow/pull/20 (feat/phase-20-release-correctness-operator-control
+  → develop). Both GitHub Actions workflows (CI + Devcontainer) green — 8/8 checks
+  SUCCESS, mergeStateStatus CLEAN. Independently pulled both CI "Test" job logs
+  (runs 30000727488 and 30000754153) and confirmed both named fixtures appear and
+  pass on each: `start_worktree_mode_ignores_main_checkout_divergence ... ok` and
+  `reference_and_cleanup_worktree_cli_flow ... ok`. This is the CI-concurrency
+  sign-off the phase's own VALIDATION.md required beyond local-green.
 
 ## Summary
 
 total: 2
-passed: 1
+passed: 2
 issues: 0
 pending: 0
 skipped: 0
-blocked: 1
+blocked: 0
 
 ## Gaps
 
-[none — no code issues found; test 2 is a prerequisite gate, not a gap]
+[none — no code issues found]
