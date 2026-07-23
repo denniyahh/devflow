@@ -32,13 +32,14 @@ use std::sync::Mutex;
 /// invariant across that crate boundary — it is true today only because no
 /// env var is currently guarded by more than one of the three statics.
 ///
-/// This mutex currently guards four variables: `PATH`,
+/// This mutex currently guards five variables: `PATH`,
 /// `DEVFLOW_GATE_TIMEOUT_SECS`, `DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS`,
-/// `DEVFLOW_GATE_NOTIFY_CMD`. A future author adding a fifth mutated
-/// variable to this crate's tests is joining this set — guard it here, not
-/// with a new mutex (D-02: per-module mutexes were rejected on measured
-/// evidence that `PATH` alone is mutated 36 times across 12 lock regions
-/// spanning at least three future target clusters).
+/// `DEVFLOW_GATE_NOTIFY_CMD`, `DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS` (WR-02,
+/// phase 20 review). A future author adding a sixth mutated variable to
+/// this crate's tests is joining this set — guard it here, not with a new
+/// mutex (D-02: per-module mutexes were rejected on measured evidence that
+/// `PATH` alone is mutated 36 times across 12 lock regions spanning at
+/// least three future target clusters).
 ///
 /// One static suffices for the whole `devflow` binary crate after the
 /// `main.rs` split (19c–19f): every D-05 target module stays inside this

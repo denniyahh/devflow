@@ -40,13 +40,36 @@ mid-run crash or kill.
   non-advance, per-loop infra-failure counter, preflight readiness gate, and
   build provenance + self-dogfood staleness gate — Phase 17 (AC-4 narrowed:
   security-artifact + reviewer-set preflight checks deferred to Phase 18)
+- ✓ Dogfood reliability hardening: project-aware `doctor` reconciliation,
+  monitor liveness (`State.monitor_pid` + `liveness()` predicate consumed by
+  both `status` and `doctor`), Code↔Validate safety-gate reachability
+  (`transition_resets_consecutive_failures`), Layer 0/Validate verdict
+  reconciliation, worktree-aware build staleness enforcement, preflight-gate
+  re-run wedge fix (bounded `preflight_retries`) — Phase 18, v1.5.0
+- ✓ Release integrity + `main.rs` decomposition: `.devflow/` artifact hygiene
+  (path/username redaction via a single `ensure_devflow_dir()` chokepoint),
+  `commit_path` no-longer-allows-empty commits, `main.rs` split 8,467 → 7
+  focused modules with zero behavioral change (single shared `ENV_MUTEX`
+  preserved across the split), AI change acceptance contract — Phase 19,
+  v1.6.0
+- ✓ Release correctness + operator control: `VersionBump` rewrites workspace
+  member self-pins by construction (20a), `cleanup --force` is fail-closed on
+  any live agent/monitor with bounded-backoff retry (20b), `devflow start
+  --until <stage>` gives a clean stop point short of Ship (20c), `devflow
+  release --check` read-only preflight (self-pin, divergence, publish order,
+  signing viability) (20d), `devflow ship --phase N [--force]` manual
+  override reusing `finish_workflow` when the monitor is dead (20e) — Phase
+  20, v2.0.0 (TBC — see Context)
 
 ### Active
 
-- Phase 18 — **Hermes Support:** HermesAgent adapter, current CLI skill file,
-  and an `events.jsonl`-driven gate-watcher plugin. Also carries 18d/18e
-  (doctor reconciliation, WR-03 test fix) deferred from Phase 17.
-  Phases 13–17 are complete.
+*(none — the v2.0.0 milestone, Phase 11–20, completed 2026-07-23 with Phase
+20. Awaiting operator decision to run `/gsd-complete-milestone` and start the
+next milestone. Hermes Support, previously slotted as "Phase 18," was
+rescoped out during the 2026-07-20 reprioritization to Dogfood Reliability
+Hardening and now sits in the backlog as `999.1` — it is NOT automatically
+next; backlog items require `/gsd-review-backlog` promotion into a new
+milestone.)*
 
 ### Out of Scope
 
@@ -65,10 +88,14 @@ mid-run crash or kill.
   through Phase 16. Current operator commands include `start`, `gate`, `logs`,
   `history`, `parallel`, `sequentagent`, `reference`, `cleanup`, `status`,
   `list`, `recover`, `doctor`, and `test`; `advance` remains hidden/internal.
-- Workspace version is `1.2.0`. Code/docs historically over-claimed
-  "v2.0.0" as current; Phase 12 corrected this — 2.0.0 is the *target*
-  version for the Phase 11–15 arc, not yet shipped, and will only be bumped
-  when that line actually ships.
+- Workspace version is `1.6.0` (Phase 19, released 2026-07-22). Code/docs
+  historically over-claimed "v2.0.0" as current; Phase 12 corrected this.
+  The milestone was later re-scoped (2026-07-21) to genuinely run Phase
+  11–20 and close at v2.0.0 — that arc is now 100% complete on disk (Phase
+  20, 2026-07-23), but whether the release actually ships as `2.0.0` or
+  `1.7.0` is an open decision: nothing across the five Phase 20 units is
+  inherently breaking, and Phase 19 already declined to spend the 2.0 slot
+  on a non-breaking changeset. Decide at ship time.
 - No `.planning/REQUIREMENTS.md` exists in this project; requirements are
   tracked per-phase in each phase's `CONTEXT.md`, not via formal REQ-IDs.
 
@@ -93,6 +120,10 @@ mid-run crash or kill.
 | MVP restructure (2026-07-14): Phase 13 → MVP Core Loop, old 13 → 15 | Priority is dogfooding the core loop on real projects again; OSS packaging is worthless until the loop it packages works end-to-end | — Pending |
 | Reintroduce a minimal `devflow.toml` | Phase 16 required typed reliability knobs while preserving hardcoded git-flow branch constants; environment variables override project values | ✓ Good |
 | Defer bootstrap (`new-project`/`map-codebase`) out of Phase 12 | Genuinely unscoped — no detailed requirements exist yet; inventing them would be speculative | — Pending |
+| Hoist `ENV_MUTEX` into one shared mutex during the `main.rs` split (Phase 19) | Three independent `static Mutex<()>` definitions were sound only by accident (each guarded a disjoint variable set); per-module mutexes would have silently broken the serialization 19i's fix depended on | ✓ Good |
+| Split `main.rs` as flat sibling modules, not a `commands/` subdirectory (Phase 19) | Mapping Phase 18's plans onto proposed clusters showed pipeline state machine absorbed 3 of 7 plans vs. commands' 2 — a subdirectory buys zero wave reduction | ✓ Good |
+| Tighten `cleanup --force`'s liveness guard to fail-closed on ANY live agent pid, not just Healthy/BetweenStages monitor states (Phase 20b, cross-AI review) | `Liveness::Unknown` (no recorded monitor) and `Stuck` (dead monitor) both still mean the agent process could be alive; a monitor-state-only guard left a real deletion-race hole | ✓ Good |
+| Reuse `finish_workflow` verbatim for the manual `ship --phase` override rather than reimplementing Ship logic (Phase 20e) | The existing fail-closed terminal-Ship contract (retry-gate-reopen, `workflow_finished` emission) already does exactly what a second out-of-process trigger needs; reimplementing risks drift between the monitor-driven and manual paths | ✓ Good |
 
 ## Key Files
 
@@ -103,4 +134,6 @@ mid-run crash or kill.
 | `.planning/CONCERNS.md` | Top findings from the original pre-Phase-1 codebase audit |
 
 ---
-*Last updated: 2026-07-19 after Phase 17 completion (verified 14/14)*
+*Last updated: 2026-07-23 after Phase 20 completion — v2.0.0 milestone
+(Phase 11-20) 100% complete on disk, PR #20 CI-green, awaiting operator
+decision to run `/gsd-complete-milestone`*
