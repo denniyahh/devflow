@@ -51,3 +51,22 @@ items fenced out to Phase 22.
   fails, core-publishes-cli-does-not (D-10).
 - Whether 999.5 is folded in at all (capacity-dependent).
 - Confirm the proposed unit set — it did not go through `/gsd-review-backlog`.
+
+## Operator scope recut (2026-07-23, interactive)
+
+The headless proposal was reviewed and revised by the operator:
+
+- **Removed 999.25 (release executor):** irreversible (crates.io publish / signed
+  tag / merge-to-main), untestable inside a dogfood loop without a real publish,
+  and its own dossier demands a dedicated interactive discuss on rollback
+  semantics. → **own dedicated phase.**
+- **Removed 999.28 (`--base`):** speculative under the current sequential-
+  supervised cadence (a merged phase gives the next its work for free); its value
+  is concurrency/stacking. → **Phase 22**, whole (not split).
+- **Backfilled** with two legibility/observability units + one stretch:
+  **999.14** (doctor planning-doc staleness reconciliation — the exact bug this
+  session hit), **999.2** (sequentagent's untracked second process, narrowed
+  since 18b shipped the monitor half), and optional **999.5**.
+- **Renamed** phase "Operator Usability & Release Execution" → "Operator
+  Legibility & Observability." Final set: 21a 999.3, 21b 999.14, 21c 999.2,
+  optional 21d 999.5. CONTEXT.md rewritten to match.

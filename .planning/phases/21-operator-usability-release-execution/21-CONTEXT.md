@@ -1,128 +1,128 @@
-# Phase 21: Operator Usability & Release Execution - Context
+# Phase 21: Operator Legibility & Observability - Context
 
-**Gathered:** 2026-07-23
+**Gathered:** 2026-07-23 (headless discuss) · **Scope recut:** 2026-07-23 (operator decision, this session)
 **Status:** Ready for planning
 
 <domain>
 ## Phase Boundary
 
-Phase 21 makes DevFlow's operator surface **legible** and takes the release cut
-from a hand-run checklist to an **executed** command — while keeping the base
-of every launched phase **explicit**. It is the operator-facing, single-writer
-half of the post-v1.7.0 work. Everything that requires two phases running or
-shipping *concurrently* to be correct is deliberately Phase 22's, not this one.
+Phase 21 makes DevFlow's operator surface **legible** and its self-reported
+state **trustworthy** — every unit is single-writer, operator-facing, reversible
+or detection-only, and fully testable without any irreversible side effect. It
+deliberately carries **no** release-execution or branching-model work.
+
+> **Scope recut (operator decision, 2026-07-23).** The headless discuss-phase
+> proposed 21a discoverability + `--base` (999.28) + release-cut executor
+> (999.25). Both of the latter were **removed** at operator review:
+> - **999.25 (release executor) → its own dedicated phase.** It drives
+>   irreversible operations (crates.io publish, signed tag, merge to main),
+>   its own dossier says it "needs its own discuss-phase design pass on
+>   failure/rollback semantics," and it cannot be exercised inside a dogfood
+>   loop without a real publish. It deserves a focused, *interactive* discuss —
+>   not a bundled, headless one.
+> - **999.28 (`--base`) → Phase 22.** Its only payoff is stacking a phase onto
+>   an *unmerged* predecessor; under the current sequential-supervised cadence,
+>   merging a phase to `develop` gives the next phase its work for free. The
+>   value is concurrency/stacking — Phase 22's domain — so all of `--base`
+>   moves there rather than being split across phases.
+>
+> The phase was renamed **"Operator Usability & Release Execution" →
+> "Operator Legibility & Observability"** to match.
 
 The ROADMAP goal was left `[To be planned]` on purpose (scaffold commit
-`56a1835`: "goals TBD pending discuss/plan"). This CONTEXT therefore also
-**proposes the scope boundary** for the phase, drawn from the phase name and the
-backlog candidates that match it. Confirm the unit set at plan/review time; it
-has **not** been through a `/gsd-review-backlog` promotion, and REQUIREMENTS.md
-carries no REQ-IDs for it.
+`56a1835`). This CONTEXT therefore also **records the operator-confirmed scope**.
+The unit set below is operator-decided; it did **not** go through a
+`/gsd-review-backlog` promotion and REQUIREMENTS.md carries no REQ-IDs, so
+confirm sizing at plan/review time.
 
-**Proposed in scope (three units, single-writer / operator-facing):**
+**In scope (operator-facing legibility / observability):**
 
 - **21a — Operator discoverability (999.3).** `devflow gate show` for truncated
   gate reasons, surface rate-limit reset times out of raw agent JSON, in-stage
   progress in `status`, and make recovery verbs (`advance`, `resume`)
-  discoverable from a stuck state. UX, not correctness.
-- **21b — Explicit `--base` branch override (999.28).** `devflow start --base
-  <branch>` defaulting to `develop`, so a phase can be cut onto an unmerged
-  predecessor to honor a `depends_on` chain. The design is substantially
-  settled in `999.28`'s CONTEXT (see decisions below).
-- **21c — Release-cut executor (999.25).** `devflow release --execute` that
-  drives version-bump PR → merge to `main` → signed tag → sync `develop` →
-  publish `devflow-core` then `devflow`. This is the large, **irreversible**
-  unit; it needs the failure/rollback design pass captured below and an operator
-  gate before the publish step.
+  discoverable from a stuck state. UX only — no behavioral change. Bundles four
+  distinct gaps; the planner may split them. **Sequence first** (lowest risk,
+  unblocks nothing).
+- **21b — Doctor reconciliation for planning-doc staleness (999.14).**
+  `devflow doctor` already reconciles phase state against events/PIDs/gates/
+  branches (18a), but nothing checks whether `ROADMAP.md`/`STATE.md`'s own
+  **narrative** still matches reality after a manual, out-of-band merge/tag/
+  publish. This session hit exactly that bug (STATE claimed Phase 18
+  unreleased after v1.5.0 shipped). **Detection-only** — flag stale version
+  claims against git tags; do **not** auto-correct prose.
+- **21c — sequentagent's untracked second process (999.2).** One
+  `phase-N-agent-pid` file per phase; `sequentagent` runs a *second* agent that
+  "does not participate in the stage machine" (`parallel.rs`) and is left
+  unrecorded. The monitor half of the original item already shipped in v1.5.0
+  (18b, `State.monitor_pid`), so this is **narrowed** to sequentagent's orphaned
+  second process only — re-scope precisely at plan time.
 
-**Optional / stretch (defer if the phase is already heavy):**
+**Optional / stretch (include only if 21a–c leave capacity):**
 
-- **999.5 — `ChangelogAppend` real content.** Replace the "Released phase via
-  DevFlow" placeholder. Cosmetic, lowest priority, and blocked on choosing a
-  content source (SUMMARY.md extraction vs plan diffs) — carry only if 21c lands
-  with room to spare.
+- **21d — `ChangelogAppend` real content (999.5).** Every generated entry reads
+  `- Released phase via DevFlow.` (`ship.rs:431`). Cosmetic, deferred three
+  times already, and **blocked on choosing a content source** (SUMMARY.md
+  extraction vs plan diffs) — which is why it is stretch-only, not a committed
+  unit.
 
-**Explicitly OUT of scope — belongs to Phase 22 (Concurrency & Governance
-Correctness):** 999.4 (version-tag contention on concurrent ship), 999.26
-(`parallel` git object-store race), 999.2 (a-phase-tracks-two-processes model),
-and the *concurrency* half of base selection (`parallel` shared-base
-derivation). **OUT — Phase 23 (Test/CI):** 999.15/17/18/19/20/22.
+**Explicitly OUT of scope:** 999.25 release executor (own dedicated phase),
+999.28 `--base` (Phase 22), plus Phase 22 concurrency (999.4, 999.26) and
+Phase 23 test/CI (999.15/17/18/19/20/22).
 </domain>
 
 <decisions>
 ## Implementation Decisions
 
-Ratings follow `gsd-core/references/planner-reversibility.md`. Because this ran
-autonomously (no interactive operator selection), treat the 21c decisions below
-as the **recommended design to validate at plan time**, not operator-locked
-choices — especially anything touching irreversible release operations.
+Ratings follow `gsd-core/references/planner-reversibility.md`.
 
-### 21b — Explicit `--base` branch override
+### Scope (operator-decided this session)
 
-- **D-01:** Add an explicit `--base <branch>` flag to `devflow start` (and the
-  worktree launch path), **defaulting to `develop`**. Base is always explicit or
-  the stated default — **never** inferred from the operator's current branch.
-  Rationale carried from `999.28`: an implicit current-branch default silently
-  roots a phase on a dirty throwaway branch. — **Reversibility:** costly —
-  once operators script `--base`, the flag name and default become a CLI
-  contract; changing the default would silently re-root phases.
-- **D-02:** The develop-rooted base is load-bearing, not incidental —
-  `feature_start` hardcodes it (`git.rs:53`, `checkout develop` then `checkout
-  -b`), and ship → Merge-to-develop → VersionBump → ChangelogAppend, the
-  `sync-main-to-develop.sh` script, and `release --check` all assume
-  feature→develop→main. So `--base` must **thread through** without regressing
-  that chain: default path stays byte-for-byte develop-rooted.
-- **D-03:** Ship/merge target when a phase is based on `feature/phase-NN` rather
-  than `develop` is an **open design question** the planner must resolve (likely
-  still merge to `develop` after the predecessor lands). Flag it; do not guess
-  it into code. — **Reversibility:** one-way — a wrong merge target on a stacked
-  phase lands commits on the wrong branch and corrupts the release lineage.
-- **D-04:** Validation: **reject** a `--base` that does not exist; **warn (not
-  block)** if the base is not an ancestor of `develop`.
-- **D-05 (scope guard):** 21b threads `--base` through **`start` only** for this
-  phase. `parallel` shared-base derivation and `resume`/`recover` base
-  reconstruction from state are Phase 22 concerns — do not expand into them here.
-
-### 21c — Release-cut executor (`devflow release --execute`)
-
-- **D-06:** `--execute` runs the **same four `release --check` preflight checks
-  first** (workspace self-pin match, develop/main divergence, crates.io publish
-  order, tag-signing viability via 20d's `gpg.format`-aware check) and
-  **hard-stops** on any failure before touching anything. Reuse the existing
-  `release_check` path (`commands.rs:1304`), do not fork a second checker.
-- **D-07:** There is an **explicit operator gate immediately before the
-  irreversible publish step**. Merge-to-main, the signed tag, and the crates.io
-  publish can never be un-published or reused. — **Reversibility:** one-way — a
-  published crate version and a pushed signed tag are permanent; this gate is the
-  last human checkpoint.
-- **D-08:** Reuse the existing after-ship hook batch machinery (`VersionBump`,
-  `ChangelogAppend`) rather than a second version-writing path — same
-  "one effect, don't reimplement" principle 20e applied to `finish_workflow`.
-  Must replicate the operator's manual-merge discipline
-  (`[[feedback-manual-merge-must-replicate-ship]]`): version+pin, changelog,
-  signed tag, publish core-then-cli, sync.
-- **D-09:** Publish ordering **encodes** the crates.io constraint 20d only
-  asserts: `devflow-core` must be live at a satisfying version on the registry
-  before `devflow`'s publish/verify resolves its path dependency. Not a warning —
-  a sequenced, verified step.
-- **D-10 (design pass required):** The planner/researcher must specify
-  **failure/rollback semantics** for the partial-failure cases 999.25 names
-  explicitly: tag lands but publish fails; `core` publishes but `cli` does not.
-  These are non-obvious and irreversible-adjacent — do not leave them implicit.
+- **D-01:** Remove 999.25 (release executor) and 999.28 (`--base`) from Phase 21
+  — see the boundary note for rationale. 999.25 → its own phase with an
+  interactive discuss; 999.28 → Phase 22. — **Reversibility:** reversible (a
+  scoping decision; nothing built yet).
+- **D-02:** Phase theme is **operator legibility & observability**; renamed from
+  "Operator Usability & Release Execution." All units must remain single-writer,
+  reversible/detection-only, and dogfood-testable (no irreversible side effects).
 
 ### 21a — Operator discoverability
 
-- **D-11:** Purely additive UX surfacing — `gate show`, rate-limit reset time in
-  human output, in-stage progress in `status`, recovery-verb hints from a stuck
-  state. No behavioral/correctness change to the pipeline. Sequence it first;
-  it is the lowest-risk unit and unblocks nothing downstream. — **Reversibility:**
+- **D-03:** Purely **additive UX** surfacing — `gate show`, rate-limit reset
+  time in human output, in-stage progress in `status`, recovery-verb hints from
+  a stuck state. No behavioral/correctness change to the pipeline. Sequence it
+  first. — **Reversibility:** reversible.
+
+### 21b — Doctor planning-doc reconciliation
+
+- **D-04:** **Detection-only.** Add a `doctor` check that compares
+  `ROADMAP.md`/`STATE.md` version/outcome claims against git tags (and, where
+  cheap, published state) and **flags** drift. Do **not** auto-edit prose —
+  same discipline 18a's reconciliation already follows. — **Reversibility:**
   reversible.
+- **D-05:** Integrate as a new `Check` in the existing `doctor` path
+  (`commands.rs:1121`, JSON body at `:1866`) so human and `--json` output stay
+  consistent; do not fork a second reporter.
+
+### 21c — sequentagent second-process tracking
+
+- **D-06:** **Re-scope before planning.** The "monitor unrecorded" half shipped
+  in v1.5.0 (18b). Remaining scope is *only* `sequentagent`'s second agent,
+  which runs off the stage machine (`parallel.rs`) and has no pid record. Define
+  what "tracked" means for a non-stage-machine handoff (a second pid file? a
+  `sequentagent`-specific record?) as the first plan step. — **Reversibility:**
+  reversible.
+
+### 21d — ChangelogAppend content (stretch)
+
+- **D-07:** Stretch-only. Blocked on choosing a per-phase content source; if
+  pulled in, that choice (SUMMARY.md extraction vs plan-diff summary) is a
+  design decision the planner must make explicit, not assume.
 
 ### Claude's Discretion
 - Exact CLI flag surface for `gate show` (positional vs `--phase`), progress
   representation in `status`, and whether 21a ships as one plan or splits by
   sub-gap — planner's call.
-- Whether 999.5 is folded in at all — include only if 21c leaves capacity.
+- Precise re-scope of 999.2 and whether 21d is folded in at all.
 </decisions>
 
 <canonical_refs>
@@ -133,86 +133,87 @@ choices — especially anything touching irreversible release operations.
 ### Phase-21 unit sources (backlog dossiers — read before scoping)
 - `.planning/phases/999.3-cli-operator-discoverability/CONTEXT.md` — 21a: the
   four discoverability gaps and why they are UX, not correctness.
-- `.planning/phases/999.28-explicit-base-branch-override/CONTEXT.md` — 21b: the
-  full `--base` design, the load-bearing develop-hardcode analysis, and the open
-  ship/merge-target question. **Most important ref for 21b.**
-- `.planning/phases/999.25-release-cut-executor/CONTEXT.md` — 21c: executor
-  goal, why it was deferred out of Phase 20, possible shapes, and the
-  partial-failure cases that need a rollback design.
+- `.planning/phases/999.14-doctor-planning-doc-reconciliation/CONTEXT.md` —
+  21b: the staleness-detection gap and the "detect, don't auto-correct" scope.
+- `.planning/phases/999.2-phase-process-tracking-model/CONTEXT.md` — 21c: the
+  two-processes-per-phase framing; note the monitor half is already shipped.
 - `.planning/phases/999.5-changelog-placeholder-content/CONTEXT.md` — optional
   21d, and the open "where does real per-phase content come from" question.
 
-### Release flow & prior-art the executor must reuse (not rediscover)
-- `CONTRIBUTING.md` §"Cutting a Release" (line 170) — the manual checklist 21c
-  automates; the executor must reproduce it exactly.
-- `crates/devflow-cli/src/commands.rs:1304` (`release_check`, 20d preflight) —
-  reuse as `--execute`'s hard-stop gate.
-- `crates/devflow-core/src/version.rs:382` — 20a workspace self-pin invariant
-  the preflight asserts.
-- `crates/devflow-core/src/git.rs:53` (`feature_start`) and `:113`/`:121`
-  (`release_start`/`release_finish`) — the develop-rooted branch model `--base`
-  extends and the executor drives.
-- `scripts/sync-main-to-develop.sh` — the post-merge sync step the executor must
-  not skip.
-- Phase 20 artifacts: `.planning/phases/20-release-correctness-operator-control/`
-  (20d `release --check`, 20e manual ship override) — the direct predecessors.
+### Code the units extend (not rediscover)
+- `crates/devflow-cli/src/commands.rs:1121` (`doctor`) + `:1866`
+  (`doctor_json_body`) — 21b adds a reconciliation `Check` here.
+- `crates/devflow-cli/src/parallel.rs` (sequentagent handoff; comments at
+  `:5`/`:181`/`:192` state it does not participate in the stage machine) and
+  `agent_result::agent_pid_path` (used at `commands.rs:889`) — 21c's surface.
+- `crates/devflow-core/src/ship.rs:431` — the `ChangelogAppend` placeholder 21d
+  would replace.
+- `devflow gate` / `devflow status` output paths (`commands.rs`, `main.rs`) —
+  21a surfacing.
 
 ### Scope-fence refs (what is NOT this phase)
-- `.planning/phases/999.4-*`, `999.26-*`, `999.2-*` — Phase 22 (concurrency).
-- ROADMAP.md §"Phase 22/23" — the boundary these units sit behind.
+- `.planning/phases/999.25-release-cut-executor/CONTEXT.md` — its own phase.
+- `.planning/phases/999.28-explicit-base-branch-override/CONTEXT.md` — Phase 22.
+- ROADMAP.md §"Phase 22/23".
 </canonical_refs>
 
 <code_context>
 ## Existing Code Insights
 
 ### Reusable Assets
-- `release_check(project_root)` (`commands.rs:1304`) — the 20d preflight; 21c's
-  `--execute` runs it verbatim as its hard-stop gate.
-- After-ship hook batch (`VersionBump`, `ChangelogAppend`) — 21c drives these
-  rather than writing a second version path (D-08).
-- `Git::release_start`/`release_finish` (`git.rs:113`/`:121`) — existing
-  git-flow release tagging the executor sequences.
-- `gpg.format`-aware tag-signing viability check (from 20d) — 21c reuses as a
-  precondition, per 999.25.
+- `doctor`'s existing `Check` list + `doctor_json_body` (`commands.rs:1121`/
+  `:1866`) — 21b appends to these; single-object JSON contract already hardened
+  (18 WR-01). Do not fork a second reporter.
+- 18b's `State.monitor_pid` (shipped v1.5.0) — 21c builds on the same
+  process-record model, extended to sequentagent's second agent.
+- `agent_result::agent_pid_path` (`commands.rs:889`) — the per-phase pid-file
+  convention 21c must reconcile against for the second process.
 
 ### Established Patterns
-- `feature_start` (`git.rs:53`) hardcodes `checkout develop` → `checkout -b
-  feature/phase-NN`. 21b generalizes the base while keeping this exact behavior
-  as the default branch (D-02).
-- "One effect, don't reimplement" (20e's `finish_workflow` reuse) — governs D-08.
+- Reconciliation = **detect and report, never auto-correct** (18a). 21b follows
+  it exactly (D-04).
 - Command surface lives in `crates/devflow-cli/src/main.rs` + `commands.rs`;
-  `release_check` is already wired at `main.rs:498`. 21a/21c extend the same
-  dispatch.
+  21a/21b extend the same dispatch.
+- `sequentagent` deliberately sits outside the stage machine (`parallel.rs`) —
+  21c must not force it into the stage model, only give its second process a
+  record.
 
 ### Integration Points
-- `devflow start` argument parsing (`main.rs`) ← 21b `--base` flag.
-- `devflow release` subcommand (`main.rs:498` / `commands.rs`) ← 21c `--execute`.
-- `devflow gate` / `devflow status` output paths ← 21a surfacing.
+- `devflow doctor` (`commands.rs:1121`) ← 21b reconciliation check.
+- `devflow gate` / `devflow status` output ← 21a surfacing.
+- `sequentagent` launch path (`parallel.rs`) ← 21c second-process record.
+- `ChangelogAppend` (`ship.rs:431`) ← optional 21d.
 </code_context>
 
 <specifics>
 ## Specific Ideas
 
-- `devflow start --phase 22 --base feature/phase-21` is the concrete motivating
-  example for 21b (intentional stacking to honor `depends_on`).
-- The executor's guiding constraint is the operator's own rule
-  (`[[feedback-manual-merge-must-replicate-ship]]`): a button-merge that skips
-  VersionBump/ChangelogAppend is the failure class 21c exists to retire.
+- The motivating bug for 21b is this session's own: `STATE.md`/`ROADMAP.md`
+  narrative drifting from git reality after a manual release — a legibility
+  failure `doctor` should catch, mirroring `[[project-gsd-ui-gate-cli-false-positive]]`
+  and the staleness class in `[[project-gsd-execute-devflow-quirks]]`.
+- 21a and 21b share a theme: both make devflow's *own* state legible to the
+  operator (one via richer live output, one via drift detection).
 </specifics>
 
 <deferred>
 ## Deferred Ideas
 
-- **Concurrency governance (Phase 22):** version-tag contention on concurrent
-  ship (999.4), `parallel` git object-store race (999.26), the two-processes-
-  per-phase tracking model (999.2), and `--base` threading through `parallel`
-  shared-base derivation and `resume`/`recover` state reconstruction.
-- **Test/CI hardening (Phase 23):** 999.15/17/18/19/20/22.
-- **999.5 `ChangelogAppend` real content** — only if 21c leaves capacity;
-  otherwise carry forward. Blocked on choosing a per-phase content source.
+- **999.25 — Release-cut executor → its own dedicated phase.** Irreversible
+  (crates.io publish, signed tag, merge to main); its dossier requires its own
+  discuss-phase on rollback semantics (tag-lands-publish-fails; core-publishes-
+  cli-does-not) and a design for testing without a real publish. Do not fold
+  back into a legibility phase.
+- **999.28 — `--base` branch override → Phase 22.** Value is concurrency/
+  stacking (build phase N on an unmerged N-1); the whole feature (start + the
+  `parallel` shared-base derivation) belongs together in the concurrency phase,
+  not split.
+- **Phase 22 concurrency:** 999.4 (version-tag contention), 999.26 (`parallel`
+  object-store race), the concurrency half of 999.2.
+- **Phase 23 test/CI:** 999.15/17/18/19/20/22.
 </deferred>
 
 ---
 
 *Phase: 21-operator-usability-release-execution*
-*Context gathered: 2026-07-23*
+*Context gathered: 2026-07-23 (headless) · recut 2026-07-23 (operator)*
