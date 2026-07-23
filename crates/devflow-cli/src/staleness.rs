@@ -53,7 +53,13 @@ fn embedded_commit_is_stale(execution_root: &Path, embedded_commit: &str) -> Sta
     match output.map(|o| o.status.code()) {
         Ok(Some(0)) => match run_git_stdout(execution_root, &["rev-parse", "HEAD"]) {
             Some(head) if head.trim() == embedded_commit.trim() => Staleness::Fresh,
-            Some(_) => Staleness::Stale,
+            Some(_) => {
+                if ancestry_range_affects_build(execution_root, embedded_commit) {
+                    Staleness::Stale
+                } else {
+                    Staleness::Fresh
+                }
+            }
             None => Staleness::Indeterminate,
         },
         // Exit 1 only says "not an ancestor" — which is true both for a
@@ -73,6 +79,25 @@ fn embedded_commit_is_stale(execution_root: &Path, embedded_commit: &str) -> Sta
         }
         _ => Staleness::Indeterminate,
     }
+}
+
+/// 21d/D-07 (999.29): whether the committed range between `embedded_commit`
+/// and `execution_root`'s current `HEAD` touches at least one build-
+/// affecting file — the content-aware narrowing of `embedded_commit_is_stale`'s
+/// strict-ancestor arm. DevFlow's own primary workflow commits docs (`.planning/`)
+/// constantly; a docs-only commit must not re-arm a hard block after every
+/// build. Reuses `affects_compiled_binary` verbatim (D-07 — not forked or
+/// reimplemented). On any git failure, returns `true` (fail toward Stale) so
+/// a git error is never a false Fresh — mirrors `tree_has_modified_build_inputs`'s
+/// `None => Indeterminate` posture, adapted here to "assume the worse
+/// outcome" since this helper only returns a `bool`, not a tri-state.
+fn ancestry_range_affects_build(execution_root: &Path, embedded_commit: &str) -> bool {
+    run_git_stdout(
+        execution_root,
+        &["diff", "--name-only", embedded_commit, "HEAD"],
+    )
+    .map(|out| out.lines().any(affects_compiled_binary))
+    .unwrap_or(true)
 }
 
 /// Shell `git` in `project_root`, returning `None` on any failure (missing
@@ -1080,6 +1105,62 @@ mod tests {
 
         std::fs::write(root.join("src/lib.rs"), "// modified after build\n").unwrap();
         assert_eq!(combined_staleness(root, &head, false), Staleness::Stale);
+    }
+
+    /// 21d/D-07 (999.29): a strict-ancestor range whose ONLY intervening
+    /// commit touches a non-build file (here, `.planning/x.md`) must read
+    /// `Fresh`, not `Stale` — the false-positive hard-block observed live
+    /// during this very phase's launch (binary embedded commit a strict
+    /// ancestor of HEAD, delta `.planning/*` only, yet hard-blocked).
+    /// Written RED first against the unmodified `Some(_) =>
+    /// Staleness::Stale` arm to confirm it fails Stale, then GREEN once
+    /// `ancestry_range_affects_build` narrows that arm.
+    #[test]
+    fn docs_only_range_is_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@e.st"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        git(&["config", "core.hooksPath", "/dev/null"]);
+
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "// base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        let embedded_commit = run_git_stdout(root, &["rev-parse", "HEAD"])
+            .expect("rev-parse HEAD")
+            .trim()
+            .to_string();
+
+        // The only intervening commit touches a doc, never a build input.
+        std::fs::create_dir_all(root.join(".planning")).unwrap();
+        std::fs::write(root.join(".planning/x.md"), "docs only\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "docs only"]);
+
+        assert_eq!(
+            embedded_commit_is_stale(root, &embedded_commit),
+            Staleness::Fresh,
+            "a docs-only strict-ancestor range must not hard-block (999.29)"
+        );
+        assert_eq!(
+            combined_staleness(root, &embedded_commit, false),
+            Staleness::Fresh
+        );
     }
 
     /// The Indeterminate branch of the decision table (must_haves truth 5,
