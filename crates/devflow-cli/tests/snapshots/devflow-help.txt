@@ -18,6 +18,7 @@ Commands:
   test          Run local quality checks: cargo test, clippy, and fmt --check
   doctor        Audit the environment and report what's installed, missing, or broken
   release       Read-only release-cut preflight: self-pin, develop/main divergence, crates.io publish order, and tag-signing viability
+  ship          Manually drive a phase through Ship when the monitor that would have consumed its already-written Ship gate response is dead
   help          Print this message or the help of the given subcommand(s)
 
 Options:

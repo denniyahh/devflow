@@ -23,13 +23,13 @@ use crate::CliError;
 use crate::config_parse::gate_timeout_secs;
 use crate::pipeline_launch::launch_stage;
 use crate::pipeline_outcomes::{run_checkout_hooks, truncate_reason};
-use devflow_core::gates::{self, GateAction, Gates};
+use devflow_core::gates::{self, GateAction, GateResponse, Gates};
 use devflow_core::hooks;
 use devflow_core::mode;
 use devflow_core::prompt::{self, FixType};
 use devflow_core::stage::Stage;
 use devflow_core::state::State;
-use devflow_core::{events, workflow};
+use devflow_core::{events, lock, workflow};
 use std::path::Path;
 use tracing::info;
 
@@ -287,6 +287,109 @@ pub(crate) fn abort(project_root: &Path, state: &State, reason: &str) -> Result<
         serde_json::json!({ "reason": truncate_reason(reason) }),
     );
     Ok(())
+}
+
+/// Manual ship override (20e, D-01): a second, out-of-process consumer of
+/// the SAME on-disk Ship gate response `run_gate`'s live blocking poll
+/// consumes. `devflow gate approve` only WRITES a response file
+/// (`Gates::respond`) — a live monitor polling `Gates::poll_response` is
+/// what actually advances the workflow. If that monitor died before
+/// consuming the response, the approval sits unconsumed forever; this
+/// function reads the already-written response directly and, on
+/// `GateAction::Advance`, drives the SAME `finish_workflow` the live poll
+/// loop would have called (D-01) — not a reimplementation of the after-ship
+/// hook batch.
+///
+/// Guard order (D-02, review: Codex HIGH + MEDIUM, Hermes ack-race):
+/// 1. Acquire the per-phase lock ([`lock::acquire`]) BEFORE touching state,
+///    so this can never race a still-live monitor's `poll_response` — the
+///    exact idiom [`crate::pipeline_launch::resume`] uses.
+/// 2. `state.stage` must be EXACTLY `Stage::Ship`; any earlier stage is
+///    refused, naming the stage to resolve first.
+/// 3. Both the Ship gate REQUEST (`Gates::gate_path`) and RESPONSE
+///    (`Gates::response_path`) must exist on disk.
+/// 4. The ACK (`Gates::ack_path`) must be ABSENT — its presence means a
+///    (now-dead) monitor already consumed this response and may have died
+///    mid-`finish_workflow`; re-running the terminal hooks in that state
+///    would risk a double-run, so this refuses and directs the operator to
+///    `devflow doctor` instead.
+///
+/// `force` is accepted and echoed in the CLI output for explicit operator
+/// auditability (Hermes LOW: make `--force` semantics explicit), but is
+/// deliberately NOT consulted by any guard above — D-02 scopes `--force` to
+/// "skip Ship-gate re-verification," never to bypassing the stage, lock,
+/// gate-existence, or ack checks themselves. This design has no separate
+/// Ship-gate re-verification step beyond those four guards, so `--force`
+/// currently changes no observable behavior; it exists so the flag is never
+/// silently ignored and cannot later be wired to widen scope without an
+/// explicit, reviewed change to this function.
+pub(crate) fn ship_override(project_root: &Path, phase: u32, force: bool) -> Result<(), CliError> {
+    let _lock = match lock::acquire(project_root, phase) {
+        Ok(guard) => guard,
+        Err(lock::LockError::Contended { pid, .. }) => {
+            return Err(CliError::Message(format!(
+                "phase {phase}: another devflow process (pid {pid}) holds the per-phase lock — \
+                 refusing to race its poll of the Ship gate response"
+            )));
+        }
+        Err(err) => return Err(CliError::Message(format!("lock error: {err}"))),
+    };
+
+    let mut state = workflow::load_state(project_root, phase)?;
+
+    if state.stage != Stage::Ship {
+        return Err(CliError::Message(format!(
+            "phase {phase} is at stage {} — `devflow ship` requires state.stage == Stage::Ship; \
+             resolve stage {} first (--force does not skip stages)",
+            state.stage, state.stage
+        )));
+    }
+
+    if !Gates::gate_path(project_root, phase, Stage::Ship).exists()
+        || !Gates::response_path(project_root, phase, Stage::Ship).exists()
+    {
+        return Err(CliError::Message(format!(
+            "phase {phase}: no Ship gate response written yet — nothing to ship (a dead monitor \
+             never wrote or received one; wait for `devflow gate approve` or resolve the pipeline first)"
+        )));
+    }
+
+    if Gates::ack_path(project_root, phase, Stage::Ship).exists() {
+        return Err(CliError::Message(format!(
+            "phase {phase}: the Ship gate response was already consumed (an ack file is present) \
+             — the phase may be mid-finalization from a monitor that died partway through; run \
+             `devflow doctor` to inspect it rather than re-running terminal hooks"
+        )));
+    }
+
+    let response_path = Gates::response_path(project_root, phase, Stage::Ship);
+    let contents = std::fs::read_to_string(&response_path).map_err(|err| {
+        CliError::Message(format!("could not read the Ship gate response: {err}"))
+    })?;
+    let response: GateResponse = serde_json::from_str(&contents).map_err(|err| {
+        CliError::Message(format!("could not parse the Ship gate response: {err}"))
+    })?;
+
+    println!(
+        "phase {phase}: manual ship override (--force={force}) — driving the already-written \
+         Ship response through the same terminal path the live monitor would have used"
+    );
+
+    match GateAction::from_response(&response) {
+        GateAction::Advance => finish_workflow(project_root, &mut state),
+        GateAction::LoopBack(_) => {
+            // Antigravity LOW: `loop_back_to_code` → `launch_stage` forks a
+            // NEW detached monitor daemon — say so explicitly, so `devflow
+            // ship` is not a silently long-running process the operator
+            // can't account for.
+            println!(
+                "phase {phase}: Ship response loops back to Code — launching a new, detached \
+                 monitor agent to drive the retry"
+            );
+            loop_back_to_code(project_root, &mut state, FixType::AuditFix)
+        }
+        GateAction::Abort(reason) => abort(project_root, &state, &reason),
+    }
 }
 
 /// Print the full pipeline that a `start` would run, without launching anything.
@@ -766,6 +869,226 @@ mod tests {
         }
 
         assert_eq!(state.consecutive_failures, 2);
+    }
+
+    /// 20e Task 1: the tracer end-to-end case — a phase parked at
+    /// `Stage::Ship` with a REQUEST + RESPONSE (approved) written via
+    /// `Gates::respond`, no ack, and no live process polling. `ship_override`
+    /// must reach the SAME terminal state `finish_workflow` produces: state
+    /// cleared, gate/response/ack files gone, `workflow_finished` emitted.
+    #[test]
+    fn ship_override_advances_via_written_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 90;
+        let branch = format!("feature/phase-{phase:02}");
+        let branch_created = std::process::Command::new("git")
+            .args(["branch", &branch, "develop"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success();
+        assert!(branch_created);
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Ship;
+        workflow::save_state(&state).unwrap();
+
+        Gates::write_gate(root, phase, Stage::Ship, "Ship complete — approve merge?").unwrap();
+        Gates::respond(
+            root,
+            phase,
+            Stage::Ship,
+            &GateResponse {
+                approved: true,
+                note: None,
+                responded_by: Some("test".into()),
+            },
+        )
+        .unwrap();
+
+        ship_override(root, phase, false).unwrap();
+
+        let err = workflow::load_state(root, phase).unwrap_err();
+        assert!(matches!(err, workflow::WorkflowError::MissingState(_)));
+        assert!(!Gates::gate_path(root, phase, Stage::Ship).exists());
+        assert!(!Gates::response_path(root, phase, Stage::Ship).exists());
+        assert!(!Gates::ack_path(root, phase, Stage::Ship).exists());
+        let last = devflow_core::events::last_event_for_phase(root, phase)
+            .expect("events recorded for phase");
+        assert_eq!(last["event"], "workflow_finished");
+    }
+
+    /// 20e Task 3: an `Abort`-routing Ship response (a rejection whose note
+    /// says "abort") must reach the SAME shared `abort` helper the live
+    /// `handle_ship_outcome` path uses — no special-cased branch inside
+    /// `ship_override`. Asserts the shared path's own effects: state
+    /// cleared, gate files cleaned up, `workflow_aborted` emitted.
+    #[test]
+    fn ship_override_abort_routes_through_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 95;
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Ship;
+        workflow::save_state(&state).unwrap();
+
+        Gates::write_gate(root, phase, Stage::Ship, "Ship complete — approve merge?").unwrap();
+        Gates::respond(
+            root,
+            phase,
+            Stage::Ship,
+            &GateResponse {
+                approved: false,
+                note: Some("abort: found a blocking regression during manual review".into()),
+                responded_by: Some("test".into()),
+            },
+        )
+        .unwrap();
+
+        ship_override(root, phase, false).unwrap();
+
+        let err = workflow::load_state(root, phase).unwrap_err();
+        assert!(matches!(err, workflow::WorkflowError::MissingState(_)));
+        assert!(!Gates::gate_path(root, phase, Stage::Ship).exists());
+        assert!(!Gates::response_path(root, phase, Stage::Ship).exists());
+        assert!(!Gates::ack_path(root, phase, Stage::Ship).exists());
+        let last = devflow_core::events::last_event_for_phase(root, phase)
+            .expect("events recorded for phase");
+        assert_eq!(last["event"], "workflow_aborted");
+    }
+
+    /// 20e Task 2 (D-02, EoP regression): `--force` must never let
+    /// `ship_override` reach `finish_workflow` from a non-Ship stage. Checked
+    /// for every earlier `Stage` with `--force` both true and false.
+    #[test]
+    fn ship_override_refuses_when_not_at_ship_stage() {
+        for stage in [Stage::Define, Stage::Plan, Stage::Code, Stage::Validate] {
+            for force in [true, false] {
+                let dir = tempfile::tempdir().unwrap();
+                let root = dir.path();
+                let phase = 91;
+
+                let mut state =
+                    State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+                state.stage = stage;
+                workflow::save_state(&state).unwrap();
+
+                let err = ship_override(root, phase, force).unwrap_err();
+                let msg = err.to_string();
+                assert!(
+                    msg.contains(&stage.to_string()),
+                    "error for stage {stage} (force={force}) must name the stage: {msg}"
+                );
+
+                // finish_workflow was never reached: state is untouched, not cleared.
+                let reloaded = workflow::load_state(root, phase)
+                    .expect("state must survive a stage-mismatch refusal, not be cleared");
+                assert_eq!(reloaded.stage, stage);
+            }
+        }
+    }
+
+    /// 20e Task 2 (edge-probe 20e/empty): `state.stage == Stage::Ship` but no
+    /// Ship gate request/response exists on disk — a dead monitor never
+    /// wrote or received one. Must fail-closed with a clear error, both with
+    /// `--force` true and false.
+    #[test]
+    fn ship_override_refuses_when_no_response_written() {
+        for force in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = 92;
+
+            let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+            state.stage = Stage::Ship;
+            workflow::save_state(&state).unwrap();
+
+            // Neither request nor response written yet.
+            let err = ship_override(root, phase, force).unwrap_err();
+            assert!(
+                err.to_string().contains("no Ship gate response"),
+                "force={force}: {err}"
+            );
+
+            // A request written but no response yet is the same fail-closed case.
+            Gates::write_gate(root, phase, Stage::Ship, "ctx").unwrap();
+            let err = ship_override(root, phase, force).unwrap_err();
+            assert!(
+                err.to_string().contains("no Ship gate response"),
+                "force={force}: {err}"
+            );
+            let _ = Gates::cleanup(root, phase, Stage::Ship);
+        }
+    }
+
+    /// 20e Task 2 (review: Codex HIGH — lock race): a contended per-phase
+    /// lock refuses fail-closed, naming the holder pid, with `--force` both
+    /// true and false — `ship_override` must never race a live holder's
+    /// `poll_response`.
+    #[test]
+    fn ship_override_refuses_when_lock_contended() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 93;
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Ship;
+        workflow::save_state(&state).unwrap();
+
+        let _held = lock::acquire(root, phase).expect("hold the per-phase lock");
+        let this_pid = std::process::id().to_string();
+
+        for force in [true, false] {
+            let err = ship_override(root, phase, force).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains(&this_pid), "force={force}: {msg}");
+        }
+    }
+
+    /// 20e Task 2 (review: Hermes ack-race): a Ship response that already
+    /// has an ack file alongside it was already consumed by a (now-dead)
+    /// monitor — `ship_override` refuses and directs to `devflow doctor`
+    /// rather than re-running terminal hooks, with `--force` both true and
+    /// false. `finish_workflow` must never be reached: state stays intact.
+    #[test]
+    fn ship_override_refuses_when_response_already_acked() {
+        for force in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let phase = 94;
+
+            let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+            state.stage = Stage::Ship;
+            workflow::save_state(&state).unwrap();
+
+            Gates::write_gate(root, phase, Stage::Ship, "ctx").unwrap();
+            Gates::respond(
+                root,
+                phase,
+                Stage::Ship,
+                &GateResponse {
+                    approved: true,
+                    note: None,
+                    responded_by: Some("test".into()),
+                },
+            )
+            .unwrap();
+            Gates::ack(root, phase, Stage::Ship).unwrap();
+
+            let err = ship_override(root, phase, force).unwrap_err();
+            assert!(
+                err.to_string().contains("devflow doctor"),
+                "force={force}: {err}"
+            );
+
+            let reloaded = workflow::load_state(root, phase)
+                .expect("an already-acked refusal must never clear state");
+            assert_eq!(reloaded.stage, Stage::Ship);
+        }
     }
 
     /// 18d concurrency edge: two concurrently-active phases' `consecutive_failures`

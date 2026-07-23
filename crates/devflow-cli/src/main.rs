@@ -17,6 +17,7 @@ use pipeline_launch::{advance, resume};
 mod pipeline_outcomes;
 
 mod pipeline_gate;
+use pipeline_gate::ship_override;
 
 mod parallel;
 use parallel::{parallel, sequentagent};
@@ -243,6 +244,27 @@ enum Command {
         /// treated as a valid run.
         #[arg(long)]
         check: bool,
+        /// Project root.
+        #[arg(default_value = ".")]
+        project: PathBuf,
+    },
+    /// Manually drive a phase through Ship when the monitor that would have
+    /// consumed its already-written Ship gate response is dead.
+    ///
+    /// A second, out-of-process trigger of the SAME terminal effect
+    /// (`finish_workflow`) the live poll loop would have run (20e, D-01) —
+    /// requires `state.stage == Stage::Ship` and an existing Ship gate
+    /// request+response pair with no prior ack; `--force` never skips an
+    /// earlier stage, the lock, or those existence checks (D-02).
+    Ship {
+        /// Phase to ship.
+        #[arg(long)]
+        phase: u32,
+        /// Accepted for explicit, auditable operator intent. Does NOT skip
+        /// the stage, lock, gate-existence, or ack checks (D-02) — see
+        /// `pipeline_gate::ship_override`'s doc comment for exact scope.
+        #[arg(long)]
+        force: bool,
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
@@ -475,6 +497,11 @@ fn run() -> Result<(), CliError> {
             }
             release_check(&project_root(project)?)
         }
+        Command::Ship {
+            phase,
+            force,
+            project,
+        } => ship_override(&project_root(project)?, phase, force),
     }
 }
 
