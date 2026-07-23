@@ -115,6 +115,22 @@ fn wait_for_pid(path: &Path) -> u32 {
     panic!("timed out waiting for a pid in {}", path.display());
 }
 
+/// Wait until a phase's persisted state is cleared (the pipeline reached
+/// Ship and `finish_workflow` called `clear_state`). 20b's new liveness
+/// guard in `cleanup` correctly refuses to remove a worktree whose monitor
+/// is still actively driving stages (`BetweenStages`/`Healthy`) — fixtures
+/// that call `cleanup` must first wait for the phase to actually finish,
+/// the same way a real operator would.
+fn wait_for_state_cleared(root: &Path, phase: u32) {
+    for _ in 0..400 {
+        if devflow_core::workflow::load_state(root, phase).is_err() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("timed out waiting for phase {phase} state to clear (pipeline never finished)");
+}
+
 fn git_stdout(root: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&git(root, args).stdout)
         .trim()
@@ -580,6 +596,30 @@ fn reference_and_cleanup_worktree_cli_flow() {
         "status missing phase worktree\n{stdout}"
     );
 
+    // 20b: cleanup now hard-refuses while a monitor is still actively
+    // driving the phase (Healthy/BetweenStages) — a real operator would
+    // resolve the phase before cleaning it up, not race the still-running
+    // monitor. This fixture's fake agent never produces real work, so
+    // Validate always loops back and forces a gate after
+    // MAX_CONSECUTIVE_FAILURES; abort it (note containing "abort" —
+    // gates.rs::GateAction::from_response) so the monitor clears state,
+    // then wait for that to land before invoking cleanup.
+    wait_for(&root.join(".devflow/gates/08-validate.json"));
+    run_devflow(
+        root,
+        &fake_bin.path,
+        &[
+            "gate",
+            "reject",
+            "8",
+            "--stage",
+            "validate",
+            "--note",
+            "abort test teardown",
+        ],
+    );
+    wait_for_state_cleared(root, 8);
+
     // cleanup — removes worktrees
     let out = run_devflow(root, &fake_bin.path, &["cleanup", "--force"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -683,6 +723,69 @@ fn cleanup_force_refuses_on_live_agent_unknown_monitor() {
         !output.status.success(),
         "cleanup --force must refuse to remove a live agent's worktree even \
          under Unknown liveness (monitor_pid = None)"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("devflow resume"),
+        "refusal must name `devflow resume` as the unblocking action, got:\n{combined}"
+    );
+    assert!(
+        wt_path.is_dir(),
+        "worktree must NOT have been removed while the agent is alive"
+    );
+}
+
+/// 20b instance 1 (D-06, review: Codex HIGH fail-closed-on-live-agent),
+/// case (b): a dead monitor (`Stuck` liveness) must NOT be treated as
+/// "safe to proceed" when the agent it was watching is still alive — the
+/// guard keys on agent liveness, not on the monitor's Healthy/BetweenStages
+/// classification alone.
+#[test]
+fn cleanup_force_refuses_on_dead_monitor_live_agent() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let phase = 9;
+    let branch = format!("feature/phase-{phase:02}");
+    seed_feature_branch(root, phase);
+
+    let wt_path = root.join(".worktrees").join(format!("phase-{phase:02}"));
+    devflow_core::worktree::add(root, &wt_path, &branch, &branch, false).unwrap();
+
+    // Agent pid file holds a genuinely alive pid (the test process itself).
+    let pid_path = devflow_core::agent_result::agent_pid_path(root, phase);
+    fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
+    fs::write(&pid_path, std::process::id().to_string()).unwrap();
+
+    // Persist a State with a DEAD monitor pid (`liveness()` classifies this
+    // Stuck, since monitor_alive is false), plus worktree_path.
+    let mut state = devflow_core::state::State::new(
+        phase,
+        devflow_core::state::AgentKind::Claude,
+        devflow_core::mode::Mode::Auto,
+        root.to_path_buf(),
+    );
+    state.worktree_path = Some(wt_path.clone());
+    state.monitor_pid = Some(0x7FFF_FFFE); // essentially never a live pid
+    devflow_core::workflow::save_state(&state).unwrap();
+
+    let fake_bin = fake_bin_dir(&[]);
+    let output = Command::new(devflow_bin())
+        .args(["cleanup", "--force"])
+        .arg(root)
+        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .current_dir(root)
+        .output()
+        .expect("run devflow cleanup");
+
+    assert!(
+        !output.status.success(),
+        "cleanup --force must refuse to remove a worktree whose agent is \
+         alive even when its monitor is dead (Stuck liveness)"
     );
     let combined = format!(
         "{}{}",

@@ -287,12 +287,97 @@ pub(crate) fn reference(
     Ok(())
 }
 
+/// Parse the phase number encoded in a `.worktrees/phase-NN[-agent]` path.
+/// Used only as a fallback join key when no persisted `State.worktree_path`
+/// matches the worktree entry (review: Codex MEDIUM — worktree->phase join).
+/// Returns `None` for paths that don't follow this naming (e.g. the static
+/// `reference` worktree), which correctly excludes it from the liveness
+/// guard — a snapshot has no owning phase/agent to be alive.
+fn phase_from_worktree_path(worktrees_dir: &Path, path: &Path) -> Option<u32> {
+    let name = path.strip_prefix(worktrees_dir).ok()?.to_str()?;
+    let rest = name.strip_prefix("phase-")?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Join a `git worktree list` entry to its owning phase `State`, preferring
+/// the persisted `worktree_path` (set by `start`/`parallel`) and falling back
+/// to worktree-directory-name or branch-name matching only when no
+/// `worktree_path` match exists (review: Codex MEDIUM). Returns `None` when
+/// no owning state can be found at all (e.g. the phase already shipped and
+/// its state was cleared) — callers treat that as "no liveness signal",
+/// not as an implicit "safe to remove."
+fn state_for_worktree<'a>(
+    states: &'a [State],
+    worktrees_dir: &Path,
+    wt: &worktree::WorktreeInfo,
+) -> Option<&'a State> {
+    if let Some(state) = states
+        .iter()
+        .find(|s| s.worktree_path.as_deref() == Some(wt.path.as_path()))
+    {
+        return Some(state);
+    }
+    if let Some(phase) = phase_from_worktree_path(worktrees_dir, &wt.path)
+        && let Some(state) = states.iter().find(|s| s.phase == phase)
+    {
+        return Some(state);
+    }
+    if let Some(branch) = &wt.branch {
+        return states
+            .iter()
+            .find(|s| *branch == format!("{FEATURE_PREFIX}phase-{:02}", s.phase));
+    }
+    None
+}
+
+/// Bounded-backoff retry around `worktree::remove`, absorbing the transient
+/// `Directory not empty` race that can occur even after a phase is confirmed
+/// dead (a lingering fd/writer from the just-exited agent). NOT a substitute
+/// for the liveness guard above — only reached once a phase is confirmed
+/// dead (agent dead AND monitor not active). `git worktree prune` is
+/// deliberately not used here: it only clears metadata for already-absent
+/// directories and would orphan leftover files on disk (Pitfall 3).
+fn remove_worktree_with_retry(
+    project_root: &Path,
+    path: &Path,
+    force: bool,
+) -> Result<(), worktree::WorktreeError> {
+    const ATTEMPTS: u32 = 3;
+    const BASE_DELAY_MS: u64 = 50;
+    let mut last_err = None;
+    for attempt in 0..ATTEMPTS {
+        match worktree::remove(project_root, path, force) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last_err = Some(err);
+                if attempt + 1 < ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        BASE_DELAY_MS * 2u64.pow(attempt),
+                    ));
+                }
+            }
+        }
+    }
+    Err(last_err.expect("loop runs ATTEMPTS >= 1 times"))
+}
+
 /// Remove phase worktrees (and the reference with --force), deleting their
 /// associated feature branches, then prune and clean up merged branches.
+///
+/// Hard-refuses (D-06, no override flag) removal of any worktree whose owning
+/// phase has a live agent (any monitor state, including Unknown/Stuck) or an
+/// active monitor (Healthy/BetweenStages) — closing the race where a real
+/// `cleanup --force` run could delete a worktree a live agent/monitor is
+/// still writing into (review: Codex HIGH, fail-closed on a live agent).
 pub(crate) fn cleanup(project_root: &Path, force: bool) -> Result<(), CliError> {
     let git = GitFlow::new(project_root);
     let worktrees_dir = worktree::worktrees_dir(project_root);
     let reference = worktree::reference_path(project_root);
+    let states = workflow::list_states(project_root);
 
     let worktrees = worktree::list(project_root)?;
     let mut removed = 0usize;
@@ -305,18 +390,54 @@ pub(crate) fn cleanup(project_root: &Path, force: bool) -> Result<(), CliError> 
             println!("keeping reference worktree (use --force to remove it)");
             continue;
         }
-        worktree::remove(project_root, &wt.path, force)?;
-        print!("removed worktree {}", wt.path.display());
-        match &wt.branch {
-            Some(branch) if branch.starts_with(FEATURE_PREFIX) => {
-                match git.delete_branch(branch, force) {
-                    Ok(()) => println!(" + deleted branch {branch}"),
-                    Err(err) => println!(" (branch {branch} kept: {err})"),
-                }
-            }
-            _ => println!(),
+
+        let matched_state = state_for_worktree(&states, &worktrees_dir, wt);
+        let phase = matched_state
+            .map(|s| s.phase)
+            .or_else(|| phase_from_worktree_path(&worktrees_dir, &wt.path));
+        let agent_alive = phase
+            .and_then(|p| agent_pid_from_file(project_root, p))
+            .is_some_and(agent::agent_running);
+        let monitor_pid = matched_state.and_then(|s| s.monitor_pid);
+        let monitor_alive = monitor_pid.is_some_and(agent::agent_running);
+        let phase_liveness = liveness(monitor_pid, monitor_alive, agent_alive);
+
+        // Fail-closed on a live agent: refuse whenever the agent is alive
+        // (regardless of monitor liveness — Unknown/Stuck included) OR the
+        // monitor is actively running the stage (Healthy/BetweenStages).
+        // Only Stuck/Unknown WITHOUT a live agent proceeds.
+        if agent_alive || matches!(phase_liveness, Liveness::Healthy | Liveness::BetweenStages) {
+            let phase_label = phase
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            return Err(CliError::Message(format!(
+                "refusing to remove worktree {} for phase {phase_label} ({}) — run `devflow resume --phase {phase_label}` or wait for it to finish",
+                wt.path.display(),
+                phase_liveness.describe(),
+            )));
         }
-        removed += 1;
+
+        match remove_worktree_with_retry(project_root, &wt.path, force) {
+            Ok(()) => {
+                print!("removed worktree {}", wt.path.display());
+                match &wt.branch {
+                    Some(branch) if branch.starts_with(FEATURE_PREFIX) => {
+                        match git.delete_branch(branch, force) {
+                            Ok(()) => println!(" + deleted branch {branch}"),
+                            Err(err) => println!(" (branch {branch} kept: {err})"),
+                        }
+                    }
+                    _ => println!(),
+                }
+                removed += 1;
+            }
+            Err(err) => {
+                println!(
+                    "warning: could not remove worktree {} after retrying — manually delete this directory: {err}",
+                    wt.path.display()
+                );
+            }
+        }
     }
 
     worktree::prune(project_root)?;
