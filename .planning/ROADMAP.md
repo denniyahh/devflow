@@ -14,7 +14,7 @@
 | 17 | Pipeline Dogfood Follow-Up | Complete    | — |
 | 18 | Dogfood Reliability Hardening | Complete    | 1.5.0 |
 | 19 | Release Integrity + `main.rs` Decomposition | Complete    | 1.6.0 |
-| 20 | Release Correctness + Operator Control | Planned | 2.0.0 (TBC) |
+| 20 | Release Correctness + Operator Control | In Progress| 2.0.0 (TBC) |
 
 ## Shipped
 
@@ -325,7 +325,7 @@ Plans:
 **Promoted from backlog** 2026-07-22: 999.24 (DEN-49), 999.23 (DEN-48), 999.6 (DEN-31), 999.13 (DEN-38), 999.7 (DEN-32).
 **Requirements:** 20a, 20b, 20c, 20d, 20e (see CONTEXT.md — no formal REQ-IDs)
 **Depends on:** Phase 19 — the `main.rs` split is what makes 999.6, 999.7 and 999.13 plannable as one phase in ~3 waves; all three previously conflicted in a single 8,467-line file. 999.7 also depends on 18a/18b (shipped v1.5.0), which are what tell an operator *why* the pipeline is stuck.
-**Plans:** 5 plans (one per unit)
+**Plans:** 2/5 plans executed
 
 **Sequencing is load-bearing:** 20a and 20b land first so this phase's own CI and release cut are trustworthy while the rest is in flight. 20d blocks on 20a — its primary check asserts 20a's invariant and must not encode today's manual patch as the expected state. 20e sequences last: it needs a design pass and it touches the Ship/outcome path 20d reasons about.
 
@@ -333,8 +333,8 @@ Plans:
 
 **Wave 1** *(20a/20b — no file overlap; both gate this phase's own release cut)*
 
-- [ ] 20-01-PLAN.md — 20a: `version::write_version` also rewrites `[workspace.dependencies]` local-path self-pins (additive inline-table pass; PR #17 guard becomes no-op-by-construction)
-- [ ] 20-02-PLAN.md — 20b: `cleanup --force` liveness guard + bounded-backoff retry (product fix for the worktree race) and `phase7_cli.rs` fixture durability (instance 2, fixture-side per D-08)
+- [x] 20-01-PLAN.md — 20a: `version::write_version` also rewrites `[workspace.dependencies]` local-path self-pins (additive inline-table pass; PR #17 guard becomes no-op-by-construction)
+- [x] 20-02-PLAN.md — 20b: `cleanup --force` liveness guard + bounded-backoff retry (product fix for the worktree race) and `phase7_cli.rs` fixture durability (instance 2, fixture-side per D-08)
 
 **Wave 2** *(20c — depends on 20b; first of the serialized 20c→20d→20e CLI-dispatch chain)*
 
@@ -540,4 +540,3 @@ Plans:
 Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
-

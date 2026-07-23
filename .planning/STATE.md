@@ -3,15 +3,16 @@ gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone
 current_phase: 20
-status: "Phase 19 complete and released as v1.6.0. Phase 20 (Release Correctness + Operator Control) scoped and promoted from backlog 2026-07-22 via /gsd-review-backlog: 999.24 (VersionBump workspace self-pins, High/S), 999.23 (phase7_cli.rs git-fixture reliability, High/M — re-sized from S after a second, unrelated flake surfaced in the same file), 999.6 (--until plan-only mode, High/M), 999.13 (release-cut preflight, High/L), 999.7 (manual ship override, High/L). 999.3 deliberately left in backlog. Next step is /gsd-discuss-phase 20 — 999.7's override mechanism needs a design pass and should share one mechanism with 18f's preflight-override. Milestone target v2.0.0 is TO BE CONFIRMED at ship time: nothing in the five units is inherently breaking."
+current_phase_name: release-correctness-operator-control
+status: executing
 stopped_at: Phase 20 context gathered — discuss-phase resolved 20e mechanism/scope, 20d ceiling, 20b product-vs-fixture
-last_updated: "2026-07-22T21:55:59.975Z"
-last_activity: 2026-07-22
-last_activity_desc: Phase 20 scoped from backlog (5 items promoted)
+last_updated: "2026-07-23T08:18:06.797Z"
+last_activity: 2026-07-23
+last_activity_desc: Phase 20 execution started
 progress:
   total_phases: 9
   completed_phases: 8
-  total_plans: 65
+  total_plans: 70
   completed_plans: 65
   percent: 89
 ---
@@ -59,10 +60,10 @@ progress:
 
 ## Current Position
 
-Phase: 20 — PLANNED (ready to execute)
-Plan: 0 of 5 (20-01..20-05 written; discuss + research + plan complete)
-Status: Phase 20 planned — run /gsd-execute-phase 20 (Wave 1: 20-01 + 20-02 parallel, disjoint files)
-Last activity: 2026-07-22 — Phase 20 discussed, researched, and planned (5 plans, 3 waves)
+Phase: 20 (release-correctness-operator-control) — EXECUTING
+Plan: 1 of 5
+Status: Executing Phase 20
+Last activity: 2026-07-23 — Phase 20 execution started
 
 Progress: [█████████████████░░░] 89%
 
