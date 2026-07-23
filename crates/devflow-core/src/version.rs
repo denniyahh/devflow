@@ -469,7 +469,22 @@ fn find_version_in_contents(contents: &str, field: &str) -> Option<String> {
             if value.starts_with('{') {
                 continue;
             }
-            return Some(value.trim_matches(['"', '\'']).to_string());
+            // Anchor on the opening quote and scan forward for the matching
+            // closing quote, ignoring everything after it (e.g. a trailing
+            // `# comment`), rather than `trim_matches` on the whole tail —
+            // that would only strip a quote sitting at the very end of the
+            // remaining string, missing it entirely when a comment follows
+            // the closing quote on the same line. Symmetric with
+            // `replace_version_in_contents`'s write-path remainder handling.
+            return match value.chars().next() {
+                Some(q @ ('"' | '\'')) => {
+                    value[1..].find(q).map(|end| value[1..1 + end].to_string())
+                }
+                _ => {
+                    let end = value.find([' ', '\t', ',', '#']).unwrap_or(value.len());
+                    Some(value[..end].to_string())
+                }
+            };
         }
     }
     None
@@ -878,6 +893,58 @@ mod tests {
             contents.contains("version = '2.3.4'  # pinned"),
             "expected single-quoted value and trailing comment to survive, got: {contents}"
         );
+    }
+
+    #[test]
+    fn read_version_extracts_clean_value_with_trailing_comment() {
+        // CR-01 (phase 20 review): `find_version_in_contents` used to
+        // `trim_matches` the whole tail of the line, which only strips a
+        // quote sitting at the very end of the remaining string. With a
+        // trailing `# comment` after the closing quote, the real closing
+        // quote is never stripped and the corrupted value fails to parse.
+        // `write_version` already preserves this exact pattern (GAP-6); the
+        // read path must be symmetric with it.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nversion = \"1.7.0\"  # pinned release version\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_version(dir.path()).unwrap(),
+            Version {
+                major: 1,
+                minor: 7,
+                patch: 0
+            }
+        );
+    }
+
+    #[test]
+    fn read_version_extracts_clean_value_without_trailing_comment() {
+        // Bare `version = "1.7.0"` (no comment) must still work.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nversion = \"1.7.0\"\n").unwrap();
+        assert_eq!(
+            read_version(dir.path()).unwrap(),
+            Version {
+                major: 1,
+                minor: 7,
+                patch: 0
+            }
+        );
+    }
+
+    #[test]
+    fn read_workspace_self_pins_extracts_clean_workspace_version_with_trailing_comment() {
+        // CR-01: `read_workspace_self_pins` calls `find_version_in_contents`
+        // for `workspace_version` too — a trailing comment next to
+        // `[workspace.package] version` must not corrupt the value
+        // `check_self_pin` compares pins against.
+        let (workspace_version, _pins) = read_workspace_self_pins(
+            "[workspace.package]\nversion = \"1.7.0\"  # pinned release version\nedition = \"2024\"\n",
+        );
+        assert_eq!(workspace_version.as_deref(), Some("1.7.0"));
     }
 
     #[test]
