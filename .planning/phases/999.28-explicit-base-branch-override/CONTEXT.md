@@ -61,4 +61,4 @@ git-flow guarantees:
   not an ancestor of `develop`.
 
 Relates to the Phase 21/22 scope (base selection is both operator usability and
-concurrency governance). Linear: TBD.
+concurrency governance). Reassigned to Phase 22 (2026-07-23). Linear: DEN-53.

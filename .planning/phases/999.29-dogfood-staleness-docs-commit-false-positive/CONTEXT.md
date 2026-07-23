@@ -97,4 +97,5 @@ safety value.
   block spuriously on its own workflow) or a fast-track standalone, since it
   taxes every dogfood run including Phase 21's own remaining stages.
 - Related but distinct: `[[feedback-dogfood-rebuild-before-revalidate]]` is the
-  *workaround*; this item is the *fix* that retires it. Linear: TBD.
+  *workaround*; this item is the *fix* that retires it. Linear: DEN-54
+  (folded into Phase 21 as unit 21d, 2026-07-23).
