@@ -30,6 +30,7 @@ use devflow_core::mode::Mode;
 use devflow_core::recover;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
+use devflow_core::version;
 use devflow_core::workflow;
 use devflow_core::worktree;
 use std::path::{Path, PathBuf};
@@ -1268,6 +1269,198 @@ pub(crate) fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// release --check (20d)
+// ---------------------------------------------------------------------------
+
+/// Read-only release-cut preflight. Ceiling is `--check` only (D-03): no
+/// state-mutating helper, no `git tag`/publish, and (once Task 2/3 land) no
+/// `git fetch` — every check here reads already-available local state.
+/// Follows `doctor`'s `Check`-list-then-report shape (reuses the same
+/// `Check` struct) so the two commands stay visually consistent.
+pub(crate) fn release_check(project_root: &Path) -> Result<(), CliError> {
+    let checks: Vec<Check> = vec![
+        check_self_pin(project_root),
+        check_divergence(project_root),
+        check_publish_order(project_root),
+        check_signing(project_root),
+    ];
+
+    let mut failed = false;
+    for c in &checks {
+        let icon = match c.status.as_str() {
+            "ok" => "✓",
+            "warn" => "⚠",
+            "fail" => "✗",
+            _ => "?",
+        };
+        let detail = c.version.as_deref().unwrap_or("-");
+        println!("  {:<32} {icon}  {detail}", c.name);
+        if matches!(c.status.as_str(), "warn" | "fail")
+            && let Some(hint) = &c.install_hint
+        {
+            println!("      — {hint}");
+        }
+        if c.status == "fail" {
+            failed = true;
+        }
+    }
+
+    if failed {
+        Err(CliError::Message(
+            "release preflight failed — see checks above".into(),
+        ))
+    } else {
+        println!("\nrelease preflight passed");
+        Ok(())
+    }
+}
+
+/// Self-pin check (asserts 20a's invariant): every local-path
+/// `[workspace.dependencies]` self-pin must equal `[workspace.package]
+/// version`, compared dynamically — never against a hardcoded expected
+/// version.
+fn check_self_pin(project_root: &Path) -> Check {
+    const NAME: &str = "self-pin (workspace member versions)";
+
+    let cargo_toml = project_root.join("Cargo.toml");
+    let contents = match std::fs::read_to_string(&cargo_toml) {
+        Ok(contents) => contents,
+        Err(err) => {
+            return Check {
+                name: NAME.into(),
+                status: "warn".into(),
+                version: Some(format!("could not read Cargo.toml: {err}")),
+                install_hint: None,
+            };
+        }
+    };
+
+    let (workspace_version, pins) = version::read_workspace_self_pins(&contents);
+    let Some(workspace_version) = workspace_version else {
+        return Check {
+            name: NAME.into(),
+            status: "warn".into(),
+            version: Some("not a workspace Cargo.toml (no [workspace.package] version)".into()),
+            install_hint: None,
+        };
+    };
+
+    let drifted: Vec<String> = pins
+        .iter()
+        .filter(|pin| pin.version != workspace_version)
+        .map(|pin| format!("{} pinned {} != {workspace_version}", pin.name, pin.version))
+        .collect();
+
+    if drifted.is_empty() {
+        Check {
+            name: NAME.into(),
+            status: "ok".into(),
+            version: Some(format!(
+                "{} member pin(s) match {workspace_version}",
+                pins.len()
+            )),
+            install_hint: None,
+        }
+    } else {
+        Check {
+            name: NAME.into(),
+            status: "fail".into(),
+            version: Some(drifted.join("; ")),
+            install_hint: Some(format!(
+                "every [workspace.dependencies] self-pin must equal [workspace.package] \
+                 version = \"{workspace_version}\" — VersionBump should have rewritten this; \
+                 see 20a/DEN-49"
+            )),
+        }
+    }
+}
+
+/// Divergence check: whether `origin/main` is an ancestor of `HEAD` — i.e.
+/// whether `scripts/sync-main-to-develop.sh` would be a no-op — read
+/// against ALREADY-FETCHED local refs, issuing NO `git fetch` (review:
+/// Codex HIGH — a "read-only" preflight must not depend on the network).
+fn check_divergence(project_root: &Path) -> Check {
+    const NAME: &str = "develop/main divergence (origin/main ancestor)";
+    match devflow_core::git::origin_main_ancestor_status(project_root) {
+        devflow_core::git::AncestorStatus::Ancestor => Check {
+            name: NAME.into(),
+            status: "ok".into(),
+            version: Some("origin/main is an ancestor of HEAD — sync would be a no-op".into()),
+            install_hint: None,
+        },
+        devflow_core::git::AncestorStatus::Diverged => Check {
+            name: NAME.into(),
+            status: "fail".into(),
+            version: Some("origin/main is NOT an ancestor of HEAD — develop has diverged".into()),
+            install_hint: Some(
+                "run scripts/sync-main-to-develop.sh before cutting the next release PR".into(),
+            ),
+        },
+        devflow_core::git::AncestorStatus::RefAbsent => Check {
+            name: NAME.into(),
+            status: "warn".into(),
+            version: Some("origin/main not fetched — cannot determine divergence".into()),
+            install_hint: Some("run `git fetch` first, then re-run this check".into()),
+        },
+    }
+}
+
+/// Publish-order check: crates.io requires `devflow-core` to be live before
+/// `devflow` (path-dependency `--dry-run`/verify resolves against the
+/// *published* registry version, not local source). Sourced from the
+/// workspace's own members/dependency graph, never a hardcoded prose
+/// string.
+fn check_publish_order(project_root: &Path) -> Check {
+    const NAME: &str = "crates.io publish order";
+    let order = devflow_core::git::publish_order(project_root);
+    if order.is_empty() {
+        return Check {
+            name: NAME.into(),
+            status: "warn".into(),
+            version: Some("could not determine workspace publish order".into()),
+            install_hint: None,
+        };
+    }
+    Check {
+        name: NAME.into(),
+        status: "ok".into(),
+        version: Some(format!("publish in order: {}", order.join(" -> "))),
+        install_hint: None,
+    }
+}
+
+/// Tag-signing viability check (20d, Pattern 4): `gpg.format`-aware,
+/// fail-soft, and reports only boolean viability + an optional PUBLIC key
+/// fingerprint — never private key material or a full filesystem path
+/// (T-20-04, ASVS V6 / WR-02).
+fn check_signing(project_root: &Path) -> Check {
+    const NAME: &str = "tag-signing viability";
+    match devflow_core::git::check_signing_viability(project_root) {
+        devflow_core::git::SigningViability::Viable { fingerprint } => Check {
+            name: NAME.into(),
+            status: "ok".into(),
+            version: Some(match fingerprint {
+                Some(fp) => format!("signing viable ({fp})"),
+                None => "signing viable".into(),
+            }),
+            install_hint: None,
+        },
+        devflow_core::git::SigningViability::NotViable { reason } => Check {
+            name: NAME.into(),
+            status: "fail".into(),
+            version: Some(reason),
+            install_hint: Some("resolve before attempting the signed release tag".into()),
+        },
+        devflow_core::git::SigningViability::Unknown { reason } => Check {
+            name: NAME.into(),
+            status: "warn".into(),
+            version: Some(reason),
+            install_hint: None,
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------

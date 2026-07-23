@@ -44,6 +44,7 @@ Define → Plan → Code → Validate → Ship
 | `devflow recover [--clean] [--phase N]` | Inspect state; `--clean` sweeps stale phases only; `--clean --phase N` clears one phase unconditionally |
 | `devflow test` | cargo test + clippy + fmt --check |
 | `devflow doctor [--json]` | Environment audit (agents installed, versions, RUST_LOG) plus per-phase reconciliation; `--json` emits one object `{"environment": [...], "reconciliation": [...]}` |
+| `devflow release --check` | Read-only release-cut preflight: workspace self-pin, develop/main divergence (no `git fetch` — reads already-fetched refs), crates.io publish order, and `gpg.format`-aware tag-signing viability. `--check` is required; a bare `devflow release` is rejected toward the deferred release-cut executor (merge/tag/sync/publish, DEN-50) |
 
 (`devflow advance` is internal — invoked by monitors with `--phase N`.)
 

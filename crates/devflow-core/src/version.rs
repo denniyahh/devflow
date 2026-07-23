@@ -364,6 +364,72 @@ fn rewrite_inline_table_version(line: &str, new_version: &str) -> Option<String>
     None
 }
 
+/// One `[workspace.dependencies]` self-pin discovered by
+/// [`read_workspace_self_pins`] — a local-path dependency's name and its
+/// pinned `version` sub-value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelfPin {
+    /// The dependency's name (left-hand side of `=` in `[workspace.dependencies]`).
+    pub name: String,
+    /// The `version = "..."` value currently pinned in the inline table.
+    pub version: String,
+}
+
+/// Extract `[workspace.package] version` and every local-path
+/// `[workspace.dependencies]` self-pin (crate name + pinned version) from a
+/// workspace Cargo.toml's contents.
+///
+/// Read-only (20d / `devflow release --check`): asserts 20a's invariant
+/// (`write_version` keeps every self-pin equal to the workspace version)
+/// without re-implementing TOML scanning — reuses the same
+/// `parse_section_header`/`find_version_in_contents`/
+/// `workspace_dependency_has_local_path`/`inline_table_fragments` helpers
+/// `write_version`'s additive rewrite pass already uses.
+///
+/// Returns `(workspace_version, pins)`. `workspace_version` is `None` when
+/// the contents have no `[workspace.package] version` field (not a workspace
+/// root Cargo.toml) — callers must treat that as "nothing to assert", not a
+/// drift.
+pub fn read_workspace_self_pins(contents: &str) -> (Option<String>, Vec<SelfPin>) {
+    let workspace_version = find_version_in_contents(contents, "workspace.package.version");
+
+    let mut current = String::new();
+    let mut pins = Vec::new();
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if let Some(header) = parse_section_header(trimmed) {
+            current = header.to_string();
+            continue;
+        }
+        if current == "workspace.dependencies"
+            && trimmed.contains('{')
+            && trimmed.contains('}')
+            && workspace_dependency_has_local_path(trimmed)
+            && let Some(fragments) = inline_table_fragments(trimmed)
+        {
+            let name = trimmed
+                .split_once('=')
+                .map(|(n, _)| n.trim().to_string())
+                .unwrap_or_default();
+            for (_, fragment) in fragments {
+                let frag = fragment.trim();
+                let Some((key, value)) = frag.split_once('=') else {
+                    continue;
+                };
+                if key.trim() != "version" {
+                    continue;
+                }
+                let value = value.trim().trim_matches(['"', '\'']);
+                pins.push(SelfPin {
+                    name: name.clone(),
+                    version: value.to_string(),
+                });
+            }
+        }
+    }
+    (workspace_version, pins)
+}
+
 /// Split a dotted field path into its TOML section path and the final key.
 fn split_field(field: &str) -> (&str, &str) {
     match field.rsplit_once('.') {
