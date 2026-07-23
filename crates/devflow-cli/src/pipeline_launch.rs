@@ -201,6 +201,15 @@ pub(crate) fn launch_stage(
 /// the branch/worktree already exist and agent/mode are read from the saved
 /// state, so neither needs to be passed as a flag and the workflow is never
 /// reset to Define.
+///
+/// 20c (review: Codex MEDIUM — resume semantics): a phase halted by
+/// `devflow start --until <stage>` persists `stopped`/`stop_reason`/
+/// `stop_until`. Without clearing them here, `state.stop_until ==
+/// Some(from)` would immediately re-stop the phase the next time
+/// `transition()` ran, and the phase would remain marked `stopped` forever
+/// even though the operator explicitly asked to resume past it. Cleared and
+/// persisted BEFORE `launch_stage`, so a reload mid-relaunch already sees
+/// the phase as no longer stopped.
 pub(crate) fn resume(project_root: &Path, phase: u32) -> Result<(), CliError> {
     let _lock = match lock::acquire(project_root, phase) {
         Ok(guard) => guard,
@@ -212,6 +221,10 @@ pub(crate) fn resume(project_root: &Path, phase: u32) -> Result<(), CliError> {
         Err(err) => return Err(CliError::Message(format!("lock error: {err}"))),
     };
     let mut state = workflow::load_state(project_root, phase)?;
+    state.stopped = false;
+    state.stop_reason = None;
+    state.stop_until = None;
+    workflow::save_state(&state)?;
     launch_stage(&mut state, None, None)
 }
 
@@ -418,6 +431,65 @@ mod tests {
              since transition() saves state before launch_stage runs"
         );
     }
+    /// 20c (review: Codex MEDIUM — resume semantics): a phase halted by
+    /// `--until <stage>` has `stopped`/`stop_reason`/`stop_until` persisted.
+    /// `resume` must clear all three BEFORE relaunching — otherwise
+    /// `transition()`'s `stop_until == Some(from)` check would immediately
+    /// re-stop the phase the next time it advances, and the phase would
+    /// stay marked `stopped` forever despite the operator's explicit
+    /// resume. Asserts on the persisted state (not just `resume`'s exit
+    /// code), since `transition()` saves state before `launch_stage` runs.
+    #[test]
+    fn resume_clears_stop_marker_and_advances_past_stop_point() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 66;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Plan;
+        state.stop_until = Some(Stage::Plan);
+        state.stopped = true;
+        state.stop_reason = Some("stopped after plan completed (--until plan)".to_string());
+        workflow::save_state(&state).unwrap();
+
+        let stub_dir = stub_agent_binary("claude");
+        let original_path = std::env::var_os("PATH");
+        let stubbed_path = prepend_path(&stub_dir, &original_path);
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", &stubbed_path);
+        }
+
+        let result = resume(root, phase);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        result.unwrap();
+
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert!(
+            !reloaded.stopped,
+            "resume must clear stopped so the phase is no longer marked halted"
+        );
+        assert_eq!(
+            reloaded.stop_reason, None,
+            "resume must clear stop_reason alongside stopped"
+        );
+        assert_eq!(
+            reloaded.stop_until, None,
+            "resume must clear stop_until so the phase does not immediately re-stop \
+             the next time it advances past Plan"
+        );
+    }
+
     /// D-01/D-06 regression: a Code-stage `Unknown` outcome (Layer 3's
     /// "process gone but commits exist" case) must route through
     /// `handle_stage_failure`'s never-silent gate, never

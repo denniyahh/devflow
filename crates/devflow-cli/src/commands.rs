@@ -1314,6 +1314,13 @@ pub(crate) struct PhaseFacts {
     pub(crate) last_launched_stage: Option<Stage>,
     pub(crate) open_gate_stages: Vec<Stage>,
     pub(crate) feature_branch_exists: bool,
+    /// Whether this phase was intentionally halted by `devflow start --until
+    /// <stage>` (20c) — `State.stopped`. A stopped phase's dead agent
+    /// pid/stale monitor pid are expected, not a crash; both
+    /// `check_dead_agent` and `check_dead_monitor` must recognize this
+    /// marker instead of reporting a `Problem` (review: Codex HIGH — the
+    /// doctor gap is bigger than `check_dead_agent` alone).
+    pub(crate) stopped: bool,
 }
 
 /// One diagnostic finding for a phase, with a copy-pasteable repair command
@@ -1370,7 +1377,7 @@ fn check_orphan_gate(facts: &PhaseFacts) -> Option<PhaseFinding> {
 /// CONTEXT.md cites (two incidents, ~4h lost, found only via `ps`).
 fn check_dead_agent(facts: &PhaseFacts) -> Option<PhaseFinding> {
     let pid = facts.agent_pid?;
-    if facts.agent_alive || !facts.stage.is_agent_stage() {
+    if facts.stopped || facts.agent_alive || !facts.stage.is_agent_stage() {
         return None;
     }
     Some(PhaseFinding {
@@ -1392,7 +1399,9 @@ fn check_dead_agent(facts: &PhaseFacts) -> Option<PhaseFinding> {
 /// here transitively — an unrecorded monitor is silently `Unknown`, never a
 /// finding).
 fn check_dead_monitor(facts: &PhaseFacts) -> Option<PhaseFinding> {
-    if liveness(facts.monitor_pid, facts.monitor_alive, facts.agent_alive) != Liveness::Stuck {
+    if facts.stopped
+        || liveness(facts.monitor_pid, facts.monitor_alive, facts.agent_alive) != Liveness::Stuck
+    {
         return None;
     }
     let pid = facts.monitor_pid?;
@@ -1495,6 +1504,7 @@ fn build_phase_facts(
     open_gates: &[OpenGate],
 ) -> PhaseFacts {
     let phase = state.phase;
+    let stopped = state.stopped;
     let agent_pid = agent_pid_from_file(project_root, phase);
     let agent_alive = agent_pid.is_some_and(agent::agent_running);
     let monitor_pid = state.monitor_pid;
@@ -1527,6 +1537,7 @@ fn build_phase_facts(
         last_launched_stage,
         open_gate_stages,
         feature_branch_exists,
+        stopped,
     }
 }
 
@@ -2116,6 +2127,7 @@ mod tests {
                 last_launched_stage: Some(Stage::Code),
                 open_gate_stages: Vec::new(),
                 feature_branch_exists: true,
+                stopped: false,
             }
         }
 
@@ -2231,6 +2243,55 @@ mod tests {
             assert_eq!(
                 monitor_finding.repair.as_deref(),
                 Some("devflow resume --phase 8")
+            );
+        }
+
+        /// 20c (D-09 + review: Codex HIGH — the doctor gap is bigger than
+        /// `check_dead_agent`): a phase intentionally halted by `devflow
+        /// start --until <stage>` sits at an agent stage with a dead agent
+        /// pid on disk. `check_dead_agent` must recognize `facts.stopped`
+        /// and report ZERO findings — this is not a crash.
+        #[test]
+        fn reconcile_phase_ignores_dead_agent_when_stopped() {
+            let facts = PhaseFacts {
+                stage: Stage::Plan,
+                agent_pid: Some(999_999),
+                agent_alive: false,
+                stopped: true,
+                ..agreeing_facts(11)
+            };
+            let findings = reconcile_phase(&facts);
+            assert!(
+                findings.iter().all(|f| f.severity != Severity::Problem),
+                "a --until-stopped phase must yield zero Problem findings, got: \
+                 {:?}",
+                findings.iter().map(|f| &f.detail).collect::<Vec<_>>()
+            );
+        }
+
+        /// 20c (D-09 + review: Codex HIGH — the doctor gap is bigger than
+        /// `check_dead_agent`): the same stopped phase may also carry a
+        /// stale `monitor_pid` (though the stop path clears it — this
+        /// proves the guard holds even if that clear were ever bypassed).
+        /// `check_dead_monitor` must also recognize `facts.stopped` and
+        /// report ZERO findings.
+        #[test]
+        fn reconcile_phase_ignores_dead_monitor_when_stopped() {
+            let facts = PhaseFacts {
+                stage: Stage::Plan,
+                monitor_pid: Some(5150),
+                monitor_alive: false,
+                agent_pid: Some(4242),
+                agent_alive: false,
+                stopped: true,
+                ..agreeing_facts(12)
+            };
+            let findings = reconcile_phase(&facts);
+            assert!(
+                findings.iter().all(|f| f.severity != Severity::Problem),
+                "a --until-stopped phase must yield zero Problem findings even with a \
+                 stale monitor_pid, got: {:?}",
+                findings.iter().map(|f| &f.detail).collect::<Vec<_>>()
             );
         }
 
