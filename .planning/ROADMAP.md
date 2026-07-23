@@ -2,7 +2,7 @@
 
 > Phase plan source of truth. Each phase drives a `devflow start` agent session.
 
-## v2.0.0 (Phase 11–20)
+## v2.0.0 milestone (open — no fixed closing phase)
 
 | Phase | Name | Status | Version |
 |---|---|---|---|
@@ -14,12 +14,13 @@
 | 17 | Pipeline Dogfood Follow-Up | Complete    | — |
 | 18 | Dogfood Reliability Hardening | Complete    | 1.5.0 |
 | 19 | Release Integrity + `main.rs` Decomposition | Complete    | 1.6.0 |
-| 20 | *(unscoped — operator-facing set)* | Planned | 2.0.0 |
+| 20 | Release Correctness + Operator Control | Complete    | 1.7.0 |
 
 ## Shipped
 
 | Phase | Name | Version |
 |---|---|---|
+| 20 | Release Correctness + Operator Control | 1.7.0 |
 | 18 | Dogfood Reliability Hardening | 1.5.0 |
 | 11 | GSD-Native Architecture + Remediation | 1.2.0 |
 | 10 | Logging + Planning Step | — |
@@ -57,7 +58,20 @@
 - **999.8 is near-alone by necessity.** It conflicts with every other high-priority candidate: 999.6 (`--until`), 999.7 (manual ship override) and 999.3 (`gate show`) all land in `main.rs`. Every phase run before the split makes the split harder and re-pays the serialization tax — Phase 18 burned 6 near-serial waves on 7 plans for exactly this reason, and the file has grown +35% (6,239 → 8,467 lines) since that was logged.
 - **Phase 20 gets the deferred set** — 999.6, 999.7, 999.13, likely 999.3 — and is what the split makes plannable as one phase in ~3 waves rather than two phases at 6.
 
-## Phase 14 split (2026-07-16)
+## Phase 20 scoping (2026-07-22)
+
+- **Phase 20 = five promoted backlog items**, in sequence: 999.24 (`VersionBump` workspace self-pins, High/S), 999.23 (`phase7_cli.rs` git-fixture reliability, High/M), 999.6 (`--until` plan-only mode, High/M), 999.13 (release-cut preflight, High/L), 999.7 (manual ship override, High/L). Promoted via `/gsd-review-backlog`; all five source claims re-verified open at HEAD (`8ecbdf9`) during promotion.
+- **999.23 re-sized S → M during promotion.** The ROADMAP entry described one flaky test (`reference_and_cleanup_worktree_cli_flow`, worktree removal race). DEN-48 had since been broadened — a second, unrelated flake in the same file (`start_worktree_mode_ignores_main_checkout_divergence`, git object-store corruption on run `29946629986`) reframes the item as a structural weakness in how `phase7_cli.rs`'s fixtures drive real `git` under CI concurrency. Two distinct root causes, and instance 1 likely has a product-side component.
+- **999.3 deliberately left in backlog.** The Phase 19 note reserved it for Phase 20 "likely", but it is the only Low-priority item in that set and it bundles four distinct UX gaps (`gate show`, rate-limit reset surfacing, in-stage `status` progress, recovery-verb discoverability). Split it before promoting rather than carrying the largest lowest-value unit in a phase already holding two L-sized items.
+- **Two release defects promoted ahead of the operator features.** 999.24 (S) has shipped broken two for two (v1.5.0 patched by `7ad260c`, v1.6.0 by PR #15) and is a *product* bug — any user with a published Cargo workspace hits it identically. 999.23 (M) sits in the release gate, and a coin-flip test trains the reader to re-run red CI instead of investigating it. Both make this phase's own release cut trustworthy, which is why they lead.
+- **999.13 blocks on 999.24.** Its highest-value check is the workspace self-pin invariant; it must assert against 999.24's fix rather than encode today's manual patch as the expected state.
+- **v2.0.0 is not yet earned.** The milestone reserves 2.0.0 for this phase, but nothing in the five units is inherently breaking, and Phase 19 already declined to burn the 2.0 slot on a non-breaking changeset. Decide at ship time: either the phase earns a breaking change or the milestone closes at 1.7.0 and the slot stays unspent.
+
+## Milestone stays open (2026-07-23)
+
+- **Decided at Phase 20 ship time:** ships as **v1.7.0**, not v2.0.0 — nothing across the five units is breaking, consistent with Phase 19's earlier call not to spend the 2.0 slot on a non-breaking changeset.
+- **The v2.0.0 milestone does NOT close at Phase 20 or at any other fixed phase.** Earlier notes above ("the milestone now runs Phase 11–20 and genuinely closes at v2.0.0," "the v2.0.0 milestone closes at Phase 20," "the milestone reserves 2.0.0 for this phase") described a *bounded* Phase 11–20 arc culminating in a 2.0.0 release. That framing is superseded: the milestone continues past Phase 20 with no predetermined phase count or closing version — 2.0.0 remains an eventual aspiration, not a scheduled endpoint. Future phases keep numbering forward (21, 22, …) under the same open milestone until a genuinely breaking change actually earns the 2.0 slot; `/gsd-complete-milestone` is not run at Phase 20.
+- Table above renamed from "v2.0.0 (Phase 11–20)" to reflect this — the phase list is historical (what's shipped so far), not a closing boundary.
 
 - **Phase 14 rescoped to Parallel Safety + Observability** — the 2026-07-14 move of Hermes into Phase 14 was a workload-balance call made before the CR-03 parallel-safety flaw was deferred there (2026-07-15), which made 14 the heaviest phase instead of the slimmest. Phase 14 now leads with CR-03 (per-phase state files, phase-threaded monitor advance, coarse lock for main-checkout mutations), keeps the `capture_agent_output()` sync-path decision, and builds observability (`logs`/`events.jsonl`/`status`) on the final per-phase state model — in that order, since the state-file shape dictates what `status`/`logs`/`events.jsonl` enumerate.
 - **Phase 16 (new): Hermes Support** — HermesAgent adapter, skill-file rewrite, and Hermes plugin moved out of 14. Depends on Phase 14 (the plugin's gate watcher consumes `events.jsonl` and the Phase 13 notify hook); sits after Phase 15 so public-facing OSS readiness isn't gated on personal-infrastructure work.
@@ -268,7 +282,7 @@ Plans:
 ### Phase 19: Release Integrity + `main.rs` Decomposition
 
 **Goal:** Close the two release-integrity defects whose blast radius reaches outside this repository (999.10's `.devflow/` PII leak into *users'* git history, 999.11's empty commit under a release tag), then decompose the 8,467-line `crates/devflow-cli/src/main.rs` as a pure-move refactor so later phases stop paying the near-serial wave tax. Adds the AI change acceptance contract (999.16) on a parallel, source-conflict-free track.
-**Targets:** v1.6.0 — nothing here is breaking and, apart from the PII fix, almost nothing is user-visible. The v2.0.0 milestone closes at Phase 20, which carries the operator-facing set this split makes plannable as one phase.
+**Targets:** v1.6.0 — nothing here is breaking and, apart from the PII fix, almost nothing is user-visible. Phase 20 carries the operator-facing set this split makes plannable as one phase.
 **Promoted from backlog** 2026-07-21: 999.10 (DEN-35), 999.11 (DEN-36), 999.8 (DEN-33), 999.16 (DEN-41).
 **Requirements:** 19a, 19b, 19c–19f, 19g (see CONTEXT.md — no formal REQ-IDs)
 **Depends on:** Phase 18 — 999.8 was deliberately blocked on it; 18a/18b are the instrumentation that makes an `ENV_MUTEX` regression observable, and 18e/18f reshaped the functions that determine the module seams.
@@ -308,6 +322,36 @@ Plans:
 
 - [x] 19-10-PLAN.md — regenerate `.planning/codebase/STRUCTURE.md` + `TESTING.md`, reconcile this ROADMAP entry
 - [x] 19-11-PLAN.md — phase gate: three-part equivalence proof on CI-on-branch (D-11), `ENV_MUTEX` disposition (D-12), scratch-repo 19a reproduction, requirement roll-call
+
+### Phase 20: Release Correctness + Operator Control
+
+**Goal:** Close the two defects that make DevFlow's own release cut unreliable (999.24's `VersionBump` self-pin, which has shipped broken two for two and hits any user with a published Cargo workspace; 999.23's unreliable `phase7_cli.rs` git fixtures, which have produced two distinct coin-flip failures on release-path PRs in a single day), then add the two operator controls the pipeline has never had — a clean stop point short of Ship (999.6) and a way to drive a phase through Ship when the monitor is dead (999.7) — plus a release-cut preflight (999.13) so the manual checklist stops being the only thing between a green suite and a broken publish.
+**Targets:** v1.7.0 — decided 2026-07-23 (see "Milestone stays open" below). Nothing in these five units is inherently breaking.
+**Promoted from backlog** 2026-07-22: 999.24 (DEN-49), 999.23 (DEN-48), 999.6 (DEN-31), 999.13 (DEN-38), 999.7 (DEN-32).
+**Requirements:** 20a, 20b, 20c, 20d, 20e (see CONTEXT.md — no formal REQ-IDs)
+**Depends on:** Phase 19 — the `main.rs` split is what makes 999.6, 999.7 and 999.13 plannable as one phase in ~3 waves; all three previously conflicted in a single 8,467-line file. 999.7 also depends on 18a/18b (shipped v1.5.0), which are what tell an operator *why* the pipeline is stuck.
+**Plans:** 5/5 plans executed
+
+**Sequencing is load-bearing:** 20a and 20b land first so this phase's own CI and release cut are trustworthy while the rest is in flight. 20d blocks on 20a — its primary check asserts 20a's invariant and must not encode today's manual patch as the expected state. 20e sequences last: it needs a design pass and it touches the Ship/outcome path 20d reasons about.
+
+Plans:
+
+**Wave 1** *(20a/20b — no file overlap; both gate this phase's own release cut)*
+
+- [x] 20-01-PLAN.md — 20a: `version::write_version` also rewrites `[workspace.dependencies]` local-path self-pins (additive inline-table pass; PR #17 guard becomes no-op-by-construction)
+- [x] 20-02-PLAN.md — 20b: `cleanup --force` liveness guard + bounded-backoff retry (product fix for the worktree race) and `phase7_cli.rs` fixture durability (instance 2, fixture-side per D-08)
+
+**Wave 2** *(20c — depends on 20b; first of the serialized 20c→20d→20e CLI-dispatch chain)*
+
+- [x] 20-03-PLAN.md — 20c: `devflow start --until <stage>` halts cleanly (new `State` stop marker, `transition` interception, `check_dead_agent` stop-awareness), `--until ship` rejected
+
+**Wave 3** *(20d — depends on 20a + 20c; serialized after 20c to avoid a shared `main.rs`/`commands.rs` clap-enum merge conflict)*
+
+- [x] 20-04-PLAN.md — 20d: `devflow release --check` read-only preflight — self-pin (asserts 20a), `develop`/`main` divergence, publish order, `gpg.format`-aware signing viability
+
+**Wave 4** *(20e — sequenced last; depends on 20a + 20d; inherits 20a's self-pin fix via VersionBump)*
+
+- [x] 20-05-PLAN.md — 20e: `devflow ship --phase N [--force]` manual override — second consumer of the on-disk Ship response, reuses `finish_workflow` (D-01), `--force` scoped to Ship (D-02)
 
 ## Backlog
 
@@ -370,28 +414,6 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.6: Plan-Only Pipeline Mode (BACKLOG)
-
-**Goal:** `devflow start --until <stage>` to halt cleanly after a named stage. Today `start` always runs Define→Plan→Code→Validate→Ship and `--mode supervise` only moves the gates, so "just do the planning" is inexpressible — the only stop is killing the monitor, which strands state and orphans a worktree. Blocks cheap, frequent dogfood runs. Found 2026-07-20 attempting to plan Phase 18 through devflow itself.
-**Priority:** High | **Size:** M — reviewed 2026-07-21: confirmed still missing (no `--until`/`stop_after`/`plan_only` anywhere in `crates/`). Ranked above pure UX since it multiplies future dogfooding — this project's highest-yield bug source — not just convenience. Linear: DEN-31.
-**Requirements:** TBD — see CONTEXT.md
-**Plans:** 0 plans
-
-Plans:
-
-- [ ] TBD (promote with /gsd-review-backlog when ready)
-
-### Phase 999.7: Manual Ship Override (BACKLOG)
-
-**Goal:** Let an operator drive a phase through Ship by hand when the pipeline is unhealthy. `devflow gate approve` does not cover this: it refuses when no gate is open (`gates.rs:186`), and when one is open it only writes a response file that a *live monitor* must consume — so a dead monitor (invisible today, see 18b) leaves the approval unconsumed forever. Must not bypass the fail-closed terminal Ship invariant. Operator request 2026-07-20.
-**Priority:** High | **Size:** L — reviewed 2026-07-21: confirmed no force-ship path exists (only `gate approve`, which requires an open gate + live monitor). Now unblocked (18a/18b's reconciliation shipped in v1.5.0). Has open design questions (share a mechanism with 18f's preflight-override?) — run a discuss-phase pass before sizing tightens further. Linear: DEN-32.
-**Requirements:** TBD — see CONTEXT.md
-**Plans:** 0 plans
-
-Plans:
-
-- [ ] TBD (promote with /gsd-review-backlog when ready)
-
 ### Phase 999.12: Layer 0 Unapproved-Probe Veto Coverage (BACKLOG)
 
 **Goal:** 17-REVIEW.md WR-04 — coverage debt on a *deliberate* trade, not a defect. 17-03 removed `evaluate_layer0`'s `Stage::Code` guard by design (D-05 gap 1), so a forgotten `DEVFLOW_TRUST_EXTERNAL_VERIFY` now vetoes at all five stages instead of one, a 5× blast-radius increase. Two verified gaps at HEAD: (a) of the three veto arms, only "approval mismatch" is tested (`agent_result.rs:1644`) — the "not approved" arm a forgotten env var actually hits has no test at any stage; (b) `docs/guides/configuration.md` states the requirement for "the parent DevFlow process" but never that the **detached monitor subprocess must inherit it**, which is where the failure manifests. Deliberately not folded into Phase 18's 18-05 (same file) — that plan had already passed the checker clean, and adding coverage debt to a verified bug-fix plan is scope creep.
@@ -407,17 +429,6 @@ Plans:
 
 **Goal:** Triggered 2026-07-20 by a GitHub Actions annotation on the first all-branch CI run — `actions/checkout@v4` targets deprecated Node.js 20 and is being force-run on Node 24. Warning only, all jobs green, but it appears on 4 job definitions across both workflow files, so the eventual break lands everywhere at once. Broader than a one-line bump: the dependency surface is inconsistently pinned — `dtolnay/rust-toolchain@stable` and `rust-toolchain.toml`'s `channel = "stable"` float entirely (CI can break from upstream with no commit here, a reproducibility gap for a project premised on trustworthy pipelines), `devcontainers/ci@v0.3` is pre-1.0, the devcontainer base image pin was last verified in Phase 15, and neither `cargo audit` nor `cargo deny` runs in CI. Deliberately not folded into Phase 18 — a dependency bump mid-phase would confound that phase's test signal.
 **Priority:** Medium | **Size:** M — reviewed 2026-07-21: confirmed `actions/checkout@v4` still current pin. Nothing failing today; most of the scope is policy decisions (pin vs. float) rather than code. Linear: DEN-34.
-**Requirements:** TBD — see CONTEXT.md
-**Plans:** 0 plans
-
-Plans:
-
-- [ ] TBD (promote with /gsd-review-backlog when ready)
-
-### Phase 999.13: Release-Cut Automation / `devflow release --check` (BACKLOG)
-
-**Goal:** DevFlow automates the phase pipeline thoroughly but the release-cut process (version-bump PR → merge → tag → develop-sync → crates.io publish) is a fully manual checklist. Cutting v1.5.0 (2026-07-21) hit three separate failures from this gap in one release: the `devflow-core` version pin drifted for the *second* time (PR #10 fixed the same drift once before), `develop` had silently diverged from `main` for a full release cycle (11 file conflicts on the next PR), and crates.io's publish ordering constraint was undocumented until hit by trial and error. A fourth, related gap: the official signed release tag has no preflight for signing viability, unlike DevFlow's own automated version-bump tags (`git.rs::tag()`, which already scopes off `tag.gpgsign` per-invocation).
-**Priority:** High | **Size:** L — added 2026-07-21, born directly from that session's release. Multiple distinct checks plus one open design question (should it also cut the tag, or just preflight?) — see CONTEXT.md. Linear: DEN-38.
 **Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
 
@@ -513,10 +524,32 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.23: Flaky `reference_and_cleanup_worktree_cli_flow` (BACKLOG)
+### Phase 999.25: Release-Cut Executor (`devflow release` that executes) (BACKLOG)
 
-**Goal:** `reference_and_cleanup_worktree_cli_flow` (`crates/devflow-cli/tests/phase7_cli.rs:82`) intermittently fails on GitHub Actions with `failed to delete '.git/worktrees/phase-08': Directory not empty` — a `git worktree remove` filesystem race. Caught on the v1.6.0 release PR; proven a flake, not a regression (the SHA's code was byte-identical to a run that passed minutes earlier, the test is untouched by Phase 19, it passed 5/5 locally, and a bare re-run went green).
-**Priority:** High | **Size:** S — it sits in the release gate, and a coin-flip test trains the reader to re-run red CI instead of investigating it. Fourth instance of this family (WR-03/18-02, 17-09 GAP-2, 19i), so treat it as a structural weakness in worktree-touching tests. Check whether `cleanup --force` has the same hole for a real user before fixing it test-side only. Linear: DEN-48.
+**Goal:** A `devflow release` that *executes* the full release cut — version-bump PR → merge to `main` → signed tag → sync `develop` → publish `devflow-core` then `devflow` to crates.io — not just the read-only preflight. Phase 20's 20d (DEN-38) delivers `--check` only; Phase 20 CONTEXT.md D-03 locked that scope and recorded this executor as the follow-up.
+**Priority:** High | **Size:** L — drives irreversible operations (squash-merge to `main`, signed tag, a crates.io publish that can never be un-published or reused), so it needs its own discuss-phase design pass on failure/rollback semantics (tag lands but publish fails; core publishes but cli does not). Blocks on Phase 20's 20a (self-pin) and 20d (`--check`): the executor's preflight step *is* 20d's check and its `VersionBump` step inherits 20a's correctness. Source: Phase 20 D-03 (2026-07-22). Linear: DEN-50 (blocked by DEN-49, DEN-38).
+**Requirements:** TBD — see CONTEXT.md
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.26: `devflow parallel` Git Object-Store Race (BACKLOG)
+
+**Goal:** Confirm-or-refute whether `devflow parallel`'s concurrent per-worktree commits can hit the same git object-store corruption seen in Phase 20's 20b instance 2 (`invalid object` mid-commit-loop, a fsync-ordering flake fixed fixture-side per D-05), and fix it at the product level if the race is real. 20-RESEARCH.md assumption A1 flagged the analog as plausible but unconfirmed — `devflow parallel` has no DevFlow-level lock serializing its concurrent commits.
+**Priority:** Medium | **Size:** M — low likelihood but high severity: if the product shares the hole, the next occurrence is a corrupted user repo with an opaque `invalid object` error, not a re-runnable red CI job. Dominated by a deliberate reproduction attempt (a code read can't settle it); the fix if needed is bounded. Relates to 999.4 / DEN-29 (concurrent-ship contention — same concurrency family). Source: Phase 20 D-08 / 20-RESEARCH A1 (2026-07-22). Linear: DEN-51.
+**Requirements:** TBD — see CONTEXT.md
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.27: `release --check` Signing-Key Inline Classification (BACKLOG)
+
+**Goal:** `check_ssh_signing_viability` (20d, `crates/devflow-core/src/git.rs`) misclassifies an inline (non-path) `user.signingkey` value — a literal key blob configured directly rather than as a file path is treated as a path and reported as not-found. Deterministic edge case; every path-based and no-key branch is already correct and tested. Full detail in `.planning/phases/20-release-correctness-operator-control/20-REVIEW.md` (INF-01).
+**Priority:** Low | **Size:** S — single classification branch + one test; found by Phase 20 code review (2026-07-23), deferred as Info-severity while CR-01/CR-02 + WR-01/02/03 were fixed inline on the phase-20 branch. Linear: DEN-52.
 **Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
 

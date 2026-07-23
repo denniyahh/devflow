@@ -27,6 +27,33 @@ pub(crate) fn gate_timeout_secs() -> u64 {
     parse_gate_timeout(std::env::var("DEVFLOW_GATE_TIMEOUT_SECS").ok())
 }
 
+/// Parse `DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS`, falling back to 60s. Pure
+/// (no env access) so it's unit-testable without mutating process-global env.
+fn parse_foreground_gate_timeout(raw: Option<String>) -> u64 {
+    const DEFAULT_SECS: u64 = 60;
+    raw.and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_SECS)
+}
+
+/// How long the FOREGROUND `devflow ship --phase` manual override (WR-02,
+/// phase 20 review) waits for a re-opened Ship gate to be answered before
+/// failing fast, configurable via `DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS`
+/// (defaults to 60s).
+///
+/// Every other caller of `finish_workflow`/`run_gate` runs inside a detached
+/// monitor process, so [`gate_timeout_secs`]'s multi-day production default
+/// is invisible to an operator's terminal. `ship_override` calls
+/// `finish_workflow` directly from the foreground CLI — if a terminal-hook
+/// failure reopens the Ship gate, waiting out the multi-day default would
+/// block the operator's shell for however long the gate takes to resolve.
+/// This bound only caps how long the FOREGROUND wait can run before erroring
+/// out with an actionable message; it does not weaken the fail-closed
+/// terminal-Ship invariant — an unanswered gate still fails the operation
+/// entirely, exactly as [`gate_timeout_secs`]'s timeout does today, just
+/// after seconds instead of days.
+pub(crate) fn foreground_gate_timeout_secs() -> u64 {
+    parse_foreground_gate_timeout(std::env::var("DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS").ok())
+}
+
 /// Parse `DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS`, falling back to 120s. Pure
 /// (no env access) so it's unit-testable without mutating process-global env.
 fn parse_checkout_lock_timeout(raw: Option<String>) -> std::time::Duration {
@@ -71,5 +98,15 @@ mod tests {
         assert_eq!(parse_gate_timeout(Some("42".into())), 42);
         assert_eq!(parse_gate_timeout(Some("bad".into())), SEVEN_DAYS);
         assert_eq!(parse_gate_timeout(None), SEVEN_DAYS);
+    }
+
+    /// WR-02: the foreground bound defaults to 60s — orders of magnitude
+    /// shorter than `gate_timeout_secs`' multi-day production default — and
+    /// is independently configurable/pure like its sibling.
+    #[test]
+    fn parse_foreground_gate_timeout_env_override() {
+        assert_eq!(parse_foreground_gate_timeout(Some("5".into())), 5);
+        assert_eq!(parse_foreground_gate_timeout(Some("bad".into())), 60);
+        assert_eq!(parse_foreground_gate_timeout(None), 60);
     }
 }

@@ -34,6 +34,7 @@ environment variables, not config file fields:
 |---|---|---|
 | `DEVFLOW_GATE_NOTIFY_CMD` | unset | Shell command fired when a gate is written (e.g. an `ntfy.sh`/desktop-notification call) |
 | `DEVFLOW_GATE_TIMEOUT_SECS` | 604800 (7 days) | How long a monitor waits at a gate before giving up |
+| `DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS` | 60 | How long `devflow ship --phase`'s foreground manual override waits for a reopened Ship gate before failing fast, instead of `DEVFLOW_GATE_TIMEOUT_SECS`'s multi-day default |
 | `DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS` | 120 | How long to wait on the shared-checkout lock before skipping the hook batch rather than running it unserialized |
 | `DEVFLOW_CAPTURE_RETENTION` | 5 | Override capture generations retained per phase |
 | `DEVFLOW_REVIEW_ANGLES` | built-in list | Override Ship review angles with a comma-separated list |

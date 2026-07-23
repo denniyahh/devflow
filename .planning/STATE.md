@@ -1,15 +1,19 @@
 ---
 gsd_state_version: 1.0
 milestone: v2.0.0
-milestone_name: milestone
-status: "Phase 19 complete and verified on 2026-07-22: 11/11 plans, 7/7 observable truths, 438 tests, and three green CI attempts on pushed SHA aa95873. Phase 20 remains unscoped and must be defined before planning."
-stopped_at: Phase 19 complete and verified; Phase 20 remains unscoped
-last_updated: "2026-07-22T10:34:28-04:00"
+milestone_name: milestone (open — no fixed closing phase)
+current_phase: 20
+current_phase_name: release-correctness-operator-control
+status: shipped
+stopped_at: Phase 20 shipped as v1.7.0 (2026-07-23) — PR #20 squash-merged to develop (e78bc82). The v2.0.0 milestone stays open (does not close at Phase 20 or any fixed phase); numbering continues forward. No phase currently in flight — next step is discussing/planning whichever phase or backlog promotion comes next.
+last_updated: "2026-07-23T11:25:00.000Z"
+last_activity: 2026-07-23
+last_activity_desc: Phase 20 shipped as v1.7.0; milestone stays open
 progress:
-  total_phases: 8
-  completed_phases: 8
-  total_plans: 65
-  completed_plans: 65
+  total_phases: 9
+  completed_phases: 9
+  total_plans: 70
+  completed_plans: 70
   percent: 100
 ---
 
@@ -19,11 +23,72 @@ progress:
 
 ## Active Phase
 
-- **Phase 20 remains unscoped.** The roadmap reserves it for the
-  operator-facing set targeting v2.0.0, but it has no detailed phase entry yet.
-  Scope it before discussion or planning.
+*(none currently in flight. Phase 20 shipped as v1.7.0, 2026-07-23 — see
+Recently Shipped below. The v2.0.0 milestone stays open: it does not close
+at Phase 20 or any fixed phase; numbering continues forward (21, 22, …)
+until a genuinely breaking change earns the 2.0 slot. Backlog items
+(999.N) are NOT automatically next — they require `/gsd-review-backlog`
+promotion.)*
+
+## Current Position
+
+Phase: 20 (release-correctness-operator-control) — SHIPPED as v1.7.0
+Plan: 5 of 5 (all executed, verified, code-reviewed, shipped)
+Status: No phase currently active. Milestone v2.0.0 stays open (no fixed closing phase) — next phase/backlog promotion not yet decided.
+Last activity: 2026-07-23 — Phase 20 shipped as v1.7.0; PR #20 squash-merged to develop (e78bc82)
+
+Progress: [████████████████████] 83/79 plans (100%)
+
+*(Machine-readable fields for `gsd-tools state begin-phase` / `advance-plan` —
+this project historically tracked position only in the narrative "Active
+Phase" section above, which `advance-plan` cannot parse (backlog 12,
+`deferred-items.md`). This section restores the standard fields so
+`begin-phase` can seed real Plan/Status values once Phase 20 starts.)*
 
 ## Recently Shipped
+
+- **Phase 20 — Release Correctness + Operator Control (Complete + Verified +
+  Shipped as v1.7.0 — 5/5 plans, 2026-07-23).** Promoted from backlog
+  2026-07-22 via `/gsd-review-backlog` as five units: 20a — 999.24
+  `VersionBump` workspace member self-pins (High/S, DEN-49); 20b — 999.23
+  `phase7_cli.rs` git-fixture reliability + `cleanup --force` liveness gate
+  (High/M, DEN-48); 20c — 999.6 `devflow start --until <stage>` (High/M,
+  DEN-31); 20d — 999.13 `devflow release --check` preflight (High/L,
+  DEN-38); 20e — 999.7 manual `devflow ship --phase N [--force]` override
+  (High/L, DEN-32).
+
+  **Executed 2026-07-23** on `feat/phase-20-release-correctness-operator-control`
+  via parallel git worktrees (Wave 1: 20-01+20-02 disjoint-file parallel;
+  Waves 2-4 single-plan by DAG construction — 20-03→20-04→20-05 share
+  `main.rs`). Post-merge gates green after every wave; final workspace suite
+  480/0 pre-review-fixes.
+
+  **Code-reviewed** (`20-REVIEW.md`): 2 blocker + 3 warning findings, all
+  fixed inline before merge (11 new regression tests) — CR-01 (`version.rs`
+  read/write asymmetry on a trailing TOML comment), CR-02 (a genuine
+  cross-plan regression: `cleanup` never learned 20c's new `state.stopped`,
+  so it could delete a `--until`-parked phase's worktree), WR-01 (dry-run
+  `--until` visibility), WR-02 (bounded foreground `ship --phase` timeout),
+  WR-03 (long-form `[dependencies.NAME]` publish-order parsing). INF-01
+  (inline signing-key classification) deferred to backlog `999.27` / Linear
+  DEN-52. Final: 491 tests / 0 failed, clippy + fmt clean.
+
+  **Verified** (`20-VERIFICATION.md`): 37/37 must-haves confirmed against
+  live source (re-run tests, not self-report). **UAT** (`20-UAT.md`): 2/2
+  passed — the real ssh-agent signing-viability check was live-verified
+  against the operator's actual setup across all 4 states (correct key / no
+  agent / empty agent / unrelated key), and CI-on-branch sign-off for the
+  two ex-flaky `phase7_cli.rs` fixtures was confirmed from PR #20's own CI
+  logs (both named fixtures pass on both workflow runs). **Security**
+  (`20-SECURITY.md`): 18 threats built from all 5 plans' `<threat_model>`
+  blocks, 0 open, ASVS L1 short-circuit (register authored at plan time,
+  all 11 named regression tests grep-confirmed present).
+
+  **PR #20** (`feat/... → develop`) opened, CI green (8/8 checks), squash-
+  merged to `develop` (`e78bc82`) 2026-07-23. **Ships as v1.7.0, not
+  v2.0.0** — decided at ship time: nothing across the five units is
+  breaking, and the v2.0.0 milestone stays open rather than closing here
+  (see ROADMAP.md "Milestone stays open," 2026-07-23).
 
 - **Phase 19 — Release Integrity + `main.rs` Decomposition (Complete + Verified
   2026-07-22 — 11/11 plans).** Targets **v1.6.0**. Promoted from backlog 2026-07-21 via
@@ -309,7 +374,7 @@ progress:
 
 ## Backlog
 
-**19 unsequenced items** remain in `.planning/phases/999.N-*/` and the
+**20 unsequenced items** remain in `.planning/phases/999.N-*/` and the
 `## Backlog` section of ROADMAP.md. The first 16 were
 reviewed/prioritized/sized 2026-07-21 (mirrored in Linear as
 `DEN-26`..`DEN-45`); 999.21 and 999.22 were filed 2026-07-22 from Phase 19's
@@ -322,7 +387,10 @@ symbol/name-set equivalence proof that validated the `main.rs` split runs only
 locally; Phase 19 shipped with an explicit accepted override for exactly this).
 999.23 (High, DEN-48) was filed the same day from the v1.6.0 release PR: a
 flaky worktree-cleanup test in the release gate, proven a flake rather than a
-regression.
+regression. 999.24 (High, DEN-49) followed from the v1.6.0 release itself:
+`VersionBump` bumps `[workspace.package] version` but not the
+`[workspace.dependencies]` self-pin, so the pin has silently shipped stale two
+releases running — invisible until `cargo publish` rejects it as a duplicate.
 The 2026-07-21 sixteen: Hermes Support (999.1, Low),
 phase-process tracking model (999.2, Medium — half-addressed by 18b's
 `monitor_pid`), CLI operator discoverability (999.3, Low), version-tag
@@ -377,6 +445,8 @@ item, already fixed and committed (`b1dcec7`), not a promotion candidate.
 | 16 | Pipeline Reliability Hardening | — | 2026-07-17 |
 | 17 | Pipeline Dogfood Follow-Up | — | 2026-07-19 |
 | 18 | Dogfood Reliability Hardening | v1.5.0 | 2026-07-21 |
+| 19 | Release Integrity + `main.rs` Decomposition | v1.6.0 | 2026-07-22 |
+| 20 | Release Correctness + Operator Control | v1.7.0 | 2026-07-23 |
 
 *Phases 8 and 10 shipped without a SUMMARY.md at the time; both were retroactively documented 2026-07-08 (see `8-SUMMARY.md`, `10-SUMMARY.md`) after reconstruction from git history. Phase 11 was reviewed and found already adequately closed out via `11-VALIDATION.md`/`11r-VALIDATION.md` (Nyquist-compliant, sign-off dated 2026-06-20) — no retroactive SUMMARY.md was needed.*
 
@@ -411,6 +481,7 @@ None currently open for Phase 17.
 
 | Date | Decision |
 |---|---|
+| 2026-07-23 | **Phase 20 executed on `feat/phase-20-release-correctness-operator-control` via parallel worktrees, not the #683 sequential degrade.** HEAD was 11 planning-only commits ahead of `origin/develop`, tripping the auto-degrade; operator chose to set `worktree.baseRef:"head"` and branch properly rather than commit straight onto `develop` (per the standing git-flow preference). Wave 1 (20-01+20-02, disjoint files) ran genuinely parallel; waves 2-4 were single-plan by DAG construction (20-03→20-04→20-05 share `main.rs`). Code review found 2 blockers (CR-01 version-read/comment asymmetry, CR-02 a genuine cross-plan regression where `cleanup` never learned 20c's `state.stopped`) + 3 warnings — operator chose to fix all 5 inline (11 new regression tests) rather than ship-then-backlog, since the branch wasn't merged yet. PR #20 opened `feat/... → develop`, CI green (8/8 checks, both named ex-flaky fixtures pass). Phase marked complete via `/gsd-verify-work 20` after live-verifying the ssh-signing UAT item against the real operator ssh-agent (4 states) and confirming CI-on-branch sign-off from PR #20's logs. `/gsd-secure-phase 20` ran State B (18 threats built from all 5 plans' `<threat_model>` blocks, 0 open, L1 short-circuit) since `workflow.security_enforcement=true` gated completion. **Milestone-boundary bug caught and corrected:** `phase.complete`'s next-phase detection picked up backlog heading `999.1` (Hermes Support) as if it were the next sequential phase — STATE.md's `current_phase`/`status` were corrected back to reflect that the v2.0.0 milestone (Phase 11-20) is 100% complete (`progress.percent: 100`, 9/9 phases) and awaiting an explicit `/gsd-complete-milestone` decision, not auto-continuation into a backlog item. PROJECT.md was also 3 phases stale (still described Phase 18 as "Hermes Support," which was rescoped away 2026-07-20) — evolved through Phases 18/19/20 in the same pass. INF-01 (signing-key inline-classification, Info-severity) deferred to backlog `999.27`/Linear DEN-52 rather than blocking the fix pass. |
 | 2026-07-20 | **18-01: `cargo test -p devflow --lib` does not work on this crate — corrected in verification, not source.** 18-01-PLAN.md's own `<verify>`/`<acceptance_criteria>` blocks (and 18-RESEARCH.md's Validation Architecture table) specify `cargo test -p devflow --lib <name>`, but `devflow` (the `devflow-cli` package) is binary-only (no `[lib]` target), so `--lib` hard-errors (`no library targets found`, exit 101) rather than filtering tests. Used the working equivalent, `cargo test -p devflow <name>` (no `--lib`), for all verification in this plan and going forward. Flag this in future 18-0N plans' verify blocks so the same false-error isn't hit again. |
 | 2026-07-20 | **18-01: two-task pure-core/wiring split requires staged `#[allow(dead_code)]` on a binary-only crate.** `crates/devflow-cli` has no `[lib]` target, so `cargo clippy --workspace --all-targets -- -D warnings` compiles the plain `bin` target *without* `#[cfg(test)]` — unit-test-only usage of a not-yet-wired item does not satisfy that build's dead-code check. Task 1 (pure `reconcile_phase` core) added `#[allow(dead_code)]` to its new items with a comment naming the exact commit that removes them; Task 2 removed every one once `doctor()` became the real caller. Verified clean independently after each commit (not just at the end). Pattern to reuse for any future plan that splits a pure-core commit from its wiring commit in this crate. |
 | 2026-07-20 | **17-REVIEW.md WR backlog triaged to completion; four fixed, five backlogged, one annotated.** The 2026-07-20 Phase 18 restructure flagged WR-01/02/03/04/07/08/09/10/11 as never triaged into the roadmap. All were re-verified against HEAD rather than trusted from the review text (the WR-06 lesson). **Fixed immediately in `234f080`** as one quality-gate-integrity bundle: WR-10 (`devflow test` ran the narrow `cargo clippy -- -D warnings`, which does not compile test targets — a live false-green generator directly in Phase 18's path, since that phase adds substantial `#[cfg(test)]` code), WR-08 (no regression guard on clippy scope in either workflow; added guards over both workflow files plus `devflow test`, each RED-proven by reverting to the narrow form and confirming the intended diagnostic), WR-07 (no job timeouts — sharper after `f25c670` enabled all-branch CI, since a hung `build_provenance` would burn GitHub's 6-hour default), WR-09 (`CONTRIBUTING.md` still advertised the narrow clippy form). **Backlogged:** WR-01+WR-02 → `999.10` (grouped — WR-02 puts the developer's home path and OS username in `events.jsonl`, WR-01 commits it into the *user's* repo; highest severity of the batch since blast radius extends to other people's repositories, and Phase 18 fixes neither, citing WR-02 only as a prevention constraint), WR-03 → `999.11` (`--allow-empty` commits rather than skips, so a terminal-batch retry can tag a release on an empty commit), WR-04 → `999.12` (coverage debt on a deliberate trade). **Annotated in place:** WR-05 — `17-VERIFICATION.md`'s "at current HEAD" claim is scoped to `f5c399a` and does not cover 17-13's three commits; corrected with a scope note rather than re-running verification on a closed, shipped, merged phase, since 17-13's substance is independently confirmed by RED-proven regression tests and the Phase 18 research pass. **Already closed before triage:** WR-06 (by the roadmap restructure), WR-11 (is Phase 18's 18d). WR-04 was deliberately NOT folded into plan 18-05 despite touching the same file — 18-05 had passed the plan-checker clean, and growing a verified plan with adjacent debt is the scope-creep pattern that made prior phases balloon. |
@@ -552,6 +623,6 @@ None currently open for Phase 17.
 
 ## Session
 
-**Last session:** 2026-07-22T10:34:28-04:00
-**Stopped at:** Phase 19 complete and verified; Phase 20 remains unscoped
-**Resume file:** None
+**Last session:** 2026-07-22T21:55:59.943Z
+**Stopped at:** Phase 20 context gathered — discuss-phase resolved 20e mechanism/scope, 20d ceiling, 20b product-vs-fixture
+**Resume file:** .planning/phases/20-release-correctness-operator-control/CONTEXT.md

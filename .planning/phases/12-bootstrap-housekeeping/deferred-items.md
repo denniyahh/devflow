@@ -21,3 +21,11 @@ auto-fixed).
   unrelated, out-of-scope change for a test-coverage plan. Flagging for a future
   housekeeping plan if per-plan `Current Plan` tracking via `advance-plan`
   becomes needed.
+- **Resolved 2026-07-22:** Added a standard `## Current Position` section
+  (`Phase:` / `Plan:` / `Status:` / `Last activity:` fields) to STATE.md,
+  additive alongside the existing narrative sections. `state begin-phase`
+  writes real `Plan: N of M` values into this section when a phase starts,
+  and `state advance-plan` now parses and increments it correctly — verified
+  against a scratch copy simulating a Phase 20 kickoff (`1 of 5` → `2 of 5`).
+  No changes made to `gsd-tools` itself; the gap was this project's STATE.md
+  missing the section the parser expects, not a tooling bug.

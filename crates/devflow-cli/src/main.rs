@@ -17,6 +17,7 @@ use pipeline_launch::{advance, resume};
 mod pipeline_outcomes;
 
 mod pipeline_gate;
+use pipeline_gate::ship_override;
 
 mod parallel;
 use parallel::{parallel, sequentagent};
@@ -24,7 +25,7 @@ use parallel::{parallel, sequentagent};
 mod commands;
 use commands::{
     cleanup, doctor, gate_list, gate_respond, history_cmd, list, logs, recover_cmd, reference,
-    resolve_gate_target, start, status, test_cmd,
+    release_check, resolve_gate_target, start, status, test_cmd,
 };
 
 mod config_parse;
@@ -67,6 +68,12 @@ enum Command {
         /// Print the pipeline that would run without launching anything.
         #[arg(long)]
         dry_run: bool,
+        /// Run the pipeline through `<stage>` and halt cleanly before
+        /// advancing further (e.g. `--until plan` runs Define+Plan then
+        /// stops before Code). `ship` is rejected — the pipeline already
+        /// stops there.
+        #[arg(long)]
+        until: Option<Stage>,
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
@@ -225,6 +232,43 @@ enum Command {
         #[arg(default_value = ".")]
         project: PathBuf,
     },
+    /// Read-only release-cut preflight: self-pin, develop/main divergence,
+    /// crates.io publish order, and tag-signing viability.
+    ///
+    /// Ceiling is `--check` only (20d) — this command never runs the actual
+    /// merge/tag/sync/publish sequence, which is a deferred, not-yet-built
+    /// executor (DEN-50).
+    Release {
+        /// Run the read-only preflight checks. Required: a bare `devflow
+        /// release` (omitted `--check`) is rejected rather than silently
+        /// treated as a valid run.
+        #[arg(long)]
+        check: bool,
+        /// Project root.
+        #[arg(default_value = ".")]
+        project: PathBuf,
+    },
+    /// Manually drive a phase through Ship when the monitor that would have
+    /// consumed its already-written Ship gate response is dead.
+    ///
+    /// A second, out-of-process trigger of the SAME terminal effect
+    /// (`finish_workflow`) the live poll loop would have run (20e, D-01) —
+    /// requires `state.stage == Stage::Ship` and an existing Ship gate
+    /// request+response pair with no prior ack; `--force` never skips an
+    /// earlier stage, the lock, or those existence checks (D-02).
+    Ship {
+        /// Phase to ship.
+        #[arg(long)]
+        phase: u32,
+        /// Accepted for explicit, auditable operator intent. Does NOT skip
+        /// the stage, lock, gate-existence, or ack checks (D-02) — see
+        /// `pipeline_gate::ship_override`'s doc comment for exact scope.
+        #[arg(long)]
+        force: bool,
+        /// Project root.
+        #[arg(default_value = ".")]
+        project: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -338,12 +382,25 @@ fn run() -> Result<(), CliError> {
             worktree: _worktree,
             no_worktree,
             dry_run,
+            until,
             project,
         } => {
             // Worktree is now the default; the deprecated `--worktree` flag is
             // an intentionally ignored no-op (see field doc comment above).
             // `--no-worktree` is the only switch that changes behavior.
             let worktree = !no_worktree;
+            // D-07: `--until ship` is a semantic no-op — `handle_ship_outcome`
+            // calls `finish_workflow` directly and never calls `transition`,
+            // so the pipeline already stops at Ship today regardless of this
+            // flag. Reject before any stage runs rather than silently
+            // accepting a flag that would never actually intercept anything.
+            if until == Some(Stage::Ship) {
+                return Err(CliError::Message(
+                    "--until ship is a no-op: Ship is already the pipeline's terminal \
+                     stage and never advances further"
+                        .to_string(),
+                ));
+            }
             start(
                 &project_root(project)?,
                 phase,
@@ -352,6 +409,7 @@ fn run() -> Result<(), CliError> {
                 force,
                 worktree,
                 dry_run,
+                until,
             )
         }
         Command::Advance { project, phase } => advance(&project_root(project)?, phase),
@@ -424,6 +482,26 @@ fn run() -> Result<(), CliError> {
         } => recover_cmd(&project_root(project)?, clean, phase),
         Command::Test { project } => test_cmd(&project_root(project)?),
         Command::Doctor { json, project } => doctor(&project_root(project)?, json),
+        Command::Release { check, project } => {
+            // D-03 / Codex MEDIUM: an omitted --check is never silently
+            // treated as a valid check run. This phase ships only the
+            // read-only preflight, not the release-cut executor (merge/tag/
+            // sync/publish) — that command is a deferred backlog item.
+            if !check {
+                return Err(CliError::Message(
+                    "devflow release requires --check: only the read-only preflight ships in \
+                     this phase. The release-cut executor (merge PR → tag → sync develop → \
+                     publish) is deferred (DEN-50) and not yet built."
+                        .to_string(),
+                ));
+            }
+            release_check(&project_root(project)?)
+        }
+        Command::Ship {
+            phase,
+            force,
+            project,
+        } => ship_override(&project_root(project)?, phase, force),
     }
 }
 

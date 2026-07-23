@@ -28,8 +28,8 @@ Define → Plan → Code → Validate → Ship
 
 | Command | Purpose |
 |---|---|
-| `devflow start --phase N --agent claude\|codex\|opencode --mode auto\|supervise [--force] [--no-worktree] [--dry-run]` | Begin a phase; a detached monitor owns the agent and auto-advances |
-| `devflow resume --phase N` | Resume a rate-limited or infra-paused phase from its saved stage (loads `state-NN.json`, does not recreate the branch/worktree or reset to Define) — the command a primary-loop rate-limit auto-resume cron invokes |
+| `devflow start --phase N --agent claude\|codex\|opencode --mode auto\|supervise [--force] [--no-worktree] [--dry-run] [--until define\|plan\|code\|validate]` | Begin a phase; a detached monitor owns the agent and auto-advances. `--until <stage>` runs through `<stage>` then halts cleanly (no orphaned monitor, no `doctor` false positive) instead of continuing to Ship; `--until ship` is rejected (a no-op — Ship is already terminal) |
+| `devflow resume --phase N` | Resume a rate-limited or infra-paused phase from its saved stage (loads `state-NN.json`, does not recreate the branch/worktree or reset to Define) — the command a primary-loop rate-limit auto-resume cron invokes. Also clears a `--until`-stopped phase's stop marker, so the phase advances past its old stop point instead of re-stopping immediately |
 | `devflow status` | All active phases: stage, gate state, agent liveness, elapsed, last action |
 | `devflow logs [-f] [--phase N] [--stderr]` | Print/follow a phase's captured agent output |
 | `devflow history [N]` | Show chronological events with retained capture and review evidence for a phase |
@@ -44,6 +44,8 @@ Define → Plan → Code → Validate → Ship
 | `devflow recover [--clean] [--phase N]` | Inspect state; `--clean` sweeps stale phases only; `--clean --phase N` clears one phase unconditionally |
 | `devflow test` | cargo test + clippy + fmt --check |
 | `devflow doctor [--json]` | Environment audit (agents installed, versions, RUST_LOG) plus per-phase reconciliation; `--json` emits one object `{"environment": [...], "reconciliation": [...]}` |
+| `devflow release --check` | Read-only release-cut preflight: workspace self-pin, develop/main divergence (no `git fetch` — reads already-fetched refs), crates.io publish order, and `gpg.format`-aware tag-signing viability. `--check` is required; a bare `devflow release` is rejected toward the deferred release-cut executor (merge/tag/sync/publish, DEN-50) |
+| `devflow ship --phase N [--force]` | **Dead-monitor recovery.** `devflow gate approve` only *writes* the Ship gate's response file — a live monitor polling for it is what actually advances the workflow. If that monitor died before consuming the response (e.g. the machine restarted mid-pipeline), the approval sits unconsumed forever. `devflow ship` reads the already-written Ship response directly and drives the phase through the same terminal path (`finish_workflow`) the live monitor would have — requires `state.stage == Stage::Ship` and an existing request+response pair with no prior ack. `--force` is accepted for explicit operator intent but never skips the stage check, the per-phase lock, the gate-existence check, or the ack check — it can never be used to skip Validate or jump ahead of a healthy pipeline. If the Ship response routes to a rejection that loops back to Code, `devflow ship` launches a **new, detached monitor agent** to drive the retry — the command prints this explicitly so it is never a silently long-running process. |
 
 (`devflow advance` is internal — invoked by monitors with `--phase N`.)
 
@@ -85,6 +87,7 @@ only because a stage failed unexpectedly).
 |---|---|---|
 | `DEVFLOW_GATE_NOTIFY_CMD` | unset | Shell command fired when a gate is written |
 | `DEVFLOW_GATE_TIMEOUT_SECS` | 604800 (7d) | How long a monitor waits at a gate before giving up |
+| `DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS` | 60 | How long `devflow ship --phase`'s foreground manual override waits for a reopened Ship gate (terminal-hook failure) before failing fast, instead of `DEVFLOW_GATE_TIMEOUT_SECS`' multi-day default |
 | `DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS` | 120 | Wait on the shared-checkout lock; on timeout the hook batch is skipped (loudly), never run unserialized |
 | `DEVFLOW_CAPTURE_RETENTION` | 5 | Capture generations retained per phase; overrides `devflow.toml` |
 | `DEVFLOW_REVIEW_ANGLES` | built-in five-angle list | Comma-separated Ship review angles; overrides `devflow.toml` |
