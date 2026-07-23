@@ -59,17 +59,18 @@ mid-run crash or kill.
   release --check` read-only preflight (self-pin, divergence, publish order,
   signing viability) (20d), `devflow ship --phase N [--force]` manual
   override reusing `finish_workflow` when the monitor is dead (20e) — Phase
-  20, v2.0.0 (TBC — see Context)
+  20, v1.7.0
 
 ### Active
 
-*(none — the v2.0.0 milestone, Phase 11–20, completed 2026-07-23 with Phase
-20. Awaiting operator decision to run `/gsd-complete-milestone` and start the
-next milestone. Hermes Support, previously slotted as "Phase 18," was
-rescoped out during the 2026-07-20 reprioritization to Dogfood Reliability
-Hardening and now sits in the backlog as `999.1` — it is NOT automatically
-next; backlog items require `/gsd-review-backlog` promotion into a new
-milestone.)*
+*(none currently in flight. Phase 20 shipped as v1.7.0, 2026-07-23. The
+v2.0.0 milestone stays open — it does NOT close at Phase 20 or any other
+fixed phase; numbering continues (21, 22, …) until a genuinely breaking
+change earns the 2.0 slot. `/gsd-complete-milestone` is not run here.
+Hermes Support, previously slotted as "Phase 18," was rescoped out during
+the 2026-07-20 reprioritization to Dogfood Reliability Hardening and now
+sits in the backlog as `999.1` — it is NOT automatically next; backlog
+items require `/gsd-review-backlog` promotion.)*
 
 ### Out of Scope
 
@@ -88,14 +89,14 @@ milestone.)*
   through Phase 16. Current operator commands include `start`, `gate`, `logs`,
   `history`, `parallel`, `sequentagent`, `reference`, `cleanup`, `status`,
   `list`, `recover`, `doctor`, and `test`; `advance` remains hidden/internal.
-- Workspace version is `1.6.0` (Phase 19, released 2026-07-22). Code/docs
+- Workspace version is `1.7.0` (Phase 20, shipped 2026-07-23). Code/docs
   historically over-claimed "v2.0.0" as current; Phase 12 corrected this.
-  The milestone was later re-scoped (2026-07-21) to genuinely run Phase
-  11–20 and close at v2.0.0 — that arc is now 100% complete on disk (Phase
-  20, 2026-07-23), but whether the release actually ships as `2.0.0` or
-  `1.7.0` is an open decision: nothing across the five Phase 20 units is
-  inherently breaking, and Phase 19 already declined to spend the 2.0 slot
-  on a non-breaking changeset. Decide at ship time.
+  The `v2.0.0` label names an open-ended milestone, not a bounded arc with
+  a scheduled closing phase — decided 2026-07-23 (ROADMAP.md "Milestone
+  stays open"): nothing across the five Phase 20 units was inherently
+  breaking, so it shipped as `1.7.0` and the milestone continues past
+  Phase 20 with no predetermined endpoint. `2.0.0` remains reserved for a
+  future genuinely-breaking change, whenever that happens to land.
 - No `.planning/REQUIREMENTS.md` exists in this project; requirements are
   tracked per-phase in each phase's `CONTEXT.md`, not via formal REQ-IDs.
 
@@ -134,6 +135,5 @@ milestone.)*
 | `.planning/CONCERNS.md` | Top findings from the original pre-Phase-1 codebase audit |
 
 ---
-*Last updated: 2026-07-23 after Phase 20 completion — v2.0.0 milestone
-(Phase 11-20) 100% complete on disk, PR #20 CI-green, awaiting operator
-decision to run `/gsd-complete-milestone`*
+*Last updated: 2026-07-23 after Phase 20 shipped as v1.7.0 — PR #20 merged
+to `develop`; the v2.0.0 milestone stays open (no fixed closing phase)*
