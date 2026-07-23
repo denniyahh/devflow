@@ -371,7 +371,12 @@ Not applicable in the traditional sense (no external ecosystem/framework churn t
 
 **If this table is empty:** N/A — three low/medium-risk items are logged above; none touch security, compliance, or irreversible behavior, consistent with D-02's constraint that every unit stay reversible/detection-only.
 
-## Open Questions
+## Open Questions (RESOLVED)
+
+> Resolved at plan time (2026-07-23), verified by the plan-checker:
+> - **Q1** → 21-03 uses a new sibling `PlanningDocFinding` type composed into `doctor_json_body` as a third top-level key (shipped phases have no active `PhaseFacts`).
+> - **Q2** → 21-04 takes the **narrow** reading (label the running slot A/B, surfaced in `status` only), with the tradeoff flagged explicitly per D-06 rather than silently assumed.
+> - **Q3** → 21-02 uses positional `phase` + optional `--stage`, matching `gate approve`/`gate reject`.
 
 1. **Does 21b's finding type reuse `PhaseFinding`/`PhaseFacts`, or need a new sibling type?**
    - What we know: `collect_phase_facts`/`PhaseFacts` are built exclusively from `workflow::list_states()` — i.e., only phases with an active `state-NN.json`. Confirmed a `remove_state`/cleanup path exists (`workflow.rs`), meaning shipped/completed phases' state files are eventually removed.
