@@ -20,7 +20,7 @@
 //! Pitfall 1).
 
 use crate::CliError;
-use crate::config_parse::gate_timeout_secs;
+use crate::config_parse::{foreground_gate_timeout_secs, gate_timeout_secs};
 use crate::pipeline_launch::launch_stage;
 use crate::pipeline_outcomes::{run_checkout_hooks, truncate_reason};
 use devflow_core::gates::{self, GateAction, GateResponse, Gates};
@@ -158,7 +158,32 @@ pub(crate) fn prepare_loop_back_to_code(
 }
 
 /// Run the terminal hooks (version bump + branch cleanup) and clear state.
+///
+/// Uses [`gate_timeout_secs`]'s multi-day production default for the
+/// retry-gate wait below — safe for every caller EXCEPT the foreground
+/// `ship_override` path (WR-02), which calls
+/// [`finish_workflow_with_gate_timeout`] directly with a bounded timeout
+/// instead.
 pub(crate) fn finish_workflow(project_root: &Path, state: &mut State) -> Result<(), CliError> {
+    finish_workflow_with_gate_timeout(project_root, state, gate_timeout_secs())
+}
+
+/// `finish_workflow`'s body, parameterized on how long the retry-gate poll
+/// (below) waits for a response before failing fast (WR-02, phase 20
+/// review). Every caller reached through a detached monitor process should
+/// keep using `finish_workflow`'s multi-day default — invisible to an
+/// operator's terminal by construction. `ship_override` is the one caller
+/// invoked directly from the foreground CLI, so it passes
+/// [`crate::config_parse::foreground_gate_timeout_secs`] here instead,
+/// bounding how long a terminal-hook failure can block the operator's shell
+/// without weakening the fail-closed terminal-Ship invariant: an unanswered
+/// gate still fails the operation entirely (via `run_gate_with_timeout`'s
+/// existing timeout error), just after seconds instead of days.
+pub(crate) fn finish_workflow_with_gate_timeout(
+    project_root: &Path,
+    state: &mut State,
+    gate_timeout_secs: u64,
+) -> Result<(), CliError> {
     loop {
         if run_checkout_hooks(project_root, state, &hooks::hooks_after_ship(), Stage::Ship) {
             break;
@@ -171,7 +196,8 @@ pub(crate) fn finish_workflow(project_root: &Path, state: &mut State) -> Result<
             "[finalization failed] phase {} terminal hooks did not complete. Resolve the git/version error, then approve to retry; reject to loop back or abort.",
             state.phase
         );
-        match run_gate(project_root, state, Stage::Ship, &context)? {
+        match run_gate_with_timeout(project_root, state, Stage::Ship, &context, gate_timeout_secs)?
+        {
             GateAction::Advance => {
                 let _ = Gates::cleanup(project_root, state.phase, Stage::Ship);
             }
@@ -201,6 +227,20 @@ pub(crate) fn run_gate(
     state: &mut State,
     stage: Stage,
     context: &str,
+) -> Result<GateAction, CliError> {
+    run_gate_with_timeout(project_root, state, stage, context, gate_timeout_secs())
+}
+
+/// `run_gate`'s body, parameterized on the poll timeout (WR-02, phase 20
+/// review) so [`finish_workflow_with_gate_timeout`]'s foreground retry-gate
+/// wait can pass a bounded timeout instead of [`gate_timeout_secs`]'s
+/// multi-day production default.
+pub(crate) fn run_gate_with_timeout(
+    project_root: &Path,
+    state: &mut State,
+    stage: Stage,
+    context: &str,
+    timeout_secs: u64,
 ) -> Result<GateAction, CliError> {
     state.gate_pending = true;
     workflow::save_state(state)?;
@@ -236,7 +276,7 @@ pub(crate) fn run_gate(
         "notify_fired",
         serde_json::json!({ "stage": stage.to_string(), "unexpected": unexpected }),
     );
-    match Gates::poll_response(project_root, state.phase, stage, gate_timeout_secs()) {
+    match Gates::poll_response(project_root, state.phase, stage, timeout_secs) {
         Some(response) => {
             state.gate_pending = false;
             workflow::save_state(state)?;
@@ -376,7 +416,23 @@ pub(crate) fn ship_override(project_root: &Path, phase: u32, force: bool) -> Res
     );
 
     match GateAction::from_response(&response) {
-        GateAction::Advance => finish_workflow(project_root, &mut state),
+        GateAction::Advance => {
+            // WR-02 (phase 20 review): finish_workflow's retry-gate wait
+            // (on a terminal-hook failure) normally uses gate_timeout_secs'
+            // multi-day production default, invisible to an operator
+            // because every OTHER caller runs inside a detached monitor.
+            // ship_override runs in the FOREGROUND CLI — bound the wait so
+            // a hook failure fails fast with an actionable message instead
+            // of blocking this shell for days.
+            let timeout = foreground_gate_timeout_secs();
+            println!(
+                "phase {phase}: if terminal-hook finalization fails, this foreground command \
+                 will wait up to {timeout}s for the reopened Ship gate before failing (vs. the \
+                 multi-day background default) — set DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS to \
+                 change this"
+            );
+            finish_workflow_with_gate_timeout(project_root, &mut state, timeout)
+        }
         GateAction::LoopBack(_) => {
             // Antigravity LOW: `loop_back_to_code` → `launch_stage` forks a
             // NEW detached monitor daemon — say so explicitly, so `devflow
@@ -930,6 +986,103 @@ mod tests {
         let last = devflow_core::events::last_event_for_phase(root, phase)
             .expect("events recorded for phase");
         assert_eq!(last["event"], "workflow_finished");
+    }
+
+    /// WR-02 (phase 20 review): `ship_override` runs in the FOREGROUND CLI,
+    /// unlike every other `finish_workflow` caller (which runs inside a
+    /// detached monitor). A terminal-hook failure (merge conflict) reopens
+    /// the Ship gate; with no response ever written for the REOPENED gate,
+    /// this must fail fast within `DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS`
+    /// (bounded here to a couple seconds) rather than block the caller's
+    /// shell for `DEVFLOW_GATE_TIMEOUT_SECS`' multi-day production default —
+    /// which is left untouched, proving the two timeouts are genuinely
+    /// independent knobs.
+    #[test]
+    fn ship_override_bounds_foreground_wait_on_terminal_hook_failure() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let original_foreground_timeout =
+            std::env::var_os("DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS");
+        // SAFETY: serialized under ENV_MUTEX. Bounds ONLY the foreground
+        // knob — DEVFLOW_GATE_TIMEOUT_SECS (the background default) is
+        // never touched by this test, so a regression that made
+        // `ship_override` fall back to the multi-day default would hang
+        // this test instead of silently passing.
+        unsafe {
+            std::env::set_var("DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS", "2");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?} failed");
+        };
+        let phase = 96;
+        let branch = format!("feature/phase-{phase:02}");
+        git(&["checkout", "-q", "-b", &branch]);
+        std::fs::write(root.join("conflict.txt"), "feature\n").unwrap();
+        git(&["add", "conflict.txt"]);
+        git(&["commit", "-q", "-m", "feature change"]);
+        git(&["checkout", "-q", "develop"]);
+        std::fs::write(root.join("conflict.txt"), "develop\n").unwrap();
+        git(&["add", "conflict.txt"]);
+        git(&["commit", "-q", "-m", "develop change"]);
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Ship;
+        workflow::save_state(&state).unwrap();
+
+        Gates::write_gate(root, phase, Stage::Ship, "Ship complete — approve merge?").unwrap();
+        Gates::respond(
+            root,
+            phase,
+            Stage::Ship,
+            &GateResponse {
+                approved: true,
+                note: None,
+                responded_by: Some("test".into()),
+            },
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let result = ship_override(root, phase, false);
+        let elapsed = started.elapsed();
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_foreground_timeout {
+                Some(value) => {
+                    std::env::set_var("DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS", value);
+                }
+                None => std::env::remove_var("DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS"),
+            }
+        }
+
+        assert!(
+            result.is_err(),
+            "an unresolved reopened Ship gate must fail closed, not silently advance"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "the foreground wait must be bounded by DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS, \
+             not gate_timeout_secs' multi-day default — took {elapsed:?}"
+        );
+        assert!(
+            Gates::gate_path(root, phase, Stage::Ship).exists(),
+            "the merge failure must reopen an actionable Ship gate for a human, not silently \
+             drop the phase"
+        );
+        assert!(
+            workflow::load_state(root, phase).is_ok(),
+            "state must NOT be cleared — finish_workflow_with_gate_timeout must fail before \
+             reaching workflow::clear_state"
+        );
     }
 
     /// 20e Task 3: an `Abort`-routing Ship response (a rejection whose note
