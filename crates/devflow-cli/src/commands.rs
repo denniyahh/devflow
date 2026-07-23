@@ -525,6 +525,58 @@ fn liveness(monitor_pid: Option<u32>, monitor_alive: bool, agent_alive: bool) ->
     }
 }
 
+/// Recovery verbs discoverable from a phase's liveness (21a, D-03) — the
+/// pure, testable counterpart to `status`'s old inline Stuck `println!`.
+/// Always includes `devflow resume` for `Stuck`; additionally includes
+/// `devflow advance` when the phase is gate-pending (the operator answers
+/// the gate then advances — the primary footgun this closes; widening the
+/// predicate further risks suggesting `advance` where nothing proves it is
+/// right, per 21-CONTEXT.md's Review Incorporation). Empty for any other
+/// liveness, so a healthy/between-stages/unknown phase prints nothing new.
+fn recovery_hints(state: &State, liveness: Liveness) -> Vec<String> {
+    if liveness != Liveness::Stuck {
+        return Vec::new();
+    }
+    let mut hints = vec![format!("devflow resume --phase {}", state.phase)];
+    if state.gate_pending {
+        hints.push(format!("devflow advance --phase {}", state.phase));
+    }
+    hints
+}
+
+/// The `ts` of a phase's most recent `stage_launched` event, or `None` when
+/// none has been recorded — the real stage-entry time (21a), mirroring
+/// `test_support::stage_launched_count`'s scan but keeping the LAST match's
+/// `ts` instead of counting matches. Read-only; deliberately never reads
+/// `state.started_at`, which is phase-level and set once in `State::new`
+/// (the 3/3 cross-AI review MEDIUM, 21-REVIEWS.md).
+fn latest_stage_launched_ts(project_root: &Path, phase: u32) -> Option<u64> {
+    std::fs::read_to_string(devflow_core::events::events_path(project_root))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| {
+            event.get("phase").and_then(serde_json::Value::as_u64) == Some(u64::from(phase))
+                && event.get("event").and_then(serde_json::Value::as_str) == Some("stage_launched")
+        })
+        .filter_map(|event| event.get("ts").and_then(serde_json::Value::as_u64))
+        .next_back()
+}
+
+/// `status`'s in-stage progress line: real elapsed time since the phase's
+/// most recent `stage_launched` event. `None` (no such event yet) renders
+/// the stage name with no age, rather than mislabeling phase age as stage
+/// age — never pass `state.started_at`'s age here (3/3 review MEDIUM).
+fn render_stage_progress_line(stage: Stage, stage_launched_ts: Option<u64>) -> String {
+    match stage_launched_ts {
+        Some(ts) => format!(
+            "  in stage {stage}: {}",
+            recover::format_age(&ts.to_string())
+        ),
+        None => format!("  in stage {stage}"),
+    }
+}
+
 pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
     // 13-DEFERRED-CR-03 acceptance: enumerate every active phase, not just
     // the last one started.
@@ -593,8 +645,15 @@ pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
             let monitor_alive = state.monitor_pid.is_some_and(agent::agent_running);
             let phase_liveness = liveness(state.monitor_pid, monitor_alive, agent_alive);
             println!("  liveness: {}", phase_liveness.describe());
-            if phase_liveness == Liveness::Stuck {
-                println!("    → devflow resume --phase {}", state.phase);
+            println!(
+                "{}",
+                render_stage_progress_line(
+                    state.stage,
+                    latest_stage_launched_ts(project_root, state.phase)
+                )
+            );
+            for hint in recovery_hints(state, phase_liveness) {
+                println!("    → {hint}");
             }
             if let Some(event) = last_events.remove(&state.phase) {
                 let ago = event
@@ -741,6 +800,70 @@ pub(crate) fn gate_respond(
         path.display()
     );
     Ok(())
+}
+
+/// Print an open gate's full, untruncated (but sanitized) context — the
+/// discoverability counterpart to `gate_list`'s 100-char table truncation
+/// (21a, D-03). Mirrors `gate_respond`'s stage auto-resolve-single-open-gate
+/// logic (`[]` → error pointing at `devflow gate list`; `[one]` → that
+/// stage; `many` → error listing stages and asking for `--stage`) so the two
+/// commands' gate-resolution behavior can never drift.
+pub(crate) fn gate_show(
+    project_root: &Path,
+    phase: u32,
+    stage: Option<Stage>,
+) -> Result<(), CliError> {
+    let stage = match stage {
+        Some(stage) => stage,
+        None => {
+            let open: Vec<_> = Gates::list_open(project_root)
+                .into_iter()
+                .filter(|g| g.phase == phase)
+                .collect();
+            match open.as_slice() {
+                [] => {
+                    return Err(CliError::Message(format!(
+                        "no open gate for phase {phase} — see `devflow gate list`"
+                    )));
+                }
+                [one] => one.stage,
+                many => {
+                    return Err(CliError::Message(format!(
+                        "phase {phase} has several open gates ({}) — pass --stage",
+                        many.iter()
+                            .map(|g| g.stage.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )));
+                }
+            }
+        }
+    };
+    let gate = Gates::list_open(project_root)
+        .into_iter()
+        .find(|g| g.phase == phase && g.stage == stage)
+        .ok_or_else(|| {
+            CliError::Message(format!(
+                "no open gate for phase {phase} stage {stage} — see `devflow gate list`"
+            ))
+        })?;
+    println!("{}", render_gate_show(&gate));
+    Ok(())
+}
+
+/// Pure render for `gate_show`'s output block — the FULL context via
+/// `render_gate_context(.., usize::MAX)` (sanitize, never truncate; contrast
+/// `gate_list`'s `render_gate_context(.., 100)`). Factored out of `gate_show`
+/// so the untruncated-context guarantee is unit-testable without capturing
+/// process stdout.
+fn render_gate_show(gate: &OpenGate) -> String {
+    format!(
+        "phase {} {} ({})\n{}",
+        gate.phase,
+        gate.stage,
+        recover::format_age(&gate.timestamp),
+        render_gate_context(&gate.context, usize::MAX),
+    )
 }
 
 /// Print (or follow) a phase's captured agent output.
@@ -893,14 +1016,31 @@ fn agent_pid_from_file(project_root: &Path, phase: u32) -> Option<u32> {
 fn cron_instruction_hints(project_root: &Path) -> Vec<String> {
     devflow_core::ship::list_cron_instructions(project_root)
         .iter()
-        .map(|instructions| {
-            format!(
-                "Cron instruction pending (phase {}): hermes cron create --from-devflow {}",
-                instructions.phase,
-                project_root.display()
-            )
-        })
+        .map(|instructions| cron_hint_line(instructions, project_root))
         .collect()
+}
+
+/// Build one cron-instruction hint line, appending a sanitized rate-limit
+/// reset segment when `instructions.retry_after` is non-empty (21a, D-03) —
+/// the reset time is already computed and persisted (`CronInstructions.
+/// retry_after`, ship.rs), this only presents it; no new detection logic.
+/// Pure so it's unit-testable without capturing process stdout.
+fn cron_hint_line(
+    instructions: &devflow_core::ship::CronInstructions,
+    project_root: &Path,
+) -> String {
+    let base = format!(
+        "Cron instruction pending (phase {}): hermes cron create --from-devflow {}",
+        instructions.phase,
+        project_root.display()
+    );
+    let retry_after = instructions.retry_after.trim();
+    if retry_after.is_empty() {
+        base
+    } else {
+        let reset = render_gate_context(retry_after, 100);
+        format!("{base} (rate-limit resets: {reset})")
+    }
 }
 
 /// Print active phase worktrees with branch and inferred phase/agent.
@@ -1943,6 +2083,73 @@ mod tests {
     }
 
     #[test]
+    fn gate_show_arg_parsing_accepts_phase_and_optional_stage() {
+        let bare = Cli::try_parse_from(["devflow", "gate", "show", "15"]).unwrap();
+        let Command::Gate {
+            action: GateCmd::Show { phase, stage, .. },
+        } = bare.command
+        else {
+            panic!("expected gate show command");
+        };
+        assert_eq!(phase, 15);
+        assert_eq!(stage, None);
+
+        let flagged =
+            Cli::try_parse_from(["devflow", "gate", "show", "15", "--stage", "ship"]).unwrap();
+        let Command::Gate {
+            action: GateCmd::Show { phase, stage, .. },
+        } = flagged.command
+        else {
+            panic!("expected gate show command with stage");
+        };
+        assert_eq!(phase, 15);
+        assert_eq!(stage, Some(Stage::Ship));
+    }
+
+    #[test]
+    fn gate_show_renders_full_untruncated_sanitized_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = format!("first line\n\u{1b}[2J{}", "x".repeat(150));
+        Gates::write_gate(dir.path(), 15, Stage::Ship, &context).unwrap();
+        let gate = Gates::list_open(dir.path())
+            .into_iter()
+            .find(|g| g.phase == 15)
+            .unwrap();
+
+        let rendered = render_gate_show(&gate);
+
+        assert!(rendered.contains(&"x".repeat(150)));
+        assert!(!rendered.contains("[truncated"));
+        assert!(!rendered.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn gate_show_errors_naming_gate_list_when_no_open_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = gate_show(dir.path(), 15, None).unwrap_err();
+        assert!(err.to_string().contains("devflow gate list"));
+    }
+
+    #[test]
+    fn gate_show_errors_asking_for_stage_with_several_open_gates() {
+        let dir = tempfile::tempdir().unwrap();
+        Gates::write_gate(dir.path(), 15, Stage::Ship, "ctx1").unwrap();
+        Gates::write_gate(dir.path(), 15, Stage::Validate, "ctx2").unwrap();
+
+        let err = gate_show(dir.path(), 15, None).unwrap_err();
+
+        assert!(err.to_string().contains("--stage"));
+    }
+
+    #[test]
+    fn gate_show_auto_resolves_single_open_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        Gates::write_gate(dir.path(), 15, Stage::Ship, "the only open gate").unwrap();
+
+        assert!(gate_show(dir.path(), 15, None).is_ok());
+    }
+
+    #[test]
     fn describe_worktree_dir_infers_phase_and_agent() {
         assert_eq!(
             describe_worktree_dir("phase-07-claude"),
@@ -1955,13 +2162,12 @@ mod tests {
     #[test]
     fn cron_instruction_hints_include_hermes_command_per_phase() {
         let dir = tempfile::tempdir().unwrap();
+        // Empty retry_after here so the exact-match assertion below isolates
+        // the base hermes-command hint from 21a's reset-time fragment
+        // (covered separately by cron_hint_line_* below).
         for phase in [7, 9] {
-            let instructions = devflow_core::ship::build_cron_instructions(
-                dir.path(),
-                phase,
-                "2026-06-18T15:45:30Z",
-                "claude,codex",
-            );
+            let instructions =
+                devflow_core::ship::build_cron_instructions(dir.path(), phase, "", "claude,codex");
             devflow_core::ship::write_cron_instructions(dir.path(), &instructions).unwrap();
         }
 
@@ -1976,6 +2182,42 @@ mod tests {
             )
         );
         assert!(hints[1].contains("(phase 9)"));
+    }
+
+    #[test]
+    fn cron_hint_line_appends_sanitized_reset_when_retry_after_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let instructions = devflow_core::ship::build_cron_instructions(
+            dir.path(),
+            7,
+            "2026-06-18T15:45:30Z",
+            "claude,codex",
+        );
+
+        let hint = cron_hint_line(&instructions, dir.path());
+
+        assert!(hint.starts_with(&format!(
+            "Cron instruction pending (phase 7): hermes cron create --from-devflow {}",
+            dir.path().display()
+        )));
+        assert!(hint.contains("(rate-limit resets: 2026-06-18T15:45:30Z)"));
+    }
+
+    #[test]
+    fn cron_hint_line_omits_reset_fragment_when_retry_after_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let instructions = devflow_core::ship::build_cron_instructions(dir.path(), 7, "", "claude");
+
+        let hint = cron_hint_line(&instructions, dir.path());
+
+        assert_eq!(
+            hint,
+            format!(
+                "Cron instruction pending (phase 7): hermes cron create --from-devflow {}",
+                dir.path().display()
+            )
+        );
+        assert!(!hint.contains("resets"));
     }
 
     #[test]
@@ -2316,6 +2558,115 @@ mod tests {
         assert!(!banner.contains(&context));
         assert!(!banner.contains('\u{1b}'));
         assert!(banner.contains("ESCALATED"));
+    }
+
+    /// 21a: `recovery_hints` returns a `resume` hint for a stuck phase,
+    /// additionally an `advance` hint when the phase is gate-pending
+    /// (answer the gate, then advance), and nothing for a non-stuck phase.
+    #[test]
+    fn recovery_hints_includes_resume_for_stuck() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::new(7, AgentKind::Claude, Mode::Auto, dir.path().to_path_buf());
+
+        let hints = recovery_hints(&state, Liveness::Stuck);
+
+        assert_eq!(hints, vec!["devflow resume --phase 7".to_string()]);
+    }
+
+    #[test]
+    fn recovery_hints_includes_advance_when_stuck_and_gate_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::new(7, AgentKind::Claude, Mode::Auto, dir.path().to_path_buf());
+        state.gate_pending = true;
+
+        let hints = recovery_hints(&state, Liveness::Stuck);
+
+        assert_eq!(
+            hints,
+            vec![
+                "devflow resume --phase 7".to_string(),
+                "devflow advance --phase 7".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn recovery_hints_empty_for_healthy() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::new(7, AgentKind::Claude, Mode::Auto, dir.path().to_path_buf());
+
+        assert!(recovery_hints(&state, Liveness::Healthy).is_empty());
+    }
+
+    /// 21a: `latest_stage_launched_ts` scans the event log for the LAST
+    /// `stage_launched` event's `ts` — the real stage-entry time — and is
+    /// `None` without one, never falling back to any other field.
+    #[test]
+    fn latest_stage_launched_ts_none_without_event() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(latest_stage_launched_ts(dir.path(), 7), None);
+    }
+
+    /// The closing proof for the 3/3 cross-AI review MEDIUM
+    /// (21-REVIEWS.md): a phase whose latest `stage_launched` event is ~90s
+    /// old but whose phase-level `started_at` is ~30m old must report the
+    /// ~90s stage age — `latest_stage_launched_ts` must never be sourced
+    /// from `state.started_at`.
+    #[test]
+    fn latest_stage_launched_ts_reflects_event_age_not_phase_started_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let stage_ts = now - 90;
+        let phase_started_at = now - 30 * 60;
+
+        let mut state = State::new(7, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.started_at = phase_started_at.to_string();
+        workflow::save_state(&state).unwrap();
+
+        events::emit(
+            root,
+            7,
+            "stage_launched",
+            serde_json::json!({"stage": "code", "agent": "claude", "monitor_pid": 1}),
+        );
+        // events::emit always stamps `ts` with the current time; rewrite it
+        // to a fixed, known-past value so the assertion is deterministic
+        // instead of racing the live clock.
+        let events_path = devflow_core::events::events_path(root);
+        let rewritten: String = std::fs::read_to_string(&events_path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+                value["ts"] = serde_json::json!(stage_ts);
+                value.to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&events_path, rewritten).unwrap();
+
+        let ts = latest_stage_launched_ts(root, 7);
+        assert_eq!(ts, Some(stage_ts));
+
+        let line = render_stage_progress_line(Stage::Code, ts);
+        assert!(line.contains("1m ago"), "expected ~90s age, got: {line}");
+        assert!(
+            !line.contains("30m ago"),
+            "must not render phase-level started_at age: {line}"
+        );
+    }
+
+    #[test]
+    fn render_stage_progress_line_omits_age_without_stage_launched_event() {
+        assert_eq!(
+            render_stage_progress_line(Stage::Plan, None),
+            "  in stage plan"
+        );
     }
 
     /// Unit tests for the pure `doctor` reconciliation core (18a). Each test
