@@ -409,7 +409,15 @@ pub(crate) fn print_dry_run(state: &State) {
         } else {
             String::new()
         };
-        println!("  {s:<9} {command}{gate}");
+        // WR-01 (phase 20 review): annotate the stage matching `--until` so
+        // the dry-run preview reflects that a real invocation would halt
+        // here instead of always showing the full Define→Ship pipeline.
+        let stop_marker = if state.stop_until == Some(s) {
+            " [STOPS HERE — --until]"
+        } else {
+            ""
+        };
+        println!("  {s:<9} {command}{gate}{stop_marker}");
         if let Some(next) = s.next() {
             let transition_hooks = hooks::hooks_for_transition(s, next);
             if !transition_hooks.is_empty() {
@@ -417,6 +425,9 @@ pub(crate) fn print_dry_run(state: &State) {
             }
         }
         stage = s.next();
+    }
+    if let Some(until) = state.stop_until {
+        println!("\nnote: --until {until} — this run will halt after {until} completes");
     }
     println!("\nafter ship: {:?}", hooks::hooks_after_ship());
 }

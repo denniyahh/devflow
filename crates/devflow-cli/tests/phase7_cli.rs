@@ -467,6 +467,76 @@ fn start_until_unknown_stage_is_rejected_by_clap() {
     assert!(!root.join(".worktrees/phase-46").exists());
 }
 
+/// WR-01 (phase 20 review): `--dry-run` must reflect `--until` in its
+/// preview instead of always printing the full Define→Ship pipeline as if
+/// `--until` had not been passed.
+#[test]
+fn start_dry_run_annotates_until_stage() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let fake_bin = fake_bin_dir(&[]);
+
+    let output = Command::new(devflow_bin())
+        .args([
+            "start", "--phase", "47", "--agent", "claude", "--mode", "auto", "--until", "plan",
+            "--dry-run",
+        ])
+        .arg(root)
+        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .current_dir(root)
+        .output()
+        .expect("run devflow");
+
+    assert!(
+        output.status.success(),
+        "dry-run must not fail\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.contains("plan") && l.contains("[STOPS HERE — --until]")),
+        "the plan stage line must be annotated as the --until stop point\nstdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("--until plan"),
+        "the preview must include a trailing note naming the --until stage\nstdout: {stdout}"
+    );
+    assert!(
+        !root.join(".worktrees/phase-47").exists(),
+        "dry-run must not create a worktree"
+    );
+}
+
+/// WR-01 counterpart: without `--until`, the preview must NOT show any stop
+/// annotation — the full pipeline runs to Ship.
+#[test]
+fn start_dry_run_without_until_has_no_stop_annotation() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let fake_bin = fake_bin_dir(&[]);
+
+    let output = Command::new(devflow_bin())
+        .args([
+            "start", "--phase", "48", "--agent", "claude", "--mode", "auto", "--dry-run",
+        ])
+        .arg(root)
+        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .current_dir(root)
+        .output()
+        .expect("run devflow");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("STOPS HERE"),
+        "no stop annotation must appear without --until\nstdout: {stdout}"
+    );
+}
+
 #[test]
 fn sequentagent_integrates_agent_a_then_rebases_agent_b() {
     let repo = tempfile::tempdir().unwrap();
