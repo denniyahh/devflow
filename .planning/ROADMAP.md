@@ -582,9 +582,17 @@ Plans:
 ### Phase 21: Operator Legibility & Observability
 
 **Goal:** Make DevFlow's operator surface **legible** and its self-reported state **trustworthy** — every unit single-writer, operator-facing, reversible or detection-only, and testable without any irreversible side effect. Scope recut from the original "Operator Usability & Release Execution" (operator decision, 2026-07-23): the release-cut executor (999.25) and `--base` (999.28) were removed (→ own phase / Phase 22 respectively) and the phase backfilled with legibility/observability units. Not `/gsd-review-backlog`-promoted; scope is operator-decided — see `phases/21-*/21-CONTEXT.md`.
-**Requirements**: TBD (no REQ-IDs)
+**Requirements**: TBD (no REQ-IDs — units 21a–21d map to CONTEXT decisions D-03..D-07)
 **Depends on:** Phase 20
-**Plans:** 0 plans
+**Plans:** 4 plans
+
+**Sequencing is load-bearing:** 21d (staleness content-awareness) leads in Wave 1
+per D-07 — the dogfood staleness guard hard-blocks this phase's own stages after
+every `.planning/` commit, so it lands first. 21a/21b/21c then serialize
+(Waves 2/3/4) because all three edit `crates/devflow-cli/src/commands.rs` and the
+same-wave zero-file-overlap rule forbids parallelizing them (the familiar
+`commands.rs`/`main.rs` contention from Phases 18/19). 21e (changelog content)
+stays excluded stretch (D-08, blocked on a content-source design decision).
 
 Units (operator-decided; committed unless marked optional):
 
@@ -596,7 +604,21 @@ Units (operator-decided; committed unless marked optional):
 
 Plans:
 
-- [ ] TBD (run /gsd-plan-phase 21 to break down)
+**Wave 1** *(21d first per D-07 — unblocks this phase's own dogfood stages)*
+
+- [ ] 21-01-PLAN.md — 21d: content-aware `embedded_commit_is_stale` strict-ancestor arm (docs-only ranges → Fresh; docs+source → Stale) + fix two now-broken fixtures + block-message wording (staleness.rs)
+
+**Wave 2** *(blocked on 21-01; shares commands.rs with 21b/21c)*
+
+- [ ] 21-02-PLAN.md — 21a: additive discoverability — `devflow gate show <phase>` (untruncated), rate-limit reset time in `status`, in-stage progress line, recovery-verb hints from a stuck state (commands.rs, main.rs)
+
+**Wave 3** *(blocked on 21-02; shares commands.rs)*
+
+- [ ] 21-03-PLAN.md — 21b: detection-only `doctor` planning-doc staleness check vs git tags — third `--json` key, v1.5.0 legacy-noise cutoff, no prose auto-edit (commands.rs)
+
+**Wave 4** *(blocked on 21-03; shares commands.rs)*
+
+- [ ] 21-04-PLAN.md — 21c: sequentagent second-process record (path-free slot A/B + AgentKind, not routed through State) surfaced in `status` (agent_result.rs, parallel.rs, commands.rs)
 
 ### Phase 22: Concurrency & Governance Correctness
 
