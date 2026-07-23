@@ -557,6 +557,17 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
+### Phase 999.28: Explicit `--base` Branch Override for `devflow start` (BACKLOG)
+
+**Goal:** Add an explicit `--base <branch>` flag to `devflow start` (default `develop`) so an operator can cut `feature/phase-NN` onto a base other than `develop` — chiefly an unmerged predecessor phase branch, to honor a `depends_on` chain and stack dependent phases. Keep the default `develop`; do **not** implicitly base on the operator's current branch (base must be explicit, never inferred from shell state).
+**Priority:** Medium | **Size:** M — base is hardcoded to `develop` (`crates/devflow-core/src/git.rs:54`) and the hardcode is load-bearing for `ship` (Merge→develop→VersionBump) and `parallel` (develop-rooted shared base), so `--base` must thread through launch, and the ship/merge-target semantics for a non-`develop` base need a design pass. The gap: the ROADMAP encodes 22→21→20 but no phase can build on an unmerged predecessor. Source: Phase 21 dogfood-launch design discussion (2026-07-23). Linear: TBD.
+**Requirements:** TBD — see CONTEXT.md
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
 ### Phase 21: Operator Usability & Release Execution
 
 **Goal:** [To be planned]
