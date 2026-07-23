@@ -139,6 +139,21 @@ fn wait_for_state_cleared(root: &Path, phase: u32) {
     panic!("timed out waiting for phase {phase} state to clear (pipeline never finished)");
 }
 
+/// Wait until a phase's persisted state has `stopped == true` (20c: a
+/// `--until`-halted phase). Polls rather than reading once, since the fake
+/// agent + monitor chain advances asynchronously.
+fn wait_for_stopped(root: &Path, phase: u32) -> devflow_core::state::State {
+    for _ in 0..400 {
+        if let Ok(state) = devflow_core::workflow::load_state(root, phase)
+            && state.stopped
+        {
+            return state;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("timed out waiting for phase {phase} state to report stopped == true");
+}
+
 fn git_stdout(root: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&git(root, args).stdout)
         .trim()
@@ -332,6 +347,49 @@ fn start_no_worktree_uses_feature_branch() {
         state.worktree_path.is_none(),
         "expected worktree_path to be None with --no-worktree, got {:?}",
         state.worktree_path
+    );
+}
+
+/// 20c (D-09 + review: Codex HIGH off-by-one): `devflow start --until plan`
+/// must run Define AND Plan to completion, then halt BEFORE advancing to
+/// Code — not stop before Plan ever runs. The fake `claude` script always
+/// reports success, so the monitor chain runs Define→advance→Plan→advance;
+/// the second `advance` calls `transition(.., Stage::Code)` with
+/// `state.stage == Plan`, which is exactly the `stop_until == Some(from)`
+/// case this plan adds.
+#[test]
+fn start_until_plan_halts_cleanly() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo(root);
+    let fake_bin = fake_bin_dir(&[(
+        "claude",
+        "#!/bin/sh\nprintf 'DEVFLOW_RESULT: {\"status\":\"success\"}\\n'\n",
+    )]);
+
+    run_devflow(
+        root,
+        &fake_bin.path,
+        &[
+            "start", "--phase", "44", "--agent", "claude", "--mode", "auto", "--until", "plan",
+        ],
+    );
+
+    let state = wait_for_stopped(root, 44);
+    assert_eq!(
+        state.stage,
+        devflow_core::stage::Stage::Plan,
+        "the persisted stage must be the COMPLETED target (Plan), proving Plan ran \
+         before the halt — not that the pipeline stopped before Plan ever launched"
+    );
+    assert!(state.stopped, "stop marker must be set");
+    assert_eq!(
+        state.monitor_pid, None,
+        "the stop path must clear monitor_pid so no monitor is left behind"
+    );
+    assert!(
+        state.stop_reason.is_some(),
+        "a human-readable stop_reason must be recorded"
     );
 }
 

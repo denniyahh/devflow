@@ -67,6 +67,12 @@ enum Command {
         /// Print the pipeline that would run without launching anything.
         #[arg(long)]
         dry_run: bool,
+        /// Run the pipeline through `<stage>` and halt cleanly before
+        /// advancing further (e.g. `--until plan` runs Define+Plan then
+        /// stops before Code). `ship` is rejected — the pipeline already
+        /// stops there.
+        #[arg(long)]
+        until: Option<Stage>,
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
@@ -338,6 +344,7 @@ fn run() -> Result<(), CliError> {
             worktree: _worktree,
             no_worktree,
             dry_run,
+            until,
             project,
         } => {
             // Worktree is now the default; the deprecated `--worktree` flag is
@@ -352,6 +359,7 @@ fn run() -> Result<(), CliError> {
                 force,
                 worktree,
                 dry_run,
+                until,
             )
         }
         Command::Advance { project, phase } => advance(&project_root(project)?, phase),

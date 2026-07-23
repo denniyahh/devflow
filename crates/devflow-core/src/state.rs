@@ -70,6 +70,23 @@ pub struct State {
     /// liveness probe reports Unknown, never Stuck.
     #[serde(default)]
     pub monitor_pid: Option<u32>,
+    /// The stage `devflow start --until <stage>` requests as the last stage
+    /// to run before halting (20c). `None` means no stop point was
+    /// requested (the pipeline runs to Ship), OR the state was written by a
+    /// binary predating this field — both cases behave identically (no
+    /// interception in `transition()`).
+    #[serde(default)]
+    pub stop_until: Option<Stage>,
+    /// Set by `transition()` when `stop_until` names the stage just
+    /// completed — a terminal-but-not-failed halt short of Ship (20c).
+    /// `false` for a normal in-flight or completed-to-Ship phase, and for
+    /// any state written by a binary predating this field.
+    #[serde(default)]
+    pub stopped: bool,
+    /// Human-readable reason recorded alongside `stopped` (20c). `None`
+    /// when `stopped` is `false`, or when the state predates this field.
+    #[serde(default)]
+    pub stop_reason: Option<String>,
 }
 
 /// Supported coding agents.
@@ -129,6 +146,9 @@ impl State {
             project_root,
             worktree_path: None,
             monitor_pid: None,
+            stop_until: None,
+            stopped: false,
+            stop_reason: None,
         }
     }
 }
@@ -191,6 +211,9 @@ mod tests {
         assert_eq!(state.preflight_retries, 0);
         assert!(!state.started_at.is_empty());
         assert_eq!(state.monitor_pid, None);
+        assert_eq!(state.stop_until, None);
+        assert!(!state.stopped);
+        assert_eq!(state.stop_reason, None);
     }
 
     #[test]

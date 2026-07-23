@@ -101,6 +101,7 @@ pub(crate) fn phase_artifact_on_develop(project_root: &Path, phase: u32, suffix:
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn start(
     project_root: &Path,
     phase: u32,
@@ -109,8 +110,10 @@ pub(crate) fn start(
     force: bool,
     worktree: bool,
     dry_run: bool,
+    until: Option<Stage>,
 ) -> Result<(), CliError> {
     let mut state = State::new(phase, agent, mode, project_root.to_path_buf());
+    state.stop_until = until;
 
     if dry_run {
         print_dry_run(&state);
