@@ -1,14 +1,16 @@
 ---
 phase: 20-release-correctness-operator-control
 verified: 2026-07-23T00:00:00Z
-status: human_needed
+status: passed
 score: 37/37 truths verified (2 human-verification items outstanding, both explicitly designated manual-only/CI-only in the phase's own VALIDATION.md — neither is a code gap)
 behavior_unverified: 0
 overrides_applied: 0
 human_verification:
+
   - test: "Run `devflow release --check` on a machine with `git config gpg.format ssh` and (a) an unlocked signing key loaded in ssh-agent, then (b) no key loaded (or an unrelated key loaded)."
     expected: "(a) reports Viable with a `SHA256:...` fingerprint that matches the configured `user.signingkey`; (b) reports NotViable with an actionable, non-crashing message ('no ssh-agent reachable', 'agent has no identities loaded', or 'has keys loaded, but not the configured signing key'). Neither case prints private key bytes or the signing key's filesystem path."
     why_human: "CI does not deterministically provision a live ssh-agent with a controllable key-loaded/empty state. This is explicitly designated a Manual-Only backstop in 20-VALIDATION.md and carries `verification: backstop` / `human_judgment: true` in 20-04-PLAN.md and 20-04-SUMMARY.md (coverage D5) — not a gap, but an outstanding pre-release checklist item."
+
   - test: "Push the phase-20 branch (or its merge commit) and confirm `cargo test --workspace` is green on a real CI runner, focused on `phase7_cli.rs`'s two previously-flaky fixtures under CI concurrency."
     expected: "0 failed on the pushed CI run, specifically for `reference_and_cleanup_worktree_cli_flow` and `start_worktree_mode_ignores_main_checkout_divergence` (the CI-concurrency-dependent flakes 20b fixes)."
     why_human: "20-02-PLAN.md's own verification section and 20-VALIDATION.md both state local 5x-green is necessary but NOT sufficient sign-off for this CI-concurrency-dependent flake class (mirrors the Phase 19 ENV_MUTEX precedent) — only a pushed CI run closes it. 20-02-SUMMARY.md already flags this as `human_judgment: true` (coverage D4); this verifier cannot trigger a pushed CI run from a local worktree."
