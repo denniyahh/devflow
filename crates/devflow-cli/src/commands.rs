@@ -525,6 +525,58 @@ fn liveness(monitor_pid: Option<u32>, monitor_alive: bool, agent_alive: bool) ->
     }
 }
 
+/// Recovery verbs discoverable from a phase's liveness (21a, D-03) — the
+/// pure, testable counterpart to `status`'s old inline Stuck `println!`.
+/// Always includes `devflow resume` for `Stuck`; additionally includes
+/// `devflow advance` when the phase is gate-pending (the operator answers
+/// the gate then advances — the primary footgun this closes; widening the
+/// predicate further risks suggesting `advance` where nothing proves it is
+/// right, per 21-CONTEXT.md's Review Incorporation). Empty for any other
+/// liveness, so a healthy/between-stages/unknown phase prints nothing new.
+fn recovery_hints(state: &State, liveness: Liveness) -> Vec<String> {
+    if liveness != Liveness::Stuck {
+        return Vec::new();
+    }
+    let mut hints = vec![format!("devflow resume --phase {}", state.phase)];
+    if state.gate_pending {
+        hints.push(format!("devflow advance --phase {}", state.phase));
+    }
+    hints
+}
+
+/// The `ts` of a phase's most recent `stage_launched` event, or `None` when
+/// none has been recorded — the real stage-entry time (21a), mirroring
+/// `test_support::stage_launched_count`'s scan but keeping the LAST match's
+/// `ts` instead of counting matches. Read-only; deliberately never reads
+/// `state.started_at`, which is phase-level and set once in `State::new`
+/// (the 3/3 cross-AI review MEDIUM, 21-REVIEWS.md).
+fn latest_stage_launched_ts(project_root: &Path, phase: u32) -> Option<u64> {
+    std::fs::read_to_string(devflow_core::events::events_path(project_root))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| {
+            event.get("phase").and_then(serde_json::Value::as_u64) == Some(u64::from(phase))
+                && event.get("event").and_then(serde_json::Value::as_str) == Some("stage_launched")
+        })
+        .filter_map(|event| event.get("ts").and_then(serde_json::Value::as_u64))
+        .next_back()
+}
+
+/// `status`'s in-stage progress line: real elapsed time since the phase's
+/// most recent `stage_launched` event. `None` (no such event yet) renders
+/// the stage name with no age, rather than mislabeling phase age as stage
+/// age — never pass `state.started_at`'s age here (3/3 review MEDIUM).
+fn render_stage_progress_line(stage: Stage, stage_launched_ts: Option<u64>) -> String {
+    match stage_launched_ts {
+        Some(ts) => format!(
+            "  in stage {stage}: {}",
+            recover::format_age(&ts.to_string())
+        ),
+        None => format!("  in stage {stage}"),
+    }
+}
+
 pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
     // 13-DEFERRED-CR-03 acceptance: enumerate every active phase, not just
     // the last one started.
@@ -593,8 +645,15 @@ pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
             let monitor_alive = state.monitor_pid.is_some_and(agent::agent_running);
             let phase_liveness = liveness(state.monitor_pid, monitor_alive, agent_alive);
             println!("  liveness: {}", phase_liveness.describe());
-            if phase_liveness == Liveness::Stuck {
-                println!("    → devflow resume --phase {}", state.phase);
+            println!(
+                "{}",
+                render_stage_progress_line(
+                    state.stage,
+                    latest_stage_launched_ts(project_root, state.phase)
+                )
+            );
+            for hint in recovery_hints(state, phase_liveness) {
+                println!("    → {hint}");
             }
             if let Some(event) = last_events.remove(&state.phase) {
                 let ago = event
@@ -2604,7 +2663,10 @@ mod tests {
 
     #[test]
     fn render_stage_progress_line_omits_age_without_stage_launched_event() {
-        assert_eq!(render_stage_progress_line(Stage::Plan, None), "  in stage plan");
+        assert_eq!(
+            render_stage_progress_line(Stage::Plan, None),
+            "  in stage plan"
+        );
     }
 
     /// Unit tests for the pure `doctor` reconciliation core (18a). Each test
