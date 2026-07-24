@@ -2865,9 +2865,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let run = |args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = devflow_core::test_support::git_command(root)
                 .args(args)
-                .current_dir(root)
                 .output()
                 .expect("spawn git");
             assert!(out.status.success(), "git {args:?} failed");
@@ -3629,9 +3628,8 @@ mod tests {
         fn init_tagged_repo(root: &Path) {
             let git = |args: &[&str]| {
                 assert!(
-                    std::process::Command::new("git")
+                    devflow_core::test_support::git_command(root)
                         .args(args)
-                        .current_dir(root)
                         .output()
                         .unwrap()
                         .status

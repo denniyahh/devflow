@@ -71,6 +71,10 @@ pub mod recover;
 pub mod ship;
 pub mod stage;
 pub mod state;
+/// Test-only helpers, also available to other crates' test targets via the
+/// `test-support` feature. Never compiled into a normal build.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod verify;
 pub mod version;
 pub mod workflow;

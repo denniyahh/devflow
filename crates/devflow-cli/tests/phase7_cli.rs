@@ -14,9 +14,10 @@ fn devflow_bin() -> &'static str {
 }
 
 fn git(root: &Path, args: &[&str]) -> Output {
-    let output = Command::new("git")
+    // Hermetic: pinning cwd alone does not stop an inherited GIT_DIR from
+    // retargeting the real repository (999.37).
+    let output = devflow_core::test_support::git_command(root)
         .args(args)
-        .current_dir(root)
         .output()
         .expect("spawn git");
     assert!(
