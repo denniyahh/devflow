@@ -1,4 +1,4 @@
-Agent-agnostic, GSD-native development workflow automation
+An opinionated, GSD-native take on AI-driven development automation
 
 Usage: devflow <COMMAND>
 

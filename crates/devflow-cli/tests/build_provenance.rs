@@ -8,7 +8,6 @@
 //! below for why.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 #[test]
 fn build_dirty_is_exactly_true_or_false() {
@@ -71,9 +70,11 @@ fn workspace_root() -> PathBuf {
 }
 
 fn run(dir: &Path, program: &str, args: &[&str]) {
-    let output = Command::new(program)
+    // Hermetic for `cargo` as well as `git`: this fixture runs a nested
+    // `cargo build`, whose build.rs shells out to git and would inherit an
+    // ambient GIT_DIR straight through to the real repository (999.37).
+    let output = devflow_core::test_support::hermetic_command(program, dir)
         .args(args)
-        .current_dir(dir)
         .output()
         .unwrap_or_else(|e| panic!("failed to run {program} {args:?}: {e}"));
     assert!(
@@ -89,9 +90,8 @@ fn run(dir: &Path, program: &str, args: &[&str]) {
 /// stands, not the last commit) from the real workspace into `dest`.
 fn copy_tracked_worktree_into(dest: &Path) {
     let root = workspace_root();
-    let output = Command::new("git")
+    let output = devflow_core::test_support::git_command(&root)
         .args(["ls-files", "-z"])
-        .current_dir(&root)
         .output()
         .expect("git ls-files");
     assert!(output.status.success(), "git ls-files failed");

@@ -519,9 +519,8 @@ mod tests {
 
         let phase = 21;
         let branch = format!("feature/phase-{phase:02}");
-        let branch_created = std::process::Command::new("git")
+        let branch_created = devflow_core::test_support::git_command(root)
             .args(["branch", &branch, "develop"])
-            .current_dir(root)
             .status()
             .unwrap()
             .success();
@@ -564,9 +563,8 @@ mod tests {
         let root = dir.path();
         init_repo(root);
         let git = |args: &[&str]| {
-            let output = std::process::Command::new("git")
+            let output = devflow_core::test_support::git_command(root)
                 .args(args)
-                .current_dir(root)
                 .output()
                 .unwrap();
             assert!(output.status.success(), "git {args:?} failed");
@@ -621,9 +619,8 @@ mod tests {
                 .as_deref(),
             Some("workflow_finished")
         );
-        let tags = std::process::Command::new("git")
+        let tags = devflow_core::test_support::git_command(root)
             .arg("tag")
-            .current_dir(root)
             .output()
             .unwrap();
         assert!(tags.stdout.is_empty());
@@ -682,9 +679,8 @@ mod tests {
         let phases = [31u32, 32u32];
         for &phase in &phases {
             let branch = format!("feature/phase-{phase:02}");
-            let branch_created = std::process::Command::new("git")
+            let branch_created = devflow_core::test_support::git_command(root)
                 .args(["branch", &branch, "develop"])
-                .current_dir(root)
                 .status()
                 .unwrap()
                 .success();
@@ -956,9 +952,8 @@ mod tests {
 
         let phase = 90;
         let branch = format!("feature/phase-{phase:02}");
-        let branch_created = std::process::Command::new("git")
+        let branch_created = devflow_core::test_support::git_command(root)
             .args(["branch", &branch, "develop"])
-            .current_dir(root)
             .status()
             .unwrap()
             .success();
@@ -1019,9 +1014,8 @@ mod tests {
         let root = dir.path();
         init_repo(root);
         let git = |args: &[&str]| {
-            let output = std::process::Command::new("git")
+            let output = devflow_core::test_support::git_command(root)
                 .args(args)
-                .current_dir(root)
                 .output()
                 .unwrap();
             assert!(output.status.success(), "git {args:?} failed");

@@ -70,12 +70,30 @@ pub fn emit(project_root: &Path, phase: u32, event: &str, fields: serde_json::Va
     }
 }
 
+/// A phase's latest event plus its newest matching `stage_launched`
+/// timestamp, both from the same one-pass read (999.30 / DEN-55 IN-01) —
+/// `devflow status` needs the real stage-entry time (21a) alongside the
+/// last-action line, and previously re-scanned the whole log per phase to
+/// get it (`latest_stage_launched_ts`, now folded in here).
+#[derive(Debug, Clone)]
+pub struct PhaseEventSummary {
+    pub event: serde_json::Value,
+    pub stage_launched_ts: Option<u64>,
+}
+
 /// The most recent event per phase, from ONE read + parse pass over the log
 /// (14-CR-10) — `devflow status` renders N phases without N full-file scans.
+/// Each summary's `stage_launched_ts` is the newest matching `stage_launched`
+/// event's `ts`, independent of what the latest event overall is: a later
+/// `transition`, `gate_fired`, or corrupt line never clears an
+/// already-recorded launch timestamp.
 pub fn last_events_by_phase(
     project_root: &Path,
-) -> std::collections::HashMap<u32, serde_json::Value> {
-    let mut latest = std::collections::HashMap::new();
+) -> std::collections::HashMap<u32, PhaseEventSummary> {
+    use std::collections::hash_map::Entry;
+
+    let mut latest: std::collections::HashMap<u32, PhaseEventSummary> =
+        std::collections::HashMap::new();
     let Ok(contents) = std::fs::read_to_string(events_path(project_root)) else {
         return latest;
     };
@@ -83,9 +101,30 @@ pub fn last_events_by_phase(
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
     {
-        if let Some(phase) = event.get("phase").and_then(|p| p.as_u64()) {
-            // Later lines overwrite earlier ones — appends are chronological.
-            latest.insert(phase as u32, event);
+        let Some(phase) = event.get("phase").and_then(|p| p.as_u64()) else {
+            continue;
+        };
+        let phase = phase as u32;
+        let launch_ts = (event.get("event").and_then(|e| e.as_str()) == Some("stage_launched"))
+            .then(|| event.get("ts").and_then(|t| t.as_u64()))
+            .flatten();
+        // Later lines overwrite the latest event by append order; the
+        // launch timestamp only moves forward when THIS line is itself a
+        // valid stage_launched event.
+        match latest.entry(phase) {
+            Entry::Occupied(mut occupied) => {
+                let summary = occupied.get_mut();
+                summary.event = event;
+                if let Some(ts) = launch_ts {
+                    summary.stage_launched_ts = Some(ts);
+                }
+            }
+            Entry::Vacant(vacant) => {
+                vacant.insert(PhaseEventSummary {
+                    event,
+                    stage_launched_ts: launch_ts,
+                });
+            }
         }
     }
     latest
@@ -93,7 +132,9 @@ pub fn last_events_by_phase(
 
 /// Read the last event line recorded for `phase`, if any.
 pub fn last_event_for_phase(project_root: &Path, phase: u32) -> Option<serde_json::Value> {
-    last_events_by_phase(project_root).remove(&phase)
+    last_events_by_phase(project_root)
+        .remove(&phase)
+        .map(|summary| summary.event)
 }
 
 /// Render an event as a short human-readable summary ("gate_fired (ship)").
@@ -216,9 +257,65 @@ mod tests {
 
         let latest = last_events_by_phase(dir.path());
         assert_eq!(latest.len(), 2);
-        assert_eq!(latest[&1]["event"], "transition");
-        assert_eq!(latest[&2]["event"], "gate_fired");
+        assert_eq!(latest[&1].event["event"], "transition");
+        assert_eq!(latest[&2].event["event"], "gate_fired");
         assert!(last_events_by_phase(&dir.path().join("empty")).is_empty());
+    }
+
+    /// 999.30 / DEN-55 IN-01: the summary's `stage_launched_ts` tracks the
+    /// NEWEST matching `stage_launched` event from the same one-pass read,
+    /// independent of the latest event overall — a later non-launch event
+    /// or a corrupt line must never clear an already-recorded timestamp.
+    #[test]
+    fn last_events_by_phase_tracks_newest_stage_launched_ts_across_the_pass() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // No stage_launched at all yet.
+        emit(dir.path(), 1, "workflow_started", serde_json::Value::Null);
+        assert_eq!(last_events_by_phase(dir.path())[&1].stage_launched_ts, None);
+
+        // First stage_launched.
+        emit(
+            dir.path(),
+            1,
+            "stage_launched",
+            serde_json::json!({"stage": "define"}),
+        );
+        let first_ts = last_events_by_phase(dir.path())[&1]
+            .stage_launched_ts
+            .expect("stage_launched recorded a timestamp");
+
+        // A later, unrelated event must not clear the launch timestamp,
+        // even though it becomes the new latest event.
+        emit(
+            dir.path(),
+            1,
+            "transition",
+            serde_json::json!({"to": "plan"}),
+        );
+        let after_transition = last_events_by_phase(dir.path());
+        assert_eq!(after_transition[&1].stage_launched_ts, Some(first_ts));
+        assert_eq!(after_transition[&1].event["event"], "transition");
+
+        // A newer stage_launched wins over the first.
+        emit(
+            dir.path(),
+            1,
+            "stage_launched",
+            serde_json::json!({"stage": "plan"}),
+        );
+        let path = events_path(dir.path());
+        let mut contents = std::fs::read_to_string(&path).unwrap();
+        // A corrupt trailing line must not affect the parsed result.
+        contents.push_str("{truncated\n");
+        std::fs::write(&path, contents).unwrap();
+
+        let latest = last_events_by_phase(dir.path());
+        let newest_ts = latest[&1]
+            .stage_launched_ts
+            .expect("newest stage_launched timestamp present");
+        assert!(newest_ts >= first_ts, "newest launch must not be older");
+        assert_eq!(latest[&1].event["event"], "stage_launched");
     }
 
     #[test]

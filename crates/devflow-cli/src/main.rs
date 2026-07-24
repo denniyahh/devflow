@@ -34,7 +34,7 @@ mod config_parse;
 #[command(
     name = "devflow",
     version,
-    about = "Agent-agnostic, GSD-native development workflow automation"
+    about = "An opinionated, GSD-native take on AI-driven development automation"
 )]
 struct Cli {
     #[command(subcommand)]

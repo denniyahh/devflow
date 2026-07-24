@@ -1,6 +1,8 @@
 # Adding an Agent
 
-DevFlow is agent-agnostic. Adding a new agent backend is a checklist, not a mystery.
+DevFlow supports three agents today (Claude Code, Codex, OpenCode) through a
+shared adapter interface — not a fully agent-neutral platform yet (see
+backlog 999.31). Adding a new supported agent is a checklist, not a mystery.
 
 ## Checklist
 

@@ -495,9 +495,8 @@ mod tests {
 
         let git = |args: &[&str], cwd: &Path| {
             assert!(
-                std::process::Command::new("git")
+                devflow_core::test_support::git_command(cwd)
                     .args(args)
-                    .current_dir(cwd)
                     .output()
                     .unwrap()
                     .status
@@ -680,9 +679,8 @@ mod tests {
     fn init_repo_with_diverged_commit(root: &Path) -> (String, String) {
         let git = |args: &[&str]| {
             assert!(
-                std::process::Command::new("git")
+                devflow_core::test_support::git_command(root)
                     .args(args)
-                    .current_dir(root)
                     .output()
                     .unwrap()
                     .status
@@ -691,9 +689,8 @@ mod tests {
             );
         };
         let rev_parse = || {
-            let out = std::process::Command::new("git")
+            let out = devflow_core::test_support::git_command(root)
                 .args(["rev-parse", "HEAD"])
-                .current_dir(root)
                 .output()
                 .unwrap();
             String::from_utf8_lossy(&out.stdout).trim().to_string()
@@ -775,9 +772,8 @@ mod tests {
         let root = dir.path();
         let git = |args: &[&str]| {
             assert!(
-                std::process::Command::new("git")
+                devflow_core::test_support::git_command(root)
                     .args(args)
-                    .current_dir(root)
                     .output()
                     .unwrap()
                     .status
@@ -863,9 +859,8 @@ mod tests {
         let root = dir.path();
         let git = |args: &[&str]| {
             assert!(
-                std::process::Command::new("git")
+                devflow_core::test_support::git_command(root)
                     .args(args)
-                    .current_dir(root)
                     .output()
                     .unwrap()
                     .status
@@ -952,9 +947,8 @@ mod tests {
         let root = dir.path();
         let git = |args: &[&str]| {
             assert!(
-                std::process::Command::new("git")
+                devflow_core::test_support::git_command(root)
                     .args(args)
-                    .current_dir(root)
                     .output()
                     .unwrap()
                     .status
@@ -1077,9 +1071,8 @@ mod tests {
         let root = dir.path();
         let git = |args: &[&str]| {
             assert!(
-                std::process::Command::new("git")
+                devflow_core::test_support::git_command(root)
                     .args(args)
-                    .current_dir(root)
                     .output()
                     .unwrap()
                     .status
@@ -1102,9 +1095,8 @@ mod tests {
         git(&["add", "."]);
         git(&["commit", "-q", "-m", "init"]);
         let head = {
-            let out = std::process::Command::new("git")
+            let out = devflow_core::test_support::git_command(root)
                 .args(["rev-parse", "HEAD"])
-                .current_dir(root)
                 .output()
                 .unwrap();
             String::from_utf8_lossy(&out.stdout).trim().to_string()
@@ -1131,9 +1123,8 @@ mod tests {
         let root = dir.path();
         let git = |args: &[&str]| {
             assert!(
-                std::process::Command::new("git")
+                devflow_core::test_support::git_command(root)
                     .args(args)
-                    .current_dir(root)
                     .output()
                     .unwrap()
                     .status
@@ -1184,9 +1175,8 @@ mod tests {
         let root = dir.path();
         let git = |args: &[&str]| {
             assert!(
-                std::process::Command::new("git")
+                devflow_core::test_support::git_command(root)
                     .args(args)
-                    .current_dir(root)
                     .output()
                     .unwrap()
                     .status
@@ -1248,9 +1238,8 @@ mod tests {
         let root = dir.path();
         let git = |args: &[&str]| {
             assert!(
-                std::process::Command::new("git")
+                devflow_core::test_support::git_command(root)
                     .args(args)
-                    .current_dir(root)
                     .output()
                     .unwrap()
                     .status
@@ -1284,9 +1273,8 @@ mod tests {
         git(&["commit", "-q", "-m", "second"]);
 
         assert!(
-            std::process::Command::new("git")
+            devflow_core::test_support::git_command(root)
                 .args(["merge-base", "--is-ancestor", &embedded_commit, "HEAD"])
-                .current_dir(root)
                 .status()
                 .unwrap()
                 .success(),
@@ -1335,9 +1323,8 @@ mod tests {
         let root = dir.path();
         let git = |args: &[&str]| {
             assert!(
-                std::process::Command::new("git")
+                devflow_core::test_support::git_command(root)
                     .args(args)
-                    .current_dir(root)
                     .output()
                     .unwrap()
                     .status
@@ -1404,9 +1391,8 @@ mod tests {
         let (_base, side) = init_repo_with_diverged_commit(root);
         let git = |args: &[&str]| {
             assert!(
-                std::process::Command::new("git")
+                devflow_core::test_support::git_command(root)
                     .args(args)
-                    .current_dir(root)
                     .output()
                     .unwrap()
                     .status
@@ -1484,9 +1470,8 @@ mod tests {
         let root = dir.path();
         let git = |args: &[&str]| {
             assert!(
-                std::process::Command::new("git")
+                devflow_core::test_support::git_command(root)
                     .args(args)
-                    .current_dir(root)
                     .output()
                     .unwrap()
                     .status

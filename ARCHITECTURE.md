@@ -1,6 +1,6 @@
 # Architecture
 
-DevFlow is an agent-agnostic CLI that drives a fixed 5-stage pipeline
+DevFlow is an opinionated CLI that drives a fixed 5-stage pipeline
 (Define → Plan → Code → Validate → Ship) end-to-end: it launches a coding
 agent per stage, evaluates whether the agent succeeded, fires human gates at
 Validate/Ship, and runs side-effecting hooks (branch/docs/changelog/version)
@@ -396,9 +396,12 @@ variable is set to a parseable value and warns when it is missing or invalid.
 
 ## Extension points — adding an agent
 
-DevFlow is agent-agnostic; agent-specific code lives only in `agents/*.rs` and
-the targeted result parsing. Adding a backend is a checklist, not a fixed
-"3 changes" — keep these in sync or tests/builds fail:
+DevFlow supports three agents today (Claude Code, Codex, OpenCode) through a
+shared `AgentAdapter` trait; agent-specific code lives only in `agents/*.rs`
+and the targeted result parsing. This is not a fully agent-neutral platform
+yet — see the driver-architecture backlog (999.31) for that direction. Adding
+a backend today is a checklist, not a fixed "3 changes" — keep these in sync
+or tests/builds fail:
 
 1. Add an adapter file under `crates/devflow-core/src/agents/` implementing the
    `AgentAdapter` trait.

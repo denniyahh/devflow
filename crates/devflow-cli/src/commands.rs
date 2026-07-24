@@ -21,7 +21,7 @@ use crate::staleness::run_git_stdout;
 use devflow_core::agent;
 use devflow_core::agent_result;
 use devflow_core::agents;
-use devflow_core::config::{DEVELOP, FEATURE_PREFIX};
+use devflow_core::config::{DEVELOP, FEATURE_PREFIX, MAIN};
 use devflow_core::events;
 use devflow_core::gates::{GateAction, GateResponse, Gates, OpenGate};
 use devflow_core::git::GitFlow;
@@ -544,25 +544,6 @@ fn recovery_hints(state: &State, liveness: Liveness) -> Vec<String> {
     hints
 }
 
-/// The `ts` of a phase's most recent `stage_launched` event, or `None` when
-/// none has been recorded — the real stage-entry time (21a), mirroring
-/// `test_support::stage_launched_count`'s scan but keeping the LAST match's
-/// `ts` instead of counting matches. Read-only; deliberately never reads
-/// `state.started_at`, which is phase-level and set once in `State::new`
-/// (the 3/3 cross-AI review MEDIUM, 21-REVIEWS.md).
-fn latest_stage_launched_ts(project_root: &Path, phase: u32) -> Option<u64> {
-    std::fs::read_to_string(devflow_core::events::events_path(project_root))
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter(|event| {
-            event.get("phase").and_then(serde_json::Value::as_u64) == Some(u64::from(phase))
-                && event.get("event").and_then(serde_json::Value::as_str) == Some("stage_launched")
-        })
-        .filter_map(|event| event.get("ts").and_then(serde_json::Value::as_u64))
-        .next_back()
-}
-
 /// `status`'s in-stage progress line: real elapsed time since the phase's
 /// most recent `stage_launched` event. `None` (no such event yet) renders
 /// the stage name with no age, rather than mislabeling phase age as stage
@@ -645,23 +626,25 @@ pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
             let monitor_alive = state.monitor_pid.is_some_and(agent::agent_running);
             let phase_liveness = liveness(state.monitor_pid, monitor_alive, agent_alive);
             println!("  liveness: {}", phase_liveness.describe());
+            let phase_summary = last_events.remove(&state.phase);
             println!(
                 "{}",
                 render_stage_progress_line(
                     state.stage,
-                    latest_stage_launched_ts(project_root, state.phase)
+                    phase_summary.as_ref().and_then(|s| s.stage_launched_ts)
                 )
             );
             for hint in recovery_hints(state, phase_liveness) {
                 println!("    → {hint}");
             }
-            if let Some(event) = last_events.remove(&state.phase) {
-                let ago = event
+            if let Some(summary) = phase_summary {
+                let ago = summary
+                    .event
                     .get("ts")
                     .and_then(|t| t.as_u64())
                     .map(|t| format!(" ({})", recover::format_age(&t.to_string())))
                     .unwrap_or_default();
-                println!("  last action: {}{ago}", events::describe(&event));
+                println!("  last action: {}{ago}", events::describe(&summary.event));
             }
         }
     }
@@ -738,6 +721,29 @@ pub(crate) fn gate_list(project_root: &Path) -> Result<(), CliError> {
 
 /// Answer an open gate from the CLI — the dogfood-facing replacement for
 /// hand-writing `.devflow/gates/NN-stage.response.json` (15a).
+/// Resolve an omitted `--stage` to the single open gate for `phase` from an
+/// already-fetched `Gates::list_open` collection — the shared no-open /
+/// single-open / ambiguous-open behavior `gate_respond` and `gate_show` both
+/// need, kept in one place so it cannot drift between them (Phase 21 review
+/// WR-01). Callers own the `Gates::list_open` read so `gate_show` can resolve
+/// and select from one fetched collection instead of reading twice (WR-03).
+fn resolve_single_open_gate_stage(open: &[OpenGate], phase: u32) -> Result<Stage, CliError> {
+    let matching: Vec<&OpenGate> = open.iter().filter(|g| g.phase == phase).collect();
+    match matching.as_slice() {
+        [] => Err(CliError::Message(format!(
+            "no open gate for phase {phase} — see `devflow gate list`"
+        ))),
+        [one] => Ok(one.stage),
+        many => Err(CliError::Message(format!(
+            "phase {phase} has several open gates ({}) — pass --stage",
+            many.iter()
+                .map(|g| g.stage.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
 pub(crate) fn gate_respond(
     project_root: &Path,
     phase: u32,
@@ -747,29 +753,7 @@ pub(crate) fn gate_respond(
 ) -> Result<(), CliError> {
     let stage = match stage {
         Some(stage) => stage,
-        None => {
-            let open: Vec<_> = Gates::list_open(project_root)
-                .into_iter()
-                .filter(|g| g.phase == phase)
-                .collect();
-            match open.as_slice() {
-                [] => {
-                    return Err(CliError::Message(format!(
-                        "no open gate for phase {phase} — see `devflow gate list`"
-                    )));
-                }
-                [one] => one.stage,
-                many => {
-                    return Err(CliError::Message(format!(
-                        "phase {phase} has several open gates ({}) — pass --stage",
-                        many.iter()
-                            .map(|g| g.stage.to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )));
-                }
-            }
-        }
+        None => resolve_single_open_gate_stage(&Gates::list_open(project_root), phase)?,
     };
     let responded_by = std::env::var("USER")
         .ok()
@@ -807,42 +791,21 @@ pub(crate) fn gate_respond(
 
 /// Print an open gate's full, untruncated (but sanitized) context — the
 /// discoverability counterpart to `gate_list`'s 100-char table truncation
-/// (21a, D-03). Mirrors `gate_respond`'s stage auto-resolve-single-open-gate
-/// logic (`[]` → error pointing at `devflow gate list`; `[one]` → that
-/// stage; `many` → error listing stages and asking for `--stage`) so the two
-/// commands' gate-resolution behavior can never drift.
+/// (21a, D-03). Shares `resolve_single_open_gate_stage` with `gate_respond`
+/// (999.30 / DEN-55 WR-01) so the two commands' gate-resolution behavior
+/// cannot drift, and resolves/selects from one fetched open-gate collection
+/// instead of reading twice (WR-03).
 pub(crate) fn gate_show(
     project_root: &Path,
     phase: u32,
     stage: Option<Stage>,
 ) -> Result<(), CliError> {
+    let open = Gates::list_open(project_root);
     let stage = match stage {
         Some(stage) => stage,
-        None => {
-            let open: Vec<_> = Gates::list_open(project_root)
-                .into_iter()
-                .filter(|g| g.phase == phase)
-                .collect();
-            match open.as_slice() {
-                [] => {
-                    return Err(CliError::Message(format!(
-                        "no open gate for phase {phase} — see `devflow gate list`"
-                    )));
-                }
-                [one] => one.stage,
-                many => {
-                    return Err(CliError::Message(format!(
-                        "phase {phase} has several open gates ({}) — pass --stage",
-                        many.iter()
-                            .map(|g| g.stage.to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )));
-                }
-            }
-        }
+        None => resolve_single_open_gate_stage(&open, phase)?,
     };
-    let gate = Gates::list_open(project_root)
+    let gate = open
         .into_iter()
         .find(|g| g.phase == phase && g.stage == stage)
         .ok_or_else(|| {
@@ -1929,7 +1892,7 @@ fn collect_phase_facts(project_root: &Path) -> Vec<PhaseFacts> {
 fn build_phase_facts(
     project_root: &Path,
     state: State,
-    last_events: &mut std::collections::HashMap<u32, serde_json::Value>,
+    last_events: &mut std::collections::HashMap<u32, events::PhaseEventSummary>,
     open_gates: &[OpenGate],
 ) -> PhaseFacts {
     let phase = state.phase;
@@ -1938,7 +1901,7 @@ fn build_phase_facts(
     let agent_alive = agent_pid.is_some_and(agent::agent_running);
     let monitor_pid = state.monitor_pid;
     let monitor_alive = monitor_pid.is_some_and(agent::agent_running);
-    let last_event = last_events.remove(&phase);
+    let last_event = last_events.remove(&phase).map(|summary| summary.event);
     let last_launched_stage = last_event.as_ref().and_then(last_launched_stage_from_event);
     let last_event_name = last_event
         .as_ref()
@@ -2265,14 +2228,14 @@ pub(crate) fn reconcile_planning_docs(
 /// `## Completed` table (best-effort — a MISSING file yields no rows for
 /// that document, never an error; `doctor` must not fabricate a `Problem`
 /// from an absent doc), parse both, and reconcile every row against the
-/// repo's git tags via `tag_exists_and_reachable(project_root, tag,
-/// "main")`. `"main"` is a LOCAL branch in this repo (verified: `git
-/// branch --list main`; `git merge-base --is-ancestor v1.7.0 main`
-/// succeeds offline) — deliberately not `origin/main` (no network
-/// dependency in `doctor`'s read-only contract) and not `develop` (wrong
-/// base). The only I/O here is two `std::fs::read_to_string` calls plus
-/// `tag_exists_and_reachable`'s `git` subprocesses — `doctor` stays
-/// read-only (no write path to either file).
+/// repo's git tags via `tag_exists_and_reachable(project_root, tag, MAIN)`.
+/// `MAIN` is a LOCAL branch in this repo (verified: `git branch --list
+/// main`; `git merge-base --is-ancestor v1.7.0 main` succeeds offline) —
+/// deliberately not `origin/main` (no network dependency in `doctor`'s
+/// read-only contract) and not `develop` (wrong base). The only I/O here is
+/// two `std::fs::read_to_string` calls plus `tag_exists_and_reachable`'s
+/// `git` subprocesses — `doctor` stays read-only (no write path to either
+/// file).
 fn collect_planning_doc_findings(project_root: &Path) -> Vec<PlanningDocFinding> {
     let roadmap =
         std::fs::read_to_string(project_root.join(".planning/ROADMAP.md")).unwrap_or_default();
@@ -2282,7 +2245,7 @@ fn collect_planning_doc_findings(project_root: &Path) -> Vec<PlanningDocFinding>
     let mut rows = parse_planning_doc_versions(&roadmap, "ROADMAP.md");
     rows.extend(parse_planning_doc_versions(&state, "STATE.md"));
 
-    let mut lookup = |tag: &str| tag_exists_and_reachable(project_root, tag, "main");
+    let mut lookup = |tag: &str| tag_exists_and_reachable(project_root, tag, MAIN);
     reconcile_planning_docs(&rows, &mut lookup)
 }
 
@@ -2865,9 +2828,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let run = |args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = devflow_core::test_support::git_command(root)
                 .args(args)
-                .current_dir(root)
                 .output()
                 .expect("spawn git");
             assert!(out.status.success(), "git {args:?} failed");
@@ -2992,22 +2954,29 @@ mod tests {
         assert!(recovery_hints(&state, Liveness::Healthy).is_empty());
     }
 
-    /// 21a: `latest_stage_launched_ts` scans the event log for the LAST
-    /// `stage_launched` event's `ts` — the real stage-entry time — and is
-    /// `None` without one, never falling back to any other field.
+    /// 21a / 999.30 IN-01: the shared one-pass event summary's
+    /// `stage_launched_ts` is the LAST `stage_launched` event's `ts` — the
+    /// real stage-entry time — and is `None` without one, never falling
+    /// back to any other field. `status` now sources this from
+    /// `events::last_events_by_phase` instead of a per-phase rescan.
     #[test]
-    fn latest_stage_launched_ts_none_without_event() {
+    fn stage_launched_ts_none_without_event() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(latest_stage_launched_ts(dir.path(), 7), None);
+        assert_eq!(
+            events::last_events_by_phase(dir.path())
+                .get(&7)
+                .and_then(|s| s.stage_launched_ts),
+            None
+        );
     }
 
     /// The closing proof for the 3/3 cross-AI review MEDIUM
     /// (21-REVIEWS.md): a phase whose latest `stage_launched` event is ~90s
     /// old but whose phase-level `started_at` is ~30m old must report the
-    /// ~90s stage age — `latest_stage_launched_ts` must never be sourced
-    /// from `state.started_at`.
+    /// ~90s stage age — the summary's `stage_launched_ts` must never be
+    /// sourced from `state.started_at`.
     #[test]
-    fn latest_stage_launched_ts_reflects_event_age_not_phase_started_at() {
+    fn stage_launched_ts_reflects_event_age_not_phase_started_at() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let now = SystemTime::now()
@@ -3044,7 +3013,9 @@ mod tests {
             + "\n";
         std::fs::write(&events_path, rewritten).unwrap();
 
-        let ts = latest_stage_launched_ts(root, 7);
+        let ts = events::last_events_by_phase(root)
+            .get(&7)
+            .and_then(|s| s.stage_launched_ts);
         assert_eq!(ts, Some(stage_ts));
 
         let line = render_stage_progress_line(Stage::Code, ts);
@@ -3629,9 +3600,8 @@ mod tests {
         fn init_tagged_repo(root: &Path) {
             let git = |args: &[&str]| {
                 assert!(
-                    std::process::Command::new("git")
+                    devflow_core::test_support::git_command(root)
                         .args(args)
-                        .current_dir(root)
                         .output()
                         .unwrap()
                         .status
@@ -3692,6 +3662,28 @@ mod tests {
                 findings.is_empty(),
                 "a project with no .planning/ dir at all must yield zero findings, not an error"
             );
+        }
+
+        /// 999.30 / DEN-55 WR-02: `collect_planning_doc_findings` must
+        /// reconcile against the named `MAIN` production branch, not an
+        /// unlinked duplicate. `init_tagged_repo` tags `v9.9.9` only on
+        /// `side`, unreachable from `main` — so a ROADMAP.md claiming
+        /// `v9.9.9` must surface a `Problem` when reconciled against `MAIN`.
+        #[test]
+        fn collect_planning_doc_findings_reconciles_against_main() {
+            let dir = tempfile::tempdir().unwrap();
+            init_tagged_repo(dir.path());
+            std::fs::create_dir_all(dir.path().join(".planning")).unwrap();
+            std::fs::write(
+                dir.path().join(".planning/ROADMAP.md"),
+                "| Phase | Name | Version |\n|---|---|---|\n| 99 | Fixture | 9.9.9 |\n",
+            )
+            .unwrap();
+
+            let findings = collect_planning_doc_findings(dir.path());
+
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].severity, Severity::Problem);
         }
 
         #[test]

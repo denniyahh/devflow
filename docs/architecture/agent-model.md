@@ -1,6 +1,8 @@
 # Agent Model
 
-DevFlow is agent-agnostic — all coding agents share the same interface.
+DevFlow supports three agents today (Claude Code, Codex, OpenCode) through
+one shared adapter interface. This is not a fully agent-neutral platform yet
+— see the driver-architecture backlog (999.31) for that direction.
 
 ## Adapter Contract
 

@@ -3,18 +3,18 @@ gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone (open — no fixed closing phase)
 current_phase: 22
-current_phase_name: Concurrency & Governance Correctness
-status: planning
-stopped_at: Phase 21 context gathered
-last_updated: "2026-07-24T00:32:53.363Z"
-last_activity: 2026-07-23
+current_phase_name: Concurrency & Governance Correctness (light dogfooding trial)
+status: complete
+stopped_at: Phase 22 trial executed, verified, and integrated for release
+last_updated: "2026-07-24T22:50:00.000Z"
+last_activity: 2026-07-24
 progress:
   total_phases: 12
-  completed_phases: 10
-  total_plans: 74
-  completed_plans: 74
-  percent: 83
-last_activity_desc: Phase 21 complete, transitioned to Phase 22
+  completed_phases: 11
+  total_plans: 76
+  completed_plans: 76
+  percent: 92
+last_activity_desc: Phase 22 trial complete; 999.37 sandbox escape root-caused and fixed; both staged for release
 ---
 
 # DevFlow — Project State
@@ -23,8 +23,27 @@ last_activity_desc: Phase 21 complete, transitioned to Phase 22
 
 ## Active Phase
 
-**Phase 22 — Concurrency & Governance Correctness** (planning — not yet broken
-down; run `/gsd-plan-phase 22`). Depends on Phase 21.
+**Phase 22 — Concurrency & Governance Correctness** — the **light dogfooding
+trial** slice is **complete** (2/2 plans: 22-01, 22-02, resolving 999.30 /
+DEN-55). Re-verified independently after 999.37, since the original "tests
+green" claim was recorded the same day this repository was corrupted: 537 tests
+across 13 binaries, 0 failed, and zero coupling to the process-management model
+being revamped. The branch was then reused as the staging branch for this
+release.
+
+The **broader** "Concurrency & Governance Correctness" scope remains unplanned
+and explicitly out of the trial's boundary: 999.4 (version-tag contention),
+999.26 (object-store races), 999.28 (`--base`).
+
+**Also delivered in this release — 999.37 (unplanned, urgent):** the test suite
+escaped its sandbox and corrupted this repository (main repo flipped to
+`core.bare=true`, committer identity rewritten to a fixture's, 10 fixture
+commits stacked onto local `main`, the first deleting all 511 tracked files).
+Root-caused to git exporting `GIT_DIR` into pre-push hooks when pushing from a
+linked worktree, which outranks `.current_dir()`. Fixed in three layers (hook
+scrub, per-command containment, fail-fast guard) and validated by controlled
+A/B. Two follow-ups filed: 999.38 (test PATH race) and 999.39 (production
+inherits a redirecting environment).
 
 Phase 21 (Operator Legibility & Observability) **complete + verified 21/21**,
 **shipped as v1.8.0** (2026-07-24) — 4/4 plans: 21a discoverability (999.3), 21b
@@ -36,12 +55,12 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 22 — Concurrency & Governance Correctness
-Plan: Not started
-Status: Ready to plan
-Last activity: 2026-07-23
+Phase: 22 — Concurrency & Governance Correctness (light dogfooding trial)
+Plan: 22-01, 22-02 complete
+Status: Complete — integrated for release, pending version bump + CHANGELOG on `develop`
+Last activity: 2026-07-24
 
-Progress: Phase 21 complete + verified + shipped as v1.8.0 (2026-07-24); Phase 22 not yet planned.
+Progress: Phase 21 shipped as v1.8.0 (2026-07-24). Phase 22's trial slice complete and re-verified; 999.37 root-caused and fixed. Both staged on `feature/phase-22` and merged to `develop`; release prep (version bump, CHANGELOG, tag) still outstanding.
 
 *(Machine-readable fields for `gsd-tools state begin-phase` / `advance-plan` —
 this project historically tracked position only in the narrative "Active
