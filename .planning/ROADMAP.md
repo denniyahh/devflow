@@ -363,7 +363,7 @@ own `phases/999.N-*/CONTEXT.md`.
 ### Phase 999.1: Hermes Support (BACKLOG)
 
 **Goal:** `HermesAgent` adapter with native-envelope completion parsing, rewrite of the stale `skills/hermes/devflow/SKILL.md`, and the Hermes plugin session mode with an events.jsonl-driven gate watcher. Held Phase 18's slot until 2026-07-20, when pipeline-reliability work took priority — personal-infrastructure work that doesn't gate anything else.
-**Priority:** Low | **Size:** L — reviewed 2026-07-21: structurally lowest (gates nothing else), operator confirmed still low priority. Linear: DEN-26.
+**Priority:** Low | **Size:** L — reviewed 2026-07-21: structurally lowest (gates nothing else), operator confirmed still low priority. Linear: DEN-26. **Note (2026-07-24):** implement as a native `AgentDriver` (999.31) rather than a legacy `AgentAdapter`, once 999.31 lands — Hermes is a committed next agent alongside Antigravity (999.32).
 **Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
 
@@ -581,6 +581,74 @@ Plans:
 **Goal:** Resolve the four advisory findings from `21-REVIEW.md` (0 critical / 3 warning / 1 info; Phase 21 verified 21/21, no correctness or security defect — these are quality/maintainability only). **WR-01:** `gate_show`'s stage auto-resolution is copy-pasted from `gate_respond` (`crates/devflow-cli/src/commands.rs:810-844`) despite a doc comment claiming the two "can never drift" — extract a shared `resolve_single_open_gate_stage` both call (the same copy-paste-with-"can never drift"-comment smell also sits at `commands.rs:1827`). **WR-02:** `collect_planning_doc_findings` (`commands.rs:2285`) hardcodes `"main"` instead of `devflow_core::config::MAIN` (`config.rs:15`) — matches today so no live bug, but an unlinked second source of truth that would emit false `doctor` Problems if the branch ever becomes configurable. **WR-03:** `gate_show` calls `Gates::list_open` twice (narrow TOCTOU + redundant read) — fetch once, reuse. **IN-01 (info):** `latest_stage_launched_ts` reintroduces the per-phase full-file `events.jsonl` rescan that 14-CR-10 eliminated in the same `status()` function — fold the last `stage_launched` ts into the existing single-pass `last_events_by_phase`.
 **Priority:** Low | **Size:** S — WR-01/02/03 are small localized fixes (default `--fix` scope covers all three); IN-01 is a follow-up perf refactor. Source: `21-REVIEW.md` (gsd-code-reviewer, 2026-07-23), deferred to backlog by operator decision. Linear: DEN-55 (Backlog).
 **Requirements:** TBD — see 21-REVIEW.md
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.31: Modular Agent Driver Architecture (BACKLOG)
+
+**Goal:** Replace the thin `AgentAdapter` trait with a modular `AgentDriver` contract — capability discovery, driver-owned prompt rendering, command building, completion parsing, and health probes — so agent-specific execution semantics stop being scattered across `prompt.rs`, `agents/*.rs`, `agent_result.rs`, and `preflight.rs`. Root cause of a confirmed dogfood failure: `Stage::gsd_command()` bakes raw `/gsd-*` slash-command strings into core, rendered identically for every adapter (enforced by a test), and Codex received them as literal shell commands during an attempted Phase 22 light dogfooding trial.
+**Priority:** High | **Size:** L — fixes a confirmed dogfood-breaking defect (31a) and is the prerequisite for onboarding more agents. Operator decision 2026-07-24: invest in the fuller driver-contract/conformance-suite scope now rather than deferring, since Antigravity (999.32) and Hermes (999.1) are both committed next agents and interface churn gets more expensive the more drivers implement against it — capability flags are still enumerated on an as-needed basis (D-01), not guessed upfront for agents not yet integrated. Source: `.planning/audits/2026-07-24-codex-compatibility-review.md`. Linear: DEN-56.
+**Requirements:** TBD — see `phases/999.31-agent-driver-modularization/CONTEXT.md`
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.32: Antigravity Agent Driver (BACKLOG)
+
+**Goal:** `AntigravityDriver` — native support for Antigravity as a DevFlow agent (via the working `agycli` binary, not the broken `agy`→GUI wrapper; see Phase 19's cross-AI review notes). First concrete consumer of the 999.31 driver contract beyond Claude/Codex/OpenCode, alongside Hermes (999.1).
+**Priority:** Medium | **Size:** M (TBD — sizing depends on `agycli`'s non-interactive/JSON output surface, not yet scoped). Blocked by 999.31 (needs the `AgentDriver` contract and conformance suite to implement against, per operator decision 2026-07-24 to build new agents modularly rather than extend `AgentAdapter`). Source: operator conversation 2026-07-24; Antigravity has been a known target since Phase 13's original scope note ("Hermes plugin + Hermes/Antigravity adapters").
+**Requirements:** TBD — see CONTEXT.md
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.33: Monitor Teardown Trap Orphans `devflow advance` (BACKLOG)
+
+**Goal:** The monitor's SIGTERM/SIGINT trap (`crates/devflow-core/src/monitor.rs:148-160`) only kills `$apid`, the backgrounded agent process: `cleanup() { [ -n "$apid" ] && kill "$apid" 2>/dev/null; exit 0; }`. Once `wait $apid` returns and the script moves into its synchronous tail call (`devflow advance --phase N`), a signal to the monitor has nothing left to kill — the trap fires, `exit 0`s the shell, but `devflow advance` is a separate already-forked child that survives, reparented to the nearest subreaper, and keeps running to completion unsupervised. This is the same bug class WR-08 (13-REVIEW.md) fixed one level up (trap only exited the shell, orphaning the agent) recurring one level deeper (trap only kills the agent, orphaning `advance`).
+**Priority:** High | **Size:** S/M — directly reproduced 2026-07-24: SIGTERM to 5 monitor wrapper processes killed the `sh` wrapper in every case but left all 5 `devflow advance` children running as orphans, requiring a second explicit kill pass. No data-loss risk observed (the orphaned `advance` calls appeared idle/blocked, not actively corrupting state), but it means an operator terminating a monitor cannot assume the process tree is actually gone. Fix shape: process-group-based teardown (`setsid`/new pgid at spawn, `killpg`/`kill(-pgid)` on stop) instead of tracking a single child PID, so a single signal reaches whichever child is currently active. Prerequisite for 999.34's `devflow stop` to be reliable. Source: operator conversation 2026-07-24, discovered via leaked `cargo test` fixture processes in the Phase 22 worktree exhibiting the identical orphaning pattern.
+**Requirements:** TBD — see `crates/devflow-core/src/monitor.rs`
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.34: `devflow stop` — Explicit, Clean Phase Abort (BACKLOG)
+
+**Goal:** DevFlow has no first-class way to stop a running phase. `cleanup --force` explicitly *refuses* to touch anything with a live agent or monitor (`crates/devflow-cli/src/commands.rs:434`) rather than stopping it, and no kill/terminate path exists anywhere in the codebase (`agent.rs` only has the read-only `agent_running` liveness check). The only lever today is an operator killing PIDs by hand at the OS level — which is what happened during the Phase 22 Codex dogfood trial when the operator told Codex to stop after discovering the compatibility problem (999.31/DEN-56), and is the likely reason that phase's state went untracked afterward (`devflow doctor` reported "no active phases — nothing to reconcile" despite the worktree, branch, and commits surviving) rather than being recorded as a clean, intentional stop.
+**Priority:** High | **Size:** M — direct product gap surfaced by a real incident, not speculative. Depends on 999.33 (needs reliable whole-tree teardown to be a real "stop," not just a best-effort signal to one PID). Proposed shape: `devflow stop --phase N [--reason "..."]` (plus a possible `--all`) that (1) resolves the phase's monitor/agent PIDs from existing state, (2) signals the whole process group — SIGTERM with a bounded grace period, escalating to SIGKILL — fixing 999.33 as a prerequisite, (3) emits an authoritative `workflow_stopped` event so `doctor`/`status`/`events.jsonl` show a clean terminal marker instead of the run trailing into nothing, (4) resolves any open gate for the phase with a note rather than leaving a phantom pending gate, (5) sets `State.stopped = true` (reusing the existing `--until` flag rather than deleting state), and (6) leaves the worktree/branch/commits untouched by default — `cleanup --force` remains the separate, now-correctly-gated step for actually discarding work. Idempotent: stopping an already-stopped or already-dead phase reports that cleanly rather than erroring. Source: operator conversation 2026-07-24.
+**Requirements:** TBD — see CONTEXT.md
+**Plans:** 0 plans
+
+**Note added 2026-07-24 (operator):** verified the successful-Ship path separately before adding this — the monitor's process tree does NOT leak on success (the shell script's tail call, `devflow advance`, runs `finish_workflow`, which already calls `workflow::clear_state` and emits `workflow_finished`; once that returns the shell script has nothing left to run and exits cleanly, so there's no live-process gap on the happy path, unlike the abort case above). What IS confirmed missing on success: `hooks_after_ship` (`crates/devflow-core/src/hooks.rs:105-112`) runs Merge/VersionBump/ChangelogAppend/BranchCleanup but has no `WorktreeRemove` step, and `branch_cleanup`'s non-force `delete_branch` only special-cases "not fully merged" errors — a branch still checked out in its `devflow start` worktree at Ship time would hit the generic warn-and-skip branch instead, silently leaving both branch and worktree in place (untested in practice: no `devflow start`-launched phase has reached a successful Ship yet, phase 22 included). Separately, confirmed by direct observation: per-phase capture files (`.devflow/phase-N-{agent-pid,stdout,stderr.log,exit}`) are never swept by anything — phases 15/16/17/21's files are still sitting in `.devflow/` long after those phases shipped. Worth a "finalize" step at the end of a successful `finish_workflow` — reusing `devflow stop`'s teardown/event-recording machinery under a distinct reason (e.g. `stop --reason completed`) rather than inventing a parallel mechanism — that removes the now-merged worktree and sweeps that phase's capture files. Design this alongside 999.34/999.33, not as a third separate command.
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.35: `devflow resume --agent` Override (BACKLOG)
+
+**Goal:** `resume --phase N` (`crates/devflow-cli/src/pipeline_launch.rs:213-229`) hard-reuses `state.agent` — the agent persisted at `start` time — with no override; `main.rs`'s `Resume` command has no `--agent` flag at all. If a phase is stuck for agent-specific reasons (exactly what happened in the Phase 22 Codex trial — 999.31/DEN-56), the only recovery today is discarding whatever Define/Plan work already landed and restarting the whole phase from Define with a different `--agent`. Add `devflow resume --phase N --agent <agent>` to relaunch the phase's saved stage with a different agent, without resetting to Define or losing prior-stage artifacts.
+**Priority:** Medium | **Size:** S — narrow, additive CLI/state change (override one field before `launch_stage`); the harder question is whether every stage prompt/completion-parsing path already tolerates a mid-phase agent switch, worth a design pass rather than assuming yes. Source: operator conversation 2026-07-24, motivated directly by the Phase 22 dogfood incident.
+**Requirements:** TBD — see CONTEXT.md
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.36: Diff Visibility Before Gating (BACKLOG)
+
+**Goal:** `gate show`/`gate list` (`crates/devflow-cli/src/commands.rs`) only render `gate.context` — the agent's self-reported text explanation via `render_gate_context` — never the actual code diff a Validate/Ship gate is asking the operator to approve. To see what a stage actually changed today, the operator has to know to `cd` into `.worktrees/phase-N` and run raw `git diff`/`git log` themselves; there's no `devflow diff` or equivalent in the CLI surface at all. Add a `devflow diff --phase N` (diffstat + optional full diff against the phase's base) that pairs with the existing `gate show`/`approve`/`reject` verbs, since gating is the tool's core trust mechanism and currently asks for a decision without first-class visibility into the thing being decided on.
+**Priority:** Medium | **Size:** S/M — mostly a thin wrapper over `git diff`/`git log` scoped to the phase's worktree and base branch; sizing risk is mainly around output volume/truncation for large diffs (same class of problem `gate show`'s untruncated-context work already solved once, 21a). Source: operator conversation 2026-07-24.
+**Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
 
 Plans:
