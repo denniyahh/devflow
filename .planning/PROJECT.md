@@ -63,8 +63,10 @@ mid-run crash or kill.
 
 ### Active
 
-*(none currently in flight. Phase 20 shipped as v1.7.0, 2026-07-23. The
-v2.0.0 milestone stays open — it does NOT close at Phase 20 or any other
+*(none currently in flight. Phase 21 (Operator Legibility & Observability)
+executed + verified on `develop`, 2026-07-23 — unshipped: the workspace
+version stays `1.7.0` until a release is cut. Phase 20 shipped as v1.7.0,
+2026-07-23. The v2.0.0 milestone stays open — it does NOT close at Phase 20 or any other
 fixed phase; numbering continues (21, 22, …) until a genuinely breaking
 change earns the 2.0 slot. `/gsd-complete-milestone` is not run here.
 Hermes Support, previously slotted as "Phase 18," was rescoped out during
@@ -135,5 +137,6 @@ items require `/gsd-review-backlog` promotion.)*
 | `.planning/CONCERNS.md` | Top findings from the original pre-Phase-1 codebase audit |
 
 ---
-*Last updated: 2026-07-23 after Phase 20 shipped as v1.7.0 — PR #20 merged
-to `develop`; the v2.0.0 milestone stays open (no fixed closing phase)*
+*Last updated: 2026-07-23 after Phase 21 (Operator Legibility & Observability)
+executed + verified on `develop` — 4/4 plans, unshipped (workspace stays
+v1.7.0); the v2.0.0 milestone stays open (no fixed closing phase)*

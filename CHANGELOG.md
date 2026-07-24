@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.8.0 — 2026-07-23
+
+Operator legibility and observability: make DevFlow's operator surface legible
+and its self-reported state trustworthy. Every unit is single-writer,
+operator-facing, and reversible or detection-only. Phase 21.
+
+### Fixed
+- DevFlow's dogfood build-staleness guard no longer hard-blocks a self-run when the only commits ahead of the running binary's embedded commit changed nothing the compiler sees. `embedded_commit_is_stale`'s strict-ancestor arm now filters `git diff --name-only <embedded> HEAD` through the same `affects_compiled_binary` predicate the dirty-tree arm already used — a docs-only (`.planning/`) range reads `Fresh`, any build-input change reads `Stale`, and a git error fails toward `Stale`. The block message no longer claims "is not an ancestor of HEAD" for the common case where the embedded commit *is* an ancestor, just behind
+
+### Added
+- `devflow gate show <phase> [--stage]` prints a gate's full context untruncated (the `gate list` view caps at 100 chars), routed through the same control-character sanitizer so it stays terminal-safe
+- `devflow status` now surfaces the rate-limit reset time in its cron hints, an in-stage progress line sourced from the latest `stage_launched` event (not the phase's own `started_at`), and `resume`/`advance` recovery-verb hints when a phase is stuck
+- `devflow doctor` gains a detection-only planning-doc staleness check that reconciles `ROADMAP.md`/`STATE.md` version and outcome claims against the repo's git tags and flags drift, in both human and `--json` output — it never rewrites prose
+- `sequentagent`'s second agent now writes a tracked, path-free slot record so `devflow status` observes it while it runs, with RAII cleanup on every exit path and no routing through the phase state machine
+
 ## 1.7.0 — 2026-07-23
 
 Release correctness and operator control: close the two defects that made

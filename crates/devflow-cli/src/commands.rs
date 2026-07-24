@@ -525,6 +525,58 @@ fn liveness(monitor_pid: Option<u32>, monitor_alive: bool, agent_alive: bool) ->
     }
 }
 
+/// Recovery verbs discoverable from a phase's liveness (21a, D-03) — the
+/// pure, testable counterpart to `status`'s old inline Stuck `println!`.
+/// Always includes `devflow resume` for `Stuck`; additionally includes
+/// `devflow advance` when the phase is gate-pending (the operator answers
+/// the gate then advances — the primary footgun this closes; widening the
+/// predicate further risks suggesting `advance` where nothing proves it is
+/// right, per 21-CONTEXT.md's Review Incorporation). Empty for any other
+/// liveness, so a healthy/between-stages/unknown phase prints nothing new.
+fn recovery_hints(state: &State, liveness: Liveness) -> Vec<String> {
+    if liveness != Liveness::Stuck {
+        return Vec::new();
+    }
+    let mut hints = vec![format!("devflow resume --phase {}", state.phase)];
+    if state.gate_pending {
+        hints.push(format!("devflow advance --phase {}", state.phase));
+    }
+    hints
+}
+
+/// The `ts` of a phase's most recent `stage_launched` event, or `None` when
+/// none has been recorded — the real stage-entry time (21a), mirroring
+/// `test_support::stage_launched_count`'s scan but keeping the LAST match's
+/// `ts` instead of counting matches. Read-only; deliberately never reads
+/// `state.started_at`, which is phase-level and set once in `State::new`
+/// (the 3/3 cross-AI review MEDIUM, 21-REVIEWS.md).
+fn latest_stage_launched_ts(project_root: &Path, phase: u32) -> Option<u64> {
+    std::fs::read_to_string(devflow_core::events::events_path(project_root))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| {
+            event.get("phase").and_then(serde_json::Value::as_u64) == Some(u64::from(phase))
+                && event.get("event").and_then(serde_json::Value::as_str) == Some("stage_launched")
+        })
+        .filter_map(|event| event.get("ts").and_then(serde_json::Value::as_u64))
+        .next_back()
+}
+
+/// `status`'s in-stage progress line: real elapsed time since the phase's
+/// most recent `stage_launched` event. `None` (no such event yet) renders
+/// the stage name with no age, rather than mislabeling phase age as stage
+/// age — never pass `state.started_at`'s age here (3/3 review MEDIUM).
+fn render_stage_progress_line(stage: Stage, stage_launched_ts: Option<u64>) -> String {
+    match stage_launched_ts {
+        Some(ts) => format!(
+            "  in stage {stage}: {}",
+            recover::format_age(&ts.to_string())
+        ),
+        None => format!("  in stage {stage}"),
+    }
+}
+
 pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
     // 13-DEFERRED-CR-03 acceptance: enumerate every active phase, not just
     // the last one started.
@@ -593,8 +645,15 @@ pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
             let monitor_alive = state.monitor_pid.is_some_and(agent::agent_running);
             let phase_liveness = liveness(state.monitor_pid, monitor_alive, agent_alive);
             println!("  liveness: {}", phase_liveness.describe());
-            if phase_liveness == Liveness::Stuck {
-                println!("    → devflow resume --phase {}", state.phase);
+            println!(
+                "{}",
+                render_stage_progress_line(
+                    state.stage,
+                    latest_stage_launched_ts(project_root, state.phase)
+                )
+            );
+            for hint in recovery_hints(state, phase_liveness) {
+                println!("    → {hint}");
             }
             if let Some(event) = last_events.remove(&state.phase) {
                 let ago = event
@@ -612,6 +671,9 @@ pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
         .as_secs();
     if let Some(banner) = render_pending_gate_banner(&Gates::list_open(project_root), now) {
         println!("\n{banner}");
+    }
+    if let Some(section) = render_sequentagent_status(project_root) {
+        println!("\n{section}");
     }
     print_open_branches(project_root);
     print_worktrees(project_root, current_worktree.as_deref());
@@ -741,6 +803,70 @@ pub(crate) fn gate_respond(
         path.display()
     );
     Ok(())
+}
+
+/// Print an open gate's full, untruncated (but sanitized) context — the
+/// discoverability counterpart to `gate_list`'s 100-char table truncation
+/// (21a, D-03). Mirrors `gate_respond`'s stage auto-resolve-single-open-gate
+/// logic (`[]` → error pointing at `devflow gate list`; `[one]` → that
+/// stage; `many` → error listing stages and asking for `--stage`) so the two
+/// commands' gate-resolution behavior can never drift.
+pub(crate) fn gate_show(
+    project_root: &Path,
+    phase: u32,
+    stage: Option<Stage>,
+) -> Result<(), CliError> {
+    let stage = match stage {
+        Some(stage) => stage,
+        None => {
+            let open: Vec<_> = Gates::list_open(project_root)
+                .into_iter()
+                .filter(|g| g.phase == phase)
+                .collect();
+            match open.as_slice() {
+                [] => {
+                    return Err(CliError::Message(format!(
+                        "no open gate for phase {phase} — see `devflow gate list`"
+                    )));
+                }
+                [one] => one.stage,
+                many => {
+                    return Err(CliError::Message(format!(
+                        "phase {phase} has several open gates ({}) — pass --stage",
+                        many.iter()
+                            .map(|g| g.stage.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )));
+                }
+            }
+        }
+    };
+    let gate = Gates::list_open(project_root)
+        .into_iter()
+        .find(|g| g.phase == phase && g.stage == stage)
+        .ok_or_else(|| {
+            CliError::Message(format!(
+                "no open gate for phase {phase} stage {stage} — see `devflow gate list`"
+            ))
+        })?;
+    println!("{}", render_gate_show(&gate));
+    Ok(())
+}
+
+/// Pure render for `gate_show`'s output block — the FULL context via
+/// `render_gate_context(.., usize::MAX)` (sanitize, never truncate; contrast
+/// `gate_list`'s `render_gate_context(.., 100)`). Factored out of `gate_show`
+/// so the untruncated-context guarantee is unit-testable without capturing
+/// process stdout.
+fn render_gate_show(gate: &OpenGate) -> String {
+    format!(
+        "phase {} {} ({})\n{}",
+        gate.phase,
+        gate.stage,
+        recover::format_age(&gate.timestamp),
+        render_gate_context(&gate.context, usize::MAX),
+    )
 }
 
 /// Print (or follow) a phase's captured agent output.
@@ -890,17 +1016,102 @@ fn agent_pid_from_file(project_root: &Path, phase: u32) -> Option<u32> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
+/// Enumerate every recorded `sequentagent` slot and render one status line
+/// per phase, naming the running agent slot (A/B), its `AgentKind`, and
+/// liveness (21c, D-06) — a sequentagent phase has no entry in
+/// `workflow::list_states`, so without this the second agent is otherwise
+/// entirely invisible to `status`. Pure and read-only: no writes, no
+/// `save_state`/`transition` call.
+///
+/// Scans `.devflow/phase-*-sequentagent` (mirroring `default_logs_phase`'s
+/// `read_dir` + `strip_prefix`/`strip_suffix` idiom) since there is no
+/// `State` to enumerate this from.
+///
+/// Liveness is distinguished by cross-referencing the slot record against
+/// the existing agent-pid file (`agent_pid_from_file` + `agent::agent_running`):
+/// - `running` — the agent-pid file exists and the process is alive.
+/// - `starting` — the slot record exists but the agent-pid file has not
+///   appeared yet (the monitor writes it asynchronously, after the slot
+///   record — cross-AI review LOW pid-race); an honest transient rather than
+///   a misleading "dead" agent.
+/// - `not running` — the agent-pid file exists but the process is dead (a
+///   stale record never renders a false-live agent, T-21c-02).
+///
+/// `doctor` integration is intentionally out of scope for this plan: `status`
+/// is the live-observability command, while `doctor` reconciles persisted
+/// `State` — surfacing this in `doctor` without a matching `--json` key would
+/// reintroduce the WR-01 human/json split (21-04-PLAN.md Review
+/// Incorporation).
+fn render_sequentagent_status(project_root: &Path) -> Option<String> {
+    let devflow = workflow::devflow_dir(project_root);
+    let mut phases: Vec<u32> = std::fs::read_dir(&devflow)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            name.to_str()?
+                .strip_prefix("phase-")?
+                .strip_suffix("-sequentagent")?
+                .parse::<u32>()
+                .ok()
+        })
+        .collect();
+    phases.sort_unstable();
+    phases.dedup();
+
+    let lines: Vec<String> = phases
+        .into_iter()
+        .filter_map(|phase| {
+            let slot = agent_result::read_sequentagent_slot(project_root, phase)?;
+            let pid = agent_pid_from_file(project_root, phase);
+            let (state, pid_suffix) = match pid {
+                Some(pid) if agent::agent_running(pid) => ("running", format!(" (pid {pid})")),
+                Some(pid) => ("not running", format!(" (pid {pid})")),
+                None => ("starting", String::new()),
+            };
+            Some(format!(
+                "sequentagent phase {phase}: agent {} ({}) {state}{pid_suffix}",
+                slot.slot, slot.agent
+            ))
+        })
+        .collect();
+
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
 fn cron_instruction_hints(project_root: &Path) -> Vec<String> {
     devflow_core::ship::list_cron_instructions(project_root)
         .iter()
-        .map(|instructions| {
-            format!(
-                "Cron instruction pending (phase {}): hermes cron create --from-devflow {}",
-                instructions.phase,
-                project_root.display()
-            )
-        })
+        .map(|instructions| cron_hint_line(instructions, project_root))
         .collect()
+}
+
+/// Build one cron-instruction hint line, appending a sanitized rate-limit
+/// reset segment when `instructions.retry_after` is non-empty (21a, D-03) —
+/// the reset time is already computed and persisted (`CronInstructions.
+/// retry_after`, ship.rs), this only presents it; no new detection logic.
+/// Pure so it's unit-testable without capturing process stdout.
+fn cron_hint_line(
+    instructions: &devflow_core::ship::CronInstructions,
+    project_root: &Path,
+) -> String {
+    let base = format!(
+        "Cron instruction pending (phase {}): hermes cron create --from-devflow {}",
+        instructions.phase,
+        project_root.display()
+    );
+    let retry_after = instructions.retry_after.trim();
+    if retry_after.is_empty() {
+        base
+    } else {
+        let reset = render_gate_context(retry_after, 100);
+        format!("{base} (rate-limit resets: {reset})")
+    }
 }
 
 /// Print active phase worktrees with branch and inferred phase/agent.
@@ -1254,16 +1465,19 @@ pub(crate) fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
     ];
 
     let facts = collect_phase_facts(project_root);
+    let doc_findings = collect_planning_doc_findings(project_root);
 
     if json {
-        // WR-01 (18-fix): a single top-level JSON document — `{"environment":
-        // [...], "reconciliation": [...]}` — instead of the pre-fix
+        // WR-01 (18-fix): a single top-level JSON document —
+        // `{"environment": [...], "reconciliation": [...],
+        // "planning_doc_staleness": [...]}` — instead of the pre-fix
         // behavior of printing the tool checks as one top-level `[...]`
         // array and then printing a SECOND, independent top-level array
         // right after it. That concatenation is not valid single-document
         // JSON for any parser that isn't NDJSON-aware (`json.load` raised
-        // "Extra data").
-        let body = doctor_json_body(&checks, &facts);
+        // "Extra data"). 21b's planning-doc check (D-05) extends this SAME
+        // object with a third key rather than forking a second array.
+        let body = doctor_json_body(&checks, &facts, &doc_findings);
         println!(
             "{}",
             serde_json::to_string_pretty(&body).expect("doctor --json body must serialize")
@@ -1287,6 +1501,7 @@ pub(crate) fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
             println!();
         }
         print!("{}", render_reconciliation_text(&facts));
+        print!("{}", render_planning_doc_text(&doc_findings));
     }
 
     Ok(())
@@ -1862,12 +2077,253 @@ fn checks_json_value(checks: &[Check]) -> serde_json::Value {
 /// JSON for any parser that isn't NDJSON-aware (`json.load` raised "Extra
 /// data" against a live fixture with one active phase). There is now
 /// exactly one top-level value: `{"environment": [...], "reconciliation":
-/// [...]}`.
-fn doctor_json_body(checks: &[Check], facts: &[PhaseFacts]) -> serde_json::Value {
+/// [...], "planning_doc_staleness": [...]}` — 21b's addition (D-05) extends
+/// this SAME object with a third key rather than forking a second reporter
+/// or printing a second top-level array.
+fn doctor_json_body(
+    checks: &[Check],
+    facts: &[PhaseFacts],
+    doc_findings: &[PlanningDocFinding],
+) -> serde_json::Value {
     serde_json::json!({
         "environment": checks_json_value(checks),
         "reconciliation": render_reconciliation_json(facts),
+        "planning_doc_staleness": render_planning_doc_findings_json(doc_findings),
     })
+}
+
+// ---------------------------------------------------------------------------
+// doctor planning-doc staleness reconciliation (21b, D-04/D-05)
+// ---------------------------------------------------------------------------
+
+/// The `v1.5.0` numeric-tuple cutoff (RESEARCH Pitfall #2): the first phase
+/// whose version claim was consistently tagged. A claimed version at or
+/// after this cutoff with no matching/reachable git tag is a real
+/// `Severity::Problem`; a claim before it is legacy history and downgrades
+/// to `Severity::Warn` — otherwise a naive per-row check floods `doctor`
+/// with pre-Phase-18 noise, the exact alert-fatigue class 999.14 exists to
+/// prevent. Compared as a NUMERIC `(major, minor, patch)` tuple, never a
+/// string, so a real future `v1.10.0` is correctly treated as post-cutoff
+/// (a lexicographic `"1.10.0" < "1.5.0"` would wrongly sort it as legacy).
+const PLANNING_DOC_STALENESS_CUTOFF: (u32, u32, u32) = (1, 5, 0);
+
+/// One detection-only finding produced by reconciling a `ROADMAP.md`/
+/// `STATE.md` version claim against the repo's git tags. A sibling of
+/// `PhaseFinding`, not a reuse of it: most claims here are about
+/// already-shipped phases with no active `state-NN.json`/`PhaseFacts`
+/// (RESEARCH Open Q1). `repair` is always `None` — D-04 forbids any
+/// auto-correction of planning-doc prose; nothing in this module has a
+/// write path to either file. Never carries a filesystem path or username
+/// (T-18-01 discipline) — only the source label, the claimed version, and
+/// a git tag name.
+pub(crate) struct PlanningDocFinding {
+    pub(crate) source: String,
+    pub(crate) claim: String,
+    pub(crate) severity: Severity,
+    pub(crate) detail: String,
+    pub(crate) repair: Option<String>,
+}
+
+/// Parse a table cell as a bare `(major, minor, patch)` semver tuple,
+/// stripping an optional leading `v`. Returns `None` for anything that
+/// isn't EXACTLY three dot-separated numeric components — this is what
+/// keeps version ranges (`0.1.0–0.6.0`), em-dash placeholders (`—`), and
+/// any other non-semver cell out of every downstream finding (RESEARCH
+/// Pitfall #2), without needing a regex crate: the range's `–` makes its
+/// middle component fail `str::parse::<u32>`, and the em-dash fails
+/// outright.
+pub(crate) fn parse_semver(cell: &str) -> Option<(u32, u32, u32)> {
+    let cell = cell.strip_prefix('v').unwrap_or(cell);
+    let mut parts = cell.split('.');
+    let major = parts.next()?.trim().parse().ok()?;
+    let minor = parts.next()?.trim().parse().ok()?;
+    let patch = parts.next()?.trim().parse().ok()?;
+    if parts.next().is_some() {
+        return None; // more than three `.`-separated components
+    }
+    Some((major, minor, patch))
+}
+
+/// Scan a `## Shipped`/`## Completed`-shaped markdown table for `(label,
+/// version)` rows whose version cell is a bare or `v`-prefixed single
+/// semver. Hand-scans lines split on `|` rather than pulling in a
+/// markdown-table parser crate — the `is_self_dogfood_workspace` (D-17)
+/// convention this codebase already follows for small, fixed-shape
+/// structured text. Skips the header row, the `|---|---|` separator row,
+/// and any cell that isn't a bare semver (ranges, em-dashes, anything
+/// else) outright; never panics on a malformed row (T-21b-03 — parse
+/// defensively, degrade rather than die). `source` (e.g. `"ROADMAP.md"`)
+/// is folded into the returned label so a caller that concatenates rows
+/// from multiple documents can still tell them apart downstream.
+pub(crate) fn parse_planning_doc_versions(text: &str, source: &str) -> Vec<(String, String)> {
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('|') {
+            continue;
+        }
+        let cells: Vec<&str> = trimmed
+            .trim_matches('|')
+            .split('|')
+            .map(str::trim)
+            .collect();
+        if cells.len() < 2 {
+            continue;
+        }
+        let label = cells[0];
+        // Header row (`Phase | Name | Version`) and the `|---|---|---|`
+        // separator row both have a first cell that is never a real phase
+        // label — skip both rather than trying to special-case each shape.
+        if label.is_empty()
+            || label.eq_ignore_ascii_case("phase")
+            || label.chars().all(|c| c == '-')
+        {
+            continue;
+        }
+        // The version column's position differs between ROADMAP.md's
+        // `## Shipped` table (Phase | Name | Version) and STATE.md's
+        // `## Completed` table (Phase | Description | Version | Date) —
+        // scan every non-label cell and keep whichever ones parse as a
+        // bare semver, rather than hardcoding a column index.
+        for cell in &cells[1..] {
+            if parse_semver(cell).is_some() {
+                rows.push((format!("{source} phase {label}"), (*cell).to_string()));
+            }
+        }
+    }
+    rows
+}
+
+/// Whether `tag` exists in `project_root` AND is reachable from
+/// `base_branch` — argv-array `git` shelling only (T-21b-02: tag strings
+/// passed in here are already validated `^v?\d+\.\d+\.\d+$` cells, never
+/// free-form; no `sh -c`). Two separate invocations, mirroring
+/// `staleness::run_git_stdout`'s idiom: existence first, so a missing tag
+/// short-circuits before the (more expensive) ancestry check.
+pub(crate) fn tag_exists_and_reachable(project_root: &Path, tag: &str, base_branch: &str) -> bool {
+    let exists = std::process::Command::new("git")
+        .args(["rev-parse", "--verify", &format!("refs/tags/{tag}")])
+        .current_dir(project_root)
+        .output()
+        .is_ok_and(|o| o.status.success());
+    exists
+        && std::process::Command::new("git")
+            .args(["merge-base", "--is-ancestor", tag, base_branch])
+            .current_dir(project_root)
+            .output()
+            .is_ok_and(|o| o.status.success())
+}
+
+/// Pure reconciliation core: for each `(label, version_cell)` row, ask the
+/// caller-supplied `tag_lookup` closure whether a `v`-normalized tag exists
+/// and is reachable — kept injectable (rather than calling
+/// `tag_exists_and_reachable` directly) so this is unit-testable without a
+/// real repository, mirroring `reconcile_phase`'s zero-I/O discipline. A
+/// miss becomes a `PlanningDocFinding` at `Severity::Problem` when the
+/// claimed version is at or after the `v1.5.0` cutoff — compared as a
+/// NUMERIC tuple via `parse_semver`, never lexicographically — else
+/// `Severity::Warn` (RESEARCH Pitfall #2). `repair` is always `None` (D-04:
+/// detection-only). Skips any row whose cell doesn't parse as a semver,
+/// defensively — `parse_planning_doc_versions` already filters these out,
+/// but this must never panic even if called with a stray malformed row.
+pub(crate) fn reconcile_planning_docs(
+    rows: &[(String, String)],
+    tag_lookup: &mut impl FnMut(&str) -> bool,
+) -> Vec<PlanningDocFinding> {
+    let mut findings = Vec::new();
+    for (label, version_cell) in rows {
+        let Some(parsed) = parse_semver(version_cell) else {
+            continue;
+        };
+        let tag = if version_cell.starts_with('v') {
+            version_cell.clone()
+        } else {
+            format!("v{version_cell}")
+        };
+        if tag_lookup(&tag) {
+            continue;
+        }
+        let severity = if parsed >= PLANNING_DOC_STALENESS_CUTOFF {
+            Severity::Problem
+        } else {
+            Severity::Warn
+        };
+        findings.push(PlanningDocFinding {
+            source: label.clone(),
+            claim: format!("{label} claims {tag}"),
+            severity,
+            detail: format!(
+                "{label} claims {tag}, but no git tag `{tag}` exists (or it isn't reachable from the base branch)"
+            ),
+            repair: None,
+        });
+    }
+    findings
+}
+
+/// Read `.planning/ROADMAP.md`'s `## Shipped` table and `.planning/STATE.md`'s
+/// `## Completed` table (best-effort — a MISSING file yields no rows for
+/// that document, never an error; `doctor` must not fabricate a `Problem`
+/// from an absent doc), parse both, and reconcile every row against the
+/// repo's git tags via `tag_exists_and_reachable(project_root, tag,
+/// "main")`. `"main"` is a LOCAL branch in this repo (verified: `git
+/// branch --list main`; `git merge-base --is-ancestor v1.7.0 main`
+/// succeeds offline) — deliberately not `origin/main` (no network
+/// dependency in `doctor`'s read-only contract) and not `develop` (wrong
+/// base). The only I/O here is two `std::fs::read_to_string` calls plus
+/// `tag_exists_and_reachable`'s `git` subprocesses — `doctor` stays
+/// read-only (no write path to either file).
+fn collect_planning_doc_findings(project_root: &Path) -> Vec<PlanningDocFinding> {
+    let roadmap =
+        std::fs::read_to_string(project_root.join(".planning/ROADMAP.md")).unwrap_or_default();
+    let state =
+        std::fs::read_to_string(project_root.join(".planning/STATE.md")).unwrap_or_default();
+
+    let mut rows = parse_planning_doc_versions(&roadmap, "ROADMAP.md");
+    rows.extend(parse_planning_doc_versions(&state, "STATE.md"));
+
+    let mut lookup = |tag: &str| tag_exists_and_reachable(project_root, tag, "main");
+    reconcile_planning_docs(&rows, &mut lookup)
+}
+
+/// Build `doctor --json`'s `"planning_doc_staleness"` array (D-05, Pattern
+/// 2), mirroring `render_reconciliation_json`'s array-building idiom.
+fn render_planning_doc_findings_json(findings: &[PlanningDocFinding]) -> serde_json::Value {
+    serde_json::Value::Array(
+        findings
+            .iter()
+            .map(|f| {
+                serde_json::json!({
+                    "source": f.source,
+                    "claim": f.claim,
+                    "severity": f.severity.label(),
+                    "detail": f.detail,
+                    "repair": f.repair,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Build `doctor`'s text planning-docs section, printed after the
+/// reconciliation section. A pure string builder (not a direct
+/// `println!`), mirroring `render_reconciliation_text`'s shape so it's
+/// directly assertable in tests without capturing process stdout. No
+/// findings prints a single `"planning docs: consistent with git tags"`
+/// line, matching the action spec.
+fn render_planning_doc_text(findings: &[PlanningDocFinding]) -> String {
+    if findings.is_empty() {
+        return "\nplanning docs: consistent with git tags\n".to_string();
+    }
+    let mut out = String::from("\nplanning docs:\n");
+    for finding in findings {
+        out.push_str(&format!(
+            "  [{}] {}\n",
+            finding.severity.label(),
+            finding.detail
+        ));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1943,6 +2399,73 @@ mod tests {
     }
 
     #[test]
+    fn gate_show_arg_parsing_accepts_phase_and_optional_stage() {
+        let bare = Cli::try_parse_from(["devflow", "gate", "show", "15"]).unwrap();
+        let Command::Gate {
+            action: GateCmd::Show { phase, stage, .. },
+        } = bare.command
+        else {
+            panic!("expected gate show command");
+        };
+        assert_eq!(phase, 15);
+        assert_eq!(stage, None);
+
+        let flagged =
+            Cli::try_parse_from(["devflow", "gate", "show", "15", "--stage", "ship"]).unwrap();
+        let Command::Gate {
+            action: GateCmd::Show { phase, stage, .. },
+        } = flagged.command
+        else {
+            panic!("expected gate show command with stage");
+        };
+        assert_eq!(phase, 15);
+        assert_eq!(stage, Some(Stage::Ship));
+    }
+
+    #[test]
+    fn gate_show_renders_full_untruncated_sanitized_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = format!("first line\n\u{1b}[2J{}", "x".repeat(150));
+        Gates::write_gate(dir.path(), 15, Stage::Ship, &context).unwrap();
+        let gate = Gates::list_open(dir.path())
+            .into_iter()
+            .find(|g| g.phase == 15)
+            .unwrap();
+
+        let rendered = render_gate_show(&gate);
+
+        assert!(rendered.contains(&"x".repeat(150)));
+        assert!(!rendered.contains("[truncated"));
+        assert!(!rendered.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn gate_show_errors_naming_gate_list_when_no_open_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = gate_show(dir.path(), 15, None).unwrap_err();
+        assert!(err.to_string().contains("devflow gate list"));
+    }
+
+    #[test]
+    fn gate_show_errors_asking_for_stage_with_several_open_gates() {
+        let dir = tempfile::tempdir().unwrap();
+        Gates::write_gate(dir.path(), 15, Stage::Ship, "ctx1").unwrap();
+        Gates::write_gate(dir.path(), 15, Stage::Validate, "ctx2").unwrap();
+
+        let err = gate_show(dir.path(), 15, None).unwrap_err();
+
+        assert!(err.to_string().contains("--stage"));
+    }
+
+    #[test]
+    fn gate_show_auto_resolves_single_open_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        Gates::write_gate(dir.path(), 15, Stage::Ship, "the only open gate").unwrap();
+
+        assert!(gate_show(dir.path(), 15, None).is_ok());
+    }
+
+    #[test]
     fn describe_worktree_dir_infers_phase_and_agent() {
         assert_eq!(
             describe_worktree_dir("phase-07-claude"),
@@ -1955,13 +2478,12 @@ mod tests {
     #[test]
     fn cron_instruction_hints_include_hermes_command_per_phase() {
         let dir = tempfile::tempdir().unwrap();
+        // Empty retry_after here so the exact-match assertion below isolates
+        // the base hermes-command hint from 21a's reset-time fragment
+        // (covered separately by cron_hint_line_* below).
         for phase in [7, 9] {
-            let instructions = devflow_core::ship::build_cron_instructions(
-                dir.path(),
-                phase,
-                "2026-06-18T15:45:30Z",
-                "claude,codex",
-            );
+            let instructions =
+                devflow_core::ship::build_cron_instructions(dir.path(), phase, "", "claude,codex");
             devflow_core::ship::write_cron_instructions(dir.path(), &instructions).unwrap();
         }
 
@@ -1976,6 +2498,42 @@ mod tests {
             )
         );
         assert!(hints[1].contains("(phase 9)"));
+    }
+
+    #[test]
+    fn cron_hint_line_appends_sanitized_reset_when_retry_after_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let instructions = devflow_core::ship::build_cron_instructions(
+            dir.path(),
+            7,
+            "2026-06-18T15:45:30Z",
+            "claude,codex",
+        );
+
+        let hint = cron_hint_line(&instructions, dir.path());
+
+        assert!(hint.starts_with(&format!(
+            "Cron instruction pending (phase 7): hermes cron create --from-devflow {}",
+            dir.path().display()
+        )));
+        assert!(hint.contains("(rate-limit resets: 2026-06-18T15:45:30Z)"));
+    }
+
+    #[test]
+    fn cron_hint_line_omits_reset_fragment_when_retry_after_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let instructions = devflow_core::ship::build_cron_instructions(dir.path(), 7, "", "claude");
+
+        let hint = cron_hint_line(&instructions, dir.path());
+
+        assert_eq!(
+            hint,
+            format!(
+                "Cron instruction pending (phase 7): hermes cron create --from-devflow {}",
+                dir.path().display()
+            )
+        );
+        assert!(!hint.contains("resets"));
     }
 
     #[test]
@@ -2056,6 +2614,84 @@ mod tests {
     fn liveness_treats_zero_and_overflow_pids_as_dead() {
         assert!(!agent::agent_running(0));
         assert!(!agent::agent_running(u32::MAX));
+    }
+
+    /// A live slot renders `agent B (codex) running`, cross-referencing the
+    /// agent-pid file the monitor already writes (21c, D-06).
+    #[test]
+    fn sequentagent_status_renders_running_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        agent_result::write_sequentagent_slot(
+            root,
+            7,
+            agent_result::SequentagentSlotKind::B,
+            AgentKind::Codex,
+        )
+        .unwrap();
+        std::fs::write(
+            agent_result::agent_pid_path(root, 7),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+
+        let rendered = render_sequentagent_status(root).unwrap();
+
+        assert!(rendered.contains("sequentagent"));
+        assert!(rendered.contains("agent B"));
+        assert!(rendered.contains("codex"));
+        assert!(rendered.contains("running"));
+        assert!(!rendered.contains("not running"));
+    }
+
+    /// A slot record whose agent-pid file names a dead process renders
+    /// "not running" — a stale record never claims a live agent (T-21c-02).
+    #[test]
+    fn sequentagent_status_renders_dead_pid_as_not_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        agent_result::write_sequentagent_slot(
+            root,
+            8,
+            agent_result::SequentagentSlotKind::A,
+            AgentKind::Claude,
+        )
+        .unwrap();
+        std::fs::write(agent_result::agent_pid_path(root, 8), "0").unwrap();
+
+        let rendered = render_sequentagent_status(root).unwrap();
+
+        assert!(rendered.contains("not running"));
+    }
+
+    /// A slot record present but with no agent-pid file yet (the monitor
+    /// writes it asynchronously — the launch/pid-write race) renders
+    /// "starting", not "not running" — an honest transient state
+    /// (cross-AI review LOW pid-race).
+    #[test]
+    fn sequentagent_status_renders_starting_when_pid_file_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        agent_result::write_sequentagent_slot(
+            root,
+            9,
+            agent_result::SequentagentSlotKind::A,
+            AgentKind::Claude,
+        )
+        .unwrap();
+
+        let rendered = render_sequentagent_status(root).unwrap();
+
+        assert!(rendered.contains("starting"));
+        assert!(!rendered.contains("not running"));
+    }
+
+    /// No slot records at all → `None`, so `status` prints nothing extra for
+    /// the common (non-sequentagent) case.
+    #[test]
+    fn sequentagent_status_none_when_no_records() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(render_sequentagent_status(dir.path()).is_none());
     }
 
     /// 18b: persisting `monitor_pid` for one phase must not disturb a
@@ -2316,6 +2952,115 @@ mod tests {
         assert!(!banner.contains(&context));
         assert!(!banner.contains('\u{1b}'));
         assert!(banner.contains("ESCALATED"));
+    }
+
+    /// 21a: `recovery_hints` returns a `resume` hint for a stuck phase,
+    /// additionally an `advance` hint when the phase is gate-pending
+    /// (answer the gate, then advance), and nothing for a non-stuck phase.
+    #[test]
+    fn recovery_hints_includes_resume_for_stuck() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::new(7, AgentKind::Claude, Mode::Auto, dir.path().to_path_buf());
+
+        let hints = recovery_hints(&state, Liveness::Stuck);
+
+        assert_eq!(hints, vec!["devflow resume --phase 7".to_string()]);
+    }
+
+    #[test]
+    fn recovery_hints_includes_advance_when_stuck_and_gate_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::new(7, AgentKind::Claude, Mode::Auto, dir.path().to_path_buf());
+        state.gate_pending = true;
+
+        let hints = recovery_hints(&state, Liveness::Stuck);
+
+        assert_eq!(
+            hints,
+            vec![
+                "devflow resume --phase 7".to_string(),
+                "devflow advance --phase 7".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn recovery_hints_empty_for_healthy() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::new(7, AgentKind::Claude, Mode::Auto, dir.path().to_path_buf());
+
+        assert!(recovery_hints(&state, Liveness::Healthy).is_empty());
+    }
+
+    /// 21a: `latest_stage_launched_ts` scans the event log for the LAST
+    /// `stage_launched` event's `ts` — the real stage-entry time — and is
+    /// `None` without one, never falling back to any other field.
+    #[test]
+    fn latest_stage_launched_ts_none_without_event() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(latest_stage_launched_ts(dir.path(), 7), None);
+    }
+
+    /// The closing proof for the 3/3 cross-AI review MEDIUM
+    /// (21-REVIEWS.md): a phase whose latest `stage_launched` event is ~90s
+    /// old but whose phase-level `started_at` is ~30m old must report the
+    /// ~90s stage age — `latest_stage_launched_ts` must never be sourced
+    /// from `state.started_at`.
+    #[test]
+    fn latest_stage_launched_ts_reflects_event_age_not_phase_started_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let stage_ts = now - 90;
+        let phase_started_at = now - 30 * 60;
+
+        let mut state = State::new(7, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.started_at = phase_started_at.to_string();
+        workflow::save_state(&state).unwrap();
+
+        events::emit(
+            root,
+            7,
+            "stage_launched",
+            serde_json::json!({"stage": "code", "agent": "claude", "monitor_pid": 1}),
+        );
+        // events::emit always stamps `ts` with the current time; rewrite it
+        // to a fixed, known-past value so the assertion is deterministic
+        // instead of racing the live clock.
+        let events_path = devflow_core::events::events_path(root);
+        let rewritten: String = std::fs::read_to_string(&events_path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+                value["ts"] = serde_json::json!(stage_ts);
+                value.to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&events_path, rewritten).unwrap();
+
+        let ts = latest_stage_launched_ts(root, 7);
+        assert_eq!(ts, Some(stage_ts));
+
+        let line = render_stage_progress_line(Stage::Code, ts);
+        assert!(line.contains("1m ago"), "expected ~90s age, got: {line}");
+        assert!(
+            !line.contains("30m ago"),
+            "must not render phase-level started_at age: {line}"
+        );
+    }
+
+    #[test]
+    fn render_stage_progress_line_omits_age_without_stage_launched_event() {
+        assert_eq!(
+            render_stage_progress_line(Stage::Plan, None),
+            "  in stage plan"
+        );
     }
 
     /// Unit tests for the pure `doctor` reconciliation core (18a). Each test
@@ -2641,7 +3386,7 @@ mod tests {
             workflow::save_state(&state).unwrap();
             let facts = collect_phase_facts(root);
 
-            let body = doctor_json_body(&checks, &facts);
+            let body = doctor_json_body(&checks, &facts, &[]);
             let serialized = serde_json::to_string(&body).unwrap();
             let reparsed: serde_json::Value = serde_json::from_str(&serialized)
                 .expect("doctor --json must be single-document JSON, not two concatenated arrays");
@@ -2654,8 +3399,19 @@ mod tests {
                 reparsed.get("reconciliation").is_some(),
                 "must carry the reconciliation findings under \"reconciliation\": {reparsed}"
             );
+            assert!(
+                reparsed.get("planning_doc_staleness").is_some(),
+                "21b: must carry the planning-doc findings under a THIRD key, \
+                 never a second concatenated array: {reparsed}"
+            );
+            assert_eq!(
+                reparsed.as_object().unwrap().len(),
+                3,
+                "doctor --json must have exactly three top-level keys: {reparsed}"
+            );
             assert!(reparsed["environment"].is_array());
             assert!(reparsed["reconciliation"].is_array());
+            assert!(reparsed["planning_doc_staleness"].is_array());
             let reconciliation = reparsed["reconciliation"].as_array().unwrap();
             assert!(
                 !reconciliation.is_empty(),
@@ -2720,6 +3476,291 @@ mod tests {
                 before_lines, after_lines,
                 "doctor must not append to events.jsonl"
             );
+        }
+    }
+
+    /// Unit tests for the pure planning-doc staleness core (21b, D-04/D-05).
+    /// `reconcile_planning_docs` takes an injected `tag_lookup` closure, so
+    /// every test here runs with zero I/O and no real repository — mirrors
+    /// `doctor_reconciliation`'s zero-I/O discipline above.
+    #[cfg(test)]
+    mod planning_doc_staleness {
+        use super::*;
+
+        const SAMPLE_TABLE: &str = "\
+| Phase | Name | Version |
+|---|---|---|
+| 20 | Release Correctness | 1.7.0 |
+| 10 | Logging | — |
+| 1–5 | Core workflow | 0.1.0–0.6.0 |
+| 9 | OSS Polish | 1.2.0 |
+| 11 | GSD-Native | 1.2.0 |
+";
+
+        #[test]
+        fn parse_planning_doc_versions_skips_non_semver_cells() {
+            let rows = parse_planning_doc_versions(SAMPLE_TABLE, "ROADMAP.md");
+            assert_eq!(
+                rows,
+                vec![
+                    ("ROADMAP.md phase 20".to_string(), "1.7.0".to_string()),
+                    ("ROADMAP.md phase 9".to_string(), "1.2.0".to_string()),
+                    ("ROADMAP.md phase 11".to_string(), "1.2.0".to_string()),
+                ],
+                "em-dash and range cells must be skipped; duplicate versions across \
+                 phases (9 and 11 both claim 1.2.0) must both still parse"
+            );
+        }
+
+        #[test]
+        fn parse_planning_doc_versions_accepts_v_prefixed_cells() {
+            let text = "| Phase | Description | Version | Date |\n\
+                         |---|---|---|---|\n\
+                         | 18 | Dogfood Hardening | v1.5.0 | 2026-07-21 |\n";
+            let rows = parse_planning_doc_versions(text, "STATE.md");
+            assert_eq!(
+                rows,
+                vec![("STATE.md phase 18".to_string(), "v1.5.0".to_string())]
+            );
+        }
+
+        #[test]
+        fn parse_semver_rejects_ranges_and_em_dash() {
+            assert_eq!(parse_semver("1.7.0"), Some((1, 7, 0)));
+            assert_eq!(parse_semver("v1.7.0"), Some((1, 7, 0)));
+            assert_eq!(parse_semver("0.1.0–0.6.0"), None);
+            assert_eq!(parse_semver("—"), None);
+            assert_eq!(parse_semver("1.7"), None);
+            assert_eq!(parse_semver("1.7.0.1"), None);
+        }
+
+        #[test]
+        fn reconcile_planning_docs_flags_problem_for_unreachable_post_cutoff_version() {
+            let rows = vec![("ROADMAP.md phase 20".to_string(), "1.7.0".to_string())];
+            let mut lookup = |_tag: &str| false; // no tag exists / unreachable
+            let findings = reconcile_planning_docs(&rows, &mut lookup);
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].severity, Severity::Problem);
+            assert!(
+                findings[0].repair.is_none(),
+                "D-04: detection-only, no repair"
+            );
+            assert!(findings[0].detail.contains("v1.7.0"));
+        }
+
+        #[test]
+        fn reconcile_planning_docs_downgrades_pre_cutoff_mismatch_to_warn() {
+            // Phase 7 claims 1.0.0 in this repo's real ROADMAP.md/STATE.md,
+            // but no v1.0.0 tag exists (tags start at v1.0.1) — must never
+            // surface as Problem (RESEARCH Pitfall #2).
+            let rows = vec![("ROADMAP.md phase 7".to_string(), "1.0.0".to_string())];
+            let mut lookup = |_tag: &str| false;
+            let findings = reconcile_planning_docs(&rows, &mut lookup);
+            assert_eq!(findings.len(), 1);
+            assert_eq!(
+                findings[0].severity,
+                Severity::Warn,
+                "pre-v1.5.0 mismatches must downgrade to Warn, never Problem"
+            );
+            assert!(findings[0].repair.is_none());
+        }
+
+        #[test]
+        fn reconcile_planning_docs_numeric_cutoff_is_not_lexicographic() {
+            // A lexicographic string compare would sort "1.10.0" < "1.5.0"
+            // and wrongly downgrade a real future release to Warn (Codex
+            // MEDIUM, cross-AI review). The cutoff must compare
+            // parse_semver's numeric tuple instead.
+            let rows = vec![
+                ("label A".to_string(), "1.10.0".to_string()),
+                ("label B".to_string(), "1.4.0".to_string()),
+            ];
+            let mut lookup = |_tag: &str| false;
+            let findings = reconcile_planning_docs(&rows, &mut lookup);
+            assert_eq!(findings.len(), 2);
+            assert_eq!(
+                findings[0].severity,
+                Severity::Problem,
+                "1.10.0 is numerically >= v1.5.0 (post-cutoff), even though \
+                 \"1.10.0\" < \"1.5.0\" as a string"
+            );
+            assert_eq!(
+                findings[1].severity,
+                Severity::Warn,
+                "1.4.0 is numerically < v1.5.0 (pre-cutoff)"
+            );
+        }
+
+        #[test]
+        fn reconcile_planning_docs_produces_no_finding_when_tag_is_reachable() {
+            let rows = vec![("ROADMAP.md phase 20".to_string(), "1.7.0".to_string())];
+            let mut lookup = |_tag: &str| true; // tag exists and is reachable
+            let findings = reconcile_planning_docs(&rows, &mut lookup);
+            assert!(findings.is_empty());
+        }
+
+        #[test]
+        fn reconcile_planning_docs_normalizes_bare_cell_to_v_prefixed_tag() {
+            let rows = vec![("ROADMAP.md phase 20".to_string(), "1.7.0".to_string())];
+            let mut seen_tag = None;
+            let mut lookup = |tag: &str| {
+                seen_tag = Some(tag.to_string());
+                true
+            };
+            reconcile_planning_docs(&rows, &mut lookup);
+            assert_eq!(seen_tag.as_deref(), Some("v1.7.0"));
+        }
+
+        #[test]
+        fn reconcile_planning_docs_skips_a_malformed_row_defensively() {
+            // Defensive path: reconcile must never panic even if handed a
+            // row whose version cell isn't a semver (parse_planning_doc_versions
+            // already filters this upstream, but reconcile must degrade, not die).
+            let rows = vec![("bad row".to_string(), "not-a-version".to_string())];
+            let mut lookup = |_tag: &str| false;
+            let findings = reconcile_planning_docs(&rows, &mut lookup);
+            assert!(findings.is_empty());
+        }
+
+        /// Fixture-backed proof of `tag_exists_and_reachable`'s two-check
+        /// contract, mirroring `staleness::init_repo_with_diverged_commit`'s
+        /// idiom: a real tempdir git repo with a tagged, reachable commit,
+        /// an untagged commit, and a commit on a diverged, unreachable branch.
+        fn init_tagged_repo(root: &Path) {
+            let git = |args: &[&str]| {
+                assert!(
+                    std::process::Command::new("git")
+                        .args(args)
+                        .current_dir(root)
+                        .output()
+                        .unwrap()
+                        .status
+                        .success(),
+                    "git {args:?} failed"
+                );
+            };
+            git(&["init", "-q", "-b", "main"]);
+            git(&["config", "user.email", "t@e.st"]);
+            git(&["config", "user.name", "t"]);
+            git(&["config", "commit.gpgsign", "false"]);
+            git(&["config", "tag.gpgsign", "false"]);
+            git(&["config", "core.hooksPath", "/dev/null"]);
+            std::fs::write(root.join("a.txt"), "one").unwrap();
+            git(&["add", "."]);
+            git(&["commit", "-q", "-m", "base"]);
+            git(&["tag", "v1.7.0"]);
+
+            git(&["checkout", "-q", "-b", "side"]);
+            std::fs::write(root.join("side.txt"), "s").unwrap();
+            git(&["add", "."]);
+            git(&["commit", "-q", "-m", "side"]);
+            git(&["tag", "v9.9.9"]); // tagged, but only reachable from `side`, not `main`
+
+            git(&["checkout", "-q", "main"]);
+        }
+
+        #[test]
+        fn tag_exists_and_reachable_true_for_a_tagged_ancestor() {
+            let dir = tempfile::tempdir().unwrap();
+            init_tagged_repo(dir.path());
+            assert!(tag_exists_and_reachable(dir.path(), "v1.7.0", "main"));
+        }
+
+        #[test]
+        fn tag_exists_and_reachable_false_for_a_missing_tag() {
+            let dir = tempfile::tempdir().unwrap();
+            init_tagged_repo(dir.path());
+            assert!(!tag_exists_and_reachable(dir.path(), "v0.0.1", "main"));
+        }
+
+        #[test]
+        fn tag_exists_and_reachable_false_for_a_tag_unreachable_from_base() {
+            let dir = tempfile::tempdir().unwrap();
+            init_tagged_repo(dir.path());
+            assert!(!tag_exists_and_reachable(dir.path(), "v9.9.9", "main"));
+        }
+
+        /// D-05/D-04: a MISSING `.planning/ROADMAP.md`/`STATE.md` must yield
+        /// no findings and never an error — `doctor` must not fabricate a
+        /// `Problem` from an absent doc. Proven against a tempdir with no
+        /// `.planning/` directory at all, not just asserted.
+        #[test]
+        fn collect_planning_doc_findings_missing_files_yield_no_findings_not_error() {
+            let dir = tempfile::tempdir().unwrap();
+            let findings = collect_planning_doc_findings(dir.path());
+            assert!(
+                findings.is_empty(),
+                "a project with no .planning/ dir at all must yield zero findings, not an error"
+            );
+        }
+
+        #[test]
+        fn render_planning_doc_text_reports_consistent_when_no_findings() {
+            assert_eq!(
+                render_planning_doc_text(&[]),
+                "\nplanning docs: consistent with git tags\n"
+            );
+        }
+
+        #[test]
+        fn render_planning_doc_text_lists_each_finding_detail() {
+            let findings = vec![PlanningDocFinding {
+                source: "ROADMAP.md phase 20".to_string(),
+                claim: "ROADMAP.md phase 20 claims v1.7.0".to_string(),
+                severity: Severity::Problem,
+                detail: "ROADMAP.md phase 20 claims v1.7.0, but no git tag `v1.7.0` exists"
+                    .to_string(),
+                repair: None,
+            }];
+            let text = render_planning_doc_text(&findings);
+            assert!(text.contains("[problem]"));
+            assert!(text.contains("ROADMAP.md phase 20 claims v1.7.0"));
+        }
+
+        #[test]
+        fn render_planning_doc_findings_json_is_an_array_of_objects() {
+            let findings = vec![PlanningDocFinding {
+                source: "ROADMAP.md phase 20".to_string(),
+                claim: "ROADMAP.md phase 20 claims v1.7.0".to_string(),
+                severity: Severity::Problem,
+                detail: "detail text".to_string(),
+                repair: None,
+            }];
+            let value = render_planning_doc_findings_json(&findings);
+            assert!(value.is_array());
+            let arr = value.as_array().unwrap();
+            assert_eq!(arr.len(), 1);
+            assert_eq!(arr[0]["severity"], "problem");
+            assert_eq!(arr[0]["source"], "ROADMAP.md phase 20");
+            assert_eq!(arr[0]["repair"], serde_json::Value::Null);
+        }
+
+        /// D-05/Pattern 2: `doctor --json` must stay a SINGLE JSON object
+        /// with `planning_doc_staleness` as a THIRD key, never a second
+        /// top-level array — the exact WR-01 regression class this phase
+        /// must not reintroduce.
+        #[test]
+        fn doctor_json_body_carries_planning_doc_staleness_as_a_third_key() {
+            let checks: Vec<Check> = Vec::new();
+            let facts: Vec<PhaseFacts> = Vec::new();
+            let doc_findings = vec![PlanningDocFinding {
+                source: "ROADMAP.md phase 20".to_string(),
+                claim: "claim".to_string(),
+                severity: Severity::Problem,
+                detail: "detail".to_string(),
+                repair: None,
+            }];
+            let body = doctor_json_body(&checks, &facts, &doc_findings);
+            let obj = body.as_object().unwrap();
+            assert_eq!(
+                obj.len(),
+                3,
+                "must be exactly {{environment, reconciliation, planning_doc_staleness}}: {body}"
+            );
+            assert!(obj.contains_key("environment"));
+            assert!(obj.contains_key("reconciliation"));
+            let staleness = obj["planning_doc_staleness"].as_array().unwrap();
+            assert_eq!(staleness.len(), 1);
         }
     }
 }

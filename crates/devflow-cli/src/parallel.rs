@@ -6,7 +6,7 @@
 //! `save_state` chokepoint here (D-14: the retrospective proposal to add one
 //! was verified wrong for exactly this reason before this phase's split).
 
-use devflow_core::agent_result::{self, AgentStatus};
+use devflow_core::agent_result::{self, AgentStatus, SequentagentSlotKind};
 use devflow_core::agents;
 use devflow_core::config::{DEVELOP, FEATURE_PREFIX, capture_retention};
 use devflow_core::events;
@@ -157,6 +157,7 @@ fn run_agent_blocking(
     phase: u32,
     agent: AgentKind,
     workdir: &Path,
+    slot: SequentagentSlotKind,
 ) -> Result<Option<agent_result::AgentResult>, CliError> {
     if let Some(stamp) = agent_result::archive_phase_files(
         project_root,
@@ -199,6 +200,12 @@ fn run_agent_blocking(
     let monitor_pid =
         monitor::spawn_monitor_no_advance(&state, program, &args, &adapter.extra_env())
             .map_err(|err| CliError::Message(format!("could not spawn monitor: {err}")))?;
+    // Additive observability bookkeeping only — a write failure here must
+    // never fail the actual agent run (D-06's narrow scope: this makes the
+    // second process observable, it does not gate execution on it).
+    if let Err(err) = agent_result::write_sequentagent_slot(project_root, phase, slot, agent) {
+        println!("warning: could not write sequentagent slot record: {err}");
+    }
     println!(
         "launched {} (monitor pid {monitor_pid}) in {}",
         adapter.name(),
@@ -273,6 +280,24 @@ fn integrate_agent_branch(
     Ok(())
 }
 
+/// RAII guard that clears the `sequentagent` slot record for `phase` when
+/// dropped. Bound once, before agent A runs, so its `Drop` impl fires on
+/// EVERY terminal path out of [`sequentagent`] below — all five error-exits
+/// (agent A failed, agent A rate-limited with zero commits, rebase-B
+/// conflict, agent B failed/rate-limited, integrate-B failure) and the
+/// success path — replacing a fragile success-path-only clear (cross-AI
+/// review MUST-FIX).
+struct SequentagentSlotGuard<'a> {
+    project_root: &'a Path,
+    phase: u32,
+}
+
+impl Drop for SequentagentSlotGuard<'_> {
+    fn drop(&mut self) {
+        agent_result::clear_sequentagent_slot(self.project_root, self.phase);
+    }
+}
+
 /// Run two agents sequentially on one phase, each in its own worktree, with a
 /// rebase handoff between them. See the `Sequentagent` command docs.
 pub(crate) fn sequentagent(
@@ -333,9 +358,21 @@ pub(crate) fn sequentagent(
     println!("worktree A: {} ({branch_a})", wt_a.display());
     println!("worktree B: {} ({branch_b})", wt_b.display());
 
+    // Clears the sequentagent slot record on EVERY exit path from this point
+    // forward — all five error-exits below AND success (cross-AI review
+    // MUST-FIX). A leaked record is harmless (render_sequentagent_status
+    // probes agent_running(pid) and renders "not running"), so this guard
+    // fixes `.devflow/` clutter accumulation, not a correctness bug.
+    let _slot_guard = SequentagentSlotGuard {
+        project_root,
+        phase,
+    };
+
     // 3. Run agent A; stop before touching B if it fails.
     println!("\n=== agent A: {agent_a} ===");
-    if let Some(result) = run_agent_blocking(project_root, phase, agent_a, &wt_a)? {
+    if let Some(result) =
+        run_agent_blocking(project_root, phase, agent_a, &wt_a, SequentagentSlotKind::A)?
+    {
         match result.status {
             AgentStatus::Failed => {
                 return Err(CliError::Message(format!(
@@ -373,7 +410,8 @@ pub(crate) fn sequentagent(
 
     // 5. Run agent B and integrate.
     println!("\n=== agent B: {agent_b} ===");
-    if let Some(result) = run_agent_blocking(project_root, phase, agent_b, &wt_b)?
+    if let Some(result) =
+        run_agent_blocking(project_root, phase, agent_b, &wt_b, SequentagentSlotKind::B)?
         && matches!(
             result.status,
             AgentStatus::Failed | AgentStatus::RateLimited
@@ -526,5 +564,59 @@ mod tests {
         );
         assert_eq!(retry_after_from_reason(Some("usage limit")), "unknown");
         assert_eq!(retry_after_from_reason(None), "unknown");
+    }
+
+    /// Proves the guard clears the slot record on drop even when drop is
+    /// reached via an early `return` — not just the success path — since a
+    /// `?`/`return` inside a block exits the enclosing scope exactly the same
+    /// way normal fall-through does (3/3-review MUST-FIX).
+    #[test]
+    fn slot_guard_clears_record_on_early_return() {
+        let dir = tempfile::tempdir().unwrap();
+        agent_result::write_sequentagent_slot(
+            dir.path(),
+            42,
+            SequentagentSlotKind::A,
+            AgentKind::Claude,
+        )
+        .unwrap();
+        assert!(agent_result::read_sequentagent_slot(dir.path(), 42).is_some());
+
+        fn exits_early(project_root: &Path, phase: u32) -> Result<(), ()> {
+            let _slot_guard = SequentagentSlotGuard {
+                project_root,
+                phase,
+            };
+            Err(()) // simulates one of sequentagent's five error-exit `return`s
+        }
+        let _ = exits_early(dir.path(), 42);
+
+        assert!(
+            agent_result::read_sequentagent_slot(dir.path(), 42).is_none(),
+            "slot guard did not clear the record on an early return"
+        );
+    }
+
+    /// Proves the guard also clears on ordinary fall-through (the success
+    /// path), not only on an early return.
+    #[test]
+    fn slot_guard_clears_record_on_success_path() {
+        let dir = tempfile::tempdir().unwrap();
+        agent_result::write_sequentagent_slot(
+            dir.path(),
+            43,
+            SequentagentSlotKind::B,
+            AgentKind::Codex,
+        )
+        .unwrap();
+
+        {
+            let _slot_guard = SequentagentSlotGuard {
+                project_root: dir.path(),
+                phase: 43,
+            };
+        }
+
+        assert!(agent_result::read_sequentagent_slot(dir.path(), 43).is_none());
     }
 }

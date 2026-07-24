@@ -370,27 +370,25 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.2: A Phase Tracks Exactly One Process (BACKLOG)
+### Phase 999.2: A Phase Tracks Exactly One Process (DELIVERED — Phase 21 / 21c)
 
 **Goal:** One `phase-N-agent-pid` file per phase leaves the monitor unrecorded and `sequentagent`'s second agent homeless. Frame as two tracked processes per phase. *(was 19b)*
-**Priority:** Medium | **Size:** M — reviewed 2026-07-21: the "monitor unrecorded" half is now fixed by Phase 18's 18b (`State.monitor_pid` shipped in v1.5.0); remaining scope is narrower — `sequentagent`'s orphaned second process only. Re-scope before promoting. Linear: DEN-27.
-**Requirements:** TBD — see CONTEXT.md
-**Plans:** 0 plans
+**Priority:** Medium | **Size:** M — the "monitor unrecorded" half shipped in v1.5.0 (18b); the narrowed remainder (`sequentagent`'s orphaned second process) was **delivered by Phase 21 unit 21c** (plan 21-04) — a path-free A/B slot record surfaced in `status`, verified 2026-07-23 (21/21). Linear: DEN-27 (Done, 2026-07-23).
+**Delivered:** Phase 21 unit 21c / plan 21-04, 2026-07-23
 
 Plans:
 
-- [ ] TBD (promote with /gsd-review-backlog when ready)
+- [x] Delivered by Phase 21 (21c / 21-04) — absorbed as a unit, not separately promoted
 
-### Phase 999.3: CLI Operator Discoverability (BACKLOG)
+### Phase 999.3: CLI Operator Discoverability (DELIVERED — Phase 21 / 21a)
 
 **Goal:** Gate reasons truncate with no `devflow gate show`; rate-limit reset times buried in raw JSON; `status` lacks in-stage progress; recovery verbs undiscoverable from a stuck state. *(was 19c)*
-**Priority:** Low | **Size:** L — reviewed 2026-07-21: confirmed still true at HEAD (no `gate show` command exists). Self-scoped as UX, safe behind correctness work; bundles 4 distinct gaps — split into smaller issues when promoted. Linear: DEN-28.
-**Requirements:** TBD — see CONTEXT.md
-**Plans:** 0 plans
+**Priority:** Low | **Size:** L — all four bundled gaps **delivered by Phase 21 unit 21a** (plan 21-02): `devflow gate show <phase>` (untruncated), rate-limit reset surfaced in `status`, in-stage progress line, recovery-verb hints — verified 2026-07-23 (21/21). Linear: DEN-28 (Done, 2026-07-23).
+**Delivered:** Phase 21 unit 21a / plan 21-02, 2026-07-23
 
 Plans:
 
-- [ ] TBD (promote with /gsd-review-backlog when ready)
+- [x] Delivered by Phase 21 (21a / 21-02) — absorbed as a unit, not separately promoted
 
 ### Phase 999.4: Version-Tag Contention on Concurrent Ship (BACKLOG)
 
@@ -436,16 +434,15 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.14: Doctor Reconciliation for Planning-Doc Staleness (BACKLOG)
+### Phase 999.14: Doctor Reconciliation for Planning-Doc Staleness (DELIVERED — Phase 21 / 21b)
 
 **Goal:** `devflow doctor`'s 18a reconciliation checks phase state against events/PIDs/gates/branches, but nothing checks whether `ROADMAP.md`/`STATE.md`'s own narrative still matches reality once a phase's outcome is decided by a manual, out-of-band action (merge, tag, publish). Found 2026-07-21: `STATE.md`/`ROADMAP.md` claimed Phase 18 was "not yet merged / released" after v1.5.0 had already shipped — the same class of bug `17-REVIEW.md` WR-06 already named once (19e/19f marked open after `17-13` had already closed them).
-**Priority:** Medium | **Size:** M — added 2026-07-21. Detection-only scope (flag stale version claims against git tags), deliberately not auto-correcting prose. Linear: DEN-39.
-**Requirements:** TBD — see CONTEXT.md
-**Plans:** 0 plans
+**Priority:** Medium | **Size:** M — **delivered by Phase 21 unit 21b** (plan 21-03): detection-only `planning_doc_staleness` finding in `doctor` (human + `--json`) reconciling ROADMAP/STATE version claims against git tags, never rewriting prose — verified 2026-07-23 (21/21; live run produced 4 correct Warn findings, 0 false Problems). Linear: DEN-39 (Done, 2026-07-23).
+**Delivered:** Phase 21 unit 21b / plan 21-03, 2026-07-23
 
 Plans:
 
-- [ ] TBD (promote with /gsd-review-backlog when ready)
+- [x] Delivered by Phase 21 (21b / 21-03) — absorbed as a unit, not separately promoted
 
 ### Phase 999.15: Hermetic Tests for Shell Entry Points (BACKLOG)
 
@@ -556,3 +553,98 @@ Plans:
 Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.28: Explicit `--base` Branch Override for `devflow start` (BACKLOG)
+
+**Goal:** Add an explicit `--base <branch>` flag to `devflow start` (default `develop`) so an operator can cut `feature/phase-NN` onto a base other than `develop` — chiefly an unmerged predecessor phase branch, to honor a `depends_on` chain and stack dependent phases. Keep the default `develop`; do **not** implicitly base on the operator's current branch (base must be explicit, never inferred from shell state).
+**Priority:** Medium | **Size:** M — base is hardcoded to `develop` (`crates/devflow-core/src/git.rs:54`) and the hardcode is load-bearing for `ship` (Merge→develop→VersionBump) and `parallel` (develop-rooted shared base), so `--base` must thread through launch, and the ship/merge-target semantics for a non-`develop` base need a design pass. The gap: the ROADMAP encodes 22→21→20 but no phase can build on an unmerged predecessor. Source: Phase 21 dogfood-launch design discussion (2026-07-23). **Reassigned to Phase 22** (concurrency/stacking value). Linear: DEN-53.
+**Requirements:** TBD — see CONTEXT.md
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.29: Dogfood Staleness Guard False-Positives on Docs-Only Commits (DELIVERED — Phase 21 / 21d)
+
+**Goal:** Make `enforce_build_staleness`'s commit-ancestry arm **content-aware** so a self-dogfood run is not hard-blocked when the only commits ahead of the binary's embedded commit changed nothing the compiler sees (`.planning/` docs, etc.). `embedded_commit_is_stale` (`crates/devflow-cli/src/staleness.rs`) returns `Stale` on *any* strict-ancestor HEAD (verified live in Phase 21: binary at `7163347`, worktree HEAD `3a17381`, delta = `.planning/*` only, yet hard-blocked), whereas the dirty-tree arm was already narrowed to `affects_compiled_binary` in 17-10. Apply the same filter to the ancestry arm: `git diff --name-only <embedded> HEAD` → if no build-affecting file changed, `Fresh`. Also fix the block message ("is not an ancestor of HEAD" is wrong for the common case where it *is* an ancestor, just behind).
+**Priority:** High | **Size:** S — a false-positive hard-block on DevFlow's own primary workflow (dogfooding commits docs constantly, re-arming the block after every build); the fix is a targeted narrowing with direct precedent (17-10) plus a mixed-range test (docs + a `.rs` change must still block, preserving the Phase 16 false-evidence protection). Retires the `[[feedback-dogfood-rebuild-before-revalidate]]` workaround. Source: Phase 21 dogfood run (2026-07-23), observed live. **Delivered as Phase 21 unit 21d** (plan 21-01): content-aware strict-ancestor arm (docs-only → Fresh, build-input → Stale, fails toward Stale on git error), verified 2026-07-23 (21/21). NOTE: in source on `develop` but **unshipped** — the running binary still false-blocks until a ≥21-01 build runs. Linear: DEN-54 (Done, 2026-07-23; estimate set to 3 to satisfy the team's completion rule).
+**Delivered:** Phase 21 unit 21d / plan 21-01, 2026-07-23
+
+Plans:
+
+- [x] Delivered by Phase 21 (21d / 21-01) — folded in as a unit, not separately promoted
+
+### Phase 999.30: Phase 21 Code-Review Cleanup — gate_show/doctor DRY + TOCTOU (BACKLOG)
+
+**Goal:** Resolve the four advisory findings from `21-REVIEW.md` (0 critical / 3 warning / 1 info; Phase 21 verified 21/21, no correctness or security defect — these are quality/maintainability only). **WR-01:** `gate_show`'s stage auto-resolution is copy-pasted from `gate_respond` (`crates/devflow-cli/src/commands.rs:810-844`) despite a doc comment claiming the two "can never drift" — extract a shared `resolve_single_open_gate_stage` both call (the same copy-paste-with-"can never drift"-comment smell also sits at `commands.rs:1827`). **WR-02:** `collect_planning_doc_findings` (`commands.rs:2285`) hardcodes `"main"` instead of `devflow_core::config::MAIN` (`config.rs:15`) — matches today so no live bug, but an unlinked second source of truth that would emit false `doctor` Problems if the branch ever becomes configurable. **WR-03:** `gate_show` calls `Gates::list_open` twice (narrow TOCTOU + redundant read) — fetch once, reuse. **IN-01 (info):** `latest_stage_launched_ts` reintroduces the per-phase full-file `events.jsonl` rescan that 14-CR-10 eliminated in the same `status()` function — fold the last `stage_launched` ts into the existing single-pass `last_events_by_phase`.
+**Priority:** Low | **Size:** S — WR-01/02/03 are small localized fixes (default `--fix` scope covers all three); IN-01 is a follow-up perf refactor. Source: `21-REVIEW.md` (gsd-code-reviewer, 2026-07-23), deferred to backlog by operator decision. Linear: DEN-55 (Backlog).
+**Requirements:** TBD — see 21-REVIEW.md
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 21: Operator Legibility & Observability
+
+**Goal:** Make DevFlow's operator surface **legible** and its self-reported state **trustworthy** — every unit single-writer, operator-facing, reversible or detection-only, and testable without any irreversible side effect. Scope recut from the original "Operator Usability & Release Execution" (operator decision, 2026-07-23): the release-cut executor (999.25) and `--base` (999.28) were removed (→ own phase / Phase 22 respectively) and the phase backfilled with legibility/observability units. Not `/gsd-review-backlog`-promoted; scope is operator-decided — see `phases/21-*/21-CONTEXT.md`.
+**Requirements**: TBD (no REQ-IDs — units 21a–21d map to CONTEXT decisions D-03..D-07)
+**Depends on:** Phase 20
+**Plans:** 4/4 plans complete
+
+**Sequencing is load-bearing:** 21d (staleness content-awareness) leads in Wave 1
+per D-07 — the dogfood staleness guard hard-blocks this phase's own stages after
+every `.planning/` commit, so it lands first. 21a/21b/21c then serialize
+(Waves 2/3/4) because all three edit `crates/devflow-cli/src/commands.rs` and the
+same-wave zero-file-overlap rule forbids parallelizing them (the familiar
+`commands.rs`/`main.rs` contention from Phases 18/19). 21e (changelog content)
+stays excluded stretch (D-08, blocked on a content-source design decision).
+
+Units (operator-decided; committed unless marked optional):
+
+- **21a** — Operator discoverability (999.3 / DEN-28): `gate show`, rate-limit reset surfacing, in-stage `status` progress, recovery-verb hints. Sequence early.
+- **21b** — Doctor planning-doc staleness reconciliation (999.14 / DEN-39): flag stale ROADMAP/STATE narrative vs git tags; detection-only.
+- **21c** — sequentagent second-process tracking (999.2 / DEN-27): narrowed — monitor half shipped v1.5.0.
+- **21d** — Dogfood staleness guard content-awareness (999.29 / DEN-54): stop docs-only false-blocks. **Sequence first** (unblocks this phase's own stages).
+- **21e** *(optional/stretch)* — ChangelogAppend real content (999.5 / DEN-30): blocked on choosing a content source.
+
+Plans:
+
+**Wave 1** *(21d first per D-07 — unblocks this phase's own dogfood stages)*
+
+- [x] 21-01-PLAN.md — 21d: content-aware `embedded_commit_is_stale` strict-ancestor arm (docs-only ranges → Fresh; docs+source → Stale) + fix two now-broken fixtures + block-message wording (staleness.rs)
+
+**Wave 2** *(blocked on 21-01; shares commands.rs with 21b/21c)*
+
+- [x] 21-02-PLAN.md — 21a: additive discoverability — `devflow gate show <phase>` (untruncated), rate-limit reset time in `status`, in-stage progress line, recovery-verb hints from a stuck state (commands.rs, main.rs)
+
+**Wave 3** *(blocked on 21-02; shares commands.rs)*
+
+- [x] 21-03-PLAN.md — 21b: detection-only `doctor` planning-doc staleness check vs git tags — third `--json` key, v1.5.0 legacy-noise cutoff, no prose auto-edit (commands.rs)
+
+**Wave 4** *(blocked on 21-03; shares commands.rs)*
+
+- [x] 21-04-PLAN.md — 21c: sequentagent second-process record (path-free slot A/B + AgentKind, not routed through State) surfaced in `status` (agent_result.rs, parallel.rs, commands.rs)
+
+### Phase 22: Concurrency & Governance Correctness
+
+**Goal:** [To be planned]
+**Requirements**: TBD
+**Depends on:** Phase 21
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (run /gsd-plan-phase 22 to break down)
+
+### Phase 23: Test Suite & CI Hardening
+
+**Goal:** [To be planned]
+**Requirements**: TBD
+**Depends on:** Phase 22
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (run /gsd-plan-phase 23 to break down)

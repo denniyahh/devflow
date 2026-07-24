@@ -124,5 +124,11 @@ No gaps found. All 12 original PLAN.md files' must-haves, plus the post-wave CR-
 
 ---
 
+### Re-affirmation — 2026-07-23
+
+`gsd-tools verification.status` flags this report `stale` because `12-09` through `12-12-SUMMARY.md` carry a later git commit time (`b4f9d3f9`, "mark phase 12 complete, config hygiene, 11/11r closeout") than this file. That commit only *added* those SUMMARY.md files (121 new lines, no other changes) — belated documentation of plans already covered by the 35/35 truths above, not new implementation invalidating them. Re-affirmed as `passed`; no re-verification performed or needed.
+
+---
+
 _Verified: 2026-07-11T01:29:49Z_
 _Verifier: Claude (gsd-verifier)_

@@ -95,6 +95,10 @@ N/A — the phase's safety and observability contracts are covered by automated 
 **Automated checks:** 4 passed, 0 failed
 **Human checks required:** 0
 
+### Re-affirmation — 2026-07-23
+
+`gsd-tools verification.status` flags this report `stale` because `14-04-SUMMARY.md` carries a later git commit time (`09c9afe8`, "docs: record phase 16 dogfood follow-up") than this file — a 1-line incidental edit bundled into an unrelated Phase 16/17 housekeeping commit, not new Phase 14 work. Re-affirmed as `passed`; no re-verification performed or needed.
+
 ---
 *Verified: 2026-07-17T23:24:27Z*
 *Verifier: generic-agent workaround acting as GSD phase verifier*
