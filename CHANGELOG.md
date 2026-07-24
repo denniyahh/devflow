@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.8.1 — 2026-07-24
+
+Test-suite containment and quality cleanup. No behavior change for `devflow`
+users: every production git invocation was already correctly pinned, so the
+defect fixed here could only affect people running the test suite from a
+checkout — but for them it was severe.
+
+### Fixed
+- **The test suite could escape its sandbox and corrupt the developer's own repository.** Running `cargo test` from a git hook — which `scripts/hooks/pre-push` does on every push — let fixtures operate on the real checkout instead of their tempdirs. Observed damage: the main repository flipped to `core.bare=true`, its committer identity was rewritten to a fixture's, and ten fixture commits were stacked onto local `main`, the first of which deleted all 511 tracked files. Root cause: git exports `GIT_DIR` into hook environments when the gitdir is non-default — precisely the case when pushing from a linked worktree — and `GIT_DIR` outranks a process's working directory when git resolves which repository to act on. Because Rust runs a test binary's tests as threads in one process, the whole suite inherited it and every fixture retargeted the real repo despite correctly pinning `.current_dir()`. Neither `git -C` nor `GIT_CEILING_DIRECTORIES` overrides `GIT_DIR`, so pinning the working directory can never be the containment mechanism; clearing the variables is. Fixed in three layers: `scripts/hooks/pre-push` now clears `$(git rev-parse --local-env-vars)` before running anything, `devflow_core::test_support::git_command` applies the same scrub per command across 50 migrated call sites, and a new guard test fails fast and names the cause when the environment is dirty
+- `gate show` and `gate respond` no longer duplicate the omitted-`--stage` resolution logic, so their behavior cannot drift apart (999.30 WR-01)
+- `gate show` reads the open-gate list once instead of twice, closing a narrow time-of-check/time-of-use window (999.30 WR-03)
+- `doctor`'s planning-doc reconciliation uses `config::MAIN` instead of a second hardcoded `"main"`, removing an unlinked source of truth that would emit false Problems if the base branch ever became configurable (999.30 WR-02)
+
+### Added
+- `scripts/hooks/pre-commit`, a chaining shim. `core.hooksPath` replaces the hooks directory wholesale, so the documented `git config core.hooksPath scripts/hooks` install step would otherwise silently disable a global pre-commit secret scanner. It delegates to whatever hook you already had, and is a no-op if you have none
+- `devflow-core` gains an off-by-default `test-support` feature exposing `test_support::git_command` for hermetic fixture construction. Not enabled in a normal build
+
+### Changed
+- DevFlow is now described as *opinionated* rather than *agent-agnostic* across the README, ARCHITECTURE, guides, both crate descriptions and `--help`. It bakes in one developer's specific take on branching, gating and verification rather than aiming to be a universal platform. Three agents are supported today (Claude Code, Codex, OpenCode) through a shared adapter; a fully agent-neutral driver architecture is backlog work
+- `status` no longer re-scans `events.jsonl` per phase for the stage-entry timestamp, folding it into the existing single-pass event summary (999.30 IN-01)
+
 ## 1.8.0 — 2026-07-23
 
 Operator legibility and observability: make DevFlow's operator surface legible
