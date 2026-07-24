@@ -9,7 +9,6 @@
 //! need to exist on disk for the check to be meaningful.
 
 use std::path::PathBuf;
-use std::process::Command;
 
 /// Cargo test binaries run with cwd = the crate dir, but `.gitignore`
 /// patterns here are anchored to the repo root, so `git check-ignore` must
@@ -50,8 +49,9 @@ fn gitignore_covers_devflow_runtime_state_paths() {
     // precisely the regression this guard exists to catch.
     let mut unignored = Vec::new();
     for path in RUNTIME_PATHS {
-        let output = Command::new("git")
-            .current_dir(repo_root())
+        // Deliberately targets the real repository, so it must reach it via
+        // `repo_root()` and not via an inherited GIT_DIR pointing elsewhere.
+        let output = devflow_core::test_support::git_command(&repo_root())
             .args(["check-ignore", "-q", path])
             .output()
             .expect("run git check-ignore");

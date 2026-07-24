@@ -54,9 +54,8 @@ pub(crate) static ENV_MUTEX: Mutex<()> = Mutex::new(());
 /// have real git plumbing to operate on rather than an empty directory.
 pub(crate) fn init_repo(root: &Path) {
     let git = |args: &[&str]| {
-        let ok = std::process::Command::new("git")
+        let ok = devflow_core::test_support::git_command(root)
             .args(args)
-            .current_dir(root)
             .output()
             .unwrap()
             .status
@@ -81,9 +80,8 @@ pub(crate) fn init_repo(root: &Path) {
 /// `devflow_core::hooks`' `init_repo_with_options(root, false)`.
 pub(crate) fn init_repo_no_version_file(root: &Path) {
     let git = |args: &[&str]| {
-        let ok = std::process::Command::new("git")
+        let ok = devflow_core::test_support::git_command(root)
             .args(args)
-            .current_dir(root)
             .output()
             .unwrap()
             .status

@@ -21,13 +21,13 @@ use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
 use devflow_core::workflow::{WorkflowError, load_state};
 use std::path::Path;
-use std::process::Command;
 use std::time::Duration;
 
 fn git(root: &Path, args: &[&str]) {
-    let output = Command::new("git")
+    // Hermetic: pinning cwd alone does not stop an inherited GIT_DIR from
+    // retargeting the real repository (999.37).
+    let output = devflow_core::test_support::git_command(root)
         .args(args)
-        .current_dir(root)
         .output()
         .expect("spawn git");
     assert!(

@@ -33,9 +33,10 @@ fn run_release(project: &Path, args: &[&str]) -> Output {
 }
 
 fn git(root: &Path, args: &[&str]) {
-    let output = Command::new("git")
+    // Hermetic: pinning cwd alone does not stop an inherited GIT_DIR from
+    // retargeting the real repository (999.37).
+    let output = devflow_core::test_support::git_command(root)
         .args(args)
-        .current_dir(root)
         .output()
         .expect("spawn git");
     assert!(
@@ -62,9 +63,8 @@ fn commit(root: &Path, name: &str) {
 }
 
 fn rev_parse(root: &Path, rev: &str) -> String {
-    let output = Command::new("git")
+    let output = devflow_core::test_support::git_command(root)
         .args(["rev-parse", rev])
-        .current_dir(root)
         .output()
         .expect("git rev-parse");
     String::from_utf8_lossy(&output.stdout).trim().to_string()

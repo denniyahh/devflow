@@ -195,13 +195,11 @@ fn stderr_or_status(output: &std::process::Output) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
     use tempfile::TempDir;
 
     fn git(root: &Path, args: &[&str]) {
-        let output = Command::new("git")
+        let output = crate::test_support::git_command(root)
             .args(args)
-            .current_dir(root)
             .output()
             .expect("spawn git");
         assert!(

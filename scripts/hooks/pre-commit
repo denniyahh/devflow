@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Chains to whatever pre-commit hook was active before this directory was
+# installed as core.hooksPath.
+#
+# `core.hooksPath` replaces the hooks directory wholesale — git consults
+# exactly one. So `git config core.hooksPath scripts/hooks` (the install step
+# in CONTRIBUTING.md) silently disables any pre-commit a developer already
+# relies on: a global secret scanner, or a repo-local .git/hooks/pre-commit.
+# Losing a secret scan without being told is a worse failure than the missing
+# hook it was traded for, so delegate instead of shadowing.
+#
+# This is a no-op for anyone without such a hook.
+set -euo pipefail
+
+global_hooks=$(git config --global --get core.hooksPath || true)
+if [ -n "$global_hooks" ]; then
+  # Expand a leading ~ ourselves; git stores the literal string.
+  global_hooks="${global_hooks/#\~/$HOME}"
+  if [ -x "$global_hooks/pre-commit" ]; then
+    exec "$global_hooks/pre-commit" "$@"
+  fi
+fi
+
+# No global hooks dir configured — fall back to the repo-local hook that
+# core.hooksPath displaced.
+repo_hook="$(git rev-parse --git-common-dir)/hooks/pre-commit"
+if [ -x "$repo_hook" ]; then
+  exec "$repo_hook" "$@"
+fi
+
+exit 0

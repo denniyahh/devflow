@@ -1,12 +1,12 @@
 # DevFlow
 
-**Agent-agnostic development workflow automation.**
+**An opinionated take on AI-driven development — not a universal agent platform, just the workflow that actually holds up under real, unattended use.**
 
 [![CI](https://github.com/denniyahh/devflow/actions/workflows/ci.yml/badge.svg)](https://github.com/denniyahh/devflow/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org)
 
-DevFlow automates the mechanical steps of AI-assisted development — branching, monitoring, verifying, documenting, shipping — so you and your coding agents can focus on building.
+DevFlow bakes in the specific methods and guardrails one developer converged on after running coding agents against real work: worktree isolation, gated human checkpoints, never-silent failure handling, and durable state that survives a crash or a `kill -9`. It isn't trying to be a lowest-common-denominator platform for every agent and every workflow — it's the system that solved the pain points that kept recurring with looser, more "flexible" tooling.
 
 ## The Problem
 
@@ -59,7 +59,7 @@ crates/
 
 **Key design decisions:**
 
-- **Agent-agnostic** — Claude, Codex, and OpenCode all implement the same `AgentAdapter` trait. Adding a new agent follows a small checklist (see [ARCHITECTURE.md](ARCHITECTURE.md#extension-points--adding-an-agent)).
+- **Opinionated, not universal** — Claude Code, Codex, and OpenCode are supported today through a shared `AgentAdapter` trait, but DevFlow is built around specific workflow decisions, not a lowest-common-denominator abstraction over every agent. Full agent-neutral modularity is a deliberate future direction, not a current guarantee (adding a supported agent today follows a small checklist — see [ARCHITECTURE.md](ARCHITECTURE.md#extension-points--adding-an-agent)).
 - **Worktree isolation by default** — agents run in isolated git worktrees (`.worktrees/phase-NN/`) unless `--no-worktree` is passed, preventing cross-phase contamination.
 - **Monitor daemon** — optional background process detects agent completion and auto-advances the state machine. No cron, no polling, no tmux.
 - **Four-layer evaluation** — operator-declared external post-conditions can fail a stage before agent-controlled signals; ordinary work then uses `DEVFLOW_RESULT`, exit code + commit count, and the final commit heuristic.

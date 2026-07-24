@@ -892,14 +892,12 @@ fn stderr_or_status(output: &std::process::Output) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
     use tempfile::TempDir;
 
     /// Run a git command in `root`, asserting success.
     fn git(root: &Path, args: &[&str]) {
-        let output = Command::new("git")
+        let output = crate::test_support::git_command(root)
             .args(args)
-            .current_dir(root)
             .output()
             .expect("spawn git");
         assert!(
@@ -910,9 +908,8 @@ mod tests {
     }
 
     fn current_branch(root: &Path) -> String {
-        let output = Command::new("git")
+        let output = crate::test_support::git_command(root)
             .args(["rev-parse", "--abbrev-ref", "HEAD"])
-            .current_dir(root)
             .output()
             .expect("rev-parse");
         String::from_utf8_lossy(&output.stdout).trim().to_string()
@@ -990,9 +987,8 @@ mod tests {
         assert_eq!(current_branch(root), "develop");
 
         // Branch is deleted and its work is now on develop.
-        let branches = Command::new("git")
+        let branches = crate::test_support::git_command(root)
             .args(["branch"])
-            .current_dir(root)
             .output()
             .unwrap();
         let listing = String::from_utf8_lossy(&branches.stdout);
@@ -1015,17 +1011,15 @@ mod tests {
         assert_eq!(current_branch(root), "develop");
 
         // Tag exists.
-        let tags = Command::new("git")
+        let tags = crate::test_support::git_command(root)
             .args(["tag"])
-            .current_dir(root)
             .output()
             .unwrap();
         assert!(String::from_utf8_lossy(&tags.stdout).contains("v1.2.0"));
 
         // Release branch deleted.
-        let branches = Command::new("git")
+        let branches = crate::test_support::git_command(root)
             .args(["branch"])
-            .current_dir(root)
             .output()
             .unwrap();
         assert!(!String::from_utf8_lossy(&branches.stdout).contains("release/1.2.0"));
@@ -1050,9 +1044,8 @@ mod tests {
             .tag("v9.9.9")
             .expect("tag must not block on $EDITOR");
 
-        let tags = Command::new("git")
+        let tags = crate::test_support::git_command(root)
             .args(["tag", "-l"])
-            .current_dir(root)
             .output()
             .unwrap();
         assert!(String::from_utf8_lossy(&tags.stdout).contains("v9.9.9"));
@@ -1060,9 +1053,8 @@ mod tests {
         // Confirm it's a lightweight tag (points directly at the commit),
         // not an annotated tag object (which `cat-file -t` would report as
         // "tag" rather than "commit").
-        let obj_type = Command::new("git")
+        let obj_type = crate::test_support::git_command(root)
             .args(["cat-file", "-t", "v9.9.9"])
-            .current_dir(root)
             .output()
             .unwrap();
         assert_eq!(
@@ -1086,9 +1078,8 @@ mod tests {
         // file is excluded by any implementation and so proves nothing; an
         // already-staged one is the real failure mode — a bare `git commit`
         // writes the whole index and would sweep it in.
-        Command::new("git")
+        crate::test_support::git_command(root)
             .args(["add", "unrelated.txt"])
-            .current_dir(root)
             .status()
             .unwrap();
 
@@ -1096,18 +1087,16 @@ mod tests {
             .commit_path("CHANGELOG.md", "docs: add changelog entry")
             .expect("commit_path");
 
-        let committed = Command::new("git")
+        let committed = crate::test_support::git_command(root)
             .args(["log", "-1", "--name-only", "--pretty=format:"])
-            .current_dir(root)
             .output()
             .unwrap();
         let committed_files = String::from_utf8_lossy(&committed.stdout);
         assert!(committed_files.contains("CHANGELOG.md"));
         assert!(!committed_files.contains("unrelated.txt"));
 
-        let status = Command::new("git")
+        let status = crate::test_support::git_command(root)
             .args(["status", "--porcelain"])
-            .current_dir(root)
             .output()
             .unwrap();
         let status = String::from_utf8_lossy(&status.stdout);
@@ -1120,9 +1109,8 @@ mod tests {
     /// `git rev-list --count HEAD`, parsed. Shared by the three tests below
     /// so a failure reports both counts instead of a bare assertion.
     fn rev_list_count(root: &Path) -> u32 {
-        let output = Command::new("git")
+        let output = crate::test_support::git_command(root)
             .args(["rev-list", "--count", "HEAD"])
-            .current_dir(root)
             .output()
             .unwrap();
         assert!(output.status.success(), "git rev-list --count HEAD failed");
@@ -1232,9 +1220,8 @@ mod tests {
         // The release branch tip must descend from the feature commit — i.e.
         // the feature-only work is present, not dropped to develop's HEAD.
         let release_tip = gf.branch_tip("release/2.0.0").expect("release tip");
-        let is_ancestor = Command::new("git")
+        let is_ancestor = crate::test_support::git_command(root)
             .args(["merge-base", "--is-ancestor", &feature_tip, &release_tip])
-            .current_dir(root)
             .output()
             .unwrap()
             .status
@@ -1401,9 +1388,8 @@ mod tests {
         assert!(gf.delete_branch("feature/phase-08", false).is_err());
         gf.delete_branch("feature/phase-08", true)
             .expect("force delete");
-        let branches = Command::new("git")
+        let branches = crate::test_support::git_command(root)
             .args(["branch"])
-            .current_dir(root)
             .output()
             .unwrap();
         assert!(!String::from_utf8_lossy(&branches.stdout).contains("feature/phase-08"));
@@ -1642,9 +1628,8 @@ mod tests {
     fn origin_main_ancestor_status_is_ancestor_when_head_is_up_to_date() {
         let repo = init_repo();
         let root = repo.path();
-        let head = Command::new("git")
+        let head = crate::test_support::git_command(root)
             .args(["rev-parse", "HEAD"])
-            .current_dir(root)
             .output()
             .unwrap();
         let head_sha = String::from_utf8_lossy(&head.stdout).trim().to_string();

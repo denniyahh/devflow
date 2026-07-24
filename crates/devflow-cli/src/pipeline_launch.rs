@@ -505,9 +505,8 @@ mod tests {
         let branch = format!("feature/phase-{phase:02}");
         let git = |args: &[&str]| {
             assert!(
-                std::process::Command::new("git")
+                devflow_core::test_support::git_command(root)
                     .args(args)
-                    .current_dir(root)
                     .status()
                     .unwrap()
                     .success(),

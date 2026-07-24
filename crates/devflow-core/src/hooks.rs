@@ -280,9 +280,8 @@ mod tests {
     use super::*;
 
     fn git(root: &Path, args: &[&str]) {
-        let ok = Command::new("git")
+        let ok = crate::test_support::git_command(root)
             .args(args)
-            .current_dir(root)
             .output()
             .unwrap()
             .status
@@ -424,9 +423,8 @@ mod tests {
         Hook::VersionBump
             .run(&mut ctx(dir.path(), Stage::Ship))
             .unwrap();
-        let tags = Command::new("git")
+        let tags = crate::test_support::git_command(dir.path())
             .arg("tag")
-            .current_dir(dir.path())
             .output()
             .unwrap();
         assert!(String::from_utf8_lossy(&tags.stdout).contains(&expected));
@@ -644,9 +642,8 @@ mod tests {
     }
 
     fn git_output(root: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
+        let output = crate::test_support::git_command(root)
             .args(args)
-            .current_dir(root)
             .output()
             .unwrap();
         assert!(output.status.success(), "git {args:?} failed");
