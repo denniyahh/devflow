@@ -609,25 +609,58 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.33: Monitor Teardown Trap Orphans `devflow advance` (BACKLOG)
+### Phase 999.33: Durable Cross-Process Handle to the Monitor Tree (OPEN PROBLEM — no known good solution)
 
-**Goal:** The monitor's SIGTERM/SIGINT trap (`crates/devflow-core/src/monitor.rs:148-160`) only kills `$apid`, the backgrounded agent process: `cleanup() { [ -n "$apid" ] && kill "$apid" 2>/dev/null; exit 0; }`. Once `wait $apid` returns and the script moves into its synchronous tail call (`devflow advance --phase N`), a signal to the monitor has nothing left to kill — the trap fires, `exit 0`s the shell, but `devflow advance` is a separate already-forked child that survives, reparented to the nearest subreaper, and keeps running to completion unsupervised. This is the same bug class WR-08 (13-REVIEW.md) fixed one level up (trap only exited the shell, orphaning the agent) recurring one level deeper (trap only kills the agent, orphaning `advance`).
-**Priority:** High | **Size:** S/M — directly reproduced 2026-07-24: SIGTERM to 5 monitor wrapper processes killed the `sh` wrapper in every case but left all 5 `devflow advance` children running as orphans, requiring a second explicit kill pass. No data-loss risk observed (the orphaned `advance` calls appeared idle/blocked, not actively corrupting state), but it means an operator terminating a monitor cannot assume the process tree is actually gone. Fix shape: process-group-based teardown (`setsid`/new pgid at spawn, `killpg`/`kill(-pgid)` on stop) instead of tracking a single child PID, so a single signal reaches whichever child is currently active. Prerequisite for 999.34's `devflow stop` to be reliable. Source: operator conversation 2026-07-24, discovered via leaked `cargo test` fixture processes in the Phase 22 worktree exhibiting the identical orphaning pattern.
-**Requirements:** TBD — see `crates/devflow-core/src/monitor.rs`
-**Plans:** 0 plans
+> **Status: this is a problem statement, not a plan.** A first implementation attempt was made 2026-07-24 and is **not merged** (branch `feature/monitor-process-group-stop`). Half of it is proven correct; the other half is unsound and has no identified replacement yet. Do not promote this to a phase until the open question below is answered — planning against the current framing would repeat the dead end.
 
-**OSS library research (2026-07-24):** two viable implementation paths, both avoiding the current shell-script signal-trap approach entirely.
+**The problem:** DevFlow spawns a detached monitor process tree (shell wrapper → coding agent → `devflow advance` tail) that deliberately **outlives the CLI invocation that created it**. A *later, unrelated* CLI invocation — `devflow stop`, `doctor`, `recover`, `status` — must then answer two questions using only what is persisted on disk:
 
-1. **Zero-new-dependency path:** `std::os::unix::process::CommandExt::process_group` (stable since Rust 1.64.0, well within this project's edition-2024 MSRV) sets a spawned child into its own new process group at spawn time; `libc::kill(-pgid, sig)` — `libc` is already a workspace dependency — signals the whole group in one call. This alone fixes the bug: replace the `sh -c` wrapper's agent-launch with a native `Command::process_group(0).spawn()`, record the resulting PID as the pgid, and have `devflow stop`/monitor-shutdown call `kill(-pid, SIGTERM)` instead of relying on a shell trap that only ever tracked one child.
-2. **Small well-known crate path:** [`command-group`](https://crates.io/crates/command-group) (Extension to `Command` to spawn in a process group; MIT/Apache-2.0, by the `watchexec` org) — 6.7M total / 753K recent downloads, actively maintained since 2021, single-purpose. Wraps the same `process_group`+`killpg` pattern behind an ergonomic `GroupChild` (`.group_spawn()`, `.kill()` kills the whole group). Built by the team behind `watchexec`, which has nearly identical "own a spawned process, guarantee clean teardown" requirements. Worth it only if the operator would rather not hand-roll the thin wrapper in path 1.
+1. Is that process tree still alive?
+2. Kill that process tree, all of it, reliably.
 
-**Evaluated and rejected:** `duct` (33M+ downloads, very popular, but its own maintainer explicitly declined to add process-group handling — see [duct.rs#41](https://github.com/oconnor663/duct.rs/issues/41) — because a library doesn't own the process-wide signal handlers a reliable group-kill needs; DevFlow's monitor does, so this gap doesn't apply to us, but duct doesn't solve the problem either way). `processkit` (exact conceptual fit — kernel-backed whole-tree kill-on-drop, supervision, restart/backoff — but created 2026-05-31, ~9K downloads, and requires adopting tokio/async into a currently fully-synchronous codebase; too immature and too large a commitment to depend on for something this load-bearing right now). `daemonize`/`fork` (solve full terminal-detachment daemonization via double-fork, which is not the confirmed problem — 999.33 is about signal delivery to a process GROUP, not about surviving a terminal hangup).
+There is currently no sound mechanism for either. Everything DevFlow persists is a bare PID, and a bare PID is not a durable handle to a tree.
 
-**Related, smaller finding (not this item's scope, worth its own backlog entry if pursued):** `agent.rs`'s `agent_running()` liveness check is a raw `kill(pid, 0)` — vulnerable to PID reuse (a dead process's PID recycled by an unrelated process reads as "still alive"). [`sysinfo`](https://crates.io/crates/sysinfo) (172M+ downloads, very actively maintained, updated within weeks of this research) could close that gap by checking process start-time/command-line instead of bare PID existence.
+**Original symptom (still valid):** the monitor's SIGTERM/SIGINT trap (`crates/devflow-core/src/monitor.rs`) only kills `$apid`, the backgrounded agent: `cleanup() { [ -n "$apid" ] && kill "$apid" 2>/dev/null; exit 0; }`. Once `wait $apid` returns and the script enters its `devflow advance` tail call, a signal has nothing left to kill — the trap exits the shell and `advance` survives as an orphan. Same bug class as WR-08 (13-REVIEW.md), one level deeper. Directly reproduced 2026-07-24: SIGTERM to 5 monitor wrappers killed every shell but left all 5 `devflow advance` children running.
+
+**Priority:** High | **Size:** Unknown — depends entirely on the open question below.
+
+#### What was tried (2026-07-24) — and what it settled
+
+**SOLVED, and proven:** putting the whole tree into one process group at spawn time. `std::os::unix::process::CommandExt::process_group(0)` (stable since Rust 1.64, zero new dependencies) does this correctly. RED-proven: reverting only that line makes the regression test fail with the exact orphaning symptom, restoring it passes. **This half is genuinely done** and lives on the unmerged branch.
+
+**UNSOUND — the actual dead end:** using the group *leader's PID* as the durable handle. Code review (two independent passes) found three concrete failure modes, all rooted in the same mistake — a leader PID is not the same thing as a group:
+
+- **Leader dead, members alive** → teardown is skipped entirely. Demonstrated empirically: `devflow stop` printed *"no live process found"* while the agent it was supposed to kill kept running. This is the `Liveness::Stuck` state `doctor` already has a dedicated check for — i.e. the case that most needs stopping.
+- **Leader exits first, members alive** → the SIGKILL escalation never fires. The shell's trap always `exit 0`s promptly, so a liveness poll on the leader goes false immediately and the escalation guard never triggers, leaving a SIGTERM-ignoring agent running forever. The documented "escalates to SIGKILL" behaviour is effectively dead code in the common case.
+- **PID reuse** → `kill(-pid, …)` on a recycled PID signals an *unrelated process group*. Strictly worse blast radius than the single-PID kill it replaced.
+
+**Libraries evaluated — none solve this:**
+
+- [`command-group`](https://crates.io/crates/command-group) (6.7M downloads, watchexec org) — **does not apply.** API surface confirmed spawn-centric: `GroupChild`/`AsyncGroupChild` handles returned from spawning, plus `UnixChildExt` for signalling children *you* spawned. **No attach-to-an-existing-pgid API.** A `GroupChild` cannot be serialized into `state.json` and reconstituted by a later process, which is precisely what DevFlow needs. It would not have prevented any of the three findings above. *(An earlier version of this entry listed it as a "viable path" — that was wrong, and only became clear after building the thing.)*
+- `duct` (33M+ downloads) — maintainer explicitly declined process-group handling, [duct.rs#41](https://github.com/oconnor663/duct.rs/issues/41).
+- `daemonize` / `fork` — solve terminal-detachment daemonization; not this problem.
+- `nix` / `rustix` — would give typed `killpg`/`getpgid`/`waitpid` instead of raw `unsafe { libc::kill(-pid, sig) }`. Cosmetic: identical logic, would have caught none of the findings.
+
+#### What the problem actually needs
+
+A **durable, nameable handle to a process tree that survives its spawner's exit** and can be queried and signalled from an unrelated process. A process group is a weak approximation: named by a recyclable PID, and its leader can vanish while members live — which is, almost word for word, failure modes 1 and 2 above.
+
+Strong forms of the primitive: **cgroup v2** (Linux) and **Job Objects** (Windows). Both are nameable, persistent, and queryable from any process — write the identifier into `state.json` and any later invocation can ask "is anything still in here?" and "kill everything in here" with no PID-reuse hazard and no leader-vs-member confusion.
+
+**Candidates, none currently viable:**
+
+- [`processkit`](https://crates.io/crates/processkit) — conceptually the right shape (kernel-backed cgroup v2 / Job Object containers, whole-tree kill-on-drop, supervision). Blocked on maturity: created 2026-05-31, ~9K downloads, and requires adopting tokio into a fully synchronous codebase.
+- **DIY cgroup v2** — Linux-only (macOS has no cgroups), unprivileged creation needs systemd user delegation, and would still need a process-group fallback path.
+
+#### Open question that unblocks this
+
+**Does DevFlow need to support macOS?** If Linux-only is acceptable, DIY cgroup v2 becomes substantially more attractive and this stops being an open problem. If not, we need either a portable abstraction (none identified) or an explicit decision to accept process-groups-plus-PID-identity-validation as a documented best-effort rather than a guarantee.
+
+**Hardening available today** (does not solve the problem, narrows it): probe group existence with `kill(-pgid, 0)` instead of leader liveness; validate PID identity via process start-time ([`sysinfo`](https://crates.io/crates/sysinfo), 172M+ downloads) so a recycled PID can't be mistaken for the original. Both apply to `agent.rs`'s `agent_running()`, which is a raw `kill(pid, 0)` today and additionally reports **zombies as alive**.
 
 Plans:
 
-- [ ] TBD (promote with /gsd-review-backlog when ready)
+- [ ] BLOCKED — answer the macOS-support question before planning
 
 ### Phase 999.34: `devflow stop` — Explicit, Clean Phase Abort (BACKLOG)
 
@@ -635,6 +668,8 @@ Plans:
 **Priority:** High | **Size:** M — direct product gap surfaced by a real incident, not speculative. Depends on 999.33 (needs reliable whole-tree teardown to be a real "stop," not just a best-effort signal to one PID). Proposed shape: `devflow stop --phase N [--reason "..."]` (plus a possible `--all`) that (1) resolves the phase's monitor/agent PIDs from existing state, (2) signals the whole process group — SIGTERM with a bounded grace period, escalating to SIGKILL — fixing 999.33 as a prerequisite, (3) emits an authoritative `workflow_stopped` event so `doctor`/`status`/`events.jsonl` show a clean terminal marker instead of the run trailing into nothing, (4) resolves any open gate for the phase with a note rather than leaving a phantom pending gate, (5) sets `State.stopped = true` (reusing the existing `--until` flag rather than deleting state), and (6) leaves the worktree/branch/commits untouched by default — `cleanup --force` remains the separate, now-correctly-gated step for actually discarding work. Idempotent: stopping an already-stopped or already-dead phase reports that cleanly rather than erroring. Source: operator conversation 2026-07-24.
 **Requirements:** TBD — see CONTEXT.md
 **Plans:** 0 plans
+
+**BLOCKED — prerequisite is an open problem (2026-07-24).** Step (2) of the proposed shape above ("signals the whole process group") assumed 999.33 had a known solution. It does not — 999.33 is now an **open problem statement**, not a plan, because the group-leader PID turns out not to be a sound durable handle to a process tree. A `devflow stop` built on that assumption was implemented on branch `feature/monitor-process-group-stop` (unmerged) and code review found three HIGH defects, all downstream of exactly that assumption: teardown skipped entirely when the leader is dead but members are alive (demonstrated — `stop` reported "no live process found" while the target agent kept running); the SIGKILL escalation never firing because the leader always exits first; and PID reuse signalling an unrelated group. Two further defects were structural rather than inherited: applying process-group isolation to `spawn_monitor_no_advance` broke Ctrl-C teardown for the foreground `sequentagent` path (which persists no `monitor_pid`, so `devflow stop` cannot reach it either), and killing the group leaves the per-phase lock file behind with a dead holder PID. **Do not re-plan this item until 999.33's open question is answered** — the rest of the design (gate resolution, `workflow_stopped` event, `State.stopped`, worktree left untouched, idempotency) held up under review and can be carried forward as-is.
 
 **Note added 2026-07-24 (operator):** verified the successful-Ship path separately before adding this — the monitor's process tree does NOT leak on success (the shell script's tail call, `devflow advance`, runs `finish_workflow`, which already calls `workflow::clear_state` and emits `workflow_finished`; once that returns the shell script has nothing left to run and exits cleanly, so there's no live-process gap on the happy path, unlike the abort case above). What IS confirmed missing on success: `hooks_after_ship` (`crates/devflow-core/src/hooks.rs:105-112`) runs Merge/VersionBump/ChangelogAppend/BranchCleanup but has no `WorktreeRemove` step, and `branch_cleanup`'s non-force `delete_branch` only special-cases "not fully merged" errors — a branch still checked out in its `devflow start` worktree at Ship time would hit the generic warn-and-skip branch instead, silently leaving both branch and worktree in place (untested in practice: no `devflow start`-launched phase has reached a successful Ship yet, phase 22 included). Separately, confirmed by direct observation: per-phase capture files (`.devflow/phase-N-{agent-pid,stdout,stderr.log,exit}`) are never swept by anything — phases 15/16/17/21's files are still sitting in `.devflow/` long after those phases shipped. Worth a "finalize" step at the end of a successful `finish_workflow` — reusing `devflow stop`'s teardown/event-recording machinery under a distinct reason (e.g. `stop --reason completed`) rather than inventing a parallel mechanism — that removes the now-merged worktree and sweeps that phase's capture files. Design this alongside 999.34/999.33, not as a third separate command.
 
