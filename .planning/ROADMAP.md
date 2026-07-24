@@ -370,27 +370,25 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.2: A Phase Tracks Exactly One Process (BACKLOG)
+### Phase 999.2: A Phase Tracks Exactly One Process (DELIVERED — Phase 21 / 21c)
 
 **Goal:** One `phase-N-agent-pid` file per phase leaves the monitor unrecorded and `sequentagent`'s second agent homeless. Frame as two tracked processes per phase. *(was 19b)*
-**Priority:** Medium | **Size:** M — reviewed 2026-07-21: the "monitor unrecorded" half is now fixed by Phase 18's 18b (`State.monitor_pid` shipped in v1.5.0); remaining scope is narrower — `sequentagent`'s orphaned second process only. Re-scope before promoting. Linear: DEN-27.
-**Requirements:** TBD — see CONTEXT.md
-**Plans:** 0 plans
+**Priority:** Medium | **Size:** M — the "monitor unrecorded" half shipped in v1.5.0 (18b); the narrowed remainder (`sequentagent`'s orphaned second process) was **delivered by Phase 21 unit 21c** (plan 21-04) — a path-free A/B slot record surfaced in `status`, verified 2026-07-23 (21/21). Linear: DEN-27 (still open — mark done on next sync).
+**Delivered:** Phase 21 unit 21c / plan 21-04, 2026-07-23
 
 Plans:
 
-- [ ] TBD (promote with /gsd-review-backlog when ready)
+- [x] Delivered by Phase 21 (21c / 21-04) — absorbed as a unit, not separately promoted
 
-### Phase 999.3: CLI Operator Discoverability (BACKLOG)
+### Phase 999.3: CLI Operator Discoverability (DELIVERED — Phase 21 / 21a)
 
 **Goal:** Gate reasons truncate with no `devflow gate show`; rate-limit reset times buried in raw JSON; `status` lacks in-stage progress; recovery verbs undiscoverable from a stuck state. *(was 19c)*
-**Priority:** Low | **Size:** L — reviewed 2026-07-21: confirmed still true at HEAD (no `gate show` command exists). Self-scoped as UX, safe behind correctness work; bundles 4 distinct gaps — split into smaller issues when promoted. Linear: DEN-28.
-**Requirements:** TBD — see CONTEXT.md
-**Plans:** 0 plans
+**Priority:** Low | **Size:** L — all four bundled gaps **delivered by Phase 21 unit 21a** (plan 21-02): `devflow gate show <phase>` (untruncated), rate-limit reset surfaced in `status`, in-stage progress line, recovery-verb hints — verified 2026-07-23 (21/21). Linear: DEN-28 (still open — mark done on next sync).
+**Delivered:** Phase 21 unit 21a / plan 21-02, 2026-07-23
 
 Plans:
 
-- [ ] TBD (promote with /gsd-review-backlog when ready)
+- [x] Delivered by Phase 21 (21a / 21-02) — absorbed as a unit, not separately promoted
 
 ### Phase 999.4: Version-Tag Contention on Concurrent Ship (BACKLOG)
 
@@ -436,16 +434,15 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.14: Doctor Reconciliation for Planning-Doc Staleness (BACKLOG)
+### Phase 999.14: Doctor Reconciliation for Planning-Doc Staleness (DELIVERED — Phase 21 / 21b)
 
 **Goal:** `devflow doctor`'s 18a reconciliation checks phase state against events/PIDs/gates/branches, but nothing checks whether `ROADMAP.md`/`STATE.md`'s own narrative still matches reality once a phase's outcome is decided by a manual, out-of-band action (merge, tag, publish). Found 2026-07-21: `STATE.md`/`ROADMAP.md` claimed Phase 18 was "not yet merged / released" after v1.5.0 had already shipped — the same class of bug `17-REVIEW.md` WR-06 already named once (19e/19f marked open after `17-13` had already closed them).
-**Priority:** Medium | **Size:** M — added 2026-07-21. Detection-only scope (flag stale version claims against git tags), deliberately not auto-correcting prose. Linear: DEN-39.
-**Requirements:** TBD — see CONTEXT.md
-**Plans:** 0 plans
+**Priority:** Medium | **Size:** M — **delivered by Phase 21 unit 21b** (plan 21-03): detection-only `planning_doc_staleness` finding in `doctor` (human + `--json`) reconciling ROADMAP/STATE version claims against git tags, never rewriting prose — verified 2026-07-23 (21/21; live run produced 4 correct Warn findings, 0 false Problems). Linear: DEN-39 (still open — mark done on next sync).
+**Delivered:** Phase 21 unit 21b / plan 21-03, 2026-07-23
 
 Plans:
 
-- [ ] TBD (promote with /gsd-review-backlog when ready)
+- [x] Delivered by Phase 21 (21b / 21-03) — absorbed as a unit, not separately promoted
 
 ### Phase 999.15: Hermetic Tests for Shell Entry Points (BACKLOG)
 
@@ -568,16 +565,15 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.29: Dogfood Staleness Guard False-Positives on Docs-Only Commits (BACKLOG)
+### Phase 999.29: Dogfood Staleness Guard False-Positives on Docs-Only Commits (DELIVERED — Phase 21 / 21d)
 
 **Goal:** Make `enforce_build_staleness`'s commit-ancestry arm **content-aware** so a self-dogfood run is not hard-blocked when the only commits ahead of the binary's embedded commit changed nothing the compiler sees (`.planning/` docs, etc.). `embedded_commit_is_stale` (`crates/devflow-cli/src/staleness.rs`) returns `Stale` on *any* strict-ancestor HEAD (verified live in Phase 21: binary at `7163347`, worktree HEAD `3a17381`, delta = `.planning/*` only, yet hard-blocked), whereas the dirty-tree arm was already narrowed to `affects_compiled_binary` in 17-10. Apply the same filter to the ancestry arm: `git diff --name-only <embedded> HEAD` → if no build-affecting file changed, `Fresh`. Also fix the block message ("is not an ancestor of HEAD" is wrong for the common case where it *is* an ancestor, just behind).
-**Priority:** High | **Size:** S — a false-positive hard-block on DevFlow's own primary workflow (dogfooding commits docs constantly, re-arming the block after every build); the fix is a targeted narrowing with direct precedent (17-10) plus a mixed-range test (docs + a `.rs` change must still block, preserving the Phase 16 false-evidence protection). Retires the `[[feedback-dogfood-rebuild-before-revalidate]]` workaround. Source: Phase 21 dogfood run (2026-07-23), observed live. **Folded into Phase 21 as unit 21d.** Linear: DEN-54.
-**Requirements:** TBD — see CONTEXT.md
-**Plans:** 0 plans
+**Priority:** High | **Size:** S — a false-positive hard-block on DevFlow's own primary workflow (dogfooding commits docs constantly, re-arming the block after every build); the fix is a targeted narrowing with direct precedent (17-10) plus a mixed-range test (docs + a `.rs` change must still block, preserving the Phase 16 false-evidence protection). Retires the `[[feedback-dogfood-rebuild-before-revalidate]]` workaround. Source: Phase 21 dogfood run (2026-07-23), observed live. **Delivered as Phase 21 unit 21d** (plan 21-01): content-aware strict-ancestor arm (docs-only → Fresh, build-input → Stale, fails toward Stale on git error), verified 2026-07-23 (21/21). NOTE: in source on `develop` but **unshipped** — the running binary still false-blocks until a ≥21-01 build runs. Linear: DEN-54 (still open — mark done on next sync).
+**Delivered:** Phase 21 unit 21d / plan 21-01, 2026-07-23
 
 Plans:
 
-- [ ] TBD (promote with /gsd-review-backlog when ready)
+- [x] Delivered by Phase 21 (21d / 21-01) — folded in as a unit, not separately promoted
 
 ### Phase 999.30: Phase 21 Code-Review Cleanup — gate_show/doctor DRY + TOCTOU (BACKLOG)
 

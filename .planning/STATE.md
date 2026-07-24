@@ -19,22 +19,20 @@ progress:
 
 # DevFlow — Project State
 
-> Last updated: 2026-07-22
+> Last updated: 2026-07-23
 
 ## Active Phase
 
-**Phase 21 — Operator Legibility & Observability** (planning). CONTEXT gathered
-and operator-recut 2026-07-23; scope is operator-decided (not
-`/gsd-review-backlog`-promoted). Units: 21a discoverability (999.3), 21b doctor
-staleness reconciliation (999.14), 21c sequentagent second-process tracking
-(999.2), 21d dogfood staleness content-awareness (999.29, sequence first),
-optional 21e changelog content (999.5). The v2.0.0 milestone stays open (no fixed
-closing phase); numbering continues forward until a breaking change earns 2.0.
+**Phase 22 — Concurrency & Governance Correctness** (planning — not yet broken
+down; run `/gsd-plan-phase 22`). Depends on Phase 21.
 
-> **Workflow note:** Phase 21 began as a devflow dogfood run (headless Define in a
-> `feature/phase-21` worktree), then moved to **manual GSD**: the worktree/branch
-> were retired and all define artifacts consolidated onto `develop`. Next step is
-> a manual `/gsd-plan-phase 21`.
+Phase 21 (Operator Legibility & Observability) **complete + verified 21/21** on
+`develop`, 2026-07-23 — 4/4 plans: 21a discoverability (999.3), 21b doctor
+staleness reconciliation (999.14), 21c sequentagent second-process tracking
+(999.2), 21d dogfood staleness content-awareness (999.29). Optional 21e
+(changelog content, 999.5) was left out of scope. **Unshipped:** workspace stays
+v1.7.0 until a release is cut. The v2.0.0 milestone stays open (no fixed closing
+phase); numbering continues forward until a breaking change earns 2.0.
 
 ## Current Position
 
@@ -43,7 +41,7 @@ Plan: Not started
 Status: Ready to plan
 Last activity: 2026-07-23 — Phase 21 complete, transitioned to Phase 22
 
-Progress: Phase 20 shipped v1.7.0 (100%); Phase 21 in planning.
+Progress: Phase 21 complete + verified (unshipped — still v1.7.0); Phase 22 not yet planned.
 
 *(Machine-readable fields for `gsd-tools state begin-phase` / `advance-plan` —
 this project historically tracked position only in the narrative "Active
