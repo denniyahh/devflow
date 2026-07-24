@@ -6,9 +6,10 @@ DevFlow is a Rust CLI that automates the mechanical workflow steps an AI
 coding agent needs to drive a development phase end-to-end: branch creation,
 agent launch, completion detection, gated human checkpoints, versioning,
 docs/changelog updates, and cleanup. It runs a 5-stage pipeline
-(Define → Plan → Code → Validate → Ship) against any of several agent-agnostic
-adapters (Claude Code, OpenAI Codex, OpenCode), in either `auto` (unattended)
-or `supervise` (gated) mode.
+(Define → Plan → Code → Validate → Ship), today against three supported
+agent adapters (Claude Code, OpenAI Codex, OpenCode) — opinionated by design,
+not a universal agent platform — in either `auto` (unattended) or
+`supervise` (gated) mode.
 
 ## Core Value
 

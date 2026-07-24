@@ -1,4 +1,4 @@
-//! DevFlow — Agent-agnostic development workflow automation.
+//! DevFlow — an opinionated take on AI-driven development automation.
 //!
 //! The core library returns structured types and performs workflow mechanics;
 //! frontends such as the CLI format output for humans or machines.

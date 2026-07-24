@@ -1,6 +1,6 @@
 # Contributing to DevFlow
 
-Thanks for your interest! DevFlow is an agent-agnostic development workflow automation CLI written in Rust.
+Thanks for your interest! DevFlow is an opinionated AI-driven development workflow automation CLI written in Rust — it bakes in one developer's specific take on branching, gating, and verification rather than trying to be a universal platform.
 
 ## Setup
 
@@ -279,9 +279,11 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for design documentation.
 
 ### Adding a New Agent
 
-DevFlow is agent-agnostic; agent-specific code lives only under
-`crates/devflow-core/src/agents/`. Adding a backend is a short checklist — keep
-these in sync or tests/builds fail:
+DevFlow supports three agents today (Claude Code, Codex, OpenCode) through a
+shared `AgentAdapter` trait; agent-specific code lives only under
+`crates/devflow-core/src/agents/`. This is not a fully agent-neutral platform
+yet — see the driver-architecture backlog (999.31). Adding a backend today is
+a short checklist — keep these in sync or tests/builds fail:
 
 1. Add an adapter file in `crates/devflow-core/src/agents/` implementing the `AgentAdapter` trait
 2. Add a variant to the `AgentKind` enum in `state.rs`
