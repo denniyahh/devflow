@@ -544,25 +544,6 @@ fn recovery_hints(state: &State, liveness: Liveness) -> Vec<String> {
     hints
 }
 
-/// The `ts` of a phase's most recent `stage_launched` event, or `None` when
-/// none has been recorded — the real stage-entry time (21a), mirroring
-/// `test_support::stage_launched_count`'s scan but keeping the LAST match's
-/// `ts` instead of counting matches. Read-only; deliberately never reads
-/// `state.started_at`, which is phase-level and set once in `State::new`
-/// (the 3/3 cross-AI review MEDIUM, 21-REVIEWS.md).
-fn latest_stage_launched_ts(project_root: &Path, phase: u32) -> Option<u64> {
-    std::fs::read_to_string(devflow_core::events::events_path(project_root))
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter(|event| {
-            event.get("phase").and_then(serde_json::Value::as_u64) == Some(u64::from(phase))
-                && event.get("event").and_then(serde_json::Value::as_str) == Some("stage_launched")
-        })
-        .filter_map(|event| event.get("ts").and_then(serde_json::Value::as_u64))
-        .next_back()
-}
-
 /// `status`'s in-stage progress line: real elapsed time since the phase's
 /// most recent `stage_launched` event. `None` (no such event yet) renders
 /// the stage name with no age, rather than mislabeling phase age as stage
@@ -645,23 +626,25 @@ pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
             let monitor_alive = state.monitor_pid.is_some_and(agent::agent_running);
             let phase_liveness = liveness(state.monitor_pid, monitor_alive, agent_alive);
             println!("  liveness: {}", phase_liveness.describe());
+            let phase_summary = last_events.remove(&state.phase);
             println!(
                 "{}",
                 render_stage_progress_line(
                     state.stage,
-                    latest_stage_launched_ts(project_root, state.phase)
+                    phase_summary.as_ref().and_then(|s| s.stage_launched_ts)
                 )
             );
             for hint in recovery_hints(state, phase_liveness) {
                 println!("    → {hint}");
             }
-            if let Some(event) = last_events.remove(&state.phase) {
-                let ago = event
+            if let Some(summary) = phase_summary {
+                let ago = summary
+                    .event
                     .get("ts")
                     .and_then(|t| t.as_u64())
                     .map(|t| format!(" ({})", recover::format_age(&t.to_string())))
                     .unwrap_or_default();
-                println!("  last action: {}{ago}", events::describe(&event));
+                println!("  last action: {}{ago}", events::describe(&summary.event));
             }
         }
     }
@@ -1909,7 +1892,7 @@ fn collect_phase_facts(project_root: &Path) -> Vec<PhaseFacts> {
 fn build_phase_facts(
     project_root: &Path,
     state: State,
-    last_events: &mut std::collections::HashMap<u32, serde_json::Value>,
+    last_events: &mut std::collections::HashMap<u32, events::PhaseEventSummary>,
     open_gates: &[OpenGate],
 ) -> PhaseFacts {
     let phase = state.phase;
@@ -1918,7 +1901,7 @@ fn build_phase_facts(
     let agent_alive = agent_pid.is_some_and(agent::agent_running);
     let monitor_pid = state.monitor_pid;
     let monitor_alive = monitor_pid.is_some_and(agent::agent_running);
-    let last_event = last_events.remove(&phase);
+    let last_event = last_events.remove(&phase).map(|summary| summary.event);
     let last_launched_stage = last_event.as_ref().and_then(last_launched_stage_from_event);
     let last_event_name = last_event
         .as_ref()
@@ -2972,22 +2955,29 @@ mod tests {
         assert!(recovery_hints(&state, Liveness::Healthy).is_empty());
     }
 
-    /// 21a: `latest_stage_launched_ts` scans the event log for the LAST
-    /// `stage_launched` event's `ts` — the real stage-entry time — and is
-    /// `None` without one, never falling back to any other field.
+    /// 21a / 999.30 IN-01: the shared one-pass event summary's
+    /// `stage_launched_ts` is the LAST `stage_launched` event's `ts` — the
+    /// real stage-entry time — and is `None` without one, never falling
+    /// back to any other field. `status` now sources this from
+    /// `events::last_events_by_phase` instead of a per-phase rescan.
     #[test]
-    fn latest_stage_launched_ts_none_without_event() {
+    fn stage_launched_ts_none_without_event() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(latest_stage_launched_ts(dir.path(), 7), None);
+        assert_eq!(
+            events::last_events_by_phase(dir.path())
+                .get(&7)
+                .and_then(|s| s.stage_launched_ts),
+            None
+        );
     }
 
     /// The closing proof for the 3/3 cross-AI review MEDIUM
     /// (21-REVIEWS.md): a phase whose latest `stage_launched` event is ~90s
     /// old but whose phase-level `started_at` is ~30m old must report the
-    /// ~90s stage age — `latest_stage_launched_ts` must never be sourced
-    /// from `state.started_at`.
+    /// ~90s stage age — the summary's `stage_launched_ts` must never be
+    /// sourced from `state.started_at`.
     #[test]
-    fn latest_stage_launched_ts_reflects_event_age_not_phase_started_at() {
+    fn stage_launched_ts_reflects_event_age_not_phase_started_at() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let now = SystemTime::now()
@@ -3024,7 +3014,9 @@ mod tests {
             + "\n";
         std::fs::write(&events_path, rewritten).unwrap();
 
-        let ts = latest_stage_launched_ts(root, 7);
+        let ts = events::last_events_by_phase(root)
+            .get(&7)
+            .and_then(|s| s.stage_launched_ts);
         assert_eq!(ts, Some(stage_ts));
 
         let line = render_stage_progress_line(Stage::Code, ts);
