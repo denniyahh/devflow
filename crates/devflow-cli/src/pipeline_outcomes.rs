@@ -574,9 +574,8 @@ mod tests {
         let phase = 34;
         let branch = "feature/phase-34";
         let git = |args: &[&str]| {
-            let output = std::process::Command::new("git")
+            let output = devflow_core::test_support::git_command(root)
                 .args(args)
-                .current_dir(root)
                 .output()
                 .unwrap();
             assert!(output.status.success(), "git {args:?} failed");
@@ -616,9 +615,8 @@ mod tests {
         let phase = 47;
         let branch = format!("feature/phase-{phase:02}");
         let git = |args: &[&str]| {
-            let output = std::process::Command::new("git")
+            let output = devflow_core::test_support::git_command(root)
                 .args(args)
-                .current_dir(root)
                 .output()
                 .unwrap();
             assert!(output.status.success(), "git {args:?} failed");
@@ -638,9 +636,8 @@ mod tests {
             "after-ship batch must succeed against a clean repo"
         );
 
-        let all_tags = std::process::Command::new("git")
+        let all_tags = devflow_core::test_support::git_command(root)
             .arg("tag")
-            .current_dir(root)
             .output()
             .unwrap();
         let all_tags = String::from_utf8_lossy(&all_tags.stdout);

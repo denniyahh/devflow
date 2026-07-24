@@ -1,6 +1,6 @@
 # Contributing to DevFlow
 
-Thanks for your interest! DevFlow is an agent-agnostic development workflow automation CLI written in Rust.
+Thanks for your interest! DevFlow is an opinionated AI-driven development workflow automation CLI written in Rust — it bakes in one developer's specific take on branching, gating, and verification rather than trying to be a universal platform.
 
 ## Setup
 
@@ -19,6 +19,22 @@ same fmt/clippy/test checks CI requires, before the push leaves your machine:
 ```bash
 git config core.hooksPath scripts/hooks
 ```
+
+Two things this hook does that are load-bearing:
+
+- It clears git's repository-local `GIT_*` variables before running the
+  tests. Git exports `GIT_DIR` into hooks when you push **from a linked
+  worktree**, and `GIT_DIR` outranks a process's working directory when git
+  decides which repository to act on — so without the scrub, every test
+  fixture that shells out to git in a tempdir retargets *your real checkout*
+  instead. This is not hypothetical: it once flipped this repository to
+  `core.bare=true`, moved a worktree's HEAD onto a fixture branch and
+  rewrote the committer identity.
+- [`scripts/hooks/pre-commit`](scripts/hooks/pre-commit) delegates to
+  whatever pre-commit hook you already had. `core.hooksPath` replaces the
+  hooks directory wholesale, so without that shim the command above would
+  silently switch off a global secret scanner. It is a no-op if you have no
+  such hook.
 
 ### Distrobox (optional)
 
@@ -263,9 +279,11 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for design documentation.
 
 ### Adding a New Agent
 
-DevFlow is agent-agnostic; agent-specific code lives only under
-`crates/devflow-core/src/agents/`. Adding a backend is a short checklist — keep
-these in sync or tests/builds fail:
+DevFlow supports three agents today (Claude Code, Codex, OpenCode) through a
+shared `AgentAdapter` trait; agent-specific code lives only under
+`crates/devflow-core/src/agents/`. This is not a fully agent-neutral platform
+yet — see the driver-architecture backlog (999.31). Adding a backend today is
+a short checklist — keep these in sync or tests/builds fail:
 
 1. Add an adapter file in `crates/devflow-core/src/agents/` implementing the `AgentAdapter` trait
 2. Add a variant to the `AgentKind` enum in `state.rs`

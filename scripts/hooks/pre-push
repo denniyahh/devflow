@@ -3,6 +3,38 @@
 # push never has to wait for a runner to say so.
 set -euo pipefail
 
+# Git exports its own repository environment into hooks — notably GIT_DIR
+# (plus GIT_WORK_TREE/GIT_INDEX_FILE/GIT_PREFIX). GIT_DIR takes precedence
+# over a process's working directory when git resolves which repository to
+# act on, and Rust runs a test binary's tests as threads in ONE process, so
+# the whole suite would inherit it. Every fixture that shells out to git in a
+# tempdir — even one that correctly pins .current_dir() — would then retarget
+# THIS repository instead, running `git init`, `git config`, `git checkout -b`
+# and `git commit` against the real checkout. That is exactly how a push from
+# a worktree flipped this repo to core.bare=true, hijacked its HEAD onto a
+# fixture branch and rewrote its committer identity (999.37).
+#
+# githooks(5) prescribes exactly this: "If your hook needs to invoke Git
+# commands in a foreign repository or in a different working tree of the same
+# repository, then it should clear these environment variables so they do not
+# interfere with Git operations at the foreign location." A fixture repo in a
+# tempdir is a foreign repository.
+#
+# `git rev-parse --local-env-vars` is git's own authoritative list of the
+# repository-local variables (15 on git 2.55), so this needs no maintenance
+# when git adds one. The extras are not repository-local and so are absent
+# from that list, but still redirect resolution. Unsetting GIT_CONFIG_COUNT
+# (in the list) is sufficient to neutralize any GIT_CONFIG_KEY_n/VALUE_n:
+# those are only read when the count is set.
+#
+# GIT_EXEC_PATH and GIT_TRACE are deliberately preserved: the first only
+# locates git's own helper binaries, the second is a debugging aid. Neither
+# can redirect which repository git acts on.
+# shellcheck disable=SC2046  # word splitting is the point: one arg per name
+unset $(git rev-parse --local-env-vars) \
+      GIT_NAMESPACE GIT_DISCOVERY_ACROSS_FILESYSTEM \
+      GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM
+
 echo "pre-push: cargo fmt --check"
 cargo fmt --check
 

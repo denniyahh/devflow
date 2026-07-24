@@ -3,18 +3,18 @@ gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone (open — no fixed closing phase)
 current_phase: 22
-current_phase_name: Concurrency & Governance Correctness
-status: planning
-stopped_at: Phase 21 context gathered
-last_updated: "2026-07-24T00:32:53.363Z"
-last_activity: 2026-07-23
+current_phase_name: Concurrency & Governance Correctness (light dogfooding trial)
+status: complete
+stopped_at: Phase 22 trial executed, verified, and integrated for release
+last_updated: "2026-07-24T22:50:00.000Z"
+last_activity: 2026-07-24
 progress:
   total_phases: 12
-  completed_phases: 10
-  total_plans: 74
-  completed_plans: 74
-  percent: 83
-last_activity_desc: Phase 21 complete, transitioned to Phase 22
+  completed_phases: 11
+  total_plans: 76
+  completed_plans: 76
+  percent: 92
+last_activity_desc: Phase 22 trial complete; 999.37 sandbox escape root-caused and fixed; both staged for release
 ---
 
 # DevFlow — Project State
@@ -23,25 +23,44 @@ last_activity_desc: Phase 21 complete, transitioned to Phase 22
 
 ## Active Phase
 
-**Phase 22 — Concurrency & Governance Correctness** (planning — not yet broken
-down; run `/gsd-plan-phase 22`). Depends on Phase 21.
+**Phase 22 — Concurrency & Governance Correctness** — the **light dogfooding
+trial** slice is **complete** (2/2 plans: 22-01, 22-02, resolving 999.30 /
+DEN-55). Re-verified independently after 999.37, since the original "tests
+green" claim was recorded the same day this repository was corrupted: 537 tests
+across 13 binaries, 0 failed, and zero coupling to the process-management model
+being revamped. The branch was then reused as the staging branch for this
+release.
 
-Phase 21 (Operator Legibility & Observability) **complete + verified 21/21** on
-`develop`, 2026-07-23 — 4/4 plans: 21a discoverability (999.3), 21b doctor
-staleness reconciliation (999.14), 21c sequentagent second-process tracking
-(999.2), 21d dogfood staleness content-awareness (999.29). Optional 21e
-(changelog content, 999.5) was left out of scope. **Unshipped:** workspace stays
-v1.7.0 until a release is cut. The v2.0.0 milestone stays open (no fixed closing
-phase); numbering continues forward until a breaking change earns 2.0.
+The **broader** "Concurrency & Governance Correctness" scope remains unplanned
+and explicitly out of the trial's boundary: 999.4 (version-tag contention),
+999.26 (object-store races), 999.28 (`--base`).
+
+**Also delivered in this release — 999.37 (unplanned, urgent):** the test suite
+escaped its sandbox and corrupted this repository (main repo flipped to
+`core.bare=true`, committer identity rewritten to a fixture's, 10 fixture
+commits stacked onto local `main`, the first deleting all 511 tracked files).
+Root-caused to git exporting `GIT_DIR` into pre-push hooks when pushing from a
+linked worktree, which outranks `.current_dir()`. Fixed in three layers (hook
+scrub, per-command containment, fail-fast guard) and validated by controlled
+A/B. Two follow-ups filed: 999.38 (test PATH race) and 999.39 (production
+inherits a redirecting environment).
+
+Phase 21 (Operator Legibility & Observability) **complete + verified 21/21**,
+**shipped as v1.8.0** (2026-07-24) — 4/4 plans: 21a discoverability (999.3), 21b
+doctor staleness reconciliation (999.14), 21c sequentagent second-process
+tracking (999.2), 21d dogfood staleness content-awareness (999.29). Optional 21e
+(changelog content, 999.5) was left out of scope. The v2.0.0 milestone stays
+open (no fixed closing phase); numbering continues forward until a breaking
+change earns 2.0.
 
 ## Current Position
 
-Phase: 22 — Concurrency & Governance Correctness
-Plan: Not started
-Status: Ready to plan
-Last activity: 2026-07-23
+Phase: 22 — Concurrency & Governance Correctness (light dogfooding trial)
+Plan: 22-01, 22-02 complete
+Status: Complete — integrated for release, pending version bump + CHANGELOG on `develop`
+Last activity: 2026-07-24
 
-Progress: Phase 21 complete + verified (unshipped — still v1.7.0); Phase 22 not yet planned.
+Progress: Phase 21 shipped as v1.8.0 (2026-07-24). Phase 22's trial slice complete and re-verified; 999.37 root-caused and fixed. Both staged on `feature/phase-22` and merged to `develop`; release prep (version bump, CHANGELOG, tag) still outstanding.
 
 *(Machine-readable fields for `gsd-tools state begin-phase` / `advance-plan` —
 this project historically tracked position only in the narrative "Active
@@ -50,6 +69,55 @@ Phase" section above, which `advance-plan` cannot parse (backlog 12,
 `begin-phase` can seed real Plan/Status values once Phase 20 starts.)*
 
 ## Recently Shipped
+
+- **Phase 21 — Operator Legibility & Observability (Complete + Verified +
+  Shipped as v1.8.0 — 4/4 plans, 2026-07-24).** Recut from "Operator Usability &
+  Release Execution" (operator decision, 2026-07-23): the release-cut executor
+  (999.25) and `--base` (999.28) were removed to their own phase / Phase 22, and
+  the phase backfilled with legibility/observability units. Not
+  `/gsd-review-backlog`-promoted; scope was operator-decided. Units: 21a — 999.3
+  operator discoverability (DEN-28); 21b — 999.14 doctor planning-doc staleness
+  reconciliation (DEN-39); 21c — 999.2 sequentagent second-process tracking,
+  narrowed (DEN-27); 21d — 999.29 dogfood staleness guard content-awareness,
+  sequenced first (DEN-54).
+
+  **Executed 2026-07-23** via 4 sequential waves in isolated git worktrees
+  (`worktree.baseRef: head`, no #683/#1369 degrade) — 21-01→21-02→21-03→21-04,
+  each a single-plan wave by DAG construction (all four touch
+  `crates/devflow-cli/src/commands.rs`, forbidding same-wave parallelism). Post-merge
+  gates green after every wave; final workspace suite 535/0.
+
+  **Code-reviewed** (`21-REVIEW.md`): 0 critical / 3 warning / 1 info — all
+  advisory (no correctness or security defect). WR-01 (`gate_show` copy-pastes
+  `gate_respond`'s stage resolution despite a "can never drift" doc comment),
+  WR-02 (hardcoded `"main"` instead of `config::MAIN`), WR-03 (narrow TOCTOU:
+  `gate_show` calls `Gates::list_open` twice), IN-01 (a per-phase event rescan
+  reintroducing the pattern 14-CR-10 eliminated). Deferred to backlog **999.30**
+  / Linear **DEN-55** by operator decision rather than fixed inline.
+
+  **Verified** (`21-VERIFICATION.md`): 21/21 must-haves confirmed against live
+  source (re-run tests, both unanimous 3/3 cross-AI review MUST-FIXes
+  independently confirmed present). **Security** (`21-SECURITY.md`): 20 threats
+  built from all 4 plans' `<threat_model>` blocks (16 mitigate + 4 accept), 0
+  open, ASVS L1 short-circuit (plan-time register, grep-depth evidence for every
+  mitigation).
+
+  **PR #23** (`release/v1.8.0 → main`) opened, CI green (8/8 checks),
+  squash-merged to `main` (`cfa9167`) 2026-07-24. Signed tag `v1.8.0` (ED25519,
+  verified) pushed. [GitHub Release](https://github.com/denniyahh/devflow/releases/tag/v1.8.0)
+  published. `scripts/sync-main-to-develop.sh` run (content-preserving `-X ours`
+  merge, tree verified byte-identical) via **PR #24** (`sync/main-to-develop-v1.8.0
+  → develop`, merge method — not squash, to preserve the main-ancestor link), CI
+  green (8/8), merged (`01ad9e4`). `devflow doctor` self-check post-release: `devflow
+  v1.8.0 ✓`, planning-doc drift check shows only expected pre-v1.5.0 legacy warns
+  (phases 6/7), zero new problems.
+
+  **Published to crates.io** (2026-07-24, operator-approved retry after the
+  auto-mode classifier blocked the first attempt) — `devflow-core` published
+  first (35 files, 532.9KiB), then `devflow` (25 files, 594.0KiB), which
+  correctly resolved `devflow-core` from the registry rather than the local
+  path, confirming publish order held. Both confirmed live at `1.8.0` via
+  `cargo search`.
 
 - **Phase 20 — Release Correctness + Operator Control (Complete + Verified +
   Shipped as v1.7.0 — 5/5 plans, 2026-07-23).** Promoted from backlog

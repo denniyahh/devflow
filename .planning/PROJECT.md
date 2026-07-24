@@ -6,9 +6,10 @@ DevFlow is a Rust CLI that automates the mechanical workflow steps an AI
 coding agent needs to drive a development phase end-to-end: branch creation,
 agent launch, completion detection, gated human checkpoints, versioning,
 docs/changelog updates, and cleanup. It runs a 5-stage pipeline
-(Define → Plan → Code → Validate → Ship) against any of several agent-agnostic
-adapters (Claude Code, OpenAI Codex, OpenCode), in either `auto` (unattended)
-or `supervise` (gated) mode.
+(Define → Plan → Code → Validate → Ship), today against three supported
+agent adapters (Claude Code, OpenAI Codex, OpenCode) — opinionated by design,
+not a universal agent platform — in either `auto` (unattended) or
+`supervise` (gated) mode.
 
 ## Core Value
 
@@ -63,9 +64,13 @@ mid-run crash or kill.
 
 ### Active
 
-*(none currently in flight. Phase 21 (Operator Legibility & Observability)
-executed + verified on `develop`, 2026-07-23 — unshipped: the workspace
-version stays `1.7.0` until a release is cut. Phase 20 shipped as v1.7.0,
+*(none currently in flight. Phase 22's **light dogfooding trial** slice is
+complete (22-01, 22-02, resolving 999.30/DEN-55) and integrated for release
+alongside the urgent 999.37 sandbox-escape fix; the broader Concurrency &
+Governance scope (999.4, 999.26, 999.28) remains unplanned. Phase 21
+(Operator Legibility & Observability)
+shipped as v1.8.0, 2026-07-24 (PR #23 → main, signed tag, GitHub Release,
+published to crates.io). Phase 20 shipped as v1.7.0,
 2026-07-23. The v2.0.0 milestone stays open — it does NOT close at Phase 20 or any other
 fixed phase; numbering continues (21, 22, …) until a genuinely breaking
 change earns the 2.0 slot. `/gsd-complete-milestone` is not run here.
@@ -91,13 +96,13 @@ items require `/gsd-review-backlog` promotion.)*
   through Phase 16. Current operator commands include `start`, `gate`, `logs`,
   `history`, `parallel`, `sequentagent`, `reference`, `cleanup`, `status`,
   `list`, `recover`, `doctor`, and `test`; `advance` remains hidden/internal.
-- Workspace version is `1.7.0` (Phase 20, shipped 2026-07-23). Code/docs
+- Workspace version is `1.8.0` (Phase 21, shipped 2026-07-24). Code/docs
   historically over-claimed "v2.0.0" as current; Phase 12 corrected this.
   The `v2.0.0` label names an open-ended milestone, not a bounded arc with
   a scheduled closing phase — decided 2026-07-23 (ROADMAP.md "Milestone
-  stays open"): nothing across the five Phase 20 units was inherently
-  breaking, so it shipped as `1.7.0` and the milestone continues past
-  Phase 20 with no predetermined endpoint. `2.0.0` remains reserved for a
+  stays open"): nothing across Phase 20's or Phase 21's units was inherently
+  breaking, so each shipped as a minor bump and the milestone continues past
+  both with no predetermined endpoint. `2.0.0` remains reserved for a
   future genuinely-breaking change, whenever that happens to land.
 - No `.planning/REQUIREMENTS.md` exists in this project; requirements are
   tracked per-phase in each phase's `CONTEXT.md`, not via formal REQ-IDs.
@@ -137,6 +142,6 @@ items require `/gsd-review-backlog` promotion.)*
 | `.planning/CONCERNS.md` | Top findings from the original pre-Phase-1 codebase audit |
 
 ---
-*Last updated: 2026-07-23 after Phase 21 (Operator Legibility & Observability)
-executed + verified on `develop` — 4/4 plans, unshipped (workspace stays
-v1.7.0); the v2.0.0 milestone stays open (no fixed closing phase)*
+*Last updated: 2026-07-24 after Phase 21 (Operator Legibility & Observability)
+shipped as v1.8.0 — 4/4 plans, verified 21/21, signed tag + GitHub Release
+published; the v2.0.0 milestone stays open (no fixed closing phase)*

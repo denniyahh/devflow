@@ -20,6 +20,7 @@
 
 | Phase | Name | Version |
 |---|---|---|
+| 21 | Operator Legibility & Observability | 1.8.0 |
 | 20 | Release Correctness + Operator Control | 1.7.0 |
 | 18 | Dogfood Reliability Hardening | 1.5.0 |
 | 11 | GSD-Native Architecture + Remediation | 1.2.0 |
@@ -575,18 +576,87 @@ Plans:
 
 - [x] Delivered by Phase 21 (21d / 21-01) — folded in as a unit, not separately promoted
 
-### Phase 999.30: Phase 21 Code-Review Cleanup — gate_show/doctor DRY + TOCTOU (BACKLOG)
+### Phase 999.30: Phase 21 Code-Review Cleanup — gate_show/doctor DRY + TOCTOU (DELIVERED — Phase 22 / 22-01, 22-02)
 
 **Goal:** Resolve the four advisory findings from `21-REVIEW.md` (0 critical / 3 warning / 1 info; Phase 21 verified 21/21, no correctness or security defect — these are quality/maintainability only). **WR-01:** `gate_show`'s stage auto-resolution is copy-pasted from `gate_respond` (`crates/devflow-cli/src/commands.rs:810-844`) despite a doc comment claiming the two "can never drift" — extract a shared `resolve_single_open_gate_stage` both call (the same copy-paste-with-"can never drift"-comment smell also sits at `commands.rs:1827`). **WR-02:** `collect_planning_doc_findings` (`commands.rs:2285`) hardcodes `"main"` instead of `devflow_core::config::MAIN` (`config.rs:15`) — matches today so no live bug, but an unlinked second source of truth that would emit false `doctor` Problems if the branch ever becomes configurable. **WR-03:** `gate_show` calls `Gates::list_open` twice (narrow TOCTOU + redundant read) — fetch once, reuse. **IN-01 (info):** `latest_stage_launched_ts` reintroduces the per-phase full-file `events.jsonl` rescan that 14-CR-10 eliminated in the same `status()` function — fold the last `stage_launched` ts into the existing single-pass `last_events_by_phase`.
-**Priority:** Low | **Size:** S — WR-01/02/03 are small localized fixes (default `--fix` scope covers all three); IN-01 is a follow-up perf refactor. Source: `21-REVIEW.md` (gsd-code-reviewer, 2026-07-23), deferred to backlog by operator decision. Linear: DEN-55 (Backlog).
-**Requirements:** TBD — see 21-REVIEW.md
-**Plans:** 0 plans
+**Priority:** Low | **Size:** S — WR-01/02/03 are small localized fixes (default `--fix` scope covers all three); IN-01 is a follow-up perf refactor. Source: `21-REVIEW.md` (gsd-code-reviewer, 2026-07-23), deferred to backlog by operator decision. Linear: DEN-55 (Done, 2026-07-24).
+**Delivered:** Phase 22 / plans 22-01 (`c442e00`), 22-02 (`2bbfabd`), 2026-07-24. Validated (fmt/clippy/workspace tests green), then integrated on `feature/phase-22` as the staging branch for this release alongside the 999.37 containment fix and the naming reframe, and merged to `develop` from there. Re-verified independently after the sandbox-escape investigation, since the original "tests green" claim was recorded on the same day the repository was corrupted: 537 tests across 13 binaries, clean, with zero coupling to the process-management model being revamped (no changed line touches monitor/pgid/spawn/teardown/liveness).
+
+Plans:
+
+- [x] Delivered by Phase 22 (22-01, 22-02) — absorbed as the phase's narrow trial scope, not separately promoted
+
+### Phase 999.31: Modular Agent Driver Architecture (BACKLOG)
+
+**Goal:** Replace the thin `AgentAdapter` trait with a modular `AgentDriver` contract — capability discovery, driver-owned prompt rendering, command building, completion parsing, and health probes — so agent-specific execution semantics stop being scattered across `prompt.rs`, `agents/*.rs`, `agent_result.rs`, and `preflight.rs`. Root cause of a confirmed dogfood failure: `Stage::gsd_command()` bakes raw `/gsd-*` slash-command strings into core, rendered identically for every adapter (enforced by a test), and Codex received them as literal shell commands during the Phase 22 trial.
+
+**Priority:** High | **Size:** L — fixes a confirmed dogfood-breaking defect and is the prerequisite for onboarding more agents. Linear: DEN-56.
+
+*This entry is deliberately abridged.* It is included because four shipped user-facing docs cite "backlog 999.31" by number — `CONTRIBUTING.md`, `ARCHITECTURE.md`, `docs/guides/adding-agent.md` and `docs/architecture/agent-model.md` — and a reference to an absent entry is worse than a short one. The full version, its `CONTEXT.md`, and the Codex compatibility audit that sourced it sit on a separate planning-docs branch not included in this release.
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.37: Test Suite Escaped Its Sandbox and Corrupted the Real Repo (RESOLVED — this release)
+
+**What happened:** running the test suite hijacked a git worktree of this repository, flipped the **main repo to `core.bare=true`**, rewrote its committer identity to a fixture's (`t <t@e.st>`), and stacked 10 fixture commits onto local `main` — the first of which **deleted all 511 tracked files**, leaving `main` pointing at a tree containing only `a.txt`. Discovered 2026-07-24 while adding macOS CI.
+
+**Root cause (confirmed, reproduced deterministically):** `scripts/hooks/pre-push` runs `cargo test --workspace`. Git **exports `GIT_DIR` into hook environments when the gitdir is non-default — exactly the case when pushing from a linked worktree** (verified side by side in one repo: a push from a normal checkout gives the hook no `GIT_DIR`; a push from a worktree gives `GIT_DIR=<main>/.git/worktrees/<name>`). `GIT_DIR` **outranks the process working directory** when git resolves which repository to act on, and Rust runs a test binary's tests as threads in ONE process, so the whole suite inherited it and every fixture retargeted the real repo *despite* correctly pinning `.current_dir()`. Because a worktree's gitdir shares `config` with the main repo, the fixtures' `git init` set `core.bare=true` there and their `git config` rewrote the identity.
+
+**Two earlier hypotheses were wrong and are recorded so they are not re-tried:** it is not a `set_current_dir`/cwd race of the `ENV_MUTEX` class (there is no `set_current_dir` anywhere in `crates/`, and an audit of every `.rs` file found **0** unpinned `Command::new("git")` on a 14-line window), and plain `git init` inside a linked worktree does **not** set `core.bare` (tested directly on git 2.55).
+
+**Also verified independently:** `git -C <dir>` does **not** override `GIT_DIR` — only the `--git-dir` flag does — and `GIT_CEILING_DIRECTORIES` does **not** contain it. Pinning the working directory can therefore never be the containment mechanism; clearing the variables is.
+
+**Fix — three layers, because no single one is sufficient:**
+
+1. `scripts/hooks/pre-push` clears `$(git rev-parse --local-env-vars)` — git's own authoritative 15-var list, so it self-maintains across git upgrades — plus `GIT_NAMESPACE`/`GIT_DISCOVERY_ACROSS_FILESYSTEM`/`GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`. Clearing `GIT_CONFIG_COUNT` is sufficient to neutralize `GIT_CONFIG_KEY_n`/`VALUE_n` (verified). `githooks(5)` prescribes exactly this for hooks touching a "foreign repository"; a fixture tempdir is one. **Prevents the known trigger.**
+2. `devflow_core::test_support::git_command` applies the same scrub **per command**, behind an off-by-default `test-support` feature. 50 test-side call sites migrated across 12 files. **Contains fixtures on every other launch path** (`git rebase --exec`, `git bisect run`, another hook, CI).
+3. `crates/devflow-cli/tests/git_env_hermeticity.rs` fails fast and names the cause when the environment is dirty. **Detection, not prevention** — tests run in parallel, so a fixture can run first; it exists so this presents as a diagnosis rather than the unrelated flake it originally looked like ("41 staleness failures").
+
+**Validation — controlled A/B in an isolated clone**, same commit and worktree, only the hook differing: scrubbed, the push is green with 156/156 passing; unscrubbed, the push is **blocked** with 42 failures, `core.bare=true` and HEAD hijacked onto fixture branch `side` — reproducing the incident down to the branch name. Separately, running the suite with `GIT_DIR` set: before layer 2, the clone was corrupted; after, the repository is **completely unharmed**.
+
+**Residual, by design:** under a dirty environment 37 unit tests still fail. They exercise *production* functions in-process, which are pinned but not scrubbed — see 999.39. Loud failure is the intended end state; scrubbing production to make them pass would mask that separate exposure.
+
+**Blast radius was test-only for users:** all 86 production `Command::new("git")` invocations already pass `current_dir()`, so `cargo install devflow` users were unaffected. The victims were developers and contributors — via a normal `git push`, not an unusual action.
+
+Plans:
+
+- [x] Delivered in this release (hook scrub, per-command containment, hermeticity guard, `pre-commit` chaining shim)
+
+### Phase 999.38: Test-Suite PATH Race Between ENV_MUTEX Mutators and Concurrent Git Callers (BACKLOG)
+
+**Goal:** `run_git_stdout` (`crates/devflow-cli/src/staleness.rs:106`) resolves `git` through `PATH`, while several tests replace `PATH` **entirely** with a stub directory containing no `git` — `pipeline_launch.rs:590`, `pipeline_outcomes.rs:879/1132/1246`, `preflight.rs:627/701`. `ENV_MUTEX` serializes those mutators against *each other* but not against the ~155 other tests in the same binary that shell out to git concurrently, so `Command::new("git")` intermittently fails to spawn and `run_git_stdout` returns `None`.
+
+**Evidence:** reproduced once in four full-suite runs — `staleness::tests::ahead_build_from_descendant_commit_warns_instead_of_blocking` panicking at `staleness.rs:891` (`rev-parse HEAD`). This is a genuine flake source, distinct from 999.37, and was found while investigating it.
+
+**Note:** Rust 2024 makes `std::env::set_var`/`remove_var` `unsafe` precisely because this pattern is unsound in a threaded test binary — the fix direction is per-`Command` `env`/`env_remove` (as 999.37's `test_support` now does for git) rather than process-global mutation. Fixing this would let `ENV_MUTEX` shrink or disappear, which is worth more than the flake itself. Related: 999.15 (hermetic tests for shell entry points).
+
+**Priority:** Medium | **Size:** M
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.39: Production Git Calls Inherit a Redirecting Environment (BACKLOG)
+
+**Goal:** DevFlow's production git invocations pin `current_dir()` but do **not** clear git's repository-local environment variables. `GIT_DIR` outranks the working directory, so any `devflow` process launched with one set — from a git hook, `git rebase --exec`, or `git bisect run` — silently operates on *that* repository instead of the project root it was given.
+
+**Evidence:** with `GIT_DIR` set, 37 unit tests fail because production functions under test (e.g. `tag_exists_and_reachable`) resolve to the wrong repository. 999.37 deliberately did **not** paper over this: fixture containment was fixed, production left honest, so the failures name a real exposure rather than hiding it.
+
+**Not the same severity as 999.37:** DevFlow is normally invoked directly, not from a hook, and the observed effect is wrong answers rather than corruption. But DevFlow *runs git hooks* as part of its own workflow, which is exactly the shape that sets these variables.
+
+**Fix direction:** route production git calls through one scrubbing constructor, mirroring `test_support::git_command`. Decide deliberately whether an operator-set `GIT_DIR` should ever be honoured — the safer default is no.
+
+**Priority:** Medium | **Size:** M — ~86 call sites, mechanical, but production behavior so it needs its own review.
 
 Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
 ### Phase 21: Operator Legibility & Observability
+
+**Shipped as v1.8.0** (2026-07-24) — PR #23 (`develop → main`, squash `cfa9167`), signed tag `v1.8.0`, [GitHub Release](https://github.com/denniyahh/devflow/releases/tag/v1.8.0). `sync-main-to-develop.sh` run via PR #24 (merge `01ad9e4`). Published to crates.io (`devflow-core` then `devflow`, both confirmed live at 1.8.0).
 
 **Goal:** Make DevFlow's operator surface **legible** and its self-reported state **trustworthy** — every unit single-writer, operator-facing, reversible or detection-only, and testable without any irreversible side effect. Scope recut from the original "Operator Usability & Release Execution" (operator decision, 2026-07-23): the release-cut executor (999.25) and `--base` (999.28) were removed (→ own phase / Phase 22 respectively) and the phase backfilled with legibility/observability units. Not `/gsd-review-backlog`-promoted; scope is operator-decided — see `phases/21-*/21-CONTEXT.md`.
 **Requirements**: TBD (no REQ-IDs — units 21a–21d map to CONTEXT decisions D-03..D-07)
@@ -629,14 +699,25 @@ Plans:
 
 ### Phase 22: Concurrency & Governance Correctness
 
-**Goal:** [To be planned]
-**Requirements**: TBD
+**Goal:** A light dogfooding trial, not the full concurrency/governance phase: resolve the four advisory findings from Phase 21's code review (`21-REVIEW.md`), promoted as backlog **999.30 / DEN-55**. Share the omitted-stage gate resolution `gate_show` and `gate_respond` currently copy-paste (WR-01); replace `collect_planning_doc_findings`'s hardcoded `"main"` with `devflow_core::config::MAIN` (WR-02); make `gate_show` read open gates once, closing a narrow TOCTOU (WR-03); fold `status`'s per-phase `events.jsonl` rescan into the existing single-pass event summary (IN-01). Runs through Validate and stops before Ship. The broader "Concurrency & Governance Correctness" scope (999.4 version-tag contention, 999.26 object-store races, 999.28 `--base`) remains unplanned and is explicitly out of this trial's boundary — see `phases/22-concurrency-governance-correctness/22-CONTEXT.md`.
+**Requirements**: TBD (no REQ-IDs — narrow trial scoped directly from 999.30 / DEN-55, see CONTEXT.md)
 **Depends on:** Phase 21
-**Plans:** 0 plans
+**Plans:** 2/2 plans complete
+
+**Trial history:** First attempted with Codex (2026-07-24) — Define succeeded, Plan failed immediately (`/gsd-plan-phase` reached Codex as a literal, non-existent shell command, the confirmed defect behind `.planning/audits/2026-07-24-codex-compatibility-review.md` and backlog 999.31/DEN-56). Two ad-hoc point-fixes were committed directly against `crates/devflow-core/src/agents/codex.rs` as a stopgap; Codex still couldn't route the skill and the run stalled on `apply_patch` errors mid-ROADMAP-promotion, leaving the workflow state lost (`devflow doctor` showed no active phase) though the worktree/branch survived. Retried 2026-07-24 with Claude directly (operator decision, given 999.31 isn't implemented yet): the two ad-hoc Codex commits were reset out (`git reset --hard` to `4af0991`), the existing `22-RESEARCH.md`/plans were kept and executed as-is.
+
+**Executed 2026-07-24** on `feature/phase-22` — 22-01 (`c442e00`) then 22-02 (`2bbfabd`), plus a docs commit (`c30f617`) promoting this ROADMAP section from `[To be planned]`, closing the plan-checker BLOCKER the stalled Codex run never resolved. **Validated**: `cargo fmt --check` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean, `cargo test --workspace` green.
+
+**Re-verified and shipped 2026-07-24.** The original "tests green" claim was recorded the same day this repository was corrupted by 999.37, so it was re-run independently from a clean checkout rather than trusted: 537 tests across 13 binaries, 0 failed. Also audited for coupling to the process-management model currently being revamped (999.33/999.34) — **zero**: no changed line touches monitor, `monitor_pid`, pgid, spawn, teardown, `Liveness`, `process_group` or supervisor, and only two source files change (`commands.rs`, `events.rs`). Both changes are read-side; the event `emit` path is untouched, so the socket-supervisor redesign leaves this work intact. `commands.rs` nets **−6 lines** by removing the `gate_show`/`gate_respond` copy-paste.
+
+The branch was then reused as the **staging branch for this release**, integrating the 999.37 containment fix and the naming reframe, tested as a unit, and merged to `develop` from there. Its name understates its final contents.
+
+*Note:* the Codex compatibility audit (`.planning/audits/2026-07-24-codex-compatibility-review.md`) and the 999.31 agent-driver-modularization backlog entry referenced above are **not in this release** — they sit on a separate planning-docs branch that was deliberately not merged, so those two references will not resolve until it lands. DEN-56 tracks the same defect in Linear.
 
 Plans:
 
-- [ ] TBD (run /gsd-plan-phase 22 to break down)
+- [x] 22-01 — Shared gate resolution + `gate_show` one-read + `MAIN` constant (WR-01, WR-02, WR-03)
+- [x] 22-02 — Single-pass `stage_launched` timestamp summary + full Validate (IN-01)
 
 ### Phase 23: Test Suite & CI Hardening
 

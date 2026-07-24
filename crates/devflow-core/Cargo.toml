@@ -7,7 +7,13 @@ repository.workspace = true
 readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Agent-agnostic development workflow state machine"
+description = "Opinionated AI-driven development workflow state machine"
+
+[features]
+# Exposes `test_support` (hermetic git command construction, 999.37) to other
+# crates' test targets. Off by default — it adds no runtime behavior and is
+# never enabled for a normal build.
+test-support = []
 
 [dependencies]
 libc = "0.2"
