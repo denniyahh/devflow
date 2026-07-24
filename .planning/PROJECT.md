@@ -64,8 +64,8 @@ mid-run crash or kill.
 ### Active
 
 *(none currently in flight. Phase 21 (Operator Legibility & Observability)
-shipped as v1.8.0, 2026-07-24 (PR #23 → main, signed tag, GitHub Release;
-crates.io publish pending operator approval). Phase 20 shipped as v1.7.0,
+shipped as v1.8.0, 2026-07-24 (PR #23 → main, signed tag, GitHub Release,
+published to crates.io). Phase 20 shipped as v1.7.0,
 2026-07-23. The v2.0.0 milestone stays open — it does NOT close at Phase 20 or any other
 fixed phase; numbering continues (21, 22, …) until a genuinely breaking
 change earns the 2.0 slot. `/gsd-complete-milestone` is not run here.

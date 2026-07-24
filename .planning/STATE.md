@@ -93,10 +93,12 @@ Phase" section above, which `advance-plan` cannot parse (backlog 12,
   v1.8.0 ✓`, planning-doc drift check shows only expected pre-v1.5.0 legacy warns
   (phases 6/7), zero new problems.
 
-  **crates.io publish pending operator approval** — `cargo publish -p devflow-core`
-  dry-run verified clean (35 files, 532.9KiB); the actual publish was blocked by
-  the auto-mode permission classifier as an irreversible public-registry action.
-  Not yet published; `devflow-core`/`devflow` remain at 1.7.0 on the index.
+  **Published to crates.io** (2026-07-24, operator-approved retry after the
+  auto-mode classifier blocked the first attempt) — `devflow-core` published
+  first (35 files, 532.9KiB), then `devflow` (25 files, 594.0KiB), which
+  correctly resolved `devflow-core` from the registry rather than the local
+  path, confirming publish order held. Both confirmed live at `1.8.0` via
+  `cargo search`.
 
 - **Phase 20 — Release Correctness + Operator Control (Complete + Verified +
   Shipped as v1.7.0 — 5/5 plans, 2026-07-23).** Promoted from backlog
