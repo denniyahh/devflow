@@ -632,14 +632,15 @@ Plans:
 
 ### Phase 22: Concurrency & Governance Correctness
 
-**Goal:** [To be planned]
-**Requirements**: TBD
+**Goal:** A light dogfooding trial, not the full concurrency/governance phase: resolve the four advisory findings from Phase 21's code review (`21-REVIEW.md`), promoted as backlog **999.30 / DEN-55**. Share the omitted-stage gate resolution `gate_show` and `gate_respond` currently copy-paste (WR-01); replace `collect_planning_doc_findings`'s hardcoded `"main"` with `devflow_core::config::MAIN` (WR-02); make `gate_show` read open gates once, closing a narrow TOCTOU (WR-03); fold `status`'s per-phase `events.jsonl` rescan into the existing single-pass event summary (IN-01). Runs through Validate and stops before Ship. The broader "Concurrency & Governance Correctness" scope (999.4 version-tag contention, 999.26 object-store races, 999.28 `--base`) remains unplanned and is explicitly out of this trial's boundary — see `phases/22-concurrency-governance-correctness/22-CONTEXT.md`.
+**Requirements**: TBD (no REQ-IDs — narrow trial scoped directly from 999.30 / DEN-55, see CONTEXT.md)
 **Depends on:** Phase 21
-**Plans:** 0 plans
+**Plans:** 2/2 plans
 
 Plans:
 
-- [ ] TBD (run /gsd-plan-phase 22 to break down)
+- [ ] 22-01 — Shared gate resolution + `gate_show` one-read + `MAIN` constant (WR-01, WR-02, WR-03)
+- [ ] 22-02 — Single-pass `stage_launched` timestamp summary + full Validate (IN-01)
 
 ### Phase 23: Test Suite & CI Hardening
 
