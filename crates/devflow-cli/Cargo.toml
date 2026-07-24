@@ -7,7 +7,7 @@ repository.workspace = true
 readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "DevFlow CLI — agent-agnostic development workflow automation"
+description = "DevFlow CLI — an opinionated take on AI-driven development automation"
 
 [dependencies]
 devflow-core.workspace = true

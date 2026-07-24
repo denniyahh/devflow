@@ -6,7 +6,7 @@ version: "0.7.0"
 
 # DevFlow — Hermes Integration
 
-DevFlow is an agent-agnostic CLI that automates the entire development workflow. This skill teaches Hermes when and how to invoke it.
+DevFlow is an opinionated CLI that automates the entire development workflow. This skill teaches Hermes when and how to invoke it.
 
 **Current version:** v0.5.0+ — direct process spawning (no tmux), PID-based monitoring.
 **Installed:** `~/.local/bin/devflow` (symlinked from `~/Github/devflow/target/release/devflow`)

@@ -36,7 +36,7 @@ human decision before DevFlow performs terminal Git operations.
 
 ## Key Design Decisions
 
-- **Agent-agnostic** — Claude Code, Codex, and OpenCode implement one adapter contract.
+- **Opinionated, not universal** — Claude Code, Codex, and OpenCode are supported through one adapter contract today; DevFlow optimizes for the workflow decisions that hold up under real use, not maximum agent interchangeability.
 - **Worktree-first** — each phase runs in its own Git worktree by default.
 - **Evidence-first** — external probes, agent results, exits, and Git state are evaluated in order.
 - **Never-silent failures** — failures open an actionable gate instead of stalling invisibly.
