@@ -722,6 +722,12 @@ No commits were lost — `develop` and the two sibling worktrees were untouched 
 
 **Immediate mitigation until fixed:** do not run `cargo test` from inside a `.worktrees/*` checkout of this repo.
 
+**SCOPE REFINEMENT (2026-07-24, after diagnosis) — this is a TEST-ONLY defect; no release is warranted.** All **86** `Command::new("git")` invocations in production code were audited and **every one passes `current_dir()`** — including the three that a naive 4-line-window grep flags as unpinned (`git.rs:174`, `agent_result.rs:664`, `commands.rs:84`), where `.current_dir()` simply appears on the 5th line or later. Production never relies on process cwd for git.
+
+Consequence: `cargo install devflow` users run no tests and are **unaffected**. The blast radius is developers and contributors running `cargo test` on a checkout. A patch release would ship zero user-visible change. **Fix and merge through the normal branch flow rather than an emergency release.**
+
+The escape is therefore in a **test fixture**, not production. Ruled out so far: no `std::env::set_current_dir` anywhere in `crates/`, and no `core.bare`/`"bare"` literal anywhere in `crates/` — so the mechanism is not an explicit cwd change or an explicit bare-config write. Still to identify: which fixture's `git` invocation escapes to the repo root. Note `cargo test` gives integration tests a cwd of `<repo>/crates/devflow-cli`, i.e. **inside the worktree**, so any fixture helper that shells out to `git` without pinning a directory operates on the real repository. Next step is to audit the test-local `git()` helper functions in `phase7_cli.rs`, `build_provenance.rs`, `release_check.rs`, and `staleness.rs` for that pattern.
+
 Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
