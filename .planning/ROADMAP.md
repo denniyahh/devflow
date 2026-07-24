@@ -576,16 +576,15 @@ Plans:
 
 - [x] Delivered by Phase 21 (21d / 21-01) — folded in as a unit, not separately promoted
 
-### Phase 999.30: Phase 21 Code-Review Cleanup — gate_show/doctor DRY + TOCTOU (BACKLOG)
+### Phase 999.30: Phase 21 Code-Review Cleanup — gate_show/doctor DRY + TOCTOU (DELIVERED — Phase 22 / 22-01, 22-02)
 
 **Goal:** Resolve the four advisory findings from `21-REVIEW.md` (0 critical / 3 warning / 1 info; Phase 21 verified 21/21, no correctness or security defect — these are quality/maintainability only). **WR-01:** `gate_show`'s stage auto-resolution is copy-pasted from `gate_respond` (`crates/devflow-cli/src/commands.rs:810-844`) despite a doc comment claiming the two "can never drift" — extract a shared `resolve_single_open_gate_stage` both call (the same copy-paste-with-"can never drift"-comment smell also sits at `commands.rs:1827`). **WR-02:** `collect_planning_doc_findings` (`commands.rs:2285`) hardcodes `"main"` instead of `devflow_core::config::MAIN` (`config.rs:15`) — matches today so no live bug, but an unlinked second source of truth that would emit false `doctor` Problems if the branch ever becomes configurable. **WR-03:** `gate_show` calls `Gates::list_open` twice (narrow TOCTOU + redundant read) — fetch once, reuse. **IN-01 (info):** `latest_stage_launched_ts` reintroduces the per-phase full-file `events.jsonl` rescan that 14-CR-10 eliminated in the same `status()` function — fold the last `stage_launched` ts into the existing single-pass `last_events_by_phase`.
-**Priority:** Low | **Size:** S — WR-01/02/03 are small localized fixes (default `--fix` scope covers all three); IN-01 is a follow-up perf refactor. Source: `21-REVIEW.md` (gsd-code-reviewer, 2026-07-23), deferred to backlog by operator decision. Linear: DEN-55 (Backlog).
-**Requirements:** TBD — see 21-REVIEW.md
-**Plans:** 0 plans
+**Priority:** Low | **Size:** S — WR-01/02/03 are small localized fixes (default `--fix` scope covers all three); IN-01 is a follow-up perf refactor. Source: `21-REVIEW.md` (gsd-code-reviewer, 2026-07-23), deferred to backlog by operator decision. Linear: DEN-55 (Done, 2026-07-24).
+**Delivered:** Phase 22 / plans 22-01 (`c442e00`), 22-02 (`2bbfabd`), 2026-07-24. NOTE: in source on `feature/phase-22` (worktree) but **not merged or pushed** — validated (fmt/clippy/workspace tests green) but stopped after Validate per the phase's narrow trial boundary; no Ship performed.
 
 Plans:
 
-- [ ] TBD (promote with /gsd-review-backlog when ready)
+- [x] Delivered by Phase 22 (22-01, 22-02) — absorbed as the phase's narrow trial scope, not separately promoted
 
 ### Phase 21: Operator Legibility & Observability
 
@@ -635,12 +634,16 @@ Plans:
 **Goal:** A light dogfooding trial, not the full concurrency/governance phase: resolve the four advisory findings from Phase 21's code review (`21-REVIEW.md`), promoted as backlog **999.30 / DEN-55**. Share the omitted-stage gate resolution `gate_show` and `gate_respond` currently copy-paste (WR-01); replace `collect_planning_doc_findings`'s hardcoded `"main"` with `devflow_core::config::MAIN` (WR-02); make `gate_show` read open gates once, closing a narrow TOCTOU (WR-03); fold `status`'s per-phase `events.jsonl` rescan into the existing single-pass event summary (IN-01). Runs through Validate and stops before Ship. The broader "Concurrency & Governance Correctness" scope (999.4 version-tag contention, 999.26 object-store races, 999.28 `--base`) remains unplanned and is explicitly out of this trial's boundary — see `phases/22-concurrency-governance-correctness/22-CONTEXT.md`.
 **Requirements**: TBD (no REQ-IDs — narrow trial scoped directly from 999.30 / DEN-55, see CONTEXT.md)
 **Depends on:** Phase 21
-**Plans:** 2/2 plans
+**Plans:** 2/2 plans complete
+
+**Trial history:** First attempted with Codex (2026-07-24) — Define succeeded, Plan failed immediately (`/gsd-plan-phase` reached Codex as a literal, non-existent shell command, the confirmed defect behind `.planning/audits/2026-07-24-codex-compatibility-review.md` and backlog 999.31/DEN-56). Two ad-hoc point-fixes were committed directly against `crates/devflow-core/src/agents/codex.rs` as a stopgap; Codex still couldn't route the skill and the run stalled on `apply_patch` errors mid-ROADMAP-promotion, leaving the workflow state lost (`devflow doctor` showed no active phase) though the worktree/branch survived. Retried 2026-07-24 with Claude directly (operator decision, given 999.31 isn't implemented yet): the two ad-hoc Codex commits were reset out (`git reset --hard` to `4af0991`), the existing `22-RESEARCH.md`/plans were kept and executed as-is.
+
+**Executed 2026-07-24** on `feature/phase-22` (worktree, not merged) — 22-01 (`c442e00`) then 22-02 (`2bbfabd`), plus a docs commit (`c30f617`) promoting this ROADMAP section from `[To be planned]`, closing the plan-checker BLOCKER the stalled Codex run never resolved. **Validated**: `cargo fmt --check` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean, `cargo test --workspace` green (492 unit tests + integration suites, 0 failed). Stopped after Validate per the trial boundary — no Ship, PR, push, or remote-state operation performed; the branch is local-only pending a future promotion decision.
 
 Plans:
 
-- [ ] 22-01 — Shared gate resolution + `gate_show` one-read + `MAIN` constant (WR-01, WR-02, WR-03)
-- [ ] 22-02 — Single-pass `stage_launched` timestamp summary + full Validate (IN-01)
+- [x] 22-01 — Shared gate resolution + `gate_show` one-read + `MAIN` constant (WR-01, WR-02, WR-03)
+- [x] 22-02 — Single-pass `stage_launched` timestamp summary + full Validate (IN-01)
 
 ### Phase 23: Test Suite & CI Hardening
 
