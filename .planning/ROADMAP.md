@@ -712,7 +712,7 @@ Plans:
 
 No commits were lost — `develop` and the two sibling worktrees were untouched — but recovery required manually resetting `core.bare`, recreating the branch from a dangling object, force-removing the hijacked worktree, and deleting a leaked `side` branch.
 
-**Suspected root cause:** Rust runs a binary's tests as threads in **one process**, and `std::env::set_current_dir` is **process-global**. A fixture that changes cwd (or leaks `GIT_DIR`/`GIT_INDEX_FILE`/`GIT_CONFIG_*`) lets a *concurrent* test's `git init`/`add`/`commit`/`config` land in the real repository instead of its tempdir. This codebase has a documented history of exactly this class of race — `ENV_MUTEX` is called out as "a repeat root cause across 19i, GAP-2 and 999.4" in the Phase 19 notes, and 19i was a PATH race of the same shape. Prime suspects are the fixtures in `crates/devflow-cli/tests/phase7_cli.rs`, `build_provenance.rs`, and `release_check.rs`, which drive real `git` heavily.
+**~~Suspected root cause~~ (SUPERSEDED — this hypothesis was wrong, see ROOT CAUSE below):** a process-global `std::env::set_current_dir` cwd race of the `ENV_MUTEX` class (19i, GAP-2, 999.4), with the fixtures in `phase7_cli.rs`/`build_provenance.rs`/`release_check.rs` as prime suspects. Disproved: there is no `set_current_dir` anywhere in `crates/`, an audit of every `.rs` file found **0** unpinned `Command::new("git")` (14-line window), and it is not a race at all — it is deterministic given the trigger.
 
 **Priority:** Urgent | **Size:** M — diagnosis is bounded (find which fixture escapes; `git config core.bare` and `git branch -D` are rare enough calls to grep for), but the fix is structural: every git-touching test must be pinned to its tempdir via explicit `-C <dir>` / `current_dir()` and must never rely on process cwd, plus a guard test that fails if any test mutates the repo root.
 
@@ -720,13 +720,43 @@ No commits were lost — `develop` and the two sibling worktrees were untouched 
 
 **Also explains:** the "41 staleness failures" seen during the blocked push were the *symptom* of an already-corrupted repo, not a flaky suite — they did not reproduce once the repo was repaired. Plausibly also a contributor to the leaked monitor/`devflow advance` processes found earlier in the same session.
 
-**Immediate mitigation until fixed:** do not run `cargo test` from inside a `.worktrees/*` checkout of this repo.
+**~~Immediate mitigation~~ (SUPERSEDED):** "do not run `cargo test` from inside a `.worktrees/*` checkout" does not describe the trigger. Running `cargo test` directly in a worktree is safe — verified across four full-suite runs in an isolated clone, all clean. The trigger is **`git push` from a worktree** with the pre-push hook installed.
 
 **SCOPE REFINEMENT (2026-07-24, after diagnosis) — this is a TEST-ONLY defect; no release is warranted.** All **86** `Command::new("git")` invocations in production code were audited and **every one passes `current_dir()`** — including the three that a naive 4-line-window grep flags as unpinned (`git.rs:174`, `agent_result.rs:664`, `commands.rs:84`), where `.current_dir()` simply appears on the 5th line or later. Production never relies on process cwd for git.
 
 Consequence: `cargo install devflow` users run no tests and are **unaffected**. The blast radius is developers and contributors running `cargo test` on a checkout. A patch release would ship zero user-visible change. **Fix and merge through the normal branch flow rather than an emergency release.**
 
-The escape is therefore in a **test fixture**, not production. Ruled out so far: no `std::env::set_current_dir` anywhere in `crates/`, and no `core.bare`/`"bare"` literal anywhere in `crates/` — so the mechanism is not an explicit cwd change or an explicit bare-config write. Still to identify: which fixture's `git` invocation escapes to the repo root. Note `cargo test` gives integration tests a cwd of `<repo>/crates/devflow-cli`, i.e. **inside the worktree**, so any fixture helper that shells out to `git` without pinning a directory operates on the real repository. Next step is to audit the test-local `git()` helper functions in `phase7_cli.rs`, `build_provenance.rs`, `release_check.rs`, and `staleness.rs` for that pattern.
+The escape is therefore in a **test fixture**, not production. Ruled out so far: no `std::env::set_current_dir` anywhere in `crates/`, and no `core.bare`/`"bare"` literal anywhere in `crates/` — so the mechanism is not an explicit cwd change or an explicit bare-config write. Still to identify: which fixture's `git` invocation escapes to the repo root. Note `cargo test` gives integration tests a cwd of `<repo>/crates/devflow-cli`, i.e. **inside the worktree**, so any fixture helper that shells out to `git` without pinning a directory operates on the real repository. Next step is to audit the test-local `git()` helper functions in `phase7_cli.rs`, `build_provenance.rs`, `release_check.rs`, and `staleness.rs` for that pattern. *(That audit found every one of them correctly pinned — the escape is not a missing `current_dir`.)*
+
+**ROOT CAUSE — CONFIRMED (2026-07-24), reproduced deterministically and fixed.**
+
+`scripts/hooks/pre-push` runs `cargo test --workspace`. Git **exports `GIT_DIR` into hook environments when the gitdir is non-default — which is exactly the case when pushing from a linked worktree** (verified side by side in one repo: a push from a normal checkout gives the hook no `GIT_DIR`; a push from a worktree gives `GIT_DIR=<main>/.git/worktrees/<name>`). `GIT_DIR` **outranks the process working directory** when git resolves which repository to act on, so every fixture retargets the real repo *despite* correctly pinning `.current_dir()`. Since a worktree's gitdir shares `config` with the main repo, the fixtures' `git init` set `core.bare=true` on the main repository and their `git config` rewrote its identity.
+
+Verified independently: `git -C <dir>` does **not** override `GIT_DIR` (only `--git-dir` does), and `GIT_CEILING_DIRECTORIES` does **not** contain it — cwd-pinning can never be the containment mechanism.
+
+Controlled A/B in an isolated clone, same commit, same worktree, only the hook differing:
+
+| | scrubbed hook | original hook |
+|---|---|---|
+| `git push` | succeeded | **blocked, exit 1** |
+| tests | **156 passed, 0 failed** | **42 failed** |
+| `core.bare` | `false` | **`true`** |
+| worktree branch | intact | **`side`** (fixture branch) |
+| stray branches | none | **`main`, `side`** |
+
+The negative control reproduces the original incident down to the branch name and the blocked push with ~40 failures — confirming the "41 staleness failures during the blocked push" were this, not a flaky suite.
+
+**Residue found in the real repo:** the escape had written the fixture identity into `.git/config` (`user.name=t`, `user.email=t@e.st`) and set `core.hooksPath=/dev/null`, which **disabled the global gitleaks pre-commit secret scan** and mis-attributed three commits (`458eef5`, `13ab3a3`, `dc1b43e`) to `t <t@e.st>`. Config repaired; those three commits remain mis-attributed.
+
+**Fixed:**
+
+- `scripts/hooks/pre-push` clears `$(git rev-parse --local-env-vars)` — git's own authoritative 15-var list, so it self-maintains across git upgrades — plus `GIT_NAMESPACE`/`GIT_DISCOVERY_ACROSS_FILESYSTEM`/`GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`. Clearing `GIT_CONFIG_COUNT` is sufficient to neutralize `GIT_CONFIG_KEY_n`/`VALUE_n` (verified).
+- `crates/devflow-cli/tests/git_env_hermeticity.rs` — fail-fast guard for every other launch path (`git rebase --exec`, `git bisect run`, another hook, CI). Verified to pass clean and to fail with a named cause under `GIT_DIR`.
+- `scripts/hooks/pre-commit` — chaining shim. `core.hooksPath` replaces the hooks directory wholesale, so the CONTRIBUTING install step would otherwise silently disable a global secret scanner. Verified: with and without the shim, a planted private key is detected and the commit blocked identically.
+
+**Still open (defence in depth, not required to close the incident):** fixture git calls are still individually unscrubbed, so a dirty environment is caught by the guard rather than contained per command. The robust form is a single `git(root) -> Command` helper applying `env_remove` per command (gitoxide's `gix-testtools` is the model), enforced by clippy `disallowed-methods` on `std::process::Command::new`, plus a sync test asserting the hard-coded list still matches `git rev-parse --local-env-vars`.
+
+**Separate confirmed bug found during this investigation (worth its own backlog entry):** `run_git_stdout` (`staleness.rs:106`) resolves `git` via `PATH`, while `pipeline_launch.rs:590`, `pipeline_outcomes.rs:879/1132/1246` and `preflight.rs:627/701` replace `PATH` *entirely* with a git-free stub dir. `ENV_MUTEX` serializes those mutators against each other but not against the ~155 concurrent git-shelling tests in the same binary, so `Command::new("git")` intermittently fails to spawn. Reproduced once in four runs (`staleness::tests::ahead_build_from_descendant_commit_warns_instead_of_blocking`, panicking at `staleness.rs:891`). Rust 2024 makes `std::env::set_var` `unsafe` precisely because this pattern is unsound in a threaded test binary.
 
 Plans:
 
