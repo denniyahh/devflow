@@ -579,6 +579,17 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
+### Phase 999.30: Phase 21 Code-Review Cleanup — gate_show/doctor DRY + TOCTOU (BACKLOG)
+
+**Goal:** Resolve the four advisory findings from `21-REVIEW.md` (0 critical / 3 warning / 1 info; Phase 21 verified 21/21, no correctness or security defect — these are quality/maintainability only). **WR-01:** `gate_show`'s stage auto-resolution is copy-pasted from `gate_respond` (`crates/devflow-cli/src/commands.rs:810-844`) despite a doc comment claiming the two "can never drift" — extract a shared `resolve_single_open_gate_stage` both call (the same copy-paste-with-"can never drift"-comment smell also sits at `commands.rs:1827`). **WR-02:** `collect_planning_doc_findings` (`commands.rs:2285`) hardcodes `"main"` instead of `devflow_core::config::MAIN` (`config.rs:15`) — matches today so no live bug, but an unlinked second source of truth that would emit false `doctor` Problems if the branch ever becomes configurable. **WR-03:** `gate_show` calls `Gates::list_open` twice (narrow TOCTOU + redundant read) — fetch once, reuse. **IN-01 (info):** `latest_stage_launched_ts` reintroduces the per-phase full-file `events.jsonl` rescan that 14-CR-10 eliminated in the same `status()` function — fold the last `stage_launched` ts into the existing single-pass `last_events_by_phase`.
+**Priority:** Low | **Size:** S — WR-01/02/03 are small localized fixes (default `--fix` scope covers all three); IN-01 is a follow-up perf refactor. Source: `21-REVIEW.md` (gsd-code-reviewer, 2026-07-23), deferred to backlog by operator decision. Not yet in Linear — create DEN-XX on promotion (per backlog↔Linear sync).
+**Requirements:** TBD — see 21-REVIEW.md
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
 ### Phase 21: Operator Legibility & Observability
 
 **Goal:** Make DevFlow's operator surface **legible** and its self-reported state **trustworthy** — every unit single-writer, operator-facing, reversible or detection-only, and testable without any irreversible side effect. Scope recut from the original "Operator Usability & Release Execution" (operator decision, 2026-07-23): the release-cut executor (999.25) and `--base` (999.28) were removed (→ own phase / Phase 22 respectively) and the phase backfilled with legibility/observability units. Not `/gsd-review-backlog`-promoted; scope is operator-decided — see `phases/21-*/21-CONTEXT.md`.
