@@ -1,7 +1,8 @@
 # Spike: Socket-Addressable Supervisor — Results
 
 Date: 2026-07-24
-Spike code: `<scratchpad>/sockspike/` (throwaway; ~200 lines, `std` + `libc` only)
+Spike code: `.planning/spikes/socket-supervisor/` (throwaway; ~200 lines,
+`std` + `libc` only; not part of the cargo workspace)
 Companion to: `2026-07-24-process-lifecycle-problem-definition.md` (F1–F7),
 `2026-07-24-process-teardown-solution-research.md`
 
