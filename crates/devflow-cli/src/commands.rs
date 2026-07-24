@@ -21,7 +21,7 @@ use crate::staleness::run_git_stdout;
 use devflow_core::agent;
 use devflow_core::agent_result;
 use devflow_core::agents;
-use devflow_core::config::{DEVELOP, FEATURE_PREFIX};
+use devflow_core::config::{DEVELOP, FEATURE_PREFIX, MAIN};
 use devflow_core::events;
 use devflow_core::gates::{GateAction, GateResponse, Gates, OpenGate};
 use devflow_core::git::GitFlow;
@@ -738,6 +738,29 @@ pub(crate) fn gate_list(project_root: &Path) -> Result<(), CliError> {
 
 /// Answer an open gate from the CLI — the dogfood-facing replacement for
 /// hand-writing `.devflow/gates/NN-stage.response.json` (15a).
+/// Resolve an omitted `--stage` to the single open gate for `phase` from an
+/// already-fetched `Gates::list_open` collection — the shared no-open /
+/// single-open / ambiguous-open behavior `gate_respond` and `gate_show` both
+/// need, kept in one place so it cannot drift between them (Phase 21 review
+/// WR-01). Callers own the `Gates::list_open` read so `gate_show` can resolve
+/// and select from one fetched collection instead of reading twice (WR-03).
+fn resolve_single_open_gate_stage(open: &[OpenGate], phase: u32) -> Result<Stage, CliError> {
+    let matching: Vec<&OpenGate> = open.iter().filter(|g| g.phase == phase).collect();
+    match matching.as_slice() {
+        [] => Err(CliError::Message(format!(
+            "no open gate for phase {phase} — see `devflow gate list`"
+        ))),
+        [one] => Ok(one.stage),
+        many => Err(CliError::Message(format!(
+            "phase {phase} has several open gates ({}) — pass --stage",
+            many.iter()
+                .map(|g| g.stage.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
 pub(crate) fn gate_respond(
     project_root: &Path,
     phase: u32,
@@ -747,29 +770,7 @@ pub(crate) fn gate_respond(
 ) -> Result<(), CliError> {
     let stage = match stage {
         Some(stage) => stage,
-        None => {
-            let open: Vec<_> = Gates::list_open(project_root)
-                .into_iter()
-                .filter(|g| g.phase == phase)
-                .collect();
-            match open.as_slice() {
-                [] => {
-                    return Err(CliError::Message(format!(
-                        "no open gate for phase {phase} — see `devflow gate list`"
-                    )));
-                }
-                [one] => one.stage,
-                many => {
-                    return Err(CliError::Message(format!(
-                        "phase {phase} has several open gates ({}) — pass --stage",
-                        many.iter()
-                            .map(|g| g.stage.to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )));
-                }
-            }
-        }
+        None => resolve_single_open_gate_stage(&Gates::list_open(project_root), phase)?,
     };
     let responded_by = std::env::var("USER")
         .ok()
@@ -807,42 +808,21 @@ pub(crate) fn gate_respond(
 
 /// Print an open gate's full, untruncated (but sanitized) context — the
 /// discoverability counterpart to `gate_list`'s 100-char table truncation
-/// (21a, D-03). Mirrors `gate_respond`'s stage auto-resolve-single-open-gate
-/// logic (`[]` → error pointing at `devflow gate list`; `[one]` → that
-/// stage; `many` → error listing stages and asking for `--stage`) so the two
-/// commands' gate-resolution behavior can never drift.
+/// (21a, D-03). Shares `resolve_single_open_gate_stage` with `gate_respond`
+/// (999.30 / DEN-55 WR-01) so the two commands' gate-resolution behavior
+/// cannot drift, and resolves/selects from one fetched open-gate collection
+/// instead of reading twice (WR-03).
 pub(crate) fn gate_show(
     project_root: &Path,
     phase: u32,
     stage: Option<Stage>,
 ) -> Result<(), CliError> {
+    let open = Gates::list_open(project_root);
     let stage = match stage {
         Some(stage) => stage,
-        None => {
-            let open: Vec<_> = Gates::list_open(project_root)
-                .into_iter()
-                .filter(|g| g.phase == phase)
-                .collect();
-            match open.as_slice() {
-                [] => {
-                    return Err(CliError::Message(format!(
-                        "no open gate for phase {phase} — see `devflow gate list`"
-                    )));
-                }
-                [one] => one.stage,
-                many => {
-                    return Err(CliError::Message(format!(
-                        "phase {phase} has several open gates ({}) — pass --stage",
-                        many.iter()
-                            .map(|g| g.stage.to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )));
-                }
-            }
-        }
+        None => resolve_single_open_gate_stage(&open, phase)?,
     };
-    let gate = Gates::list_open(project_root)
+    let gate = open
         .into_iter()
         .find(|g| g.phase == phase && g.stage == stage)
         .ok_or_else(|| {
@@ -2265,14 +2245,14 @@ pub(crate) fn reconcile_planning_docs(
 /// `## Completed` table (best-effort — a MISSING file yields no rows for
 /// that document, never an error; `doctor` must not fabricate a `Problem`
 /// from an absent doc), parse both, and reconcile every row against the
-/// repo's git tags via `tag_exists_and_reachable(project_root, tag,
-/// "main")`. `"main"` is a LOCAL branch in this repo (verified: `git
-/// branch --list main`; `git merge-base --is-ancestor v1.7.0 main`
-/// succeeds offline) — deliberately not `origin/main` (no network
-/// dependency in `doctor`'s read-only contract) and not `develop` (wrong
-/// base). The only I/O here is two `std::fs::read_to_string` calls plus
-/// `tag_exists_and_reachable`'s `git` subprocesses — `doctor` stays
-/// read-only (no write path to either file).
+/// repo's git tags via `tag_exists_and_reachable(project_root, tag, MAIN)`.
+/// `MAIN` is a LOCAL branch in this repo (verified: `git branch --list
+/// main`; `git merge-base --is-ancestor v1.7.0 main` succeeds offline) —
+/// deliberately not `origin/main` (no network dependency in `doctor`'s
+/// read-only contract) and not `develop` (wrong base). The only I/O here is
+/// two `std::fs::read_to_string` calls plus `tag_exists_and_reachable`'s
+/// `git` subprocesses — `doctor` stays read-only (no write path to either
+/// file).
 fn collect_planning_doc_findings(project_root: &Path) -> Vec<PlanningDocFinding> {
     let roadmap =
         std::fs::read_to_string(project_root.join(".planning/ROADMAP.md")).unwrap_or_default();
@@ -2282,7 +2262,7 @@ fn collect_planning_doc_findings(project_root: &Path) -> Vec<PlanningDocFinding>
     let mut rows = parse_planning_doc_versions(&roadmap, "ROADMAP.md");
     rows.extend(parse_planning_doc_versions(&state, "STATE.md"));
 
-    let mut lookup = |tag: &str| tag_exists_and_reachable(project_root, tag, "main");
+    let mut lookup = |tag: &str| tag_exists_and_reachable(project_root, tag, MAIN);
     reconcile_planning_docs(&rows, &mut lookup)
 }
 
@@ -3692,6 +3672,28 @@ mod tests {
                 findings.is_empty(),
                 "a project with no .planning/ dir at all must yield zero findings, not an error"
             );
+        }
+
+        /// 999.30 / DEN-55 WR-02: `collect_planning_doc_findings` must
+        /// reconcile against the named `MAIN` production branch, not an
+        /// unlinked duplicate. `init_tagged_repo` tags `v9.9.9` only on
+        /// `side`, unreachable from `main` — so a ROADMAP.md claiming
+        /// `v9.9.9` must surface a `Problem` when reconciled against `MAIN`.
+        #[test]
+        fn collect_planning_doc_findings_reconciles_against_main() {
+            let dir = tempfile::tempdir().unwrap();
+            init_tagged_repo(dir.path());
+            std::fs::create_dir_all(dir.path().join(".planning")).unwrap();
+            std::fs::write(
+                dir.path().join(".planning/ROADMAP.md"),
+                "| Phase | Name | Version |\n|---|---|---|\n| 99 | Fixture | 9.9.9 |\n",
+            )
+            .unwrap();
+
+            let findings = collect_planning_doc_findings(dir.path());
+
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].severity, Severity::Problem);
         }
 
         #[test]
