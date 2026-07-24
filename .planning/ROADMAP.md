@@ -699,6 +699,33 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
+### Phase 999.37: Test Suite Escapes Its Sandbox and Corrupts the Real Repo (BACKLOG — URGENT)
+
+**Goal:** Running `cargo test --workspace` from inside a git worktree of this repository **hijacked that worktree's git state and flipped the main repository to bare**. Reproduced live 2026-07-24 while adding macOS CI. This is the most severe defect currently known: the test suite can destroy the developer's working repository.
+
+**Observed damage** (worktree `.worktrees/macos-ci`, created clean via `git worktree add`, then `cargo test --workspace` run inside it):
+
+- Worktree HEAD moved to `616038e "unrelated follow-up"` on a branch named `side` — **a test fixture's history**, with fixture files `a.txt` and `src/main.rs` in the index.
+- Every real repository file (`ARCHITECTURE.md`, `.github/`, `Cargo.lock`, …) reported as **untracked**; `a.txt`/`src/main.rs` reported as **deleted**.
+- The feature branch `chore/macos-ci` was **deleted**, orphaning its commit (recoverable only because the object survived).
+- **The MAIN repository had `core.bare` set to `true`**, so `git status` there failed with *"this operation must be run in a work tree"*.
+
+No commits were lost — `develop` and the two sibling worktrees were untouched — but recovery required manually resetting `core.bare`, recreating the branch from a dangling object, force-removing the hijacked worktree, and deleting a leaked `side` branch.
+
+**Suspected root cause:** Rust runs a binary's tests as threads in **one process**, and `std::env::set_current_dir` is **process-global**. A fixture that changes cwd (or leaks `GIT_DIR`/`GIT_INDEX_FILE`/`GIT_CONFIG_*`) lets a *concurrent* test's `git init`/`add`/`commit`/`config` land in the real repository instead of its tempdir. This codebase has a documented history of exactly this class of race — `ENV_MUTEX` is called out as "a repeat root cause across 19i, GAP-2 and 999.4" in the Phase 19 notes, and 19i was a PATH race of the same shape. Prime suspects are the fixtures in `crates/devflow-cli/tests/phase7_cli.rs`, `build_provenance.rs`, and `release_check.rs`, which drive real `git` heavily.
+
+**Priority:** Urgent | **Size:** M — diagnosis is bounded (find which fixture escapes; `git config core.bare` and `git branch -D` are rare enough calls to grep for), but the fix is structural: every git-touching test must be pinned to its tempdir via explicit `-C <dir>` / `current_dir()` and must never rely on process cwd, plus a guard test that fails if any test mutates the repo root.
+
+**Why this outranks the macOS CI work it was found during:** adding a slower runner with different timing to a suite that can escape its sandbox produces confusing red runs *and* risks CI checkouts. Fix containment first, then land macOS.
+
+**Also explains:** the "41 staleness failures" seen during the blocked push were the *symptom* of an already-corrupted repo, not a flaky suite — they did not reproduce once the repo was repaired. Plausibly also a contributor to the leaked monitor/`devflow advance` processes found earlier in the same session.
+
+**Immediate mitigation until fixed:** do not run `cargo test` from inside a `.worktrees/*` checkout of this repo.
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
 ### Phase 21: Operator Legibility & Observability
 
 **Shipped as v1.8.0** (2026-07-24) — PR #23 (`develop → main`, squash `cfa9167`), signed tag `v1.8.0`, [GitHub Release](https://github.com/denniyahh/devflow/releases/tag/v1.8.0). `sync-main-to-develop.sh` run via PR #24 (merge `01ad9e4`). Published to crates.io (`devflow-core` then `devflow`, both confirmed live at 1.8.0).
