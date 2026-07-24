@@ -2,42 +2,46 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone (open — no fixed closing phase)
-current_phase: 20
-current_phase_name: release-correctness-operator-control
-status: shipped
-stopped_at: Phase 20 shipped as v1.7.0 (2026-07-23) — PR #20 squash-merged to develop (e78bc82). The v2.0.0 milestone stays open (does not close at Phase 20 or any fixed phase); numbering continues forward. No phase currently in flight — next step is discussing/planning whichever phase or backlog promotion comes next.
-last_updated: "2026-07-23T11:25:00.000Z"
+current_phase: 22
+current_phase_name: Concurrency & Governance Correctness
+status: planning
+stopped_at: Phase 21 context gathered
+last_updated: "2026-07-24T00:32:53.363Z"
 last_activity: 2026-07-23
-last_activity_desc: Phase 20 shipped as v1.7.0; milestone stays open
 progress:
-  total_phases: 9
-  completed_phases: 9
-  total_plans: 70
-  completed_plans: 70
-  percent: 100
+  total_phases: 12
+  completed_phases: 10
+  total_plans: 74
+  completed_plans: 74
+  percent: 83
+last_activity_desc: Phase 21 complete, transitioned to Phase 22
 ---
 
 # DevFlow — Project State
 
-> Last updated: 2026-07-22
+> Last updated: 2026-07-23
 
 ## Active Phase
 
-*(none currently in flight. Phase 20 shipped as v1.7.0, 2026-07-23 — see
-Recently Shipped below. The v2.0.0 milestone stays open: it does not close
-at Phase 20 or any fixed phase; numbering continues forward (21, 22, …)
-until a genuinely breaking change earns the 2.0 slot. Backlog items
-(999.N) are NOT automatically next — they require `/gsd-review-backlog`
-promotion.)*
+**Phase 22 — Concurrency & Governance Correctness** (planning — not yet broken
+down; run `/gsd-plan-phase 22`). Depends on Phase 21.
+
+Phase 21 (Operator Legibility & Observability) **complete + verified 21/21** on
+`develop`, 2026-07-23 — 4/4 plans: 21a discoverability (999.3), 21b doctor
+staleness reconciliation (999.14), 21c sequentagent second-process tracking
+(999.2), 21d dogfood staleness content-awareness (999.29). Optional 21e
+(changelog content, 999.5) was left out of scope. **Unshipped:** workspace stays
+v1.7.0 until a release is cut. The v2.0.0 milestone stays open (no fixed closing
+phase); numbering continues forward until a breaking change earns 2.0.
 
 ## Current Position
 
-Phase: 20 (release-correctness-operator-control) — SHIPPED as v1.7.0
-Plan: 5 of 5 (all executed, verified, code-reviewed, shipped)
-Status: No phase currently active. Milestone v2.0.0 stays open (no fixed closing phase) — next phase/backlog promotion not yet decided.
-Last activity: 2026-07-23 — Phase 20 shipped as v1.7.0; PR #20 squash-merged to develop (e78bc82)
+Phase: 22 — Concurrency & Governance Correctness
+Plan: Not started
+Status: Ready to plan
+Last activity: 2026-07-23
 
-Progress: [████████████████████] 83/79 plans (100%)
+Progress: Phase 21 complete + verified (unshipped — still v1.7.0); Phase 22 not yet planned.
 
 *(Machine-readable fields for `gsd-tools state begin-phase` / `advance-plan` —
 this project historically tracked position only in the narrative "Active
@@ -89,6 +93,19 @@ Phase" section above, which `advance-plan` cannot parse (backlog 12,
   v2.0.0** — decided at ship time: nothing across the five units is
   breaking, and the v2.0.0 milestone stays open rather than closing here
   (see ROADMAP.md "Milestone stays open," 2026-07-23).
+
+  **Fully released 2026-07-23.** `sync-main-to-develop.sh` run first (had
+  not been run after v1.6.0 — `origin/main` had diverged from `develop`;
+  caught by this phase's own new `devflow release --check` tool, then
+  fixed the standard way). Version bump PR #21 (`chore/release-v1.7.0`,
+  `Cargo.toml`/`Cargo.lock`/`CHANGELOG.md`) squash-merged to `develop`
+  (`d1cf508`). Release PR #22 (`release: v1.7.0`, `develop → main`)
+  squash-merged to `main` (`5c7259a`). Signed tag `v1.7.0` pushed
+  (ED25519, verified). [GitHub Release](https://github.com/denniyahh/devflow/releases/tag/v1.7.0)
+  published. `devflow-core` then `devflow` published to crates.io
+  (`cargo search` confirms both at `1.7.0`). `develop` re-synced from
+  `main` post-release. `devflow release --check` — the tool this very
+  phase built — passed clean at every stage of the cut.
 
 - **Phase 19 — Release Integrity + `main.rs` Decomposition (Complete + Verified
   2026-07-22 — 11/11 plans).** Targets **v1.6.0**. Promoted from backlog 2026-07-21 via
@@ -623,6 +640,6 @@ None currently open for Phase 17.
 
 ## Session
 
-**Last session:** 2026-07-22T21:55:59.943Z
-**Stopped at:** Phase 20 context gathered — discuss-phase resolved 20e mechanism/scope, 20d ceiling, 20b product-vs-fixture
-**Resume file:** .planning/phases/20-release-correctness-operator-control/CONTEXT.md
+**Last session:** 2026-07-23T17:20:24.303Z
+**Stopped at:** Phase 21 context gathered
+**Resume file:** .planning/phases/21-operator-usability-release-execution/21-CONTEXT.md
