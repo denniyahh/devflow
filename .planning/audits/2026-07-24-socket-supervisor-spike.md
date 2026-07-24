@@ -128,6 +128,65 @@ macOS. The project-root hash keeps concurrent projects from colliding.
 not *derived* from the project path at probe time — otherwise a changed
 `$XDG_RUNTIME_DIR`/`$TMPDIR` between invocations orphans the handle.
 
+**⚠️ Open decision — `$XDG_RUNTIME_DIR` is deleted on logout.** systemd removes
+`/run/user/$UID` when the last session for that user ends. DevFlow's whole
+premise is long unattended runs, so an operator logging out mid-run would
+destroy the socket while the monitor kept running — unreachable, with only the
+pgid backstop left. `~/.cache/devflow/` is ~45 bytes on macOS (still far under
+104) and survives logout. **Recommend `~/.cache/devflow/` over
+`$XDG_RUNTIME_DIR`** unless there's a reason to prefer tmpfs.
+
+---
+
+# Part 2 — Replacement parity
+
+Second spike round: can this actually *replace* the production `sh -c` monitor?
+Tested every responsibility of the current script, in a realistic layout
+(project root + `.worktrees/phase-NN` + runtime-dir socket).
+
+| Req | Production responsibility | Result |
+|---|---|---|
+| **R-A** | Agent runs in the **worktree** cwd | ✅ `CWD=/tmp/pr/.worktrees/phase-22` |
+| **R-B** | stdout/stderr to **separate** files; stderr must never corrupt JSON stdout | ✅ 0 stderr lines in stdout, 1 in stderr; `DEVFLOW_RESULT` parseable on its own line |
+| **R-C** | Agent pid recorded to pidfile | ✅ |
+| **R-D** | Accurate exit code recorded | ✅ agent `exit 7` → exitfile `7` (signal deaths map to 128+n) |
+| **R-E** | `devflow advance` tail runs on natural completion | ✅ |
+| **R-F** | Adapter env (Codex `GIT_CONFIG_*`) reaches agent **and its children** | ✅ `GRANDCHILD_SEES=false` — propagated two levels |
+| **R-G** | Detached; survives the spawning CLI exiting | ✅ (Part 1, C4) |
+| **R-J** | Project-wide sweep with **no state file** | ✅ lists + probes `rt/*.sock` |
+| **R-K** | Teardown still records an exit code (no silent outcome) | ✅ `143` (SIGTERM) |
+| **R-L** | Socket not world-accessible | ✅ mode `0600` |
+| **R-M** | **A stop is not a completion** — `advance` must be suppressed | ✅ advance marker absent after stop |
+| — | Concurrency (`devflow parallel`): 3 monitors, selective stop | ✅ stopping phase 8 left 7 and 9 untouched |
+| — | Phase 22 incident replay: SIGKILL monitor by hand, no state file | ✅ sweep reports `STALE`; pgid backstop reaped 2 group members |
+
+### The architectural win found in round 2
+
+**The `advance` tail should run *in-process*, not as a forked child.**
+
+The production script ends with `; devflow advance --phase N` — a *separate
+forked process*. That process is the thing the original bug orphaned (the trap
+only ever tracked `$apid`, so a signal arriving during the tail had nothing to
+kill). Because the monitor is now `devflow` itself, it can simply call the
+advance logic directly and then exit.
+
+**This removes the original failure mode by construction: there is no tail
+process left to orphan.** The stage-N monitor calls advance, advance spawns the
+stage-N+1 monitor, stage-N's monitor exits. Cleaner than today's shape.
+
+### R-M is a genuine behavioural improvement, not just parity
+
+Today, killing a monitor mid-run leaves the advance tail's fate ambiguous
+(orphaned and still running, in the bug case). The socket design makes the
+distinction explicit and enforceable:
+
+- agent exits on its own → record exit code → **run advance** → exit
+- operator issues `stop` → kill group → record exit code → **suppress
+  advance** → exit
+
+A stopped phase must not advance its own state machine. That was never
+expressible in the shell script.
+
 ## Resulting design
 
 ```jsonc
@@ -180,16 +239,25 @@ directory listing plus a probe per socket.
 
 ## Known gaps / not yet proven
 
+Resolved in round 2: capture/exit-code/advance parity, concurrency, socket
+permissions. Still open:
+
 - **macOS is unverified.** No macOS host, no macOS CI. The 104-byte `sun_path`
-  limit is documented, not measured here. Everything else *should* be
-  identical (Unix sockets, `killpg`, `process_group` are all POSIX) but this
-  needs a real run before macOS support is claimed rather than implied.
-- **The real monitor is more than the spike.** The spike's supervisor does
-  capture-free `spawn → serve → kill`. The production one must also do stdout/
-  stderr capture to files, exit-code recording, and the `devflow advance` tail
-  call — i.e. everything the current shell script does, rewritten in Rust.
-  That is the bulk of the actual work and is not de-risked by this spike.
-- **Concurrency under `devflow parallel`** (N monitors, N sockets) is not
-  exercised here.
-- **Socket permissions.** Not tested; should be user-only (0600) since any
-  local process that can connect can issue `shutdown`.
+  limit is documented, not measured. Everything used here is POSIX (Unix
+  sockets, `killpg`, `process_group`, `current_dir`), so it *should* port
+  unchanged — but that is an inference, and macOS support should not be
+  claimed until it is run there. **This is now the single largest unknown.**
+- **The monitor's own signal handling.** The spike installs no handler, so a
+  SIGTERM to the monitor kills it without cleanup → stale socket. That degrades
+  correctly (sweep finds it, backstop reaps the group), but production should
+  trap SIGTERM/SIGINT and perform the same clean shutdown as the socket
+  `shutdown` command.
+- **`wait_for_agent_exit` semantics for `sequentagent`.** The exit file is
+  still written, so the existing blocking-poll consumer should work unchanged —
+  but this was not exercised. Moot if `sequentagent` is dropped.
+- **Large / streaming output.** Captures go straight to files via
+  `Stdio::from(File)` — the same mechanism as the shell redirect, so no
+  buffering regression is expected. Not stress-tested.
+- **Rewrite scope.** The spike proves the mechanism, not the migration. Every
+  consumer of `spawn_monitor`/`wait_for_agent_pid`/`wait_for_agent_exit` and
+  the `.devflow/phase-NN-*` artifacts (10+ files) must keep working.
