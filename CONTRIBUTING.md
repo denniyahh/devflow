@@ -20,6 +20,22 @@ same fmt/clippy/test checks CI requires, before the push leaves your machine:
 git config core.hooksPath scripts/hooks
 ```
 
+Two things this hook does that are load-bearing:
+
+- It clears git's repository-local `GIT_*` variables before running the
+  tests. Git exports `GIT_DIR` into hooks when you push **from a linked
+  worktree**, and `GIT_DIR` outranks a process's working directory when git
+  decides which repository to act on — so without the scrub, every test
+  fixture that shells out to git in a tempdir retargets *your real checkout*
+  instead. This is not hypothetical: it once flipped this repository to
+  `core.bare=true`, moved a worktree's HEAD onto a fixture branch and
+  rewrote the committer identity.
+- [`scripts/hooks/pre-commit`](scripts/hooks/pre-commit) delegates to
+  whatever pre-commit hook you already had. `core.hooksPath` replaces the
+  hooks directory wholesale, so without that shim the command above would
+  silently switch off a global secret scanner. It is a no-op if you have no
+  such hook.
+
 ### Distrobox (optional)
 
 If you use [distrobox](https://github.com/89luca89/distrobox), you can create an isolated environment:

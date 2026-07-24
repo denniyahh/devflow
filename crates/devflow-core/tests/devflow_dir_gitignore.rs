@@ -26,7 +26,6 @@ use devflow_core::ship;
 use devflow_core::workflow;
 use devflow_core::{AgentKind, Mode, Stage, State};
 use std::path::Path;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 /// `true` iff `root/.devflow/.gitignore` exists with trimmed content `*`.
@@ -190,9 +189,10 @@ fn archive_phase_files_or_panic(root: &Path, phase: u32) {
 }
 
 fn git(root: &Path, args: &[&str]) {
-    let output = Command::new("git")
+    // Hermetic: pinning cwd alone does not stop an inherited GIT_DIR from
+    // retargeting the real repository (999.37).
+    let output = devflow_core::test_support::git_command(root)
         .args(args)
-        .current_dir(root)
         .output()
         .expect("spawn git");
     assert!(
@@ -246,9 +246,8 @@ fn git_add_all_no_longer_sweeps_devflow_into_a_commit() {
     git(root, &["add", "."]);
     git(root, &["commit", "-q", "-m", "routine commit"]);
 
-    let committed = Command::new("git")
+    let committed = devflow_core::test_support::git_command(root)
         .args(["log", "-1", "--name-only", "--pretty=format:"])
-        .current_dir(root)
         .output()
         .expect("git log");
     let committed_files = String::from_utf8_lossy(&committed.stdout);
@@ -264,9 +263,8 @@ fn git_add_all_no_longer_sweeps_devflow_into_a_commit() {
     workflow::ensure_devflow_dir(&root2.join(".devflow")).expect("ensure_devflow_dir");
 
     git(root2, &["add", "."]);
-    let status = Command::new("git")
+    let status = devflow_core::test_support::git_command(root2)
         .args(["status", "--porcelain"])
-        .current_dir(root2)
         .output()
         .expect("git status");
     assert!(

@@ -1212,7 +1212,6 @@ mod tests {
     use crate::mode::Mode;
     use crate::stage::Stage;
     use crate::state::{AgentKind, State};
-    use std::process::Command;
 
     fn state_in(root: &Path, phase: u32) -> State {
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
@@ -1221,9 +1220,8 @@ mod tests {
     }
 
     fn git(root: &Path, args: &[&str]) {
-        let output = Command::new("git")
+        let output = crate::test_support::git_command(root)
             .args(args)
-            .current_dir(root)
             .output()
             .unwrap();
         assert!(

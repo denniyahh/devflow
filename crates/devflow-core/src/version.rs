@@ -559,12 +559,10 @@ fn replace_version_in_contents(contents: &str, field: &str, new_version: &str) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
 
     fn git(root: &Path, args: &[&str]) {
-        let ok = Command::new("git")
+        let ok = crate::test_support::git_command(root)
             .args(args)
-            .current_dir(root)
             .output()
             .unwrap()
             .status
