@@ -26,13 +26,13 @@ last_activity_desc: Phase 21 complete, transitioned to Phase 22
 **Phase 22 — Concurrency & Governance Correctness** (planning — not yet broken
 down; run `/gsd-plan-phase 22`). Depends on Phase 21.
 
-Phase 21 (Operator Legibility & Observability) **complete + verified 21/21** on
-`develop`, 2026-07-23 — 4/4 plans: 21a discoverability (999.3), 21b doctor
-staleness reconciliation (999.14), 21c sequentagent second-process tracking
-(999.2), 21d dogfood staleness content-awareness (999.29). Optional 21e
-(changelog content, 999.5) was left out of scope. **Unshipped:** workspace stays
-v1.7.0 until a release is cut. The v2.0.0 milestone stays open (no fixed closing
-phase); numbering continues forward until a breaking change earns 2.0.
+Phase 21 (Operator Legibility & Observability) **complete + verified 21/21**,
+**shipped as v1.8.0** (2026-07-24) — 4/4 plans: 21a discoverability (999.3), 21b
+doctor staleness reconciliation (999.14), 21c sequentagent second-process
+tracking (999.2), 21d dogfood staleness content-awareness (999.29). Optional 21e
+(changelog content, 999.5) was left out of scope. The v2.0.0 milestone stays
+open (no fixed closing phase); numbering continues forward until a breaking
+change earns 2.0.
 
 ## Current Position
 
@@ -41,7 +41,7 @@ Plan: Not started
 Status: Ready to plan
 Last activity: 2026-07-23
 
-Progress: Phase 21 complete + verified (unshipped — still v1.7.0); Phase 22 not yet planned.
+Progress: Phase 21 complete + verified + shipped as v1.8.0 (2026-07-24); Phase 22 not yet planned.
 
 *(Machine-readable fields for `gsd-tools state begin-phase` / `advance-plan` —
 this project historically tracked position only in the narrative "Active
@@ -50,6 +50,53 @@ Phase" section above, which `advance-plan` cannot parse (backlog 12,
 `begin-phase` can seed real Plan/Status values once Phase 20 starts.)*
 
 ## Recently Shipped
+
+- **Phase 21 — Operator Legibility & Observability (Complete + Verified +
+  Shipped as v1.8.0 — 4/4 plans, 2026-07-24).** Recut from "Operator Usability &
+  Release Execution" (operator decision, 2026-07-23): the release-cut executor
+  (999.25) and `--base` (999.28) were removed to their own phase / Phase 22, and
+  the phase backfilled with legibility/observability units. Not
+  `/gsd-review-backlog`-promoted; scope was operator-decided. Units: 21a — 999.3
+  operator discoverability (DEN-28); 21b — 999.14 doctor planning-doc staleness
+  reconciliation (DEN-39); 21c — 999.2 sequentagent second-process tracking,
+  narrowed (DEN-27); 21d — 999.29 dogfood staleness guard content-awareness,
+  sequenced first (DEN-54).
+
+  **Executed 2026-07-23** via 4 sequential waves in isolated git worktrees
+  (`worktree.baseRef: head`, no #683/#1369 degrade) — 21-01→21-02→21-03→21-04,
+  each a single-plan wave by DAG construction (all four touch
+  `crates/devflow-cli/src/commands.rs`, forbidding same-wave parallelism). Post-merge
+  gates green after every wave; final workspace suite 535/0.
+
+  **Code-reviewed** (`21-REVIEW.md`): 0 critical / 3 warning / 1 info — all
+  advisory (no correctness or security defect). WR-01 (`gate_show` copy-pastes
+  `gate_respond`'s stage resolution despite a "can never drift" doc comment),
+  WR-02 (hardcoded `"main"` instead of `config::MAIN`), WR-03 (narrow TOCTOU:
+  `gate_show` calls `Gates::list_open` twice), IN-01 (a per-phase event rescan
+  reintroducing the pattern 14-CR-10 eliminated). Deferred to backlog **999.30**
+  / Linear **DEN-55** by operator decision rather than fixed inline.
+
+  **Verified** (`21-VERIFICATION.md`): 21/21 must-haves confirmed against live
+  source (re-run tests, both unanimous 3/3 cross-AI review MUST-FIXes
+  independently confirmed present). **Security** (`21-SECURITY.md`): 20 threats
+  built from all 4 plans' `<threat_model>` blocks (16 mitigate + 4 accept), 0
+  open, ASVS L1 short-circuit (plan-time register, grep-depth evidence for every
+  mitigation).
+
+  **PR #23** (`release/v1.8.0 → main`) opened, CI green (8/8 checks),
+  squash-merged to `main` (`cfa9167`) 2026-07-24. Signed tag `v1.8.0` (ED25519,
+  verified) pushed. [GitHub Release](https://github.com/denniyahh/devflow/releases/tag/v1.8.0)
+  published. `scripts/sync-main-to-develop.sh` run (content-preserving `-X ours`
+  merge, tree verified byte-identical) via **PR #24** (`sync/main-to-develop-v1.8.0
+  → develop`, merge method — not squash, to preserve the main-ancestor link), CI
+  green (8/8), merged (`01ad9e4`). `devflow doctor` self-check post-release: `devflow
+  v1.8.0 ✓`, planning-doc drift check shows only expected pre-v1.5.0 legacy warns
+  (phases 6/7), zero new problems.
+
+  **crates.io publish pending operator approval** — `cargo publish -p devflow-core`
+  dry-run verified clean (35 files, 532.9KiB); the actual publish was blocked by
+  the auto-mode permission classifier as an irreversible public-registry action.
+  Not yet published; `devflow-core`/`devflow` remain at 1.7.0 on the index.
 
 - **Phase 20 — Release Correctness + Operator Control (Complete + Verified +
   Shipped as v1.7.0 — 5/5 plans, 2026-07-23).** Promoted from backlog
