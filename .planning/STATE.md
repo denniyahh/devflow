@@ -6,15 +6,15 @@ current_phase: 22
 current_phase_name: Concurrency & Governance Correctness
 status: planning
 stopped_at: Phase 21 context gathered
-last_updated: "2026-07-23T21:43:32.525Z"
+last_updated: "2026-07-24T00:32:53.363Z"
 last_activity: 2026-07-23
-last_activity_desc: Phase 21 complete, transitioned to Phase 22
 progress:
   total_phases: 12
   completed_phases: 10
   total_plans: 74
   completed_plans: 74
   percent: 83
+last_activity_desc: Phase 21 complete, transitioned to Phase 22
 ---
 
 # DevFlow — Project State
@@ -39,7 +39,7 @@ phase); numbering continues forward until a breaking change earns 2.0.
 Phase: 22 — Concurrency & Governance Correctness
 Plan: Not started
 Status: Ready to plan
-Last activity: 2026-07-23 — Phase 21 complete, transitioned to Phase 22
+Last activity: 2026-07-23
 
 Progress: Phase 21 complete + verified (unshipped — still v1.7.0); Phase 22 not yet planned.
 
