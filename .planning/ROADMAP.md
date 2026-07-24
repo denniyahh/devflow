@@ -616,6 +616,15 @@ Plans:
 **Requirements:** TBD — see `crates/devflow-core/src/monitor.rs`
 **Plans:** 0 plans
 
+**OSS library research (2026-07-24):** two viable implementation paths, both avoiding the current shell-script signal-trap approach entirely.
+
+1. **Zero-new-dependency path:** `std::os::unix::process::CommandExt::process_group` (stable since Rust 1.64.0, well within this project's edition-2024 MSRV) sets a spawned child into its own new process group at spawn time; `libc::kill(-pgid, sig)` — `libc` is already a workspace dependency — signals the whole group in one call. This alone fixes the bug: replace the `sh -c` wrapper's agent-launch with a native `Command::process_group(0).spawn()`, record the resulting PID as the pgid, and have `devflow stop`/monitor-shutdown call `kill(-pid, SIGTERM)` instead of relying on a shell trap that only ever tracked one child.
+2. **Small well-known crate path:** [`command-group`](https://crates.io/crates/command-group) (Extension to `Command` to spawn in a process group; MIT/Apache-2.0, by the `watchexec` org) — 6.7M total / 753K recent downloads, actively maintained since 2021, single-purpose. Wraps the same `process_group`+`killpg` pattern behind an ergonomic `GroupChild` (`.group_spawn()`, `.kill()` kills the whole group). Built by the team behind `watchexec`, which has nearly identical "own a spawned process, guarantee clean teardown" requirements. Worth it only if the operator would rather not hand-roll the thin wrapper in path 1.
+
+**Evaluated and rejected:** `duct` (33M+ downloads, very popular, but its own maintainer explicitly declined to add process-group handling — see [duct.rs#41](https://github.com/oconnor663/duct.rs/issues/41) — because a library doesn't own the process-wide signal handlers a reliable group-kill needs; DevFlow's monitor does, so this gap doesn't apply to us, but duct doesn't solve the problem either way). `processkit` (exact conceptual fit — kernel-backed whole-tree kill-on-drop, supervision, restart/backoff — but created 2026-05-31, ~9K downloads, and requires adopting tokio/async into a currently fully-synchronous codebase; too immature and too large a commitment to depend on for something this load-bearing right now). `daemonize`/`fork` (solve full terminal-detachment daemonization via double-fork, which is not the confirmed problem — 999.33 is about signal delivery to a process GROUP, not about surviving a terminal hangup).
+
+**Related, smaller finding (not this item's scope, worth its own backlog entry if pursued):** `agent.rs`'s `agent_running()` liveness check is a raw `kill(pid, 0)` — vulnerable to PID reuse (a dead process's PID recycled by an unrelated process reads as "still alive"). [`sysinfo`](https://crates.io/crates/sysinfo) (172M+ downloads, very actively maintained, updated within weeks of this research) could close that gap by checking process start-time/command-line instead of bare PID existence.
+
 Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
