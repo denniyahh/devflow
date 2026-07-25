@@ -739,7 +739,7 @@ and 999.34/DEN-59 plus the dogfood-probe finding this phase generates first).
 Plans carry the unit identifiers `23a`, `23b`, `23c`, `23d` and `yes-ship` as
 requirement tokens.
 **Depends on:** Phase 22
-**Plans:** 1/12 plans executed
+**Plans:** 2/12 plans executed
 touch `monitor.rs`, `commands.rs` or `main.rs`, and the same-wave zero-file-overlap
 rule forbids parallelism)
 
@@ -827,7 +827,7 @@ verb (README, ARCHITECTURE, OPERATIONS, CHANGELOG), not two.
 Plans:
 
 - [x] 23-01-PLAN.md
-- [ ] 23-02-PLAN.md
+- [x] 23-02-PLAN.md
 - [ ] 23-03-PLAN.md
 - [ ] 23-04-PLAN.md
 - [ ] 23-05-PLAN.md
