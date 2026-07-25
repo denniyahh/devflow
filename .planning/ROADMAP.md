@@ -739,7 +739,7 @@ and 999.34/DEN-59 plus the dogfood-probe finding this phase generates first).
 Plans carry the unit identifiers `23a`, `23b`, `23c`, `23d` and `yes-ship` as
 requirement tokens.
 **Depends on:** Phase 22
-**Plans:** 12 plans across 12 waves (serial by construction — nine of the twelve
+**Plans:** 1/12 plans executed
 touch `monitor.rs`, `commands.rs` or `main.rs`, and the same-wave zero-file-overlap
 rule forbids parallelism)
 
@@ -825,9 +825,23 @@ identifiers. The 11-file count is correct. Four operator documents mention the
 verb (README, ARCHITECTURE, OPERATIONS, CHANGELOG), not two.
 
 Plans:
+
+- [x] 23-01-PLAN.md
+- [ ] 23-02-PLAN.md
+- [ ] 23-03-PLAN.md
+- [ ] 23-04-PLAN.md
+- [ ] 23-05-PLAN.md
+- [ ] 23-06-PLAN.md
+- [ ] 23-07-PLAN.md
+- [ ] 23-08-PLAN.md
+- [ ] 23-09-PLAN.md
+- [ ] 23-10-PLAN.md
+- [ ] 23-11-PLAN.md
+- [ ] 23-12-PLAN.md
+
 **Wave 1**
 
-- [ ] 23-01 — Rebuild the binary and scaffold an isolated scratch probe target (23a)
+- [x] 23-01 — Rebuild the binary and scaffold an isolated scratch probe target (23a)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
