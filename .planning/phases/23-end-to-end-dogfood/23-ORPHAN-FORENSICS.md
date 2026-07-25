@@ -60,11 +60,26 @@ Every one of the 27 corresponded to a scratch repo whose `state-NN.json` carried
 explicitly against 7 dirs spanning every class and age band: **7 of 7 matched**,
 and the remaining 20 all carried gate files.
 
-**`devflow advance` blocks indefinitely when the stage it evaluates raises a
-human gate.** There is no timeout, no detach, no TTL, and no reaper. So:
+**`devflow advance` blocks when the stage it evaluates raises a human gate.**
 
-> Every DevFlow run that ends at a gate and is then abandoned leaves one
-> permanently-resident process pair. Forever.
+> **Correction — added 2026-07-25 after the phase-23 research re-aim.** The
+> sentence that stood here read *"There is no timeout, no detach, no TTL, and no
+> reaper,"* and its first clause was **wrong**. There *is* a timeout:
+> `gate_timeout_secs()` defaults to **7 days**, overridable via
+> `DEVFLOW_GATE_TIMEOUT_SECS` (`crates/devflow-cli/src/config_parse.rs:24-28`).
+> The blocking wait is also a documented, deliberate design property rather than
+> an oversight — `crates/devflow-core/src/lock.rs:8-9` states that `advance()`
+> holds the per-phase lock *"across a gate's multi-day blocking wait."* No orphan
+> in this population was older than 30 hours, so none was near expiry, which is
+> why the measurement could not distinguish "7 days" from "forever."
+>
+> The finding survives; the framing sharpens. The defect is not an unbounded
+> wait — it is a wait bounded so loosely it is **operationally indistinguishable
+> from unbounded**. There is still no detach and no reaper, and 7 days is far
+> past the point where an operator has stopped thinking about the run.
+
+> Every DevFlow run that ends at a gate and is then abandoned holds a process
+> pair resident for up to seven days.
 
 ## The inversion this proves
 
