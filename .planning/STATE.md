@@ -5,14 +5,14 @@ milestone_name: milestone (open — no fixed closing phase)
 current_phase: 23
 current_phase_name: End-to-End Dogfood — One Phase, Define→Ship, Unattended, With Claude
 status: scoped
-stopped_at: Phase 23 scope recut from "Test Suite & CI Hardening"; awaiting /gsd-discuss-phase 23
-last_updated: "2026-07-25T14:50:00.000Z"
+stopped_at: Phase 23 context gathered
+last_updated: "2026-07-25T16:26:45.432Z"
 last_activity: 2026-07-25
 progress:
   total_phases: 12
   completed_phases: 11
-  total_plans: 78
-  completed_plans: 78
+  total_plans: 76
+  completed_plans: 76
   percent: 92
 last_activity_desc: Phase 22 SUMMARY/VERIFICATION backfilled (9eb4010); Phase 23 rescoped to end-to-end Claude dogfood (supervisor 999.33 + stop 999.34, sequentagent dropped)
 ---
@@ -739,6 +739,6 @@ None currently open for Phase 17.
 
 ## Session
 
-**Last session:** 2026-07-23T17:20:24.303Z
-**Stopped at:** Phase 21 context gathered
-**Resume file:** .planning/phases/21-operator-usability-release-execution/21-CONTEXT.md
+**Last session:** 2026-07-25T16:26:45.398Z
+**Stopped at:** Phase 23 context gathered
+**Resume file:** .planning/phases/23-end-to-end-dogfood/23-CONTEXT.md
