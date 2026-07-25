@@ -558,16 +558,26 @@ treating a missing worktree as an error.
 
 **If this table is empty:** N/A — see entries above.
 
-## Open Questions
+## Open Questions (RESOLVED)
 
-1. **Exact ordering of gate write/respond for `--yes-ship`.**
+*All three were resolved during planning (2026-07-25). Resolutions recorded inline below.*
+
+1. **RESOLVED — Exact ordering of gate write/respond for `--yes-ship`.**
+   *Resolution: the wrapper-function shape was adopted — `run_gate_auto_approved`, with exactly one
+   call site, plus a named negative test guarding the finalization-retry gate. See `23-09-PLAN.md`.*
    - What we know: `Gates::write_gate` + `Gates::respond` + `Gates::poll_response` together produce the right event shape (gate_fired → gate_resolved with an explicit `responded_by`).
    - What's unclear: whether the cleanest implementation adds a parameter to `run_gate_with_timeout` (auto-respond immediately after `write_gate`, before `poll_response`) or introduces a separate wrapper function called only from `handle_ship_outcome`. Both satisfy D-06; the tradeoff is code reuse vs. avoiding Pitfall 3 (auto-answering the wrong gate).
    - Recommendation: planner picks the wrapper-function shape — it makes "only the primary Ship approval gate is ever auto-answered" true by construction (the finalization-retry gate's call site never invokes the wrapper), rather than true by convention (a boolean check someone could accidentally widen later).
 
-2. **Whether `commands::advance`'s CLI-facing function already separates cleanly from its core logic** (see A2). Recommendation: verify at plan time by reading the full body of `advance()` in `commands.rs`/wherever it's currently implemented, before sizing the 23b in-process-advance task.
+2. **RESOLVED — Whether `commands::advance`'s CLI-facing function already separates cleanly from its core logic** (see A2). Recommendation was: verify at plan time by reading the full body of `advance()` before sizing the 23b in-process-advance task.
+   *Resolution: verified at plan time. `advance` is `pub(crate)` in the CLI crate, so the split is by
+   crate rather than by extraction — the supervisor loop lives in `devflow-core` (`monitor::serve`)
+   and the advance wiring lives in `devflow-cli` (`pipeline_launch::supervise`). Assumption A2 is
+   settled. See `23-06-PLAN.md`.*
 
-3. **Whether 23a's probe should target a genuinely trivial synthetic phase, or a small real backlog item.** CONTEXT.md says "a small real phase" for 23a and reserves the actual acceptance run (D-02) for a "low-stakes phase" in this repo. Recommendation: for 23a (scratch repo), any single-file, single-requirement synthetic phase is sufficient and lower-risk than trying to import a real backlog item into a throwaway repo — the probe is about the supervisor/pipeline mechanism, not the content of the work.
+3. **RESOLVED — Whether 23a's probe should target a genuinely trivial synthetic phase, or a small real backlog item.** CONTEXT.md says "a small real phase" for 23a and reserves the actual acceptance run (D-02) for a "low-stakes phase" in this repo. Recommendation: for 23a (scratch repo), any single-file, single-requirement synthetic phase is sufficient and lower-risk than trying to import a real backlog item into a throwaway repo — the probe is about the supervisor/pipeline mechanism, not the content of the work.
+   *Resolution: the synthetic single-task scratch repo was adopted, gated behaviourally on `doctor`
+   plus `--dry-run` rather than structurally. See `23-01-PLAN.md`.*
 
 ## Environment Availability
 

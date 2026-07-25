@@ -765,10 +765,12 @@ runs; 21d addressed that and shipped in v1.8.0/v1.8.1, so it should not recur �
   literal shell commands; Claude Code consumes slash commands natively. Deferring
   it removes the single largest item from the critical path. It returns as the
   prerequisite for onboarding any second agent.
+
 - **999.25 / DEN-50 (release-cut executor)** — "end to end" here ends when the
   **Ship stage completes** (merge, version bump, changelog) on the branch. The
   crates.io publish stays manual; it drives irreversible operations and needs its
   own failure/rollback design pass.
+
 - **999.4, 999.26** (concurrency/contention) — only bind under concurrent ship or
   `devflow parallel`, neither of which is on the single-phase happy path.
 
@@ -778,6 +780,7 @@ Units (operator-decided 2026-07-25; sequencing is load-bearing):
   ≥v1.8.1 binary and record exactly where it dies. **Sequence first**: it either
   confirms the supervisor is the blocker or surfaces something cheaper that bites
   before it, and it is the only unit that can invalidate the rest of this scope.
+
 - **23b** — **Socket-addressable supervisor** (999.33 / DEN-58). Replace the
   `sh -c` monitor with a socket-addressable supervisor. Two properties carry this
   phase: the `advance` tail stops being a separate forkable process and runs
@@ -787,10 +790,12 @@ Units (operator-decided 2026-07-25; sequencing is load-bearing):
   spike-proven (C1–C6 + R-A..R-M); the spike is preserved at
   `.planning/spikes/socket-supervisor/`. The migration, not the mechanism, is the
   work: ~8 files consume `spawn_monitor`/`wait_for_agent_pid`/`wait_for_agent_exit`.
+
 - **23c** — **`devflow stop`** (999.34 / DEN-59). Explicit clean phase abort.
   Blocked on 23b only; falls out cheaply once the socket handle exists. Includes
   R-M — a stop must **suppress** advance, since a stopped phase must not advance
   its own state machine.
+
 - **23d** *(subtractive)* — **Drop `sequentagent`.** ~110 references across 11
   files. Shrinks 23b and closes DEN-58's explicitly-untested
   `wait_for_agent_exit` gap in the riskiest part of the migration. Coherent with
@@ -820,16 +825,50 @@ identifiers. The 11-file count is correct. Four operator documents mention the
 verb (README, ARCHITECTURE, OPERATIONS, CHANGELOG), not two.
 
 Plans:
+**Wave 1**
 
 - [ ] 23-01 — Rebuild the binary and scaffold an isolated scratch probe target (23a)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
 - [ ] 23-02 — 23a probe: drive one unattended run in the scratch repo, record where it dies (23a, tracer)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
 - [ ] 23-03 — 23d: delete the two-agent verb from the CLI crate + reconcile docs (23d, D-11/D-12 checkpoint)
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
 - [ ] 23-04 — 23d: delete the remaining core-side surface, workspace count to zero (23d)
+
+**Wave 5** *(blocked on Wave 4 completion)*
+
 - [ ] 23-05 — 23b: persisted supervisor handle + `yes_ship` on State, client-side socket primitives (23b, yes-ship)
+
+**Wave 6** *(blocked on Wave 5 completion)*
+
 - [ ] 23-06 — 23b: the supervisor run loop, `devflow supervise`, in-process advance, signal handling (23b)
+
+**Wave 7** *(blocked on Wave 6 completion)*
+
 - [ ] 23-07 — 23b: big-bang `sh -c` removal + spawn call-site swap + e2e rewrite (23b, D-08 checkpoint)
+
+**Wave 8** *(blocked on Wave 7 completion)*
+
 - [ ] 23-08 — 23b: re-point `status`/`doctor`/`cleanup` at the socket probe + pre-supervisor finding (23b)
+
+**Wave 9** *(blocked on Wave 8 completion)*
+
 - [ ] 23-09 — `--yes-ship`: per-run flag, auto-answered Ship gate, retry gate untouched (yes-ship)
+
+**Wave 10** *(blocked on Wave 9 completion)*
+
 - [ ] 23-10 — 23c: `devflow stop`, after-ship worktree removal, stop-time capture archival (23c)
+
+**Wave 11** *(blocked on Wave 10 completion)*
+
 - [ ] 23-11 — Acceptance prep: recovery point, low-stakes target, rebuild (23a, yes-ship, D-07 checkpoint)
+
+**Wave 12** *(blocked on Wave 11 completion)*
+
 - [ ] 23-12 — Acceptance run: one phase Define→Ship, unattended, self-hosted (all units)
