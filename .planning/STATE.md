@@ -2,34 +2,65 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone (open — no fixed closing phase)
-current_phase: 22
-current_phase_name: Concurrency & Governance Correctness (light dogfooding trial)
-status: complete
-stopped_at: Phase 22 trial executed, verified, and integrated for release
-last_updated: "2026-07-24T22:50:00.000Z"
-last_activity: 2026-07-24
+current_phase: 23
+current_phase_name: End-to-End Dogfood — One Phase, Define→Ship, Unattended, With Claude
+status: scoped
+stopped_at: Phase 23 scope recut from "Test Suite & CI Hardening"; awaiting /gsd-discuss-phase 23
+last_updated: "2026-07-25T14:50:00.000Z"
+last_activity: 2026-07-25
 progress:
   total_phases: 12
   completed_phases: 11
-  total_plans: 76
-  completed_plans: 76
+  total_plans: 78
+  completed_plans: 78
   percent: 92
-last_activity_desc: Phase 22 trial complete; 999.37 sandbox escape root-caused and fixed; both staged for release
+last_activity_desc: Phase 22 SUMMARY/VERIFICATION backfilled (9eb4010); Phase 23 rescoped to end-to-end Claude dogfood (supervisor 999.33 + stop 999.34, sequentagent dropped)
 ---
 
 # DevFlow — Project State
 
-> Last updated: 2026-07-23
+> Last updated: 2026-07-25
 
 ## Active Phase
 
+**Phase 23 — End-to-End Dogfood: One Phase, Define→Ship, Unattended, With
+Claude** — **scoped 2026-07-25, not yet discussed or planned.** The goal is the
+"basic development workflow works end to end" milestone: `devflow start --phase
+N` drives one real phase Define→Ship with Claude, unattended, with no manual
+`ps`, no manual `devflow advance`, and no silent stall.
+
+The phase previously read "Test Suite & CI Hardening" with a `[To be planned]`
+placeholder goal. That theme (999.15/17/18/19/20/22) advances the end-to-end
+goal by ~zero, so it returned to the backlog and the phase was repurposed —
+nothing was lost, the entry had no content beyond its title.
+
+**Grounded in the run record**, not speculation: `.devflow/events.jsonl` shows
+**no phase has ever completed a full five-stage devflow-driven run.** Phase 17
+(Claude) is the high-water mark — it reached Ship, looped back to Code, then
+died to two silent monitor deaths costing ~4h. Phase 21 stopped after Define.
+Phase 22 (Codex) stops dead at a Plan relaunch with no `advance_evaluated`.
+
+Four units, sequencing load-bearing: **23a** dogfood probe (first — it can
+invalidate the rest of the scope), **23b** socket-addressable supervisor
+(999.33/DEN-58, spike-proven, makes the `advance` tail in-process and thereby
+removes the Phase 17 failure mode by construction), **23c** `devflow stop`
+(999.34/DEN-59, cheap once the socket handle exists), **23d** drop
+`sequentagent` (subtractive; shrinks 23b and closes DEN-58's untested
+`wait_for_agent_exit` gap).
+
+**Deliberately deferred:** 999.31/DEN-56 (Modular Agent Driver) — highest-priority
+backlog item by label but a *Codex* blocker, not a Claude one; 999.25/DEN-50
+(release-cut executor) — "end to end" stops when the Ship stage completes, the
+crates.io publish stays manual.
+
 **Phase 22 — Concurrency & Governance Correctness** — the **light dogfooding
 trial** slice is **complete** (2/2 plans: 22-01, 22-02, resolving 999.30 /
-DEN-55). Re-verified independently after 999.37, since the original "tests
-green" claim was recorded the same day this repository was corrupted: 537 tests
-across 13 binaries, 0 failed, and zero coupling to the process-management model
-being revamped. The branch was then reused as the staging branch for this
-release.
+DEN-55), shipped in v1.8.1. Re-verified independently after 999.37, since the
+original "tests green" claim was recorded the same day this repository was
+corrupted: 537 tests across 13 binaries, 0 failed, and zero coupling to the
+process-management model being revamped. The branch was then reused as the
+staging branch for that release. Its SUMMARY and VERIFICATION artifacts were
+never written by the executor and were backfilled 2026-07-25 (`9eb4010`).
 
 The **broader** "Concurrency & Governance Correctness" scope remains unplanned
 and explicitly out of the trial's boundary: 999.4 (version-tag contention),
@@ -55,12 +86,12 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 22 — Concurrency & Governance Correctness (light dogfooding trial)
-Plan: 22-01, 22-02 complete
-Status: Complete — integrated for release, pending version bump + CHANGELOG on `develop`
-Last activity: 2026-07-24
+Phase: 23 — End-to-End Dogfood (Define→Ship, unattended, Claude)
+Plan: none yet — scope recut 2026-07-25, awaiting /gsd-discuss-phase 23
+Status: Scoped — 4 units decided (23a probe, 23b supervisor, 23c stop, 23d drop sequentagent)
+Last activity: 2026-07-25
 
-Progress: Phase 21 shipped as v1.8.0 (2026-07-24). Phase 22's trial slice complete and re-verified; 999.37 root-caused and fixed. Both staged on `feature/phase-22` and merged to `develop`; release prep (version bump, CHANGELOG, tag) still outstanding.
+Progress: Phases 21 (v1.8.0) and 22 (v1.8.1) shipped. Phase 22's missing SUMMARY/VERIFICATION artifacts backfilled 2026-07-25 (`9eb4010`), clearing a false "incomplete phase" route in /gsd-progress. Phase 23 rescoped from "Test Suite & CI Hardening" to the end-to-end Claude dogfood goal; acceptance is behavioural — one phase driven start-to-finish by devflow, unattended, reaching a completed Ship stage.
 
 *(Machine-readable fields for `gsd-tools state begin-phase` / `advance-plan` —
 this project historically tracked position only in the narrative "Active

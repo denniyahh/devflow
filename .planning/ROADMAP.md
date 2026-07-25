@@ -719,13 +719,89 @@ Plans:
 - [x] 22-01 — Shared gate resolution + `gate_show` one-read + `MAIN` constant (WR-01, WR-02, WR-03)
 - [x] 22-02 — Single-pass `stage_launched` timestamp summary + full Validate (IN-01)
 
-### Phase 23: Test Suite & CI Hardening
+### Phase 23: End-to-End Dogfood — One Phase, Define→Ship, Unattended, With Claude
 
-**Goal:** [To be planned]
-**Requirements**: TBD
+**Goal:** Make `devflow start --phase N` drive one real phase from Define
+through Ship **unattended with Claude**, with no manual `ps`, no manual
+`devflow advance`, and no silent stall. This is the "basic development
+workflow works end to end" milestone, scoped deliberately narrow: one agent
+(Claude), one phase, no release cut.
+
+**Scope recut 2026-07-25 (operator decision).** This phase previously read
+"Test Suite & CI Hardening" with a `[To be planned]` placeholder goal. That
+theme — 999.15, 999.17, 999.18, 999.19, 999.20, 999.22 — was reviewed against
+the end-to-end goal and advances it by approximately zero, so it returns to the
+backlog undisturbed and this phase is repurposed. Nothing was lost: the prior
+entry had no content beyond its title.
+
+**Requirements**: TBD (no REQ-IDs — units 23a–23d, sourced from 999.33/DEN-58
+and 999.34/DEN-59 plus the dogfood-probe finding this phase generates first)
 **Depends on:** Phase 22
 **Plans:** 0 plans
 
+**Why this scope, from the run record.** `.devflow/events.jsonl` shows **no
+phase has ever completed a full five-stage devflow-driven run**:
+
+| Phase | Agent | Furthest reached | How it ended |
+|-------|-------|------------------|--------------|
+| 17 (2026-07-18) | Claude | define→plan→code→validate→**ship**→loop_back→code | two silent monitor deaths, ~4h lost, recovered by hand |
+| 21 (2026-07-23) | Claude | `self_dogfood_stale_blocked` → define | `workflow_finished` after one stage |
+| 22 (2026-07-24) | Codex | define→plan→gate→`stale_blocked`→plan relaunch | stops dead — no `advance_evaluated` |
+
+Phase 17 is the high-water mark and predates a month of changes. Phase 22's
+death was Codex-specific (999.31). The staleness guard blocked two of the three
+runs; 21d addressed that and shipped in v1.8.0/v1.8.1, so it should not recur —
+23a verifies rather than assumes.
+
+**Deliberately out of scope, and why:**
+
+- **999.31 / DEN-56 (Modular Agent Driver, High, L)** — the highest-priority
+  backlog item by label, and **not a blocker here**. Its root cause is
+  `Stage::gsd_command()` emitting raw `/gsd-*` strings that *Codex* receives as
+  literal shell commands; Claude Code consumes slash commands natively. Deferring
+  it removes the single largest item from the critical path. It returns as the
+  prerequisite for onboarding any second agent.
+- **999.25 / DEN-50 (release-cut executor)** — "end to end" here ends when the
+  **Ship stage completes** (merge, version bump, changelog) on the branch. The
+  crates.io publish stays manual; it drives irreversible operations and needs its
+  own failure/rollback design pass.
+- **999.4, 999.26** (concurrency/contention) — only bind under concurrent ship or
+  `devflow parallel`, neither of which is on the single-phase happy path.
+
+Units (operator-decided 2026-07-25; sequencing is load-bearing):
+
+- **23a** — **Dogfood probe.** Run `devflow start` on a small real phase with a
+  ≥v1.8.1 binary and record exactly where it dies. **Sequence first**: it either
+  confirms the supervisor is the blocker or surfaces something cheaper that bites
+  before it, and it is the only unit that can invalidate the rest of this scope.
+- **23b** — **Socket-addressable supervisor** (999.33 / DEN-58). Replace the
+  `sh -c` monitor with a socket-addressable supervisor. Two properties carry this
+  phase: the `advance` tail stops being a separate forkable process and runs
+  in-process — **removing the Phase 17 failure mode by construction** — and
+  liveness becomes answerable as GONE/STALE/ALIVE with no PID, so a dead monitor
+  is no longer indistinguishable from a healthy between-stages pause. Design is
+  spike-proven (C1–C6 + R-A..R-M); the spike is preserved at
+  `.planning/spikes/socket-supervisor/`. The migration, not the mechanism, is the
+  work: ~8 files consume `spawn_monitor`/`wait_for_agent_pid`/`wait_for_agent_exit`.
+- **23c** — **`devflow stop`** (999.34 / DEN-59). Explicit clean phase abort.
+  Blocked on 23b only; falls out cheaply once the socket handle exists. Includes
+  R-M — a stop must **suppress** advance, since a stopped phase must not advance
+  its own state machine.
+- **23d** *(subtractive)* — **Drop `sequentagent`.** ~110 references across 11
+  files. Shrinks 23b and closes DEN-58's explicitly-untested
+  `wait_for_agent_exit` gap in the riskiest part of the migration. Coherent with
+  Claude-only: token-exhaustion failover has no second agent to reach. The
+  capability itself is preserved as an intent in 999.42 / DEN-67, to be
+  reimplemented on the supervisor if and when a second agent is supported.
+
+**Acceptance criterion is behavioural, not code-shaped:** one phase driven
+start-to-finish by `devflow` with Claude, unattended, reaching a completed Ship
+stage without manual intervention.
+
+**macOS note:** DEN-58 flags macOS as entirely unverified (no host, no CI) and
+the 104-byte `sun_path` limit as documented-not-measured. Out of scope here —
+the operator platform is Linux; do not claim macOS support from this phase.
+
 Plans:
 
-- [ ] TBD (run /gsd-plan-phase 23 to break down)
+- [ ] TBD (run /gsd-discuss-phase 23, then /gsd-plan-phase 23 to break down)
