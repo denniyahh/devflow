@@ -1026,7 +1026,21 @@ supervisor is required to close this phase." It is not — see Question D.
 
 ---
 
-## Open Questions
+## Open Questions (ALL RESOLVED — see resolutions inline)
+
+> **Resolution status, added after planning (2026-07-25).** All three questions
+> below were resolved during the replan, but the resolutions were originally
+> recorded only in downstream plan objectives. They are marked inline here so a
+> reader of this document alone does not see them as still-open:
+>
+> - **Q1 — rate-limit gates:** RESOLVED (deferred, explicitly) in `23-04-PLAN.md`.
+>   Out of scope for this phase; the reaper bounds the process leak they cause,
+>   but auto-resume is not built here.
+> - **Q2 — Assumption A2 (Ship-evidence placement):** RESOLVED in `23-06-PLAN.md`.
+>   The flagged risk was real; see that plan for the corrected placement inside
+>   `merge_feature`, before `BranchCleanup`.
+> - **Q3 — sweep automation:** RESOLVED in `23-04-PLAN.md` — on-demand only, no
+>   background scheduler.
 
 1. **Rate-limit gates (NEW, surfaced by the orphan forensics, not designed here per the objective's scope).**
    - What we know: `23-ORPHAN-FORENSICS.md` documents a probe that died at `define` with `status: "ratelimited"` and no parseable retry time — "auto-resume cron not scheduled; resume manually." This is a gate that is, today, unresolvable except by a human waiting out a weekly quota window.

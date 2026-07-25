@@ -11,6 +11,29 @@ created: 2026-07-25
 
 # Phase 23 — Validation Strategy
 
+> ## ⚠ STALE — DO NOT USE AS THE VALIDATION CONTRACT UNTIL REGENERATED
+>
+> **Flagged 2026-07-25 by the plan-checker during the phase-23 replan.**
+>
+> Everything below this banner was written for the **pre-replan** plan set, whose
+> premise plan 23-02's probe invalidated. It still describes a socket-supervisor
+> design that **no current plan builds**: socket mode `0600`, `GONE/STALE/ALIVE`
+> liveness, a `supervisor` field round-trip, and an instruction to rewrite
+> `monitor.rs` tests "against the socket supervisor". None of that appears
+> anywhere in plans 23-03…23-11.
+>
+> Using this file as-is would validate a design that does not exist — the exact
+> false-green class this phase was re-aimed to eliminate. That would be a
+> particularly bad way to fail.
+>
+> **Current validation contract:** the `must_haves` blocks in
+> `23-03-PLAN.md` … `23-11-PLAN.md`, plus `23-PROBE-FINDINGS.md` and
+> `23-ORPHAN-FORENSICS.md` for the evidence those must_haves derive from.
+>
+> **To fix:** regenerate the per-task verification map and Wave 0 checklist from
+> the current plan set via `/gsd-validate-phase 23`. The plan-checker rated this
+> non-blocking for execution, but it must not survive past ship.
+
 > Per-phase validation contract for feedback sampling during execution.
 > Seeded from `23-RESEARCH.md` § Validation Architecture.
 
