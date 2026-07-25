@@ -1,69 +1,56 @@
-# Phase 23: End-to-End Dogfood - Research
+# Phase 23: End-to-End Dogfood - Research (RE-AIM after 23-02's probe)
 
-**Researched:** 2026-07-25
-**Domain:** Unix process supervision (socket-addressable handle replacing a shell-script monitor), DevFlow's own gate/pipeline state machine, CLI surface reduction
-**Confidence:** HIGH (grounded in re-read source, live `rg`/`cargo test` verification, and the project's own spike/audit docs — not training-data guesses about DevFlow internals). Two items are explicitly flagged LOW/MEDIUM (macOS, exact historical reference counts) — see Assumptions Log.
+**Researched:** 2026-07-25 (rewrite — supersedes the 2026-07-25 version written
+before the probe ran)
+**Domain:** DevFlow's own gate/state-machine persistence and process model
+(`devflow advance`, `Gates`, per-phase file lock); a minimal `devflow stop`;
+the false-green attestation class that actually blocked Ship twice; CLI
+surface reduction (`sequentagent`)
+**Confidence:** HIGH for everything under "NEW — the re-aimed research"
+below (grounded in source re-read this session, line-cited, and in the two
+evidence documents this rewrite is required to treat as ground truth).
+MEDIUM/LOW items are flagged inline and logged in Assumptions.
 
-## Summary
+---
 
-Phase 23 has almost no invention left to do at the mechanism level — the hard
-design work is already finished and recorded in
-`.planning/audits/2026-07-24-socket-supervisor-spike.md` (superseding an
-earlier, rejected cgroup/pgroup design in
-`2026-07-24-process-teardown-solution-research.md` — see the note in
-Architecture Patterns). What remains is: (1) run the probe (23a) to prove or
-correct the assumption that the supervisor is the actual blocker; (2)
-mechanically migrate ~8 production call sites plus 2 test files from
-`sh -c`-monitor primitives to the socket-addressable ones (23b); (3) build
-`devflow stop` on top of the new handle (23c, cheap once 23b lands); (4)
-delete `sequentagent` (142 references across 11 files — larger than
-CONTEXT.md's recorded ~110/11, see Package Legitimacy... no, see the 23d
-inventory below); and (5) add `--yes-ship`, which has one exact call site
-(`pipeline_outcomes.rs:275-286`, `handle_ship_outcome`) and one exact
-mechanism for "auto-answer, not bypass" (self-write a `GateResponse` via the
-existing `Gates::respond` API immediately after `Gates::write_gate`, so the
-audit trail is indistinguishable in shape from a human response except for
-`responded_by`).
+## Why this document was rewritten, in one paragraph
 
-No new dependency is needed anywhere in this phase. `libc = "0.2"` is already
-a `devflow-core` dependency; `std::os::unix::net::{UnixListener, UnixStream}`
-needs nothing new. The spike proves the exact shape to build.
+Phase 23's own probe (`23-02-PLAN.md` Task 1, recorded in
+`23-PROBE-FINDINGS.md`) ran the original plan's leading unit and produced
+evidence that **contradicts** the premise the previous version of this
+document (and 23b/23c's original scope) was built on. The `sh -c` monitor
+does not die — it ran correctly for 59 minutes, 11 stage launches, 3
+correctly-counted consecutive failures, and was still alive at the end. Two
+independent runs on this machine reached **Ship**, and both were stopped by
+content/config gates, not process failures. Separately,
+`23-ORPHAN-FORENSICS.md` found 27 real orphaned process pairs (54 processes,
+168.6 MB) on this operator's machine, and traced their common cause to a
+single, precise mechanism verified in this session against live source:
+**`devflow advance` blocks in the foreground, holding a per-phase lock, on a
+`Gates::poll_response` call whose default timeout is 7 days** — not literally
+infinite, but long enough that every abandoned gate leaves a resident process
+pair for hours to days. This document replaces the old "replace the monitor"
+research with research into **bounding that wait, building a minimal
+`devflow stop`, and fixing the false-green attestation class** — the three
+things the operator's 2026-07-25 replan decision asked this rewrite to make
+executable.
 
-**Primary recommendation:** Plan 23b as a mechanical, file-by-file migration
-against the verified call-site inventory below (not a redesign — the design
-is already spike-proven), land signal handling (SIGTERM/SIGINT → clean
-`shutdown`-equivalent) inside 23b rather than deferring it (cheap given
-`std`-only signal handling is available via a self-pipe/`signal-hook`-free
-polling pattern — see Common Pitfalls), give the scratch repo for 23a the
-minimal `develop`+`main` git-flow scaffold plus a one-phase `.planning/`
-skeleton, and thread `--yes-ship` as a `State`-persisted per-run boolean
-(`#[serde(default)]`, following the exact precedent of `monitor_pid` /
-`stop_until` / `preflight_retries`) rather than a CLI-only value, since the
-Ship gate may fire stages/process-invocations after the original `start`
-command line is gone.
-
-## Architectural Responsibility Map
-
-| Capability | Primary Tier | Secondary Tier | Rationale |
-|------------|-------------|----------------|-----------|
-| Process supervision (spawn/liveness/teardown) | Backend/CLI process (devflow-core) | OS (Unix socket + pgid) | The monitor **is** `devflow` itself post-23b; the socket is an OS-level rendezvous point, not a separate service tier |
-| `advance` (stage transition logic) | Backend/CLI process (in-process, D-10) | — | Runs inside the same process as the monitor after 23b; no longer a forked CLI invocation |
-| Gate approval / `--yes-ship` | Backend/CLI process (devflow-core `gates.rs`) | Persisted state (`state.json`) | Gate protocol is file-based IPC already; auto-answer is a producer of the same file, not a new tier |
-| `devflow stop` | Backend/CLI process | OS (socket `shutdown` message + `killpg` backstop) | Mirrors the supervisor's own teardown path exactly — no new tier |
-| Scratch-repo probe target (23a) | Filesystem / git (repo tier) | — | Not a code capability — a fixture; belongs to the "project under test" tier, entirely outside devflow's own process model |
-| `sequentagent` removal | CLI surface (devflow-cli `main.rs`/`parallel.rs`) | — | Pure subtraction from the command-dispatch tier; no new tier introduced |
-
-## User Constraints
+---
 
 <user_constraints>
 ## User Constraints (from CONTEXT.md)
+
+*Unchanged from the original CONTEXT.md — reproduced verbatim. The probe's
+findings do not revoke any of these decisions; they change which units need
+which amount of new implementation to satisfy them (see "Re-Aimed Scope"
+below for the mapping).*
 
 ### Locked Decisions
 
 **Dogfood probe and acceptance (23a)**
 - D-01: 23a's probe runs in a scratch repo, not this checkout (blast-radius isolation post-999.37). Reversible.
 - D-02: The phase's final acceptance run is self-hosted (this repo), only after the scratch probe has proven the supervisor — because `staleness_outcome` (`crates/devflow-cli/src/staleness.rs:276-284`) only hard-blocks `(is_self_dogfood: true, Stale)`; a scratch-only acceptance would never exercise the most frequent observed dogfood killer. Reversible.
-- D-03: Probe output is a recorded artifact (events.jsonl excerpts + `.devflow/phase-N-*` captures), not a verbal report. 23a is explicitly permitted to invalidate the rest of this phase's scope. Reversible.
+- D-03: Probe output is a recorded artifact (events.jsonl excerpts + `.devflow/phase-N-*` captures), not a verbal report. 23a is explicitly permitted to invalidate the rest of this phase's scope. **This fired — see below.**
 
 **Unattended semantics and `--yes-ship`**
 - D-04: Add a `--yes-ship` pre-authorization flag. Required because `Mode::Auto` does not gate-skip Ship — `crates/devflow-core/src/mode.rs:82-94`/`96-105` documents "Ship always gates (both modes)". Costly to reverse (user-facing CLI flag on the irreversible merge/version/changelog path).
@@ -72,21 +59,25 @@ command line is gone.
 - D-07 (ACCEPTED RISK): `--yes-ship` is NOT refused on the self-dogfood workspace. Combined with D-02, the acceptance run will unattended-merge a real phase into `develop`, bump the version, and append the changelog on this repository. Suggested mitigations for the planner to encode, not re-decide: drive a low-stakes phase for the acceptance run; establish a recovery point (tag or branch) before it starts. One-way.
 
 **Supervisor migration (23b)**
-- D-08: Big-bang replacement, no feature flag — delete the `sh -c` path outright. One-way; ~8 files.
-- D-09: Already decided, do not re-open — socket lives in `~/.cache/devflow/` (not `$XDG_RUNTIME_DIR`, which systemd deletes on logout); socket path is stored in `state.json`, never derived at probe time; liveness is `connect()` → GONE/STALE/ALIVE with no PID on the happy path; pgid backstop applies only when STALE, guarded by `start_time` + `boot_id`. Costly to reverse.
-- D-10: The `advance` tail runs in-process — the monitor becomes `devflow` itself and calls advance directly, removing the Phase 17 failure mode by construction. Reversible within the new design.
+- D-08: Big-bang replacement, no feature flag — delete the `sh -c` path outright. One-way; ~8 files. **Re-scoped by this rewrite: this decision applies IF AND WHEN the socket supervisor is built. The probe/forensics evidence shows the phase's acceptance criterion does not require it — see "What survives" below. D-08 is not revoked; it is deferred alongside the rest of the supervisor build.**
+- D-09: Already decided, do not re-open — socket lives in `~/.cache/devflow/` (not `$XDG_RUNTIME_DIR`, which systemd deletes on logout); socket path is stored in `state.json`, never derived at probe time; liveness is `connect()` → GONE/STALE/ALIVE with no PID on the happy path; pgid backstop applies only when STALE, guarded by `start_time` + `boot_id`. Costly to reverse. **Same re-scoping as D-08: this remains the correct design IF the supervisor is later built; the `~/.cache/devflow/` location is reused below for the new cross-root gate registry regardless of whether the socket mechanism itself is built.**
+- D-10: The `advance` tail runs in-process — the monitor becomes `devflow` itself and calls advance directly, removing the Phase 17 failure mode by construction. Reversible within the new design. **This rewrite finds a NEW, narrower justification for D-10 (see Research Question A/B below) — it is still not required for the MVP.**
 
 **`sequentagent` removal (23d)**
 - D-11: Hard delete the `sequentagent` verb (`crates/devflow-cli/src/main.rs:159`, dispatch at `:483`). One-way — removes a published CLI command from a crates.io-released binary.
 - D-12: This removal earns the v2.0.0 slot — assume a major version bump, not minor. One-way.
 - D-13: The capability intent is preserved (DEN-67/999.42, not discarded) — reimplemented on the supervisor when a second agent is supported, prerequisites DEN-58 + DEN-56. Reversible.
 
+**None of D-11/D-12/D-13 are touched by the probe.** 23d is untouched scope —
+see Scope Verdict table in `23-PROBE-FINDINGS.md` and the re-confirmed
+inventory below.
+
 ### Claude's Discretion
 
-- **Supervisor signal handling.** DEN-58 notes the spike installs no handler, so SIGTERM to the monitor leaves a stale socket (degrades correctly via sweep + pgid backstop, but production "should" trap SIGTERM/SIGINT and perform the same clean shutdown as the socket `shutdown` command). Land in 23b or defer — must be an explicit, recorded call.
-- **Scratch-repo scaffolding for 23a** — minimum `.planning/` + GSD structure the probe target needs to be a valid devflow target.
-- **In-flight-phase behaviour across the D-08 upgrade** — whether a phase whose `state.json` predates the `supervisor` field should be refused with guidance, or handled some other way.
-- **Whether `hooks_after_ship` gains a `WorktreeRemove` step** and whether per-phase capture files get swept (DEN-59's operator note) — both untested-on-success paths this phase is first to exercise.
+- **Supervisor signal handling.** DEN-58 notes the spike installs no handler, so SIGTERM to the monitor leaves a stale socket (degrades correctly via sweep + pgid backstop, but production "should" trap SIGTERM/SIGINT and perform the same clean shutdown as the socket `shutdown` command). Land in 23b or defer — must be an explicit, recorded call. **This rewrite finds the equivalent gap already exists in the CURRENT (non-socket) monitor script and is load-bearing for `devflow stop`'s design — see Pitfall "SIGTERM to the monitor does not reach the advance tail" below.**
+- **Scratch-repo scaffolding for 23a** — minimum `.planning/` + GSD structure the probe target needs to be a valid devflow target. **Resolved and executed by 23-01; see `23-PROBE-SETUP.md`. Not re-litigated here.**
+- **In-flight-phase behaviour across the D-08 upgrade** — whether a phase whose `state.json` predates the `supervisor` field should be refused with guidance, or handled some other way. **Moot for the MVP scope below (no new `supervisor` field is introduced); remains relevant only if/when the socket supervisor is eventually built.**
+- **Whether `hooks_after_ship` gains a `WorktreeRemove` step** and whether per-phase capture files get swept (DEN-59's operator note) — both untested-on-success paths this phase is first to exercise. **Still open; unaffected by the re-aim, see "Carried forward: hooks_after_ship" below.**
 
 ### Deferred Ideas (OUT OF SCOPE)
 
@@ -96,408 +87,738 @@ command line is gone.
 - 999.42/DEN-67 agent failover on token exhaustion — preserved intent, blocked on DEN-58 + DEN-56.
 - macOS verification — DEN-58 flags it as the single largest unknown; out of scope, do not claim macOS support from this phase.
 - 999.38/DEN-65 test-suite PATH race; 999.39/DEN-66 production git calls inherit a redirecting environment; the old Test Suite & CI Hardening theme (999.15/17/18/19/20/22).
+- **NEW this rewrite:** rate-limit gates that are unresolvable by construction (`23-ORPHAN-FORENSICS.md` point 4 — a probe died at `define` with `status: "ratelimited"`, no parseable retry time, no scheduled auto-resume). Real finding, no locked decision exists for it. See Open Questions — the planner should make an explicit call (fix now vs. defer), not silently drop it.
 </user_constraints>
 
 <phase_requirements>
-## Phase Requirements
+## Phase Requirements (re-aimed)
 
-No REQ-IDs exist for this phase (ROADMAP.md and CONTEXT.md both record "TBD — units 23a-23d, sourced from 999.33/DEN-58 and 999.34/DEN-59 plus the dogfood-probe finding this phase generates first"). The planner should treat the four units below as the requirement set; 23a is explicitly permitted to add/replace requirements based on what it finds.
+No REQ-IDs exist for this phase. The unit table below replaces the original
+one — units keep their letters for continuity with 23-CONTEXT.md/ROADMAP.md,
+but three of the four descriptions changed to match what the probe proved is
+actually required.
 
-| ID (unit) | Description | Research Support |
-|-----------|-------------|-------------------|
-| 23a | Dogfood probe: run `devflow start` on a small real phase in a scratch repo with a ≥v1.8.1 binary; record exactly where it dies | See "Scratch-repo scaffolding" and "Current binary/version state" below |
-| 23b | Socket-addressable supervisor replacing `sh -c` monitor (999.33/DEN-58) | See "23b Migration Inventory" and "Architecture Patterns" |
-| 23c | `devflow stop` — explicit clean phase abort (999.34/DEN-59), blocked on 23b | See "How --yes-ship threads through" adjacent section and "hooks_after_ship / capture sweep" |
-| 23d | Drop `sequentagent` (subtractive) | See "23d Deletion Inventory" |
-| (cross-cutting) | `--yes-ship` pre-authorization flag (D-04..D-07) | See "How --yes-ship threads through" |
+| ID (unit) | Status | Description (re-aimed) | Research Support |
+|-----------|--------|--------------------------|-------------------|
+| 23a | **COMPLETE** (23-01, 23-02, merged) | Dogfood probe — ran, found the process model was never the blocker. Do not re-plan. | `23-PROBE-FINDINGS.md`, `23-ORPHAN-FORENSICS.md` |
+| 23b | **REDEFINED** | Bound gate lifetime: cross-root enumeration of `gate_pending` roots + an aged-gate auto-reject mechanism, reusing `Gates::respond` verbatim. The full socket-addressable supervisor is now optional/deferred — see "What Survives" below. | Research Question A |
+| 23c | **REDEFINED, smaller** | `devflow stop` — buildable directly against the existing per-phase lock file and `Gates::respond`, without waiting on a supervisor. | Research Question B |
+| 23d | **UNCHANGED** | Drop `sequentagent` (subtractive). Independently valid; the probe never touched this code path. | 23d Deletion Inventory (carried forward, re-confirmed unchanged) |
+| (cross-cutting) | **UNCHANGED, but now the phase's actual bottleneck** | `--yes-ship` pre-authorization flag (D-04..D-07) | See "How --yes-ship threads through" (carried forward) |
+| (cross-cutting, **NEW**) | **NEW — added by this replan** | A Ship-stage structural evidence check (git merge/tag/remote), independent of the agent's own self-report, so a false-green `VERIFICATION.md` cannot reach an approved Ship gate a second time. | Research Question C |
 </phase_requirements>
+
+---
+
+## Summary
+
+Phase 23's mechanism-level design work from the original research (the
+socket-supervisor spike, the migration inventories, the `--yes-ship` wiring)
+is still technically sound, but the probe proved the phase does not need most
+of it to hit its actual acceptance criterion. The real blocker the operator's
+machine has been living with is narrower and cheaper to fix than "replace the
+monitor": **`devflow advance`, once it reaches a stage that fires a gate,
+blocks in the foreground holding a per-phase file lock
+(`crates/devflow-core/src/lock.rs:1-11`, confirmed by its own doc comment),
+polling `Gates::poll_response` with a default 7-day timeout
+(`crates/devflow-cli/src/config_parse.rs:16-27`)**. Every phase that gates and
+is then abandoned — including the 24 of 27 orphans that were pointed at empty
+scratch directories and gated instantly and correctly — leaves that process
+pair running for up to a week. Two runs on this exact machine, in the same
+hour, both reached Ship and were stopped by content/config problems (a
+false-green `VERIFICATION.md`, and a missing `SECURITY.md` under an enforcing
+gate), not by a dead or ambiguous monitor.
+
+**Primary recommendation:** build the three things the probe actually
+justifies, in this order, without the supervisor rewrite:
+
+1. **Bound gate lifetime (23b, redefined).** Add a lightweight, project-root
+   registry under `~/.cache/devflow/` (same directory D-09 already locked in
+   for a different reason) that `spawn_monitor`/`advance` register into and
+   deregister from. A new `devflow gate sweep` (or `doctor --fix`) command
+   enumerates every registered root's `gate_pending` state via the *already
+   existing* `Gates::list_open` (per-root) and, for gates older than an
+   operator-configurable threshold, writes a rejection `GateResponse` via the
+   *already existing* `Gates::respond` API — the exact same "auto-answer, not
+   bypass" mechanism `--yes-ship` uses. The still-alive, still-polling
+   `devflow advance` process picks the response up on its own next
+   backoff-capped poll (≤60s) and tears itself down through its own existing
+   `abort()` path. **No process is ever signalled by this mechanism** — it
+   only writes a file the target process already knows how to read.
+2. **`devflow stop` (23c, redefined, smaller).** For the case where nobody
+   wants to wait even 60 seconds for the sweep's write to be noticed (or the
+   process is genuinely stuck earlier than the gate poll), `devflow stop
+   --phase N` reads `.devflow/lock-{phase:02}` — which **already contains the
+   PID of the exact process to signal**, because `lock::acquire`
+   (`crates/devflow-core/src/lock.rs:32-34`) writes `std::process::id()` of
+   whichever process is currently running `advance()`. SIGTERM to that PID
+   is safe at any point during the gate poll (nothing is mid-write — the gate
+   file and `state.gate_pending = true` are persisted *before* the poll loop
+   starts, `pipeline_gate.rs:250-283`). This requires **zero new dependency
+   and zero supervisor** — it is a ~30-line CLI command against APIs that
+   already exist.
+3. **Fix the false-green attestation class (new cross-cutting item).** Both
+   Ship blocks recorded in the orphan forensics were content/config problems,
+   not devflow-core defects — but devflow-core currently has **no structural
+   check of its own** that a Ship approval corresponds to a real merge/tag.
+   The existing `evaluate_layer0` (`crates/devflow-core/src/agent_result.rs:704-796`)
+   already proves the *pattern* — an operator-approved external probe that
+   outranks the agent's own self-report — for arbitrary declared commands.
+   Recommend a narrow, default-on (not opt-in like Layer 0 today) Ship-stage
+   evidence check built the same way.
+
+`sequentagent` deletion (23d) is unaffected and should proceed exactly as
+originally scoped — the probe never exercised that code path and the
+inventory below is re-confirmed unchanged (no `crates/` files were touched by
+23-01/23-02).
+
+**The socket-addressable supervisor (23b's original scope) is deferred, not
+discarded.** Its design remains spike-proven and is the right long-term
+architecture for portability and true liveness-ambiguity resolution, but
+nothing in the two evidence documents shows the phase's stated acceptance
+criterion — "no manual `ps`, no manual `devflow advance`, no silent stall" —
+requires it. Building it now would cost ~8 files' worth of migration to fix a
+problem (monitor death) the probe did not find, while leaving the actual
+problem (unbounded gate wait + no enumeration + no stop) exactly as
+unaddressed as a supervisor rewrite with no TTL/reaper would leave it (per
+`23-ORPHAN-FORENSICS.md`'s own explicit warning: *"a supervisor that owns the
+agent is worth building if and only if it also bounds gate waits... otherwise
+it reproduces the leak with better logging"*).
+
+---
+
+## Architectural Responsibility Map
+
+| Capability | Primary Tier | Secondary Tier | Rationale |
+|------------|-------------|----------------|-----------|
+| Gate wait bounding / cross-root enumeration | Backend/CLI process (devflow-core `gates.rs` + new registry module) | Filesystem (`~/.cache/devflow/`) | Pure extension of the existing file-based gate protocol; no OS-level rendezvous point needed |
+| `devflow stop` | Backend/CLI process (devflow-cli, new `commands.rs` verb) | OS (`kill()` on the lock-file PID) | Targets a single already-known PID via an already-existing lock file; no new process-group or socket primitive required |
+| Ship-stage structural evidence check | Backend/CLI process (devflow-core `agent_result.rs`, new default-on Layer-0-shaped check) | Git (repo tier, read-only queries) | Mirrors `evaluate_layer0`'s existing "external evidence outranks self-report" pattern exactly |
+| `sequentagent` removal | CLI surface (devflow-cli `main.rs`/`parallel.rs`) | — | Pure subtraction; unaffected by the re-aim |
+| Socket-addressable supervisor (DEFERRED) | Backend/CLI process | OS (Unix socket + pgid) | Still the correct tier if/when built; not required for this phase's acceptance criterion |
+| Scratch-repo probe target (23a, COMPLETE) | Filesystem / git (repo tier) | — | Fixture, not a capability; already delivered |
+
+---
+
+## NEW — the re-aimed research
+
+### Research Question A — Bounding gate lifetime (the orphan fix)
+
+**What actually happens today, verified line-by-line:**
+
+1. `crates/devflow-cli/src/pipeline_launch.rs:290-298` — `advance()` acquires
+   a **per-phase** lock (`lock::acquire`) before doing anything else. The
+   lock's own module doc comment states plainly why it is per-phase and not
+   per-project: *"`advance()` holds it across a gate's multi-day blocking
+   wait"* (`crates/devflow-core/src/lock.rs:8-9`). This is the load-bearing
+   fact for the whole question: **the block is already a known, named,
+   documented design property of this codebase**, not an accidental omission.
+2. If the stage's outcome fires a gate (Ship's routine approval, Validate's
+   retry-exhaustion gate, or the "never-silent" catch-all for any stage), the
+   call chain reaches `run_gate_with_timeout`
+   (`crates/devflow-cli/src/pipeline_gate.rs:243-319`):
+   - `state.gate_pending = true` is persisted, and `Gates::write_gate` writes
+     the request file, **both before** the poll starts
+     (`pipeline_gate.rs:250-252`).
+   - `Gates::poll_response` (`crates/devflow-core/src/gates.rs:222-248`) then
+     polls with exponential backoff (1s → 2s → 4s … capped at 60s) until
+     `timeout_secs` elapses.
+   - `timeout_secs` defaults to `gate_timeout_secs()`
+     (`crates/devflow-cli/src/config_parse.rs:16-27`), whose doc comment says
+     **"falling back to 7 days on"** an unset `DEVFLOW_GATE_TIMEOUT_SECS`. A
+     separate, much shorter default (60s,
+     `foreground_gate_timeout_secs`, `config_parse.rs:30-55`) exists but is
+     used **only** by `ship_override`'s foreground retry-gate wait
+     (`pipeline_gate.rs:176-181`) — it is not the value the detached monitor
+     uses for a routine gate.
+3. **On timeout** (the `None` branch, `pipeline_gate.rs:307-317`): a
+   `gate_timeout` event is emitted and an `Err` is returned. That `Err`
+   propagates out of `advance()`, `main()` prints it and calls
+   `std::process::exit(1)` (`crates/devflow-cli/src/main.rs:384`). The
+   process **does** eventually terminate — this refines the orphan-forensics
+   framing of "no timeout" to "a timeout that defaults to 7 days," which for
+   an operational leak (168.6 MB / 54 processes / up to 30h observed) is
+   effectively the same problem. **Critically, `state.gate_pending` is never
+   cleared on this path** (only the `Some(response)` branch at line 286
+   clears it) — so even after the natural 7-day timeout fires, the phase's
+   `state.json` still claims a gate is pending until a human runs `devflow
+   resume`/`advance` again. This IS already correctly detectable —
+   `state.monitor_pid`'s liveness goes to `false` once the `sh -c` shell (see
+   below) also exits, and the existing (monitor dead, agent dead) → `Stuck`
+   classification (Finding 1's table, still implemented in `commands.rs`'s
+   `liveness()`) already reports this correctly. **The existing
+   observability model is not broken for this case — it is just too slow to
+   matter operationally at a 7-day default.**
+4. **What kills the leak, concretely, without any of this:** because
+   `run_gate_with_timeout` writes the gate file and `gate_pending` *before*
+   polling, and `Gates::respond` (`gates.rs:179-198`) simply writes a
+   response file that the same live process's own poll loop will pick up on
+   its very next iteration (≤60s later, by construction of the backoff cap),
+   **the cheapest possible "TTL" implementation writes no kill signal at
+   all** — it writes a `GateResponse{approved: false, note:
+   Some("...abort...".into()), responded_by: Some("devflow-reap")}` via the
+   *existing* `Gates::respond`. `GateAction::from_response`
+   (`gates.rs:69-79`) turns `approved: false` + a note containing "abort"
+   into `GateAction::Abort(note)`, and the already-running `advance()` call
+   drives its own clean `abort()` (`pipeline_gate.rs:322-335`): gate files
+   cleaned up, `workflow::clear_state` called, `workflow_aborted` emitted.
+   The `sh -c` monitor's own script has nothing after the `devflow advance`
+   line, so once `advance` exits cleanly the monitor process exits right
+   behind it — **no orphan, no kill(1), no supervisor**, using only APIs that
+   already exist and are already tested (`Gates::respond` is exercised by the
+   existing `--yes-ship`/`ship_override`/`gate_respond` code paths).
+
+**What would break if `devflow advance` stopped blocking (the "detach
+instead" option), traced explicitly:** the per-phase lock's own doc comment
+(`lock.rs:8-9`) already explains the design intent — a project-wide lock
+would starve `devflow parallel`'s sibling phases, so the lock is scoped
+per-phase precisely so ONE phase's multi-day gate wait cannot block another
+phase's advance. Making `advance` non-blocking would require reintroducing
+*some* long-lived process to own the poll loop and eventually call `abort`/
+`transition` once a response appears — which is exactly what the supervisor
+would be. There is no way to "just not block" without either (a) building a
+supervisor (the deferred option), or (b) polling from an external cron/sweep
+process instead of the same process the gate was raised from — which is
+precisely what the sweep/reap mechanism above already is, minus the
+supervisor. **Recommendation: do not detach `advance`. Keep it blocking (it
+correctly holds the per-phase lock and correctly represents "this phase is
+mid-workflow" for the whole time it's gated); add an external, periodic sweep
+that resolves aged gates via the existing response-file protocol.** This is
+not a menu item — it is the only option of the four that requires zero new
+process-lifecycle code.
+
+**Gate-state persistence, and the minimum change to let a gate expire without
+losing never-fail-silently:**
+
+- `.devflow/gates/{phase:02}-{stage}.json` (`GateFile`, `gates.rs`) already
+  carries a `timestamp` field (`unix_now()`, `gates.rs:333-337`) — age is
+  already computable with **zero new persisted fields**.
+- `state-{phase:02}.json`'s `gate_pending: bool` (`state.rs:28`) is already
+  the exact signal a sweep needs to find candidates, combined with
+  `Gates::list_open` (`gates.rs:140-172`, already returns `phase`, `stage`,
+  `context`, `timestamp` per open gate) — **this enumeration primitive
+  already exists, per-project-root.** No new persisted field on `State` or on
+  the gate file is required for the sweep itself.
+- The never-fail-silently guarantee is **preserved by construction**, not
+  weakened, because the sweep's rejection is written through the exact same
+  `Gates::respond` → `gate_resolved` event path a human's answer takes
+  (`pipeline_gate.rs:284-306`) — the audit trail shows a real, timestamped,
+  `responded_by: "devflow-reap"` decision, not a silently-vanished gate. This
+  is the same "auto-answer, not bypass" shape D-06 already locked in for
+  `--yes-ship`; extending it to a second, symmetric auto-*rejecter* is a
+  natural, minimal reuse, not a new mechanism.
+
+**Enumeration — what it would take to answer "what is gated on this
+machine," verified as genuinely absent:**
+
+- `Gates::list_open` is scoped to one `project_root` — confirmed by its
+  signature (`gates.rs:140`) and every call site (`gate_show`, `gate_respond`,
+  `doctor`'s `collect_phase_facts` in `commands.rs`). There is **no existing
+  cross-root registry anywhere in this codebase** — confirmed by grepping for
+  `~/.cache/devflow`, `registry`, and `sweep` across `crates/`: zero
+  production hits. `23-ORPHAN-FORENSICS.md`'s own account of how it was
+  written ("assembled with `ps` and `find`") is independent, direct
+  confirmation from the operator's own experience.
+- **Recommendation:** a small, append-only registry file,
+  `~/.cache/devflow/roots.json` (reusing D-09's already-locked-in directory
+  choice for an unrelated-but-compatible reason — it survives logout and has
+  ample `sun_path`-class headroom for a plain JSON file, which has no length
+  constraint at all since it is not a socket path). `launch_stage_inner`
+  (`pipeline_launch.rs:55-149`, the same function that already writes
+  `state.monitor_pid` at line 131) registers `(project_root, phase)` into it
+  at spawn time; `advance()`'s terminal paths (`abort`,
+  `finish_workflow_with_gate_timeout`'s success path) deregister it. A sweep
+  reads this file, then re-uses `Gates::list_open` per listed root — no new
+  per-root state needed beyond what already exists. **This is a new artifact
+  (does not exist today), but it is the only new persisted state this
+  question's recommendation requires.**
+
+---
+
+### Research Question B — `devflow stop` (was unit 23c)
+
+**Can a useful `devflow stop` be built without the full socket supervisor?
+Yes — the exact mechanism to signal already exists and was verified this
+session by tracing the shell script `spawn_monitor_inner` generates
+(`crates/devflow-core/src/monitor.rs:148-160`):**
+
+```
+apid=''; cleanup() { [ -n "$apid" ] && kill "$apid" 2>/dev/null; exit 0; }
+trap cleanup TERM INT
+cd '<workdir>' || exit 1
+"$@" > '<stdout>' 2>'<stderr>' &
+apid=$!; echo $apid > '<pid_file>'
+wait $apid; echo $? > '<exit_file>'; <binary> advance '<project_root>' --phase <N>
+```
+
+The `wait $apid; echo $?; advance ...` line is **one compound statement**,
+executed sequentially by the same `sh -c` process, not backgrounded. Two
+consequences, both verified against the script text and against
+`lock.rs`/`advance()`'s own behavior, and both new findings this session
+(neither the original research nor the two evidence documents state this
+explicitly):
+
+1. **The `trap cleanup TERM INT` only ever kills `$apid`** — the variable
+   captured for the *agent* process, set once, before `advance` ever runs.
+   By the time `advance` is the sh script's active foreground child, `$apid`
+   already refers to a long-exited process. **Sending SIGTERM to the `sh -c`
+   monitor PID (`state.monitor_pid`) while it is running the trailing
+   `advance` line does not terminate `advance` — it orphans it**, exactly the
+   Phase-17-shaped bug the original hypothesis was about, but for the
+   *advance tail* specifically rather than the agent. This is a genuinely new
+   failure mode discovered by this rewrite, not previously documented
+   anywhere in this project's planning history.
+2. **The correct target is the `devflow advance` process itself, and it is
+   already trivially findable.** `lock::acquire` (`lock.rs:32-34`) writes
+   `std::process::id()` — the CURRENT process's own PID, i.e. the `advance`
+   invocation itself — into `.devflow/lock-{phase:02}`. That file is created
+   the moment `advance()` starts and is held for the entire duration of any
+   gate wait. **A minimal `devflow stop --phase N` needs only: read
+   `.devflow/lock-{phase:02}`, confirm the PID is alive
+   (`agent::agent_running`, already exists and is already hardened per
+   Finding 1), and `kill(pid, SIGTERM)` it.** Once that process exits (however
+   it exits — cleanly via a caught signal, or simply killed), the `sh -c`
+   monitor's `wait`/foreground-child-exited condition resolves and the
+   monitor itself falls off the end of the script and exits on its own —
+   **no second signal, no process-group tracking, no pgid backstop needed**,
+   because there is nothing left in the script after the `advance` line.
+
+**What this MVP is missing relative to the full supervisor design, stated
+plainly:** a bare `kill(pid, SIGTERM)` on the `advance` process interrupts it
+mid-`Gates::poll_response` with **no cleanup** — `state.gate_pending` stays
+`true`, the gate file stays open, and the operator is left exactly where the
+7-day-timeout path already leaves them (a `Stuck` classification, recoverable
+via `devflow resume`). **Recommendation: prefer the write-a-rejection-
+response approach from Research Question A as `devflow stop`'s primary
+mechanism too** (it produces a clean `workflow_aborted` event and a properly
+cleared `state.json`, using code that already exists) **and use the
+lock-file-PID `kill` only as the fallback** for the (rarer) case where
+`advance` is not yet blocked on a gate — mid-`evaluate_agent_result`, for
+instance — where there is no gate file to respond to. This gives `devflow
+stop` two paths from one small function: if `Gates::list_open` shows an open
+gate for the phase, write a rejection response and wait briefly (≤60s) for
+the process to notice it and exit on its own; otherwise, fall back to a
+direct `kill(pid, SIGTERM)` on the lock-file PID. Either path was verified
+this session to require **zero new dependency, zero new process-lifecycle
+primitive, and zero of the socket-supervisor spike's mechanism.**
+
+**Interaction with `cleanup --force`'s deliberate refusal to touch live
+processes** (`crates/devflow-cli/src/commands.rs:372-443`): `cleanup`'s
+liveness check keys off `state.monitor_pid` via `agent::agent_running`
+(`commands.rs:405-407`) — the `sh -c` process, which (per the trace above) IS
+correctly alive for the entire duration a gate is pending, so `cleanup
+--force` correctly refuses to touch it today, exactly as designed. `devflow
+stop` must be a **new, separate verb**, not a flag on `cleanup`: `cleanup`'s
+whole contract is "remove a worktree for a phase that has already finished or
+is safely dead," and its refusal on a live phase is a deliberate safety
+property (D-06 in an earlier phase's own decisions, "no override flag" —
+confirmed by the doc comment at `commands.rs:375`). Overloading `cleanup
+--force` to also mean "stop the live thing first" would weaken a safety
+property a previous phase specifically hardened. **`devflow stop` should be
+the verb that changes a phase's liveness from live to dead; `cleanup --force`
+should keep refusing to touch anything still live, and only be usable
+afterward** — exactly the sequencing CONTEXT.md's own Integration Points
+section already anticipated ("`cleanup --force` — deliberately refuses...
+`devflow stop` (23c) becomes the verb that actually stops one").
+
+---
+
+### Research Question C — The false-green attestation class
+
+**What produced a `01-VERIFICATION.md` that scored the Ship stage `VERIFIED`
+while Ship had never run, and where does the catch actually happen?**
+
+Traced through devflow-core's own evaluation pipeline
+(`crates/devflow-core/src/agent_result.rs`) this session: `VERIFICATION.md`
+is **not a devflow-core artifact and devflow-core never reads it.**
+`evaluate_agent_result`/`evaluate_agent_result_inner` (`agent_result.rs:837+`)
+consume only: (a) commit evidence on the phase branch, (b) the agent's own
+`DEVFLOW_RESULT` JSON payload (its self-reported `status`/`verdict`), and (c)
+optionally, `evaluate_layer0`'s operator-declared external probe commands
+(`agent_result.rs:704-796`, gated by `crate::config::external_verify_enabled`
+— **opt-in, off by default**). None of these three inspect the *content* of a
+GSD-produced document like `VERIFICATION.md`. The catch that actually
+happened — "review: CR-01 (Critical) — `01-VERIFICATION.md` scores...
+VERIFIED... but Ship never ran: `git log --merges --all` is empty, 0 tags, 0
+remotes" (`23-PROBE-FINDINGS.md`'s `events.jsonl` line at
+`ts:1785015595`) — happened **entirely inside the Claude agent's own GSD
+Ship-stage workflow** (a review/audit step the agent itself ran as part of
+its `/gsd-ship`-family prompt chain), which then reported `status: "failed"`
+back to devflow through the normal `DEVFLOW_RESULT` contract. **This is a
+GSD-prompt-side self-audit, not a devflow-core structural guard.** It worked
+this one time because the agent's own review pass happened to catch it —
+that is non-deterministic prompt behavior, not a code-enforced invariant, and
+nothing in devflow-core would have caught the same defect if the agent's
+review had missed it.
+
+**Is there an existing check that could have caught "Ship scored verified but
+no merge/tag/remote exists"?** No — confirmed by reading
+`evaluate_layer0`/`evaluate_agent_result_inner` in full this session. The
+closest existing pattern is `evaluate_layer0` itself: it already implements
+exactly the right shape — "run an external, operator-approved probe; a
+failing probe outranks the agent's own self-report" — just scoped to
+arbitrary, opt-in, per-phase-declared shell commands, not to Ship
+specifically. **Recommendation: add a narrow, default-on (not opt-in)
+structural check that runs automatically whenever a stage's outcome is about
+to be evaluated as a Ship approval** — e.g. before `handle_ship_outcome`
+(`pipeline_outcomes.rs:275-286`, carried forward below) accepts an
+`AgentStatus::Success` at `Stage::Ship`, independently confirm at least one
+of: a new merge commit exists on the target branch since the phase's
+`started_at`, or a new tag was created, or the remote was pushed to. This is
+architecturally the same pattern as `evaluate_layer0`, narrowed to one
+stage and enabled unconditionally (no `external_verify_enabled` opt-in,
+since this is closing a specific, now-proven-real gap rather than adding a
+general-purpose feature). **This is new, devflow-core-side work this replan
+adds to the phase's scope** — it did not exist in the original 23b/23c/23d
+unit breakdown.
+
+**Is the `security_enforcement=true` + missing `SECURITY.md` block correct
+behaviour, or a config-scoping defect? Verified against this repo's own
+config, `.planning/config.json` (read this session):** the key is **absent**
+from this project's `workflow` block, which — per this project's own
+established convention throughout its planning history ("absent =
+enabled") — means security enforcement **is active by default in this
+repo, exactly as it would be in the scratch probe**. `scripts/scratch-dogfood-
+repo.sh` was checked for any override (`rg -n security_enforcement`) and
+found none — the scratch repo inherits the same default. **This means the
+self-hosted D-02 acceptance run is NOT structurally exempt from the same
+wall that blocked `devflow-probe-02`** — it is symmetric, not a scratch-only
+artifact. Every prior phase in this repo (see `STATE.md`'s "Recently
+Shipped" entries — Phase 21, Phase 20, Phase 18 each produced an
+`NN-SECURITY.md`) has produced a `SECURITY.md` as a normal part of its own
+Ship-stage workflow, so this is very likely a non-issue **in practice** for
+a real phase driven by the standard GSD Ship-stage prompt chain — but it is
+an assumption, not verified this session (no phase has yet completed an
+end-to-end unattended run in this repo to confirm the artifact is always
+produced before the preflight check runs). **Recommendation for the planner:
+either (a) explicitly verify the chosen low-stakes acceptance phase's own
+plan set includes a task that produces a `SECURITY.md` before Ship, or (b)
+add a defensive check earlier in the phase's own pipeline (Validate stage) so
+a missing `SECURITY.md` surfaces as an ordinary Validate gap rather than a
+Ship-time preflight surprise discovered only after the phase has otherwise
+completed.**
+
+---
+
+### Research Question D — What survives from the supervisor work
+
+Read `.planning/audits/2026-07-24-socket-supervisor-spike.md` in full again
+this session, cross-checked against A/B/C above.
+
+| Supervisor design element | Survives? | Why |
+|---|---|---|
+| Socket-addressable liveness (GONE/STALE/ALIVE via `connect()`) | **DEFERRED, not required.** | The probe found monitor liveness was never actually ambiguous in the observed runs (`infra_failures: 0`; the monitor was correctly alive the whole time). PID-based liveness (`agent::agent_running`, already hardened) is adequate for the narrow, known-location kill/enumerate operations Question A/B need. Solves a real but different problem (Finding 1's "who watches the watcher" ambiguity) than the one this phase's acceptance criterion requires closed. |
+| In-process `advance` tail (D-10) | **DEFERRED, but gains a new, narrower justification.** | Question B's finding — that SIGTERM to the monitor does not reach the `advance` child because the shell trap only tracks `$apid` — is a real argument *for* eventually folding `advance` into the same process as the monitor (one process, one signal handler, no "which PID do I actually target" lookup). But the lock-file-PID trick (Question B) already gives `devflow stop` a working, minimal target without this migration. Recommend: keep D-10 on the backlog as the long-term cleanup, not required now. |
+| `~/.cache/devflow/` as a durable, logout-surviving location (D-09) | **PARTIALLY SURVIVES.** | The location decision (not `$XDG_RUNTIME_DIR`) is reused directly for the new cross-root gate registry (Question A) — same rationale (must survive logout), different payload (a JSON root list instead of a socket). The `sun_path`-length constraint (C6) that motivated the *directory choice* for sockets specifically does not apply to a plain file, but the directory itself is still the right, already-decided location. |
+| pgid backstop / `killpg` teardown | **DEFERRED, not required.** | Question B's MVP kills exactly one known PID; there is no process tree to tear down because the shell script never backgrounds the `advance` tail (it's a plain foreground command), and the agent's own tree is already correctly torn down today by the existing `sigterm_to_monitor_also_kills_the_agent` regression test (`monitor.rs:340-382`, WR-08) for the *agent* case, which this rewrite did not find any evidence of being broken. |
+| Cross-platform/container uniformity argument for sockets over cgroups | **STILL VALID, still not the deciding factor here.** | Correct reasoning, orthogonal to whether this phase needs to ship it now. |
+| Takeover safety / a 2nd monitor refusing a live socket | **DEFERRED.** | Not exercised by anything in the MVP scope; no socket exists to take over. |
+
+**`sequentagent` deletion (23d) never depended on the hypothesis — confirmed,
+not merely asserted.** Re-ran the exact verification this session:
+`git log --oneline` shows 23-01/23-02 touched only
+`scripts/scratch-dogfood-repo.sh` and planning docs — `git status --porcelain
+crates/` was clean before this session's reads, and no commit since the
+original research's `rg` count (2026-07-25) has touched `crates/`. **The 142
+references / 11 files inventory below is re-confirmed current, unchanged,
+independently valid cleanup**, exactly as `23-PROBE-FINDINGS.md`'s Scope
+Verdict table already states ("UNTOUCHED").
+
+---
 
 ## Standard Stack
 
 ### Core
 
+No new dependency for any of the three re-aimed units (A/B/C). Everything
+they need is already a resolved dependency:
+
 | Library | Version | Purpose | Why Standard |
-|---------|---------|---------|---------------|
-| `libc` | `0.2` (already a `devflow-core` dependency) `[VERIFIED: crates/devflow-core/Cargo.toml:19]` | `kill`, `killpg`, raw signal numbers | Already used by `agent.rs`/`monitor.rs`/`preflight.rs`; no version bump needed for this phase |
-| `std::os::unix::net::{UnixListener, UnixStream}` | stable since Rust 1.0 (Unix-only) | Socket-addressable supervisor's durable handle | Proven in the spike (`spikes/socket-supervisor/main.rs`); zero new dependency, matches DEN-58's explicit "no new dependency" design win |
-| `std::os::unix::process::CommandExt::process_group(0)` | stable since Rust 1.64 `[CITED: process-lifecycle-problem-definition.md §5]` | Places the whole spawned tree in one killable process group at spawn time | Already the validated building block from the abandoned branch; carries forward unchanged into the socket design |
-| `serde` / `serde_json` | `1` (workspace) `[VERIFIED: Cargo.toml:21-22]` | `State.supervisor` block persistence | Existing pattern for every other `state.json` field |
-| `thiserror` | `2` (workspace) `[VERIFIED: Cargo.toml:25]` | New supervisor error variants, matching `MonitorError`'s existing shape | House convention (`CONVENTIONS.md` Error Handling) |
+|---------|---------|---------|--------------|
+| `libc` | `0.2` (already a `devflow-core` dependency) `[VERIFIED: crates/devflow-core/Cargo.toml:19]` | `kill()` for `devflow stop`'s fallback path | Already used by `agent.rs`'s `agent_running` and `lock.rs`'s `pid_is_alive` — `devflow stop` reuses these, not a new call site |
+| `serde` / `serde_json` | `1` (workspace) `[VERIFIED: Cargo.toml:21-22]` | The new `~/.cache/devflow/roots.json` registry file's (de)serialization | Existing pattern for every other JSON artifact (`GateFile`, `GateResponse`, `state-NN.json`) |
+| `thiserror` | `2` (workspace) `[VERIFIED: Cargo.toml:25]` | Any new error variants for the registry/sweep/stop modules | House convention |
+| `std::fs` / `std::process` | stable | Registry file I/O, `Command`/`kill` for `devflow stop` | Nothing beyond what `lock.rs`/`gates.rs`/`monitor.rs` already do |
 
-### Supporting
+**No socket, no `std::os::unix::net`, no `process_group`, no `sysinfo`-class
+crate is needed for the re-aimed scope.** Those remain accurate
+recommendations *if and only if* the deferred supervisor work is later
+picked up (see Question D) — left in the "Alternatives Considered" table
+below, carried forward, for that future phase's benefit.
 
-| Library | Version | Purpose | When to Use |
-|---------|---------|---------|-------------|
-| `tempfile` | `3` (already a dev-dependency, both crates) `[VERIFIED: Cargo.toml]` | Test fixtures for the new supervisor module | Only in `#[cfg(test)]`/integration tests, per existing pattern |
-
-### Alternatives Considered
+### Alternatives Considered (carried forward — still correct if the deferred supervisor work is later picked up)
 
 | Instead of | Could Use | Tradeoff |
 |------------|-----------|----------|
-| Unix domain socket handle | cgroup v2 (`cgroup.kill`/`cgroup.procs`) | **Rejected by this project's own prior research** (`2026-07-24-process-teardown-solution-research.md`): does not work in containers even with delegation flags (verified empirically with rootless podman on this host), and the operator's own dev environment includes containerized work. The socket design is container-safe and cross-platform-uniform; do not resurrect the cgroup design. |
-| Unix domain socket handle | `command-group` / `process-wrap` (watchexec org) | **Ruled out, do not re-propose** — spawn-centric handle (`GroupChild`), cannot be serialized into `state.json` and reconstituted by a later process (fails requirement R3). |
-| Unix domain socket handle | `processkit` | **Ruled out, do not re-propose** — architecturally incapable: cgroup dir name is salted per-process specifically to prevent reconstruction; `adopt()` needs a live tokio `Child`; ~8-week-old crate with a hard tokio dependency in a fully synchronous codebase. |
-| Unix domain socket handle | `duct` / `daemonize` / `nix` / `rustix` | **Ruled out, do not re-propose** — `duct`'s maintainer explicitly declined process-group handling; `daemonize`/`fork` solve terminal detachment, a different problem; `nix`/`rustix` are cosmetic typed wrappers over the same `libc` calls already in use, catching none of F1-F7. |
-| Persisted `sysinfo`-based PID+start_time identity | `procfs-core`/`libproc` high-res start time | Only relevant for the STALE-path pgid backstop, which this design already uses `start_time` + `boot_id` for without adding `sysinfo` — grounded in the spike's own C5 result (`/proc` fields read directly). Not needed as a new dependency for the happy path. |
+| Unix domain socket handle | cgroup v2 (`cgroup.kill`/`cgroup.procs`) | **Rejected by this project's own prior research** (`2026-07-24-process-teardown-solution-research.md`): does not work in containers even with delegation flags (verified empirically with rootless podman on this host). Do not resurrect. |
+| Unix domain socket handle | `command-group` / `process-wrap` / `processkit` / `duct` / `daemonize` / `nix` / `rustix` | **Each ruled out for a recorded reason** in the original research (unserializable handle, tokio dependency in a sync codebase, terminal-detachment-not-teardown, cosmetic wrappers over the same `libc` calls). Do not re-propose without new evidence. |
 
-**Installation:** No new packages. Verify existing pins:
-```bash
-cargo tree -p devflow-core -i libc   # confirm libc 0.2.x already resolved
-```
-
-**Version verification:** `libc = "0.2"` and `serde`/`serde_json`/`thiserror` are already pinned workspace-wide and used by the exact modules (`monitor.rs`, `agent.rs`, `state.rs`) this phase touches — re-verified live via `Cargo.toml` reads on 2026-07-25, not training-data recall.
+**Version verification:** `libc`/`serde`/`serde_json`/`thiserror` re-verified
+live against `Cargo.toml` this session (2026-07-25) — no drift since the
+original research's check on the same day.
 
 ## Package Legitimacy Audit
 
-**Not applicable.** This phase installs zero new external packages — the entire design is `std` + the already-present `libc` crate (D-09/DEN-58's explicit "no new dependency" win, re-confirmed against `Cargo.toml` this session). No package-legitimacy check is needed.
+**Not applicable.** The re-aimed scope (A/B/C) installs zero new external
+packages — every primitive it uses (`libc::kill`, `serde_json`,
+`std::fs`) is already a resolved workspace dependency, re-verified this
+session. No package-legitimacy check is needed.
 
 **Packages removed due to [SLOP] verdict:** none.
 **Packages flagged as suspicious [SUS]:** none.
 
+---
+
 ## Architecture Patterns
 
-### Two prior research passes exist — only the second is current
-
-`.planning/audits/2026-07-24-process-lifecycle-problem-definition.md` and its
-companion `2026-07-24-process-teardown-solution-research.md` reach a
-**cgroup-v2-primary, pgroup-fallback** design (`process_handle` with
-`mechanism: "cgroup" | "pgroup"`). That design was then **superseded** by a
-third, later document — `2026-07-24-socket-supervisor-spike.md` — which
-spikes and validates a simpler, uniform **socket-addressable supervisor**
-design instead (no cgroup at all). CONTEXT.md's D-09 locks the *socket*
-design ("carried forward from DEN-58's spike... do not re-open"), and the
-ROADMAP/CONTEXT text for 23b describes the socket design exclusively. **The
-planner must build the socket design, not the cgroup/pgroup design** — the
-two earlier documents remain useful for (a) the failure-mode catalog F1-F7,
-which the socket design is graded against, and (b) the list of ruled-out
-crates, but their own `process_handle`/cgroup recommendation is not what
-ships. This is a real inconsistency across the project's own planning docs;
-flagging it explicitly so the plan is not built against the stale
-recommendation.
-
-### System Architecture Diagram
+### System Architecture Diagram (re-aimed scope only)
 
 ```
 devflow start --phase N
         |
         v
-  launch_stage_inner (pipeline_launch.rs)
-        |  (preflight, staleness gate, capture archival)
+  launch_stage_inner (pipeline_launch.rs:55)  ── unchanged
+        |  spawns monitor::spawn_monitor (unchanged sh -c body)
+        |  NEW: registers (project_root, phase) into
+        |       ~/.cache/devflow/roots.json
         v
-  monitor::spawn_supervisor(state, program, args, envs)   <- NEW, replaces spawn_monitor
+  sh -c monitor (unchanged) ── owns agent, then runs `devflow advance` as
+        |                      its own foreground child (unchanged)
+        v
+  advance() (pipeline_launch.rs:260) ── acquires per-phase lock (unchanged)
         |
         v
-  +---------------------------------------------------------+
-  |  supervisor process (was: "sh -c ...", is now: devflow   |
-  |  itself, argv0 signals "I am the supervisor")            |
-  |                                                            |
-  |  binds ~/.cache/devflow/<hash(project_root)>-<phase>.sock  |
-  |  spawns agent (Command::process_group(0))                 |
-  |  writes agent-pid file; captures stdout/stderr to files    |
-  |                                                            |
-  |  loop {                                                    |
-  |    agent exits naturally -----------> write exit code      |
-  |                                        run `advance` IN-    |
-  |                                        PROCESS (D-10)       |
-  |                                        remove socket, exit  |
-  |                                                              |
-  |    receives "shutdown" on socket ---> killpg(SIGTERM..KILL)  |
-  |                                        write exit code 143   |
-  |                                        SUPPRESS advance (R-M)|
-  |                                        remove socket, exit   |
-  |                                                              |
-  |    receives SIGTERM/SIGINT (OS) ----> [Claude's discretion:  |
-  |                                        same clean-shutdown    |
-  |                                        path as "shutdown"]    |
-  |  }                                                            |
-  +---------------------------------------------------------+
-        ^                                          ^
-        | connect() -> ALIVE/STALE/GONE            | "shutdown" message
-        |                                          |
-  devflow status / doctor                    devflow stop (23c, NEW)
-  (liveness re-pointed at socket probe        (writes workflow_stopped event,
-   instead of PID-based agent_running)         resolves open gates, suppresses
-                                                advance via R-M)
+  evaluate_agent_result ── NEW: Ship-stage structural evidence check
+        |                       (Research Question C) runs here, before a
+        |                       Ship AgentStatus::Success is trusted
+        v
+  outcome fires a gate? ── run_gate_with_timeout (unchanged: write_gate,
+        |                   gate_pending=true, poll_response, 7-day default)
+        |
+        +--> NEW: devflow gate sweep (external, periodic or on-demand)
+        |         reads ~/.cache/devflow/roots.json
+        |         → Gates::list_open per root (unchanged, already exists)
+        |         → for gates older than threshold: Gates::respond
+        |           {approved:false, note:"...abort...", responded_by:
+        |           "devflow-reap"}  (unchanged API, new caller)
+        |         → the still-polling advance() picks it up on its own
+        |           next iteration (≤60s), runs its own abort() (unchanged)
+        |
+        +--> NEW: devflow stop --phase N (on-demand, operator-invoked)
+                  reads .devflow/lock-{phase:02} for the advance PID
+                  (unchanged file, new reader)
+                  → if a gate is open: write the same rejection response
+                    as the sweep above, wait briefly for self-teardown
+                  → else: kill(pid, SIGTERM) directly (fallback only)
 ```
 
 ### Recommended Project Structure
 
-No new top-level module is strictly required — the existing `crates/devflow-core/src/monitor.rs` is the natural home for the rewritten supervisor (it already owns `spawn_monitor`/`spawn_monitor_no_advance`/`wait_for_agent_pid`/`wait_for_agent_exit`, all of which this phase replaces or removes). Recommend replacing its internals in place rather than adding a parallel `supervisor.rs`, since D-08 is a big-bang replacement (no dual-path period during which two modules would coexist).
-
 ```
 crates/devflow-core/src/
-├── monitor.rs        # rewritten: socket bind/listen, spawn, liveness probe, shutdown, sweep
-├── state.rs           # + `supervisor: Option<SupervisorHandle>` field (serde(default))
-├── agent.rs            # agent_running() retained ONLY as the pgid-backstop identity check
+├── gates.rs           # unchanged API surface; new caller sites only
+├── lock.rs             # unchanged; devflow stop reads its existing file format
+├── agent_result.rs      # + a narrow, default-on Ship evidence check
+                          #   (new function, same shape as evaluate_layer0)
+├── registry.rs          # NEW — ~/.cache/devflow/roots.json read/write,
+                          #   the only genuinely new module this scope needs
 crates/devflow-cli/src/
-├── pipeline_launch.rs  # spawn_supervisor call site (replaces spawn_monitor)
-├── commands.rs         # `status`/`doctor` liveness re-pointed at socket probe; NEW `stop` command
-├── parallel.rs          # DELETED (sequentagent, 23d) — `parallel` (N-phases-concurrently) stays
-├── main.rs              # Sequentagent variant + dispatch arm DELETED (23d); `--yes-ship` flag added to Start
+├── pipeline_launch.rs   # launch_stage_inner registers into the new registry
+├── pipeline_gate.rs      # advance()'s abort() path deregisters
+├── commands.rs            # NEW: `stop` command; NEW: `gate sweep` command
+├── main.rs                 # NEW: Command::Stop, Command::GateSweep dispatch arms;
+                             # `--yes-ship` flag added to Start (unchanged from
+                             # original research); 23d's Sequentagent removal
+                             # (unchanged from original research)
 ```
 
-### Pattern 1: Socket path as a durable, PID-free handle
+### Pattern 1: Auto-reject via the existing gate-response protocol (NEW)
 
-**What:** Bind a Unix domain socket at a short, fixed-length path (`~/.cache/devflow/<hash>-<phase>.sock`, keyed by a hash of `project_root` + phase to avoid cross-project collision) and store that path string in `state.json`. Liveness is answered purely by `connect()`: no socket file = GONE; file exists but `ECONNREFUSED` = STALE; connects = ALIVE. No PID is read on the happy path.
+**What:** Write a `GateResponse{approved: false, note: Some("...abort..."),
+responded_by: Some("devflow-reap")}` for any gate older than a threshold,
+using the unmodified `Gates::respond` API. No process is signalled.
 
-**When to use:** Every phase's monitor/supervisor spawn (replaces both `spawn_monitor` and `spawn_monitor_no_advance` — though the latter's caller, `sequentagent`, is deleted in this same phase, so only the `spawn_monitor` shape survives).
+**When to use:** The sweep's primary mechanism (Question A); `devflow stop`'s
+primary mechanism when a gate is actually open (Question B).
 
-**Example (from the verified spike):**
+**Example (illustrating the exact existing API, not new code):**
 ```rust
-// Source: .planning/spikes/socket-supervisor/main.rs (re-run this to reproduce)
-fn status(sock: &str) {
-    if !Path::new(sock).exists() { println!("GONE"); return }
-    match UnixStream::connect(sock) {
-        Ok(mut s) => {
-            let _ = writeln!(s, "ping");
-            let mut r = String::new();
-            let _ = BufReader::new(s).read_line(&mut r);
-            println!("ALIVE ({})", r.trim());
+// Existing API, unmodified — crates/devflow-core/src/gates.rs
+use devflow_core::gates::{Gates, GateResponse};
+
+Gates::respond(project_root, phase, stage, &GateResponse {
+    approved: false,
+    note: Some("abort: gate exceeded max unattended age with no response".into()),
+    responded_by: Some("devflow-reap".into()),
+})?;
+// The live `devflow advance` process (still polling Gates::poll_response,
+// pipeline_gate.rs:284) picks this up on its own next backoff-capped
+// iteration (≤60s) and runs its own clean `abort()` — pipeline_gate.rs:322.
+```
+
+### Pattern 2: Lock-file PID as `devflow stop`'s fallback target (NEW)
+
+**What:** `.devflow/lock-{phase:02}` already contains the exact PID to
+signal — the process currently running `advance()` for that phase.
+
+**When to use:** `devflow stop`'s fallback path, only when
+`Gates::list_open` shows no open gate for the phase (so there is nothing to
+write a response to) but the phase is still recorded as active.
+
+**Example:**
+```rust
+// Existing file format, unmodified — crates/devflow-core/src/lock.rs
+let lock_path = project_root.join(".devflow").join(format!("lock-{phase:02}"));
+if let Ok(pid) = std::fs::read_to_string(&lock_path) {
+    if let Ok(pid) = pid.trim().parse::<u32>() {
+        if devflow_core::agent::agent_running(pid) {
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
         }
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => println!("STALE"),
-        Err(e) => println!("UNKNOWN {e}"),
     }
 }
 ```
 
-**Why `~/.cache/devflow/` and not `$XDG_RUNTIME_DIR` (already locked, D-09):** `$XDG_RUNTIME_DIR` is removed by systemd when the last session for a user ends — fatal for a long unattended run if the operator logs out. `~/.cache/devflow/<hash>.sock` is ~45 bytes on macOS (well under the 104-byte `sun_path` limit) and survives logout.
+**Anti-pattern to avoid:** sending SIGTERM to `state.monitor_pid` (the `sh
+-c` process) expecting it to also terminate the `advance` child. Verified
+this session (Question B) that the script's trap only ever tracks `$apid`
+(the agent), never the `advance` tail — this WILL orphan `advance` rather
+than stopping it.
 
-### Pattern 2: In-process `advance` tail (D-10)
+### Pattern 3: Ship-stage structural evidence check (NEW, Question C)
 
-**What:** The supervisor, on natural agent exit, calls the `advance` logic as a Rust function call in the same process — not a forked `devflow advance` subprocess.
+**What:** Before trusting an `AgentStatus::Success` at `Stage::Ship`,
+independently confirm git evidence exists — mirrors `evaluate_layer0`'s
+existing "external probe outranks self-report" shape, narrowed to one stage
+and made default-on.
 
-**When to use:** Every natural-completion path. This is the single property that removes Phase 17's failure mode by construction (no forkable tail process left to orphan on a signal).
+**When to use:** Inside `evaluate_agent_result_inner`'s Ship-stage path, or
+as a new check `handle_ship_outcome` (`pipeline_outcomes.rs:275-286`, carried
+forward below) consults before accepting the gate approval.
 
-**Example:**
 ```rust
-// Source: .planning/spikes/socket-supervisor/main.rs (adapted)
-if let Ok(Some(st)) = child.lock().unwrap().try_wait() {
-    let code = st.code().unwrap_or_else(|| 128 + st.signal().unwrap_or(0));
-    std::fs::write(&exit_file, format!("{code}\n"))?;
-    // R-E: call devflow's own advance() function directly here — no
-    // `Command::new(binary).arg("advance")` subprocess spawn.
-    devflow_core::advance_in_process(&project_root, phase)?;   // production name TBD by planner
-    std::fs::remove_file(&sock)?;
-    std::process::exit(0);
+// Illustrative shape only — planner sizes the actual diff.
+// Mirrors evaluate_layer0's existing pattern (agent_result.rs:704-796):
+// an external, structural signal outranks the agent's own self-report.
+fn verify_ship_evidence(project_root: &Path, state: &State) -> bool {
+    // e.g.: any new merge commit on the target branch since state.started_at,
+    // OR a new tag, OR evidence of a remote push — planner picks the cheapest
+    // reliable signal against this project's actual git-flow shape
+    // (crates/devflow-core/src/git.rs already has the merge/tag primitives
+    // hooks.rs's own `hooks_after_ship` uses).
+    todo!()
 }
 ```
 
-**Migration note:** today's `advance_tail` in `monitor.rs:138-147` builds a shell string
-`"; {binary} advance {project_root} --phase {phase}"`. This entire code path
-is deleted; the equivalent logic must be reachable as a plain function call
-from within the (now Rust, not shell) supervisor process. The planner should
-verify whether `commands::advance` (the CLI's existing `Advance` dispatch
-target) is already free of CLI-only concerns (arg parsing, `project_root()`
-resolution) or needs a thin extraction so the supervisor can call the core
-logic directly without going through `clap`.
+### Anti-Patterns to Avoid
 
-### Pattern 3: STALE-path pgid backstop, gated by identity validation
+- **Rebuilding the full socket supervisor to fix this phase's acceptance
+  criterion.** Per Question D: none of A/B/C require it. If a future phase
+  needs true liveness-ambiguity resolution (Finding 1's original problem),
+  build it then, against fresh evidence that ambiguity is actually occurring
+  — this probe found it was not.
+- **Treating the 7-day `gate_timeout_secs()` default as "no timeout."** It is
+  a real, already-implemented, already-tested timeout — just too long for
+  unattended-orphan purposes. Do not reintroduce a duplicate timeout
+  mechanism; either lower the effective default for background contexts or
+  add the sweep above (both are compatible, complementary, and neither
+  requires touching the other).
+- **Sending SIGTERM to `state.monitor_pid` as `devflow stop`'s only
+  mechanism.** Verified this session to orphan the `advance` tail rather than
+  stopping it (Pattern 2's anti-pattern note above).
 
-**What:** When the socket is STALE (file exists, `ECONNREFUSED`), do not assume the tree is dead — enumerate processes by the persisted `agent_pgid`, validate `start_time` + `boot_id` before `killpg`, per the spike's C5 result.
-
-**When to use:** `devflow stop`'s STALE branch, and any sweep/recovery path.
-
-**Anti-Patterns to Avoid**
-- **Leader-PID-as-handle:** the root cause of the original three failure modes (F1/F2/F3). Never reintroduce a design where liveness is answered by `kill(leader_pid, 0)`.
-- **Deriving the socket path at probe time instead of reading it from `state.json`:** a changed `$XDG_RUNTIME_DIR`/`$TMPDIR` between invocations would orphan the handle. Already locked by D-09 — do not regress this in implementation.
-- **Treating a stop as a completion:** R-M is the one behavioral property that most needs a dedicated regression test — a `devflow stop` must never allow `advance` to run afterward.
-- **Reintroducing `process_group(0)` on the no-advance path:** F4 (Ctrl-C regression) was caused by exactly this. Moot after 23d removes `spawn_monitor_no_advance`'s only caller, but note it explicitly in case any other future caller of that shape appears.
+---
 
 ## Don't Hand-Roll
 
 | Problem | Don't Build | Use Instead | Why |
 |---------|-------------|--------------|-----|
-| Process-tree teardown across a later, unrelated process | A ppid-walking kill utility, or a hand-rolled cgroup v2 client | The already-spiked socket+killpg design (this phase) | ppid-walking is unsound (severed-ppid orphans, verified reproduce-able); cgroup v2 fails in containers (verified with rootless podman) |
-| Cross-process durable liveness | Polling `kill(pid, 0)` | `connect()` to the socket | `kill(pid, 0)` cannot distinguish a dead leader from a healthy between-stages pause (Finding 1) and reports zombies as alive (F6) |
-| Gate auto-approval audit trail | A CLI-only bypass flag that skips gate-writing entirely | `Gates::write_gate` + `Gates::respond` (both already exist) | D-06 requires the decision to be recorded exactly like a human response; the existing API already supports self-produced responses — no new mechanism needed |
-| Phase capture-file cleanup on stop | A bespoke deletion routine | `agent_result::archive_phase_files` (already exists, already called on relaunch rollover) | Reuses the exact retention-aware archival the project already trusts, rather than inventing a second deletion path with different retention semantics |
+| Gate expiry / auto-rejection | A new kill-based reaper, a new response-file format, a new event type | `Gates::respond` + the existing poll loop's own pickup (≤60s) | The exact mechanism already exists and is already tested via `--yes-ship`/`ship_override`/`gate_respond`; a new mechanism would duplicate it with a different, unaudited shape |
+| Finding the right process to stop | A pgid/process-group walk, a new PID-tracking file | `.devflow/lock-{phase:02}`, which already names the exact process | The lock file already exists for a different reason (serializing `advance` invocations) and happens to be the perfect stop-target registry with zero new writer code |
+| Cross-root discovery | A `find`/`ps`-based ad hoc sweep (what the forensics doc had to resort to) | A small, explicit registry file at `~/.cache/devflow/roots.json`, written by the same code path that already writes `state.monitor_pid` | A registry is O(1) to read and cannot miss a root the way a filesystem/process scan can (renamed binaries, deleted worktrees, non-conventional scratch paths all defeated `ps`/`find` in the forensics account) |
+| Ship-approval integrity | A GSD-prompt-only re-check (what caught it this once, non-deterministically) | A narrow, default-on structural check inside devflow-core, modeled on the existing `evaluate_layer0` pattern | `evaluate_layer0` already proves this exact shape works and is testable; a prompt-only catch is not code-enforced and not guaranteed to fire next time |
 
-**Key insight:** Every "don't hand-roll" item above already has a load-bearing implementation living in this codebase today. The work in 23b/23c/`--yes-ship` is almost entirely *wiring existing primitives to a new call site*, not inventing new ones.
+**Key insight (unchanged from the original research, still true, more true
+now than before):** every "don't hand-roll" item above already has a
+load-bearing implementation living in this codebase today. The re-aimed
+scope is, if anything, *more* purely "wire existing primitives to a new call
+site" than the original supervisor-migration scope was.
 
-## 23b Migration Inventory (verified against the live tree, 2026-07-25)
+---
+
+## CARRIED FORWARD — still valid, unaffected by the probe
+
+### 23b Migration Inventory (re-confirmed unchanged this session — relevant ONLY if/when the deferred supervisor work is later picked up)
 
 `rg -n "spawn_monitor\b|spawn_monitor_no_advance|wait_for_agent_pid|wait_for_agent_exit" --type rust crates/`
-was re-run this session (not assumed from CONTEXT.md's summary). **CONTEXT.md's
-"~8 files" figure is confirmed exactly correct** — 8 distinct files outside
-`monitor.rs` itself reference these four functions:
+re-verified this session as unchanged since the original research (no
+`crates/` commits between the two research passes — confirmed via `git log`).
+8 files outside `monitor.rs` itself reference these four functions:
 
-| File | Line(s) | Reference type | What it needs to become |
+| File | Line(s) | Reference type | What it needs to become (IF the supervisor is later built) |
 |------|---------|------------------|------------------------------|
-| `crates/devflow-cli/src/pipeline_launch.rs` | `:126` (functional call: `monitor::spawn_monitor(state, program, &args, &adapter.extra_env())`); `:68`, `:91`, `:562` (comments) | **Functional call site — the production spawn path** | Replace with the new supervisor-spawn function (e.g. `monitor::spawn_supervisor`). This is the single load-bearing migration point for the entire "start a phase" path. |
-| `crates/devflow-cli/src/parallel.rs` | `:201` (functional: `monitor::spawn_monitor_no_advance(&state, program, &args, &adapter.extra_env())`); `:217` (functional: `monitor::wait_for_agent_exit(project_root, phase, monitor_pid)`) | **Functional call sites — both exclusively serve `sequentagent`** | **Deleted, not migrated** — both call sites live inside `sequentagent`'s synchronous handoff loop, which 23d removes in this same phase. Confirms DEN-58's note that dropping `sequentagent` "closes the explicitly-untested `wait_for_agent_exit` gap" — that gap disappears because the function itself disappears. |
-| `crates/devflow-core/tests/monitor_e2e.rs` | `:19` (import), `:77` (`spawn_monitor(&state, "sh", &args, &[])`), `:80` (`wait_for_agent_pid(root, phase)`) | **Test file — functional calls against the OLD API** | Rewrite both tests (`monitor_owns_fake_agent_and_records_devflow_result`, `advance_state_loading_fails_cleanly_for_missing_and_corrupt_state`) against the new socket-based spawn/liveness API. This is the natural home to add the new GONE/STALE/ALIVE regression coverage (see Validation Architecture). |
-| `crates/devflow-core/tests/devflow_dir_gitignore.rs` | `:56`, `:109` (comments); `:115` (functional: `monitor::spawn_monitor_no_advance(...)`); `:121`, `:130` (comments/assertions) | **Test file — functional call against a function being deleted (23d)** | This test currently exercises `.devflow/` directory-creation coverage via the no-advance variant specifically. Since `spawn_monitor_no_advance` is deleted, this test must be repointed at the surviving spawn function (whatever `spawn_monitor` becomes) to keep its actual coverage goal (all `.devflow`-constructing call sites produce a correctly-`.gitignore`'d directory) intact — do not simply delete the test case, or the "7 independent `create_dir_all` sites" coverage guarantee from Phase 19 silently narrows. |
-| `crates/devflow-cli/src/preflight.rs` | `:4`, `:95`, `:174`, `:361` (comments); `:365` (test function name `run_preflight_failing_check_gates_and_never_reaches_spawn_monitor`) | **Doc-comment / test-name references only — no functional call** | Update comment wording to match the new function name(s); the test itself (asserting preflight failure never reaches the spawn step) does not need behavioral changes, only its name/comments to stay accurate. |
-| `crates/devflow-cli/src/staleness.rs` | `:288` (comment: "`monitor::spawn_monitor`. A Stale build against DevFlow's OWN workspace...") | **Doc-comment reference only** | Update wording only — `enforce_build_staleness` itself has no functional dependency on the monitor's internals, only calls it "before `monitor::spawn_monitor`" in prose. |
-| `crates/devflow-cli/src/test_support.rs` | `:187`, `:218` (comments) | **Doc-comment references only** | Update wording only. |
-| `crates/devflow-core/src/monitor.rs` | entire file | **The module being rewritten** | Not a "consumer" — this IS the implementation. Replace `spawn_monitor_inner`'s shell-script body, delete `spawn_monitor_no_advance`/`wait_for_agent_exit` (23d makes them dead code), keep `wait_for_agent_pid` only if the new design still needs a short post-spawn poll (likely superseded by the socket handshake itself). |
+| `crates/devflow-cli/src/pipeline_launch.rs` | `:126` (functional call: `monitor::spawn_monitor(state, program, &args, &adapter.extra_env())`); `:68`, `:91`, `:562` (comments) | **Functional call site — the production spawn path** | Replace with the new supervisor-spawn function. |
+| `crates/devflow-cli/src/parallel.rs` | `:201` (functional: `monitor::spawn_monitor_no_advance(...)`); `:217` (functional: `monitor::wait_for_agent_exit(...)`) | **Functional call sites — both exclusively serve `sequentagent`** | **Deleted, not migrated** — both call sites live inside `sequentagent`'s handoff loop, which 23d removes regardless of the supervisor question. |
+| `crates/devflow-core/tests/monitor_e2e.rs` | `:19`, `:77`, `:80` | **Test file — functional calls against the OLD API** | Rewrite against the new socket-based spawn/liveness API, if built. |
+| `crates/devflow-core/tests/devflow_dir_gitignore.rs` | `:56`, `:109`, `:115`, `:121`, `:130` | **Test file — functional call against a function being deleted (23d)** | Repoint at the surviving spawn function; do not delete the test's actual coverage goal. |
+| `crates/devflow-cli/src/preflight.rs` | `:4`, `:95`, `:174`, `:361`, `:365` | **Doc-comment / test-name references only** | Wording only. |
+| `crates/devflow-cli/src/staleness.rs` | `:288` | **Doc-comment reference only** | Wording only. |
+| `crates/devflow-cli/src/test_support.rs` | `:187`, `:218` | **Doc-comment references only** | Wording only. |
+| `crates/devflow-core/src/monitor.rs` | entire file | **The module being rewritten, if built** | Not a "consumer." |
 
-**Additional consumer beyond the "~8 files" scope, not double-counted by CONTEXT.md's list but load-bearing for the phase's actual goal (observability):** `crates/devflow-cli/src/commands.rs` — `liveness()` (`:517-526`), `check_dead_agent`/`check_dead_monitor` (`:1770`, `:1793`), and `status`'s PID-based probe (currently `agent_running(agent_pid)` per `main.rs:2917`/`commands.rs`) all key off `state.monitor_pid` today and must be re-pointed at the new socket probe so GONE/STALE/ALIVE actually surface to `devflow status`/`doctor` — this is explicitly called out in CONTEXT.md's "Integration Points" section and is what makes a dead monitor distinguishable from a healthy pause (the phase's core observability goal), even though it wasn't counted in the "~8 files" figure.
+**Additional consumer beyond the "~8 files" scope (observability
+re-pointing, IF the supervisor is built):** `crates/devflow-cli/src/commands.rs`
+— `liveness()` (`:517-526`), `check_dead_agent`/`check_dead_monitor`
+(`:1770`, `:1793`), `status`'s PID-based probe — all key off
+`state.monitor_pid` today; **note that the re-aimed scope (A/B/C) does NOT
+require touching any of these** — PID-based liveness stays exactly as-is for
+the MVP, since it was never found to be the problem.
 
-## 23d Deletion Inventory (verified against the live tree, 2026-07-25)
+### 23d Deletion Inventory (re-confirmed unchanged this session — proceed exactly as scoped, independent of everything else in this document)
 
-`rg -c "sequentagent|Sequentagent|SequentAgent" --type rust crates/` was re-run
-this session. **The actual total is 142 references across 11 files — higher
-than CONTEXT.md's/ROADMAP.md's recorded "~110 references across 11 files."**
-The 11-file count is correct.
+`rg -c "sequentagent|Sequentagent|SequentAgent" --type rust crates/`
+re-verified this session: still **142 references across 11 files**, matching
+the original research's corrected count (CONTEXT.md's "~110" was a
+case-sensitive lowercase-only search that missed real PascalCase Rust
+identifiers — confirmed again this session, unchanged).
 
-**Root cause of the discrepancy, verified directly:** a second, case-sensitive,
-lowercase-only pass (`rg -c "sequentagent"`, no alternation) reproduces
-CONTEXT.md's exact numbers (`agent_result.rs` 34, `parallel.rs` 28,
-`commands.rs` 21, `phase7_cli.rs` 10, `ship.rs` 8, `monitor.rs` 3, total 111 —
-matching the recorded "~110" almost exactly). **CONTEXT.md's count was a
-lowercase-only search that missed every PascalCase Rust identifier** — the
-`Sequentagent` CLI enum variant (`main.rs:159`), the `Command::Sequentagent`
-match arm (`main.rs:483`), `SequentagentSlotKind`, and similar. Those
-identifiers are real, functional, must-delete references, not noise — so the
-higher, case-insensitive count is the correct one to plan against.
+| File | Verified count | Notes |
+|------|----------------------|-------|
+| `crates/devflow-core/src/agent_result.rs` | 48 | `SequentagentSlotKind`, `write_sequentagent_slot`, plus its own test module — real production+test surface |
+| `crates/devflow-cli/src/parallel.rs` | 40 | Confirm at plan time whether the entire file is deleted or only `sequentagent`-specific functions (the `parallel` — N-phases-concurrently — command lives in the same file and must be preserved) |
+| `crates/devflow-cli/src/commands.rs` | 24 | Includes `sequentagent_status_renders_*` rendering + tests |
+| `crates/devflow-cli/tests/phase7_cli.rs` | 10 | Matches original exactly |
+| `crates/devflow-core/src/ship.rs` | 8 | Matches original exactly |
+| `crates/devflow-core/src/monitor.rs` | 3 | Doc comment on `spawn_monitor_no_advance` plus its own reference |
+| `crates/devflow-cli/src/main.rs` | 4 | The `Sequentagent` CLI variant (`:159`), its dispatch arm (`:483-488`), the `use parallel::{parallel, sequentagent}` import (`:23`) |
+| `crates/devflow-core/tests/devflow_dir_gitignore.rs` | 2 | Comment references to the `spawn_monitor_no_advance` call this test exercises |
+| `crates/devflow-core/src/git.rs` | 1 | Verify at plan time whether functional or comment |
+| `crates/devflow-core/src/agent.rs` | 1 | Verify at plan time |
+| `crates/devflow-cli/src/pipeline_outcomes.rs` | 1 | **Load-bearing exception, do not delete:** `retry_after_from_reason` "must *move*, not be deleted" per the earlier teardown-research doc — verify at plan time whether this reference is that function (survives, relocated) or an unrelated mention |
+| **Total** | **142** | 11-file count confirmed accurate |
 
-| File | CONTEXT.md's count | Verified count (this session) | Notes |
-|------|----------------------|----------------------------------|-------|
-| `crates/devflow-core/src/agent_result.rs` | 34 | **48** | Largest undercounts here — likely `sequentagent`-slot rendering (`SequentagentSlotKind`, `write_sequentagent_slot`) plus its own test module, both real production+test surface, not comment noise |
-| `crates/devflow-cli/src/parallel.rs` | 28 | **40** | This file's own module is largely `sequentagent`'s home; confirm whether the entire file is deleted or only the `sequentagent`-specific functions within it (the `parallel` — N-phases-concurrently — command lives in the same file and must be preserved) |
-| `crates/devflow-cli/src/commands.rs` | 21 | **24** | Includes `status`'s `sequentagent_status_renders_*` rendering + tests (`commands.rs:2585` area) |
-| `crates/devflow-cli/tests/phase7_cli.rs` | 10 | **10** | Matches exactly |
-| `crates/devflow-core/src/ship.rs` | 8 | **8** | Matches exactly |
-| `crates/devflow-core/src/monitor.rs` | 3 | **3** | Matches exactly — the doc comment on `spawn_monitor_no_advance` plus its own reference |
-| `crates/devflow-cli/src/main.rs` | (implied, "singles") | **4** | The `Sequentagent` CLI variant (`:159`), its dispatch arm (`:483-488`), and the `use parallel::{parallel, sequentagent}` import (`:23`) |
-| `crates/devflow-core/tests/devflow_dir_gitignore.rs` | (implied, "singles") | **2** | Comment references to the `spawn_monitor_no_advance` call this test currently exercises |
-| `crates/devflow-core/src/git.rs` | (implied, "singles") | **1** | Not yet inspected line-by-line this session — verify at plan time whether this is a functional dependency or a comment |
-| `crates/devflow-core/src/agent.rs` | (implied, "singles") | **1** | Not yet inspected line-by-line this session — verify at plan time |
-| `crates/devflow-cli/src/pipeline_outcomes.rs` | 1 (`retry_after_from_reason` per the process-teardown research doc's open-decision #2) | **1** | **Load-bearing exception, do not delete this one:** `2026-07-24-process-teardown-solution-research.md` §6 explicitly warns `retry_after_from_reason` "must *move*, not be deleted — `pipeline_outcomes.rs:92` uses it for the primary loop's rate-limit auto-resume." Verify at plan time whether this specific reference is that function (in which case it survives, relocated) or an unrelated `sequentagent` mention. |
-| **Total** | **~110** | **142** | 32 references higher than recorded; file-count of 11 confirmed accurate |
+**Public/documented-contract surface for D-12's v2.0.0 justification** (still
+accurate, unchanged): `crates/devflow-cli/tests/snapshots/devflow-help.txt:12`
+already lists `sequentagent  Run two agents sequentially on one phase, each in
+its own worktree` — regenerating this snapshot is required, not optional.
+`README.md`/`CHANGELOG.md` both mention `sequentagent` and need updates.
 
-**Public/documented-contract surface for D-12's v2.0.0 justification — verified this session, full-repo grep beyond `crates/`:**
-- `crates/devflow-cli/tests/snapshots/devflow-help.txt:12` — the **committed help snapshot already lists** `sequentagent  Run two agents sequentially on one phase, each in its own worktree`. This is direct, verified evidence the command is real, documented, public CLI surface — regenerating this snapshot after deletion is a required, not optional, part of 23d (and `help_snapshot.rs`'s existing regression test will fail loudly if the snapshot isn't updated, per its design as a CLI-surface guard).
-- `README.md` and `CHANGELOG.md` both mention `sequentagent` `[VERIFIED: rg -l "sequentagent" README.md CHANGELOG.md, this session]` — both need a documentation update as part of 23d's scope (a v2.0.0-earning breaking change should not leave stale user-facing docs describing a deleted command). Exact wording changes are a planning-time task, not sized here.
+### How `--yes-ship` threads through (carried forward, unaffected by the re-aim — and now more load-bearing than before, since it is the mechanism that actually made both probe runs reach Ship at all)
 
-## Runtime State Inventory
-
-> Included because 23b is a rename/refactor-adjacent phase: the on-disk `monitor_pid`-based process handle is being replaced by a `supervisor` socket-path handle, and 23d deletes a published CLI verb.
-
-| Category | Items Found | Action Required |
-|----------|-------------|------------------|
-| Stored data (`state.json`) | `monitor_pid: Option<u32>` field (currently the only process handle persisted, `state.rs:66-72`). Must coexist with or be replaced by a new `supervisor: Option<SupervisorHandle>` block (`socket_path`, `agent_pgid`, `agent_start_time`, `boot_id`, per D-09/the spike's "Resulting design"). | **Code edit, not data migration** — every existing field added since 17-01 (`infra_failures`, `preflight_retries`, `monitor_pid` itself, `stop_until`/`stopped`/`stop_reason`) uses `#[serde(default)]` and this phase should follow the identical pattern. See "In-flight-phase behaviour" below for the precise semantics of an old `state.json` missing the new field. |
-| Live service config | None found outside this repo's own `.devflow/` directory — DevFlow has no external service (n8n/Datadog/Tailscale-style) configuration to worry about for this phase. | None. |
-| OS-registered state | None — no systemd units, launchd plists, pm2, or Task Scheduler entries reference the monitor process. The monitor is a plain child process, not an OS-registered service. | None. |
-| Secrets/env vars | None — no secret or env-var *names* reference `monitor`/`sequentagent`; `DEVFLOW_GATE_TIMEOUT_SECS` etc. are untouched by this phase. | None. |
-| Build artifacts | The installed `devflow` binary on `PATH` (`/home/linuxbrew/.linuxbrew/bin/devflow`, a symlink to `target/release/devflow`) is a **stale build from 2026-07-23 22:31, reporting `v1.8.0`**, while `Cargo.toml`'s workspace version is already `1.8.1`. | **Rebuild required before 23a's probe** — `cargo build --release` (or equivalent) must run and produce a binary reporting `≥1.8.1` before the probe is meaningful. See "Current binary/version state" below — this is a documented, recurring project pitfall (memory: "Rebuild before re-validating a dogfood fix"). |
-
-**In-flight-phase behaviour across the D-08 upgrade (Claude's-discretion answer, with rationale):**
-
-`state.rs` currently follows one consistent, well-tested pattern for every
-field added after the initial design: `#[serde(default)]`, defaulting to a
-value that is *distinguishable from a real value* and that downstream
-consumers already treat as "unknown, never assume Stuck/Healthy" (see
-`state.rs:66-70`'s own doc comment on `monitor_pid: None`, and
-`commands.rs:517-526`'s `liveness()` function, whose `None` arm always
-resolves to `Liveness::Unknown`, never `Stuck` — this is directly tested by
-`liveness_unknown_when_no_monitor_recorded`). **Recommendation: follow this
-exact precedent.** Add `supervisor: Option<SupervisorHandle>` with
-`#[serde(default)]`. A `state.json` written by a pre-23b binary deserializes
-with `supervisor: None`, and every new liveness/stop code path must treat
-`None` the same way `monitor_pid: None` is treated today — `Unknown`, never
-a hard error, never a false `Stuck`.
-
-The genuinely new risk (not covered by "absent field defaults to None") is
-narrower and worth calling out explicitly for the planner: **a phase whose
-monitor was spawned by the OLD `sh -c` mechanism (so `state.json` still has
-a *populated* `monitor_pid: Some(pid)`) gets its binary upgraded mid-run to
-a ≥23b binary that only knows how to probe `supervisor.socket_path`.**
-Because D-08 is a big-bang replacement with no dual-path period, the new
-binary's `status`/`doctor`/`stop` will find `supervisor: None` and correctly
-report `Unknown` — but the *actual* `sh -c` monitor may still be alive,
-untracked by anything the new binary can query. This is not a data-corruption
-risk (nothing is silently misreported as healthy) but it IS a **silent loss
-of control** — an old-style monitor becomes unreachable by any new-binary
-command. **Recommendation:** the planner should have `devflow doctor`
-explicitly detect this exact shape (`monitor_pid: Some(_)` AND
-`supervisor: None`) and surface a distinct, named finding — e.g. "phase N was
-started by a pre-supervisor binary; its monitor cannot be queried or stopped
-by this binary — locate and signal it manually, or let it complete
-naturally" — rather than folding it into the generic `Unknown` bucket. This
-is a one-time transition concern (D-08's big-bang has no long-term dual-path
-cost) and is cheap to add as one more `doctor` finding alongside the existing
-`check_dead_agent`/`check_dead_monitor`.
-
-## Common Pitfalls
-
-### Pitfall 1: Building the superseded cgroup/pgroup design instead of the locked socket design
-
-**What goes wrong:** `.planning/audits/2026-07-24-process-teardown-solution-research.md` is a thorough, well-cited document recommending a *different* design (`process_handle` with `mechanism: "cgroup" | "pgroup"`) than the one CONTEXT.md's D-09 locks in.
-**Why it happens:** Both documents are dated 2026-07-24, both are canonical-refs-listed, and a planner skimming rather than reading D-09 closely could reasonably pick up the cgroup design as "the plan."
-**How to avoid:** Treat `2026-07-24-socket-supervisor-spike.md` (and D-09's explicit "already decided — do not re-open" language) as authoritative for the design; treat the two lifecycle/teardown-research docs as background on failure modes (F1-F7) and ruled-out crates only.
-**Warning signs:** Any plan task that mentions `cgroup.kill`, `cgroup.procs`, or `mechanism: "cgroup" | "pgroup"` in `state.json` is building the wrong design.
-
-### Pitfall 2: Threading `--yes-ship` as a CLI-only value instead of persisted state
-
-**What goes wrong:** The Ship gate (`handle_ship_outcome`, `pipeline_outcomes.rs:275-286`) may fire long after the original `devflow start --phase N --yes-ship` invocation exited — potentially across a monitor restart, a `devflow resume`, or (post-23b) a fresh supervisor process. A CLI-only flag captured only in the original process's memory is gone by the time Ship's gate fires.
-**Why it happens:** `--force`, `--dry-run`, and most other `Start` flags ARE CLI-only and consumed immediately, so it is the natural first instinct to treat `--yes-ship` the same way.
-**How to avoid:** Persist the authorization on `State` at `State::new()` time (a new `yes_ship: bool` field, `#[serde(default)]` — false for anything that predates it), exactly like `mode`/`stop_until` are persisted per-phase-run values, not global config. This does not violate D-05 ("never config-persistable") — D-05 is about `devflow.toml`/env-var defaults becoming a standing setting, not about a single run's own `state.json` remembering the flag that run was given.
-**Warning signs:** A plan task that reads `--yes-ship` only inside the `Command::Start` match arm and never touches `state.rs`.
-
-### Pitfall 3: Auto-answering the wrong gate
-
-**What goes wrong:** There are (at least) two gates that touch Ship: the primary "Ship complete — approve merge?" gate at `handle_ship_outcome` (`pipeline_outcomes.rs:276-280`), and a **separate** finalization-retry gate inside `finish_workflow_with_gate_timeout` (`pipeline_gate.rs`, fired only when the terminal hooks — Merge/VersionBump/ChangelogAppend/BranchCleanup — fail after the first approval). D-06 says "the Ship gate" (singular) auto-answers; it does not say the finalization-retry gate should also be silently pre-approved.
-**Why it happens:** Both gates use `Stage::Ship` as their tag, so a naive `if stage == Stage::Ship && state.yes_ship` check in `run_gate_with_timeout` would auto-answer both, including the one that exists specifically because something already went wrong (a git/version error mid-finalization).
-**How to avoid:** Scope the auto-answer narrowly to the call site in `handle_ship_outcome`, not to `run_gate`/`run_gate_with_timeout` generically by stage tag. Recommend either a dedicated wrapper (`run_gate_auto_approved`) called only from `handle_ship_outcome`, or an explicit extra parameter distinguishing "the routine pre-merge approval" from "a post-failure finalization retry."
-**Warning signs:** A single boolean check keyed only on `stage == Stage::Ship` anywhere inside `pipeline_gate.rs`.
-
-### Pitfall 4: Forgetting the `advance` tail's env/adapter propagation when moving it in-process
-
-**What goes wrong:** Today's shell monitor rides adapter-scoped env vars (e.g. Codex's unsigned-commit override) through the whole chain: `sh → agent → its git children` (`monitor.rs:168-170`, R-F in the spike). Moving `advance` in-process removes a shell hop but the supervisor process itself must still have inherited/threaded the same env for anything `advance` does that shells out to git.
-**Why it happens:** It's easy to focus the migration on "the agent still needs the env" and forget that `advance`'s own git operations (checkout hooks, commits) run in the same process now, inheriting whatever the supervisor process's environment happens to be at that point — which may differ from what a fresh `devflow advance` subprocess invocation would have had.
-**How to avoid:** Audit what env `advance`'s call chain (`transition` → `run_checkout_hooks` → git operations) currently expects when invoked as a fresh CLI process vs. as a function call inside the long-lived supervisor process that already launched the agent with `adapter.extra_env()`.
-**Warning signs:** A test that passes when `advance` runs as `devflow advance` from a clean shell but fails/differs when driven through the new in-process path.
-
-### Pitfall 5: Believing `--until ship` already gives you `--yes-ship`-equivalent behavior
-
-**What goes wrong:** `main.rs`'s existing `--until` handling has a special case: "`--until ship` is a semantic no-op... Ship is already the pipeline's terminal stage." This is unrelated to `--yes-ship` — `--until` controls where the pipeline **stops**, not whether Ship's gate auto-approves. Do not conflate the two flags or assume one subsumes the other.
-**Warning signs:** A plan task that tries to reuse `--until`'s Ship handling to implement `--yes-ship`.
-
-### Pitfall 6: Validating a dogfood fix (or running the 23a probe) against a stale binary
-
-**What goes wrong:** The binary on `PATH` at research time (`/home/linuxbrew/.linuxbrew/bin/devflow`, a symlink into `target/release/devflow`) reports `devflow 1.8.0` and was built 2026-07-23 22:31 — **before** the workspace's own `Cargo.toml` version was bumped to `1.8.1`. CONTEXT.md's requirement of "≥v1.8.1 binary" for 23a is not currently satisfied.
-**Why it happens:** `cargo install --path` / a release build is a manual step that is easy to forget after a version bump that only touched `Cargo.toml`/`CHANGELOG.md` in a docs-only commit.
-**How to avoid:** `cargo build --release --workspace` (or `cargo install --path crates/devflow-cli --force`) immediately before running 23a's probe, then re-verify `devflow --version` reports `≥1.8.1` before proceeding. This is a previously-documented, recurring project pitfall (own project memory: "Rebuild before re-validating a dogfood fix").
-**Warning signs:** `devflow --version` printing `1.8.0` (or any version behind `Cargo.toml`'s `[workspace.package].version`) right before 23a is attempted.
-
-## Code Examples
-
-### Verified STALE-vs-ALIVE probe (the mechanism 23b must reproduce in production code)
+The exact call site (`pipeline_outcomes.rs:275-286`, `handle_ship_outcome`)
+and exact reusable API (`Gates::write_gate` + `Gates::respond`) are unchanged
+from the original research. `State`-persisted-boolean precedent
+(`monitor_pid` / `stop_until` / `preflight_retries`, all `#[serde(default)]`)
+is the pattern to follow for a `yes_ship: bool` field — **this precedent is
+also exactly the pattern this rewrite's Question A/B new fields (a future
+`gate_pending`-registry entry, if the planner chooses to add anything beyond
+the external `roots.json` file) should follow, should any new `State` field
+turn out to be needed.**
 
 ```rust
-// Source: .planning/spikes/socket-supervisor/main.rs:163-175 (verified to build
-// and run standalone, rustc 1.97.1, 2026-07-24)
-fn status(sock: &str) {
-    if !Path::new(sock).exists() { println!("GONE"); return }
-    match UnixStream::connect(sock) {
-        Ok(mut s) => {
-            let _ = writeln!(s, "ping");
-            let mut r = String::new();
-            let _ = BufReader::new(s).read_line(&mut r);
-            println!("ALIVE ({})", r.trim());
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => println!("STALE"),
-        Err(e) => println!("UNKNOWN {e}"),
-    }
-}
-```
-
-### `--yes-ship` auto-answer (grounded in existing production API, not the spike)
-
-```rust
-// Existing production API this phase reuses verbatim (crates/devflow-core/src/gates.rs):
-//   Gates::write_gate(project_root, phase, stage, context) -> writes the request
-//   Gates::respond(project_root, phase, stage, &GateResponse) -> writes a response
-//   Gates::poll_response(...) -> already polls for and picks up whatever response exists,
-//                                 including one written milliseconds ago by ourselves.
-//
-// Recommended shape for handle_ship_outcome's auto-approve path (pipeline_outcomes.rs:275-286):
+// Recommended shape for handle_ship_outcome's auto-approve path (pipeline_outcomes.rs:275-286),
+// unchanged from the original research:
 pub(crate) fn handle_ship_outcome(project_root: &Path, state: &mut State) -> Result<(), CliError> {
     if state.yes_ship {
-        // D-06: still fires the gate and still records an explicit decision —
-        // this is Gates::respond, not a bypass of run_gate's event/notify emission.
         Gates::write_gate(project_root, state.phase, Stage::Ship, "Ship complete — approve merge?")?;
         Gates::respond(project_root, state.phase, Stage::Ship, &GateResponse {
             approved: true,
@@ -512,89 +833,231 @@ pub(crate) fn handle_ship_outcome(project_root: &Path, state: &mut State) -> Res
     }
 }
 ```
-The planner should verify the exact ordering (write-then-respond before
-`run_gate`'s own `write_gate` call would double-write; more likely
-`run_gate_with_timeout` itself needs the auto-respond injected between its
-existing `Gates::write_gate` call and its `Gates::poll_response` call, using
-an added parameter rather than duplicating `write_gate`). The sketch above is
-illustrative of the *event-shape*, not a literal diff — see Pitfall 3 for why
-this must not be a blanket `stage == Stage::Ship` check inside the generic
-`run_gate_with_timeout`.
 
-### `WorktreeRemove` hook (reusing an existing primitive, for the `hooks_after_ship` question)
+**A newly-relevant interaction to flag (not present in the original
+research):** the sweep mechanism from Question A and `--yes-ship` both write
+through `Gates::respond`, which refuses a second write once a response
+exists (`GateError::AlreadyResponded`, `gates.rs:189-191`) — this is a safe,
+first-writer-wins race resolution with no double-response risk. If `--yes-
+ship` writes its approval before the sweep would otherwise consider the gate
+"aged," the sweep simply finds no open gate for that phase+stage on its next
+pass and does nothing. No coordination code is needed between the two
+mechanisms.
+
+### Carried forward: `hooks_after_ship` / `WorktreeRemove` (Claude's Discretion item, still open, unaffected by the re-aim)
 
 ```rust
 // worktree::remove already exists and is already called this way from
 // crates/devflow-cli/src/commands.rs:278 (cleanup) and parallel.rs:39/350:
 worktree::remove(project_root, &path, /* force */ true)?;
 ```
-A `Hook::WorktreeRemove` variant added to `hooks_after_ship()` (`hooks.rs:105-111`)
-would call this exact function against `state.worktree_path`, matching the
-existing `BranchCleanup` hook's tolerance for "already gone" (see
-`hooks.rs:127-135`'s handling of an already-deleted branch) rather than
-treating a missing worktree as an error.
+A `Hook::WorktreeRemove` variant added to `hooks_after_ship()`
+(`hooks.rs:105-111`) would call this exact function against
+`state.worktree_path`, matching the existing `BranchCleanup` hook's
+tolerance for "already gone." Still the planner's discretion whether to land
+this now.
+
+---
+
+## Runtime State Inventory
+
+> Included because this rewrite proposes exactly one genuinely new persisted
+> artifact (the cross-root registry) and touches an existing bool field
+> (`state.gate_pending`) only by reading it, never by changing its shape.
+
+| Category | Items Found | Action Required |
+|----------|-------------|------------------|
+| Stored data (`.devflow/gates/*.json`, `state-NN.json`) | `GateFile.timestamp` (already present, `gates.rs`) and `State.gate_pending` (already present, `state.rs:28`) are sufficient for the sweep — **no schema change to either.** | None — read-only consumption by the new sweep/stop commands. |
+| Stored data (NEW) | `~/.cache/devflow/roots.json` — a new, project-scoped-but-machine-global file, does not exist today. | **New code, new file** — `launch_stage_inner` writes an entry at spawn; `abort()`/`finish_workflow_with_gate_timeout`'s success path removes it. Follow the existing `write_atomic`-style pattern already used by `gates.rs`'s `write_atomic` (`gates.rs:323-330`) to avoid a torn write from a concurrent `devflow parallel` run. |
+| Live service config | None found outside this repo's own `.devflow/` directory — unchanged from the original research. | None. |
+| OS-registered state | None — unchanged. | None. |
+| Secrets/env vars | `DEVFLOW_GATE_TIMEOUT_SECS`/`DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS` already exist and are unaffected by this rewrite's recommendations (the sweep is additive, not a replacement for either). | None. |
+| Build artifacts | The installed `devflow` binary is now **current** — 23-01 (`bede035`) ran `cargo build --release --workspace` and confirmed `devflow --version` reports `1.8.1`, matching `Cargo.toml`. **The previous research's Pitfall 6 (stale binary) is resolved and does not need to be repeated for this replan's units**, though it remains good practice to re-verify immediately before any further dogfood run. | None currently — re-verify before executing any new plan against this repo. |
+
+---
+
+## Common Pitfalls
+
+### Pitfall 1: Re-reading the old research's "the monitor dies" framing as still current
+
+**What goes wrong:** A planner skimming ROADMAP.md's original Phase 23 framing, or `OPERATOR-OBSERVABILITY-FINDINGS.md`'s Finding 1 (Phase 17, 2026-07-18/19), could reasonably plan against "the monitor is unobservable and dies silently."
+**Why it happens:** Finding 1 is a real, correctly-diagnosed incident from a different run, months before this probe. It is not wrong about what happened in Phase 17 — it is simply not what happened in either of this probe's two runs, and the orphan forensics found the population-level cause is the opposite (immortality, not death).
+**How to avoid:** Treat `23-PROBE-FINDINGS.md` and `23-ORPHAN-FORENSICS.md` as the authoritative, most-recent, directly-measured account of what actually blocks an unattended run on this machine today. Finding 1 remains true background on a *different*, real (if less frequent) problem — liveness ambiguity — that Question D leaves correctly deferred, not dismissed.
+**Warning signs:** Any plan task whose stated justification is "so a dead monitor can be detected" rather than "so an abandoned gate does not leak a process for up to 7 days."
+
+### Pitfall 2: SIGTERM to `state.monitor_pid` as `devflow stop`'s mechanism
+
+**What goes wrong:** Orphans the `devflow advance` process instead of stopping it — verified this session by tracing the shell script's trap, which only ever tracks `$apid` (the agent), never the trailing `advance` invocation.
+**Why it happens:** `state.monitor_pid` is the obvious, already-displayed PID (`devflow status` already shows it); it is natural to assume signalling it stops "the phase."
+**How to avoid:** Target `.devflow/lock-{phase:02}`'s PID (the `advance` process itself) for the stop, or prefer the gate-response write path (Pattern 1) whenever a gate is actually open.
+**Warning signs:** A `stop` implementation that only reads `state.monitor_pid` and never reads the lock file or `Gates::list_open`.
+
+### Pitfall 3: Building a reaper that kills instead of writing a response
+
+**What goes wrong:** A `kill(pid, SIGTERM)`-based reaper leaves `state.gate_pending: true` and the gate file open — the exact same incomplete state the natural 7-day timeout already produces, just faster. It also loses the audit trail a `GateResponse` would have recorded.
+**Why it happens:** "Kill the process" is the more obvious mental model for "stop this from running forever" than "write a file the process is already polling for."
+**How to avoid:** Prefer `Gates::respond` (Pattern 1) as the sweep's primary mechanism; reserve `kill()` for `devflow stop`'s narrow fallback (no gate currently open).
+**Warning signs:** A sweep/reap implementation whose primary code path calls `libc::kill` rather than `Gates::respond`.
+
+### Pitfall 4: Assuming the false-green catch will happen again
+
+**What goes wrong:** Treating the fact that the agent's own GSD review caught the false `VERIFICATION.md` this one time as evidence the problem is already handled.
+**Why it happens:** It DID work, and it is tempting to read a single successful catch as a systemic guarantee.
+**How to avoid:** Remember this was a non-deterministic prompt-driven review, not a devflow-core-enforced invariant (Question C). Build the structural check regardless of whether the prompt-side catch "usually" works.
+**Warning signs:** A plan that treats Ship's attestation integrity as "already fixed" because of this one probe run.
+
+### Pitfall 5: Believing the self-hosted acceptance run is exempt from the SECURITY.md preflight wall
+
+**What goes wrong:** Assuming D-02's self-hosted acceptance run, unlike the scratch probe, won't hit `workflow.security_enforcement=true` + missing `SECURITY.md`.
+**Why it happens:** The scratch repo is a throwaway fixture, so it's tempting to assume the block is scratch-specific.
+**How to avoid:** `.planning/config.json` in THIS repo (verified this session) has no `security_enforcement` override either — the default applies here too. Verify the chosen low-stakes acceptance phase's plan set actually produces a `SECURITY.md` before Ship (Question C's recommendation).
+**Warning signs:** No task in the acceptance-phase's plan set that produces or checks for a `SECURITY.md`.
+
+### Pitfall 6 (carried forward, still relevant): Threading `--yes-ship` as a CLI-only value instead of persisted state
+
+**What goes wrong:** The Ship gate may fire long after the original invocation's process exited. A CLI-only flag is gone by the time it matters.
+**How to avoid:** Persist on `State` at `State::new()` time, `#[serde(default)]`, exactly like `mode`/`stop_until`.
+**Warning signs:** A plan task that reads `--yes-ship` only inside the `Command::Start` match arm and never touches `state.rs`.
+
+### Pitfall 7 (carried forward, still relevant): Auto-answering the wrong gate
+
+**What goes wrong:** `run_gate_with_timeout`'s finalization-retry gate (`finish_workflow_with_gate_timeout`) also tags `Stage::Ship` — a naive `stage == Stage::Ship` check would auto-approve both the routine Ship gate and the post-failure retry gate.
+**How to avoid:** Scope any auto-answer (yes-ship or the sweep's rejection) to the specific call site, not a blanket stage-tag check.
+**Warning signs:** A single boolean check keyed only on `stage == Stage::Ship` anywhere inside `pipeline_gate.rs`.
+
+---
+
+## Code Examples
+
+### The exact evidence for the block (verbatim, from live source read this session)
+
+```
+// crates/devflow-core/src/lock.rs:8-9
+// The lock is scoped per-phase (not per-project): `advance()` holds it
+// across a gate's multi-day blocking wait, ...
+
+// crates/devflow-cli/src/config_parse.rs:16-17,25
+/// Parse `DEVFLOW_GATE_TIMEOUT_SECS`'s raw value, falling back to 7 days on
+/// ...
+/// via `DEVFLOW_GATE_TIMEOUT_SECS` (defaults to 7 days).
+```
+
+### Auto-reject sweep (new, illustrative — the pattern, not a literal diff)
+
+```rust
+// Read the new registry, then reuse Gates::list_open (unchanged) per root.
+for root in registry::load_roots()? {
+    for gate in devflow_core::gates::Gates::list_open(&root) {
+        if age_secs(&gate.timestamp) > sweep_max_age_secs() {
+            let _ = devflow_core::gates::Gates::respond(
+                &root, gate.phase, gate.stage,
+                &devflow_core::gates::GateResponse {
+                    approved: false,
+                    note: Some("abort: gate exceeded max unattended age with no response".into()),
+                    responded_by: Some("devflow-reap".into()),
+                },
+            );
+        }
+    }
+}
+```
+
+### `devflow stop` (new, illustrative)
+
+```rust
+pub(crate) fn stop(project_root: &Path, phase: u32) -> Result<(), CliError> {
+    let open = devflow_core::gates::Gates::list_open(project_root)
+        .into_iter()
+        .find(|g| g.phase == phase);
+    if let Some(gate) = open {
+        devflow_core::gates::Gates::respond(project_root, phase, gate.stage, &GateResponse {
+            approved: false,
+            note: Some("abort: stopped by operator".into()),
+            responded_by: Some("devflow-stop".into()),
+        })?;
+        // The live advance() process notices within <=60s and tears itself
+        // down via its own existing abort() path — no signal needed.
+        return Ok(());
+    }
+    // Fallback: no gate open, but the phase may still be mid-evaluation.
+    let lock_path = project_root.join(".devflow").join(format!("lock-{phase:02}"));
+    if let Ok(contents) = std::fs::read_to_string(&lock_path) {
+        if let Ok(pid) = contents.trim().parse::<u32>() {
+            if devflow_core::agent::agent_running(pid) {
+                unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
+            }
+        }
+    }
+    Ok(())
+}
+```
+
+### `WorktreeRemove` hook (carried forward, unchanged)
+
+```rust
+worktree::remove(project_root, &path, /* force */ true)?;
+```
+
+---
 
 ## State of the Art
 
 | Old Approach | Current Approach | When Changed | Impact |
 |--------------|-------------------|---------------|--------|
-| `monitor_pid`-based liveness (`kill(pid, 0)`) | Socket-based liveness (`connect()` → GONE/STALE/ALIVE) | This phase (23b) | Distinguishes a dead monitor from a healthy between-stages pause — closes Finding 1/F1/F6 by construction |
-| `devflow advance` as a forked tail process | In-process `advance` call from the supervisor | This phase (23b, D-10) | Removes the exact Phase 17 orphaned-tail failure mode |
-| `sequentagent` (two-agent sequential handoff) | Deleted; capability intent preserved in DEN-67 for future re-implementation on the supervisor | This phase (23d) | Removes ~142 references, closes DEN-58's untested `wait_for_agent_exit` gap, earns the v2.0.0 slot (D-12) |
-| Cgroup-v2-primary / pgroup-fallback teardown design (`2026-07-24-process-teardown-solution-research.md`) | Socket-addressable supervisor (uniform across platforms and containers) | Superseded same-day, 2026-07-24, by the spike | Container-compatible (cgroup v2 fails under rootless podman even with delegation flags, verified on this host); one implementation instead of a Linux/macOS branch |
+| "The monitor dies, so replace it" (original 23b premise) | "The monitor never stops, so bound the wait" (this rewrite) | 23-02's probe, 2026-07-25 | Redirects the phase's actual engineering effort from an 8-file rewrite to ~2-3 small, additive modules |
+| No cross-root gate visibility | `~/.cache/devflow/roots.json` + `devflow gate sweep` (NEW, this rewrite) | This phase (redefined 23b) | Answers "what is gated on this machine" without `ps`/`find` archaeology |
+| `devflow stop` blocked on the supervisor (23c originally depended on 23b) | `devflow stop` buildable directly against the existing lock file + `Gates::respond` | This phase (redefined 23c) | Removes a hard dependency; 23c no longer needs 23b to land first |
+| Ship approval trusted the agent's self-report + a non-deterministic prompt-side review | A default-on, devflow-core-side structural evidence check (NEW, this rewrite) | This phase (new cross-cutting item) | Closes the actual class of defect that stopped both recorded Ship attempts |
 
-**Deprecated/outdated:**
-- `spawn_monitor_no_advance` / `wait_for_agent_exit` — both existed solely to serve `sequentagent`'s synchronous handoff; both are removed once 23d lands, closing DEN-58's explicitly-untested gap in this exact code path.
-- The `sh -c` shell-script monitor body in `monitor.rs:148-160` (the `apid=''; cleanup() {...}; trap cleanup TERM INT; ...` script) — replaced wholesale by 23b, not incrementally patched.
+**Deprecated/outdated:** the original 23b/23c framing as "the socket
+supervisor is required to close this phase." It is not — see Question D.
+
+---
 
 ## Assumptions Log
 
 | # | Claim | Section | Risk if Wrong |
 |---|-------|---------|----------------|
-| A1 | The exact name/shape of a new `SupervisorHandle` struct field on `State` (`socket_path`, `agent_pgid`, `agent_start_time`, `boot_id`) — the spike's "Resulting design" JSON is illustrative, not a committed Rust type name. `[ASSUMED]` | Architecture Patterns, Runtime State Inventory | Low — the planner will define the actual struct; this is a naming/shape suggestion only, not a locked contract |
-| A2 | Whether `commands::advance`'s existing CLI dispatch logic is already separable into a pure "advance this phase" function callable without going through `clap`/`project_root()` resolution, or needs extraction first. Not directly verified by reading every line of `advance()`'s body this session. `[ASSUMED]` | Architecture Patterns Pattern 2 | Medium — if not already separable, 23b's estimate should include a small extraction step before the in-process call can be wired up |
-| A3 | macOS `sun_path` limit (104 bytes) and the general macOS-portability claims in the spike are **the spike's own admission**, not independently re-measured this session (no macOS host available). Already correctly marked out-of-scope per CONTEXT.md/ROADMAP.md. `[CITED: socket-supervisor-spike.md, already flagged there as documented-not-measured]` | Standard Stack, Architecture Patterns | None for this phase specifically — explicitly out of scope; risk belongs to a future macOS-verification phase |
-| A4 | The precise historical Linear/DEN-58 "Known gaps — read before planning" section content was not independently re-fetched via a Linear MCP tool in this research session (no such tool was available in this agent's toolset). Reliance is on the spike audit document's own "Known gaps / not yet proven" section, which appears to be the same content restated. `[ASSUMED — content equivalence, not independently cross-checked against Linear]` | Package Legitimacy Audit (N/A note), general | Low-Medium — if DEN-58's Linear description carries additional detail beyond the spike doc, the planner should fetch it directly before finalizing the 23b plan |
+| A1 | The self-hosted D-02 acceptance run's chosen low-stakes phase will produce a `SECURITY.md` before Ship through its own ordinary GSD workflow (Question C). Not verified this session — no phase in this repo has yet completed an unattended end-to-end run to confirm. `[ASSUMED]` | Research Question C, Pitfall 5 | Medium — if wrong, the acceptance run hits the exact same preflight wall `devflow-probe-02` did, on the real repo, mid-acceptance |
+| A2 | A narrow, default-on Ship-evidence check (git merge/tag/remote) is a sufficient structural signal and does not produce false positives against this project's actual git-flow shape (squash-merge to `develop`, then a separate release PR to `main` — per `STATE.md`'s release history). Not exhaustively verified against every historical Ship shape this session. `[ASSUMED]` | Research Question C, Pattern 3 | Medium — an overly strict check could block a legitimate Ship; the planner should verify the exact evidence signal against 2-3 of this repo's own past Ship commits before landing it |
+| A3 | The exact shape/location of the new `~/.cache/devflow/roots.json` registry (fields, atomicity strategy) is a recommendation, not a locked contract — the planner may find a different shape preferable as long as it answers "what roots are currently active" in O(1). `[ASSUMED]` | Research Question A, Runtime State Inventory | Low — naming/shape only, no behavioral risk |
+| A4 | Rate-limit gates being "unresolvable by construction" (a probe died at `define` with `status: "ratelimited"`, no scheduled auto-resume) is a real, separate finding this rewrite surfaces but does not design a fix for, per the objective's explicit scope (bound gate lifetime / stop / false-green). `[CITED: 23-ORPHAN-FORENSICS.md]` | Open Questions below | Low for this phase's scope, but the planner should make an explicit call (fix now vs. defer) rather than silently drop it — see Open Questions |
+| A5 | macOS portability claims (unchanged from the original research) remain out of scope and unverified — no macOS host available this session either. `[CITED: socket-supervisor-spike.md, self-flagged there as documented-not-measured]` | Standard Stack (deferred supervisor section) | None for the re-aimed scope — the deferred supervisor work carries this risk forward unchanged |
 
-**If this table is empty:** N/A — see entries above.
+---
 
-## Open Questions (RESOLVED)
+## Open Questions
 
-*All three were resolved during planning (2026-07-25). Resolutions recorded inline below.*
+1. **Rate-limit gates (NEW, surfaced by the orphan forensics, not designed here per the objective's scope).**
+   - What we know: `23-ORPHAN-FORENSICS.md` documents a probe that died at `define` with `status: "ratelimited"` and no parseable retry time — "auto-resume cron not scheduled; resume manually." This is a gate that is, today, unresolvable except by a human waiting out a weekly quota window.
+   - What's unclear: whether this phase's scope should include a minimal fix (e.g., surfacing the retry-after time prominently, or scheduling an auto-resume cron) or should explicitly defer it to the backlog.
+   - Recommendation: the planner should make this an explicit, recorded decision (fix now, given it's directly adjacent to the gate-lifetime work already in scope, vs. defer as a separate backlog item) rather than silently absorbing or silently dropping it.
 
-1. **RESOLVED — Exact ordering of gate write/respond for `--yes-ship`.**
-   *Resolution: the wrapper-function shape was adopted — `run_gate_auto_approved`, with exactly one
-   call site, plus a named negative test guarding the finalization-retry gate. See `23-09-PLAN.md`.*
-   - What we know: `Gates::write_gate` + `Gates::respond` + `Gates::poll_response` together produce the right event shape (gate_fired → gate_resolved with an explicit `responded_by`).
-   - What's unclear: whether the cleanest implementation adds a parameter to `run_gate_with_timeout` (auto-respond immediately after `write_gate`, before `poll_response`) or introduces a separate wrapper function called only from `handle_ship_outcome`. Both satisfy D-06; the tradeoff is code reuse vs. avoiding Pitfall 3 (auto-answering the wrong gate).
-   - Recommendation: planner picks the wrapper-function shape — it makes "only the primary Ship approval gate is ever auto-answered" true by construction (the finalization-retry gate's call site never invokes the wrapper), rather than true by convention (a boolean check someone could accidentally widen later).
+2. **Exact Ship-evidence signal for Question C's structural check.**
+   - What we know: git merge commits, tags, and remote pushes are all plausible signals; `hooks_after_ship` already has primitives for at least some of these (`hooks.rs`).
+   - What's unclear: which single signal (or combination) is cheapest and most reliable against this project's actual git-flow shape, verified at plan time against 2-3 real past Ship commits in this repo's own history.
+   - Recommendation: verify against real history before finalizing, per Assumption A2.
 
-2. **RESOLVED — Whether `commands::advance`'s CLI-facing function already separates cleanly from its core logic** (see A2). Recommendation was: verify at plan time by reading the full body of `advance()` before sizing the 23b in-process-advance task.
-   *Resolution: verified at plan time. `advance` is `pub(crate)` in the CLI crate, so the split is by
-   crate rather than by extraction — the supervisor loop lives in `devflow-core` (`monitor::serve`)
-   and the advance wiring lives in `devflow-cli` (`pipeline_launch::supervise`). Assumption A2 is
-   settled. See `23-06-PLAN.md`.*
+3. **Sweep trigger mechanism — periodic daemon/cron vs. on-demand only.**
+   - What we know: the sweep (Question A) can be invoked on-demand (`devflow gate sweep`, operator-run) with zero new background process. A fully "self-healing" system would want it to run periodically without operator action.
+   - What's unclear: whether this phase's scope should wire the sweep into an existing periodic mechanism (e.g., a cron/systemd-timer the operator already runs for `devflow`, if one exists) or ship it as an on-demand-only command for this phase, deferring automation.
+   - Recommendation: ship on-demand only for this phase (matches D-03's "cheapest workload that crosses the seams" instinct); note automation as a natural, small follow-up, not a blocker for this phase's acceptance criterion.
 
-3. **RESOLVED — Whether 23a's probe should target a genuinely trivial synthetic phase, or a small real backlog item.** CONTEXT.md says "a small real phase" for 23a and reserves the actual acceptance run (D-02) for a "low-stakes phase" in this repo. Recommendation: for 23a (scratch repo), any single-file, single-requirement synthetic phase is sufficient and lower-risk than trying to import a real backlog item into a throwaway repo — the probe is about the supervisor/pipeline mechanism, not the content of the work.
-   *Resolution: the synthetic single-task scratch repo was adopted, gated behaviourally on `doctor`
-   plus `--dry-run` rather than structurally. See `23-01-PLAN.md`.*
+---
 
 ## Environment Availability
 
 | Dependency | Required By | Available | Version | Fallback |
 |------------|--------------|-----------|---------|-----------|
-| Rust toolchain (`cargo`, `rustc`) | Building the ≥v1.8.1 binary for 23a; the whole phase | Yes | rustc 1.97.1 (per spike README) | — |
-| `libc` crate | Socket/signal/pgid primitives | Yes, already resolved | `0.2.x` (workspace-pinned `"0.2"`) | — |
-| Unix domain sockets (`AF_UNIX`) | The supervisor's durable handle | Yes (Linux host, confirmed by the spike's own successful run on this exact host) | Kernel/OS feature, not a package | — |
-| `~/.cache/devflow/` writability | Socket bind location (D-09) | Not explicitly verified this session, but `~/.cache` is a standard user-writable XDG cache dir on this host (Fedora Kinoite) | — | If unwritable, the design has no documented fallback — the planner should add a preflight check with a clear error, not silently fall back to `$TMPDIR`/project-relative paths (both explicitly ruled out by C6) |
-| `devflow` binary on `PATH` | 23a's probe ("with a ≥v1.8.1 binary") | **Currently stale** — installed binary reports `1.8.0`, built 2026-07-23, one version behind `Cargo.toml`'s `1.8.1` | 1.8.0 (installed) vs 1.8.1 (workspace source) | Rebuild: `cargo build --release --workspace` or `cargo install --path crates/devflow-cli --force`, then re-verify `devflow --version` |
-| Rootless container runtime (podman) | Only relevant if the cgroup design were chosen | N/A — not needed; the socket design is the locked one | — | — |
+| Rust toolchain (`cargo`, `rustc`) | Building the re-aimed units | Yes | rustc 1.97.1 | — |
+| `libc` crate | `kill()` for `devflow stop`'s fallback path | Yes, already resolved | `0.2.x` (workspace-pinned `"0.2"`) | — |
+| `~/.cache/devflow/` writability | The new cross-root registry file | Not explicitly re-verified this session, but `~/.cache` is a standard user-writable XDG cache dir on this host (Fedora Kinoite) — same conclusion as the original research reached for the (now-deferred) socket location | — | If unwritable, add a preflight check with a clear error rather than silently degrading |
+| `devflow` binary on `PATH` | Any further dogfood run | **Current** — 23-01 rebuilt it; `devflow --version` confirmed `1.8.1`, matching `Cargo.toml` | 1.8.1 | Re-verify immediately before any new run (standard project practice, not a new risk) |
 
-**Missing dependencies with no fallback:**
-- None identified as blocking, once the binary is rebuilt.
+**Missing dependencies with no fallback:** none identified.
+**Missing dependencies with fallback:** none currently blocking.
 
-**Missing dependencies with fallback:**
-- The stale installed `devflow` binary — fallback is a rebuild (see above), not a blocker once done.
+---
 
 ## Validation Architecture
 
@@ -602,77 +1065,43 @@ treating a missing worktree as an error.
 
 | Property | Value |
 |----------|-------|
-| Framework | Rust's built-in `cargo test` harness (no separate framework/assertion crate) `[VERIFIED: .planning/codebase/TESTING.md, cross-checked live: 541 tests currently pass across 13 binaries, cargo test --workspace, 2026-07-25]` |
-| Config file | none — behavior driven by `.github/workflows/ci.yml`'s three jobs (`cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`) |
-| Quick run command | `cargo test -p devflow <filter>` (CLI) / `cargo test -p devflow-core <filter>` (core) |
+| Framework | Rust's built-in `cargo test` harness `[VERIFIED: .planning/codebase/TESTING.md, cross-checked live this session]` |
+| Config file | none — `.github/workflows/ci.yml`'s three jobs (`cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`) |
+| Quick run command | `cargo test -p devflow <filter>` / `cargo test -p devflow-core <filter>` |
 | Full suite command | `cargo test --workspace` |
 
-### Phase Requirements → Test Map
+### Phase Requirements → Test Map (re-aimed)
 
-| Req (unit) | Behavior | Test Type | Automated Command | File Exists? |
-|------------|----------|-----------|---------------------|---------------|
-| 23a | Probe records exact failure point in a scratch repo | Manual/behavioral — not automatable (the entire point is running the real unattended pipeline once) | N/A — the probe itself IS the test; assert on `events.jsonl` content + `.devflow/phase-N-*` captures per D-03 | N/A |
-| 23b (socket mechanism) | GONE/STALE/ALIVE liveness with no PID; whole-tree teardown incl. severed-ppid orphans; takeover safety | unit + integration | `cargo test -p devflow-core -- monitor::` (new tests replacing the current `spawn_monitor`-based ones in `monitor.rs`'s own `#[cfg(test)] mod tests`) | ❌ Wave 0 — current tests exercise the shell-script monitor and must be rewritten against the new implementation, not merely extended |
-| 23b (state round-trip) | `supervisor: Option<SupervisorHandle>` round-trips through serde; absent-field defaults correctly | unit | `cargo test -p devflow-core -- state::tests` | ❌ Wave 0 — new field, new tests, following the exact pattern of `monitor_pid_round_trips_through_serde` / `monitor_pid_absent_from_json_defaults_to_none` (`state.rs:312-345`) |
-| 23b (advance in-process, D-10) | Natural agent exit triggers `advance` without a forked subprocess | integration | Extend or succeed `crates/devflow-core/tests/monitor_e2e.rs` (see below) | ⚠️ Partial — existing file covers the OLD mechanism; needs new or replaced test cases |
-| 23c (`devflow stop`) | Explicit stop suppresses `advance` (R-M); idempotent on already-stopped/dead phase; preserves pre-existing `stop_reason` | unit + integration | `cargo test -p devflow -- stop` (new) | ❌ Wave 0 |
-| 23d (`sequentagent` removal) | CLI no longer accepts `sequentagent`; help snapshot updated; no dangling references | integration (regression guard) | `cargo test -p devflow -- help_snapshot` (existing, `tests/help_snapshot.rs`) + `rg -c sequentagent crates/` returns 0 | ✅ existing guard, needs its committed snapshot regenerated |
-| `--yes-ship` | Gate fires, auto-responds, records `responded_by`; only the primary Ship gate is affected, not the finalization-retry gate | unit + integration | `cargo test -p devflow -- pipeline_outcomes::tests` (extend existing Ship-gate tests, e.g. near `pipeline_outcomes.rs:1514-1576`) | ⚠️ Partial — existing Ship-gate test scaffolding exists; needs new `yes_ship` cases |
-| `--yes-ship` (D-05, not persistable) | `devflow.toml`/env var cannot set `yes_ship` | unit | New test in `config_parse.rs` or `main.rs` asserting no config/env path sets it | ❌ Wave 0 |
+| Unit | Behavior | Test Type | Automated Command | File Exists? |
+|------|----------|-----------|---------------------|---------------|
+| 23b (registry) | `~/.cache/devflow/roots.json` round-trips; a spawned phase registers, a torn-down phase deregisters | unit | `cargo test -p devflow-core -- registry::` (new) | ❌ Wave 0 |
+| 23b (sweep) | Aged open gate gets an auto-reject response; fresh open gate is left untouched; a live `advance()` process picks up the response and tears down cleanly | integration | `cargo test -p devflow -- gate_sweep::` (new; extend `monitor_e2e.rs`-style fake-agent fixture so the "live process notices the response" half is exercised for real, not just the write) | ❌ Wave 0 |
+| 23c (`devflow stop`) | Gate-open path writes a rejection response and the target process exits within the poll's backoff window; no-gate-open path falls back to `kill()` on the lock-file PID; idempotent on an already-stopped phase | unit + integration | `cargo test -p devflow -- stop::` (new) | ❌ Wave 0 |
+| 23d (`sequentagent` removal) | CLI no longer accepts `sequentagent`; help snapshot updated; no dangling references | integration (regression guard) | `cargo test -p devflow -- help_snapshot` (existing) + `rg -c sequentagent crates/` returns 0 | ✅ existing guard, needs its committed snapshot regenerated |
+| `--yes-ship` | Unchanged from the original research | unit + integration | `cargo test -p devflow -- pipeline_outcomes::tests` (extend existing) | ⚠️ Partial — existing scaffolding |
+| Ship evidence check (NEW) | An `AgentStatus::Success` at `Stage::Ship` with no corresponding git evidence is downgraded/rejected before the gate fires; a genuine Ship (real merge/tag) is unaffected | unit + integration | `cargo test -p devflow-core -- agent_result::tests` (extend, new cases mirroring `evaluate_layer0`'s existing test shape) | ❌ Wave 0 |
 
 ### Sampling Rate
 
 - **Per task commit:** targeted `cargo test -p devflow-core -- <module>` / `cargo test -p devflow -- <module>` for the module just touched.
-- **Per wave merge:** `cargo test --workspace` (full suite, currently 541 tests / 0 failed at time of research) plus `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check`, matching CI exactly.
-- **Phase gate:** Full suite green, PLUS the 23a scratch-repo probe run (D-03's recorded artifact), PLUS the D-02 self-hosted acceptance run, before `/gsd-verify-work`.
+- **Per wave merge:** `cargo test --workspace` (full suite; last known-green 541/0 as of the original research session, re-verify at plan time) plus `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check`.
+- **Phase gate:** Full suite green, plus a repeat of the D-02 self-hosted acceptance run (unattended, this repo, driving a real low-stakes phase to a completed Ship), before `/gsd-verify-work`.
 
-### What can only be validated by the actual dogfood run
+### What can only be validated by an actual run
 
-`cargo test` proves the supervisor mechanism (liveness state machine,
-teardown, `state.json` round-trip) and the gate-recording mechanism for
-`--yes-ship`. It **cannot** prove the phase's actual acceptance criterion —
-"one phase driven start-to-finish by devflow, unattended, reaching a
-completed Ship stage" — because that requires a real Claude Code invocation
-consuming real GSD slash commands over real wall-clock time, which is
-exactly what 23a (scratch probe) and the final D-02 self-hosted acceptance
-run exist to exercise. `crates/devflow-core/tests/monitor_e2e.rs` is the
-right *pattern* to extend (it already fakes the agent binary and asserts on
-captured stdout/exit files) but is not a substitute for the real run — it
-uses a fake `sh`/echo agent, not Claude. Recommend: `monitor_e2e.rs` gets new
-test cases for the rewritten supervisor mechanism (fake-agent, fast,
-deterministic); the actual unattended-with-Claude proof stays entirely
-outside `cargo test`, captured instead as the D-03 recorded artifact (events
-+ captures) from 23a, and again from the final self-hosted acceptance run.
+`cargo test` proves the sweep/stop/registry mechanisms and the Ship-evidence
+check's logic. It **cannot** prove the phase's actual acceptance criterion —
+"no manual `ps`, no manual `devflow advance`, no silent stall" — without a
+real unattended run. Recommend: re-run the same scratch-probe shape 23-01/
+23-02 already built (`scripts/scratch-dogfood-repo.sh`) as the new units'
+integration proof, specifically engineering a scenario that reaches a
+Validate-retry-exhaustion or Ship gate and then verifying (a) the sweep or
+`devflow stop` actually clears it within the expected window, and (b) no
+process pair is left behind afterward (`ps` check, read-only, matching the
+probe's own evidentiary discipline). Then the D-02 self-hosted acceptance run
+remains the final, real proof of the whole phase.
 
-### Distinguishing "healthy between-stages pause" from "silent stall" — the core observability requirement
-
-This is the literal problem statement (Finding 1) the phase exists to solve,
-so the validation plan must assert on it directly, not assume it:
-
-- **What must be observed:** after 23b, `devflow status`/`doctor` must be
-  re-pointed at the socket probe (GONE/STALE/ALIVE) instead of
-  `agent_running(monitor_pid)`. A regression test should assert that a
-  **STALE** socket (monitor process killed without cleanup, socket file
-  left behind) renders as a distinct, actionable state — not silently
-  folded into the same bucket as a monitor that legitimately hasn't been
-  spawned yet (`GONE`/`Unknown`).
-- **Sampling/observation rate for the actual unattended run:** the 23a
-  probe and the D-02 acceptance run should be observed by polling
-  `devflow status`/`.devflow/events.jsonl` at an interval short enough to
-  catch a stage transition (stages here run minutes-to-tens-of-minutes per
-  the codebase's own test-timeout conventions) but long enough not to
-  interfere — every 30-60 seconds is a reasonable default, mirroring the
-  spike's own liveness-poll cadence (30ms in the spike's internal exit-code
-  poll, which is far tighter than needed for human/operator-facing
-  observation).
-- **Evidence the run must capture to count as validated:** per D-03, this
-  is not optional — `events.jsonl` excerpts spanning every stage transition
-  (`transition`, `stage_launched`, `gate_fired`, `gate_resolved`,
-  `workflow_finished`) plus the `.devflow/phase-N-*` capture files (stdout,
-  stderr, exit code, agent-pid) for at least the stage where the run
-  succeeds or first fails. A run that "seems to have worked" without this
-  evidence trail does not satisfy the phase's own behavioral acceptance
-  criterion.
+---
 
 ## Security Domain
 
@@ -680,50 +1109,51 @@ so the validation plan must assert on it directly, not assume it:
 
 | ASVS Category | Applies | Standard Control |
 |----------------|---------|---------------------|
-| V2 Authentication | No | No user-facing authentication surface changes in this phase |
-| V3 Session Management | No | N/A — DevFlow has no session concept beyond its own phase state machine |
-| V4 Access Control | Yes | The new Unix domain socket must be mode `0600` (already proven in the spike, `main.rs:80`) so only the owning user can connect and issue `shutdown`/`ping` — anyone who can connect can stop the phase (R-L in the spike's own parity table) |
-| V5 Input Validation | Yes | The socket protocol is line-based text (`ping`/`shutdown`); the supervisor must reject/ignore unrecognized commands (already proven: spike's `o => writeln!(s, "unknown {o}")` fallback) rather than executing arbitrary input |
-| V6 Cryptography | No | No cryptographic material introduced by this phase |
+| V2 Authentication | No | No user-facing authentication surface changes |
+| V3 Session Management | No | N/A |
+| V4 Access Control | Yes | `~/.cache/devflow/roots.json` and `.devflow/lock-{phase:02}` are both per-user filesystem artifacts already relying on standard Unix file permissions (no socket, so no TOCTOU-chmod window exists this time — a plain file created with default `umask` under a user-owned `~/.cache/devflow/` directory is adequate; recommend the directory itself be `0700`, matching the original research's socket-directory recommendation, reused here for the same reason) |
+| V5 Input Validation | Yes | The registry file and gate-response writes are all `serde_json`-typed, not free-text — malformed entries fail to parse and are skipped (matching `Gates::list_open`'s existing "any unparsable file is skipped — listing must degrade, not die" pattern, `gates.rs:139`) |
+| V6 Cryptography | No | No cryptographic material introduced |
 
 ### Known Threat Patterns for this stack
 
 | Pattern | STRIDE | Standard Mitigation |
 |---------|--------|-----------------------|
-| A local, unprivileged user on a shared multi-user host connects to another user's supervisor socket and issues `shutdown` | Denial of Service | Socket file permissions `0600` (owner-only), already proven in the spike; verify this survives the production port, since `UnixListener::bind` followed by `set_permissions` has a brief TOCTOU window between bind and chmod — recommend binding into a directory that is itself `0700` (the `~/.cache/devflow/` directory itself, not just the socket file) to close that window |
-| A recycled PID is mistaken for the original agent/monitor process during the STALE-path pgid backstop | Spoofing / Tampering | `start_time` + `boot_id` validation before any `killpg`, exactly as designed in the spike/D-09 — do not skip this validation as an optimization |
-| `--yes-ship` silently becomes a standing default via config/env, defeating its own "explicit per-run" safety property | Elevation of Privilege (of a sort — an unattended process gains merge authority it shouldn't have by default) | D-05's own constraint: no `devflow.toml`/env-var path may set it; must be a CLI flag consumed once per invocation and persisted only in that run's own `state.json` |
-| A malformed or adversarial line sent to the socket (neither `ping` nor `shutdown`) is misinterpreted as a command | Tampering | Explicit match with a catch-all `unknown` response (already in the spike) — the planner must carry this exact fallback into production code, not assume only well-formed input arrives |
+| A stale/incorrect entry in `~/.cache/devflow/roots.json` causes the sweep to probe a root that no longer exists or belongs to a different, unrelated project | Tampering (of a sort — self-inflicted, not adversarial) | `Gates::list_open` already degrades gracefully on an unreadable/missing directory (`gates.rs:142-144`); the sweep should treat a registry entry whose `project_root` no longer exists as stale and prune it, not error |
+| A local, unprivileged user on a shared multi-user host reads another user's `.devflow/gates/*.json` context (which may contain agent-generated, untrusted text — same caveat `gates.rs:296`'s doc comment already notes for the notify hook) | Information Disclosure | Standard Unix file permissions on `.devflow/` (owned by the project's owning user); this rewrite introduces no new exposure beyond what already exists |
+| A malicious or buggy sweep implementation writes an APPROVE response instead of a REJECT for an aged gate, effectively becoming an unauthorized `--yes-ship` | Elevation of Privilege | The sweep must only ever construct `GateResponse{approved: false, ...}` — recommend a dedicated, narrowly-typed helper (e.g., a function that can only produce a rejection) rather than a generic `respond(approved: bool, ...)` call site the sweep shares with `--yes-ship`'s approval path, so a future refactor cannot accidentally wire the sweep to the approving branch |
+| `devflow stop`'s fallback `kill()` path targets the wrong PID due to PID reuse (the lock file's recorded PID has since been recycled by an unrelated process) | Spoofing | `agent::agent_running` is already hardened against pid `0`/out-of-range values (Finding 1); recommend also validating the target process's command line (`/proc/<pid>/cmdline` on Linux) still looks like a `devflow` invocation before signalling it, matching the spirit of the deferred supervisor's `start_time`/`boot_id` validation even without adopting that full mechanism |
+
+---
 
 ## Sources
 
 ### Primary (HIGH confidence)
-- `.planning/audits/2026-07-24-socket-supervisor-spike.md` — read in full this session; authoritative design (C1-C6, R-A..R-M, resulting `state.json` shape)
-- `.planning/spikes/socket-supervisor/main.rs` and `README.md` — read in full this session; the actual proof-of-mechanism code
-- `.planning/audits/2026-07-24-process-lifecycle-problem-definition.md` — read in full this session; failure-mode catalog F1-F7, ruled-out crates
-- `.planning/audits/2026-07-24-process-teardown-solution-research.md` — read in full this session; superseded cgroup/pgroup recommendation, but authoritative for ruled-out crates and empirical container findings
-- `.planning/audits/2026-07-24-scope-creep-complexity-review.md` — read in full this session
-- `.planning/OPERATOR-OBSERVABILITY-FINDINGS.md` — read in full this session (Findings 1-3)
-- `.planning/ROADMAP.md` § Phase 23 — read in full this session
+- `.planning/phases/23-end-to-end-dogfood/23-PROBE-FINDINGS.md` — read in full this session; the authoritative single-run evidence base for this rewrite
+- `.planning/phases/23-end-to-end-dogfood/23-ORPHAN-FORENSICS.md` — read in full this session; the authoritative population-level evidence base
+- Live source reads this session, all line-cited above: `crates/devflow-core/src/monitor.rs` (full file), `crates/devflow-core/src/gates.rs` (full file), `crates/devflow-core/src/lock.rs` (relevant sections), `crates/devflow-cli/src/pipeline_launch.rs` (lines 1-330), `crates/devflow-cli/src/pipeline_gate.rs` (lines 1-340+), `crates/devflow-cli/src/config_parse.rs` (gate-timeout functions), `crates/devflow-cli/src/commands.rs` (cleanup, gate-related sections), `crates/devflow-cli/src/main.rs` (main/run/dispatch), `crates/devflow-core/src/agent_result.rs` (evaluate_layer0, reconcile_layer0_verdict, evaluate_agent_result)
+- Live command output this session: `git log`/`git show --stat` confirming no `crates/` changes since the original research; `rg` re-counts for `spawn_monitor`/`sequentagent`; `cat .planning/config.json` confirming no `security_enforcement` override in this repo
 - `.planning/phases/23-end-to-end-dogfood/23-CONTEXT.md` — read in full this session
-- Live source reads this session: `crates/devflow-core/src/monitor.rs`, `state.rs`, `mode.rs`, `gates.rs`; `crates/devflow-cli/src/pipeline_launch.rs`, `pipeline_gate.rs`, `pipeline_outcomes.rs` (excerpts), `staleness.rs`, `preflight.rs`, `main.rs`, `commands.rs` (excerpts), `hooks.rs` (grep), `agent_result.rs` (grep)
-- Live command output this session: `rg` counts for `spawn_monitor`/`wait_for_agent_*` call sites and `sequentagent` references; `cargo test --workspace` (541 passed, 0 failed); `devflow --version` (1.8.0, stale) vs `Cargo.toml` version (1.8.1)
+- `.planning/STATE.md` — read (first ~490 lines) this session for project history and release-shape context
+- `.planning/OPERATOR-OBSERVABILITY-FINDINGS.md` — read in full this session (Finding 1, the account this rewrite's Question D corrects the framing of, not the facts of)
+- `.planning/audits/2026-07-24-socket-supervisor-spike.md` — read in full this session; re-assessed under Question D, not re-derived from scratch
 
 ### Secondary (MEDIUM confidence)
-- `.planning/codebase/TESTING.md`, `.planning/codebase/CONVENTIONS.md` — read in full this session, house conventions
+- The original `23-RESEARCH.md` (this file's predecessor) — sections explicitly marked "carried forward" above were re-verified, not merely copied
 
 ### Tertiary (LOW confidence)
-- macOS-specific claims throughout the spike/audit docs — explicitly self-flagged there as documented, not measured; not independently re-verified this session (no macOS host); correctly out of scope per CONTEXT.md
+- macOS-specific claims (unchanged, deferred alongside the supervisor work) — explicitly self-flagged as documented, not measured, in the original spike doc; not independently re-verified this session
 
 ## Metadata
 
 **Confidence breakdown:**
-- Standard stack: HIGH — zero new dependencies; existing pins verified live against `Cargo.toml`
-- Architecture (socket supervisor design): HIGH — spike-proven and re-read in full this session; the one open item (Pitfall 1's document inconsistency) is called out explicitly rather than silently resolved
-- `--yes-ship` threading: HIGH — exact call site (`pipeline_outcomes.rs:275-286`) and exact reusable API (`Gates::write_gate`/`Gates::respond`) both verified live this session
-- 23b/23d inventories: HIGH — both re-counted live via `rg` this session; 23d's actual count (142/11 files) differs from CONTEXT.md's recorded ~110, documented as a correction, not a guess
-- Pitfalls: HIGH — each grounded in either a specific source line read this session or a specific project-memory note, not generic training-data pattern-matching
-- macOS/Linear-issue-content equivalence: LOW/MEDIUM — explicitly logged in Assumptions
+- Research Question A (gate lifetime): HIGH — every claim traced to a specific, live-read source line this session, including the two new findings (the 7-day-not-infinite refinement, and the SIGTERM-orphans-the-advance-tail bug)
+- Research Question B (`devflow stop`): HIGH — the lock-file-PID mechanism was verified by reading `lock.rs`'s own doc comment and `acquire`'s implementation directly
+- Research Question C (false-green class): HIGH for "devflow-core does not read VERIFICATION.md" (directly verified by reading the full evaluation pipeline); MEDIUM for "the self-hosted acceptance run will produce a SECURITY.md in practice" (Assumption A1, not directly verified — no completed unattended run in this repo yet)
+- Research Question D (what survives): HIGH — a direct, line-by-line re-assessment of the spike's own claims against A/B/C's findings
+- 23b/23d inventories (carried forward): HIGH — re-confirmed unchanged via `git log`/`rg` this session, not merely copied from the prior document
+- Pitfalls: HIGH — each grounded in a specific source line or a specific evidence-document quote, not generic pattern-matching
+- macOS/rate-limit-gate-fix scope: LOW/MEDIUM — explicitly logged as open in Assumptions/Open Questions, not silently resolved
 
-**Research date:** 2026-07-25
-**Valid until:** ~7 days (fast-moving — this is an active, currently-being-planned phase in a solo-maintained repo where the underlying source can change daily; re-verify call-site counts and installed-binary version immediately before planning if more than a few days pass)
+**Research date:** 2026-07-25 (rewrite)
+**Valid until:** ~7 days — this is an active, currently-being-replanned phase in a solo-maintained repo; re-verify line numbers and the "no `crates/` changes since" claim immediately before planning if more than a few days pass.
