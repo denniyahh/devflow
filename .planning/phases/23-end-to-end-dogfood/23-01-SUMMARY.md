@@ -131,6 +131,14 @@ None - no external service configuration required. `claude --version` confirmed 
 - 23-02's probe must still supply the behavioral proof `--dry-run` cannot: a real (non-dry-run) `devflow start --phase 1 --agent claude --mode auto <dest>` launch through this scratch repo, per `23-PROBE-SETUP.md`'s explicit scope boundary.
 - No blockers.
 
+## Self-Check: PASSED
+
+- FOUND: scripts/scratch-dogfood-repo.sh
+- FOUND: .planning/phases/23-end-to-end-dogfood/23-PROBE-SETUP.md
+- FOUND: .planning/phases/23-end-to-end-dogfood/23-01-SUMMARY.md
+- FOUND: bede035 (Task 2 commit)
+- FOUND: 83cffe5 (SUMMARY metadata commit)
+
 ---
 *Phase: 23-end-to-end-dogfood*
 *Completed: 2026-07-25*
