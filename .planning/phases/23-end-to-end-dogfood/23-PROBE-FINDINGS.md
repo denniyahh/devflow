@@ -331,3 +331,41 @@ redacted from this document (replaced with `<repo>`, `<scratch-dest>`,
 `<home>`, or similar placeholders). Paths under `/tmp/devflow-probe-23a-*`
 are scratch paths carrying no identity and are kept verbatim per the phase's
 own threat model.
+
+## Scope gate resolution (Task 2 — blocking human-verify)
+
+**Resolved:** 2026-07-25, by the operator, in response to the checkpoint presented
+by the execute-phase orchestrator.
+
+**Signal given:** `invalidated: replan 23`
+
+**Consequence, per `23-02-PLAN.md` Task 2 and `23-CONTEXT.md`:** execution of
+phase 23 STOPS at wave 2. Plans 23-03 through 23-12 do **not** execute against
+the current plan set. They require replanning via `/gsd-plan-phase 23` against
+this probe's finding before any of them runs.
+
+**What the replan must account for:**
+
+1. The `sh -c` monitor is **not** what blocks an end-to-end run. It carried 11
+   `stage_launched` events across 59 minutes with `infra_failures: 0` and is
+   still alive at the time of writing. The "monitor death blocks runs" premise
+   underlying 23b (and therefore the ordering of 23-05 through 23-08) does not
+   survive this evidence.
+2. The real stop cause was a **content-review rejection at Ship** — DevFlow
+   correctly refused to ship because `01-VERIFICATION.md` scored the Ship stage
+   as `✓ VERIFIED` / `status: passed` / `score: 3/3` when Ship had demonstrably
+   not run. The false-green class, not the process class, is what actually
+   stands between DevFlow and an unattended end-to-end run.
+3. A **separate, real** monitor defect is nonetheless evidenced: 28 pre-existing
+   hung `devflow advance` processes were inventoried on this machine before the
+   probe (aged ~1h41m to ~1d4h57m, all with dead `claude -p` children). The
+   `sh -c` monitor leaks orphaned processes. This is a genuine operational
+   problem and a legitimate justification for supervisor work — but it is a
+   different justification than the one the current plan set was built on, and
+   it implies different acceptance criteria.
+4. Two observability defects surfaced incidentally and are worth scoping:
+   the Ship-stage capture was **rotated out** of the fixed-depth history ring by
+   subsequent retry captures, destroying the fullest evidence for the run's most
+   important failure; and there is still **no command to stop a running phase**
+   (the gap 23d was chartered to close), so the probe's own monitor cannot be
+   cleanly terminated.
