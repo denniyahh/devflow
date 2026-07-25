@@ -734,14 +734,15 @@ the end-to-end goal and advances it by approximately zero, so it returns to the
 backlog undisturbed and this phase is repurposed. Nothing was lost: the prior
 entry had no content beyond its title.
 
-**Requirements**: TBD (no REQ-IDs — units 23a–23d, sourced from 999.33/DEN-58
-and 999.34/DEN-59 plus the dogfood-probe finding this phase generates first).
-Plans carry the unit identifiers `23a`, `23b`, `23c`, `23d` and `yes-ship` as
-requirement tokens.
+**Requirements**: TBD (no REQ-IDs — units 23a–23e, sourced from 999.33/DEN-58
+and 999.34/DEN-59 plus the dogfood-probe finding this phase generated first).
+Plans carry the unit identifiers `23a`, `23b`, `23c`, `23d`, `23e` and
+`yes-ship` as requirement tokens. **`23b` and `23c` were redefined, and `23e`
+added, by the 2026-07-25 replan** — see "Re-aimed 2026-07-25" below.
 **Depends on:** Phase 22
-**Plans:** 2/12 plans executed
-touch `monitor.rs`, `commands.rs` or `main.rs`, and the same-wave zero-file-overlap
-rule forbids parallelism)
+**Plans:** 2/11 plans executed (23-01, 23-02 merged; 23-03…23-11 replanned
+2026-07-25; the original 23-03…23-12 are archived under
+`phases/23-end-to-end-dogfood/superseded/`)
 
 **Why this scope, from the run record.** `.devflow/events.jsonl` shows **no
 phase has ever completed a full five-stage devflow-driven run**:
@@ -811,12 +812,58 @@ stage without manual intervention.
 the 104-byte `sun_path` limit as documented-not-measured. Out of scope here —
 the operator platform is Linux; do not claim macOS support from this phase.
 
-**Planned 2026-07-25.** Sequencing follows the load-bearing order CONTEXT.md
-fixes — 23a first (it alone may invalidate the rest), then **23d before 23b**
-(deleting the two-agent verb removes the only two functional call sites of
-`spawn_monitor_no_advance` / `wait_for_agent_exit`, so 23b ports live code
-instead of DEN-58's explicitly-untested path), then 23b, then `--yes-ship`,
-then 23c, then the self-hosted acceptance run last.
+**Re-aimed 2026-07-25 (operator decision, after 23a's probe).** 23a ran and
+**disproved the phase's central hypothesis.** The `sh -c` monitor does not die:
+one 59-minute unattended run carried 11 `stage_launched` events, archived a
+capture on every hop, counted failures correctly, fired the threshold gate
+correctly, ended with `infra_failures: 0`, and was still alive at the end
+(`23-PROBE-FINDINGS.md`). It made the first full Define→Ship traverse on record,
+and a second independent run reached Ship within the same hour. Both were
+stopped by **content/config gates**, and by two *different* ones — a false-green
+`VERIFICATION.md` scoring an unrun Ship stage, and a `/gsd-ship` preflight block
+on a missing SECURITY.md (`23-ORPHAN-FORENSICS.md`).
+
+The real defect is the inverse: monitor **over-durability**. Forensics on 27
+orphaned pairs (54 processes, 168.6 MB, gates up to 30h old) found `wait $apid`
+had already returned in every one; what was still running was the trailing
+`devflow advance`, blocked on a gate whose wait is bounded at 7 days
+(`config_parse.rs:24-28`) — bounded so loosely it is operationally
+indistinguishable from unbounded. No detach, no reaper, no way to enumerate what
+is gated, and no command to stop a running phase.
+
+Plans 23-03…23-12 were built on the disproved premise and are archived to
+`superseded/`. The replanned set is aimed at the evidence:
+
+- **23b — REDEFINED.** No longer "replace the `sh -c` monitor with a socket
+  supervisor." Now **bound gate lifetime**: a cross-root registry plus
+  `devflow gate list --all-roots` (23-03), and `devflow gate sweep` auto-rejecting
+  aged gates through the existing `Gates::respond` protocol so the still-polling
+  `advance` tears itself down via its own `abort()` path — no signal, no
+  supervisor, no new dependency (23-04).
+- **23c — REDEFINED, smaller.** `devflow stop` (23-05), no longer blocked on 23b.
+  Built against the existing per-phase lock file, which already records the exact
+  PID to signal. Targets the lock holder, never `state.monitor_pid` — the monitor
+  shell's trap only ever tracks the agent, so signalling it orphans `advance`
+  rather than stopping it.
+- **23e — NEW this replan.** The false-green attestation class: a structural
+  Ship-evidence oracle (`devflow evidence`), declarable as a Layer 0 probe, plus
+  an enforced merge post-condition (23-06). `devflow-core` never reads
+  `VERIFICATION.md`, so the catch that worked was a non-deterministic prompt-side
+  review, not an enforced invariant.
+- **23d — UNCHANGED**, and no longer front-loaded. Its original "delete before
+  the migration" rationale died with the supervisor deferral, so it now follows
+  the evidence-priority work (23-07, 23-08).
+- **`--yes-ship` — UNCHANGED, and now the binding constraint** on the acceptance
+  criterion, since `Mode::should_gate` gates Ship in both modes (23-09).
+- **The socket-addressable supervisor is DEFERRED, not discarded** — with it,
+  D-08 and D-10. Nothing in the evidence shows this phase's acceptance criterion
+  requires it; building it now would fix a problem the probe did not find.
+  D-09's `~/.cache/devflow/` location decision is reused for the new registry.
+
+Sequencing: enumeration → reaper → stop → evidence oracle → 23d → `--yes-ship`
+→ acceptance prep → acceptance run. Waves are mostly sequential because almost
+every unit touches `commands.rs` or `main.rs`, and the same-wave
+zero-file-overlap rule forbids parallelism.
 
 **RESEARCH correction carried into the plans:** the deletion inventory is
 **142 references across 11 files**, not the ~110 recorded above — the original
@@ -826,18 +873,21 @@ verb (README, ARCHITECTURE, OPERATIONS, CHANGELOG), not two.
 
 Plans:
 
-- [x] 23-01-PLAN.md
-- [x] 23-02-PLAN.md
-- [ ] 23-03-PLAN.md
-- [ ] 23-04-PLAN.md
-- [ ] 23-05-PLAN.md
-- [ ] 23-06-PLAN.md
-- [ ] 23-07-PLAN.md
-- [ ] 23-08-PLAN.md
-- [ ] 23-09-PLAN.md
-- [ ] 23-10-PLAN.md
-- [ ] 23-11-PLAN.md
-- [ ] 23-12-PLAN.md
+- [x] 23-01-PLAN.md — Rebuild the binary and scaffold an isolated scratch probe target (23a)
+- [x] 23-02-PLAN.md — 23a probe: one unattended run, recorded where it stopped (23a)
+- [ ] 23-03-PLAN.md — 23b: cross-root gate registry + `devflow gate list --all-roots`
+- [ ] 23-04-PLAN.md — 23b: `devflow gate sweep` — bound gate lifetime by auto-rejecting aged gates
+- [ ] 23-05-PLAN.md — 23c: `devflow stop`, targeting the lock holder
+- [ ] 23-06-PLAN.md — 23e: Ship-evidence oracle + enforced merge post-condition
+- [ ] 23-07-PLAN.md — 23d: delete the two-agent verb from the CLI crate + reconcile docs
+- [ ] 23-08-PLAN.md — 23d: delete the core-side surface, workspace count to zero
+- [ ] 23-09-PLAN.md — `--yes-ship`: per-run flag, one auto-answered Ship gate
+- [ ] 23-10-PLAN.md — Acceptance prep: authorization, rehearsed recovery point, preconditions
+- [ ] 23-11-PLAN.md — Acceptance run: one phase Define→Ship, unattended, self-hosted
+
+*(The original 23-03…23-12 are archived under `superseded/` — see the re-aim
+note above. The plan list below renumbers from 23-03; 23-01 and 23-02 are
+unchanged and already merged.)*
 
 **Wave 1**
 
@@ -845,44 +895,37 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 23-02 — 23a probe: drive one unattended run in the scratch repo, record where it dies (23a, tracer)
+- [x] 23-02 — 23a probe: drive one unattended run in the scratch repo, record where it stopped (23a, tracer)
 
-**Wave 3** *(blocked on Wave 2 completion)*
+**Wave 1 (replanned set)**
 
-- [ ] 23-03 — 23d: delete the two-agent verb from the CLI crate + reconcile docs (23d, D-11/D-12 checkpoint)
+- [ ] 23-03 — 23b: registry module, registration on the launch path, cross-root gate listing with age (23b)
 
-**Wave 4** *(blocked on Wave 3 completion)*
+**Wave 2** *(blocked on 23-03)*
 
-- [ ] 23-04 — 23d: delete the remaining core-side surface, workspace count to zero (23d)
+- [ ] 23-04 — 23b: `Gates::reap` + `devflow gate sweep`, proven against a real parked `advance` child (23b)
 
-**Wave 5** *(blocked on Wave 4 completion)*
+**Wave 3** *(blocked on 23-04)*
 
-- [ ] 23-05 — 23b: persisted supervisor handle + `yes_ship` on State, client-side socket primitives (23b, yes-ship)
+- [ ] 23-05 — 23c: `devflow stop` — gate-response path, lock-holder signalling fallback, identity check (23c)
 
-**Wave 6** *(blocked on Wave 5 completion)*
+**Wave 4** *(blocked on 23-05)*
 
-- [ ] 23-06 — 23b: the supervisor run loop, `devflow supervise`, in-process advance, signal handling (23b)
+- [ ] 23-06 — 23e: `devflow evidence` oracle, `--require-shipped`, merge post-condition in the Merge hook (23e)
 
-**Wave 7** *(blocked on Wave 6 completion)*
+**Wave 5** *(blocked on 23-06)*
 
-- [ ] 23-07 — 23b: big-bang `sh -c` removal + spawn call-site swap + e2e rewrite (23b, D-08 checkpoint)
+- [ ] 23-07 — 23d: delete the verb, preserve single-agent resume, reconcile four docs (23d, D-11/D-12 checkpoint)
 
-**Wave 8** *(blocked on Wave 7 completion)*
+**Wave 6** *(blocked on 23-07; the two plans below run in parallel — zero file overlap)*
 
-- [ ] 23-08 — 23b: re-point `status`/`doctor`/`cleanup` at the socket probe + pre-supervisor finding (23b)
+- [ ] 23-08 — 23d: delete the core-side surface, re-point constructor coverage (23d)
+- [ ] 23-09 — `--yes-ship`: persisted per-run flag, one auto-answered gate, two negative guarantees (yes-ship)
 
-**Wave 9** *(blocked on Wave 8 completion)*
+**Wave 7** *(blocked on 23-08 and 23-09)*
 
-- [ ] 23-09 — `--yes-ship`: per-run flag, auto-answered Ship gate, retry gate untouched (yes-ship)
+- [ ] 23-10 — Acceptance prep: D-07 authorization, rehearsed recovery point, seven behavioural checks (all units)
 
-**Wave 10** *(blocked on Wave 9 completion)*
+**Wave 8** *(blocked on 23-10)*
 
-- [ ] 23-10 — 23c: `devflow stop`, after-ship worktree removal, stop-time capture archival (23c)
-
-**Wave 11** *(blocked on Wave 10 completion)*
-
-- [ ] 23-11 — Acceptance prep: recovery point, low-stakes target, rebuild (23a, yes-ship, D-07 checkpoint)
-
-**Wave 12** *(blocked on Wave 11 completion)*
-
-- [ ] 23-12 — Acceptance run: one phase Define→Ship, unattended, self-hosted (all units)
+- [ ] 23-11 — Acceptance run: one phase Define→Ship, unattended, self-hosted (all units)
