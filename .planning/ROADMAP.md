@@ -735,9 +735,13 @@ backlog undisturbed and this phase is repurposed. Nothing was lost: the prior
 entry had no content beyond its title.
 
 **Requirements**: TBD (no REQ-IDs — units 23a–23d, sourced from 999.33/DEN-58
-and 999.34/DEN-59 plus the dogfood-probe finding this phase generates first)
+and 999.34/DEN-59 plus the dogfood-probe finding this phase generates first).
+Plans carry the unit identifiers `23a`, `23b`, `23c`, `23d` and `yes-ship` as
+requirement tokens.
 **Depends on:** Phase 22
-**Plans:** 0 plans
+**Plans:** 12 plans across 12 waves (serial by construction — nine of the twelve
+touch `monitor.rs`, `commands.rs` or `main.rs`, and the same-wave zero-file-overlap
+rule forbids parallelism)
 
 **Why this scope, from the run record.** `.devflow/events.jsonl` shows **no
 phase has ever completed a full five-stage devflow-driven run**:
@@ -802,6 +806,30 @@ stage without manual intervention.
 the 104-byte `sun_path` limit as documented-not-measured. Out of scope here —
 the operator platform is Linux; do not claim macOS support from this phase.
 
+**Planned 2026-07-25.** Sequencing follows the load-bearing order CONTEXT.md
+fixes — 23a first (it alone may invalidate the rest), then **23d before 23b**
+(deleting the two-agent verb removes the only two functional call sites of
+`spawn_monitor_no_advance` / `wait_for_agent_exit`, so 23b ports live code
+instead of DEN-58's explicitly-untested path), then 23b, then `--yes-ship`,
+then 23c, then the self-hosted acceptance run last.
+
+**RESEARCH correction carried into the plans:** the deletion inventory is
+**142 references across 11 files**, not the ~110 recorded above — the original
+count came from a lowercase-only grep that missed the PascalCase Rust
+identifiers. The 11-file count is correct. Four operator documents mention the
+verb (README, ARCHITECTURE, OPERATIONS, CHANGELOG), not two.
+
 Plans:
 
-- [ ] TBD (run /gsd-discuss-phase 23, then /gsd-plan-phase 23 to break down)
+- [ ] 23-01 — Rebuild the binary and scaffold an isolated scratch probe target (23a)
+- [ ] 23-02 — 23a probe: drive one unattended run in the scratch repo, record where it dies (23a, tracer)
+- [ ] 23-03 — 23d: delete the two-agent verb from the CLI crate + reconcile docs (23d, D-11/D-12 checkpoint)
+- [ ] 23-04 — 23d: delete the remaining core-side surface, workspace count to zero (23d)
+- [ ] 23-05 — 23b: persisted supervisor handle + `yes_ship` on State, client-side socket primitives (23b, yes-ship)
+- [ ] 23-06 — 23b: the supervisor run loop, `devflow supervise`, in-process advance, signal handling (23b)
+- [ ] 23-07 — 23b: big-bang `sh -c` removal + spawn call-site swap + e2e rewrite (23b, D-08 checkpoint)
+- [ ] 23-08 — 23b: re-point `status`/`doctor`/`cleanup` at the socket probe + pre-supervisor finding (23b)
+- [ ] 23-09 — `--yes-ship`: per-run flag, auto-answered Ship gate, retry gate untouched (yes-ship)
+- [ ] 23-10 — 23c: `devflow stop`, after-ship worktree removal, stop-time capture archival (23c)
+- [ ] 23-11 — Acceptance prep: recovery point, low-stakes target, rebuild (23a, yes-ship, D-07 checkpoint)
+- [ ] 23-12 — Acceptance run: one phase Define→Ship, unattended, self-hosted (all units)
