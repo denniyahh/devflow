@@ -882,7 +882,7 @@ Plans carry the unit identifiers `23a`, `23b`, `23c`, `23d`, `23e` and
 `yes-ship` as requirement tokens. **`23b` and `23c` were redefined, and `23e`
 added, by the 2026-07-25 replan** — see "Re-aimed 2026-07-25" below.
 **Depends on:** Phase 22
-**Plans:** 15/15 plans executed
+**Plans:** 15/16 plans executed
 gap-closure set** (planned 2026-07-26 from `23-VERIFICATION.md`'s single
 recorded gap), unstarted
 2026-07-25; the original 23-03…23-12 are archived under
@@ -1094,6 +1094,8 @@ Four required findings, all now closed in the plan text:
 
 Plans:
 
+- [ ] 23-16-PLAN.md
+
 - [x] 23-01-PLAN.md — Rebuild the binary and scaffold an isolated scratch probe target (23a)
 - [x] 23-02-PLAN.md — 23a probe: one unattended run, recorded where it stopped (23a)
 - [x] 23-03-PLAN.md — 23b: cross-root gate registry (one file per root/phase) + `devflow gate list --all-roots`
@@ -1183,7 +1185,7 @@ as code per the operator's gap-closure decision above. Units 23a–23e and
 
 **Wave 12** *(blocked on 23-14)*
 
-- [ ] 23-15 — Acceptance retry: `devflow start --phase 24 --agent claude --mode auto --yes-ship`, observed read-only, recorded in `23-ACCEPTANCE-RUN-2.md` (the 23-11 record is left byte-identical). Acceptance is claimable **only** on a quoted `workflow_shipped` event plus `devflow evidence --phase 24 --require-shipped` exiting 0 — `workflow_finished` is explicitly not sufficient (23-acceptance)
+- [x] 23-15 — Acceptance retry: `devflow start --phase 24 --agent claude --mode auto --yes-ship`, observed read-only, recorded in `23-ACCEPTANCE-RUN-2.md` (the 23-11 record is left byte-identical). Acceptance is claimable **only** on a quoted `workflow_shipped` event plus `devflow evidence --phase 24 --require-shipped` exiting 0 — `workflow_finished` is explicitly not sufficient (23-acceptance)
 
 ### Phase 24: `release --check` Signing-Key Inline Classification
 
