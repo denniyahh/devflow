@@ -1168,12 +1168,48 @@ fn stop_via_lock(project_root: &Path, phase: u32) -> Result<(), CliError> {
         );
         return Ok(());
     }
-    if !agent::looks_like_devflow_process(pid) {
-        return Err(CliError::Message(format!(
-            "refusing to signal pid {pid} for phase {phase} — its command line does not \
-             identify it as a devflow process; the lock may be stale with a recycled pid. \
-             Inspect it manually (e.g. `ps -p {pid}`) before proceeding."
-        )));
+    // Identity must be MATCHED against what the lock recorded, never inferred
+    // from /proc (999.47). `looks_like_devflow_process` alone returns true for
+    // any freshly forked child of a devflow process that has not finished
+    // execve — during that window the child carries its parent's cmdline and
+    // exe — so it would authorise signalling an unrelated process. Confirmed
+    // in CI, not theorised.
+    //
+    // `(pid, starttime)` is unique for the life of a boot: a recycled pid
+    // necessarily starts later than the one it replaced, and a mid-execve
+    // child has its own start time distinct from its parent's.
+    match lock::holder_identity(project_root, phase) {
+        Some((recorded_pid, Some(recorded_start))) if recorded_pid == pid => {
+            if !agent::is_same_process(pid, recorded_start) {
+                return Err(CliError::Message(format!(
+                    "refusing to signal pid {pid} for phase {phase} — it is not the \
+                     process that took the lock. The lock recorded start time \
+                     {recorded_start}, but pid {pid} now reports {:?}, so the pid has \
+                     been recycled and belongs to something else. Inspect it manually \
+                     (e.g. `ps -p {pid}`) before proceeding.",
+                    agent::process_start_time(pid)
+                )));
+            }
+        }
+        Some((_, None)) => {
+            // Legacy single-line lock, written before start times were
+            // recorded. Identity cannot be confirmed, so fail closed rather
+            // than fall back to the unsound cmdline check.
+            return Err(CliError::Message(format!(
+                "refusing to signal pid {pid} for phase {phase} — the lock file records \
+                 no start time, so this process's identity cannot be confirmed. The lock \
+                 predates identity recording; if the run is genuinely stuck, inspect the \
+                 pid manually (e.g. `ps -p {pid}`) and remove \
+                 .devflow/lock-{phase:02} once you are satisfied."
+            )));
+        }
+        _ => {
+            return Err(CliError::Message(format!(
+                "refusing to signal pid {pid} for phase {phase} — the lock file's holder \
+                 could not be read back for identity confirmation. Inspect it manually \
+                 (e.g. `ps -p {pid}`) before proceeding."
+            )));
+        }
     }
     if agent::terminate(pid) {
         println!("stop: signalled pid {pid}, phase {phase}'s lock holder");
@@ -3324,6 +3360,90 @@ mod tests {
         assert!(
             lock_survived,
             "the lock file must be untouched — stop must not signal anything"
+        );
+    }
+
+    /// 999.47: a lock recording a start time that does not match the live
+    /// process must be refused. This is the pid-recycling case — the lock
+    /// named pid N, N died, and something unrelated now holds it.
+    ///
+    /// Unlike the cmdline check this replaced, the verdict does not depend
+    /// on what the process *looks* like, so a `sleep` and a real devflow
+    /// binary are rejected identically.
+    #[test]
+    fn stop_refuses_when_the_recorded_start_time_does_not_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 201;
+
+        // Our own pid is genuinely alive and genuinely devflow-named, so the
+        // old cmdline check would have happily signalled it. Only the start
+        // time distinguishes "this process" from "whatever holds this pid".
+        let pid = std::process::id();
+        let real_start = devflow_core::agent::process_start_time(pid)
+            .expect("read our own start time from /proc");
+        let wrong_start = real_start + 1;
+
+        let lock_path = root.join(".devflow").join(format!("lock-{phase:02}"));
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        std::fs::write(&lock_path, format!("{pid}\n{wrong_start}")).unwrap();
+
+        let err = stop(root, phase).expect_err("a start-time mismatch must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains(&pid.to_string()),
+            "error must name the pid it refused to signal, got: {message}"
+        );
+        assert!(
+            message.contains("not the process that took the lock"),
+            "error must say the identity did not match, got: {message}"
+        );
+        assert!(
+            lock_path.exists(),
+            "the lock file must be untouched — stop must not signal anything"
+        );
+    }
+
+    /// The positive case: when the lock's recorded identity matches the live
+    /// process, `stop` proceeds. Without this, the refusal test above would
+    /// pass equally well against a `stop` that refused unconditionally.
+    #[test]
+    fn stop_signals_the_holder_when_the_recorded_identity_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 202;
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let child_pid = child.id();
+
+        // Record the child's OWN identity — the honest case, where the lock
+        // holder really is the process named. Poll for the start time: a
+        // freshly forked child may not have exec'd yet (999.47).
+        let mut child_start = None;
+        for _ in 0..100 {
+            child_start = devflow_core::agent::process_start_time(child_pid);
+            if child_start.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let child_start = child_start.expect("read the child's start time");
+
+        let lock_path = root.join(".devflow").join(format!("lock-{phase:02}"));
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        std::fs::write(&lock_path, format!("{child_pid}\n{child_start}")).unwrap();
+
+        let result = stop(root, phase);
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            result.is_ok(),
+            "a matching identity must be signalled, not refused: {result:?}"
         );
     }
 

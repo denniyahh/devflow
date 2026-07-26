@@ -39,6 +39,66 @@ pub fn terminate(pid: u32) -> bool {
     pid > 0 && unsafe { libc::kill(pid, libc::SIGTERM) == 0 }
 }
 
+/// A process's start time — field 22 of `/proc/<pid>/stat`, in clock ticks
+/// since boot.
+///
+/// This is the missing half of process identity. A PID alone is ambiguous:
+/// the kernel reuses it after the process exits, so a stale record naming
+/// pid 1234 may now refer to something entirely unrelated. `(pid, starttime)`
+/// is unique for the life of a boot, because a recycled pid necessarily
+/// starts later than the one it replaced.
+///
+/// Record this alongside a pid whenever the pid will be acted on later —
+/// signalled, killed, reported as a holder — and require BOTH to match
+/// before acting. That is the only check immune to the two ways `/proc`
+/// lies about identity:
+///
+/// * **PID reuse.** cmdline/exe describe whoever holds the pid *now*.
+/// * **The fork/exec window (999.47).** Between `Command::spawn()` returning
+///   a pid and the child completing `execve`, the child is a copy of its
+///   parent: `/proc/<pid>/cmdline` reports the PARENT's argv and
+///   `/proc/<pid>/exe` the parent's binary. A devflow process's freshly
+///   spawned child therefore looks exactly like devflow itself. Confirmed
+///   directly in CI, where container overlayfs widens that window enough to
+///   hit routinely.
+///
+/// `comm` is inherited across `fork` too, so it is no better. There is no
+/// field that distinguishes a mid-`execve` child from its parent — they are
+/// genuinely the same image at that instant. Identity must be *recorded*,
+/// never inferred.
+///
+/// **Granularity caveat, measured not assumed.** The value is in clock ticks
+/// since boot — `USER_HZ`, conventionally 100, so 10ms. Two processes created
+/// within the same tick report the *same* start time; this was observed
+/// directly while testing, where a test binary and a child it spawned
+/// microseconds later were indistinguishable by this field alone.
+///
+/// That does not weaken the pid-recycling guarantee this exists for: for a
+/// pid to be recycled the kernel must exhaust and wrap the pid space, which
+/// takes vastly longer than 10ms. It does mean this must not be used to
+/// distinguish a parent from a child it just spawned — for that, compare
+/// pids, which differ by construction.
+///
+/// Returns `None` when the stat file cannot be read or parsed — the
+/// fail-closed direction, meaning "identity could not be confirmed."
+pub fn process_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Field 2 (comm) is parenthesised and may itself contain spaces or
+    // parentheses, so split after the FINAL ')' rather than tokenising the
+    // whole line. After that point, field 3 is index 0, so field 22 is 19.
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(19)?.parse::<u64>().ok()
+}
+
+/// Whether `pid` is the same process instance that recorded `expected_start`.
+///
+/// The identity check `devflow stop` and friends should use. See
+/// [`process_start_time`] for why a pid alone — or any `/proc`-derived
+/// description of it — cannot answer this.
+pub fn is_same_process(pid: u32, expected_start: u64) -> bool {
+    process_start_time(pid) == Some(expected_start)
+}
+
 /// Best-effort, Linux-only identity check for `devflow stop`'s signalling
 /// fallback (T-23-52, PID reuse in a stale lock file): does
 /// `/proc/<pid>/cmdline` name a devflow process? Reads the NUL-separated
@@ -48,6 +108,13 @@ pub fn terminate(pid: u32) -> bool {
 /// — the fail-closed direction. A `false` return means "identity could not
 /// be confirmed," and callers must treat that as "do not signal," never as
 /// "signal anyway."
+///
+/// **UNSOUND ON ITS OWN — see 999.47.** This returns `true` for any freshly
+/// `fork`ed child of a devflow process that has not yet completed `execve`,
+/// because such a child transiently carries its parent's cmdline. It is
+/// retained only as a secondary, advisory signal; prefer
+/// [`is_same_process`] with a recorded start time, which cannot be fooled
+/// this way. Never let this function alone authorise a signal.
 pub fn looks_like_devflow_process(pid: u32) -> bool {
     let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
         return false;

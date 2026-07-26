@@ -83,15 +83,11 @@ fn acquire_path(path: PathBuf) -> Result<LockGuard, LockError> {
 
     match File::create_new(&path) {
         Ok(mut f) => {
-            let pid = std::process::id().to_string();
-            write!(f, "{pid}")?;
+            write!(f, "{}", lock_contents())?;
             Ok(LockGuard { path })
         }
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-            let pid = fs::read_to_string(&path)
-                .unwrap_or_else(|_| "unknown".into())
-                .trim()
-                .to_string();
+            let pid = read_holder_pid(&path);
             // Stale-holder recovery (13-06 dogfood finding): a killed or
             // crashed holder never runs LockGuard's Drop, and its abandoned
             // lock wedges every future `advance` for the project — silently,
@@ -108,15 +104,11 @@ fn acquire_path(path: PathBuf) -> Result<LockGuard, LockError> {
                 let _ = fs::remove_file(&path);
                 return match File::create_new(&path) {
                     Ok(mut f) => {
-                        let pid = std::process::id().to_string();
-                        write!(f, "{pid}")?;
+                        write!(f, "{}", lock_contents())?;
                         Ok(LockGuard { path })
                     }
                     Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-                        let pid = fs::read_to_string(&path)
-                            .unwrap_or_else(|_| "unknown".into())
-                            .trim()
-                            .to_string();
+                        let pid = read_holder_pid(&path);
                         Err(LockError::Contended { pid, path })
                     }
                     Err(err) => Err(err.into()),
@@ -126,6 +118,66 @@ fn acquire_path(path: PathBuf) -> Result<LockGuard, LockError> {
         }
         Err(err) => Err(err.into()),
     }
+}
+
+/// The lock file's contents: the holder's pid on line 1, and its start time
+/// (`/proc/<pid>/stat` field 22) on line 2 when readable.
+///
+/// Two lines rather than one field, deliberately: every existing reader takes
+/// the first line, so the format stays backward compatible in both
+/// directions — an old binary reads a new lock file's pid correctly, and a
+/// new binary reads an old single-line lock file with the start time simply
+/// absent.
+///
+/// The start time is what makes the record an *identity* rather than a
+/// number. See [`crate::agent::process_start_time`]: a pid alone can be
+/// recycled, and a pid inspected via `/proc` can also be a devflow process's
+/// own child caught mid-`execve` (999.47), so anything that later signals
+/// this holder must match both halves.
+fn lock_contents() -> String {
+    let pid = std::process::id();
+    match crate::agent::process_start_time(pid) {
+        Some(start) => format!("{pid}\n{start}"),
+        // Fail soft on write, fail closed on use: a lock without a start
+        // time still works for mutual exclusion, and readers that need
+        // identity refuse to signal rather than guess.
+        None => format!("{pid}"),
+    }
+}
+
+/// The holder pid recorded in a lock file — the first line only, so a
+/// two-line lock file parses identically to the historical one-line form.
+fn read_holder_pid(path: &Path) -> String {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| text.lines().next().map(|line| line.trim().to_string()))
+        .filter(|pid| !pid.is_empty())
+        .unwrap_or_else(|| "unknown".into())
+}
+
+/// The holder's recorded start time, if the lock file carries one. `None`
+/// for a legacy single-line lock, or when the value is unparseable.
+fn read_holder_start_time(path: &Path) -> Option<u64> {
+    fs::read_to_string(path)
+        .ok()?
+        .lines()
+        .nth(1)?
+        .trim()
+        .parse::<u64>()
+        .ok()
+}
+
+/// The recorded identity of a phase lock's holder: its pid, and its start
+/// time when the lock records one.
+///
+/// Callers that intend to **signal** the holder must require the start time
+/// to be present and to match [`crate::agent::process_start_time`] for that
+/// pid. A `None` start time means the lock predates identity recording and
+/// the holder cannot be confirmed — refuse, do not guess.
+pub fn holder_identity(project_root: &Path, phase: u32) -> Option<(u32, Option<u64>)> {
+    let path = lock_path(project_root, phase);
+    let pid = read_holder_pid(&path).parse::<u32>().ok()?;
+    Some((pid, read_holder_start_time(&path)))
 }
 
 /// Whether the pid recorded in a lock file refers to a live process.
@@ -144,8 +196,11 @@ fn pid_is_alive(pid: &str) -> bool {
 /// returning the PID of the holder if the file exists.
 pub fn holder(project_root: &Path, phase: u32) -> Option<(String, PathBuf)> {
     let path = lock_path(project_root, phase);
-    let pid = fs::read_to_string(&path).ok()?;
-    let pid = pid.trim().to_string();
+    // First line only: lock files now carry the holder's start time on line
+    // 2, and reading the whole file would yield "1234\n5678" as the "pid".
+    fs::read_to_string(&path).ok()?;
+    let pid = read_holder_pid(&path);
+    let pid = if pid == "unknown" { String::new() } else { pid };
     if pid.is_empty() {
         // Stale empty lock file — clean it up
         let _ = fs::remove_file(&path);
@@ -211,10 +266,8 @@ pub fn remove_stale_locks(project_root: &Path) -> Vec<String> {
             continue;
         }
         let path = entry.path();
-        let holder_pid = fs::read_to_string(&path)
-            .unwrap_or_default()
-            .trim()
-            .to_string();
+        // First line only — line 2 is the holder's start time.
+        let holder_pid = read_holder_pid(&path);
         if pid_is_alive(&holder_pid) {
             warnings.push(format!(
                 "kept {} — holder pid {holder_pid} is still alive",

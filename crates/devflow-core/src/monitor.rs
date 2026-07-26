@@ -318,26 +318,25 @@ mod tests {
         // avoid flaking under load. (Window widened to 5s: at 2s this
         // still flaked under a fully parallel workspace test run.)
         //
-        // 2026-07-26: widened again, 5s -> 15s, after CI moved into the
-        // pinned devcontainer (db1b4bf) and this failed in both runs. The
-        // container is a slower, more contended environment than the host
-        // these budgets were tuned against.
+        // 2026-07-26: this was widened 5s -> 15s for the containerised CI
+        // job and STILL failed, then reverted to 5s. That widening was a
+        // mistake: 15s is far beyond any plausible trap-and-kill latency,
+        // so the agent is not being reaped SLOWLY, it is not being reaped.
+        // Buying silence with a bigger number would have hidden a real
+        // defect behind a green check — the exact false negative this
+        // repository keeps getting bitten by.
         //
-        // Widening was chosen deliberately, and only because the MECHANISM
-        // was verified independently first: DevFlow's real monitor script
-        // shape was run under both `bash` and `dash` (the container's
-        // /bin/sh is dash, the Fedora host's is bash) and the trap killed
-        // the backgrounded agent correctly in both. So this is a budget
-        // that is too tight, not a trap that does not fire — the opposite
-        // call from 999.47, where a failure was left red because it
-        // exposed a genuine defect.
+        // The trap mechanism itself is verified working: DevFlow's real
+        // monitor script shape was run under both `bash` and `dash` (the
+        // container's /bin/sh is dash, the Fedora host's is bash) and both
+        // killed the backgrounded agent correctly. So the defect is in how
+        // the agent is spawned or identified under container timing, not in
+        // the shell trap — see 999.47, whose confirmed transient fork/exec
+        // window is the prime suspect for the same class of failure here.
         //
-        // If this flakes again at 15s, do NOT widen a third time: that
-        // would mean the agent is not being reaped rather than being
-        // reaped slowly, which is a real bug and plausibly the same
-        // scheduling starvation that fits 999.47's never-exec'd child.
+        // Leave this red until that is fixed. Do NOT widen it again.
         let mut still_running = true;
-        for _ in 0..750 {
+        for _ in 0..250 {
             if !crate::agent::agent_running(agent_pid) {
                 still_running = false;
                 break;
