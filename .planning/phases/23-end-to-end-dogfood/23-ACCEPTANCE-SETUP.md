@@ -406,13 +406,15 @@ scoped as a small, S-sized, single-branch fix; it is not verified today
 whether the Define/Plan stages for a phase this small will produce
 `threat_model` content substantial enough to trigger the same security-audit
 step, or whether a minimal plan could reach Ship with no `*-SECURITY.md` ever
-written. **Disposition: escalated.** Remedies available at Task 4: (1) accept
-the risk that the run may hit this wall exactly as the recorded probe did,
-relying on the never-silent gate to surface it as an actionable Ship-stage
-gate rather than a silent failure; or (2) require, as an explicit condition of
-`proceed`, that 999.27's own Plan stage include a `<threat_model>` block
-substantial enough to produce a `*-SECURITY.md` (i.e. treat this as a planning
-constraint communicated to the run, not a code change made here).
+written. **Disposition: escalated — accepted unmitigated by operator at Task
+4.** Two remedies were available: (1) accept the risk that the run may hit
+this wall exactly as the recorded probe did, relying on the never-silent gate
+to surface it as an actionable Ship-stage gate rather than a silent failure;
+or (2) require, as an explicit condition of `proceed`, that phase 24's own
+Plan stage include a `<threat_model>` block substantial enough to produce a
+`*-SECURITY.md`. **The operator selected (1) explicitly** — see "Task 4 —
+Authorization" below for the verbatim decision and reasoning. Remedy (2) was
+NOT directed.
 
 ### Precondition B — no Ship-completion claim at Validate
 
@@ -424,23 +426,93 @@ constraint communicated to the run, not a code change made here).
 
 **Exact finding:** there is no target-phase `must_haves` truth or acceptance
 criterion to quote, because none has been written yet — 999.27 has 0 plans.
-**Disposition: escalated**, for the identical reason as Precondition A: the
-check the plan specifies is a check against files that do not exist.
+**Disposition: escalated — accepted unmitigated by operator at Task 4**, for
+the identical reason as Precondition A: the check the plan specifies is a
+check against files that do not exist.
 
-**Remedy the plan itself names, available to propose (not applied here,
-unilaterally, since this task has no authority to write 999.27's plan):**
+**Remedy the plan itself names, offered and explicitly NOT directed:**
 declare `devflow evidence --phase 24 --require-shipped` (or whatever numeric
 phase 999.27 is actually promoted to — see the numbering wrinkle above) as
 999.27's `external_verify` probe when it is planned. This makes the
 "did Ship actually complete" question checked by code (plan 23-06's oracle,
 exit-code-stable) rather than by a Validate-stage review that may or may not
 notice a self-attested Ship claim — closing the exact false-green class the
-other recorded probe run hit. **Disposition: escalated, with a named,
-concrete remedy ready to hand to whoever plans 999.27/phase 24.**
+other recorded probe run hit. **The operator was shown this remedy at Task 4
+and explicitly declined to direct it** — recorded here as available-but-declined
+so a later reader can see it was considered, not overlooked. See "Task 4 —
+Authorization" below for the verbatim decision.
 
 ---
 
-## Summary for Task 4
+## Task 4 — Authorization (D-07)
+
+**Decision: PROCEED.** Recorded verbatim from the operator's Task 4 response.
+
+**(a) Target phase.** 999.27, to be promoted to concrete phase number **24**
+before the acceptance run begins. The operator chose 24 explicitly — it
+matches this artifact's own inference, so every Task 2 check recorded against
+`--phase 24` remains valid and does not need re-running. **The promotion
+itself is NOT owned by this plan or this executor:** it is an explicit
+inter-wave prerequisite the orchestrator must perform between plans 23-10 and
+23-11, because neither plan declares `ROADMAP.md` in its `files_modified`. See
+"Next Phase Readiness" in `23-10-SUMMARY.md` for the stated prerequisite.
+
+What phase 24 changes, in concrete terms: the inline signing-key
+misclassification in `check_ssh_signing_viability`
+(`crates/devflow-core/src/git.rs`) — one classification branch plus one test,
+in a release-preflight *advisory* check. It touches no merge, version, or
+ship control flow.
+
+**(b) Expected VersionBump result: 2.0.0.** Unchanged from Task 1, re-confirmed
+against source: driven by plan 23-07's already-landed breaking removal and the
+unreleased `## 2.0.0` CHANGELOG heading, not by anything in phase 24's
+content. Any other result — minor, patch, or no bump — is to be reported by
+plan 23-11 as a defect signal, not absorbed as noise.
+
+**(c) Recovery path read and undo latency accepted.** The operator was shown,
+and explicitly accepted: force-push to `develop` is refused categorically
+(ruleset with `bypass_actors: []`, `current_user_can_bypass: "never"`, no
+admin override); the real undo is a revert pull request,
+`git revert -m 1 <merge-sha>`, with `required_approving_review_count: 0` and 4
+required CI checks, measured at approximately 2 minutes; and the worst case is
+a merge commit already on `develop` with a failed terminal batch and a
+reopened Ship gate, with no automatic rollback at any layer. **Latency class:
+revert PR, ~2 minutes. Accepted.**
+
+**(d) Disposition of the two escalated content preconditions: ACCEPTED
+UNMITIGATED. No remedies directed.** This is a deliberate, explicit operator
+decision, not an oversight. Reasoning, recorded verbatim so the record is
+honest about what was traded:
+
+- devflow's Define and Plan stages are designed to author the target's plan
+  set themselves (`crates/devflow-core/src/stage.rs:54-55` maps Define to
+  `/gsd-discuss-phase {N}` and Plan to `/gsd-plan-phase {N}`). Driving an
+  unplanned phase is the intended use, not a workaround. Preconditions A and B
+  are therefore unresolvable *in advance* by construction for any target that
+  genuinely starts at Define — pre-planning a target would remove the
+  escalation only by removing the thing being tested.
+- The operator chose the option described as the purest test of the loop: let
+  `/gsd-plan-phase` do whatever it normally does and find out, accepting a
+  higher chance the run parks at Ship preflight.
+- The accepted consequence, stated plainly: if phase 24's Plan stage does not
+  produce the `*-SECURITY.md` that preflight demands
+  (`.planning/config.json` has `workflow.security_enforcement: true`), the run
+  is expected to be turned away at Ship preflight. On the recorded probe
+  evidence that block occurs before any merge, so the cost is a failed
+  acceptance run rather than a damaged `develop`. That trade was put to the
+  operator and accepted.
+- Precondition B's named remedy — declaring
+  `devflow evidence --phase 24 --require-shipped` as phase 24's
+  `external_verify` probe — was offered and explicitly NOT directed. Recorded
+  as available-but-declined so a later reader can see it was considered.
+
+Each precondition's disposition line above has been updated from `escalated`
+to `escalated — accepted unmitigated by operator at Task 4`. Neither is
+recorded as `clear` or `remedied` — neither is true.
+
+---
+
+## Summary
 
 | Item | Status |
 |---|---|
@@ -452,9 +524,10 @@ concrete remedy ready to hand to whoever plans 999.27/phase 24.**
 | Local restore rehearsal | ✅ succeeded — tree byte-identical |
 | Remote restore path established | ✅ revert PR, ~2 min (no human-review wait; force-push refused for everyone, no admin override exists) |
 | Worst-case failed-run state documented | ✅ merge commit stays, batch aborts, Ship gate reopens |
-| Precondition A (security artifact) | ⚠ **ESCALATED** — `security_enforcement: true` confirmed; 999.27 has no plan set to check yet |
-| Precondition B (no self-attested Ship claim) | ⚠ **ESCALATED** — same root cause (no plan set yet); remedy named (`--require-shipped` as external_verify) |
-| Phase-numbering wrinkle | ⚠ **Flagged** — `999.27` → inferred `--phase 24`, not yet a confirmed assignment |
+| Precondition A (security artifact) | ⚠ **ESCALATED — ACCEPTED UNMITIGATED** by operator at Task 4 |
+| Precondition B (no self-attested Ship claim) | ⚠ **ESCALATED — ACCEPTED UNMITIGATED** by operator at Task 4; remedy offered, declined |
+| Phase-numbering wrinkle | ⚠ **Flagged** — `999.27` → operator-confirmed `--phase 24`; promotion is an orchestrator-owned inter-wave prerequisite for plan 23-11 |
+| Task 4 authorization | ✅ **PROCEED** — recorded verbatim above |
 
 `git status --porcelain` confirmed empty after this artifact is committed
 (verified below, before the commit that adds this file).
