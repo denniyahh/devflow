@@ -866,6 +866,83 @@ pub(crate) fn gate_respond(
     Ok(())
 }
 
+/// Answer or report every aged, unattended gate across every registered root
+/// (or a single `root`, when given) — the acting half of 23b's bound gate
+/// lifetime. Never signals any process; `Gates::reap` (structurally
+/// incapable of approving, T-23-41) is the ONLY write path, so the sweep's
+/// sole effect on the world is written bytes a live poller was already
+/// watching for.
+///
+/// The default threshold below is a Task-1 placeholder — Task 2 replaces it
+/// with the configurable, fail-safe `config_parse::gate_max_unattended_age_secs()`
+/// (`DEVFLOW_GATE_MAX_UNATTENDED_AGE_SECS`, still six hours by default).
+pub(crate) fn gate_sweep(
+    max_age_secs: Option<u64>,
+    dry_run: bool,
+    root: Option<PathBuf>,
+) -> Result<(), CliError> {
+    const SIX_HOURS: u64 = 6 * 60 * 60;
+    let threshold = max_age_secs.unwrap_or(SIX_HOURS);
+
+    let roots: Vec<PathBuf> = match root {
+        Some(root) => vec![root],
+        None => {
+            registry::prune_missing();
+            registry::load_roots()
+                .into_iter()
+                .map(|r| r.project_root)
+                .collect()
+        }
+    };
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    for project_root in &roots {
+        for gate in Gates::list_open(project_root) {
+            let Ok(ts) = gate.timestamp.parse::<u64>() else {
+                continue;
+            };
+            let age = now.saturating_sub(ts);
+            if age < threshold {
+                continue;
+            }
+            if dry_run {
+                println!(
+                    "would reap phase {} {} (age {age}s) at {}",
+                    gate.phase,
+                    gate.stage,
+                    project_root.display()
+                );
+                continue;
+            }
+            match Gates::reap(
+                project_root,
+                gate.phase,
+                gate.stage,
+                "abort: reaped by devflow gate sweep (unattended gate exceeded max age)",
+                "devflow-reap",
+            ) {
+                Ok(_) => println!(
+                    "reaped phase {} {} (age {age}s) at {}",
+                    gate.phase,
+                    gate.stage,
+                    project_root.display()
+                ),
+                Err(err) => println!(
+                    "skipped phase {} {} at {}: {err}",
+                    gate.phase,
+                    gate.stage,
+                    project_root.display()
+                ),
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Print an open gate's full, untruncated (but sanitized) context — the
 /// discoverability counterpart to `gate_list`'s 100-char table truncation
 /// (21a, D-03). Shares `resolve_single_open_gate_stage` with `gate_respond`
