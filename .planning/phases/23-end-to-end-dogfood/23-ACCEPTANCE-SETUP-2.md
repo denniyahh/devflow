@@ -694,5 +694,224 @@ targets (local filesystem paths, not the public repo account name).
 
 ## Task 3 — Authorization
 
-*(recorded by the continuation agent once the operator responds to the
-checkpoint)*
+**Authorized against:** `origin/develop` SHA `0dad20d3e85d82d60235b8f91cb944e4cbed433c`
+(the same SHA Task 1 and Task 2 measured — re-fetched and re-confirmed
+unchanged immediately before recording this section: `git rev-parse
+origin/develop` = `0dad20d3e85d82d60235b8f91cb944e4cbed433c`, `git rev-parse
+develop` = `0dad20d3e85d82d60235b8f91cb944e4cbed433c`, `git status --porcelain`
+empty).
+
+**Date:** 2026-07-26.
+
+**Selection: `proceed`.**
+
+**This checkpoint is the one-way gate for 23-15's run and is not a
+re-decision of D-07.** D-07's risk acceptance is settled in `23-CONTEXT.md`,
+recorded as `PROCEED` in `23-ACCEPTANCE-SETUP.md` Task 4, and `ROADMAP.md`'s
+2026-07-26 gap-closure decision — *"the gap plan should ship the guard **and**
+re-run the acceptance attempt against Phase 24"* — stands as the standing
+authorization for the retry itself. What this checkpoint authorizes is
+narrower: launch now, against this tree (`0dad20d`) and this binary
+(`b5db079a…6dc98`), at this moment.
+
+### The operator's response, verbatim, across three exchanges
+
+**Exchange 1 — authorization selection:**
+
+> proceed, but with a different version prediction
+
+**Exchange 2 — when asked for the version, challenging the orchestrator's
+analysis:**
+
+> I have no idea where you're coming up with 1.11 from, that's totally
+> nonsensical. We're currently at 1.8.1. Maybe these changes merit a bump to
+> 1.8.2.
+
+**Exchange 3 — after being shown the `compute_version` evidence below and
+re-asked whether to proceed knowing `VersionBump` will likely write
+~1.11.339 and tag it on `develop` rather than 1.8.2:**
+
+> Proceed — the bad version IS the finding
+
+**Recorded selection: PROCEED.**
+**Recorded predicted version: `1.8.2`.**
+
+The operator's prediction (`1.8.2`) is recorded as given, with informed
+acceptance that the actual result is expected to differ from it — the
+mismatch itself is the accepted finding, not a surprise to be discovered
+post-run. 23-15 compares the actual result against `1.8.2`, not against the
+orchestrator's own `1.11.x` estimate below; the estimate exists only so the
+comparison in 23-15 is against a stated pre-run expectation rather than a
+number invented after the fact.
+
+### Pre-run finding: `compute_version` will not produce `1.8.2`
+
+**Re-verified directly against source and against this repository's actual
+git history before recording it here — not copied from the orchestrator's
+finding on trust.**
+
+`devflow_core::version::compute_version`
+(`crates/devflow-core/src/version.rs:142-150`) composes the version from
+three independently-measured sources and never reads `CHANGELOG.md`:
+
+```
+pub fn compute_version(project_root: &Path) -> Result<Version, VersionError> {
+    let major = match detect_version_file(project_root) {
+        Some(path) => read_major_version(&path)?,
+        None => 0,
+    };
+    let minor = count_git_tags(project_root)?;
+    let patch = commits_since_last_minor_tag(project_root)?;
+    ...
+}
+```
+
+**Major** — `read_major_version(Cargo.toml)`:
+
+```
+$ rg '^version' Cargo.toml
+version = "1.8.1"
+```
+
+→ major = `1`.
+
+**Minor** — `count_git_tags()` (`version.rs:90-106`) runs plain `git tag`
+with **no semver filter at all** and counts every line:
+
+```
+$ git tag -l | sort -V
+archive-planning-docs-2026-07-24
+v1.0.1
+v1.2.0
+v1.3.0
+v1.3.69
+v1.4.0
+v1.5.0
+v1.6.0
+v1.7.0
+v1.8.0
+v1.8.1
+$ git tag -l | wc -l
+11
+```
+
+→ minor = `11`, one of the eleven being the non-version tag
+`archive-planning-docs-2026-07-24`.
+
+**Patch** — `commits_since_last_minor_tag()` (`version.rs:110-138`) shells to
+`git describe --tags --abbrev=0` with no ref argument (so it describes
+whatever is checked out when `VersionBump` runs — `develop`, post-merge) and
+counts `rev-list --count <that tag>..HEAD`:
+
+```
+$ git describe --tags --abbrev=0 origin/develop
+v1.4.0
+$ git rev-list --count v1.4.0..origin/develop
+338
+```
+
+→ patch = `338` as of this measurement (`origin/develop` at `0dad20d`); this
+will grow with whatever commits the Phase 24 run itself adds before
+`VersionBump` executes.
+
+⇒ **computed version on `develop` right now ≈ `1.11.338`**, growing to
+`1.11.339`+ once the run's own commits land. This is a defect in the release
+machinery — a formula collision between "count of all tags" (used as minor)
+and "distance from the tag `git describe` happens to pick" (used as patch),
+neither of which tracks semver intent — surfaced by this dogfood run, not
+fixed by it.
+
+**Root cause, corrected from the orchestrator's stated explanation — this is
+the one place my own re-verification diverges from the finding as handed to
+me.** The finding attributed `git describe`'s choice of `v1.4.0` (instead of
+the much newer `v1.8.1`) to *"git's default `--candidates=10` limit,
+exceeded at 11 tags."* I tested that claim directly and it does not hold:
+
+```
+$ git describe --tags --abbrev=0 --candidates=20 origin/develop
+v1.4.0
+$ git describe --tags --abbrev=0 --candidates=50 origin/develop
+v1.4.0
+$ git describe --tags --abbrev=0 --debug origin/develop
+describe origin/develop
+No exact match on refs or tags, searching to describe
+finished search at 4320d90bfdc2881d9161ec9dbee491b6c2fbcadb
+ annotated        338 v1.4.0
+ annotated        463 v1.3.0
+ annotated        656 v1.8.1
+ annotated        657 v1.8.0
+ annotated        658 v1.7.0
+ annotated        659 v1.6.0
+ annotated        661 v1.5.0
+ lightweight      663 v1.3.69
+traversed 667 commits
+v1.4.0
+```
+
+Raising `--candidates` to 20 and 50 changes nothing, and `--debug` shows the
+search visits all eight tags reachable from `origin/develop` well within any
+candidate cap — the limit is never hit. `git describe` picks the tag with
+the **fewest** commits between the tag and `HEAD` among all candidates it
+finds, and that number is genuinely smaller for `v1.4.0` (338) than for
+`v1.8.1` (656):
+
+```
+$ git merge-base --is-ancestor v1.4.0 v1.8.1; echo "exit: $?"
+exit: 1
+```
+
+`v1.4.0` is **not** an ancestor of `v1.8.1` — the two tags sit on divergent
+lineages. `git log --graph` shows why: this repository's release flow tags
+each release on a squash-merged commit that lands on `main`, then a
+`merge: sync main back into develop after release` commit folds it back into
+`develop` with `-X ours`. `v1.4.0` was tagged directly on a `develop`-side
+commit (`chore(release): v1.4.0`, in the left-hand chain), while `v1.5.0`
+through `v1.8.1` each sit on the `main`-side chain of a sync-merge pair. That
+topology makes `git describe`'s tag-to-`HEAD` distance metric — which is not
+simple chronological or version order, but the count of commits reachable
+from `HEAD` that are not reachable from the candidate tag — genuinely
+smaller for the older, develop-side tag than for the newer, main-side ones.
+
+**Corrected root cause: not a candidate-count truncation, but the interaction
+between `git describe`'s nearest-tag-by-commit-distance heuristic and this
+repository's main/develop sync-merge topology**, which lets an older tag
+register as "nearer" than a newer one. The empirical prediction
+(`v1.4.0`, patch `338`, computed version `≈1.11.338`) is unchanged and
+independently confirmed by direct re-measurement above; only the *mechanism*
+the orchestrator offered for it is corrected here, per this task's own
+instruction to re-verify rather than copy findings on trust.
+
+**Also recorded, re-verified against `CHANGELOG.md` and `Cargo.toml`
+directly:**
+
+- The minor-from-tag-count scheme was internally consistent through `v1.8.0`
+  — eight version tags existed before it was cut (`v1.0.1`, `v1.2.0`,
+  `v1.3.0`, `v1.3.69`, `v1.4.0`, `v1.5.0`, `v1.6.0`, `v1.7.0`), giving
+  minor = 8 at that point. `v1.8.1` breaks the pattern: a ninth tag
+  (`v1.8.0` itself) existed by then, which the formula would render as
+  `1.9.x`, not `1.8.1` — consistent with `1.8.1` having been hand-set rather
+  than formula-derived, in keeping with this project's manual release
+  process.
+- `CHANGELOG.md:3` stages `## 2.0.0 — 2026-07-26` as the next entry, which
+  `VersionBump` cannot reach at all while `Cargo.toml` reads a `1.x` major —
+  `compute_version`'s major component comes only from the version file, never
+  from `CHANGELOG.md`.
+- `ChangelogAppend` runs after `VersionBump` in `hooks_after_ship()`'s
+  fail-fast batch and is documented to describe the version `VersionBump`
+  actually wrote — so the changelog entry the run produces will describe
+  `~1.11.339`, not `2.0.0` and not the operator's predicted `1.8.2`.
+
+**This is a defect in the release machinery, surfaced by the dogfood run,
+not fixed by it.** `compute_version` is not modified by this plan or by any
+plan in this phase — the operator was shown this evidence before authorizing
+and chose to proceed specifically so the run would expose it in an
+unattended trace, per Exchange 3 above. Fixing `compute_version` is out of
+this plan's scope and is explicitly deferred, to be filed as a backlog item
+once 23-15's run confirms the mismatch in practice.
+
+### What this section does not do
+
+It does not re-litigate D-07, HOLD, or RETARGET — `proceed` was the selected
+option, recorded verbatim above. It does not modify `compute_version`,
+`Cargo.toml`, `CHANGELOG.md`, or any source file — this artifact is the only
+change this task makes. `develop` is not touched by this task.
