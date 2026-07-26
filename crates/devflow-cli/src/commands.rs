@@ -2954,6 +2954,64 @@ mod tests {
         assert!(banner.contains("ESCALATED"));
     }
 
+    /// 23-03 Task 3: a gate whose age has crossed the escalation threshold
+    /// renders with a trailing urgency marker.
+    #[test]
+    fn render_gate_age_marks_escalated_gate_urgent() {
+        let now = 10_000u64;
+        let old_timestamp = (now - GATE_ESCALATION_THRESHOLD_SECS - 60).to_string();
+
+        let age = render_gate_age(&old_timestamp, now);
+
+        assert!(
+            age.ends_with('!'),
+            "an escalated gate's age must carry a trailing urgency marker, got {age:?}"
+        );
+    }
+
+    /// A gate younger than the escalation threshold renders with an age and
+    /// no urgency marker.
+    #[test]
+    fn render_gate_age_no_marker_for_fresh_gate() {
+        let now = 10_000u64;
+        let fresh_timestamp = (now - 30).to_string();
+
+        let age = render_gate_age(&fresh_timestamp, now);
+
+        assert!(
+            !age.ends_with('!'),
+            "a fresh gate must not carry an urgency marker, got {age:?}"
+        );
+    }
+
+    /// A `timestamp` that does not parse as `u64` must render an unknown
+    /// age (`?`) rather than panicking or being silently dropped — the
+    /// forensics record shows dropping unusual rows is exactly how the
+    /// orphan population stayed invisible.
+    #[test]
+    fn render_gate_age_unknown_for_non_numeric_timestamp() {
+        let age = render_gate_age("not-a-number", 10_000);
+        assert_eq!(age, "?");
+    }
+
+    /// The `--all-roots` row-rendering must still include a gate whose
+    /// timestamp is non-numeric — the row is present in the output, just
+    /// with an unknown age, matching the acceptance criterion literally.
+    #[test]
+    fn all_roots_row_includes_gate_with_non_numeric_timestamp() {
+        let gate = OpenGate {
+            phase: 42,
+            stage: Stage::Ship,
+            context: "ctx".to_string(),
+            timestamp: "not-a-number".to_string(),
+        };
+
+        let row = render_all_roots_gate_row(Path::new("/tmp/some-root"), &gate, 10_000);
+
+        assert!(row.contains("42"), "row must still name the phase: {row}");
+        assert!(row.contains('?'), "row must render the unknown age: {row}");
+    }
+
     /// 21a: `recovery_hints` returns a `resume` hint for a stuck phase,
     /// additionally an `advance` hint when the phase is gate-pending
     /// (answer the gate, then advance), and nothing for a non-stuck phase.

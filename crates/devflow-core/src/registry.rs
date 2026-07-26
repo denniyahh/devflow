@@ -447,6 +447,61 @@ mod tests {
     }
 
     #[test]
+    fn deregister_in_removes_matching_pair_and_leaves_sibling_phase_intact() {
+        let cache = tempfile::tempdir().unwrap();
+        let root = PathBuf::from("/tmp/project-dereg-phase");
+        register_in(cache.path(), &root, 1).unwrap();
+        register_in(cache.path(), &root, 2).unwrap();
+
+        deregister_in(cache.path(), &root, 1).unwrap();
+
+        let roots = load_roots_in(cache.path());
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].phase, 2);
+    }
+
+    /// Deregistration must be scoped to one root as well as one phase —
+    /// deleting `rootA`'s entry must never touch `rootB`'s.
+    #[test]
+    fn deregister_in_is_scoped_to_one_root_and_leaves_sibling_root_intact() {
+        let cache = tempfile::tempdir().unwrap();
+        let root_a = PathBuf::from("/tmp/project-dereg-root-a");
+        let root_b = PathBuf::from("/tmp/project-dereg-root-b");
+        register_in(cache.path(), &root_a, 1).unwrap();
+        register_in(cache.path(), &root_b, 1).unwrap();
+
+        deregister_in(cache.path(), &root_a, 1).unwrap();
+
+        let roots = load_roots_in(cache.path());
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].project_root, root_b);
+    }
+
+    #[test]
+    fn deregister_in_on_never_registered_pair_is_a_noop() {
+        let cache = tempfile::tempdir().unwrap();
+        let root = PathBuf::from("/tmp/project-never-registered");
+
+        deregister_in(cache.path(), &root, 1).unwrap();
+
+        assert!(load_roots_in(cache.path()).is_empty());
+    }
+
+    /// `deregister_in` treats a missing file as success — calling it twice
+    /// (the second time on an already-removed entry) must not error.
+    #[test]
+    fn deregister_in_is_idempotent_when_entry_already_removed() {
+        let cache = tempfile::tempdir().unwrap();
+        let root = PathBuf::from("/tmp/project-dereg-idempotent");
+        register_in(cache.path(), &root, 1).unwrap();
+
+        deregister_in(cache.path(), &root, 1).unwrap();
+        deregister_in(cache.path(), &root, 1).unwrap();
+
+        assert!(load_roots_in(cache.path()).is_empty());
+    }
+
+    #[test]
     fn path_digest_is_stable_and_distinguishes_different_paths() {
         let a = Path::new("/tmp/project-a");
         let b = Path::new("/tmp/project-b");
