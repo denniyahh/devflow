@@ -50,20 +50,6 @@ pub fn spawn_monitor(
     spawn_monitor_inner(state, program, args, envs, true)
 }
 
-/// Spawn a monitor that owns the agent and records its capture files but does
-/// NOT advance the stage machine when the agent exits. Used by `sequentagent`,
-/// which drives its own synchronous handoff loop: the CLI blocks on the exit
-/// file (see [`wait_for_agent_exit`]) while the monitor guarantees capture
-/// survives even if the CLI dies.
-pub fn spawn_monitor_no_advance(
-    state: &State,
-    program: &str,
-    args: &[String],
-    envs: &[(String, String)],
-) -> Result<u32, MonitorError> {
-    spawn_monitor_inner(state, program, args, envs, false)
-}
-
 fn spawn_monitor_inner(
     state: &State,
     program: &str,
@@ -195,42 +181,6 @@ pub fn wait_for_agent_pid(project_root: &Path, phase: u32) -> Option<u32> {
     }
     debug!("agent PID not found for phase {phase} after polling");
     None
-}
-
-/// Block until the monitor records the agent's exit code, returning it.
-///
-/// Used by callers that need a synchronous run on top of monitor-owned
-/// execution (sequentagent's rebase handoff). Polls the exit file; if the
-/// monitor process disappears without ever writing it (killed, crashed),
-/// returns an error instead of hanging forever. There is deliberately no
-/// time-based cap — agent runs are legitimately long (tens of minutes) and
-/// monitor liveness is the meaningful bound.
-pub fn wait_for_agent_exit(
-    project_root: &Path,
-    phase: u32,
-    monitor_pid: u32,
-) -> Result<i32, MonitorError> {
-    let exit_path = crate::agent_result::exit_code_path(project_root, phase);
-    loop {
-        if let Ok(contents) = std::fs::read_to_string(&exit_path)
-            && let Ok(code) = contents.trim().parse::<i32>()
-        {
-            return Ok(code);
-        }
-        if !crate::agent::agent_running(monitor_pid) {
-            // One final read: the monitor may have written the file and
-            // exited between our read above and the liveness check.
-            if let Ok(contents) = std::fs::read_to_string(&exit_path)
-                && let Ok(code) = contents.trim().parse::<i32>()
-            {
-                return Ok(code);
-            }
-            return Err(MonitorError::Io(std::io::Error::other(format!(
-                "monitor (pid {monitor_pid}) exited without recording an exit code for phase {phase}"
-            ))));
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
 }
 
 /// Escape a string for safe use in a single-quoted shell context.
@@ -379,39 +329,6 @@ mod tests {
             !still_running,
             "agent (pid {agent_pid}) was orphaned — still running after monitor SIGTERM"
         );
-    }
-
-    /// 14b: sequentagent's synchronous handoff = no-advance monitor + a
-    /// blocking wait on the exit file. The monitor still owns capture; the
-    /// caller gets the real exit code back.
-    #[test]
-    fn no_advance_monitor_plus_wait_returns_exit_code_and_captures() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = state_in(dir.path());
-        let args = vec!["-c".to_string(), "echo SEQ_READY; exit 3".to_string()];
-
-        let monitor_pid = spawn_monitor_no_advance(&state, "sh", &args, &[]).unwrap();
-        let code = wait_for_agent_exit(dir.path(), state.phase, monitor_pid)
-            .expect("exit code must be reaped");
-
-        assert_eq!(code, 3);
-        let captured =
-            std::fs::read_to_string(crate::agent_result::stdout_path(dir.path(), state.phase))
-                .unwrap_or_default();
-        assert!(
-            captured.contains("SEQ_READY"),
-            "stdout captured: {captured:?}"
-        );
-    }
-
-    /// A dead monitor that never wrote the exit file must yield an error, not
-    /// an infinite hang.
-    #[test]
-    fn wait_for_agent_exit_errors_when_monitor_is_gone() {
-        let dir = tempfile::tempdir().unwrap();
-        // PID that is essentially certain not to be alive; no exit file.
-        let err = wait_for_agent_exit(dir.path(), 4, 0x7FFF_FFFE).unwrap_err();
-        assert!(err.to_string().contains("without recording an exit code"));
     }
 
     #[test]

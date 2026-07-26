@@ -241,11 +241,8 @@ cron, no scheduler, no agent cooperation. `spawn_monitor()` spawns a
 
 Because the monitor outlives the `devflow start`/`devflow advance`
 invocation that spawned it, agent stdout keeps flowing into the capture
-file and the exit code is still reaped after the CLI process returns. A
-second entry point, `spawn_monitor_no_advance()`, spawns the same
-capture-owning child but skips step 3, for a caller that wants to block on
-the agent's exit synchronously instead of letting the monitor advance the
-stage machine itself.
+file and the exit code is still reaped after the CLI process returns.
+`spawn_monitor()` is the single way an agent process is spawned (23d).
 
 ## Worktree model
 
@@ -265,8 +262,7 @@ backs:
   `.worktrees/reference/`.
 
 Branch integration uses `GitFlow::ensure_branch()` (create at a start point
-without checking out) and `fast_forward_branch()` (move a ref forward only
-if it is a descendant — refuses non-fast-forward updates).
+without checking out).
 
 ## Git and ship model
 
