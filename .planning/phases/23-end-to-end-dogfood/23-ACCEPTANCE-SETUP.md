@@ -348,4 +348,113 @@ that regardless). The recovery ref's role is to give the operator (or a
 future audit) an unambiguous, remotely-verified answer to "what did `develop`
 look like immediately before this run" — not to be reset onto directly.
 
-<!-- gsd:write-continue -->
+---
+
+## Task 3 — The two content preconditions
+
+**Both preconditions are ESCALATED, not clear, and not silently remedied.**
+The plan's own two named checks are checks "about the target phase's own plan
+set," and 999.27 currently has **zero plans** (`ROADMAP.md`: "**Plans:** 0
+plans", "`[ ] TBD (promote with /gsd-review-backlog when ready)`"). An absent
+plan set is not the same as a plan set that was checked and came back clean —
+recording either precondition as "clear" here would be exactly the false-green
+class this phase exists to close. Both are reported below with what a
+resolution would require, so the operator can weigh them at Task 4 rather than
+discover them mid-run.
+
+### Precondition A — the security artifact
+
+**Files read:**
+- `.planning/config.json` (read directly by this task, not taken on
+  `23-RESEARCH.md`'s word)
+- `~/.claude/gsd-core/workflows/ship.md` (the actual enforcement mechanism —
+  see finding below)
+- `crates/` workspace source (`rg -rn 'security_enforcement|SECURITY.md' crates/`
+  — **zero matches**; the check is not implemented in DevFlow's own Rust
+  source at all)
+- ROADMAP.md's entry for backlog `999.27` (no plan files exist yet to inspect)
+
+**Exact finding, `.planning/config.json` quoted directly:**
+```json
+"workflow": {
+  "security_enforcement": true,
+  "security_asvs_level": 1,
+  "security_block_on": "high"
+}
+```
+**`security_enforcement` IS `true`** in this repository — confirmed by direct
+reading, not inferred. `23-RESEARCH.md`'s Assumption A1 (that no override
+exists) is confirmed correct.
+
+**This means preflight WILL demand a security artifact.** The check itself
+lives outside DevFlow's Rust source, in the `/gsd-ship` slash-command
+workflow (`~/.claude/gsd-core/workflows/ship.md:89-107`): it resolves the
+`ship:pre` capability-registry hook, and if an active entry exists with
+`capId == "security"` and `blocking == true`, it requires
+`<phase-dir>/*-SECURITY.md` to exist with frontmatter `threats_open == 0`
+before shipping — exactly the wall `23-PROBE-FINDINGS.md` recorded one probe
+hitting.
+
+**Whether 999.27's own future plan set will produce this artifact cannot be
+checked today, because that plan set does not exist.** Corroborating context
+in the operator's favor: every phase in this project's recent history (18
+through 22, and every plan-10 predecessor in phase 23) has produced a
+`NN-SECURITY.md` as a routine part of its own execution — the mechanism
+appears to fire automatically once a phase has threat-model content in its
+plans, not as an opt-in step planners must remember. But 999.27 is explicitly
+scoped as a small, S-sized, single-branch fix; it is not verified today
+whether the Define/Plan stages for a phase this small will produce
+`threat_model` content substantial enough to trigger the same security-audit
+step, or whether a minimal plan could reach Ship with no `*-SECURITY.md` ever
+written. **Disposition: escalated.** Remedies available at Task 4: (1) accept
+the risk that the run may hit this wall exactly as the recorded probe did,
+relying on the never-silent gate to surface it as an actionable Ship-stage
+gate rather than a silent failure; or (2) require, as an explicit condition of
+`proceed`, that 999.27's own Plan stage include a `<threat_model>` block
+substantial enough to produce a `*-SECURITY.md` (i.e. treat this as a planning
+constraint communicated to the run, not a code change made here).
+
+### Precondition B — no Ship-completion claim at Validate
+
+**Files read:**
+- ROADMAP.md's entry for backlog `999.27` (the only existing text describing
+  this phase's scope — no `must_haves` or acceptance-criteria block exists
+  because no `PLAN.md`/`SPEC.md` has been written)
+- `23-06-SUMMARY.md` (the oracle this precondition's remedy would use)
+
+**Exact finding:** there is no target-phase `must_haves` truth or acceptance
+criterion to quote, because none has been written yet — 999.27 has 0 plans.
+**Disposition: escalated**, for the identical reason as Precondition A: the
+check the plan specifies is a check against files that do not exist.
+
+**Remedy the plan itself names, available to propose (not applied here,
+unilaterally, since this task has no authority to write 999.27's plan):**
+declare `devflow evidence --phase 24 --require-shipped` (or whatever numeric
+phase 999.27 is actually promoted to — see the numbering wrinkle above) as
+999.27's `external_verify` probe when it is planned. This makes the
+"did Ship actually complete" question checked by code (plan 23-06's oracle,
+exit-code-stable) rather than by a Validate-stage review that may or may not
+notice a self-attested Ship claim — closing the exact false-green class the
+other recorded probe run hit. **Disposition: escalated, with a named,
+concrete remedy ready to hand to whoever plans 999.27/phase 24.**
+
+---
+
+## Summary for Task 4
+
+| Item | Status |
+|---|---|
+| Rebuild + binary-on-PATH proof | ✅ done — hash-verified, symlink-resolved |
+| Seven behavioral checks | ✅ all seven answered correctly |
+| Pre-run workspace gate chain | ✅ green — 592 passed / 0 failed, clippy clean, fmt clean |
+| Pre-run baseline pair | ✅ recorded — 592 (current) / 9 (23-08's deliberate removal, already reflected) |
+| Recovery ref created + pushed + read back | ✅ `recovery/pre-23-11-acceptance-e0f87c2` @ `e0f87c2` |
+| Local restore rehearsal | ✅ succeeded — tree byte-identical |
+| Remote restore path established | ✅ revert PR, ~2 min (no human-review wait; force-push refused for everyone, no admin override exists) |
+| Worst-case failed-run state documented | ✅ merge commit stays, batch aborts, Ship gate reopens |
+| Precondition A (security artifact) | ⚠ **ESCALATED** — `security_enforcement: true` confirmed; 999.27 has no plan set to check yet |
+| Precondition B (no self-attested Ship claim) | ⚠ **ESCALATED** — same root cause (no plan set yet); remedy named (`--require-shipped` as external_verify) |
+| Phase-numbering wrinkle | ⚠ **Flagged** — `999.27` → inferred `--phase 24`, not yet a confirmed assignment |
+
+`git status --porcelain` confirmed empty after this artifact is committed
+(verified below, before the commit that adds this file).
