@@ -166,9 +166,8 @@ reclaim if the recorded PID is dead):
   `devflow parallel`'s sibling phases.
 - **Project-wide checkout lock** (`.devflow/lock-project`,
   `lock::acquire_project_blocking`) — a coarse, seconds-scale lock that
-  serializes mutations of the shared primary checkout (hook batches,
-  `sequentagent`'s branch integration) across concurrently finishing
-  phases. It must never be held across a gate wait; on timeout
+  serializes mutations of the shared primary checkout (hook batches) across
+  concurrently finishing phases. It must never be held across a gate wait; on timeout
   (`DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS`, default 120s) the hook batch is
   **skipped** (loudly, via `events.jsonl`) rather than ever run
   unserialized.
@@ -244,8 +243,9 @@ Because the monitor outlives the `devflow start`/`devflow advance`
 invocation that spawned it, agent stdout keeps flowing into the capture
 file and the exit code is still reaped after the CLI process returns. A
 second entry point, `spawn_monitor_no_advance()`, spawns the same
-capture-owning child but skips step 3 — used by `sequentagent`, which
-drives its own synchronous handoff loop instead.
+capture-owning child but skips step 3, for a caller that wants to block on
+the agent's exit synchronously instead of letting the monitor advance the
+stage machine itself.
 
 ## Worktree model
 
@@ -261,8 +261,6 @@ backs:
 - `start` (default) — run a single phase in its own worktree;
   `--no-worktree` runs directly in the primary checkout instead.
 - `parallel` — run multiple phases concurrently, each in its own worktree.
-- `sequentagent` — run two agents in sequence on one phase, each in its own
-  worktree, rebasing the second onto the first's integrated branch.
 - `reference` — create or refresh a static snapshot worktree at
   `.worktrees/reference/`.
 

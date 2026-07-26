@@ -158,7 +158,8 @@ fn all_seven_devflow_constructors_produce_the_gitignore() {
     {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let instructions = ship::build_cron_instructions(root, 1, "2026-01-01T00:00:00Z", "claude");
+        let instructions =
+            ship::build_single_agent_cron_instructions(root, 1, "2026-01-01T00:00:00Z");
         ship::write_cron_instructions(root, &instructions).expect("write_cron_instructions");
         if !gitignore_is_star(root) {
             failures.push("ship::write_cron_instructions (ship.rs)");
