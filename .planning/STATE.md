@@ -4,17 +4,17 @@ milestone: v2.0.0
 milestone_name: milestone (open — no fixed closing phase)
 current_phase: 23
 current_phase_name: end-to-end-dogfood
-status: "Ready to execute — Phase 23 gap closure planned (23-12…23-15, waves 9-12). Closes the one gap in 23-VERIFICATION.md (failed truth 8, the behavioral acceptance criterion): ship the devflow start reachability guard as code, then retry the acceptance run against Phase 24. The retry's merge precondition is already satisfied — Phase 23 reached develop via PR #31 (06824c2)."
+status: executing
 stopped_at: Planned 23-12…23-15 (gap closure) — 15/15 plans exist, 11 executed, 4 ready
-last_updated: "2026-07-26T20:07:30.000Z"
+last_updated: "2026-07-26T20:31:42.669Z"
 last_activity: 2026-07-26
-last_activity_desc: "/gsd-plan-phase 23 --gaps: 4 gap-closure plans created (23-12 guard, 23-13 merge+rebuild proof, 23-14 precondition re-measure + one-way launch decision, 23-15 acceptance retry); plan-checker VERIFICATION PASSED on iteration 1; decision coverage 13/13"
+last_activity_desc: Phase 23 execution started
 progress:
   total_phases: 13
-  completed_phases: 12
-  total_plans: 87
+  completed_phases: 11
+  total_plans: 91
   completed_plans: 87
-  percent: 92
+  percent: 85
 ---
 
 # DevFlow — Project State
@@ -86,11 +86,11 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 23 (end-to-end-dogfood) — 15 plans; 11 executed, 4 planned and ready (gap closure)
-Plan: 11 of 15
-Status: Ready to execute the gap closure. `23-VERIFICATION.md` scored 7/8 — every code-shaped unit (23a–23e, `yes-ship`) VERIFIED, and one gap: truth 8, the behavioral acceptance criterion. `/gsd-plan-phase 23 --gaps` produced four sequential plans against it. `23-12` ships the third precondition as code — a `PhaseReachability` probe in `preflight.rs` that refuses before `devflow start` forks its worktree when the target phase is absent from the base branch — per the operator-confirmed ROADMAP decision that this be a guard, not a checklist item. `23-13` merges it behind a blocking operator checkpoint and proves the shipped binary refuses. `23-14` re-measures every precondition on the post-merge tree and takes the one-way launch decision. `23-15` retries the acceptance run against Phase 24, claimable only on a `workflow_shipped` event plus `devflow evidence --phase 24 --require-shipped` exiting 0 — `workflow_finished` is explicitly not sufficient.
+Phase: 23 (end-to-end-dogfood) — EXECUTING
+Plan: 1 of 15
+Status: Executing Phase 23
 The gap's first `missing:` item is already satisfied and is not re-done: Phase 23 reached `develop` via PR #31 (`06824c2`), and Phase 24's ROADMAP entry and `.planning/phases/24-*/` directory are both now reachable from `origin/develop` — the exact absence that killed the 23-11 run.
-Last activity: 2026-07-26 — /gsd-plan-phase 23 --gaps: 4 gap-closure plans created and committed; plan-checker returned VERIFICATION PASSED on the first iteration; decision coverage gate 13/13
+Last activity: 2026-07-26 — Phase 23 execution started
 
 **Note on the "Plan: 2 of 11" value this replaces:** `gsd-tools state advance-plan` only increments whatever value is already in this field; it was last set to "Plan: 1 of 11" before phase 23's first plan ever executed and was never updated across the parallel-worktree waves (23-01 through 23-09), since worktree executors deliberately do not touch STATE.md. This executor is the first sequential (main-tree) executor in phase 23 and corrected the field directly to match reality (10 of 11 plans complete) rather than trust the tool's naive +1 increment from a stale base.
 

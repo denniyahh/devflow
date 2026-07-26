@@ -882,7 +882,7 @@ Plans carry the unit identifiers `23a`, `23b`, `23c`, `23d`, `23e` and
 `yes-ship` as requirement tokens. **`23b` and `23c` were redefined, and `23e`
 added, by the 2026-07-25 replan** — see "Re-aimed 2026-07-25" below.
 **Depends on:** Phase 22
-**Plans:** 15 plans — 11/11 original plans executed; **23-12 … 23-15 are the
+**Plans:** 12/15 plans executed
 gap-closure set** (planned 2026-07-26 from `23-VERIFICATION.md`'s single
 recorded gap), unstarted
 2026-07-25; the original 23-03…23-12 are archived under
@@ -1105,7 +1105,7 @@ Plans:
 - [x] 23-09-PLAN.md — `--yes-ship`: per-run flag, one auto-answered Ship gate
 - [x] 23-10-PLAN.md — Acceptance prep: target selection, rehearsed recovery point, preconditions, then one-way authorization
 - [x] 23-11-PLAN.md — Acceptance run: one phase Define→Ship, unattended, self-hosted
-- [ ] 23-12-PLAN.md — 23f: the `devflow start` reachability guard — refuse before scaffolding when the phase is not on the base branch
+- [x] 23-12-PLAN.md — 23f: the `devflow start` reachability guard — refuse before scaffolding when the phase is not on the base branch
 - [ ] 23-13-PLAN.md — 23f: merge the guard to `develop` (operator checkpoint), rebuild, prove at runtime the binary carries it
 - [ ] 23-14-PLAN.md — Acceptance preconditions re-measured on the post-merge tree, fresh recovery ref, one-way launch decision
 - [ ] 23-15-PLAN.md — Acceptance retry: one phase Define→completed Ship, unattended, judged only by `workflow_shipped` + `--require-shipped`
