@@ -24,7 +24,7 @@ use devflow_core::agent_result;
 use devflow_core::agents;
 use devflow_core::config::{DEVELOP, FEATURE_PREFIX, MAIN};
 use devflow_core::events;
-use devflow_core::gates::{GateAction, GateResponse, Gates, OpenGate};
+use devflow_core::gates::{GateAction, GateError, GateResponse, Gates, OpenGate};
 use devflow_core::git::GitFlow;
 use devflow_core::history;
 use devflow_core::lock;
@@ -1001,10 +1001,15 @@ pub(crate) fn stop(project_root: &Path, phase: u32) -> Result<(), CliError> {
 /// The primary path: answer `phase`'s open gate with a rejection whose note
 /// contains the abort keyword, so `GateAction::from_response` resolves to
 /// `GateAction::Abort` rather than `LoopBack(Code)` — looping back would
-/// relaunch an agent on a phase the operator just asked to stop. Returns
-/// `Ok(true)` when a gate was found and reaped, telling the caller not to
-/// fall through to [`stop_via_lock`]; `Ok(false)` when there is no open
-/// gate for `phase` at all, which is the signal to fall through.
+/// relaunch an agent on a phase the operator just asked to stop.
+///
+/// Returns `Ok(true)` when a gate was found and handled — either reaped
+/// here, or discovered already answered by a race — telling the caller not
+/// to fall through to [`stop_via_lock`]. Returns `Ok(false)` when there is
+/// no open gate for `phase` at all, including the race where `Gates::reap`
+/// reports `NoOpenGate` after this function's own `Gates::list_open` scan
+/// found one; that is the signal to fall through, not an error (cross-AI
+/// review 23-10).
 fn stop_via_gate(project_root: &Path, phase: u32) -> Result<bool, CliError> {
     let Some(gate) = Gates::list_open(project_root)
         .into_iter()
@@ -1012,20 +1017,37 @@ fn stop_via_gate(project_root: &Path, phase: u32) -> Result<bool, CliError> {
     else {
         return Ok(false);
     };
-    let path = Gates::reap(
+    match Gates::reap(
         project_root,
         phase,
         gate.stage,
         "abort: stopped by `devflow stop`",
         "devflow-stop",
-    )?;
-    println!(
-        "stop: wrote a rejection for phase {phase} {} at {} — the process waiting on it \
-         will pick this up on its next poll, within the 60s backoff cap",
-        gate.stage,
-        path.display()
-    );
-    Ok(true)
+    ) {
+        Ok(path) => {
+            println!(
+                "stop: wrote a rejection for phase {phase} {} at {} — the process waiting \
+                 on it will pick this up on its next poll, within the 60s backoff cap",
+                gate.stage,
+                path.display()
+            );
+            Ok(true)
+        }
+        // A human, `--yes-ship`, or `devflow gate sweep` already answered
+        // this gate between our `list_open` scan and this `reap` call. The
+        // phase is already ending — that is success, not a failure to
+        // report.
+        Err(GateError::AlreadyResponded { .. }) => {
+            println!(
+                "stop: phase {phase} {} already has a response awaiting pickup — the phase \
+                 is already ending",
+                gate.stage
+            );
+            Ok(true)
+        }
+        Err(GateError::NoOpenGate { .. }) => Ok(false),
+        Err(err) => Err(err.into()),
+    }
 }
 
 /// The fallback: signal the process recorded in `phase`'s per-phase lock
@@ -1072,9 +1094,18 @@ fn stop_via_lock(project_root: &Path, phase: u32) -> Result<(), CliError> {
 /// any earlier reason (e.g. a prior `--until` halt) by appending rather
 /// than overwriting. Never touches `stop_until` — that field means
 /// something different (the requested halt stage for `devflow start
-/// --until`) and `transition()` reads it.
+/// --until`) and `transition()` reads it. A phase with no persisted state
+/// at all — never started, or already cleared by a completed abort — is
+/// already stopped; that is success, not an error.
 fn persist_stopped_state(project_root: &Path, phase: u32) -> Result<(), CliError> {
-    let mut state = workflow::load_state(project_root, phase)?;
+    let mut state = match workflow::load_state(project_root, phase) {
+        Ok(state) => state,
+        Err(workflow::WorkflowError::MissingState(_)) => {
+            println!("stop: no persisted state for phase {phase} — already stopped");
+            return Ok(());
+        }
+        Err(err) => return Err(err.into()),
+    };
     state.stopped = true;
     let reason = "stopped via `devflow stop`".to_string();
     state.stop_reason = Some(match state.stop_reason.take() {
@@ -3234,6 +3265,16 @@ mod tests {
             "stop must succeed — a recorded monitor_pid alone must never be signalled or \
              treated as a blocker",
         );
+    }
+
+    /// Task 3 behavior: no open gate, no lock file, and no persisted state
+    /// at all — a phase that was never started — is a successful no-op.
+    #[test]
+    fn stop_is_a_success_no_op_with_no_gate_and_no_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        stop(root, 201).expect("stop against nothing present must succeed");
     }
 
     /// 14-CR-03: a capture file SHORTER than the follower's offset means the

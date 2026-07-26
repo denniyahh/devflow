@@ -10,7 +10,7 @@
 //! `gate_sweep_e2e.rs`) — this drives the real compiled binary via
 //! `Command::new`, not an in-process call.
 
-use devflow_core::gates::Gates;
+use devflow_core::gates::{GateResponse, Gates};
 use devflow_core::mode::Mode;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
@@ -321,5 +321,200 @@ fn stop_help_documents_phase_flag() {
     assert!(
         stdout.contains("--phase"),
         "--help missing --phase:\n{stdout}"
+    );
+}
+
+/// Task 3 behavior: stop run twice against the same gated phase both return
+/// success, and the second run does not modify the response file the first
+/// one wrote.
+#[test]
+fn stop_is_idempotent_against_an_already_answered_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let phase = 99;
+
+    Gates::write_gate(root, phase, Stage::Ship, "approve merge?").unwrap();
+    let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+    devflow_core::workflow::save_state(&state).unwrap();
+
+    let run_stop = || {
+        Command::new(devflow_bin())
+            .args(["stop", "--phase", &phase.to_string(), "--root"])
+            .arg(root)
+            .output()
+            .expect("run devflow stop")
+    };
+
+    let first = run_stop();
+    assert!(
+        first.status.success(),
+        "first stop failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let response_path = Gates::response_path(root, phase, Stage::Ship);
+    let first_bytes =
+        std::fs::read(&response_path).expect("response file must exist after first stop");
+
+    let second = run_stop();
+    assert!(
+        second.status.success(),
+        "second stop failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second_bytes = std::fs::read(&response_path).expect("response file must still exist");
+    assert_eq!(
+        first_bytes, second_bytes,
+        "the second stop must not modify the response file the first one wrote"
+    );
+}
+
+/// Task 3 behavior: a response written by hand before `stop` ever runs (a
+/// human beat the operator to it) must survive byte-identical — `stop` is a
+/// success no-op here, not a clobber.
+#[test]
+fn stop_against_a_hand_written_response_is_a_success_no_op() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let phase = 100;
+
+    Gates::write_gate(root, phase, Stage::Ship, "approve merge?").unwrap();
+    Gates::respond(
+        root,
+        phase,
+        Stage::Ship,
+        &GateResponse {
+            approved: false,
+            note: Some("hand-written rejection".into()),
+            responded_by: Some("human".into()),
+        },
+    )
+    .unwrap();
+    let response_path = Gates::response_path(root, phase, Stage::Ship);
+    let before = std::fs::read(&response_path).unwrap();
+
+    let output = Command::new(devflow_bin())
+        .args(["stop", "--phase", &phase.to_string(), "--root"])
+        .arg(root)
+        .output()
+        .expect("run devflow stop");
+    assert!(
+        output.status.success(),
+        "devflow stop failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let after = std::fs::read(&response_path).unwrap();
+    assert_eq!(
+        before, after,
+        "stop must not clobber an existing hand-written response"
+    );
+}
+
+/// Task 3 behavior: a root with no persisted state at all — a phase that
+/// was never started, or whose state was already cleared — is a success,
+/// not an error.
+#[test]
+fn stop_against_a_root_with_no_state_is_a_success() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let phase = 101;
+
+    let output = Command::new(devflow_bin())
+        .args(["stop", "--phase", &phase.to_string(), "--root"])
+        .arg(root)
+        .output()
+        .expect("run devflow stop");
+    assert!(
+        output.status.success(),
+        "stop against a root with no state must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Task 3's composition proof (23-CONTEXT.md's Integration Points, T-23-54):
+/// stop makes a phase not-live; `cleanup`'s existing `stopped && !force`
+/// refusal (20c/CR-02) must still decline it, and `cleanup --force` must
+/// then succeed — the two verbs compose in that order, and `cleanup`'s
+/// fail-closed guarantee is provably unweakened by this plan.
+#[test]
+fn stop_then_cleanup_composes_refuse_then_force() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let phase = 102;
+
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "devflow@example.com"]);
+    git(root, &["config", "user.name", "DevFlow Tests"]);
+    git(root, &["config", "commit.gpgsign", "false"]);
+    git(root, &["config", "core.hooksPath", "/dev/null"]);
+    git(root, &["checkout", "-q", "-b", "develop"]);
+    std::fs::write(root.join("README.md"), "base\n").unwrap();
+    git(root, &["add", "README.md"]);
+    git(root, &["commit", "-q", "-m", "base"]);
+
+    let branch = format!("feature/phase-{phase:02}");
+    git(root, &["checkout", "-q", "-b", &branch]);
+    std::fs::write(root.join("work.txt"), "agent work\n").unwrap();
+    git(root, &["add", "work.txt"]);
+    git(root, &["commit", "-q", "-m", "agent work"]);
+    git(root, &["checkout", "-q", "develop"]);
+
+    let wt_path = root.join(".worktrees").join(format!("phase-{phase:02}"));
+    devflow_core::worktree::add(root, &wt_path, &branch, &branch, false).unwrap();
+
+    let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+    state.worktree_path = Some(wt_path.clone());
+    devflow_core::workflow::save_state(&state).unwrap();
+
+    // No open gate, no lock — the lock-holder fallback is a no-op, and the
+    // only observable effect of this stop is state.stopped/stop_reason.
+    let stopped = Command::new(devflow_bin())
+        .args(["stop", "--phase", &phase.to_string(), "--root"])
+        .arg(root)
+        .output()
+        .expect("run devflow stop");
+    assert!(
+        stopped.status.success(),
+        "devflow stop failed: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    let stopped_state = devflow_core::workflow::load_state(root, phase).unwrap();
+    assert!(
+        stopped_state.stopped,
+        "stop must have marked the phase stopped before the composition check runs"
+    );
+
+    // cleanup without --force must still decline — the fail-closed
+    // guarantee this plan's design depends on and does not weaken.
+    let refused = Command::new(devflow_bin())
+        .args(["cleanup"])
+        .arg(root)
+        .output()
+        .expect("run devflow cleanup");
+    assert!(
+        refused.status.success(),
+        "cleanup on a stopped phase must not error, only skip: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(
+        wt_path.is_dir(),
+        "cleanup without --force must not remove a stop-marked phase's worktree"
+    );
+
+    // cleanup --force is the documented escape hatch — the two verbs
+    // compose in that order.
+    let forced = Command::new(devflow_bin())
+        .args(["cleanup", "--force"])
+        .arg(root)
+        .output()
+        .expect("run devflow cleanup --force");
+    assert!(
+        forced.status.success(),
+        "cleanup --force must succeed: {}",
+        String::from_utf8_lossy(&forced.stderr)
+    );
+    assert!(
+        !wt_path.is_dir(),
+        "cleanup --force must remove the worktree after stop"
     );
 }
