@@ -97,6 +97,7 @@ only because a stage failed unexpectedly).
 | `DEVFLOW_EXTERNAL_VERIFY_ENABLED` | true | Enable PLAN-declared external post-condition probes; overrides `devflow.toml` |
 | `RUST_LOG` | `info` | Log verbosity (stderr) |
 | `DEVFLOW_LOG_FORMAT` | plain | `json` for machine-readable log lines |
+| `DEVFLOW_E2E_CHILD_TIMEOUT_SECS` | 90 | Test-only: bounds `gate_sweep_e2e.rs`'s patience with a spawned `devflow advance` child so CI cannot hang indefinitely; not read by any production code path |
 
 ## `.devflow/` file inventory
 
