@@ -94,21 +94,99 @@ fn path_digest(path: &Path) -> u64 {
 }
 
 /// Register `(project_root, phase)` into the machine-global registry under
-/// `cache_dir`. Pure with respect to env. Creates the roots directory if
-/// absent and writes only this registration's own file — there is no load
-/// step, no merge step, and no rewrite of any other entry. Re-registering
-/// the same pair simply overwrites its own file with a fresh
-/// `registered_at`.
+/// `cache_dir`. Pure with respect to env. Creates the cache directory and
+/// the roots directory if absent (both private, mode `0o700` — T-23-33)
+/// and writes only this registration's own file, atomically — there is no
+/// load step, no merge step, and no rewrite of any other entry.
+/// Re-registering the same pair simply overwrites its own file with a
+/// fresh `registered_at`.
+///
+/// Atomicity here protects against a torn READ of one entry (two
+/// concurrent registrations of the SAME pair both complete and
+/// `load_roots_in` sees exactly one, valid file). It is not the mitigation
+/// for a lost update — the per-file shape has no read-modify-write step to
+/// lose one in, so two concurrent registrations of DIFFERENT pairs both
+/// survive by construction, not by locking.
 pub fn register_in(cache_dir: &Path, project_root: &Path, phase: u32) -> Result<(), RegistryError> {
+    ensure_private_dir(cache_dir)?;
     let dir = roots_dir_in(cache_dir);
-    std::fs::create_dir_all(&dir)?;
+    ensure_private_dir(&dir)?;
     let entry = RegisteredRoot {
         project_root: project_root.to_path_buf(),
         phase,
         registered_at: unix_now(),
     };
     let path = entry_path_in(cache_dir, project_root, phase);
-    std::fs::write(&path, serde_json::to_string_pretty(&entry)?)?;
+    write_atomic(&path, &serde_json::to_string_pretty(&entry)?)?;
+    Ok(())
+}
+
+/// Remove the entry file for every registered root whose `project_root` no
+/// longer exists on disk, plus every entry file that cannot be parsed at
+/// all (so unreadable files cannot accumulate forever), returning the
+/// number of files removed. Removal is per-file `remove_file`; there is no
+/// rewrite of surviving entries, so pruning cannot disturb a registration
+/// written concurrently with it. Deliberately NOT called from
+/// [`load_roots_in`] — that must stay side-effect-free so a read-only
+/// command cannot mutate machine state; callers invoke this explicitly.
+pub fn prune_missing_in(cache_dir: &Path) -> usize {
+    let mut removed = 0;
+    let dir = roots_dir_in(cache_dir);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.ends_with(".json") {
+            continue;
+        }
+        let path = entry.path();
+        let root_still_exists = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|contents| serde_json::from_str::<RegisteredRoot>(&contents).ok())
+            .is_some_and(|root| root.project_root.is_dir());
+        if !root_still_exists && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// [`prune_missing_in`] against the resolved machine-global cache dir. `0`
+/// when [`cache_dir`] resolves to `None`.
+pub fn prune_missing() -> usize {
+    let Some(dir) = cache_dir() else {
+        return 0;
+    };
+    prune_missing_in(&dir)
+}
+
+/// Create `dir` if absent and set its mode to `0o700` — the registry names
+/// every project this user is currently running, which is information
+/// disclosure on a shared host (T-23-33). Same rationale D-09 recorded for
+/// the socket directory, reused here for a plain directory of files.
+fn ensure_private_dir(dir: &Path) -> Result<(), RegistryError> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+/// Write `contents` to `path` atomically: write a uniquely-named temp file
+/// in the same directory, then `rename` over the target so a reader never
+/// observes a partial file. The temp name is unique per call (process id +
+/// a monotonic counter), unlike `gates.rs::write_atomic`'s fixed `.tmp`
+/// suffix — that shape is safe there because writers to one gate file are
+/// serialized elsewhere, but registry entries have no such lock, and two
+/// concurrent writers to the SAME entry sharing one temp path could tear
+/// each other's in-flight write.
+fn write_atomic(path: &Path, contents: &str) -> Result<(), RegistryError> {
+    static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp.{}.{n}", std::process::id()));
+    std::fs::write(&tmp, contents)?;
+    std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
@@ -312,19 +390,21 @@ mod tests {
 
         register_in(&cache_path, &root, 1).unwrap();
 
-        let cache_mode = std::fs::metadata(&cache_path)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(cache_mode, 0o700, "cache dir must be created with mode 0700");
+        let cache_mode = std::fs::metadata(&cache_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            cache_mode, 0o700,
+            "cache dir must be created with mode 0700"
+        );
 
         let roots_mode = std::fs::metadata(roots_dir_in(&cache_path))
             .unwrap()
             .permissions()
             .mode()
             & 0o777;
-        assert_eq!(roots_mode, 0o700, "roots dir must be created with mode 0700");
+        assert_eq!(
+            roots_mode, 0o700,
+            "roots dir must be created with mode 0700"
+        );
     }
 
     #[test]
