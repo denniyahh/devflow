@@ -103,7 +103,22 @@ pub(crate) fn parallel(
     for (phase, agent) in pairs {
         println!("\n=== phase {phase} ({agent}) ===");
         // Worktree mode keeps each run isolated so the phases run together.
-        start(project_root, phase, agent, mode, force, true, false, None)?;
+        // `devflow parallel` has no `--yes-ship` flag of its own (D-05: the
+        // pre-authorization must be typed per invocation on `devflow
+        // start`), so every phase it launches keeps the routine gated Ship
+        // behavior — `false` here changes nothing about `parallel`'s
+        // existing behavior.
+        start(
+            project_root,
+            phase,
+            agent,
+            mode,
+            force,
+            true,
+            false,
+            None,
+            false,
+        )?;
     }
     Ok(())
 }

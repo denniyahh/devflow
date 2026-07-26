@@ -75,6 +75,16 @@ enum Command {
         /// stops there.
         #[arg(long)]
         until: Option<Stage>,
+        /// Pre-authorize the Ship gate so this run can reach a completed
+        /// Ship stage unattended (D-04/D-05/D-06, 23-09). The Ship gate
+        /// still fires and is still answered through the normal gate
+        /// protocol — this only supplies the approval automatically,
+        /// attributed to `--yes-ship` in the gate ledger. Must be typed on
+        /// every invocation: it cannot be set in `devflow.toml` or any
+        /// environment variable (D-05), so an unattended auto-merge can
+        /// never become a standing, silent default.
+        #[arg(long)]
+        yes_ship: bool,
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
@@ -435,6 +445,7 @@ fn run() -> Result<(), CliError> {
             no_worktree,
             dry_run,
             until,
+            yes_ship,
             project,
         } => {
             // Worktree is now the default; the deprecated `--worktree` flag is
@@ -462,6 +473,7 @@ fn run() -> Result<(), CliError> {
                 worktree,
                 dry_run,
                 until,
+                yes_ship,
             )
         }
         Command::Advance { project, phase } => advance(&project_root(project)?, phase),

@@ -116,9 +116,15 @@ pub(crate) fn start(
     worktree: bool,
     dry_run: bool,
     until: Option<Stage>,
+    yes_ship: bool,
 ) -> Result<(), CliError> {
     let mut state = State::new(phase, agent, mode, project_root.to_path_buf());
     state.stop_until = until;
+    // The only assignment in the crate that ever sets `yes_ship` to a
+    // non-default value — from the parsed `--yes-ship` CLI flag, before the
+    // first `save_state` below, so the persisted authorization exists before
+    // the detached monitor that will later consult it is ever spawned.
+    state.yes_ship = yes_ship;
 
     if dry_run {
         print_dry_run(&state);

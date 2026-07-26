@@ -87,6 +87,18 @@ pub struct State {
     /// when `stopped` is `false`, or when the state predates this field.
     #[serde(default)]
     pub stop_reason: Option<String>,
+    /// Pre-authorization for the Ship gate (D-04/D-05/D-06, 23-09),
+    /// set only from the `--yes-ship` CLI flag typed on `devflow start`.
+    ///
+    /// Persisted rather than passed through the call stack: the Ship gate
+    /// fires inside a detached monitor's `advance` process, minutes to
+    /// hours after the launching `devflow start` process has already
+    /// exited, so a CLI-scoped value would be gone by the time it matters —
+    /// only a value written to `state.json` at start time survives to be
+    /// read back by that later, separate process. `false` for any state
+    /// written by a binary predating this field.
+    #[serde(default)]
+    pub yes_ship: bool,
 }
 
 /// Supported coding agents.
@@ -149,6 +161,7 @@ impl State {
             stop_until: None,
             stopped: false,
             stop_reason: None,
+            yes_ship: false,
         }
     }
 }
@@ -214,6 +227,7 @@ mod tests {
         assert_eq!(state.stop_until, None);
         assert!(!state.stopped);
         assert_eq!(state.stop_reason, None);
+        assert!(!state.yes_ship);
     }
 
     #[test]
@@ -342,6 +356,40 @@ mod tests {
         }"#;
         let loaded: State = serde_json::from_str(json).unwrap();
         assert_eq!(loaded.monitor_pid, None);
+    }
+
+    /// 23-09 Task 1: `yes_ship` round-trips through serde as an exact `bool`
+    /// — its own key appears in the persisted JSON, and a fresh deserialize
+    /// recovers the value set, mirroring the `monitor_pid` pair above.
+    #[test]
+    fn yes_ship_round_trips_through_serde() {
+        let mut state = State::new(1, AgentKind::Claude, Mode::Auto, PathBuf::from("/repo"));
+        state.yes_ship = true;
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(
+            json.contains("yes_ship"),
+            "yes_ship must appear in persisted JSON"
+        );
+        let loaded: State = serde_json::from_str(&json).unwrap();
+        assert!(loaded.yes_ship, "yes_ship must round-trip through serde");
+    }
+
+    /// A serde-absent `yes_ship` (state written by a pre-23-09 binary) must
+    /// deserialize to `false`, not fail to deserialize — the same
+    /// backward-compat pattern as every other `#[serde(default)]` field
+    /// added since 17-01.
+    #[test]
+    fn yes_ship_absent_from_json_defaults_to_false() {
+        let json = r#"{
+            "stage": "code",
+            "phase": 1,
+            "agent": "claude",
+            "mode": "auto",
+            "started_at": "0",
+            "project_root": "/repo"
+        }"#;
+        let loaded: State = serde_json::from_str(json).unwrap();
+        assert!(!loaded.yes_ship);
     }
 
     /// 20c: `stop_until`/`stopped`/`stop_reason` all round-trip through
