@@ -25,7 +25,7 @@ use parallel::{parallel, sequentagent};
 mod commands;
 use commands::{
     cleanup, doctor, gate_list, gate_respond, gate_show, gate_sweep, history_cmd, list, logs,
-    recover_cmd, reference, release_check, resolve_gate_target, start, status, test_cmd,
+    recover_cmd, reference, release_check, resolve_gate_target, start, status, stop, test_cmd,
 };
 
 mod config_parse;
@@ -268,6 +268,22 @@ enum Command {
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
+    },
+    /// End a running phase cleanly (23c): answers its open gate with a
+    /// rejection if one is open — the target unwinds through its own abort
+    /// path, no signal sent — otherwise signals the process recorded in its
+    /// per-phase lock file (`.devflow/lock-{phase:02}`), never
+    /// `state.monitor_pid` (the PID `devflow status` displays, and the
+    /// wrong one — see `commands::stop`'s doc comment). Idempotent: safe to
+    /// run against an already-stopped, never-started, or already-dead
+    /// phase.
+    Stop {
+        /// Phase to stop.
+        #[arg(long)]
+        phase: u32,
+        /// Project root. Defaults to the current directory.
+        #[arg(long)]
+        root: Option<PathBuf>,
     },
 }
 
@@ -547,6 +563,10 @@ fn run() -> Result<(), CliError> {
             force,
             project,
         } => ship_override(&project_root(project)?, phase, force),
+        Command::Stop { phase, root } => stop(
+            &project_root(root.unwrap_or_else(|| PathBuf::from(".")))?,
+            phase,
+        ),
     }
 }
 
