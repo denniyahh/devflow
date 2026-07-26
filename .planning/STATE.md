@@ -5,15 +5,15 @@ milestone_name: milestone (open — no fixed closing phase)
 current_phase: 23
 current_phase_name: end-to-end-dogfood
 status: executing
-stopped_at: Planned 23-12…23-15 (gap closure) — 15/15 plans exist, 11 executed, 4 ready
-last_updated: "2026-07-26T20:31:42.669Z"
+stopped_at: Completed 23-13-PLAN.md
+last_updated: "2026-07-26T21:16:00.201Z"
 last_activity: 2026-07-26
 last_activity_desc: Phase 23 execution started
 progress:
   total_phases: 13
   completed_phases: 11
   total_plans: 91
-  completed_plans: 87
+  completed_plans: 89
   percent: 85
 ---
 
@@ -87,14 +87,14 @@ change earns 2.0.
 ## Current Position
 
 Phase: 23 (end-to-end-dogfood) — EXECUTING
-Plan: 1 of 15
+Plan: 13 of 15
 Status: Executing Phase 23
-The gap's first `missing:` item is already satisfied and is not re-done: Phase 23 reached `develop` via PR #31 (`06824c2`), and Phase 24's ROADMAP entry and `.planning/phases/24-*/` directory are both now reachable from `origin/develop` — the exact absence that killed the 23-11 run.
-Last activity: 2026-07-26 — Phase 23 execution started
+23-13 complete: guard (23-12) merged to `origin/develop` via PR #32 (operator merge, `0dad20d`), binary rebuilt from the merged tip and proven at runtime to refuse an unreachable phase, phase 24 confirmed reachable from `origin/develop`. Load-bearing finding recorded, not fixed here: local `develop` on this machine is 0 ahead / 120 behind `origin/develop`, and `commands.rs:146` resolves the guard against the local ref — 23-14 must re-verify (and if needed fast-forward) before the acceptance launch.
+Last activity: 2026-07-26 — 23-13 executed (Task 2 artifact write + Task 3, continuation agent)
 
-**Note on the "Plan: 2 of 11" value this replaces:** `gsd-tools state advance-plan` only increments whatever value is already in this field; it was last set to "Plan: 1 of 11" before phase 23's first plan ever executed and was never updated across the parallel-worktree waves (23-01 through 23-09), since worktree executors deliberately do not touch STATE.md. This executor is the first sequential (main-tree) executor in phase 23 and corrected the field directly to match reality (10 of 11 plans complete) rather than trust the tool's naive +1 increment from a stale base.
+**Note on the "Plan: 2 of 15" value this replaces:** `gsd-tools state advance-plan` only increments whatever value is already in this field, which had drifted to "2 of 15" (the parallel-worktree waves 23-01…23-09 deliberately never touch STATE.md, and this field was last corrected against reality at "10 of 11 plans complete" before the plan count grew to 15 with the gap-closure plans 23-12…23-15). Corrected directly to "13 of 15" to match reality (23-12 and 23-13 both now executed) rather than trust the tool's naive +1 increment from a stale base.
 
-Progress: [███████░░░] 73% (11 of 15 plans executed; 23-12…23-15 are the gap closure)
+Progress: [██████████] 98% (13 of 15 plans executed; 23-14…23-15 remain)
 
 *(Machine-readable fields for `gsd-tools state begin-phase` / `advance-plan` —
 this project historically tracked position only in the narrative "Active
@@ -680,6 +680,8 @@ None currently open for Phase 17.
 - [Phase 23]: 23-10: the real develop restore mechanism is a GitHub ruleset (develop-merge-or-squash, required_approving_review_count: 0), not the classic branch-protection API (which reported a contradictory value of 1) — determined by cross-checking against this repo's own PR history rather than trusting the first API response; force-push is refused categorically (no bypass_actors, current_user_can_bypass: never), real undo is a revert PR measured at ~2 minutes.
 - [Phase 23]: Acceptance run (23-11): record valid, acceptance FAILED — target Phase 24 unreachable from develop at launch (orchestrator sequencing gap, not a DevFlow defect); recovery point not needed/not used
 - [Phase 23]: Third precondition class named for future acceptance attempts: verify target phase ROADMAP entry is reachable from develop itself before devflow start, not just from the executing branch
+- [Phase ?]: 23-13: Local develop is 0 ahead/120 behind origin/develop and is the ref commands.rs:146 actually consults for the reachability guard; fast-forward remedy named but deliberately deferred to 23-14 to preserve the evidence its re-measurement step is designed to catch.
+- [Phase ?]: 23-13: Guard (23-12) merged to origin/develop via PR #32 (operator-performed, commit 0dad20d), rebuild proven diff-empty against origin/develop, binary refusal of an unreachable phase demonstrated at runtime in a throwaway clone (exit 1, 'is not reachable from'), phase 24 confirmed reachable from origin/develop.
 
 ## Roadmap Evolution
 
@@ -747,9 +749,10 @@ None currently open for Phase 17.
 | Phase 19 P08 | 37min | 3 tasks | 5 files |
 | Phase 23 P10 | ~65min (across 2 checkpoints) | 4 tasks | 1 files |
 | Phase 23 P11 | 42min | 3 tasks | 2 files |
+| Phase 23 P13 | 18min | 3 tasks | 1 files |
 
 ## Session
 
-**Last session:** 2026-07-26T13:07:22.541Z
-**Stopped at:** Completed 23-11-PLAN.md — acceptance run executed, record valid, acceptance FAILED (target unreachable from develop); phase behavioral criterion not met, retry needs Phase 23 merged to develop first
+**Last session:** 2026-07-26T21:16:00.157Z
+**Stopped at:** Completed 23-13-PLAN.md
 **Resume file:** None
