@@ -740,7 +740,7 @@ Plans carry the unit identifiers `23a`, `23b`, `23c`, `23d`, `23e` and
 `yes-ship` as requirement tokens. **`23b` and `23c` were redefined, and `23e`
 added, by the 2026-07-25 replan** — see "Re-aimed 2026-07-25" below.
 **Depends on:** Phase 22
-**Plans:** 9/11 plans executed
+**Plans:** 10/11 plans executed
 2026-07-25; the original 23-03…23-12 are archived under
 `phases/23-end-to-end-dogfood/superseded/`)
 
@@ -921,7 +921,7 @@ Plans:
 - [x] 23-07-PLAN.md — 23d: delete the two-agent verb from the CLI crate + reconcile docs
 - [x] 23-08-PLAN.md — 23d: delete the core-side surface, workspace count to zero
 - [x] 23-09-PLAN.md — `--yes-ship`: per-run flag, one auto-answered Ship gate
-- [ ] 23-10-PLAN.md — Acceptance prep: target selection, rehearsed recovery point, preconditions, then one-way authorization
+- [x] 23-10-PLAN.md — Acceptance prep: target selection, rehearsed recovery point, preconditions, then one-way authorization
 - [ ] 23-11-PLAN.md — Acceptance run: one phase Define→Ship, unattended, self-hosted
 
 *(The original 23-03…23-12 are archived under `superseded/` — see the re-aim
@@ -963,7 +963,7 @@ unchanged and already merged.)*
 
 **Wave 7** *(blocked on 23-08 and 23-09)*
 
-- [ ] 23-10 — Acceptance prep: target selection, seven behavioural checks, rehearsed recovery point, content preconditions, then the D-07 one-way authorization (all units)
+- [x] 23-10 — Acceptance prep: target selection, seven behavioural checks, rehearsed recovery point, content preconditions, then the D-07 one-way authorization (all units) — operator authorized PROCEED against backlog 999.27 (-> phase 24), both content preconditions accepted unmitigated. Orchestrator must promote 999.27 to phase 24 in this file before dispatching 23-11.
 
 **Wave 8** *(blocked on 23-10)*
 

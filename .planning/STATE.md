@@ -5,16 +5,16 @@ milestone_name: milestone (open — no fixed closing phase)
 current_phase: 23
 current_phase_name: end-to-end-dogfood
 status: executing
-stopped_at: Phase 23 context gathered
-last_updated: "2026-07-26T01:06:05.886Z"
-last_activity: 2026-07-25
-last_activity_desc: Phase 23 execution started
+stopped_at: Completed 23-10-PLAN.md — acceptance setup + operator authorization recorded; orchestrator must promote backlog 999.27 to phase 24 before dispatching plan 23-11
+last_updated: "2026-07-26T12:14:56.875Z"
+last_activity: 2026-07-26
+last_activity_desc: "plan 23-10 complete: rebuild proof, 7 behavioral checks, recovery point (recovery/pre-23-11-acceptance-e0f87c2) pushed+rehearsed, real remote restore path determined, operator authorized PROCEED against phase 24 with both content preconditions accepted unmitigated"
 progress:
   total_phases: 12
   completed_phases: 11
   total_plans: 87
-  completed_plans: 78
-  percent: 90
+  completed_plans: 86
+  percent: 92
 ---
 
 # DevFlow — Project State
@@ -87,11 +87,13 @@ change earns 2.0.
 ## Current Position
 
 Phase: 23 (end-to-end-dogfood) — EXECUTING
-Plan: 1 of 11
-Status: Executing Phase 23
-Last activity: 2026-07-25 — Phase 23 execution started
+Plan: 11 of 11
+Status: Executing Phase 23 — plan 23-10 complete (acceptance setup + operator authorization recorded); orchestrator must promote backlog 999.27 to phase 24 in ROADMAP.md before plan 23-11 dispatches
+Last activity: 2026-07-26 — plan 23-10 complete: rebuild proof, 7 behavioral checks, recovery point (recovery/pre-23-11-acceptance-e0f87c2) pushed+rehearsed, real remote restore path determined, operator authorized PROCEED against phase 24 with both content preconditions accepted unmitigated
 
-Progress: Phases 21 (v1.8.0) and 22 (v1.8.1) shipped. Phase 22's missing SUMMARY/VERIFICATION artifacts backfilled 2026-07-25 (`9eb4010`), clearing a false "incomplete phase" route in /gsd-progress. Phase 23 rescoped from "Test Suite & CI Hardening" to the end-to-end Claude dogfood goal; acceptance is behavioural — one phase driven start-to-finish by devflow, unattended, reaching a completed Ship stage.
+**Note on the "Plan: 2 of 11" value this replaces:** `gsd-tools state advance-plan` only increments whatever value is already in this field; it was last set to "Plan: 1 of 11" before phase 23's first plan ever executed and was never updated across the parallel-worktree waves (23-01 through 23-09), since worktree executors deliberately do not touch STATE.md. This executor is the first sequential (main-tree) executor in phase 23 and corrected the field directly to match reality (10 of 11 plans complete) rather than trust the tool's naive +1 increment from a stale base.
+
+Progress: [██████████] 99%
 
 *(Machine-readable fields for `gsd-tools state begin-phase` / `advance-plan` —
 this project historically tracked position only in the narrative "Active
@@ -671,6 +673,8 @@ None currently open for Phase 17.
 - [Phase 19]: 19-05: dogfood checkpoint for 19g approved on combined evidence — an in-session five-diff run (same agent authored and reviewed, so it could not prove isolated wiring by itself) plus an independently-spawned, context-isolated gsd-code-reviewer subagent that caught both anti-pattern shapes cold. Recorded gap for later triage: the isolated reviewer's generic judgment agreed but did not cite the ai-change-acceptance contract by name unless the dispatch explicitly loaded it — review-dispatch prompts should load the skill explicitly, and part of that wiring surface lives outside this repository.
 - [Phase 19]: 19-07: staleness + preflight clusters extracted into staleness.rs/preflight.rs (shakedown run for the mechanical extraction procedure ahead of 19-08/19-09's larger clusters); 438/438 tests unchanged, every moved function diffs clean against the 19-06 baseline SHA modulo pub(crate); preflight <-> pipeline bidirectional call preserved as direct calls, not abstracted. Two findings recorded for 19-08/19-09: a wider-than-estimated pub(crate) surface (worktree_writable_roots, ensure_agent_binary, agent_program, phase_artifact_on_develop all needed it beyond the plan's run_preflight/launch_stage_inner estimate), and a bug in the plan's own literal name-set extraction command (`rg '::tests::' | sed 's/.*::tests:://'` silently drops main.rs's own top-level mod tests entries; corrected to `sed 's/.*:://'`).
 - [Phase 19]: 19-08: pipeline state machine split into pipeline_launch.rs/pipeline_outcomes.rs/pipeline_gate.rs (D-06 seams A/B/C), main.rs down to 3,313 lines from phase-start 8,467; three-way module cycle preserved as direct pub(crate) calls, zero unexplained diffs against baseline
+- [Phase 23]: 23-10 Task 4: operator authorized PROCEED against backlog 999.27 (-> phase 24), accepting both content preconditions (security artifact, no self-attested Ship claim) unmitigated rather than remedied — devflow's Define/Plan stages are designed to author an unplanned target's own plan set, so pre-resolving either precondition would remove the thing the acceptance run tests.
+- [Phase 23]: 23-10: the real develop restore mechanism is a GitHub ruleset (develop-merge-or-squash, required_approving_review_count: 0), not the classic branch-protection API (which reported a contradictory value of 1) — determined by cross-checking against this repo's own PR history rather than trusting the first API response; force-push is refused categorically (no bypass_actors, current_user_can_bypass: never), real undo is a revert PR measured at ~2 minutes.
 
 ## Roadmap Evolution
 
@@ -736,9 +740,10 @@ None currently open for Phase 17.
 | Phase 19 P05 | n/a | 1 tasks | 0 files |
 | Phase 19 P07 | 71min | 2 tasks | 3 files |
 | Phase 19 P08 | 37min | 3 tasks | 5 files |
+| Phase 23 P10 | ~65min (across 2 checkpoints) | 4 tasks | 1 files |
 
 ## Session
 
-**Last session:** 2026-07-25T16:26:45.398Z
-**Stopped at:** Phase 23 context gathered
-**Resume file:** .planning/phases/23-end-to-end-dogfood/23-CONTEXT.md
+**Last session:** 2026-07-26T12:14:56.841Z
+**Stopped at:** Completed 23-10-PLAN.md — acceptance setup + operator authorization recorded; orchestrator must promote backlog 999.27 to phase 24 before dispatching plan 23-11
+**Resume file:** None
