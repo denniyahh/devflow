@@ -162,6 +162,36 @@ pub fn prune_missing() -> usize {
     prune_missing_in(&dir)
 }
 
+/// Remove the entry file for `(project_root, phase)`, if present. With the
+/// per-file storage shape this is a single `remove_file` on
+/// [`entry_path_in`] — no load, no rewrite, and therefore no way to
+/// disturb a sibling entry belonging to another phase or another root. A
+/// missing file (never registered, or already deregistered) is treated as
+/// success rather than an error.
+pub fn deregister_in(
+    cache_dir: &Path,
+    project_root: &Path,
+    phase: u32,
+) -> Result<(), RegistryError> {
+    let path = entry_path_in(cache_dir, project_root, phase);
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// [`deregister_in`] against the resolved machine-global cache dir.
+/// Deregistration is best-effort observability cleanup, so any error
+/// (including [`cache_dir`] resolving to `None`) is swallowed — mirrors
+/// how every call site invokes this with `let _ =`.
+pub fn deregister(project_root: &Path, phase: u32) {
+    let Some(dir) = cache_dir() else {
+        return;
+    };
+    let _ = deregister_in(&dir, project_root, phase);
+}
+
 /// Create `dir` if absent and set its mode to `0o700` — the registry names
 /// every project this user is currently running, which is information
 /// disclosure on a shared host (T-23-33). Same rationale D-09 recorded for
@@ -447,7 +477,7 @@ mod tests {
     }
 
     #[test]
-    fn deregister_in_removes_matching_pair_and_leaves_sibling_phase_intact() {
+    fn dereg_removes_matching_pair_and_leaves_sibling_phase_intact() {
         let cache = tempfile::tempdir().unwrap();
         let root = PathBuf::from("/tmp/project-dereg-phase");
         register_in(cache.path(), &root, 1).unwrap();
@@ -463,7 +493,7 @@ mod tests {
     /// Deregistration must be scoped to one root as well as one phase —
     /// deleting `rootA`'s entry must never touch `rootB`'s.
     #[test]
-    fn deregister_in_is_scoped_to_one_root_and_leaves_sibling_root_intact() {
+    fn dereg_is_scoped_to_one_root_and_leaves_sibling_root_intact() {
         let cache = tempfile::tempdir().unwrap();
         let root_a = PathBuf::from("/tmp/project-dereg-root-a");
         let root_b = PathBuf::from("/tmp/project-dereg-root-b");
@@ -478,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn deregister_in_on_never_registered_pair_is_a_noop() {
+    fn dereg_on_never_registered_pair_is_a_noop() {
         let cache = tempfile::tempdir().unwrap();
         let root = PathBuf::from("/tmp/project-never-registered");
 
@@ -490,7 +520,7 @@ mod tests {
     /// `deregister_in` treats a missing file as success — calling it twice
     /// (the second time on an already-removed entry) must not error.
     #[test]
-    fn deregister_in_is_idempotent_when_entry_already_removed() {
+    fn dereg_is_idempotent_when_entry_already_removed() {
         let cache = tempfile::tempdir().unwrap();
         let root = PathBuf::from("/tmp/project-dereg-idempotent");
         register_in(cache.path(), &root, 1).unwrap();

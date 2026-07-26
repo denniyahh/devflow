@@ -742,19 +742,58 @@ fn gate_list_all_roots() -> Result<(), CliError> {
         println!("no open gates across {} registered root(s)", roots.len());
         return Ok(());
     }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     println!("{:<6} {:<9} {:<9} ROOT / CONTEXT", "PHASE", "STAGE", "AGE");
     for (root, gate) in &rows {
-        let context = render_gate_context(&gate.context, 100);
-        println!(
-            "{:<6} {:<9} {:<9} {}",
-            gate.phase,
-            gate.stage.to_string(),
-            recover::format_age(&gate.timestamp),
-            root.display(),
-        );
-        println!("           {context}");
+        println!("{}", render_all_roots_gate_row(root, gate, now));
     }
     Ok(())
+}
+
+/// Render one `--all-roots` gate row: the PHASE/STAGE/AGE/ROOT line plus a
+/// second, indented context line. Pure given `now` — the same pattern
+/// `render_pending_gate_banner` already uses — so it's unit-testable
+/// without mutating wall-clock time.
+fn render_all_roots_gate_row(root: &Path, gate: &OpenGate, now: u64) -> String {
+    let context = render_gate_context(&gate.context, 100);
+    format!(
+        "{:<6} {:<9} {:<9} {}\n           {context}",
+        gate.phase,
+        gate.stage.to_string(),
+        render_gate_age(&gate.timestamp, now),
+        root.display(),
+    )
+}
+
+/// Render a gate's `timestamp` as a compact age for `--all-roots`, with a
+/// trailing urgency marker once it reaches
+/// [`GATE_ESCALATION_THRESHOLD_SECS`] — reusing the same threshold
+/// `render_pending_gate_banner` escalates on, rather than inventing a
+/// second one. A `timestamp` that does not parse as `u64`, or that is
+/// somehow in the future relative to `now`, renders `?` — the row is still
+/// listed, matching the forensics record that dropping unusual rows is
+/// exactly how the orphan population stayed invisible.
+fn render_gate_age(timestamp: &str, now: u64) -> String {
+    let Ok(ts) = timestamp.parse::<u64>() else {
+        return "?".to_string();
+    };
+    let Some(age) = now.checked_sub(ts) else {
+        return "?".to_string();
+    };
+    let compact = match age {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86400 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86400),
+    };
+    if age >= GATE_ESCALATION_THRESHOLD_SECS {
+        format!("{compact}!")
+    } else {
+        compact
+    }
 }
 
 /// Answer an open gate from the CLI — the dogfood-facing replacement for
