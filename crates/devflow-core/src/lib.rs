@@ -68,6 +68,7 @@ pub mod monitor;
 pub mod outcome_policy;
 pub mod prompt;
 pub mod recover;
+pub mod registry;
 pub mod ship;
 pub mod stage;
 pub mod state;

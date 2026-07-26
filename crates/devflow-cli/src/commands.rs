@@ -28,6 +28,7 @@ use devflow_core::git::GitFlow;
 use devflow_core::history;
 use devflow_core::mode::Mode;
 use devflow_core::recover;
+use devflow_core::registry;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
 use devflow_core::version;
@@ -695,8 +696,15 @@ fn render_pending_gate_banner(open: &[OpenGate], now: u64) -> Option<String> {
     Some(banner)
 }
 
-/// List every gate awaiting a human response.
-pub(crate) fn gate_list(project_root: &Path) -> Result<(), CliError> {
+/// List every gate awaiting a human response. When `all_roots` is set,
+/// answers "what is gated on this machine?" across every root this machine
+/// has registered (`registry::load_roots`) in one invocation, with a
+/// leading ROOT column and a per-gate age; behaviour is otherwise
+/// byte-identical to the single-root listing (23-03).
+pub(crate) fn gate_list(project_root: &Path, all_roots: bool) -> Result<(), CliError> {
+    if all_roots {
+        return gate_list_all_roots();
+    }
     let open = Gates::list_open(project_root);
     if open.is_empty() {
         println!("no open gates");
@@ -716,6 +724,36 @@ pub(crate) fn gate_list(project_root: &Path) -> Result<(), CliError> {
         "\nanswer with: devflow gate approve <phase> [--note ...] | \
          devflow gate reject <phase> --note ... (note with \"abort\" ends the phase)"
     );
+    Ok(())
+}
+
+/// The `--all-roots` half of [`gate_list`]: fan out `Gates::list_open`
+/// across every registered root and render an additional leading ROOT
+/// column. A registered root with no open gates simply contributes no rows.
+fn gate_list_all_roots() -> Result<(), CliError> {
+    let roots = registry::load_roots();
+    let mut rows: Vec<(PathBuf, OpenGate)> = Vec::new();
+    for root in &roots {
+        for gate in Gates::list_open(&root.project_root) {
+            rows.push((root.project_root.clone(), gate));
+        }
+    }
+    if rows.is_empty() {
+        println!("no open gates across {} registered root(s)", roots.len());
+        return Ok(());
+    }
+    println!("{:<6} {:<9} {:<9} ROOT / CONTEXT", "PHASE", "STAGE", "AGE");
+    for (root, gate) in &rows {
+        let context = render_gate_context(&gate.context, 100);
+        println!(
+            "{:<6} {:<9} {:<9} {}",
+            gate.phase,
+            gate.stage.to_string(),
+            recover::format_age(&gate.timestamp),
+            root.display(),
+        );
+        println!("           {context}");
+    }
     Ok(())
 }
 
