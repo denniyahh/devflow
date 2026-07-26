@@ -27,6 +27,7 @@ use devflow_core::events;
 use devflow_core::gates::{GateAction, GateResponse, Gates, OpenGate};
 use devflow_core::git::GitFlow;
 use devflow_core::history;
+use devflow_core::lock;
 use devflow_core::mode::Mode;
 use devflow_core::recover;
 use devflow_core::registry;
@@ -984,25 +985,32 @@ pub(crate) fn gate_sweep(
 /// with no remedy but `kill(1)`. Answers `phase`'s open gate if it has one —
 /// the primary path, since it is the only one that produces a clean final
 /// state: the target unwinds through its own `abort()` and releases its
-/// lock. (The signalling fallback for a phase with no open gate lands in
-/// 23-05 Task 2.)
+/// lock; otherwise signals the process recorded in `phase`'s per-phase lock
+/// file (never `state.monitor_pid` — T-23-51: the monitor shell script's
+/// `trap` closure only ever captures the **agent's** pid, never the
+/// trailing `advance` invocation, so by the time `advance` is the shell's
+/// foreground child, `monitor_pid` already names a process that exited long
+/// ago; `lock::holder`'s recorded pid is the only correct target).
 pub(crate) fn stop(project_root: &Path, phase: u32) -> Result<(), CliError> {
-    stop_via_gate(project_root, phase)?;
+    if !stop_via_gate(project_root, phase)? {
+        stop_via_lock(project_root, phase)?;
+    }
     persist_stopped_state(project_root, phase)
 }
 
 /// The primary path: answer `phase`'s open gate with a rejection whose note
 /// contains the abort keyword, so `GateAction::from_response` resolves to
 /// `GateAction::Abort` rather than `LoopBack(Code)` — looping back would
-/// relaunch an agent on a phase the operator just asked to stop. A no-op
-/// when there is no open gate for `phase` at all — Task 2 adds the
-/// lock-holder fallback for that case.
-fn stop_via_gate(project_root: &Path, phase: u32) -> Result<(), CliError> {
+/// relaunch an agent on a phase the operator just asked to stop. Returns
+/// `Ok(true)` when a gate was found and reaped, telling the caller not to
+/// fall through to [`stop_via_lock`]; `Ok(false)` when there is no open
+/// gate for `phase` at all, which is the signal to fall through.
+fn stop_via_gate(project_root: &Path, phase: u32) -> Result<bool, CliError> {
     let Some(gate) = Gates::list_open(project_root)
         .into_iter()
         .find(|g| g.phase == phase)
     else {
-        return Ok(());
+        return Ok(false);
     };
     let path = Gates::reap(
         project_root,
@@ -1017,6 +1025,46 @@ fn stop_via_gate(project_root: &Path, phase: u32) -> Result<(), CliError> {
         gate.stage,
         path.display()
     );
+    Ok(true)
+}
+
+/// The fallback: signal the process recorded in `phase`'s per-phase lock
+/// file — the process actually running `advance()` and holding the lock
+/// across the gate wait. Fail-closed on identity (T-23-52): a live pid that
+/// does not look like a devflow process is refused, not signalled, since
+/// the lock may be stale with a recycled pid. Never reads
+/// `state.monitor_pid` — see [`stop`]'s doc comment.
+fn stop_via_lock(project_root: &Path, phase: u32) -> Result<(), CliError> {
+    let Some((pid_str, _path)) = lock::holder(project_root, phase) else {
+        println!("stop: no lock held for phase {phase} — nothing is running `advance()`");
+        return Ok(());
+    };
+    let Ok(pid) = pid_str.parse::<u32>() else {
+        println!(
+            "stop: phase {phase}'s lock file holds a corrupt pid ({pid_str}) — treating it \
+             as stale"
+        );
+        return Ok(());
+    };
+    if !agent::agent_running(pid) {
+        println!(
+            "stop: phase {phase}'s lock names pid {pid}, which is not alive — stale lock, \
+             nothing to signal"
+        );
+        return Ok(());
+    }
+    if !agent::looks_like_devflow_process(pid) {
+        return Err(CliError::Message(format!(
+            "refusing to signal pid {pid} for phase {phase} — its command line does not \
+             identify it as a devflow process; the lock may be stale with a recycled pid. \
+             Inspect it manually (e.g. `ps -p {pid}`) before proceeding."
+        )));
+    }
+    if agent::terminate(pid) {
+        println!("stop: signalled pid {pid}, phase {phase}'s lock holder");
+    } else {
+        println!("stop: pid {pid} could not be signalled (it may have just exited)");
+    }
     Ok(())
 }
 
@@ -3098,6 +3146,94 @@ mod tests {
         let event = devflow_core::events::last_event_for_phase(root, 32).unwrap();
         assert_eq!(event["event"], "gate_reaped");
         assert_eq!(event["stage"], "ship");
+    }
+
+    /// Task 2 behavior (T-23-52 fail-closed): a lock file naming a live pid
+    /// that does not identify as a devflow process must be refused, never
+    /// signalled. Constructed against this test binary's own pid when its
+    /// exe name doesn't start with `devflow` (cargo names devflow-cli's own
+    /// test binary `devflow-<hash>`, which WOULD look like devflow — so
+    /// this falls back to a spawned `sleep` child in that case).
+    #[test]
+    fn stop_refuses_to_signal_a_live_pid_that_fails_the_identity_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 200;
+
+        let self_exe_is_devflow_named = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .is_some_and(|name| name.starts_with("devflow"));
+
+        let mut sleeper: Option<std::process::Child> = None;
+        let pid = if self_exe_is_devflow_named {
+            let child = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn sleep");
+            let pid = child.id();
+            sleeper = Some(child);
+            pid
+        } else {
+            std::process::id()
+        };
+
+        let lock_path = root.join(".devflow").join(format!("lock-{phase:02}"));
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        std::fs::write(&lock_path, pid.to_string()).unwrap();
+
+        let err = stop(root, phase).expect_err("a failed identity check must return an error");
+        let message = err.to_string();
+        assert!(
+            message.contains(&pid.to_string()),
+            "error must name the pid it refused to signal, got: {message}"
+        );
+        assert!(
+            lock_path.exists(),
+            "the lock file must be untouched — stop must not signal anything"
+        );
+
+        if let Some(mut child) = sleeper {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    /// Task 2 behavior: a lock file naming a dead pid is stale — reclaimed
+    /// silently, never signalled, and never an error. An explicit state
+    /// file is present so this test exercises only the lock-fallback path
+    /// under test, not Task 3's separate missing-state tolerance.
+    #[test]
+    fn stop_is_a_success_no_op_when_the_lock_names_a_dead_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 202;
+        let lock_path = root.join(".devflow").join(format!("lock-{phase:02}"));
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        // Above default kernel pid_max — guaranteed not alive.
+        std::fs::write(&lock_path, "9999999").unwrap();
+        let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        workflow::save_state(&state).unwrap();
+
+        stop(root, phase).expect("stop against a stale lock must succeed, not error");
+    }
+
+    /// T-23-51: a live `monitor_pid` recorded in `State` — with no open gate
+    /// and no lock file — must never be treated as a signalling target.
+    /// `stop` only ever looks at the lock file.
+    #[test]
+    fn stop_never_treats_monitor_pid_as_a_signalling_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 203;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.monitor_pid = Some(std::process::id());
+        workflow::save_state(&state).unwrap();
+
+        stop(root, phase).expect(
+            "stop must succeed — a recorded monitor_pid alone must never be signalled or \
+             treated as a blocker",
+        );
     }
 
     /// 14-CR-03: a capture file SHORTER than the follower's offset means the
