@@ -28,6 +28,7 @@ use devflow_core::git::GitFlow;
 use devflow_core::history;
 use devflow_core::mode::Mode;
 use devflow_core::recover;
+use devflow_core::registry;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
 use devflow_core::version;
@@ -695,8 +696,15 @@ fn render_pending_gate_banner(open: &[OpenGate], now: u64) -> Option<String> {
     Some(banner)
 }
 
-/// List every gate awaiting a human response.
-pub(crate) fn gate_list(project_root: &Path) -> Result<(), CliError> {
+/// List every gate awaiting a human response. When `all_roots` is set,
+/// answers "what is gated on this machine?" across every root this machine
+/// has registered (`registry::load_roots`) in one invocation, with a
+/// leading ROOT column and a per-gate age; behaviour is otherwise
+/// byte-identical to the single-root listing (23-03).
+pub(crate) fn gate_list(project_root: &Path, all_roots: bool) -> Result<(), CliError> {
+    if all_roots {
+        return gate_list_all_roots();
+    }
     let open = Gates::list_open(project_root);
     if open.is_empty() {
         println!("no open gates");
@@ -717,6 +725,75 @@ pub(crate) fn gate_list(project_root: &Path) -> Result<(), CliError> {
          devflow gate reject <phase> --note ... (note with \"abort\" ends the phase)"
     );
     Ok(())
+}
+
+/// The `--all-roots` half of [`gate_list`]: fan out `Gates::list_open`
+/// across every registered root and render an additional leading ROOT
+/// column. A registered root with no open gates simply contributes no rows.
+fn gate_list_all_roots() -> Result<(), CliError> {
+    let roots = registry::load_roots();
+    let mut rows: Vec<(PathBuf, OpenGate)> = Vec::new();
+    for root in &roots {
+        for gate in Gates::list_open(&root.project_root) {
+            rows.push((root.project_root.clone(), gate));
+        }
+    }
+    if rows.is_empty() {
+        println!("no open gates across {} registered root(s)", roots.len());
+        return Ok(());
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    println!("{:<6} {:<9} {:<9} ROOT / CONTEXT", "PHASE", "STAGE", "AGE");
+    for (root, gate) in &rows {
+        println!("{}", render_all_roots_gate_row(root, gate, now));
+    }
+    Ok(())
+}
+
+/// Render one `--all-roots` gate row: the PHASE/STAGE/AGE/ROOT line plus a
+/// second, indented context line. Pure given `now` — the same pattern
+/// `render_pending_gate_banner` already uses — so it's unit-testable
+/// without mutating wall-clock time.
+fn render_all_roots_gate_row(root: &Path, gate: &OpenGate, now: u64) -> String {
+    let context = render_gate_context(&gate.context, 100);
+    format!(
+        "{:<6} {:<9} {:<9} {}\n           {context}",
+        gate.phase,
+        gate.stage.to_string(),
+        render_gate_age(&gate.timestamp, now),
+        root.display(),
+    )
+}
+
+/// Render a gate's `timestamp` as a compact age for `--all-roots`, with a
+/// trailing urgency marker once it reaches
+/// [`GATE_ESCALATION_THRESHOLD_SECS`] — reusing the same threshold
+/// `render_pending_gate_banner` escalates on, rather than inventing a
+/// second one. A `timestamp` that does not parse as `u64`, or that is
+/// somehow in the future relative to `now`, renders `?` — the row is still
+/// listed, matching the forensics record that dropping unusual rows is
+/// exactly how the orphan population stayed invisible.
+fn render_gate_age(timestamp: &str, now: u64) -> String {
+    let Ok(ts) = timestamp.parse::<u64>() else {
+        return "?".to_string();
+    };
+    let Some(age) = now.checked_sub(ts) else {
+        return "?".to_string();
+    };
+    let compact = match age {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86400 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86400),
+    };
+    if age >= GATE_ESCALATION_THRESHOLD_SECS {
+        format!("{compact}!")
+    } else {
+        compact
+    }
 }
 
 /// Answer an open gate from the CLI — the dogfood-facing replacement for
@@ -2914,6 +2991,64 @@ mod tests {
         assert!(!banner.contains(&context));
         assert!(!banner.contains('\u{1b}'));
         assert!(banner.contains("ESCALATED"));
+    }
+
+    /// 23-03 Task 3: a gate whose age has crossed the escalation threshold
+    /// renders with a trailing urgency marker.
+    #[test]
+    fn render_gate_age_marks_escalated_gate_urgent() {
+        let now = 10_000u64;
+        let old_timestamp = (now - GATE_ESCALATION_THRESHOLD_SECS - 60).to_string();
+
+        let age = render_gate_age(&old_timestamp, now);
+
+        assert!(
+            age.ends_with('!'),
+            "an escalated gate's age must carry a trailing urgency marker, got {age:?}"
+        );
+    }
+
+    /// A gate younger than the escalation threshold renders with an age and
+    /// no urgency marker.
+    #[test]
+    fn render_gate_age_no_marker_for_fresh_gate() {
+        let now = 10_000u64;
+        let fresh_timestamp = (now - 30).to_string();
+
+        let age = render_gate_age(&fresh_timestamp, now);
+
+        assert!(
+            !age.ends_with('!'),
+            "a fresh gate must not carry an urgency marker, got {age:?}"
+        );
+    }
+
+    /// A `timestamp` that does not parse as `u64` must render an unknown
+    /// age (`?`) rather than panicking or being silently dropped — the
+    /// forensics record shows dropping unusual rows is exactly how the
+    /// orphan population stayed invisible.
+    #[test]
+    fn render_gate_age_unknown_for_non_numeric_timestamp() {
+        let age = render_gate_age("not-a-number", 10_000);
+        assert_eq!(age, "?");
+    }
+
+    /// The `--all-roots` row-rendering must still include a gate whose
+    /// timestamp is non-numeric — the row is present in the output, just
+    /// with an unknown age, matching the acceptance criterion literally.
+    #[test]
+    fn all_roots_row_includes_gate_with_non_numeric_timestamp() {
+        let gate = OpenGate {
+            phase: 42,
+            stage: Stage::Ship,
+            context: "ctx".to_string(),
+            timestamp: "not-a-number".to_string(),
+        };
+
+        let row = render_all_roots_gate_row(Path::new("/tmp/some-root"), &gate, 10_000);
+
+        assert!(row.contains("42"), "row must still name the phase: {row}");
+        assert!(row.contains('?'), "row must render the unknown age: {row}");
     }
 
     /// 21a: `recovery_hints` returns a `resume` hint for a stuck phase,

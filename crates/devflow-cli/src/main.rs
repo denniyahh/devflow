@@ -275,6 +275,11 @@ enum Command {
 enum GateCmd {
     /// List gates awaiting a response.
     List {
+        /// List open gates across every root this machine has registered
+        /// (`devflow start` registers a launched phase), instead of only
+        /// the current project.
+        #[arg(long = "all-roots")]
+        all_roots: bool,
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
@@ -429,7 +434,7 @@ fn run() -> Result<(), CliError> {
         Command::Advance { project, phase } => advance(&project_root(project)?, phase),
         Command::Resume { phase, project } => resume(&project_root(project)?, phase),
         Command::Gate { action } => match action {
-            GateCmd::List { project } => gate_list(&project_root(project)?),
+            GateCmd::List { all_roots, project } => gate_list(&project_root(project)?, all_roots),
             GateCmd::Approve {
                 phase,
                 stage,

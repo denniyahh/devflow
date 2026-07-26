@@ -29,7 +29,7 @@ use devflow_core::mode;
 use devflow_core::prompt::{self, FixType};
 use devflow_core::stage::Stage;
 use devflow_core::state::State;
-use devflow_core::{events, lock, workflow};
+use devflow_core::{events, lock, registry, workflow};
 use std::path::Path;
 use tracing::info;
 
@@ -215,6 +215,10 @@ pub(crate) fn finish_workflow_with_gate_timeout(
     let _ = Gates::cleanup(project_root, state.phase, Stage::Validate);
     let _ = Gates::cleanup(project_root, state.phase, Stage::Ship);
     workflow::clear_state(project_root, state.phase)?;
+    // 23b: the workflow is genuinely over — deregister this (project_root,
+    // phase) from the machine-global registry so `devflow gate list
+    // --all-roots` stops naming a phase that no longer exists.
+    registry::deregister(project_root, state.phase);
     events::emit(
         project_root,
         state.phase,
@@ -325,6 +329,9 @@ pub(crate) fn abort(project_root: &Path, state: &State, reason: &str) -> Result<
     // survives on disk and is silently reused if the gate fires again later.
     let _ = Gates::cleanup(project_root, state.phase, state.stage);
     let _ = workflow::clear_state(project_root, state.phase);
+    // 23b: an abort also ends the workflow — deregister the same as the
+    // success path so an aborted phase does not linger in the registry.
+    registry::deregister(project_root, state.phase);
     events::emit(
         project_root,
         state.phase,
