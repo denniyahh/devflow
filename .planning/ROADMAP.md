@@ -732,17 +732,29 @@ Plans:
 
 **Goal:** `agent::looks_like_devflow_process(pid)` intermittently returns `true` for a plain `sleep` process. It is the last guard before `SIGTERM` in `devflow stop` (`commands.rs:1171`), so a false positive is the **dangerous** direction — it *permits* signalling a process that is not DevFlow's, which is exactly the recycled-pid hazard its own error message names ("the lock may be stale with a recycled pid").
 
-**Evidence:** `agent::tests::looks_like_devflow_process_is_false_for_a_non_devflow_process` failed in 2 of 6 CI samples on 2026-07-26 (~33%), across commits that touched no Rust source at all (`e00a16d`, `8929236` — both `.planning/`-only). The same commit passed on one trigger and failed on the other, and the pattern flipped between commits, so it is non-deterministic rather than environment-specific. The ~20 CI runs before that were green. Introduced with the predicate itself in `dec4583` (plan 23-05).
+**Evidence — TWO independent tests at two layers catch this, 3 failing CI runs across 2 commits on 2026-07-26**, both commits touching no Rust source at all (`e00a16d`, `8929236` — `.planning/`-only). The ~20 CI runs before these were green. Introduced with the predicate itself in `dec4583` (plan 23-05).
 
-**Mechanism NOT yet identified — do not assume one.** Two hypotheses are already **disproved**: (1) local flakiness under CPU contention — 40/40 passes; (2) fork/exec cmdline inheritance, i.e. reading the parent's `/proc/<pid>/cmdline` before the child `exec`s — a 3000-iteration probe observed it 0 times.
+1. `agent::tests::looks_like_devflow_process_is_false_for_a_non_devflow_process` (`agent.rs:142`) — the unit test. Failed on `8929236` in both the CI and Devcontainer workflows.
+2. `commands::tests::stop_refuses_to_signal_a_live_pid_that_fails_the_identity_check` (`commands.rs:3163`) — the CLI integration test. Failed on `e00a16d`.
 
-**Diagnostics are already in place** (`21449bd`, no production change). The assertion now reports the child's cmdline before *and* after the predicate call, its `/proc/<pid>/exe`, and the test process's own identity, with a decision tree: both cmdlines naming a devflow binary ⇒ the pid is not the spawned `sleep` (recycled/misattributed); the two differing ⇒ the cmdline changed under the predicate; both naming `sleep` ⇒ the matching logic is at fault. **The next reproduction should name the cause — read it before choosing a fix.**
+**(2) is the serious one and proves the full production path, not just a wrong bool.** That test spawns a `sleep`, writes its pid into the phase lock file, and asserts `stop()` returns `Err`. It panicked on `expect_err` — so `stop()` returned `Ok`: the identity guard passed and **`devflow stop` sent `SIGTERM` to an unrelated `sleep` process.** This is the guard's stated purpose failing end-to-end, observed in CI, not a theoretical risk inferred from a predicate.
+
+The same commit passes on one trigger and fails on the other, and the pattern flips between commits, so it is non-deterministic rather than environment-specific.
+
+**Mechanism NOT yet identified — do not assume one.** Status of the hypotheses:
+
+- **Local flakiness under CPU contention — not reproduced.** 40/40 passes locally with the machine loaded.
+- **fork/exec cmdline inheritance** (reading the parent's `/proc/<pid>/cmdline` before the child `exec`s) — **not reproduced locally, but NOT disproved.** A 3000-iteration probe observed it 0 times; that probe was single-threaded, warm-cache, and on a local filesystem, so it almost certainly took Rust's `posix_spawn` fast path. CI runs many test threads inside a container on overlayfs with a cold cache, where `std` can fall back to `fork` + `execvp` and the PATH lookup for `sleep` is far slower — widening exactly the window the probe could not open. An earlier revision of this entry called this "disproved"; that was an overstatement and is retracted.
+
+**Diagnostics are in place for test (1) only** (`21449bd`, no production change). The assertion now reports the child's cmdline before *and* after the predicate call, its `/proc/<pid>/exe`, and the test process's own identity, with a decision tree: both cmdlines naming a devflow binary ⇒ the pid is not the spawned `sleep` (recycled/misattributed); the two differing ⇒ the cmdline changed under the predicate; both naming `sleep` ⇒ the matching logic is at fault. **The next reproduction should name the cause — read it before choosing a fix.** Test (2) is still a bare `expect_err` and should get the same treatment; whichever reproduces first wins.
+
+**Not to be confused with the unrelated flake in the same PR.** `reference_and_cleanup_worktree_cli_flow` (`phase7_cli.rs:107`) also failed on `91bff73` in both workflows. That is the pre-existing, already-tracked 20b flake (Linear DEN-48, High, Todo) — a git-fixture problem, unrelated to this predicate. Three distinct tests failed across this PR; do not merge them into one story.
 
 **Known independent weakness, visible by inspection:** the predicate matches **any** argv element whose basename starts with `devflow`, not just `argv[0]`. So `sleep /tmp/devflow-scratch/x` matches, as does any process merely *mentioning* a devflow path in its arguments. Tightening to `argv[0]` and corroborating via `/proc/<pid>/exe` narrows the false-positive surface regardless of the intermittent cause.
 
 **Related TOCTOU, likely 999.44's scope:** even a correct predicate is checked and *then* acted on — the pid can be recycled between `looks_like_devflow_process(pid)` and `terminate(pid)`.
 
-**Priority:** Medium | **Size:** S–M — S if the diagnostics name a simple cause, M if it needs a non-pid identity handle. Linear: DEN-72.
+**Priority:** High — raised from Medium once test (2) showed `devflow stop` actually signalling a non-devflow process, rather than a predicate merely returning the wrong value. | **Size:** S–M — S if the diagnostics name a simple cause, M if it needs a non-pid identity handle. Linear: DEN-72.
 
 Plans:
 
