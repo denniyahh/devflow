@@ -130,6 +130,34 @@ therefore *always* eligible for ancestry-based deletion. Cleanup should either
 skip a configurable ref prefix (`recovery/*`) or refuse to delete refs it did
 not create.
 
+**Reproduced again later the same day**, after 23-11 restored it: the local
+branch was gone a second time while the `origin` copy persisted. Two deletions
+in one day from ordinary hygiene runs.
+
+### B2a. Disposition of the recovery ref — deliberately retained
+
+`recovery/pre-23-11-acceptance-e0f87c2` **still exists on `origin`** at
+`e0f87c2c2230257f7aa8092a836225626941d09a`. It was never used: the acceptance
+run stopped at Define, so no merge, version bump, or changelog commit occurred
+and there was nothing to roll back.
+
+It currently points at the **same commit as `origin/develop`** — zero commits
+unique to it — so it protects nothing today. Operator decision 2026-07-26:
+**keep it until Phase 23 is merged into `develop` and that merge is settled**,
+at which point `e0f87c2` becomes the pre-Phase-23 marker and the ref can be
+pruned as ordinary cleanup.
+
+Notes for whoever picks this up:
+- **Do not restore the local copy.** `devflow cleanup` will keep deleting it
+  (see B2 above). The `origin` copy is the one that matters.
+- Pruning is `git push origin --delete recovery/pre-23-11-acceptance-e0f87c2`.
+  Safe whenever the operator chooses — the SHA is recorded in this file,
+  `23-ACCEPTANCE-SETUP.md`, `23-ACCEPTANCE-RUN.md`, `23-10-SUMMARY.md`,
+  `23-11-SUMMARY.md`, and `ROADMAP.md`, so a ref can be recreated at it at any
+  time.
+- **A retry of the acceptance run needs a fresh recovery point** at the
+  then-current `develop` tip. This ref does not serve the next attempt.
+
 ### B3. Self-dogfood staleness — only the warn branch was exercised
 
 Already recorded as this plan's own coverage gap in `23-ACCEPTANCE-RUN.md` §9;
