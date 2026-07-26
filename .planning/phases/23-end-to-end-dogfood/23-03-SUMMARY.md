@@ -217,3 +217,15 @@ None - no external service configuration required.
 ---
 *Phase: 23-end-to-end-dogfood*
 *Completed: 2026-07-26*
+
+## Self-Check: PASSED
+
+- FOUND: crates/devflow-core/src/registry.rs
+- FOUND: .planning/phases/23-end-to-end-dogfood/23-03-SUMMARY.md
+- FOUND: commit 0796585 (Task 1 feat)
+- FOUND: commit a68c992 (docs deviation)
+- FOUND: commit 3321410 (Task 2 RED)
+- FOUND: commit 6755b8a (Task 2 GREEN)
+- FOUND: commit 938af8b (Task 3 RED)
+- FOUND: commit 1efb9f1 (Task 3 GREEN)
+- FOUND: commit 6727296 (this SUMMARY.md)
