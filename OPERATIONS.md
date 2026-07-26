@@ -38,7 +38,6 @@ Define → Plan → Code → Validate → Ship
 | `devflow gate reject <phase> --note ... [--stage S]` | Reject — loops back to Code; a note containing `abort` ends the phase |
 | `devflow gate sweep [--max-age-secs N] [--dry-run] [--root PATH]` | Answer or report aged, unattended gates across every registered root (or one `--root`) — bounds an abandoned run's lifetime without `kill(1)`. On-demand only; nothing schedules it. Never writes an approval |
 | `devflow parallel --phases 7,8 [--agents claude,codex] [--mode M] [--force]` | Run phases concurrently, each in its own worktree + monitor |
-| `devflow sequentagent --phase N --agents a,b [--force]` | Two agents sequentially on one phase with a rebase handoff |
 | `devflow list` | Feature branches with divergence from develop |
 | `devflow reference [--branch B] [--refresh]` | Static snapshot worktree at `.worktrees/reference/` |
 | `devflow stop --phase N [--root PATH]` | End a running phase cleanly (23c). Answers its open gate with a rejection if one is open — the target unwinds through its own abort path, no signal sent — otherwise signals the process recorded in `.devflow/lock-{phase:02}` (never `state.monitor_pid`, which the generated monitor script's trap only ever captures for the agent, not the trailing `advance`) after confirming it is alive and its `/proc/<pid>/cmdline` identifies it as belonging to DevFlow. Idempotent; marks `state.stopped`/`state.stop_reason` so `cleanup`'s existing fail-closed refusal (unweakened by this command) recognizes the phase as no longer live — `stop` then `cleanup --force` compose in that order |
@@ -112,7 +111,7 @@ only because a stage failed unexpectedly).
 | `phase-NN-exit` / `phase-NN-agent-pid` | Exit code + PID the monitor records |
 | `gates/NN-<stage>.json` (+ `.response.json`, `.ack.json`) | Gate request / answer / receipt |
 | `events.jsonl` | Append-only event log (schema v1, one JSON object per line, phase id on every line) — tail it from any tool |
-| `cron-instructions-NN.json` | Rate-limit resume record — `devflow resume --phase N` for a paused single-agent run, or the `sequentagent` handoff command for a paused two-agent run |
+| `cron-instructions-NN.json` | Rate-limit resume record naming `devflow resume --phase N` for a paused run |
 | `history/phase-NN/` | Bounded archive of prior stage stdout/exit captures |
 
 Everything under `.devflow/` and `.worktrees/` is runtime state

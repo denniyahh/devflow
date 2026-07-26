@@ -151,48 +151,11 @@ pub fn delete_cron_instructions(project_root: &Path, phase: u32) -> Result<(), S
     Ok(())
 }
 
-/// Build a Hermes cron-instructions manifest for resuming `sequentagent`.
-pub fn build_cron_instructions(
-    project_root: &Path,
-    phase: u32,
-    retry_after: &str,
-    next_agents: &str,
-) -> CronInstructions {
-    let project = project_root.display().to_string();
-    let args = vec![
-        "sequentagent".to_string(),
-        "--phase".to_string(),
-        phase.to_string(),
-        "--agents".to_string(),
-        next_agents.to_string(),
-    ];
-    CronInstructions {
-        project: project.clone(),
-        phase,
-        status: "rate_limited".to_string(),
-        retry_after: retry_after.to_string(),
-        resume: ResumeCommand {
-            command: "devflow".to_string(),
-            args,
-        },
-        hermes_cron: HermesCronJob {
-            schedule: cron_schedule_from_retry_after(retry_after).unwrap_or_default(),
-            name: format!("devflow-phase-{phase:02}-resume"),
-            command: format!(
-                "cd {} && devflow sequentagent --phase {phase} --agents {next_agents}",
-                shell_quote(&project)
-            ),
-            once: true,
-        },
-    }
-}
-
 /// Build a Hermes cron-instructions manifest for resuming the PRIMARY
 /// single-agent `advance()` monitor loop (D-09, review consensus #5) via
-/// `devflow resume --phase N` — distinct from [`build_cron_instructions`],
-/// which resumes the two-agent `sequentagent` handoff. `agent` is
-/// intentionally omitted from the resume command: `devflow resume` loads it
-/// (along with mode and stage) from the phase's saved state.
+/// `devflow resume --phase N`. `agent` is intentionally omitted from the
+/// resume command: `devflow resume` loads it (along with mode and stage)
+/// from the phase's saved state.
 pub fn build_single_agent_cron_instructions(
     project_root: &Path,
     phase: u32,
@@ -450,7 +413,7 @@ mod tests {
     #[test]
     fn cron_instructions_save_load_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let record = build_cron_instructions(dir.path(), 7, "2026-06-18T15:45:30Z", "codex,claude");
+        let record = build_single_agent_cron_instructions(dir.path(), 7, "2026-06-18T15:45:30Z");
 
         write_cron_instructions(dir.path(), &record).unwrap();
 
@@ -460,7 +423,7 @@ mod tests {
     #[test]
     fn delete_cron_instructions_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
-        let record = build_cron_instructions(dir.path(), 7, "2026-06-18T15:45:30Z", "codex,claude");
+        let record = build_single_agent_cron_instructions(dir.path(), 7, "2026-06-18T15:45:30Z");
         write_cron_instructions(dir.path(), &record).unwrap();
 
         delete_cron_instructions(dir.path(), 7).unwrap();
@@ -473,8 +436,8 @@ mod tests {
     #[test]
     fn cron_instructions_are_per_phase() {
         let dir = tempfile::tempdir().unwrap();
-        let a = build_cron_instructions(dir.path(), 7, "2026-06-18T15:45:30Z", "claude,codex");
-        let b = build_cron_instructions(dir.path(), 8, "2026-06-18T16:45:30Z", "codex,claude");
+        let a = build_single_agent_cron_instructions(dir.path(), 7, "2026-06-18T15:45:30Z");
+        let b = build_single_agent_cron_instructions(dir.path(), 8, "2026-06-18T16:45:30Z");
         write_cron_instructions(dir.path(), &a).unwrap();
         write_cron_instructions(dir.path(), &b).unwrap();
 
@@ -493,7 +456,7 @@ mod tests {
     #[test]
     fn legacy_cron_instructions_are_read_and_deleted() {
         let dir = tempfile::tempdir().unwrap();
-        let record = build_cron_instructions(dir.path(), 5, "2026-06-18T15:45:30Z", "claude,codex");
+        let record = build_single_agent_cron_instructions(dir.path(), 5, "2026-06-18T15:45:30Z");
         let legacy = legacy_cron_instructions_path(dir.path());
         std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
         std::fs::write(&legacy, serde_json::to_string_pretty(&record).unwrap()).unwrap();
@@ -590,25 +553,6 @@ mod tests {
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
     }
 
-    #[test]
-    fn cron_instructions_include_resume_command() {
-        let dir = tempfile::tempdir().unwrap();
-        let record = build_cron_instructions(dir.path(), 7, "2026-06-18T15:45:30Z", "codex,claude");
-
-        assert_eq!(record.resume.command, "devflow");
-        assert_eq!(
-            record.resume.args,
-            ["sequentagent", "--phase", "7", "--agents", "codex,claude"]
-        );
-        assert!(
-            record
-                .hermes_cron
-                .command
-                .contains("devflow sequentagent --phase 7 --agents codex,claude")
-        );
-        assert!(record.hermes_cron.once);
-    }
-
     /// Review consensus #5: the single-agent resume record must invoke
     /// `devflow resume --phase N` (which relaunches saved state), never the
     /// unsafe `devflow start` (resets to Define) or the two-agent
@@ -634,7 +578,7 @@ mod tests {
     #[test]
     fn cron_instructions_reject_unparseable_retry_time() {
         let dir = tempfile::tempdir().unwrap();
-        let record = build_cron_instructions(dir.path(), 7, "unknown", "codex,claude");
+        let record = build_single_agent_cron_instructions(dir.path(), 7, "unknown");
 
         assert_ne!(record.hermes_cron.schedule, "* * * * *");
         assert!(record.hermes_cron.schedule.is_empty());

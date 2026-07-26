@@ -84,7 +84,7 @@ DevFlow evaluates agent output in four layers:
 | 2. Exit code + commits | Exit 0 **and** commits on the feature branch = success; otherwise failed | Fallback |
 | 3. Commit heuristic | Exit code unknown: commits exist = probable success (with warning) | Last resort |
 
-Rate-limit detection: during `devflow sequentagent`, if an agent's stdout contains rate-limit messages (429), DevFlow writes a per-phase `.devflow/cron-instructions-{phase:02}.json` for rescheduling.
+Rate-limit detection: if an agent's stdout contains rate-limit messages (429), DevFlow writes a per-phase `.devflow/cron-instructions-{phase:02}.json` for rescheduling.
 
 ## Commands
 
@@ -106,7 +106,6 @@ Rate-limit detection: during `devflow sequentagent`, if an agent's stdout contai
 | Command | Description |
 |---|---|
 | `devflow parallel --phases 7,8 [--agents claude,codex]` | Run multiple phases concurrently in isolated worktrees |
-| `devflow sequentagent --phase 7 --agents claude,codex` | Run two agents sequentially on one phase with worktree isolation |
 | `devflow reference [--refresh]` | Create a static reference worktree for multi-agent handoff |
 
 ### Quality

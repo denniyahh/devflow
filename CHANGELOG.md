@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.0.0 — 2026-07-26
+
+The breaking change the v2.0.0 slot was held open for (milestone note,
+2026-07-24: "until a genuinely breaking change earns the 2.0 slot").
+
+### Removed (Breaking)
+- **The `sequentagent` CLI verb is gone.** `devflow sequentagent --phase N --agents a,b [--force]` — two agents run sequentially on one phase, each in its own worktree, with a rebase handoff between them — no longer exists; invoking it now fails with clap's unrecognized-subcommand error (D-11, 23d). Removed with it: the CLI-side `sequentagent`/`run_agent_blocking`/`integrate_agent_branch` implementation, the two-agent Hermes cron-resume builder (`ship::build_cron_instructions`), and `status`'s two-agent slot-liveness rendering. The primary single-agent rate-limit resume path (`devflow resume --phase N`, `ship::build_single_agent_cron_instructions`) and `devflow parallel` (run N phases concurrently) are unaffected. The capability intent is preserved, not discarded — DEN-67 (999.42) tracks reimplementing agent failover on the socket-addressable supervisor (DEN-58) if and when a second agent is supported, rather than restoring this in-process handoff
+
 ## 1.8.1 — 2026-07-24
 
 Test-suite containment and quality cleanup. No behavior change for `devflow`

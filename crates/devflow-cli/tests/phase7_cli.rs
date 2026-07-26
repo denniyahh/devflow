@@ -552,12 +552,8 @@ fn status_prints_cron_hint_when_cron_instructions_exist() {
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
-    let instructions = devflow_core::ship::build_cron_instructions(
-        root,
-        7,
-        "2026-06-18T15:45:30Z",
-        "claude,codex",
-    );
+    let instructions =
+        devflow_core::ship::build_single_agent_cron_instructions(root, 7, "2026-06-18T15:45:30Z");
     devflow_core::ship::write_cron_instructions(root, &instructions).unwrap();
     let fake_bin = fake_bin_dir(&[]);
 
