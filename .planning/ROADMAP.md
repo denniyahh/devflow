@@ -741,12 +741,32 @@ Plans:
 
 The same commit passes on one trigger and fails on the other, and the pattern flips between commits, so it is non-deterministic rather than environment-specific.
 
-**Mechanism NOT yet identified — do not assume one.** Status of the hypotheses:
+**FAILURE STATE ESTABLISHED 2026-07-26** — from the instrumented assertion, once CI moved into the pinned container (`db1b4bf`) and the flake became **deterministic** rather than ~33%. Verbatim:
 
-- **Local flakiness under CPU contention — not reproduced.** 40/40 passes locally with the machine loaded.
-- **fork/exec cmdline inheritance** (reading the parent's `/proc/<pid>/cmdline` before the child `exec`s) — **not reproduced locally, but NOT disproved.** A 3000-iteration probe observed it 0 times; that probe was single-threaded, warm-cache, and on a local filesystem, so it almost certainly took Rust's `posix_spawn` fast path. CI runs many test threads inside a container on overlayfs with a cold cache, where `std` can fall back to `fork` + `execvp` and the PATH lookup for `sleep` is far slower — widening exactly the window the probe could not open. An earlier revision of this entry called this "disproved"; that was an overstatement and is retracted.
+```
+branch taken:        spawned sleep
+pid under test:      3054
+cmdline before stop: /__w/devflow/devflow/target/debug/deps/devflow-c2105e00bf2afc4e
+cmdline after stop:  /__w/devflow/devflow/target/debug/deps/devflow-c2105e00bf2afc4e
+status before stop:  Name=commands::tests State=R (running) Pid=3054 PPid=2856 Threads=1
+child.try_wait():    Ok(None)
+direct predicate:    looks_like_devflow_process(3054) = true
+test process:        pid 2856
+```
 
-**Diagnostics are in place for test (1) only** (`21449bd`, no production change). The assertion now reports the child's cmdline before *and* after the predicate call, its `/proc/<pid>/exe`, and the test process's own identity, with a decision tree: both cmdlines naming a devflow binary ⇒ the pid is not the spawned `sleep` (recycled/misattributed); the two differing ⇒ the cmdline changed under the predicate; both naming `sleep` ⇒ the matching logic is at fault. **The next reproduction should name the cause — read it before choosing a fix.** Test (2) is still a bare `expect_err` and should get the same treatment; whichever reproduces first wins.
+**The child forks and never `exec`s, and stays that way.** `PPid` is the test process, so it *is* our child; `try_wait()` is `Ok(None)`, so it has not exited; `Name` is `commands::tests` — the *forking Rust test thread's* name, not `sleep`; and the state is unchanged across the whole `stop()` call. It therefore still carries the parent's `cmdline`, which is why the predicate answers `true`.
+
+This **rules out**, with evidence: pid recycling (PPid matches), a transient read window (stable before *and* after), a matching-logic bug in the predicate (the cmdline genuinely is a devflow binary's), and fixture self-sabotage (the `spawned sleep` branch was taken).
+
+**WHY the child never `exec`s is still unknown, and three hypotheses are now disconfirmed. Do not adopt one without evidence:**
+
+- **Local CPU contention** — 40/40 pass with the machine loaded.
+- **Transient fork/exec cmdline inheritance** — 4000 spawns × 3 modes, including `pre_exec` to *force* the `fork`+`execvp` path off `posix_spawn`, observed it **0 times**. (An earlier revision called this "disproved", then retracted it as an overstatement; the CI evidence above now disproves the *transient* form outright, since the state is persistent, while leaving "never execs" as the actual finding.)
+- **glibc environment-lock deadlock inherited across `fork`** (a `setenv` in another thread holding the lock when the child forks, wedging `execvp`'s PATH lookup) — a 4-thread `setenv` storm across 300 spawns wedged **0** children.
+
+**The fix does not depend on resolving that.** Whatever wedges the child, the production defect is that `looks_like_devflow_process` trusts `/proc/<pid>/cmdline`, which a forked-not-`exec`'d child inherits wholesale from its devflow parent. `/proc/<pid>/exe` is no better — it is inherited too. **Identity must be a recorded pair, not an inference:** persist `(pid, starttime)` — field 22 of `/proc/<pid>/stat` — in the lock file and require both to match before signalling. That is immune to inheritance *and* closes the check-then-signal TOCTOU below, so it subsumes both defects.
+
+**Both tests are instrumented** (`21449bd`, `a6f479a`; no production change) and CI reproduces deterministically in-container, so any future hypothesis can be tested in one push.
 
 **Not to be confused with the unrelated flake in the same PR.** `reference_and_cleanup_worktree_cli_flow` (`phase7_cli.rs:107`) also failed on `91bff73` in both workflows. That is the pre-existing, already-tracked 20b flake (Linear DEN-48, High, Todo) — a git-fixture problem, unrelated to this predicate. Three distinct tests failed across this PR; do not merge them into one story.
 
