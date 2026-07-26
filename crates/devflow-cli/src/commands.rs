@@ -17,7 +17,7 @@ use crate::parallel::ensure_phase_worktree;
 use crate::pipeline_gate::print_dry_run;
 use crate::pipeline_launch::{launch_stage, single_active_phase};
 use crate::pipeline_outcomes::render_gate_context;
-use crate::preflight::{agent_program, ensure_agent_binary};
+use crate::preflight::{agent_program, ensure_agent_binary, ensure_phase_reachable_on_base};
 use crate::staleness::run_git_stdout;
 use devflow_core::agent;
 use devflow_core::agent_result;
@@ -134,6 +134,16 @@ pub(crate) fn start(
     // 14-CR-05: fail on a missing agent binary BEFORE any branch/worktree is
     // scaffolded (launch_stage re-checks for the advance-time launch paths).
     ensure_agent_binary(agent_program(agent))?;
+
+    // 23f (gap closure, 23-12): refuse before ANY git mutation when phase N
+    // is not reachable from DEVELOP — the exact branch `ensure_phase_worktree`
+    // passes to `worktree::add` as `start_point`, so the branch this guard
+    // inspects and the branch the run forks can never disagree. Precedes
+    // BOTH fork paths (`ensure_phase_worktree` below, and `GitFlow::feature_start`
+    // in the `else` branch), and precedes the Codex leg deliberately: if
+    // phase N is absent from `develop` entirely, "no CONTEXT.md on develop"
+    // is a narrower and misleading diagnosis of the same root fact.
+    ensure_phase_reachable_on_base(project_root, phase, DEVELOP)?;
 
     // 13-06 dogfood pre-flight (Codex leg): a fresh headless Codex run can
     // never pass Define — GSD's discuss-phase is an interview, and Codex's

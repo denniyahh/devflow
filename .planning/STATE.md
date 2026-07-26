@@ -4,17 +4,17 @@ milestone: v2.0.0
 milestone_name: milestone (open — no fixed closing phase)
 current_phase: 23
 current_phase_name: end-to-end-dogfood
-status: "Phase 23 executed (11/11 plans) - acceptance run (23-11) FAILED: target Phase 24 unreachable from develop at launch (orchestrator sequencing gap, not a DevFlow defect); record valid, recovery point not needed/not used; retry needs Phase 23 merged to develop first plus a new third precondition check"
-stopped_at: Completed 23-11-PLAN.md — acceptance run executed, record valid, acceptance FAILED (target unreachable from develop); phase behavioral criterion not met, retry needs Phase 23 merged to develop first
-last_updated: "2026-07-26T13:07:22.582Z"
+status: executing
+stopped_at: Planned 23-12…23-15 (gap closure) — 15/15 plans exist, 11 executed, 4 ready
+last_updated: "2026-07-26T20:31:42.669Z"
 last_activity: 2026-07-26
-last_activity_desc: "plan 23-11 complete: acceptance run launched unattended, stopped at Define (target Phase 24 unreachable from develop), observed the full 10-minute window, ended cleanly via devflow stop, post-run hygiene proven, operator verdict record:valid / FAILED recorded"
+last_activity_desc: Phase 23 execution started
 progress:
   total_phases: 13
-  completed_phases: 12
-  total_plans: 87
+  completed_phases: 11
+  total_plans: 91
   completed_plans: 87
-  percent: 92
+  percent: 85
 ---
 
 # DevFlow — Project State
@@ -86,14 +86,15 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 23 (end-to-end-dogfood) — 11/11 plans executed; behavioral acceptance criterion NOT met
-Plan: 11 of 11
-Status: All plans executed and their artifacts produced. The phase's own goal — one phase driven start-to-finish by DevFlow, unattended, reaching a completed Ship — is unmet: plan 23-11's acceptance run stopped at Define (target Phase 24 unreachable from `develop` at launch time). Operator verdict: record valid, acceptance FAILED. A retry needs Phase 23 merged to `develop` first, plus a newly-named third precondition check (verify the target's ROADMAP entry is reachable from `develop` before launch). See `23-11-SUMMARY.md` / `23-ACCEPTANCE-RUN.md` for the full record.
-Last activity: 2026-07-26 — plan 23-11 complete: acceptance run launched unattended, stopped at Define, observed the full mandated 10-minute window, ended cleanly via `devflow stop`, post-run hygiene proven, operator verdict recorded
+Phase: 23 (end-to-end-dogfood) — EXECUTING
+Plan: 1 of 15
+Status: Executing Phase 23
+The gap's first `missing:` item is already satisfied and is not re-done: Phase 23 reached `develop` via PR #31 (`06824c2`), and Phase 24's ROADMAP entry and `.planning/phases/24-*/` directory are both now reachable from `origin/develop` — the exact absence that killed the 23-11 run.
+Last activity: 2026-07-26 — Phase 23 execution started
 
 **Note on the "Plan: 2 of 11" value this replaces:** `gsd-tools state advance-plan` only increments whatever value is already in this field; it was last set to "Plan: 1 of 11" before phase 23's first plan ever executed and was never updated across the parallel-worktree waves (23-01 through 23-09), since worktree executors deliberately do not touch STATE.md. This executor is the first sequential (main-tree) executor in phase 23 and corrected the field directly to match reality (10 of 11 plans complete) rather than trust the tool's naive +1 increment from a stale base.
 
-Progress: [██████████] 100%
+Progress: [███████░░░] 73% (11 of 15 plans executed; 23-12…23-15 are the gap closure)
 
 *(Machine-readable fields for `gsd-tools state begin-phase` / `advance-plan` —
 this project historically tracked position only in the narrative "Active

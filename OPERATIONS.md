@@ -28,7 +28,7 @@ Define → Plan → Code → Validate → Ship
 
 | Command | Purpose |
 |---|---|
-| `devflow start --phase N --agent claude\|codex\|opencode --mode auto\|supervise [--force] [--no-worktree] [--dry-run] [--until define\|plan\|code\|validate]` | Begin a phase; a detached monitor owns the agent and auto-advances. `--until <stage>` runs through `<stage>` then halts cleanly (no orphaned monitor, no `doctor` false positive) instead of continuing to Ship; `--until ship` is rejected (a no-op — Ship is already terminal) |
+| `devflow start --phase N --agent claude\|codex\|opencode --mode auto\|supervise [--force] [--no-worktree] [--dry-run] [--until define\|plan\|code\|validate]` | Begin a phase; a detached monitor owns the agent and auto-advances. `--until <stage>` runs through `<stage>` then halts cleanly (no orphaned monitor, no `doctor` false positive) instead of continuing to Ship; `--until ship` is rejected (a no-op — Ship is already terminal). Refuses before scaffolding anything if phase N is not reachable from `develop` (see Preflight refusals below) |
 | `devflow resume --phase N` | Resume a rate-limited or infra-paused phase from its saved stage (loads `state-NN.json`, does not recreate the branch/worktree or reset to Define) — the command a primary-loop rate-limit auto-resume cron invokes. Also clears a `--until`-stopped phase's stop marker, so the phase advances past its old stop point instead of re-stopping immediately |
 | `devflow status` | All active phases: stage, gate state, agent liveness, elapsed, last action |
 | `devflow logs [-f] [--phase N] [--stderr]` | Print/follow a phase's captured agent output |
@@ -50,6 +50,17 @@ Define → Plan → Code → Validate → Ship
 | `devflow evidence --phase N [--json] [--require-shipped] [--root PATH]` | **Read-only structural oracle (23-06):** reports DevFlow's own append-only record of whether a phase actually shipped, instead of trusting an agent-authored attestation document. `shipped` is strictly true only after the terminal-only `workflow_shipped` event has been emitted (the last step inside `finish_workflow_with_gate_timeout`, once the entire post-Ship hook batch has succeeded) — a phase halted by `--until <stage>` always reports `shipped: false`, even though it emits the older, ambiguous `workflow_finished` event too (surfaced separately as `workflow_finished_seen`/`finished_reason` for corroboration, never consulted by `shipped`). `--require-shipped` exits non-zero unless `shipped` is true, so it is declarable as a `verify::external_verify_commands` Layer 0 probe (opt-in per phase; a phase's PLAN must declare it and the operator must approve it via `DEVFLOW_TRUST_EXTERNAL_VERIFY`) — a failed declared probe outranks every agent-controlled signal. |
 
 (`devflow advance` is internal — invoked by monitors with `--phase N`.)
+
+## Preflight refusals
+
+Checks `devflow start` performs, in order, before it scaffolds anything (a
+worktree, a feature branch, or `.devflow/` state):
+
+| Check | Condition | Operator action |
+|---|---|---|
+| Agent binary present | The agent's executable (`claude`/`codex`/`opencode`) is not found on `PATH` | Install the agent, or run `devflow doctor` |
+| Phase reachable from `develop` (23f) | Phase N's `### Phase N:` ROADMAP heading or its `.planning/phases/NN-*/` directory is missing from `develop` — skipped entirely if `develop` has no `.planning/ROADMAP.md` at all | Merge the branch carrying the phase's planning artifacts into `develop`, then re-run |
+| Codex headless Define | `--agent codex` and phase N has no `-CONTEXT.md` on `develop` — Codex's `exec` mode cannot answer Define's interview headlessly | Run `/gsd-discuss-phase N` interactively first (any agent), or use `--agent claude` |
 
 ## Answering gates
 

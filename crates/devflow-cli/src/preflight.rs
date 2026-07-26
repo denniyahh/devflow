@@ -91,6 +91,184 @@ pub(crate) fn ensure_agent_binary(program: &str) -> Result<(), CliError> {
 }
 
 // ---------------------------------------------------------------------------
+// 23f (gap closure, 23-12): phase-reachability guard. `devflow start` forks
+// a worktree (or, in `--no-worktree` mode, a feature branch) from `develop`
+// — if the target phase's ROADMAP.md heading or `.planning/phases/NN-*/`
+// directory is not actually present on `develop`, the run is invisible to
+// itself and floundered silently through Define before finally aborting
+// (the 2026-07-26 acceptance-run failure, `23-FINDINGS.md` §B1). This
+// probe catches that class of precondition failure BEFORE any git mutation.
+// ---------------------------------------------------------------------------
+
+/// The result of probing whether a phase is reachable from a base branch:
+/// both the ROADMAP heading and the phase directory must be present for
+/// `Reachable`; either being present-and-checkable but absent yields
+/// `Unreachable`, whose two fields record whether each half was **found**
+/// (at least one is always `false` in that variant). `Undeterminable` means
+/// the probe could not see the base branch at all (no such branch, no
+/// repository, or no `.planning/ROADMAP.md` on it) — the guard fails open
+/// in that case rather than block a repository that never gave DevFlow a
+/// basis to judge reachability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PhaseReachability {
+    /// Both the ROADMAP heading and the phase directory are present on the
+    /// base branch.
+    Reachable,
+    /// The probe could not determine reachability (missing base branch, not
+    /// a repository, or the base branch carries no `.planning/ROADMAP.md`
+    /// at all) — the guard must never refuse in this case.
+    Undeterminable,
+    /// At least one half is confirmed absent from the base branch.
+    Unreachable {
+        /// Whether the `### Phase {N}:` ROADMAP heading was found.
+        roadmap_entry_found: bool,
+        /// Whether a `.planning/phases/{NN}-*/` directory was found.
+        phase_dir_found: bool,
+    },
+}
+
+/// Probe whether `phase` is reachable from `base` in the repository at
+/// `project_root`: four ordered git invocations, each a spawn error or
+/// non-success status short-circuiting to `Undeterminable` per the
+/// fail-open-where-blind contract this project's `phase_artifact_on_develop`
+/// (`commands.rs`) already establishes.
+///
+/// NOTE: `base` is always `devflow_core::config::DEVELOP` at the one call
+/// site today. If the base branch ever becomes configurable (999.30 WR-02
+/// already flagged the sibling hardcoded `"main"`), this function's callers
+/// must be re-pointed at that configuration alongside it.
+pub(crate) fn phase_reachability_on_base(
+    project_root: &Path,
+    phase: u32,
+    base: &str,
+) -> PhaseReachability {
+    // Step 1: does the base branch even exist here?
+    let verify = std::process::Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", base])
+        .current_dir(project_root)
+        .output();
+    match verify {
+        Ok(out) if out.status.success() => {}
+        _ => return PhaseReachability::Undeterminable,
+    }
+
+    // Step 2: does the base branch carry a `.planning/ROADMAP.md` at all?
+    // A repository with no roadmap has given DevFlow no basis to judge
+    // reachability — fail open rather than treat "no roadmap" as "phase
+    // missing" (this is what keeps `phase7_cli.rs`'s no-ROADMAP fixtures,
+    // and any repository that simply doesn't keep a roadmap, unaffected).
+    let roadmap = std::process::Command::new("git")
+        .args(["show", &format!("{base}:.planning/ROADMAP.md")])
+        .current_dir(project_root)
+        .output();
+    let roadmap_text = match roadmap {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
+        _ => return PhaseReachability::Undeterminable,
+    };
+
+    // Step 3: scan for the phase heading. The trailing colon is
+    // load-bearing — it stops a probe for phase 2 from matching
+    // `### Phase 24:`; every heading in this project's ROADMAP already uses
+    // this exact form.
+    let heading = format!("### Phase {phase}:");
+    let roadmap_entry_found = roadmap_text
+        .lines()
+        .any(|line| line.trim_start().starts_with(&heading));
+
+    // Step 4: does the phase directory exist on the base branch? Same
+    // `strip_prefix` + `rest.contains('/')` idiom as
+    // `commands::phase_artifact_on_develop` — a directory holding only a
+    // `.gitkeep` still counts as present, and phase numbers are
+    // zero-padded (phase 7 is `07-`, phase 24 is `24-`).
+    let ls_tree = std::process::Command::new("git")
+        .args([
+            "ls-tree",
+            "-r",
+            "--name-only",
+            base,
+            "--",
+            ".planning/phases/",
+        ])
+        .current_dir(project_root)
+        .output();
+    let phase_dir_found = match ls_tree {
+        Ok(out) if out.status.success() => {
+            let prefix = format!(".planning/phases/{phase:02}-");
+            String::from_utf8_lossy(&out.stdout).lines().any(|path| {
+                path.strip_prefix(&prefix)
+                    .is_some_and(|rest| rest.contains('/'))
+            })
+        }
+        _ => return PhaseReachability::Undeterminable,
+    };
+
+    if roadmap_entry_found && phase_dir_found {
+        PhaseReachability::Reachable
+    } else {
+        PhaseReachability::Unreachable {
+            roadmap_entry_found,
+            phase_dir_found,
+        }
+    }
+}
+
+/// Builds the operator-facing refusal message for an `Unreachable` result —
+/// a pure function so the message is unit-testable without git. Names the
+/// base branch and each missing half; contains no absolute filesystem path,
+/// no `project_root`, and no username — every path named is
+/// repository-relative. This repository has leaked absolute paths into
+/// operator-facing strings three times (999.10, and again in 18-07's
+/// `self_dogfood_stale_blocked` reason); this must not be a fourth.
+pub(crate) fn unreachable_message(
+    phase: u32,
+    base: &str,
+    roadmap_entry_found: bool,
+    phase_dir_found: bool,
+) -> String {
+    let mut msg = format!(
+        "phase {phase} is not reachable from `{base}` — the branch `devflow start` \
+         forks its worktree from:\n"
+    );
+    if !roadmap_entry_found {
+        msg.push_str(&format!(
+            "  missing: the `### Phase {phase}:` heading in `ROADMAP.md` on `{base}`\n"
+        ));
+    }
+    if !phase_dir_found {
+        msg.push_str(&format!(
+            "  missing: a `.planning/phases/{phase:02}-*/` directory on `{base}`\n"
+        ));
+    }
+    msg.push_str(&format!(
+        "a phase promoted only on another branch is invisible to this run — merge that \
+         branch into `{base}` first, then re-run."
+    ));
+    msg
+}
+
+/// Refuse before `devflow start` forks anything when `phase` is not
+/// reachable from `base`. `Reachable` and `Undeterminable` both return
+/// `Ok(())` — the guard fails open where it cannot see.
+pub(crate) fn ensure_phase_reachable_on_base(
+    project_root: &Path,
+    phase: u32,
+    base: &str,
+) -> Result<(), CliError> {
+    match phase_reachability_on_base(project_root, phase, base) {
+        PhaseReachability::Reachable | PhaseReachability::Undeterminable => Ok(()),
+        PhaseReachability::Unreachable {
+            roadmap_entry_found,
+            phase_dir_found,
+        } => Err(CliError::Message(unreachable_message(
+            phase,
+            base,
+            roadmap_entry_found,
+            phase_dir_found,
+        ))),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 17c: preflight readiness gate (D-13-D-16) — generic universal checks +
 // adapter hook, run from `launch_stage` before `monitor::spawn_monitor` so a
 // readiness failure is caught before any agent time is spent.
@@ -767,5 +945,183 @@ mod tests {
             reloaded.preflight_retries, 0,
             "the reset must be persisted to disk, not just held in memory"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // 23f (gap closure, 23-12, Task 2): phase-reachability discrimination —
+    // the guard must refuse for the right reason, and fail open where it
+    // cannot see.
+    // -----------------------------------------------------------------
+
+    /// Builds a git repo with a `develop` branch whose `.planning/ROADMAP.md`
+    /// content is controlled per-test, optionally committing a
+    /// `.planning/phases/{phase:02}-{slug}/.gitkeep` alongside it.
+    fn reachability_fixture(roadmap: &str, phase_dir: Option<(u32, &str)>) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let run = |args: &[&str]| {
+            assert!(
+                devflow_core::test_support::git_command(root)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@e.st"]);
+        run(&["config", "user.name", "t"]);
+        run(&["config", "commit.gpgsign", "false"]);
+        run(&["config", "core.hooksPath", "/dev/null"]);
+        run(&["checkout", "-q", "-b", "develop"]);
+
+        std::fs::create_dir_all(root.join(".planning")).unwrap();
+        std::fs::write(root.join(".planning/ROADMAP.md"), roadmap).unwrap();
+        if let Some((phase, slug)) = phase_dir {
+            let d = root.join(format!(".planning/phases/{phase:02}-{slug}"));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join(".gitkeep"), "").unwrap();
+        }
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "fixture"]);
+        dir
+    }
+
+    #[test]
+    fn reachability_is_reachable_when_roadmap_entry_and_phase_dir_are_both_on_base() {
+        let dir = reachability_fixture("### Phase 24: Something\n", Some((24, "something")));
+        let root = dir.path();
+        assert_eq!(
+            phase_reachability_on_base(root, 24, "develop"),
+            PhaseReachability::Reachable
+        );
+        assert!(ensure_phase_reachable_on_base(root, 24, "develop").is_ok());
+    }
+
+    #[test]
+    fn reachability_is_unreachable_when_the_phase_dir_is_absent_from_base() {
+        let dir = reachability_fixture("### Phase 24: Something\n", None);
+        let root = dir.path();
+        assert_eq!(
+            phase_reachability_on_base(root, 24, "develop"),
+            PhaseReachability::Unreachable {
+                roadmap_entry_found: true,
+                phase_dir_found: false,
+            }
+        );
+    }
+
+    #[test]
+    fn reachability_is_unreachable_when_the_roadmap_entry_is_absent_from_base() {
+        let dir = reachability_fixture("### Phase 1: Something else\n", Some((24, "something")));
+        let root = dir.path();
+        assert_eq!(
+            phase_reachability_on_base(root, 24, "develop"),
+            PhaseReachability::Unreachable {
+                roadmap_entry_found: false,
+                phase_dir_found: true,
+            }
+        );
+    }
+
+    /// D-fail-open: a probe which cannot see must never refuse.
+    #[test]
+    fn reachability_is_undeterminable_outside_a_git_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(
+            phase_reachability_on_base(root, 24, "develop"),
+            PhaseReachability::Undeterminable
+        );
+        assert!(
+            ensure_phase_reachable_on_base(root, 24, "develop").is_ok(),
+            "a probe that cannot see must never refuse (fail-open contract)"
+        );
+    }
+
+    /// This is precisely the shape of every existing `phase7_cli.rs` fixture
+    /// (a real `develop` branch with a committed file but no
+    /// `.planning/ROADMAP.md`) — why the guard is not a breaking change.
+    #[test]
+    fn reachability_is_undeterminable_when_base_has_no_roadmap_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let run = |args: &[&str]| {
+            assert!(
+                devflow_core::test_support::git_command(root)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@e.st"]);
+        run(&["config", "user.name", "t"]);
+        run(&["config", "commit.gpgsign", "false"]);
+        run(&["config", "core.hooksPath", "/dev/null"]);
+        run(&["checkout", "-q", "-b", "develop"]);
+        std::fs::write(root.join("README.md"), "no roadmap here\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "no roadmap"]);
+
+        assert_eq!(
+            phase_reachability_on_base(root, 24, "develop"),
+            PhaseReachability::Undeterminable
+        );
+        assert!(ensure_phase_reachable_on_base(root, 24, "develop").is_ok());
+    }
+
+    /// Pins the trailing colon's job: it stops a probe for phase 24 from
+    /// matching a heading for a different phase number that merely starts
+    /// with the same digits.
+    #[test]
+    fn phase_heading_probe_does_not_confuse_a_phase_number_prefix() {
+        let dir = reachability_fixture("### Phase 240: Later\n", Some((24, "something")));
+        let root = dir.path();
+        assert_eq!(
+            phase_reachability_on_base(root, 24, "develop"),
+            PhaseReachability::Unreachable {
+                roadmap_entry_found: false,
+                phase_dir_found: true,
+            }
+        );
+    }
+
+    #[test]
+    fn unreachable_message_names_the_base_branch_and_each_missing_half() {
+        let roadmap_missing = unreachable_message(24, "develop", false, true);
+        assert!(roadmap_missing.contains("is not reachable from"));
+        assert!(roadmap_missing.contains("develop"));
+        assert!(roadmap_missing.contains("### Phase 24:"));
+        assert!(!roadmap_missing.contains(".planning/phases/24-"));
+
+        let dir_missing = unreachable_message(24, "develop", true, false);
+        assert!(dir_missing.contains("is not reachable from"));
+        assert!(dir_missing.contains("develop"));
+        assert!(!dir_missing.contains("### Phase 24:"));
+        assert!(dir_missing.contains(".planning/phases/24-"));
+
+        let both_missing = unreachable_message(24, "develop", false, false);
+        assert!(both_missing.contains("is not reachable from"));
+        assert!(both_missing.contains("develop"));
+        assert!(both_missing.contains("### Phase 24:"));
+        assert!(both_missing.contains(".planning/phases/24-"));
+    }
+
+    /// 999.10: the message must contain no absolute filesystem path or
+    /// username — every path it names is repository-relative.
+    #[test]
+    fn unreachable_message_contains_no_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture_root = dir.path().to_string_lossy().into_owned();
+        let msg = unreachable_message(24, "develop", false, false);
+        assert!(!msg.contains(&fixture_root));
+        assert!(!msg.contains("/home/"));
+        assert!(!msg.contains("/Users/"));
     }
 }
