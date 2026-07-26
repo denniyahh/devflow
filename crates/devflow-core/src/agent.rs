@@ -14,13 +14,53 @@
 /// permanently alive), and a value above `i32::MAX` would wrap negative
 /// through an `as libc::pid_t` cast — `kill(-1, 0)` probes every process
 /// the caller may signal and virtually always succeeds.
+///
+/// **Zombies are NOT running.** `kill(pid, 0)` succeeds for a process that
+/// has exited but not yet been reaped: the pid stays allocated until its
+/// parent calls `wait`, so the bare POSIX check reports a dead agent as
+/// alive. That is not academic here — when a monitor dies before its agent,
+/// the agent reparents to PID 1, and inside a container PID 1 is whatever
+/// the image runs (cargo, a shell, the test harness), none of which reap
+/// orphans the way an init system does. The zombie then persists for the
+/// life of the container and every liveness check keeps answering "yes".
+///
+/// That is exactly the "monitor over-durability" class Phase 23 exists to
+/// close: an operator, `gate sweep`, or `stop` asking "is this phase still
+/// running?" would be told yes forever about a process that is already dead.
+/// Observed directly in CI (`sigterm_to_monitor_also_kills_the_agent`), where
+/// both monitor and agent were `State=Z` and the agent had reparented to
+/// PPid=1 while the bare check still reported them alive.
+///
+/// Reading `/proc` is Linux-only; where it cannot be read, this falls back to
+/// the `kill(0)` answer rather than inventing one.
 pub fn agent_running(pid: u32) -> bool {
     // kill(pid, 0) is the standard POSIX way to check process existence
     // without sending an actual signal.
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
+    let Ok(signed) = libc::pid_t::try_from(pid) else {
         return false;
     };
-    pid > 0 && unsafe { libc::kill(pid, 0) == 0 }
+    if signed <= 0 || unsafe { libc::kill(signed, 0) } != 0 {
+        return false;
+    }
+    !is_zombie(pid)
+}
+
+/// Whether `pid` has exited but not yet been reaped — `State: Z` in
+/// `/proc/<pid>/status`.
+///
+/// Returns `false` when the status file cannot be read: an unreadable
+/// `/proc` entry means "cannot tell", and the caller has already established
+/// via `kill(0)` that the pid exists, so claiming zombie-hood here would
+/// invent information.
+fn is_zombie(pid: u32) -> bool {
+    let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+        return false;
+    };
+    status
+        .lines()
+        .find(|line| line.starts_with("State:"))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .is_some_and(|state| state == "Z")
 }
 
 /// Send SIGTERM to `pid` — the crate's one process-termination call, used by
@@ -139,6 +179,44 @@ mod tests {
     fn agent_running_detects_self() {
         // The current process is, by definition, running.
         assert!(agent_running(std::process::id()));
+    }
+
+    /// A reaped-pending child is dead, not running. `kill(pid, 0)` succeeds
+    /// on a zombie because the pid is still allocated, so the bare POSIX
+    /// check reports it alive — which is how a container with no reaping
+    /// init can make a dead agent look permanently live.
+    #[test]
+    fn agent_running_is_false_for_an_unreaped_zombie() {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        let pid = child.id();
+
+        // Wait for it to become a zombie WITHOUT reaping it: poll /proc for
+        // State: Z rather than calling wait(), which would clear the pid.
+        let mut became_zombie = false;
+        for _ in 0..200 {
+            if super::is_zombie(pid) {
+                became_zombie = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(became_zombie, "child never became an unreaped zombie");
+
+        // The bare POSIX check still says "alive" — that is the trap.
+        assert_eq!(
+            unsafe { libc::kill(pid as libc::pid_t, 0) },
+            0,
+            "kill(pid, 0) is expected to still succeed on a zombie — if this \
+             fails the test is no longer exercising the case it was written for"
+        );
+        assert!(
+            !agent_running(pid),
+            "a zombie has exited and must not be reported as running"
+        );
+
+        let _ = child.wait();
     }
 
     #[test]
