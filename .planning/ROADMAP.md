@@ -740,7 +740,7 @@ Plans carry the unit identifiers `23a`, `23b`, `23c`, `23d`, `23e` and
 `yes-ship` as requirement tokens. **`23b` and `23c` were redefined, and `23e`
 added, by the 2026-07-25 replan** — see "Re-aimed 2026-07-25" below.
 **Depends on:** Phase 22
-**Plans:** 5/11 plans executed
+**Plans:** 6/11 plans executed
 2026-07-25; the original 23-03…23-12 are archived under
 `phases/23-end-to-end-dogfood/superseded/`)
 
@@ -917,7 +917,7 @@ Plans:
 - [x] 23-03-PLAN.md — 23b: cross-root gate registry (one file per root/phase) + `devflow gate list --all-roots`
 - [x] 23-04-PLAN.md — 23b: `devflow gate sweep` — bound gate lifetime by auto-rejecting aged gates
 - [x] 23-05-PLAN.md — 23c: `devflow stop`, targeting the lock holder
-- [ ] 23-06-PLAN.md — 23e: terminal-only `workflow_shipped` event + Ship-evidence oracle + enforced merge post-condition
+- [x] 23-06-PLAN.md — 23e: terminal-only `workflow_shipped` event + Ship-evidence oracle + enforced merge post-condition
 - [ ] 23-07-PLAN.md — 23d: delete the two-agent verb from the CLI crate + reconcile docs
 - [ ] 23-08-PLAN.md — 23d: delete the core-side surface, workspace count to zero
 - [ ] 23-09-PLAN.md — `--yes-ship`: per-run flag, one auto-answered Ship gate
@@ -946,7 +946,7 @@ unchanged and already merged.)*
 
 **Wave 3** *(blocked on 23-04)*
 
-- [ ] 23-05 — 23c: `devflow stop` — gate-response path, lock-holder signalling fallback, identity check (23c)
+- [x] 23-05 — 23c: `devflow stop` — gate-response path, lock-holder signalling fallback, identity check (23c)
 
 **Wave 4** *(blocked on 23-05)*
 
