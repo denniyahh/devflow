@@ -754,6 +754,8 @@ direct predicate:    looks_like_devflow_process(3054) = true
 test process:        pid 2856
 ```
 
+**SUPERSEDED 2026-07-26 — see "MECHANISM CONFIRMED" below.** The reading in this paragraph ("never execs, persistently") was wrong: both of its samples happened to land inside a window that is merely *wide*, not permanent.
+
 **The child forks and never `exec`s, and stays that way.** `PPid` is the test process, so it *is* our child; `try_wait()` is `Ok(None)`, so it has not exited; `Name` is `commands::tests` — the *forking Rust test thread's* name, not `sleep`; and the state is unchanged across the whole `stop()` call. It therefore still carries the parent's `cmdline`, which is why the predicate answers `true`.
 
 This **rules out**, with evidence: pid recycling (PPid matches), a transient read window (stable before *and* after), a matching-logic bug in the predicate (the cmdline genuinely is a devflow binary's), and fixture self-sabotage (the `spawned sleep` branch was taken).
@@ -763,6 +765,20 @@ This **rules out**, with evidence: pid recycling (PPid matches), a transient rea
 - **Local CPU contention** — 40/40 pass with the machine loaded.
 - **Transient fork/exec cmdline inheritance** — 4000 spawns × 3 modes, including `pre_exec` to *force* the `fork`+`execvp` path off `posix_spawn`, observed it **0 times**. (An earlier revision called this "disproved", then retracted it as an overstatement; the CI evidence above now disproves the *transient* form outright, since the state is persistent, while leaving "never execs" as the actual finding.)
 - **glibc environment-lock deadlock inherited across `fork`** (a `setenv` in another thread holding the lock when the child forks, wedging `execvp`'s PATH lookup) — a 4-thread `setenv` storm across 300 spawns wedged **0** children.
+
+**MECHANISM CONFIRMED 2026-07-26 — transient fork/exec window, observed directly.** From the `agent.rs` unit test in the devcontainer job:
+
+```
+child cmdline before: /workspaces/devflow/target/debug/deps/devflow_core-e2538b0c9f19931c
+child cmdline after:  <empty>
+child /proc/7335/exe: /usr/bin/sleep
+```
+
+`/proc/<pid>/exe` resolves to `/usr/bin/sleep`, so the child **did** exec. The cmdline read caught it mid-flight: the parent's argv beforehand, empty afterwards. Between `Command::spawn()` returning a pid and the child completing `execve`, `/proc/<pid>/cmdline` still reports the *parent's* command line — and `looks_like_devflow_process` reads exactly that.
+
+**This is the hypothesis that was twice recorded above as "not reproduced" and then "disproved". Both retractions were wrong, and the fault was the instrument, not the theory.** The local probes (3000 and 4000 spawns, including `pre_exec` to force the `fork`+`execvp` path) ran on a warm local filesystem where `execve` completes in microseconds, so the window was never observable. Container overlayfs makes it wide enough to hit routinely. The earlier "persistent, never execs" reading came from a sample pair that both landed inside that wide window.
+
+**Lesson for the next reader:** a negative result from a probe is evidence about the probe's sensitivity, not proof about the system. Reproduce in the environment that fails.
 
 **The fix does not depend on resolving that.** Whatever wedges the child, the production defect is that `looks_like_devflow_process` trusts `/proc/<pid>/cmdline`, which a forked-not-`exec`'d child inherits wholesale from its devflow parent. `/proc/<pid>/exe` is no better — it is inherited too. **Identity must be a recorded pair, not an inference:** persist `(pid, starttime)` — field 22 of `/proc/<pid>/stat` — in the lock file and require both to match before signalling. That is immune to inheritance *and* closes the check-then-signal TOCTOU below, so it subsumes both defects.
 
