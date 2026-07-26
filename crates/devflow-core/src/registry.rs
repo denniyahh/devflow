@@ -250,6 +250,122 @@ mod tests {
         assert_eq!(roots.len(), 1);
     }
 
+    /// Cross-AI review BLOCKER 4's required fix: two concurrent
+    /// registrations for two DIFFERENT (project_root, phase) pairs must
+    /// BOTH survive — the per-file storage shape has no read-modify-write
+    /// step to lose one in.
+    #[test]
+    fn concurrent_registration_of_different_pairs_both_survive() {
+        let cache = tempfile::tempdir().unwrap();
+        let cache_path = cache.path().to_path_buf();
+        let root_a = PathBuf::from("/tmp/concurrent-project-a");
+        let root_b = PathBuf::from("/tmp/concurrent-project-b");
+
+        std::thread::scope(|scope| {
+            let a = scope.spawn(|| register_in(&cache_path, &root_a, 1));
+            let b = scope.spawn(|| register_in(&cache_path, &root_b, 1));
+            a.join().unwrap().unwrap();
+            b.join().unwrap().unwrap();
+        });
+
+        let roots = load_roots_in(&cache_path);
+        assert_eq!(roots.len(), 2, "both concurrent registrations must survive");
+        assert!(roots.iter().any(|r| r.project_root == root_a));
+        assert!(roots.iter().any(|r| r.project_root == root_b));
+    }
+
+    /// Two concurrent registrations for the SAME pair must never produce a
+    /// torn file — write-temp-then-rename per entry protects against a
+    /// torn read of the one file both writers target.
+    #[test]
+    fn concurrent_registration_of_same_pair_results_in_one_valid_entry() {
+        let cache = tempfile::tempdir().unwrap();
+        let cache_path = cache.path().to_path_buf();
+        let root = PathBuf::from("/tmp/concurrent-project-same");
+
+        std::thread::scope(|scope| {
+            let a = scope.spawn(|| register_in(&cache_path, &root, 1));
+            let b = scope.spawn(|| register_in(&cache_path, &root, 1));
+            a.join().unwrap().unwrap();
+            b.join().unwrap().unwrap();
+        });
+
+        let entry_path = entry_path_in(&cache_path, &root, 1);
+        let contents = std::fs::read_to_string(&entry_path).unwrap();
+        let parsed: RegisteredRoot =
+            serde_json::from_str(&contents).expect("entry must not be torn");
+        assert_eq!(parsed.project_root, root);
+
+        let roots = load_roots_in(&cache_path);
+        assert_eq!(roots.len(), 1);
+    }
+
+    /// T-23-33: the registry names every project this user is currently
+    /// running — both the cache dir and the roots dir must be created
+    /// private (0700), not inherit whatever the parent directory's mode is.
+    #[test]
+    fn register_in_creates_cache_and_roots_dirs_with_mode_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let cache_path = base.path().join("nested-cache");
+        let root = PathBuf::from("/tmp/project-perm");
+
+        register_in(&cache_path, &root, 1).unwrap();
+
+        let cache_mode = std::fs::metadata(&cache_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(cache_mode, 0o700, "cache dir must be created with mode 0700");
+
+        let roots_mode = std::fs::metadata(roots_dir_in(&cache_path))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(roots_mode, 0o700, "roots dir must be created with mode 0700");
+    }
+
+    #[test]
+    fn prune_missing_in_removes_entry_for_deleted_root_and_reports_count() {
+        let cache = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let project_path = project.path().to_path_buf();
+        register_in(cache.path(), &project_path, 1).unwrap();
+        drop(project); // deletes the project's directory from disk
+
+        let removed = prune_missing_in(cache.path());
+
+        assert_eq!(removed, 1);
+        assert!(load_roots_in(cache.path()).is_empty());
+    }
+
+    #[test]
+    fn prune_missing_in_keeps_entry_for_existing_root() {
+        let cache = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        register_in(cache.path(), project.path(), 1).unwrap();
+
+        let removed = prune_missing_in(cache.path());
+
+        assert_eq!(removed, 0);
+        assert_eq!(load_roots_in(cache.path()).len(), 1);
+    }
+
+    #[test]
+    fn prune_missing_in_removes_and_counts_unparsable_entry() {
+        let cache = tempfile::tempdir().unwrap();
+        let dir = roots_dir_in(cache.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("junk.json"), "{not json").unwrap();
+
+        let removed = prune_missing_in(cache.path());
+
+        assert_eq!(removed, 1);
+        assert!(load_roots_in(cache.path()).is_empty());
+    }
+
     #[test]
     fn path_digest_is_stable_and_distinguishes_different_paths() {
         let a = Path::new("/tmp/project-a");
