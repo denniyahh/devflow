@@ -3142,6 +3142,32 @@ mod tests {
         }
     }
 
+    /// Pull the identity-bearing fields out of `/proc/<pid>/status` for
+    /// failure diagnostics. `PPid` is the decisive one: it says whether the
+    /// pid still belongs to the child we spawned or has been recycled by an
+    /// unrelated process. Test-only; never used in a decision.
+    fn debug_proc_status(pid: u32) -> String {
+        match std::fs::read_to_string(format!("/proc/{pid}/status")) {
+            Ok(text) => {
+                let pick = |key: &str| {
+                    text.lines()
+                        .find(|l| l.starts_with(key))
+                        .map(|l| l.split_whitespace().skip(1).collect::<Vec<_>>().join(" "))
+                        .unwrap_or_else(|| "?".to_string())
+                };
+                format!(
+                    "Name={} State={} Pid={} PPid={} Threads={}",
+                    pick("Name:"),
+                    pick("State:"),
+                    pick("Pid:"),
+                    pick("PPid:"),
+                    pick("Threads:")
+                )
+            }
+            Err(err) => format!("<unreadable: {err}>"),
+        }
+    }
+
     /// Task 2 behavior (T-23-52 fail-closed): a lock file naming a live pid
     /// that does not identify as a devflow process must be refused, never
     /// signalled. Constructed against this test binary's own pid when its
@@ -3183,10 +3209,23 @@ mod tests {
         // every artifact that could name the cause, so capture the guard's own
         // inputs around the call. Not reproducible locally as of 2026-07-26 —
         // see the backlog entry for the attempts already ruled out.
+        // CI (2026-07-26) showed the child's cmdline equal to this test
+        // binary's own, stably before and after. cmdline alone cannot say
+        // WHY. /proc/<pid>/status disambiguates: PPid tells us whether this
+        // pid is still our child (if not, it was recycled by an unrelated
+        // process), Name is the post-exec binary name, and State reveals a
+        // zombie whose cmdline reads empty.
+        let status_before = debug_proc_status(pid);
         let cmdline_before = debug_cmdline(pid);
         let predicate_verdict = agent::looks_like_devflow_process(pid);
         let result = stop(root, phase);
         let cmdline_after = debug_cmdline(pid);
+        let status_after = debug_proc_status(pid);
+        // Did the spawned child already exit before we ever looked at it?
+        let child_exited = sleeper
+            .as_mut()
+            .map(|c| format!("{:?}", c.try_wait()))
+            .unwrap_or_else(|| "<no child spawned>".to_string());
         let lock_survived = lock_path.exists();
 
         // Reap before asserting: a panic here must not leak the sleeper for
@@ -3206,14 +3245,20 @@ mod tests {
                  \x20 pid under test:      {pid}\n\
                  \x20 cmdline before stop: {cmdline_before}\n\
                  \x20 cmdline after stop:  {cmdline_after}\n\
+                 \x20 status before stop:  {status_before}\n\
+                 \x20 status after stop:   {status_after}\n\
+                 \x20 child.try_wait():    {child_exited}\n\
                  \x20 direct predicate:    looks_like_devflow_process({pid}) = {predicate_verdict}\n\
                  \x20 lock file survived:  {lock_survived}\n\
                  \x20 test process:        pid {} cmdline {}\n\
-                 If the branch is `own pid`, current_exe() failed to look devflow-named \
-                 and the test sabotaged itself — fix the fixture, not the predicate. \
-                 If the branch is `spawned sleep` and the cmdlines name a devflow binary, \
-                 the pid is not the sleep we spawned. If they name `sleep`, the predicate's \
-                 matching logic is at fault.",
+                 Read PPid first. If PPid is NOT this test process, the pid was \
+                 recycled by an unrelated process and the predicate answered about \
+                 a different process than the one we spawned — a TOCTOU in the \
+                 fixture and in `stop` itself, not a matching bug. If PPid IS this \
+                 process and Name is not `sleep`, the child never exec'd. If State \
+                 is Z, it is a zombie whose /proc entries are unreliable. If the \
+                 branch is `own pid`, current_exe() failed to look devflow-named and \
+                 the test sabotaged itself — fix the fixture, not the predicate.",
                 if self_exe_is_devflow_named {
                     "spawned sleep"
                 } else {
