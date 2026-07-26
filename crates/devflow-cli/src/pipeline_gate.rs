@@ -784,6 +784,119 @@ mod tests {
         assert!(tags.stdout.is_empty());
     }
 
+    /// 23-09 Task 2 (T-23-91's regression guard, cross-AI-review HIGH): with
+    /// `state.yes_ship` set, a terminal-hook failure that reopens the
+    /// finalization gate must NOT be auto-approved — the reopened gate is a
+    /// different call site (passing `None`) than the routine Ship approval
+    /// in `handle_ship_outcome` (passing `Some`), and this is the concrete
+    /// proof. If a future refactor folds `state.yes_ship` into
+    /// `run_gate_with_timeout`'s own body instead of threading it as a
+    /// caller argument (see that parameter's doc comment), this test fails
+    /// loudly: the reopened gate would then find an unexpected response and
+    /// never block for a human.
+    ///
+    /// `VersionBump` is failed deterministically by pre-creating the exact
+    /// tag it will attempt to create (`hooks.rs:286-287`, `git.tag(&tag)`),
+    /// with the version computed the same way the hook computes it
+    /// (`version::compute_version`) so the fixture does not silently stop
+    /// failing when the repository's version changes. `Merge` runs first in
+    /// `hooks_after_ship` and succeeds — the feature branch is created
+    /// identical to `develop`, so `is_merged_into_develop` is immediately
+    /// true and `merge_feature` takes its already-merged no-op success
+    /// path — exactly the "Merge has already succeeded" state the reopened
+    /// gate exists for (no rollback policy, `hooks.rs` doc comment on
+    /// `merge_feature`).
+    #[test]
+    fn finalization_retry_gate_never_auto_approves_even_with_yes_ship_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 60;
+        let branch = format!("feature/phase-{phase:02}");
+        let branch_created = devflow_core::test_support::git_command(root)
+            .args(["branch", &branch, "develop"])
+            .status()
+            .unwrap()
+            .success();
+        assert!(branch_created);
+
+        // Computed the same way version_bump computes it — MAJOR from
+        // Cargo.toml (stable), MINOR from the git tag count. The fixture is
+        // about to add exactly one tag at HEAD, so at VersionBump's own
+        // call time the tag count will be `tags_before + 1` and "commits
+        // since the most recent tag" will be 0 (our tag sits at HEAD, and
+        // Merge below is a no-op — the feature branch is identical to
+        // develop — so nothing moves HEAD in between). That is the fixed
+        // point: the tag we create here is exactly the tag VersionBump will
+        // independently compute and attempt to create.
+        let major = devflow_core::version::compute_version(root)
+            .expect("compute expected version")
+            .major;
+        let tags_before = devflow_core::version::count_git_tags(root).expect("count existing tags");
+        let expected_tag = format!("v{major}.{}.0", tags_before + 1);
+        let git = devflow_core::git::GitFlow::new(root);
+        git.tag(&expected_tag)
+            .expect("pre-create the tag VersionBump will attempt");
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Ship;
+        state.yes_ship = true;
+        workflow::save_state(&state).unwrap();
+
+        let root_owned = root.to_path_buf();
+        let handle = std::thread::spawn(move || {
+            let mut state = workflow::load_state(&root_owned, phase).unwrap();
+            finish_workflow(&root_owned, &mut state)
+        });
+
+        let gate_path = Gates::gate_path(root, phase, Stage::Ship);
+        for _ in 0..150 {
+            if gate_path.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            gate_path.exists(),
+            "a terminal-hook failure must reopen the Ship gate even with yes_ship set"
+        );
+
+        // Give any (incorrect) auto-write a moment to have happened if it
+        // were ever going to.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let response_path = Gates::response_path(root, phase, Stage::Ship);
+        assert!(
+            !response_path.exists(),
+            "yes_ship must NEVER auto-approve the reopened finalization-retry gate \
+             (T-23-91) — a failing finalization must wait for a human"
+        );
+        assert!(
+            workflow::load_state(root, phase).unwrap().gate_pending,
+            "the reopened gate must be recorded as pending, awaiting a human"
+        );
+        assert!(
+            devflow_core::events::has_event_for_phase(root, phase, "merge_result"),
+            "Merge must have succeeded before VersionBump failed — the reopened gate must be \
+             exercised in the state it actually occurs in"
+        );
+
+        // Unblock the poll (reject, not approve — this test's subject is
+        // that nothing auto-approves it) so the spawned thread can finish.
+        Gates::respond(
+            root,
+            phase,
+            Stage::Ship,
+            &GateResponse {
+                approved: false,
+                note: Some("abort: test cleanup".into()),
+                responded_by: Some("test".into()),
+            },
+        )
+        .unwrap();
+        handle.join().unwrap().unwrap();
+    }
+
     /// 13-DEFERRED-CR-03 acceptance: two phases advancing their Ship stages
     /// CONCURRENTLY must each finish their own stage machine — per-phase
     /// state files prevent cross-phase clobbering, and the coarse checkout

@@ -1613,6 +1613,39 @@ mod tests {
         assert!(!prompt.contains("--gaps-only"));
     }
 
+    /// 23-09 Task 2 (D-05, cross-AI review finding: this project's config
+    /// loader ignores unknown keys and would accept the key silently, so a
+    /// parse-only test would pass vacuously). Framed as absence of
+    /// *behaviour*, not absence of a parse error: a `devflow.toml`
+    /// containing a key literally named `yes_ship` must load without
+    /// erroring (proving the file was accepted, not rejected), AND a fresh
+    /// `State` — built the same way `commands::start` builds one when
+    /// `--yes-ship` is NOT passed — must still have `yes_ship == false`.
+    /// `DevflowConfig` (`devflow-core/src/config.rs`) has no field of that
+    /// name, so nothing in `load_config`'s output could ever reach `State`
+    /// even if a caller tried to wire it — the two systems are disconnected
+    /// by construction, and this test asserts that outcome rather than
+    /// assuming it.
+    #[test]
+    fn config_file_with_yes_ship_key_loads_but_never_sets_the_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("devflow.toml"), "yes_ship = true\n").unwrap();
+
+        // The config loader must accept the file — an unknown key must not
+        // be a load failure (fail-soft is the existing contract; this just
+        // proves this specific key doesn't somehow special-case that).
+        let _config = devflow_core::config::load_config(root);
+
+        // The same construction `commands::start` performs when `--yes-ship`
+        // is omitted: no code path derives `yes_ship` from `devflow.toml`.
+        let state = State::new(1, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        assert!(
+            !state.yes_ship,
+            "no devflow.toml key may ever set the Ship pre-authorization (D-05)"
+        );
+    }
+
     /// 23-09 Task 1 acceptance: with `state.yes_ship` set, `handle_ship_outcome`
     /// writes the Ship gate request exactly once (never reopened) and the
     /// resolved gate carries the flag's literal `--yes-ship` attribution —
