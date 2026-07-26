@@ -740,7 +740,7 @@ Plans carry the unit identifiers `23a`, `23b`, `23c`, `23d`, `23e` and
 `yes-ship` as requirement tokens. **`23b` and `23c` were redefined, and `23e`
 added, by the 2026-07-25 replan** — see "Re-aimed 2026-07-25" below.
 **Depends on:** Phase 22
-**Plans:** 3/11 plans executed
+**Plans:** 4/11 plans executed
 2026-07-25; the original 23-03…23-12 are archived under
 `phases/23-end-to-end-dogfood/superseded/`)
 
@@ -915,7 +915,7 @@ Plans:
 - [x] 23-01-PLAN.md — Rebuild the binary and scaffold an isolated scratch probe target (23a)
 - [x] 23-02-PLAN.md — 23a probe: one unattended run, recorded where it stopped (23a)
 - [x] 23-03-PLAN.md — 23b: cross-root gate registry (one file per root/phase) + `devflow gate list --all-roots`
-- [ ] 23-04-PLAN.md — 23b: `devflow gate sweep` — bound gate lifetime by auto-rejecting aged gates
+- [x] 23-04-PLAN.md — 23b: `devflow gate sweep` — bound gate lifetime by auto-rejecting aged gates
 - [ ] 23-05-PLAN.md — 23c: `devflow stop`, targeting the lock holder
 - [ ] 23-06-PLAN.md — 23e: terminal-only `workflow_shipped` event + Ship-evidence oracle + enforced merge post-condition
 - [ ] 23-07-PLAN.md — 23d: delete the two-agent verb from the CLI crate + reconcile docs
@@ -938,7 +938,7 @@ unchanged and already merged.)*
 
 **Wave 1 (replanned set)**
 
-- [ ] 23-03 — 23b: registry module, registration on the launch path, cross-root gate listing with age (23b)
+- [x] 23-03 — 23b: registry module, registration on the launch path, cross-root gate listing with age (23b)
 
 **Wave 2** *(blocked on 23-03)*
 
