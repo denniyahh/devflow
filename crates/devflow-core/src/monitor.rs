@@ -317,8 +317,27 @@ mod tests {
         // poll rather than sleep a fixed amount to keep this fast and
         // avoid flaking under load. (Window widened to 5s: at 2s this
         // still flaked under a fully parallel workspace test run.)
+        //
+        // 2026-07-26: widened again, 5s -> 15s, after CI moved into the
+        // pinned devcontainer (db1b4bf) and this failed in both runs. The
+        // container is a slower, more contended environment than the host
+        // these budgets were tuned against.
+        //
+        // Widening was chosen deliberately, and only because the MECHANISM
+        // was verified independently first: DevFlow's real monitor script
+        // shape was run under both `bash` and `dash` (the container's
+        // /bin/sh is dash, the Fedora host's is bash) and the trap killed
+        // the backgrounded agent correctly in both. So this is a budget
+        // that is too tight, not a trap that does not fire — the opposite
+        // call from 999.47, where a failure was left red because it
+        // exposed a genuine defect.
+        //
+        // If this flakes again at 15s, do NOT widen a third time: that
+        // would mean the agent is not being reaped rather than being
+        // reaped slowly, which is a real bug and plausibly the same
+        // scheduling starvation that fits 999.47's never-exec'd child.
         let mut still_running = true;
-        for _ in 0..250 {
+        for _ in 0..750 {
             if !crate::agent::agent_running(agent_pid) {
                 still_running = false;
                 break;
