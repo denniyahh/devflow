@@ -291,6 +291,44 @@ mod tests {
     /// terminate the agent it owns. Before the fix, `cleanup()` only exited
     /// the monitor shell, leaving the agent orphaned and running/committing
     /// unsupervised with nothing left to call `devflow advance` for it.
+    /// A one-line identity/state summary of a pid, for failure diagnostics.
+    /// `Name`/`State`/`PPid` come from `/proc/<pid>/status`; the cmdline
+    /// distinguishes a shell that exec'd its command from one that forked it.
+    /// Test-only; never used in a decision.
+    fn proc_snapshot(pid: u32) -> String {
+        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+            return format!("GONE (no /proc/{pid})");
+        };
+        let field = |key: &str| {
+            status
+                .lines()
+                .find(|l| l.starts_with(key))
+                .map(|l| l.split_whitespace().skip(1).collect::<Vec<_>>().join(" "))
+                .unwrap_or_else(|| "?".into())
+        };
+        let cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))
+            .map(|raw| {
+                let joined = raw
+                    .split(|&b| b == 0)
+                    .filter(|a| !a.is_empty())
+                    .map(|a| String::from_utf8_lossy(a).into_owned())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if joined.is_empty() {
+                    "<empty>".to_string()
+                } else {
+                    joined
+                }
+            })
+            .unwrap_or_else(|e| format!("<unreadable: {e}>"));
+        format!(
+            "ALIVE Name={} State={} PPid={} cmdline=[{cmdline}]",
+            field("Name:"),
+            field("State:"),
+            field("PPid:")
+        )
+    }
+
     #[test]
     fn sigterm_to_monitor_also_kills_the_agent() {
         let dir = tempfile::tempdir().unwrap();
@@ -307,11 +345,21 @@ mod tests {
             "agent should be running before SIGTERM"
         );
 
+        // Snapshot both processes before signalling. This assertion fails in
+        // containerised CI and cannot be reproduced locally, and a bare
+        // "still running" message discards everything that could explain it
+        // — the same antipattern that made 999.47 expensive to diagnose.
+        let monitor_before = proc_snapshot(monitor_pid);
+        let agent_before = proc_snapshot(agent_pid);
+
         // SIGTERM the monitor, as an operator (or lock.rs's stale-holder
         // reclaim path) would to abort a run.
-        unsafe {
-            libc::kill(monitor_pid as libc::pid_t, libc::SIGTERM);
-        }
+        let kill_rc = unsafe { libc::kill(monitor_pid as libc::pid_t, libc::SIGTERM) };
+        let kill_err = if kill_rc == 0 {
+            "ok".to_string()
+        } else {
+            format!("errno {}", std::io::Error::last_os_error())
+        };
 
         // The agent should be killed promptly by the monitor's trap —
         // poll rather than sleep a fixed amount to keep this fast and
@@ -343,9 +391,33 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+        let monitor_after = proc_snapshot(monitor_pid);
+        let agent_after = proc_snapshot(agent_pid);
+        let pidfile =
+            std::fs::read_to_string(crate::agent_result::agent_pid_path(dir.path(), state.phase))
+                .unwrap_or_else(|e| format!("<unreadable: {e}>"));
+
         assert!(
             !still_running,
-            "agent (pid {agent_pid}) was orphaned — still running after monitor SIGTERM"
+            "agent (pid {agent_pid}) was orphaned — still running after monitor SIGTERM\n\
+             \x20 monitor pid:      {monitor_pid}\n\
+             \x20 kill(TERM) rc:    {kill_rc} ({kill_err})\n\
+             \x20 monitor before:   {monitor_before}\n\
+             \x20 monitor after:    {monitor_after}\n\
+             \x20 agent pid:        {agent_pid}\n\
+             \x20 agent before:     {agent_before}\n\
+             \x20 agent after:      {agent_after}\n\
+             \x20 pidfile contents: {}\n\
+             Read the monitor's `after` line first. GONE means the shell died \
+             without running its trap — most likely SIGTERM arrived before \
+             `trap` was installed, or it was killed rather than handling the \
+             signal, either way leaving the agent unreaped. STILL ALIVE means \
+             the trap never fired or `kill $apid` failed, so compare the agent \
+             pid against the pidfile and check the agent's PPid: if PPid is not \
+             the monitor, `$!` did not name the process we are polling. If the \
+             agent's Name is `sh` rather than `sleep`, the agent shell forked \
+             rather than exec'd, so killing it leaves its own child behind.",
+            pidfile.trim()
         );
     }
 
