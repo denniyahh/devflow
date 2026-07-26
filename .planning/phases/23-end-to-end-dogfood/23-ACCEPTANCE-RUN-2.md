@@ -775,3 +775,153 @@ written. `/tmp/.tmpXXXXXX`-style scratch-root names (§8's gate-list rows)
 are left as-is per this phase's established convention — they carry no home
 directory or username, only opaque `mktemp`-style random suffixes.
 
+---
+
+## 15. Operator judgment (Task 3)
+
+Two verdicts, recorded verbatim and kept as separate, non-blended outcomes
+per this plan's own design.
+
+### Verdict 1 — Record validity
+
+> **`record: valid`** — the artifact declares `outcome: run-incomplete` on
+> its first content line, quotes raw event lines, lists absent events
+> honestly, and names the stop cause precisely with a source-verified root
+> cause. Per the plan, a run-incomplete record that names its stop cause
+> precisely is a SUCCESSFUL execution of 23-15 even though the acceptance
+> failed.
+
+### Verdict 2 — Acceptance
+
+> **`failed`** — the acceptance run failed. Forced by the two-piece evidence
+> contract: zero `workflow_shipped` events for phase 24, and
+> `devflow evidence --phase 24 --require-shipped` unchanged at exit 1. The
+> run never reached Define.
+
+Both facts restated for the record, unchanged from §7: no `workflow_shipped`
+line exists anywhere in `.devflow/events.jsonl` for phase 24 across either
+attempt, and `devflow evidence --phase 24 --require-shipped` exits `1` both
+pre-run and post-run. The phase's own behavioural acceptance criterion —
+"one phase driven Define→completed Ship, unattended, with Claude" — is
+**not met** by this run.
+
+### Next step chosen
+
+**Retry with a develop-built binary.** Per §10's structural finding — the
+running binary's embedded commit (`0c9dcfe`, built from `feature/phase-23`)
+and `origin/develop`'s tip (`0dad20d`) are mutually non-ancestors, so any
+binary built from this project's own working branch will always trip the
+divergent-lineage `Stale`/`Block` path against `develop`-based targets,
+regardless of content — the operator directs: check out `develop` in a
+scratch location, `cargo build --release` there, and relaunch with that
+binary so its embedded commit is provably an ancestor of the worktree fork
+point. The operator confirms this requires a **new gap-closure plan,
+23-16**, and that **23-14's preconditions must be re-run** because the
+binary itself changes (a different binary means a different hash to record,
+a different freshness re-check, and a fresh `origin/develop` SHA
+re-verification — none of which 23-14's existing record can be assumed to
+still cover).
+
+### Recovery-ref disposition
+
+The operator did not override the default; the documented disposition
+applies, recorded here as such:
+
+- **Both `origin` refs remain untouched.** `recovery/pre-23-11-acceptance-e0f87c2`
+  (`e0f87c2c2230257f7aa8092a836225626941d09a`) and
+  `recovery/pre-23-15-acceptance-0dad20d`
+  (`0dad20d3e85d82d60235b8f91cb944e4cbed433c`) are both still present on
+  `origin` at their recorded SHAs — reconfirmed independently at Task 3 time
+  via `git ls-remote origin 'refs/heads/recovery/*'`.
+- **The deleted LOCAL copy of `recovery/pre-23-11-acceptance-e0f87c2` is
+  deliberately NOT restored**, per `23-FINDINGS.md` §B2a's own instruction
+  not to keep re-restoring it — `devflow cleanup` will only delete it again.
+- **`recovery/pre-23-15-acceptance-0dad20d` is now UNUSED** — this run never
+  reached a stage that could have needed it (no merge occurred to undo) —
+  but per the operator's instruction it is **retained on `origin`, not
+  deleted**, because the chosen next step (23-16, a retry with a
+  develop-built binary) is expected to authorize against the same
+  `origin/develop` tip this ref was cut against, and a fresh restore
+  rehearsal against the same SHA has no reason to be re-run from scratch.
+
+### Corrections to this record, from the orchestrator's independent re-check
+
+Two corrections are folded in here rather than silently dropped, per the
+orchestrator's review of Tasks 1–2:
+
+**1. Post-run hygiene (§8) overclaimed "worktree cleaned up."** Re-checked
+independently at Task 3 time:
+
+```
+$ git worktree list
+/var/home/denniyahh/Github/devflow 28cdda1 [feature/phase-23]
+$ ls -la .worktrees/
+total 0
+drwx------. 1 denniyahh denniyahh   0 Jul 26 18:11 .
+drwx------. 1 denniyahh denniyahh 650 Jul 26 16:45 ..
+$ git branch --list 'feature/phase-24'
+(empty)
+```
+
+`git worktree list` shows only the primary checkout — the `phase-24`
+worktree registration is genuinely gone, and `feature/phase-24` is
+genuinely gone as a branch, matching §8's claim about those two. **But
+`.worktrees/` itself still exists on disk as an empty directory shell** —
+`devflow cleanup`'s worktree removal did not remove the now-empty parent
+directory it lived under. §8 stated "removed worktree
+`<repo-root>/.worktrees/phase-24`" (true, and quoted verbatim from the
+tool's own output) but did not separately note that the parent directory
+persists — "worktree cleaned up" as an overall characterization overclaims
+by omission. Corrected statement: the worktree *registration* and the
+`feature/phase-24` branch are both gone; the `.worktrees/` directory itself
+remains as an empty, inert leftover. **Not deleted as part of this fix** —
+the plan's hygiene criterion is about open gates and resident processes for
+phase 24, not about an empty directory shell, and this plan's own boundary
+is "no source changes" / observational-only for Tasks 1–2; removing it here
+would exceed Task 3's scope. Left in place, disclosed.
+
+**2. Resident-process inventory is larger than §8's snapshot, and larger
+than the gate population.** Re-run independently at Task 3 time:
+
+```
+$ pgrep -af devflow
+```
+
+Six live process pairs found (`sh -c ...` wrapper + `devflow advance` per
+pair), **all for phase 12**, rooted at `/tmp/.tmp8YPpPz`, `/tmp/.tmpBV38S7`,
+`/tmp/.tmpG3tGxd`, `/tmp/.tmpNuFaCh`, `/tmp/.tmpSAHPzj`, `/tmp/.tmpqZmoON`.
+**None is for phase 24 and none is at this project root** — confirming §8's
+own conclusion ("Zero real processes reference phase 24") still holds.
+These are the known `23-FINDINGS.md` §A1/§A3 orphan class, explicitly named
+here as **pre-existing noise from this project's own test fixtures**
+(`gate_sweep_e2e.rs`/`stop_e2e.rs` and older phase-12 fixtures), not this
+run's residue — consistent with §8's own characterization.
+
+Worth naming as one line beyond what §8 recorded: `devflow gate list
+--all-roots`, re-run independently at Task 3 time, now shows **six** rows
+(`/tmp/.tmp8YPpPz`, `/tmp/.tmpBV38S7`, `/tmp/.tmpG3tGxd`, `/tmp/.tmpNuFaCh`,
+`/tmp/.tmpSAHPzj`, `/tmp/.tmpqZmoON`) — one more than §8's own five-row
+reading, and `.tmpqZmoON` in particular **did not appear in the
+orchestrator's earlier `gate list --all-roots` snapshot at all**. The
+process population (6 pairs) and the gate population (6 rows) now agree
+with each other at Task 3 time, but both have grown since §8 was written
+minutes earlier — the noise class is actively accruing new entries during
+this very session, faster than any single snapshot captures. Not
+attributable to phase 24 (which registered no gate at all, per §3); named
+here as a finding about the noise class's growth rate, not a new defect.
+
+### Independent re-verification of the root cause (orchestrator + Task 3)
+
+Re-run independently, matching §10's own result exactly:
+
+```
+$ git merge-base --is-ancestor 0c9dcfecb9c15cf39a07c766e91f805df67f56ab 0dad20d3e85d82d60235b8f91cb944e4cbed433c
+exit: 1
+$ git merge-base --is-ancestor 0dad20d3e85d82d60235b8f91cb944e4cbed433c 0c9dcfecb9c15cf39a07c766e91f805df67f56ab
+exit: 1
+```
+
+Both mutually non-ancestors, confirming genuine divergence rather than
+linear staleness — the same result §10 recorded, now independently
+reproduced at Task 3 time rather than trusted from the earlier section.
+
