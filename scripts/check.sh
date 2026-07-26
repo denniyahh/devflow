@@ -39,8 +39,13 @@ run_clippy() {
 }
 
 run_test() {
-    echo "==> cargo test --workspace"
-    cargo test --workspace
+    # --no-fail-fast deliberately: without it cargo stops at the first failing
+    # test BINARY, so a failure in devflow-core hides every failure in
+    # devflow-cli. Chasing CI one masked failure at a time cost several
+    # round trips on 2026-07-26; one run should report everything that is
+    # broken, not the alphabetically-first thing.
+    echo "==> cargo test --workspace --no-fail-fast"
+    cargo test --workspace --no-fail-fast
 }
 
 run_build() {
