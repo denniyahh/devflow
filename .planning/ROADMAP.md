@@ -831,6 +831,31 @@ across plans 23-10/23-11, not a DevFlow defect — see
 retry needs (Phase 23 merged to `develop` first, plus a named third
 precondition check).
 
+**Gap-closure decision, operator-confirmed 2026-07-26.** The third precondition
+is to be shipped as a **`devflow start` guard**, not merely a documented
+operator checklist item. Before forking its worktree, `devflow start --phase N`
+must verify that phase N's `ROADMAP.md` entry and `.planning/phases/<N>-*/`
+directory are reachable **from the base branch it is about to fork from** — and
+refuse with a legible message when they are not. Rationale: the guard converts
+a ~90-second silent flounder at Define into an immediate, actionable refusal,
+and prevents recurrence structurally rather than by discipline. A checklist
+item would only have caught this if the operator remembered to run it, which is
+exactly what failed in 23-10/23-11. This is an input to `/gsd-plan-phase 23
+--gaps`; the gap plan should ship the guard **and** re-run the acceptance
+attempt against Phase 24.
+
+**Deliberately NOT the acceptance target: the test-hygiene work (999.46 /
+DEN-70).** It was considered and rejected on 2026-07-26. Three reasons: (1) its
+headline symptom does not reproduce on the current tree; (2) **reflexivity** —
+the acceptance run *is* a `devflow advance` process tree, and process-reaping
+teardown executes inside the `cargo test --workspace` that DevFlow's own
+Validate stage runs, so an over-broad reaper can kill the harness observing it,
+making "DevFlow failed" indistinguishable from "the test suite shot the
+supervisor"; (3) it discards Phase 24's existing vetting. "Test-only" is not
+"low-consequence" when the tests manipulate the same process class the harness
+depends on. Phase 24 remains the target; 999.46 should be done as ordinary
+work, not driven by DevFlow.
+
 **Why this scope, from the run record.** `.devflow/events.jsonl` shows **no
 phase has ever completed a full five-stage devflow-driven run**:
 
