@@ -217,3 +217,231 @@ to signature trust.
 — the only match at the point this grep was run is the grep command itself,
 quoted verbatim inside Task 1's pre-existing redaction note. No new path
 leaked by this section.
+
+## Task 3: Rebuild from the merged tip, prove the guard at runtime
+
+**Fetch and confirm the base** (re-run independently in this task, per the
+plan's instruction to treat every claim as its own measurement):
+
+```
+$ git fetch origin
+$ git rev-parse origin/develop
+0dad20d3e85d82d60235b8f91cb944e4cbed433c
+$ git merge-base --is-ancestor 2f8686efdc7eefe26fc4fadbc6b170372030ee10 origin/develop
+$ echo "exit: $?"
+exit: 0
+```
+
+The guard head SHA is confirmed an ancestor of `origin/develop`, again.
+
+**What tree the rebuild was actually built from.** This task's build ran
+from the working branch `feature/phase-23` at `0c9dcfe` (the commit that
+just recorded Task 2 above), not from a checkout of `origin/develop`
+itself. The equivalence is demonstrated, not asserted:
+
+```
+$ git rev-parse --abbrev-ref HEAD
+feature/phase-23
+$ git diff origin/develop HEAD -- crates/ Cargo.toml Cargo.lock | wc -l
+0
+```
+
+Zero lines of diff across every path that can affect the compiled binary
+(`crates/`, `Cargo.toml`, `Cargo.lock`) between this HEAD and
+`origin/develop`. The only commits on `feature/phase-23` not on
+`origin/develop` are this plan's own planning-doc commits (Task 1's
+`7f055c5` and Task 2's `0c9dcfe`, both touching only
+`.planning/phases/23-end-to-end-dogfood/23-GUARD-SHIP-RECORD.md`), so the
+compiled code built here is identical, byte-for-byte in source, to what
+`origin/develop`'s tree contains. This is the same reasoning
+`23-ACCEPTANCE-RUN.md`'s own binary-freshness precondition used
+(`git diff --stat <prior-rebuild-sha> HEAD -- crates/ Cargo.toml Cargo.lock`),
+reproduced here against `origin/develop` directly rather than against a
+prior rebuild's SHA.
+
+**Rebuild:**
+
+```
+$ cargo build --release
+   Compiling devflow-core v1.8.1 (…/crates/devflow-core)
+   Compiling devflow v1.8.1 (…/crates/devflow-cli)
+    Finished `release` profile [optimized] target(s) in 16.39s
+```
+
+**Version and hash of the freshly built binary:**
+
+```
+$ ./target/release/devflow --version
+devflow 1.8.1
+$ sha256sum ./target/release/devflow
+b5db079ad7c76a9e33d7f6b1bffa0b1caeedf208789f7f38353602628e26dc98  ./target/release/devflow
+```
+
+`1.8.1` matches the workspace `Cargo.toml` version.
+
+**PATH-resolved binary comparison:**
+
+```
+$ command -v devflow
+<homebrew-prefix>/bin/devflow
+$ sha256sum "$(command -v devflow)"
+b5db079ad7c76a9e33d7f6b1bffa0b1caeedf208789f7f38353602628e26dc98  <homebrew-prefix>/bin/devflow
+```
+
+**Match: yes.** The PATH-resolved `devflow`'s sha256 is byte-identical to
+the freshly built `./target/release/devflow`'s sha256
+(`b5db079a…6dc98` both). The binary the acceptance run would invoke via
+PATH is the same binary just rebuilt from the merged tip — no
+stale-binary mismatch to surface.
+
+**Runtime guard proof, throwaway clone — not this repository.**
+
+Cloned the current tree into a tempdir:
+
+```
+$ git clone --no-hardlinks --branch develop <project root> <tmpdir>
+Cloning into '<tmpdir>'...
+done.
+$ cd <tmpdir> && git rev-parse --abbrev-ref HEAD && git rev-parse HEAD
+develop
+e0f87c2c2230257f7aa8092a836225626941d09a
+```
+
+Note on which `develop` this clones: `--branch develop` against a local
+path clones the **local** `develop` ref (`e0f87c2…`), the same stale ref
+Finding 1 measures above — not `origin/develop`. This is not a defect in
+the proof: the guard being tested is compiled into the binary already (this
+repository's HEAD is diff-empty against `origin/develop` for all code
+paths, confirmed above), and what the clone supplies is real, git-backed
+`ROADMAP.md`/phase-directory data for the binary's runtime probe to
+inspect. For the phase-97 probe below, phase 97 is absent from every
+`develop` tip this repository has ever had, local or remote, so the choice
+of which `develop` tip is cloned does not affect this probe's validity.
+This clone additionally happens to be a faithful reproduction of exactly
+what the production binary consults today, since Finding 1 established
+that `commands.rs:146` reads the local `develop` ref, not `origin/develop`.
+
+**Pre-confirmation that phase 97 is genuinely absent, read-only, against the clone's `develop`:**
+
+```
+$ git show develop:.planning/ROADMAP.md | rg -c '^### Phase 97:'
+(no match — rg -c exits 1, prints nothing: 0 occurrences)
+$ git ls-tree -r --name-only develop -- .planning/phases/ | rg '^\.planning/phases/97-'
+(no match — rg exits 1: no such path)
+```
+
+Both confirmed absent before the probe runs.
+
+**The runtime invocation, verbatim, against the freshly built binary:**
+
+```
+$ ./target/release/devflow start --phase 97 --agent claude --mode auto <tmpdir>
+```
+
+**Exit status:** `1` (non-zero).
+
+**Verbatim stderr:**
+
+```
+error: phase 97 is not reachable from `develop` — the branch `devflow start` forks its worktree from:
+  missing: the `### Phase 97:` heading in `ROADMAP.md` on `develop`
+  missing: a `.planning/phases/97-*/` directory on `develop`
+a phase promoted only on another branch is invisible to this run — merge that branch into `develop` first, then re-run.
+```
+
+**Stdout:** empty.
+
+The refusal fired: stderr contains both `is not reachable from` and
+`develop`, matching this task's asserted contract. The message names each
+missing half (`ROADMAP.md` heading, phase directory) and contains no
+absolute filesystem path, no username — consistent with `23-12-PLAN.md`'s
+stated no-path-leak requirement.
+
+**Post-refusal scaffolding check, inside the clone:**
+
+```
+$ test -d .worktrees && echo EXISTS || echo absent
+absent
+$ test -f .devflow/state-97.json && echo EXISTS || echo absent
+absent
+$ git branch --list feature/phase-97
+(empty)
+```
+
+No worktree, no state file, no feature branch. Nothing was scaffolded
+before or during the refusal.
+
+**Why a clone and not this repository, and why the complementary property
+is not separately proven here:** if the guard were broken, this exact
+command run against this repository's own working tree would have forked
+a real worktree from `develop` and launched a real Claude session on a
+phase that does not exist. Bounding that to a tempdir costs nothing in the
+strength of the claim — it is the same binary, and the clone's `ROADMAP.md`
+and phase-directory data are the real, git-tracked data this project
+maintains, not a synthetic fixture. The complementary property — that the
+guard does not over-refuse a *reachable* phase — is not independently
+proven inside this task; it fails loudly and visibly instead, since 23-15's
+own acceptance launch would be refused immediately were the guard
+over-broad, which is a stronger, later-stage falsification than anything
+this task could construct.
+
+**Phase 24 reachability, confirmed read-only against `origin/develop` — not the local ref, not the working branch:**
+
+```
+$ git show origin/develop:.planning/ROADMAP.md | rg '^### Phase 24:'
+### Phase 24: `release --check` Signing-Key Inline Classification
+$ git ls-tree -r --name-only origin/develop -- .planning/phases/ | rg '^\.planning/phases/24-'
+.planning/phases/24-release-check-signing-key-inline-classification/.gitkeep
+```
+
+Both halves present on `origin/develop`. The matched roadmap heading line
+and the matched phase-directory path are quoted verbatim above.
+
+**Finding — is a `.gitkeep`-only directory sufficient?** Yes, and this is
+stated as an explicit finding rather than assumed. The phase-24 directory
+on `origin/develop` currently holds only `.gitkeep`
+(`git ls-tree -r --name-only origin/develop -- .planning/phases/24-*/`
+lists exactly that one path and nothing else). The guard's contract, per
+`23-12-PLAN.md`, is **directory presence**, not directory contents — the
+same idiom `commands::phase_artifact_on_develop` already uses elsewhere in
+this codebase. The acceptance run's own Define stage
+(`/gsd-discuss-phase 24`) is what populates the directory with
+`24-CONTEXT.md` and onward; the guard exists to stop a run from being
+invisible to `devflow start` altogether, not to pre-validate that Define
+has already happened. A `.gitkeep`-only directory therefore satisfies both
+the guard's check and the acceptance run's actual needs — the same shape
+`23-ACCEPTANCE-RUN.md` § 1 recorded as a pre-launch precondition
+("`.planning/phases/24-*/` exists with only a `.gitkeep`") the last time
+this phase reached this exact launch point, before the guard existed to
+fail-open on it.
+
+**Redaction check, Task 3 section, and the placeholders it required.** This
+section's raw output named this executor's actual home-directory path
+(`command -v devflow` and the throwaway clone's tempdir path); both are
+replaced above with `<homebrew-prefix>` and `<tmpdir>` placeholders before
+committing, per this phase's redaction checklist (999.10 leak class:
+absolute home paths and tempdir paths). Grep run against the file as
+committed:
+
+```
+$ rg -n '/home/denniyahh|/var/home/denniyahh|/tmp/' .planning/phases/23-end-to-end-dogfood/23-GUARD-SHIP-RECORD.md
+```
+
+Every matching line is one of this file's own three redaction-grep commands,
+quoted verbatim inside Task 1's, Task 2's, and this Task 3's redaction
+notes respectively (self-reference, since the grep command string itself
+contains the pattern it searches for) — no operator path leaked into any
+recorded command output.
+
+**Cleanup, confirmed:**
+
+```
+$ rm -rf <tmpdir>
+$ test -d <tmpdir> && echo "STILL EXISTS" || echo "removed"
+removed
+$ git status --porcelain
+(empty)
+```
+
+The temporary clone is removed and this repository's working tree is
+clean.
