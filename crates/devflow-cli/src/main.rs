@@ -20,7 +20,7 @@ mod pipeline_gate;
 use pipeline_gate::ship_override;
 
 mod parallel;
-use parallel::{parallel, sequentagent};
+use parallel::parallel;
 
 mod commands;
 use commands::{
@@ -146,25 +146,6 @@ enum Command {
         #[arg(long, default_value = "auto")]
         mode: Mode,
         /// Recreate worktrees if they already exist.
-        #[arg(long)]
-        force: bool,
-        /// Project root.
-        #[arg(default_value = ".")]
-        project: PathBuf,
-    },
-    /// Run two agents sequentially on one phase, each in its own worktree.
-    ///
-    /// Agent A runs first; its work is integrated into `feature/phase-NN`, then
-    /// agent B rebases onto the updated base and runs. Rebase conflicts are
-    /// surfaced for manual resolution — the worktree boundary is the isolation.
-    Sequentagent {
-        /// Phase number to work on.
-        #[arg(long)]
-        phase: u32,
-        /// Exactly two comma-separated agents, e.g. `claude,codex`.
-        #[arg(long)]
-        agents: String,
-        /// Recreate agent worktrees/branches if they already exist.
         #[arg(long)]
         force: bool,
         /// Project root.
@@ -542,12 +523,6 @@ fn run() -> Result<(), CliError> {
             mode,
             force,
         ),
-        Command::Sequentagent {
-            phase,
-            agents,
-            force,
-            project,
-        } => sequentagent(&project_root(project)?, phase, &agents, force),
         Command::Reference {
             branch,
             refresh,
