@@ -655,6 +655,68 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
+### Phase 999.40: State-Orphaned Processes Are Unreachable by `stop` and `gate sweep` (BACKLOG)
+
+**Goal:** A `devflow advance` process can outlive its own lock **and** its persisted state. When it does, both of Phase 23's new primitives return success while the orphan keeps running: `gate sweep` never lists it (its root is absent from the registry, so cross-root enumeration cannot see it), and `devflow stop --phase N --root PATH` reports `no lock held … nothing is running advance()` and exits 0.
+
+**Evidence:** observed live 2026-07-26 while clearing the machine's orphan population with Phase 23's own tooling. 22 of 23 orphans were reaped by `devflow gate sweep`; PID 3744133 (`--phase 7`, root `/tmp/.tmpMVmZBl`, ~8.6h old) was unreachable. `stop` was tried against both phase 7 and phase 8 (the root's state file is `state-08.json`) — both returned the same no-lock/no-state message and exit 0. `kill -TERM` cleared it in 1s. Full detail: `.planning/phases/23-end-to-end-dogfood/23-FINDINGS.md` §A1.
+
+**Why it matters:** the messages are *true* against recorded state, so this is not a false attestation — but an operator reading exit codes concludes the machine is clean when it is not. This is the residue of the orphan class Phase 23 was written to close, and the one case still requiring `kill(1)`.
+
+**Fix direction:** a registry-independent path — scan for running `devflow advance` children and reconcile against the registry, surfacing "running but unregistered" as its own reportable class rather than silence. Likely belongs in `doctor` as a finding plus a `gate sweep` flag.
+
+**Priority:** Medium | **Size:** M — needs a PID-discovery mechanism that is safe on shared machines and does not misidentify unrelated processes.
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.41: Registry Emits Duplicate Entries for a Single Root (BACKLOG)
+
+**Goal:** `registry.rs` records more than one entry for the same `(root, phase, stage)` triple, inflating what `gate sweep --dry-run` reports.
+
+**Evidence:** 2026-07-26 sweep of the machine's orphan population — `/tmp/.tmpal43JM` appeared four times in the dry-run listing (`phase 7 code` ×2, `phase 8 code` ×2, identical ages per pair). Dry run reported `24 would be reaped`; the real sweep reported `22 reaped, 0 skipped, 0 left alone`. Detail: `23-FINDINGS.md` §A2.
+
+**Why it matters:** low functional severity — the sweep is idempotent and no double-reap occurred — but the dry-run count is exactly what an operator reads before authorizing a destructive sweep, and it over-reports. Trust in the preview matters more than the two-entry delta.
+
+**Priority:** Low | **Size:** S — dedup on `(root, phase, stage)` at write or read; add a regression test asserting dry-run count equals executed count.
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.42: E2E Suites Leak Monitor Pairs on Every Run (BACKLOG)
+
+**Goal:** `gate_sweep_e2e.rs` and `stop_e2e.rs` (Phase 23) and older phase-12 fixtures spawn real, separate `devflow advance` children and do not reap them at teardown. Every full `cargo test --workspace` refills the machine's orphan population.
+
+**Evidence:** 23 orphaned processes (~128 MB resident, oldest 11h45m) accumulated across roughly 12 hours of Phase 23 development, all in `/tmp/.tmp*` scratch roots created by these suites; none touched a real repository. Detail: `23-FINDINGS.md` §A3.
+
+**Do not weaken the tests to fix this.** Spawning a real child is what makes them strong — plan 23-04's summary correctly calls it the suite's strongest claim, and plan 23-05's `stop_e2e` depends on the same property. The fix belongs in teardown, not in the assertion.
+
+**Fix direction:** a `Drop` guard or explicit teardown that stops each spawned child, ideally exercising `devflow stop` so the cleanup path is itself under test.
+
+**Priority:** Medium | **Size:** S — test-harness only, no production change. Worth doing soon: it is the actual source of the population 999.40 is about.
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.43: `devflow cleanup` Deletes Recovery Refs by Ancestry (BACKLOG)
+
+**Goal:** `devflow cleanup` deletes local branches it judges "merged" by ancestry, which necessarily includes recovery points. A recovery ref is *defined* as a pointer at a known-good commit, so it is always an ancestor and therefore always eligible for deletion.
+
+**Evidence:** during plan 23-11, `devflow cleanup` (run for worktree/branch hygiene) deleted the local `recovery/pre-23-11-acceptance-e0f87c2`. The copy on `origin` was untouched and the local branch was restored from it in the same session, so nothing was lost — but the deletion was unintended and was disclosed rather than silently corrected. Recorded in `23-ACCEPTANCE-RUN.md` §6/§7 and `23-FINDINGS.md` §B2.
+
+**Why it matters:** the whole point of establishing a recovery point before a one-way operation is that it survives until the operator retires it. A cleanup verb that removes it — even locally, even while the remote persists — undermines the mitigation at exactly the moment it is supposed to be load-bearing.
+
+**Fix direction:** skip a configurable ref prefix (`recovery/*` by default), or have cleanup refuse to delete refs it did not create.
+
+**Priority:** Low | **Size:** S — one predicate plus a test.
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
 ### Phase 21: Operator Legibility & Observability
 
 **Shipped as v1.8.0** (2026-07-24) — PR #23 (`develop → main`, squash `cfa9167`), signed tag `v1.8.0`, [GitHub Release](https://github.com/denniyahh/devflow/releases/tag/v1.8.0). `sync-main-to-develop.sh` run via PR #24 (merge `01ad9e4`). Published to crates.io (`devflow-core` then `devflow`, both confirmed live at 1.8.0).
