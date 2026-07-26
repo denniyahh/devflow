@@ -10,14 +10,16 @@
 //! `agent_result.rs:704-711`): a failed declared probe outranks every
 //! agent-controlled signal.
 //!
-//! **This module is opt-in per phase, deliberately.** `external_verify_enabled`
-//! defaults on, but a declared command must additionally be approved via
-//! [`crate::verify::TRUST_EXTERNAL_VERIFY_ENV`] before it runs at all — this
-//! module does not itself decide whether Layer 0 is active, and it must not:
-//! a default-on, unconditional `--require-shipped` probe would fail at every
-//! pre-Ship stage of every phase and block all work (T-23-64). Declaring this
-//! probe is a per-phase choice a PLAN author makes when a phase's own
-//! attestation claims a completed Ship.
+//! **This module is opt-in per phase, deliberately, and this module does not
+//! itself decide whether Layer 0 is active** — it only reports facts. A
+//! declared command must be approved via
+//! [`crate::verify::TRUST_EXTERNAL_VERIFY_ENV`] before it ever runs, on top
+//! of whatever project-level configuration gates declared-probe execution in
+//! the first place. This module must not be, and is not, the thing that
+//! flips that switch on: a default-on, unconditional `--require-shipped`
+//! probe would fail at every pre-Ship stage of every phase and block all
+//! work (T-23-64). Declaring this probe is a per-phase choice a PLAN author
+//! makes when a phase's own attestation claims a completed Ship.
 
 use crate::git::GitFlow;
 use crate::stage::Stage;

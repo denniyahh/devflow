@@ -4413,4 +4413,64 @@ mod tests {
             assert_eq!(staleness.len(), 1);
         }
     }
+
+    /// 23-06 Task 3 acceptance: `--require-shipped` is exit-code-stable on
+    /// the strict `shipped` predicate ALONE — a shipped phase's call
+    /// succeeds, an otherwise-identical unshipped phase's call fails, with
+    /// every other evidence field held constant (neither phase has any git
+    /// state or persisted workflow state in this fixture).
+    #[test]
+    fn evidence_require_shipped_exits_ok_iff_the_phase_has_shipped() {
+        let dir = tempfile::tempdir().unwrap();
+        events::emit(
+            dir.path(),
+            30,
+            "workflow_shipped",
+            serde_json::json!({"stage": "ship"}),
+        );
+
+        assert!(evidence(dir.path(), 30, false, true).is_ok());
+        assert!(evidence(dir.path(), 31, false, true).is_err());
+    }
+
+    /// 23-06 Task 3 acceptance: a phase that only stopped (`--until`) must
+    /// fail `--require-shipped` with a message that says so explicitly,
+    /// not a generic "not shipped" — this is the confusing case named in
+    /// Task 1's acceptance criteria ("it finished but it did not ship").
+    #[test]
+    fn evidence_require_shipped_names_stopped_at_rather_than_generic_not_shipped() {
+        let dir = tempfile::tempdir().unwrap();
+        events::emit(
+            dir.path(),
+            32,
+            "workflow_finished",
+            serde_json::json!({"reason": "stopped_at", "stage": "plan"}),
+        );
+
+        let err = evidence(dir.path(), 32, false, true).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("stopped"),
+            "message must name the stopped-at case, got: {message}"
+        );
+    }
+
+    /// 23-06 Task 3 acceptance: the `--require-shipped` failure message is a
+    /// single line (it ends up verbatim in a gate context read on a phone)
+    /// and names the phase.
+    #[test]
+    fn evidence_require_shipped_failure_message_is_single_line_and_names_phase() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let err = evidence(dir.path(), 33, false, true).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            !message.contains('\n'),
+            "message must be one line: {message:?}"
+        );
+        assert!(
+            message.contains("33"),
+            "message must name the phase: {message}"
+        );
+    }
 }
