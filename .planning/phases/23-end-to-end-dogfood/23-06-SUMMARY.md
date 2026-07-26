@@ -236,3 +236,11 @@ None.
 ---
 *Phase: 23-end-to-end-dogfood*
 *Completed: 2026-07-26*
+
+## Self-Check: PASSED
+
+- `crates/devflow-core/src/ship_evidence.rs` — FOUND
+- Task commit `c650cd6` — FOUND
+- Task commit `147c43f` — FOUND
+- Task commit `49b981e` — FOUND
+- SUMMARY commit `b0e0f51` — FOUND
