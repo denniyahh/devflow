@@ -140,6 +140,29 @@ fn branch_cleanup(ctx: &HookContext) -> Result<(), HookError> {
     Ok(())
 }
 
+/// Merge the phase's feature branch into develop, then re-assert ancestry
+/// (23-06 / T-23-62) before reporting success.
+///
+/// **The post-merge ancestry re-check runs here — immediately after
+/// `merge_feature_into_develop` returns `Ok`, while the feature branch still
+/// exists — because this is the only place in `hooks_after_ship` where the
+/// assertion is both meaningful and safe.** `BranchCleanup` runs later in the
+/// same batch and deletes the branch; after that, an ancestry check fails
+/// closed on an absent branch (`git.rs:89-92`: "an absent branch is not proof
+/// of a merge") and would report `false` for every successfully shipped
+/// phase, so this check can never be moved after the batch without inverting
+/// its meaning.
+///
+/// **No-rollback policy, stated here because it must not be re-derived
+/// later:** on the ancestry re-check's failure path below, `merge_feature`
+/// does NOT undo the merge. `git merge --no-ff` has already committed on
+/// `develop` by the time the re-check runs, and automatically resetting a
+/// shared integration branch is a far more dangerous operation than the
+/// inconsistency it would be papering over. Instead, this returns `Err`; the
+/// containing `run_checkout_hooks` batch fails; `finish_workflow_with_gate_timeout`
+/// reopens an actionable Ship gate whose context tells a human to resolve the
+/// git error, and the operator decides. Plan 23-10's recovery-path artifact
+/// must know this exact state.
 fn merge_feature(ctx: &HookContext) -> Result<(), HookError> {
     let git = GitFlow::new(&ctx.project_root);
     let branch = format!("{}phase-{:02}", ctx.git_flow.feature_prefix, ctx.phase);
@@ -161,6 +184,21 @@ fn merge_feature(ctx: &HookContext) -> Result<(), HookError> {
     }
 
     git.merge_feature_into_develop(ctx.phase)?;
+
+    if !git.is_merged_into_develop(ctx.phase) {
+        crate::events::emit(
+            &ctx.project_root,
+            ctx.phase,
+            "merge_result",
+            serde_json::json!({"merged": false, "branch": branch}),
+        );
+        return Err(crate::git::GitError::Command(format!(
+            "merge of `{branch}` reported success but the branch is still not an ancestor of \
+             develop; refusing to report an unproven merge"
+        ))
+        .into());
+    }
+
     info!("Merge: merged {branch} into develop");
     crate::events::emit(
         &ctx.project_root,
@@ -639,6 +677,46 @@ mod tests {
             .run(&mut ctx(dir.path(), Stage::Ship))
             .unwrap_err();
         assert!(error.to_string().contains("unproven merge"));
+    }
+
+    /// 23-06 Task 2 acceptance: a real merge through the hook, with the new
+    /// post-merge ancestry re-check present, still succeeds and still
+    /// records a `merge_result` event with `merged: true` — proving the
+    /// added assertion is a no-op on the happy path it re-confirms.
+    #[test]
+    fn merge_through_hook_records_true_merged_result_after_ancestry_reconfirmed() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        git(dir.path(), &["checkout", "-q", "-b", "feature/phase-11"]);
+        std::fs::write(dir.path().join("feature.txt"), "phase work\n").unwrap();
+        git(dir.path(), &["add", "feature.txt"]);
+        git(dir.path(), &["commit", "-q", "-m", "phase work"]);
+        git(dir.path(), &["checkout", "-q", "develop"]);
+
+        Hook::Merge.run(&mut ctx(dir.path(), Stage::Ship)).unwrap();
+
+        assert!(GitFlow::new(dir.path()).is_merged_into_develop(11));
+        let last = crate::events::last_event_for_phase(dir.path(), 11)
+            .expect("merge_result event recorded");
+        assert_eq!(last["event"], "merge_result");
+        assert_eq!(last["merged"], true);
+        assert_eq!(last["branch"], "feature/phase-11");
+    }
+
+    /// 23-06 Task 2: the pre-existing missing-branch refusal is unchanged —
+    /// it still short-circuits before the merge (and before the new
+    /// post-condition) ever runs, so it never even reaches the event log.
+    #[test]
+    fn merge_fails_closed_when_branch_absent_emits_no_merge_result_event() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+
+        let _ = Hook::Merge.run(&mut ctx(dir.path(), Stage::Ship));
+
+        assert!(
+            crate::events::last_event_for_phase(dir.path(), 11).is_none(),
+            "a missing feature branch must short-circuit before any event is emitted"
+        );
     }
 
     fn git_output(root: &Path, args: &[&str]) -> String {
