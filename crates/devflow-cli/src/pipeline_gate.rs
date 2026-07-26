@@ -23,7 +23,7 @@ use crate::CliError;
 use crate::config_parse::{foreground_gate_timeout_secs, gate_timeout_secs};
 use crate::pipeline_launch::launch_stage;
 use crate::pipeline_outcomes::{run_checkout_hooks, truncate_reason};
-use devflow_core::gates::{self, GateAction, GateResponse, Gates};
+use devflow_core::gates::{self, GateAction, GateError, GateResponse, Gates};
 use devflow_core::hooks;
 use devflow_core::mode;
 use devflow_core::prompt::{self, FixType};
@@ -196,12 +196,19 @@ pub(crate) fn finish_workflow_with_gate_timeout(
             "[finalization failed] phase {} terminal hooks did not complete. Resolve the git/version error, then approve to retry; reject to loop back or abort.",
             state.phase
         );
+        // This is the reopened finalization-retry gate, NEVER the routine
+        // Ship approval — it must always pass `None` here. Auto-approving
+        // it would mean "the merge could not be completed" gets silently
+        // retried forever with no human ever seeing it (T-23-91). The one
+        // and only site permitted to pass a non-`None` auto-response is
+        // `handle_ship_outcome` in `pipeline_outcomes.rs`.
         match run_gate_with_timeout(
             project_root,
             state,
             Stage::Ship,
             &context,
             gate_timeout_secs,
+            None,
         )? {
             GateAction::Advance => {
                 let _ = Gates::cleanup(project_root, state.phase, Stage::Ship);
@@ -257,7 +264,14 @@ pub(crate) fn run_gate(
     stage: Stage,
     context: &str,
 ) -> Result<GateAction, CliError> {
-    run_gate_with_timeout(project_root, state, stage, context, gate_timeout_secs())
+    run_gate_with_timeout(
+        project_root,
+        state,
+        stage,
+        context,
+        gate_timeout_secs(),
+        None,
+    )
 }
 
 /// `run_gate`'s body, parameterized on the poll timeout (WR-02, phase 20
@@ -270,6 +284,16 @@ pub(crate) fn run_gate_with_timeout(
     stage: Stage,
     context: &str,
     timeout_secs: u64,
+    // 23-09 (D-04/D-05/D-06): a pre-authorized response to write for this
+    // gate, or `None` for a real human gate. This function must NEVER
+    // derive this value from `state` (e.g. `state.yes_ship`) — the decision
+    // belongs to the caller precisely so the reopened finalization-retry
+    // gate in `finish_workflow_with_gate_timeout` cannot inherit an
+    // authorization meant only for the routine Ship approval. The regression
+    // test `finalization_retry_gate_never_auto_approves_even_with_yes_ship_set`
+    // (pipeline_outcomes.rs) fails loudly if a future refactor reads the
+    // flag from `state` inside this function instead of receiving it here.
+    auto_response: Option<&GateResponse>,
 ) -> Result<GateAction, CliError> {
     state.gate_pending = true;
     workflow::save_state(state)?;
@@ -305,6 +329,22 @@ pub(crate) fn run_gate_with_timeout(
         "notify_fired",
         serde_json::json!({ "stage": stage.to_string(), "unexpected": unexpected }),
     );
+    // The auto-response, if any, is written here — after the gate request
+    // and both `gate_fired`/`notify_fired` events, so the event stream still
+    // reads as a real gate that was really answered, and before
+    // `Gates::poll_response` below so the poll's very first read finds it
+    // (`Gates::respond` refuses with `NoOpenGate` if written before
+    // `Gates::write_gate` above, and `poll_response` would never observe a
+    // response written after it returns).
+    if let Some(response) = auto_response {
+        match Gates::respond(project_root, state.phase, stage, response) {
+            Ok(_) => {}
+            // A human or 23b's stale-gate sweep may have answered first;
+            // first-writer-wins is the correct resolution, not an error.
+            Err(GateError::AlreadyResponded { .. }) => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
     match Gates::poll_response(project_root, state.phase, stage, timeout_secs) {
         Some(response) => {
             state.gate_pending = false;

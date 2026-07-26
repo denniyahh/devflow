@@ -13,12 +13,14 @@
 //! actually move the state machine.
 
 use crate::CliError;
-use crate::config_parse::checkout_lock_timeout;
+use crate::config_parse::{checkout_lock_timeout, gate_timeout_secs};
 use crate::parallel::retry_after_from_reason;
-use crate::pipeline_gate::{abort, finish_workflow, loop_back_to_code, run_gate, transition};
+use crate::pipeline_gate::{
+    abort, finish_workflow, loop_back_to_code, run_gate, run_gate_with_timeout, transition,
+};
 use crate::pipeline_launch::launch_stage;
 use devflow_core::config::GitFlowConfig;
-use devflow_core::gates::{GateAction, Gates};
+use devflow_core::gates::{GateAction, GateResponse, Gates};
 use devflow_core::hooks::{self, HookContext};
 use devflow_core::mode;
 use devflow_core::prompt::FixType;
@@ -272,12 +274,28 @@ pub(crate) fn handle_validate_outcome(
 }
 
 /// Decide what happens after the Ship stage completes — always gated.
+///
+/// **The only site in the crate permitted to pass a non-`None` auto-response
+/// to `run_gate_with_timeout`.** This is the routine Ship approval — D-04's
+/// pre-authorization exists to answer exactly this gate. It must never be
+/// generalized into `run_gate_with_timeout`'s own body: the reopened
+/// finalization-retry gate in `finish_workflow_with_gate_timeout` is a
+/// *different call*, deliberately passing `None`, because auto-approving
+/// "the merge could not be completed" would retry a failing finalization
+/// forever with no human ever seeing it.
 pub(crate) fn handle_ship_outcome(project_root: &Path, state: &mut State) -> Result<(), CliError> {
-    match run_gate(
+    let auto_response = state.yes_ship.then(|| GateResponse {
+        approved: true,
+        note: Some("pre-authorized by --yes-ship".to_string()),
+        responded_by: Some("--yes-ship".to_string()),
+    });
+    match run_gate_with_timeout(
         project_root,
         state,
         Stage::Ship,
         "Ship complete — approve merge?",
+        gate_timeout_secs(),
+        auto_response.as_ref(),
     )? {
         GateAction::Advance => finish_workflow(project_root, state),
         GateAction::LoopBack(_) => loop_back_to_code(project_root, state, FixType::GapsOnly),
@@ -1593,6 +1611,125 @@ mod tests {
         let prompt = prompt::fix_prompt(FixType::AuditFix, 11);
         assert!(prompt.contains("/gsd-audit-fix"));
         assert!(!prompt.contains("--gaps-only"));
+    }
+
+    /// 23-09 Task 1 acceptance: with `state.yes_ship` set, `handle_ship_outcome`
+    /// writes the Ship gate request exactly once (never reopened) and the
+    /// resolved gate carries the flag's literal `--yes-ship` attribution —
+    /// proving the auto-response is written through the normal protocol
+    /// (`gate_fired` → `notify_fired` → `gate_resolved`), not a bypass.
+    #[test]
+    fn handle_ship_outcome_with_yes_ship_auto_approves_exactly_once_with_attribution() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 50;
+        let branch = format!("feature/phase-{phase:02}");
+        let branch_created = devflow_core::test_support::git_command(root)
+            .args(["branch", &branch, "develop"])
+            .status()
+            .unwrap()
+            .success();
+        assert!(branch_created);
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Ship;
+        state.yes_ship = true;
+        workflow::save_state(&state).unwrap();
+
+        handle_ship_outcome(root, &mut state).unwrap();
+
+        // The workflow completed unattended — no human ever wrote a response.
+        assert!(
+            matches!(
+                workflow::load_state(root, phase),
+                Err(workflow::WorkflowError::MissingState(_))
+            ),
+            "the pre-authorized gate must let the run reach a completed Ship without a human"
+        );
+        assert!(!Gates::gate_path(root, phase, Stage::Ship).exists());
+        assert!(!Gates::response_path(root, phase, Stage::Ship).exists());
+        assert!(!Gates::ack_path(root, phase, Stage::Ship).exists());
+
+        // Exactly one gate_fired for this phase+stage — the retry-gate reopen
+        // path (a second gate_fired) must never have run.
+        let contents =
+            std::fs::read_to_string(devflow_core::events::events_path(root)).unwrap_or_default();
+        let gate_fired_count = contents
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| {
+                event["event"] == "gate_fired"
+                    && event["phase"] == phase
+                    && event["stage"] == "ship"
+            })
+            .count();
+        assert_eq!(
+            gate_fired_count, 1,
+            "the Ship gate must be written exactly once, not reopened"
+        );
+
+        let resolved =
+            devflow_core::events::last_event_of_kind_for_phase(root, phase, "gate_resolved")
+                .expect("a gate_resolved event must be recorded");
+        assert_eq!(resolved["stage"], "ship");
+        assert_eq!(resolved["approved"], true);
+        assert_eq!(resolved["action"], "advance");
+        assert_eq!(
+            resolved["responded_by"], "--yes-ship",
+            "the gate ledger must carry the pre-authorization's literal attribution"
+        );
+    }
+
+    /// 23-09 Task 1 acceptance (the negative half): with `state.yes_ship`
+    /// unset (the default), `handle_ship_outcome` writes a gate request but
+    /// never writes a response — the routine Ship approval still waits for a
+    /// human exactly as before this flag existed.
+    #[test]
+    fn handle_ship_outcome_without_yes_ship_writes_gate_but_no_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let phase = 51;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Ship;
+        assert!(!state.yes_ship, "yes_ship must default to false");
+        workflow::save_state(&state).unwrap();
+
+        let gate_path = Gates::gate_path(root, phase, Stage::Ship);
+        let response_path = Gates::response_path(root, phase, Stage::Ship);
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                handle_ship_outcome(root, &mut state).unwrap();
+            });
+
+            let mut seen = false;
+            for _ in 0..150 {
+                if gate_path.exists() {
+                    seen = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert!(seen, "handle_ship_outcome must write a gate request");
+            // Give the (non-existent) auto-response write a moment to have
+            // happened if it were ever going to — it must not.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(
+                !response_path.exists(),
+                "with yes_ship unset, no response may ever be auto-written — the run must wait for a human"
+            );
+
+            // Unblock the poll so the spawned thread finishes.
+            std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &response_path,
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap();
+        });
     }
 
     /// A Code-stage failure must fire a gate AND run the configured notify
