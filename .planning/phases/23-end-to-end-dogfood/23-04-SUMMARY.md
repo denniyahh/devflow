@@ -232,3 +232,17 @@ None - no external service configuration required.
 ---
 *Phase: 23-end-to-end-dogfood*
 *Completed: 2026-07-25*
+
+## Self-Check: PASSED
+
+- FOUND: crates/devflow-core/src/gates.rs
+- FOUND: crates/devflow-cli/src/main.rs
+- FOUND: crates/devflow-cli/src/commands.rs
+- FOUND: crates/devflow-cli/src/config_parse.rs
+- FOUND: crates/devflow-cli/tests/gate_sweep_e2e.rs
+- FOUND: OPERATIONS.md
+- FOUND: .planning/phases/23-end-to-end-dogfood/23-04-SUMMARY.md
+- FOUND: commit 73450ac (Task 1 feat)
+- FOUND: commit 2c20f29 (Task 2 feat)
+- FOUND: commit 99cf682 (Task 3 test)
+- FOUND: commit 6c8facc (this SUMMARY.md)
