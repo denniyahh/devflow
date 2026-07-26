@@ -271,3 +271,387 @@ pipeline (which had already fully terminated by the time `cleanup` ran), but
 it is a real, unanticipated side effect of a command this record's author
 chose to run, and per the plan's disclosure standard it is named plainly
 rather than folded quietly into "cleanup succeeded."**
+
+---
+
+## 7. Post-run hygiene (Task 2) — proving the run left nothing behind
+
+All commands below use this phase's own new instruments (23-04/23-05/23-06)
+against the acceptance run they are meant to police — the strongest available
+demonstration that they work, per the plan's own framing.
+
+### `devflow gate list --all-roots`
+
+```
+$ devflow gate list --all-roots | grep -c '^24 '
+0
+```
+
+Zero rows for phase 24. The 22 pre-existing stale entries plan 23-10 already
+recorded as noise from earlier (23-01/23-02) probes are still present,
+unrelated to this run (different `/tmp/.tmpXXXXXX` project roots, different
+phases — 7, 8, 12). **One additional entry appeared during this run's
+observation window**, also unrelated: a `/tmp/.tmp…`-rooted phase-12 gate
+whose backing process (`ps` showed a `sh -c … cd '/tmp/.tmp…'` wrapper with a
+start time *before* this run was ever launched) is a pre-existing, unrelated
+background process on this shared machine — not something this run created,
+and left untouched per the read-only/no-unrelated-cleanup discipline. No row
+in either count is attributable to phase 24.
+
+### `devflow gate sweep --dry-run`
+
+```
+$ devflow gate sweep --dry-run
+would reap phase 12 plan (age …s) at /tmp/.tmp…
+  … (22 lines, matching the 22 pre-existing stale entries above)
+sweep complete (dry run): 22 would be reaped, 0 skipped, 1 left alone
+EXIT=0
+```
+
+Nothing mutated (dry run). Zero phase-24 lines. The "1 left alone" is a gate
+below the reap-age threshold — again, not phase 24 (already confirmed zero
+rows above); not investigated further as it is out of this task's scope
+(pre-existing, unrelated background activity on a shared machine, not this
+run's responsibility to clean up — that is `gate sweep`'s own on-demand job,
+run here in dry-run/read-only form only).
+
+### `devflow evidence --phase 24 --json` and `--require-shipped`
+
+**Pre-run baseline** (quoted verbatim from `23-ACCEPTANCE-SETUP.md`, Task 2,
+check 5): `devflow evidence --phase 24 --require-shipped` exited **1**
+before this run, with `shipped: false`.
+
+**Post-run:**
+
+```
+$ devflow evidence --phase 24 --json
+{
+  "phase": 24,
+  "shipped": false,
+  "workflow_finished_seen": false,
+  "finished_reason": null,
+  "stage": null,
+  "state_present": false,
+  "feature_branch_exists": true,
+  "merged_into_develop": true,
+  "has_remote": true
+}
+
+$ devflow evidence --phase 24 --require-shipped
+phase: 24
+shipped: false
+workflow_finished_seen: false
+finished_reason: none
+stage: none
+state_present: false
+feature_branch_exists: true
+merged_into_develop: true
+has_remote: true
+error: phase 24 has not shipped — DevFlow has no record of a completed Ship
+EXIT=1
+```
+
+**Exit code, adjacent to the declaration, so agreement is checkable at a
+glance: pre-run `EXIT=1` → post-run `EXIT=1`. `outcome: run-incomplete`
+(line 1 of this document) agrees with both.** They never disagreed at any
+point in this run; no correction was ever needed.
+
+`shipped: false` and `workflow_finished_seen: false` together are the load-
+bearing pair: this is not "finished because it was stopped" (plan 23-06's
+exact confusion target) — it is a phase that never had a `workflow_finished`
+line at all, terminating instead in `workflow_aborted` (§2). `feature_branch_exists:
+true` and `merged_into_develop: true` are both artifacts of the branch's own
+zero-commit history, not evidence of a real merge — `feature/phase-24` was
+created at, and never diverged from, `develop`'s own tip
+(`e0f87c2c2230257f7aa8092a836225626941d09a`), so a trivial ancestry check
+reads it as "merged" by definition (0 commits ahead means nothing to merge).
+No commit was ever made on it (`git rev-list --count
+e0f87c2c2230257f7aa8092a836225626941d09a..feature/phase-24` → `0`), and it
+was subsequently removed entirely (see below).
+
+### Process inventory (read-only)
+
+```
+$ ps aux | grep -c 'phase.24\|phase-24'
+0
+```
+
+Captured read-only (`ps aux` piped to a count, nothing signaled or killed).
+Zero processes referencing phase 24 remained after the stop sequence in §3
+completed — matches the empty `.devflow/lock-24` / `state-24.json` /
+`.devflow/gates/` state already recorded there.
+
+### `devflow status`
+
+```
+$ devflow status .
+stage: idle
+project_root: <repo-root>
+
+open branches:
+  feature/phase-23 — 84 ahead
+```
+
+No active phases; the `PENDING GATE` block that was present immediately
+after the gate fired (quoted below, from before the stop, for contrast) is
+gone:
+
+```
+==================== PENDING GATE ====================
+!!!: phase 24 define (2m ago)
+  [never-silent] stage define failed: Phase 24 does not exist in .planning/ROADMAP.md … — human review needed (retry, loop-to-code, or abort)
+  approve: devflow gate approve 24 --stage define
+  reject:  devflow gate reject 24 --stage define --note <reason>
+======================================================
+```
+
+### Worktree/branch cleanup, and the side effect (fully disclosed)
+
+`devflow cleanup` (no `--phase` selector; the command only ever touches paths
+under `.worktrees/`, confirmed by reading `crates/devflow-cli/src/commands.rs`
+before running it — never the main checkout) was run once, after the stop
+sequence had already fully completed:
+
+```
+$ devflow cleanup
+deleting branch: feature/phase-24
+removed worktree <repo-root>/.worktrees/phase-24 + deleted branch feature/phase-24
+cleaning up merged branch: recovery/pre-23-11-acceptance-e0f87c2
+deleted merged branch recovery/pre-23-11-acceptance-e0f87c2
+EXIT=0
+```
+
+**The second line is the disclosed side effect.** `cleanup`'s "remove merged
+branches" logic is not scoped to `feature/phase-*` — it swept up
+`recovery/pre-23-11-acceptance-e0f87c2` too, because that ref's tip
+(`e0f87c2…`) is trivially an ancestor of `develop` (it *is* `develop`'s own
+tip from before this phase started), which the same ancestry check that
+makes `feature/phase-24` read as "merged" also applies to. This is plan
+23-10's own rehearsed recovery ref — the local branch, specifically; **the
+remote copy on `origin` was never touched** (`git branch -d`-class local
+deletion does not touch a remote ref, and this was confirmed immediately,
+read-only, via `git ls-remote origin refs/heads/recovery/pre-23-11-acceptance-e0f87c2`
+and a `git fetch origin --prune`, both returning the ref unchanged at
+`e0f87c2c2230257f7aa8092a836225626941d09a`). The local branch was then
+restored from `origin` in the same session (`git branch
+recovery/pre-23-11-acceptance-e0f87c2 origin/recovery/pre-23-11-acceptance-e0f87c2`),
+confirmed to point at the identical SHA. **Net effect: zero loss of the
+actual recovery capability (the remote ref is, and was always, the
+authoritative copy per `23-ACCEPTANCE-SETUP.md`'s own reasoning), but a real
+and worth-recording finding about `devflow cleanup`: it will delete any local
+branch it judges "merged" by ancestry, including branches it does not own or
+manage (like an operator's own recovery ref), if their tip happens to be
+reachable from `develop`.** This is disclosed here in full rather than
+silently corrected, per this plan's own standard.
+
+---
+
+## 8. Post-run git evidence, compared against the Task-1 prediction
+
+| | Predicted (`23-ACCEPTANCE-SETUP.md`, Task 1) | Actual (post-run) |
+|---|---|---|
+| Merge into `develop` | Expected, as part of a successful Ship | **None.** `develop`/`origin/develop` unchanged at `e0f87c2c2230257f7aa8092a836225626941d09a`, identical to the pre-run tip. |
+| Resulting version (`VersionBump`) | **2.0.0** | **No version bump occurred.** `Cargo.toml` still reads `version = "1.8.1"`. |
+| Changelog commit | Expected, as part of `hooks_after_ship` | **None.** `CHANGELOG.md`'s `## 2.0.0` heading is the same pre-existing, undated-release draft entry that was already present before this run (from plan 23-07's landed breaking removal) — this run added nothing to it. |
+
+This delta is **exactly what a run that never reached Ship should produce** —
+the plan's own artifacts section names this explicitly: *"(None of the above
+when the outcome is `run-incomplete` — in that case record what, if
+anything, the partial run did leave on `develop`.)"* What the partial run
+left on `develop`: nothing. Zero commits, zero branches, zero file changes.
+Any other result — a version bump or merge commit appearing despite the
+run having stopped at Define — would have been the alarming finding; its
+absence is the expected, correct one.
+
+---
+
+## 9. Self-dogfood staleness path — exercised, but not the hard-block branch (coverage gap)
+
+The launch log's very first non-worktree-creation line:
+
+```
+warning: build provenance staleness check did not confirm a fresh build for stage define — proceeding (only DevFlow's own workspace is ever hard-blocked, D-18)
+```
+
+Read against `crates/devflow-cli/src/staleness.rs`: `is_self_dogfood_workspace(project_root)`
+correctly returned `true` — this **is** DevFlow's own workspace by
+construction (`Cargo.toml`'s `members` array literally names
+`crates/devflow-core` and `crates/devflow-cli`). So the self-dogfood
+detection itself **was** exercised, and correctly identified this run as
+self-dogfood. What did **not** happen is the `Stale` classification that
+would have hard-blocked it (`StalenessOutcome::Block`, D-18): the binary's
+embedded commit (`8aa914b705c3fb16ba0781e9f028c5e59084b11f` — visible in the
+`workflow_started` event in §2, and confirmed to be a real, deep commit on
+`feature/phase-23`'s own lineage: `chore(phase-23): update tracking after
+wave 6`) is a **descendant** of the phase-24 worktree's HEAD (which checked
+out `develop`'s tip, `e0f87c2…`, chronologically much earlier). Per
+`embedded_commit_is_stale`'s own documented logic, that is the `Ahead`
+classification ("the embedded commit is a strict descendant of
+`execution_root`'s HEAD: the binary is newer than the source it drives"),
+which `staleness_outcome` maps to `Warn` for **every** project, self-dogfood
+or not — never `Block`. `Block` only fires for `(self_dogfood=true,
+Staleness::Stale)`, i.e., an **old** binary being run against **newer**
+tracked source it doesn't know about — the Phase 16 false-evidence incident
+this gate exists to prevent.
+
+**Recorded as the plan's own named coverage-gap truth (backstop
+verification):** the self-dogfood staleness **hard block** was **not**
+exercised by this run. What was exercised is the detection half of the
+mechanism (`is_self_dogfood_workspace` correctly firing `true`) and the
+`Ahead`-branch warn path — a different, non-blocking branch of the same
+function. The reason is structural to this run's own shape, not incidental:
+this run's binary was freshly and correctly rebuilt (§1), and the target
+worktree was necessarily *behind* that fresh binary (freshly branched from
+`develop`, which predates all of Phase 23's work) — the inverse of the
+"stale binary, newer source" scenario the hard block guards against. A
+future acceptance attempt that (a) is run against a target whose worktree
+*is* ahead of the installed binary's embedded commit, and (b) is DevFlow's
+own workspace, would be needed to actually exercise `StalenessOutcome::Block`
+end to end. This gap is named here rather than left implicit, per the
+plan's own must-have.
+
+---
+
+## 10. Full gate chain (post-run tree)
+
+Run on the post-run tree (main checkout, `feature/phase-23`, unaffected by
+the phase-24 attempt — confirmed clean via `git status --short` before and
+after):
+
+```
+$ cargo test --workspace
+… 592 passed; 0 failed; 0 ignored (summed across all binaries, incl. doc-tests)
+$ cargo clippy --workspace --all-targets -- -D warnings
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.62s
+EXIT=0
+$ cargo fmt --check
+EXIT=0
+```
+
+**Chain result: 0 as a single chain.**
+
+**Compared against plan 23-10's recorded pre-run baseline pair:**
+
+| Value | Count | Source |
+|---|---|---|
+| Pre-run passing count (`23-10`, this same tree before this run) | **592** | `23-ACCEPTANCE-SETUP.md` |
+| Plan 23-08's deliberate-removal count (already reflected in 592) | **9** | `23-08-SUMMARY.md` |
+| **Post-run passing count (this document)** | **592** | measured directly above |
+
+**Delta: zero.** Exactly expected — this run never touched
+`crates/`/`Cargo.toml`/`Cargo.lock` (it never got past Define, and Define
+never writes source), so a byte-identical test count is the correct outcome,
+not a coincidence. A count that had moved in either direction without an
+explanation would have been the finding requiring investigation; 592 → 592
+is the clean, unremarkable result of a run that stopped before touching any
+code.
+
+---
+
+## 11. Mechanisms this run left unexercised
+
+Named plainly, per the plan's instruction not to imply broader coverage than
+was actually exercised:
+
+- **`--yes-ship` Ship-gate pre-authorization (D-04/D-05/D-06, 23-09).** The
+  flag was correctly *persisted* (`state-24.json` recorded `"yes_ship":
+  true"`), proving the plumbing that carries the flag from CLI arg to
+  on-disk state works — but the run never reached the Ship stage, so the
+  actual auto-approval behavior at a real Ship gate was never exercised end
+  to end by this run.
+- **`devflow gate sweep` in its reaping (non-dry-run) form.** Only
+  `--dry-run` was used (§7); no gate — this run's own or any of the 22+
+  pre-existing unrelated ones — was ever actually reaped by this session.
+- **The `hooks_after_ship` batch** (`Merge` → `VersionBump` →
+  `ChangelogAppend` → `BranchCleanup`) and its no-rollback-on-partial-failure
+  behavior. Never reached; the run stopped at Define.
+- **The self-dogfood staleness hard block (`StalenessOutcome::Block`).**
+  Detected as self-dogfood, but only the `Ahead`/warn branch fired — see §9.
+  This is this plan's own explicitly named coverage gap.
+- **`devflow resume`** (the rate-limit/infra-pause resume path). Not
+  triggered — this run never hit a rate limit or infra failure; it stopped
+  on a content gate.
+- **Plan, Code, and Validate stage content**, and the Code↔Validate
+  consecutive-failure ceiling (18d/18e). Never reached.
+
+**Exercised, for contrast:** `devflow start`'s non-blocking hand-off to a
+detached monitor process; the never-silent gate firing correctly on an
+unexpected stage failure (`gate_fired` → `notify_fired`, in that order, both
+present); `devflow stop`'s clean rejection-and-unwind path, including the
+parked `advance` process picking up the response within its documented 60s
+backoff cap; `devflow gate list --all-roots` and `--dry-run` sweep as
+read-only inspection tools; `devflow evidence`'s `--json`/`--require-shipped`
+oracle, both before and after; and `devflow cleanup`'s worktree/branch
+removal (with the disclosed recovery-branch side effect, §7).
+
+---
+
+## 12. What this run does and does not prove
+
+**Does prove:** DevFlow's never-silent gate mechanism correctly detected a
+genuine precondition failure (a target phase whose only definition lives on
+an unmerged branch) and refused to proceed silently or fabricate scope; the
+Claude agent driving Define correctly diagnosed the failure and reported it
+through the documented completion protocol rather than inventing a roadmap
+entry; `devflow stop` cleanly ends a parked, gated run within its documented
+backoff window, with the underlying `advance` process picking up the
+rejection and exiting on its own; the acceptance oracle
+(`devflow evidence --require-shipped`) correctly reads a stopped run as
+not-shipped both before and after, with no disagreement to reconcile;
+`devflow gate list`/`sweep --dry-run` correctly enumerate and would-reap
+unrelated stale state without touching this run's own registration; and this
+run's poll instrument avoided the probe's own documented last-line-only
+defect by testing named events across the recent tail.
+
+**Does not prove:** that DevFlow can drive a phase all the way to a
+completed, shipped Ship stage unattended — this run never got past Define,
+so the pipeline's Plan/Code/Validate/Ship stages, the `--yes-ship`
+auto-approval's actual firing, the `hooks_after_ship` batch, the
+Code↔Validate failure-ceiling loop, and the self-dogfood staleness **hard
+block** specifically (as opposed to its detection) remain unexercised by
+this attempt (§11). One run — even a fully successful one — would only ever
+be one sample; this run is a *partial* sample of a different kind, more
+informative about the gate/stop/evidence layer than about the five-stage
+pipeline itself. Phase 17 previously reached Ship and still died later
+(STATE.md); nothing here should be read as a durability or reliability
+claim about repeated runs, only as a record of what this one specific
+attempt, under these specific conditions, actually did.
+
+**On the phase's own acceptance criterion:** not met by this attempt. The
+phase's goal — "one phase has actually been driven start-to-finish by
+devflow, unattended, reaching a completed Ship stage" — remains unproven.
+What this attempt establishes is that the mechanisms built in plans
+23-03–23-10 to make failure *legible and recoverable* (never-silent gates,
+`devflow stop`, the evidence oracle, gate enumeration) all behaved correctly
+when the very first stage of a real attempt hit a real, unanticipated
+precondition gap. Whether that is sufficient grounds for `accepted with
+gaps` or `failed` is Task 3's judgment, not this document's.
+
+---
+
+## 13. Redaction
+
+Per the cross-AI review's checklist: the operator's OS account name, the
+home-directory basename, absolute home paths, temporary session-scratch
+paths (the executor's own working directory under the system temp root),
+and the remote URL were checked for and redacted throughout this document
+(replaced with `<repo-root>`, `<origin-url>`-style placeholders, or
+PID/generic placeholders where a literal value added no evidentiary
+content). Confirmed by direct grep before each commit — command shape shown
+with the searched-for literal itself replaced by a placeholder, since
+quoting the literal here would reintroduce exactly what this section
+confirms is absent:
+
+```
+$ rg -c "<os-account-name>" 23-ACCEPTANCE-RUN.md
+0 matches
+$ rg -c "<home-path-prefix>" 23-ACCEPTANCE-RUN.md
+0 matches
+$ rg -c "<scratch-session-path-prefix>" 23-ACCEPTANCE-RUN.md
+0 matches
+```
+
+`/tmp/.tmpXXXXXX`-style random scratch names (from the pre-existing,
+unrelated gate entries in §7) were left as-is, matching
+`23-ACCEPTANCE-SETUP.md`'s own established convention — they carry no home
+directory or username, only opaque `mktemp`-style random suffixes.
