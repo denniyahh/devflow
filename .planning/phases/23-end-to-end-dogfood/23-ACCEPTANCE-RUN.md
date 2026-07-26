@@ -655,3 +655,108 @@ $ rg -c "<scratch-session-path-prefix>" 23-ACCEPTANCE-RUN.md
 unrelated gate entries in §7) were left as-is, matching
 `23-ACCEPTANCE-SETUP.md`'s own established convention — they carry no home
 directory or username, only opaque `mktemp`-style random suffixes.
+
+---
+
+## 14. Task 3 — Operator judgment
+
+**This section records the operator's own verdicts verbatim, plus
+orchestrator-independent corroboration gathered before those verdicts were
+given.** Per this plan's own design, the two outcomes stay separate and
+neither is blended into the other.
+
+### Operator verdicts (verbatim)
+
+> **record: valid**
+>
+> **failed: the acceptance target was unreachable from `develop`, so the run
+> could not have reached Ship.**
+>
+> Recovery point: **NOT needed, and not used.** `origin/develop` is at
+> `e0f87c2c2230257f7aa8092a836225626941d09a` — byte-identical to
+> `recovery/pre-23-11-acceptance-e0f87c2`. No merge, no version bump (still
+> 1.8.1), no changelog commit occurred. The recovery ref remains on `origin`
+> and can be deleted as ordinary cleanup whenever the operator chooses; it
+> is not load-bearing.
+
+**RUN RECORD: valid. ACCEPTANCE: failed.** Recorded as two separate,
+non-contradictory facts — a valid record of a failed acceptance attempt is
+exactly the outcome class this plan's own design exists to make possible
+(§"Two outcomes, not one" in `23-11-PLAN.md`'s objective).
+
+### Independent corroboration (orchestrator, gathered before the verdicts)
+
+Recorded here as corroboration of what this document already claimed, not
+as new claims:
+
+- `devflow evidence --phase 24 --require-shipped` exits **1** post-run,
+  unchanged from the pre-run baseline. Agrees with `outcome: run-incomplete`
+  (line 1 of this document).
+- `origin/develop` == the recovery ref SHA
+  (`e0f87c2c2230257f7aa8092a836225626941d09a`). Workspace version
+  unchanged: still `1.8.1`.
+- Zero open gates for phase 24.
+
+### Root cause, attributed plainly
+
+The orchestrator promoted backlog 999.27 to Phase 24 in commits `a80a6b7` +
+`753350e` — both on `feature/phase-23`. `devflow start` forks a fresh
+feature branch from `develop`'s current tip, and `develop` has never
+contained those two commits, so the target phase did not exist in the tree
+this run was handed. **The run was structurally unable to succeed from the
+moment of that promotion** — not from anything that happened during the run
+itself. **This is an orchestrator sequencing error across plans 23-10/23-11,
+not a DevFlow defect.** DevFlow's agent correctly detected the missing
+roadmap entry, refused to fabricate one, and reported failure through the
+documented completion protocol; the never-silent gate fired exactly as
+designed (§2). The product did not misbehave — the acceptance run's own
+setup handed it an unreachable target.
+
+### A third precondition class, named for future attempts
+
+Plan 23-10 Task 2's seven behavioral checks, and Task 3's two content
+preconditions (security artifact; no self-attested Ship claim), together
+did not test a third, distinct question: **can `devflow start` actually see
+the target phase from the branch it will fork from?** Neither precondition A
+nor B covers this — both concern the target phase's own *content* once
+reached; this concerns whether the target phase's ROADMAP entry is even
+*reachable* from `develop` before the run starts. This is the precondition
+that actually stopped this run, and it is recommended by name for any future
+acceptance attempt: **verify the target phase's ROADMAP.md entry (and
+`.planning/phases/<N>-*/` directory) are present on `develop` itself — not
+merely on the branch the acceptance plan happens to be executing from —
+before launching `devflow start`.**
+
+### Scoping clarification — orphan processes, machine-wide vs. phase-24
+
+§7's "Process inventory (read-only)" claim of zero leftover processes is
+**accurate as scoped to phase 24**, and phase 24 genuinely has zero — that
+claim stands unchanged. A broader, machine-wide check
+(`devflow gate list --all-roots`, run again after the operator's review)
+surfaces a separate fact worth making explicit so it is not over-read
+against the phase-24 claim: **24 orphaned `devflow advance` processes are
+present on this machine right now, oldest ~1h35m, all rooted under
+`/tmp/.tmp*` scratch directories, none touching this repository or phase
+24.** These are residue from this phase's own end-to-end test suites
+(`gate_sweep_e2e`, `stop_e2e`, and phase-12 fixtures created during earlier
+plans' own test runs) — not from this acceptance run, and not newly
+discovered by it (§7 already recorded the same 22-and-growing count as
+pre-existing noise from earlier probes; the count now stands at 24). This is
+recorded as two things at once:
+
+1. **A live validation of plan 23-03's own enumeration mechanism** — nothing
+   before this phase existed that could have surfaced this population at
+   all; `devflow gate list --all-roots` is doing exactly the job it was
+   built for, and `devflow gate sweep` (23-04) is the documented remedy,
+   available on demand.
+2. **A real finding, independent of this acceptance run's own verdict:**
+   this phase's own e2e test suites leak monitor/advance process pairs into
+   `/tmp` scratch directories rather than cleaning up after themselves.
+   Worth a follow-up (not scoped to this plan, and not fixed here per this
+   plan's own no-source-files-modified boundary — see `<artifacts>` in
+   `23-11-PLAN.md`).
+
+**The phase-24 hygiene claim in §7 is not being restated as wrong — it was
+correctly scoped and remains correct.** This section exists only to make the
+machine-wide picture explicit so a reader of §7 alone could not mistakenly
+generalize "zero for phase 24" into "zero on the machine."
