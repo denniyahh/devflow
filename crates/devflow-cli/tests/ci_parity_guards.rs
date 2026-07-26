@@ -158,6 +158,73 @@ fn ci_workflow_delegates_to_the_shared_check_script() {
     );
 }
 
+/// CR-01 for `devcontainer.yml`'s `runCmd`, which runs under `bash -c`:
+/// without `set -e` as the first line, only the LAST command's exit code
+/// counts and a failing check cannot fail the job.
+#[test]
+fn devcontainer_runcmd_fails_fast_before_any_check() {
+    let path = repo_root().join(".github/workflows/devcontainer.yml");
+    let workflow = read(&path);
+
+    let mut lines = workflow.lines();
+    for line in lines.by_ref() {
+        if line.trim_start() == "runCmd: |" {
+            break;
+        }
+    }
+    let block_indent = workflow
+        .lines()
+        .find(|l| l.trim_start() == "runCmd: |")
+        .map(|l| l.len() - l.trim_start().len())
+        .expect("find `runCmd: |` in devcontainer.yml");
+
+    let mut cmd_lines = Vec::new();
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if line.len() - line.trim_start().len() <= block_indent {
+            break;
+        }
+        cmd_lines.push(line.trim());
+    }
+
+    assert!(
+        !cmd_lines.is_empty(),
+        "could not locate command lines inside `runCmd: |` in {}",
+        path.display()
+    );
+    assert_eq!(
+        cmd_lines[0], "set -e",
+        "`runCmd`'s first command line must be exactly `set -e` (15-REVIEW.md \
+         CR-01). Found: {:?}\nfull runCmd: {cmd_lines:#?}",
+        cmd_lines[0]
+    );
+    assert!(
+        cmd_lines.iter().any(|l| l.contains("scripts/check.sh")),
+        "devcontainer.yml must delegate to scripts/check.sh so it does not \
+         become a second definition of green. Found: {cmd_lines:#?}"
+    );
+}
+
+/// This workflow's job name is a REQUIRED status check on `develop`, declared
+/// in the `develop-merge-or-squash` ruleset — which classic branch protection
+/// does not report. Deleting the workflow or renaming this job makes a
+/// required check that can never report, wedging every merge to develop. That
+/// happened on 2026-07-26; this guard exists so it cannot happen silently.
+#[test]
+fn devcontainer_job_name_matches_the_required_status_check() {
+    let path = repo_root().join(".github/workflows/devcontainer.yml");
+    let workflow = read(&path);
+    assert!(
+        workflow.contains("name: Build + test in devcontainer"),
+        "{} must define a job named exactly `Build + test in devcontainer` — \
+         it is a required status check on develop. Verify with:\n  \
+         gh api repos/denniyahh/devflow/rules/branches/develop",
+        path.display()
+    );
+}
+
 /// CI must run the same pinned image the devcontainer declares, or "local
 /// parity" is a claim with nothing behind it.
 #[test]
