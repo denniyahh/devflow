@@ -3,9 +3,8 @@
 //! All agents run in non-interactive mode (`claude -p`, `codex exec`) under a
 //! detached monitor that owns the process and its capture files (see
 //! [`crate::monitor`]). The old synchronous launch/capture path
-//! (`launch_agent` + `capture_agent_output`) was removed in 14b once
-//! `sequentagent` moved behind monitor-owned execution — the monitor is now
-//! the single way an agent process is spawned.
+//! (`launch_agent` + `capture_agent_output`) was removed in 14b — the monitor
+//! is now the single way an agent process is spawned.
 
 /// Check whether a process with the given PID is still running.
 ///

@@ -53,7 +53,7 @@ fn wait_for_file(path: &Path, timeout: Duration) {
 /// Reap `pid`, then poll until it is no longer a live process (or `timeout`
 /// elapses).
 ///
-/// Codex review: `spawn_monitor_no_advance` returns only a detached child's
+/// Codex review: `monitor::spawn_monitor` returns only a detached child's
 /// `u32` pid, not a `Child` handle the test could `.wait()` on. But this test
 /// binary is still the OS-level parent of that process (it called
 /// `Command::spawn()` internally), so it never gets reparented to init —
@@ -106,19 +106,31 @@ fn all_seven_devflow_constructors_produce_the_gitignore() {
         }
     }
 
-    // 3. monitor::spawn_monitor_no_advance -> monitor.rs capture dir
-    //    (the sequentagent/parallel path — never calls save_state, D-14).
+    // 3. monitor::spawn_monitor -> monitor.rs capture dir (a spawn path that
+    //    creates the capture directory without going through save_state —
+    //    the state passed here is synthetic and never persisted, D-14).
+    //
+    //    spawn_monitor appends a `devflow advance` tail that the deleted
+    //    no-advance variant omitted (23-08). That tail's `binary` resolves
+    //    via `std::env::current_exe()`, which inside `cargo test` is this
+    //    test binary itself, not the real `devflow` CLI — invoking it with
+    //    `advance <root> --phase 1` hits the Rust test harness's own
+    //    argument parser, which rejects the unrecognized `--phase` flag and
+    //    exits immediately (~milliseconds; independently confirmed via a
+    //    direct invocation of the built test binary). It never reaches
+    //    `devflow advance`'s real state-loading or gate logic, so there is
+    //    no risk of blocking on a multi-day gate wait here — the same
+    //    fail-fast tail already runs, unbounded and unremarked, in every
+    //    other `spawn_monitor`-based test in `monitor.rs`. No additional
+    //    timeout override is needed; `wait_for_file` and `wait_for_pid_to_die`
+    //    below are the test's real (and sufficient) synchronisation points.
     {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let state = State::new(1, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        let pid = monitor::spawn_monitor_no_advance(
-            &state,
-            "sh",
-            &["-c".to_string(), "exit 0".to_string()],
-            &[],
-        )
-        .expect("spawn_monitor_no_advance");
+        let pid =
+            monitor::spawn_monitor(&state, "sh", &["-c".to_string(), "exit 0".to_string()], &[])
+                .expect("spawn_monitor");
 
         wait_for_file(
             &agent_result::exit_code_path(root, 1),
@@ -127,12 +139,13 @@ fn all_seven_devflow_constructors_produce_the_gitignore() {
         wait_for_pid_to_die(pid, Duration::from_secs(5));
 
         if !gitignore_is_star(root) {
-            failures.push("monitor::spawn_monitor_no_advance (monitor.rs)");
+            failures.push("monitor::spawn_monitor (monitor.rs)");
         }
     }
 
     // 4. agent_result::archive_phase_files -> agent_result.rs history_dir
-    //    (the sequentagent/parallel path — also never calls save_state).
+    //    (called from launch_stage before every agent spawn — this fixture
+    //    exercises it directly, without going through save_state).
     {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
