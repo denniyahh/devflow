@@ -728,6 +728,26 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
+### Phase 999.47: `looks_like_devflow_process` False-Positives Under CI Load (BACKLOG)
+
+**Goal:** `agent::looks_like_devflow_process(pid)` intermittently returns `true` for a plain `sleep` process. It is the last guard before `SIGTERM` in `devflow stop` (`commands.rs:1171`), so a false positive is the **dangerous** direction — it *permits* signalling a process that is not DevFlow's, which is exactly the recycled-pid hazard its own error message names ("the lock may be stale with a recycled pid").
+
+**Evidence:** `agent::tests::looks_like_devflow_process_is_false_for_a_non_devflow_process` failed in 2 of 6 CI samples on 2026-07-26 (~33%), across commits that touched no Rust source at all (`e00a16d`, `8929236` — both `.planning/`-only). The same commit passed on one trigger and failed on the other, and the pattern flipped between commits, so it is non-deterministic rather than environment-specific. The ~20 CI runs before that were green. Introduced with the predicate itself in `dec4583` (plan 23-05).
+
+**Mechanism NOT yet identified — do not assume one.** Two hypotheses are already **disproved**: (1) local flakiness under CPU contention — 40/40 passes; (2) fork/exec cmdline inheritance, i.e. reading the parent's `/proc/<pid>/cmdline` before the child `exec`s — a 3000-iteration probe observed it 0 times.
+
+**Diagnostics are already in place** (`21449bd`, no production change). The assertion now reports the child's cmdline before *and* after the predicate call, its `/proc/<pid>/exe`, and the test process's own identity, with a decision tree: both cmdlines naming a devflow binary ⇒ the pid is not the spawned `sleep` (recycled/misattributed); the two differing ⇒ the cmdline changed under the predicate; both naming `sleep` ⇒ the matching logic is at fault. **The next reproduction should name the cause — read it before choosing a fix.**
+
+**Known independent weakness, visible by inspection:** the predicate matches **any** argv element whose basename starts with `devflow`, not just `argv[0]`. So `sleep /tmp/devflow-scratch/x` matches, as does any process merely *mentioning* a devflow path in its arguments. Tightening to `argv[0]` and corroborating via `/proc/<pid>/exe` narrows the false-positive surface regardless of the intermittent cause.
+
+**Related TOCTOU, likely 999.44's scope:** even a correct predicate is checked and *then* acted on — the pid can be recycled between `looks_like_devflow_process(pid)` and `terminate(pid)`.
+
+**Priority:** Medium | **Size:** S–M — S if the diagnostics name a simple cause, M if it needs a non-pid identity handle. Linear: DEN-72.
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
 ### Phase 21: Operator Legibility & Observability
 
 **Shipped as v1.8.0** (2026-07-24) — PR #23 (`develop → main`, squash `cfa9167`), signed tag `v1.8.0`, [GitHub Release](https://github.com/denniyahh/devflow/releases/tag/v1.8.0). `sync-main-to-develop.sh` run via PR #24 (merge `01ad9e4`). Published to crates.io (`devflow-core` then `devflow`, both confirmed live at 1.8.0).
