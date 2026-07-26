@@ -882,7 +882,7 @@ Plans carry the unit identifiers `23a`, `23b`, `23c`, `23d`, `23e` and
 `yes-ship` as requirement tokens. **`23b` and `23c` were redefined, and `23e`
 added, by the 2026-07-25 replan** — see "Re-aimed 2026-07-25" below.
 **Depends on:** Phase 22
-**Plans:** 13/15 plans executed
+**Plans:** 14/15 plans executed
 gap-closure set** (planned 2026-07-26 from `23-VERIFICATION.md`'s single
 recorded gap), unstarted
 2026-07-25; the original 23-03…23-12 are archived under
@@ -1107,7 +1107,7 @@ Plans:
 - [x] 23-11-PLAN.md — Acceptance run: one phase Define→Ship, unattended, self-hosted
 - [x] 23-12-PLAN.md — 23f: the `devflow start` reachability guard — refuse before scaffolding when the phase is not on the base branch
 - [x] 23-13-PLAN.md — 23f: merge the guard to `develop` (operator checkpoint), rebuild, prove at runtime the binary carries it
-- [ ] 23-14-PLAN.md — Acceptance preconditions re-measured on the post-merge tree, fresh recovery ref, one-way launch decision
+- [x] 23-14-PLAN.md — Acceptance preconditions re-measured on the post-merge tree, fresh recovery ref, one-way launch decision
 - [ ] 23-15-PLAN.md — Acceptance retry: one phase Define→completed Ship, unattended, judged only by `workflow_shipped` + `--require-shipped`
 
 *(The original 23-03…23-12 are archived under `superseded/` — see the re-aim
@@ -1175,7 +1175,7 @@ as code per the operator's gap-closure decision above. Units 23a–23e and
 
 **Wave 10** *(blocked on 23-12)*
 
-- [ ] 23-13 — 23f: pull request to `develop`, CI green, **blocking operator merge checkpoint** (no autonomous write to `develop`), then rebuild and a runtime refusal proof in a throwaway clone with the binary hash recorded (23f, 23-acceptance)
+- [x] 23-13 — 23f: pull request to `develop`, CI green, **blocking operator merge checkpoint** (no autonomous write to `develop`), then rebuild and a runtime refusal proof in a throwaway clone with the binary hash recorded (23f, 23-acceptance)
 
 **Wave 11** *(blocked on 23-13)*
 

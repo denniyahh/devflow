@@ -5,15 +5,15 @@ milestone_name: milestone (open — no fixed closing phase)
 current_phase: 23
 current_phase_name: end-to-end-dogfood
 status: executing
-stopped_at: Completed 23-13-PLAN.md
-last_updated: "2026-07-26T21:16:00.201Z"
+stopped_at: Completed 23-14-PLAN.md
+last_updated: "2026-07-26T22:03:32.308Z"
 last_activity: 2026-07-26
-last_activity_desc: Phase 23 execution started
+last_activity_desc: 23-13 executed (Task 2 artifact write + Task 3, continuation agent)
 progress:
   total_phases: 13
   completed_phases: 11
   total_plans: 91
-  completed_plans: 89
+  completed_plans: 90
   percent: 85
 ---
 
@@ -87,14 +87,14 @@ change earns 2.0.
 ## Current Position
 
 Phase: 23 (end-to-end-dogfood) — EXECUTING
-Plan: 13 of 15
-Status: Executing Phase 23
-23-13 complete: guard (23-12) merged to `origin/develop` via PR #32 (operator merge, `0dad20d`), binary rebuilt from the merged tip and proven at runtime to refuse an unreachable phase, phase 24 confirmed reachable from `origin/develop`. Load-bearing finding recorded, not fixed here: local `develop` on this machine is 0 ahead / 120 behind `origin/develop`, and `commands.rs:146` resolves the guard against the local ref — 23-14 must re-verify (and if needed fast-forward) before the acceptance launch.
-Last activity: 2026-07-26 — 23-13 executed (Task 2 artifact write + Task 3, continuation agent)
+Plan: 14 of 15
+Status: Ready to execute 23-15 (one-way acceptance launch — operator-authorized PROCEED)
+23-14 complete: local `develop` fast-forwarded to `origin/develop` (pure fast-forward, 0 ahead/120 behind, per 23-13's carried-forward finding), all seven behavioural checks plus an eighth reachability check re-run against the post-merge tree, a fresh remote-only recovery ref (`recovery/pre-23-15-acceptance-0dad20d`) cut with a rehearsed restore path, and the operator's verbatim PROCEED authorization recorded against `origin/develop` `0dad20d` with predicted version `1.8.2` — informed that `compute_version` will actually produce `~1.11.339` and that the mismatch is the accepted finding. See `23-ACCEPTANCE-SETUP-2.md`.
+Last activity: 2026-07-26 — 23-14 executed (Tasks 1-2 by prior agent; Task 3 authorization + SUMMARY by continuation agent)
 
 **Note on the "Plan: 2 of 15" value this replaces:** `gsd-tools state advance-plan` only increments whatever value is already in this field, which had drifted to "2 of 15" (the parallel-worktree waves 23-01…23-09 deliberately never touch STATE.md, and this field was last corrected against reality at "10 of 11 plans complete" before the plan count grew to 15 with the gap-closure plans 23-12…23-15). Corrected directly to "13 of 15" to match reality (23-12 and 23-13 both now executed) rather than trust the tool's naive +1 increment from a stale base.
 
-Progress: [██████████] 98% (13 of 15 plans executed; 23-14…23-15 remain)
+Progress: [██████████] 99% (14 of 15 plans executed; 23-15 remains)
 
 *(Machine-readable fields for `gsd-tools state begin-phase` / `advance-plan` —
 this project historically tracked position only in the narrative "Active
@@ -682,6 +682,9 @@ None currently open for Phase 17.
 - [Phase 23]: Third precondition class named for future acceptance attempts: verify target phase ROADMAP entry is reachable from develop itself before devflow start, not just from the executing branch
 - [Phase ?]: 23-13: Local develop is 0 ahead/120 behind origin/develop and is the ref commands.rs:146 actually consults for the reachability guard; fast-forward remedy named but deliberately deferred to 23-14 to preserve the evidence its re-measurement step is designed to catch.
 - [Phase ?]: 23-13: Guard (23-12) merged to origin/develop via PR #32 (operator-performed, commit 0dad20d), rebuild proven diff-empty against origin/develop, binary refusal of an unreachable phase demonstrated at runtime in a throwaway clone (exit 1, 'is not reachable from'), phase 24 confirmed reachable from origin/develop.
+- [Phase ?]: Fast-forwarded local develop to origin/develop in 23-14 Task 1 (pure fast-forward, 0 ahead/120 behind) rather than deferring a third time.
+- [Phase ?]: Operator authorized 23-15's acceptance launch (PROCEED) against origin/develop 0dad20d, predicting version 1.8.2 while informed compute_version will actually produce ~1.11.339 — the mismatch is the accepted finding.
+- [Phase ?]: Corrected the compute_version pre-run finding's stated root cause from a --candidates=10 truncation to git describe's nearest-tag-by-commit-distance heuristic colliding with the main/develop sync-merge topology (v1.4.0 and v1.8.1 are on divergent lineages).
 
 ## Roadmap Evolution
 
@@ -750,9 +753,10 @@ None currently open for Phase 17.
 | Phase 23 P10 | ~65min (across 2 checkpoints) | 4 tasks | 1 files |
 | Phase 23 P11 | 42min | 3 tasks | 2 files |
 | Phase 23 P13 | 18min | 3 tasks | 1 files |
+| Phase 23 P14 | N/A (continuation) | 3 tasks | 2 files |
 
 ## Session
 
-**Last session:** 2026-07-26T21:16:00.157Z
-**Stopped at:** Completed 23-13-PLAN.md
+**Last session:** 2026-07-26T22:03:32.269Z
+**Stopped at:** Completed 23-14-PLAN.md
 **Resume file:** None
