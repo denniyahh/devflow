@@ -882,7 +882,7 @@ Plans carry the unit identifiers `23a`, `23b`, `23c`, `23d`, `23e` and
 `yes-ship` as requirement tokens. **`23b` and `23c` were redefined, and `23e`
 added, by the 2026-07-25 replan** — see "Re-aimed 2026-07-25" below.
 **Depends on:** Phase 22
-**Plans:** 14/15 plans executed
+**Plans:** 15/15 plans executed
 gap-closure set** (planned 2026-07-26 from `23-VERIFICATION.md`'s single
 recorded gap), unstarted
 2026-07-25; the original 23-03…23-12 are archived under
@@ -1108,7 +1108,7 @@ Plans:
 - [x] 23-12-PLAN.md — 23f: the `devflow start` reachability guard — refuse before scaffolding when the phase is not on the base branch
 - [x] 23-13-PLAN.md — 23f: merge the guard to `develop` (operator checkpoint), rebuild, prove at runtime the binary carries it
 - [x] 23-14-PLAN.md — Acceptance preconditions re-measured on the post-merge tree, fresh recovery ref, one-way launch decision
-- [ ] 23-15-PLAN.md — Acceptance retry: one phase Define→completed Ship, unattended, judged only by `workflow_shipped` + `--require-shipped`
+- [x] 23-15-PLAN.md — Acceptance retry: one phase Define→completed Ship, unattended, judged only by `workflow_shipped` + `--require-shipped`
 
 *(The original 23-03…23-12 are archived under `superseded/` — see the re-aim
 note above. The plan list below renumbers from 23-03; 23-01 and 23-02 are
@@ -1179,7 +1179,7 @@ as code per the operator's gap-closure decision above. Units 23a–23e and
 
 **Wave 11** *(blocked on 23-13)*
 
-- [ ] 23-14 — All seven behavioural checks re-run against the post-merge binary (nothing carried forward), an eighth reachability check, fresh remote-only recovery ref with a rehearsed restore, then the **one-way launch decision checkpoint** for 23-15 (23-acceptance)
+- [x] 23-14 — All seven behavioural checks re-run against the post-merge binary (nothing carried forward), an eighth reachability check, fresh remote-only recovery ref with a rehearsed restore, then the **one-way launch decision checkpoint** for 23-15 (23-acceptance)
 
 **Wave 12** *(blocked on 23-14)*
 

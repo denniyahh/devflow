@@ -5,16 +5,16 @@ milestone_name: milestone (open — no fixed closing phase)
 current_phase: 23
 current_phase_name: end-to-end-dogfood
 status: executing
-stopped_at: Completed 23-14-PLAN.md
-last_updated: "2026-07-26T22:03:32.308Z"
+stopped_at: Completed 23-15-PLAN.md — acceptance FAILED, phase 23 goal unmet, 23-16 retry planned
+last_updated: "2026-07-26T22:35:41.228Z"
 last_activity: 2026-07-26
-last_activity_desc: 23-13 executed (Task 2 artifact write + Task 3, continuation agent)
+last_activity_desc: 23-14 executed (Tasks 1-2 by prior agent; Task 3 authorization + SUMMARY by continuation agent)
 progress:
   total_phases: 13
-  completed_phases: 11
+  completed_phases: 12
   total_plans: 91
-  completed_plans: 90
-  percent: 85
+  completed_plans: 91
+  percent: 92
 ---
 
 # DevFlow — Project State
@@ -86,15 +86,23 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 23 (end-to-end-dogfood) — EXECUTING
-Plan: 14 of 15
-Status: Ready to execute 23-15 (one-way acceptance launch — operator-authorized PROCEED)
-23-14 complete: local `develop` fast-forwarded to `origin/develop` (pure fast-forward, 0 ahead/120 behind, per 23-13's carried-forward finding), all seven behavioural checks plus an eighth reachability check re-run against the post-merge tree, a fresh remote-only recovery ref (`recovery/pre-23-15-acceptance-0dad20d`) cut with a rehearsed restore path, and the operator's verbatim PROCEED authorization recorded against `origin/develop` `0dad20d` with predicted version `1.8.2` — informed that `compute_version` will actually produce `~1.11.339` and that the mismatch is the accepted finding. See `23-ACCEPTANCE-SETUP-2.md`.
-Last activity: 2026-07-26 — 23-14 executed (Tasks 1-2 by prior agent; Task 3 authorization + SUMMARY by continuation agent)
+Phase: 23 (end-to-end-dogfood) — **NOT COMPLETE — behavioural acceptance criterion UNMET, 23-16 gap-closure retry required**
+Plan: 15 of 15 (all 15 plans executed; the phase's own goal is still not achieved — see below)
+Status: 23-15 executed and judged. **ACCEPTANCE FAILED** for the second consecutive attempt. Do not read "15 of 15 plans executed" or the 100% progress bar below as phase completion — that percentage counts *plans run*, not the phase's behavioural goal, and the goal was not met.
+
+**23-15 result (second acceptance attempt, 2026-07-26):** `devflow start --phase 24 --agent claude --mode auto --yes-ship` was blocked at launch by the self-dogfood staleness hard block (D-18) — the binary's embedded commit (`0c9dcfe`, built from `feature/phase-23`) and `origin/develop`'s tip (`0dad20d`) are mutually non-ancestors (genuine divergence, confirmed via `git merge-base --is-ancestor` both directions, exit 1 each way), so the block fired before Define ever launched. No `workflow_shipped` event exists for phase 24; `devflow evidence --phase 24 --require-shipped` exits 1 both pre- and post-run — unchanged. See `.planning/phases/23-end-to-end-dogfood/23-ACCEPTANCE-RUN-2.md`.
+
+**Operator's two verdicts (recorded verbatim in `23-ACCEPTANCE-RUN-2.md` §15):** `record: valid` (the run-incomplete declaration precisely names its stop cause, source-verified) and `acceptance: failed` (forced by the two-piece evidence contract — no `workflow_shipped`, `--require-shipped` unchanged at exit 1). **Phase 23's own behavioural acceptance criterion — "one phase driven Define→completed Ship, unattended, with Claude" — remains UNMET after two attempts** (attempt 1 failed on target unreachability, now fixed; attempt 2 failed on binary provenance).
+
+**Agreed next action: a new gap-closure plan, 23-16.** Build `devflow` from a `develop` checkout (not `feature/phase-23`, which can never produce a binary whose embedded commit is an ancestor of `develop`'s tip — the divergent-lineage staleness path will trip against any `develop`-based target regardless of content). 23-14's preconditions (freshness re-check, binary hash, `origin/develop` SHA verification, recovery-ref rehearsal) must be re-run against that new binary before a third launch attempt.
+
+**Recovery-ref disposition:** both `origin` refs (`recovery/pre-23-11-acceptance-e0f87c2`, `recovery/pre-23-15-acceptance-0dad20d`) remain untouched on `origin`; the local copy of the pre-23-11 ref, deleted again by `devflow cleanup`, is deliberately NOT restored (per `23-FINDINGS.md` §B2a); the pre-23-15 ref is now unused (no merge to undo) but retained on `origin` for reuse by the 23-16 retry rather than deleted.
+
+Last activity: 2026-07-26 — 23-15 executed and judged (Tasks 1-2 by prior agent; Task 3 operator verdicts recorded by continuation agent). Phase 23 remains open pending 23-16.
 
 **Note on the "Plan: 2 of 15" value this replaces:** `gsd-tools state advance-plan` only increments whatever value is already in this field, which had drifted to "2 of 15" (the parallel-worktree waves 23-01…23-09 deliberately never touch STATE.md, and this field was last corrected against reality at "10 of 11 plans complete" before the plan count grew to 15 with the gap-closure plans 23-12…23-15). Corrected directly to "13 of 15" to match reality (23-12 and 23-13 both now executed) rather than trust the tool's naive +1 increment from a stale base.
 
-Progress: [██████████] 99% (14 of 15 plans executed; 23-15 remains)
+Progress: [██████████] 100% (15 of 15 plans executed — plan-count only; the phase's behavioural acceptance goal is UNMET and requires plan 23-16 to close)
 
 *(Machine-readable fields for `gsd-tools state begin-phase` / `advance-plan` —
 this project historically tracked position only in the narrative "Active
@@ -685,6 +693,8 @@ None currently open for Phase 17.
 - [Phase ?]: Fast-forwarded local develop to origin/develop in 23-14 Task 1 (pure fast-forward, 0 ahead/120 behind) rather than deferring a third time.
 - [Phase ?]: Operator authorized 23-15's acceptance launch (PROCEED) against origin/develop 0dad20d, predicting version 1.8.2 while informed compute_version will actually produce ~1.11.339 — the mismatch is the accepted finding.
 - [Phase ?]: Corrected the compute_version pre-run finding's stated root cause from a --candidates=10 truncation to git describe's nearest-tag-by-commit-distance heuristic colliding with the main/develop sync-merge topology (v1.4.0 and v1.8.1 are on divergent lineages).
+- [Phase ?]: Operator verdict: 23-15 record valid, acceptance failed — behavioural acceptance criterion unmet; next step is a new gap-closure plan 23-16 with a develop-built binary
+- [Phase ?]: Recovery-ref disposition: both origin refs retained; local pre-23-11 copy not restored per 23-FINDINGS SS B2a; pre-23-15 ref retained unused for 23-16
 
 ## Roadmap Evolution
 
@@ -754,9 +764,10 @@ None currently open for Phase 17.
 | Phase 23 P11 | 42min | 3 tasks | 2 files |
 | Phase 23 P13 | 18min | 3 tasks | 1 files |
 | Phase 23 P14 | N/A (continuation) | 3 tasks | 2 files |
+| Phase 23 P15 | 17min | 3 tasks | 1 files |
 
 ## Session
 
-**Last session:** 2026-07-26T22:03:32.269Z
-**Stopped at:** Completed 23-14-PLAN.md
+**Last session:** 2026-07-26T22:35:41.190Z
+**Stopped at:** Completed 23-15-PLAN.md — acceptance FAILED, phase 23 goal unmet, 23-16 retry planned
 **Resume file:** None
