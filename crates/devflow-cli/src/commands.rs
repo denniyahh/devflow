@@ -3126,6 +3126,22 @@ mod tests {
         assert_eq!(event["stage"], "ship");
     }
 
+    /// Render `/proc/<pid>/cmdline` readably for failure diagnostics: the
+    /// NUL-separated argv joined with ` | `, or a marker when it cannot be
+    /// read. Test-only; never used in a decision, only in a message.
+    fn debug_cmdline(pid: u32) -> String {
+        match std::fs::read(format!("/proc/{pid}/cmdline")) {
+            Ok(raw) if raw.iter().all(|&byte| byte == 0) => "<empty>".to_string(),
+            Ok(raw) => raw
+                .split(|&byte| byte == 0)
+                .filter(|arg| !arg.is_empty())
+                .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                .collect::<Vec<_>>()
+                .join(" | "),
+            Err(err) => format!("<unreadable: {err}>"),
+        }
+    }
+
     /// Task 2 behavior (T-23-52 fail-closed): a lock file naming a live pid
     /// that does not identify as a devflow process must be refused, never
     /// signalled. Constructed against this test binary's own pid when its
@@ -3160,21 +3176,63 @@ mod tests {
         std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
         std::fs::write(&lock_path, pid.to_string()).unwrap();
 
-        let err = stop(root, phase).expect_err("a failed identity check must return an error");
+        // This assertion has failed intermittently in CI (999.47 / DEN-72) in
+        // the FALSE-POSITIVE direction: `stop()` returned Ok, meaning the
+        // identity guard passed for a pid that is not a devflow process and
+        // `devflow stop` went on to signal it. A bare `expect_err` throws away
+        // every artifact that could name the cause, so capture the guard's own
+        // inputs around the call. Not reproducible locally as of 2026-07-26 —
+        // see the backlog entry for the attempts already ruled out.
+        let cmdline_before = debug_cmdline(pid);
+        let predicate_verdict = agent::looks_like_devflow_process(pid);
+        let result = stop(root, phase);
+        let cmdline_after = debug_cmdline(pid);
+        let lock_survived = lock_path.exists();
+
+        // Reap before asserting: a panic here must not leak the sleeper for
+        // its full 30s (this repo already has an orphan problem, 999.44/46).
+        if let Some(mut child) = sleeper {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
+        let err = match result {
+            Err(err) => err,
+            Ok(()) => panic!(
+                "stop() returned Ok — the identity guard PASSED for pid {pid}, so \
+                 `devflow stop` signalled a process that is not devflow.\n\
+                 \x20 branch taken:        {}\n\
+                 \x20 current_exe():       {:?}\n\
+                 \x20 pid under test:      {pid}\n\
+                 \x20 cmdline before stop: {cmdline_before}\n\
+                 \x20 cmdline after stop:  {cmdline_after}\n\
+                 \x20 direct predicate:    looks_like_devflow_process({pid}) = {predicate_verdict}\n\
+                 \x20 lock file survived:  {lock_survived}\n\
+                 \x20 test process:        pid {} cmdline {}\n\
+                 If the branch is `own pid`, current_exe() failed to look devflow-named \
+                 and the test sabotaged itself — fix the fixture, not the predicate. \
+                 If the branch is `spawned sleep` and the cmdlines name a devflow binary, \
+                 the pid is not the sleep we spawned. If they name `sleep`, the predicate's \
+                 matching logic is at fault.",
+                if self_exe_is_devflow_named {
+                    "spawned sleep"
+                } else {
+                    "own pid"
+                },
+                std::env::current_exe(),
+                std::process::id(),
+                debug_cmdline(std::process::id()),
+            ),
+        };
         let message = err.to_string();
         assert!(
             message.contains(&pid.to_string()),
             "error must name the pid it refused to signal, got: {message}"
         );
         assert!(
-            lock_path.exists(),
+            lock_survived,
             "the lock file must be untouched — stop must not signal anything"
         );
-
-        if let Some(mut child) = sleeper {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
     }
 
     /// Task 2 behavior: a lock file naming a dead pid is stale — reclaimed
