@@ -521,3 +521,178 @@ string in GitHub URLs unredacted. No `/home/denniyahh` or
 `/var/home/denniyahh` absolute path appears anywhere in this section — only
 the public repository URL, retained for the same reason
 `23-GUARD-SHIP-RECORD.md` retained it.
+
+---
+
+## Task 2 — Fresh recovery point on `origin`, real restore path
+
+### Cut at the right commit
+
+Recovery ref must point at the `origin/develop` tip Task 1 recorded:
+`0dad20d3e85d82d60235b8f91cb944e4cbed433c`. Named per the established
+convention, scoped to this plan and carrying the short SHA it protects:
+`recovery/pre-23-15-acceptance-0dad20d`.
+
+```
+$ git ls-remote origin 'refs/heads/recovery/pre-23-15-acceptance-*'
+(no match — none exists yet)
+```
+
+### Push and read back — no local branch created
+
+```
+$ git push origin 0dad20d3e85d82d60235b8f91cb944e4cbed433c:refs/heads/recovery/pre-23-15-acceptance-0dad20d
+remote: Create a pull request for 'recovery/pre-23-15-acceptance-0dad20d' on GitHub by visiting:
+remote:      https://github.com/denniyahh/devflow/pull/new/recovery/pre-23-15-acceptance-0dad20d
+To https://github.com/denniyahh/devflow.git
+ * [new branch]      0dad20d3e85d82d60235b8f91cb944e4cbed433c -> recovery/pre-23-15-acceptance-0dad20d
+
+$ git ls-remote origin refs/heads/recovery/pre-23-15-acceptance-0dad20d
+0dad20d3e85d82d60235b8f91cb944e4cbed433c	refs/heads/recovery/pre-23-15-acceptance-0dad20d
+```
+
+**Read-back SHA (`0dad20d3e85d82d60235b8f91cb944e4cbed433c`) equals the
+`git rev-parse origin/develop` value Task 1 recorded exactly.**
+
+The push itself ran through this repository's tracked pre-push hook
+(`scripts/check-in-container.sh all`, in the pinned devcontainer) — `cargo
+fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and
+`cargo test --workspace --no-fail-fast` all ran again inside the container
+and reported `check.sh: all OK` before the push left the machine, an
+independent (containerized) re-confirmation of the same 608/0/clean result
+Task 1 measured natively.
+
+```
+$ git branch --list 'recovery/pre-23-15-acceptance-*'
+(empty)
+```
+
+**No local copy exists — deliberate.** `devflow cleanup` judges branches
+merged by ancestry, and a recovery ref is by definition an ancestor of the
+branch it protects, so it is *always* eligible for deletion. `23-FINDINGS.md`
+§B2 records this happening twice in one day to the previous recovery ref
+(`recovery/pre-23-11-acceptance-e0f87c2`). This ref is deliberately
+remote-only for that reason. The new ref name is distinct from
+`recovery/pre-23-11-acceptance-e0f87c2` — that ref points at the pre-Phase-23
+commit (`e0f87c2`), now 120 commits stale relative to `origin/develop`; it
+protects nothing for this attempt and is left untouched per its own recorded
+disposition (`23-FINDINGS.md` §B2a — retained until Phase 23's merge into
+`develop` is settled, which it now is via PR #32, but pruning that ref is not
+this task's job).
+
+### Throwaway-clone restore rehearsal
+
+Cloned this repository's local working copy into a scratch directory
+(`git clone --no-hardlinks`, local filesystem source, no network, no remote
+side effect):
+
+```
+$ git clone --no-hardlinks --quiet <project-root> <tmpdir>
+$ cd <tmpdir>
+$ git checkout develop
+Switched to a new branch 'develop'
+$ git rev-parse develop
+0dad20d3e85d82d60235b8f91cb944e4cbed433c
+
+$ echo "bad-run-marker" > BAD_RUN_MARKER.txt
+$ git add BAD_RUN_MARKER.txt
+$ git commit -q -m "simulate bad run" --no-verify
+$ git rev-parse develop
+a6feb0c9583db008e7e45923f314f1133ac33315
+
+$ git reset --hard 0dad20d3e85d82d60235b8f91cb944e4cbed433c
+HEAD is now at 0dad20d Merge pull request #32 from denniyahh/feature/phase-23
+$ git rev-parse develop
+0dad20d3e85d82d60235b8f91cb944e4cbed433c
+
+$ git diff --stat 0dad20d3e85d82d60235b8f91cb944e4cbed433c develop
+(empty — no output)
+```
+
+**Tree comparison succeeded: byte-identical.** `git rev-parse develop` after
+the restore equals the recovery SHA exactly, and `git diff --stat` between
+the recovery SHA and the restored `develop` produced no output. The clone
+already contained this exact commit as `develop`'s own tip (the recovery ref
+and `develop`'s current tip are the same SHA today), so the rehearsal proves
+the mechanical reset operation reproduces the pre-run tree — the load-bearing
+property the real restore path depends on. Clone removed at the end of the
+task:
+
+```
+$ rm -rf <tmpdir>
+$ test -d <tmpdir> && echo "STILL EXISTS" || echo "removed"
+removed
+```
+
+### The real restore path — protected branch, PR required, CI wait
+
+`develop` is governed by an active ruleset (re-confirmed today, unchanged
+from `23-ACCEPTANCE-SETUP.md`'s prior measurement):
+
+```
+$ gh api repos/denniyahh/devflow/branches/develop/protection
+allow_force_pushes.enabled: false
+enforce_admins.enabled: true
+
+$ gh api repos/denniyahh/devflow/rulesets/19616771
+rules:
+  - pull_request: required_approving_review_count=0, allowed_merge_methods=[merge, squash]
+  - required_status_checks: strict=true, contexts=[Test, Clippy, Format, "Build + test in devcontainer"]
+bypass_actors: []
+current_user_can_bypass: "never"
+```
+
+**Force-push refused categorically** — `bypass_actors` empty,
+`current_user_can_bypass: "never"`, no admin override exists for this branch.
+The real restore is a **revert pull request**, not a force-push and not an
+administrative bypass:
+
+```
+git revert -m 1 <bad-merge-sha> --no-edit    # on a new branch off develop
+git push origin <revert-branch>
+gh pr create --base develop --head <revert-branch> --title "revert: <reason>"
+# wait for Test / Clippy / Format / "Build + test in devcontainer" to report success
+gh pr merge <pr-number> --merge   # or --squash; both allowed by the ruleset
+```
+
+**Latency, measured from this repository's own recent CI runs on `develop`:**
+
+```
+$ gh run list --branch develop --limit 5
+completed  success  Merge pull request #32 ...  CI            develop  push  1m40s  2026-07-26T21:02:27Z
+completed  success  Merge pull request #32 ...  Devcontainer  develop  push  1m51s  2026-07-26T21:02:27Z
+completed  success  Merge pull request #31 ...  CI            develop  push  1m37s  2026-07-26T19:30:17Z
+completed  success  Merge pull request #31 ...  Devcontainer  develop  push  2m2s   2026-07-26T19:30:17Z
+```
+
+Both required jobs run in parallel and complete in **under 2 minutes**; no
+human-review wait is structurally required (`required_approving_review_count:
+0`). **Budget ~2 minutes of CI wait plus the seconds it takes to author and
+push the revert commit and open/merge the PR** — this is the real cost of
+undoing a bad run, stated here so it is budgeted rather than discovered at
+02:00.
+
+## Redaction check, Task 2 section
+
+```
+$ rg -n '/home/denniyahh|/var/home/denniyahh' .planning/phases/23-end-to-end-dogfood/23-ACCEPTANCE-SETUP-2.md
+(no match)
+```
+
+Grep run against the file as committed, after this task's additions. No
+operator home-directory path appears anywhere in this section — the `gh api
+repos/denniyahh/devflow/...` command lines and the `git push`/`git fetch`
+transcripts' `github.com/denniyahh/devflow` URLs are the public repository's
+own account name, not a local filesystem leak; see the Task 1 redaction
+section above for the full interpretation and its citation of
+`23-GUARD-SHIP-RECORD.md`'s identical precedent. The scratch clone's tempdir
+path is redacted to `<tmpdir>` and the project root to `<project-root>`
+throughout this section, per the 999.10 leak class this checklist actually
+targets (local filesystem paths, not the public repo account name).
+
+---
+
+## Task 3 — Authorization
+
+*(recorded by the continuation agent once the operator responds to the
+checkpoint)*
