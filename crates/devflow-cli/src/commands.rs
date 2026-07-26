@@ -979,6 +979,64 @@ pub(crate) fn gate_sweep(
     Ok(())
 }
 
+/// End a running phase cleanly (23c) — the missing primitive
+/// `23-ORPHAN-FORENSICS.md` names as the reason 54 processes accumulated
+/// with no remedy but `kill(1)`. Answers `phase`'s open gate if it has one —
+/// the primary path, since it is the only one that produces a clean final
+/// state: the target unwinds through its own `abort()` and releases its
+/// lock. (The signalling fallback for a phase with no open gate lands in
+/// 23-05 Task 2.)
+pub(crate) fn stop(project_root: &Path, phase: u32) -> Result<(), CliError> {
+    stop_via_gate(project_root, phase)?;
+    persist_stopped_state(project_root, phase)
+}
+
+/// The primary path: answer `phase`'s open gate with a rejection whose note
+/// contains the abort keyword, so `GateAction::from_response` resolves to
+/// `GateAction::Abort` rather than `LoopBack(Code)` — looping back would
+/// relaunch an agent on a phase the operator just asked to stop. A no-op
+/// when there is no open gate for `phase` at all — Task 2 adds the
+/// lock-holder fallback for that case.
+fn stop_via_gate(project_root: &Path, phase: u32) -> Result<(), CliError> {
+    let Some(gate) = Gates::list_open(project_root)
+        .into_iter()
+        .find(|g| g.phase == phase)
+    else {
+        return Ok(());
+    };
+    let path = Gates::reap(
+        project_root,
+        phase,
+        gate.stage,
+        "abort: stopped by `devflow stop`",
+        "devflow-stop",
+    )?;
+    println!(
+        "stop: wrote a rejection for phase {phase} {} at {} — the process waiting on it \
+         will pick this up on its next poll, within the 60s backoff cap",
+        gate.stage,
+        path.display()
+    );
+    Ok(())
+}
+
+/// Persist the operator's intent: mark `stopped` and record why, preserving
+/// any earlier reason (e.g. a prior `--until` halt) by appending rather
+/// than overwriting. Never touches `stop_until` — that field means
+/// something different (the requested halt stage for `devflow start
+/// --until`) and `transition()` reads it.
+fn persist_stopped_state(project_root: &Path, phase: u32) -> Result<(), CliError> {
+    let mut state = workflow::load_state(project_root, phase)?;
+    state.stopped = true;
+    let reason = "stopped via `devflow stop`".to_string();
+    state.stop_reason = Some(match state.stop_reason.take() {
+        Some(existing) if !existing.is_empty() => format!("{existing}; {reason}"),
+        _ => reason,
+    });
+    workflow::save_state(&state)?;
+    Ok(())
+}
+
 /// Print an open gate's full, untruncated (but sanitized) context — the
 /// discoverability counterpart to `gate_list`'s 100-char table truncation
 /// (21a, D-03). Shares `resolve_single_open_gate_stage` with `gate_respond`

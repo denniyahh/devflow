@@ -41,6 +41,7 @@ Define → Plan → Code → Validate → Ship
 | `devflow sequentagent --phase N --agents a,b [--force]` | Two agents sequentially on one phase with a rebase handoff |
 | `devflow list` | Feature branches with divergence from develop |
 | `devflow reference [--branch B] [--refresh]` | Static snapshot worktree at `.worktrees/reference/` |
+| `devflow stop --phase N [--root PATH]` | End a running phase cleanly (23c). Answers its open gate with a rejection if one is open — the target unwinds through its own abort path, no signal sent — otherwise signals the process recorded in `.devflow/lock-{phase:02}` (never `state.monitor_pid`, which the generated monitor script's trap only ever captures for the agent, not the trailing `advance`) after confirming it is alive and its `/proc/<pid>/cmdline` identifies it as a devflow process. Idempotent; marks `state.stopped`/`state.stop_reason` so `cleanup`'s existing fail-closed refusal (unweakened by this command) recognizes the phase as no longer live — `stop` then `cleanup --force` compose in that order |
 | `devflow cleanup [--force]` | Remove phase worktrees + their feature branches |
 | `devflow recover [--clean] [--phase N]` | Inspect state; `--clean` sweeps stale phases only; `--clean --phase N` clears one phase unconditionally |
 | `devflow test` | cargo test + clippy + fmt --check |
