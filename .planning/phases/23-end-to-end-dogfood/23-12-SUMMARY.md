@@ -178,3 +178,11 @@ The guard is wired and proven end-to-end on this branch (`worktree-agent-a2bc6de
 ---
 *Phase: 23-end-to-end-dogfood*
 *Completed: 2026-07-26*
+
+## Self-Check: PASSED
+
+All created/modified files confirmed present on disk: `crates/devflow-cli/src/preflight.rs`,
+`crates/devflow-cli/src/commands.rs`, `crates/devflow-cli/tests/start_reachability_e2e.rs`,
+`CHANGELOG.md`, `OPERATIONS.md`, `.planning/phases/23-end-to-end-dogfood/23-12-SUMMARY.md`.
+All four commits (`fdc0a3d`, `fbf535b`, `9ebde0b`, `edd5f23`) confirmed present in
+`git log --oneline -6`. No missing items.
