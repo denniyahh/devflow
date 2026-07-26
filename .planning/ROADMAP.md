@@ -544,16 +544,17 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.27: `release --check` Signing-Key Inline Classification (BACKLOG)
+### Phase 999.27: `release --check` Signing-Key Inline Classification (PROMOTED — Phase 24)
 
 **Goal:** `check_ssh_signing_viability` (20d, `crates/devflow-core/src/git.rs`) misclassifies an inline (non-path) `user.signingkey` value — a literal key blob configured directly rather than as a file path is treated as a path and reported as not-found. Deterministic edge case; every path-based and no-key branch is already correct and tested. Full detail in `.planning/phases/20-release-correctness-operator-control/20-REVIEW.md` (INF-01).
 **Priority:** Low | **Size:** S — single classification branch + one test; found by Phase 20 code review (2026-07-23), deferred as Info-severity while CR-01/CR-02 + WR-01/02/03 were fixed inline on the phase-20 branch. Linear: DEN-52.
 **Requirements:** TBD — see CONTEXT.md
+**Promoted:** Phase 24, 2026-07-26 — selected as the acceptance target for Phase 23 plan 23-11 (D-02)
 **Plans:** 0 plans
 
 Plans:
 
-- [ ] TBD (promote with /gsd-review-backlog when ready)
+- [x] Promoted to Phase 24 — see the Phase 24 entry for the active tracking
 
 ### Phase 999.28: Explicit `--base` Branch Override for `devflow start` (BACKLOG)
 
@@ -968,3 +969,17 @@ unchanged and already merged.)*
 **Wave 8** *(blocked on 23-10)*
 
 - [ ] 23-11 — Acceptance run: one phase Define→Ship, unattended, self-hosted (all units)
+
+### Phase 24: `release --check` Signing-Key Inline Classification
+
+**Goal:** `check_ssh_signing_viability` (20d, `crates/devflow-core/src/git.rs`) misclassifies an inline (non-path) `user.signingkey` value — a literal key blob configured directly rather than as a file path is treated as a path and reported as not-found. Deterministic edge case; every path-based and no-key branch is already correct and tested. Full detail in `.planning/phases/20-release-correctness-operator-control/20-REVIEW.md` (INF-01).
+**Priority:** Low | **Size:** S — single classification branch + one test; found by Phase 20 code review (2026-07-23). Linear: DEN-52.
+**Requirements**: TBD — promoted from backlog 999.27
+**Depends on:** Phase 23
+**Plans:** 0 plans
+
+*Promoted from backlog Phase 999.27 on 2026-07-26 as the acceptance target for Phase 23 plan 23-11 (D-02). Selected as low-stakes by consequence: a release-preflight advisory check that touches no merge, version, or ship control flow.*
+
+Plans:
+
+- [ ] TBD (run /gsd-plan-phase 24 to break down)
