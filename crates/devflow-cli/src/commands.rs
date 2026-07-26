@@ -31,6 +31,7 @@ use devflow_core::lock;
 use devflow_core::mode::Mode;
 use devflow_core::recover;
 use devflow_core::registry;
+use devflow_core::ship_evidence;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
 use devflow_core::version;
@@ -666,6 +667,95 @@ pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
     for hint in cron_instruction_hints(project_root) {
         println!("\n{hint}");
     }
+    Ok(())
+}
+
+/// Report DevFlow's own structural record of whether `phase` shipped
+/// (23-06) — reads `devflow_core::ship_evidence::collect`, a strictly
+/// read-only oracle sourced from the append-only event log, never from an
+/// agent-authored attestation document.
+///
+/// **Three dead-end predicates/placements this plan disproved. Documented
+/// here so the next person reading this code does not re-derive and
+/// re-attempt them:**
+///
+/// 1. **Pre-gate merge check.** `hooks_after_ship` (`hooks.rs:105-112`) only
+///    runs from `finish_workflow_with_gate_timeout`, itself only reached from
+///    `handle_ship_outcome`'s `GateAction::Advance` arm — i.e. AFTER the Ship
+///    gate has already been approved. A check for a merge/tag/push placed
+///    before gate approval would fail for every legitimate Ship; RESEARCH.md's
+///    Question C / Pattern 3 recommendation to place it there was verified
+///    wrong against live source.
+/// 2. **Post-batch ancestry check.** `BranchCleanup` runs immediately after
+///    `Merge` in that same `hooks_after_ship` batch and deletes the feature
+///    branch. `GitFlow::is_merged_into_develop` fails closed on an absent
+///    branch (`git.rs:89-97`: "an absent branch is not proof of a merge"), so
+///    an ancestry check run after the batch completes returns `false` for
+///    EVERY successfully shipped phase.
+/// 3. **`workflow_finished` as the shipped predicate.** Emitted at TWO
+///    sites: real Ship finalization, and `transition`'s `devflow start
+///    --until <stage>` clean-stop branch
+///    (`crates/devflow-cli/src/pipeline_gate.rs:67`, the
+///    `state.stop_until == Some(from)` arm near the top of `transition`),
+///    which returns with payload `{"reason": "stopped_at", …}` BEFORE any
+///    checkout hook, before `state.stage = to`, before the `"transition"`
+///    event, and before `launch_stage` runs — nothing resembling a Ship has
+///    happened. A phase halted after one stage would read as shipped. This
+///    is the dead end most likely to be reintroduced: a cross-AI review
+///    caught it after it had already been written into this plan three
+///    times as "the only site emitting `workflow_finished`."
+pub(crate) fn evidence(
+    project_root: &Path,
+    phase: u32,
+    json: bool,
+    require_shipped: bool,
+) -> Result<(), CliError> {
+    let evidence = ship_evidence::collect(project_root, phase);
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&evidence).expect("ShipEvidence must serialize")
+        );
+    } else {
+        println!("phase: {}", evidence.phase);
+        println!("shipped: {}", evidence.shipped);
+        println!(
+            "workflow_finished_seen: {}",
+            evidence.workflow_finished_seen
+        );
+        println!(
+            "finished_reason: {}",
+            evidence.finished_reason.as_deref().unwrap_or("none")
+        );
+        println!(
+            "stage: {}",
+            evidence
+                .stage
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "none".into())
+        );
+        println!("state_present: {}", evidence.state_present);
+        println!("feature_branch_exists: {}", evidence.feature_branch_exists);
+        println!("merged_into_develop: {}", evidence.merged_into_develop);
+        println!("has_remote: {}", evidence.has_remote);
+    }
+
+    if require_shipped && !evidence.shipped {
+        // "It finished but it did not ship" is the confusing case a reader
+        // hits first — say so explicitly rather than a generic "not shipped"
+        // (Task 1 acceptance criteria).
+        let detail = if ship_evidence::is_stopped_at(&evidence) {
+            format!(
+                "phase {phase} has not shipped — DevFlow's own record shows it stopped after \
+                 one stage (--until) rather than reaching a finalized Ship"
+            )
+        } else {
+            format!("phase {phase} has not shipped — DevFlow has no record of a completed Ship")
+        };
+        return Err(CliError::Message(detail));
+    }
+
     Ok(())
 }
 

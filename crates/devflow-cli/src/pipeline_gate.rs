@@ -219,6 +219,26 @@ pub(crate) fn finish_workflow_with_gate_timeout(
     // phase) from the machine-global registry so `devflow gate list
     // --all-roots` stops naming a phase that no longer exists.
     registry::deregister(project_root, state.phase);
+    // 23-06 / T-23-67: the ONLY site in the workspace permitted to emit
+    // `workflow_shipped`. This is the strict shipped predicate `ship_evidence`
+    // reads — deliberately NOT `workflow_finished` below, which is also
+    // emitted by `transition`'s `--until` clean-stop branch (`pipeline_gate.rs`,
+    // `state.stop_until == Some(from)` arm) with a `"stopped_at"` reason,
+    // before any hook, stage assignment, or launch runs. A phase halted after
+    // one stage must never read as shipped. Ordering here is load-bearing in
+    // both directions: after the hook-success loop `break` above, so it can
+    // only fire once the entire `hooks_after_ship` batch has succeeded; and
+    // before `workflow_finished` below, because existing tests assert a
+    // phase's event stream ENDS in `workflow_finished` — do not move this
+    // emission after it.
+    events::emit(
+        project_root,
+        state.phase,
+        "workflow_shipped",
+        serde_json::json!({
+            "stage": Stage::Ship.to_string(),
+        }),
+    );
     events::emit(
         project_root,
         state.phase,
@@ -562,6 +582,97 @@ mod tests {
         assert!(!Gates::response_path(root, phase, Stage::Ship).exists());
         assert!(!Gates::ack_path(root, phase, Stage::Ship).exists());
         assert!(!Gates::gate_path(root, phase, Stage::Validate).exists());
+    }
+
+    /// 23-06 Task 1 acceptance: a real Ship finalization emits the
+    /// terminal-only `workflow_shipped` event, and
+    /// `ship_evidence::collect` reads it as `shipped: true` — proving the
+    /// event this module emits is exactly the one the oracle consumes.
+    #[test]
+    fn advance_ship_success_emits_workflow_shipped_and_ship_evidence_reports_shipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 23;
+        let branch = format!("feature/phase-{phase:02}");
+        let branch_created = devflow_core::test_support::git_command(root)
+            .args(["branch", &branch, "develop"])
+            .status()
+            .unwrap()
+            .success();
+        assert!(branch_created);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Ship;
+        workflow::save_state(&state).unwrap();
+
+        std::fs::write(
+            agent_result::stdout_path(root, phase),
+            "DEVFLOW_RESULT: {\"status\":\"success\"}\n",
+        )
+        .unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Ship);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":true,"note":null,"responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        advance(root, Some(phase)).unwrap();
+
+        assert!(
+            devflow_core::events::has_event_for_phase(root, phase, "workflow_shipped"),
+            "a real Ship finalization must emit the terminal-only workflow_shipped event"
+        );
+        let evidence = devflow_core::ship_evidence::collect(root, phase);
+        assert!(
+            evidence.shipped,
+            "ship_evidence must read the just-emitted workflow_shipped event as shipped"
+        );
+        // The pre-existing invariant several other tests in this module
+        // depend on: the phase's event stream still ends in
+        // workflow_finished, unmodified by this task's additive emission.
+        let last = devflow_core::events::last_event_for_phase(root, phase)
+            .expect("events recorded for phase");
+        assert_eq!(last["event"], "workflow_finished");
+    }
+
+    /// 23-06 Task 1's named blocker regression guard (BLOCKER 1,
+    /// cross-AI-review-caught): a phase halted cleanly by `devflow start
+    /// --until <stage>` runs `transition`'s `stop_until` clean-stop branch,
+    /// which emits `workflow_finished` with a `"stopped_at"` reason and
+    /// returns before any hook, stage assignment, or `launch_stage` call —
+    /// `workflow_shipped` must never be emitted on this path, and
+    /// `ship_evidence::collect(..).shipped` must read false even though
+    /// `workflow_finished_seen` is true.
+    #[test]
+    fn until_stop_never_emits_workflow_shipped_and_ship_evidence_reports_not_shipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 24;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Plan;
+        state.stop_until = Some(Stage::Plan);
+        workflow::save_state(&state).unwrap();
+
+        transition(root, &mut state, Stage::Code).unwrap();
+
+        assert!(
+            !devflow_core::events::has_event_for_phase(root, phase, "workflow_shipped"),
+            "the --until clean-stop branch must never emit workflow_shipped"
+        );
+        let evidence = devflow_core::ship_evidence::collect(root, phase);
+        assert!(
+            !evidence.shipped,
+            "a phase that only stopped after one stage must not read as shipped"
+        );
+        assert!(evidence.workflow_finished_seen);
+        assert_eq!(evidence.finished_reason.as_deref(), Some("stopped_at"));
+        assert!(devflow_core::ship_evidence::is_stopped_at(&evidence));
     }
 
     #[test]

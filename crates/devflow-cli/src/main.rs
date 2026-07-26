@@ -24,8 +24,9 @@ use parallel::{parallel, sequentagent};
 
 mod commands;
 use commands::{
-    cleanup, doctor, gate_list, gate_respond, gate_show, gate_sweep, history_cmd, list, logs,
-    recover_cmd, reference, release_check, resolve_gate_target, start, status, stop, test_cmd,
+    cleanup, doctor, evidence, gate_list, gate_respond, gate_show, gate_sweep, history_cmd, list,
+    logs, recover_cmd, reference, release_check, resolve_gate_target, start, status, stop,
+    test_cmd,
 };
 
 mod config_parse;
@@ -282,6 +283,25 @@ enum Command {
         #[arg(long)]
         phase: u32,
         /// Project root. Defaults to the current directory.
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
+    /// Report DevFlow's own structural record of whether a phase shipped
+    /// (23-06) — a read-only oracle sourced from the append-only event log,
+    /// not from any agent-authored attestation document. See
+    /// `devflow_core::ship_evidence` for the full contract.
+    Evidence {
+        /// Phase to report on.
+        #[arg(long)]
+        phase: u32,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Exit non-zero unless DevFlow's own record shows this phase
+        /// shipped — declarable as a Layer 0 `external_verify` probe.
+        #[arg(long)]
+        require_shipped: bool,
+        /// Project root.
         #[arg(long)]
         root: Option<PathBuf>,
     },
@@ -566,6 +586,17 @@ fn run() -> Result<(), CliError> {
         Command::Stop { phase, root } => stop(
             &project_root(root.unwrap_or_else(|| PathBuf::from(".")))?,
             phase,
+        ),
+        Command::Evidence {
+            phase,
+            json,
+            require_shipped,
+            root,
+        } => evidence(
+            &project_root(root.unwrap_or_else(|| PathBuf::from(".")))?,
+            phase,
+            json,
+            require_shipped,
         ),
     }
 }
