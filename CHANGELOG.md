@@ -8,6 +8,9 @@ The breaking change the v2.0.0 slot was held open for (milestone note,
 ### Removed (Breaking)
 - **The `sequentagent` CLI verb is gone.** `devflow sequentagent --phase N --agents a,b [--force]` — two agents run sequentially on one phase, each in its own worktree, with a rebase handoff between them — no longer exists; invoking it now fails with clap's unrecognized-subcommand error (D-11, 23d). Removed with it: the CLI-side `sequentagent`/`run_agent_blocking`/`integrate_agent_branch` implementation, the two-agent Hermes cron-resume builder (`ship::build_cron_instructions`), and `status`'s two-agent slot-liveness rendering. The primary single-agent rate-limit resume path (`devflow resume --phase N`, `ship::build_single_agent_cron_instructions`) and `devflow parallel` (run N phases concurrently) are unaffected. The capability intent is preserved, not discarded — DEN-67 (999.42) tracks reimplementing agent failover on the socket-addressable supervisor (DEN-58) if and when a second agent is supported, rather than restoring this in-process handoff
 
+### Added
+- **`devflow start` now refuses, before creating any worktree or branch, when the target phase is not reachable from `develop`** — the branch it forks from. Reachability means both the phase's `### Phase N:` heading in `ROADMAP.md` and its `.planning/phases/NN-*/` directory are present on `develop`; either being absent (checkably) refuses the run and names the missing half. This closes the exact 2026-07-26 acceptance-run failure: a phase promoted onto a feature branch and never merged to `develop` was invisible to the run, which then spent its Define stage discovering there was nothing to define before finally aborting. The check is skipped (fails open) when `develop` carries no `.planning/ROADMAP.md` at all, so repositories that don't keep a roadmap are unaffected (23f)
+
 ## 1.8.1 — 2026-07-24
 
 Test-suite containment and quality cleanup. No behavior change for `devflow`
