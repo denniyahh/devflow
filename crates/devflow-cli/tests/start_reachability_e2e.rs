@@ -179,3 +179,55 @@ fn start_refuses_a_phase_promoted_only_on_the_working_branch_and_scaffolds_nothi
         "a refused start must not create feature/phase-24"
     );
 }
+
+/// Proves the refusal precedes `GitFlow::feature_start` too, not merely
+/// `ensure_phase_worktree` — `--no-worktree` must be refused before any
+/// branch is created.
+#[test]
+fn start_refuses_before_creating_the_feature_branch_in_no_worktree_mode() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    init_repo_with_phase_24_promoted_only_on_feature_branch(root);
+    let fake_bin = fake_bin_dir();
+
+    let output = Command::new(devflow_bin())
+        .args([
+            "start",
+            "--phase",
+            "24",
+            "--agent",
+            "claude",
+            "--mode",
+            "auto",
+            "--no-worktree",
+        ])
+        .arg(root)
+        .env("PATH", path_with_fake_bin(&fake_bin.path))
+        .current_dir(root)
+        .output()
+        .expect("run devflow");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "devflow start --no-worktree must refuse an unreachable phase, but exited \
+         successfully\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("is not reachable from"),
+        "stderr must carry the refusal phrase `is not reachable from`, got:\n{stderr}"
+    );
+
+    let branch_list = devflow_core::test_support::git_command(root)
+        .args(["branch", "--list", "feature/phase-24"])
+        .output()
+        .expect("spawn git branch --list");
+    assert!(
+        String::from_utf8_lossy(&branch_list.stdout)
+            .trim()
+            .is_empty(),
+        "a refused --no-worktree start must not create feature/phase-24 either"
+    );
+}
