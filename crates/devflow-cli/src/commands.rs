@@ -3168,6 +3168,41 @@ mod tests {
         }
     }
 
+    /// Kernel-level view of what a pid is actually *doing*, for 999.47.
+    /// `wchan` names the kernel function it is blocked in; `syscall` gives the
+    /// current syscall number (or `running` when in userspace); `utime`/`stime`
+    /// are CPU tick counters, so sampling twice shows whether it is burning CPU
+    /// (spinning) or making no progress at all (blocked). Test-only.
+    ///
+    /// `syscall` and `stack` need PTRACE_MODE_ATTACH; unreadable is itself a
+    /// datum, so failures are reported rather than hidden.
+    fn debug_proc_runtime(pid: u32) -> String {
+        let read = |what: &str| {
+            std::fs::read_to_string(format!("/proc/{pid}/{what}"))
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|e| format!("<unreadable: {e}>"))
+        };
+        // /proc/<pid>/stat: field 3 = state, 14 = utime, 15 = stime, 22 = starttime.
+        // The comm field is parenthesised and may contain spaces, so split after
+        // the final ')' rather than tokenising the whole line.
+        let stat = read("stat");
+        let (state, utime, stime, starttime) = stat
+            .rfind(')')
+            .map(|i| {
+                let rest: Vec<&str> = stat[i + 1..].split_whitespace().collect();
+                let get = |n: usize| rest.get(n).copied().unwrap_or("?").to_string();
+                // rest[0] is field 3 (state), so field N is rest[N - 3].
+                (get(0), get(11), get(12), get(19))
+            })
+            .unwrap_or_else(|| ("?".into(), "?".into(), "?".into(), "?".into()));
+        format!(
+            "state={state} utime={utime} stime={stime} starttime={starttime} \
+             wchan={} syscall={}",
+            read("wchan"),
+            read("syscall"),
+        )
+    }
+
     /// Task 2 behavior (T-23-52 fail-closed): a lock file naming a live pid
     /// that does not identify as a devflow process must be refused, never
     /// signalled. Constructed against this test binary's own pid when its
@@ -3217,10 +3252,18 @@ mod tests {
         // zombie whose cmdline reads empty.
         let status_before = debug_proc_status(pid);
         let cmdline_before = debug_cmdline(pid);
+        // Two samples ~60ms apart: if utime/stime advance the child is
+        // spinning in userspace; if they are static and wchan names a kernel
+        // function it is genuinely blocked. State=R with a static utime would
+        // mean runnable-but-never-scheduled, i.e. starvation.
+        let runtime_1 = debug_proc_runtime(pid);
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        let runtime_2 = debug_proc_runtime(pid);
         let predicate_verdict = agent::looks_like_devflow_process(pid);
         let result = stop(root, phase);
         let cmdline_after = debug_cmdline(pid);
         let status_after = debug_proc_status(pid);
+        let runtime_3 = debug_proc_runtime(pid);
         // Did the spawned child already exit before we ever looked at it?
         let child_exited = sleeper
             .as_mut()
@@ -3247,18 +3290,22 @@ mod tests {
                  \x20 cmdline after stop:  {cmdline_after}\n\
                  \x20 status before stop:  {status_before}\n\
                  \x20 status after stop:   {status_after}\n\
+                 \x20 runtime t0:          {runtime_1}\n\
+                 \x20 runtime t0+60ms:     {runtime_2}\n\
+                 \x20 runtime after stop:  {runtime_3}\n\
                  \x20 child.try_wait():    {child_exited}\n\
                  \x20 direct predicate:    looks_like_devflow_process({pid}) = {predicate_verdict}\n\
                  \x20 lock file survived:  {lock_survived}\n\
                  \x20 test process:        pid {} cmdline {}\n\
-                 Read PPid first. If PPid is NOT this test process, the pid was \
-                 recycled by an unrelated process and the predicate answered about \
-                 a different process than the one we spawned — a TOCTOU in the \
-                 fixture and in `stop` itself, not a matching bug. If PPid IS this \
-                 process and Name is not `sleep`, the child never exec'd. If State \
-                 is Z, it is a zombie whose /proc entries are unreliable. If the \
-                 branch is `own pid`, current_exe() failed to look devflow-named and \
-                 the test sabotaged itself — fix the fixture, not the predicate.",
+                 KNOWN (999.47): PPid is this process and Name is the forking test \
+                 thread, so the child forks and never exec's, persistently. The open \
+                 question is WHY, and the runtime samples answer it: utime/stime \
+                 ADVANCING across t0 -> t0+60ms means it is spinning in userspace \
+                 (look at `syscall=running`); STATIC with a named `wchan` means it is \
+                 blocked in the kernel (wchan names the function — a futex points at \
+                 a lock inherited across fork); STATIC with state=R and wchan=0 means \
+                 runnable but never scheduled, i.e. starvation, not a deadlock. \
+                 `syscall` gives the syscall number it is stuck in, if any.",
                 if self_exe_is_devflow_named {
                     "spawned sleep"
                 } else {
