@@ -741,9 +741,22 @@ Plans carry the unit identifiers `23a`, `23b`, `23c`, `23d`, `23e` and
 `yes-ship` as requirement tokens. **`23b` and `23c` were redefined, and `23e`
 added, by the 2026-07-25 replan** — see "Re-aimed 2026-07-25" below.
 **Depends on:** Phase 22
-**Plans:** 10/11 plans executed
+**Plans:** 11/11 plans executed
 2026-07-25; the original 23-03…23-12 are archived under
 `phases/23-end-to-end-dogfood/superseded/`)
+
+**Status: all 11 plans executed, but the phase's own behavioral acceptance
+criterion is NOT met.** Plan 23-11 (2026-07-26) ran the acceptance attempt:
+`devflow start --phase 24 --agent claude --mode auto --yes-ship` stopped at
+Define — the target phase's own ROADMAP entry (promoted by this phase's own
+plan-10/11 orchestration) was unreachable from `develop`, the branch
+`devflow start` always forks a fresh worktree from, because the promotion
+landed only on `feature/phase-23`, still unmerged. Operator verdict:
+`record: valid`, `failed`. Root cause is an orchestrator sequencing gap
+across plans 23-10/23-11, not a DevFlow defect — see
+`23-11-SUMMARY.md`/`23-ACCEPTANCE-RUN.md` for the full record and what a
+retry needs (Phase 23 merged to `develop` first, plus a named third
+precondition check).
 
 **Why this scope, from the run record.** `.devflow/events.jsonl` shows **no
 phase has ever completed a full five-stage devflow-driven run**:
@@ -923,7 +936,7 @@ Plans:
 - [x] 23-08-PLAN.md — 23d: delete the core-side surface, workspace count to zero
 - [x] 23-09-PLAN.md — `--yes-ship`: per-run flag, one auto-answered Ship gate
 - [x] 23-10-PLAN.md — Acceptance prep: target selection, rehearsed recovery point, preconditions, then one-way authorization
-- [ ] 23-11-PLAN.md — Acceptance run: one phase Define→Ship, unattended, self-hosted
+- [x] 23-11-PLAN.md — Acceptance run: one phase Define→Ship, unattended, self-hosted
 
 *(The original 23-03…23-12 are archived under `superseded/` — see the re-aim
 note above. The plan list below renumbers from 23-03; 23-01 and 23-02 are
@@ -968,7 +981,7 @@ unchanged and already merged.)*
 
 **Wave 8** *(blocked on 23-10)*
 
-- [ ] 23-11 — Acceptance run: one phase Define→Ship, unattended, self-hosted (all units)
+- [x] 23-11 — Acceptance run: one phase Define→Ship, unattended, self-hosted (all units) — **plan executed, record valid; ACCEPTANCE FAILED** (target Phase 24 unreachable from `develop` at launch — orchestrator sequencing gap, not a DevFlow defect). Phase's behavioral acceptance criterion NOT met by this run; see `23-11-SUMMARY.md` "Next Phase Readiness" for what a retry needs.
 
 ### Phase 24: `release --check` Signing-Key Inline Classification
 

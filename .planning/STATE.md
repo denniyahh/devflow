@@ -4,16 +4,16 @@ milestone: v2.0.0
 milestone_name: milestone (open — no fixed closing phase)
 current_phase: 23
 current_phase_name: end-to-end-dogfood
-status: executing
-stopped_at: Completed 23-10-PLAN.md — acceptance setup + operator authorization recorded; orchestrator must promote backlog 999.27 to phase 24 before dispatching plan 23-11
-last_updated: "2026-07-26T12:14:56.875Z"
+status: "Phase 23 executed (11/11 plans) - acceptance run (23-11) FAILED: target Phase 24 unreachable from develop at launch (orchestrator sequencing gap, not a DevFlow defect); record valid, recovery point not needed/not used; retry needs Phase 23 merged to develop first plus a new third precondition check"
+stopped_at: Completed 23-11-PLAN.md — acceptance run executed, record valid, acceptance FAILED (target unreachable from develop); phase behavioral criterion not met, retry needs Phase 23 merged to develop first
+last_updated: "2026-07-26T13:07:22.582Z"
 last_activity: 2026-07-26
-last_activity_desc: "plan 23-10 complete: rebuild proof, 7 behavioral checks, recovery point (recovery/pre-23-11-acceptance-e0f87c2) pushed+rehearsed, real remote restore path determined, operator authorized PROCEED against phase 24 with both content preconditions accepted unmitigated"
+last_activity_desc: "plan 23-11 complete: acceptance run launched unattended, stopped at Define (target Phase 24 unreachable from develop), observed the full 10-minute window, ended cleanly via devflow stop, post-run hygiene proven, operator verdict record:valid / FAILED recorded"
 progress:
-  total_phases: 12
-  completed_phases: 11
+  total_phases: 13
+  completed_phases: 12
   total_plans: 87
-  completed_plans: 86
+  completed_plans: 87
   percent: 92
 ---
 
@@ -86,14 +86,14 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 23 (end-to-end-dogfood) — EXECUTING
+Phase: 23 (end-to-end-dogfood) — 11/11 plans executed; behavioral acceptance criterion NOT met
 Plan: 11 of 11
-Status: Executing Phase 23 — plan 23-10 complete (acceptance setup + operator authorization recorded); orchestrator must promote backlog 999.27 to phase 24 in ROADMAP.md before plan 23-11 dispatches
-Last activity: 2026-07-26 — plan 23-10 complete: rebuild proof, 7 behavioral checks, recovery point (recovery/pre-23-11-acceptance-e0f87c2) pushed+rehearsed, real remote restore path determined, operator authorized PROCEED against phase 24 with both content preconditions accepted unmitigated
+Status: All plans executed and their artifacts produced. The phase's own goal — one phase driven start-to-finish by DevFlow, unattended, reaching a completed Ship — is unmet: plan 23-11's acceptance run stopped at Define (target Phase 24 unreachable from `develop` at launch time). Operator verdict: record valid, acceptance FAILED. A retry needs Phase 23 merged to `develop` first, plus a newly-named third precondition check (verify the target's ROADMAP entry is reachable from `develop` before launch). See `23-11-SUMMARY.md` / `23-ACCEPTANCE-RUN.md` for the full record.
+Last activity: 2026-07-26 — plan 23-11 complete: acceptance run launched unattended, stopped at Define, observed the full mandated 10-minute window, ended cleanly via `devflow stop`, post-run hygiene proven, operator verdict recorded
 
 **Note on the "Plan: 2 of 11" value this replaces:** `gsd-tools state advance-plan` only increments whatever value is already in this field; it was last set to "Plan: 1 of 11" before phase 23's first plan ever executed and was never updated across the parallel-worktree waves (23-01 through 23-09), since worktree executors deliberately do not touch STATE.md. This executor is the first sequential (main-tree) executor in phase 23 and corrected the field directly to match reality (10 of 11 plans complete) rather than trust the tool's naive +1 increment from a stale base.
 
-Progress: [██████████] 99%
+Progress: [██████████] 100%
 
 *(Machine-readable fields for `gsd-tools state begin-phase` / `advance-plan` —
 this project historically tracked position only in the narrative "Active
@@ -595,6 +595,8 @@ None currently open for Phase 17.
   ship/version-bump concurrency work, not Phase 17 or 18. See
   `17-VALIDATION.md` GAP-2 and `17-09-SUMMARY.md`.
 
+- Phase 23 behavioral acceptance criterion (one phase Define-to-Ship, unattended) NOT met — 23-11 acceptance run stopped at Define; requires Phase 23 merged to develop before Phase 24 (or any new target) is reachable for a retry
+
 ## Decisions
 
 | Date | Decision |
@@ -675,6 +677,8 @@ None currently open for Phase 17.
 - [Phase 19]: 19-08: pipeline state machine split into pipeline_launch.rs/pipeline_outcomes.rs/pipeline_gate.rs (D-06 seams A/B/C), main.rs down to 3,313 lines from phase-start 8,467; three-way module cycle preserved as direct pub(crate) calls, zero unexplained diffs against baseline
 - [Phase 23]: 23-10 Task 4: operator authorized PROCEED against backlog 999.27 (-> phase 24), accepting both content preconditions (security artifact, no self-attested Ship claim) unmitigated rather than remedied — devflow's Define/Plan stages are designed to author an unplanned target's own plan set, so pre-resolving either precondition would remove the thing the acceptance run tests.
 - [Phase 23]: 23-10: the real develop restore mechanism is a GitHub ruleset (develop-merge-or-squash, required_approving_review_count: 0), not the classic branch-protection API (which reported a contradictory value of 1) — determined by cross-checking against this repo's own PR history rather than trusting the first API response; force-push is refused categorically (no bypass_actors, current_user_can_bypass: never), real undo is a revert PR measured at ~2 minutes.
+- [Phase 23]: Acceptance run (23-11): record valid, acceptance FAILED — target Phase 24 unreachable from develop at launch (orchestrator sequencing gap, not a DevFlow defect); recovery point not needed/not used
+- [Phase 23]: Third precondition class named for future acceptance attempts: verify target phase ROADMAP entry is reachable from develop itself before devflow start, not just from the executing branch
 
 ## Roadmap Evolution
 
@@ -741,9 +745,10 @@ None currently open for Phase 17.
 | Phase 19 P07 | 71min | 2 tasks | 3 files |
 | Phase 19 P08 | 37min | 3 tasks | 5 files |
 | Phase 23 P10 | ~65min (across 2 checkpoints) | 4 tasks | 1 files |
+| Phase 23 P11 | 42min | 3 tasks | 2 files |
 
 ## Session
 
-**Last session:** 2026-07-26T12:14:56.841Z
-**Stopped at:** Completed 23-10-PLAN.md — acceptance setup + operator authorization recorded; orchestrator must promote backlog 999.27 to phase 24 before dispatching plan 23-11
+**Last session:** 2026-07-26T13:07:22.541Z
+**Stopped at:** Completed 23-11-PLAN.md — acceptance run executed, record valid, acceptance FAILED (target unreachable from develop); phase behavioral criterion not met, retry needs Phase 23 merged to develop first
 **Resume file:** None
