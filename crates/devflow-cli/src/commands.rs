@@ -11,6 +11,7 @@
 //! split is meant to remove.
 
 use crate::CliError;
+use crate::config_parse;
 use crate::config_parse::GATE_ESCALATION_THRESHOLD_SECS;
 use crate::parallel::ensure_phase_worktree;
 use crate::pipeline_gate::print_dry_run;
@@ -873,16 +874,21 @@ pub(crate) fn gate_respond(
 /// sole effect on the world is written bytes a live poller was already
 /// watching for.
 ///
-/// The default threshold below is a Task-1 placeholder — Task 2 replaces it
-/// with the configurable, fail-safe `config_parse::gate_max_unattended_age_secs()`
-/// (`DEVFLOW_GATE_MAX_UNATTENDED_AGE_SECS`, still six hours by default).
+/// `GateError::NoOpenGate`/`AlreadyResponded` are treated as benign races —
+/// a human or `--yes-ship` may have answered the same gate between
+/// `list_open` and `reap` — and counted as skipped rather than returned as
+/// an error; `Gates::respond`'s own refusal to clobber an unconsumed
+/// response is the first-writer-wins resolution that makes this safe with
+/// no new coordination code. Every successful reap emits `gate_reaped` in
+/// this process (the audit trail half — `run_gate_with_timeout`'s own
+/// `gate_resolved` fires independently in the target process when it picks
+/// the response up).
 pub(crate) fn gate_sweep(
     max_age_secs: Option<u64>,
     dry_run: bool,
     root: Option<PathBuf>,
 ) -> Result<(), CliError> {
-    const SIX_HOURS: u64 = 6 * 60 * 60;
-    let threshold = max_age_secs.unwrap_or(SIX_HOURS);
+    let threshold = max_age_secs.unwrap_or_else(config_parse::gate_max_unattended_age_secs);
 
     let roots: Vec<PathBuf> = match root {
         Some(root) => vec![root],
@@ -900,16 +906,23 @@ pub(crate) fn gate_sweep(
         .unwrap_or_default()
         .as_secs();
 
+    let mut reaped = 0u32;
+    let mut skipped = 0u32;
+    let mut left_alone = 0u32;
+
     for project_root in &roots {
         for gate in Gates::list_open(project_root) {
             let Ok(ts) = gate.timestamp.parse::<u64>() else {
+                left_alone += 1;
                 continue;
             };
             let age = now.saturating_sub(ts);
             if age < threshold {
+                left_alone += 1;
                 continue;
             }
             if dry_run {
+                reaped += 1;
                 println!(
                     "would reap phase {} {} (age {age}s) at {}",
                     gate.phase,
@@ -925,20 +938,43 @@ pub(crate) fn gate_sweep(
                 "abort: reaped by devflow gate sweep (unattended gate exceeded max age)",
                 "devflow-reap",
             ) {
-                Ok(_) => println!(
-                    "reaped phase {} {} (age {age}s) at {}",
-                    gate.phase,
-                    gate.stage,
-                    project_root.display()
-                ),
-                Err(err) => println!(
-                    "skipped phase {} {} at {}: {err}",
-                    gate.phase,
-                    gate.stage,
-                    project_root.display()
-                ),
+                Ok(_) => {
+                    reaped += 1;
+                    events::emit(
+                        project_root,
+                        gate.phase,
+                        "gate_reaped",
+                        serde_json::json!({
+                            "stage": gate.stage.to_string(),
+                            "age_secs": age,
+                            "max_age_secs": threshold,
+                        }),
+                    );
+                    println!(
+                        "reaped phase {} {} (age {age}s) at {}",
+                        gate.phase,
+                        gate.stage,
+                        project_root.display()
+                    );
+                }
+                Err(err) => {
+                    skipped += 1;
+                    println!(
+                        "skipped phase {} {} at {} — already answered ({err})",
+                        gate.phase,
+                        gate.stage,
+                        project_root.display()
+                    );
+                }
             }
         }
+    }
+    if dry_run {
+        println!(
+            "sweep complete (dry run): {reaped} would be reaped, {skipped} skipped, {left_alone} left alone"
+        );
+    } else {
+        println!("sweep complete: {reaped} reaped, {skipped} skipped, {left_alone} left alone");
     }
     Ok(())
 }
@@ -2919,6 +2955,91 @@ mod tests {
             "explicit-stage rejection must land"
         );
         assert!(!Gates::response_path(root, 15, Stage::Ship).exists());
+    }
+
+    /// Backdate an already-written gate's `timestamp` so it reads as
+    /// `age_secs` old — the deterministic way `gate_sweep` tests make a gate
+    /// look abandoned without sleeping.
+    fn backdate_gate(root: &Path, phase: u32, stage: Stage, age_secs: u64) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let gate = devflow_core::gates::GateFile {
+            phase,
+            stage,
+            context: "ctx".to_string(),
+            timestamp: now.saturating_sub(age_secs).to_string(),
+        };
+        std::fs::write(
+            Gates::gate_path(root, phase, stage),
+            serde_json::to_string_pretty(&gate).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Task 2 behavior: `--dry-run` computes and prints every decision but
+    /// writes nothing — the aged gate stays open with no response file.
+    #[test]
+    fn gate_sweep_dry_run_does_not_write_a_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        Gates::write_gate(root, 30, Stage::Ship, "ctx").unwrap();
+        backdate_gate(root, 30, Stage::Ship, 7 * 60 * 60);
+
+        gate_sweep(None, true, Some(root.to_path_buf())).unwrap();
+
+        assert!(
+            !Gates::response_path(root, 30, Stage::Ship).exists(),
+            "dry-run must never write a response file"
+        );
+        let open = Gates::list_open(root);
+        assert_eq!(open.len(), 1, "dry-run must leave the gate open");
+    }
+
+    /// Task 2 behavior: a gate that already has a response is a benign race
+    /// (a human or `--yes-ship` may have answered it between `list_open`
+    /// and `reap`) — the sweep must return `Ok` and leave the existing
+    /// response byte-for-byte untouched, never overwrite it.
+    #[test]
+    fn gate_sweep_skips_already_responded_gate_without_clobbering() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        Gates::write_gate(root, 31, Stage::Ship, "ctx").unwrap();
+        backdate_gate(root, 31, Stage::Ship, 7 * 60 * 60);
+        let response = GateResponse {
+            approved: true,
+            note: None,
+            responded_by: Some("human".into()),
+        };
+        Gates::respond(root, 31, Stage::Ship, &response).unwrap();
+        let before = std::fs::read_to_string(Gates::response_path(root, 31, Stage::Ship)).unwrap();
+
+        let result = gate_sweep(None, false, Some(root.to_path_buf()));
+
+        assert!(result.is_ok(), "an already-answered gate must not error");
+        let after = std::fs::read_to_string(Gates::response_path(root, 31, Stage::Ship)).unwrap();
+        assert_eq!(
+            before, after,
+            "the pre-existing response must be byte-identical afterwards"
+        );
+    }
+
+    /// Task 2 behavior (T-23-43 audit trail): a successful reap emits
+    /// `gate_reaped` in the sweep's own process — one of the two
+    /// independent, attributed records a reaped gate leaves.
+    #[test]
+    fn gate_sweep_emits_gate_reaped_event_on_reap() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        Gates::write_gate(root, 32, Stage::Ship, "ctx").unwrap();
+        backdate_gate(root, 32, Stage::Ship, 7 * 60 * 60);
+
+        gate_sweep(None, false, Some(root.to_path_buf())).unwrap();
+
+        let event = devflow_core::events::last_event_for_phase(root, 32).unwrap();
+        assert_eq!(event["event"], "gate_reaped");
+        assert_eq!(event["stage"], "ship");
     }
 
     /// 14-CR-03: a capture file SHORTER than the follower's offset means the
