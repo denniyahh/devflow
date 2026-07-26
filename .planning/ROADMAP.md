@@ -740,7 +740,7 @@ Plans carry the unit identifiers `23a`, `23b`, `23c`, `23d`, `23e` and
 `yes-ship` as requirement tokens. **`23b` and `23c` were redefined, and `23e`
 added, by the 2026-07-25 replan** — see "Re-aimed 2026-07-25" below.
 **Depends on:** Phase 22
-**Plans:** 7/11 plans executed
+**Plans:** 9/11 plans executed
 2026-07-25; the original 23-03…23-12 are archived under
 `phases/23-end-to-end-dogfood/superseded/`)
 
@@ -919,8 +919,8 @@ Plans:
 - [x] 23-05-PLAN.md — 23c: `devflow stop`, targeting the lock holder
 - [x] 23-06-PLAN.md — 23e: terminal-only `workflow_shipped` event + Ship-evidence oracle + enforced merge post-condition
 - [x] 23-07-PLAN.md — 23d: delete the two-agent verb from the CLI crate + reconcile docs
-- [ ] 23-08-PLAN.md — 23d: delete the core-side surface, workspace count to zero
-- [ ] 23-09-PLAN.md — `--yes-ship`: per-run flag, one auto-answered Ship gate
+- [x] 23-08-PLAN.md — 23d: delete the core-side surface, workspace count to zero
+- [x] 23-09-PLAN.md — `--yes-ship`: per-run flag, one auto-answered Ship gate
 - [ ] 23-10-PLAN.md — Acceptance prep: target selection, rehearsed recovery point, preconditions, then one-way authorization
 - [ ] 23-11-PLAN.md — Acceptance run: one phase Define→Ship, unattended, self-hosted
 
@@ -954,12 +954,12 @@ unchanged and already merged.)*
 
 **Wave 5** *(blocked on 23-06)*
 
-- [ ] 23-07 — 23d: delete the verb, preserve single-agent resume, reconcile four docs (23d, D-11/D-12 checkpoint)
+- [x] 23-07 — 23d: delete the verb, preserve single-agent resume, reconcile four docs (23d, D-11/D-12 checkpoint)
 
 **Wave 6** *(blocked on 23-07; the two plans below run in parallel — zero file overlap)*
 
-- [ ] 23-08 — 23d: delete the core-side surface, re-point constructor coverage (23d)
-- [ ] 23-09 — `--yes-ship`: persisted per-run flag, one auto-answered gate, two negative guarantees (yes-ship)
+- [x] 23-08 — 23d: delete the core-side surface, re-point constructor coverage (23d)
+- [x] 23-09 — `--yes-ship`: persisted per-run flag, one auto-answered gate, two negative guarantees (yes-ship)
 
 **Wave 7** *(blocked on 23-08 and 23-09)*
 
