@@ -36,6 +36,18 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+      # These jobs run as root inside a container while actions/checkout
+      # leaves the workspace owned by the runner user (uid 1001), so git
+      # refuses every command with "detected dubious ownership". checkout's
+      # own safe.directory entry is scoped to its step and is not visible
+      # here — GIT_CONFIG_GLOBAL is unset by the time tests run. Confirmed
+      # from git's own stderr in run 30214005214.
+      #
+      # Must precede assert-image-parity.sh: that script resolves the repo
+      # root via `git rev-parse` and would otherwise silently fall back to
+      # `pwd` instead of failing loudly.
+      - name: Trust the workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Assert CI image matches the devcontainer definition
         run: scripts/assert-image-parity.sh "mcr.microsoft.com/devcontainers/rust:2.0.13-1-bookworm"
       - run: scripts/check.sh test
@@ -48,6 +60,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
+      - name: Trust the workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - run: scripts/check.sh clippy
 
   fmt:
@@ -58,4 +72,6 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
+      - name: Trust the workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - run: scripts/check.sh fmt
