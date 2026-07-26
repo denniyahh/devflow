@@ -197,6 +197,32 @@ impl Gates {
         Ok(path)
     }
 
+    /// Answer an abandoned gate with a rejection — the reaping half of 23b's
+    /// aged-gate sweep. Mitigation for T-23-41 (Elevation of Privilege): this
+    /// function takes **no** boolean parameter and hard-codes `approved:
+    /// false` at the literal below, so no caller — buggy or refactored — can
+    /// ever make it write an approval. It is the sweep's ONLY write path.
+    ///
+    /// The caller-supplied `note`'s lowercase form MUST contain the abort
+    /// keyword [`GateAction::from_response`] matches on (`"abort"`), so the
+    /// reap resolves to `GateAction::Abort` rather than
+    /// `GateAction::LoopBack(Stage::Code)` — a loop-back would relaunch an
+    /// agent on an abandoned run, the opposite of what a reap should do.
+    pub fn reap(
+        project_root: &Path,
+        phase: u32,
+        stage: Stage,
+        note: &str,
+        responded_by: &str,
+    ) -> Result<PathBuf, GateError> {
+        let response = GateResponse {
+            approved: false,
+            note: Some(note.to_string()),
+            responded_by: Some(responded_by.to_string()),
+        };
+        Self::respond(project_root, phase, stage, &response)
+    }
+
     /// Write a gate request, creating the gates directory if needed.
     pub fn write_gate(
         project_root: &Path,

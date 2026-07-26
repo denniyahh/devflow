@@ -1,5 +1,23 @@
 name: CI
 
+# Every job runs inside the SAME pinned image the devcontainer uses, and
+# invokes the SAME scripts/check.sh a developer runs via
+# scripts/check-in-container.sh. Host OS, libc, and toolchain are therefore
+# identical between a local check and a CI check — the divergence that made
+# 999.47 cost hours to chase.
+#
+# Job names `Test`, `Clippy` and `Format` are REQUIRED STATUS CHECKS on the
+# protected `main` branch. Renaming or removing one blocks every future merge
+# to main, because the required check would never report. Verify with:
+#   gh api repos/denniyahh/devflow/branches/main/protection \
+#     --jq .required_status_checks.contexts
+# before touching them.
+#
+# The image tag is repeated per job because GitHub Actions does not expand
+# `env` inside `jobs.<id>.container.image`. scripts/assert-image-parity.sh
+# fails the Test job if these drift from .devcontainer/devcontainer.json,
+# so the duplication cannot rot silently.
+
 on:
   push:
   pull_request:
@@ -12,31 +30,48 @@ concurrency:
 jobs:
   test:
     name: Test
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    runs-on: ubuntu-24.04
+    container:
+      image: mcr.microsoft.com/devcontainers/rust:2.0.13-1-bookworm
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --workspace
+      # These jobs run as root inside a container while actions/checkout
+      # leaves the workspace owned by the runner user (uid 1001), so git
+      # refuses every command with "detected dubious ownership". checkout's
+      # own safe.directory entry is scoped to its step and is not visible
+      # here — GIT_CONFIG_GLOBAL is unset by the time tests run. Confirmed
+      # from git's own stderr in run 30214005214.
+      #
+      # Must precede assert-image-parity.sh: that script resolves the repo
+      # root via `git rev-parse` and would otherwise silently fall back to
+      # `pwd` instead of failing loudly.
+      - name: Trust the workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Assert CI image matches the devcontainer definition
+        run: scripts/assert-image-parity.sh "mcr.microsoft.com/devcontainers/rust:2.0.13-1-bookworm"
+      - run: scripts/check.sh test
 
   clippy:
     name: Clippy
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    runs-on: ubuntu-24.04
+    container:
+      image: mcr.microsoft.com/devcontainers/rust:2.0.13-1-bookworm
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Trust the workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - run: scripts/check.sh clippy
 
   fmt:
     name: Format
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    container:
+      image: mcr.microsoft.com/devcontainers/rust:2.0.13-1-bookworm
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - run: cargo fmt --check
+      - name: Trust the workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - run: scripts/check.sh fmt

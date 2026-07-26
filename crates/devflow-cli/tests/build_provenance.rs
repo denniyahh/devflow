@@ -94,7 +94,40 @@ fn copy_tracked_worktree_into(dest: &Path) {
         .args(["ls-files", "-z"])
         .output()
         .expect("git ls-files");
-    assert!(output.status.success(), "git ls-files failed");
+    // Report git's own words. A bare `assert!` here discarded the stderr and
+    // turned a CI failure into a guessing game (the same antipattern that made
+    // 999.47 expensive). `ls-files` fails for reasons that are obvious the
+    // moment you can read them — dubious ownership, a missing .git, a
+    // redirected GIT_DIR — and invisible when you cannot.
+    assert!(
+        output.status.success(),
+        "git ls-files failed in {}\n  status: {}\n  stdout: {}\n  stderr: {}\n  \
+         repo owner uid: {}\n  process uid:    {}\n  HOME={:?} GIT_CONFIG_GLOBAL={:?}",
+        root.display(),
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        // Ownership mismatch between the repo and the running user is the
+        // usual cause under containerised CI, so report both sides of the
+        // comparison git itself makes. Read from /proc rather than pulling
+        // `libc` into this crate purely for a diagnostic.
+        {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&root)
+                .map(|m| m.uid().to_string())
+                .unwrap_or_else(|e| format!("<unreadable: {e}>"))
+        },
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|t| {
+                t.lines()
+                    .find(|l| l.starts_with("Uid:"))
+                    .map(|l| l.trim_start_matches("Uid:").trim().to_string())
+            })
+            .unwrap_or_else(|| "<unknown>".to_string()),
+        std::env::var("HOME").ok(),
+        std::env::var("GIT_CONFIG_GLOBAL").ok(),
+    );
     for rel in output.stdout.split(|&b| b == 0).filter(|s| !s.is_empty()) {
         let rel = std::str::from_utf8(rel).expect("tracked path is utf8");
         let src = root.join(rel);

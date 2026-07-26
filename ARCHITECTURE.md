@@ -166,9 +166,8 @@ reclaim if the recorded PID is dead):
   `devflow parallel`'s sibling phases.
 - **Project-wide checkout lock** (`.devflow/lock-project`,
   `lock::acquire_project_blocking`) — a coarse, seconds-scale lock that
-  serializes mutations of the shared primary checkout (hook batches,
-  `sequentagent`'s branch integration) across concurrently finishing
-  phases. It must never be held across a gate wait; on timeout
+  serializes mutations of the shared primary checkout (hook batches) across
+  concurrently finishing phases. It must never be held across a gate wait; on timeout
   (`DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS`, default 120s) the hook batch is
   **skipped** (loudly, via `events.jsonl`) rather than ever run
   unserialized.
@@ -242,10 +241,8 @@ cron, no scheduler, no agent cooperation. `spawn_monitor()` spawns a
 
 Because the monitor outlives the `devflow start`/`devflow advance`
 invocation that spawned it, agent stdout keeps flowing into the capture
-file and the exit code is still reaped after the CLI process returns. A
-second entry point, `spawn_monitor_no_advance()`, spawns the same
-capture-owning child but skips step 3 — used by `sequentagent`, which
-drives its own synchronous handoff loop instead.
+file and the exit code is still reaped after the CLI process returns.
+`spawn_monitor()` is the single way an agent process is spawned (23d).
 
 ## Worktree model
 
@@ -261,14 +258,11 @@ backs:
 - `start` (default) — run a single phase in its own worktree;
   `--no-worktree` runs directly in the primary checkout instead.
 - `parallel` — run multiple phases concurrently, each in its own worktree.
-- `sequentagent` — run two agents in sequence on one phase, each in its own
-  worktree, rebasing the second onto the first's integrated branch.
 - `reference` — create or refresh a static snapshot worktree at
   `.worktrees/reference/`.
 
 Branch integration uses `GitFlow::ensure_branch()` (create at a start point
-without checking out) and `fast_forward_branch()` (move a ref forward only
-if it is a descendant — refuses non-fast-forward updates).
+without checking out).
 
 ## Git and ship model
 

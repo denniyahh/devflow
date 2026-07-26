@@ -544,16 +544,17 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.27: `release --check` Signing-Key Inline Classification (BACKLOG)
+### Phase 999.27: `release --check` Signing-Key Inline Classification (PROMOTED — Phase 24)
 
 **Goal:** `check_ssh_signing_viability` (20d, `crates/devflow-core/src/git.rs`) misclassifies an inline (non-path) `user.signingkey` value — a literal key blob configured directly rather than as a file path is treated as a path and reported as not-found. Deterministic edge case; every path-based and no-key branch is already correct and tested. Full detail in `.planning/phases/20-release-correctness-operator-control/20-REVIEW.md` (INF-01).
 **Priority:** Low | **Size:** S — single classification branch + one test; found by Phase 20 code review (2026-07-23), deferred as Info-severity while CR-01/CR-02 + WR-01/02/03 were fixed inline on the phase-20 branch. Linear: DEN-52.
 **Requirements:** TBD — see CONTEXT.md
+**Promoted:** Phase 24, 2026-07-26 — selected as the acceptance target for Phase 23 plan 23-11 (D-02)
 **Plans:** 0 plans
 
 Plans:
 
-- [ ] TBD (promote with /gsd-review-backlog when ready)
+- [x] Promoted to Phase 24 — see the Phase 24 entry for the active tracking
 
 ### Phase 999.28: Explicit `--base` Branch Override for `devflow start` (BACKLOG)
 
@@ -654,6 +655,147 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
+<!--
+RENUMBERED 2026-07-26. The four findings below were originally filed as
+999.40–999.43 by Phase 23, but 999.40/41/42 were already taken in Linear by
+DEN-63 / DEN-64 / DEN-67 respectively — three unrelated items that had never
+been mirrored back into this file, so the collision was invisible here. The
+three colliding entries moved to 999.44/45/46; 999.43 was free and kept its
+number. Next free backlog number is 999.47.
+-->
+
+### Phase 999.44: State-Orphaned Processes Are Unreachable by `stop` and `gate sweep` (BACKLOG)
+
+**Goal:** A `devflow advance` process can outlive its own lock **and** its persisted state. When it does, both of Phase 23's new primitives return success while the orphan keeps running: `gate sweep` never lists it (its root is absent from the registry, so cross-root enumeration cannot see it), and `devflow stop --phase N --root PATH` reports `no lock held … nothing is running advance()` and exits 0.
+
+**Evidence:** observed live 2026-07-26 while clearing the machine's orphan population with Phase 23's own tooling. 22 of 23 orphans were reaped by `devflow gate sweep`; PID 3744133 (`--phase 7`, root `/tmp/.tmpMVmZBl`, ~8.6h old) was unreachable. `stop` was tried against both phase 7 and phase 8 (the root's state file is `state-08.json`) — both returned the same no-lock/no-state message and exit 0. `kill -TERM` cleared it in 1s. Full detail: `.planning/phases/23-end-to-end-dogfood/23-FINDINGS.md` §A1.
+
+**Why it matters:** the messages are *true* against recorded state, so this is not a false attestation — but an operator reading exit codes concludes the machine is clean when it is not. This is the residue of the orphan class Phase 23 was written to close, and the one case still requiring `kill(1)`.
+
+**Fix direction:** a registry-independent path — scan for running `devflow advance` children and reconcile against the registry, surfacing "running but unregistered" as its own reportable class rather than silence. Likely belongs in `doctor` as a finding plus a `gate sweep` flag.
+
+**Priority:** Medium | **Size:** M — needs a PID-discovery mechanism that is safe on shared machines and does not misidentify unrelated processes. Linear: DEN-68.
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.45: Registry Emits Duplicate Entries for a Single Root (BACKLOG)
+
+**Goal:** `registry.rs` records more than one entry for the same `(root, phase, stage)` triple, inflating what `gate sweep --dry-run` reports.
+
+**Evidence:** 2026-07-26 sweep of the machine's orphan population — `/tmp/.tmpal43JM` appeared four times in the dry-run listing (`phase 7 code` ×2, `phase 8 code` ×2, identical ages per pair). Dry run reported `24 would be reaped`; the real sweep reported `22 reaped, 0 skipped, 0 left alone`. Detail: `23-FINDINGS.md` §A2.
+
+**Why it matters:** low functional severity — the sweep is idempotent and no double-reap occurred — but the dry-run count is exactly what an operator reads before authorizing a destructive sweep, and it over-reports. Trust in the preview matters more than the two-entry delta.
+
+**Priority:** Low | **Size:** S — dedup on `(root, phase, stage)` at write or read; add a regression test asserting dry-run count equals executed count. Linear: DEN-69.
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.46: E2E Suites Leak Scratch Roots; Process Leak Does Not Reproduce on a Clean Run (BACKLOG)
+
+**Goal:** `gate_sweep_e2e.rs` and `stop_e2e.rs` (Phase 23) and older phase-12 fixtures spawn real, separate `devflow advance` children. Their `/tmp/.tmp*` scratch roots are not removed at teardown and accumulate without bound.
+
+**Evidence:** 23 orphaned processes (~128 MB resident, oldest 11h45m) accumulated across roughly 12 hours of Phase 23 development, all in `/tmp/.tmp*` scratch roots created by these suites; none touched a real repository. Detail: `23-FINDINGS.md` §A3.
+
+**SCOPE CORRECTED 2026-07-26 (post-phase-23 verification).** The original entry claimed "every full `cargo test --workspace` refills the machine's orphan population." **That is not reproducible on the current tree and the title has been corrected accordingly.** Two consecutive full runs (`cargo test --workspace --no-fail-fast`, true cargo exit 0, 592 passed / 0 failed across 16 binaries) left **zero** orphaned `devflow advance` processes — `wait_for_child_exit`'s bounded `wait()` in both suites does reap the direct child. What those two runs *did* leak is **2 scratch directories**. The standing population is **410 dirs / 300 MB spanning 2026-07-21 → 2026-07-26**, i.e. accumulated from interrupted and crashed development runs plus the roots held open by the genuinely orphaned processes, **not** from clean runs. Whoever picks this up should scope it as directory-lifecycle hygiene and treat any process-reaping work as belonging to 999.44 instead.
+
+**Do not weaken the tests to fix this.** Spawning a real child is what makes them strong — plan 23-04's summary correctly calls it the suite's strongest claim, and plan 23-05's `stop_e2e` depends on the same property. The fix belongs in teardown, not in the assertion.
+
+**Fix direction:** a `Drop` guard or explicit teardown that stops each spawned child, ideally exercising `devflow stop` so the cleanup path is itself under test.
+
+**Priority:** Low (downgraded from Medium with the scope correction — no process leak on clean runs) | **Size:** S — test-harness only, no production change. It is a contributing source of the population 999.44 is about, not the whole of it. Linear: DEN-70.
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.43: `devflow cleanup` Deletes Recovery Refs by Ancestry (BACKLOG)
+
+**Goal:** `devflow cleanup` deletes local branches it judges "merged" by ancestry, which necessarily includes recovery points. A recovery ref is *defined* as a pointer at a known-good commit, so it is always an ancestor and therefore always eligible for deletion.
+
+**Evidence:** during plan 23-11, `devflow cleanup` (run for worktree/branch hygiene) deleted the local `recovery/pre-23-11-acceptance-e0f87c2`. The copy on `origin` was untouched and the local branch was restored from it in the same session, so nothing was lost — but the deletion was unintended and was disclosed rather than silently corrected. Recorded in `23-ACCEPTANCE-RUN.md` §6/§7 and `23-FINDINGS.md` §B2.
+
+**Why it matters:** the whole point of establishing a recovery point before a one-way operation is that it survives until the operator retires it. A cleanup verb that removes it — even locally, even while the remote persists — undermines the mitigation at exactly the moment it is supposed to be load-bearing.
+
+**Fix direction:** skip a configurable ref prefix (`recovery/*` by default), or have cleanup refuse to delete refs it did not create. Linear: DEN-71.
+
+**Priority:** Low | **Size:** S — one predicate plus a test.
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.47: `looks_like_devflow_process` False-Positives Under CI Load (BACKLOG)
+
+**Goal:** `agent::looks_like_devflow_process(pid)` intermittently returns `true` for a plain `sleep` process. It is the last guard before `SIGTERM` in `devflow stop` (`commands.rs:1171`), so a false positive is the **dangerous** direction — it *permits* signalling a process that is not DevFlow's, which is exactly the recycled-pid hazard its own error message names ("the lock may be stale with a recycled pid").
+
+**Evidence — TWO independent tests at two layers catch this, 3 failing CI runs across 2 commits on 2026-07-26**, both commits touching no Rust source at all (`e00a16d`, `8929236` — `.planning/`-only). The ~20 CI runs before these were green. Introduced with the predicate itself in `dec4583` (plan 23-05).
+
+1. `agent::tests::looks_like_devflow_process_is_false_for_a_non_devflow_process` (`agent.rs:142`) — the unit test. Failed on `8929236` in both the CI and Devcontainer workflows.
+2. `commands::tests::stop_refuses_to_signal_a_live_pid_that_fails_the_identity_check` (`commands.rs:3163`) — the CLI integration test. Failed on `e00a16d`.
+
+**(2) is the serious one and proves the full production path, not just a wrong bool.** That test spawns a `sleep`, writes its pid into the phase lock file, and asserts `stop()` returns `Err`. It panicked on `expect_err` — so `stop()` returned `Ok`: the identity guard passed and **`devflow stop` sent `SIGTERM` to an unrelated `sleep` process.** This is the guard's stated purpose failing end-to-end, observed in CI, not a theoretical risk inferred from a predicate.
+
+The same commit passes on one trigger and fails on the other, and the pattern flips between commits, so it is non-deterministic rather than environment-specific.
+
+**FAILURE STATE ESTABLISHED 2026-07-26** — from the instrumented assertion, once CI moved into the pinned container (`db1b4bf`) and the flake became **deterministic** rather than ~33%. Verbatim:
+
+```
+branch taken:        spawned sleep
+pid under test:      3054
+cmdline before stop: /__w/devflow/devflow/target/debug/deps/devflow-c2105e00bf2afc4e
+cmdline after stop:  /__w/devflow/devflow/target/debug/deps/devflow-c2105e00bf2afc4e
+status before stop:  Name=commands::tests State=R (running) Pid=3054 PPid=2856 Threads=1
+child.try_wait():    Ok(None)
+direct predicate:    looks_like_devflow_process(3054) = true
+test process:        pid 2856
+```
+
+**SUPERSEDED 2026-07-26 — see "MECHANISM CONFIRMED" below.** The reading in this paragraph ("never execs, persistently") was wrong: both of its samples happened to land inside a window that is merely *wide*, not permanent.
+
+**The child forks and never `exec`s, and stays that way.** `PPid` is the test process, so it *is* our child; `try_wait()` is `Ok(None)`, so it has not exited; `Name` is `commands::tests` — the *forking Rust test thread's* name, not `sleep`; and the state is unchanged across the whole `stop()` call. It therefore still carries the parent's `cmdline`, which is why the predicate answers `true`.
+
+This **rules out**, with evidence: pid recycling (PPid matches), a transient read window (stable before *and* after), a matching-logic bug in the predicate (the cmdline genuinely is a devflow binary's), and fixture self-sabotage (the `spawned sleep` branch was taken).
+
+**WHY the child never `exec`s is still unknown, and three hypotheses are now disconfirmed. Do not adopt one without evidence:**
+
+- **Local CPU contention** — 40/40 pass with the machine loaded.
+- **Transient fork/exec cmdline inheritance** — 4000 spawns × 3 modes, including `pre_exec` to *force* the `fork`+`execvp` path off `posix_spawn`, observed it **0 times**. (An earlier revision called this "disproved", then retracted it as an overstatement; the CI evidence above now disproves the *transient* form outright, since the state is persistent, while leaving "never execs" as the actual finding.)
+- **glibc environment-lock deadlock inherited across `fork`** (a `setenv` in another thread holding the lock when the child forks, wedging `execvp`'s PATH lookup) — a 4-thread `setenv` storm across 300 spawns wedged **0** children.
+
+**MECHANISM CONFIRMED 2026-07-26 — transient fork/exec window, observed directly.** From the `agent.rs` unit test in the devcontainer job:
+
+```
+child cmdline before: /workspaces/devflow/target/debug/deps/devflow_core-e2538b0c9f19931c
+child cmdline after:  <empty>
+child /proc/7335/exe: /usr/bin/sleep
+```
+
+`/proc/<pid>/exe` resolves to `/usr/bin/sleep`, so the child **did** exec. The cmdline read caught it mid-flight: the parent's argv beforehand, empty afterwards. Between `Command::spawn()` returning a pid and the child completing `execve`, `/proc/<pid>/cmdline` still reports the *parent's* command line — and `looks_like_devflow_process` reads exactly that.
+
+**This is the hypothesis that was twice recorded above as "not reproduced" and then "disproved". Both retractions were wrong, and the fault was the instrument, not the theory.** The local probes (3000 and 4000 spawns, including `pre_exec` to force the `fork`+`execvp` path) ran on a warm local filesystem where `execve` completes in microseconds, so the window was never observable. Container overlayfs makes it wide enough to hit routinely. The earlier "persistent, never execs" reading came from a sample pair that both landed inside that wide window.
+
+**Lesson for the next reader:** a negative result from a probe is evidence about the probe's sensitivity, not proof about the system. Reproduce in the environment that fails.
+
+**The fix does not depend on resolving that.** Whatever wedges the child, the production defect is that `looks_like_devflow_process` trusts `/proc/<pid>/cmdline`, which a forked-not-`exec`'d child inherits wholesale from its devflow parent. `/proc/<pid>/exe` is no better — it is inherited too. **Identity must be a recorded pair, not an inference:** persist `(pid, starttime)` — field 22 of `/proc/<pid>/stat` — in the lock file and require both to match before signalling. That is immune to inheritance *and* closes the check-then-signal TOCTOU below, so it subsumes both defects.
+
+**Both tests are instrumented** (`21449bd`, `a6f479a`; no production change) and CI reproduces deterministically in-container, so any future hypothesis can be tested in one push.
+
+**Not to be confused with the unrelated flake in the same PR.** `reference_and_cleanup_worktree_cli_flow` (`phase7_cli.rs:107`) also failed on `91bff73` in both workflows. That is the pre-existing, already-tracked 20b flake (Linear DEN-48, High, Todo) — a git-fixture problem, unrelated to this predicate. Three distinct tests failed across this PR; do not merge them into one story.
+
+**Known independent weakness, visible by inspection:** the predicate matches **any** argv element whose basename starts with `devflow`, not just `argv[0]`. So `sleep /tmp/devflow-scratch/x` matches, as does any process merely *mentioning* a devflow path in its arguments. Tightening to `argv[0]` and corroborating via `/proc/<pid>/exe` narrows the false-positive surface regardless of the intermittent cause.
+
+**Related TOCTOU, likely 999.44's scope:** even a correct predicate is checked and *then* acted on — the pid can be recycled between `looks_like_devflow_process(pid)` and `terminate(pid)`.
+
+**Priority:** High — raised from Medium once test (2) showed `devflow stop` actually signalling a non-devflow process, rather than a predicate merely returning the wrong value. | **Size:** S–M — S if the diagnostics name a simple cause, M if it needs a non-pid identity handle. Linear: DEN-72.
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
 ### Phase 21: Operator Legibility & Observability
 
 **Shipped as v1.8.0** (2026-07-24) — PR #23 (`develop → main`, squash `cfa9167`), signed tag `v1.8.0`, [GitHub Release](https://github.com/denniyahh/devflow/releases/tag/v1.8.0). `sync-main-to-develop.sh` run via PR #24 (merge `01ad9e4`). Published to crates.io (`devflow-core` then `devflow`, both confirmed live at 1.8.0).
@@ -712,20 +854,311 @@ Plans:
 
 The branch was then reused as the **staging branch for this release**, integrating the 999.37 containment fix and the naming reframe, tested as a unit, and merged to `develop` from there. Its name understates its final contents.
 
-*Note:* the Codex compatibility audit (`.planning/audits/2026-07-24-codex-compatibility-review.md`) and the 999.31 agent-driver-modularization backlog entry referenced above are **not in this release** — they sit on a separate planning-docs branch that was deliberately not merged, so those two references will not resolve until it lands. DEN-56 tracks the same defect in Linear.
+*Note:* the Codex compatibility audit (`.planning/audits/2026-07-24-codex-compatibility-review.md`) and the 999.31 agent-driver-modularization backlog entry (`.planning/phases/999.31-agent-driver-modularization/CONTEXT.md`) referenced above were **not in the v1.8.1 release** — they sat on the unmerged `archive/planning-docs-2026-07-24` branch. **Recovered onto the mainline 2026-07-25**, along with the three process-lifecycle/teardown/supervisor audits and the scope-creep review, so those references now resolve. DEN-56 tracks the same defect in Linear.
 
 Plans:
 
 - [x] 22-01 — Shared gate resolution + `gate_show` one-read + `MAIN` constant (WR-01, WR-02, WR-03)
 - [x] 22-02 — Single-pass `stage_launched` timestamp summary + full Validate (IN-01)
 
-### Phase 23: Test Suite & CI Hardening
+### Phase 23: End-to-End Dogfood — One Phase, Define→Ship, Unattended, With Claude
 
-**Goal:** [To be planned]
-**Requirements**: TBD
+**Goal:** Make `devflow start --phase N` drive one real phase from Define
+through Ship **unattended with Claude**, with no manual `ps`, no manual
+`devflow advance`, and no silent stall. This is the "basic development
+workflow works end to end" milestone, scoped deliberately narrow: one agent
+(Claude), one phase, no release cut.
+
+**Scope recut 2026-07-25 (operator decision).** This phase previously read
+"Test Suite & CI Hardening" with a `[To be planned]` placeholder goal. That
+theme — 999.15, 999.17, 999.18, 999.19, 999.20, 999.22 — was reviewed against
+the end-to-end goal and advances it by approximately zero, so it returns to the
+backlog undisturbed and this phase is repurposed. Nothing was lost: the prior
+entry had no content beyond its title.
+
+**Requirements**: TBD (no REQ-IDs — units 23a–23e, sourced from 999.33/DEN-58
+and 999.34/DEN-59 plus the dogfood-probe finding this phase generated first).
+Plans carry the unit identifiers `23a`, `23b`, `23c`, `23d`, `23e` and
+`yes-ship` as requirement tokens. **`23b` and `23c` were redefined, and `23e`
+added, by the 2026-07-25 replan** — see "Re-aimed 2026-07-25" below.
 **Depends on:** Phase 22
-**Plans:** 0 plans
+**Plans:** 11/11 plans executed
+2026-07-25; the original 23-03…23-12 are archived under
+`phases/23-end-to-end-dogfood/superseded/`)
+
+**Status: all 11 plans executed, but the phase's own behavioral acceptance
+criterion is NOT met.** Plan 23-11 (2026-07-26) ran the acceptance attempt:
+`devflow start --phase 24 --agent claude --mode auto --yes-ship` stopped at
+Define — the target phase's own ROADMAP entry (promoted by this phase's own
+plan-10/11 orchestration) was unreachable from `develop`, the branch
+`devflow start` always forks a fresh worktree from, because the promotion
+landed only on `feature/phase-23`, still unmerged. Operator verdict:
+`record: valid`, `failed`. Root cause is an orchestrator sequencing gap
+across plans 23-10/23-11, not a DevFlow defect — see
+`23-11-SUMMARY.md`/`23-ACCEPTANCE-RUN.md` for the full record and what a
+retry needs (Phase 23 merged to `develop` first, plus a named third
+precondition check).
+
+**Gap-closure decision, operator-confirmed 2026-07-26.** The third precondition
+is to be shipped as a **`devflow start` guard**, not merely a documented
+operator checklist item. Before forking its worktree, `devflow start --phase N`
+must verify that phase N's `ROADMAP.md` entry and `.planning/phases/<N>-*/`
+directory are reachable **from the base branch it is about to fork from** — and
+refuse with a legible message when they are not. Rationale: the guard converts
+a ~90-second silent flounder at Define into an immediate, actionable refusal,
+and prevents recurrence structurally rather than by discipline. A checklist
+item would only have caught this if the operator remembered to run it, which is
+exactly what failed in 23-10/23-11. This is an input to `/gsd-plan-phase 23
+--gaps`; the gap plan should ship the guard **and** re-run the acceptance
+attempt against Phase 24.
+
+**Deliberately NOT the acceptance target: the test-hygiene work (999.46 /
+DEN-70).** It was considered and rejected on 2026-07-26. Three reasons: (1) its
+headline symptom does not reproduce on the current tree; (2) **reflexivity** —
+the acceptance run *is* a `devflow advance` process tree, and process-reaping
+teardown executes inside the `cargo test --workspace` that DevFlow's own
+Validate stage runs, so an over-broad reaper can kill the harness observing it,
+making "DevFlow failed" indistinguishable from "the test suite shot the
+supervisor"; (3) it discards Phase 24's existing vetting. "Test-only" is not
+"low-consequence" when the tests manipulate the same process class the harness
+depends on. Phase 24 remains the target; 999.46 should be done as ordinary
+work, not driven by DevFlow.
+
+**Why this scope, from the run record.** `.devflow/events.jsonl` shows **no
+phase has ever completed a full five-stage devflow-driven run**:
+
+| Phase | Agent | Furthest reached | How it ended |
+|-------|-------|------------------|--------------|
+| 17 (2026-07-18) | Claude | define→plan→code→validate→**ship**→loop_back→code | two silent monitor deaths, ~4h lost, recovered by hand |
+| 21 (2026-07-23) | Claude | `self_dogfood_stale_blocked` → define | `workflow_finished` after one stage |
+| 22 (2026-07-24) | Codex | define→plan→gate→`stale_blocked`→plan relaunch | stops dead — no `advance_evaluated` |
+
+Phase 17 is the high-water mark and predates a month of changes. Phase 22's
+death was Codex-specific (999.31). The staleness guard blocked two of the three
+runs; 21d addressed that and shipped in v1.8.0/v1.8.1, so it should not recur —
+23a verifies rather than assumes.
+
+**Deliberately out of scope, and why:**
+
+- **999.31 / DEN-56 (Modular Agent Driver, High, L)** — the highest-priority
+  backlog item by label, and **not a blocker here**. Its root cause is
+  `Stage::gsd_command()` emitting raw `/gsd-*` strings that *Codex* receives as
+  literal shell commands; Claude Code consumes slash commands natively. Deferring
+  it removes the single largest item from the critical path. It returns as the
+  prerequisite for onboarding any second agent.
+
+- **999.25 / DEN-50 (release-cut executor)** — "end to end" here ends when the
+  **Ship stage completes** (merge, version bump, changelog) on the branch. The
+  crates.io publish stays manual; it drives irreversible operations and needs its
+  own failure/rollback design pass.
+
+- **999.4, 999.26** (concurrency/contention) — only bind under concurrent ship or
+  `devflow parallel`, neither of which is on the single-phase happy path.
+
+Units (operator-decided 2026-07-25; sequencing is load-bearing):
+
+- **23a** — **Dogfood probe.** Run `devflow start` on a small real phase with a
+  ≥v1.8.1 binary and record exactly where it dies. **Sequence first**: it either
+  confirms the supervisor is the blocker or surfaces something cheaper that bites
+  before it, and it is the only unit that can invalidate the rest of this scope.
+
+- **23b** — **Socket-addressable supervisor** (999.33 / DEN-58). Replace the
+  `sh -c` monitor with a socket-addressable supervisor. Two properties carry this
+  phase: the `advance` tail stops being a separate forkable process and runs
+  in-process — **removing the Phase 17 failure mode by construction** — and
+  liveness becomes answerable as GONE/STALE/ALIVE with no PID, so a dead monitor
+  is no longer indistinguishable from a healthy between-stages pause. Design is
+  spike-proven (C1–C6 + R-A..R-M); the spike is preserved at
+  `.planning/spikes/socket-supervisor/`. The migration, not the mechanism, is the
+  work: ~8 files consume `spawn_monitor`/`wait_for_agent_pid`/`wait_for_agent_exit`.
+
+- **23c** — **`devflow stop`** (999.34 / DEN-59). Explicit clean phase abort.
+  Blocked on 23b only; falls out cheaply once the socket handle exists. Includes
+  R-M — a stop must **suppress** advance, since a stopped phase must not advance
+  its own state machine.
+
+- **23d** *(subtractive)* — **Drop `sequentagent`.** ~110 references across 11
+  files. Shrinks 23b and closes DEN-58's explicitly-untested
+  `wait_for_agent_exit` gap in the riskiest part of the migration. Coherent with
+  Claude-only: token-exhaustion failover has no second agent to reach. The
+  capability itself is preserved as an intent in 999.42 / DEN-67, to be
+  reimplemented on the supervisor if and when a second agent is supported.
+
+**Acceptance criterion is behavioural, not code-shaped:** one phase driven
+start-to-finish by `devflow` with Claude, unattended, reaching a completed Ship
+stage without manual intervention.
+
+**macOS note:** DEN-58 flags macOS as entirely unverified (no host, no CI) and
+the 104-byte `sun_path` limit as documented-not-measured. Out of scope here —
+the operator platform is Linux; do not claim macOS support from this phase.
+
+**Re-aimed 2026-07-25 (operator decision, after 23a's probe).** 23a ran and
+**disproved the phase's central hypothesis.** The `sh -c` monitor does not die:
+one 59-minute unattended run carried 11 `stage_launched` events, archived a
+capture on every hop, counted failures correctly, fired the threshold gate
+correctly, ended with `infra_failures: 0`, and was still alive at the end
+(`23-PROBE-FINDINGS.md`). It made the first full Define→Ship traverse on record,
+and a second independent run reached Ship within the same hour. Both were
+stopped by **content/config gates**, and by two *different* ones — a false-green
+`VERIFICATION.md` scoring an unrun Ship stage, and a `/gsd-ship` preflight block
+on a missing SECURITY.md (`23-ORPHAN-FORENSICS.md`).
+
+The real defect is the inverse: monitor **over-durability**. Forensics on 27
+orphaned pairs (54 processes, 168.6 MB, gates up to 30h old) found `wait $apid`
+had already returned in every one; what was still running was the trailing
+`devflow advance`, blocked on a gate whose wait is bounded at 7 days
+(`config_parse.rs:24-28`) — bounded so loosely it is operationally
+indistinguishable from unbounded. No detach, no reaper, no way to enumerate what
+is gated, and no command to stop a running phase.
+
+Plans 23-03…23-12 were built on the disproved premise and are archived to
+`superseded/`. The replanned set is aimed at the evidence:
+
+- **23b — REDEFINED.** No longer "replace the `sh -c` monitor with a socket
+  supervisor." Now **bound gate lifetime**: a cross-root registry plus
+  `devflow gate list --all-roots` (23-03), and `devflow gate sweep` auto-rejecting
+  aged gates through the existing `Gates::respond` protocol so the still-polling
+  `advance` tears itself down via its own `abort()` path — no signal, no
+  supervisor, no new dependency (23-04).
+
+- **23c — REDEFINED, smaller.** `devflow stop` (23-05), no longer blocked on 23b.
+  Built against the existing per-phase lock file, which already records the exact
+  PID to signal. Targets the lock holder, never `state.monitor_pid` — the monitor
+  shell's trap only ever tracks the agent, so signalling it orphans `advance`
+  rather than stopping it.
+
+- **23e — NEW this replan.** The false-green attestation class: a structural
+  Ship-evidence oracle (`devflow evidence`), declarable as a Layer 0 probe, plus
+  an enforced merge post-condition (23-06). `devflow-core` never reads
+  `VERIFICATION.md`, so the catch that worked was a non-deterministic prompt-side
+  review, not an enforced invariant.
+
+- **23d — UNCHANGED**, and no longer front-loaded. Its original "delete before
+  the migration" rationale died with the supervisor deferral, so it now follows
+  the evidence-priority work (23-07, 23-08).
+
+- **`--yes-ship` — UNCHANGED, and now the binding constraint** on the acceptance
+  criterion, since `Mode::should_gate` gates Ship in both modes (23-09).
+
+- **The socket-addressable supervisor is DEFERRED, not discarded** — with it,
+  D-08 and D-10. Nothing in the evidence shows this phase's acceptance criterion
+  requires it; building it now would fix a problem the probe did not find.
+  D-09's `~/.cache/devflow/` location decision is reused for the new registry.
+
+Sequencing: enumeration → reaper → stop → evidence oracle → 23d → `--yes-ship`
+→ acceptance prep → acceptance run. Waves are mostly sequential because almost
+every unit touches `commands.rs` or `main.rs`, and the same-wave
+zero-file-overlap rule forbids parallelism.
+
+**RESEARCH correction carried into the plans:** the deletion inventory is
+**142 references across 11 files**, not the ~110 recorded above — the original
+count came from a lowercase-only grep that missed the PascalCase Rust
+identifiers. The 11-file count is correct. Four operator documents mention the
+verb (README, ARCHITECTURE, OPERATIONS, CHANGELOG), not two.
+
+**Cross-AI review revision, 2026-07-26 (`23-REVIEWS.md`, verdict
+`changes_requested`).** Three lanes (Codex / OpenCode / Hermes); every HIGH
+finding was re-verified against source by the orchestrator before replanning.
+Plans 23-03 … 23-11 were revised in place — no renumbering, no new plan, no
+change to any `depends_on` edge, so the wave assignment above is unchanged.
+Four required findings, all now closed in the plan text:
+
+1. **23-06's shipped predicate was itself a false green.** `workflow_finished`
+   is emitted at two sites, not one — real Ship finalization
+   (`pipeline_gate.rs:221`, `Null` payload) *and* `transition`'s
+   `devflow start --until` clean-stop branch (`pipeline_gate.rs:79`, payload
+   `{"reason":"stopped_at"}`), which returns before any hook runs. The oracle
+   built to eliminate false greens would have reported **shipped** for a phase
+   halted after one stage — the shape the run record already logs for Phase 21.
+   Fixed by emitting a distinct terminal-only **`workflow_shipped`** event with
+   exactly one emission site and making that the predicate.
+
+2. **23-10's one-way authorization preceded the rehearsal it demanded
+   confirmation of.** Split into a reversible target selection (Task 1) and the
+   one-way authorization (Task 4), with the rebuild, recovery rehearsal, remote
+   restore-path discovery and both content preconditions in between.
+
+3. **Verification chains could exit 0 on a broken build.** The
+   `cargo test … | rg -q 'FAILED' && exit 1 || cargo clippy …` shape in four
+   plans falls through to the `||` branch when a compile, link, or panic failure
+   prints no `test result: FAILED` line. Replaced everywhere with direct
+   `&&` status chains; targeted runs now capture to a gitignored log and gate on
+   cargo's own exit status before asserting a nonzero pass count.
+
+4. **23-03's registry contradicted itself on concurrency.** Storage reshaped
+   from one shared `roots.json` to one file per `(project_root, phase)`, so a
+   concurrent registration cannot be lost and "a running phase cannot be missing
+   from the registry" is structurally true rather than aspirational.
 
 Plans:
 
-- [ ] TBD (run /gsd-plan-phase 23 to break down)
+- [x] 23-01-PLAN.md — Rebuild the binary and scaffold an isolated scratch probe target (23a)
+- [x] 23-02-PLAN.md — 23a probe: one unattended run, recorded where it stopped (23a)
+- [x] 23-03-PLAN.md — 23b: cross-root gate registry (one file per root/phase) + `devflow gate list --all-roots`
+- [x] 23-04-PLAN.md — 23b: `devflow gate sweep` — bound gate lifetime by auto-rejecting aged gates
+- [x] 23-05-PLAN.md — 23c: `devflow stop`, targeting the lock holder
+- [x] 23-06-PLAN.md — 23e: terminal-only `workflow_shipped` event + Ship-evidence oracle + enforced merge post-condition
+- [x] 23-07-PLAN.md — 23d: delete the two-agent verb from the CLI crate + reconcile docs
+- [x] 23-08-PLAN.md — 23d: delete the core-side surface, workspace count to zero
+- [x] 23-09-PLAN.md — `--yes-ship`: per-run flag, one auto-answered Ship gate
+- [x] 23-10-PLAN.md — Acceptance prep: target selection, rehearsed recovery point, preconditions, then one-way authorization
+- [x] 23-11-PLAN.md — Acceptance run: one phase Define→Ship, unattended, self-hosted
+
+*(The original 23-03…23-12 are archived under `superseded/` — see the re-aim
+note above. The plan list below renumbers from 23-03; 23-01 and 23-02 are
+unchanged and already merged.)*
+
+**Wave 1**
+
+- [x] 23-01 — Rebuild the binary and scaffold an isolated scratch probe target (23a)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
+- [x] 23-02 — 23a probe: drive one unattended run in the scratch repo, record where it stopped (23a, tracer)
+
+**Wave 1 (replanned set)**
+
+- [x] 23-03 — 23b: registry module, registration on the launch path, cross-root gate listing with age (23b)
+
+**Wave 2** *(blocked on 23-03)*
+
+- [x] 23-04 — 23b: `Gates::reap` + `devflow gate sweep`, proven against a real parked `advance` child (23b)
+
+**Wave 3** *(blocked on 23-04)*
+
+- [x] 23-05 — 23c: `devflow stop` — gate-response path, lock-holder signalling fallback, identity check (23c)
+
+**Wave 4** *(blocked on 23-05)*
+
+- [x] 23-06 — 23e: terminal-only `workflow_shipped` event, `devflow evidence` oracle, `--require-shipped`, merge post-condition in the Merge hook (23e)
+
+**Wave 5** *(blocked on 23-06)*
+
+- [x] 23-07 — 23d: delete the verb, preserve single-agent resume, reconcile four docs (23d, D-11/D-12 checkpoint)
+
+**Wave 6** *(blocked on 23-07; the two plans below run in parallel — zero file overlap)*
+
+- [x] 23-08 — 23d: delete the core-side surface, re-point constructor coverage (23d)
+- [x] 23-09 — `--yes-ship`: persisted per-run flag, one auto-answered gate, two negative guarantees (yes-ship)
+
+**Wave 7** *(blocked on 23-08 and 23-09)*
+
+- [x] 23-10 — Acceptance prep: target selection, seven behavioural checks, rehearsed recovery point, content preconditions, then the D-07 one-way authorization (all units) — operator authorized PROCEED against backlog 999.27 (-> phase 24), both content preconditions accepted unmitigated. Orchestrator must promote 999.27 to phase 24 in this file before dispatching 23-11.
+
+**Wave 8** *(blocked on 23-10)*
+
+- [x] 23-11 — Acceptance run: one phase Define→Ship, unattended, self-hosted (all units) — **plan executed, record valid; ACCEPTANCE FAILED** (target Phase 24 unreachable from `develop` at launch — orchestrator sequencing gap, not a DevFlow defect). Phase's behavioral acceptance criterion NOT met by this run; see `23-11-SUMMARY.md` "Next Phase Readiness" for what a retry needs.
+
+### Phase 24: `release --check` Signing-Key Inline Classification
+
+**Goal:** `check_ssh_signing_viability` (20d, `crates/devflow-core/src/git.rs`) misclassifies an inline (non-path) `user.signingkey` value — a literal key blob configured directly rather than as a file path is treated as a path and reported as not-found. Deterministic edge case; every path-based and no-key branch is already correct and tested. Full detail in `.planning/phases/20-release-correctness-operator-control/20-REVIEW.md` (INF-01).
+**Priority:** Low | **Size:** S — single classification branch + one test; found by Phase 20 code review (2026-07-23). Linear: DEN-52.
+**Requirements**: TBD — promoted from backlog 999.27
+**Depends on:** Phase 23
+**Plans:** 0 plans
+
+*Promoted from backlog Phase 999.27 on 2026-07-26 as the acceptance target for Phase 23 plan 23-11 (D-02). Selected as low-stakes by consequence: a release-preflight advisory check that touches no merge, version, or ship control flow.*
+
+Plans:
+
+- [ ] TBD (run /gsd-plan-phase 24 to break down)

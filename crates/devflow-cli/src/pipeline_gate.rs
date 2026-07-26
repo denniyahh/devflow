@@ -23,13 +23,13 @@ use crate::CliError;
 use crate::config_parse::{foreground_gate_timeout_secs, gate_timeout_secs};
 use crate::pipeline_launch::launch_stage;
 use crate::pipeline_outcomes::{run_checkout_hooks, truncate_reason};
-use devflow_core::gates::{self, GateAction, GateResponse, Gates};
+use devflow_core::gates::{self, GateAction, GateError, GateResponse, Gates};
 use devflow_core::hooks;
 use devflow_core::mode;
 use devflow_core::prompt::{self, FixType};
 use devflow_core::stage::Stage;
 use devflow_core::state::State;
-use devflow_core::{events, lock, workflow};
+use devflow_core::{events, lock, registry, workflow};
 use std::path::Path;
 use tracing::info;
 
@@ -196,12 +196,19 @@ pub(crate) fn finish_workflow_with_gate_timeout(
             "[finalization failed] phase {} terminal hooks did not complete. Resolve the git/version error, then approve to retry; reject to loop back or abort.",
             state.phase
         );
+        // This is the reopened finalization-retry gate, NEVER the routine
+        // Ship approval — it must always pass `None` here. Auto-approving
+        // it would mean "the merge could not be completed" gets silently
+        // retried forever with no human ever seeing it (T-23-91). The one
+        // and only site permitted to pass a non-`None` auto-response is
+        // `handle_ship_outcome` in `pipeline_outcomes.rs`.
         match run_gate_with_timeout(
             project_root,
             state,
             Stage::Ship,
             &context,
             gate_timeout_secs,
+            None,
         )? {
             GateAction::Advance => {
                 let _ = Gates::cleanup(project_root, state.phase, Stage::Ship);
@@ -215,6 +222,30 @@ pub(crate) fn finish_workflow_with_gate_timeout(
     let _ = Gates::cleanup(project_root, state.phase, Stage::Validate);
     let _ = Gates::cleanup(project_root, state.phase, Stage::Ship);
     workflow::clear_state(project_root, state.phase)?;
+    // 23b: the workflow is genuinely over — deregister this (project_root,
+    // phase) from the machine-global registry so `devflow gate list
+    // --all-roots` stops naming a phase that no longer exists.
+    registry::deregister(project_root, state.phase);
+    // 23-06 / T-23-67: the ONLY site in the workspace permitted to emit
+    // `workflow_shipped`. This is the strict shipped predicate `ship_evidence`
+    // reads — deliberately NOT `workflow_finished` below, which is also
+    // emitted by `transition`'s `--until` clean-stop branch (`pipeline_gate.rs`,
+    // `state.stop_until == Some(from)` arm) with a `"stopped_at"` reason,
+    // before any hook, stage assignment, or launch runs. A phase halted after
+    // one stage must never read as shipped. Ordering here is load-bearing in
+    // both directions: after the hook-success loop `break` above, so it can
+    // only fire once the entire `hooks_after_ship` batch has succeeded; and
+    // before `workflow_finished` below, because existing tests assert a
+    // phase's event stream ENDS in `workflow_finished` — do not move this
+    // emission after it.
+    events::emit(
+        project_root,
+        state.phase,
+        "workflow_shipped",
+        serde_json::json!({
+            "stage": Stage::Ship.to_string(),
+        }),
+    );
     events::emit(
         project_root,
         state.phase,
@@ -233,7 +264,14 @@ pub(crate) fn run_gate(
     stage: Stage,
     context: &str,
 ) -> Result<GateAction, CliError> {
-    run_gate_with_timeout(project_root, state, stage, context, gate_timeout_secs())
+    run_gate_with_timeout(
+        project_root,
+        state,
+        stage,
+        context,
+        gate_timeout_secs(),
+        None,
+    )
 }
 
 /// `run_gate`'s body, parameterized on the poll timeout (WR-02, phase 20
@@ -246,6 +284,16 @@ pub(crate) fn run_gate_with_timeout(
     stage: Stage,
     context: &str,
     timeout_secs: u64,
+    // 23-09 (D-04/D-05/D-06): a pre-authorized response to write for this
+    // gate, or `None` for a real human gate. This function must NEVER
+    // derive this value from `state` (e.g. `state.yes_ship`) — the decision
+    // belongs to the caller precisely so the reopened finalization-retry
+    // gate in `finish_workflow_with_gate_timeout` cannot inherit an
+    // authorization meant only for the routine Ship approval. The regression
+    // test `finalization_retry_gate_never_auto_approves_even_with_yes_ship_set`
+    // (pipeline_outcomes.rs) fails loudly if a future refactor reads the
+    // flag from `state` inside this function instead of receiving it here.
+    auto_response: Option<&GateResponse>,
 ) -> Result<GateAction, CliError> {
     state.gate_pending = true;
     workflow::save_state(state)?;
@@ -281,6 +329,22 @@ pub(crate) fn run_gate_with_timeout(
         "notify_fired",
         serde_json::json!({ "stage": stage.to_string(), "unexpected": unexpected }),
     );
+    // The auto-response, if any, is written here — after the gate request
+    // and both `gate_fired`/`notify_fired` events, so the event stream still
+    // reads as a real gate that was really answered, and before
+    // `Gates::poll_response` below so the poll's very first read finds it
+    // (`Gates::respond` refuses with `NoOpenGate` if written before
+    // `Gates::write_gate` above, and `poll_response` would never observe a
+    // response written after it returns).
+    if let Some(response) = auto_response {
+        match Gates::respond(project_root, state.phase, stage, response) {
+            Ok(_) => {}
+            // A human or 23b's stale-gate sweep may have answered first;
+            // first-writer-wins is the correct resolution, not an error.
+            Err(GateError::AlreadyResponded { .. }) => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
     match Gates::poll_response(project_root, state.phase, stage, timeout_secs) {
         Some(response) => {
             state.gate_pending = false;
@@ -325,6 +389,9 @@ pub(crate) fn abort(project_root: &Path, state: &State, reason: &str) -> Result<
     // survives on disk and is silently reused if the gate fires again later.
     let _ = Gates::cleanup(project_root, state.phase, state.stage);
     let _ = workflow::clear_state(project_root, state.phase);
+    // 23b: an abort also ends the workflow — deregister the same as the
+    // success path so an aborted phase does not linger in the registry.
+    registry::deregister(project_root, state.phase);
     events::emit(
         project_root,
         state.phase,
@@ -557,6 +624,97 @@ mod tests {
         assert!(!Gates::gate_path(root, phase, Stage::Validate).exists());
     }
 
+    /// 23-06 Task 1 acceptance: a real Ship finalization emits the
+    /// terminal-only `workflow_shipped` event, and
+    /// `ship_evidence::collect` reads it as `shipped: true` — proving the
+    /// event this module emits is exactly the one the oracle consumes.
+    #[test]
+    fn advance_ship_success_emits_workflow_shipped_and_ship_evidence_reports_shipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 23;
+        let branch = format!("feature/phase-{phase:02}");
+        let branch_created = devflow_core::test_support::git_command(root)
+            .args(["branch", &branch, "develop"])
+            .status()
+            .unwrap()
+            .success();
+        assert!(branch_created);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Ship;
+        workflow::save_state(&state).unwrap();
+
+        std::fs::write(
+            agent_result::stdout_path(root, phase),
+            "DEVFLOW_RESULT: {\"status\":\"success\"}\n",
+        )
+        .unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Ship);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":true,"note":null,"responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        advance(root, Some(phase)).unwrap();
+
+        assert!(
+            devflow_core::events::has_event_for_phase(root, phase, "workflow_shipped"),
+            "a real Ship finalization must emit the terminal-only workflow_shipped event"
+        );
+        let evidence = devflow_core::ship_evidence::collect(root, phase);
+        assert!(
+            evidence.shipped,
+            "ship_evidence must read the just-emitted workflow_shipped event as shipped"
+        );
+        // The pre-existing invariant several other tests in this module
+        // depend on: the phase's event stream still ends in
+        // workflow_finished, unmodified by this task's additive emission.
+        let last = devflow_core::events::last_event_for_phase(root, phase)
+            .expect("events recorded for phase");
+        assert_eq!(last["event"], "workflow_finished");
+    }
+
+    /// 23-06 Task 1's named blocker regression guard (BLOCKER 1,
+    /// cross-AI-review-caught): a phase halted cleanly by `devflow start
+    /// --until <stage>` runs `transition`'s `stop_until` clean-stop branch,
+    /// which emits `workflow_finished` with a `"stopped_at"` reason and
+    /// returns before any hook, stage assignment, or `launch_stage` call —
+    /// `workflow_shipped` must never be emitted on this path, and
+    /// `ship_evidence::collect(..).shipped` must read false even though
+    /// `workflow_finished_seen` is true.
+    #[test]
+    fn until_stop_never_emits_workflow_shipped_and_ship_evidence_reports_not_shipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 24;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Plan;
+        state.stop_until = Some(Stage::Plan);
+        workflow::save_state(&state).unwrap();
+
+        transition(root, &mut state, Stage::Code).unwrap();
+
+        assert!(
+            !devflow_core::events::has_event_for_phase(root, phase, "workflow_shipped"),
+            "the --until clean-stop branch must never emit workflow_shipped"
+        );
+        let evidence = devflow_core::ship_evidence::collect(root, phase);
+        assert!(
+            !evidence.shipped,
+            "a phase that only stopped after one stage must not read as shipped"
+        );
+        assert!(evidence.workflow_finished_seen);
+        assert_eq!(evidence.finished_reason.as_deref(), Some("stopped_at"));
+        assert!(devflow_core::ship_evidence::is_stopped_at(&evidence));
+    }
+
     #[test]
     fn terminal_merge_failure_reopens_actionable_gate_and_never_reports_finished() {
         let dir = tempfile::tempdir().unwrap();
@@ -624,6 +782,119 @@ mod tests {
             .output()
             .unwrap();
         assert!(tags.stdout.is_empty());
+    }
+
+    /// 23-09 Task 2 (T-23-91's regression guard, cross-AI-review HIGH): with
+    /// `state.yes_ship` set, a terminal-hook failure that reopens the
+    /// finalization gate must NOT be auto-approved — the reopened gate is a
+    /// different call site (passing `None`) than the routine Ship approval
+    /// in `handle_ship_outcome` (passing `Some`), and this is the concrete
+    /// proof. If a future refactor folds `state.yes_ship` into
+    /// `run_gate_with_timeout`'s own body instead of threading it as a
+    /// caller argument (see that parameter's doc comment), this test fails
+    /// loudly: the reopened gate would then find an unexpected response and
+    /// never block for a human.
+    ///
+    /// `VersionBump` is failed deterministically by pre-creating the exact
+    /// tag it will attempt to create (`hooks.rs:286-287`, `git.tag(&tag)`),
+    /// with the version computed the same way the hook computes it
+    /// (`version::compute_version`) so the fixture does not silently stop
+    /// failing when the repository's version changes. `Merge` runs first in
+    /// `hooks_after_ship` and succeeds — the feature branch is created
+    /// identical to `develop`, so `is_merged_into_develop` is immediately
+    /// true and `merge_feature` takes its already-merged no-op success
+    /// path — exactly the "Merge has already succeeded" state the reopened
+    /// gate exists for (no rollback policy, `hooks.rs` doc comment on
+    /// `merge_feature`).
+    #[test]
+    fn finalization_retry_gate_never_auto_approves_even_with_yes_ship_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 60;
+        let branch = format!("feature/phase-{phase:02}");
+        let branch_created = devflow_core::test_support::git_command(root)
+            .args(["branch", &branch, "develop"])
+            .status()
+            .unwrap()
+            .success();
+        assert!(branch_created);
+
+        // Computed the same way version_bump computes it — MAJOR from
+        // Cargo.toml (stable), MINOR from the git tag count. The fixture is
+        // about to add exactly one tag at HEAD, so at VersionBump's own
+        // call time the tag count will be `tags_before + 1` and "commits
+        // since the most recent tag" will be 0 (our tag sits at HEAD, and
+        // Merge below is a no-op — the feature branch is identical to
+        // develop — so nothing moves HEAD in between). That is the fixed
+        // point: the tag we create here is exactly the tag VersionBump will
+        // independently compute and attempt to create.
+        let major = devflow_core::version::compute_version(root)
+            .expect("compute expected version")
+            .major;
+        let tags_before = devflow_core::version::count_git_tags(root).expect("count existing tags");
+        let expected_tag = format!("v{major}.{}.0", tags_before + 1);
+        let git = devflow_core::git::GitFlow::new(root);
+        git.tag(&expected_tag)
+            .expect("pre-create the tag VersionBump will attempt");
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Ship;
+        state.yes_ship = true;
+        workflow::save_state(&state).unwrap();
+
+        let root_owned = root.to_path_buf();
+        let handle = std::thread::spawn(move || {
+            let mut state = workflow::load_state(&root_owned, phase).unwrap();
+            finish_workflow(&root_owned, &mut state)
+        });
+
+        let gate_path = Gates::gate_path(root, phase, Stage::Ship);
+        for _ in 0..150 {
+            if gate_path.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            gate_path.exists(),
+            "a terminal-hook failure must reopen the Ship gate even with yes_ship set"
+        );
+
+        // Give any (incorrect) auto-write a moment to have happened if it
+        // were ever going to.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let response_path = Gates::response_path(root, phase, Stage::Ship);
+        assert!(
+            !response_path.exists(),
+            "yes_ship must NEVER auto-approve the reopened finalization-retry gate \
+             (T-23-91) — a failing finalization must wait for a human"
+        );
+        assert!(
+            workflow::load_state(root, phase).unwrap().gate_pending,
+            "the reopened gate must be recorded as pending, awaiting a human"
+        );
+        assert!(
+            devflow_core::events::has_event_for_phase(root, phase, "merge_result"),
+            "Merge must have succeeded before VersionBump failed — the reopened gate must be \
+             exercised in the state it actually occurs in"
+        );
+
+        // Unblock the poll (reject, not approve — this test's subject is
+        // that nothing auto-approves it) so the spawned thread can finish.
+        Gates::respond(
+            root,
+            phase,
+            Stage::Ship,
+            &GateResponse {
+                approved: false,
+                note: Some("abort: test cleanup".into()),
+                responded_by: Some("test".into()),
+            },
+        )
+        .unwrap();
+        handle.join().unwrap().unwrap();
     }
 
     /// 13-DEFERRED-CR-03 acceptance: two phases advancing their Ship stages

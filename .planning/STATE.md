@@ -2,34 +2,65 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone (open — no fixed closing phase)
-current_phase: 22
-current_phase_name: Concurrency & Governance Correctness (light dogfooding trial)
-status: complete
-stopped_at: Phase 22 trial executed, verified, and integrated for release
-last_updated: "2026-07-24T22:50:00.000Z"
-last_activity: 2026-07-24
+current_phase: 23
+current_phase_name: end-to-end-dogfood
+status: "Phase 23 executed (11/11 plans) - acceptance run (23-11) FAILED: target Phase 24 unreachable from develop at launch (orchestrator sequencing gap, not a DevFlow defect); record valid, recovery point not needed/not used; retry needs Phase 23 merged to develop first plus a new third precondition check"
+stopped_at: Completed 23-11-PLAN.md — acceptance run executed, record valid, acceptance FAILED (target unreachable from develop); phase behavioral criterion not met, retry needs Phase 23 merged to develop first
+last_updated: "2026-07-26T13:07:22.582Z"
+last_activity: 2026-07-26
+last_activity_desc: "plan 23-11 complete: acceptance run launched unattended, stopped at Define (target Phase 24 unreachable from develop), observed the full 10-minute window, ended cleanly via devflow stop, post-run hygiene proven, operator verdict record:valid / FAILED recorded"
 progress:
-  total_phases: 12
-  completed_phases: 11
-  total_plans: 76
-  completed_plans: 76
+  total_phases: 13
+  completed_phases: 12
+  total_plans: 87
+  completed_plans: 87
   percent: 92
-last_activity_desc: Phase 22 trial complete; 999.37 sandbox escape root-caused and fixed; both staged for release
 ---
 
 # DevFlow — Project State
 
-> Last updated: 2026-07-23
+> Last updated: 2026-07-25
 
 ## Active Phase
 
+**Phase 23 — End-to-End Dogfood: One Phase, Define→Ship, Unattended, With
+Claude** — **scoped 2026-07-25, not yet discussed or planned.** The goal is the
+"basic development workflow works end to end" milestone: `devflow start --phase
+N` drives one real phase Define→Ship with Claude, unattended, with no manual
+`ps`, no manual `devflow advance`, and no silent stall.
+
+The phase previously read "Test Suite & CI Hardening" with a `[To be planned]`
+placeholder goal. That theme (999.15/17/18/19/20/22) advances the end-to-end
+goal by ~zero, so it returned to the backlog and the phase was repurposed —
+nothing was lost, the entry had no content beyond its title.
+
+**Grounded in the run record**, not speculation: `.devflow/events.jsonl` shows
+**no phase has ever completed a full five-stage devflow-driven run.** Phase 17
+(Claude) is the high-water mark — it reached Ship, looped back to Code, then
+died to two silent monitor deaths costing ~4h. Phase 21 stopped after Define.
+Phase 22 (Codex) stops dead at a Plan relaunch with no `advance_evaluated`.
+
+Four units, sequencing load-bearing: **23a** dogfood probe (first — it can
+invalidate the rest of the scope), **23b** socket-addressable supervisor
+(999.33/DEN-58, spike-proven, makes the `advance` tail in-process and thereby
+removes the Phase 17 failure mode by construction), **23c** `devflow stop`
+(999.34/DEN-59, cheap once the socket handle exists), **23d** drop
+`sequentagent` (subtractive; shrinks 23b and closes DEN-58's untested
+`wait_for_agent_exit` gap).
+
+**Deliberately deferred:** 999.31/DEN-56 (Modular Agent Driver) — highest-priority
+backlog item by label but a *Codex* blocker, not a Claude one; 999.25/DEN-50
+(release-cut executor) — "end to end" stops when the Ship stage completes, the
+crates.io publish stays manual.
+
 **Phase 22 — Concurrency & Governance Correctness** — the **light dogfooding
 trial** slice is **complete** (2/2 plans: 22-01, 22-02, resolving 999.30 /
-DEN-55). Re-verified independently after 999.37, since the original "tests
-green" claim was recorded the same day this repository was corrupted: 537 tests
-across 13 binaries, 0 failed, and zero coupling to the process-management model
-being revamped. The branch was then reused as the staging branch for this
-release.
+DEN-55), shipped in v1.8.1. Re-verified independently after 999.37, since the
+original "tests green" claim was recorded the same day this repository was
+corrupted: 537 tests across 13 binaries, 0 failed, and zero coupling to the
+process-management model being revamped. The branch was then reused as the
+staging branch for that release. Its SUMMARY and VERIFICATION artifacts were
+never written by the executor and were backfilled 2026-07-25 (`9eb4010`).
 
 The **broader** "Concurrency & Governance Correctness" scope remains unplanned
 and explicitly out of the trial's boundary: 999.4 (version-tag contention),
@@ -55,12 +86,14 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 22 — Concurrency & Governance Correctness (light dogfooding trial)
-Plan: 22-01, 22-02 complete
-Status: Complete — integrated for release, pending version bump + CHANGELOG on `develop`
-Last activity: 2026-07-24
+Phase: 23 (end-to-end-dogfood) — 11/11 plans executed; behavioral acceptance criterion NOT met
+Plan: 11 of 11
+Status: All plans executed and their artifacts produced. The phase's own goal — one phase driven start-to-finish by DevFlow, unattended, reaching a completed Ship — is unmet: plan 23-11's acceptance run stopped at Define (target Phase 24 unreachable from `develop` at launch time). Operator verdict: record valid, acceptance FAILED. A retry needs Phase 23 merged to `develop` first, plus a newly-named third precondition check (verify the target's ROADMAP entry is reachable from `develop` before launch). See `23-11-SUMMARY.md` / `23-ACCEPTANCE-RUN.md` for the full record.
+Last activity: 2026-07-26 — plan 23-11 complete: acceptance run launched unattended, stopped at Define, observed the full mandated 10-minute window, ended cleanly via `devflow stop`, post-run hygiene proven, operator verdict recorded
 
-Progress: Phase 21 shipped as v1.8.0 (2026-07-24). Phase 22's trial slice complete and re-verified; 999.37 root-caused and fixed. Both staged on `feature/phase-22` and merged to `develop`; release prep (version bump, CHANGELOG, tag) still outstanding.
+**Note on the "Plan: 2 of 11" value this replaces:** `gsd-tools state advance-plan` only increments whatever value is already in this field; it was last set to "Plan: 1 of 11" before phase 23's first plan ever executed and was never updated across the parallel-worktree waves (23-01 through 23-09), since worktree executors deliberately do not touch STATE.md. This executor is the first sequential (main-tree) executor in phase 23 and corrected the field directly to match reality (10 of 11 plans complete) rather than trust the tool's naive +1 increment from a stale base.
+
+Progress: [██████████] 100%
 
 *(Machine-readable fields for `gsd-tools state begin-phase` / `advance-plan` —
 this project historically tracked position only in the narrative "Active
@@ -562,6 +595,8 @@ None currently open for Phase 17.
   ship/version-bump concurrency work, not Phase 17 or 18. See
   `17-VALIDATION.md` GAP-2 and `17-09-SUMMARY.md`.
 
+- Phase 23 behavioral acceptance criterion (one phase Define-to-Ship, unattended) NOT met — 23-11 acceptance run stopped at Define; requires Phase 23 merged to develop before Phase 24 (or any new target) is reachable for a retry
+
 ## Decisions
 
 | Date | Decision |
@@ -640,6 +675,10 @@ None currently open for Phase 17.
 - [Phase 19]: 19-05: dogfood checkpoint for 19g approved on combined evidence — an in-session five-diff run (same agent authored and reviewed, so it could not prove isolated wiring by itself) plus an independently-spawned, context-isolated gsd-code-reviewer subagent that caught both anti-pattern shapes cold. Recorded gap for later triage: the isolated reviewer's generic judgment agreed but did not cite the ai-change-acceptance contract by name unless the dispatch explicitly loaded it — review-dispatch prompts should load the skill explicitly, and part of that wiring surface lives outside this repository.
 - [Phase 19]: 19-07: staleness + preflight clusters extracted into staleness.rs/preflight.rs (shakedown run for the mechanical extraction procedure ahead of 19-08/19-09's larger clusters); 438/438 tests unchanged, every moved function diffs clean against the 19-06 baseline SHA modulo pub(crate); preflight <-> pipeline bidirectional call preserved as direct calls, not abstracted. Two findings recorded for 19-08/19-09: a wider-than-estimated pub(crate) surface (worktree_writable_roots, ensure_agent_binary, agent_program, phase_artifact_on_develop all needed it beyond the plan's run_preflight/launch_stage_inner estimate), and a bug in the plan's own literal name-set extraction command (`rg '::tests::' | sed 's/.*::tests:://'` silently drops main.rs's own top-level mod tests entries; corrected to `sed 's/.*:://'`).
 - [Phase 19]: 19-08: pipeline state machine split into pipeline_launch.rs/pipeline_outcomes.rs/pipeline_gate.rs (D-06 seams A/B/C), main.rs down to 3,313 lines from phase-start 8,467; three-way module cycle preserved as direct pub(crate) calls, zero unexplained diffs against baseline
+- [Phase 23]: 23-10 Task 4: operator authorized PROCEED against backlog 999.27 (-> phase 24), accepting both content preconditions (security artifact, no self-attested Ship claim) unmitigated rather than remedied — devflow's Define/Plan stages are designed to author an unplanned target's own plan set, so pre-resolving either precondition would remove the thing the acceptance run tests.
+- [Phase 23]: 23-10: the real develop restore mechanism is a GitHub ruleset (develop-merge-or-squash, required_approving_review_count: 0), not the classic branch-protection API (which reported a contradictory value of 1) — determined by cross-checking against this repo's own PR history rather than trusting the first API response; force-push is refused categorically (no bypass_actors, current_user_can_bypass: never), real undo is a revert PR measured at ~2 minutes.
+- [Phase 23]: Acceptance run (23-11): record valid, acceptance FAILED — target Phase 24 unreachable from develop at launch (orchestrator sequencing gap, not a DevFlow defect); recovery point not needed/not used
+- [Phase 23]: Third precondition class named for future acceptance attempts: verify target phase ROADMAP entry is reachable from develop itself before devflow start, not just from the executing branch
 
 ## Roadmap Evolution
 
@@ -705,9 +744,11 @@ None currently open for Phase 17.
 | Phase 19 P05 | n/a | 1 tasks | 0 files |
 | Phase 19 P07 | 71min | 2 tasks | 3 files |
 | Phase 19 P08 | 37min | 3 tasks | 5 files |
+| Phase 23 P10 | ~65min (across 2 checkpoints) | 4 tasks | 1 files |
+| Phase 23 P11 | 42min | 3 tasks | 2 files |
 
 ## Session
 
-**Last session:** 2026-07-23T17:20:24.303Z
-**Stopped at:** Phase 21 context gathered
-**Resume file:** .planning/phases/21-operator-usability-release-execution/21-CONTEXT.md
+**Last session:** 2026-07-26T13:07:22.541Z
+**Stopped at:** Completed 23-11-PLAN.md — acceptance run executed, record valid, acceptance FAILED (target unreachable from develop); phase behavioral criterion not met, retry needs Phase 23 merged to develop first
+**Resume file:** None

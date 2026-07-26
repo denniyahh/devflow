@@ -185,18 +185,40 @@ second copy of the contract.
 
 ## Cutting a Release
 
-1. On `develop`: bump `version` in the root `Cargo.toml`, run `cargo build`
-   to sync `Cargo.lock`, add a new top `## X.Y.Z` section to `CHANGELOG.md`.
-2. Open a PR from `develop` into `main` titled
-   `release: vX.Y.Z — <short description>`.
-3. Once CI is green, squash-merge it (this repo's branch settings only
-   allow squash merges into `main` — real merge commits are disabled).
-4. Tag the resulting commit on `main`: `git tag -a vX.Y.Z <commit> -m "..."`,
-   then `git push origin vX.Y.Z`.
-5. **Immediately run `scripts/sync-main-to-develop.sh`** from a clean
-   `develop` checkout, then `git push origin develop`.
+**Both `develop` and `main` are protected branches** — direct pushes are
+rejected ("Changes must be made through a pull request", plus required status
+checks) even for the maintainer. Every step below that changes a branch goes
+through a PR.
 
-Step 5 is not optional. Because `main` only accepts squash merges, its new
+1. Bump the version in **two** places in the root `Cargo.toml`: `version`
+   under `[workspace.package]`, **and** `devflow-core`'s `version` under
+   `[workspace.dependencies]`. Bumping only the first is the easy miss;
+   `crates/devflow-cli/tests/workspace_version_pin.rs` guards the pair, but
+   only after the fact. Then `cargo build` to sync `Cargo.lock`, and add a new
+   top `## X.Y.Z` section to `CHANGELOG.md`.
+2. Since `develop` is protected, put step 1 (and any work being released) on a
+   branch and open a PR into `develop`. Merge it once CI is green.
+3. Open a PR from `develop` into `main` titled
+   `release: vX.Y.Z — <short description>`.
+4. Once CI is green, squash-merge it (this repo's branch settings only
+   allow squash merges into `main` — real merge commits are disabled).
+5. Tag the resulting commit on `main`: `git tag -s vX.Y.Z <commit> -m "..."`,
+   then `git push origin vX.Y.Z`. Use `-s`, not `-a`: releases are
+   SSH-signed, and a repo-local `tag.gpgsign=false` means `-a` alone will
+   not sign. Verify with `git tag -v vX.Y.Z`.
+6. **Immediately run `scripts/sync-main-to-develop.sh`** from a clean
+   `develop` checkout. It produces a merge commit locally; because `develop`
+   is protected you cannot push it directly — put it on a `sync/` branch and
+   open a PR into `develop`.
+
+   > **The sync PR must be merged with a merge commit, NOT squashed.**
+   > Squashing collapses the two parents into one and discards the ancestry
+   > link, which is the entire point of the step.
+
+7. Create a GitHub Release for the tag (convention since v1.7.0, and how the
+   CHANGELOG section reaches users who don't read the repo).
+
+Step 6 is not optional. Because `main` only accepts squash merges, its new
 release commit has no parent relationship back to `develop` — skip this
 step and the *next* release PR will conflict against a stale merge-base
 (this happened going into v1.5.0: main and develop had silently diverged
@@ -204,11 +226,17 @@ since v1.4.0, producing conflicts across 11 files including core Rust
 source). The script performs a content-preserving `-X ours` merge — it
 verifies the resulting tree is byte-identical to develop's before allowing
 itself to proceed — so it only ever links history, never changes content.
+Confirm it worked with `git merge-base --is-ancestor origin/main
+origin/develop`.
 
 To publish to crates.io after tagging: `cargo publish -p devflow-core`
-first (it must be live on the registry before the next step, since
-`devflow`'s manifest depends on it by version, not by path, once
-packaged), then `cargo publish -p devflow`.
+**first**, then `cargo publish -p devflow`. This ordering is a hard
+requirement, not a convention — `devflow`'s manifest depends on
+`devflow-core` by version rather than by path once packaged, and as of
+v1.8.1 `devflow-cli` also carries a dev-dependency on it for the
+`test-support` feature. Publishing out of order fails to build. `cargo
+publish` waits for the registry to make the crate available before
+returning, so the second command can follow immediately.
 
 ## Commit Conventions
 

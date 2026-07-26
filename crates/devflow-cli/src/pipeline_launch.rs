@@ -130,6 +130,11 @@ pub(crate) fn launch_stage_inner(
     // (18b).
     state.monitor_pid = Some(pid);
     workflow::save_state(state)?;
+    // 23b: register this (project_root, phase) in the machine-global
+    // registry on the same code path that just recorded monitor_pid, so a
+    // running phase cannot be missing from `devflow gate list --all-roots`.
+    // Best-effort observability — never a reason to fail a launch.
+    let _ = devflow_core::registry::register(&state.project_root, state.phase);
     events::emit(
         &state.project_root,
         state.phase,

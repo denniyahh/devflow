@@ -50,20 +50,6 @@ pub fn spawn_monitor(
     spawn_monitor_inner(state, program, args, envs, true)
 }
 
-/// Spawn a monitor that owns the agent and records its capture files but does
-/// NOT advance the stage machine when the agent exits. Used by `sequentagent`,
-/// which drives its own synchronous handoff loop: the CLI blocks on the exit
-/// file (see [`wait_for_agent_exit`]) while the monitor guarantees capture
-/// survives even if the CLI dies.
-pub fn spawn_monitor_no_advance(
-    state: &State,
-    program: &str,
-    args: &[String],
-    envs: &[(String, String)],
-) -> Result<u32, MonitorError> {
-    spawn_monitor_inner(state, program, args, envs, false)
-}
-
 fn spawn_monitor_inner(
     state: &State,
     program: &str,
@@ -197,42 +183,6 @@ pub fn wait_for_agent_pid(project_root: &Path, phase: u32) -> Option<u32> {
     None
 }
 
-/// Block until the monitor records the agent's exit code, returning it.
-///
-/// Used by callers that need a synchronous run on top of monitor-owned
-/// execution (sequentagent's rebase handoff). Polls the exit file; if the
-/// monitor process disappears without ever writing it (killed, crashed),
-/// returns an error instead of hanging forever. There is deliberately no
-/// time-based cap — agent runs are legitimately long (tens of minutes) and
-/// monitor liveness is the meaningful bound.
-pub fn wait_for_agent_exit(
-    project_root: &Path,
-    phase: u32,
-    monitor_pid: u32,
-) -> Result<i32, MonitorError> {
-    let exit_path = crate::agent_result::exit_code_path(project_root, phase);
-    loop {
-        if let Ok(contents) = std::fs::read_to_string(&exit_path)
-            && let Ok(code) = contents.trim().parse::<i32>()
-        {
-            return Ok(code);
-        }
-        if !crate::agent::agent_running(monitor_pid) {
-            // One final read: the monitor may have written the file and
-            // exited between our read above and the liveness check.
-            if let Ok(contents) = std::fs::read_to_string(&exit_path)
-                && let Ok(code) = contents.trim().parse::<i32>()
-            {
-                return Ok(code);
-            }
-            return Err(MonitorError::Io(std::io::Error::other(format!(
-                "monitor (pid {monitor_pid}) exited without recording an exit code for phase {phase}"
-            ))));
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
 /// Escape a string for safe use in a single-quoted shell context.
 fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -341,6 +291,44 @@ mod tests {
     /// terminate the agent it owns. Before the fix, `cleanup()` only exited
     /// the monitor shell, leaving the agent orphaned and running/committing
     /// unsupervised with nothing left to call `devflow advance` for it.
+    /// A one-line identity/state summary of a pid, for failure diagnostics.
+    /// `Name`/`State`/`PPid` come from `/proc/<pid>/status`; the cmdline
+    /// distinguishes a shell that exec'd its command from one that forked it.
+    /// Test-only; never used in a decision.
+    fn proc_snapshot(pid: u32) -> String {
+        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+            return format!("GONE (no /proc/{pid})");
+        };
+        let field = |key: &str| {
+            status
+                .lines()
+                .find(|l| l.starts_with(key))
+                .map(|l| l.split_whitespace().skip(1).collect::<Vec<_>>().join(" "))
+                .unwrap_or_else(|| "?".into())
+        };
+        let cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))
+            .map(|raw| {
+                let joined = raw
+                    .split(|&b| b == 0)
+                    .filter(|a| !a.is_empty())
+                    .map(|a| String::from_utf8_lossy(a).into_owned())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if joined.is_empty() {
+                    "<empty>".to_string()
+                } else {
+                    joined
+                }
+            })
+            .unwrap_or_else(|e| format!("<unreadable: {e}>"));
+        format!(
+            "ALIVE Name={} State={} PPid={} cmdline=[{cmdline}]",
+            field("Name:"),
+            field("State:"),
+            field("PPid:")
+        )
+    }
+
     #[test]
     fn sigterm_to_monitor_also_kills_the_agent() {
         let dir = tempfile::tempdir().unwrap();
@@ -357,16 +345,44 @@ mod tests {
             "agent should be running before SIGTERM"
         );
 
+        // Snapshot both processes before signalling. This assertion fails in
+        // containerised CI and cannot be reproduced locally, and a bare
+        // "still running" message discards everything that could explain it
+        // — the same antipattern that made 999.47 expensive to diagnose.
+        let monitor_before = proc_snapshot(monitor_pid);
+        let agent_before = proc_snapshot(agent_pid);
+
         // SIGTERM the monitor, as an operator (or lock.rs's stale-holder
         // reclaim path) would to abort a run.
-        unsafe {
-            libc::kill(monitor_pid as libc::pid_t, libc::SIGTERM);
-        }
+        let kill_rc = unsafe { libc::kill(monitor_pid as libc::pid_t, libc::SIGTERM) };
+        let kill_err = if kill_rc == 0 {
+            "ok".to_string()
+        } else {
+            format!("errno {}", std::io::Error::last_os_error())
+        };
 
         // The agent should be killed promptly by the monitor's trap —
         // poll rather than sleep a fixed amount to keep this fast and
         // avoid flaking under load. (Window widened to 5s: at 2s this
         // still flaked under a fully parallel workspace test run.)
+        //
+        // 2026-07-26: this was widened 5s -> 15s for the containerised CI
+        // job and STILL failed, then reverted to 5s. That widening was a
+        // mistake: 15s is far beyond any plausible trap-and-kill latency,
+        // so the agent is not being reaped SLOWLY, it is not being reaped.
+        // Buying silence with a bigger number would have hidden a real
+        // defect behind a green check — the exact false negative this
+        // repository keeps getting bitten by.
+        //
+        // The trap mechanism itself is verified working: DevFlow's real
+        // monitor script shape was run under both `bash` and `dash` (the
+        // container's /bin/sh is dash, the Fedora host's is bash) and both
+        // killed the backgrounded agent correctly. So the defect is in how
+        // the agent is spawned or identified under container timing, not in
+        // the shell trap — see 999.47, whose confirmed transient fork/exec
+        // window is the prime suspect for the same class of failure here.
+        //
+        // Leave this red until that is fixed. Do NOT widen it again.
         let mut still_running = true;
         for _ in 0..250 {
             if !crate::agent::agent_running(agent_pid) {
@@ -375,43 +391,34 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+        let monitor_after = proc_snapshot(monitor_pid);
+        let agent_after = proc_snapshot(agent_pid);
+        let pidfile =
+            std::fs::read_to_string(crate::agent_result::agent_pid_path(dir.path(), state.phase))
+                .unwrap_or_else(|e| format!("<unreadable: {e}>"));
+
         assert!(
             !still_running,
-            "agent (pid {agent_pid}) was orphaned — still running after monitor SIGTERM"
+            "agent (pid {agent_pid}) was orphaned — still running after monitor SIGTERM\n\
+             \x20 monitor pid:      {monitor_pid}\n\
+             \x20 kill(TERM) rc:    {kill_rc} ({kill_err})\n\
+             \x20 monitor before:   {monitor_before}\n\
+             \x20 monitor after:    {monitor_after}\n\
+             \x20 agent pid:        {agent_pid}\n\
+             \x20 agent before:     {agent_before}\n\
+             \x20 agent after:      {agent_after}\n\
+             \x20 pidfile contents: {}\n\
+             Read the monitor's `after` line first. GONE means the shell died \
+             without running its trap — most likely SIGTERM arrived before \
+             `trap` was installed, or it was killed rather than handling the \
+             signal, either way leaving the agent unreaped. STILL ALIVE means \
+             the trap never fired or `kill $apid` failed, so compare the agent \
+             pid against the pidfile and check the agent's PPid: if PPid is not \
+             the monitor, `$!` did not name the process we are polling. If the \
+             agent's Name is `sh` rather than `sleep`, the agent shell forked \
+             rather than exec'd, so killing it leaves its own child behind.",
+            pidfile.trim()
         );
-    }
-
-    /// 14b: sequentagent's synchronous handoff = no-advance monitor + a
-    /// blocking wait on the exit file. The monitor still owns capture; the
-    /// caller gets the real exit code back.
-    #[test]
-    fn no_advance_monitor_plus_wait_returns_exit_code_and_captures() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = state_in(dir.path());
-        let args = vec!["-c".to_string(), "echo SEQ_READY; exit 3".to_string()];
-
-        let monitor_pid = spawn_monitor_no_advance(&state, "sh", &args, &[]).unwrap();
-        let code = wait_for_agent_exit(dir.path(), state.phase, monitor_pid)
-            .expect("exit code must be reaped");
-
-        assert_eq!(code, 3);
-        let captured =
-            std::fs::read_to_string(crate::agent_result::stdout_path(dir.path(), state.phase))
-                .unwrap_or_default();
-        assert!(
-            captured.contains("SEQ_READY"),
-            "stdout captured: {captured:?}"
-        );
-    }
-
-    /// A dead monitor that never wrote the exit file must yield an error, not
-    /// an infinite hang.
-    #[test]
-    fn wait_for_agent_exit_errors_when_monitor_is_gone() {
-        let dir = tempfile::tempdir().unwrap();
-        // PID that is essentially certain not to be alive; no exit file.
-        let err = wait_for_agent_exit(dir.path(), 4, 0x7FFF_FFFE).unwrap_err();
-        assert!(err.to_string().contains("without recording an exit code"));
     }
 
     #[test]

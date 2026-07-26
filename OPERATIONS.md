@@ -36,16 +36,18 @@ Define → Plan → Code → Validate → Ship
 | `devflow gate list` | Gates awaiting a response |
 | `devflow gate approve <phase> [--stage S] [--note ...]` | Approve a gate — the workflow advances |
 | `devflow gate reject <phase> --note ... [--stage S]` | Reject — loops back to Code; a note containing `abort` ends the phase |
+| `devflow gate sweep [--max-age-secs N] [--dry-run] [--root PATH]` | Answer or report aged, unattended gates across every registered root (or one `--root`) — bounds an abandoned run's lifetime without `kill(1)`. On-demand only; nothing schedules it. Never writes an approval |
 | `devflow parallel --phases 7,8 [--agents claude,codex] [--mode M] [--force]` | Run phases concurrently, each in its own worktree + monitor |
-| `devflow sequentagent --phase N --agents a,b [--force]` | Two agents sequentially on one phase with a rebase handoff |
 | `devflow list` | Feature branches with divergence from develop |
 | `devflow reference [--branch B] [--refresh]` | Static snapshot worktree at `.worktrees/reference/` |
+| `devflow stop --phase N [--root PATH]` | End a running phase cleanly (23c). Answers its open gate with a rejection if one is open — the target unwinds through its own abort path, no signal sent — otherwise signals the process recorded in `.devflow/lock-{phase:02}` (never `state.monitor_pid`, which the generated monitor script's trap only ever captures for the agent, not the trailing `advance`) after confirming it is alive and its `/proc/<pid>/cmdline` identifies it as belonging to DevFlow. Idempotent; marks `state.stopped`/`state.stop_reason` so `cleanup`'s existing fail-closed refusal (unweakened by this command) recognizes the phase as no longer live — `stop` then `cleanup --force` compose in that order |
 | `devflow cleanup [--force]` | Remove phase worktrees + their feature branches |
 | `devflow recover [--clean] [--phase N]` | Inspect state; `--clean` sweeps stale phases only; `--clean --phase N` clears one phase unconditionally |
 | `devflow test` | cargo test + clippy + fmt --check |
 | `devflow doctor [--json]` | Environment audit (agents installed, versions, RUST_LOG) plus per-phase reconciliation; `--json` emits one object `{"environment": [...], "reconciliation": [...]}` |
 | `devflow release --check` | Read-only release-cut preflight: workspace self-pin, develop/main divergence (no `git fetch` — reads already-fetched refs), crates.io publish order, and `gpg.format`-aware tag-signing viability. `--check` is required; a bare `devflow release` is rejected toward the deferred release-cut executor (merge/tag/sync/publish, DEN-50) |
 | `devflow ship --phase N [--force]` | **Dead-monitor recovery.** `devflow gate approve` only *writes* the Ship gate's response file — a live monitor polling for it is what actually advances the workflow. If that monitor died before consuming the response (e.g. the machine restarted mid-pipeline), the approval sits unconsumed forever. `devflow ship` reads the already-written Ship response directly and drives the phase through the same terminal path (`finish_workflow`) the live monitor would have — requires `state.stage == Stage::Ship` and an existing request+response pair with no prior ack. `--force` is accepted for explicit operator intent but never skips the stage check, the per-phase lock, the gate-existence check, or the ack check — it can never be used to skip Validate or jump ahead of a healthy pipeline. If the Ship response routes to a rejection that loops back to Code, `devflow ship` launches a **new, detached monitor agent** to drive the retry — the command prints this explicitly so it is never a silently long-running process. |
+| `devflow evidence --phase N [--json] [--require-shipped] [--root PATH]` | **Read-only structural oracle (23-06):** reports DevFlow's own append-only record of whether a phase actually shipped, instead of trusting an agent-authored attestation document. `shipped` is strictly true only after the terminal-only `workflow_shipped` event has been emitted (the last step inside `finish_workflow_with_gate_timeout`, once the entire post-Ship hook batch has succeeded) — a phase halted by `--until <stage>` always reports `shipped: false`, even though it emits the older, ambiguous `workflow_finished` event too (surfaced separately as `workflow_finished_seen`/`finished_reason` for corroboration, never consulted by `shipped`). `--require-shipped` exits non-zero unless `shipped` is true, so it is declarable as a `verify::external_verify_commands` Layer 0 probe (opt-in per phase; a phase's PLAN must declare it and the operator must approve it via `DEVFLOW_TRUST_EXTERNAL_VERIFY`) — a failed declared probe outranks every agent-controlled signal. |
 
 (`devflow advance` is internal — invoked by monitors with `--phase N`.)
 
@@ -89,11 +91,14 @@ only because a stage failed unexpectedly).
 | `DEVFLOW_GATE_TIMEOUT_SECS` | 604800 (7d) | How long a monitor waits at a gate before giving up |
 | `DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS` | 60 | How long `devflow ship --phase`'s foreground manual override waits for a reopened Ship gate (terminal-hook failure) before failing fast, instead of `DEVFLOW_GATE_TIMEOUT_SECS`' multi-day default |
 | `DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS` | 120 | Wait on the shared-checkout lock; on timeout the hook batch is skipped (loudly), never run unserialized |
+| `DEVFLOW_GATE_MAX_UNATTENDED_AGE_SECS` | 21600 (6h) | Age threshold `devflow gate sweep` uses to decide a gate is abandoned; independent of and much shorter than `DEVFLOW_GATE_TIMEOUT_SECS` — an unparsable value or explicit `0` falls back to the default rather than reaping every gate on the machine |
+| `DEVFLOW_CACHE_DIR` | unset (falls back to `$XDG_CACHE_HOME/devflow`, then `$HOME/.cache/devflow`) | Test/override hook for the machine-global registry directory (`devflow gate list --all-roots`) |
 | `DEVFLOW_CAPTURE_RETENTION` | 5 | Capture generations retained per phase; overrides `devflow.toml` |
 | `DEVFLOW_REVIEW_ANGLES` | built-in five-angle list | Comma-separated Ship review angles; overrides `devflow.toml` |
 | `DEVFLOW_EXTERNAL_VERIFY_ENABLED` | true | Enable PLAN-declared external post-condition probes; overrides `devflow.toml` |
 | `RUST_LOG` | `info` | Log verbosity (stderr) |
 | `DEVFLOW_LOG_FORMAT` | plain | `json` for machine-readable log lines |
+| `DEVFLOW_E2E_CHILD_TIMEOUT_SECS` | 90 | Test-only: bounds `gate_sweep_e2e.rs`'s patience with a spawned `devflow advance` child so CI cannot hang indefinitely; not read by any production code path |
 
 ## `.devflow/` file inventory
 
@@ -106,7 +111,7 @@ only because a stage failed unexpectedly).
 | `phase-NN-exit` / `phase-NN-agent-pid` | Exit code + PID the monitor records |
 | `gates/NN-<stage>.json` (+ `.response.json`, `.ack.json`) | Gate request / answer / receipt |
 | `events.jsonl` | Append-only event log (schema v1, one JSON object per line, phase id on every line) — tail it from any tool |
-| `cron-instructions-NN.json` | Rate-limit resume record — `devflow resume --phase N` for a paused single-agent run, or the `sequentagent` handoff command for a paused two-agent run |
+| `cron-instructions-NN.json` | Rate-limit resume record naming `devflow resume --phase N` for a paused run |
 | `history/phase-NN/` | Bounded archive of prior stage stdout/exit captures |
 
 Everything under `.devflow/` and `.worktrees/` is runtime state
