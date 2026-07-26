@@ -24,8 +24,8 @@ use parallel::{parallel, sequentagent};
 
 mod commands;
 use commands::{
-    cleanup, doctor, gate_list, gate_respond, gate_show, history_cmd, list, logs, recover_cmd,
-    reference, release_check, resolve_gate_target, start, status, test_cmd,
+    cleanup, doctor, gate_list, gate_respond, gate_show, gate_sweep, history_cmd, list, logs,
+    recover_cmd, reference, release_check, resolve_gate_target, start, status, test_cmd,
 };
 
 mod config_parse;
@@ -344,6 +344,22 @@ enum GateCmd {
         #[arg(default_value = ".")]
         project: PathBuf,
     },
+    /// Answer or report aged, unattended gates across every registered root
+    /// (23b) — bounds an abandoned run's lifetime without `kill(1)` and
+    /// without a supervisor. On-demand only: nothing schedules this for you.
+    Sweep {
+        /// Age threshold in seconds — a gate older than this is reaped.
+        /// Defaults to `DEVFLOW_GATE_MAX_UNATTENDED_AGE_SECS` (six hours).
+        #[arg(long = "max-age-secs")]
+        max_age_secs: Option<u64>,
+        /// Report what would be reaped without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Restrict the sweep to one project root instead of every root
+        /// this machine has registered (`registry::load_roots`).
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -464,6 +480,11 @@ fn run() -> Result<(), CliError> {
                 stage,
                 project,
             } => gate_show(&project_root(project)?, phase, stage),
+            GateCmd::Sweep {
+                max_age_secs,
+                dry_run,
+                root,
+            } => gate_sweep(max_age_secs, dry_run, root),
         },
         Command::Logs {
             phase,

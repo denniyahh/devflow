@@ -70,9 +70,65 @@ pub(crate) fn checkout_lock_timeout() -> std::time::Duration {
     parse_checkout_lock_timeout(std::env::var("DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS").ok())
 }
 
+/// Parse the raw value of the sweep's max-unattended-age override. Pure (no
+/// env access) so it's unit-testable without mutating process-global env.
+/// Both an unparsable value and an explicit zero fall back to the six-hour
+/// default — the fail-safe direction matters: a threshold of zero would
+/// make an invoked sweep reap every open gate on the machine on its next
+/// run, so a typo or an empty override must never resolve to "reap
+/// everything."
+fn parse_gate_max_unattended_age(raw: Option<String>) -> u64 {
+    const SIX_HOURS: u64 = 6 * 60 * 60;
+    match raw.and_then(|s| s.parse::<u64>().ok()) {
+        Some(0) | None => SIX_HOURS,
+        Some(secs) => secs,
+    }
+}
+
+/// How long an open gate may sit unattended before an invoked `devflow gate
+/// sweep` is willing to call it abandoned. Deliberately independent of and
+/// far shorter than [`gate_timeout_secs`]'s multi-day default: "how long to
+/// wait for a human" and "how long before a sweep gives up on one" are
+/// different questions, and conflating them is arguably what let the
+/// forensics record's oldest orphaned gates reach thirty hours. This value
+/// gates nothing on its own — the sweep it feeds is on-demand only
+/// (23-RESEARCH.md Open Question 3); nothing schedules it.
+pub(crate) fn gate_max_unattended_age_secs() -> u64 {
+    parse_gate_max_unattended_age(std::env::var("DEVFLOW_GATE_MAX_UNATTENDED_AGE_SECS").ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 23b (Task 2): the four fail-safe cases named in the plan's behavior
+    /// block — absent, explicit, unparsable, and explicit-zero. Named with a
+    /// `max_unattended_age_` prefix (not `parse_gate_max_unattended_age_`)
+    /// so these test names don't collide with the plan's literal `rg -n 'fn
+    /// parse_gate_max_unattended_age'` acceptance grep, which must match
+    /// only the function definition (23-03 precedent: `dereg_*` renaming).
+    #[test]
+    fn max_unattended_age_defaults_when_absent() {
+        assert_eq!(parse_gate_max_unattended_age(None), 6 * 60 * 60);
+    }
+
+    #[test]
+    fn max_unattended_age_parses_explicit_value() {
+        assert_eq!(parse_gate_max_unattended_age(Some("900".into())), 900);
+    }
+
+    #[test]
+    fn max_unattended_age_defaults_on_unparsable() {
+        assert_eq!(
+            parse_gate_max_unattended_age(Some("nonsense".into())),
+            6 * 60 * 60
+        );
+    }
+
+    #[test]
+    fn max_unattended_age_defaults_on_explicit_zero() {
+        assert_eq!(parse_gate_max_unattended_age(Some("0".into())), 6 * 60 * 60);
+    }
 
     #[test]
     fn parse_checkout_lock_timeout_defaults_and_parses() {

@@ -36,6 +36,7 @@ Define → Plan → Code → Validate → Ship
 | `devflow gate list` | Gates awaiting a response |
 | `devflow gate approve <phase> [--stage S] [--note ...]` | Approve a gate — the workflow advances |
 | `devflow gate reject <phase> --note ... [--stage S]` | Reject — loops back to Code; a note containing `abort` ends the phase |
+| `devflow gate sweep [--max-age-secs N] [--dry-run] [--root PATH]` | Answer or report aged, unattended gates across every registered root (or one `--root`) — bounds an abandoned run's lifetime without `kill(1)`. On-demand only; nothing schedules it. Never writes an approval |
 | `devflow parallel --phases 7,8 [--agents claude,codex] [--mode M] [--force]` | Run phases concurrently, each in its own worktree + monitor |
 | `devflow sequentagent --phase N --agents a,b [--force]` | Two agents sequentially on one phase with a rebase handoff |
 | `devflow list` | Feature branches with divergence from develop |
@@ -89,12 +90,14 @@ only because a stage failed unexpectedly).
 | `DEVFLOW_GATE_TIMEOUT_SECS` | 604800 (7d) | How long a monitor waits at a gate before giving up |
 | `DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS` | 60 | How long `devflow ship --phase`'s foreground manual override waits for a reopened Ship gate (terminal-hook failure) before failing fast, instead of `DEVFLOW_GATE_TIMEOUT_SECS`' multi-day default |
 | `DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS` | 120 | Wait on the shared-checkout lock; on timeout the hook batch is skipped (loudly), never run unserialized |
+| `DEVFLOW_GATE_MAX_UNATTENDED_AGE_SECS` | 21600 (6h) | Age threshold `devflow gate sweep` uses to decide a gate is abandoned; independent of and much shorter than `DEVFLOW_GATE_TIMEOUT_SECS` — an unparsable value or explicit `0` falls back to the default rather than reaping every gate on the machine |
 | `DEVFLOW_CACHE_DIR` | unset (falls back to `$XDG_CACHE_HOME/devflow`, then `$HOME/.cache/devflow`) | Test/override hook for the machine-global registry directory (`devflow gate list --all-roots`) |
 | `DEVFLOW_CAPTURE_RETENTION` | 5 | Capture generations retained per phase; overrides `devflow.toml` |
 | `DEVFLOW_REVIEW_ANGLES` | built-in five-angle list | Comma-separated Ship review angles; overrides `devflow.toml` |
 | `DEVFLOW_EXTERNAL_VERIFY_ENABLED` | true | Enable PLAN-declared external post-condition probes; overrides `devflow.toml` |
 | `RUST_LOG` | `info` | Log verbosity (stderr) |
 | `DEVFLOW_LOG_FORMAT` | plain | `json` for machine-readable log lines |
+| `DEVFLOW_E2E_CHILD_TIMEOUT_SECS` | 90 | Test-only: bounds `gate_sweep_e2e.rs`'s patience with a spawned `devflow advance` child so CI cannot hang indefinitely; not read by any production code path |
 
 ## `.devflow/` file inventory
 
