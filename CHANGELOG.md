@@ -11,6 +11,9 @@ The breaking change the v2.0.0 slot was held open for (milestone note,
 ### Added
 - **`devflow start` now refuses, before creating any worktree or branch, when the target phase is not reachable from `develop`** — the branch it forks from. Reachability means both the phase's `### Phase N:` heading in `ROADMAP.md` and its `.planning/phases/NN-*/` directory are present on `develop`; either being absent (checkably) refuses the run and names the missing half. This closes the exact 2026-07-26 acceptance-run failure: a phase promoted onto a feature branch and never merged to `develop` was invisible to the run, which then spent its Define stage discovering there was nothing to define before finally aborting. The check is skipped (fails open) when `develop` carries no `.planning/ROADMAP.md` at all, so repositories that don't keep a roadmap are unaffected (23f)
 
+### Fixed
+- **`devflow start`'s self-dogfood staleness guard no longer hard-blocks a build whose embedded commit has genuinely diverged from `HEAD` (neither is an ancestor of the other) but differs only in non-build files.** The divergent-lineage arm of `embedded_commit_is_stale` now runs the same content check the linear strict-ancestor arm already ran (`ancestry_range_affects_build`, reused verbatim, per 21d/999.29), instead of returning `Stale` unconditionally on any divergence. This fixes the 2026-07-26 phase-23 acceptance run, which was blocked before Define ever launched by a binary whose only divergence from the target `develop` tip was a `.planning/` doc commit. A divergent range that touches a real build-affecting file (`.rs`/`Cargo.toml`/`Cargo.lock`/`build.rs`/`rust-toolchain.toml`) still blocks, unchanged (23g)
+
 ## 1.8.1 — 2026-07-24
 
 Test-suite containment and quality cleanup. No behavior change for `devflow`
