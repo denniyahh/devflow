@@ -35,11 +35,21 @@ unset $(git rev-parse --local-env-vars) \
       GIT_NAMESPACE GIT_DISCOVERY_ACROSS_FILESYSTEM \
       GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM
 
-echo "pre-push: cargo fmt --check"
-cargo fmt --check
-
-echo "pre-push: cargo clippy --workspace --all-targets -- -D warnings"
-cargo clippy --workspace --all-targets -- -D warnings
-
-echo "pre-push: cargo test --workspace"
-cargo test --workspace
+# Verify in the pinned devcontainer image, not against the host toolchain.
+#
+# This hook used to run host `cargo` directly. That is how a commit passed
+# every check on this Fedora host and went red on a Debian runner minutes
+# later (999.47) — the hook was mirroring CI's *commands* but not its
+# *environment*, so it could only ever catch a subset of what CI catches.
+#
+# DEVFLOW_SKIP_CONTAINER_CHECK=1 falls back to host checks. That is a
+# deliberate escape hatch for when Docker is unavailable, and it is NOT
+# equivalent: a green host run does not imply CI will be green.
+if [ "${DEVFLOW_SKIP_CONTAINER_CHECK:-0}" = "1" ]; then
+    echo "pre-push: WARNING — container check skipped, running host checks."
+    echo "pre-push: a green result here does NOT imply CI will be green."
+    scripts/check.sh all
+else
+    echo "pre-push: scripts/check-in-container.sh all"
+    scripts/check-in-container.sh all
+fi

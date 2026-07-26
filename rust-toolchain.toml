@@ -1,3 +1,13 @@
+# Pinned to an exact version, deliberately — never a floating channel.
+#
+# `channel = "stable"` floats: the host, the CI runner, and the devcontainer
+# each resolve it whenever they happen to run, so they can silently drift onto
+# different compilers and produce a "works on my machine" nobody can attribute.
+# .devcontainer/devcontainer.json already pins its image with that reasoning
+# spelled out; this file was the remaining floating input.
+#
+# Bumping: change the version here, then run scripts/check-in-container.sh to
+# confirm the pinned image's rustup can install it before pushing.
 [toolchain]
-channel = "stable"
+channel = "1.97.1"
 components = ["clippy", "rustfmt"]
