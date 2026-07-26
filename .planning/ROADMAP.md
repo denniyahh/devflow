@@ -871,18 +871,49 @@ count came from a lowercase-only grep that missed the PascalCase Rust
 identifiers. The 11-file count is correct. Four operator documents mention the
 verb (README, ARCHITECTURE, OPERATIONS, CHANGELOG), not two.
 
+**Cross-AI review revision, 2026-07-26 (`23-REVIEWS.md`, verdict
+`changes_requested`).** Three lanes (Codex / OpenCode / Hermes); every HIGH
+finding was re-verified against source by the orchestrator before replanning.
+Plans 23-03 … 23-11 were revised in place — no renumbering, no new plan, no
+change to any `depends_on` edge, so the wave assignment above is unchanged.
+Four required findings, all now closed in the plan text:
+
+1. **23-06's shipped predicate was itself a false green.** `workflow_finished`
+   is emitted at two sites, not one — real Ship finalization
+   (`pipeline_gate.rs:221`, `Null` payload) *and* `transition`'s
+   `devflow start --until` clean-stop branch (`pipeline_gate.rs:79`, payload
+   `{"reason":"stopped_at"}`), which returns before any hook runs. The oracle
+   built to eliminate false greens would have reported **shipped** for a phase
+   halted after one stage — the shape the run record already logs for Phase 21.
+   Fixed by emitting a distinct terminal-only **`workflow_shipped`** event with
+   exactly one emission site and making that the predicate.
+2. **23-10's one-way authorization preceded the rehearsal it demanded
+   confirmation of.** Split into a reversible target selection (Task 1) and the
+   one-way authorization (Task 4), with the rebuild, recovery rehearsal, remote
+   restore-path discovery and both content preconditions in between.
+3. **Verification chains could exit 0 on a broken build.** The
+   `cargo test … | rg -q 'FAILED' && exit 1 || cargo clippy …` shape in four
+   plans falls through to the `||` branch when a compile, link, or panic failure
+   prints no `test result: FAILED` line. Replaced everywhere with direct
+   `&&` status chains; targeted runs now capture to a gitignored log and gate on
+   cargo's own exit status before asserting a nonzero pass count.
+4. **23-03's registry contradicted itself on concurrency.** Storage reshaped
+   from one shared `roots.json` to one file per `(project_root, phase)`, so a
+   concurrent registration cannot be lost and "a running phase cannot be missing
+   from the registry" is structurally true rather than aspirational.
+
 Plans:
 
 - [x] 23-01-PLAN.md — Rebuild the binary and scaffold an isolated scratch probe target (23a)
 - [x] 23-02-PLAN.md — 23a probe: one unattended run, recorded where it stopped (23a)
-- [ ] 23-03-PLAN.md — 23b: cross-root gate registry + `devflow gate list --all-roots`
+- [ ] 23-03-PLAN.md — 23b: cross-root gate registry (one file per root/phase) + `devflow gate list --all-roots`
 - [ ] 23-04-PLAN.md — 23b: `devflow gate sweep` — bound gate lifetime by auto-rejecting aged gates
 - [ ] 23-05-PLAN.md — 23c: `devflow stop`, targeting the lock holder
-- [ ] 23-06-PLAN.md — 23e: Ship-evidence oracle + enforced merge post-condition
+- [ ] 23-06-PLAN.md — 23e: terminal-only `workflow_shipped` event + Ship-evidence oracle + enforced merge post-condition
 - [ ] 23-07-PLAN.md — 23d: delete the two-agent verb from the CLI crate + reconcile docs
 - [ ] 23-08-PLAN.md — 23d: delete the core-side surface, workspace count to zero
 - [ ] 23-09-PLAN.md — `--yes-ship`: per-run flag, one auto-answered Ship gate
-- [ ] 23-10-PLAN.md — Acceptance prep: authorization, rehearsed recovery point, preconditions
+- [ ] 23-10-PLAN.md — Acceptance prep: target selection, rehearsed recovery point, preconditions, then one-way authorization
 - [ ] 23-11-PLAN.md — Acceptance run: one phase Define→Ship, unattended, self-hosted
 
 *(The original 23-03…23-12 are archived under `superseded/` — see the re-aim
@@ -911,7 +942,7 @@ unchanged and already merged.)*
 
 **Wave 4** *(blocked on 23-05)*
 
-- [ ] 23-06 — 23e: `devflow evidence` oracle, `--require-shipped`, merge post-condition in the Merge hook (23e)
+- [ ] 23-06 — 23e: terminal-only `workflow_shipped` event, `devflow evidence` oracle, `--require-shipped`, merge post-condition in the Merge hook (23e)
 
 **Wave 5** *(blocked on 23-06)*
 
@@ -924,7 +955,7 @@ unchanged and already merged.)*
 
 **Wave 7** *(blocked on 23-08 and 23-09)*
 
-- [ ] 23-10 — Acceptance prep: D-07 authorization, rehearsed recovery point, seven behavioural checks (all units)
+- [ ] 23-10 — Acceptance prep: target selection, seven behavioural checks, rehearsed recovery point, content preconditions, then the D-07 one-way authorization (all units)
 
 **Wave 8** *(blocked on 23-10)*
 
