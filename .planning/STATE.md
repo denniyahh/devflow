@@ -6,15 +6,15 @@ current_phase: 23
 current_phase_name: end-to-end-dogfood
 status: executing
 stopped_at: Phase 23 context gathered
-last_updated: "2026-07-25T23:58:48.727Z"
+last_updated: "2026-07-26T01:06:05.886Z"
 last_activity: 2026-07-25
 last_activity_desc: Phase 23 execution started
 progress:
   total_phases: 12
   completed_phases: 11
   total_plans: 87
-  completed_plans: 76
-  percent: 86
+  completed_plans: 78
+  percent: 90
 ---
 
 # DevFlow — Project State
@@ -87,8 +87,8 @@ change earns 2.0.
 ## Current Position
 
 Phase: 23 (end-to-end-dogfood) — EXECUTING
-Plan: 1 of 12
-Status: Ready to execute
+Plan: 1 of 11
+Status: Executing Phase 23
 Last activity: 2026-07-25 — Phase 23 execution started
 
 Progress: Phases 21 (v1.8.0) and 22 (v1.8.1) shipped. Phase 22's missing SUMMARY/VERIFICATION artifacts backfilled 2026-07-25 (`9eb4010`), clearing a false "incomplete phase" route in /gsd-progress. Phase 23 rescoped from "Test Suite & CI Hardening" to the end-to-end Claude dogfood goal; acceptance is behavioural — one phase driven start-to-finish by devflow, unattended, reaching a completed Ship stage.

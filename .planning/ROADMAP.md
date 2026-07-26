@@ -740,7 +740,7 @@ Plans carry the unit identifiers `23a`, `23b`, `23c`, `23d`, `23e` and
 `yes-ship` as requirement tokens. **`23b` and `23c` were redefined, and `23e`
 added, by the 2026-07-25 replan** — see "Re-aimed 2026-07-25" below.
 **Depends on:** Phase 22
-**Plans:** 2/11 plans executed (23-01, 23-02 merged; 23-03…23-11 replanned
+**Plans:** 3/11 plans executed
 2026-07-25; the original 23-03…23-12 are archived under
 `phases/23-end-to-end-dogfood/superseded/`)
 
@@ -840,21 +840,26 @@ Plans 23-03…23-12 were built on the disproved premise and are archived to
   aged gates through the existing `Gates::respond` protocol so the still-polling
   `advance` tears itself down via its own `abort()` path — no signal, no
   supervisor, no new dependency (23-04).
+
 - **23c — REDEFINED, smaller.** `devflow stop` (23-05), no longer blocked on 23b.
   Built against the existing per-phase lock file, which already records the exact
   PID to signal. Targets the lock holder, never `state.monitor_pid` — the monitor
   shell's trap only ever tracks the agent, so signalling it orphans `advance`
   rather than stopping it.
+
 - **23e — NEW this replan.** The false-green attestation class: a structural
   Ship-evidence oracle (`devflow evidence`), declarable as a Layer 0 probe, plus
   an enforced merge post-condition (23-06). `devflow-core` never reads
   `VERIFICATION.md`, so the catch that worked was a non-deterministic prompt-side
   review, not an enforced invariant.
+
 - **23d — UNCHANGED**, and no longer front-loaded. Its original "delete before
   the migration" rationale died with the supervisor deferral, so it now follows
   the evidence-priority work (23-07, 23-08).
+
 - **`--yes-ship` — UNCHANGED, and now the binding constraint** on the acceptance
   criterion, since `Mode::should_gate` gates Ship in both modes (23-09).
+
 - **The socket-addressable supervisor is DEFERRED, not discarded** — with it,
   D-08 and D-10. Nothing in the evidence shows this phase's acceptance criterion
   requires it; building it now would fix a problem the probe did not find.
@@ -887,16 +892,19 @@ Four required findings, all now closed in the plan text:
    halted after one stage — the shape the run record already logs for Phase 21.
    Fixed by emitting a distinct terminal-only **`workflow_shipped`** event with
    exactly one emission site and making that the predicate.
+
 2. **23-10's one-way authorization preceded the rehearsal it demanded
    confirmation of.** Split into a reversible target selection (Task 1) and the
    one-way authorization (Task 4), with the rebuild, recovery rehearsal, remote
    restore-path discovery and both content preconditions in between.
+
 3. **Verification chains could exit 0 on a broken build.** The
    `cargo test … | rg -q 'FAILED' && exit 1 || cargo clippy …` shape in four
    plans falls through to the `||` branch when a compile, link, or panic failure
    prints no `test result: FAILED` line. Replaced everywhere with direct
    `&&` status chains; targeted runs now capture to a gitignored log and gate on
    cargo's own exit status before asserting a nonzero pass count.
+
 4. **23-03's registry contradicted itself on concurrency.** Storage reshaped
    from one shared `roots.json` to one file per `(project_root, phase)`, so a
    concurrent registration cannot be lost and "a running phase cannot be missing
@@ -906,7 +914,7 @@ Plans:
 
 - [x] 23-01-PLAN.md — Rebuild the binary and scaffold an isolated scratch probe target (23a)
 - [x] 23-02-PLAN.md — 23a probe: one unattended run, recorded where it stopped (23a)
-- [ ] 23-03-PLAN.md — 23b: cross-root gate registry (one file per root/phase) + `devflow gate list --all-roots`
+- [x] 23-03-PLAN.md — 23b: cross-root gate registry (one file per root/phase) + `devflow gate list --all-roots`
 - [ ] 23-04-PLAN.md — 23b: `devflow gate sweep` — bound gate lifetime by auto-rejecting aged gates
 - [ ] 23-05-PLAN.md — 23c: `devflow stop`, targeting the lock holder
 - [ ] 23-06-PLAN.md — 23e: terminal-only `workflow_shipped` event + Ship-evidence oracle + enforced merge post-condition
