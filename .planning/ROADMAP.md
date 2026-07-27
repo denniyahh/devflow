@@ -702,6 +702,14 @@ Plans:
 
 **SCOPE CORRECTED 2026-07-26 (post-phase-23 verification).** The original entry claimed "every full `cargo test --workspace` refills the machine's orphan population." **That is not reproducible on the current tree and the title has been corrected accordingly.** Two consecutive full runs (`cargo test --workspace --no-fail-fast`, true cargo exit 0, 592 passed / 0 failed across 16 binaries) left **zero** orphaned `devflow advance` processes — `wait_for_child_exit`'s bounded `wait()` in both suites does reap the direct child. What those two runs *did* leak is **2 scratch directories**. The standing population is **410 dirs / 300 MB spanning 2026-07-21 → 2026-07-26**, i.e. accumulated from interrupted and crashed development runs plus the roots held open by the genuinely orphaned processes, **not** from clean runs. Whoever picks this up should scope it as directory-lifecycle hygiene and treat any process-reaping work as belonging to 999.44 instead.
 
+**RE-OPENED 2026-07-27 — the process leak DID reproduce, and the prior "zero" may be a measurement artifact.** During Phase 24's acceptance run, two orphaned monitor/agent pairs were created at 05:21 and 05:26, squarely inside the Code stage window (05:04:29 → 05:41:20), on a stage that completed normally (exit 0, clean transition to Validate) — not an interrupted or crashed run. Their scratch roots `/tmp/.tmp6087E2` and `/tmp/.tmpczQmqp` still exist and still carry `phase-12-*` fixture paths, matching this entry's named suites.
+
+**Census at 2026-07-27:** **14 orphaned monitor/agent pairs (28 processes, ~123 MB RSS, oldest ~19h)**, and **456 scratch dirs / 302 MB** — up from the 410 dirs / 300 MB recorded above.
+
+**Hypothesis for the contradiction, needs confirming before either measurement is trusted:** these processes reparent to `systemd --user` (pid 1965 on this host), **not** to pid 1, because `systemd --user` sets itself as a child subreaper. A census that tests `ppid == 1` returns **zero orphans on any systemd host even while dozens exist** — and that is exactly the shape of the "two consecutive clean runs left zero orphaned processes" result above. This was reproduced live while writing this entry: `ppid==1` counted 0, while `ppid==1965` counted 14. Whoever picks this up should first re-run the original scope-correction measurement with a subreaper-aware predicate before concluding anything about clean-run behaviour; the earlier result may be correct, but it cannot be relied on until re-measured.
+
+**Priority:** raise back to Medium if the re-measurement confirms clean-run leakage.
+
 **Do not weaken the tests to fix this.** Spawning a real child is what makes them strong — plan 23-04's summary correctly calls it the suite's strongest claim, and plan 23-05's `stop_e2e` depends on the same property. The fix belongs in teardown, not in the assertion.
 
 **Fix direction:** a `Drop` guard or explicit teardown that stops each spawned child, ideally exercising `devflow stop` so the cleanup path is itself under test.
@@ -791,6 +799,49 @@ child /proc/7335/exe: /usr/bin/sleep
 **Related TOCTOU, likely 999.44's scope:** even a correct predicate is checked and *then* acted on — the pid can be recycled between `looks_like_devflow_process(pid)` and `terminate(pid)`.
 
 **Priority:** High — raised from Medium once test (2) showed `devflow stop` actually signalling a non-devflow process, rather than a predicate merely returning the wrong value. | **Size:** S–M — S if the diagnostics name a simple cause, M if it needs a non-pid identity handle. Linear: DEN-72.
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.48: Driving Binary Is Re-Checked for Staleness Mid-Run, Halting Self-Modifying Phases (BACKLOG)
+
+**Goal:** `enforce_build_staleness` is called inside `launch_stage` (`pipeline_launch.rs:93`), so D-18's staleness check re-runs at **every** stage launch, not once at `devflow start`. When DevFlow drives a phase that modifies DevFlow's own source, the first stage boundary after that code lands re-evaluates the binary against the now-ahead worktree, classifies it `Stale`, and hard-blocks. Such a phase can never complete unattended.
+
+**Evidence — Phase 24, 2026-07-27.** The run reached Define→Plan→Code fully unattended (a project first; no phase had previously passed Define), then halted at the Validate boundary with `self_dogfood_stale_blocked`. The Code stage itself succeeded: exit 0, 15 commits, both plans complete with SUMMARYs, review, and UAT. The build-affecting diff that tripped the guard was `crates/devflow-core/src/git.rs` and `crates/devflow-cli/tests/release_check.rs` — i.e. the phase's own deliverable. Detail: `23-ACCEPTANCE-RUN-3.md`.
+
+**This was structurally guaranteed at scoping time.** Phase 24 was promoted as the acceptance target for being "low-stakes *by consequence*" — a preflight advisory touching no merge/version/ship control flow. That criterion measured blast radius, not self-modification. Any phase editing DevFlow's compiled source hits this regardless of blast radius.
+
+**Fix direction — pin the driver.** Once the initial check passes at `devflow start`, hold that verdict for the remainder of the phase run instead of re-evaluating against the evolving worktree. Record the pinned commit in the event log so the provenance stays auditable.
+
+**Rejected alternatives, with reasons (do not re-propose without addressing these):**
+
+1. **Rebuild the binary mid-run.** Adopts *unvalidated* code into the driver and makes the change under test partly responsible for certifying itself. Rejected by the operator 2026-07-27: *"I don't want unvalidated code to be used to rebuild the binary mid-run. Only validated and pushed code should ever be used. What if the code fails validation?"* Confirmed unnecessary as well as unsafe: `check_ssh_signing_viability` has one caller (`git.rs:831`) and is on no pipeline path — `hooks_after_ship` is Merge→VersionBump→ChangelogAppend→BranchCleanup, and neither Validate nor Ship invokes `release --check`. The rebuild would have carried all of the risk for none of the benefit.
+2. **A dogfood bypass flag.** `is_self_dogfood_workspace` (`staleness.rs:240`) already restricts the hard block to a `Cargo.toml` whose `members` is exactly `crates/devflow-core` + `crates/devflow-cli` — this repository and nothing else, with tests asserting lookalikes don't trip it. A "bypass for dogfooding" therefore disables the guard in the only circumstance it ever fires: equivalent to deleting D-18. It also contradicts D-05's precedent that a dangerous authorization must be typed per-invocation and never become a standing default — and a stale binary is worse than `--yes-ship`, which at least produces a visible merge rather than silently wrong evidence.
+
+**Design principle:** separate **driver** from **subject**. The driver's trustworthiness comes from *provenance* — built from a validated, pushed, CI-green commit — not from matching the worktree it happens to drive. The subject is validated by `cargo test` compiled from source, which never consults the installed binary. D-18 currently conflates the two. A stronger variant worth evaluating: drive self-dogfood runs from an installed release rather than `target/release/` of the repo under test.
+
+**Do not weaken D-18 generally.** It is correct for its originating incident (Phase 16 false evidence: committed, forgot to rebuild). The defect is its *scope*, not its existence.
+
+**Priority:** High | **Size:** S–M — S if pinning is a state field threaded through `launch_stage`, M if it needs the installed-release driver model. Linear: DEN-73.
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.49: `compute_version` Derives a Nonsensical Version from Tag Count and Describe Distance (BACKLOG)
+
+**Goal:** `compute_version` (`version.rs:142-150`) composes major from `Cargo.toml`, minor from `count_git_tags()` — a raw `git tag` line count with **no semver filter at all** — and patch from `commits_since_last_minor_tag()` via `git describe --tags --abbrev=0` distance. None of the three tracks semver intent.
+
+**Measured 2026-07-27 at `origin/develop` `9916e2f`:** major=`1`, minor=`11` (eleven tags, one being the non-version `archive-planning-docs-2026-07-24`), patch=`359` (distance from `v1.4.0`). Computed version ≈ **`1.11.359`**, against a real project version of `1.8.1` and a `CHANGELOG.md` staging `2.0.0`.
+
+**Root cause of the describe anomaly — verified, and this corrects an earlier hypothesis.** A previous analysis attributed it to git's default `--candidates=10` being exceeded at 11 tags; that is wrong, and `--candidates=20`/`50` change nothing. `git describe` selects the tag with the **fewest commits to HEAD**. This repository tags releases on squash-merges landing on `main`, then folds them back with `-X ours` sync merges. `v1.4.0` sits on a develop-side commit (distance 359); `v1.5.0`..`v1.8.1` sit on the main-side chain (distance 656+). `git merge-base --is-ancestor v1.4.0 v1.8.1` exits 1 — genuinely divergent lineages. So an older tag legitimately registers as "nearer" than a newer one.
+
+**Impact.** `hooks_after_ship` runs Merge → VersionBump → ChangelogAppend → BranchCleanup as a **fail-fast batch with no rollback**, and `merge_feature`'s doc comment states the no-rollback policy explicitly. Any DevFlow-driven ship writes `~1.11.x` into `Cargo.toml`, tags it, and appends a changelog entry describing it — onto `develop`, after the merge has already committed.
+
+**Why this is still open.** Surfaced twice (23-14 pre-run analysis; again 2026-07-27 pre-launch) and deferred both times *because no acceptance run ever reached Ship*. Phase 24 shipped by manual PR, which bypasses `hooks_after_ship` entirely. The defect is therefore fully latent and will fire on the **first** DevFlow-driven ship that ever succeeds — including the next acceptance attempt.
+
+**Priority:** High — it is the one known defect guaranteed to corrupt a real release, and it is armed the moment 999.48 unblocks an end-to-end run. | **Size:** S — filter `count_git_tags` to semver tags and anchor the patch count to the highest reachable version tag rather than `git describe`'s nearest. Linear: DEN-74.
 
 Plans:
 
