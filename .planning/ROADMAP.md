@@ -1398,8 +1398,8 @@ Plans:
 ### Phase 25: End-to-End Dogfood Blockers — Start, Progress, Finish, Recover
 
 **Goal:** Make an unattended `devflow start --phase N --agent claude --mode auto --yes-ship` run reach a completed Ship stage **without a human touching it**, by closing the four things that currently prevent it. Phase 23 proved the goal is not reachable today: its third acceptance attempt drove Define→Plan→Code unattended — the furthest any run has gone — then halted, and two of its three attempts additionally required a human to repair the base ref before `devflow start` would even launch. This phase closes the specific, individually-evidenced blockers rather than re-attempting the run and rediscovering them.
-**Priority:** High | **Size:** M — five units, each S or S–M, all with a filed Linear issue and reproduction already recorded. No design pass needed; the fix directions are written.
-**Requirements**: TBD — promoted from backlog 999.51, 999.48, 999.49, 999.44, 999.47
+**Priority:** High | **Size:** M — six units. Five are S or S–M with a filed Linear issue and recorded reproduction; 25f is S and docs-only. No design pass needed; the fix directions are written.
+**Requirements**: TBD — promoted from backlog 999.51, 999.48, 999.49, 999.44, 999.47; plus 25f (CONTRIBUTING release-procedure drift, no backlog entry — found 2026-07-27)
 **Depends on:** Phase 24
 **Plans:** 0 plans
 
@@ -1417,6 +1417,8 @@ Plans:
 **Plus one unit that is not a requirement but a stall generator:**
 
 **25e** — 999.47 / DEN-72. `MAX_CONSECUTIVE_FAILURES = 3` (`mode.rs:18`) forces a gate after three consecutive Validate failures. A test that fails roughly half the time under CI load is therefore not merely CI noise inside an unattended loop — it is a mechanism for halting a healthy run. Cheapest unit in the phase; its production risk is already closed, so this is test-only work.
+
+**25f** — CONTRIBUTING.md's release procedure is stale in two ways after the signing work merged in PR #38, and both mislead at the highest-stakes step. **(a)** Step 5 says `git tag -s vX.Y.Z <commit>`. On a machine where the agent works, `user.signingkey` is the *agent's* key, so that command produces an **agent-signed release tag** — exactly what the maintainer-key policy exists to prevent. The `pre-push` hook now refuses to push such a tag, so the outcome is a blocked release rather than a mis-signed one, but the operator discovers it *after* the squash-merge to `main` has already happened. Step 5 must direct the reader to `git -c user.signingkey="$(git config --get devflow.releaseSigningKey)" tag -s …`. **(b)** The same step warns that "a repo-local `tag.gpgsign=false` means `-a` alone will not sign" — no longer true, since the tracked `.gitconfig` added in #38 sets `tag.gpgsign=true`. A reader following a stale warning reasons about the wrong failure mode. Size S, docs-only. Found 2026-07-27 while walking the v2.0.0 release; the drift was introduced by #38 itself, so it is this project's own regression to close.
 
 **Sequencing.** 25a → 25b → 25c is the spine and is ordered: a run must start correctly before "does it progress" is even observable, and must progress before "does it finish correctly" can be tested. 25d and 25e are independent of the spine and of each other, so they can run in parallel with it.
 
