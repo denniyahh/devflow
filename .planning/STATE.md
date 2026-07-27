@@ -5,14 +5,14 @@ milestone_name: milestone (open — no fixed closing phase)
 current_phase: 24
 current_phase_name: BACKLOG
 status: planning
-stopped_at: Phase 25 context gathered
-last_updated: "2026-07-27T16:08:11.949Z"
+stopped_at: Phase 25 planned — 7 plans, 3 waves, plan-checker PASS
+last_updated: "2026-07-27T18:39:26.337Z"
 last_activity: 2026-07-27
 last_activity_desc: Phase 23 complete, transitioned to Phase 24
 progress:
   total_phases: 14
   completed_phases: 13
-  total_plans: 94
+  total_plans: 101
   completed_plans: 94
   percent: 93
 ---
@@ -781,6 +781,6 @@ None currently open for Phase 17.
 
 ## Session
 
-**Last session:** 2026-07-27T16:08:11.908Z
-**Stopped at:** Phase 25 context gathered
-**Resume file:** .planning/phases/25-end-to-end-dogfood-blockers/25-CONTEXT.md
+**Last session:** 2026-07-27T18:39:26.294Z
+**Stopped at:** Phase 25 planned — 7 plans, 3 waves, plan-checker PASS
+**Resume file:** .planning/phases/25-end-to-end-dogfood-blockers/25-01-PLAN.md
