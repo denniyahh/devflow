@@ -494,3 +494,69 @@ fn release_check_signing_degrades_when_ssh_add_absent() {
         "must not panic, got: {stdout}"
     );
 }
+
+/// D-06/D-08/D-10/D-11 (24-02 Task 2): the fail-soft proof for an inline
+/// `user.signingkey` when the ssh tooling itself is absent from `PATH`. No
+/// real keypair is generated — the point under test is the classification
+/// (inline vs. path), not fingerprinting, and the tooling that would
+/// fingerprint it is deliberately absent here.
+///
+/// The load-bearing assertion is the absence of the signing check's
+/// `NotViable` remediation hint (copied character-for-character from
+/// `check_signing` in `commands.rs`): `install_hint` is `None` on the
+/// `Unknown` arm and `Some(...)` only on `NotViable`, so a hard-failing
+/// signing check always prints this hint and a fail-soft one never does.
+/// Before 24-01, an inline value on this same fixture hit the path branch's
+/// missing-key-file `NotViable` and printed exactly this hint — that is the
+/// headline defect this assertion falsifies.
+#[test]
+fn release_check_inline_signingkey_degrades_to_warn_when_ssh_tooling_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_repo(root);
+    commit(root, "base.txt");
+    git(root, &["config", "gpg.format", "ssh"]);
+    let inline_blob = "key::ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFAKEFIXTUREKEYMATERIALZZZZZZZZZZZZZZZZZZZZZZ devflow-fixture";
+    git(root, &["config", "user.signingkey", inline_blob]);
+
+    let isolated_home = tempfile::tempdir().unwrap();
+    let path_dir = git_only_path();
+    let output = Command::new(devflow_bin())
+        .arg("release")
+        .arg("--check")
+        .arg(root)
+        .env("HOME", isolated_home.path())
+        .env("PATH", path_dir.path())
+        .output()
+        .expect("spawn devflow release");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("ssh-add not found"),
+        "expected the fail-soft 'ssh-add not found' reason (D-06), got: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !stdout.contains("resolve before attempting the signed release tag"),
+        "expected NO signing remediation hint — its presence would mean the inline value \
+         produced a hard NotViable fail instead of a fail-soft warn, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("user.signingkey is set but the key file does not exist"),
+        "expected no missing-key-file diagnostic for an inline value, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFAKEFIXTUREKEYMATERIALZZZZZZZZZZZZZZZZZZZZZZ"
+        ),
+        "expected no part of the configured inline blob in output, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("AAAAC3NzaC1lZDI1NTE5AAAAIFAKEFIXTUREKEYMATERIALZZZZZZZZZZZZZZZZZZZZZZ"),
+        "expected no part of the key's base64 body token in output, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("panicked"),
+        "must not panic, got: {stdout}"
+    );
+}
