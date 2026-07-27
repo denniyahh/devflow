@@ -155,6 +155,29 @@ from the policy I originally defined."*
   breaking changes.
   — **Reversibility:** reversible.
 
+  **AMENDED during plan review, 2026-07-27 — the literal range is wrong; see
+  `25-01-PLAN.md` §`<measured_correction>`.** `baseline..HEAD` as written above
+  yields **678 of this repository's 797 non-merge commits**, reaching back to
+  2026-06-20, because every release squash-merges `develop`→`main` — so no
+  develop-side commit is ever an ancestor of a release tag, while the `-X ours`
+  sync merge-back restores ancestry only in the direction D-07 needs. Measured
+  live: `v2.0.0..HEAD` = 678 commits / 62 `feat` → `2.1.0`, against a correct
+  `2.0.1`. **The permanence trap is the disqualifier:** the first commit
+  anywhere carrying `!` or `BREAKING CHANGE:` never leaves the range, so D-09's
+  gate would fire on every subsequent ship forever — turning the unattended run
+  this phase exists to unblock into a permanent halt.
+
+  The rule above is unchanged; only the commit set fed to the classifier
+  changes, via a two-branch anchor verified on both topologies present here.
+  `--first-parent` was measured as an alternative and does **not** fix it (383
+  commits). The operator reviewed the simpler alternatives — implementing D-08
+  literally, and replacing the whole classifier with a suggest-and-confirm
+  mechanism — and elected on 2026-07-27 to **keep the full classifier including
+  the anchor**.
+
+  **This deepens D-12:** the sync merge is now load-bearing in a *second* way —
+  it is the range anchor, not only the ancestry restorer.
+
 - **D-09:** **A major bump opens a gate; it never ships unattended.** Detection
   runs as a **named preflight check** inside `run_preflight`
   (`crates/devflow-cli/src/preflight.rs`), reusing the existing gate + notify
@@ -273,12 +296,20 @@ from the policy I originally defined."*
 - **D-17:** 25a (999.51) and 25d (999.44) were offered for discussion and the
   operator elected not to open them. Their backlog entries' fix directions
   stand as written and are the planner's input:
-  - **25a** — 999.51's three options (fetch-before-resolve / resolve against
-    `origin/develop` / compare-and-refuse-loudly), operator's tension
-    unresolved: refuse-loudly is the S-sized variant the entry sizes for, but a
-    refusal still means an unattended run does not start. The entry's binding
-    constraint: *"the 'heading present but code stale' case must be closed, not
-    just the 'heading absent' one."*
+  - **25a** — ~~unresolved~~ **RESOLVED during plan review, 2026-07-27. See
+    `25-05-PLAN.md` §`<resolved_decision>` (D-18a).** Selected: fetch, compare,
+    **fast-forward the local base when it is safe, else refuse loudly.** The
+    deciding fact is that local `develop` is behind `origin/develop` in the
+    *normal steady state* after any PR-merged ship, so refuse-loudly would halt
+    on the common path rather than an edge case. The operator's simplicity
+    tiebreaker was applied and found not to govern — simplicity decides between
+    options that both work, and refuse-loudly does not make an unattended run
+    start. Consequence: `25-05-PLAN.md` dropped its `checkpoint:decision` and is
+    now `autonomous: true`; the "no `git fetch` in the start path" property at
+    `commands.rs:1877`/`:1980` is **reversed for the start path** and must be
+    re-worded there rather than left contradicting the code.
+    The entry's binding constraint still governs: *"the 'heading present but
+    code stale' case must be closed, not just the 'heading absent' one."*
   - **25d** — registry-independent PID discovery, safe on a shared machine;
     **must** escalate `TERM` → `KILL` with a bounded wait and *verify* death
     rather than assume it; **must** reap the wrapper/child pair together
