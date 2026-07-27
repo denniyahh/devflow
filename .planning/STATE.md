@@ -2,19 +2,19 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone (open — no fixed closing phase)
-current_phase: 999.1
+current_phase: 24
 current_phase_name: BACKLOG
 status: planning
-stopped_at: "Phases 23 and 24 both complete and merged (develop 40fce19). No active phase — next work is the backlog; highest-priority items are 999.48/DEN-73 (pin the driving binary) and 999.49/DEN-74 (compute_version)."
-last_updated: "2026-07-27T10:40:00.000Z"
+stopped_at: Phase 25 context gathered
+last_updated: "2026-07-27T16:08:11.949Z"
 last_activity: 2026-07-27
-last_activity_desc: "Phases 23 and 24 complete; no active phase (phase.complete advanced to 24, corrected — 24 was already complete)"
+last_activity_desc: Phase 23 complete, transitioned to Phase 24
 progress:
-  total_phases: 13
+  total_phases: 14
   completed_phases: 13
   total_plans: 94
   completed_plans: 94
-  percent: 100
+  percent: 93
 ---
 
 # DevFlow — Project State
@@ -781,6 +781,6 @@ None currently open for Phase 17.
 
 ## Session
 
-**Last session:** 2026-07-27T09:24:44.919Z
-**Stopped at:** Completed 24-02-PLAN.md
-**Resume file:** None
+**Last session:** 2026-07-27T16:08:11.908Z
+**Stopped at:** Phase 25 context gathered
+**Resume file:** .planning/phases/25-end-to-end-dogfood-blockers/25-CONTEXT.md
