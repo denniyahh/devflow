@@ -63,37 +63,58 @@ still blocks, unchanged. Cites `23g`.
 
 ### Pull request
 
-- **Pushed head SHA:** `c2e947a53e4781da9ee799beaba9e541d16781db`
-  (`git push --force-with-lease origin HEAD` — the tracked pre-push hook,
-  `scripts/hooks/pre-push` → `scripts/check-in-container.sh all`, run
-  inside the pinned devcontainer, ran `cargo fmt --check`, `cargo clippy
-  --workspace --all-targets -- -D warnings`, and `cargo test --workspace
-  --no-fail-fast` before the push left the machine — all reported clean,
-  `check.sh: all OK`.)
+**Note on sequencing:** the PR was opened right after the Task 1 fix commit
+(`c2e947a`) was pushed, before the `CHANGELOG.md`/record commit
+(`973d185`) existed. That ordering mistake was caught immediately — the
+checkpoint's own `how-to-verify` requires the operator to read the
+`CHANGELOG.md` entry inside the PR diff — and corrected by pushing
+`973d185` onto the same branch before recording this section, so the PR
+now carries both commits. The SHAs and CI results below are the FINAL
+state, after both pushes.
+
+- **Pushed head SHA (final):** `973d1859b8ad661c74407e20842c26aaadb61ce9`
+  — carries both `c2e947a53e4781da9ee799beaba9e541d16781db`
+  (`fix(23-16): content-check the divergent-lineage staleness arm`) and
+  `973d1859b8ad661c74407e20842c26aaadb61ce9` (`docs(23-16): document fix,
+  run full gate chain, open PR #33`).
+  (`git push --force-with-lease origin HEAD`, both pushes — the tracked
+  pre-push hook, `scripts/hooks/pre-push` → `scripts/check-in-container.sh
+  all`, run inside the pinned devcontainer, ran `cargo fmt --check`,
+  `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test
+  --workspace --no-fail-fast` before each push left the machine — both
+  reported clean, `check.sh: all OK`.)
 - **Pull request:** [PR #33](https://github.com/denniyahh/devflow/pull/33)
   — `fix(23-16): content-check divergent-lineage staleness arm`
   - `gh pr view 33 --json number,baseRefName,state,url`:
     `{"baseRefName":"develop","number":33,"state":"OPEN","url":"https://github.com/denniyahh/devflow/pull/33"}`
-- **CI conclusion** (`gh pr checks 33`, final poll, verbatim — two runs
-  appear per check because the push triggered two workflow dispatches):
+- **CI conclusion, final push (`973d185`)** (`gh pr checks 33`, final poll,
+  verbatim — two runs appear per check because the push triggered two
+  workflow dispatches):
 
   ```
-  Build + test in devcontainer	pass	1m55s	https://github.com/denniyahh/devflow/actions/runs/30226047303/job/89856287666
-  Build + test in devcontainer	pass	1m53s	https://github.com/denniyahh/devflow/actions/runs/30226069850/job/89856345542
-  Clippy	pass	1m2s	https://github.com/denniyahh/devflow/actions/runs/30226047300/job/89856586611
-  Clippy	pass	1m0s	https://github.com/denniyahh/devflow/actions/runs/30226069855/job/89856345518
-  Format	pass	1m7s	https://github.com/denniyahh/devflow/actions/runs/30226047300/job/89856600721
-  Format	pass	48s	https://github.com/denniyahh/devflow/actions/runs/30226069855/job/89856345513
-  Test	pass	1m35s	https://github.com/denniyahh/devflow/actions/runs/30226047300/job/89856586251
-  Test	pass	1m28s	https://github.com/denniyahh/devflow/actions/runs/30226069855/job/89856345516
+  Build + test in devcontainer	pass	1m59s	https://github.com/denniyahh/devflow/actions/runs/30226345407/job/89857048937
+  Build + test in devcontainer	pass	1m58s	https://github.com/denniyahh/devflow/actions/runs/30226346716/job/89857294029
+  Clippy	pass	59s	https://github.com/denniyahh/devflow/actions/runs/30226345391/job/89857293814
+  Clippy	pass	1m0s	https://github.com/denniyahh/devflow/actions/runs/30226346706/job/89857052610
+  Format	pass	48s	https://github.com/denniyahh/devflow/actions/runs/30226345391/job/89857293915
+  Format	pass	48s	https://github.com/denniyahh/devflow/actions/runs/30226346706/job/89857052612
+  Test	pass	1m36s	https://github.com/denniyahh/devflow/actions/runs/30226345391/job/89857293310
+  Test	pass	1m37s	https://github.com/denniyahh/devflow/actions/runs/30226346706/job/89857052606
   ```
 
-  No check pending or failing at time of recording.
+  No check pending or failing at time of recording (`gh pr checks 33` exit
+  0).
 
-  **A finding, recorded rather than silently absorbed:** one of the two
-  `Test` job dispatches initially failed
+  **A finding, recorded rather than silently absorbed, occurring on BOTH
+  pushes:** on the first push (`c2e947a`), one of the two `Test` job
+  dispatches initially failed
   (`https://github.com/denniyahh/devflow/actions/runs/30226047300/job/89856287706`,
-  `test result: FAILED. 362 passed; 1 failed`) on a single test —
+  `test result: FAILED. 362 passed; 1 failed`). On the second push
+  (`973d185`), the SAME test failed again, this time on both a `Test`
+  dispatch AND a `Build + test in devcontainer` dispatch
+  (`.../30226345391/job/89857049024` and `.../30226346716/job/89857052649`
+  respectively, both `test result: FAILED. 362 passed; 1 failed`). Every
+  failure was the identical single test —
   `agent::tests::looks_like_devflow_process_is_false_for_a_non_devflow_process`
   in `crates/devflow-core/src/agent.rs`, a file this plan does not touch.
   The test's own in-source comment (`agent.rs:303-309`) documents it as a
@@ -103,13 +124,16 @@ still blocks, unchanged. Cites `23g`.
   fix — out of this plan's scope boundary (only issues directly caused by
   this plan's own changes are auto-fixable; this is a pre-existing failure
   in an unrelated file). This task's own local `cargo test --workspace`
-  run (quoted above) never reproduced it. The check's twin dispatch on the
-  same push (`.../30226069855/job/89856345516`) passed. The failed job was
-  re-run via `gh run rerun 30226047300 --failed` — no code was changed, no
-  new commit was pushed — and passed on rerun (quoted above, `1m35s`).
-  Filed as an out-of-scope, pre-existing flake; no `deferred-items.md`
-  entry was needed beyond this record since the flake's own doc comment
-  already names and tracks it in source.
+  runs (three separate runs across this task, all quoted above or earlier
+  in this file) never reproduced it. Each failed job's twin dispatch on
+  the same push passed. All three failed jobs
+  (`30226047300`/`Test`, `30226345391`/`Test`, `30226346716`/`Build + test
+  in devcontainer`) were re-run via `gh run rerun <id> --failed` — no code
+  was changed, no new commit was pushed between a failure and its rerun —
+  and each passed cleanly on rerun (all quoted above in the final CI
+  table). Filed as an out-of-scope, pre-existing flake; no
+  `deferred-items.md` entry was needed beyond this record since the
+  flake's own doc comment already names and tracks it in source.
 - **PR body** cites `23-ACCEPTANCE-RUN-2.md` §10 by name, the
   `0c9dcfe`/`0dad20d` mutually-non-ancestor SHA pair, states that the
   operator rejected the develop-only-build workaround in favor of this
@@ -120,7 +144,7 @@ still blocks, unchanged. Cites `23g`.
     plan's Task 1 dispatch, per the orchestrator's pre-dispatch check) →
     `0dad20d Merge pull request #32 from denniyahh/feature/phase-23`
   - After: `git fetch origin && git log origin/develop --oneline -1`
-    (checked after PR #33 opened and CI confirmed green) →
+    (checked after PR #33's final push and CI confirmed green) →
     `0dad20d Merge pull request #32 from denniyahh/feature/phase-23`
   - Identical. No autonomous write reached `develop`.
 
