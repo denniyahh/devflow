@@ -672,9 +672,13 @@ number. Next free backlog number is 999.47.
 
 **Why it matters:** the messages are *true* against recorded state, so this is not a false attestation — but an operator reading exit codes concludes the machine is clean when it is not. This is the residue of the orphan class Phase 23 was written to close, and the one case still requiring `kill(1)`.
 
-**Fix direction:** a registry-independent path — scan for running `devflow advance` children and reconcile against the registry, surfacing "running but unregistered" as its own reportable class rather than silence. Likely belongs in `doctor` as a finding plus a `gate sweep` flag.
+**ESCALATED 2026-07-27 — these orphans are SIGTERM-IMMUNE, contradicting this entry's own evidence above.** The 2026-07-26 note records "`kill -TERM` cleared it in 1s." That did **not** reproduce. Clearing the machine's population today: 15 orphaned monitor wrappers (all `ppid == 1965`, i.e. reparented to `systemd --user`, all rooted in `/tmp/.tmp*`) were sent `SIGTERM`; **all 15 survived**, re-checked after real elapsed time, not an instant re-poll. Only `SIGKILL` cleared them. Killing the wrappers then **orphaned their `devflow advance` children**, which reparented to `systemd --user` in turn and *also* required `SIGKILL` — 30 processes total, none responding to `SIGTERM`.
 
-**Priority:** Medium | **Size:** M — needs a PID-discovery mechanism that is safe on shared machines and does not misidentify unrelated processes. Linear: DEN-68.
+**Why that matters more than the enumeration gap.** Each wrapper installs `trap cleanup TERM INT` where `cleanup` kills `$apid` and exits. That handler is evidently not firing — the most likely mechanism is the shell being blocked in `wait $apid` on a child it can never reap. **Any reaping path built on `SIGTERM` will therefore report success and leave the process running**, which is a strictly worse failure than the silence this entry already describes. The two-layer structure (wrapper + child, each independently reparented) also means a reaper must handle *both* layers; killing only the wrapper manufactures a fresh orphan.
+
+**Fix direction, revised:** a registry-independent path — scan for running `devflow advance` children and reconcile against the registry, surfacing "running but unregistered" as its own reportable class rather than silence. Likely belongs in `doctor` as a finding plus a `gate sweep` flag. It **must** escalate `TERM` → `KILL` with a bounded wait and verify death rather than assuming it, and must reap the wrapper/child pair together. Add a regression test asserting a `TERM`-ignoring child is still cleared.
+
+**Priority:** High — raised from Medium. `SIGTERM` immunity means the documented recovery path silently fails, and the fix direction as originally written (enumeration only) would not have cleared a single one of today's 30 processes. | **Size:** M — needs a PID-discovery mechanism that is safe on shared machines and does not misidentify unrelated processes. Linear: DEN-68.
 
 Plans:
 
@@ -710,9 +714,18 @@ Plans:
 
 **Re-measured the same day with a subreaper-aware census — the scope correction above HOLDS for clean runs.** A full `cargo test --workspace && cargo clippy && cargo fmt --check` chain in the phase-24 worktree (618 passed / 0 failed / 17 binaries, chain exit 0) was bracketed by a `ppid`-agnostic census: **14 orphaned pairs before, 14 after — zero new.** That is a third clean run corroborating the original two, this time immune to the `ppid == 1` flaw. The earlier scope correction was right, and the measurement-artifact hypothesis is retracted.
 
-**What remains genuinely open.** The two pairs created at 05:21/05:26 during Phase 24's Code stage are still unexplained: they appeared inside a stage that completed normally (exit 0), yet a clean test chain does not reproduce them. So the leak is **intermittent and tied to some non-clean path** — an interrupted test invocation inside the GSD execute flow, or a `devflow` subprocess spawned by a route the standalone chain doesn't exercise. That is the thing to chase; "does `cargo test` leak" is settled as no.
+**SETTLED 2026-07-27 by a controlled experiment from a genuinely clean baseline.** The machine's entire orphan population (30 processes, 456 scratch dirs) was cleared first, so for the first time the measurement had no pre-existing contamination. Then one full `cargo test --workspace` (618 passed, exit 0), bracketed by a census:
 
-**Priority:** unchanged at Low for the clean-run claim. The intermittent Code-stage path is the open question and may warrant Medium once characterised.
+| Metric | Before | After | Delta |
+|---|---|---|---|
+| `devflow advance` processes | 0 | 0 | **0** |
+| `/tmp/.tmp*` scratch dirs | 2 | 3 | **+1** |
+
+**Conclusion, now on firm evidence rather than inference: a clean `cargo test --workspace` leaks ZERO processes and exactly ONE scratch directory.** The original scope correction was right on both counts, and this entry is correctly scoped as directory-lifecycle hygiene. The `ppid == 1` measurement-artifact hypothesis floated earlier today is retracted (see above); it was worth testing and it was wrong.
+
+**Where the process leak actually comes from.** Not clean runs. The orphans cleared today were rooted in `/tmp/.tmp*` fixtures from **interrupted** runs — including several using `.worktrees/phase-24/target/debug/devflow`, i.e. created during Phase 24's Code stage, where GSD's execute flow runs tests under `workflow.test_gate_timeout`. A timeout killing a test process mid-run orphans whatever it spawned, which matches every property observed. Process reaping therefore belongs to **999.44**, and that entry has been escalated after today's discovery that these orphans are `SIGTERM`-immune.
+
+**Priority:** Low, confirmed — the clean-run claim is settled and the remaining scope is directory hygiene (~1 dir per full test run).
 
 **Do not weaken the tests to fix this.** Spawning a real child is what makes them strong — plan 23-04's summary correctly calls it the suite's strongest claim, and plan 23-05's `stop_e2e` depends on the same property. The fix belongs in teardown, not in the assertion.
 
