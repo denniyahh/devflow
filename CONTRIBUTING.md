@@ -264,6 +264,22 @@ through a PR.
    > **The sync PR must be merged with a merge commit, NOT squashed.**
    > Squashing collapses the two parents into one and discards the ancestry
    > link, which is the entire point of the step.
+   >
+   > **Do not use auto-merge on this PR.** It defaults to squash, which is
+   > exactly how the v2.0.0 sync failed on 2026-07-27 — the PR merged, the
+   > link was destroyed, and a second PR was needed to repair it. Use the
+   > **"Create a merge commit"** button explicitly. This is not a repository
+   > restriction to work around: `allow_merge_commit` is `true` and the
+   > `develop` ruleset permits `["merge","squash"]`; auto-merge simply does
+   > not pick the one this step requires.
+
+   Confirm the step actually worked — a squashed sync looks successful:
+
+   ```bash
+   git merge-base --is-ancestor origin/main origin/develop && echo OK
+   ```
+
+   If that prints nothing, the link was not created and the sync must be redone.
 
 7. Create a GitHub Release for the tag (convention since v1.7.0, and how the
    CHANGELOG section reaches users who don't read the repo).
