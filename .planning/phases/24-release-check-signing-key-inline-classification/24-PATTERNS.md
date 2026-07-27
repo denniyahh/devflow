@@ -142,36 +142,35 @@ fn check_ssh_signing_viability(project_root: &Path) -> SigningViability {
 }
 ```
 
-**Only the `:748-753` arm is replaced.** Everything from the `ssh-add` spawn (`:755`) through the end (`:791`) is unchanged EXCEPT `public_key_fingerprint(key_path)` at `:773` must become a reference to a `fingerprint: Option<String>` local computed once before the `ssh-add -l` spawn (per RESEARCH.md's recommended shape — "compute `fingerprint` once, leave the match block referencing a local variable instead of re-calling `public_key_fingerprint(key_path)` inline"), so D-07's shared match block is truly untouched in substance.
+**Only the `:748-753` arm is replaced.** Everything from the `ssh-add` spawn (`:755`) through the end (`:791`) is unchanged EXCEPT the single `public_key_fingerprint(key_path)` call at `:773`, which becomes a two-way source selection **inside the `KeysListed` arm**. It must stay inside that arm: fingerprint acquisition is lazy today, and hoisting it above the `ssh-add -l` spawn would add an `ssh-keygen` process to the path branch's no-agent path — a real behaviour change that D-12's "byte-for-byte" requirement forbids.
 
-**Recommended replacement shape** (RESEARCH.md Pattern 1, illustrative — exact enum/inlining is Claude's Discretion per CONTEXT.md D-01 note):
+**Recommended replacement shape** (illustrative — exact helper shape is Claude's Discretion per CONTEXT.md D-01 note; `24-01-PLAN.md` Task 1 Step 4 is authoritative and supersedes this snippet on any disagreement):
 ```rust
 // Mirrors `man git-config`'s user.signingKey precedence (D-01):
 // key:: form, then deprecated raw ssh- form, else a path. Never stat a
-// path for a prefix-matched value (D-02).
-let trimmed = signingkey.trim();
-let inline_blob: Option<&str> = if let Some(rest) = trimmed.strip_prefix("key::") {
-    Some(rest)
-} else if trimmed.starts_with("ssh-") {
-    Some(trimmed)
-} else {
-    None
-};
+// path for a prefix-matched value (D-02). Pure — no I/O.
+let inline_blob = inline_signing_key_blob(&signingkey);
 
+// Path branch keeps today's early return, byte-for-byte (D-12).
+if inline_blob.is_none() {
+    let key_path = Path::new(&signingkey);
+    if !key_path.exists() {
+        return SigningViability::NotViable {
+            reason: "user.signingkey is set but the key file does not exist".into(),
+        };
+    }
+}
+
+// ... existing ssh-add -l spawn and classify_ssh_add_status match, unchanged (D-07).
+// ONLY inside the KeysListed arm, where :773 calls public_key_fingerprint today:
 let fingerprint = match inline_blob {
     Some(blob) => inline_key_fingerprint(blob),
-    None => {
-        let key_path = Path::new(&signingkey);
-        if !key_path.exists() {
-            return SigningViability::NotViable {
-                reason: "user.signingkey is set but the key file does not exist".into(),
-            };
-        }
-        public_key_fingerprint(key_path)
-    }
+    None => public_key_fingerprint(Path::new(&signingkey)),
 };
 ```
-Then the existing `ssh-add -l` spawn + `classify_ssh_add_status` match block (`:755-790`) references `fingerprint` instead of re-deriving it inline at `:773`.
+The `Some(fingerprint) if stdout.contains(&fingerprint)`, `Some(_) => NotViable`, and `None => Unknown` arms below it are then reached identically from both branches, unmodified.
+
+> ⚠ **Earlier revisions of this file showed `fingerprint` computed eagerly, before the `ssh-add -l` spawn.** That shape is wrong: it spawns `ssh-keygen` even when there is no agent, changing the path branch's observable process sequence. If you have that version in context, discard it.
 
 **Do NOT touch:** `classify_ssh_add_status`/`SigningStatus` (`:662-685`, D-07 — shared unchanged), `git_config` (`:704-717`, unchanged), `check_gpg_signing_viability` (out of scope, starts `:793`).
 

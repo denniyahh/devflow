@@ -6,13 +6,13 @@ current_phase: 23
 current_phase_name: end-to-end-dogfood
 status: executing
 stopped_at: Phase 24 context gathered
-last_updated: "2026-07-27T08:33:55.638Z"
+last_updated: "2026-07-27T09:03:26.147Z"
 last_activity: 2026-07-26
 last_activity_desc: Phase 23 execution started
 progress:
   total_phases: 13
   completed_phases: 11
-  total_plans: 92
+  total_plans: 94
   completed_plans: 91
   percent: 85
 ---
@@ -88,7 +88,7 @@ change earns 2.0.
 
 Phase: 23 (end-to-end-dogfood) — EXECUTING
 Plan: 1 of 16
-Status: Executing Phase 23
+Status: Ready to execute
 
 **23-15 result (second acceptance attempt, 2026-07-26):** `devflow start --phase 24 --agent claude --mode auto --yes-ship` was blocked at launch by the self-dogfood staleness hard block (D-18) — the binary's embedded commit (`0c9dcfe`, built from `feature/phase-23`) and `origin/develop`'s tip (`0dad20d`) are mutually non-ancestors (genuine divergence, confirmed via `git merge-base --is-ancestor` both directions, exit 1 each way), so the block fired before Define ever launched. No `workflow_shipped` event exists for phase 24; `devflow evidence --phase 24 --require-shipped` exits 1 both pre- and post-run — unchanged. See `.planning/phases/23-end-to-end-dogfood/23-ACCEPTANCE-RUN-2.md`.
 
