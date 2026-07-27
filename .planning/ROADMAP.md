@@ -937,14 +937,38 @@ Plans carry the unit identifiers `23a`, `23b`, `23c`, `23d`, `23e` and
 `yes-ship` as requirement tokens. **`23b` and `23c` were redefined, and `23e`
 added, by the 2026-07-25 replan** — see "Re-aimed 2026-07-25" below.
 **Depends on:** Phase 22
-**Plans:** 15/16 plans executed
+**Plans:** 16/16 plans complete
 gap-closure set** (planned 2026-07-26 from `23-VERIFICATION.md`'s single
 recorded gap), unstarted
 2026-07-25; the original 23-03…23-12 are archived under
 `phases/23-end-to-end-dogfood/superseded/`)
 
-**Status: all 11 plans executed, but the phase's own behavioral acceptance
-criterion is NOT met.** Plan 23-11 (2026-07-26) ran the acceptance attempt:
+**FINAL STATUS 2026-07-27 — CLOSED, 16/16 plans, by recorded operator decision.**
+Attempt 3 (`23-ACCEPTANCE-RUN-3.md`) drove Define → Plan → Code **fully
+unattended**, all three stages succeeding with verified on-disk deliverables — the
+furthest any DevFlow-driven run has reached in this project's history — then halted
+at the Validate boundary on a **correct** D-18 staleness firing, because the target
+phase modifies DevFlow's own compiled source. Resuming would have required
+rebuilding the driver from unvalidated code, which the operator rejected on
+soundness grounds.
+
+The behavioural criterion is therefore **accepted-unmet, not satisfied**, and is now
+permanently unmeetable for phase 24: that phase was completed manually and merged
+via PR #34, so a re-run would no-op through every stage and `workflow_shipped` can
+never be emitted for it. The structural cause is filed as **999.48 / DEN-73**; the
+oracle was deliberately NOT re-pointed at a substitute target. Full disposition in
+`23-VERIFICATION.md`'s `accepted_exception` frontmatter block.
+
+Positively: the halt was **not a silent stall** — the failure mode this phase exists
+to eliminate. The guard emitted a typed event and both monitor and agent exited
+cleanly, against Phase 17's two silent monitor deaths at ~4h each.
+
+---
+
+*Historical record below, superseded by the FINAL STATUS above but retained:*
+
+**Status (as of plan 23-11): all 11 plans executed, but the phase's own behavioral
+acceptance criterion is NOT met.** Plan 23-11 (2026-07-26) ran the acceptance attempt:
 `devflow start --phase 24 --agent claude --mode auto --yes-ship` stopped at
 Define — the target phase's own ROADMAP entry (promoted by this phase's own
 plan-10/11 orchestration) was unreachable from `develop`, the branch
@@ -1149,7 +1173,7 @@ Four required findings, all now closed in the plan text:
 
 Plans:
 
-- [ ] 23-16-PLAN.md
+- [x] 23-16-PLAN.md
 
 - [x] 23-01-PLAN.md — Rebuild the binary and scaffold an isolated scratch probe target (23a)
 - [x] 23-02-PLAN.md — 23a probe: one unattended run, recorded where it stopped (23a)
