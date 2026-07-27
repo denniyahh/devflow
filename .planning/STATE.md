@@ -2,13 +2,13 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone (open — no fixed closing phase)
-current_phase: 24
-current_phase_name: release-check-signing-key-inline-classification
-status: verifying
+current_phase: 999.1
+current_phase_name: BACKLOG
+status: planning
 stopped_at: Completed 24-02-PLAN.md
-last_updated: "2026-07-27T09:24:44.960Z"
+last_updated: "2026-07-27T10:17:51.718Z"
 last_activity: 2026-07-27
-last_activity_desc: Phase 24 execution started
+last_activity_desc: Phase 24 complete, transitioned to Phase 999.1
 progress:
   total_phases: 13
   completed_phases: 12
@@ -86,9 +86,9 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 24 (release-check-signing-key-inline-classification) — EXECUTING
-Plan: 2 of 2
-Status: Phase complete — ready for verification
+Phase: 999.1 — Hermes Support (BACKLOG)
+Plan: Not started
+Status: Ready to plan
 
 **23-15 result (second acceptance attempt, 2026-07-26):** `devflow start --phase 24 --agent claude --mode auto --yes-ship` was blocked at launch by the self-dogfood staleness hard block (D-18) — the binary's embedded commit (`0c9dcfe`, built from `feature/phase-23`) and `origin/develop`'s tip (`0dad20d`) are mutually non-ancestors (genuine divergence, confirmed via `git merge-base --is-ancestor` both directions, exit 1 each way), so the block fired before Define ever launched. No `workflow_shipped` event exists for phase 24; `devflow evidence --phase 24 --require-shipped` exits 1 both pre- and post-run — unchanged. See `.planning/phases/23-end-to-end-dogfood/23-ACCEPTANCE-RUN-2.md`.
 
@@ -106,7 +106,7 @@ Scope boundary: 23-16 is the **fix only** (change + regression tests + PR into `
 
 **Recovery-ref disposition:** both `origin` refs (`recovery/pre-23-11-acceptance-e0f87c2`, `recovery/pre-23-15-acceptance-0dad20d`) remain untouched on `origin`; the local copy of the pre-23-11 ref, deleted again by `devflow cleanup`, is deliberately NOT restored (per `23-FINDINGS.md` §B2a); the pre-23-15 ref is now unused (no merge to undo) but retained on `origin` for reuse by the 23-16 retry rather than deleted.
 
-Last activity: 2026-07-27 — Phase 24 execution started
+Last activity: 2026-07-27 — Phase 24 complete, transitioned to Phase 999.1
 
 **Note on the "Plan: 2 of 15" value this replaces:** `gsd-tools state advance-plan` only increments whatever value is already in this field, which had drifted to "2 of 15" (the parallel-worktree waves 23-01…23-09 deliberately never touch STATE.md, and this field was last corrected against reality at "10 of 11 plans complete" before the plan count grew to 15 with the gap-closure plans 23-12…23-15). Corrected directly to "13 of 15" to match reality (23-12 and 23-13 both now executed) rather than trust the tool's naive +1 increment from a stale base.
 
