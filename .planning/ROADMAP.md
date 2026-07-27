@@ -875,7 +875,11 @@ Plans:
 
 **Do not weaken D-18 generally.** It is correct for its originating incident (Phase 16 false evidence: committed, forgot to rebuild). The defect is its *scope*, not its existence.
 
-**Priority:** High | **Size:** S–M — S if pinning is a state field threaded through `launch_stage`, M if it needs the installed-release driver model. Linear: DEN-73.
+**Size re-assessed 2026-07-27 — S, not S–M.** The distinguishing information already exists: `launch_stage`'s third parameter `archived_stage: Option<Stage>` is `None` for a fresh start (`commands.rs:236`) and `Some(stage)` for a transition (`pipeline_gate.rs:110/122`, `pipeline_outcomes.rs:362/370`). The fix is therefore `if archived_stage.is_none() { enforce_build_staleness(…)?; }` — one guard, no new state, no design pass. `pipeline_launch.rs:165` already documents this shape for the `Advance` arm. The earlier estimate was made before checking whether the parameter existed.
+
+**Keep the module; do not delete it.** `staleness.rs` (1,794 lines, 21 tests) is gated entirely on `is_self_dogfood_workspace` and so is genuine dogfooding-only overhead — a fair deletion candidate on cost grounds. It is retained because the outstanding work is a single line, and discarding a tested, working module to avoid one guard is the worse trade. Note the module's tests are a known flake source (999.38's PATH race is `staleness::tests::ahead_build_from_descendant_commit_warns_instead_of_blocking`, `staleness.rs:891`), which argues for fixing 999.38 rather than for deletion.
+
+**Priority:** High | **Size:** S — one guard on an existing parameter. Linear: DEN-73.
 
 Plans:
 
@@ -955,6 +959,24 @@ This is the *second* time the base ref has broken an acceptance attempt in a dif
 **Fix direction:** resolve the base through a ref that cannot be stale, or make staleness impossible to ignore. Options, roughly in increasing cost: (1) fetch the base before resolving it, which is the smallest change but adds a network dependency to `start`; (2) resolve against `origin/develop` rather than `develop`, matching what `ship`'s divergence check already does, and require the local ref only where a working tree is genuinely needed; (3) keep local resolution but compare against the remote-tracking ref and refuse loudly with the exact `git fetch` command when they differ — no network on the happy path, and never a silent stale-base run. Whichever is chosen, the "heading present but code stale" case must be closed, not just the "heading absent" one.
 
 **Priority:** High — it has now forced manual intervention on two of three acceptance attempts, which is disqualifying for a goal whose whole definition is "unattended", and its silent variant can produce a green run against the wrong source. | **Size:** S–M — S for the refuse-loudly variant, M if `start` gains a fetch and its failure modes. Linear: DEN-76.
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.52: DevFlow Imposes a Branch Model Whose Required Repair Step It Does Not Ship (BACKLOG)
+
+**Goal:** DevFlow hard-codes a git-flow branch model on every project it drives — `MAIN`, `DEVELOP`, `FEATURE_PREFIX` are constants in `config.rs:15-19`, not configuration. That model has a required maintenance step DevFlow neither performs nor provides: when a user squash-merges `develop` → `main` for a release, the squash commit has **no parent relationship** back to `develop`, so `develop` never learns `main` moved and the *next* release conflicts against a stale merge-base.
+
+**DevFlow diagnoses this and offers no remedy.** `release --check`'s divergence gate correctly reports `origin/main is NOT an ancestor of HEAD — develop has diverged` (verified live 2026-07-27, after this repository's own v2.0.0 sync PR was squashed). But the fix — `scripts/sync-main-to-develop.sh` — exists only in this repository: it is not a subcommand (`devflow --help` has no `sync`), and it lives outside the crate directories so cargo does not package it. A user is told something is wrong and left to derive `-X ours`, the tree-identity verification, and the must-not-be-squashed constraint themselves.
+
+**Not merely theoretical, and not merely a dogfooding artifact.** All three of those details went wrong *for this project, with the script in hand*, during the v2.0.0 release on 2026-07-27: the sync PR was squashed (auto-merge defaults to it), destroying the ancestry link and requiring a second PR. The same repository previously hit the underlying divergence going into v1.5.0, producing conflicts across 11 files including core Rust source.
+
+**Feature → develop is unaffected.** `merge_feature` uses `git merge --no-ff` (`hooks.rs:158`), a real merge, so DevFlow's own ship hook never creates this problem. The gap is strictly the `develop` → `main` hop, which is manual for users because `devflow release` is `--check` only (999.25).
+
+**Fix direction:** ship the capability, not just the diagnosis. A `devflow sync` subcommand carrying the script's logic — `-X ours`, verify the resulting tree is byte-identical before proceeding, refuse if it is not — plus a pointer to it from the `release --check` divergence message, so the tool that reports the problem also names the command that fixes it. Folding it into 999.25's release executor is the alternative; doing neither leaves users with a diagnosis and no cure.
+
+**Priority:** Medium — no data loss and the divergence is detected, but it degrades silently into painful merge conflicts at exactly the moment (a release) when a user least wants them, and DevFlow created the condition by imposing the branch model. | **Size:** S–M — the logic already exists in shell and is proven; the work is porting it, wiring the subcommand, and cross-referencing the check. Linear: DEN-77.
 
 Plans:
 
@@ -1411,6 +1433,10 @@ Plans:
 |---|---|---|---|
 | 1 | A run **starts** on a current base | **25a** — 999.51 / DEN-76 | Blocked 2 of 3 acceptance attempts; a human ran `git fetch` by hand each time |
 | 2 | A run **progresses** through all five stages | **25b** — 999.48 / DEN-73 | Attempt 3 halted at the Validate boundary on a correct D-18 firing |
+
+**25b re-sized S (was S–M), 2026-07-27 — the fix is one guard, not a design pass.** `launch_stage`'s third parameter, `archived_stage: Option<Stage>`, *already* distinguishes the two cases at every call site: `None` is a fresh start (`commands.rs:236`, i.e. `devflow start`), `Some(stage)` is a transition (`pipeline_gate.rs:110/122`, `pipeline_outcomes.rs:362/370`). Pinning the verdict is therefore `if archived_stage.is_none() { enforce_build_staleness(…)?; }` — no new state field, no threading, no design pass. `pipeline_launch.rs:165` already documents this exact shape for the `Advance` arm ("skipping a check it just adjudicated for this one relaunch, not granting a standing bypass"). The earlier S–M estimate was made before checking whether the distinguishing information already existed; it did.
+
+**Why 25b is kept rather than deleted, though it is the only dogfood-only unit.** `staleness.rs` is 1,794 lines and 21 tests, all gated on `is_self_dogfood_workspace` — it fires in this repository and nowhere else, so it is genuine dogfooding overhead and a fair candidate for removal. It is retained because the outstanding work is a single line: deleting a tested, working module to avoid one guard is a worse trade than paying it. The default stays **on for a self-dogfood workspace, evaluated once at `start`**, which preserves the Phase 16 false-evidence protection (a stale binary cannot *begin* driving its own repo) while removing the mid-run halt, which has no safety value — the source it reports staleness against is the phase's own in-progress work. A bypass *flag* is deliberately not the mechanism: since the guard fires only here, "skip in dogfood" is deletion with extra steps.
 | 3 | A run **finishes** with correct artifacts | **25c** — 999.49 / DEN-74 | `compute_version` yields `~1.11.359` against a real `1.8.1` |
 | 4 | A stalled run **recovers** without `kill(1)` | **25d** — 999.44 / DEN-68 | 15/15 orphans survived `SIGTERM`; only `SIGKILL` cleared them |
 

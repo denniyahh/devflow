@@ -24,6 +24,29 @@ You use AI coding agents (Claude Code, Codex, OpenCode) to build features. But e
 
 DevFlow handles all of this. You say `devflow start --phase 3 --agent claude --mode auto` and walk away.
 
+> **Where the automation stops.** Steps 1–6 and 9 are automated end to end. The
+> release cut itself — opening the `develop` → `main` PR, tagging, and publishing
+> — is deliberately still manual; `devflow release --check` runs the preflight but
+> does not execute the release.
+>
+> **If you squash-merge `develop` → `main`,** be aware that the squash commit has
+> no parent link back to `develop`, so `develop` never learns `main` moved and your
+> *next* release will conflict against a stale merge-base. `devflow release --check`
+> detects this (`origin/main is NOT an ancestor of HEAD`), but DevFlow does not yet
+> ship the repair. Until it does, merge `main` back into `develop` after each
+> release with a real merge commit:
+>
+> ```bash
+> git checkout develop
+> git merge -X ours origin/main      # -X ours: develop's content wins; history-link only
+> # verify this changed nothing:
+> git diff --stat origin/main..HEAD  # inspect before pushing
+> ```
+>
+> Confirm it worked with `git merge-base --is-ancestor origin/main origin/develop`.
+> A real merge is required — squashing this step collapses the two parents and
+> discards the link, which is the whole point.
+
 ## Quick Start
 
 ```bash
