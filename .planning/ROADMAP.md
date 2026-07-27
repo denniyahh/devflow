@@ -693,7 +693,7 @@ three colliding entries moved to 999.44/45/46; 999.43 was free and kept its
 number. Next free backlog number is 999.47.
 -->
 
-### Phase 999.44: State-Orphaned Processes Are Unreachable by `stop` and `gate sweep` (BACKLOG)
+### Phase 999.44: State-Orphaned Processes Are Unreachable by `stop` and `gate sweep` (PROMOTED — Phase 25)
 
 **Goal:** A `devflow advance` process can outlive its own lock **and** its persisted state. When it does, both of Phase 23's new primitives return success while the orphan keeps running: `gate sweep` never lists it (its root is absent from the registry, so cross-root enumeration cannot see it), and `devflow stop --phase N --root PATH` reports `no lock held … nothing is running advance()` and exits 0.
 
@@ -782,7 +782,7 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.47: `looks_like_devflow_process` False-Positives Under CI Load (BACKLOG)
+### Phase 999.47: `looks_like_devflow_process` False-Positives Under CI Load (PROMOTED — Phase 25)
 
 **Goal:** `agent::looks_like_devflow_process(pid)` intermittently returns `true` for a plain `sleep` process. It is the last guard before `SIGTERM` in `devflow stop` (`commands.rs:1171`), so a false positive is the **dangerous** direction — it *permits* signalling a process that is not DevFlow's, which is exactly the recycled-pid hazard its own error message names ("the lock may be stale with a recycled pid").
 
@@ -850,7 +850,7 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.48: Driving Binary Is Re-Checked for Staleness Mid-Run, Halting Self-Modifying Phases (BACKLOG)
+### Phase 999.48: Driving Binary Is Re-Checked for Staleness Mid-Run, Halting Self-Modifying Phases (PROMOTED — Phase 25)
 
 **Goal:** `enforce_build_staleness` is called inside `launch_stage` (`pipeline_launch.rs:93`), so D-18's staleness check re-runs at **every** stage launch, not once at `devflow start`. When DevFlow drives a phase that modifies DevFlow's own source, the first stage boundary after that code lands re-evaluates the binary against the now-ahead worktree, classifies it `Stale`, and hard-blocks. Such a phase can never complete unattended.
 
@@ -875,7 +875,7 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.49: `compute_version` Derives a Nonsensical Version from Tag Count and Describe Distance (BACKLOG)
+### Phase 999.49: `compute_version` Derives a Nonsensical Version from Tag Count and Describe Distance (PROMOTED — Phase 25)
 
 **Goal:** `compute_version` (`version.rs:142-150`) composes major from `Cargo.toml`, minor from `count_git_tags()` — a raw `git tag` line count with **no semver filter at all** — and patch from `commits_since_last_minor_tag()` via `git describe --tags --abbrev=0` distance. None of the three tracks semver intent.
 
@@ -934,7 +934,7 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.51: `devflow start` Resolves Its Base From a Possibly-Stale Local `develop`, and Never Fetches (BACKLOG)
+### Phase 999.51: `devflow start` Resolves Its Base From a Possibly-Stale Local `develop`, and Never Fetches (PROMOTED — Phase 25)
 
 **Goal:** `devflow start` resolves its base branch from the **local** `develop` ref — `DEVELOP` is the literal string `"develop"` (`config.rs:17`), consumed by `ensure_phase_reachable_on_base` (`commands.rs:146`) and by the worktree fork (`commands.rs:285`). Nothing in the start path fetches: `commands.rs:1877` and `:1980` state the design explicitly — checks run "against ALREADY-FETCHED local refs, issuing NO `git fetch`". So when local `develop` is behind `origin/develop`, an unattended run either refuses for a phase that demonstrably exists on the remote, or forks its worktree from a stale base and runs the phase against outdated code.
 
@@ -1388,3 +1388,47 @@ Plans:
 **Wave 2** *(blocked on 24-01)*
 
 - [x] 24-02-PLAN.md — Operator-boundary proof: `devflow release --check` neither leaks the inline blob nor reports it missing, and degrades to a non-blocking `warn` when the ssh tooling is absent
+
+### Phase 25: End-to-End Dogfood Blockers — Start, Progress, Finish, Recover
+
+**Goal:** Make an unattended `devflow start --phase N --agent claude --mode auto --yes-ship` run reach a completed Ship stage **without a human touching it**, by closing the four things that currently prevent it. Phase 23 proved the goal is not reachable today: its third acceptance attempt drove Define→Plan→Code unattended — the furthest any run has gone — then halted, and two of its three attempts additionally required a human to repair the base ref before `devflow start` would even launch. This phase closes the specific, individually-evidenced blockers rather than re-attempting the run and rediscovering them.
+**Priority:** High | **Size:** M — five units, each S or S–M, all with a filed Linear issue and reproduction already recorded. No design pass needed; the fix directions are written.
+**Requirements**: TBD — promoted from backlog 999.51, 999.48, 999.49, 999.44, 999.47
+**Depends on:** Phase 24
+**Plans:** 0 plans
+
+*Scoped 2026-07-27 against one criterion — "what does an unattended run need in order to finish?" — after validating every open High in the backlog against the codebase. The four requirements below are the decomposition; each unit maps to exactly one.*
+
+**The four requirements, and the unit that closes each:**
+
+| # | Requirement | Unit | Evidence it is unmet today |
+|---|---|---|---|
+| 1 | A run **starts** on a current base | **25a** — 999.51 / DEN-76 | Blocked 2 of 3 acceptance attempts; a human ran `git fetch` by hand each time |
+| 2 | A run **progresses** through all five stages | **25b** — 999.48 / DEN-73 | Attempt 3 halted at the Validate boundary on a correct D-18 firing |
+| 3 | A run **finishes** with correct artifacts | **25c** — 999.49 / DEN-74 | `compute_version` yields `~1.11.359` against a real `1.8.1` |
+| 4 | A stalled run **recovers** without `kill(1)` | **25d** — 999.44 / DEN-68 | 15/15 orphans survived `SIGTERM`; only `SIGKILL` cleared them |
+
+**Plus one unit that is not a requirement but a stall generator:**
+
+**25e** — 999.47 / DEN-72. `MAX_CONSECUTIVE_FAILURES = 3` (`mode.rs:18`) forces a gate after three consecutive Validate failures. A test that fails roughly half the time under CI load is therefore not merely CI noise inside an unattended loop — it is a mechanism for halting a healthy run. Cheapest unit in the phase; its production risk is already closed, so this is test-only work.
+
+**Sequencing.** 25a → 25b → 25c is the spine and is ordered: a run must start correctly before "does it progress" is even observable, and must progress before "does it finish correctly" can be tested. 25d and 25e are independent of the spine and of each other, so they can run in parallel with it.
+
+**25b and 25c compose and must ship together.** 25b makes an unattended run reachable; 25c fires on the first run that succeeds. Shipping 25b alone converts a phase that cannot finish into one that finishes by writing a garbage version and tagging it on `develop` — strictly worse than the current halt, because `hooks_after_ship` has no rollback after its `Merge` step.
+
+**Optional sixth unit — 999.38 (Medium), operator's call at plan time.** A test-suite `PATH` race, distinct from 999.47 but the same failure shape: a genuine flake ("reproduced once in four full-suite runs") feeding the same 3-strike Validate gate. Folding it in with 25e does the flake work in one pass; leaving it out does not block the goal. Not counted in this phase's size.
+
+**Deliberately excluded, with reasons — do not re-add without revisiting these:**
+
+- **999.31 / DEN-56** (modular agent driver) — a *Codex* blocker. This goal is scoped "with Claude"; Phase 23 deferred it for precisely this reason. Including it roughly doubles the phase and moves the stated goal by zero.
+- **999.25 / DEN-50** (release-cut executor) — Phase 23's own scoping states *"'end to end' stops when the Ship stage completes, the crates.io publish stays manual."* Including it re-expands a deliberately narrowed scope.
+- **999.15 / DEN-40** (hermetic shell-entry-point tests) and **999.21 / DEN-46** (AI-acceptance wiring) — neither sits on the dogfood execution path; DEN-46's wiring surface is partly outside this repository.
+- **999.4 / DEN-29** (concurrent-ship version race) — requires two simultaneous ships; this goal is one phase.
+- **999.5 / DEN-30** (changelog placeholder content) — on the Ship path but cosmetic, M-sized, and deferred three times for want of a content source.
+- **999.39** (production git calls inherit `GIT_DIR`) — a real exposure of the 999.37 class, but `devflow` is not invoked from a git hook on the pipeline's critical path. Considered and excluded, not overlooked.
+
+**Acceptance.** The phase is done when a single `devflow start --phase N --agent claude --mode auto --yes-ship` reaches Ship with no human intervention and `devflow evidence --phase N --require-shipped` exits 0 — the same code-checked oracle Phase 23 used, which has never yet returned success for any phase. Choose a target phase that does **not** modify DevFlow's own source, or 25b must be verified first; Phase 24's selection as "low-stakes by consequence" measured blast radius rather than self-modification, which is what actually disqualified it.
+
+Plans:
+
+- [ ] TBD (run /gsd-plan-phase 25 to break down)
