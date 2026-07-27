@@ -882,7 +882,7 @@ Plans carry the unit identifiers `23a`, `23b`, `23c`, `23d`, `23e` and
 `yes-ship` as requirement tokens. **`23b` and `23c` were redefined, and `23e`
 added, by the 2026-07-25 replan** — see "Re-aimed 2026-07-25" below.
 **Depends on:** Phase 22
-**Plans:** 12/15 plans executed
+**Plans:** 15/16 plans executed
 gap-closure set** (planned 2026-07-26 from `23-VERIFICATION.md`'s single
 recorded gap), unstarted
 2026-07-25; the original 23-03…23-12 are archived under
@@ -1094,6 +1094,8 @@ Four required findings, all now closed in the plan text:
 
 Plans:
 
+- [ ] 23-16-PLAN.md
+
 - [x] 23-01-PLAN.md — Rebuild the binary and scaffold an isolated scratch probe target (23a)
 - [x] 23-02-PLAN.md — 23a probe: one unattended run, recorded where it stopped (23a)
 - [x] 23-03-PLAN.md — 23b: cross-root gate registry (one file per root/phase) + `devflow gate list --all-roots`
@@ -1106,9 +1108,9 @@ Plans:
 - [x] 23-10-PLAN.md — Acceptance prep: target selection, rehearsed recovery point, preconditions, then one-way authorization
 - [x] 23-11-PLAN.md — Acceptance run: one phase Define→Ship, unattended, self-hosted
 - [x] 23-12-PLAN.md — 23f: the `devflow start` reachability guard — refuse before scaffolding when the phase is not on the base branch
-- [ ] 23-13-PLAN.md — 23f: merge the guard to `develop` (operator checkpoint), rebuild, prove at runtime the binary carries it
-- [ ] 23-14-PLAN.md — Acceptance preconditions re-measured on the post-merge tree, fresh recovery ref, one-way launch decision
-- [ ] 23-15-PLAN.md — Acceptance retry: one phase Define→completed Ship, unattended, judged only by `workflow_shipped` + `--require-shipped`
+- [x] 23-13-PLAN.md — 23f: merge the guard to `develop` (operator checkpoint), rebuild, prove at runtime the binary carries it
+- [x] 23-14-PLAN.md — Acceptance preconditions re-measured on the post-merge tree, fresh recovery ref, one-way launch decision
+- [x] 23-15-PLAN.md — Acceptance retry: one phase Define→completed Ship, unattended, judged only by `workflow_shipped` + `--require-shipped`
 
 *(The original 23-03…23-12 are archived under `superseded/` — see the re-aim
 note above. The plan list below renumbers from 23-03; 23-01 and 23-02 are
@@ -1171,19 +1173,19 @@ as code per the operator's gap-closure decision above. Units 23a–23e and
 
 **Wave 9** *(gap closure; no dependency on any earlier gap plan)*
 
-- [ ] 23-12 — 23f: `PhaseReachability` probe + refusal in `preflight.rs`, wired into `commands::start` ahead of both fork paths; e2e regression test proven red against the unwired binary; fails open when the base branch carries no `ROADMAP.md`, so the pre-existing `phase7_cli` suite is unaffected (23f)
+- [x] 23-12 — 23f: `PhaseReachability` probe + refusal in `preflight.rs`, wired into `commands::start` ahead of both fork paths; e2e regression test proven red against the unwired binary; fails open when the base branch carries no `ROADMAP.md`, so the pre-existing `phase7_cli` suite is unaffected (23f)
 
 **Wave 10** *(blocked on 23-12)*
 
-- [ ] 23-13 — 23f: pull request to `develop`, CI green, **blocking operator merge checkpoint** (no autonomous write to `develop`), then rebuild and a runtime refusal proof in a throwaway clone with the binary hash recorded (23f, 23-acceptance)
+- [x] 23-13 — 23f: pull request to `develop`, CI green, **blocking operator merge checkpoint** (no autonomous write to `develop`), then rebuild and a runtime refusal proof in a throwaway clone with the binary hash recorded (23f, 23-acceptance)
 
 **Wave 11** *(blocked on 23-13)*
 
-- [ ] 23-14 — All seven behavioural checks re-run against the post-merge binary (nothing carried forward), an eighth reachability check, fresh remote-only recovery ref with a rehearsed restore, then the **one-way launch decision checkpoint** for 23-15 (23-acceptance)
+- [x] 23-14 — All seven behavioural checks re-run against the post-merge binary (nothing carried forward), an eighth reachability check, fresh remote-only recovery ref with a rehearsed restore, then the **one-way launch decision checkpoint** for 23-15 (23-acceptance)
 
 **Wave 12** *(blocked on 23-14)*
 
-- [ ] 23-15 — Acceptance retry: `devflow start --phase 24 --agent claude --mode auto --yes-ship`, observed read-only, recorded in `23-ACCEPTANCE-RUN-2.md` (the 23-11 record is left byte-identical). Acceptance is claimable **only** on a quoted `workflow_shipped` event plus `devflow evidence --phase 24 --require-shipped` exiting 0 — `workflow_finished` is explicitly not sufficient (23-acceptance)
+- [x] 23-15 — Acceptance retry: `devflow start --phase 24 --agent claude --mode auto --yes-ship`, observed read-only, recorded in `23-ACCEPTANCE-RUN-2.md` (the 23-11 record is left byte-identical). Acceptance is claimable **only** on a quoted `workflow_shipped` event plus `devflow evidence --phase 24 --require-shipped` exiting 0 — `workflow_finished` is explicitly not sufficient (23-acceptance)
 
 ### Phase 24: `release --check` Signing-Key Inline Classification
 
