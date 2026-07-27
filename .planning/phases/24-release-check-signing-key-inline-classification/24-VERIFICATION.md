@@ -1,10 +1,11 @@
 ---
 phase: 24-release-check-signing-key-inline-classification
 verified: 2026-07-27T09:38:32Z
-status: human_needed
-score: 12/13 must-haves verified
+status: passed
+score: 13/13 must-haves verified
 behavior_unverified: 0
-backstop_unverified: 1 # D-04's positive live-agent Viable arm — explicitly declared `verification: backstop` in 24-02-PLAN.md frontmatter; cannot be exercised deterministically in CI
+backstop_unverified: 0 # RESOLVED 2026-07-27 — D-04's positive live-agent Viable arm was executed against a real ssh-agent and passed, with a pre-fix negative control isolating the fix as the cause. Full record in 24-UAT.md "Execution record".
+resolved_by_uat: 2026-07-27T10:16:00Z
 overrides_applied: 0
 human_verification:
   - test: "D-04 positive arm — on a host whose ssh-agent actually holds the configured inline key, run `git config user.signingkey \"key::$(cat ~/.ssh/id_ed25519.pub)\"` in a scratch clone, then `devflow release --check`."
