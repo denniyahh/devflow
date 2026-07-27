@@ -1420,10 +1420,10 @@ Plans:
 ### Phase 25: End-to-End Dogfood Blockers — Start, Progress, Finish, Recover
 
 **Goal:** Make an unattended `devflow start --phase N --agent claude --mode auto --yes-ship` run reach a completed Ship stage **without a human touching it**, by closing the four things that currently prevent it. Phase 23 proved the goal is not reachable today: its third acceptance attempt drove Define→Plan→Code unattended — the furthest any run has gone — then halted, and two of its three attempts additionally required a human to repair the base ref before `devflow start` would even launch. This phase closes the specific, individually-evidenced blockers rather than re-attempting the run and rediscovering them.
-**Priority:** High | **Size:** M — six units. Five are S or S–M with a filed Linear issue and recorded reproduction; 25f is S and docs-only. No design pass needed; the fix directions are written.
-**Requirements**: TBD — promoted from backlog 999.51, 999.48, 999.49, 999.44, 999.47; plus 25f (CONTRIBUTING release-procedure drift, no backlog entry — found 2026-07-27)
+**Priority:** High | **Size:** L (re-sized at plan time, 2026-07-27 — was M) — six units plus 999.38 folded in. 25b, 25e, 25f and 999.38 are genuinely S as filed; 25a is S–M with its option still unchosen; **25c is M, not the S this entry states** — it is a full replacement of `compute_version`'s three inputs plus a new preflight gate plus a previously-unflagged consumer at `pipeline_gate.rs:809-840`. No phase split recommended; see `25-01-PLAN.md` § Phase-level notes for the assessment and the seam if one is ever wanted.
+**Requirements**: TBD — promoted from backlog 999.51, 999.48, 999.49, 999.44, 999.47; plus 25f (CONTRIBUTING release-procedure drift, no backlog entry — found 2026-07-27). Tracked by unit identifier (`25a`–`25f`, `999.38`), not by REQ-ID — this project has no `.planning/REQUIREMENTS.md`.
 **Depends on:** Phase 24
-**Plans:** 0 plans
+**Plans:** 7 plans in 3 waves
 
 *Scoped 2026-07-27 against one criterion — "what does an unattended run need in order to finish?" — after validating every open High in the backlog against the codebase. The four requirements below are the decomposition; each unit maps to exactly one.*
 
@@ -1463,6 +1463,27 @@ Plans:
 
 **Acceptance.** The phase is done when a single `devflow start --phase N --agent claude --mode auto --yes-ship` reaches Ship with no human intervention and `devflow evidence --phase N --require-shipped` exits 0 — the same code-checked oracle Phase 23 used, which has never yet returned success for any phase. Choose a target phase that does **not** modify DevFlow's own source, or 25b must be verified first; Phase 24's selection as "low-stakes by consequence" measured blast radius rather than self-modification, which is what actually disqualified it.
 
+**Planned 2026-07-27 — 7 plans across 3 waves.** Ordered by file ownership rather than by the
+spine above: `commands.rs` is touched by four of the six units and `preflight.rs` by two, so the
+same-wave zero-file-overlap rule forces the sequencing (the same constraint Phases 18, 19 and 21
+each hit). D-15's decoupling of the acceptance run dissolves the spine's observational rationale,
+so the code dependency graph is what orders the work. **25b (plan 25-03) and 25c (plans 25-01 and
+25-06) all land in this phase**, honouring the ship-together constraint below.
+
 Plans:
 
-- [ ] TBD (run /gsd-plan-phase 25 to break down)
+**Wave 1** *(four plans in parallel — disjoint file sets)*
+
+- [ ] 25-01-PLAN.md — 25c derivation: reachable-tag baseline, anchored commit range, conventional-commit classification, rewritten `compute_version` (`version.rs`, `+semver`, `+git-conventional`)
+- [ ] 25-02-PLAN.md — 25d/25e core primitives: `terminate_and_verify`, registry-independent stray discovery, `#[deprecated]` on the unsound predicate (`agent.rs`)
+- [ ] 25-03-PLAN.md — 25b + 999.38: hoist the staleness adjudication into `start`, prove it is not re-adjudicated mid-run, de-race the descendant-commit test (`pipeline_launch.rs`, `commands.rs`, `staleness.rs`)
+- [ ] 25-04-PLAN.md — 25f + D-06 + D-16: CONTRIBUTING release step 5, the versioning constraint in two places, the Acceptance paragraph below (`CONTRIBUTING.md`, `ROADMAP.md`, `PROJECT.md`)
+
+**Wave 2** *(blocked on 25-03 — shares `commands.rs`)*
+
+- [ ] 25-05-PLAN.md — 25a: base-ref currency probe wired ahead of the reachability guard, with a blocking `checkpoint:decision` resolving D-17's recorded, unresolved operator tension (`preflight.rs`, `commands.rs`)
+
+**Wave 3** *(two plans in parallel — blocked on 25-01/25-02 and on 25-05's file ownership)*
+
+- [ ] 25-06-PLAN.md — 25c gate: `preflight_major_bump_check` (D-09) plus the `pipeline_gate.rs` fixture that re-derives the replaced algorithm (`preflight.rs`, `pipeline_gate.rs`)
+- [ ] 25-07-PLAN.md — 25d/25e surface: `doctor` stray finding, opt-in `gate sweep` reaping, deleted-root e2e test, retargeted `stop` identity test (`commands.rs`, `main.rs`, new `tests/reap_strays_e2e.rs`)
