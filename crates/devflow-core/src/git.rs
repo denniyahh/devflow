@@ -1688,4 +1688,180 @@ mod tests {
             }
         }
     }
+
+    /// D-01/D-02/D-03: a flat table over the pure classifier proving git's
+    /// own prefix precedence — `key::` strip first, then the raw `ssh-`
+    /// compat form, else a path. Non-`ssh-` algorithms (`ecdsa-`, `sk-`)
+    /// reach the inline branch ONLY through `key::` (D-03) — a bare form of
+    /// either is a path, matching git.
+    #[test]
+    fn inline_signing_key_blob_follows_git_prefix_precedence() {
+        assert_eq!(
+            inline_signing_key_blob("key::ssh-rsa AAAAB3 id"),
+            Some("ssh-rsa AAAAB3 id")
+        );
+        assert_eq!(
+            inline_signing_key_blob("key::ssh-ed25519 AAAAC3 id"),
+            Some("ssh-ed25519 AAAAC3 id")
+        );
+        assert_eq!(
+            inline_signing_key_blob("key::ecdsa-sha2-nistp256 AAAAE2 id"),
+            Some("ecdsa-sha2-nistp256 AAAAE2 id")
+        );
+        assert_eq!(inline_signing_key_blob("key::"), Some(""));
+        assert_eq!(
+            inline_signing_key_blob("ssh-ed25519 AAAAC3 id"),
+            Some("ssh-ed25519 AAAAC3 id")
+        );
+        assert_eq!(
+            inline_signing_key_blob("  key::ssh-ed25519 AAAAC3 id  "),
+            Some("ssh-ed25519 AAAAC3 id")
+        );
+        // D-02: a value that plausibly names an existing file is STILL
+        // inline, because the classifier never stats it.
+        assert_eq!(inline_signing_key_blob("ssh-key.pub"), Some("ssh-key.pub"));
+        assert_eq!(
+            inline_signing_key_blob("/home/operator/.ssh/id_ed25519.pub"),
+            None
+        );
+        // D-03: bare, no `key::` prefix, so git treats these as paths and so
+        // must DevFlow.
+        assert_eq!(
+            inline_signing_key_blob("ecdsa-sha2-nistp256 AAAAE2 id"),
+            None
+        );
+        assert_eq!(
+            inline_signing_key_blob("sk-ssh-ed25519@openssh.com AAAAG id"),
+            None
+        );
+        assert_eq!(inline_signing_key_blob("ABCD1234"), None);
+    }
+
+    /// D-03/D-12: values that neither start with `key::` nor `ssh-` still
+    /// take the path branch and keep today's byte-for-byte behavior — the
+    /// early `.exists()` return, before `ssh-add` is ever spawned. This is
+    /// the D-03 falsifier: bare `ecdsa-`/`sk-` forms must NOT be treated as
+    /// inline.
+    #[test]
+    fn check_signing_viability_still_reports_missing_file_for_a_path_value() {
+        const MISSING_FILE_REASON: &str = "user.signingkey is set but the key file does not exist";
+        let path_values = [
+            "/nonexistent/path/to/a/signing/key/that/does/not/exist",
+            "ecdsa-sha2-nistp256 AAAAE2 devflow-fixture",
+            "sk-ssh-ed25519@openssh.com AAAAG devflow-fixture",
+        ];
+        for value in path_values {
+            let repo = init_repo();
+            let root = repo.path();
+            git(root, &["config", "gpg.format", "ssh"]);
+            git(root, &["config", "user.signingkey", value]);
+
+            let result = check_signing_viability(root);
+
+            assert_eq!(
+                result,
+                SigningViability::NotViable {
+                    reason: MISSING_FILE_REASON.to_string(),
+                },
+                "value {value:?} did not take the path branch: {result:?}"
+            );
+        }
+    }
+
+    /// D-04/D-05/D-09: `inline_key_fingerprint` (stdin) must produce the
+    /// EXACT SAME `SHA256:` fingerprint as `public_key_fingerprint` (path)
+    /// for the same real key — proving the D-01 -> D-05 chain and that the
+    /// blob genuinely reached `ssh-keygen` via stdin. `ssh-keygen -lf`
+    /// interprets a `-f` argument as a filename, so a blob passed on argv
+    /// (or never written to the pipe) could not produce a correct
+    /// fingerprint; a green assertion here is only reachable if the blob
+    /// went to stdin.
+    #[test]
+    fn inline_key_fingerprint_matches_the_path_branch_for_the_same_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("devflow-fixture-key");
+        let keygen = Command::new("ssh-keygen")
+            .args([
+                "-t",
+                "ed25519",
+                "-f",
+                key_path.to_str().unwrap(),
+                "-N",
+                "",
+                "-q",
+            ])
+            .output()
+            .expect("spawn ssh-keygen");
+        assert!(
+            keygen.status.success(),
+            "ssh-keygen fixture setup failed: {}",
+            String::from_utf8_lossy(&keygen.stderr)
+        );
+        let pub_key_path = dir.path().join("devflow-fixture-key.pub");
+        let blob = std::fs::read_to_string(&pub_key_path)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        // Assert the inline result FIRST and independently, before any
+        // comparison — a both-`None` result must never pass tautologically.
+        let inline_fp = inline_key_fingerprint(&blob);
+        assert!(
+            inline_fp.is_some(),
+            "inline_key_fingerprint returned None for a real key"
+        );
+        let inline_fp = inline_fp.unwrap();
+        assert!(
+            inline_fp.starts_with("SHA256:"),
+            "unexpected fingerprint shape: {inline_fp}"
+        );
+
+        let path_fp = public_key_fingerprint(&pub_key_path);
+        assert!(
+            path_fp.is_some(),
+            "public_key_fingerprint returned None for a real key"
+        );
+        let path_fp = path_fp.unwrap();
+
+        assert_eq!(inline_fp, path_fp);
+
+        // Closing the D-01 -> D-05 chain: feeding the key:: prefixed form
+        // through the classifier and then the fingerprint helper yields the
+        // same fingerprint.
+        let prefixed = format!("key::{blob}");
+        let classified_blob = inline_signing_key_blob(&prefixed).unwrap();
+        let chained_fp = inline_key_fingerprint(classified_blob).unwrap();
+        assert_eq!(chained_fp, path_fp);
+    }
+
+    /// D-06: every inline-branch failure mode must degrade to `Unknown`
+    /// (or, at the `pub` boundary, one of the two shared agent-state
+    /// `NotViable` reasons that both branches can legitimately reach) —
+    /// never a NEW hard fail introduced by this phase. Agent-independent:
+    /// these values are unparseable/empty regardless of host ssh-agent
+    /// state.
+    #[test]
+    fn check_signing_viability_never_hard_fails_on_an_unparseable_inline_key() {
+        const NO_AGENT_REASON: &str = "no ssh-agent reachable (SSH_AUTH_SOCK unset or dead)";
+        const AGENT_EMPTY_REASON: &str = "ssh-agent reachable but has no identities loaded";
+        let unparseable_values = ["key::", "key::this is not a key at all"];
+        for value in unparseable_values {
+            let repo = init_repo();
+            let root = repo.path();
+            git(root, &["config", "gpg.format", "ssh"]);
+            git(root, &["config", "user.signingkey", value]);
+
+            let result = check_signing_viability(root);
+
+            if let SigningViability::NotViable { reason } = &result {
+                assert!(
+                    reason == NO_AGENT_REASON || reason == AGENT_EMPTY_REASON,
+                    "value {value:?} produced an unexpected hard fail: {result:?}"
+                );
+            }
+        }
+
+        assert_eq!(inline_key_fingerprint(""), None);
+        assert_eq!(inline_key_fingerprint("not a key\n"), None);
+    }
 }
