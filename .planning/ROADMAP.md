@@ -362,6 +362,12 @@ own `phases/999.N-*/CONTEXT.md`.
 
 ### Phase 25 candidates — all open High items, validated 2026-07-27
 
+> **Outcome:** Phase 25 was scoped from this analysis the same day. Five of these
+> were taken (999.51, 999.48, 999.49, 999.44, 999.47) and are now marked
+> `PROMOTED — Phase 25`; the rest stay in the backlog with the exclusion reasons
+> recorded in Phase 25's own entry. This table is retained as the record of what
+> was considered and why, not as an open work list.
+
 Every backlog entry marked **High** was re-checked against the codebase on
 2026-07-27, not trusted from its own text. Eight are genuinely open; one was
 already delivered and is called out below so it is not re-promoted.
