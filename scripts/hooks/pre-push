@@ -35,6 +35,82 @@ unset $(git rev-parse --local-env-vars) \
       GIT_NAMESPACE GIT_DISCOVERY_ACROSS_FILESYSTEM \
       GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM
 
+# ---------------------------------------------------------------------------
+# Release-signing policy: a tag or a `main` push must carry the maintainer's
+# key, never the agent's.
+#
+# This repository is developed with an AI agent that signs its own commits
+# with its own key. Both keys are configured with the same `user.email`, so a
+# tag signed with the WRONG key renders identically in `git log`, in
+# `git tag -v`'s signer line, and on GitHub — "Verified", maintainer's
+# address, no visible difference. The only field that distinguishes them is
+# the key fingerprint, so that is what this compares. Do not rewrite this to
+# check the signer string; it cannot detect the case this exists to catch.
+#
+# Opt-in by design: unset `devflow.releaseSigningKey` means no enforcement,
+# so a contributor who never cuts a release needs no setup. Once set it is
+# absolute — there is deliberately no override environment variable, because
+# an override is exactly what a mistaken release would reach for. To push a
+# rejected tag, re-sign it with the right key.
+#
+# Runs BEFORE the container check below: this costs milliseconds and the
+# container check costs minutes, so a policy violation should not wait.
+RELEASE_KEY="$(git config --get devflow.releaseSigningKey || true)"
+if [ -n "$RELEASE_KEY" ]; then
+    RELEASE_KEY_EXPANDED="${RELEASE_KEY/#\~/$HOME}"
+    if [ ! -r "$RELEASE_KEY_EXPANDED" ]; then
+        echo "pre-push: devflow.releaseSigningKey points at an unreadable file:" >&2
+        echo "  $RELEASE_KEY" >&2
+        echo "  Fix the path or unset it: git config --local --unset devflow.releaseSigningKey" >&2
+        exit 1
+    fi
+    RELEASE_FPR="$(ssh-keygen -lf "$RELEASE_KEY_EXPANDED" | awk '{print $2}')"
+
+    # git feeds the pre-push hook one line per ref on stdin:
+    #   <local ref> <local sha> <remote ref> <remote sha>
+    # A deletion has an all-zero local sha and is never a signing concern.
+    while read -r local_ref local_sha remote_ref _remote_sha; do
+        [ -z "${local_ref:-}" ] && continue
+        case "$local_sha" in *[!0]*) ;; *) continue ;; esac
+
+        case "$remote_ref" in
+            refs/tags/*)
+                tag_name="${remote_ref#refs/tags/}"
+                verify_out="$(git verify-tag --raw "$tag_name" 2>&1 || true)"
+                # `|| true` is load-bearing under `set -e`: grep exits 1 when
+                # the tag carries no signature at all, which would abort the
+                # hook right here — refusing the push, but SILENTLY, with the
+                # "not signed" diagnostic below never reached. A silent
+                # refusal is the failure mode this repository exists to
+                # eliminate; caught by the unsigned-tag case in
+                # tests/pre_push_signing_policy.rs.
+                got_fpr="$(printf '%s' "$verify_out" | grep -oE 'SHA256:[A-Za-z0-9+/]+' | head -1 || true)"
+                if [ -z "$got_fpr" ]; then
+                    echo "pre-push: REFUSING to push tag '$tag_name' — it is not signed." >&2
+                    echo "  Release tags must be signed with the maintainer key." >&2
+                    echo "  Re-create it:  git -c user.signingkey=$RELEASE_KEY tag -s -f $tag_name -m '...'" >&2
+                    exit 1
+                fi
+                if [ "$got_fpr" != "$RELEASE_FPR" ]; then
+                    echo "pre-push: REFUSING to push tag '$tag_name' — signed with the wrong key." >&2
+                    echo "  signed by: $got_fpr" >&2
+                    echo "  required:  $RELEASE_FPR  ($RELEASE_KEY)" >&2
+                    echo "  Both keys share your user.email, so this tag LOOKS correct — the" >&2
+                    echo "  fingerprint is the only thing that differs. Re-sign it:" >&2
+                    echo "    git -c user.signingkey=$RELEASE_KEY tag -s -f $tag_name -m '...'" >&2
+                    exit 1
+                fi
+                ;;
+            refs/heads/main)
+                echo "pre-push: REFUSING a direct push to 'main'." >&2
+                echo "  main is squash-only via pull request; a direct push would also carry" >&2
+                echo "  whatever key signed its commits rather than the maintainer key." >&2
+                exit 1
+                ;;
+        esac
+    done
+fi
+
 # Verify in the pinned devcontainer image, not against the host toolchain.
 #
 # This hook used to run host `cargo` directly. That is how a commit passed

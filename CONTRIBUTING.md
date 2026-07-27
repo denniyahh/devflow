@@ -36,6 +36,56 @@ Two things this hook does that are load-bearing:
   silently switch off a global secret scanner. It is a no-op if you have no
   such hook.
 
+### Repository git policy
+
+Git cannot version `.git/config`, so settings that must survive a fresh clone
+live in the tracked [`.gitconfig`](.gitconfig) and are pulled in once:
+
+```bash
+git config --local include.path ../.gitconfig
+```
+
+(the path is relative to `.git/config`). This turns on SSH-format signing for
+both commits and tags. It deliberately does **not** set `user.signingkey` —
+that is per-contributor and this repository is public.
+
+### Release signing
+
+Releases and `main` are restricted to the maintainer's key, enforced by
+`scripts/hooks/pre-push`.
+
+This matters here more than in most repositories because DevFlow is developed
+with an AI agent that commits under **its own** signing key. Two keys are
+therefore in play, and they are not interchangeable:
+
+| Config | Signs | Whose key |
+|---|---|---|
+| `user.signingkey` | ordinary commits | the agent's, on a machine where it works |
+| `devflow.releaseSigningKey` | release tags, `main` | the maintainer's — the only key permitted |
+
+Both are configured with the same `user.email`, so a tag signed with the wrong
+key looks correct everywhere a human checks: `git log`, `git tag -v`'s signer
+line, and GitHub's "Verified" badge all show the maintainer. Only the key
+fingerprint differs, which is why the hook compares fingerprints.
+
+If you cut releases, set your key once:
+
+```bash
+git config --local devflow.releaseSigningKey ~/.ssh/<your-key>.pub
+```
+
+Then tag with it explicitly, since `user.signingkey` may point elsewhere:
+
+```bash
+git -c user.signingkey="$(git config --get devflow.releaseSigningKey)" \
+    tag -s vX.Y.Z -m "vX.Y.Z"
+```
+
+Leaving `devflow.releaseSigningKey` unset disables the check entirely, so a
+contributor who never cuts a release needs no configuration. Once set there is
+no override flag — an override is what a mistaken release would reach for. To
+push a rejected tag, re-sign it with the right key.
+
 ### Distrobox (optional)
 
 If you use [distrobox](https://github.com/89luca89/distrobox), you can create an isolated environment:
