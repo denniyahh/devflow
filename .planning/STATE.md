@@ -5,8 +5,8 @@ milestone_name: milestone (open — no fixed closing phase)
 current_phase: 23
 current_phase_name: end-to-end-dogfood
 status: executing
-stopped_at: Completed 23-15-PLAN.md — acceptance FAILED, phase 23 goal unmet, 23-16 retry planned
-last_updated: "2026-07-26T23:40:46.545Z"
+stopped_at: Phase 24 context gathered
+last_updated: "2026-07-27T08:33:55.638Z"
 last_activity: 2026-07-26
 last_activity_desc: Phase 23 execution started
 progress:
@@ -776,6 +776,6 @@ None currently open for Phase 17.
 
 ## Session
 
-**Last session:** 2026-07-26T22:35:41.190Z
-**Stopped at:** Completed 23-15-PLAN.md — acceptance FAILED, phase 23 goal unmet, 23-16 retry planned
-**Resume file:** None
+**Last session:** 2026-07-27T08:33:55.598Z
+**Stopped at:** Phase 24 context gathered
+**Resume file:** .planning/phases/24-release-check-signing-key-inline-classification/24-CONTEXT.md
