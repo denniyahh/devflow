@@ -2,19 +2,19 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone (open — no fixed closing phase)
-current_phase: 23
-current_phase_name: end-to-end-dogfood
-status: executing
-stopped_at: Completed 23-15-PLAN.md — acceptance FAILED, phase 23 goal unmet, 23-16 retry planned
-last_updated: "2026-07-26T23:40:46.545Z"
-last_activity: 2026-07-26
-last_activity_desc: Phase 23 execution started
+current_phase: 999.1
+current_phase_name: BACKLOG
+status: planning
+stopped_at: Completed 24-02-PLAN.md
+last_updated: "2026-07-27T10:17:51.718Z"
+last_activity: 2026-07-27
+last_activity_desc: Phase 24 complete, transitioned to Phase 999.1
 progress:
   total_phases: 13
-  completed_phases: 11
-  total_plans: 92
-  completed_plans: 91
-  percent: 85
+  completed_phases: 12
+  total_plans: 94
+  completed_plans: 93
+  percent: 92
 ---
 
 # DevFlow — Project State
@@ -86,9 +86,9 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 23 (end-to-end-dogfood) — EXECUTING
-Plan: 1 of 16
-Status: Executing Phase 23
+Phase: 999.1 — Hermes Support (BACKLOG)
+Plan: Not started
+Status: Ready to plan
 
 **23-15 result (second acceptance attempt, 2026-07-26):** `devflow start --phase 24 --agent claude --mode auto --yes-ship` was blocked at launch by the self-dogfood staleness hard block (D-18) — the binary's embedded commit (`0c9dcfe`, built from `feature/phase-23`) and `origin/develop`'s tip (`0dad20d`) are mutually non-ancestors (genuine divergence, confirmed via `git merge-base --is-ancestor` both directions, exit 1 each way), so the block fired before Define ever launched. No `workflow_shipped` event exists for phase 24; `devflow evidence --phase 24 --require-shipped` exits 1 both pre- and post-run — unchanged. See `.planning/phases/23-end-to-end-dogfood/23-ACCEPTANCE-RUN-2.md`.
 
@@ -106,11 +106,11 @@ Scope boundary: 23-16 is the **fix only** (change + regression tests + PR into `
 
 **Recovery-ref disposition:** both `origin` refs (`recovery/pre-23-11-acceptance-e0f87c2`, `recovery/pre-23-15-acceptance-0dad20d`) remain untouched on `origin`; the local copy of the pre-23-11 ref, deleted again by `devflow cleanup`, is deliberately NOT restored (per `23-FINDINGS.md` §B2a); the pre-23-15 ref is now unused (no merge to undo) but retained on `origin` for reuse by the 23-16 retry rather than deleted.
 
-Last activity: 2026-07-26 — Phase 23 execution started
+Last activity: 2026-07-27 — Phase 24 complete, transitioned to Phase 999.1
 
 **Note on the "Plan: 2 of 15" value this replaces:** `gsd-tools state advance-plan` only increments whatever value is already in this field, which had drifted to "2 of 15" (the parallel-worktree waves 23-01…23-09 deliberately never touch STATE.md, and this field was last corrected against reality at "10 of 11 plans complete" before the plan count grew to 15 with the gap-closure plans 23-12…23-15). Corrected directly to "13 of 15" to match reality (23-12 and 23-13 both now executed) rather than trust the tool's naive +1 increment from a stale base.
 
-Progress: [██████████] 100% (15 of 15 plans executed — plan-count only; the phase's behavioural acceptance goal is UNMET and requires plan 23-16 to close)
+Progress: [██████████] 99% (15 of 15 plans executed — plan-count only; the phase's behavioural acceptance goal is UNMET and requires plan 23-16 to close)
 
 *(Machine-readable fields for `gsd-tools state begin-phase` / `advance-plan` —
 this project historically tracked position only in the narrative "Active
@@ -703,6 +703,9 @@ None currently open for Phase 17.
 - [Phase ?]: Corrected the compute_version pre-run finding's stated root cause from a --candidates=10 truncation to git describe's nearest-tag-by-commit-distance heuristic colliding with the main/develop sync-merge topology (v1.4.0 and v1.8.1 are on divergent lineages).
 - [Phase ?]: Operator verdict: 23-15 record valid, acceptance failed — behavioural acceptance criterion unmet; next step is a new gap-closure plan 23-16 with a develop-built binary
 - [Phase ?]: Recovery-ref disposition: both origin refs retained; local pre-23-11 copy not restored per 23-FINDINGS SS B2a; pre-23-15 ref retained unused for 23-16
+- [Phase ?]: 24-01: raw inline signingkey allowlist kept to exactly ssh- (D-03), not widened to ecdsa-/sk- as 20-REVIEW.md IN-01 had proposed
+- [Phase ?]: 24-02: RED evidence captured via controlled git show/checkout HEAD -- file overwrite instead of git stash push/pop, since the target file was already committed (not locally modified) and stash pop in that state risks silently applying a sibling worktree's leftover WIP
+- [Phase ?]: 24-02: derived redaction assertions from the generated key's own whitespace tokens (base64 body, comment) rather than only the whole blob, per D-08's whole-or-in-part requirement
 
 ## Roadmap Evolution
 
@@ -773,9 +776,11 @@ None currently open for Phase 17.
 | Phase 23 P13 | 18min | 3 tasks | 1 files |
 | Phase 23 P14 | N/A (continuation) | 3 tasks | 2 files |
 | Phase 23 P15 | 17min | 3 tasks | 1 files |
+| Phase 24 P01 | 7min | 2 tasks | 1 files |
+| Phase 24 P02 | 8min | 2 tasks | 1 files |
 
 ## Session
 
-**Last session:** 2026-07-26T22:35:41.190Z
-**Stopped at:** Completed 23-15-PLAN.md — acceptance FAILED, phase 23 goal unmet, 23-16 retry planned
+**Last session:** 2026-07-27T09:24:44.919Z
+**Stopped at:** Completed 24-02-PLAN.md
 **Resume file:** None
