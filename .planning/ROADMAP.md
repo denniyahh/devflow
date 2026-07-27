@@ -360,6 +360,35 @@ Unsequenced items — not part of the active phase sequence. Promote with
 `/gsd-review-backlog` when ready; each carries accumulated context in its
 own `phases/999.N-*/CONTEXT.md`.
 
+### Phase 25 candidates — all open High items, validated 2026-07-27
+
+Every backlog entry marked **High** was re-checked against the codebase on
+2026-07-27, not trusted from its own text. Eight are genuinely open; one was
+already delivered and is called out below so it is not re-promoted.
+
+| Item | Linear | What it blocks | Validation performed |
+|---|---|---|---|
+| **999.48** Pin the driving binary | DEN-73 | **The end-to-end dogfood goal itself.** No phase that touches DevFlow's own source can complete unattended until this lands — proven by Phase 23's attempt 3 halting at Validate | Filed 2026-07-27 from a live run |
+| **999.49** `compute_version` | DEN-74 | The first DevFlow-driven release that ever succeeds. Armed the moment 999.48 unblocks one | Re-measured at `9916e2f`: computes `~1.11.359` against a real `1.8.1` |
+| **999.44** State-orphaned processes | DEN-68 | Reliable cleanup. Escalated 2026-07-27: these orphans are **`SIGTERM`-immune**, so any reaper built on `TERM` reports success and leaves them running | 30 processes cleared by hand; 15/15 survived `TERM`, all needed `KILL` |
+| **999.47** `looks_like_devflow_process` flake | DEN-72 | CI throughput — cost two retries on 2026-07-27 alone (~50% failure rate). Production risk is already closed; this is now a test-only defect | `/proc/PID/exe` capture confirmed the fork→exec window as the mechanism |
+| **999.31** Modular agent driver | DEN-56 | Onboarding any agent beyond Claude; a confirmed Codex dogfood failure | Confirmed still open: `Stage::gsd_command()` (`stage.rs:52`) still returns literal `/gsd-*` strings from core |
+| **999.25** Release-cut executor | DEN-50 | Making releases repeatable instead of a manual checklist — the 2.0.0 cut is being done entirely by hand | Confirmed still open: `devflow release` exposes exactly one option, `--check` |
+| **999.15** Hermetic tests for shell entry points | DEN-40 | Confidence in `install.sh` (every new user's first run) and `sync-main-to-develop.sh` (mutates real branch history) | All three scripts still present; no behavioral test references them |
+| **999.21** AI change-acceptance wiring | DEN-46 | The contract governing AI review rather than only existing | `.claude/skills/ai-change-acceptance/` present in-repo; wiring surface partly lives in the GSD workflow **outside** this repository, so an in-repo fix may not fully close it |
+
+**Not a candidate — already delivered:** 999.29 (dogfood staleness false-positives,
+DEN-54) still carries a `**Priority:** High` line in its body, but its heading reads
+`DELIVERED — Phase 21 / 21d` and DEN-54 is Done. A naive grep for High will surface
+it; it must not be re-promoted. Its "in source but unshipped" note is also stale —
+2.0.0 ships it.
+
+**Sequencing observation, not a decision.** 999.48 and 999.49 are the pair that
+gates the end-to-end goal, and they compose: 999.48 makes an unattended run
+reachable, at which point 999.49 fires on its first success. Taking either alone
+leaves the goal blocked. 999.47 is unrelated but cheap and is currently taxing
+every PR.
+
 ### Phase 999.1: Hermes Support (BACKLOG)
 
 **Goal:** `HermesAgent` adapter with native-envelope completion parsing, rewrite of the stale `skills/hermes/devflow/SKILL.md`, and the Hermes plugin session mode with an events.jsonl-driven gate watcher. Held Phase 18's slot until 2026-07-20, when pipeline-reliability work took priority — personal-infrastructure work that doesn't gate anything else.
