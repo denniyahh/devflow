@@ -2,18 +2,18 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone (open — no fixed closing phase)
-current_phase: 23
-current_phase_name: end-to-end-dogfood
+current_phase: 24
+current_phase_name: release-check-signing-key-inline-classification
 status: executing
-stopped_at: Phase 24 context gathered
-last_updated: "2026-07-27T09:03:26.147Z"
-last_activity: 2026-07-26
-last_activity_desc: Phase 23 execution started
+stopped_at: Completed 24-01-PLAN.md
+last_updated: "2026-07-27T09:14:39.950Z"
+last_activity: 2026-07-27
+last_activity_desc: Phase 24 execution started
 progress:
   total_phases: 13
   completed_phases: 11
   total_plans: 94
-  completed_plans: 91
+  completed_plans: 92
   percent: 85
 ---
 
@@ -86,8 +86,8 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 23 (end-to-end-dogfood) — EXECUTING
-Plan: 1 of 16
+Phase: 24 (release-check-signing-key-inline-classification) — EXECUTING
+Plan: 2 of 2
 Status: Ready to execute
 
 **23-15 result (second acceptance attempt, 2026-07-26):** `devflow start --phase 24 --agent claude --mode auto --yes-ship` was blocked at launch by the self-dogfood staleness hard block (D-18) — the binary's embedded commit (`0c9dcfe`, built from `feature/phase-23`) and `origin/develop`'s tip (`0dad20d`) are mutually non-ancestors (genuine divergence, confirmed via `git merge-base --is-ancestor` both directions, exit 1 each way), so the block fired before Define ever launched. No `workflow_shipped` event exists for phase 24; `devflow evidence --phase 24 --require-shipped` exits 1 both pre- and post-run — unchanged. See `.planning/phases/23-end-to-end-dogfood/23-ACCEPTANCE-RUN-2.md`.
@@ -106,11 +106,11 @@ Scope boundary: 23-16 is the **fix only** (change + regression tests + PR into `
 
 **Recovery-ref disposition:** both `origin` refs (`recovery/pre-23-11-acceptance-e0f87c2`, `recovery/pre-23-15-acceptance-0dad20d`) remain untouched on `origin`; the local copy of the pre-23-11 ref, deleted again by `devflow cleanup`, is deliberately NOT restored (per `23-FINDINGS.md` §B2a); the pre-23-15 ref is now unused (no merge to undo) but retained on `origin` for reuse by the 23-16 retry rather than deleted.
 
-Last activity: 2026-07-26 — Phase 23 execution started
+Last activity: 2026-07-27 — Phase 24 execution started
 
 **Note on the "Plan: 2 of 15" value this replaces:** `gsd-tools state advance-plan` only increments whatever value is already in this field, which had drifted to "2 of 15" (the parallel-worktree waves 23-01…23-09 deliberately never touch STATE.md, and this field was last corrected against reality at "10 of 11 plans complete" before the plan count grew to 15 with the gap-closure plans 23-12…23-15). Corrected directly to "13 of 15" to match reality (23-12 and 23-13 both now executed) rather than trust the tool's naive +1 increment from a stale base.
 
-Progress: [██████████] 100% (15 of 15 plans executed — plan-count only; the phase's behavioural acceptance goal is UNMET and requires plan 23-16 to close)
+Progress: [██████████] 98% (15 of 15 plans executed — plan-count only; the phase's behavioural acceptance goal is UNMET and requires plan 23-16 to close)
 
 *(Machine-readable fields for `gsd-tools state begin-phase` / `advance-plan` —
 this project historically tracked position only in the narrative "Active
@@ -703,6 +703,7 @@ None currently open for Phase 17.
 - [Phase ?]: Corrected the compute_version pre-run finding's stated root cause from a --candidates=10 truncation to git describe's nearest-tag-by-commit-distance heuristic colliding with the main/develop sync-merge topology (v1.4.0 and v1.8.1 are on divergent lineages).
 - [Phase ?]: Operator verdict: 23-15 record valid, acceptance failed — behavioural acceptance criterion unmet; next step is a new gap-closure plan 23-16 with a develop-built binary
 - [Phase ?]: Recovery-ref disposition: both origin refs retained; local pre-23-11 copy not restored per 23-FINDINGS SS B2a; pre-23-15 ref retained unused for 23-16
+- [Phase ?]: 24-01: raw inline signingkey allowlist kept to exactly ssh- (D-03), not widened to ecdsa-/sk- as 20-REVIEW.md IN-01 had proposed
 
 ## Roadmap Evolution
 
@@ -773,9 +774,10 @@ None currently open for Phase 17.
 | Phase 23 P13 | 18min | 3 tasks | 1 files |
 | Phase 23 P14 | N/A (continuation) | 3 tasks | 2 files |
 | Phase 23 P15 | 17min | 3 tasks | 1 files |
+| Phase 24 P01 | 7min | 2 tasks | 1 files |
 
 ## Session
 
-**Last session:** 2026-07-27T08:33:55.598Z
-**Stopped at:** Phase 24 context gathered
-**Resume file:** .planning/phases/24-release-check-signing-key-inline-classification/24-CONTEXT.md
+**Last session:** 2026-07-27T09:14:39.908Z
+**Stopped at:** Completed 24-01-PLAN.md
+**Resume file:** None

@@ -1193,7 +1193,7 @@ as code per the operator's gap-closure decision above. Units 23a–23e and
 **Priority:** Low | **Size:** S — single classification branch + one test; found by Phase 20 code review (2026-07-23). Linear: DEN-52.
 **Requirements**: TBD — promoted from backlog 999.27
 **Depends on:** Phase 23
-**Plans:** 2 plans
+**Plans:** 1/2 plans executed
 
 *Promoted from backlog Phase 999.27 on 2026-07-26 as the acceptance target for Phase 23 plan 23-11 (D-02). Selected as low-stakes by consequence: a release-preflight advisory check that touches no merge, version, or ship control flow.*
 
@@ -1201,7 +1201,7 @@ Plans:
 
 **Wave 1**
 
-- [ ] 24-01-PLAN.md — Classify `key::`/raw-`ssh-` `user.signingkey` values as inline keys per git's own prefix precedence, fingerprint them via `ssh-keygen -lf -` over stdin, and prove it with five agent-independent tests in `devflow-core::git`
+- [x] 24-01-PLAN.md — Classify `key::`/raw-`ssh-` `user.signingkey` values as inline keys per git's own prefix precedence, fingerprint them via `ssh-keygen -lf -` over stdin, and prove it with five agent-independent tests in `devflow-core::git`
 
 **Wave 2** *(blocked on 24-01)*
 
