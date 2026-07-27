@@ -20,12 +20,13 @@ mod pipeline_gate;
 use pipeline_gate::ship_override;
 
 mod parallel;
-use parallel::{parallel, sequentagent};
+use parallel::parallel;
 
 mod commands;
 use commands::{
-    cleanup, doctor, gate_list, gate_respond, gate_show, history_cmd, list, logs, recover_cmd,
-    reference, release_check, resolve_gate_target, start, status, test_cmd,
+    cleanup, doctor, evidence, gate_list, gate_respond, gate_show, gate_sweep, history_cmd, list,
+    logs, recover_cmd, reference, release_check, resolve_gate_target, start, status, stop,
+    test_cmd,
 };
 
 mod config_parse;
@@ -74,6 +75,16 @@ enum Command {
         /// stops there.
         #[arg(long)]
         until: Option<Stage>,
+        /// Pre-authorize the Ship gate so this run can reach a completed
+        /// Ship stage unattended (D-04/D-05/D-06, 23-09). The Ship gate
+        /// still fires and is still answered through the normal gate
+        /// protocol — this only supplies the approval automatically,
+        /// attributed to `--yes-ship` in the gate ledger. Must be typed on
+        /// every invocation: it cannot be set in `devflow.toml` or any
+        /// environment variable (D-05), so an unattended auto-merge can
+        /// never become a standing, silent default.
+        #[arg(long)]
+        yes_ship: bool,
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
@@ -145,25 +156,6 @@ enum Command {
         #[arg(long, default_value = "auto")]
         mode: Mode,
         /// Recreate worktrees if they already exist.
-        #[arg(long)]
-        force: bool,
-        /// Project root.
-        #[arg(default_value = ".")]
-        project: PathBuf,
-    },
-    /// Run two agents sequentially on one phase, each in its own worktree.
-    ///
-    /// Agent A runs first; its work is integrated into `feature/phase-NN`, then
-    /// agent B rebases onto the updated base and runs. Rebase conflicts are
-    /// surfaced for manual resolution — the worktree boundary is the isolation.
-    Sequentagent {
-        /// Phase number to work on.
-        #[arg(long)]
-        phase: u32,
-        /// Exactly two comma-separated agents, e.g. `claude,codex`.
-        #[arg(long)]
-        agents: String,
-        /// Recreate agent worktrees/branches if they already exist.
         #[arg(long)]
         force: bool,
         /// Project root.
@@ -269,12 +261,52 @@ enum Command {
         #[arg(default_value = ".")]
         project: PathBuf,
     },
+    /// End a running phase cleanly (23c): answers its open gate with a
+    /// rejection if one is open — the target unwinds through its own abort
+    /// path, no signal sent — otherwise signals the process recorded in its
+    /// per-phase lock file (`.devflow/lock-{phase:02}`), never
+    /// `state.monitor_pid` (the PID `devflow status` displays, and the
+    /// wrong one — see `commands::stop`'s doc comment). Idempotent: safe to
+    /// run against an already-stopped, never-started, or already-dead
+    /// phase.
+    Stop {
+        /// Phase to stop.
+        #[arg(long)]
+        phase: u32,
+        /// Project root. Defaults to the current directory.
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
+    /// Report DevFlow's own structural record of whether a phase shipped
+    /// (23-06) — a read-only oracle sourced from the append-only event log,
+    /// not from any agent-authored attestation document. See
+    /// `devflow_core::ship_evidence` for the full contract.
+    Evidence {
+        /// Phase to report on.
+        #[arg(long)]
+        phase: u32,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Exit non-zero unless DevFlow's own record shows this phase
+        /// shipped — declarable as a Layer 0 `external_verify` probe.
+        #[arg(long)]
+        require_shipped: bool,
+        /// Project root.
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 enum GateCmd {
     /// List gates awaiting a response.
     List {
+        /// List open gates across every root this machine has registered
+        /// (`devflow start` registers a launched phase), instead of only
+        /// the current project.
+        #[arg(long = "all-roots")]
+        all_roots: bool,
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
@@ -339,6 +371,22 @@ enum GateCmd {
         #[arg(default_value = ".")]
         project: PathBuf,
     },
+    /// Answer or report aged, unattended gates across every registered root
+    /// (23b) — bounds an abandoned run's lifetime without `kill(1)` and
+    /// without a supervisor. On-demand only: nothing schedules this for you.
+    Sweep {
+        /// Age threshold in seconds — a gate older than this is reaped.
+        /// Defaults to `DEVFLOW_GATE_MAX_UNATTENDED_AGE_SECS` (six hours).
+        #[arg(long = "max-age-secs")]
+        max_age_secs: Option<u64>,
+        /// Report what would be reaped without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Restrict the sweep to one project root instead of every root
+        /// this machine has registered (`registry::load_roots`).
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -397,6 +445,7 @@ fn run() -> Result<(), CliError> {
             no_worktree,
             dry_run,
             until,
+            yes_ship,
             project,
         } => {
             // Worktree is now the default; the deprecated `--worktree` flag is
@@ -424,12 +473,13 @@ fn run() -> Result<(), CliError> {
                 worktree,
                 dry_run,
                 until,
+                yes_ship,
             )
         }
         Command::Advance { project, phase } => advance(&project_root(project)?, phase),
         Command::Resume { phase, project } => resume(&project_root(project)?, phase),
         Command::Gate { action } => match action {
-            GateCmd::List { project } => gate_list(&project_root(project)?),
+            GateCmd::List { all_roots, project } => gate_list(&project_root(project)?, all_roots),
             GateCmd::Approve {
                 phase,
                 stage,
@@ -459,6 +509,11 @@ fn run() -> Result<(), CliError> {
                 stage,
                 project,
             } => gate_show(&project_root(project)?, phase, stage),
+            GateCmd::Sweep {
+                max_age_secs,
+                dry_run,
+                root,
+            } => gate_sweep(max_age_secs, dry_run, root),
         },
         Command::Logs {
             phase,
@@ -480,12 +535,6 @@ fn run() -> Result<(), CliError> {
             mode,
             force,
         ),
-        Command::Sequentagent {
-            phase,
-            agents,
-            force,
-            project,
-        } => sequentagent(&project_root(project)?, phase, &agents, force),
         Command::Reference {
             branch,
             refresh,
@@ -521,6 +570,21 @@ fn run() -> Result<(), CliError> {
             force,
             project,
         } => ship_override(&project_root(project)?, phase, force),
+        Command::Stop { phase, root } => stop(
+            &project_root(root.unwrap_or_else(|| PathBuf::from(".")))?,
+            phase,
+        ),
+        Command::Evidence {
+            phase,
+            json,
+            require_shipped,
+            root,
+        } => evidence(
+            &project_root(root.unwrap_or_else(|| PathBuf::from(".")))?,
+            phase,
+            json,
+            require_shipped,
+        ),
     }
 }
 

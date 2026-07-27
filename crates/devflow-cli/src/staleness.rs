@@ -27,8 +27,10 @@ use crate::CliError;
 /// Fresh — `merge-base --is-ancestor` also exits 0 when `embedded_commit` is
 /// a STRICT ancestor of HEAD (HEAD moved forward since the build), which is
 /// exactly the "committed new commits, forgot to rebuild" incident class
-/// this fix closes. Only an EXACT match to the current HEAD commit is
-/// genuinely Fresh.
+/// this fix closes. An EXACT match to the current HEAD commit is genuinely
+/// Fresh; so, per 23g, is a strict-ancestor OR a genuinely divergent
+/// (mutually non-ancestor) range whose committed diff touches no
+/// build-affecting file (`ancestry_range_affects_build`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Staleness {
     Fresh,
@@ -73,7 +75,19 @@ fn embedded_commit_is_stale(execution_root: &Path, embedded_commit: &str) -> Sta
                 .output();
             match reverse.map(|o| o.status.code()) {
                 Ok(Some(0)) => Staleness::Ahead,
-                Ok(Some(1)) => Staleness::Stale,
+                // 23g (2026-07-26 acceptance-run false block): genuine
+                // divergence — neither commit is an ancestor of the other —
+                // is content-checked exactly like the strict-ancestor arm
+                // above, reusing `ancestry_range_affects_build` verbatim. A
+                // divergent range that touches nothing build-affecting
+                // (e.g. only `.planning/` docs) must not hard-block.
+                Ok(Some(1)) => {
+                    if ancestry_range_affects_build(execution_root, embedded_commit) {
+                        Staleness::Stale
+                    } else {
+                        Staleness::Fresh
+                    }
+                }
                 _ => Staleness::Indeterminate,
             }
         }
@@ -81,16 +95,19 @@ fn embedded_commit_is_stale(execution_root: &Path, embedded_commit: &str) -> Sta
     }
 }
 
-/// 21d/D-07 (999.29): whether the committed range between `embedded_commit`
-/// and `execution_root`'s current `HEAD` touches at least one build-
-/// affecting file — the content-aware narrowing of `embedded_commit_is_stale`'s
-/// strict-ancestor arm. DevFlow's own primary workflow commits docs (`.planning/`)
-/// constantly; a docs-only commit must not re-arm a hard block after every
-/// build. Reuses `affects_compiled_binary` verbatim (D-07 — not forked or
-/// reimplemented). On any git failure, returns `true` (fail toward Stale) so
-/// a git error is never a false Fresh — mirrors `tree_has_modified_build_inputs`'s
-/// `None => Indeterminate` posture, adapted here to "assume the worse
-/// outcome" since this helper only returns a `bool`, not a tri-state.
+/// 21d/D-07 (999.29), extended by 23g: whether the committed range between
+/// `embedded_commit` and `execution_root`'s current `HEAD` touches at least
+/// one build-affecting file — the content-aware narrowing of
+/// `embedded_commit_is_stale`'s strict-ancestor arm AND (23g) its
+/// divergent-lineage arm. DevFlow's own primary workflow commits docs
+/// (`.planning/`) constantly; a docs-only commit must not re-arm a hard
+/// block after every build, whether the resulting relationship is linear
+/// staleness or genuine divergence. Reuses `affects_compiled_binary`
+/// verbatim (D-07 — not forked or reimplemented). On any git failure,
+/// returns `true` (fail toward Stale) so a git error is never a false Fresh
+/// — mirrors `tree_has_modified_build_inputs`'s `None => Indeterminate`
+/// posture, adapted here to "assume the worse outcome" since this helper
+/// only returns a `bool`, not a tri-state.
 fn ancestry_range_affects_build(execution_root: &Path, embedded_commit: &str) -> bool {
     run_git_stdout(
         execution_root,
@@ -1505,6 +1522,273 @@ mod tests {
         assert!(
             result.is_ok(),
             "an Indeterminate result must never hard-block"
+        );
+    }
+
+    /// 23g (2026-07-26 acceptance-run regression, 23-16): a genuinely
+    /// divergent range — neither commit an ancestor of the other, unlike
+    /// `docs_only_range_is_fresh`'s strict-ancestor shape — whose only
+    /// difference is a `.planning/` doc must classify `Fresh`, not `Stale`.
+    /// This is the exact shape that blocked the 23-15 acceptance run: the
+    /// running binary's embedded commit (`0c9dcfe`) and the target worktree's
+    /// HEAD (`0dad20d`) were mutually non-ancestors, differing only by a
+    /// `.planning/` doc, yet the unmodified bare-`Stale` reverse-probe arm
+    /// hard-blocked unconditionally with no content check at all.
+    /// Written RED first against that unmodified arm to confirm it fails on
+    /// the `Fresh` assertion (not a fixture-precondition assertion, not a
+    /// compile error), then GREEN once the divergent arm calls
+    /// `ancestry_range_affects_build` exactly like the strict-ancestor arm
+    /// above it already does.
+    #[test]
+    fn divergent_lineage_docs_only_range_is_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            assert!(
+                devflow_core::test_support::git_command(root)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        git(&["init", "-q", "-b", "trunk"]);
+        git(&["config", "user.email", "t@e.st"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        git(&["config", "core.hooksPath", "/dev/null"]);
+
+        // `base`: a build-affecting file both branches inherit unchanged, so
+        // it never appears in the eventual diff between them.
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "// base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+
+        // `embedded-side`'s tip becomes the embedded_commit under test —
+        // adds only a doc.
+        git(&["checkout", "-q", "-b", "embedded-side"]);
+        std::fs::create_dir_all(root.join(".planning")).unwrap();
+        std::fs::write(root.join(".planning/a.md"), "embedded side doc\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "embedded side: docs only"]);
+        let embedded_commit = run_git_stdout(root, &["rev-parse", "HEAD"])
+            .expect("rev-parse HEAD")
+            .trim()
+            .to_string();
+
+        // Back to `trunk`, which advances independently — this becomes the
+        // repo's current HEAD at assertion time. Neither branch's later
+        // commit is an ancestor of the other.
+        git(&["checkout", "-q", "trunk"]);
+        std::fs::create_dir_all(root.join(".planning")).unwrap();
+        std::fs::write(root.join(".planning/b.md"), "trunk doc\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "trunk: docs only"]);
+
+        // Fixture precondition: confirm genuine divergence — neither commit
+        // is an ancestor of the other — before trusting the assertion below,
+        // so a broken fixture fails loudly rather than silently validating
+        // the wrong shape.
+        let forward = devflow_core::test_support::git_command(root)
+            .args(["merge-base", "--is-ancestor", &embedded_commit, "HEAD"])
+            .status()
+            .unwrap();
+        assert_eq!(
+            forward.code(),
+            Some(1),
+            "fixture precondition: embedded commit must NOT be an ancestor of HEAD"
+        );
+        let reverse = devflow_core::test_support::git_command(root)
+            .args(["merge-base", "--is-ancestor", "HEAD", &embedded_commit])
+            .status()
+            .unwrap();
+        assert_eq!(
+            reverse.code(),
+            Some(1),
+            "fixture precondition: HEAD must NOT be an ancestor of the embedded commit \
+             either — this must be genuine divergence, not a strict-ancestor shape"
+        );
+
+        assert_eq!(
+            embedded_commit_is_stale(root, &embedded_commit),
+            Staleness::Fresh,
+            "23g / 2026-07-26 acceptance-run regression shape: a docs-only divergent \
+             range must not hard-block"
+        );
+    }
+
+    /// 23g: real-change protection preserved on the divergent path — the
+    /// same mutually-non-ancestor construction as
+    /// `divergent_lineage_docs_only_range_is_fresh`, but the range also
+    /// touches a real `.rs` (build-affecting) file. Must still classify
+    /// `Stale` — guards against the fix over-permitting a genuinely stale
+    /// divergent build.
+    #[test]
+    fn divergent_lineage_with_source_change_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            assert!(
+                devflow_core::test_support::git_command(root)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        git(&["init", "-q", "-b", "trunk"]);
+        git(&["config", "user.email", "t@e.st"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        git(&["config", "core.hooksPath", "/dev/null"]);
+
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "// base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+
+        // `embedded-side`'s tip becomes the embedded_commit under test —
+        // this time it modifies a real build-affecting file.
+        git(&["checkout", "-q", "-b", "embedded-side"]);
+        std::fs::write(root.join("src/lib.rs"), "// embedded side change\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "embedded side: source change"]);
+        let embedded_commit = run_git_stdout(root, &["rev-parse", "HEAD"])
+            .expect("rev-parse HEAD")
+            .trim()
+            .to_string();
+
+        git(&["checkout", "-q", "trunk"]);
+        std::fs::create_dir_all(root.join(".planning")).unwrap();
+        std::fs::write(root.join(".planning/b.md"), "trunk doc\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "trunk: docs only"]);
+
+        let forward = devflow_core::test_support::git_command(root)
+            .args(["merge-base", "--is-ancestor", &embedded_commit, "HEAD"])
+            .status()
+            .unwrap();
+        assert_eq!(
+            forward.code(),
+            Some(1),
+            "fixture precondition: embedded commit must NOT be an ancestor of HEAD"
+        );
+        let reverse = devflow_core::test_support::git_command(root)
+            .args(["merge-base", "--is-ancestor", "HEAD", &embedded_commit])
+            .status()
+            .unwrap();
+        assert_eq!(
+            reverse.code(),
+            Some(1),
+            "fixture precondition: HEAD must NOT be an ancestor of the embedded commit \
+             either — this must be genuine divergence, not a strict-ancestor shape"
+        );
+
+        assert_eq!(
+            embedded_commit_is_stale(root, &embedded_commit),
+            Staleness::Stale,
+            "a divergent range touching a real source file must still hard-block, \
+             even after the 23g content-check fix"
+        );
+    }
+
+    /// 23g end-to-end proof (test-signal-rejection pattern 4): the
+    /// `divergent_lineage_docs_only_range_is_fresh` fixture, but driven
+    /// through the real `enforce_build_staleness` entry point against a
+    /// self-dogfood workspace, not only the pure `embedded_commit_is_stale`
+    /// predicate. Proves the fix reaches the actual call path
+    /// `devflow start` uses (the 23-15 acceptance run's real failure mode),
+    /// not merely a source-level assertion one layer removed from it.
+    #[test]
+    fn enforce_build_staleness_does_not_block_self_dogfood_on_divergent_docs_only_lineage() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            assert!(
+                devflow_core::test_support::git_command(root)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        git(&["init", "-q", "-b", "trunk"]);
+        git(&["config", "user.email", "t@e.st"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        git(&["config", "core.hooksPath", "/dev/null"]);
+
+        // `base`: a build-affecting file both branches inherit unchanged,
+        // plus a workspace `Cargo.toml` so `is_self_dogfood_workspace` is
+        // true for this fixture root.
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "// base\n").unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/devflow-core\", \"crates/devflow-cli\"]\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+
+        git(&["checkout", "-q", "-b", "embedded-side"]);
+        std::fs::create_dir_all(root.join(".planning")).unwrap();
+        std::fs::write(root.join(".planning/a.md"), "embedded side doc\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "embedded side: docs only"]);
+        let embedded_commit = run_git_stdout(root, &["rev-parse", "HEAD"])
+            .expect("rev-parse HEAD")
+            .trim()
+            .to_string();
+
+        git(&["checkout", "-q", "trunk"]);
+        std::fs::create_dir_all(root.join(".planning")).unwrap();
+        std::fs::write(root.join(".planning/b.md"), "trunk doc\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "trunk: docs only"]);
+
+        let forward = devflow_core::test_support::git_command(root)
+            .args(["merge-base", "--is-ancestor", &embedded_commit, "HEAD"])
+            .status()
+            .unwrap();
+        assert_eq!(
+            forward.code(),
+            Some(1),
+            "fixture precondition: embedded commit must NOT be an ancestor of HEAD"
+        );
+        let reverse = devflow_core::test_support::git_command(root)
+            .args(["merge-base", "--is-ancestor", "HEAD", &embedded_commit])
+            .status()
+            .unwrap();
+        assert_eq!(
+            reverse.code(),
+            Some(1),
+            "fixture precondition: HEAD must NOT be an ancestor of the embedded commit \
+             either — this must be genuine divergence, not a strict-ancestor shape"
+        );
+
+        assert!(
+            is_self_dogfood_workspace(root),
+            "fixture precondition: this workspace must be classified self-dogfood"
+        );
+
+        let phase = 66;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+
+        let result = enforce_build_staleness(root, &state, &embedded_commit, false);
+        assert!(
+            result.is_ok(),
+            "23g: enforce_build_staleness must not hard-block the self-dogfood \
+             divergent-docs-only-lineage shape that blocked the 23-15 acceptance run: \
+             {result:?}"
         );
     }
 }

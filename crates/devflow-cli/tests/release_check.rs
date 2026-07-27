@@ -302,6 +302,143 @@ fn release_check_signing_output_leaks_no_key_material_or_path() {
     );
 }
 
+/// D-08/D-10/D-11 (24-02 Task 1): the operator-boundary proof for plan
+/// 24-01's inline-key classification. Before 24-01, ANY `user.signingkey`
+/// value was treated as a filesystem path, so a legitimately-shaped inline
+/// value (`key::`-prefixed or the deprecated raw `ssh-` form) was always
+/// reported as a missing key file — a false hard fail. This test proves
+/// both inline forms are now classified correctly at the CLI boundary and
+/// that the configured blob never reaches stdout, in whole or in part.
+/// `SSH_AUTH_SOCK`/`SSH_AGENT_PID` are removed (via `run_release`'s
+/// isolation), so both runs deterministically reach the shared
+/// "no ssh-agent reachable" arm rather than depending on a locally running
+/// agent — which also proves the inline value travelled all the way to
+/// that shared code path instead of short-circuiting on the path-existence
+/// check.
+#[test]
+fn release_check_inline_signingkey_is_not_reported_missing_and_leaks_no_key_material() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_repo(root);
+    commit(root, "base.txt");
+    git(root, &["config", "gpg.format", "ssh"]);
+
+    let key_path = root.join("inline-signing-key");
+    let keygen = Command::new("ssh-keygen")
+        .args([
+            "-t",
+            "ed25519",
+            "-f",
+            key_path.to_str().unwrap(),
+            "-N",
+            "",
+            "-q",
+        ])
+        .output()
+        .expect("spawn ssh-keygen");
+    assert!(
+        keygen.status.success(),
+        "ssh-keygen fixture setup failed: {}",
+        String::from_utf8_lossy(&keygen.stderr)
+    );
+    let pub_key_path = root.join("inline-signing-key.pub");
+    let blob = std::fs::read_to_string(&pub_key_path)
+        .expect("read generated public key")
+        .trim()
+        .to_string();
+    let mut tokens = blob.split_whitespace();
+    let key_type_token = tokens.next().expect("public key has a key-type token");
+    let base64_body_token = tokens.next().expect("public key has a base64 body token");
+    let comment_token = tokens.next().expect("public key has a comment token");
+    assert!(
+        blob.starts_with("ssh-ed25519"),
+        "expected an ed25519 public key blob, got: {blob}"
+    );
+
+    const MISSING_FILE_REASON: &str = "user.signingkey is set but the key file does not exist";
+
+    // Form 1 (D-01 rule 1): `key::`-prefixed inline value.
+    git(
+        root,
+        &["config", "user.signingkey", &format!("key::{blob}")],
+    );
+    let output = run_release(root, &["--check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains(MISSING_FILE_REASON),
+        "key:: form: expected no missing-key-file diagnostic for an inline value, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains(&blob),
+        "key:: form: expected no part of the configured blob in output, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains(base64_body_token),
+        "key:: form: expected no part of the key's base64 body in output, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains(comment_token),
+        "key:: form: expected no part of the key's comment token in output, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("PRIVATE KEY"),
+        "key:: form: expected no private key material in output, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains(root.to_str().unwrap()),
+        "key:: form: expected no filesystem path in output, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("panicked"),
+        "key:: form: must never panic, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("no ssh-agent reachable"),
+        "key:: form: expected the inline value to reach the shared agent-status arm, got: {stdout}"
+    );
+
+    // Form 2 (D-01 rule 2): the raw deprecated `ssh-` form (no `key::` prefix).
+    assert!(
+        key_type_token.starts_with("ssh-"),
+        "sanity: raw form must itself start with ssh- to exercise D-01 rule 2, got: {key_type_token}"
+    );
+    git(root, &["config", "user.signingkey", &blob]);
+    let output = run_release(root, &["--check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains(MISSING_FILE_REASON),
+        "raw ssh- form: expected no missing-key-file diagnostic for an inline value, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains(&blob),
+        "raw ssh- form: expected no part of the configured blob in output, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains(base64_body_token),
+        "raw ssh- form: expected no part of the key's base64 body in output, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains(comment_token),
+        "raw ssh- form: expected no part of the key's comment token in output, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("PRIVATE KEY"),
+        "raw ssh- form: expected no private key material in output, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains(root.to_str().unwrap()),
+        "raw ssh- form: expected no filesystem path in output, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("panicked"),
+        "raw ssh- form: must never panic, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("no ssh-agent reachable"),
+        "raw ssh- form: expected the inline value to reach the shared agent-status arm, got: {stdout}"
+    );
+}
+
 /// A `PATH` containing ONLY a symlink to the real `git` binary — unlike a
 /// bare directory restriction (e.g. `/usr/bin`), this guarantees `ssh-add`/
 /// `ssh-keygen` are genuinely absent regardless of the host (some distros,
@@ -351,6 +488,72 @@ fn release_check_signing_degrades_when_ssh_add_absent() {
         stdout.contains("ssh-add not found"),
         "expected a fail-soft 'tool not found' message, got: {stdout}\nstderr: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !stdout.contains("panicked"),
+        "must not panic, got: {stdout}"
+    );
+}
+
+/// D-06/D-08/D-10/D-11 (24-02 Task 2): the fail-soft proof for an inline
+/// `user.signingkey` when the ssh tooling itself is absent from `PATH`. No
+/// real keypair is generated — the point under test is the classification
+/// (inline vs. path), not fingerprinting, and the tooling that would
+/// fingerprint it is deliberately absent here.
+///
+/// The load-bearing assertion is the absence of the signing check's
+/// `NotViable` remediation hint (copied character-for-character from
+/// `check_signing` in `commands.rs`): `install_hint` is `None` on the
+/// `Unknown` arm and `Some(...)` only on `NotViable`, so a hard-failing
+/// signing check always prints this hint and a fail-soft one never does.
+/// Before 24-01, an inline value on this same fixture hit the path branch's
+/// missing-key-file `NotViable` and printed exactly this hint — that is the
+/// headline defect this assertion falsifies.
+#[test]
+fn release_check_inline_signingkey_degrades_to_warn_when_ssh_tooling_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_repo(root);
+    commit(root, "base.txt");
+    git(root, &["config", "gpg.format", "ssh"]);
+    let inline_blob = "key::ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFAKEFIXTUREKEYMATERIALZZZZZZZZZZZZZZZZZZZZZZ devflow-fixture";
+    git(root, &["config", "user.signingkey", inline_blob]);
+
+    let isolated_home = tempfile::tempdir().unwrap();
+    let path_dir = git_only_path();
+    let output = Command::new(devflow_bin())
+        .arg("release")
+        .arg("--check")
+        .arg(root)
+        .env("HOME", isolated_home.path())
+        .env("PATH", path_dir.path())
+        .output()
+        .expect("spawn devflow release");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("ssh-add not found"),
+        "expected the fail-soft 'ssh-add not found' reason (D-06), got: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !stdout.contains("resolve before attempting the signed release tag"),
+        "expected NO signing remediation hint — its presence would mean the inline value \
+         produced a hard NotViable fail instead of a fail-soft warn, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("user.signingkey is set but the key file does not exist"),
+        "expected no missing-key-file diagnostic for an inline value, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFAKEFIXTUREKEYMATERIALZZZZZZZZZZZZZZZZZZZZZZ"
+        ),
+        "expected no part of the configured inline blob in output, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("AAAAC3NzaC1lZDI1NTE5AAAAIFAKEFIXTUREKEYMATERIALZZZZZZZZZZZZZZZZZZZZZZ"),
+        "expected no part of the key's base64 body token in output, got: {stdout}"
     );
     assert!(
         !stdout.contains("panicked"),

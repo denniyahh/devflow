@@ -11,23 +11,27 @@
 //! split is meant to remove.
 
 use crate::CliError;
+use crate::config_parse;
 use crate::config_parse::GATE_ESCALATION_THRESHOLD_SECS;
 use crate::parallel::ensure_phase_worktree;
 use crate::pipeline_gate::print_dry_run;
 use crate::pipeline_launch::{launch_stage, single_active_phase};
 use crate::pipeline_outcomes::render_gate_context;
-use crate::preflight::{agent_program, ensure_agent_binary};
+use crate::preflight::{agent_program, ensure_agent_binary, ensure_phase_reachable_on_base};
 use crate::staleness::run_git_stdout;
 use devflow_core::agent;
 use devflow_core::agent_result;
 use devflow_core::agents;
 use devflow_core::config::{DEVELOP, FEATURE_PREFIX, MAIN};
 use devflow_core::events;
-use devflow_core::gates::{GateAction, GateResponse, Gates, OpenGate};
+use devflow_core::gates::{GateAction, GateError, GateResponse, Gates, OpenGate};
 use devflow_core::git::GitFlow;
 use devflow_core::history;
+use devflow_core::lock;
 use devflow_core::mode::Mode;
 use devflow_core::recover;
+use devflow_core::registry;
+use devflow_core::ship_evidence;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
 use devflow_core::version;
@@ -112,9 +116,15 @@ pub(crate) fn start(
     worktree: bool,
     dry_run: bool,
     until: Option<Stage>,
+    yes_ship: bool,
 ) -> Result<(), CliError> {
     let mut state = State::new(phase, agent, mode, project_root.to_path_buf());
     state.stop_until = until;
+    // The only assignment in the crate that ever sets `yes_ship` to a
+    // non-default value — from the parsed `--yes-ship` CLI flag, before the
+    // first `save_state` below, so the persisted authorization exists before
+    // the detached monitor that will later consult it is ever spawned.
+    state.yes_ship = yes_ship;
 
     if dry_run {
         print_dry_run(&state);
@@ -124,6 +134,16 @@ pub(crate) fn start(
     // 14-CR-05: fail on a missing agent binary BEFORE any branch/worktree is
     // scaffolded (launch_stage re-checks for the advance-time launch paths).
     ensure_agent_binary(agent_program(agent))?;
+
+    // 23f (gap closure, 23-12): refuse before ANY git mutation when phase N
+    // is not reachable from DEVELOP — the exact branch `ensure_phase_worktree`
+    // passes to `worktree::add` as `start_point`, so the branch this guard
+    // inspects and the branch the run forks can never disagree. Precedes
+    // BOTH fork paths (`ensure_phase_worktree` below, and `GitFlow::feature_start`
+    // in the `else` branch), and precedes the Codex leg deliberately: if
+    // phase N is absent from `develop` entirely, "no CONTEXT.md on develop"
+    // is a narrower and misleading diagnosis of the same root fact.
+    ensure_phase_reachable_on_base(project_root, phase, DEVELOP)?;
 
     // 13-06 dogfood pre-flight (Codex leg): a fresh headless Codex run can
     // never pass Define — GSD's discuss-phase is an interview, and Codex's
@@ -655,14 +675,100 @@ pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
     if let Some(banner) = render_pending_gate_banner(&Gates::list_open(project_root), now) {
         println!("\n{banner}");
     }
-    if let Some(section) = render_sequentagent_status(project_root) {
-        println!("\n{section}");
-    }
     print_open_branches(project_root);
     print_worktrees(project_root, current_worktree.as_deref());
     for hint in cron_instruction_hints(project_root) {
         println!("\n{hint}");
     }
+    Ok(())
+}
+
+/// Report DevFlow's own structural record of whether `phase` shipped
+/// (23-06) — reads `devflow_core::ship_evidence::collect`, a strictly
+/// read-only oracle sourced from the append-only event log, never from an
+/// agent-authored attestation document.
+///
+/// **Three dead-end predicates/placements this plan disproved. Documented
+/// here so the next person reading this code does not re-derive and
+/// re-attempt them:**
+///
+/// 1. **Pre-gate merge check.** `hooks_after_ship` (`hooks.rs:105-112`) only
+///    runs from `finish_workflow_with_gate_timeout`, itself only reached from
+///    `handle_ship_outcome`'s `GateAction::Advance` arm — i.e. AFTER the Ship
+///    gate has already been approved. A check for a merge/tag/push placed
+///    before gate approval would fail for every legitimate Ship; RESEARCH.md's
+///    Question C / Pattern 3 recommendation to place it there was verified
+///    wrong against live source.
+/// 2. **Post-batch ancestry check.** `BranchCleanup` runs immediately after
+///    `Merge` in that same `hooks_after_ship` batch and deletes the feature
+///    branch. `GitFlow::is_merged_into_develop` fails closed on an absent
+///    branch (`git.rs:89-97`: "an absent branch is not proof of a merge"), so
+///    an ancestry check run after the batch completes returns `false` for
+///    EVERY successfully shipped phase.
+/// 3. **`workflow_finished` as the shipped predicate.** Emitted at TWO
+///    sites: real Ship finalization, and `transition`'s `devflow start
+///    --until <stage>` clean-stop branch
+///    (`crates/devflow-cli/src/pipeline_gate.rs:67`, the
+///    `state.stop_until == Some(from)` arm near the top of `transition`),
+///    which returns with payload `{"reason": "stopped_at", …}` BEFORE any
+///    checkout hook, before `state.stage = to`, before the `"transition"`
+///    event, and before `launch_stage` runs — nothing resembling a Ship has
+///    happened. A phase halted after one stage would read as shipped. This
+///    is the dead end most likely to be reintroduced: a cross-AI review
+///    caught it after it had already been written into this plan three
+///    times as "the only site emitting `workflow_finished`."
+pub(crate) fn evidence(
+    project_root: &Path,
+    phase: u32,
+    json: bool,
+    require_shipped: bool,
+) -> Result<(), CliError> {
+    let evidence = ship_evidence::collect(project_root, phase);
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&evidence).expect("ShipEvidence must serialize")
+        );
+    } else {
+        println!("phase: {}", evidence.phase);
+        println!("shipped: {}", evidence.shipped);
+        println!(
+            "workflow_finished_seen: {}",
+            evidence.workflow_finished_seen
+        );
+        println!(
+            "finished_reason: {}",
+            evidence.finished_reason.as_deref().unwrap_or("none")
+        );
+        println!(
+            "stage: {}",
+            evidence
+                .stage
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "none".into())
+        );
+        println!("state_present: {}", evidence.state_present);
+        println!("feature_branch_exists: {}", evidence.feature_branch_exists);
+        println!("merged_into_develop: {}", evidence.merged_into_develop);
+        println!("has_remote: {}", evidence.has_remote);
+    }
+
+    if require_shipped && !evidence.shipped {
+        // "It finished but it did not ship" is the confusing case a reader
+        // hits first — say so explicitly rather than a generic "not shipped"
+        // (Task 1 acceptance criteria).
+        let detail = if ship_evidence::is_stopped_at(&evidence) {
+            format!(
+                "phase {phase} has not shipped — DevFlow's own record shows it stopped after \
+                 one stage (--until) rather than reaching a finalized Ship"
+            )
+        } else {
+            format!("phase {phase} has not shipped — DevFlow has no record of a completed Ship")
+        };
+        return Err(CliError::Message(detail));
+    }
+
     Ok(())
 }
 
@@ -695,8 +801,15 @@ fn render_pending_gate_banner(open: &[OpenGate], now: u64) -> Option<String> {
     Some(banner)
 }
 
-/// List every gate awaiting a human response.
-pub(crate) fn gate_list(project_root: &Path) -> Result<(), CliError> {
+/// List every gate awaiting a human response. When `all_roots` is set,
+/// answers "what is gated on this machine?" across every root this machine
+/// has registered (`registry::load_roots`) in one invocation, with a
+/// leading ROOT column and a per-gate age; behaviour is otherwise
+/// byte-identical to the single-root listing (23-03).
+pub(crate) fn gate_list(project_root: &Path, all_roots: bool) -> Result<(), CliError> {
+    if all_roots {
+        return gate_list_all_roots();
+    }
     let open = Gates::list_open(project_root);
     if open.is_empty() {
         println!("no open gates");
@@ -717,6 +830,75 @@ pub(crate) fn gate_list(project_root: &Path) -> Result<(), CliError> {
          devflow gate reject <phase> --note ... (note with \"abort\" ends the phase)"
     );
     Ok(())
+}
+
+/// The `--all-roots` half of [`gate_list`]: fan out `Gates::list_open`
+/// across every registered root and render an additional leading ROOT
+/// column. A registered root with no open gates simply contributes no rows.
+fn gate_list_all_roots() -> Result<(), CliError> {
+    let roots = registry::load_roots();
+    let mut rows: Vec<(PathBuf, OpenGate)> = Vec::new();
+    for root in &roots {
+        for gate in Gates::list_open(&root.project_root) {
+            rows.push((root.project_root.clone(), gate));
+        }
+    }
+    if rows.is_empty() {
+        println!("no open gates across {} registered root(s)", roots.len());
+        return Ok(());
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    println!("{:<6} {:<9} {:<9} ROOT / CONTEXT", "PHASE", "STAGE", "AGE");
+    for (root, gate) in &rows {
+        println!("{}", render_all_roots_gate_row(root, gate, now));
+    }
+    Ok(())
+}
+
+/// Render one `--all-roots` gate row: the PHASE/STAGE/AGE/ROOT line plus a
+/// second, indented context line. Pure given `now` — the same pattern
+/// `render_pending_gate_banner` already uses — so it's unit-testable
+/// without mutating wall-clock time.
+fn render_all_roots_gate_row(root: &Path, gate: &OpenGate, now: u64) -> String {
+    let context = render_gate_context(&gate.context, 100);
+    format!(
+        "{:<6} {:<9} {:<9} {}\n           {context}",
+        gate.phase,
+        gate.stage.to_string(),
+        render_gate_age(&gate.timestamp, now),
+        root.display(),
+    )
+}
+
+/// Render a gate's `timestamp` as a compact age for `--all-roots`, with a
+/// trailing urgency marker once it reaches
+/// [`GATE_ESCALATION_THRESHOLD_SECS`] — reusing the same threshold
+/// `render_pending_gate_banner` escalates on, rather than inventing a
+/// second one. A `timestamp` that does not parse as `u64`, or that is
+/// somehow in the future relative to `now`, renders `?` — the row is still
+/// listed, matching the forensics record that dropping unusual rows is
+/// exactly how the orphan population stayed invisible.
+fn render_gate_age(timestamp: &str, now: u64) -> String {
+    let Ok(ts) = timestamp.parse::<u64>() else {
+        return "?".to_string();
+    };
+    let Some(age) = now.checked_sub(ts) else {
+        return "?".to_string();
+    };
+    let compact = match age {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86400 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86400),
+    };
+    if age >= GATE_ESCALATION_THRESHOLD_SECS {
+        format!("{compact}!")
+    } else {
+        compact
+    }
 }
 
 /// Answer an open gate from the CLI — the dogfood-facing replacement for
@@ -786,6 +968,290 @@ pub(crate) fn gate_respond(
         if approved { "approved" } else { "rejected" },
         path.display()
     );
+    Ok(())
+}
+
+/// Answer or report every aged, unattended gate across every registered root
+/// (or a single `root`, when given) — the acting half of 23b's bound gate
+/// lifetime. Never signals any process; `Gates::reap` (structurally
+/// incapable of approving, T-23-41) is the ONLY write path, so the sweep's
+/// sole effect on the world is written bytes a live poller was already
+/// watching for.
+///
+/// `GateError::NoOpenGate`/`AlreadyResponded` are treated as benign races —
+/// a human or `--yes-ship` may have answered the same gate between
+/// `list_open` and `reap` — and counted as skipped rather than returned as
+/// an error; `Gates::respond`'s own refusal to clobber an unconsumed
+/// response is the first-writer-wins resolution that makes this safe with
+/// no new coordination code. Every successful reap emits `gate_reaped` in
+/// this process (the audit trail half — `run_gate_with_timeout`'s own
+/// `gate_resolved` fires independently in the target process when it picks
+/// the response up).
+pub(crate) fn gate_sweep(
+    max_age_secs: Option<u64>,
+    dry_run: bool,
+    root: Option<PathBuf>,
+) -> Result<(), CliError> {
+    let threshold = max_age_secs.unwrap_or_else(config_parse::gate_max_unattended_age_secs);
+
+    let roots: Vec<PathBuf> = match root {
+        Some(root) => vec![root],
+        None => {
+            registry::prune_missing();
+            registry::load_roots()
+                .into_iter()
+                .map(|r| r.project_root)
+                .collect()
+        }
+    };
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let mut reaped = 0u32;
+    let mut skipped = 0u32;
+    let mut left_alone = 0u32;
+
+    for project_root in &roots {
+        for gate in Gates::list_open(project_root) {
+            let Ok(ts) = gate.timestamp.parse::<u64>() else {
+                left_alone += 1;
+                continue;
+            };
+            let age = now.saturating_sub(ts);
+            if age < threshold {
+                left_alone += 1;
+                continue;
+            }
+            if dry_run {
+                reaped += 1;
+                println!(
+                    "would reap phase {} {} (age {age}s) at {}",
+                    gate.phase,
+                    gate.stage,
+                    project_root.display()
+                );
+                continue;
+            }
+            match Gates::reap(
+                project_root,
+                gate.phase,
+                gate.stage,
+                "abort: reaped by devflow gate sweep (unattended gate exceeded max age)",
+                "devflow-reap",
+            ) {
+                Ok(_) => {
+                    reaped += 1;
+                    events::emit(
+                        project_root,
+                        gate.phase,
+                        "gate_reaped",
+                        serde_json::json!({
+                            "stage": gate.stage.to_string(),
+                            "age_secs": age,
+                            "max_age_secs": threshold,
+                        }),
+                    );
+                    println!(
+                        "reaped phase {} {} (age {age}s) at {}",
+                        gate.phase,
+                        gate.stage,
+                        project_root.display()
+                    );
+                }
+                Err(err) => {
+                    skipped += 1;
+                    println!(
+                        "skipped phase {} {} at {} — already answered ({err})",
+                        gate.phase,
+                        gate.stage,
+                        project_root.display()
+                    );
+                }
+            }
+        }
+    }
+    if dry_run {
+        println!(
+            "sweep complete (dry run): {reaped} would be reaped, {skipped} skipped, {left_alone} left alone"
+        );
+    } else {
+        println!("sweep complete: {reaped} reaped, {skipped} skipped, {left_alone} left alone");
+    }
+    Ok(())
+}
+
+/// End a running phase cleanly (23c) — the missing primitive
+/// `23-ORPHAN-FORENSICS.md` names as the reason 54 processes accumulated
+/// with no remedy but `kill(1)`. Answers `phase`'s open gate if it has one —
+/// the primary path, since it is the only one that produces a clean final
+/// state: the target unwinds through its own `abort()` and releases its
+/// lock; otherwise signals the process recorded in `phase`'s per-phase lock
+/// file (never `state.monitor_pid` — T-23-51: the monitor shell script's
+/// `trap` closure only ever captures the **agent's** pid, never the
+/// trailing `advance` invocation, so by the time `advance` is the shell's
+/// foreground child, `monitor_pid` already names a process that exited long
+/// ago; `lock::holder`'s recorded pid is the only correct target).
+pub(crate) fn stop(project_root: &Path, phase: u32) -> Result<(), CliError> {
+    if !stop_via_gate(project_root, phase)? {
+        stop_via_lock(project_root, phase)?;
+    }
+    persist_stopped_state(project_root, phase)
+}
+
+/// The primary path: answer `phase`'s open gate with a rejection whose note
+/// contains the abort keyword, so `GateAction::from_response` resolves to
+/// `GateAction::Abort` rather than `LoopBack(Code)` — looping back would
+/// relaunch an agent on a phase the operator just asked to stop.
+///
+/// Returns `Ok(true)` when a gate was found and handled — either reaped
+/// here, or discovered already answered by a race — telling the caller not
+/// to fall through to [`stop_via_lock`]. Returns `Ok(false)` when there is
+/// no open gate for `phase` at all, including the race where `Gates::reap`
+/// reports `NoOpenGate` after this function's own `Gates::list_open` scan
+/// found one; that is the signal to fall through, not an error (cross-AI
+/// review 23-10).
+fn stop_via_gate(project_root: &Path, phase: u32) -> Result<bool, CliError> {
+    let Some(gate) = Gates::list_open(project_root)
+        .into_iter()
+        .find(|g| g.phase == phase)
+    else {
+        return Ok(false);
+    };
+    match Gates::reap(
+        project_root,
+        phase,
+        gate.stage,
+        "abort: stopped by `devflow stop`",
+        "devflow-stop",
+    ) {
+        Ok(path) => {
+            println!(
+                "stop: wrote a rejection for phase {phase} {} at {} — the process waiting \
+                 on it will pick this up on its next poll, within the 60s backoff cap",
+                gate.stage,
+                path.display()
+            );
+            Ok(true)
+        }
+        // A human, `--yes-ship`, or `devflow gate sweep` already answered
+        // this gate between our `list_open` scan and this `reap` call. The
+        // phase is already ending — that is success, not a failure to
+        // report.
+        Err(GateError::AlreadyResponded { .. }) => {
+            println!(
+                "stop: phase {phase} {} already has a response awaiting pickup — the phase \
+                 is already ending",
+                gate.stage
+            );
+            Ok(true)
+        }
+        Err(GateError::NoOpenGate { .. }) => Ok(false),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// The fallback: signal the process recorded in `phase`'s per-phase lock
+/// file — the process actually running `advance()` and holding the lock
+/// across the gate wait. Fail-closed on identity (T-23-52): a live pid that
+/// does not look like a devflow process is refused, not signalled, since
+/// the lock may be stale with a recycled pid. Never reads
+/// `state.monitor_pid` — see [`stop`]'s doc comment.
+fn stop_via_lock(project_root: &Path, phase: u32) -> Result<(), CliError> {
+    let Some((pid_str, _path)) = lock::holder(project_root, phase) else {
+        println!("stop: no lock held for phase {phase} — nothing is running `advance()`");
+        return Ok(());
+    };
+    let Ok(pid) = pid_str.parse::<u32>() else {
+        println!(
+            "stop: phase {phase}'s lock file holds a corrupt pid ({pid_str}) — treating it \
+             as stale"
+        );
+        return Ok(());
+    };
+    if !agent::agent_running(pid) {
+        println!(
+            "stop: phase {phase}'s lock names pid {pid}, which is not alive — stale lock, \
+             nothing to signal"
+        );
+        return Ok(());
+    }
+    // Identity must be MATCHED against what the lock recorded, never inferred
+    // from /proc (999.47). `looks_like_devflow_process` alone returns true for
+    // any freshly forked child of a devflow process that has not finished
+    // execve — during that window the child carries its parent's cmdline and
+    // exe — so it would authorise signalling an unrelated process. Confirmed
+    // in CI, not theorised.
+    //
+    // `(pid, starttime)` is unique for the life of a boot: a recycled pid
+    // necessarily starts later than the one it replaced, and a mid-execve
+    // child has its own start time distinct from its parent's.
+    match lock::holder_identity(project_root, phase) {
+        Some((recorded_pid, Some(recorded_start))) if recorded_pid == pid => {
+            if !agent::is_same_process(pid, recorded_start) {
+                return Err(CliError::Message(format!(
+                    "refusing to signal pid {pid} for phase {phase} — it is not the \
+                     process that took the lock. The lock recorded start time \
+                     {recorded_start}, but pid {pid} now reports {:?}, so the pid has \
+                     been recycled and belongs to something else. Inspect it manually \
+                     (e.g. `ps -p {pid}`) before proceeding.",
+                    agent::process_start_time(pid)
+                )));
+            }
+        }
+        Some((_, None)) => {
+            // Legacy single-line lock, written before start times were
+            // recorded. Identity cannot be confirmed, so fail closed rather
+            // than fall back to the unsound cmdline check.
+            return Err(CliError::Message(format!(
+                "refusing to signal pid {pid} for phase {phase} — the lock file records \
+                 no start time, so this process's identity cannot be confirmed. The lock \
+                 predates identity recording; if the run is genuinely stuck, inspect the \
+                 pid manually (e.g. `ps -p {pid}`) and remove \
+                 .devflow/lock-{phase:02} once you are satisfied."
+            )));
+        }
+        _ => {
+            return Err(CliError::Message(format!(
+                "refusing to signal pid {pid} for phase {phase} — the lock file's holder \
+                 could not be read back for identity confirmation. Inspect it manually \
+                 (e.g. `ps -p {pid}`) before proceeding."
+            )));
+        }
+    }
+    if agent::terminate(pid) {
+        println!("stop: signalled pid {pid}, phase {phase}'s lock holder");
+    } else {
+        println!("stop: pid {pid} could not be signalled (it may have just exited)");
+    }
+    Ok(())
+}
+
+/// Persist the operator's intent: mark `stopped` and record why, preserving
+/// any earlier reason (e.g. a prior `--until` halt) by appending rather
+/// than overwriting. Never touches `stop_until` — that field means
+/// something different (the requested halt stage for `devflow start
+/// --until`) and `transition()` reads it. A phase with no persisted state
+/// at all — never started, or already cleared by a completed abort — is
+/// already stopped; that is success, not an error.
+fn persist_stopped_state(project_root: &Path, phase: u32) -> Result<(), CliError> {
+    let mut state = match workflow::load_state(project_root, phase) {
+        Ok(state) => state,
+        Err(workflow::WorkflowError::MissingState(_)) => {
+            println!("stop: no persisted state for phase {phase} — already stopped");
+            return Ok(());
+        }
+        Err(err) => return Err(err.into()),
+    };
+    state.stopped = true;
+    let reason = "stopped via `devflow stop`".to_string();
+    state.stop_reason = Some(match state.stop_reason.take() {
+        Some(existing) if !existing.is_empty() => format!("{existing}; {reason}"),
+        _ => reason,
+    });
+    workflow::save_state(&state)?;
     Ok(())
 }
 
@@ -977,74 +1443,6 @@ fn default_logs_phase(project_root: &Path) -> Result<u32, CliError> {
 fn agent_pid_from_file(project_root: &Path, phase: u32) -> Option<u32> {
     let path = agent_result::agent_pid_path(project_root, phase);
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
-}
-
-/// Enumerate every recorded `sequentagent` slot and render one status line
-/// per phase, naming the running agent slot (A/B), its `AgentKind`, and
-/// liveness (21c, D-06) — a sequentagent phase has no entry in
-/// `workflow::list_states`, so without this the second agent is otherwise
-/// entirely invisible to `status`. Pure and read-only: no writes, no
-/// `save_state`/`transition` call.
-///
-/// Scans `.devflow/phase-*-sequentagent` (mirroring `default_logs_phase`'s
-/// `read_dir` + `strip_prefix`/`strip_suffix` idiom) since there is no
-/// `State` to enumerate this from.
-///
-/// Liveness is distinguished by cross-referencing the slot record against
-/// the existing agent-pid file (`agent_pid_from_file` + `agent::agent_running`):
-/// - `running` — the agent-pid file exists and the process is alive.
-/// - `starting` — the slot record exists but the agent-pid file has not
-///   appeared yet (the monitor writes it asynchronously, after the slot
-///   record — cross-AI review LOW pid-race); an honest transient rather than
-///   a misleading "dead" agent.
-/// - `not running` — the agent-pid file exists but the process is dead (a
-///   stale record never renders a false-live agent, T-21c-02).
-///
-/// `doctor` integration is intentionally out of scope for this plan: `status`
-/// is the live-observability command, while `doctor` reconciles persisted
-/// `State` — surfacing this in `doctor` without a matching `--json` key would
-/// reintroduce the WR-01 human/json split (21-04-PLAN.md Review
-/// Incorporation).
-fn render_sequentagent_status(project_root: &Path) -> Option<String> {
-    let devflow = workflow::devflow_dir(project_root);
-    let mut phases: Vec<u32> = std::fs::read_dir(&devflow)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name();
-            name.to_str()?
-                .strip_prefix("phase-")?
-                .strip_suffix("-sequentagent")?
-                .parse::<u32>()
-                .ok()
-        })
-        .collect();
-    phases.sort_unstable();
-    phases.dedup();
-
-    let lines: Vec<String> = phases
-        .into_iter()
-        .filter_map(|phase| {
-            let slot = agent_result::read_sequentagent_slot(project_root, phase)?;
-            let pid = agent_pid_from_file(project_root, phase);
-            let (state, pid_suffix) = match pid {
-                Some(pid) if agent::agent_running(pid) => ("running", format!(" (pid {pid})")),
-                Some(pid) => ("not running", format!(" (pid {pid})")),
-                None => ("starting", String::new()),
-            };
-            Some(format!(
-                "sequentagent phase {phase}: agent {} ({}) {state}{pid_suffix}",
-                slot.slot, slot.agent
-            ))
-        })
-        .collect();
-
-    if lines.is_empty() {
-        None
-    } else {
-        Some(lines.join("\n"))
-    }
 }
 
 fn cron_instruction_hints(project_root: &Path) -> Vec<String> {
@@ -2446,7 +2844,7 @@ mod tests {
         // (covered separately by cron_hint_line_* below).
         for phase in [7, 9] {
             let instructions =
-                devflow_core::ship::build_cron_instructions(dir.path(), phase, "", "claude,codex");
+                devflow_core::ship::build_single_agent_cron_instructions(dir.path(), phase, "");
             devflow_core::ship::write_cron_instructions(dir.path(), &instructions).unwrap();
         }
 
@@ -2466,11 +2864,10 @@ mod tests {
     #[test]
     fn cron_hint_line_appends_sanitized_reset_when_retry_after_present() {
         let dir = tempfile::tempdir().unwrap();
-        let instructions = devflow_core::ship::build_cron_instructions(
+        let instructions = devflow_core::ship::build_single_agent_cron_instructions(
             dir.path(),
             7,
             "2026-06-18T15:45:30Z",
-            "claude,codex",
         );
 
         let hint = cron_hint_line(&instructions, dir.path());
@@ -2485,7 +2882,8 @@ mod tests {
     #[test]
     fn cron_hint_line_omits_reset_fragment_when_retry_after_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let instructions = devflow_core::ship::build_cron_instructions(dir.path(), 7, "", "claude");
+        let instructions =
+            devflow_core::ship::build_single_agent_cron_instructions(dir.path(), 7, "");
 
         let hint = cron_hint_line(&instructions, dir.path());
 
@@ -2577,84 +2975,6 @@ mod tests {
     fn liveness_treats_zero_and_overflow_pids_as_dead() {
         assert!(!agent::agent_running(0));
         assert!(!agent::agent_running(u32::MAX));
-    }
-
-    /// A live slot renders `agent B (codex) running`, cross-referencing the
-    /// agent-pid file the monitor already writes (21c, D-06).
-    #[test]
-    fn sequentagent_status_renders_running_slot() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        agent_result::write_sequentagent_slot(
-            root,
-            7,
-            agent_result::SequentagentSlotKind::B,
-            AgentKind::Codex,
-        )
-        .unwrap();
-        std::fs::write(
-            agent_result::agent_pid_path(root, 7),
-            std::process::id().to_string(),
-        )
-        .unwrap();
-
-        let rendered = render_sequentagent_status(root).unwrap();
-
-        assert!(rendered.contains("sequentagent"));
-        assert!(rendered.contains("agent B"));
-        assert!(rendered.contains("codex"));
-        assert!(rendered.contains("running"));
-        assert!(!rendered.contains("not running"));
-    }
-
-    /// A slot record whose agent-pid file names a dead process renders
-    /// "not running" — a stale record never claims a live agent (T-21c-02).
-    #[test]
-    fn sequentagent_status_renders_dead_pid_as_not_running() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        agent_result::write_sequentagent_slot(
-            root,
-            8,
-            agent_result::SequentagentSlotKind::A,
-            AgentKind::Claude,
-        )
-        .unwrap();
-        std::fs::write(agent_result::agent_pid_path(root, 8), "0").unwrap();
-
-        let rendered = render_sequentagent_status(root).unwrap();
-
-        assert!(rendered.contains("not running"));
-    }
-
-    /// A slot record present but with no agent-pid file yet (the monitor
-    /// writes it asynchronously — the launch/pid-write race) renders
-    /// "starting", not "not running" — an honest transient state
-    /// (cross-AI review LOW pid-race).
-    #[test]
-    fn sequentagent_status_renders_starting_when_pid_file_missing() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        agent_result::write_sequentagent_slot(
-            root,
-            9,
-            agent_result::SequentagentSlotKind::A,
-            AgentKind::Claude,
-        )
-        .unwrap();
-
-        let rendered = render_sequentagent_status(root).unwrap();
-
-        assert!(rendered.contains("starting"));
-        assert!(!rendered.contains("not running"));
-    }
-
-    /// No slot records at all → `None`, so `status` prints nothing extra for
-    /// the common (non-sequentagent) case.
-    #[test]
-    fn sequentagent_status_none_when_no_records() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(render_sequentagent_status(dir.path()).is_none());
     }
 
     /// 18b: persisting `monitor_pid` for one phase must not disturb a
@@ -2765,6 +3085,423 @@ mod tests {
             "explicit-stage rejection must land"
         );
         assert!(!Gates::response_path(root, 15, Stage::Ship).exists());
+    }
+
+    /// Backdate an already-written gate's `timestamp` so it reads as
+    /// `age_secs` old — the deterministic way `gate_sweep` tests make a gate
+    /// look abandoned without sleeping.
+    fn backdate_gate(root: &Path, phase: u32, stage: Stage, age_secs: u64) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let gate = devflow_core::gates::GateFile {
+            phase,
+            stage,
+            context: "ctx".to_string(),
+            timestamp: now.saturating_sub(age_secs).to_string(),
+        };
+        std::fs::write(
+            Gates::gate_path(root, phase, stage),
+            serde_json::to_string_pretty(&gate).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Task 2 behavior: `--dry-run` computes and prints every decision but
+    /// writes nothing — the aged gate stays open with no response file.
+    #[test]
+    fn gate_sweep_dry_run_does_not_write_a_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        Gates::write_gate(root, 30, Stage::Ship, "ctx").unwrap();
+        backdate_gate(root, 30, Stage::Ship, 7 * 60 * 60);
+
+        gate_sweep(None, true, Some(root.to_path_buf())).unwrap();
+
+        assert!(
+            !Gates::response_path(root, 30, Stage::Ship).exists(),
+            "dry-run must never write a response file"
+        );
+        let open = Gates::list_open(root);
+        assert_eq!(open.len(), 1, "dry-run must leave the gate open");
+    }
+
+    /// Task 2 behavior: a gate that already has a response is a benign race
+    /// (a human or `--yes-ship` may have answered it between `list_open`
+    /// and `reap`) — the sweep must return `Ok` and leave the existing
+    /// response byte-for-byte untouched, never overwrite it.
+    #[test]
+    fn gate_sweep_skips_already_responded_gate_without_clobbering() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        Gates::write_gate(root, 31, Stage::Ship, "ctx").unwrap();
+        backdate_gate(root, 31, Stage::Ship, 7 * 60 * 60);
+        let response = GateResponse {
+            approved: true,
+            note: None,
+            responded_by: Some("human".into()),
+        };
+        Gates::respond(root, 31, Stage::Ship, &response).unwrap();
+        let before = std::fs::read_to_string(Gates::response_path(root, 31, Stage::Ship)).unwrap();
+
+        let result = gate_sweep(None, false, Some(root.to_path_buf()));
+
+        assert!(result.is_ok(), "an already-answered gate must not error");
+        let after = std::fs::read_to_string(Gates::response_path(root, 31, Stage::Ship)).unwrap();
+        assert_eq!(
+            before, after,
+            "the pre-existing response must be byte-identical afterwards"
+        );
+    }
+
+    /// Task 2 behavior (T-23-43 audit trail): a successful reap emits
+    /// `gate_reaped` in the sweep's own process — one of the two
+    /// independent, attributed records a reaped gate leaves.
+    #[test]
+    fn gate_sweep_emits_gate_reaped_event_on_reap() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        Gates::write_gate(root, 32, Stage::Ship, "ctx").unwrap();
+        backdate_gate(root, 32, Stage::Ship, 7 * 60 * 60);
+
+        gate_sweep(None, false, Some(root.to_path_buf())).unwrap();
+
+        let event = devflow_core::events::last_event_for_phase(root, 32).unwrap();
+        assert_eq!(event["event"], "gate_reaped");
+        assert_eq!(event["stage"], "ship");
+    }
+
+    /// Render `/proc/<pid>/cmdline` readably for failure diagnostics: the
+    /// NUL-separated argv joined with ` | `, or a marker when it cannot be
+    /// read. Test-only; never used in a decision, only in a message.
+    fn debug_cmdline(pid: u32) -> String {
+        match std::fs::read(format!("/proc/{pid}/cmdline")) {
+            Ok(raw) if raw.iter().all(|&byte| byte == 0) => "<empty>".to_string(),
+            Ok(raw) => raw
+                .split(|&byte| byte == 0)
+                .filter(|arg| !arg.is_empty())
+                .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                .collect::<Vec<_>>()
+                .join(" | "),
+            Err(err) => format!("<unreadable: {err}>"),
+        }
+    }
+
+    /// Pull the identity-bearing fields out of `/proc/<pid>/status` for
+    /// failure diagnostics. `PPid` is the decisive one: it says whether the
+    /// pid still belongs to the child we spawned or has been recycled by an
+    /// unrelated process. Test-only; never used in a decision.
+    fn debug_proc_status(pid: u32) -> String {
+        match std::fs::read_to_string(format!("/proc/{pid}/status")) {
+            Ok(text) => {
+                let pick = |key: &str| {
+                    text.lines()
+                        .find(|l| l.starts_with(key))
+                        .map(|l| l.split_whitespace().skip(1).collect::<Vec<_>>().join(" "))
+                        .unwrap_or_else(|| "?".to_string())
+                };
+                format!(
+                    "Name={} State={} Pid={} PPid={} Threads={}",
+                    pick("Name:"),
+                    pick("State:"),
+                    pick("Pid:"),
+                    pick("PPid:"),
+                    pick("Threads:")
+                )
+            }
+            Err(err) => format!("<unreadable: {err}>"),
+        }
+    }
+
+    /// Kernel-level view of what a pid is actually *doing*, for 999.47.
+    /// `wchan` names the kernel function it is blocked in; `syscall` gives the
+    /// current syscall number (or `running` when in userspace); `utime`/`stime`
+    /// are CPU tick counters, so sampling twice shows whether it is burning CPU
+    /// (spinning) or making no progress at all (blocked). Test-only.
+    ///
+    /// `syscall` and `stack` need PTRACE_MODE_ATTACH; unreadable is itself a
+    /// datum, so failures are reported rather than hidden.
+    fn debug_proc_runtime(pid: u32) -> String {
+        let read = |what: &str| {
+            std::fs::read_to_string(format!("/proc/{pid}/{what}"))
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|e| format!("<unreadable: {e}>"))
+        };
+        // /proc/<pid>/stat: field 3 = state, 14 = utime, 15 = stime, 22 = starttime.
+        // The comm field is parenthesised and may contain spaces, so split after
+        // the final ')' rather than tokenising the whole line.
+        let stat = read("stat");
+        let (state, utime, stime, starttime) = stat
+            .rfind(')')
+            .map(|i| {
+                let rest: Vec<&str> = stat[i + 1..].split_whitespace().collect();
+                let get = |n: usize| rest.get(n).copied().unwrap_or("?").to_string();
+                // rest[0] is field 3 (state), so field N is rest[N - 3].
+                (get(0), get(11), get(12), get(19))
+            })
+            .unwrap_or_else(|| ("?".into(), "?".into(), "?".into(), "?".into()));
+        format!(
+            "state={state} utime={utime} stime={stime} starttime={starttime} \
+             wchan={} syscall={}",
+            read("wchan"),
+            read("syscall"),
+        )
+    }
+
+    /// Task 2 behavior (T-23-52 fail-closed): a lock file naming a live pid
+    /// that does not identify as a devflow process must be refused, never
+    /// signalled. Constructed against this test binary's own pid when its
+    /// exe name doesn't start with `devflow` (cargo names devflow-cli's own
+    /// test binary `devflow-<hash>`, which WOULD look like devflow — so
+    /// this falls back to a spawned `sleep` child in that case).
+    #[test]
+    fn stop_refuses_to_signal_a_live_pid_that_fails_the_identity_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 200;
+
+        let self_exe_is_devflow_named = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .is_some_and(|name| name.starts_with("devflow"));
+
+        let mut sleeper: Option<std::process::Child> = None;
+        let pid = if self_exe_is_devflow_named {
+            let child = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn sleep");
+            let pid = child.id();
+            sleeper = Some(child);
+            pid
+        } else {
+            std::process::id()
+        };
+
+        let lock_path = root.join(".devflow").join(format!("lock-{phase:02}"));
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        std::fs::write(&lock_path, pid.to_string()).unwrap();
+
+        // This assertion has failed intermittently in CI (999.47 / DEN-72) in
+        // the FALSE-POSITIVE direction: `stop()` returned Ok, meaning the
+        // identity guard passed for a pid that is not a devflow process and
+        // `devflow stop` went on to signal it. A bare `expect_err` throws away
+        // every artifact that could name the cause, so capture the guard's own
+        // inputs around the call. Not reproducible locally as of 2026-07-26 —
+        // see the backlog entry for the attempts already ruled out.
+        // CI (2026-07-26) showed the child's cmdline equal to this test
+        // binary's own, stably before and after. cmdline alone cannot say
+        // WHY. /proc/<pid>/status disambiguates: PPid tells us whether this
+        // pid is still our child (if not, it was recycled by an unrelated
+        // process), Name is the post-exec binary name, and State reveals a
+        // zombie whose cmdline reads empty.
+        let status_before = debug_proc_status(pid);
+        let cmdline_before = debug_cmdline(pid);
+        // Two samples ~60ms apart: if utime/stime advance the child is
+        // spinning in userspace; if they are static and wchan names a kernel
+        // function it is genuinely blocked. State=R with a static utime would
+        // mean runnable-but-never-scheduled, i.e. starvation.
+        let runtime_1 = debug_proc_runtime(pid);
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        let runtime_2 = debug_proc_runtime(pid);
+        let predicate_verdict = agent::looks_like_devflow_process(pid);
+        let result = stop(root, phase);
+        let cmdline_after = debug_cmdline(pid);
+        let status_after = debug_proc_status(pid);
+        let runtime_3 = debug_proc_runtime(pid);
+        // Did the spawned child already exit before we ever looked at it?
+        let child_exited = sleeper
+            .as_mut()
+            .map(|c| format!("{:?}", c.try_wait()))
+            .unwrap_or_else(|| "<no child spawned>".to_string());
+        let lock_survived = lock_path.exists();
+
+        // Reap before asserting: a panic here must not leak the sleeper for
+        // its full 30s (this repo already has an orphan problem, 999.44/46).
+        if let Some(mut child) = sleeper {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
+        let err = match result {
+            Err(err) => err,
+            Ok(()) => panic!(
+                "stop() returned Ok — the identity guard PASSED for pid {pid}, so \
+                 `devflow stop` signalled a process that is not devflow.\n\
+                 \x20 branch taken:        {}\n\
+                 \x20 current_exe():       {:?}\n\
+                 \x20 pid under test:      {pid}\n\
+                 \x20 cmdline before stop: {cmdline_before}\n\
+                 \x20 cmdline after stop:  {cmdline_after}\n\
+                 \x20 status before stop:  {status_before}\n\
+                 \x20 status after stop:   {status_after}\n\
+                 \x20 runtime t0:          {runtime_1}\n\
+                 \x20 runtime t0+60ms:     {runtime_2}\n\
+                 \x20 runtime after stop:  {runtime_3}\n\
+                 \x20 child.try_wait():    {child_exited}\n\
+                 \x20 direct predicate:    looks_like_devflow_process({pid}) = {predicate_verdict}\n\
+                 \x20 lock file survived:  {lock_survived}\n\
+                 \x20 test process:        pid {} cmdline {}\n\
+                 KNOWN (999.47): PPid is this process and Name is the forking test \
+                 thread, so the child forks and never exec's, persistently. The open \
+                 question is WHY, and the runtime samples answer it: utime/stime \
+                 ADVANCING across t0 -> t0+60ms means it is spinning in userspace \
+                 (look at `syscall=running`); STATIC with a named `wchan` means it is \
+                 blocked in the kernel (wchan names the function — a futex points at \
+                 a lock inherited across fork); STATIC with state=R and wchan=0 means \
+                 runnable but never scheduled, i.e. starvation, not a deadlock. \
+                 `syscall` gives the syscall number it is stuck in, if any.",
+                if self_exe_is_devflow_named {
+                    "spawned sleep"
+                } else {
+                    "own pid"
+                },
+                std::env::current_exe(),
+                std::process::id(),
+                debug_cmdline(std::process::id()),
+            ),
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains(&pid.to_string()),
+            "error must name the pid it refused to signal, got: {message}"
+        );
+        assert!(
+            lock_survived,
+            "the lock file must be untouched — stop must not signal anything"
+        );
+    }
+
+    /// 999.47: a lock recording a start time that does not match the live
+    /// process must be refused. This is the pid-recycling case — the lock
+    /// named pid N, N died, and something unrelated now holds it.
+    ///
+    /// Unlike the cmdline check this replaced, the verdict does not depend
+    /// on what the process *looks* like, so a `sleep` and a real devflow
+    /// binary are rejected identically.
+    #[test]
+    fn stop_refuses_when_the_recorded_start_time_does_not_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 201;
+
+        // Our own pid is genuinely alive and genuinely devflow-named, so the
+        // old cmdline check would have happily signalled it. Only the start
+        // time distinguishes "this process" from "whatever holds this pid".
+        let pid = std::process::id();
+        let real_start = devflow_core::agent::process_start_time(pid)
+            .expect("read our own start time from /proc");
+        let wrong_start = real_start + 1;
+
+        let lock_path = root.join(".devflow").join(format!("lock-{phase:02}"));
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        std::fs::write(&lock_path, format!("{pid}\n{wrong_start}")).unwrap();
+
+        let err = stop(root, phase).expect_err("a start-time mismatch must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains(&pid.to_string()),
+            "error must name the pid it refused to signal, got: {message}"
+        );
+        assert!(
+            message.contains("not the process that took the lock"),
+            "error must say the identity did not match, got: {message}"
+        );
+        assert!(
+            lock_path.exists(),
+            "the lock file must be untouched — stop must not signal anything"
+        );
+    }
+
+    /// The positive case: when the lock's recorded identity matches the live
+    /// process, `stop` proceeds. Without this, the refusal test above would
+    /// pass equally well against a `stop` that refused unconditionally.
+    #[test]
+    fn stop_signals_the_holder_when_the_recorded_identity_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 202;
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let child_pid = child.id();
+
+        // Record the child's OWN identity — the honest case, where the lock
+        // holder really is the process named. Poll for the start time: a
+        // freshly forked child may not have exec'd yet (999.47).
+        let mut child_start = None;
+        for _ in 0..100 {
+            child_start = devflow_core::agent::process_start_time(child_pid);
+            if child_start.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let child_start = child_start.expect("read the child's start time");
+
+        let lock_path = root.join(".devflow").join(format!("lock-{phase:02}"));
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        std::fs::write(&lock_path, format!("{child_pid}\n{child_start}")).unwrap();
+
+        let result = stop(root, phase);
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            result.is_ok(),
+            "a matching identity must be signalled, not refused: {result:?}"
+        );
+    }
+
+    /// Task 2 behavior: a lock file naming a dead pid is stale — reclaimed
+    /// silently, never signalled, and never an error. An explicit state
+    /// file is present so this test exercises only the lock-fallback path
+    /// under test, not Task 3's separate missing-state tolerance.
+    #[test]
+    fn stop_is_a_success_no_op_when_the_lock_names_a_dead_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 202;
+        let lock_path = root.join(".devflow").join(format!("lock-{phase:02}"));
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        // Above default kernel pid_max — guaranteed not alive.
+        std::fs::write(&lock_path, "9999999").unwrap();
+        let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        workflow::save_state(&state).unwrap();
+
+        stop(root, phase).expect("stop against a stale lock must succeed, not error");
+    }
+
+    /// T-23-51: a live `monitor_pid` recorded in `State` — with no open gate
+    /// and no lock file — must never be treated as a signalling target.
+    /// `stop` only ever looks at the lock file.
+    #[test]
+    fn stop_never_treats_monitor_pid_as_a_signalling_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 203;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.monitor_pid = Some(std::process::id());
+        workflow::save_state(&state).unwrap();
+
+        stop(root, phase).expect(
+            "stop must succeed — a recorded monitor_pid alone must never be signalled or \
+             treated as a blocker",
+        );
+    }
+
+    /// Task 3 behavior: no open gate, no lock file, and no persisted state
+    /// at all — a phase that was never started — is a successful no-op.
+    #[test]
+    fn stop_is_a_success_no_op_with_no_gate_and_no_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        stop(root, 201).expect("stop against nothing present must succeed");
     }
 
     /// 14-CR-03: a capture file SHORTER than the follower's offset means the
@@ -2914,6 +3651,64 @@ mod tests {
         assert!(!banner.contains(&context));
         assert!(!banner.contains('\u{1b}'));
         assert!(banner.contains("ESCALATED"));
+    }
+
+    /// 23-03 Task 3: a gate whose age has crossed the escalation threshold
+    /// renders with a trailing urgency marker.
+    #[test]
+    fn render_gate_age_marks_escalated_gate_urgent() {
+        let now = 10_000u64;
+        let old_timestamp = (now - GATE_ESCALATION_THRESHOLD_SECS - 60).to_string();
+
+        let age = render_gate_age(&old_timestamp, now);
+
+        assert!(
+            age.ends_with('!'),
+            "an escalated gate's age must carry a trailing urgency marker, got {age:?}"
+        );
+    }
+
+    /// A gate younger than the escalation threshold renders with an age and
+    /// no urgency marker.
+    #[test]
+    fn render_gate_age_no_marker_for_fresh_gate() {
+        let now = 10_000u64;
+        let fresh_timestamp = (now - 30).to_string();
+
+        let age = render_gate_age(&fresh_timestamp, now);
+
+        assert!(
+            !age.ends_with('!'),
+            "a fresh gate must not carry an urgency marker, got {age:?}"
+        );
+    }
+
+    /// A `timestamp` that does not parse as `u64` must render an unknown
+    /// age (`?`) rather than panicking or being silently dropped — the
+    /// forensics record shows dropping unusual rows is exactly how the
+    /// orphan population stayed invisible.
+    #[test]
+    fn render_gate_age_unknown_for_non_numeric_timestamp() {
+        let age = render_gate_age("not-a-number", 10_000);
+        assert_eq!(age, "?");
+    }
+
+    /// The `--all-roots` row-rendering must still include a gate whose
+    /// timestamp is non-numeric — the row is present in the output, just
+    /// with an unknown age, matching the acceptance criterion literally.
+    #[test]
+    fn all_roots_row_includes_gate_with_non_numeric_timestamp() {
+        let gate = OpenGate {
+            phase: 42,
+            stage: Stage::Ship,
+            context: "ctx".to_string(),
+            timestamp: "not-a-number".to_string(),
+        };
+
+        let row = render_all_roots_gate_row(Path::new("/tmp/some-root"), &gate, 10_000);
+
+        assert!(row.contains("42"), "row must still name the phase: {row}");
+        assert!(row.contains('?'), "row must render the unknown age: {row}");
     }
 
     /// 21a: `recovery_hints` returns a `resume` hint for a stuck phase,
@@ -3754,5 +4549,65 @@ mod tests {
             let staleness = obj["planning_doc_staleness"].as_array().unwrap();
             assert_eq!(staleness.len(), 1);
         }
+    }
+
+    /// 23-06 Task 3 acceptance: `--require-shipped` is exit-code-stable on
+    /// the strict `shipped` predicate ALONE — a shipped phase's call
+    /// succeeds, an otherwise-identical unshipped phase's call fails, with
+    /// every other evidence field held constant (neither phase has any git
+    /// state or persisted workflow state in this fixture).
+    #[test]
+    fn evidence_require_shipped_exits_ok_iff_the_phase_has_shipped() {
+        let dir = tempfile::tempdir().unwrap();
+        events::emit(
+            dir.path(),
+            30,
+            "workflow_shipped",
+            serde_json::json!({"stage": "ship"}),
+        );
+
+        assert!(evidence(dir.path(), 30, false, true).is_ok());
+        assert!(evidence(dir.path(), 31, false, true).is_err());
+    }
+
+    /// 23-06 Task 3 acceptance: a phase that only stopped (`--until`) must
+    /// fail `--require-shipped` with a message that says so explicitly,
+    /// not a generic "not shipped" — this is the confusing case named in
+    /// Task 1's acceptance criteria ("it finished but it did not ship").
+    #[test]
+    fn evidence_require_shipped_names_stopped_at_rather_than_generic_not_shipped() {
+        let dir = tempfile::tempdir().unwrap();
+        events::emit(
+            dir.path(),
+            32,
+            "workflow_finished",
+            serde_json::json!({"reason": "stopped_at", "stage": "plan"}),
+        );
+
+        let err = evidence(dir.path(), 32, false, true).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("stopped"),
+            "message must name the stopped-at case, got: {message}"
+        );
+    }
+
+    /// 23-06 Task 3 acceptance: the `--require-shipped` failure message is a
+    /// single line (it ends up verbatim in a gate context read on a phone)
+    /// and names the phase.
+    #[test]
+    fn evidence_require_shipped_failure_message_is_single_line_and_names_phase() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let err = evidence(dir.path(), 33, false, true).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            !message.contains('\n'),
+            "message must be one line: {message:?}"
+        );
+        assert!(
+            message.contains("33"),
+            "message must name the phase: {message}"
+        );
     }
 }

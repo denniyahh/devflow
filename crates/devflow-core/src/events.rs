@@ -137,6 +137,43 @@ pub fn last_event_for_phase(project_root: &Path, phase: u32) -> Option<serde_jso
         .map(|summary| summary.event)
 }
 
+/// Read the last event line for `phase` whose `event` field equals `event`,
+/// if any. Scans the log line by line, parsing each as JSON; an unparsable
+/// line is skipped, not fatal — the log is append-only and a torn final line
+/// must not make the whole history unreadable. A missing file returns `None`.
+///
+/// This is a targeted, single-event-kind scan, distinct from
+/// [`last_events_by_phase`]'s one-pass "latest event of any kind per phase"
+/// read — `ship_evidence::collect` needs the last occurrence of one
+/// *specific* event name, which the latest-of-any-kind index does not
+/// preserve once a later, different event overwrites it.
+pub fn last_event_of_kind_for_phase(
+    project_root: &Path,
+    phase: u32,
+    event: &str,
+) -> Option<serde_json::Value> {
+    let contents = std::fs::read_to_string(events_path(project_root)).ok()?;
+    let mut last = None;
+    for value in contents
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+    {
+        if value.get("phase").and_then(|p| p.as_u64()) == Some(phase as u64)
+            && value.get("event").and_then(|e| e.as_str()) == Some(event)
+        {
+            last = Some(value);
+        }
+    }
+    last
+}
+
+/// Whether `phase` has ever emitted an event named `event`. Implemented as
+/// [`last_event_of_kind_for_phase`]`.is_some()` so there is one scanner, not
+/// two.
+pub fn has_event_for_phase(project_root: &Path, phase: u32, event: &str) -> bool {
+    last_event_of_kind_for_phase(project_root, phase, event).is_some()
+}
+
 /// Render an event as a short human-readable summary ("gate_fired (ship)").
 pub fn describe(event: &serde_json::Value) -> String {
     let kind = event
@@ -329,6 +366,49 @@ mod tests {
 
         let last = last_event_for_phase(dir.path(), 4).expect("valid line still found");
         assert_eq!(last["event"], "workflow_started");
+    }
+
+    // These tests deliberately use a generic marker event name rather than
+    // any production event literal, keeping this generic scanner's tests
+    // decoupled from any one caller's naming choice. `ship_evidence::tests`
+    // exercises this same scanner against its real, specific event name.
+    const MARKER_EVENT: &str = "marker_event";
+
+    #[test]
+    fn last_event_of_kind_for_phase_filters_by_phase_and_event_name() {
+        let dir = tempfile::tempdir().unwrap();
+        emit(dir.path(), 1, "workflow_finished", serde_json::Value::Null);
+        emit(
+            dir.path(),
+            1,
+            MARKER_EVENT,
+            serde_json::json!({"stage": "ship"}),
+        );
+        emit(
+            dir.path(),
+            2,
+            MARKER_EVENT,
+            serde_json::json!({"stage": "ship"}),
+        );
+
+        let phase1 = last_event_of_kind_for_phase(dir.path(), 1, MARKER_EVENT)
+            .expect("phase 1 marker event exists");
+        assert_eq!(phase1["stage"], "ship");
+        assert!(has_event_for_phase(dir.path(), 1, MARKER_EVENT));
+        assert!(!has_event_for_phase(dir.path(), 3, MARKER_EVENT));
+        assert!(last_event_of_kind_for_phase(dir.path(), 3, MARKER_EVENT).is_none());
+    }
+
+    #[test]
+    fn last_event_of_kind_for_phase_skips_corrupt_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        emit(dir.path(), 4, MARKER_EVENT, serde_json::Value::Null);
+        let path = events_path(dir.path());
+        let mut contents = std::fs::read_to_string(&path).unwrap();
+        contents.push_str("{truncated\n");
+        std::fs::write(&path, contents).unwrap();
+
+        assert!(has_event_for_phase(dir.path(), 4, MARKER_EVENT));
     }
 
     #[test]

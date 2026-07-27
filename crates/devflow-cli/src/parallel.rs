@@ -1,29 +1,15 @@
-//! Multi-phase orchestration: spawning and integrating several phases at
-//! once (`parallel`), and the `sequentagent` blocking two-agent handoff path.
-//!
-//! `run_agent_blocking` operates on synthetic, never-persisted state —
-//! `sequentagent` does not participate in the stage machine, so there is no
-//! `save_state` chokepoint here (D-14: the retrospective proposal to add one
-//! was verified wrong for exactly this reason before this phase's split).
+//! Multi-phase orchestration: spawning several phases concurrently, each in
+//! its own worktree (`parallel`).
 
-use devflow_core::agent_result::{self, AgentStatus, SequentagentSlotKind};
-use devflow_core::agents;
-use devflow_core::config::{DEVELOP, FEATURE_PREFIX, capture_retention};
-use devflow_core::events;
+use devflow_core::config::{DEVELOP, FEATURE_PREFIX};
 use devflow_core::git::GitFlow;
-use devflow_core::lock;
 use devflow_core::mode::Mode;
-use devflow_core::monitor;
-use devflow_core::prompt;
-use devflow_core::stage::Stage;
-use devflow_core::state::{AgentKind, State};
+use devflow_core::state::AgentKind;
 use devflow_core::worktree;
 use std::path::{Path, PathBuf};
 
 use crate::CliError;
 use crate::commands::start;
-use crate::config_parse::checkout_lock_timeout;
-use crate::preflight::{agent_program, ensure_agent_binary, worktree_writable_roots};
 
 /// Create the phase worktree at `.worktrees/phase-NN/` on `feature/phase-NN`.
 pub(crate) fn ensure_phase_worktree(
@@ -54,7 +40,7 @@ pub(crate) fn ensure_phase_worktree(
 }
 
 // ---------------------------------------------------------------------------
-// parallel / sequentagent
+// parallel
 // ---------------------------------------------------------------------------
 
 /// Parse `--phases` and optional `--agents` into positional (phase, agent)
@@ -117,325 +103,23 @@ pub(crate) fn parallel(
     for (phase, agent) in pairs {
         println!("\n=== phase {phase} ({agent}) ===");
         // Worktree mode keeps each run isolated so the phases run together.
-        start(project_root, phase, agent, mode, force, true, false, None)?;
-    }
-    Ok(())
-}
-
-/// Parse exactly two comma-separated agents for `sequentagent`.
-fn split_two_agents(agents: &str) -> Result<(AgentKind, AgentKind), CliError> {
-    let parsed: Vec<AgentKind> = agents
-        .split(',')
-        .map(|a| a.trim())
-        .filter(|a| !a.is_empty())
-        .map(|a| {
-            a.parse::<AgentKind>()
-                .map_err(|err| CliError::Message(err.to_string()))
-        })
-        .collect::<Result<_, _>>()?;
-    if parsed.len() != 2 {
-        return Err(CliError::Message(format!(
-            "sequentagent requires exactly two agents (e.g. claude,codex), got {}",
-            parsed.len()
-        )));
-    }
-    Ok((parsed[0], parsed[1]))
-}
-
-/// Launch one agent via a no-advance monitor, block until it exits, and
-/// return its self-reported result (parsed from the DEVFLOW_RESULT marker,
-/// if present). Used by sequentagent, where the rebase handoff between
-/// agents requires a synchronous run.
-///
-/// 14b: this used to be a CLI-owned `launch_agent` + `capture_agent_output`
-/// pipe — the last synchronous execution path. It now rides the same
-/// monitor-owned execution as everything else (stderr separated from the
-/// parseable stdout capture, exit code reaped even if this CLI dies) and
-/// simply blocks on the exit file the monitor writes.
-fn run_agent_blocking(
-    project_root: &Path,
-    phase: u32,
-    agent: AgentKind,
-    workdir: &Path,
-    slot: SequentagentSlotKind,
-) -> Result<Option<agent_result::AgentResult>, CliError> {
-    if let Some(stamp) = agent_result::archive_phase_files(
-        project_root,
-        workdir,
-        phase,
-        capture_retention(project_root),
-    )
-    .map_err(|err| {
-        CliError::Message(format!(
-            "could not archive phase {phase} capture before rollover: {err}"
-        ))
-    })? {
-        events::emit(
+        // `devflow parallel` has no `--yes-ship` flag of its own (D-05: the
+        // pre-authorization must be typed per invocation on `devflow
+        // start`), so every phase it launches keeps the routine gated Ship
+        // behavior — `false` here changes nothing about `parallel`'s
+        // existing behavior.
+        start(
             project_root,
             phase,
-            "capture_archived",
-            serde_json::json!({"stage": "code", "stamp": stamp}),
-        );
+            agent,
+            mode,
+            force,
+            true,
+            false,
+            None,
+            false,
+        )?;
     }
-    let adapter = agents::adapter_for(agent);
-    let prompt = prompt::stage_prompt_for_project(Stage::Code, phase, project_root);
-    // sequentagent always runs in a worktree — the main repo's `.git/` and
-    // the worktree admin dir must stay writable for sandboxed agents to
-    // commit (13-06 dogfood finding).
-    let roots = if workdir == project_root {
-        Vec::new()
-    } else {
-        worktree_writable_roots(project_root, workdir)
-    };
-    let (program, args) = adapter.exec_command(phase, &prompt, &roots);
-    ensure_agent_binary(program)?;
-    // Synthetic, never-persisted state: the monitor only reads project_root,
-    // phase, and worktree_path from it — sequentagent does not participate
-    // in the stage machine.
-    let mut state = State::new(phase, agent, Mode::Auto, project_root.to_path_buf());
-    state.stage = Stage::Code;
-    if workdir != project_root {
-        state.worktree_path = Some(workdir.to_path_buf());
-    }
-    let monitor_pid =
-        monitor::spawn_monitor_no_advance(&state, program, &args, &adapter.extra_env())
-            .map_err(|err| CliError::Message(format!("could not spawn monitor: {err}")))?;
-    // Additive observability bookkeeping only — a write failure here must
-    // never fail the actual agent run (D-06's narrow scope: this makes the
-    // second process observable, it does not gate execution on it).
-    if let Err(err) = agent_result::write_sequentagent_slot(project_root, phase, slot, agent) {
-        println!("warning: could not write sequentagent slot record: {err}");
-    }
-    println!(
-        "launched {} (monitor pid {monitor_pid}) in {}",
-        adapter.name(),
-        workdir.display()
-    );
-    // 14-CR-09: the sync path used to stream agent stderr to this terminal;
-    // the monitor captures it instead — tell the operator where to watch.
-    println!("  watch live: devflow logs -f --phase {phase} [--stderr]");
-    let exit_code = monitor::wait_for_agent_exit(project_root, phase, monitor_pid)
-        .map_err(|err| CliError::Message(format!("agent run did not complete: {err}")))?;
-    println!("agent {agent} exited with code {exit_code}");
-    // The monitor wrote stdout to the same file evaluate_layer1 reads, so
-    // delegate to it directly rather than re-implementing a subset of its
-    // precedence here — this is the single code path that knows how to find
-    // a Codex agent's DEVFLOW_RESULT marker inside its JSONL `--json` event
-    // stream (parse_codex_event_result).
-    let result = agent_result::evaluate_layer1(project_root, phase);
-    // Layer-1 silence is not success: a crashed agent (nonzero exit, no
-    // marker, no envelope) yields None here, and sequentagent's callers
-    // treat None as "proceed to integrate". Mirror Layer 2's exit-code gate
-    // so a crash never fast-forwards a half-finished branch into the base.
-    if result.is_none() && exit_code != 0 {
-        return Ok(Some(agent_result::AgentResult {
-            status: AgentStatus::Failed,
-            exit_code: Some(exit_code),
-            reason: Some(format!(
-                "agent exited with code {exit_code} without reporting a result"
-            )),
-            commits: None,
-            summary: None,
-            verdict: None,
-            // Mirrors Layer 2's exit-code gate per this block's own comment
-            // (review consensus #3).
-            decided_by_layer: Some(2),
-        }));
-    }
-    Ok(result)
-}
-
-/// Integrate an agent branch into the shared base, pushing if a remote
-/// exists. Serialized on the coarse checkout lock: branch fast-forwards and
-/// pushes mutate shared refs that a concurrently finishing phase's hooks
-/// also touch (13-DEFERRED-CR-03 sequentagent re-check).
-fn integrate_agent_branch(
-    project_root: &Path,
-    git: &GitFlow,
-    base: &str,
-    agent_branch: &str,
-) -> Result<(), CliError> {
-    // 14-CR-07: this hard-fails on a lock timeout by design (a shared-ref
-    // mutation must never run unlocked), which can leave an earlier agent's
-    // branch integrated and this one not — so the error carries resume
-    // guidance instead of leaving the operator to guess (re-running with
-    // --force would re-run agents on top of already-integrated work).
-    let _checkout_lock = lock::acquire_project_blocking(project_root, checkout_lock_timeout())
-        .map_err(|err| {
-            CliError::Message(format!(
-                "could not lock checkout to integrate {agent_branch} into {base}: {err}. \
-                 Earlier integrations into {base} are already in place; once the lock \
-                 holder finishes, integrate manually with \
-                 `git fetch . {agent_branch}:{base}` — do NOT re-run sequentagent --force."
-            ))
-        })?;
-    git.fast_forward_branch(base, agent_branch)?;
-    println!("integrated {agent_branch} into {base}");
-    if git.has_remote() {
-        match git.push(base) {
-            Ok(()) => println!("pushed {base} to origin"),
-            Err(err) => println!("warning: could not push {base}: {err}"),
-        }
-    }
-    Ok(())
-}
-
-/// RAII guard that clears the `sequentagent` slot record for `phase` when
-/// dropped. Bound once, before agent A runs, so its `Drop` impl fires on
-/// EVERY terminal path out of [`sequentagent`] below — all five error-exits
-/// (agent A failed, agent A rate-limited with zero commits, rebase-B
-/// conflict, agent B failed/rate-limited, integrate-B failure) and the
-/// success path — replacing a fragile success-path-only clear (cross-AI
-/// review MUST-FIX).
-struct SequentagentSlotGuard<'a> {
-    project_root: &'a Path,
-    phase: u32,
-}
-
-impl Drop for SequentagentSlotGuard<'_> {
-    fn drop(&mut self) {
-        agent_result::clear_sequentagent_slot(self.project_root, self.phase);
-    }
-}
-
-/// Run two agents sequentially on one phase, each in its own worktree, with a
-/// rebase handoff between them. See the `Sequentagent` command docs.
-pub(crate) fn sequentagent(
-    project_root: &Path,
-    phase: u32,
-    agents: &str,
-    force: bool,
-) -> Result<(), CliError> {
-    // 14b: hold this phase's lock for the whole run — a monitored pipeline
-    // run and a sequentagent run for the same phase share capture files and
-    // branches, and previously nothing excluded them from colliding.
-    let _phase_lock = match lock::acquire(project_root, phase) {
-        Ok(guard) => guard,
-        Err(lock::LockError::Contended { pid, path: _ }) => {
-            return Err(CliError::Message(format!(
-                "phase {phase} is already being driven by another devflow process (pid {pid})"
-            )));
-        }
-        Err(err) => return Err(CliError::Message(format!("lock error: {err}"))),
-    };
-    if let Err(err) = devflow_core::ship::delete_cron_instructions(project_root, phase) {
-        println!("warning: could not remove stale cron-instructions file: {err}");
-    }
-    let (agent_a, agent_b) = split_two_agents(agents)?;
-    // 14-CR-05: both binaries must resolve before any branch/worktree is
-    // scaffolded — agent B's absence should not surface after A's full run.
-    ensure_agent_binary(agent_program(agent_a))?;
-    ensure_agent_binary(agent_program(agent_b))?;
-    let git = GitFlow::new(project_root);
-    let base = format!("{FEATURE_PREFIX}phase-{phase:02}");
-
-    // 1. Ensure the shared base branch exists off develop, without leaving the
-    //    main checkout on it. Ref creation is serialized on the checkout lock
-    //    like every other shared-ref mutation.
-    {
-        let _checkout_lock = lock::acquire_project_blocking(project_root, checkout_lock_timeout())
-            .map_err(|err| CliError::Message(format!("could not lock checkout: {err}")))?;
-        git.ensure_branch(&base, DEVELOP)?;
-    }
-
-    // 2. Create one worktree per agent, both off the current base tip.
-    let branch_a = format!("{base}-{agent_a}");
-    let branch_b = format!("{base}-{agent_b}");
-    let wt_a = worktree::phase_agent_path(project_root, phase, &agent_a.to_string());
-    let wt_b = worktree::phase_agent_path(project_root, phase, &agent_b.to_string());
-
-    if force {
-        for (wt, branch) in [(&wt_a, &branch_a), (&wt_b, &branch_b)] {
-            if wt.exists() {
-                worktree::remove(project_root, wt, true)?;
-            }
-            let _ = git.delete_branch(branch, true);
-        }
-    }
-
-    add_or_explain(project_root, &wt_a, &branch_a, &base)?;
-    add_or_explain(project_root, &wt_b, &branch_b, &base)?;
-    println!("worktree A: {} ({branch_a})", wt_a.display());
-    println!("worktree B: {} ({branch_b})", wt_b.display());
-
-    // Clears the sequentagent slot record on EVERY exit path from this point
-    // forward — all five error-exits below AND success (cross-AI review
-    // MUST-FIX). A leaked record is harmless (render_sequentagent_status
-    // probes agent_running(pid) and renders "not running"), so this guard
-    // fixes `.devflow/` clutter accumulation, not a correctness bug.
-    let _slot_guard = SequentagentSlotGuard {
-        project_root,
-        phase,
-    };
-
-    // 3. Run agent A; stop before touching B if it fails.
-    println!("\n=== agent A: {agent_a} ===");
-    if let Some(result) =
-        run_agent_blocking(project_root, phase, agent_a, &wt_a, SequentagentSlotKind::A)?
-    {
-        match result.status {
-            AgentStatus::Failed => {
-                return Err(CliError::Message(format!(
-                    "agent A ({agent_a}) failed: {}",
-                    result.reason.unwrap_or_else(|| "no details".into())
-                )));
-            }
-            AgentStatus::RateLimited => {
-                let retry_after = retry_after_from_reason(result.reason.as_deref());
-                write_rate_limit_cron(project_root, phase, &retry_after, agents)?;
-                let commits = count_commits_between(project_root, &base, &branch_a)?;
-                if commits == 0 {
-                    println!(
-                        "Agent A rate-limited with zero commits; paused — resume record at {}",
-                        devflow_core::ship::cron_instructions_path(project_root, phase).display()
-                    );
-                    return Ok(());
-                }
-                println!("Agent A rate-limited; handing off to agent B");
-            }
-            _ => {}
-        }
-    }
-    integrate_agent_branch(project_root, &git, &base, &branch_a)?;
-
-    // 4. Rebase B onto the updated base; surface conflicts for manual fixing.
-    git.rebase_in(&wt_b, &base).map_err(|err| {
-        CliError::Message(format!(
-            "rebase of {branch_b} onto {base} hit conflicts — resolve them in {} \
-             then re-run sequentagent: {err}",
-            wt_b.display()
-        ))
-    })?;
-    println!("rebased {branch_b} onto {base}");
-
-    // 5. Run agent B and integrate.
-    println!("\n=== agent B: {agent_b} ===");
-    if let Some(result) =
-        run_agent_blocking(project_root, phase, agent_b, &wt_b, SequentagentSlotKind::B)?
-        && matches!(
-            result.status,
-            AgentStatus::Failed | AgentStatus::RateLimited
-        )
-    {
-        let label = if result.status == AgentStatus::RateLimited {
-            "rate-limited"
-        } else {
-            "failed"
-        };
-        return Err(CliError::Message(format!(
-            "agent B ({agent_b}) {label}: {}",
-            result.reason.unwrap_or_else(|| "no details".into())
-        )));
-    }
-    integrate_agent_branch(project_root, &git, &base, &branch_b)?;
-    // WR-02: the phase has shipped — a surviving cron-instructions file would
-    // mislead `devflow status`/a Hermes cron into re-running it. A failed
-    // delete must be visible, not swallowed, for the same reason.
-    if let Err(err) = devflow_core::ship::delete_cron_instructions(project_root, phase) {
-        println!("warning: could not remove cron-instructions file: {err}");
-    }
-
-    println!("\nsequentagent complete — both agents integrated into {base}");
     Ok(())
 }
 
@@ -444,71 +128,6 @@ pub(crate) fn retry_after_from_reason(reason: Option<&str>) -> String {
         .and_then(|s| s.strip_prefix("rate limited until "))
         .unwrap_or("unknown")
         .to_string()
-}
-
-fn write_rate_limit_cron(
-    project_root: &Path,
-    phase: u32,
-    retry_after: &str,
-    agents: &str,
-) -> Result<(), CliError> {
-    let instructions =
-        devflow_core::ship::build_cron_instructions(project_root, phase, retry_after, agents);
-    devflow_core::ship::write_cron_instructions(project_root, &instructions)?;
-    if instructions.hermes_cron.schedule.is_empty() {
-        println!("no parseable retry time — auto-resume cron not scheduled; resume manually");
-    } else {
-        // 14-CR-08: name the file that was actually written (per-phase),
-        // not the retired single-slot path.
-        println!(
-            "wrote {}",
-            devflow_core::ship::cron_instructions_path(project_root, phase)
-                .strip_prefix(project_root)
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| {
-                    devflow_core::ship::cron_instructions_path(project_root, phase)
-                        .display()
-                        .to_string()
-                })
-        );
-    }
-    Ok(())
-}
-
-fn count_commits_between(project_root: &Path, base: &str, branch: &str) -> Result<u32, CliError> {
-    let range = format!("{base}..{branch}");
-    let output = std::process::Command::new("git")
-        .args(["rev-list", "--count", &range])
-        .current_dir(project_root)
-        .output()
-        .map_err(|err| CliError::Message(format!("could not count commits on {branch}: {err}")))?;
-    if !output.status.success() {
-        return Err(CliError::Message(format!(
-            "could not count commits on {branch}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse::<u32>()
-        .map_err(|err| CliError::Message(format!("invalid commit count for {branch}: {err}")))
-}
-
-/// Add a worktree, turning the "already exists" error into actionable advice.
-fn add_or_explain(
-    project_root: &Path,
-    path: &Path,
-    branch: &str,
-    base: &str,
-) -> Result<(), CliError> {
-    match worktree::add(project_root, path, branch, base, true) {
-        Ok(()) => Ok(()),
-        Err(devflow_core::worktree::WorktreeError::Exists(p)) => Err(CliError::Message(format!(
-            "worktree already exists at {} — use --force to recreate it",
-            p.display()
-        ))),
-        Err(err) => Err(err.into()),
-    }
 }
 
 #[cfg(test)]
@@ -546,17 +165,6 @@ mod tests {
     }
 
     #[test]
-    fn split_two_agents_requires_exactly_two() {
-        assert_eq!(
-            split_two_agents("claude, codex").unwrap(),
-            (AgentKind::Claude, AgentKind::Codex)
-        );
-        assert!(split_two_agents("claude").is_err());
-        assert!(split_two_agents("claude,codex,opencode").is_err());
-        assert!(split_two_agents("claude,bogus").is_err());
-    }
-
-    #[test]
     fn retry_after_from_reason_strips_prefix() {
         assert_eq!(
             retry_after_from_reason(Some("rate limited until 2026-06-18T15:45:30Z")),
@@ -564,59 +172,5 @@ mod tests {
         );
         assert_eq!(retry_after_from_reason(Some("usage limit")), "unknown");
         assert_eq!(retry_after_from_reason(None), "unknown");
-    }
-
-    /// Proves the guard clears the slot record on drop even when drop is
-    /// reached via an early `return` — not just the success path — since a
-    /// `?`/`return` inside a block exits the enclosing scope exactly the same
-    /// way normal fall-through does (3/3-review MUST-FIX).
-    #[test]
-    fn slot_guard_clears_record_on_early_return() {
-        let dir = tempfile::tempdir().unwrap();
-        agent_result::write_sequentagent_slot(
-            dir.path(),
-            42,
-            SequentagentSlotKind::A,
-            AgentKind::Claude,
-        )
-        .unwrap();
-        assert!(agent_result::read_sequentagent_slot(dir.path(), 42).is_some());
-
-        fn exits_early(project_root: &Path, phase: u32) -> Result<(), ()> {
-            let _slot_guard = SequentagentSlotGuard {
-                project_root,
-                phase,
-            };
-            Err(()) // simulates one of sequentagent's five error-exit `return`s
-        }
-        let _ = exits_early(dir.path(), 42);
-
-        assert!(
-            agent_result::read_sequentagent_slot(dir.path(), 42).is_none(),
-            "slot guard did not clear the record on an early return"
-        );
-    }
-
-    /// Proves the guard also clears on ordinary fall-through (the success
-    /// path), not only on an early return.
-    #[test]
-    fn slot_guard_clears_record_on_success_path() {
-        let dir = tempfile::tempdir().unwrap();
-        agent_result::write_sequentagent_slot(
-            dir.path(),
-            43,
-            SequentagentSlotKind::B,
-            AgentKind::Codex,
-        )
-        .unwrap();
-
-        {
-            let _slot_guard = SequentagentSlotGuard {
-                project_root: dir.path(),
-                phase: 43,
-            };
-        }
-
-        assert!(agent_result::read_sequentagent_slot(dir.path(), 43).is_none());
     }
 }

@@ -36,6 +36,56 @@ Two things this hook does that are load-bearing:
   silently switch off a global secret scanner. It is a no-op if you have no
   such hook.
 
+### Repository git policy
+
+Git cannot version `.git/config`, so settings that must survive a fresh clone
+live in the tracked [`.gitconfig`](.gitconfig) and are pulled in once:
+
+```bash
+git config --local include.path ../.gitconfig
+```
+
+(the path is relative to `.git/config`). This turns on SSH-format signing for
+both commits and tags. It deliberately does **not** set `user.signingkey` —
+that is per-contributor and this repository is public.
+
+### Release signing
+
+Releases and `main` are restricted to the maintainer's key, enforced by
+`scripts/hooks/pre-push`.
+
+This matters here more than in most repositories because DevFlow is developed
+with an AI agent that commits under **its own** signing key. Two keys are
+therefore in play, and they are not interchangeable:
+
+| Config | Signs | Whose key |
+|---|---|---|
+| `user.signingkey` | ordinary commits | the agent's, on a machine where it works |
+| `devflow.releaseSigningKey` | release tags, `main` | the maintainer's — the only key permitted |
+
+Both are configured with the same `user.email`, so a tag signed with the wrong
+key looks correct everywhere a human checks: `git log`, `git tag -v`'s signer
+line, and GitHub's "Verified" badge all show the maintainer. Only the key
+fingerprint differs, which is why the hook compares fingerprints.
+
+If you cut releases, set your key once:
+
+```bash
+git config --local devflow.releaseSigningKey ~/.ssh/<your-key>.pub
+```
+
+Then tag with it explicitly, since `user.signingkey` may point elsewhere:
+
+```bash
+git -c user.signingkey="$(git config --get devflow.releaseSigningKey)" \
+    tag -s vX.Y.Z -m "vX.Y.Z"
+```
+
+Leaving `devflow.releaseSigningKey` unset disables the check entirely, so a
+contributor who never cuts a release needs no configuration. Once set there is
+no override flag — an override is what a mistaken release would reach for. To
+push a rejected tag, re-sign it with the right key.
+
 ### Distrobox (optional)
 
 If you use [distrobox](https://github.com/89luca89/distrobox), you can create an isolated environment:
@@ -185,18 +235,40 @@ second copy of the contract.
 
 ## Cutting a Release
 
-1. On `develop`: bump `version` in the root `Cargo.toml`, run `cargo build`
-   to sync `Cargo.lock`, add a new top `## X.Y.Z` section to `CHANGELOG.md`.
-2. Open a PR from `develop` into `main` titled
-   `release: vX.Y.Z — <short description>`.
-3. Once CI is green, squash-merge it (this repo's branch settings only
-   allow squash merges into `main` — real merge commits are disabled).
-4. Tag the resulting commit on `main`: `git tag -a vX.Y.Z <commit> -m "..."`,
-   then `git push origin vX.Y.Z`.
-5. **Immediately run `scripts/sync-main-to-develop.sh`** from a clean
-   `develop` checkout, then `git push origin develop`.
+**Both `develop` and `main` are protected branches** — direct pushes are
+rejected ("Changes must be made through a pull request", plus required status
+checks) even for the maintainer. Every step below that changes a branch goes
+through a PR.
 
-Step 5 is not optional. Because `main` only accepts squash merges, its new
+1. Bump the version in **two** places in the root `Cargo.toml`: `version`
+   under `[workspace.package]`, **and** `devflow-core`'s `version` under
+   `[workspace.dependencies]`. Bumping only the first is the easy miss;
+   `crates/devflow-cli/tests/workspace_version_pin.rs` guards the pair, but
+   only after the fact. Then `cargo build` to sync `Cargo.lock`, and add a new
+   top `## X.Y.Z` section to `CHANGELOG.md`.
+2. Since `develop` is protected, put step 1 (and any work being released) on a
+   branch and open a PR into `develop`. Merge it once CI is green.
+3. Open a PR from `develop` into `main` titled
+   `release: vX.Y.Z — <short description>`.
+4. Once CI is green, squash-merge it (this repo's branch settings only
+   allow squash merges into `main` — real merge commits are disabled).
+5. Tag the resulting commit on `main`: `git tag -s vX.Y.Z <commit> -m "..."`,
+   then `git push origin vX.Y.Z`. Use `-s`, not `-a`: releases are
+   SSH-signed, and a repo-local `tag.gpgsign=false` means `-a` alone will
+   not sign. Verify with `git tag -v vX.Y.Z`.
+6. **Immediately run `scripts/sync-main-to-develop.sh`** from a clean
+   `develop` checkout. It produces a merge commit locally; because `develop`
+   is protected you cannot push it directly — put it on a `sync/` branch and
+   open a PR into `develop`.
+
+   > **The sync PR must be merged with a merge commit, NOT squashed.**
+   > Squashing collapses the two parents into one and discards the ancestry
+   > link, which is the entire point of the step.
+
+7. Create a GitHub Release for the tag (convention since v1.7.0, and how the
+   CHANGELOG section reaches users who don't read the repo).
+
+Step 6 is not optional. Because `main` only accepts squash merges, its new
 release commit has no parent relationship back to `develop` — skip this
 step and the *next* release PR will conflict against a stale merge-base
 (this happened going into v1.5.0: main and develop had silently diverged
@@ -204,11 +276,17 @@ since v1.4.0, producing conflicts across 11 files including core Rust
 source). The script performs a content-preserving `-X ours` merge — it
 verifies the resulting tree is byte-identical to develop's before allowing
 itself to proceed — so it only ever links history, never changes content.
+Confirm it worked with `git merge-base --is-ancestor origin/main
+origin/develop`.
 
 To publish to crates.io after tagging: `cargo publish -p devflow-core`
-first (it must be live on the registry before the next step, since
-`devflow`'s manifest depends on it by version, not by path, once
-packaged), then `cargo publish -p devflow`.
+**first**, then `cargo publish -p devflow`. This ordering is a hard
+requirement, not a convention — `devflow`'s manifest depends on
+`devflow-core` by version rather than by path once packaged, and as of
+v1.8.1 `devflow-cli` also carries a dev-dependency on it for the
+`test-support` feature. Publishing out of order fails to build. `cargo
+publish` waits for the registry to make the crate available before
+returning, so the second command can follow immediately.
 
 ## Commit Conventions
 

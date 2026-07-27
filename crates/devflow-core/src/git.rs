@@ -1,8 +1,9 @@
 //! Git-flow operations implemented with plain `git` commands.
 
 use crate::config::GitFlowConfig;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use tracing::{debug, info, warn};
 
 /// Errors produced by git-flow operations.
@@ -196,42 +197,6 @@ impl GitFlow {
             return Ok(());
         }
         self.git(["branch", branch, start_point])
-    }
-
-    /// Fast-forward `target`'s ref to `source` (must be a descendant).
-    ///
-    /// `target` must not be checked out in any worktree. Errors if the move
-    /// would not be a fast-forward.
-    pub fn fast_forward_branch(&self, target: &str, source: &str) -> Result<(), GitError> {
-        let is_ancestor = Command::new("git")
-            .args(["merge-base", "--is-ancestor", target, source])
-            .current_dir(&self.root)
-            .output()?
-            .status
-            .success();
-        if !is_ancestor {
-            return Err(GitError::Command(format!(
-                "{target} is not an ancestor of {source}; refusing non-fast-forward update"
-            )));
-        }
-        self.git(["branch", "-f", target, source])
-    }
-
-    /// Rebase the branch checked out at `dir` onto `onto`.
-    ///
-    /// Runs `git rebase` inside the given worktree directory. On conflict the
-    /// rebase is aborted and an error is returned so the caller can surface it.
-    pub fn rebase_in(&self, dir: &Path, onto: &str) -> Result<(), GitError> {
-        debug!("rebasing worktree at {} onto {onto}", dir.display());
-        match git_in(dir, &["rebase", onto]) {
-            Ok(()) => Ok(()),
-            Err(err) => {
-                // Leave the worktree clean for the user to retry.
-                warn!("rebase conflict in {}; aborting", dir.display());
-                let _ = git_in(dir, &["rebase", "--abort"]);
-                Err(err)
-            }
-        }
     }
 
     /// Check out an existing branch in the main worktree.
@@ -771,21 +736,103 @@ fn public_key_fingerprint(pub_key_path: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
-/// `gpg.format == "ssh"` branch (Pattern 4): `user.signingkey` must be set
-/// and the key file must exist, then `ssh-add -l`'s exit code determines
-/// viability. On a match, only the PUBLIC key's fingerprint is reported —
-/// never the configured key's filesystem path.
+/// Classifies a `user.signingkey` value the way `git` itself does (mirrors
+/// `man git-config`'s `user.signingKey` precedence, D-01): a `key::`-prefixed
+/// value is inline with the prefix stripped; otherwise a value starting with
+/// the deprecated raw `ssh-` compat form is inline as-is; otherwise the value
+/// is a filesystem path. Pure — no I/O, no `Path`, no `.exists()` — so the
+/// classification never depends on the host's filesystem.
+///
+/// The prefix decides unconditionally (D-02): a value that also happens to
+/// name an existing file (e.g. `ssh-key.pub`) is still classified inline,
+/// because git never stats the value. The raw allowlist is `ssh-` only
+/// (D-03) — `ecdsa-`/`sk-` bare forms are NOT added here; git treats those as
+/// paths, and they only reach the inline branch through the `key::` prefix.
+fn inline_signing_key_blob(signingkey: &str) -> Option<&str> {
+    let trimmed = signingkey.trim();
+    if let Some(remainder) = trimmed.strip_prefix("key::") {
+        Some(remainder)
+    } else if trimmed.starts_with("ssh-") {
+        Some(trimmed)
+    } else {
+        None
+    }
+}
+
+/// `ssh-keygen -lf -`'s fingerprint (`SHA256:...`) for an inline key blob
+/// piped over stdin — mirrors [`public_key_fingerprint`]'s `Option<String>`
+/// return, fail-soft `.ok()?` chain, and identical output parse (D-05: the
+/// output shape is the same whether the key arrived by path or by stdin).
+///
+/// The blob is written to the child's stdin ONLY — never as an argv element
+/// and never through a temp file (D-09): argv is world-readable via
+/// `/proc/<pid>/cmdline`. A later refactor that passes the blob as a
+/// `Command` argument is a security regression, not a cleanup.
+///
+/// Every failure mode — `ssh-keygen` absent, a non-zero exit, unparseable
+/// stdout, or the empty blob produced by a bare `key::` value — returns
+/// `None` here, which the caller routes to `SigningViability::Unknown`,
+/// never a hard-fail `NotViable` (D-06). That includes the empty-blob case:
+/// `ssh-keygen` exits non-zero on empty stdin, which this function surfaces
+/// as `None` with no special-case branch.
+fn inline_key_fingerprint(key_blob: &str) -> Option<String> {
+    let mut child = Command::new("ssh-keygen")
+        .args(["-lf", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+
+    // `.take()` then `drop()` positively closes the stdin pipe before
+    // `wait_with_output()` — a borrow via `.as_mut()` happens to work on
+    // this host but is not a documented guarantee and could hang on a
+    // differently-shaped input.
+    let mut stdin = child.stdin.take()?;
+    stdin.write_all(key_blob.as_bytes()).ok()?;
+    drop(stdin);
+
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .nth(1)
+        .map(str::to_string)
+}
+
+/// `gpg.format == "ssh"` branch (Pattern 4): `user.signingkey` must be set.
+/// Its value is classified by git's own prefix rules (D-01) into either an
+/// inline key blob or a filesystem path; only a path value is required to
+/// exist. `ssh-add -l`'s exit code then determines viability. On a match,
+/// only the matched public key's `SHA256:` fingerprint is reported — never
+/// the configured value in any form (D-08's redaction contract, unchanged).
 fn check_ssh_signing_viability(project_root: &Path) -> SigningViability {
     let Some(signingkey) = git_config(project_root, "user.signingkey") else {
         return SigningViability::NotViable {
             reason: "gpg.format=ssh but user.signingkey is not set".into(),
         };
     };
-    let key_path = Path::new(&signingkey);
-    if !key_path.exists() {
-        return SigningViability::NotViable {
-            reason: "user.signingkey is set but the key file does not exist".into(),
-        };
+
+    // Mirrors `man git-config`'s user.signingKey precedence (D-01): key::
+    // form, then deprecated raw ssh- form, else a path. Never stat a path
+    // for a prefix-matched value (D-02).
+    let inline_blob = inline_signing_key_blob(&signingkey);
+
+    // Path branch keeps today's early return, byte-for-byte (D-12): the
+    // `.exists()` check runs first and a missing file still returns the
+    // existing missing-key-file `NotViable` before `ssh-add` is ever
+    // spawned. No `.exists()` call executes for a prefix-matched value
+    // (RESEARCH Pitfall 3: an extra defensive stat here is exactly the
+    // divergence-from-git this phase exists to remove).
+    if inline_blob.is_none() {
+        let key_path = Path::new(&signingkey);
+        if !key_path.exists() {
+            return SigningViability::NotViable {
+                reason: "user.signingkey is set but the key file does not exist".into(),
+            };
+        }
     }
 
     let output = match Command::new("ssh-add").arg("-l").output() {
@@ -806,7 +853,15 @@ fn check_ssh_signing_viability(project_root: &Path) -> SigningViability {
         },
         SigningStatus::KeysListed => {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            match public_key_fingerprint(key_path) {
+            // Fingerprint acquisition stays lazy, inside this arm only
+            // (D-12): the path branch must still spawn exactly the same
+            // processes in the same order as today, so this selection
+            // cannot be hoisted above the `ssh-add -l` spawn.
+            let fingerprint = match inline_blob {
+                Some(blob) => inline_key_fingerprint(blob),
+                None => public_key_fingerprint(Path::new(&signingkey)),
+            };
+            match fingerprint {
                 Some(fingerprint) if stdout.contains(&fingerprint) => SigningViability::Viable {
                     fingerprint: Some(fingerprint),
                 },
@@ -866,17 +921,6 @@ pub fn check_signing_viability(project_root: &Path) -> SigningViability {
     match git_config(project_root, "gpg.format").as_deref() {
         Some("ssh") => check_ssh_signing_viability(project_root),
         _ => check_gpg_signing_viability(project_root),
-    }
-}
-
-/// Run a git command in an arbitrary directory (e.g. a worktree).
-fn git_in(dir: &Path, args: &[&str]) -> Result<(), GitError> {
-    debug!("git (in {}) {}", dir.display(), args.join(" "));
-    let output = Command::new("git").args(args).current_dir(dir).output()?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(GitError::Command(stderr_or_status(&output)))
     }
 }
 
@@ -1400,82 +1444,6 @@ mod tests {
     }
 
     #[test]
-    fn sequentagent_helpers_integrate_and_rebase_cleanly() {
-        let repo = init_repo();
-        let root = repo.path();
-        let gf = flow(root);
-
-        // Base branch off develop, not checked out anywhere.
-        gf.ensure_branch("feature/phase-07", "develop")
-            .expect("ensure base");
-        assert!(gf.branch_exists("feature/phase-07"));
-        assert!(!gf.branch_tip("feature/phase-07").unwrap().is_empty());
-        // ensure_branch is idempotent.
-        gf.ensure_branch("feature/phase-07", "develop")
-            .expect("ensure again");
-
-        // Two agent worktrees off the same base tip.
-        let wt_a = root.join(".worktrees/a");
-        let wt_b = root.join(".worktrees/b");
-        crate::worktree::add(root, &wt_a, "feat-a", "feature/phase-07", true).expect("add A");
-        crate::worktree::add(root, &wt_b, "feat-b", "feature/phase-07", true).expect("add B");
-
-        // Agent A commits a new file, then we integrate A into the base (ff).
-        std::fs::write(wt_a.join("a.txt"), "from-a\n").unwrap();
-        git(&wt_a, &["add", "."]);
-        git(&wt_a, &["commit", "-q", "-m", "a work"]);
-        gf.fast_forward_branch("feature/phase-07", "feat-a")
-            .expect("ff base to A");
-        assert_eq!(
-            gf.branch_tip("feature/phase-07").unwrap(),
-            gf.branch_tip("feat-a").unwrap()
-        );
-
-        // Agent B (no overlapping changes) rebases onto the updated base cleanly.
-        gf.rebase_in(&wt_b, "feature/phase-07")
-            .expect("clean rebase");
-        // B now contains A's file.
-        assert!(wt_b.join("a.txt").exists());
-    }
-
-    #[test]
-    fn rebase_in_aborts_and_errors_on_conflict() {
-        let repo = init_repo();
-        let root = repo.path();
-        let gf = flow(root);
-
-        gf.ensure_branch("feature/phase-07", "develop")
-            .expect("ensure base");
-
-        // Worktree B is created off the ORIGINAL base, then edits a.txt.
-        let wt_b = root.join(".worktrees/b");
-        crate::worktree::add(root, &wt_b, "feat-b", "feature/phase-07", true).expect("add B");
-        std::fs::write(wt_b.join("a.txt"), "from-b\n").unwrap();
-        git(&wt_b, &["add", "."]);
-        git(&wt_b, &["commit", "-q", "-m", "b edits a"]);
-
-        // Meanwhile the base advances with a conflicting a.txt (via worktree A).
-        let wt_a = root.join(".worktrees/a");
-        crate::worktree::add(root, &wt_a, "feat-a", "feature/phase-07", true).expect("add A");
-        std::fs::write(wt_a.join("a.txt"), "from-base\n").unwrap();
-        git(&wt_a, &["add", "."]);
-        git(&wt_a, &["commit", "-q", "-m", "base edits a"]);
-        gf.fast_forward_branch("feature/phase-07", "feat-a")
-            .expect("ff base to A");
-
-        // Rebasing B onto the updated base conflicts on a.txt → error + abort.
-        let err = gf.rebase_in(&wt_b, "feature/phase-07").unwrap_err();
-        assert!(matches!(err, GitError::Command(_)));
-        // The abort left no rebase-in-progress state behind.
-        assert!(!root.join(".git/worktrees/b/rebase-merge").exists());
-        // B is still usable: its own commit is intact.
-        assert_eq!(
-            std::fs::read_to_string(wt_b.join("a.txt")).unwrap(),
-            "from-b\n"
-        );
-    }
-
-    #[test]
     fn merge_of_missing_branch_is_an_error() {
         let repo = init_repo();
         let root = repo.path();
@@ -1687,5 +1655,213 @@ mod tests {
             }
             other => panic!("expected Unknown (fail-soft), got: {other:?}"),
         }
+    }
+
+    /// D-01/D-02/D-10: an inline `user.signingkey` value — either the
+    /// `key::`-prefixed form or the raw deprecated `ssh-` compat form — must
+    /// never be classified as a missing filesystem path. Git never stats an
+    /// inline value, so this must never return the missing-key-file
+    /// `NotViable`. This test intentionally does NOT assert which of
+    /// `Viable`/agent-`NotViable`/`Unknown` is returned, since that depends
+    /// on the host's ssh-agent state (D-10).
+    #[test]
+    fn check_signing_viability_never_reports_key_file_missing_for_inline_key() {
+        const MISSING_FILE_REASON: &str = "user.signingkey is set but the key file does not exist";
+        let inline_values = [
+            "key::ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFAKEFIXTUREKEYMATERIALZZZZZZZZZZZZZZZZZZZZZZ devflow-fixture",
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFAKEFIXTUREKEYMATERIALZZZZZZZZZZZZZZZZZZZZZZ devflow-fixture",
+        ];
+        for value in inline_values {
+            let repo = init_repo();
+            let root = repo.path();
+            git(root, &["config", "gpg.format", "ssh"]);
+            git(root, &["config", "user.signingkey", value]);
+
+            let result = check_signing_viability(root);
+
+            if let SigningViability::NotViable { reason } = &result {
+                assert_ne!(
+                    reason, MISSING_FILE_REASON,
+                    "inline signingkey value {value:?} incorrectly classified as a \
+                     missing file: {result:?}"
+                );
+            }
+        }
+    }
+
+    /// D-01/D-02/D-03: a flat table over the pure classifier proving git's
+    /// own prefix precedence — `key::` strip first, then the raw `ssh-`
+    /// compat form, else a path. Non-`ssh-` algorithms (`ecdsa-`, `sk-`)
+    /// reach the inline branch ONLY through `key::` (D-03) — a bare form of
+    /// either is a path, matching git.
+    #[test]
+    fn inline_signing_key_blob_follows_git_prefix_precedence() {
+        assert_eq!(
+            inline_signing_key_blob("key::ssh-rsa AAAAB3 id"),
+            Some("ssh-rsa AAAAB3 id")
+        );
+        assert_eq!(
+            inline_signing_key_blob("key::ssh-ed25519 AAAAC3 id"),
+            Some("ssh-ed25519 AAAAC3 id")
+        );
+        assert_eq!(
+            inline_signing_key_blob("key::ecdsa-sha2-nistp256 AAAAE2 id"),
+            Some("ecdsa-sha2-nistp256 AAAAE2 id")
+        );
+        assert_eq!(inline_signing_key_blob("key::"), Some(""));
+        assert_eq!(
+            inline_signing_key_blob("ssh-ed25519 AAAAC3 id"),
+            Some("ssh-ed25519 AAAAC3 id")
+        );
+        assert_eq!(
+            inline_signing_key_blob("  key::ssh-ed25519 AAAAC3 id  "),
+            Some("ssh-ed25519 AAAAC3 id")
+        );
+        // D-02: a value that plausibly names an existing file is STILL
+        // inline, because the classifier never stats it.
+        assert_eq!(inline_signing_key_blob("ssh-key.pub"), Some("ssh-key.pub"));
+        assert_eq!(
+            inline_signing_key_blob("/home/operator/.ssh/id_ed25519.pub"),
+            None
+        );
+        // D-03: bare, no `key::` prefix, so git treats these as paths and so
+        // must DevFlow.
+        assert_eq!(
+            inline_signing_key_blob("ecdsa-sha2-nistp256 AAAAE2 id"),
+            None
+        );
+        assert_eq!(
+            inline_signing_key_blob("sk-ssh-ed25519@openssh.com AAAAG id"),
+            None
+        );
+        assert_eq!(inline_signing_key_blob("ABCD1234"), None);
+    }
+
+    /// D-03/D-12: values that neither start with `key::` nor `ssh-` still
+    /// take the path branch and keep today's byte-for-byte behavior — the
+    /// early `.exists()` return, before `ssh-add` is ever spawned. This is
+    /// the D-03 falsifier: bare `ecdsa-`/`sk-` forms must NOT be treated as
+    /// inline.
+    #[test]
+    fn check_signing_viability_still_reports_missing_file_for_a_path_value() {
+        const MISSING_FILE_REASON: &str = "user.signingkey is set but the key file does not exist";
+        let path_values = [
+            "/nonexistent/path/to/a/signing/key/that/does/not/exist",
+            "ecdsa-sha2-nistp256 AAAAE2 devflow-fixture",
+            "sk-ssh-ed25519@openssh.com AAAAG devflow-fixture",
+        ];
+        for value in path_values {
+            let repo = init_repo();
+            let root = repo.path();
+            git(root, &["config", "gpg.format", "ssh"]);
+            git(root, &["config", "user.signingkey", value]);
+
+            let result = check_signing_viability(root);
+
+            assert_eq!(
+                result,
+                SigningViability::NotViable {
+                    reason: MISSING_FILE_REASON.to_string(),
+                },
+                "value {value:?} did not take the path branch: {result:?}"
+            );
+        }
+    }
+
+    /// D-04/D-05/D-09: `inline_key_fingerprint` (stdin) must produce the
+    /// EXACT SAME `SHA256:` fingerprint as `public_key_fingerprint` (path)
+    /// for the same real key — proving the D-01 -> D-05 chain and that the
+    /// blob genuinely reached `ssh-keygen` via stdin. `ssh-keygen -lf`
+    /// interprets a `-f` argument as a filename, so a blob passed on argv
+    /// (or never written to the pipe) could not produce a correct
+    /// fingerprint; a green assertion here is only reachable if the blob
+    /// went to stdin.
+    #[test]
+    fn inline_key_fingerprint_matches_the_path_branch_for_the_same_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("devflow-fixture-key");
+        let keygen = Command::new("ssh-keygen")
+            .args([
+                "-t",
+                "ed25519",
+                "-f",
+                key_path.to_str().unwrap(),
+                "-N",
+                "",
+                "-q",
+            ])
+            .output()
+            .expect("spawn ssh-keygen");
+        assert!(
+            keygen.status.success(),
+            "ssh-keygen fixture setup failed: {}",
+            String::from_utf8_lossy(&keygen.stderr)
+        );
+        let pub_key_path = dir.path().join("devflow-fixture-key.pub");
+        let blob = std::fs::read_to_string(&pub_key_path)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        // Assert the inline result FIRST and independently, before any
+        // comparison — a both-`None` result must never pass tautologically.
+        let inline_fp = inline_key_fingerprint(&blob);
+        assert!(
+            inline_fp.is_some(),
+            "inline_key_fingerprint returned None for a real key"
+        );
+        let inline_fp = inline_fp.unwrap();
+        assert!(
+            inline_fp.starts_with("SHA256:"),
+            "unexpected fingerprint shape: {inline_fp}"
+        );
+
+        let path_fp = public_key_fingerprint(&pub_key_path);
+        assert!(
+            path_fp.is_some(),
+            "public_key_fingerprint returned None for a real key"
+        );
+        let path_fp = path_fp.unwrap();
+
+        assert_eq!(inline_fp, path_fp);
+
+        // Closing the D-01 -> D-05 chain: feeding the key:: prefixed form
+        // through the classifier and then the fingerprint helper yields the
+        // same fingerprint.
+        let prefixed = format!("key::{blob}");
+        let classified_blob = inline_signing_key_blob(&prefixed).unwrap();
+        let chained_fp = inline_key_fingerprint(classified_blob).unwrap();
+        assert_eq!(chained_fp, path_fp);
+    }
+
+    /// D-06: every inline-branch failure mode must degrade to `Unknown`
+    /// (or, at the `pub` boundary, one of the two shared agent-state
+    /// `NotViable` reasons that both branches can legitimately reach) —
+    /// never a NEW hard fail introduced by this phase. Agent-independent:
+    /// these values are unparseable/empty regardless of host ssh-agent
+    /// state.
+    #[test]
+    fn check_signing_viability_never_hard_fails_on_an_unparseable_inline_key() {
+        const NO_AGENT_REASON: &str = "no ssh-agent reachable (SSH_AUTH_SOCK unset or dead)";
+        const AGENT_EMPTY_REASON: &str = "ssh-agent reachable but has no identities loaded";
+        let unparseable_values = ["key::", "key::this is not a key at all"];
+        for value in unparseable_values {
+            let repo = init_repo();
+            let root = repo.path();
+            git(root, &["config", "gpg.format", "ssh"]);
+            git(root, &["config", "user.signingkey", value]);
+
+            let result = check_signing_viability(root);
+
+            if let SigningViability::NotViable { reason } = &result {
+                assert!(
+                    reason == NO_AGENT_REASON || reason == AGENT_EMPTY_REASON,
+                    "value {value:?} produced an unexpected hard fail: {result:?}"
+                );
+            }
+        }
+
+        assert_eq!(inline_key_fingerprint(""), None);
+        assert_eq!(inline_key_fingerprint("not a key\n"), None);
     }
 }

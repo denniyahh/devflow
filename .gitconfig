@@ -1,0 +1,49 @@
+# Tracked git policy for this repository.
+#
+# Git cannot version `.git/config`, so repository policy that must survive a
+# fresh clone lives here and is pulled in with a one-time:
+#
+#     git config --local include.path ../.gitconfig
+#
+# (the path is relative to `.git/config`). CONTRIBUTING.md documents this
+# next to the `core.hooksPath` step.
+#
+# WHAT BELONGS HERE: settings that are true for every contributor.
+# WHAT DOES NOT: anything naming a specific person, key file, or home
+# directory. `user.signingkey` in particular is per-contributor and MUST stay
+# in local config — this repository is public.
+
+[gpg]
+	format = ssh
+
+[commit]
+	gpgsign = true
+
+[tag]
+	gpgsign = true
+
+# Release signing policy (enforced by scripts/hooks/pre-push).
+#
+# This repository is developed with an AI agent that commits under its own
+# signing key, so two keys are in play and they are NOT interchangeable:
+#
+#   * `user.signingkey`             — signs ordinary commits. On a machine
+#                                     where the agent works, this is the
+#                                     AGENT's key, so agent commits are
+#                                     attributable to the agent.
+#   * `devflow.releaseSigningKey`   — the human maintainer's key. The ONLY
+#                                     key permitted to sign a release tag or
+#                                     a push to `main`.
+#
+# Both signatures carry the same `user.email`, so a tag signed with the wrong
+# key LOOKS correct in `git log` and on GitHub. The identity that
+# distinguishes them is the key fingerprint, which is why the pre-push hook
+# compares fingerprints rather than trusting the signer string.
+#
+# Set your maintainer key once, locally:
+#
+#     git config --local devflow.releaseSigningKey ~/.ssh/<your-key>.pub
+#
+# When unset, the hook does not block — a contributor who never cuts releases
+# needs no configuration. When set, it is enforced with no override flag: the
+# escape hatch is to sign the tag with the right key.

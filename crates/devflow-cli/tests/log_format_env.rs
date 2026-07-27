@@ -54,6 +54,7 @@ fn project_with_legacy_state() -> tempfile::TempDir {
         stop_until: None,
         stopped: false,
         stop_reason: None,
+        yes_ship: false,
     };
     let json = serde_json::to_string_pretty(&state).expect("serialize legacy state");
     std::fs::write(devflow_dir.join("state.json"), json).expect("write legacy state.json");

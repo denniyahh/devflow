@@ -1,5 +1,27 @@
 name: Devcontainer
 
+# RESTORED 2026-07-26 after being deleted earlier the same day.
+#
+# The delete was wrong for a reason that was not visible in classic branch
+# protection: the repository ruleset `develop-merge-or-squash` lists
+# "Build + test in devcontainer" as a REQUIRED status check for `develop`.
+# `gh api repos/.../branches/develop/protection` reports no required checks,
+# because rulesets are a separate mechanism — so removing this workflow made
+# a required check that can never report, wedging every merge to develop.
+#
+# Check BOTH before touching a workflow's job name or existence:
+#   gh api repos/denniyahh/devflow/branches/<branch>/protection
+#   gh api repos/denniyahh/devflow/rules/branches/<branch>
+#
+# The job name below is that required check verbatim. Renaming it re-wedges
+# develop. `main` separately requires Test/Clippy/Format from ci.yml.
+#
+# This is NOT a second definition of "green": it runs the same
+# scripts/check.sh that ci.yml and scripts/check-in-container.sh run. What it
+# adds over ci.yml is coverage of .devcontainer/devcontainer.json itself —
+# ci.yml runs the pinned image directly, so a broken postCreateCommand or a
+# bad devcontainer definition would otherwise reach developers unverified.
+
 on:
   push:
   pull_request:
@@ -12,7 +34,7 @@ concurrency:
 jobs:
   devcontainer:
     name: Build + test in devcontainer
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
@@ -20,9 +42,11 @@ jobs:
         uses: devcontainers/ci@v0.3
         with:
           push: never
+          # `set -e` MUST stay the first line: runCmd runs under `bash -c`,
+          # and without it only the LAST command's exit code counts, so a
+          # failing check could not fail the job (15-REVIEW.md CR-01).
+          # ci_parity_guards.rs asserts this.
           runCmd: |
             set -e
-            cargo build --workspace
-            cargo test --workspace
-            cargo clippy --workspace --all-targets -- -D warnings
-            cargo fmt --check
+            git config --global --add safe.directory "$PWD"
+            scripts/check.sh all
