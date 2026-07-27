@@ -934,6 +934,26 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
+### Phase 999.51: `devflow start` Resolves Its Base From a Possibly-Stale Local `develop`, and Never Fetches (BACKLOG)
+
+**Goal:** `devflow start` resolves its base branch from the **local** `develop` ref — `DEVELOP` is the literal string `"develop"` (`config.rs:17`), consumed by `ensure_phase_reachable_on_base` (`commands.rs:146`) and by the worktree fork (`commands.rs:285`). Nothing in the start path fetches: `commands.rs:1877` and `:1980` state the design explicitly — checks run "against ALREADY-FETCHED local refs, issuing NO `git fetch`". So when local `develop` is behind `origin/develop`, an unattended run either refuses for a phase that demonstrably exists on the remote, or forks its worktree from a stale base and runs the phase against outdated code.
+
+**Evidence — the 2026-07-27 acceptance run required a human to fix this before launch.** Local `develop` was `0 ahead / 21 behind` `origin/develop`. Phase 24's heading was present on `origin/develop` and absent from local `develop`, so `ensure_phase_reachable_on_base` would have refused a phase that was plainly reachable on the remote. The operator ran `git fetch origin develop:develop` by hand before launching. That manual step is the entire finding: **an unattended run has no operator to perform it.**
+
+This is the *second* time the base ref has broken an acceptance attempt in a different way. `23-ACCEPTANCE-SETUP-2.md` records the same class on 2026-07-26 (local `develop` 120 behind, adjudicated and hand-fixed in plan 23-14). Both attempts needed a human to reconcile the base before `devflow start` could work.
+
+**The dangerous variant is the silent one.** A refusal is loud and recoverable. But when the phase heading *does* exist on a stale local `develop` while the code does not, the guard passes and the run forks from an outdated base — producing a green run against the wrong source. That is the false-evidence shape D-18 exists to prevent, arriving through the base ref instead of the binary.
+
+**Distinct from 999.28 (DEN-51).** That item adds an explicit `--base <branch>` override so a phase can stack on an unmerged predecessor. This is not about *which* branch is chosen but about whether the chosen branch is *current*. Fixing 999.28 alone leaves this open, and vice versa.
+
+**Fix direction:** resolve the base through a ref that cannot be stale, or make staleness impossible to ignore. Options, roughly in increasing cost: (1) fetch the base before resolving it, which is the smallest change but adds a network dependency to `start`; (2) resolve against `origin/develop` rather than `develop`, matching what `ship`'s divergence check already does, and require the local ref only where a working tree is genuinely needed; (3) keep local resolution but compare against the remote-tracking ref and refuse loudly with the exact `git fetch` command when they differ — no network on the happy path, and never a silent stale-base run. Whichever is chosen, the "heading present but code stale" case must be closed, not just the "heading absent" one.
+
+**Priority:** High — it has now forced manual intervention on two of three acceptance attempts, which is disqualifying for a goal whose whole definition is "unattended", and its silent variant can produce a green run against the wrong source. | **Size:** S–M — S for the refuse-loudly variant, M if `start` gains a fetch and its failure modes. Linear: DEN-76.
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
 ### Phase 21: Operator Legibility & Observability
 
 **Shipped as v1.8.0** (2026-07-24) — PR #23 (`develop → main`, squash `cfa9167`), signed tag `v1.8.0`, [GitHub Release](https://github.com/denniyahh/devflow/releases/tag/v1.8.0). `sync-main-to-develop.sh` run via PR #24 (merge `01ad9e4`). Published to crates.io (`devflow-core` then `devflow`, both confirmed live at 1.8.0).
