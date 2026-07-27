@@ -5,16 +5,16 @@ milestone_name: milestone (open — no fixed closing phase)
 current_phase: 999.1
 current_phase_name: BACKLOG
 status: planning
-stopped_at: Completed 24-02-PLAN.md
-last_updated: "2026-07-27T10:17:51.718Z"
+stopped_at: "Phases 23 and 24 both complete and merged (develop 40fce19). No active phase — next work is the backlog; highest-priority items are 999.48/DEN-73 (pin the driving binary) and 999.49/DEN-74 (compute_version)."
+last_updated: "2026-07-27T10:40:00.000Z"
 last_activity: 2026-07-27
-last_activity_desc: Phase 24 complete, transitioned to Phase 999.1
+last_activity_desc: "Phases 23 and 24 complete; no active phase (phase.complete advanced to 24, corrected — 24 was already complete)"
 progress:
   total_phases: 13
-  completed_phases: 12
+  completed_phases: 13
   total_plans: 94
-  completed_plans: 93
-  percent: 92
+  completed_plans: 94
+  percent: 100
 ---
 
 # DevFlow — Project State
@@ -86,7 +86,7 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 999.1 — Hermes Support (BACKLOG)
+Phase: 24 — `release --check` Signing-Key Inline Classification
 Plan: Not started
 Status: Ready to plan
 
@@ -106,7 +106,7 @@ Scope boundary: 23-16 is the **fix only** (change + regression tests + PR into `
 
 **Recovery-ref disposition:** both `origin` refs (`recovery/pre-23-11-acceptance-e0f87c2`, `recovery/pre-23-15-acceptance-0dad20d`) remain untouched on `origin`; the local copy of the pre-23-11 ref, deleted again by `devflow cleanup`, is deliberately NOT restored (per `23-FINDINGS.md` §B2a); the pre-23-15 ref is now unused (no merge to undo) but retained on `origin` for reuse by the 23-16 retry rather than deleted.
 
-Last activity: 2026-07-27 — Phase 24 complete, transitioned to Phase 999.1
+Last activity: 2026-07-27 — Phase 23 complete, transitioned to Phase 24
 
 **Note on the "Plan: 2 of 15" value this replaces:** `gsd-tools state advance-plan` only increments whatever value is already in this field, which had drifted to "2 of 15" (the parallel-worktree waves 23-01…23-09 deliberately never touch STATE.md, and this field was last corrected against reality at "10 of 11 plans complete" before the plan count grew to 15 with the gap-closure plans 23-12…23-15). Corrected directly to "13 of 15" to match reality (23-12 and 23-13 both now executed) rather than trust the tool's naive +1 increment from a stale base.
 
