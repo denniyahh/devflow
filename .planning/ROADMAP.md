@@ -706,9 +706,13 @@ Plans:
 
 **Census at 2026-07-27:** **14 orphaned monitor/agent pairs (28 processes, ~123 MB RSS, oldest ~19h)**, and **456 scratch dirs / 302 MB** — up from the 410 dirs / 300 MB recorded above.
 
-**Hypothesis for the contradiction, needs confirming before either measurement is trusted:** these processes reparent to `systemd --user` (pid 1965 on this host), **not** to pid 1, because `systemd --user` sets itself as a child subreaper. A census that tests `ppid == 1` returns **zero orphans on any systemd host even while dozens exist** — and that is exactly the shape of the "two consecutive clean runs left zero orphaned processes" result above. This was reproduced live while writing this entry: `ppid==1` counted 0, while `ppid==1965` counted 14. Whoever picks this up should first re-run the original scope-correction measurement with a subreaper-aware predicate before concluding anything about clean-run behaviour; the earlier result may be correct, but it cannot be relied on until re-measured.
+**A subreaper caveat, worth knowing but NOT the explanation.** These processes reparent to `systemd --user` (pid 1965 on this host), **not** to pid 1, because `systemd --user` sets itself as a child subreaper. A census testing `ppid == 1` therefore returns zero orphans on any systemd host even while dozens exist (`ppid==1` counted 0 while `ppid==1965` counted 14). Any future census must be subreaper-aware. This was initially offered here as the explanation for the "clean runs leak nothing" result above — **that hypothesis was tested and is wrong; see below.**
 
-**Priority:** raise back to Medium if the re-measurement confirms clean-run leakage.
+**Re-measured the same day with a subreaper-aware census — the scope correction above HOLDS for clean runs.** A full `cargo test --workspace && cargo clippy && cargo fmt --check` chain in the phase-24 worktree (618 passed / 0 failed / 17 binaries, chain exit 0) was bracketed by a `ppid`-agnostic census: **14 orphaned pairs before, 14 after — zero new.** That is a third clean run corroborating the original two, this time immune to the `ppid == 1` flaw. The earlier scope correction was right, and the measurement-artifact hypothesis is retracted.
+
+**What remains genuinely open.** The two pairs created at 05:21/05:26 during Phase 24's Code stage are still unexplained: they appeared inside a stage that completed normally (exit 0), yet a clean test chain does not reproduce them. So the leak is **intermittent and tied to some non-clean path** — an interrupted test invocation inside the GSD execute flow, or a `devflow` subprocess spawned by a route the standalone chain doesn't exercise. That is the thing to chase; "does `cargo test` leak" is settled as no.
+
+**Priority:** unchanged at Low for the clean-run claim. The intermittent Code-stage path is the open question and may warrant Medium once characterised.
 
 **Do not weaken the tests to fix this.** Spawning a real child is what makes them strong — plan 23-04's summary correctly calls it the suite's strongest claim, and plan 23-05's `stop_e2e` depends on the same property. The fix belongs in teardown, not in the assertion.
 
