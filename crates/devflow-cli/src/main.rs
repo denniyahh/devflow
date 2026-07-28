@@ -386,6 +386,16 @@ enum GateCmd {
         /// this machine has registered (`registry::load_roots`).
         #[arg(long)]
         root: Option<PathBuf>,
+        /// Also discover and clear STATE-ORPHANED processes (999.44) by
+        /// scanning the OS process table directly — registry-independent,
+        /// so it also catches a process whose project root no longer
+        /// exists on disk (`devflow stop`/the default sweep above cannot
+        /// see either). Off by default: this signals processes identified
+        /// by inference from `/proc` rather than a lock file the process
+        /// itself wrote, so it must be explicitly authorised. Combine with
+        /// `--dry-run` to preview what would be reaped first.
+        #[arg(long)]
+        reap_strays: bool,
     },
 }
 
@@ -513,7 +523,8 @@ fn run() -> Result<(), CliError> {
                 max_age_secs,
                 dry_run,
                 root,
-            } => gate_sweep(max_age_secs, dry_run, root),
+                reap_strays,
+            } => gate_sweep(max_age_secs, dry_run, root, reap_strays),
         },
         Command::Logs {
             phase,

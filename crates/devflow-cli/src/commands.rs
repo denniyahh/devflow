@@ -1056,6 +1056,7 @@ pub(crate) fn gate_sweep(
     max_age_secs: Option<u64>,
     dry_run: bool,
     root: Option<PathBuf>,
+    reap_strays: bool,
 ) -> Result<(), CliError> {
     let threshold = max_age_secs.unwrap_or_else(config_parse::gate_max_unattended_age_secs);
 
@@ -1138,6 +1139,87 @@ pub(crate) fn gate_sweep(
             }
         }
     }
+
+    // 999.44/DEN-68: opt-in only. Registry-independent, so this pass is NOT
+    // scoped to `roots` above — a stray by definition has no project root
+    // for any registry entry, lock file, or state file to name, which is
+    // exactly why the census above cannot see it either. Extends the SAME
+    // reaped/skipped/left-alone counters and dry-run summary line rather
+    // than printing a second, separate report.
+    if reap_strays {
+        let candidates = agent::discover_stray_devflow_processes();
+        let results = reap_stray_candidates(&candidates, dry_run);
+        // The event's natural home: the explicit `--root`, when given
+        // (exactly 999.44's own reproduction shape — an operator who
+        // already knows which root's stray they're chasing), else the
+        // first registered root, arbitrarily but deterministically, so the
+        // audit trail lands somewhere tailable rather than nowhere. A
+        // stray has no root of its own to prefer instead.
+        let event_root = roots.first();
+        for result in &results {
+            let layer = stray_layer_label(result.layer);
+            match result.outcome {
+                StrayReapOutcome::Reaped if dry_run => {
+                    reaped += 1;
+                    println!("would reap stray pid {} ({layer})", result.pid);
+                }
+                StrayReapOutcome::Reaped => {
+                    reaped += 1;
+                    if let Some(event_root) = event_root {
+                        events::emit(
+                            event_root,
+                            // Machine-scoped, not phase-scoped (999.44): a
+                            // stray has no phase, so `0` is a sentinel
+                            // meaning "not tied to any specific phase" —
+                            // never a real phase number, which this
+                            // project's phases never assign.
+                            0,
+                            "stray_reaped",
+                            serde_json::json!({
+                                "pid": result.pid,
+                                "layer": layer,
+                            }),
+                        );
+                    }
+                    println!("reaped stray pid {} ({layer})", result.pid);
+                }
+                StrayReapOutcome::IdentityMismatch => {
+                    skipped += 1;
+                    println!(
+                        "skipped stray pid {} ({layer}) — identity could not be re-confirmed \
+                         immediately before signalling (the pid may have been recycled since \
+                         discovery); inspect it manually (e.g. `ps -p {}`) before assuming it \
+                         is safe",
+                        result.pid, result.pid
+                    );
+                }
+                StrayReapOutcome::ReapFailed => {
+                    skipped += 1;
+                    println!(
+                        "failed to verify death for stray pid {} ({layer}) even after SIGKILL \
+                         escalation — inspect it manually (e.g. `ps -p {}`)",
+                        result.pid, result.pid
+                    );
+                }
+            }
+        }
+        // Reap both layers together (999.44): clearing only the wrapper
+        // manufactures a fresh orphan out of its trailing advance child.
+        // Re-run discovery once more after the pass to report anything
+        // newly exposed rather than leaving it silently behind, instead of
+        // looping unboundedly within one invocation.
+        if !dry_run && !results.is_empty() {
+            let remaining = agent::discover_stray_devflow_processes();
+            if !remaining.is_empty() {
+                println!(
+                    "note: {} stray process(es) still discoverable after this pass — re-run \
+                     `devflow gate sweep --reap-strays` to clear them",
+                    remaining.len()
+                );
+            }
+        }
+    }
+
     if dry_run {
         println!(
             "sweep complete (dry run): {reaped} would be reaped, {skipped} skipped, {left_alone} left alone"
@@ -1146,6 +1228,89 @@ pub(crate) fn gate_sweep(
         println!("sweep complete: {reaped} reaped, {skipped} skipped, {left_alone} left alone");
     }
     Ok(())
+}
+
+/// What became of one [`agent::StrayProcess`] candidate the opt-in
+/// stray-reaping pass considered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StrayReapOutcome {
+    /// Signalled and verified dead (or, under `dry_run`, "would have been
+    /// signalled" — nothing is actually sent in that case).
+    Reaped,
+    /// The pid's start time no longer matched what discovery recorded, so
+    /// it was refused rather than signalled — 999.47's "Related TOCTOU":
+    /// the pid could have been recycled between the census and this pass.
+    IdentityMismatch,
+    /// Identity re-confirmed, but the process was still alive even after
+    /// [`agent::terminate_and_verify`]'s bounded `SIGKILL` escalation.
+    ReapFailed,
+}
+
+/// One candidate's outcome, paired with its pid and layer so a caller can
+/// report it without re-deriving either from side effects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StrayReapResult {
+    pid: u32,
+    layer: agent::StrayLayer,
+    outcome: StrayReapOutcome,
+}
+
+/// The opt-in reaper's pure(-ish) core: given an already-discovered
+/// candidate list, re-confirm each one's identity immediately before acting
+/// and clear it with a verified, escalating signal — never a bare
+/// unverified one. Split from [`gate_sweep`] and injectable (a `&[..]`
+/// slice, not a live call to [`agent::discover_stray_devflow_processes`])
+/// the same way [`reconcile_planning_docs`] is split from
+/// `collect_planning_doc_findings`, so this is directly unit-testable
+/// against a synthetic or a real-but-fixture-owned candidate list, never
+/// the whole machine's live census.
+///
+/// Its only side effect (beyond the `dry_run` preview, which signals
+/// nothing) is [`agent::terminate_and_verify`]'s TERM→KILL escalation — a
+/// single unverified `SIGTERM` is exactly what makes the CURRENT recovery
+/// path report success while the process keeps running (999.44's own
+/// lesson), so this never calls the bare [`agent::terminate`].
+fn reap_stray_candidates(
+    candidates: &[agent::StrayProcess],
+    dry_run: bool,
+) -> Vec<StrayReapResult> {
+    candidates
+        .iter()
+        .map(|candidate| {
+            // Re-confirm identity immediately before acting, closing the
+            // discovery-to-signal TOCTOU window (999.47's "Related
+            // TOCTOU") — copies `stop_via_lock`'s fail-closed posture:
+            // refuse on any uncertainty, never signal on a mismatch.
+            if !agent::is_same_process(candidate.pid, candidate.start_time) {
+                return StrayReapResult {
+                    pid: candidate.pid,
+                    layer: candidate.layer,
+                    outcome: StrayReapOutcome::IdentityMismatch,
+                };
+            }
+            if dry_run {
+                return StrayReapResult {
+                    pid: candidate.pid,
+                    layer: candidate.layer,
+                    outcome: StrayReapOutcome::Reaped,
+                };
+            }
+            let cleared = agent::terminate_and_verify(
+                candidate.pid,
+                agent::TERMINATE_VERIFY_WAIT,
+                agent::TERMINATE_VERIFY_POLL,
+            );
+            StrayReapResult {
+                pid: candidate.pid,
+                layer: candidate.layer,
+                outcome: if cleared {
+                    StrayReapOutcome::Reaped
+                } else {
+                    StrayReapOutcome::ReapFailed
+                },
+            }
+        })
+        .collect()
 }
 
 /// End a running phase cleanly (23c) — the missing primitive
@@ -3305,7 +3470,7 @@ mod tests {
         Gates::write_gate(root, 30, Stage::Ship, "ctx").unwrap();
         backdate_gate(root, 30, Stage::Ship, 7 * 60 * 60);
 
-        gate_sweep(None, true, Some(root.to_path_buf())).unwrap();
+        gate_sweep(None, true, Some(root.to_path_buf()), false).unwrap();
 
         assert!(
             !Gates::response_path(root, 30, Stage::Ship).exists(),
@@ -3333,7 +3498,7 @@ mod tests {
         Gates::respond(root, 31, Stage::Ship, &response).unwrap();
         let before = std::fs::read_to_string(Gates::response_path(root, 31, Stage::Ship)).unwrap();
 
-        let result = gate_sweep(None, false, Some(root.to_path_buf()));
+        let result = gate_sweep(None, false, Some(root.to_path_buf()), false);
 
         assert!(result.is_ok(), "an already-answered gate must not error");
         let after = std::fs::read_to_string(Gates::response_path(root, 31, Stage::Ship)).unwrap();
@@ -3353,11 +3518,206 @@ mod tests {
         Gates::write_gate(root, 32, Stage::Ship, "ctx").unwrap();
         backdate_gate(root, 32, Stage::Ship, 7 * 60 * 60);
 
-        gate_sweep(None, false, Some(root.to_path_buf())).unwrap();
+        gate_sweep(None, false, Some(root.to_path_buf()), false).unwrap();
 
         let event = devflow_core::events::last_event_for_phase(root, 32).unwrap();
         assert_eq!(event["event"], "gate_reaped");
         assert_eq!(event["stage"], "ship");
+    }
+
+    /// Wrap a real, test-owned pid as the `agent::StrayProcess` shape
+    /// `discover_stray_devflow_processes` would have produced for it,
+    /// WITHOUT actually scanning the whole machine's `/proc` — 999.44's own
+    /// per-test safety rule: a reaping test must never act on anything it
+    /// did not spawn itself, and this machine's live process table
+    /// legitimately contains other, unrelated devflow activity while these
+    /// tests run.
+    fn stray_candidate_for(pid: u32, layer: agent::StrayLayer) -> agent::StrayProcess {
+        agent::StrayProcess {
+            pid,
+            start_time: agent::process_start_time(pid)
+                .expect("must be able to read the fixture's own recorded start time"),
+            layer,
+        }
+    }
+
+    /// Task 2 behavior: `--dry-run` computes and reports the outcome but
+    /// signals nothing — mirrors the existing gate-reaping dry-run
+    /// contract, extended to strays.
+    #[test]
+    fn reap_stray_candidates_dry_run_never_signals() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep fixture");
+        let pid = child.id();
+        let candidate = stray_candidate_for(pid, agent::StrayLayer::MonitorWrapper);
+
+        let results = reap_stray_candidates(&[candidate], true);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].outcome, StrayReapOutcome::Reaped);
+        assert!(
+            agent::agent_running(pid),
+            "dry-run must never actually signal the candidate"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// Task 2 behavior: a real candidate is cleared with VERIFIED death —
+    /// counted as reaped only once `agent::terminate_and_verify` confirms
+    /// it, never on the basis of a signal alone (999.44's own lesson: an
+    /// unverified `SIGTERM` is what makes the CURRENT recovery path report
+    /// success while the process keeps running).
+    #[test]
+    fn reap_stray_candidates_clears_a_real_child_with_verified_death() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep fixture");
+        let pid = child.id();
+        let candidate = stray_candidate_for(pid, agent::StrayLayer::AdvanceChild);
+
+        let results = reap_stray_candidates(&[candidate], false);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].outcome, StrayReapOutcome::Reaped);
+        assert!(
+            !agent::agent_running(pid),
+            "a successful reap must leave the candidate verified dead, not merely signalled"
+        );
+
+        let _ = child.wait();
+    }
+
+    /// D-17's escalation, exercised through `gate_sweep`'s own reaping
+    /// core (`reap_stray_candidates`) rather than the raw
+    /// `terminate_and_verify` primitive 25-02 already covers directly — a
+    /// `SIGTERM`-ignoring child must still be cleared, via `SIGKILL`,
+    /// within the bounded wait.
+    #[test]
+    fn reap_stray_candidates_escalates_to_kill_for_a_term_ignoring_child() {
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("trap '' TERM; sleep 30")
+            .spawn()
+            .expect("spawn TERM-ignoring fixture");
+        let pid = child.id();
+        // Give the shell a moment to install its trap before signalling.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let candidate = stray_candidate_for(pid, agent::StrayLayer::MonitorWrapper);
+
+        let results = reap_stray_candidates(&[candidate], false);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].outcome, StrayReapOutcome::Reaped);
+        assert!(
+            !agent::agent_running(pid),
+            "a TERM-ignoring candidate must still be cleared via SIGKILL escalation"
+        );
+
+        let _ = child.wait();
+    }
+
+    /// The safety-critical case (999.47's "Related TOCTOU"): a candidate
+    /// whose recorded start time no longer matches at signal time — the pid
+    /// could have been recycled between discovery and this pass — must be
+    /// refused, counted separately from a successful reap, and, the
+    /// assertion that actually matters, the live process behind that pid
+    /// must NOT be signalled.
+    #[test]
+    fn reap_stray_candidates_refuses_on_identity_mismatch_without_signalling() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep fixture");
+        let pid = child.id();
+        let real_start = agent::process_start_time(pid).expect("read real start time");
+        let mismatched = agent::StrayProcess {
+            pid,
+            start_time: real_start.wrapping_add(1),
+            layer: agent::StrayLayer::MonitorWrapper,
+        };
+
+        let results = reap_stray_candidates(&[mismatched], false);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].outcome, StrayReapOutcome::IdentityMismatch);
+        assert!(
+            agent::agent_running(pid),
+            "an identity mismatch must never be signalled — the whole point of the \
+             re-confirmation"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// Flag wiring, exercised through the real `gate_sweep` entry point.
+    /// `--dry-run` is provably safe to run against the live machine (it
+    /// never signals anything, no matter what else is discovered) — this
+    /// is the one test in this file that drives the actual CLI-facing
+    /// function with `reap_strays: true` rather than the injectable core
+    /// directly, deliberately avoiding a non-dry-run invocation: this
+    /// machine's live process table legitimately contains other, unrelated
+    /// devflow activity (concurrent phases in sibling worktrees) while
+    /// these tests run, and a non-dry-run sweep is registry-independent by
+    /// design — it would act on that too, not just this fixture.
+    #[test]
+    fn gate_sweep_reap_strays_dry_run_discovers_a_real_stray_without_signalling() {
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("trap cleanup TERM INT; sleep 30")
+            .spawn()
+            .expect("spawn monitor-wrapper-shaped fixture");
+        let pid = child.id();
+        let dir = tempfile::tempdir().unwrap();
+
+        assert!(
+            agent::discover_stray_devflow_processes()
+                .iter()
+                .any(|p| p.pid == pid),
+            "the fixture must be part of the real discovery census gate_sweep would use"
+        );
+
+        gate_sweep(None, true, Some(dir.path().to_path_buf()), true).unwrap();
+
+        assert!(
+            agent::agent_running(pid),
+            "--dry-run must never signal a discovered stray, no matter what else the machine \
+             is running"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// Task 2 behavior: without the flag, `gate_sweep` never even looks at
+    /// the process table — a live stray-shaped fixture is neither
+    /// discovered nor touched, and `gate_sweep`'s existing behavior stays
+    /// byte-for-byte unchanged.
+    #[test]
+    fn gate_sweep_without_reap_strays_flag_ignores_a_live_stray() {
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("trap cleanup TERM INT; sleep 30")
+            .spawn()
+            .expect("spawn monitor-wrapper-shaped fixture");
+        let pid = child.id();
+        let dir = tempfile::tempdir().unwrap();
+
+        gate_sweep(None, false, Some(dir.path().to_path_buf()), false).unwrap();
+
+        assert!(
+            agent::agent_running(pid),
+            "gate_sweep without --reap-strays must never signal anything discoverable only \
+             via the process table"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     /// Render `/proc/<pid>/cmdline` readably for failure diagnostics: the
