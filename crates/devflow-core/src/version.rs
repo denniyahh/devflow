@@ -48,6 +48,20 @@ pub enum VersionError {
     /// A git command failed.
     #[error("git command failed: {0}")]
     Git(String),
+    /// D-10: the highest semver tag in the repository is not reachable from
+    /// `HEAD` — refuse rather than silently computing a version below the
+    /// real release history (T-25-04). Typically means a `develop` -> `main`
+    /// sync was squashed instead of merged (999.52), or the tag was created
+    /// on an orphan ref never merged anywhere.
+    #[error(
+        "highest semver tag `{tag}` is not reachable from HEAD — merge its branch into \
+         the current branch (or, if a develop/main sync was squashed instead of merged, \
+         re-run `scripts/sync-main-to-develop.sh`), then retry"
+    )]
+    UnreachableBaseline {
+        /// The unreachable tag's name (e.g. `"v9.9.9"`).
+        tag: String,
+    },
 }
 
 /// Detect the project's version file, checking Cargo.toml, then pyproject.toml,
@@ -93,7 +107,15 @@ pub fn read_major_version(path: &Path) -> Result<u32, VersionError> {
     Ok(major)
 }
 
-/// Count all git tags (the MINOR component).
+/// Count all git tags.
+///
+/// **Superseded (D-07):** `compute_version` no longer derives MINOR from a
+/// raw tag count — use [`reachable_semver_baseline`] instead. Retained
+/// (rather than deleted) because `devflow-core` has no `publish = false` and
+/// this function is `pub`, so removal would be a breaking API change of a
+/// published crate (same reasoning CONTEXT.md D-13 records for
+/// `looks_like_devflow_process`).
+#[deprecated(note = "superseded by `reachable_semver_baseline` (D-07)")]
 pub fn count_git_tags(project_root: &Path) -> Result<u32, VersionError> {
     let output = Command::new("git")
         .arg("tag")
@@ -112,8 +134,15 @@ pub fn count_git_tags(project_root: &Path) -> Result<u32, VersionError> {
     Ok(count as u32)
 }
 
-/// Count commits since the most recent tag (the PATCH component). If there are
-/// no tags yet, counts all commits reachable from HEAD.
+/// Count commits since the most recent tag. If there are no tags yet, counts
+/// all commits reachable from HEAD.
+///
+/// **Superseded (D-08):** `compute_version` no longer derives PATCH from
+/// `git describe` distance — use [`classify_range_bump`] over
+/// [`release_range_start`]'s anchored range instead. Retained (rather than
+/// deleted) for the same published-crate-API reason as
+/// [`count_git_tags`]'s doc comment.
+#[deprecated(note = "superseded by `classify_range_bump` (D-08)")]
 pub fn commits_since_last_minor_tag(project_root: &Path) -> Result<u32, VersionError> {
     let last_tag = Command::new("git")
         .args(["describe", "--tags", "--abbrev=0"])
@@ -399,7 +428,25 @@ fn apply_bump(baseline: &semver::Version, bump: Bump) -> semver::Version {
 /// the only writer, and [`read_version`] is the only reader of what's on
 /// disk.
 pub fn compute_version(project_root: &Path) -> Result<Version, VersionError> {
+    let highest = highest_semver_tag(project_root)?;
     let baseline = reachable_semver_baseline(project_root)?;
+
+    // D-10: refuse rather than silently falling back to the highest
+    // *reachable* tag when the true highest tag exists but is not reachable
+    // from HEAD (T-25-04) — see `reachable_semver_baseline`'s doc comment for
+    // the D-12 sync-discipline coupling this predicate depends on.
+    if let Some(highest) = &highest {
+        let unreachable = match &baseline {
+            Some(reachable) => highest > reachable,
+            None => true,
+        };
+        if unreachable {
+            return Err(VersionError::UnreachableBaseline {
+                tag: format!("v{highest}"),
+            });
+        }
+    }
+
     let baseline_version = baseline
         .clone()
         .unwrap_or_else(|| semver::Version::new(0, 0, 0));
@@ -1155,7 +1202,10 @@ mod tests {
         let main_branch = current_branch(root);
 
         git(root, &["checkout", "--orphan", "orphan-release"]);
-        git(root, &["commit", "--allow-empty", "-q", "-m", "chore: orphan"]);
+        git(
+            root,
+            &["commit", "--allow-empty", "-q", "-m", "chore: orphan"],
+        );
         tag(root, "v9.9.9");
         git(root, &["checkout", &main_branch]);
 
@@ -1164,9 +1214,9 @@ mod tests {
             VersionError::UnreachableBaseline { tag } => {
                 assert_eq!(tag, "v9.9.9", "refusal must name the unreachable tag");
             }
-            other => panic!(
-                "expected UnreachableBaseline (never a silent smaller Ok), got: {other:?}"
-            ),
+            other => {
+                panic!("expected UnreachableBaseline (never a silent smaller Ok), got: {other:?}")
+            }
         }
     }
 
