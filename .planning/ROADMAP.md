@@ -1016,6 +1016,42 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
+### Phase 999.55: `phase7_cli::wait_for` Fixed 5s Budget Times Out Under Load (BACKLOG)
+
+**Goal:** `crates/devflow-cli/tests/phase7_cli.rs`'s `wait_for` polls for artifacts written by a real spawned monitor on a hard-coded budget — `for _ in 0..200 { … sleep(25ms) }`, five seconds, no backoff, no scaling, no env override. **7 call sites** use it, so the exposure is wider than the one test that has tripped.
+
+**Two failures on 2026-07-28,** both on docs-only changes so neither could have caused it: GitHub Actions' `Build + test in devcontainer` on PR #48 (`timed out waiting for …/gates/08-validate.json`, while the identical job passed on the parallel run of the same commit), and the local `pre-push` container gate rejecting the first push of PR #52 (passed on immediate retry, nothing changed). Load-dependent, not random — both occurred alongside concurrent sibling jobs.
+
+**This is not a suite-quality problem, and the data matters.** 25 CI failures in the last 200 runs (12.5%) were dated 2026-07-26/27 and dominated by `agent::tests::looks_like_devflow_process_is_false_for_a_non_devflow_process` — 999.47, closed by Phase 25. **Zero CI failures on 2026-07-28** once the barrier landed. `phase7_cli` appears nowhere in those 25. The suite runs 17 tests in 1.86s, so speed is not the issue, and it is the only suite driving the real compiled binary against real git repos and real spawned monitors — the coverage class Phase 25 proved in-process tests miss. Fix the timing assumption; do not cull the suite.
+
+**Measurement caveat:** `gh run rerun --failed` overwrites a run's historical conclusion, so a re-run flake vanishes from `gh run list`. The PR #48 instance is already masked this way; future flake-rate analysis will under-report unless it accounts for that.
+
+**Fix direction:** make the budget configurable with a longer CI default (e.g. `DEVFLOW_TEST_WAIT_SECS`, 5s locally / ~30s under `CI`), and have the panic report the budget it actually used. Test-only; no production change.
+
+**Priority:** Medium — intermittently blocks pushes and CI on unrelated changes, and each occurrence costs a retry plus the diagnosis of whether it is real. | **Size:** S — one helper plus its call sites. Linear: DEN-80.
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.56: macOS CI Coverage Without Breaking Required Checks (BACKLOG)
+
+**Goal:** DevFlow shells out to `git`, reads `/proc`, spawns detached monitors and manipulates worktrees — all platform-sensitive, all currently exercised only on Linux. Add macOS to the test and clippy matrices so a platform break is caught before a user finds it.
+
+*Extracted 2026-07-28 from the abandoned `chore/macos-ci` branch (tip `f651698`, last touched 2026-07-24) before that branch was deleted. The branch's other 10 commits were docs already incorporated elsewhere. **The intent is worth keeping; its diff is not.***
+
+**Rationale worth preserving from the branch:** `fail-fast: false`, so a platform-specific break yields the full failure set from both runners in one run rather than whichever tripped first; clippy on **both** platforms deliberately, because once any `cfg(target_os)` code exists a Linux-only clippy cannot see inside the macOS arm; `fmt` on one runner only, being platform-independent; and a longer timeout (the branch raised test from 20 to 30 minutes) since macOS runners are slower and `phase7_cli.rs` drives real git fixtures.
+
+**Traps — do NOT apply the branch's diff as-is.** It predates the container-parity work and regresses three things. (1) It renames the jobs to `Test (${{ matrix.os }})` / `Clippy (${{ matrix.os }})`; those exact strings are REQUIRED STATUS CHECKS on **both** the `main-squash-only` and `develop-merge-or-squash` rulesets, so renaming them makes the required check never report and wedges every merge to both branches — this has already happened once here (`devcontainer.yml`'s header records it), and classic `branches/*/protection` will not show it because rulesets are a separate mechanism. (2) It strips the pinned container and replaces `scripts/check.sh <part>` with raw `cargo`, destroying the CI/local parity that exists because that divergence made 999.47 cost hours. (3) It drops the `Trust the workspace` safe.directory step and the `assert-image-parity.sh` call, both of which exist for recorded reasons.
+
+**Unsolved design constraint:** the Linux jobs get hermeticity from a pinned Linux container that macOS cannot use, so a naive matrix cannot keep both. Either keep the containerised Linux jobs under their existing names and add separately-named macOS jobs, or restructure while preserving the required-check names exactly — and update both rulesets in the same change if any new required name is introduced.
+
+**Priority:** Low — no known macOS user or reported break; this is preventive. | **Size:** M, not the S the branch's diff suggests — the matrix is easy, preserving required-check names and container parity simultaneously is the actual work. Linear: DEN-81.
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
 ### Phase 21: Operator Legibility & Observability
 
 **Shipped as v1.8.0** (2026-07-24) — PR #23 (`develop → main`, squash `cfa9167`), signed tag `v1.8.0`, [GitHub Release](https://github.com/denniyahh/devflow/releases/tag/v1.8.0). `sync-main-to-develop.sh` run via PR #24 (merge `01ad9e4`). Published to crates.io (`devflow-core` then `devflow`, both confirmed live at 1.8.0).
