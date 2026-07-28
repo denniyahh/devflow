@@ -1568,10 +1568,23 @@ mod tests {
         }
 
         let adapter = FailOnceAdapter::new();
-        let should_continue = run_preflight(root, &mut state, &adapter).unwrap();
-        if should_continue {
-            launch_stage(&mut state, None, None).unwrap();
-        }
+        let preflight = run_preflight(root, &mut state, &adapter);
+        let continuation = match &preflight {
+            Ok(true) => launch_stage(&mut state, None, None),
+            _ => Ok(()),
+        };
+
+        // WR-05 / 999.44: `run_preflight`'s `Advance` arm calls
+        // `launch_stage_inner` directly (`:943`), which spawns a real
+        // detached monitor wrapper and records its pid on this same
+        // `&mut State` — reached indirectly, through recursion, rather than
+        // through this test's own explicit `launch_stage` call above. The
+        // guard must bind here, the first line after the final `&mut state`
+        // use, because every line below is a panic site, including
+        // unwrapping `preflight` itself: that call can spawn the monitor and
+        // then still fail a later `?`. The wrapper must die before `dir`
+        // unlinks the project root out from under it.
+        let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
 
         // SAFETY: still serialized under ENV_MUTEX from above.
         unsafe {
@@ -1580,6 +1593,13 @@ mod tests {
                 None => std::env::remove_var("PATH"),
             }
         }
+
+        // Unwrapping moves below the PATH restore above — deliberate, not an
+        // accidental reorder: on the error path, PATH is now restored before
+        // the panic instead of after it, narrowing the window in which a
+        // failing test leaves a mutated PATH behind for whatever runs next.
+        let should_continue = preflight.unwrap();
+        continuation.unwrap();
 
         assert!(
             !should_continue,
@@ -1591,6 +1611,12 @@ mod tests {
             launches, 1,
             "a preflight failure resolved by Advance must launch the agent \
              exactly once, not {launches}"
+        );
+        assert!(
+            state.monitor_pid.is_some(),
+            "this test is expected to drive a real monitor::spawn_monitor \
+             through run_preflight's Advance arm — None here means WR-05's \
+             premise was wrong and the guard above reaped nothing"
         );
     }
 
