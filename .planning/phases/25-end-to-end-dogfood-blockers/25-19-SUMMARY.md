@@ -143,3 +143,10 @@ None - no external service configuration required.
 ---
 *Phase: 25-end-to-end-dogfood-blockers*
 *Completed: 2026-07-28*
+
+## Self-Check: PASSED
+
+- FOUND: `.planning/phases/25-end-to-end-dogfood-blockers/25-19-SUMMARY.md`
+- FOUND: `02cb9ba` (Task 1 commit)
+- FOUND: `dd14c37` (Task 2 commit)
+- FOUND: `c0bf207` (SUMMARY.md commit)
