@@ -413,6 +413,18 @@ mod tests {
 
         let result = launch_stage(&mut state, None, None);
 
+        // WR-03 / 999.46: this launch_stage call spawns a real detached
+        // monitor wrapper, same as the staleness test above; the guard must
+        // reap it before `dir` drops below. Bound here — this test's LAST
+        // `&mut state` use — the guard outranks every panicking checkpoint
+        // that follows: `result.unwrap()`, the `assert!` on
+        // `state.monitor_pid.is_some()`, `workflow::load_state(...).unwrap()`,
+        // and the `assert_eq!` on the reloaded pid. Binding here also covers
+        // the narrower case of a launch that spawned the monitor and then
+        // failed a later `?` inside `launch_stage_inner` — `result` would be
+        // `Err` but the pid would nonetheless be live (G-25-2, 25-17).
+        let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
+
         // SAFETY: still serialized under ENV_MUTEX from above.
         unsafe {
             match &original_path {
@@ -432,12 +444,6 @@ mod tests {
             "the monitor pid recorded by launch_stage must be persisted to disk, \
              since transition() saves state before launch_stage runs"
         );
-
-        // WR-03 (999.46): pre-existing omission, not attributable to phase 25 —
-        // this test's launch_stage call spawns a real detached monitor
-        // wrapper same as the staleness test above; reap it, verified, before
-        // `dir` drops below.
-        reap_spawned_monitor(&state);
     }
     /// 20c (review: Codex MEDIUM — resume semantics): a phase halted by
     /// `--until <stage>` has `stopped`/`stop_reason`/`stop_until` persisted.
