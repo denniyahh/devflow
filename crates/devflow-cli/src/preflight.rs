@@ -611,14 +611,26 @@ fn major_bump_check_applies(stage: Stage) -> bool {
 /// (T-25-52), since commit subjects are attacker-influenced text and this
 /// reason reaches a persisted gate file and operator output. It contains no
 /// absolute filesystem path (WR-02).
+///
+/// CR-02 (`25-REVIEW.md`, 25-08): classification runs against
+/// `execution_root = state.worktree_path.as_deref().unwrap_or(project_root)`
+/// — the phase's worktree when `state.worktree_path` is set, else
+/// `project_root` — exactly the idiom `staleness.rs::enforce_build_staleness`
+/// established for the identical distinction. In `devflow start`'s default
+/// (worktree) execution mode, the phase's own commits live only on the
+/// worktree's feature branch and are unreachable from `project_root`'s HEAD
+/// until `hooks_after_ship`'s Merge step, which runs AFTER this preflight —
+/// evaluating against `project_root` alone would make a `feat!:` commit
+/// invisible to this gate.
 fn preflight_major_bump_check(project_root: &Path, state: &State) -> Result<(), String> {
     if !major_bump_check_applies(state.stage) {
         return Ok(());
     }
+    let execution_root = state.worktree_path.as_deref().unwrap_or(project_root);
 
-    let highest = version::highest_semver_tag(project_root).map_err(|err| err.to_string())?;
+    let highest = version::highest_semver_tag(execution_root).map_err(|err| err.to_string())?;
     let baseline =
-        version::reachable_semver_baseline(project_root).map_err(|err| err.to_string())?;
+        version::reachable_semver_baseline(execution_root).map_err(|err| err.to_string())?;
 
     // D-10: refuse rather than proceed when the true highest tag exists but
     // is not reachable from HEAD — mirrors `compute_version`'s own refusal
@@ -640,12 +652,12 @@ fn preflight_major_bump_check(project_root: &Path, state: &State) -> Result<(), 
     let baseline_tag = baseline.as_ref().map(|tag| format!("v{tag}"));
     let range_start = match &baseline_tag {
         Some(tag) => {
-            version::release_range_start(project_root, tag).map_err(|err| err.to_string())?
+            version::release_range_start(execution_root, tag).map_err(|err| err.to_string())?
         }
         None => String::new(),
     };
-    let bump =
-        version::classify_range_bump(project_root, &range_start).map_err(|err| err.to_string())?;
+    let bump = version::classify_range_bump(execution_root, &range_start)
+        .map_err(|err| err.to_string())?;
 
     if bump != version::Bump::Major {
         return Ok(());
@@ -654,7 +666,7 @@ fn preflight_major_bump_check(project_root: &Path, state: &State) -> Result<(), 
     let baseline_display = baseline_tag.as_deref().unwrap_or("(none)").to_string();
     let baseline_major = baseline.as_ref().map(|v| v.major).unwrap_or(0);
     let resulting_major = baseline_major + 1;
-    let subjects = breaking_commit_subjects(project_root, &range_start);
+    let subjects = breaking_commit_subjects(execution_root, &range_start);
     let subjects_display = if subjects.is_empty() {
         String::new()
     } else {
@@ -675,7 +687,11 @@ fn preflight_major_bump_check(project_root: &Path, state: &State) -> Result<(), 
 /// failure or non-zero exit yields an empty list rather than propagating an
 /// error — this is a diagnostic aid for the message, not part of the
 /// classification itself.
-fn breaking_commit_subjects(project_root: &Path, range_start: &str) -> Vec<String> {
+///
+/// CR-02 (25-08): `execution_root` (the phase's worktree when set, else
+/// `project_root`) — see [`preflight_major_bump_check`]'s doc comment — so
+/// this diagnostic scan agrees with the classification it explains.
+fn breaking_commit_subjects(execution_root: &Path, range_start: &str) -> Vec<String> {
     let range = if range_start.is_empty() {
         "HEAD".to_string()
     } else {
@@ -683,7 +699,7 @@ fn breaking_commit_subjects(project_root: &Path, range_start: &str) -> Vec<Strin
     };
     let Ok(output) = std::process::Command::new("git")
         .args(["log", "--no-merges", &range, "--format=%H%x1f%B%x1e"])
-        .current_dir(project_root)
+        .current_dir(execution_root)
         .output()
     else {
         return Vec::new();
@@ -717,10 +733,49 @@ fn breaking_commit_subjects(project_root: &Path, range_start: &str) -> Vec<Strin
 
 /// The generic (universal) preflight checks (D-14) — the adapter-specific
 /// hook is composed separately in [`run_preflight`].
+///
+/// CR-01 (`25-REVIEW.md`, 25-08): runs all three checks unconditionally and
+/// aggregates every `Err` into one reason, rather than `?`-short-circuiting
+/// on the first failure. `run_preflight`'s `GateAction::Advance` arm
+/// relaunches via `launch_stage_inner` directly and never re-runs this
+/// function — so under the old `?`-chain, a check that never ran once
+/// (because an earlier check in the chain failed first) would never run at
+/// all for that stage launch, and a human approving that earlier gate would
+/// never have been shown the unrun check's reason. Aggregation closes that
+/// hole for every check in this chain, not just the major-bump check that
+/// surfaced it (`25-VERIFICATION.md`'s named fix, `25-REVIEW.md`'s option
+/// (a); option (b), special-casing the `Advance` arm instead, was
+/// deliberately not taken — it would not close the same hole for a future
+/// check added to this chain).
+///
+/// Reasons are ordered by consequence, **major-bump FIRST**, then
+/// interactivity, then gh-auth — load-bearing, not cosmetic:
+/// `run_preflight` passes the joined string through [`truncate_reason`] (a
+/// hard 300-character cap) before it reaches the gate context, and the
+/// major-bump reason is both the longest of the three and the only one
+/// whose loss would silently re-open the unattended-ship hole D-09 exists
+/// to close.
+///
+/// The adapter-specific hook (composed by [`run_preflight`] via
+/// `.and_then`) is deliberately NOT folded into this aggregation —
+/// `25-VERIFICATION.md`'s gap-closure scope names only these three generic
+/// checks; this is a scope boundary, not an oversight.
 fn generic_preflight_checks(project_root: &Path, state: &State) -> Result<(), String> {
-    preflight_interactivity_check(project_root, state)?;
-    preflight_gh_auth_check(state)?;
-    preflight_major_bump_check(project_root, state)
+    let mut reasons = Vec::new();
+    if let Err(reason) = preflight_major_bump_check(project_root, state) {
+        reasons.push(reason);
+    }
+    if let Err(reason) = preflight_interactivity_check(project_root, state) {
+        reasons.push(reason);
+    }
+    if let Err(reason) = preflight_gh_auth_check(state) {
+        reasons.push(reason);
+    }
+    if reasons.is_empty() {
+        Ok(())
+    } else {
+        Err(reasons.join("; "))
+    }
 }
 
 /// Gate a stage launch on readiness (17c, D-13-D-16): the generic universal
@@ -740,11 +795,16 @@ fn generic_preflight_checks(project_root: &Path, state: &State) -> Result<(), St
 /// spawned the agent a second time).
 ///
 /// 18f (D-18f): `GateAction::Advance` on a preflight gate is an explicit
-/// override — the check has already been adjudicated by a human, both
-/// production checks (`preflight_interactivity_check`,
-/// `preflight_gh_auth_check`) are deterministic idempotent predicates a
-/// gate approval cannot change, so re-running them is guaranteed to fail
-/// identically. The `Advance` arm therefore relaunches via
+/// override — the check has already been adjudicated by a human, and every
+/// generic check (`preflight_major_bump_check`,
+/// `preflight_interactivity_check`, `preflight_gh_auth_check`) is a
+/// deterministic idempotent predicate a gate approval cannot change, so
+/// re-running them is guaranteed to fail identically. **This justification
+/// is sound only because [`generic_preflight_checks`] aggregates rather than
+/// `?`-short-circuits (CR-01, 25-08): every applicable check has actually
+/// been evaluated and its reason shown to the human before the gate opens,
+/// so skipping the re-check on `Advance` cannot silently skip a check that
+/// never ran once.** The `Advance` arm therefore relaunches via
 /// [`launch_stage_inner`] directly, SKIPPING this function entirely on the
 /// retry. `GateAction::LoopBack` still calls the full [`launch_stage`]
 /// (re-entering this function), because that path means the operator will
@@ -1032,6 +1092,107 @@ mod tests {
         assert!(err.contains("not reachable"), "{err}");
     }
 
+    /// CR-02 (`25-REVIEW.md`): a real `git worktree add` fixture proving the
+    /// D-09 major-bump gate must classify the WORKTREE's HEAD, not
+    /// `project_root`'s, in `devflow start`'s default (worktree) execution
+    /// mode. Mirrors `staleness.rs::worktree_staleness_fixture`'s
+    /// construction exactly: `project_root` and `worktree_path` are SIBLING
+    /// directories under one outer tempdir (never nested — a nested worktree
+    /// path would contain `project_root`'s path as a string prefix, making
+    /// path-discriminating assertions mutually exclusive), `git init -q -b
+    /// develop` plus the same five config lines `major_bump_fixture` uses,
+    /// one `chore: init` commit tagged `v1.0.0` on `develop`, then `git
+    /// worktree add -b feature/phase-90 <worktree_path> develop` from
+    /// `project_root`. Exactly ONE commit is made, and made ONLY inside
+    /// `worktree_path`, with the message `feat(scope)!: drop legacy api` —
+    /// the identical breaking-marker shape and message
+    /// `major_bump_errs_naming_bump_baseline_and_version_for_major_at_ship`
+    /// uses, so a classification difference cannot be attributed to message
+    /// shape. `project_root`'s HEAD (`develop`) never moves.
+    ///
+    /// Tags live in the shared object database, so `v1.0.0` is visible and
+    /// reachable from the worktree's HEAD (`git tag --merged HEAD` run in the
+    /// worktree returns it) — this is the property that makes the fixture
+    /// meaningful: the baseline resolves identically from either root, only
+    /// the classified range differs.
+    ///
+    /// Returns `(tempdir_guard, worktree_path)`. `project_root` is
+    /// `tempdir_guard.path().join("project")`, matching
+    /// `worktree_staleness_fixture`'s return contract. The guard must be kept
+    /// alive for the duration of the test.
+    fn major_bump_worktree_fixture() -> (tempfile::TempDir, PathBuf) {
+        let outer = tempfile::tempdir().unwrap();
+        let project_root = outer.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let worktree_path = outer.path().join("worktree");
+
+        run_git(&project_root, &["init", "-q", "-b", "develop"]);
+        run_git(&project_root, &["config", "user.email", "t@e.st"]);
+        run_git(&project_root, &["config", "user.name", "t"]);
+        run_git(&project_root, &["config", "commit.gpgsign", "false"]);
+        run_git(&project_root, &["config", "tag.gpgsign", "false"]);
+        run_git(&project_root, &["config", "core.hooksPath", "/dev/null"]);
+        commit_msg(&project_root, "a.txt", "chore: init");
+        tag(&project_root, "v1.0.0");
+
+        run_git(
+            &project_root,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/phase-90",
+                worktree_path.to_str().unwrap(),
+                "develop",
+            ],
+        );
+
+        // ONE commit made ONLY inside the worktree — project_root's HEAD
+        // (develop) never moves. This asymmetry is exactly CR-02's mechanism.
+        commit_msg(&worktree_path, "b.txt", "feat(scope)!: drop legacy api");
+
+        (outer, worktree_path)
+    }
+
+    /// CR-02 (`25-REVIEW.md`): `preflight_major_bump_check` must classify the
+    /// tree the phase's code actually lives in. Before Task 2's fix, this
+    /// check always shells git against `project_root`, so a breaking commit
+    /// that exists ONLY on the worktree's feature branch (the default
+    /// `devflow start` execution mode) is invisible — this test is RED until
+    /// Task 2 lands. Both halves are asserted in one test, exactly as
+    /// `embedded_commit_is_stale_uses_worktree_head` does, because a single
+    /// assertion would pass for the wrong reason if the fixture were built
+    /// incorrectly.
+    #[test]
+    fn preflight_major_bump_check_fires_against_the_worktree_head() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let (outer, worktree_path) = major_bump_worktree_fixture();
+        let project_root = outer.path().join("project");
+
+        let mut state = State::new(76, AgentKind::Claude, Mode::Auto, project_root.clone());
+        state.stage = Stage::Ship;
+        state.worktree_path = Some(worktree_path.clone());
+
+        let err = preflight_major_bump_check(&project_root, &state).unwrap_err();
+        assert!(err.contains("MAJOR"), "{err}");
+        assert!(err.contains("v1.0.0"), "{err}");
+        assert!(err.contains("v2.0.0"), "{err}");
+        assert!(err.contains("drop legacy api"), "{err}");
+
+        // Negative half: with no worktree set, the SAME call classifies
+        // project_root's HEAD (develop), where the breaking commit does not
+        // exist — proving the fixture discriminates on execution root and
+        // that the positive assertion above is not passing for an unrelated
+        // reason.
+        state.worktree_path = None;
+        assert!(
+            preflight_major_bump_check(&project_root, &state).is_ok(),
+            "with no worktree set, the check must classify project_root's own HEAD, which \
+             never received the breaking commit"
+        );
+    }
+
     /// D-09 integration (mirrors `run_preflight_failing_check_gates_and_never_
     /// reaches_spawn_monitor`): a breaking-commit range at Stage::Ship drives
     /// `run_preflight` into the never-silent gate rather than continuing
@@ -1147,6 +1308,70 @@ mod tests {
             result.is_err(),
             "yes_ship must never auto-approve this gate — an unattended \
              Ok(_) within the bounded timeout would mean it did, got {result:?}"
+        );
+    }
+
+    /// [`agent_free_git_only_path_dir`], extended with an executable `gh`
+    /// stub that always exits 1 — makes [`preflight_gh_auth_check`] take its
+    /// hard `Err` branch (`gh` present, reports unauthenticated) rather than
+    /// its fail-soft binary-absent branch, which is the only way to compose
+    /// a gh-auth failure with a major-bump failure at the same stage. Mirrors
+    /// `agent_free_dir_with_agent_stub`'s stub-writing construction (content
+    /// plus `PermissionsExt` mode `0o755`).
+    fn git_only_path_dir_with_failing_gh() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = agent_free_git_only_path_dir();
+        let path = dir.path().join("gh");
+        std::fs::write(&path, "#!/bin/sh\nexit 1\n").unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        dir
+    }
+
+    /// CR-01 (`25-REVIEW.md`, 25-08): `generic_preflight_checks` must not
+    /// `?`-short-circuit — a gh-auth failure must not hide a major-bump
+    /// failure that also applies at the same stage. Composes Task 1's
+    /// worktree fixture (Task 2's fix) with a failing `gh` stub, so the two
+    /// defects this plan closes are exercised together, exactly as they
+    /// compose in production.
+    #[test]
+    fn generic_preflight_checks_reports_major_bump_even_when_gh_auth_fails_first() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let git_only_dir = git_only_path_dir_with_failing_gh();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", git_only_dir.path());
+        }
+
+        let (outer, worktree_path) = major_bump_worktree_fixture();
+        let project_root = outer.path().join("project");
+        let mut state = State::new(77, AgentKind::Claude, Mode::Auto, project_root.clone());
+        state.stage = Stage::Ship;
+        state.worktree_path = Some(worktree_path);
+
+        let err = generic_preflight_checks(&project_root, &state).unwrap_err();
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        assert!(err.contains("MAJOR"), "{err}");
+        assert!(err.contains("drop legacy api"), "{err}");
+        assert!(err.contains("not authenticated"), "{err}");
+
+        // T-25-08-03: the 300-character truncation cap cannot elide the
+        // highest-consequence reason — proven by ordering the major-bump
+        // reason first in generic_preflight_checks.
+        assert!(
+            truncate_reason(&err).contains("MAJOR"),
+            "{}",
+            truncate_reason(&err)
         );
     }
 
