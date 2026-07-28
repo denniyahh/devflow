@@ -6,14 +6,14 @@ current_phase: 25
 current_phase_name: end-to-end-dogfood-blockers
 status: executing
 stopped_at: Phase 25 planned — 7 plans, 3 waves, plan-checker PASS
-last_updated: "2026-07-28T03:51:56.223Z"
-last_activity: 2026-07-27
+last_updated: "2026-07-28T04:11:29.193Z"
+last_activity: 2026-07-28
 last_activity_desc: Phase 25 execution started
 progress:
   total_phases: 14
   completed_phases: 13
   total_plans: 104
-  completed_plans: 94
+  completed_plans: 101
   percent: 93
 ---
 
@@ -87,8 +87,8 @@ change earns 2.0.
 ## Current Position
 
 Phase: 25 (end-to-end-dogfood-blockers) — EXECUTING
-Plan: 1 of 7
-Status: Ready to execute
+Plan: 1 of 10
+Status: Executing Phase 25
 
 **23-15 result (second acceptance attempt, 2026-07-26):** `devflow start --phase 24 --agent claude --mode auto --yes-ship` was blocked at launch by the self-dogfood staleness hard block (D-18) — the binary's embedded commit (`0c9dcfe`, built from `feature/phase-23`) and `origin/develop`'s tip (`0dad20d`) are mutually non-ancestors (genuine divergence, confirmed via `git merge-base --is-ancestor` both directions, exit 1 each way), so the block fired before Define ever launched. No `workflow_shipped` event exists for phase 24; `devflow evidence --phase 24 --require-shipped` exits 1 both pre- and post-run — unchanged. See `.planning/phases/23-end-to-end-dogfood/23-ACCEPTANCE-RUN-2.md`.
 
@@ -106,7 +106,7 @@ Scope boundary: 23-16 is the **fix only** (change + regression tests + PR into `
 
 **Recovery-ref disposition:** both `origin` refs (`recovery/pre-23-11-acceptance-e0f87c2`, `recovery/pre-23-15-acceptance-0dad20d`) remain untouched on `origin`; the local copy of the pre-23-11 ref, deleted again by `devflow cleanup`, is deliberately NOT restored (per `23-FINDINGS.md` §B2a); the pre-23-15 ref is now unused (no merge to undo) but retained on `origin` for reuse by the 23-16 retry rather than deleted.
 
-Last activity: 2026-07-27 — Phase 25 execution started
+Last activity: 2026-07-28 — Phase 25 execution started
 
 **Note on the "Plan: 2 of 15" value this replaces:** `gsd-tools state advance-plan` only increments whatever value is already in this field, which had drifted to "2 of 15" (the parallel-worktree waves 23-01…23-09 deliberately never touch STATE.md, and this field was last corrected against reality at "10 of 11 plans complete" before the plan count grew to 15 with the gap-closure plans 23-12…23-15). Corrected directly to "13 of 15" to match reality (23-12 and 23-13 both now executed) rather than trust the tool's naive +1 increment from a stale base.
 
