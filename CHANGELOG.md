@@ -1,5 +1,29 @@
 # Changelog
 
+## 2.1.0 — 2026-07-28
+
+Phase 25 — the blockers that stopped an unattended `devflow start` run from
+reaching a completed Ship stage. Phase 23 had proven the goal unreachable: its
+furthest attempt drove Define→Plan→Code unattended then halted, and two of its
+three attempts needed a human to repair the base ref before `devflow start`
+would launch at all.
+
+### Fixed
+- **`compute_version` no longer invents version numbers (25c).** It derived a version from three inputs — `Cargo.toml` major, raw tag *count* as minor, and commits-since as patch — which computed `~1.11.359` against a real `1.8.1`. It now derives the baseline from the highest semver tag *reachable from HEAD* and classifies the commits since that baseline with a conventional-commit parser. A baseline that exists in the repository but is not reachable from the release branch is refused outright (`UnreachableBaseline`) rather than silently producing a smaller version. `release_range_start`'s commit-range anchor now walks the full ancestry path, so a squash-sync release topology no longer drops commits from classification
+- **A major version bump can no longer ship unattended (25c/D-09).** `devflow start --yes-ship` pre-authorizes the Ship gate, which meant a major bump could ship with no human ever seeing it. A major bump now opens its own preflight gate that `--yes-ship` cannot auto-approve — the auto-response is a parameter of the gate call, never derived from state. The check is evaluated against the phase's own worktree, not the main checkout, so it fires in the default execution path
+- **`devflow doctor` no longer reports live, registered processes as orphans, and `gate sweep --reap-strays` no longer SIGKILLs them (25d).** The `/proc` census is structural by design — argv shape plus euid, no ownership test — and `doctor` asserted an orphan conclusion the code never established, naming a destructive repair for it. On a machine running concurrent DevFlow phases this listed every sibling run's monitor as a stray. Both surfaces now filter that census through one shared reachability set: every `monitor_pid` and lock holder across every registered root. `--root` unions into that safety set and never narrows it — narrowing would protect less while still reaping machine-wide. A process whose project root was deleted contributes nothing to the set and so remains reapable, which is the case the feature exists for
+- **`devflow start` no longer launches from a stale base ref, and repairing one can no longer corrupt it (25a).** The base branch is fetched and compared before launch; when it is strictly behind it is fast-forwarded, otherwise the run refuses loudly. The fast-forward is a compare-and-swap (`git update-ref` with an expected old value), so a ref that moved between the check and the write is refused rather than silently rolled back, and its "not checked out" precondition is evaluated across every worktree in the repository rather than just the one being launched from
+- **Build-staleness is adjudicated once per run (25b).** The self-dogfood staleness check ran on every stage launch, so a run that started against a current build could be blocked mid-flight by a later commit. It now runs once, at `start`, against the phase's worktree HEAD, and never again for the life of the run
+- **A test-suite race that produced a ~50% CI failure rate is closed (25e/999.47).** A process's `/proc` cmdline is inherited from its parent during the window between `fork` and `exec`, so a census taken inside that window could match the wrong process. A bounded exec-visibility barrier now covers every affected spawn site, and the production reaper refuses to signal inside the window via an age floor. Closed against an 11-observation streak with the residual failure probability stated rather than claimed eliminated
+
+### Added
+- **`devflow gate sweep --reap-strays`** — opt-in reaping of orphaned monitor processes with bounded TERM→KILL escalation and verified death, plus a `--dry-run` preview. Identity is re-confirmed immediately before any signal, so a recycled PID cannot be hit
+- **`devflow doctor` reports state-orphaned processes as their own finding class**, describing only what was actually checked — an argv-shape match owned by the caller — instead of asserting orphan-ness
+
+### Changed
+- **CONTRIBUTING.md's release procedure no longer drifts from what the code does (25f).** The tagging step now shows the explicit key-selection form (`git -c user.signingkey="$(git config --get devflow.releaseSigningKey)" tag -s`) rather than a bare `git tag -s`, which signs with whatever key happens to be configured on the machine — a real hazard here, because the release key and the agent's commit key share a `user.email` and differ only by fingerprint
+- **README documents where the automation stops** — the release cut itself (opening the `develop` → `main` PR, tagging, publishing) is deliberately manual; `devflow release --check` runs the preflight but does not execute the release
+
 ## 2.0.0 — 2026-07-26
 
 The breaking change the v2.0.0 slot was held open for (milestone note,
