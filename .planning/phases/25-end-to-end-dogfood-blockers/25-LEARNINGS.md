@@ -5,17 +5,18 @@ project: "DevFlow"
 generated: "2026-07-28"
 counts:
   decisions: 10
-  lessons: 9
+  lessons: 10
   patterns: 7
-  surprises: 6
+  surprises: 7
 missing_artifacts: []
 extraction_notes: >
   All 19 PLAN.md and 18 SUMMARY.md files, 25-UAT.md, and 25-VERIFICATION.md were available.
-  25-VERIFICATION.md was read at its COMMITTED state (git HEAD, the round-4 re-verification
-  block) rather than from the working tree, because a round-5 gsd-verifier run was rewriting
-  that file concurrently and a working-tree read risked a torn file. Round-5 verification
-  outcomes are therefore not represented below; re-run this extraction after that verifier
-  lands if its findings need to be captured.
+  First pass read 25-VERIFICATION.md at its COMMITTED state (git HEAD, the round-4
+  re-verification block) rather than from the working tree, because a round-5 gsd-verifier run
+  was rewriting that file concurrently and a working-tree read risked a torn file. That verifier
+  has since landed with status `passed` (10/10), and this file was AMENDED to incorporate its
+  findings — see the final Lesson and final Surprise, both sourced to the round-5 verification
+  block. No earlier item was altered by the amendment.
 ---
 
 # Phase 25 Learnings: end-to-end-dogfood-blockers
@@ -197,6 +198,21 @@ were caught by executors following the plan's own contingency instructions rathe
 literal steps.
 **Source:** 25-06-SUMMARY.md, 25-09-SUMMARY.md
 
+### Enumerate by the scarce prerequisite, not by the call graph — the call-graph list was itself incomplete
+Round 5 closed the leak hunt, but only because an *orthogonal* method was used to confirm it.
+
+**Context:** The orchestrator's sweep enumerated eight functions that reach `launch_stage` and
+cross-referenced them against tests. The verifier instead grepped for the two helpers that place a
+stub agent binary on `PATH` (`stub_agent_binary`, `agent_free_dir_with_agent_stub`) and classified
+every caller — reaching the same 7 sites by a different route. It then found a **ninth** wrapper
+(`commands::start`, `commands.rs:113/302`) that the eight-entry list had missed. That ninth entry
+happened not to expand the leak count, because no in-process test in `commands.rs` uses either stub
+helper — but the call-graph enumeration was incomplete *again*, on the very pass that was supposed
+to close it. A spawn requires a stubbed binary on `PATH`; that prerequisite is scarce, greppable,
+and cannot be reached around, whereas the set of wrappers reaching a spawn is open-ended. Enumerate
+on the scarce prerequisite.
+**Source:** 25-VERIFICATION.md (round-5 block)
+
 ---
 
 ## Patterns
@@ -320,3 +336,15 @@ under them — 999.44's reproduction shape, produced by the phase's own suite.
 this consumed rounds 4 and 5 (plans 25-16, 25-17, 25-18, 25-19) — more plans than several of the
 phase's production units.
 **Source:** 25-16-SUMMARY.md, 25-REVIEW.md WR-03/WR-05/WR-06, .planning/WINDOWS.md
+
+### The enumeration closed only when a third method agreed with the second
+Four rounds asserted completeness; three were wrong.
+
+**Impact:** 25-16 (call sites) missed two. 25-18 (call sites + `run_preflight` arms) missed one and
+asserted none remained. The orchestrator's eight-entry call-graph sweep found the last leak but
+itself missed a ninth wrapper. Only the verifier's stub-helper grep — an independent discriminator,
+run by a party that had not authored any of the fixes — produced a completeness claim that survived
+scrutiny, and it did so by agreeing with the previous method's *site list* while disagreeing with
+its *wrapper list*. The durable practice is not "enumerate more carefully" but "confirm an
+enumeration with a method that could fail differently, run by someone who did not write the fix."
+**Source:** 25-VERIFICATION.md (round-5 block), 25-16-SUMMARY.md, 25-18-SUMMARY.md
