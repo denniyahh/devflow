@@ -252,10 +252,26 @@ through a PR.
    `release: vX.Y.Z — <short description>`.
 4. Once CI is green, squash-merge it (this repo's branch settings only
    allow squash merges into `main` — real merge commits are disabled).
-5. Tag the resulting commit on `main`: `git tag -s vX.Y.Z <commit> -m "..."`,
-   then `git push origin vX.Y.Z`. Use `-s`, not `-a`: releases are
-   SSH-signed, and a repo-local `tag.gpgsign=false` means `-a` alone will
-   not sign. Verify with `git tag -v vX.Y.Z`.
+5. Tag the resulting commit on `main` with the maintainer key, using the same
+   explicit key-selection form documented in [§ Release
+   signing](#release-signing) — never a bare `git tag -s`, which signs with
+   whatever `user.signingkey` happens to be on the machine running it (the
+   agent's, on a machine where the agent works):
+
+   ```bash
+   git -c user.signingkey="$(git config --get devflow.releaseSigningKey)" \
+       tag -s vX.Y.Z <commit> -m "vX.Y.Z"
+   git push origin vX.Y.Z
+   ```
+
+   Use `-s` with the explicit key selection, not `-a`: signing is already on
+   by repository policy (`.gitconfig`'s `[tag] gpgsign = true`), so the risk
+   here is not an unsigned tag but a tag signed with the *wrong* key — one
+   that looks correct in `git log`, `git tag -v`'s signer line, and GitHub's
+   "Verified" badge, because both keys share the same `user.email`. Only the
+   key fingerprint differs, which is why `scripts/hooks/pre-push` compares
+   fingerprints rather than trusting the signer string. Verify with
+   `git tag -v vX.Y.Z`.
 6. **Immediately run `scripts/sync-main-to-develop.sh`** from a clean
    `develop` checkout. It produces a merge commit locally; because `develop`
    is protected you cannot push it directly — put it on a `sync/` branch and
