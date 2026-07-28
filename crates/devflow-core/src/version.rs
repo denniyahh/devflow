@@ -939,6 +939,27 @@ mod tests {
         git(root, &["merge", "-s", "ours", "-m", message, branch]);
     }
 
+    /// Simulate the shape `GitFlow::merge_feature_into_develop`
+    /// (`crates/devflow-core/src/git.rs:86`) produces for every phase branch
+    /// merged into `develop`: a real, ordinary `--no-ff` merge commit.
+    /// Ordinary post-release feature work lands this way too, which is what
+    /// makes it a merge commit on the ancestry path in addition to the
+    /// sync-merge-back — the reason `release_range_start` cannot simply
+    /// anchor at "the last merge commit."
+    fn merge_no_ff(root: &Path, branch: &str, message: &str) {
+        git(root, &["merge", "--no-ff", "-m", message, branch]);
+    }
+
+    /// Capture `HEAD`'s commit SHA, mirroring `current_branch`'s construction.
+    fn head_sha(root: &Path) -> String {
+        let output = crate::test_support::git_command(root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "rev-parse HEAD failed");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
     #[test]
     fn detect_prefers_cargo_then_pyproject_then_package_json() {
         let dir = tempfile::tempdir().unwrap();
@@ -1185,6 +1206,152 @@ mod tests {
                 minor: 1,
                 patch: 1
             }
+        );
+    }
+
+    /// Reproduces CR-03 (`25-REVIEW.md`): the current `release_range_start`
+    /// inspects only the ancestry path's FIRST commit (`C1`) and tests
+    /// whether the baseline tag is an ancestor of `C1`'s first parent. When a
+    /// commit lands directly on trunk between the tag and the sync-merge-back
+    /// (a hotfix pushed straight to `main`), that intervening commit becomes
+    /// `C1` — its first parent IS the tag commit, so
+    /// `git merge-base --is-ancestor <tag> <tag>` is trivially true, the
+    /// function wrongly concludes the tag already sat on mainline, and it
+    /// returns the literal `tag..HEAD` range — reintroducing the pre-release
+    /// `develop` history the whole D-08 anchor exists to exclude.
+    ///
+    /// RED until Task 2 lands (`release_range_start` walks the whole
+    /// ancestry path instead of only `C1`).
+    #[test]
+    fn trunk_commit_between_tag_and_sync_merge_still_anchors_at_the_sync_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        commit_msg(root, "base.txt", "chore: init");
+        let trunk = current_branch(root);
+
+        checkout_new(root, "develop");
+        commit_msg(root, "d1.txt", "feat: develop work one");
+        commit_msg(root, "d2.txt", "feat: develop work two");
+
+        checkout(root, &trunk);
+        commit_msg(root, "sq1.txt", "feat: squashed release of develop work");
+        tag(root, "v2.0.0");
+
+        // Still on trunk: the intervening direct-trunk commit that turns
+        // CR-03's C1-only heuristic into a false positive.
+        commit_msg(root, "hot.txt", "fix: hotfix pushed straight to main");
+
+        checkout(root, "develop");
+        merge_ours(
+            root,
+            &trunk,
+            "merge: sync main back into develop after release",
+        );
+        let sync_merge = head_sha(root);
+        commit_msg(root, "f1.txt", "fix: patch after sync");
+
+        assert_eq!(
+            release_range_start(root, "v2.0.0").unwrap(),
+            sync_merge,
+            "anchor must be the sync merge, not the hotfix's tag-ancestor first parent"
+        );
+        assert_eq!(
+            compute_version(root).unwrap(),
+            Version {
+                major: 2,
+                minor: 0,
+                patch: 1
+            },
+            "pre-fix this yields 2.1.0: the range collapses to tag..HEAD and \
+             re-admits d1/d2's two feat commits"
+        );
+    }
+
+    /// Tripwire pinning this plan's deliberate deviation from
+    /// `25-REVIEW.md`/`25-VERIFICATION.md`'s fix sketch ("anchor at the last
+    /// merge commit in the ancestry path"). `GitFlow::merge_feature_into_develop`
+    /// (`crates/devflow-core/src/git.rs:86`) merges every phase branch into
+    /// `develop` with `git merge --no-ff`, so ordinary POST-RELEASE feature
+    /// work also produces merge commits on the ancestry path — not just the
+    /// sync-merge-back. Measured live against this repository 2026-07-28
+    /// (`git rev-list --ancestry-path --reverse v2.0.0..develop`): the
+    /// correct anchor is `c92229e` (the sync merge), but the literal "last
+    /// merge commit" rule would return `819987b` (a later, unrelated PR
+    /// merge), whose range silently drops an intervening commit from
+    /// classification. Today that dropped commit is a `docs:` commit and
+    /// nothing breaks; a `feat!:` in that same position would be dropped
+    /// instead — a false negative that lets a major bump ship unattended,
+    /// exactly what D-09 exists to prevent.
+    ///
+    /// This test is GREEN before AND after Task 2: it is green today (this
+    /// is what the CURRENT C1-only code already gets right), and it must
+    /// stay green under the generalized full-ancestry-path rule Task 2
+    /// implements. It goes RED only under the review's literal "last merge
+    /// commit" sketch — do not simplify the implementation into that sketch.
+    ///
+    /// Deviation from this plan's literal construction: without the
+    /// intervening `chore: continue develop work after sync` commit below,
+    /// `git rev-list --ancestry-path --reverse` places the feature branch's
+    /// single-parent commit (`ft1`) BEFORE the sync-merge commit itself in
+    /// its output — a real, measured property of that exact shape (verified
+    /// live 2026-07-28; see 25-09-SUMMARY.md), not test flakiness — which
+    /// made the fixture as originally specified fail pre-fix (asserting
+    /// behavior the current C1-only code does not actually have). Per this
+    /// plan's own instruction ("If Test 2 fails pre-fix, the fixture is
+    /// malformed — stop and fix it"), one ordinary intervening develop
+    /// commit was inserted between the sync merge and the feature branch's
+    /// creation, which is itself realistic (post-release develop work
+    /// commonly precedes the next feature branch) and restores C1 = the
+    /// sync merge under the current implementation without changing either
+    /// assertion.
+    #[test]
+    fn feature_merge_after_sync_merge_does_not_move_the_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        commit_msg(root, "base.txt", "chore: init");
+        let trunk = current_branch(root);
+
+        checkout_new(root, "develop");
+        commit_msg(root, "d1.txt", "feat: develop work one");
+
+        checkout(root, &trunk);
+        commit_msg(root, "sq1.txt", "feat: squashed release of develop work");
+        tag(root, "v2.0.0");
+
+        checkout(root, "develop");
+        merge_ours(
+            root,
+            &trunk,
+            "merge: sync main back into develop after release",
+        );
+        let sync_merge = head_sha(root);
+        commit_msg(root, "tail.txt", "chore: continue develop work after sync");
+
+        checkout_new(root, "feature/phase-99");
+        commit_msg(root, "ft1.txt", "feat: post-release capability");
+        checkout(root, "develop");
+        merge_no_ff(
+            root,
+            "feature/phase-99",
+            "Merge pull request #99 from feature/phase-99",
+        );
+        commit_msg(root, "f1.txt", "fix: patch after the feature merge");
+
+        assert_eq!(
+            release_range_start(root, "v2.0.0").unwrap(),
+            sync_merge,
+            "anchor must be the sync merge, not the later feature-branch pull-request merge"
+        );
+        assert_eq!(
+            compute_version(root).unwrap(),
+            Version {
+                major: 2,
+                minor: 1,
+                patch: 0
+            },
+            "ft1's feat must be inside the classified range"
         );
     }
 
