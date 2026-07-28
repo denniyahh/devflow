@@ -161,7 +161,10 @@ items require `/gsd-review-backlog` promotion.)*
 
 ---
 *Last updated: 2026-07-28 after Phase 25 (End-to-End Dogfood Blockers)
-completed — 18/19 plans (25-10 superseded by 25-13), verified 10/10 across five
-gap-closure rounds, broken-windows ledger at 0 open / 1 waived / 4 fixed. Not
-yet shipped: the work sits on `feature/phase-25`, unreleased. The v2.0.0
-milestone stays open (no fixed closing phase)*
+shipped as v2.1.0 — 18/19 plans (25-10 superseded by 25-13), verified 10/10
+across five gap-closure rounds, 129/129 threats closed, broken-windows ledger at
+0 open / 1 waived / 4 fixed. PR #47 → develop, #50 squash-merged to main,
+signed tag `v2.1.0` (maintainer key, fingerprint verified), main→develop sync
+merge-committed (#51), GitHub Release published, and both crates published to
+crates.io in order (devflow-core → devflow). The v2.0.0 milestone stays open (no
+fixed closing phase)*
