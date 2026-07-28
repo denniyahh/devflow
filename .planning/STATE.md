@@ -87,31 +87,44 @@ change earns 2.0.
 ## Current Position
 
 Phase: 25 (end-to-end-dogfood-blockers) — EXECUTING
-Plan: 1 of 13
+Plan: 11 of 13 executed (25-10 superseded, no SUMMARY will exist; 25-13 in progress —
+Tasks 1-2 done, Task 3 human sign-off pending)
 Status: Executing Phase 25
 
-**25-10 halt (2026-07-28):** GAP 1 (25-08) and GAP 2 (25-09) are closed and merged. GAP 3
-(truth 7, 25e / 999.47) is **not** closed — it is now `reproduced`, a strictly worse state
-than the `PRESENT_BEHAVIOR_UNVERIFIED` it started in.
+**25-10 → 25-13 (2026-07-28):** GAP 1 (25-08) and GAP 2 (25-09) closed and merged. GAP 3
+(truth 7, 25e / 999.47) moved through three states this run: `PRESENT_BEHAVIOR_UNVERIFIED`
+(25-VERIFICATION.md) → `reproduced` by 25-10's Step A push, rejected 2/2 by the `pre-push`
+hook on `commands::tests::gate_sweep_reap_strays_dry_run_discovers_a_real_stray_without_signalling`
+(`commands.rs:3678`, `25-CI-OBSERVATION.md`) → the defect class closed by construction (25-11's
+measured `25-SITE-CENSUS.md` + exec-visibility barrier at all 6 vulnerable/vacuous-negative
+sites; 25-12's `agent::STRAY_MIN_AGE` production age floor) → **`no_reproduction across 11
+observations`** (25-13's `25-CI-TRIALS.md`): 6 local `scripts/check-in-container.sh all`
+push-gate observations (5 standalone + the `pre-push` hook's own 6th) and 5 serialized,
+completed CI `Test`-job trials, all green, all at `tested_head_sha`
+`82328b31eb5cbb8d795bc86f048b2602904dc8f4`.
 
-25-10's Step A push was rejected 2/2 by the `pre-push` hook
-(`core.hooksPath=scripts/hooks` → `scripts/check-in-container.sh all`, pinned image) on
-`commands::tests::gate_sweep_reap_strays_dry_run_discovers_a_real_stray_without_signalling`
-(`commands.rs:3678`). Mechanism: `Command::spawn()` returns after `fork()` but before
-`execve()`, so `/proc/<pid>/cmdline` still holds the parent's argv and
-`discover_stray_devflow_processes()` cannot see the fixture — 999.47's cmdline-inheritance
-race verbatim. Phase 25 retargeted the two known-flaky tests off `spawn()` but left the same
-shape at `commands.rs:3706`, `agent.rs:639`, `agent.rs:668`, `agent.rs:691`: the two tests
-were fixed, the defect class was not.
+`origin/feature/phase-25` advanced off `a5a068f` through the real `pre-push` gate to
+`tested_head_sha` (75 previously-local-only commits pushed), and will advance again to
+`evidence_commit_sha` once this STATE.md commit and `25-CI-TRIALS.md`'s artifact commit are
+pushed. `25-10-PLAN.md` is `status: superseded`, `superseded_by: "25-13"` — it will never
+have a `25-10-SUMMARY.md`.
 
-Load-sensitive: 2/2 failures via the push path (fmt+clippy then test under `taskset -c 0,1`),
-0/17 across warm standalone container runs — a warm local green is uninformative here.
+**`no_reproduction` is not a closure claim.** `25-CI-TRIALS.md`'s `## Limits of this
+evidence` states the residual (`~6.1%` against the pessimistic exact-binomial bound, `~0.05%`
+against the recorded ~50% historical rate) and names the structural argument (25-11 + 25-12)
+as what actually carries the claim. The word that means closed belongs to a human — Task 3 of
+`25-13-PLAN.md` is a `blocking` checkpoint covering BOTH this evidence (Part A) and
+`25-VALIDATION.md`'s three 25f human-judgment documentation rows (Part B), neither of which
+an executor self-report may discharge.
 
-Full evidence and reproduction recipe: `.planning/phases/25-end-to-end-dogfood-blockers/25-CI-OBSERVATION.md`.
+Full evidence: `.planning/phases/25-end-to-end-dogfood-blockers/25-CI-OBSERVATION.md` (the
+2/2 reproduction) and `.planning/phases/25-end-to-end-dogfood-blockers/25-CI-TRIALS.md` (the
+11-observation no-reproduction streak).
 
-**Next action:** `/gsd-plan-phase 25 --gaps` — plan an exec-visibility barrier across all five
-sites, then re-run 25-10's five CI trials. `origin/feature/phase-25` is still at `a5a068f`;
-55 commits are local-only and cannot be pushed until the gate passes.
+**Next action:** await the human's Task 3 response (Part A: 25e evidence sign-off; Part B:
+25f's three rows) via the `25-13` checkpoint. No further planning is needed — 25-11/25-12
+already closed the code-level defect class; this phase's remaining work is entirely the
+human sign-off gate.
 
 **23-15 result (second acceptance attempt, 2026-07-26):** `devflow start --phase 24 --agent claude --mode auto --yes-ship` was blocked at launch by the self-dogfood staleness hard block (D-18) — the binary's embedded commit (`0c9dcfe`, built from `feature/phase-23`) and `origin/develop`'s tip (`0dad20d`) are mutually non-ancestors (genuine divergence, confirmed via `git merge-base --is-ancestor` both directions, exit 1 each way), so the block fired before Define ever launched. No `workflow_shipped` event exists for phase 24; `devflow evidence --phase 24 --require-shipped` exits 1 both pre- and post-run — unchanged. See `.planning/phases/23-end-to-end-dogfood/23-ACCEPTANCE-RUN-2.md`.
 

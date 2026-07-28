@@ -2,12 +2,12 @@
 phase: 25-end-to-end-dogfood-blockers
 unit: 25e
 backlog: 999.47 / DEN-72
-observed: 2026-07-28T14:59:06Z
+observed: 2026-07-28T15:13:33Z
 tested_head_sha: 82328b31eb5cbb8d795bc86f048b2602904dc8f4
 evidence_commit_sha: pending
 run_id: 30371091367
 local_gate_runs: 6
-ci_trials: 1
+ci_trials: 5
 image: mcr.microsoft.com/devcontainers/rust:2.0.13-1-bookworm
 hooks_path: /var/home/denniyahh/Github/devflow/scripts/hooks
 status: no_reproduction
@@ -15,9 +15,14 @@ status: no_reproduction
 
 # 25e / 999.47 — CI trials (closure evidence for truth 7)
 
-**In progress.** Six local push-gate observations complete (five standalone + the `pre-push`
-hook's own sixth run), the push crossed the real gate and landed, and trial 1 of 5 CI `Test`-job
-trials is recorded below. Trials 2-5 land in Task 2.
+**Complete: `no_reproduction across 11 observations at tested_head_sha`.** Six local
+push-gate observations (five standalone `scripts/check-in-container.sh all` runs plus the
+`pre-push` hook's own sixth run) and five serialized, completed CI `Test`-job trials — all
+green, all at the one settled tree `82328b31eb5cbb8d795bc86f048b2602904dc8f4`. Every test
+`25-SITE-CENSUS.md` names as vulnerable, plus the two 25-10-named tests, is proven by
+verbatim log line to have actually executed in trial 1 and trial 5. See `## Limits of this
+evidence` below — this is an observation with a stated residual, not a proof of absence, and
+the disposition of truth 7 belongs to the human in Task 3, not to this artifact.
 
 ## A note on `hooks_path`
 
@@ -101,11 +106,55 @@ All 5 CI trials complete.
 
 ## Discarded runs
 
-none so far.
+none. Cross-checked against `gh run list --branch feature/phase-25 --workflow CI --limit 20
+--json databaseId,conclusion,headSha,status`: only two runs exist on this branch — run
+`30371091367` (this plan's five attempts, all `success`, at `tested_head_sha`) and run
+`30315862664` (the pre-existing `success` run at `a5a068f`, predating this plan). No
+`cancelled` or failed run at `tested_head_sha` is missing from this section because none
+exists.
 
 ## Census-test execution proof
 
-pending (Task 2 Step 2).
+Pulled with `gh run view 30371091367 --attempt <n> --log --job <test_job_id>` — trial 1 =
+attempt 1, `Test` job id `90314831687`; trial 5 = attempt 5, `Test` job id `90318117166`.
+Every test in the required set (`25-SITE-CENSUS.md`'s four `## Vulnerable sites` rows, plus
+the observed-failing test and the two 25-10-named tests — several rows overlap) is present,
+verbatim, `... ok`, in both logs. Tests living in `reap_strays_e2e.rs` (integration binary)
+print without a module prefix, as expected.
+
+**V1 — `agent::tests::discover_stray_devflow_processes_finds_a_monitor_wrapper`**
+- Trial 1: `test agent::tests::discover_stray_devflow_processes_finds_a_monitor_wrapper ... ok`
+- Trial 5: `test agent::tests::discover_stray_devflow_processes_finds_a_monitor_wrapper ... ok`
+
+**V2 — `commands::tests::gate_sweep_reap_strays_dry_run_discovers_a_real_stray_without_signalling`**
+(also the mandatory observed-2/2-failing test from `25-CI-OBSERVATION.md`)
+- Trial 1: `test commands::tests::gate_sweep_reap_strays_dry_run_discovers_a_real_stray_without_signalling ... ok`
+- Trial 5: `test commands::tests::gate_sweep_reap_strays_dry_run_discovers_a_real_stray_without_signalling ... ok`
+
+**V3 — `commands::tests::stray_process_finding::doctor_finds_a_real_stray_and_never_signals_it_across_two_runs`**
+- Trial 1: `test commands::tests::stray_process_finding::doctor_finds_a_real_stray_and_never_signals_it_across_two_runs ... ok`
+- Trial 5: `test commands::tests::stray_process_finding::doctor_finds_a_real_stray_and_never_signals_it_across_two_runs ... ok`
+
+**V4 — `reap_clears_a_process_whose_root_was_deleted_which_devflow_stop_cannot_see`** (integration
+binary `reap_strays_e2e`, no module prefix)
+- Trial 1: `test reap_clears_a_process_whose_root_was_deleted_which_devflow_stop_cannot_see ... ok`
+- Trial 5: `test reap_clears_a_process_whose_root_was_deleted_which_devflow_stop_cannot_see ... ok`
+
+**25-10-named — `agent::tests::looks_like_devflow_process_is_false_for_a_non_devflow_process`**
+(no longer the test at risk per D-13, execution recorded anyway per this plan's requirement)
+- Trial 1: `test agent::tests::looks_like_devflow_process_is_false_for_a_non_devflow_process ... ok`
+- Trial 5: `test agent::tests::looks_like_devflow_process_is_false_for_a_non_devflow_process ... ok`
+
+**25-10-named — `commands::tests::stop_refuses_to_signal_a_live_pid_that_fails_the_identity_check`**
+- Trial 1: `test commands::tests::stop_refuses_to_signal_a_live_pid_that_fails_the_identity_check ... ok`
+- Trial 5: `test commands::tests::stop_refuses_to_signal_a_live_pid_that_fails_the_identity_check ... ok`
+
+No required line was absent from either log. `25-SITE-CENSUS.md`'s two `VACUOUS-NEGATIVE`
+rows (A1, A2) assert NOT-FIND and are not part of this proof set — they prove the barrier
+does not over-trigger, a different property than "did this test run," and are exercised by
+the same green `Test` job runs (`agent::tests::discover_stray_devflow_processes_rejects_the_999_47_false_positive_shape`,
+`agent::tests::discover_stray_devflow_processes_rejects_devflow_named_argv0_with_wrong_argv1`)
+without needing separate log extraction for this proof.
 
 ## Triage
 
@@ -113,4 +162,43 @@ none — nothing has failed.
 
 ## Limits of this evidence
 
-pending (Task 2 Step 3 finalises this section).
+1. **The headline is `no reproduction across 11 observations at 82328b31eb5cbb8d795bc86f048b2602904dc8f4`** —
+   six of the push-gate shape and five CI `Test`-job trials. It is an observation with a
+   stated residual, not a proof of absence.
+2. **The residuals.** `~6.1%` against the exact-binomial 95% lower bound `p >= 0.224` derived
+   from the 2-of-2 reproduction recorded in `25-CI-OBSERVATION.md`, and `~0.05%` against the
+   ~50% per-run rate `ROADMAP.md` records for 999.47. Neither is zero.
+3. **The shape asymmetry.** CI's `Test` job runs `scripts/check.sh test`, not `all`, and
+   applies no `taskset` pin, so the five CI trials do NOT reproduce the fmt->clippy->test
+   ordering under a 2-core pin that produced every observed failure. The six push-gate
+   observations (identical to the `pre-push` hook's own command) are the sensitive
+   instrument; the CI trials discharge 19-RESEARCH.md's D-11 standing CI-on-branch standard,
+   which is a different job than bounding the residual.
+4. **What actually carries the argument.** 25-11's measured site census
+   (`25-SITE-CENSUS.md`: 4 `VULNERABLE-POSITIVE` + 2 `VACUOUS-NEGATIVE` sites, all barriered)
+   plus a bounded exec-visibility barrier at every vulnerable site, and 25-12's age floor
+   (`agent::STRAY_MIN_AGE`) refusing the production reaper inside the exec-visibility window.
+   The observations above corroborate that structure; they do not stand alone. The phase's
+   earlier "structurally removed" claim (routed to human verification in `25-VERIFICATION.md`
+   as `PRESENT_BEHAVIOR_UNVERIFIED`, then falsified by `25-CI-OBSERVATION.md`'s 2/2
+   reproduction) failed precisely because it asserted a structural argument that had never
+   been measured — this one has `25-SITE-CENSUS.md` behind it.
+5. **The disposition of truth 7 is the human's**, recorded in Task 3, not this artifact's own
+   authority. `status: no_reproduction` above is this artifact's honest description of what
+   was observed; it is not a closure claim, and the `status` vocabulary
+   (`no_reproduction | reproduced | inconclusive`) deliberately contains no value meaning
+   closed.
+6. **`evidence_commit_sha` will not equal `tested_head_sha`, and it should not.** The commit
+   that records `evidence_commit_sha` into this file's own frontmatter is itself a descendant
+   of `tested_head_sha` that did not exist when the eleven observations above were taken. A
+   file cannot contain the SHA of the commit that introduces it — this is why the standing
+   final-state gate is ancestry (`git merge-base --is-ancestor tested_head_sha
+   origin/feature/phase-25`), not equality. See `25-13-PLAN.md`'s `<sha_vocabulary>`.
+7. **`core.hooksPath` measures as an absolute path, not the literal string `scripts/hooks`.**
+   `git config --get core.hooksPath` printed
+   `/var/home/denniyahh/Github/devflow/scripts/hooks` throughout this run, not the relative
+   string a literal comparison would expect. Same directory, same hook — the substance of
+   every push-gate row above is unaffected — but a downstream automated check written as a
+   literal string equality will not match this measured value, and this artifact records what
+   was actually measured rather than adjusting the value or the config to make a literal
+   check pass.
