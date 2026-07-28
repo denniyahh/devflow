@@ -1423,7 +1423,7 @@ Plans:
 **Priority:** High | **Size:** L (re-sized at plan time, 2026-07-27 — was M) — six units plus 999.38 folded in. 25b, 25e, 25f and 999.38 are genuinely S as filed; 25a is S–M, option chosen at plan review 2026-07-27 (fetch + fast-forward-when-safe, else refuse — see `25-05-PLAN.md` §`<resolved_decision>`, and CONTEXT.md D-17 as amended); **25c is M, not the S this entry states** — it is a full replacement of `compute_version`'s three inputs plus a new preflight gate plus a previously-unflagged consumer at `pipeline_gate.rs:809-840`. No phase split recommended; see `25-01-PLAN.md` § Phase-level notes for the assessment and the seam if one is ever wanted.
 **Requirements**: TBD — promoted from backlog 999.51, 999.48, 999.49, 999.44, 999.47; plus 25f (CONTRIBUTING release-procedure drift, no backlog entry — found 2026-07-27). Tracked by unit identifier (`25a`–`25f`, `999.38`), not by REQ-ID — this project has no `.planning/REQUIREMENTS.md`.
 **Depends on:** Phase 24
-**Plans:** 9/10 plans executed
+**Plans:** 10/13 plans executed
 
 Gap-closure plans (wave numbering restarts at 1 for this run):
 
@@ -1477,6 +1477,10 @@ so the code dependency graph is what orders the work. **25b (plan 25-03) and 25c
 25-06) all land in this phase**, honouring the ship-together constraint below.
 
 Plans:
+
+- [x] 25-11-PLAN.md
+- [ ] 25-12-PLAN.md
+- [ ] 25-13-PLAN.md
 
 **Wave 1** *(four plans in parallel — disjoint file sets)*
 

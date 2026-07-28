@@ -6,14 +6,14 @@ current_phase: 25
 current_phase_name: end-to-end-dogfood-blockers
 status: executing
 stopped_at: Phase 25 gap-closure halted at 25-10 — 999.47 reproduced, truth 7 NOT closed
-last_updated: "2026-07-28T05:20:00.000Z"
+last_updated: "2026-07-28T13:35:14.005Z"
 last_activity: 2026-07-28
-last_activity_desc: 25-08/25-09 landed; 25-10 halted on a 999.47 reproduction
+last_activity_desc: Phase 25 execution started
 progress:
   total_phases: 14
   completed_phases: 13
-  total_plans: 104
-  completed_plans: 101
+  total_plans: 107
+  completed_plans: 103
   percent: 93
 ---
 
@@ -86,9 +86,9 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 25 (end-to-end-dogfood-blockers) — HALTED (9 of 10 plans complete)
-Plan: 10 of 10
-Status: Gap-closure halted at 25-10 — needs a new gap plan before the phase can close
+Phase: 25 (end-to-end-dogfood-blockers) — EXECUTING
+Plan: 1 of 13
+Status: Executing Phase 25
 
 **25-10 halt (2026-07-28):** GAP 1 (25-08) and GAP 2 (25-09) are closed and merged. GAP 3
 (truth 7, 25e / 999.47) is **not** closed — it is now `reproduced`, a strictly worse state
