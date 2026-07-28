@@ -5,10 +5,10 @@ milestone_name: milestone (open — no fixed closing phase)
 current_phase: 25
 current_phase_name: end-to-end-dogfood-blockers
 status: executing
-stopped_at: Phase 25 planned — 7 plans, 3 waves, plan-checker PASS
-last_updated: "2026-07-28T04:11:29.193Z"
+stopped_at: Phase 25 gap-closure halted at 25-10 — 999.47 reproduced, truth 7 NOT closed
+last_updated: "2026-07-28T05:20:00.000Z"
 last_activity: 2026-07-28
-last_activity_desc: Phase 25 execution started
+last_activity_desc: 25-08/25-09 landed; 25-10 halted on a 999.47 reproduction
 progress:
   total_phases: 14
   completed_phases: 13
@@ -86,9 +86,32 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 25 (end-to-end-dogfood-blockers) — EXECUTING
-Plan: 1 of 10
-Status: Executing Phase 25
+Phase: 25 (end-to-end-dogfood-blockers) — HALTED (9 of 10 plans complete)
+Plan: 10 of 10
+Status: Gap-closure halted at 25-10 — needs a new gap plan before the phase can close
+
+**25-10 halt (2026-07-28):** GAP 1 (25-08) and GAP 2 (25-09) are closed and merged. GAP 3
+(truth 7, 25e / 999.47) is **not** closed — it is now `reproduced`, a strictly worse state
+than the `PRESENT_BEHAVIOR_UNVERIFIED` it started in.
+
+25-10's Step A push was rejected 2/2 by the `pre-push` hook
+(`core.hooksPath=scripts/hooks` → `scripts/check-in-container.sh all`, pinned image) on
+`commands::tests::gate_sweep_reap_strays_dry_run_discovers_a_real_stray_without_signalling`
+(`commands.rs:3678`). Mechanism: `Command::spawn()` returns after `fork()` but before
+`execve()`, so `/proc/<pid>/cmdline` still holds the parent's argv and
+`discover_stray_devflow_processes()` cannot see the fixture — 999.47's cmdline-inheritance
+race verbatim. Phase 25 retargeted the two known-flaky tests off `spawn()` but left the same
+shape at `commands.rs:3706`, `agent.rs:639`, `agent.rs:668`, `agent.rs:691`: the two tests
+were fixed, the defect class was not.
+
+Load-sensitive: 2/2 failures via the push path (fmt+clippy then test under `taskset -c 0,1`),
+0/17 across warm standalone container runs — a warm local green is uninformative here.
+
+Full evidence and reproduction recipe: `.planning/phases/25-end-to-end-dogfood-blockers/25-CI-OBSERVATION.md`.
+
+**Next action:** `/gsd-plan-phase 25 --gaps` — plan an exec-visibility barrier across all five
+sites, then re-run 25-10's five CI trials. `origin/feature/phase-25` is still at `a5a068f`;
+55 commits are local-only and cannot be pushed until the gate passes.
 
 **23-15 result (second acceptance attempt, 2026-07-26):** `devflow start --phase 24 --agent claude --mode auto --yes-ship` was blocked at launch by the self-dogfood staleness hard block (D-18) — the binary's embedded commit (`0c9dcfe`, built from `feature/phase-23`) and `origin/develop`'s tip (`0dad20d`) are mutually non-ancestors (genuine divergence, confirmed via `git merge-base --is-ancestor` both directions, exit 1 each way), so the block fired before Define ever launched. No `workflow_shipped` event exists for phase 24; `devflow evidence --phase 24 --require-shipped` exits 1 both pre- and post-run — unchanged. See `.planning/phases/23-end-to-end-dogfood/23-ACCEPTANCE-RUN-2.md`.
 
