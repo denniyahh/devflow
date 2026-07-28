@@ -1,4 +1,12 @@
-//! Hermetic git invocation for test fixtures (999.37).
+//! This crate's test-only helper surface, reachable cross-crate through the
+//! `test-support` feature (`lib.rs:76-79`'s
+//! `#[cfg(any(test, feature = "test-support"))]` gate keeps all of it absent
+//! from a normal build). Two unrelated hazards live here, each documented at
+//! its own definitions below: hermetic git invocation for test fixtures
+//! (999.37, the module's original scope) and the 999.47 exec-visibility
+//! barrier (25-11).
+//!
+//! ## Hermetic git invocation (999.37)
 //!
 //! Test fixtures build throwaway repositories in tempdirs and shell out to
 //! `git` against them. Pinning the working directory is **not** sufficient to
@@ -150,6 +158,125 @@ mod tests {
         assert_eq!(
             ours, from_git,
             "REPO_LOCAL_GIT_VARS has drifted from `git rev-parse --local-env-vars`"
+        );
+    }
+
+    /// Positive case (25-11/999.47, the whole point of the barrier): a real
+    /// child whose argv[0] basename is known and differs from this test
+    /// binary's own must be reported exec-visible, and after the function
+    /// returns, `/proc/<pid>/cmdline` must genuinely hold the child's own
+    /// argv — never the caller's.
+    #[test]
+    fn wait_for_exec_visibility_detects_a_real_child_and_leaves_it_exec_visible() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn sleep fixture");
+        let pid = child.id();
+
+        let visible = wait_for_exec_visibility(
+            pid,
+            "sleep",
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(2),
+        );
+        assert!(visible, "a real sleep child must become exec-visible");
+
+        let raw = std::fs::read(format!("/proc/{pid}/cmdline"))
+            .expect("must be able to read the child's cmdline after the barrier returns");
+        let args: Vec<String> = raw
+            .split(|&b| b == 0)
+            .filter(|a| !a.is_empty())
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect();
+        assert_eq!(
+            args.first().map(String::as_str),
+            Some("sleep"),
+            "after the barrier returns, cmdline must be the child's own argv, not the caller's"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// Timeout is a value, not a hang (25-11/999.47): calling against this
+    /// process's OWN pid with an `expected_argv0_basename` that can never
+    /// match must return `false` within roughly `wait`, not indefinitely.
+    #[test]
+    fn wait_for_exec_visibility_times_out_bounded_when_it_never_matches() {
+        let start = std::time::Instant::now();
+        let visible = wait_for_exec_visibility(
+            std::process::id(),
+            "this-basename-can-never-match-anything",
+            std::time::Duration::from_millis(200),
+            std::time::Duration::from_millis(2),
+        );
+        let elapsed = start.elapsed();
+
+        assert!(!visible, "a basename that can never match must return false");
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "must return within roughly `wait`, not hang indefinitely — took {elapsed:?}"
+        );
+    }
+
+    /// Dead pid (25-11/999.47): a pid that is not alive must return `false`
+    /// promptly, never panicking and never blocking for the full `wait`
+    /// ceiling — the caller cannot distinguish "will never be alive" from
+    /// "still forking" without this short-circuit.
+    #[test]
+    fn wait_for_exec_visibility_returns_false_promptly_for_a_dead_pid() {
+        let start = std::time::Instant::now();
+        let visible = wait_for_exec_visibility(
+            0x7FFF_FFFE,
+            "anything",
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(20),
+        );
+        let elapsed = start.elapsed();
+
+        assert!(!visible, "a dead pid must never be reported exec-visible");
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "a dead pid must not wait out the full ceiling, took {elapsed:?}"
+        );
+    }
+
+    /// Self-argv guard (25-11/999.47): the function must not report success
+    /// merely because argv[0]'s basename matches while the observed cmdline
+    /// is still byte-identical to the caller's own `/proc/self/cmdline`.
+    /// Calling it against the caller's own pid with the caller's own argv[0]
+    /// basename matches condition (i) by construction — the result must
+    /// still be `false`, because condition (ii) never holds for the caller's
+    /// own unchanging cmdline.
+    #[test]
+    fn wait_for_exec_visibility_rejects_a_self_match_on_unchanged_cmdline() {
+        let self_pid = std::process::id();
+        let raw = std::fs::read(format!("/proc/{self_pid}/cmdline"))
+            .expect("must be able to read this process's own cmdline");
+        let self_basename = raw
+            .split(|&b| b == 0)
+            .find(|a| !a.is_empty())
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .and_then(|arg0| {
+                std::path::Path::new(&arg0)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(str::to_string)
+            })
+            .expect("must be able to derive this process's own argv[0] basename");
+
+        let visible = wait_for_exec_visibility(
+            self_pid,
+            &self_basename,
+            std::time::Duration::from_millis(200),
+            std::time::Duration::from_millis(2),
+        );
+
+        assert!(
+            !visible,
+            "a self-match on unchanged cmdline must never report exec-visible, even though \
+             argv[0]'s basename matches by construction"
         );
     }
 }
