@@ -4,7 +4,7 @@ unit: 25e
 backlog: 999.47 / DEN-72
 observed: 2026-07-28T15:13:33Z
 tested_head_sha: 82328b31eb5cbb8d795bc86f048b2602904dc8f4
-evidence_commit_sha: pending
+evidence_commit_sha: 7a1ca53135b76f4779440bca0764ad08f63a3166
 run_id: 30371091367
 local_gate_runs: 6
 ci_trials: 5
@@ -106,12 +106,20 @@ All 5 CI trials complete.
 
 ## Discarded runs
 
-none. Cross-checked against `gh run list --branch feature/phase-25 --workflow CI --limit 20
---json databaseId,conclusion,headSha,status`: only two runs exist on this branch — run
+**Trials: none discarded.** Cross-checked against `gh run list --branch feature/phase-25
+--workflow CI --limit 20 --json databaseId,conclusion,headSha,status` at the time the streak
+completed: only two runs existed on this branch at `tested_head_sha` or earlier — run
 `30371091367` (this plan's five attempts, all `success`, at `tested_head_sha`) and run
 `30315862664` (the pre-existing `success` run at `a5a068f`, predating this plan). No
 `cancelled` or failed run at `tested_head_sha` is missing from this section because none
 exists.
+
+**Out-of-band (not a trial): run `30372588414`.** Triggered by Step 4's evidence push
+(`git push origin feature/phase-25` after all 5 CI trials read `completed`), at
+`evidence_commit_sha` `7a1ca53135b76f4779440bca0764ad08f63a3166` — a different tree than
+`tested_head_sha`. This run is expected and accounted for, not counted toward the 5 CI
+trials above, and not a discarded/cancelled trial either — it simply exists on a SHA the
+11-observation streak was never run against.
 
 ## Census-test execution proof
 
@@ -193,7 +201,12 @@ none — nothing has failed.
    of `tested_head_sha` that did not exist when the eleven observations above were taken. A
    file cannot contain the SHA of the commit that introduces it — this is why the standing
    final-state gate is ancestry (`git merge-base --is-ancestor tested_head_sha
-   origin/feature/phase-25`), not equality. See `25-13-PLAN.md`'s `<sha_vocabulary>`.
+   origin/feature/phase-25`), not equality. See `25-13-PLAN.md`'s `<sha_vocabulary>`. Confirmed
+   concretely: `evidence_commit_sha` is `7a1ca53135b76f4779440bca0764ad08f63a3166`, not
+   `tested_head_sha` `82328b31eb5cbb8d795bc86f048b2602904dc8f4`, and
+   `git merge-base --is-ancestor 82328b31eb5cbb8d795bc86f048b2602904dc8f4
+   origin/feature/phase-25` exits 0 — this is the expected end state, not an error, and this
+   is not re-recorded or re-chased.
 7. **`core.hooksPath` measures as an absolute path, not the literal string `scripts/hooks`.**
    `git config --get core.hooksPath` printed
    `/var/home/denniyahh/Github/devflow/scripts/hooks` throughout this run, not the relative
