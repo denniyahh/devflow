@@ -795,11 +795,40 @@ mod tests {
     /// loudly: the reopened gate would then find an unexpected response and
     /// never block for a human.
     ///
-    /// `VersionBump` is failed deterministically by pre-creating the exact
-    /// tag it will attempt to create (`hooks.rs:286-287`, `git.tag(&tag)`),
-    /// with the version computed the same way the hook computes it
-    /// (`version::compute_version`) so the fixture does not silently stop
-    /// failing when the repository's version changes. `Merge` runs first in
+    /// `VersionBump` is failed deterministically via `version::compute_version`
+    /// itself refusing (D-10's `UnreachableBaseline`), rather than by
+    /// pre-creating a tag name for `git.tag(&tag)` to collide with
+    /// (`hooks.rs:286-287`).
+    ///
+    /// **Why not a tag-name collision (25-01 rewrite, D-07/D-08):** the prior
+    /// (pre-25-01) algorithm derived MINOR from a raw, reachability-blind git
+    /// tag *count*, so pre-creating one extra tag deterministically
+    /// incremented that count by exactly one, and the fixture could predict
+    /// and pre-create the exact resulting tag name. The 25-01 algorithm is
+    /// no longer count-based: `compute_version` derives its baseline from
+    /// the highest semver tag *reachable from HEAD*, and always bumps
+    /// strictly past that baseline (D-10's no-bump-collapses-to-patch floor
+    /// guarantees this even when nothing in the range warrants a bump — see
+    /// `apply_bump`'s doc comment in `version.rs`). Consequently, pre-creating
+    /// ANY tag reachable from HEAD makes it become the new baseline the next
+    /// time `compute_version` runs, and the recomputed result is
+    /// *unconditionally different* from (one patch past) whatever we just
+    /// created — there is no reachable tag this fixture could create that
+    /// `compute_version` would ever predict again, so a tag-name collision
+    /// can no longer be constructed this way. (Confirmed empirically during
+    /// this rewrite: pre-creating the tag `compute_version` returned before
+    /// any tag existed did not collide — `VersionBump`'s own later call saw
+    /// that tag as the new reachable baseline and computed the next patch
+    /// past it instead, so `finish_workflow` shipped successfully instead of
+    /// re-opening the gate this test exists to exercise.)
+    ///
+    /// Instead, this fixture tags an **unreachable** orphan commit
+    /// (`git tag` sees it via [`devflow_core::version::highest_semver_tag`]'s
+    /// reachability-blind repo-wide scan; `develop`'s own reachable baseline
+    /// stays `None` because the tag is not an ancestor of `develop`) — D-10's
+    /// refusal fires unconditionally in that state, independent of any
+    /// version arithmetic, so `VersionBump` fails deterministically before it
+    /// ever reaches its `git.tag(&tag)` call. `Merge` still runs first in
     /// `hooks_after_ship` and succeeds — the feature branch is created
     /// identical to `develop`, so `is_merged_into_develop` is immediately
     /// true and `merge_feature` takes its already-merged no-op success
@@ -812,6 +841,32 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
+        // Tag an orphan commit unreachable from `develop` — this makes
+        // `version::compute_version` refuse unconditionally (D-10's
+        // `UnreachableBaseline`) once `VersionBump` calls it, regardless of
+        // any subsequent state. `develop` is where `init_repo` leaves HEAD
+        // checked out, and is restored as the checkout before continuing.
+        let git_cmd = |args: &[&str]| {
+            assert!(
+                devflow_core::test_support::git_command(root)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        git_cmd(&["checkout", "--orphan", "unreachable-release"]);
+        git_cmd(&["commit", "--allow-empty", "-q", "-m", "chore: orphan"]);
+        git_cmd(&["tag", "v9.9.9"]);
+        git_cmd(&["checkout", "develop"]);
+        assert!(
+            devflow_core::version::compute_version(root).is_err(),
+            "the orphan tag must make compute_version refuse (D-10) before \
+             VersionBump ever gets to its own git.tag(&tag) call"
+        );
+
         let phase = 60;
         let branch = format!("feature/phase-{phase:02}");
         let branch_created = devflow_core::test_support::git_command(root)
@@ -820,24 +875,6 @@ mod tests {
             .unwrap()
             .success();
         assert!(branch_created);
-
-        // Computed the same way version_bump computes it — MAJOR from
-        // Cargo.toml (stable), MINOR from the git tag count. The fixture is
-        // about to add exactly one tag at HEAD, so at VersionBump's own
-        // call time the tag count will be `tags_before + 1` and "commits
-        // since the most recent tag" will be 0 (our tag sits at HEAD, and
-        // Merge below is a no-op — the feature branch is identical to
-        // develop — so nothing moves HEAD in between). That is the fixed
-        // point: the tag we create here is exactly the tag VersionBump will
-        // independently compute and attempt to create.
-        let major = devflow_core::version::compute_version(root)
-            .expect("compute expected version")
-            .major;
-        let tags_before = devflow_core::version::count_git_tags(root).expect("count existing tags");
-        let expected_tag = format!("v{major}.{}.0", tags_before + 1);
-        let git = devflow_core::git::GitFlow::new(root);
-        git.tag(&expected_tag)
-            .expect("pre-create the tag VersionBump will attempt");
 
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Ship;
