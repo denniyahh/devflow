@@ -733,10 +733,49 @@ fn breaking_commit_subjects(execution_root: &Path, range_start: &str) -> Vec<Str
 
 /// The generic (universal) preflight checks (D-14) — the adapter-specific
 /// hook is composed separately in [`run_preflight`].
+///
+/// CR-01 (`25-REVIEW.md`, 25-08): runs all three checks unconditionally and
+/// aggregates every `Err` into one reason, rather than `?`-short-circuiting
+/// on the first failure. `run_preflight`'s `GateAction::Advance` arm
+/// relaunches via `launch_stage_inner` directly and never re-runs this
+/// function — so under the old `?`-chain, a check that never ran once
+/// (because an earlier check in the chain failed first) would never run at
+/// all for that stage launch, and a human approving that earlier gate would
+/// never have been shown the unrun check's reason. Aggregation closes that
+/// hole for every check in this chain, not just the major-bump check that
+/// surfaced it (`25-VERIFICATION.md`'s named fix, `25-REVIEW.md`'s option
+/// (a); option (b), special-casing the `Advance` arm instead, was
+/// deliberately not taken — it would not close the same hole for a future
+/// check added to this chain).
+///
+/// Reasons are ordered by consequence, **major-bump FIRST**, then
+/// interactivity, then gh-auth — load-bearing, not cosmetic:
+/// `run_preflight` passes the joined string through [`truncate_reason`] (a
+/// hard 300-character cap) before it reaches the gate context, and the
+/// major-bump reason is both the longest of the three and the only one
+/// whose loss would silently re-open the unattended-ship hole D-09 exists
+/// to close.
+///
+/// The adapter-specific hook (composed by [`run_preflight`] via
+/// `.and_then`) is deliberately NOT folded into this aggregation —
+/// `25-VERIFICATION.md`'s gap-closure scope names only these three generic
+/// checks; this is a scope boundary, not an oversight.
 fn generic_preflight_checks(project_root: &Path, state: &State) -> Result<(), String> {
-    preflight_interactivity_check(project_root, state)?;
-    preflight_gh_auth_check(state)?;
-    preflight_major_bump_check(project_root, state)
+    let mut reasons = Vec::new();
+    if let Err(reason) = preflight_major_bump_check(project_root, state) {
+        reasons.push(reason);
+    }
+    if let Err(reason) = preflight_interactivity_check(project_root, state) {
+        reasons.push(reason);
+    }
+    if let Err(reason) = preflight_gh_auth_check(state) {
+        reasons.push(reason);
+    }
+    if reasons.is_empty() {
+        Ok(())
+    } else {
+        Err(reasons.join("; "))
+    }
 }
 
 /// Gate a stage launch on readiness (17c, D-13-D-16): the generic universal
@@ -756,11 +795,16 @@ fn generic_preflight_checks(project_root: &Path, state: &State) -> Result<(), St
 /// spawned the agent a second time).
 ///
 /// 18f (D-18f): `GateAction::Advance` on a preflight gate is an explicit
-/// override — the check has already been adjudicated by a human, both
-/// production checks (`preflight_interactivity_check`,
-/// `preflight_gh_auth_check`) are deterministic idempotent predicates a
-/// gate approval cannot change, so re-running them is guaranteed to fail
-/// identically. The `Advance` arm therefore relaunches via
+/// override — the check has already been adjudicated by a human, and every
+/// generic check (`preflight_major_bump_check`,
+/// `preflight_interactivity_check`, `preflight_gh_auth_check`) is a
+/// deterministic idempotent predicate a gate approval cannot change, so
+/// re-running them is guaranteed to fail identically. **This justification
+/// is sound only because [`generic_preflight_checks`] aggregates rather than
+/// `?`-short-circuits (CR-01, 25-08): every applicable check has actually
+/// been evaluated and its reason shown to the human before the gate opens,
+/// so skipping the re-check on `Advance` cannot silently skip a check that
+/// never ran once.** The `Advance` arm therefore relaunches via
 /// [`launch_stage_inner`] directly, SKIPPING this function entirely on the
 /// retry. `GateAction::LoopBack` still calls the full [`launch_stage`]
 /// (re-entering this function), because that path means the operator will
