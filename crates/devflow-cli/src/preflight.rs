@@ -1267,6 +1267,70 @@ mod tests {
         );
     }
 
+    /// [`agent_free_git_only_path_dir`], extended with an executable `gh`
+    /// stub that always exits 1 — makes [`preflight_gh_auth_check`] take its
+    /// hard `Err` branch (`gh` present, reports unauthenticated) rather than
+    /// its fail-soft binary-absent branch, which is the only way to compose
+    /// a gh-auth failure with a major-bump failure at the same stage. Mirrors
+    /// `agent_free_dir_with_agent_stub`'s stub-writing construction (content
+    /// plus `PermissionsExt` mode `0o755`).
+    fn git_only_path_dir_with_failing_gh() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = agent_free_git_only_path_dir();
+        let path = dir.path().join("gh");
+        std::fs::write(&path, "#!/bin/sh\nexit 1\n").unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        dir
+    }
+
+    /// CR-01 (`25-REVIEW.md`, 25-08): `generic_preflight_checks` must not
+    /// `?`-short-circuit — a gh-auth failure must not hide a major-bump
+    /// failure that also applies at the same stage. Composes Task 1's
+    /// worktree fixture (Task 2's fix) with a failing `gh` stub, so the two
+    /// defects this plan closes are exercised together, exactly as they
+    /// compose in production.
+    #[test]
+    fn generic_preflight_checks_reports_major_bump_even_when_gh_auth_fails_first() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let git_only_dir = git_only_path_dir_with_failing_gh();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", git_only_dir.path());
+        }
+
+        let (outer, worktree_path) = major_bump_worktree_fixture();
+        let project_root = outer.path().join("project");
+        let mut state = State::new(77, AgentKind::Claude, Mode::Auto, project_root.clone());
+        state.stage = Stage::Ship;
+        state.worktree_path = Some(worktree_path);
+
+        let err = generic_preflight_checks(&project_root, &state).unwrap_err();
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        assert!(err.contains("MAJOR"), "{err}");
+        assert!(err.contains("drop legacy api"), "{err}");
+        assert!(err.contains("not authenticated"), "{err}");
+
+        // T-25-08-03: the 300-character truncation cap cannot elide the
+        // highest-consequence reason — proven by ordering the major-bump
+        // reason first in generic_preflight_checks.
+        assert!(
+            truncate_reason(&err).contains("MAJOR"),
+            "{}",
+            truncate_reason(&err)
+        );
+    }
+
     /// A failing preflight check routes through the never-silent gate and,
     /// on Abort, never reaches `monitor::spawn_monitor` — no `stage_launched`
     /// event is ever recorded. The Abort response is pre-seeded so
