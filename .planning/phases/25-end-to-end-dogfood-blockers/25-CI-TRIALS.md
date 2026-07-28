@@ -92,8 +92,9 @@ executor directly, and is the one that gated the actual push.
 | trial | run id | attempt | head sha | Test job | conclusion | url |
 |-------|--------|---------|----------|----------|------------|-----|
 | 1 | 30371091367 | 1 | 82328b31eb5cbb8d795bc86f048b2602904dc8f4 | success | success | https://github.com/denniyahh/devflow/actions/runs/30371091367 |
+| 2 | 30371091367 | 2 | 82328b31eb5cbb8d795bc86f048b2602904dc8f4 | success | success | https://github.com/denniyahh/devflow/actions/runs/30371091367 |
 
-Trials 2-5: pending (Task 2).
+Trials 3-5: pending.
 
 ## Discarded runs
 
