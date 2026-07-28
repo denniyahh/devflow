@@ -27,7 +27,7 @@ use devflow_core::gates::{GateAction, Gates};
 use devflow_core::mode::{self, Mode};
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
-use devflow_core::{agents, events, workflow};
+use devflow_core::{agents, events, version, workflow};
 use std::path::{Path, PathBuf};
 
 /// The sandbox writable roots a worktree-hosted agent needs to commit: the
@@ -552,11 +552,175 @@ fn preflight_gh_auth_check(state: &State) -> Result<(), String> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// D-09 (999.49 / DEN-74, second half): a major version bump must never ship
+// unattended. `hooks_after_ship` runs Merge -> VersionBump -> ChangelogAppend
+// -> BranchCleanup as a fail-fast batch with **no rollback** once Merge has
+// committed (`merge_feature`'s own doc comment, `devflow-core/src/hooks.rs`)
+// — a gate opening inside `VersionBump` itself would open AFTER the merge to
+// `develop` had already landed. **Placement here, at preflight, is
+// load-bearing, not cosmetic:** this is what makes the gate meaningful — it
+// is evaluated strictly before `hooks_after_ship` runs at all.
+//
+// D-18f's `Advance` semantics apply exactly as they do to the sibling
+// generic checks above: a human `Advance` on this gate relaunches via
+// `launch_stage_inner` directly and skips the re-check, which is correct
+// here because the classification is a deterministic idempotent predicate —
+// a gate approval cannot change what the commit range classifies to, so
+// re-running it would fail identically.
+//
+// **This check cannot be auto-approved.** `run_gate_with_timeout` (see its
+// doc comment in `pipeline_gate.rs`) deliberately does not derive
+// auto-approval from `state.yes_ship`, and forbids a future refactor from
+// folding it in. This check inherits that property rather than
+// re-implementing it — it performs no `yes_ship` handling of its own.
+//
+// **25-RESEARCH.md Open Question 1 is resolved here, not carried forward as
+// an open risk:** the Ship-stage agent's own commits (the code-review
+// report, and the ship-workflow's state-file commit) are both `docs`-typed
+// under D-08's classifier and so contribute no bump — no breaking-change
+// commit can land between this gate and `hooks_after_ship` running. No
+// second classification immediately before `Merge` is added.
+// ---------------------------------------------------------------------------
+
+/// D-09: whether the major-bump preflight check applies to `stage` —
+/// hardcoded to `Stage::Ship`, exactly the way [`gh_auth_check_applies`] is
+/// hardcoded, and split out as its own pure predicate for the same reason:
+/// so "does not run for a non-Ship stage" is directly unit-testable without
+/// any git fixture.
+fn major_bump_check_applies(stage: Stage) -> bool {
+    stage == Stage::Ship
+}
+
+/// D-09: a major bump opens a `[never-silent]` gate before `hooks_after_ship`
+/// runs, run ONLY when [`major_bump_check_applies`] (Ship). Classifies the
+/// SAME range [`version::compute_version`] will classify, by calling the
+/// same helpers it calls — [`version::highest_semver_tag`],
+/// [`version::reachable_semver_baseline`], [`version::release_range_start`],
+/// [`version::classify_range_bump`] — so this check and `VersionBump`'s
+/// later evaluation can never disagree.
+///
+/// A derivation error, including D-10's unreachable-baseline refusal, is
+/// surfaced as a preflight failure rather than silently treated as "no major
+/// bump": a version derivation that cannot be trusted must not proceed into
+/// the no-rollback batch (T-25-54).
+///
+/// The `Err` string names the classified bump kind, the baseline tag, and
+/// the resulting version, plus (for the major case) the deciding commits'
+/// subjects so a human can adjudicate — passed through [`truncate_reason`]
+/// (T-25-52), since commit subjects are attacker-influenced text and this
+/// reason reaches a persisted gate file and operator output. It contains no
+/// absolute filesystem path (WR-02).
+fn preflight_major_bump_check(project_root: &Path, state: &State) -> Result<(), String> {
+    if !major_bump_check_applies(state.stage) {
+        return Ok(());
+    }
+
+    let highest = version::highest_semver_tag(project_root).map_err(|err| err.to_string())?;
+    let baseline =
+        version::reachable_semver_baseline(project_root).map_err(|err| err.to_string())?;
+
+    // D-10: refuse rather than proceed when the true highest tag exists but
+    // is not reachable from HEAD — mirrors `compute_version`'s own refusal
+    // exactly, since this check must never disagree with it.
+    if let Some(highest) = &highest {
+        let unreachable = match &baseline {
+            Some(reachable) => highest > reachable,
+            None => true,
+        };
+        if unreachable {
+            return Err(truncate_reason(&format!(
+                "version derivation refused: highest semver tag `v{highest}` is not reachable \
+                 from HEAD (D-10) — a major-bump classification cannot be trusted here, so \
+                 preflight refuses rather than proceed toward a no-rollback ship batch"
+            )));
+        }
+    }
+
+    let baseline_tag = baseline.as_ref().map(|tag| format!("v{tag}"));
+    let range_start = match &baseline_tag {
+        Some(tag) => {
+            version::release_range_start(project_root, tag).map_err(|err| err.to_string())?
+        }
+        None => String::new(),
+    };
+    let bump =
+        version::classify_range_bump(project_root, &range_start).map_err(|err| err.to_string())?;
+
+    if bump != version::Bump::Major {
+        return Ok(());
+    }
+
+    let baseline_display = baseline_tag.as_deref().unwrap_or("(none)").to_string();
+    let baseline_major = baseline.as_ref().map(|v| v.major).unwrap_or(0);
+    let resulting_major = baseline_major + 1;
+    let subjects = breaking_commit_subjects(project_root, &range_start);
+    let subjects_display = if subjects.is_empty() {
+        String::new()
+    } else {
+        format!(" — deciding commit(s): {}", subjects.join("; "))
+    };
+
+    Err(truncate_reason(&format!(
+        "classified bump is MAJOR — baseline `{baseline_display}`, resulting version \
+         `v{resulting_major}.0.0`; a major version bump never ships unattended (D-09){subjects_display}"
+    )))
+}
+
+/// D-09 diagnostic aid: the deciding commit subjects for a major-bump gate's
+/// `Err` message — re-scans the same range [`version::classify_range_bump`]
+/// classified, using the identical `%H%x1f%B%x1e` git-log idiom, so a human
+/// reviewing the gate can see which commit(s) carry a breaking marker
+/// without re-deriving the range themselves. Best-effort: a git spawn
+/// failure or non-zero exit yields an empty list rather than propagating an
+/// error — this is a diagnostic aid for the message, not part of the
+/// classification itself.
+fn breaking_commit_subjects(project_root: &Path, range_start: &str) -> Vec<String> {
+    let range = if range_start.is_empty() {
+        "HEAD".to_string()
+    } else {
+        format!("{range_start}..HEAD")
+    };
+    let Ok(output) = std::process::Command::new("git")
+        .args(["log", "--no-merges", &range, "--format=%H%x1f%B%x1e"])
+        .current_dir(project_root)
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut subjects = Vec::new();
+    for record in stdout.split('\u{1e}') {
+        let record = record.trim_matches('\n');
+        if record.is_empty() {
+            continue;
+        }
+        let Some((_hash, message)) = record.split_once('\u{1f}') else {
+            continue;
+        };
+        let message = message.trim();
+        let subject = message.lines().next().unwrap_or_default();
+        let is_breaking = subject
+            .split_once(':')
+            .is_some_and(|(prefix, _)| prefix.contains('!'))
+            || message.contains("BREAKING CHANGE:")
+            || message.contains("BREAKING-CHANGE:");
+        if is_breaking {
+            subjects.push(subject.to_string());
+        }
+    }
+    subjects
+}
+
 /// The generic (universal) preflight checks (D-14) — the adapter-specific
 /// hook is composed separately in [`run_preflight`].
 fn generic_preflight_checks(project_root: &Path, state: &State) -> Result<(), String> {
     preflight_interactivity_check(project_root, state)?;
-    preflight_gh_auth_check(state)
+    preflight_gh_auth_check(state)?;
+    preflight_major_bump_check(project_root, state)
 }
 
 /// Gate a stage launch on readiness (17c, D-13-D-16): the generic universal
@@ -745,6 +909,245 @@ mod tests {
         for stage in [Stage::Define, Stage::Plan, Stage::Code, Stage::Validate] {
             assert!(!gh_auth_check_applies(stage));
         }
+    }
+
+    // -----------------------------------------------------------------
+    // D-09 (999.49/DEN-74): major-bump preflight check.
+    // -----------------------------------------------------------------
+
+    /// D-09 scope: hardcoded to Stage::Ship, mirroring `gh_auth_check_applies`.
+    #[test]
+    fn major_bump_check_applies_only_to_ship_stage() {
+        assert!(major_bump_check_applies(Stage::Ship));
+        for stage in [Stage::Define, Stage::Plan, Stage::Code, Stage::Validate] {
+            assert!(!major_bump_check_applies(stage));
+        }
+    }
+
+    fn commit_msg(root: &Path, name: &str, message: &str) {
+        std::fs::write(root.join(name), name).unwrap();
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-q", "-m", message]);
+    }
+
+    fn tag(root: &Path, name: &str) {
+        run_git(root, &["tag", name]);
+    }
+
+    /// A minimal repo with `v1.0.0` tagged at the initial commit — the
+    /// baseline every major-bump fixture below builds on.
+    fn major_bump_fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        run_git(root, &["init", "-q"]);
+        run_git(root, &["config", "user.email", "t@e.st"]);
+        run_git(root, &["config", "user.name", "t"]);
+        run_git(root, &["config", "commit.gpgsign", "false"]);
+        run_git(root, &["config", "tag.gpgsign", "false"]);
+        run_git(root, &["config", "core.hooksPath", "/dev/null"]);
+        commit_msg(root, "a.txt", "chore: init");
+        tag(root, "v1.0.0");
+        dir
+    }
+
+    /// A non-Ship stage returns `Ok(())` without ever shelling out to git —
+    /// the fixture directory is not even a git repository, so a git spawn
+    /// or exit failure would surface as `Err` were the check to ever reach
+    /// the git-shelling branch. `Ok(())` here is evidence of the early
+    /// return in `major_bump_check_applies`.
+    #[test]
+    fn major_bump_short_circuits_for_non_ship_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut state = State::new(70, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        for stage in [Stage::Define, Stage::Plan, Stage::Code, Stage::Validate] {
+            state.stage = stage;
+            assert!(
+                preflight_major_bump_check(root, &state).is_ok(),
+                "stage {stage} must short-circuit before ever shelling out to git"
+            );
+        }
+    }
+
+    /// A range classifying to patch or minor passes silently at Ship.
+    #[test]
+    fn major_bump_ok_for_patch_or_minor_bump_at_ship() {
+        let dir = major_bump_fixture();
+        let root = dir.path();
+        commit_msg(root, "b.txt", "fix(x): correct off-by-one");
+
+        let mut state = State::new(71, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Ship;
+        assert!(preflight_major_bump_check(root, &state).is_ok());
+
+        commit_msg(root, "c.txt", "feat(x): add capability");
+        assert!(preflight_major_bump_check(root, &state).is_ok());
+    }
+
+    /// A breaking-change commit at Ship fails, naming the bump kind, the
+    /// baseline tag, the resulting version, and the deciding commit subject.
+    #[test]
+    fn major_bump_errs_naming_bump_baseline_and_version_for_major_at_ship() {
+        let dir = major_bump_fixture();
+        let root = dir.path();
+        commit_msg(root, "b.txt", "feat(scope)!: drop legacy api");
+
+        let mut state = State::new(72, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Ship;
+        let err = preflight_major_bump_check(root, &state).unwrap_err();
+        assert!(err.contains("MAJOR"), "{err}");
+        assert!(err.contains("v1.0.0"), "{err}");
+        assert!(err.contains("v2.0.0"), "{err}");
+        assert!(err.contains("drop legacy api"), "{err}");
+    }
+
+    /// D-10: an unreachable highest tag is surfaced as a preflight failure
+    /// (never a silent pass) — mirrors `version.rs`'s own
+    /// `unreachable_highest_tag_refuses_rather_than_falling_back` fixture.
+    #[test]
+    fn major_bump_surfaces_unreachable_baseline_refusal() {
+        let dir = major_bump_fixture();
+        let root = dir.path();
+        let main_branch = {
+            let out = devflow_core::test_support::git_command(root)
+                .args(["symbolic-ref", "--short", "HEAD"])
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        run_git(root, &["checkout", "--orphan", "orphan-release"]);
+        run_git(
+            root,
+            &["commit", "--allow-empty", "-q", "-m", "chore: orphan"],
+        );
+        tag(root, "v9.9.9");
+        run_git(root, &["checkout", &main_branch]);
+
+        let mut state = State::new(73, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Ship;
+        let err = preflight_major_bump_check(root, &state).unwrap_err();
+        assert!(err.contains("v9.9.9"), "{err}");
+        assert!(err.contains("not reachable"), "{err}");
+    }
+
+    /// D-09 integration (mirrors `run_preflight_failing_check_gates_and_never_
+    /// reaches_spawn_monitor`): a breaking-commit range at Stage::Ship drives
+    /// `run_preflight` into the never-silent gate rather than continuing
+    /// toward `hooks_after_ship`, and never reaches `monitor::spawn_monitor`.
+    /// PATH is replaced (never prepended) with a `git`-only directory so
+    /// `gh` never resolves — this test's outcome must not depend on whether
+    /// the host running the suite happens to have `gh` installed and
+    /// authenticated, which would otherwise make `preflight_gh_auth_check`
+    /// (composed earlier in the same chain) the check that actually fails
+    /// instead of this one.
+    #[test]
+    fn run_preflight_major_bump_gates_and_never_ships_unattended() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let git_only_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", git_only_dir.path());
+        }
+
+        let dir = major_bump_fixture();
+        let root = dir.path();
+        commit_msg(root, "b.txt", "feat(scope)!: drop legacy api");
+
+        let phase = 74;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Ship;
+        state.yes_ship = true;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Ship);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        let adapter = agents::adapter_for(AgentKind::Claude);
+        let should_continue = run_preflight(root, &mut state, adapter.as_ref()).unwrap();
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        assert!(
+            !should_continue,
+            "a major bump at Ship must gate rather than tell its caller to continue launch_stage"
+        );
+        assert!(
+            workflow::load_state(root, phase).is_err(),
+            "abort() must clear state — spawn_monitor was never reached"
+        );
+        let last = devflow_core::events::last_event_for_phase(root, phase)
+            .expect("gate_fired/gate_resolved must have been recorded");
+        assert_ne!(last["event"], "stage_launched");
+    }
+
+    /// D-09/T-25-51: `state.yes_ship` must never auto-approve this gate.
+    /// `run_preflight`'s gate call (`run_gate`, which always passes `None`
+    /// for the auto-response — see that parameter's doc comment in
+    /// `pipeline_gate.rs`) structurally cannot read `state.yes_ship` at all,
+    /// and this test is the concrete proof: with `yes_ship` set and NO
+    /// response ever written, the gate poll must block for the full bounded
+    /// timeout and then surface a gate-timeout `Err` — an (incorrect)
+    /// auto-approval would instead resolve immediately, well inside the
+    /// timeout window. `DEVFLOW_GATE_TIMEOUT_SECS` is bounded under
+    /// `ENV_MUTEX` so a regression here fails fast instead of hanging the
+    /// suite for 7 days (mirrors
+    /// `run_preflight_advance_skips_recheck_on_idempotently_failing_check`).
+    #[test]
+    fn run_preflight_major_bump_gate_not_auto_approved_by_yes_ship() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let original_gate_timeout = std::env::var_os("DEVFLOW_GATE_TIMEOUT_SECS");
+        let git_only_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("DEVFLOW_GATE_TIMEOUT_SECS", "1");
+            std::env::set_var("PATH", git_only_dir.path());
+        }
+
+        let dir = major_bump_fixture();
+        let root = dir.path();
+        commit_msg(root, "b.txt", "feat(scope)!: drop legacy api");
+
+        let phase = 75;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Ship;
+        state.yes_ship = true;
+        workflow::save_state(&state).unwrap();
+
+        let adapter = agents::adapter_for(AgentKind::Claude);
+        let result = run_preflight(root, &mut state, adapter.as_ref());
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+            match &original_gate_timeout {
+                Some(value) => std::env::set_var("DEVFLOW_GATE_TIMEOUT_SECS", value),
+                None => std::env::remove_var("DEVFLOW_GATE_TIMEOUT_SECS"),
+            }
+        }
+
+        assert!(
+            result.is_err(),
+            "yes_ship must never auto-approve this gate — an unattended \
+             Ok(_) within the bounded timeout would mean it did, got {result:?}"
+        );
     }
 
     /// A failing preflight check routes through the never-silent gate and,
