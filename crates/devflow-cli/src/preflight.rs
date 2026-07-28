@@ -1568,10 +1568,23 @@ mod tests {
         }
 
         let adapter = FailOnceAdapter::new();
-        let should_continue = run_preflight(root, &mut state, &adapter).unwrap();
-        if should_continue {
-            launch_stage(&mut state, None, None).unwrap();
-        }
+        let preflight = run_preflight(root, &mut state, &adapter);
+        let continuation = match &preflight {
+            Ok(true) => launch_stage(&mut state, None, None),
+            _ => Ok(()),
+        };
+
+        // WR-05 / 999.44: `run_preflight`'s `Advance` arm calls
+        // `launch_stage_inner` directly (`:943`), which spawns a real
+        // detached monitor wrapper and records its pid on this same
+        // `&mut State` — reached indirectly, through recursion, rather than
+        // through this test's own explicit `launch_stage` call above. The
+        // guard must bind here, the first line after the final `&mut state`
+        // use, because every line below is a panic site, including
+        // unwrapping `preflight` itself: that call can spawn the monitor and
+        // then still fail a later `?`. The wrapper must die before `dir`
+        // unlinks the project root out from under it.
+        let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
 
         // SAFETY: still serialized under ENV_MUTEX from above.
         unsafe {
@@ -1580,6 +1593,13 @@ mod tests {
                 None => std::env::remove_var("PATH"),
             }
         }
+
+        // Unwrapping moves below the PATH restore above — deliberate, not an
+        // accidental reorder: on the error path, PATH is now restored before
+        // the panic instead of after it, narrowing the window in which a
+        // failing test leaves a mutated PATH behind for whatever runs next.
+        let should_continue = preflight.unwrap();
+        continuation.unwrap();
 
         assert!(
             !should_continue,
@@ -1591,6 +1611,12 @@ mod tests {
             launches, 1,
             "a preflight failure resolved by Advance must launch the agent \
              exactly once, not {launches}"
+        );
+        assert!(
+            state.monitor_pid.is_some(),
+            "this test is expected to drive a real monitor::spawn_monitor \
+             through run_preflight's Advance arm — None here means WR-05's \
+             premise was wrong and the guard above reaped nothing"
         );
     }
 
@@ -1630,10 +1656,25 @@ mod tests {
         }
 
         let adapter = FailOnceAdapter::new();
-        let should_continue = run_preflight(root, &mut state, &adapter).unwrap();
-        if should_continue {
-            launch_stage(&mut state, None, None).unwrap();
-        }
+        let preflight = run_preflight(root, &mut state, &adapter);
+        let continuation = match &preflight {
+            Ok(true) => launch_stage(&mut state, None, None),
+            _ => Ok(()),
+        };
+
+        // WR-05 / 999.44: this test's spawn arrives through the
+        // `GateAction::LoopBack(_)` arm (`preflight.rs:945-950`), which calls
+        // `launch_stage` at `:949`. That re-resolves the REAL Claude adapter
+        // (whose default preflight passes), re-runs `run_preflight` against
+        // it, and falls through to the same `launch_stage_inner` and the
+        // same `monitor::spawn_monitor` — one spawn, on the same
+        // `&mut State`, reached by a longer road than the Advance arm above.
+        // The guard must bind here, the first line after the final
+        // `&mut state` use, because every line below is a panic site,
+        // including unwrapping `preflight` itself: that call can spawn the
+        // monitor and then still fail a later `?`. The wrapper must die
+        // before `dir` unlinks the project root out from under it.
+        let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
 
         // SAFETY: still serialized under ENV_MUTEX from above.
         unsafe {
@@ -1642,6 +1683,13 @@ mod tests {
                 None => std::env::remove_var("PATH"),
             }
         }
+
+        // Unwrapping moves below the PATH restore above — deliberate, not an
+        // accidental reorder: on the error path, PATH is now restored before
+        // the panic instead of after it, narrowing the window in which a
+        // failing test leaves a mutated PATH behind for whatever runs next.
+        let should_continue = preflight.unwrap();
+        continuation.unwrap();
 
         assert!(
             !should_continue,
@@ -1653,6 +1701,12 @@ mod tests {
             launches, 1,
             "a preflight failure resolved by LoopBack must launch the agent \
              exactly once, not {launches}"
+        );
+        assert!(
+            state.monitor_pid.is_some(),
+            "this test is expected to drive a real monitor::spawn_monitor \
+             through run_preflight's LoopBack arm — None here means WR-05's \
+             premise was wrong and the guard above reaped nothing"
         );
     }
 
@@ -1724,6 +1778,20 @@ mod tests {
 
         let result = run_preflight(root, &mut state, &AlwaysFailAdapter);
 
+        // WR-05 / 999.44 (residual finding, 25-18 verification step 6): the
+        // "approved" response here drives run_preflight's GateAction::Advance
+        // arm, which calls launch_stage_inner UNCONDITIONALLY — skipping the
+        // just-adjudicated check is the entire point of this test, so there
+        // is no recursive re-check to fail first. With a working `codex` +
+        // `sh` stub on PATH (`agent_free_dir_with_agent_stub`), this spawns a
+        // REAL detached monitor wrapper — confirmed empirically while
+        // re-deriving this plan's verification-step-6 enumeration, a leak
+        // this plan's originally-declared scope (the two `_exactly_once`
+        // tests) did not name. The guard must bind here, the first line
+        // after the final `&mut state` use, ahead of every panicking
+        // checkpoint below, for the same reason as the two conversions above.
+        let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
+
         // SAFETY: still serialized under ENV_MUTEX from above.
         unsafe {
             match &original_path {
@@ -1748,6 +1816,13 @@ mod tests {
         assert_eq!(
             state.preflight_retries, 0,
             "a human Advance must reset the retry counter"
+        );
+        assert!(
+            state.monitor_pid.is_some(),
+            "this test's Advance arm is expected to drive a real \
+             monitor::spawn_monitor via launch_stage_inner — None here means \
+             this residual finding's premise was wrong and the guard above \
+             reaped nothing"
         );
     }
 
