@@ -643,6 +643,19 @@ mod tests {
             .expect("spawn monitor-wrapper-shaped fixture");
         let pid = child.id();
 
+        // 999.47: cross the exec-visibility barrier before reading the
+        // cmdline-derived census, or this test races the fixture's own
+        // fork()->execve() window (25-11).
+        assert!(
+            crate::test_support::wait_for_exec_visibility(
+                pid,
+                "sh",
+                crate::test_support::EXEC_VISIBILITY_WAIT,
+                crate::test_support::EXEC_VISIBILITY_POLL,
+            ),
+            "pid {pid}: exec visibility timed out before the fixture became discoverable"
+        );
+
         let found = discover_stray_devflow_processes();
         let candidate = found.iter().find(|p| p.pid == pid);
 
@@ -670,6 +683,23 @@ mod tests {
             .expect("spawn 999.47-shaped fixture");
         let pid = child.id();
 
+        // 999.47/25-11: without this barrier, the assertion below passes
+        // during the fork()->execve() window for a reason unrelated to what
+        // it claims to test — the census is reading the CALLER's (this test
+        // binary's) argv, which matches neither Layer 1 nor Layer 2, so the
+        // NOT-FIND assertion is vacuously true regardless of whether the
+        // fixture's own shape is correctly rejected. Crossing the barrier
+        // first makes the NOT-FIND assertion mean what it claims.
+        assert!(
+            crate::test_support::wait_for_exec_visibility(
+                pid,
+                "sh",
+                crate::test_support::EXEC_VISIBILITY_WAIT,
+                crate::test_support::EXEC_VISIBILITY_POLL,
+            ),
+            "pid {pid}: exec visibility timed out before the fixture became discoverable"
+        );
+
         let found = discover_stray_devflow_processes();
 
         let _ = child.kill();
@@ -692,6 +722,22 @@ mod tests {
             .spawn()
             .expect("spawn devflow-argv0 fixture");
         let pid = child.id();
+
+        // 999.47/25-11: same reasoning as the false-positive-shape test
+        // above — without this barrier, the NOT-FIND assertion below passes
+        // vacuously during the fork()->execve() window (the caller's own
+        // argv matches neither layer), which says nothing about whether
+        // THIS fixture's argv[0]==devflow/argv[1]!=advance shape is
+        // correctly rejected once its own exec has actually landed.
+        assert!(
+            crate::test_support::wait_for_exec_visibility(
+                pid,
+                "devflow",
+                crate::test_support::EXEC_VISIBILITY_WAIT,
+                crate::test_support::EXEC_VISIBILITY_POLL,
+            ),
+            "pid {pid}: exec visibility timed out before the fixture became discoverable"
+        );
 
         let found = discover_stray_devflow_processes();
 
