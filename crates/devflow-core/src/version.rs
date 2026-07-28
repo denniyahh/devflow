@@ -1,25 +1,32 @@
 //! Hybrid Git-based SemVer.
 //!
-//! DevFlow derives the version from a mix of the project's version file and git
-//! history rather than a config-driven scheme:
+//! DevFlow derives the version entirely from git history (D-11) — the
+//! version file (`Cargo.toml`, `pyproject.toml`, or `package.json`) is no
+//! longer an input to [`compute_version`], only an output [`write_version`]
+//! produces:
 //!
-//! - **MAJOR** — read from the auto-detected version file (`Cargo.toml`,
-//!   `pyproject.toml`, or `package.json`). This is the one component a human
-//!   bumps deliberately.
-//! - **MINOR** — the number of git tags (one tag per shipped milestone).
-//! - **PATCH** — commits since the most recent tag.
+//! - **Baseline** — the highest semver tag reachable from `HEAD`
+//!   ([`reachable_semver_baseline`], D-07). If the highest semver tag in the
+//!   repository overall is NOT reachable from `HEAD`, `compute_version`
+//!   refuses rather than silently falling back to a smaller reachable tag
+//!   (D-10).
+//! - **Bump** — classified from the conventional-commit intent of the
+//!   commits added since that baseline was released
+//!   ([`classify_range_bump`], D-08), over a range anchored by
+//!   [`release_range_start`] to survive this repository's squash-merge +
+//!   sync-back release topology.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// A computed semantic version.
+/// A semantic version, whether read from disk or computed from git history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Version {
-    /// Major component, from the version file.
+    /// Major version component.
     pub major: u32,
-    /// Minor component, from the git tag count.
+    /// Minor version component.
     pub minor: u32,
-    /// Patch component, from commits since the last tag.
+    /// Patch version component.
     pub patch: u32,
 }
 
@@ -137,19 +144,277 @@ pub fn commits_since_last_minor_tag(project_root: &Path) -> Result<u32, VersionE
     Ok(count)
 }
 
-/// Compute the full version: MAJOR from the version file, MINOR from the tag
-/// count, PATCH from commits since the last tag.
-pub fn compute_version(project_root: &Path) -> Result<Version, VersionError> {
-    let major = match detect_version_file(project_root) {
-        Some(path) => read_major_version(&path)?,
-        None => 0,
+/// Enumerate every tag in the repository (no reachability restriction), keep
+/// only values that parse as `vMAJOR.MINOR.PATCH` semver (a leading `v` is
+/// stripped first — the `semver` crate's grammar is bare `MAJOR.MINOR.PATCH`),
+/// and return the maximum by semver ordering (D-07). A stray non-semver tag
+/// (e.g. this repository's `archive-planning-docs-2026-07-24`) is silently
+/// excluded via `filter_map(...ok())` rather than erroring — a malformed tag
+/// can never crash this path (T-25-02).
+pub fn highest_semver_tag(project_root: &Path) -> Result<Option<semver::Version>, VersionError> {
+    let output = Command::new("git")
+        .arg("tag")
+        .current_dir(project_root)
+        .output()
+        .map_err(|err| VersionError::Git(err.to_string()))?;
+    if !output.status.success() {
+        return Err(VersionError::Git(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix('v'))
+        .filter_map(|stripped| semver::Version::parse(stripped).ok())
+        .max())
+}
+
+/// As [`highest_semver_tag`], but restricted to tags reachable from `HEAD`
+/// via `git tag --merged HEAD` — one spawn instead of an O(n) per-tag
+/// `merge-base --is-ancestor` loop, mirroring `GitFlow::cleanup_merged`'s
+/// existing `branch --merged` precedent in `git.rs`. This is `compute_version`'s
+/// baseline (D-07).
+///
+/// **D-12 coupling:** this predicate's correctness depends on the `develop`
+/// → `main` sync PR being MERGED, not squashed — a squashed sync breaks the
+/// ancestry link this `--merged` check relies on. `compute_version`'s
+/// refusal (D-10, `VersionError::UnreachableBaseline`) is the mitigation if
+/// that discipline is ever violated; 999.52 is the backlog item that would
+/// ship a structural repair, deliberately not in this phase.
+pub fn reachable_semver_baseline(
+    project_root: &Path,
+) -> Result<Option<semver::Version>, VersionError> {
+    let output = Command::new("git")
+        .args(["tag", "--merged", "HEAD"])
+        .current_dir(project_root)
+        .output()
+        .map_err(|err| VersionError::Git(err.to_string()))?;
+    if !output.status.success() {
+        return Err(VersionError::Git(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix('v'))
+        .filter_map(|stripped| semver::Version::parse(stripped).ok())
+        .max())
+}
+
+/// Resolve the commit range start for D-08's conventional-commit classifier,
+/// given the baseline tag name (e.g. `"v2.0.0"`).
+///
+/// This exists because every release in this repository squash-merges
+/// `develop` into `main`, so no develop-side commit is ever an ancestor of
+/// the release tag it was squashed into — a `-X ours` sync merge-back
+/// restores ancestry in the OTHER direction only (the tag becomes an
+/// ancestor of `HEAD`, which is what makes D-07's `--merged HEAD`
+/// reachability filter work), but the commits the tag *released* stay
+/// outside its ancestry forever. A literal `baseline..HEAD` range therefore
+/// re-includes the entire pre-release history on every subsequent ship —
+/// measured live 2026-07-27: `v2.0.0..HEAD` is 677 non-merge commits (62
+/// `feat`), against 5 (0 `feat`) for the anchored range this function
+/// computes. See 25-01-PLAN.md's `<measured_correction>`.
+///
+/// Anchor rule:
+/// - `C1` = the earliest commit on the ancestry path from `baseline_tag` to
+///   `HEAD` (`git rev-list --ancestry-path --reverse <tag>..HEAD`, first
+///   line).
+/// - If `C1` does not exist, the tag is at `HEAD` — range start is the tag.
+/// - If the tag is an ancestor of `C1`'s first parent, the tag already sat
+///   on this mainline (the ordinary, non-squashed case, e.g. `v1.8.0..v1.8.1`)
+///   — range start is the tag, unchanged from the literal D-08 rule.
+/// - Otherwise the tag entered `HEAD`'s history through `C1` (the sync
+///   merge-back) — range start is `C1`.
+pub fn release_range_start(
+    project_root: &Path,
+    baseline_tag: &str,
+) -> Result<String, VersionError> {
+    let ancestry = Command::new("git")
+        .args([
+            "rev-list",
+            "--ancestry-path",
+            "--reverse",
+            &format!("{baseline_tag}..HEAD"),
+        ])
+        .current_dir(project_root)
+        .output()
+        .map_err(|err| VersionError::Git(err.to_string()))?;
+    if !ancestry.status.success() {
+        return Err(VersionError::Git(
+            String::from_utf8_lossy(&ancestry.stderr).trim().to_string(),
+        ));
+    }
+    let c1 = String::from_utf8_lossy(&ancestry.stdout)
+        .lines()
+        .next()
+        .map(str::to_string);
+    let Some(c1) = c1 else {
+        // Nothing after the tag — it sits at HEAD.
+        return Ok(baseline_tag.to_string());
     };
-    let minor = count_git_tags(project_root)?;
-    let patch = commits_since_last_minor_tag(project_root)?;
+
+    let first_parent = Command::new("git")
+        .args(["rev-parse", &format!("{c1}^1")])
+        .current_dir(project_root)
+        .output()
+        .map_err(|err| VersionError::Git(err.to_string()))?;
+    if !first_parent.status.success() {
+        // C1 is a root commit with no first parent — the tag cannot be an
+        // ancestor of something that doesn't exist; treat C1 itself as the
+        // anchor (same branch as the sync-merge case below).
+        return Ok(c1);
+    }
+    let first_parent = String::from_utf8_lossy(&first_parent.stdout)
+        .trim()
+        .to_string();
+
+    let tag_is_ancestor_of_first_parent = Command::new("git")
+        .args(["merge-base", "--is-ancestor", baseline_tag, &first_parent])
+        .current_dir(project_root)
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+
+    if tag_is_ancestor_of_first_parent {
+        Ok(baseline_tag.to_string())
+    } else {
+        Ok(c1)
+    }
+}
+
+/// The classified conventional-commit bump for a range of commits (D-08).
+/// Declaration order is the precedence order (lowest to highest), so
+/// `Iterator::max()`/[`Ord::max`] over a range's individual classifications
+/// yields the highest-precedence result directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Bump {
+    /// No commit's type maps to a version-affecting change (`docs`, `test`,
+    /// `chore`, `ci`, `refactor`, `style`). `compute_version` collapses this
+    /// to [`Bump::Patch`] at the call site (D-10's floor) so a range with
+    /// nothing bumping still yields a distinct version.
+    None,
+    /// `fix`/`perf`; any recognised-but-unlisted conventional-commit type
+    /// (D-10's same floor); or a commit message that failed to parse as a
+    /// conventional commit at all (D-10: unrecognised/malformed → patch).
+    Patch,
+    /// `feat`.
+    Minor,
+    /// A breaking change: `!` after an optional scope and before the colon
+    /// (`feat(scope)!: ...`), or a `BREAKING CHANGE:`/`BREAKING-CHANGE:`
+    /// footer, regardless of the commit's own type.
+    Major,
+}
+
+/// Classify the highest-precedence conventional-commit bump over
+/// `--no-merges` commits in `range_start..HEAD`. `range_start` may be the
+/// empty string, meaning "no baseline tag exists" — the whole history
+/// reachable from `HEAD` is classified instead (`git log --no-merges HEAD`,
+/// no exclusion).
+///
+/// Commits are read via `%H%x1f%B%x1e`: `%B` is the raw message (subject,
+/// blank line, body and footers) in exactly the shape
+/// `git_conventional::Commit::parse` expects, and `%x1f`/`%x1e` are git's own
+/// unit/record separators — safe against arbitrary characters a commit
+/// message may contain, unlike splitting on newlines.
+pub fn classify_range_bump(project_root: &Path, range_start: &str) -> Result<Bump, VersionError> {
+    let range = if range_start.is_empty() {
+        "HEAD".to_string()
+    } else {
+        format!("{range_start}..HEAD")
+    };
+    let output = Command::new("git")
+        .args(["log", "--no-merges", &range, "--format=%H%x1f%B%x1e"])
+        .current_dir(project_root)
+        .output()
+        .map_err(|err| VersionError::Git(err.to_string()))?;
+    if !output.status.success() {
+        return Err(VersionError::Git(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut bump = Bump::None;
+    for record in stdout.split('\u{1e}') {
+        let record = record.trim_matches('\n');
+        if record.is_empty() {
+            continue;
+        }
+        let Some((_hash, message)) = record.split_once('\u{1f}') else {
+            continue;
+        };
+        let this_bump = classify_commit_message(message.trim());
+        bump = bump.max(this_bump);
+    }
+    Ok(bump)
+}
+
+/// Classify one commit message's bump per D-08/D-10. An unparseable message
+/// (D-10: unrecognised/malformed) and a breaking-change marker (regardless of
+/// type) are both checked before the type match, since either overrides a
+/// recognised type's own precedence.
+fn classify_commit_message(message: &str) -> Bump {
+    let Ok(commit) = git_conventional::Commit::parse(message) else {
+        return Bump::Patch;
+    };
+    if commit.breaking() {
+        return Bump::Major;
+    }
+    let ty = commit.type_();
+    if ty == git_conventional::Type::FEAT {
+        Bump::Minor
+    } else if ty == git_conventional::Type::FIX || ty == git_conventional::Type::PERF {
+        Bump::Patch
+    } else if ty == git_conventional::Type::DOCS
+        || ty == git_conventional::Type::TEST
+        || ty == git_conventional::Type::CHORE
+        || ty == "ci"
+        || ty == git_conventional::Type::REFACTOR
+        || ty == git_conventional::Type::STYLE
+    {
+        Bump::None
+    } else {
+        // Any other recognised-but-unlisted type — D-10's same floor.
+        Bump::Patch
+    }
+}
+
+/// Apply a classified [`Bump`] to a baseline version (D-08/D-10).
+fn apply_bump(baseline: &semver::Version, bump: Bump) -> semver::Version {
+    match bump {
+        Bump::Major => semver::Version::new(baseline.major + 1, 0, 0),
+        Bump::Minor => semver::Version::new(baseline.major, baseline.minor + 1, 0),
+        // D-10: no-bump collapses to patch so every completed ship still
+        // yields a distinct version.
+        Bump::Patch | Bump::None => {
+            semver::Version::new(baseline.major, baseline.minor, baseline.patch + 1)
+        }
+    }
+}
+
+/// Compute the full version: the baseline resolved from the highest
+/// reachable semver tag (D-07), bumped by the conventional-commit
+/// classification of the commits added since that baseline was released
+/// (D-08). The version file is NOT read here (D-11) — [`write_version`] is
+/// the only writer, and [`read_version`] is the only reader of what's on
+/// disk.
+pub fn compute_version(project_root: &Path) -> Result<Version, VersionError> {
+    let baseline = reachable_semver_baseline(project_root)?;
+    let baseline_version = baseline
+        .clone()
+        .unwrap_or_else(|| semver::Version::new(0, 0, 0));
+
+    let range_start = match &baseline {
+        Some(tag) => release_range_start(project_root, &format!("v{tag}"))?,
+        None => String::new(),
+    };
+    let bump = classify_range_bump(project_root, &range_start)?;
+    let bumped = apply_bump(&baseline_version, bump);
+
     Ok(Version {
-        major,
-        minor,
-        patch,
+        major: bumped.major as u32,
+        minor: bumped.minor as u32,
+        patch: bumped.patch as u32,
     })
 }
 
@@ -163,6 +428,10 @@ pub fn compute_version(project_root: &Path) -> Result<Version, VersionError> {
 /// actually wrote (e.g. after a tag was just cut) must use this instead of
 /// `compute_version`, which would see the new tag and return a different,
 /// larger version.
+///
+/// D-11 changed what `compute_version` reads (git history only, never the
+/// version file) — it did not change this function's role: `read_version`
+/// still reports exactly what's on disk, unconditionally.
 pub fn read_version(project_root: &Path) -> Result<Version, VersionError> {
     let path = detect_version_file(project_root)
         .ok_or_else(|| VersionError::Parse("no version file found".into()))?;
@@ -585,6 +854,44 @@ mod tests {
         git(root, &["commit", "-q", "-m", &format!("add {name}")]);
     }
 
+    /// As [`commit`], but with an explicit commit message — needed for
+    /// conventional-commit classification fixtures, where the message
+    /// content (not the file name) is what's under test.
+    fn commit_msg(root: &Path, name: &str, message: &str) {
+        std::fs::write(root.join(name), name).unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-q", "-m", message]);
+    }
+
+    /// One-line `tag` helper of the same shape as `git`/`init_repo`/`commit`.
+    fn tag(root: &Path, name: &str) {
+        git(root, &["tag", name]);
+    }
+
+    fn current_branch(root: &Path) -> String {
+        let output = crate::test_support::git_command(root)
+            .args(["symbolic-ref", "--short", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "symbolic-ref --short HEAD failed");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn checkout_new(root: &Path, branch: &str) {
+        git(root, &["checkout", "-b", branch]);
+    }
+
+    fn checkout(root: &Path, branch: &str) {
+        git(root, &["checkout", branch]);
+    }
+
+    /// Simulate `scripts/sync-main-to-develop.sh`'s content-preserving
+    /// `-X ours` merge: a real merge commit (so ancestry is restored) whose
+    /// tree is unaffected (so nothing about `develop`'s own content changes).
+    fn merge_ours(root: &Path, branch: &str, message: &str) {
+        git(root, &["merge", "-s", "ours", "-m", message, branch]);
+    }
+
     #[test]
     fn detect_prefers_cargo_then_pyproject_then_package_json() {
         let dir = tempfile::tempdir().unwrap();
@@ -657,24 +964,35 @@ mod tests {
     }
 
     #[test]
-    fn count_tags_and_commits_drive_minor_and_patch() {
+    fn docs_only_commits_after_tag_yield_patch_floor() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
-        std::fs::write(root.join("Cargo.toml"), "[package]\nversion = \"2.0.0\"\n").unwrap();
-        commit(root, "a.txt");
-        // No tags yet → minor 0, patch counts all commits.
-        assert_eq!(count_git_tags(root).unwrap(), 0);
-        let v = compute_version(root).unwrap();
-        assert_eq!(v.major, 2);
-        assert_eq!(v.minor, 0);
-        assert!(v.patch >= 1);
+        commit_msg(root, "a.txt", "chore: init");
+        tag(root, "v2.0.0");
+        commit_msg(root, "b.txt", "docs: update readme");
+        commit_msg(root, "c.txt", "docs: fix typo");
 
-        git(root, &["tag", "v2.0.0"]);
-        commit(root, "b.txt");
-        commit(root, "c.txt");
-        assert_eq!(count_git_tags(root).unwrap(), 1);
-        assert_eq!(commits_since_last_minor_tag(root).unwrap(), 2);
+        let v = compute_version(root).unwrap();
+        assert_eq!(
+            v,
+            Version {
+                major: 2,
+                minor: 0,
+                patch: 1
+            }
+        );
+    }
+
+    #[test]
+    fn feat_commit_after_tag_yields_minor_bump() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        commit_msg(root, "a.txt", "chore: init");
+        tag(root, "v2.0.0");
+        commit_msg(root, "b.txt", "docs: update readme");
+        commit_msg(root, "c.txt", "feat(x): add new capability");
 
         let v = compute_version(root).unwrap();
         assert_eq!(
@@ -682,10 +1000,145 @@ mod tests {
             Version {
                 major: 2,
                 minor: 1,
-                patch: 2
+                patch: 0
             }
         );
-        assert_eq!(v.to_string(), "2.1.2");
+    }
+
+    #[test]
+    fn fix_commit_after_tag_yields_patch_bump() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        commit_msg(root, "a.txt", "chore: init");
+        tag(root, "v2.0.0");
+        commit_msg(root, "b.txt", "fix(x): correct off-by-one");
+
+        let v = compute_version(root).unwrap();
+        assert_eq!(
+            v,
+            Version {
+                major: 2,
+                minor: 0,
+                patch: 1
+            }
+        );
+    }
+
+    #[test]
+    fn no_semver_tag_at_all_yields_documented_empty_repo_contract() {
+        // Empty-repo contract (D-07/D-08 with no baseline tag): baseline is
+        // 0.0.0, and the very first commit's own classification applies
+        // directly — a `feat` yields the minor floor, `0.1.0`.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        commit_msg(root, "a.txt", "feat: initial capability");
+
+        let v = compute_version(root).unwrap();
+        assert_eq!(
+            v,
+            Version {
+                major: 0,
+                minor: 1,
+                patch: 0
+            }
+        );
+    }
+
+    #[test]
+    fn squash_sync_topology_classifies_only_post_merge_commits() {
+        // Reproduces this repository's real release shape: `develop` work is
+        // squash-merged into a fresh commit on the trunk (no ancestry back to
+        // develop's originals), then a content-preserving `-X ours` merge
+        // syncs the trunk back into develop, restoring ancestry in the OTHER
+        // direction only. The classifier must see only the commit(s) added
+        // AFTER that sync merge, not develop's pre-squash originals.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        commit_msg(root, "base.txt", "chore: init");
+        let trunk = current_branch(root);
+
+        checkout_new(root, "develop");
+        commit_msg(root, "d1.txt", "feat: develop work one");
+        commit_msg(root, "d2.txt", "feat: develop work two");
+
+        checkout(root, &trunk);
+        commit_msg(root, "sq1.txt", "feat: squashed release of develop work");
+        tag(root, "v2.0.0");
+
+        checkout(root, "develop");
+        merge_ours(
+            root,
+            &trunk,
+            "merge: sync main back into develop after release",
+        );
+        commit_msg(root, "f1.txt", "fix: patch after sync");
+
+        let v = compute_version(root).unwrap();
+        assert_eq!(
+            v,
+            Version {
+                major: 2,
+                minor: 0,
+                patch: 1
+            }
+        );
+    }
+
+    #[test]
+    fn two_squash_sync_cycles_anchor_to_the_second_merge_only() {
+        // Pins the property release_range_start's doc comment names: because
+        // reachable_semver_baseline always selects the highest reachable
+        // tag, the ancestry path from that tag to HEAD crosses exactly one
+        // sync merge — so inspecting only C1's first parent is sufficient
+        // even with TWO release cycles in history. If baseline selection
+        // ever regressed to anchor at the first cycle's merge instead of the
+        // second, this fixture's first-cycle `feat` (d1) would leak back
+        // into the classified range and wrongly produce a minor bump.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        commit_msg(root, "base.txt", "chore: init");
+        let trunk = current_branch(root);
+
+        checkout_new(root, "develop");
+        commit_msg(root, "d1.txt", "feat: first cycle work");
+
+        checkout(root, &trunk);
+        commit_msg(root, "sq1.txt", "feat: first squashed release");
+        tag(root, "v2.0.0");
+
+        checkout(root, "develop");
+        merge_ours(
+            root,
+            &trunk,
+            "merge: sync main back into develop after release (1)",
+        );
+        commit_msg(root, "d3.txt", "feat: second cycle work");
+
+        checkout(root, &trunk);
+        commit_msg(root, "sq2.txt", "feat: second squashed release");
+        tag(root, "v2.1.0");
+
+        checkout(root, "develop");
+        merge_ours(
+            root,
+            &trunk,
+            "merge: sync main back into develop after release (2)",
+        );
+        commit_msg(root, "f1.txt", "fix: patch after second sync");
+
+        let v = compute_version(root).unwrap();
+        assert_eq!(
+            v,
+            Version {
+                major: 2,
+                minor: 1,
+                patch: 1
+            }
+        );
     }
 
     #[test]
@@ -972,8 +1425,10 @@ mod tests {
         git(root, &["tag", "v2.0.0"]);
         commit(root, "b.txt");
         commit(root, "c.txt");
-        // compute_version would see 1 tag + 2 commits since => 2.1.2.
-        // read_version must still report exactly what's on disk: 2.0.0.
+        // compute_version would recompute from git history (baseline v2.0.0,
+        // bumped by whatever the two later commits classify to) instead of
+        // reporting the version file. read_version must still report exactly
+        // what's on disk: 2.0.0.
         assert_eq!(
             read_version(root).unwrap(),
             Version {
