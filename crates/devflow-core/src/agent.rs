@@ -218,6 +218,179 @@ pub fn is_same_process(pid: u32, expected_start: u64) -> bool {
     process_start_time(pid) == Some(expected_start)
 }
 
+/// Which structural layer of a DevFlow-spawned process tree
+/// [`discover_stray_devflow_processes`] matched a candidate against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrayLayer {
+    /// The monitor wrapper shell spawned by `monitor::spawn_monitor` — the
+    /// `sh -c <script>` process that owns the agent and, on exit, runs
+    /// `devflow advance`.
+    MonitorWrapper,
+    /// The trailing `devflow advance` invocation the wrapper's script runs
+    /// as its last command once the agent exits.
+    AdvanceChild,
+}
+
+/// A process discovered by [`discover_stray_devflow_processes`]: its pid,
+/// the start time recorded at discovery time, and which layer matched it.
+///
+/// The recorded `start_time` is what lets a later caller re-confirm this is
+/// still the same process — via [`is_same_process`] — immediately before
+/// acting on it, closing the check-then-act window between discovery and
+/// signalling (999.47's "Related TOCTOU").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StrayProcess {
+    /// The discovered process's pid.
+    pub pid: u32,
+    /// The pid's recorded start time (`/proc/<pid>/stat` field 22), captured
+    /// at discovery time for later identity re-confirmation.
+    pub start_time: u64,
+    /// Which structural matcher identified this process.
+    pub layer: StrayLayer,
+}
+
+/// The monitor wrapper's trap-installation line, copied byte-for-byte from
+/// `monitor::spawn_monitor_inner`'s literal script text (see
+/// `crates/devflow-core/src/monitor.rs`) — not paraphrased or reduced to a
+/// single word, so a reader can grep both files for this exact string to
+/// confirm they still agree. If the wrapper script's text ever changes, this
+/// constant must change with it in the same commit.
+const MONITOR_WRAPPER_MARKER: &str = "trap cleanup TERM INT";
+
+/// The devflow CLI binary's name — `crates/devflow-cli/Cargo.toml`'s
+/// `[package].name`, with no `[[bin]]` override, so cargo names the built
+/// binary after the package. Matched against argv[0]'s basename for Layer 2.
+const DEVFLOW_BINARY_NAME: &str = "devflow";
+
+/// The advance subcommand's literal name (`Command::Advance` in
+/// `devflow-cli/src/main.rs`), matched against argv[1] for Layer 2.
+const ADVANCE_SUBCOMMAND: &str = "advance";
+
+/// Census both of DevFlow's orphan-prone process layers directly from the OS
+/// process table — the only remaining discovery surface once a project root
+/// has been deleted off disk, taking every registry entry, lock file and
+/// state file with it (999.44).
+///
+/// This is a pure, read-only survey: it never signals a process. Deciding
+/// whether to act on a result, and re-confirming identity immediately
+/// beforehand, is the caller's job.
+///
+/// Two structural matchers, deliberately narrower than the predicate
+/// 999.47 disproved (which matched ANY argv element whose basename began
+/// with the binary name, so `sleep /tmp/devflow-scratch/x` was a false
+/// positive):
+///
+/// * **Layer 1 — the monitor wrapper.** `argv[0]` is `sh`, `argv[1]` is
+///   `-c`, and `argv[2]` (the script) contains [`MONITOR_WRAPPER_MARKER`]
+///   verbatim.
+/// * **Layer 2 — the trailing advance child.** `argv[0]`'s basename equals
+///   [`DEVFLOW_BINARY_NAME`] AND `argv[1]` equals [`ADVANCE_SUBCOMMAND`].
+///
+/// Neither matcher scans all argv elements or matches a prefix; both check
+/// specific, named positions only.
+///
+/// Two hard constraints on the census, both load-bearing:
+///
+/// 1. **No parentage filter.** These orphans reparent to the user's
+///    per-user service manager, not to the init process — a parent-identity
+///    filter was directly measured against this repository (23-FINDINGS.md)
+///    to report zero orphans while 14 genuinely existed. This function does
+///    not consult parentage at all.
+/// 2. **Never return a process owned by another user.** Each candidate's
+///    owning uid is compared against the caller's effective uid, and
+///    anything that does not match is skipped — the concrete hazard is a
+///    caller later signalling a stranger's process on a shared machine.
+///
+/// Every read failure is tolerated silently (a pid that vanishes between
+/// the directory listing and the cmdline/stat read is normal churn, not an
+/// error), and an unreadable `/proc` returns an empty list rather than
+/// propagating an error.
+pub fn discover_stray_devflow_processes() -> Vec<StrayProcess> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+
+    let my_uid = unsafe { libc::geteuid() };
+    let mut found = Vec::new();
+
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+
+        // Shared-machine safety: skip anything not owned by us before
+        // reading anything else about it.
+        let Ok(owner_metadata) = std::fs::metadata(entry.path()) else {
+            continue;
+        };
+        if std::os::unix::fs::MetadataExt::uid(&owner_metadata) != my_uid {
+            continue;
+        }
+
+        let Ok(raw_cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        let args: Vec<String> = raw_cmdline
+            .split(|&byte| byte == 0)
+            .filter(|arg| !arg.is_empty())
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect();
+
+        let Some(layer) = classify_stray_layer(&args) else {
+            continue;
+        };
+
+        // The candidate's identity, recorded now so a caller can
+        // re-confirm it with `is_same_process` right before acting.
+        let Some(start_time) = process_start_time(pid) else {
+            continue; // exited between the directory listing and here
+        };
+
+        found.push(StrayProcess {
+            pid,
+            start_time,
+            layer,
+        });
+    }
+
+    found
+}
+
+/// Basename of an argv element, matching the idiom already used by
+/// [`looks_like_devflow_process`].
+fn argv_basename(arg: &str) -> Option<&str> {
+    std::path::Path::new(arg)
+        .file_name()
+        .and_then(|n| n.to_str())
+}
+
+/// Which layer (if any) an argv list structurally matches. See
+/// [`discover_stray_devflow_processes`] for the two matchers' exact shape.
+fn classify_stray_layer(args: &[String]) -> Option<StrayLayer> {
+    let is_monitor_wrapper = args.len() >= 3
+        && argv_basename(&args[0]) == Some("sh")
+        && args[1] == "-c"
+        && args[2].contains(MONITOR_WRAPPER_MARKER);
+    if is_monitor_wrapper {
+        return Some(StrayLayer::MonitorWrapper);
+    }
+
+    let is_advance_child = args
+        .first()
+        .and_then(|argv0| argv_basename(argv0))
+        .is_some_and(|name| name == DEVFLOW_BINARY_NAME)
+        && args.get(1).map(String::as_str) == Some(ADVANCE_SUBCOMMAND);
+    if is_advance_child {
+        return Some(StrayLayer::AdvanceChild);
+    }
+
+    None
+}
+
 /// Best-effort, Linux-only identity check for `devflow stop`'s signalling
 /// fallback (T-23-52, PID reuse in a stale lock file): does
 /// `/proc/<pid>/cmdline` name a devflow process? Reads the NUL-separated
@@ -451,6 +624,92 @@ mod tests {
         );
 
         let _ = child.wait();
+    }
+
+    #[test]
+    fn discover_stray_devflow_processes_finds_a_monitor_wrapper() {
+        // A shell invoked with `-c` whose script argument contains the
+        // wrapper's literal marker, verbatim from monitor.rs.
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("trap cleanup TERM INT; sleep 30")
+            .spawn()
+            .expect("spawn monitor-wrapper-shaped fixture");
+        let pid = child.id();
+
+        let found = discover_stray_devflow_processes();
+        let candidate = found.iter().find(|p| p.pid == pid);
+
+        let candidate = candidate.expect("monitor wrapper fixture must be discovered");
+        assert_eq!(candidate.layer, StrayLayer::MonitorWrapper);
+        assert!(
+            is_same_process(pid, candidate.start_time),
+            "the recorded start time must re-confirm identity while the process is alive"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn discover_stray_devflow_processes_rejects_the_999_47_false_positive_shape() {
+        // The exact false-positive class 999.47 measured: a process that
+        // merely mentions a devflow-looking path as an argument, not
+        // structurally shaped like either layer.
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .arg("/tmp/devflow-scratch/looks-like-devflow")
+            .spawn()
+            .expect("spawn 999.47-shaped fixture");
+        let pid = child.id();
+
+        let found = discover_stray_devflow_processes();
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            !found.iter().any(|p| p.pid == pid),
+            "a process merely mentioning a devflow-looking path must not be discovered"
+        );
+    }
+
+    #[test]
+    fn discover_stray_devflow_processes_rejects_devflow_named_argv0_with_wrong_argv1() {
+        // argv[0]'s basename matches the binary name, but argv[1] is not
+        // the advance subcommand — Layer 2 requires BOTH positions.
+        let mut child = std::process::Command::new("sleep");
+        std::os::unix::process::CommandExt::arg0(&mut child, "devflow");
+        let mut child = child
+            .arg("30")
+            .spawn()
+            .expect("spawn devflow-argv0 fixture");
+        let pid = child.id();
+
+        let found = discover_stray_devflow_processes();
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            !found.iter().any(|p| p.pid == pid),
+            "argv[0]==devflow with argv[1] != advance must not be discovered as Layer 2"
+        );
+    }
+
+    #[test]
+    fn discover_stray_devflow_processes_excludes_an_unrelated_process() {
+        // This test binary's own process is neither the wrapper's `sh -c`
+        // shape nor a `devflow advance` invocation, so it must never be
+        // discovered — proving the census does not match by default and
+        // completes a full /proc scan without error.
+        let self_pid = std::process::id();
+        let found = discover_stray_devflow_processes();
+        assert!(
+            !found.iter().any(|p| p.pid == self_pid),
+            "the test binary itself must never be discovered as a stray process"
+        );
     }
 
     #[test]
