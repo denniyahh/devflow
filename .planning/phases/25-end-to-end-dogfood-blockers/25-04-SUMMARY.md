@@ -152,3 +152,7 @@ None - no external service configuration required. `.gitconfig` was deliberately
 ---
 *Phase: 25-end-to-end-dogfood-blockers*
 *Completed: 2026-07-27*
+
+## Self-Check: PASSED
+
+All claimed files verified present (`CONTRIBUTING.md`, `.planning/ROADMAP.md`, `.planning/PROJECT.md`, this SUMMARY.md); all claimed commits (`701a021`, `a376fa0`, `71c9d25`) verified present in `git log`.
