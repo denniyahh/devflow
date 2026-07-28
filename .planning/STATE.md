@@ -2,19 +2,19 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone (open — no fixed closing phase)
-current_phase: 999.1
-current_phase_name: BACKLOG
-status: planning
-stopped_at: "Phases 23 and 24 both complete and merged (develop 40fce19). No active phase — next work is the backlog; highest-priority items are 999.48/DEN-73 (pin the driving binary) and 999.49/DEN-74 (compute_version)."
-last_updated: "2026-07-27T10:40:00.000Z"
-last_activity: 2026-07-27
-last_activity_desc: "Phases 23 and 24 complete; no active phase (phase.complete advanced to 24, corrected — 24 was already complete)"
+current_phase: 25
+current_phase_name: end-to-end-dogfood-blockers
+status: "Phase 25 shipped and merged — PR #47 → develop"
+stopped_at: Phase 25 SHIPPED AND MERGED — PR #47 merged to develop 2026-07-28 (merge commit 5b39f0c, operator-approved); verified 10/10, threats_open 0, ledger 0 open. Unreleased: develop→main sync PR not yet opened.
+last_updated: "2026-07-28T21:38:22.575Z"
+last_activity: 2026-07-28
 progress:
-  total_phases: 13
-  completed_phases: 13
-  total_plans: 94
-  completed_plans: 94
+  total_phases: 14
+  completed_phases: 14
+  total_plans: 112
+  completed_plans: 112
   percent: 100
+last_activity_desc: Phase 25 complete (10/10 verified, ledger 0 open). NOT advanced to 999.1 — phase.complete's next-phase detection again picked up the 999.1 backlog heading as if sequential (same bug corrected after Phase 20, recorded in the history log below). Backlog items require /gsd-review-backlog promotion.
 ---
 
 # DevFlow — Project State
@@ -86,9 +86,54 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 24 — `release --check` Signing-Key Inline Classification
+Phase: 999.1 — Hermes Support (BACKLOG)
 Plan: Not started
-Status: Ready to plan
+Tasks 1-3 done, both human sign-offs recorded in 25-13-SUMMARY.md; 25-14/25-15/25-16
+planned 2026-07-28 as gap-closure round 3, not yet executed)
+Status: Phase 25 shipped — PR #47
+
+**25-10 → 25-13 (2026-07-28):** GAP 1 (25-08) and GAP 2 (25-09) closed and merged. GAP 3
+(truth 7, 25e / 999.47) moved through three states this run: `PRESENT_BEHAVIOR_UNVERIFIED`
+(25-VERIFICATION.md) → `reproduced` by 25-10's Step A push, rejected 2/2 by the `pre-push`
+hook on `commands::tests::gate_sweep_reap_strays_dry_run_discovers_a_real_stray_without_signalling`
+(`commands.rs:3678`, `25-CI-OBSERVATION.md`) → the defect class closed by construction (25-11's
+measured `25-SITE-CENSUS.md` + exec-visibility barrier at all 6 vulnerable/vacuous-negative
+sites; 25-12's `agent::STRAY_MIN_AGE` production age floor) → **`no_reproduction across 11
+observations`** (25-13's `25-CI-TRIALS.md`): 6 local `scripts/check-in-container.sh all`
+push-gate observations (5 standalone + the `pre-push` hook's own 6th) and 5 serialized,
+completed CI `Test`-job trials, all green, all at `tested_head_sha`
+`82328b31eb5cbb8d795bc86f048b2602904dc8f4`.
+
+`origin/feature/phase-25` advanced off `a5a068f` through the real `pre-push` gate to
+`tested_head_sha` (75 previously-local-only commits pushed), and will advance again to
+`evidence_commit_sha` once this STATE.md commit and `25-CI-TRIALS.md`'s artifact commit are
+pushed. `25-10-PLAN.md` is `status: superseded`, `superseded_by: "25-13"` — it will never
+have a `25-10-SUMMARY.md`.
+
+**`no_reproduction` is not a closure claim — and it still isn't, after sign-off.**
+`25-CI-TRIALS.md`'s `status` field remains `no_reproduction`; Task 3's human sign-off is
+recorded as a decision layered on top of that artifact, not an edit to it. Task 3's two
+required responses (Part A: 25e evidence; Part B: 25f's three `25-VALIDATION.md` rows) were
+both recorded verbatim, dated 2026-07-28, in `25-13-SUMMARY.md`.
+
+**Part A resolution:** the human asked whether the observation shape could move from local
+push-gate to GitHub CI; declined (source change, voids the `tested_head_sha` streak, CI is the
+less sensitive instrument per `## Limits of this evidence` point 3), so the human's stated
+pre-authorised approval applied. **Truth 7 (999.47/DEN-72) is recorded as human-verified
+against `25-CI-TRIALS.md`'s evidence, residuals stated — not proven absent.** A backlog
+follow-up was surfaced (a single native-2-vCPU CI job running `scripts/check.sh all`, to
+convert the local observation into a standing per-push guard) but not implemented here.
+**Part B:** approved, with the orchestrator's independent per-row corroboration recorded
+alongside as corroboration only.
+
+Full evidence: `.planning/phases/25-end-to-end-dogfood-blockers/25-CI-OBSERVATION.md` (the
+2/2 reproduction), `.planning/phases/25-end-to-end-dogfood-blockers/25-CI-TRIALS.md` (the
+11-observation no-reproduction streak), and
+`.planning/phases/25-end-to-end-dogfood-blockers/25-13-SUMMARY.md` (both verbatim sign-offs).
+
+**Next action:** plan-level gap-closure work for Phase 25 is complete (25-08, 25-09, 25-11,
+25-12, 25-13; 25-10 superseded). Remaining work is phase-level verification and closure —
+owned by the orchestrator, not this plan.
 
 **23-15 result (second acceptance attempt, 2026-07-26):** `devflow start --phase 24 --agent claude --mode auto --yes-ship` was blocked at launch by the self-dogfood staleness hard block (D-18) — the binary's embedded commit (`0c9dcfe`, built from `feature/phase-23`) and `origin/develop`'s tip (`0dad20d`) are mutually non-ancestors (genuine divergence, confirmed via `git merge-base --is-ancestor` both directions, exit 1 each way), so the block fired before Define ever launched. No `workflow_shipped` event exists for phase 24; `devflow evidence --phase 24 --require-shipped` exits 1 both pre- and post-run — unchanged. See `.planning/phases/23-end-to-end-dogfood/23-ACCEPTANCE-RUN-2.md`.
 
@@ -106,11 +151,11 @@ Scope boundary: 23-16 is the **fix only** (change + regression tests + PR into `
 
 **Recovery-ref disposition:** both `origin` refs (`recovery/pre-23-11-acceptance-e0f87c2`, `recovery/pre-23-15-acceptance-0dad20d`) remain untouched on `origin`; the local copy of the pre-23-11 ref, deleted again by `devflow cleanup`, is deliberately NOT restored (per `23-FINDINGS.md` §B2a); the pre-23-15 ref is now unused (no merge to undo) but retained on `origin` for reuse by the 23-16 retry rather than deleted.
 
-Last activity: 2026-07-27 — Phase 23 complete, transitioned to Phase 24
+Last activity: 2026-07-28
 
 **Note on the "Plan: 2 of 15" value this replaces:** `gsd-tools state advance-plan` only increments whatever value is already in this field, which had drifted to "2 of 15" (the parallel-worktree waves 23-01…23-09 deliberately never touch STATE.md, and this field was last corrected against reality at "10 of 11 plans complete" before the plan count grew to 15 with the gap-closure plans 23-12…23-15). Corrected directly to "13 of 15" to match reality (23-12 and 23-13 both now executed) rather than trust the tool's naive +1 increment from a stale base.
 
-Progress: [██████████] 99% (15 of 15 plans executed — plan-count only; the phase's behavioural acceptance goal is UNMET and requires plan 23-16 to close)
+Progress: [██████████] 100% (15 of 15 plans executed — plan-count only; the phase's behavioural acceptance goal is UNMET and requires plan 23-16 to close)
 
 *(Machine-readable fields for `gsd-tools state begin-phase` / `advance-plan` —
 this project historically tracked position only in the narrative "Active
@@ -706,6 +751,9 @@ None currently open for Phase 17.
 - [Phase ?]: 24-01: raw inline signingkey allowlist kept to exactly ssh- (D-03), not widened to ecdsa-/sk- as 20-REVIEW.md IN-01 had proposed
 - [Phase ?]: 24-02: RED evidence captured via controlled git show/checkout HEAD -- file overwrite instead of git stash push/pop, since the target file was already committed (not locally modified) and stash pop in that state risks silently applying a sibling worktree's leftover WIP
 - [Phase ?]: 24-02: derived redaction assertions from the generated key's own whitespace tokens (base64 body, comment) rather than only the whole blob, per D-08's whole-or-in-part requirement
+- [Phase ?]: Plan 25-10 superseded (not re-run) — its 'structurally removed' premise was falsified by 25-CI-OBSERVATION.md
+- [Phase ?]: Human declined to substitute CI-shape for local push-gate observation in 25e evidence — CI's Test job lacks the taskset pin and fmt->clippy->test ordering that produced the 2/2 reproduction; conditional pre-authorised approval of truth 7 applied instead
+- [Phase ?]: Truth 7 (999.47/DEN-72) recorded as human-verified against 25-CI-TRIALS.md's 11-observation evidence, residuals stated — not upgraded to a closure claim; 25-VALIDATION.md rows 1-3 (25f) human-approved
 
 ## Roadmap Evolution
 
@@ -778,9 +826,10 @@ None currently open for Phase 17.
 | Phase 23 P15 | 17min | 3 tasks | 1 files |
 | Phase 24 P01 | 7min | 2 tasks | 1 files |
 | Phase 24 P02 | 8min | 2 tasks | 1 files |
+| Phase 25 P13 | ~30min automated + human review turnaround | 3 tasks | 6 files |
 
 ## Session
 
-**Last session:** 2026-07-27T09:24:44.919Z
-**Stopped at:** Completed 24-02-PLAN.md
+**Last session:** 2026-07-28T15:54:05.268Z
+**Stopped at:** Completed 25-13-PLAN.md (human sign-off recorded, both parts approved)
 **Resume file:** None

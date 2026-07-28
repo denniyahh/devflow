@@ -252,10 +252,26 @@ through a PR.
    `release: vX.Y.Z — <short description>`.
 4. Once CI is green, squash-merge it (this repo's branch settings only
    allow squash merges into `main` — real merge commits are disabled).
-5. Tag the resulting commit on `main`: `git tag -s vX.Y.Z <commit> -m "..."`,
-   then `git push origin vX.Y.Z`. Use `-s`, not `-a`: releases are
-   SSH-signed, and a repo-local `tag.gpgsign=false` means `-a` alone will
-   not sign. Verify with `git tag -v vX.Y.Z`.
+5. Tag the resulting commit on `main` with the maintainer key, using the same
+   explicit key-selection form documented in [§ Release
+   signing](#release-signing) — never a bare `git tag -s`, which signs with
+   whatever `user.signingkey` happens to be on the machine running it (the
+   agent's, on a machine where the agent works):
+
+   ```bash
+   git -c user.signingkey="$(git config --get devflow.releaseSigningKey)" \
+       tag -s vX.Y.Z <commit> -m "vX.Y.Z"
+   git push origin vX.Y.Z
+   ```
+
+   Use `-s` with the explicit key selection, not `-a`: signing is already on
+   by repository policy (`.gitconfig`'s `[tag] gpgsign = true`), so the risk
+   here is not an unsigned tag but a tag signed with the *wrong* key — one
+   that looks correct in `git log`, `git tag -v`'s signer line, and GitHub's
+   "Verified" badge, because both keys share the same `user.email`. Only the
+   key fingerprint differs, which is why `scripts/hooks/pre-push` compares
+   fingerprints rather than trusting the signer string. Verify with
+   `git tag -v vX.Y.Z`.
 6. **Immediately run `scripts/sync-main-to-develop.sh`** from a clean
    `develop` checkout. It produces a merge commit locally; because `develop`
    is protected you cannot push it directly — put it on a `sync/` branch and
@@ -264,6 +280,22 @@ through a PR.
    > **The sync PR must be merged with a merge commit, NOT squashed.**
    > Squashing collapses the two parents into one and discards the ancestry
    > link, which is the entire point of the step.
+   >
+   > **Do not use auto-merge on this PR.** It defaults to squash, which is
+   > exactly how the v2.0.0 sync failed on 2026-07-27 — the PR merged, the
+   > link was destroyed, and a second PR was needed to repair it. Use the
+   > **"Create a merge commit"** button explicitly. This is not a repository
+   > restriction to work around: `allow_merge_commit` is `true` and the
+   > `develop` ruleset permits `["merge","squash"]`; auto-merge simply does
+   > not pick the one this step requires.
+
+   Confirm the step actually worked — a squashed sync looks successful:
+
+   ```bash
+   git merge-base --is-ancestor origin/main origin/develop && echo OK
+   ```
+
+   If that prints nothing, the link was not created and the sync must be redone.
 
 7. Create a GitHub Release for the tag (convention since v1.7.0, and how the
    CHANGELOG section reaches users who don't read the repo).

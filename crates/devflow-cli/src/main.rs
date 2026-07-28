@@ -383,9 +383,27 @@ enum GateCmd {
         #[arg(long)]
         dry_run: bool,
         /// Restrict the sweep to one project root instead of every root
-        /// this machine has registered (`registry::load_roots`).
+        /// this machine has registered (`registry::load_roots`). Does NOT
+        /// scope `--reap-strays`: that pass is machine-wide by construction
+        /// (a stray has no project root to scope by), and the
+        /// reachability safety filter it uses is likewise always
+        /// machine-wide regardless of this flag (CR-01, 25-15).
         #[arg(long)]
         root: Option<PathBuf>,
+        /// Also discover and clear devflow processes shaped like a monitor
+        /// wrapper or an `advance` child (999.44), by scanning the OS
+        /// process table directly rather than trusting a lock file the
+        /// process itself wrote. Matches only two structural argv shapes,
+        /// owned by the calling user, older than the minimum age, and NOT
+        /// named by any registered root's state file or lock file (CR-01,
+        /// 25-15) — a pid a live registry entry still reaches is never
+        /// touched. Discovery itself stays registry-independent, so this
+        /// still catches a process whose project root no longer exists on
+        /// disk (`devflow stop`/the default sweep above cannot see
+        /// either). Off by default: preview with `--dry-run` before
+        /// authorising it for real.
+        #[arg(long)]
+        reap_strays: bool,
     },
 }
 
@@ -513,7 +531,8 @@ fn run() -> Result<(), CliError> {
                 max_age_secs,
                 dry_run,
                 root,
-            } => gate_sweep(max_age_secs, dry_run, root),
+                reap_strays,
+            } => gate_sweep(max_age_secs, dry_run, root, reap_strays),
         },
         Command::Logs {
             phase,

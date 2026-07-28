@@ -61,6 +61,19 @@ mid-run crash or kill.
   signing viability) (20d), `devflow ship --phase N [--force]` manual
   override reusing `finish_workflow` when the monitor is dead (20e) — Phase
   20, v1.7.0
+- ✓ End-to-end dogfood blockers: `compute_version` derives from the highest
+  *reachable* semver tag plus conventional-commit classification and refuses on
+  an unreachable baseline (25c), a major bump opens a human gate and never
+  ships unattended, `enforce_build_staleness` is adjudicated once at `start`
+  rather than per stage (25b), `ensure_base_ref_current` repairs a stale base
+  via a compare-and-swap `git update-ref` behind a repository-wide
+  checked-out predicate (25a), `doctor` / `gate sweep --reap-strays` filter the
+  structural `/proc` census against a machine-wide registry-reachable pid set
+  so a live registered monitor can no longer be reported or SIGKILLed as an
+  orphan (25d), the 999.47 cmdline-inheritance CI flake is closed under an
+  11-observation streak with human sign-off (25e), and CONTRIBUTING.md's
+  release procedure no longer drifts from what 25c implements (25f) — Phase 25,
+  verified 10/10, unreleased
 
 ### Active
 
@@ -114,9 +127,14 @@ items require `/gsd-review-backlog` promotion.)*
   network deps).
 - **Runtime**: `git` required; no `tmux` dependency since Phase 11.
 - **Build**: `cargo build --release` → single static binary (~20MB).
-- **Versioning**: hybrid git-based SemVer via `version.rs` — do not
-  reintroduce commit-message-based versioning (deprecated, reorganized June
-  2026).
+- **Versioning**: git-derived SemVer via `version.rs` — the version derives
+  from the highest reachable semver tag (ancestry-checked, semver-ordered,
+  never `git describe`) plus the conventional-commit intent of the commits
+  added since that baseline was released. The version file (`Cargo.toml`) is
+  a derived **output** that `VersionBump` writes, not an input `compute_version`
+  reads. A major bump opens a human gate inside preflight and never ships
+  unattended. (Phase 25, D-06/D-07/D-09/D-11 — supersedes the June 2026
+  commit-message-derivation ban, lifted 2026-07-27.)
 
 ## Key Decisions
 
@@ -142,6 +160,8 @@ items require `/gsd-review-backlog` promotion.)*
 | `.planning/CONCERNS.md` | Top findings from the original pre-Phase-1 codebase audit |
 
 ---
-*Last updated: 2026-07-24 after Phase 21 (Operator Legibility & Observability)
-shipped as v1.8.0 — 4/4 plans, verified 21/21, signed tag + GitHub Release
-published; the v2.0.0 milestone stays open (no fixed closing phase)*
+*Last updated: 2026-07-28 after Phase 25 (End-to-End Dogfood Blockers)
+completed — 18/19 plans (25-10 superseded by 25-13), verified 10/10 across five
+gap-closure rounds, broken-windows ledger at 0 open / 1 waived / 4 fixed. Not
+yet shipped: the work sits on `feature/phase-25`, unreleased. The v2.0.0
+milestone stays open (no fixed closing phase)*

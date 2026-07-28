@@ -285,3 +285,279 @@ pub(crate) fn stage_launched_count(root: &Path, phase: u32) -> usize {
         })
         .count()
 }
+
+/// The single reap mechanism: escalate through `terminate_and_verify`
+/// (bounded TERM-then-KILL — 999.44 measured 15 of 15 orphaned monitor
+/// wrappers surviving a bare `SIGTERM` against this exact process shape, so
+/// an unescalated signal would leave the leak in place while appearing to
+/// fix it), then return a VERIFIED liveness answer.
+///
+/// Asserts nothing and panics on no path — the caller decides what a `false`
+/// means. This matters because one of its two callers
+/// ([`ReapMonitorOnDrop::drop`]) may run during a stack unwind, where a
+/// panic would call `abort()` and kill the whole test binary instead of
+/// merely failing the one test in flight.
+fn reap_monitor_pid(pid: u32) -> bool {
+    devflow_core::agent::terminate_and_verify(
+        pid,
+        devflow_core::agent::TERMINATE_VERIFY_WAIT,
+        devflow_core::agent::TERMINATE_VERIFY_POLL,
+    );
+    !devflow_core::agent::agent_running(pid)
+}
+
+/// Reap the detached monitor wrapper a real `launch_stage_inner` call just
+/// spawned, verifying its death rather than assuming it (WR-03, 999.46).
+///
+/// This plain-call form runs ONLY if every preceding statement in its caller
+/// returned normally — a panic anywhere between the launch and this call
+/// skips it entirely, since Rust abandons the remaining statements of a
+/// function the moment a panic begins unwinding. [`ReapMonitorOnDrop`] is
+/// therefore the default for any test with assertions between the launch and
+/// teardown; this function is for the narrow case where a guard cannot be
+/// bound. Its only caller after G-25-2 (25-17) is
+/// `tests::trailing_reap_call_is_skipped_when_a_later_assertion_panics`,
+/// which exists precisely to demonstrate this failure mode.
+///
+/// Any test that drives a real `launch_stage_inner` causes it to spawn a
+/// detached monitor wrapper (`monitor::spawn_monitor`) that is DESIGNED to
+/// outlive the call that spawned it — that is exactly what lets a real
+/// `devflow start` invocation return while the monitor keeps watching the
+/// agent. A test that drives the same call path gets the same detached
+/// wrapper, and since nothing else in a test's lifetime ever signals it, the
+/// TEST is the only thing that ever could — so the test owns reaping it.
+///
+/// The pid to reap comes from `state.monitor_pid` on the same `&mut State`
+/// the caller handed to `launch_stage_inner` — the only on-disk-free handle a
+/// test has on what it just caused to exist (`pipeline_launch.rs` writes the
+/// spawned pid there immediately after `monitor::spawn_monitor` returns).
+/// This function never scans `/proc`, never guesses, and never signals a pid
+/// it did not read from that same handle.
+///
+/// Must be called BEFORE the caller's `TempDir` guard drops — reaping after
+/// the project root has already been deleted is 999.44's reproduction shape
+/// with extra steps, not a fix for it.
+///
+/// Tolerates `state.monitor_pid == None` by returning quietly, with no
+/// `unwrap`, no `expect` and no panic: an early-failing `launch_stage_inner`
+/// clears the field before any fallible step (`pipeline_launch.rs:70`), and a
+/// teardown helper that panics on that path would mask the launch's own
+/// failure rather than merely fail to clean up after it.
+pub(crate) fn reap_spawned_monitor(state: &State) {
+    let Some(pid) = state.monitor_pid else {
+        return;
+    };
+    assert!(
+        reap_monitor_pid(pid),
+        "monitor wrapper pid {pid}, spawned by this test's own launch_stage_inner call, must be \
+         verified dead after reaping — not merely assumed dead"
+    );
+}
+
+/// RAII guard that reaps a spawned monitor wrapper on EVERY exit path of the
+/// scope it is bound in — including a path on which a later assertion
+/// panics. This is the fix for G-25-2 / WINDOWS.md item 3: a plain trailing
+/// call to [`reap_spawned_monitor`] only runs on the success path, since Rust
+/// abandons the rest of a function's statements the instant a panic begins
+/// unwinding, so it is the language's own `Drop` guarantee — not a call
+/// ordering convention — that makes the reap unconditional.
+pub(crate) struct ReapMonitorOnDrop {
+    pid: Option<u32>,
+}
+
+impl ReapMonitorOnDrop {
+    /// Capture `state.monitor_pid` BY VALUE, not `&'a State`.
+    ///
+    /// By value: at every call site this guard is bound strictly AFTER the
+    /// test's final `&mut state` use, so a borrow would not conflict with
+    /// anything at that point — but a `&'a State` guard would still tie the
+    /// guard's lifetime to the `State` binding's own scope, which is exactly
+    /// the kind of incidental coupling a teardown guard should not have. A
+    /// bare `Option<u32>` keeps the guard independent of `State` entirely.
+    ///
+    /// Named `after_launch`, not `new`: bound before the launch call
+    /// returns, it captures `None` and silently does nothing — the
+    /// constructor name carries the ordering requirement to the call site
+    /// rather than leaving it to a doc comment alone.
+    pub(crate) fn after_launch(state: &State) -> Self {
+        Self {
+            pid: state.monitor_pid,
+        }
+    }
+}
+
+impl Drop for ReapMonitorOnDrop {
+    fn drop(&mut self) {
+        let Some(pid) = self.pid else {
+            return;
+        };
+        if !reap_monitor_pid(pid) {
+            // The check below is the double-panic interlock — the ONLY
+            // thing standing between "an assertion failed" and "the whole
+            // test binary aborted". A `Drop` that panics while an unwind is
+            // already in flight calls `abort()`, which would turn one
+            // legible failing assertion into a crashed test binary that
+            // reports nothing about any of the other ~694 tests in the
+            // process. On that path we still attempted the reap above —
+            // only the complaint is downgraded to stderr, since the panic
+            // already in flight is the more informative failure.
+            if std::thread::panicking() {
+                // NOT `eprintln!`: that macro routes through `std::io::_eprint`,
+                // which panics ("failed printing to stderr") if the underlying
+                // write fails. On this branch a panic is already unwinding, so
+                // that second panic would `abort()` — the very outcome the
+                // `panicking()` check exists to avoid. Write directly and
+                // discard the result: if we cannot even report the leak, the
+                // in-flight panic is still the more informative failure.
+                use std::io::Write as _;
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "ReapMonitorOnDrop: monitor wrapper pid {pid} still alive after reap \
+                     during an unwind — not re-panicking because a panic is already in flight"
+                );
+            } else {
+                panic!(
+                    "monitor wrapper pid {pid}, spawned by this test's own launch call, must be \
+                     verified dead after reaping — not merely assumed dead"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use devflow_core::mode::Mode;
+    use devflow_core::state::AgentKind;
+    use std::panic::AssertUnwindSafe;
+    use std::process::Command;
+
+    /// Owns a real, deterministically long-lived child process (`sleep
+    /// 300`) so these tests have a subject whose liveness is a deterministic
+    /// question. WR-05 established that the stubbed agent wrapper's own
+    /// exit is a timing accident (the stub exits in under a millisecond and
+    /// its trailing `devflow advance` resolves to the test binary, which
+    /// rejects the argument shape and exits immediately) — "is it still
+    /// alive?" would not reliably discriminate anything against it. It must
+    /// be deterministic here, or neither test below proves what it claims
+    /// to.
+    ///
+    /// `Drop` kills then waits, ignoring both results and panicking on no
+    /// path: these tests police process leaks and must not leave a zombie
+    /// of their own behind.
+    struct ChildGuard(std::process::Child);
+
+    impl ChildGuard {
+        fn spawn() -> Self {
+            Self(
+                Command::new("sleep")
+                    .arg("300")
+                    .spawn()
+                    .expect("sleep must be spawnable to run this test"),
+            )
+        }
+
+        fn pid(&self) -> u32 {
+            self.0.id()
+        }
+    }
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// A `State` whose only relevant field is `monitor_pid`. No I/O occurs —
+    /// the project root is never read, since nothing in the reap path
+    /// touches disk.
+    fn state_holding(pid: u32) -> State {
+        let mut state = State::new(
+            0,
+            AgentKind::Claude,
+            Mode::Auto,
+            PathBuf::from("/nonexistent"),
+        );
+        state.monitor_pid = Some(pid);
+        state
+    }
+
+    /// Proves the guard reaps during a REAL unwind: bind it inside a closure
+    /// whose body then fails an assertion, and confirm the subject is dead
+    /// after `catch_unwind` returns `Err`.
+    ///
+    /// `cargo test` captures the resulting panic output and prints it only
+    /// for a FAILING test, so a passing run here is quiet — no panic hook is
+    /// installed (installing one would be process-global and would swallow
+    /// output from unrelated tests running in parallel).
+    #[test]
+    fn reap_guard_reaps_the_monitor_when_a_later_assertion_panics() {
+        let child = ChildGuard::spawn();
+        let pid = child.pid();
+        let state = state_holding(pid);
+
+        assert!(
+            devflow_core::agent::agent_running(pid),
+            "precondition: a test whose subject is already dead proves nothing"
+        );
+
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
+            assert_eq!(
+                std::hint::black_box(1_u32),
+                2,
+                "deliberate failing assertion"
+            );
+        }));
+
+        assert!(result.is_err(), "the closure must have panicked");
+        assert!(
+            !devflow_core::agent::agent_running(pid),
+            "the guard did not reap the monitor during the unwind"
+        );
+    }
+
+    /// CONTROL: identical setup, but the closure calls the plain trailing
+    /// helper AFTER a failing assertion instead of binding the guard. Proves
+    /// the pair discriminates rather than being vacuous — a trailing
+    /// statement cannot run during an unwind, so the subject here must
+    /// still be ALIVE after `catch_unwind` returns `Err`, unlike the test
+    /// above.
+    ///
+    /// The outer `ReapMonitorOnDrop` is this test's OWN unwind-safe cleanup
+    /// (bound before the closure so it drops after it, killing the survivor
+    /// the control just proved the trailing call could not reach); declaring
+    /// `ChildGuard` before it means drop order is closure-locals, then the
+    /// outer guard (kills), then `ChildGuard` (waits, clearing the zombie).
+    #[test]
+    fn trailing_reap_call_is_skipped_when_a_later_assertion_panics() {
+        let child = ChildGuard::spawn();
+        let pid = child.pid();
+        let state = state_holding(pid);
+
+        assert!(
+            devflow_core::agent::agent_running(pid),
+            "precondition: a test whose subject is already dead proves nothing"
+        );
+
+        let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
+
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            assert_eq!(
+                std::hint::black_box(1_u32),
+                2,
+                "deliberate failing assertion"
+            );
+            reap_spawned_monitor(&state);
+        }));
+
+        assert!(result.is_err(), "the closure must have panicked");
+        assert!(
+            devflow_core::agent::agent_running(pid),
+            "this proves the trailing call form does NOT run during an unwind — the reason the \
+             guard test above is not vacuous"
+        );
+    }
+}
