@@ -40,7 +40,7 @@ DEN-50 (release-cut executor), 999.15/DEN-40, 999.21/DEN-46, 999.4/DEN-29,
 
 ### Scope corrections — the ROADMAP entry is wrong in two places
 
-- **D-01 (corrects the ROADMAP's 25b sizing rationale):** The entry states that
+- **D-01 [informational] (corrects the ROADMAP's 25b sizing rationale):** The entry states that
   `launch_stage`'s `archived_stage: Option<Stage>` parameter already
   distinguishes fresh start from transition, so the fix is
   `if archived_stage.is_none() { enforce_build_staleness(…)?; }`. **It does
