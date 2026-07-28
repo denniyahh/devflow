@@ -611,14 +611,26 @@ fn major_bump_check_applies(stage: Stage) -> bool {
 /// (T-25-52), since commit subjects are attacker-influenced text and this
 /// reason reaches a persisted gate file and operator output. It contains no
 /// absolute filesystem path (WR-02).
+///
+/// CR-02 (`25-REVIEW.md`, 25-08): classification runs against
+/// `execution_root = state.worktree_path.as_deref().unwrap_or(project_root)`
+/// — the phase's worktree when `state.worktree_path` is set, else
+/// `project_root` — exactly the idiom `staleness.rs::enforce_build_staleness`
+/// established for the identical distinction. In `devflow start`'s default
+/// (worktree) execution mode, the phase's own commits live only on the
+/// worktree's feature branch and are unreachable from `project_root`'s HEAD
+/// until `hooks_after_ship`'s Merge step, which runs AFTER this preflight —
+/// evaluating against `project_root` alone would make a `feat!:` commit
+/// invisible to this gate.
 fn preflight_major_bump_check(project_root: &Path, state: &State) -> Result<(), String> {
     if !major_bump_check_applies(state.stage) {
         return Ok(());
     }
+    let execution_root = state.worktree_path.as_deref().unwrap_or(project_root);
 
-    let highest = version::highest_semver_tag(project_root).map_err(|err| err.to_string())?;
+    let highest = version::highest_semver_tag(execution_root).map_err(|err| err.to_string())?;
     let baseline =
-        version::reachable_semver_baseline(project_root).map_err(|err| err.to_string())?;
+        version::reachable_semver_baseline(execution_root).map_err(|err| err.to_string())?;
 
     // D-10: refuse rather than proceed when the true highest tag exists but
     // is not reachable from HEAD — mirrors `compute_version`'s own refusal
@@ -640,12 +652,12 @@ fn preflight_major_bump_check(project_root: &Path, state: &State) -> Result<(), 
     let baseline_tag = baseline.as_ref().map(|tag| format!("v{tag}"));
     let range_start = match &baseline_tag {
         Some(tag) => {
-            version::release_range_start(project_root, tag).map_err(|err| err.to_string())?
+            version::release_range_start(execution_root, tag).map_err(|err| err.to_string())?
         }
         None => String::new(),
     };
-    let bump =
-        version::classify_range_bump(project_root, &range_start).map_err(|err| err.to_string())?;
+    let bump = version::classify_range_bump(execution_root, &range_start)
+        .map_err(|err| err.to_string())?;
 
     if bump != version::Bump::Major {
         return Ok(());
@@ -654,7 +666,7 @@ fn preflight_major_bump_check(project_root: &Path, state: &State) -> Result<(), 
     let baseline_display = baseline_tag.as_deref().unwrap_or("(none)").to_string();
     let baseline_major = baseline.as_ref().map(|v| v.major).unwrap_or(0);
     let resulting_major = baseline_major + 1;
-    let subjects = breaking_commit_subjects(project_root, &range_start);
+    let subjects = breaking_commit_subjects(execution_root, &range_start);
     let subjects_display = if subjects.is_empty() {
         String::new()
     } else {
@@ -675,7 +687,11 @@ fn preflight_major_bump_check(project_root: &Path, state: &State) -> Result<(), 
 /// failure or non-zero exit yields an empty list rather than propagating an
 /// error — this is a diagnostic aid for the message, not part of the
 /// classification itself.
-fn breaking_commit_subjects(project_root: &Path, range_start: &str) -> Vec<String> {
+///
+/// CR-02 (25-08): `execution_root` (the phase's worktree when set, else
+/// `project_root`) — see [`preflight_major_bump_check`]'s doc comment — so
+/// this diagnostic scan agrees with the classification it explains.
+fn breaking_commit_subjects(execution_root: &Path, range_start: &str) -> Vec<String> {
     let range = if range_start.is_empty() {
         "HEAD".to_string()
     } else {
@@ -683,7 +699,7 @@ fn breaking_commit_subjects(project_root: &Path, range_start: &str) -> Vec<Strin
     };
     let Ok(output) = std::process::Command::new("git")
         .args(["log", "--no-merges", &range, "--format=%H%x1f%B%x1e"])
-        .current_dir(project_root)
+        .current_dir(execution_root)
         .output()
     else {
         return Vec::new();
