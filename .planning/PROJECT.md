@@ -114,9 +114,14 @@ items require `/gsd-review-backlog` promotion.)*
   network deps).
 - **Runtime**: `git` required; no `tmux` dependency since Phase 11.
 - **Build**: `cargo build --release` → single static binary (~20MB).
-- **Versioning**: hybrid git-based SemVer via `version.rs` — do not
-  reintroduce commit-message-based versioning (deprecated, reorganized June
-  2026).
+- **Versioning**: git-derived SemVer via `version.rs` — the version derives
+  from the highest reachable semver tag (ancestry-checked, semver-ordered,
+  never `git describe`) plus the conventional-commit intent of the commits
+  added since that baseline was released. The version file (`Cargo.toml`) is
+  a derived **output** that `VersionBump` writes, not an input `compute_version`
+  reads. A major bump opens a human gate inside preflight and never ships
+  unattended. (Phase 25, D-06/D-07/D-09/D-11 — supersedes the June 2026
+  commit-message-derivation ban, lifted 2026-07-27.)
 
 ## Key Decisions
 
