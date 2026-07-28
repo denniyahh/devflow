@@ -79,6 +79,85 @@ pub fn terminate(pid: u32) -> bool {
     pid > 0 && unsafe { libc::kill(pid, libc::SIGTERM) == 0 }
 }
 
+/// Default bounded wait for [`terminate_and_verify`]'s escalation to
+/// `SIGKILL`. A few seconds is long enough for a well-behaved process to
+/// shut down after `SIGTERM`, short enough that an unattended loop is not
+/// stalled indefinitely waiting on one that won't.
+pub const TERMINATE_VERIFY_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Default poll interval while [`terminate_and_verify`] waits for its target
+/// to exit. Callers that need a different ceiling or granularity should pass
+/// their own `wait`/`poll` rather than inventing new constants.
+pub const TERMINATE_VERIFY_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Terminate `pid`, escalating to `SIGKILL` if it has not exited within
+/// `wait`, and return a **verified fact** about whether it is dead —
+/// never an assumption.
+///
+/// Sequence: send one `SIGTERM` via [`terminate`]. If that fails to signal
+/// the process at all (already gone, or the pid is invalid), report whether
+/// it is already dead — "could not signal it" and "already dead" are the
+/// same outcome from the caller's perspective. Otherwise poll
+/// [`agent_running`] at `poll` intervals until `wait` elapses, returning
+/// `true` the moment it reports dead. On expiry, escalate with `SIGKILL` and
+/// return the (inverted) liveness check one final time.
+///
+/// **`SIGKILL` escalation is not optional here.** 999.44's 2026-07-27
+/// measurement found 15 of 15 orphaned monitor wrappers surviving `SIGTERM`
+/// — the wrapper installs `trap cleanup TERM INT`, which evidently does not
+/// fire, most likely because the shell is blocked in `wait` on a child it
+/// can never reap. Per 25-RESEARCH.md Open Question 2 and 999.47's own
+/// recorded lesson, this function deliberately does **not** depend on
+/// explaining that mechanism — the escalation works regardless of *why*
+/// `SIGTERM` alone fails. That is accepted unexplained behaviour this code
+/// defends against, not a root cause this function resolves.
+///
+/// A non-positive `pid`, or one that does not fit `libc::pid_t`, returns
+/// `false` immediately and signals nothing — the same wraparound/group-
+/// signal hazard [`agent_running`] and [`terminate`] already guard against.
+pub fn terminate_and_verify(
+    pid: u32,
+    wait: std::time::Duration,
+    poll: std::time::Duration,
+) -> bool {
+    let Ok(signed) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if signed <= 0 {
+        return false;
+    }
+
+    if !terminate(pid) {
+        // Could not be signalled at all — already dead counts as success.
+        return !agent_running(pid);
+    }
+
+    let term_deadline = std::time::Instant::now() + wait;
+    while std::time::Instant::now() < term_deadline {
+        if !agent_running(pid) {
+            return true;
+        }
+        std::thread::sleep(poll);
+    }
+
+    // TERM alone did not clear it within the bounded wait — escalate.
+    unsafe {
+        libc::kill(signed, libc::SIGKILL);
+    }
+    // SIGKILL is uncatchable but not synchronous: the kernel needs a moment
+    // to actually deliver it, so poll again rather than checking exactly
+    // once — a single immediate check can race the kernel and report a
+    // just-killed process as still alive.
+    let kill_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while std::time::Instant::now() < kill_deadline {
+        if !agent_running(pid) {
+            return true;
+        }
+        std::thread::sleep(poll);
+    }
+    !agent_running(pid)
+}
+
 /// A process's start time — field 22 of `/proc/<pid>/stat`, in clock ticks
 /// since boot.
 ///
@@ -265,6 +344,113 @@ mod tests {
             !status.success(),
             "a SIGTERM'd child must not report a successful exit, got {status:?}"
         );
+    }
+
+    #[test]
+    fn terminate_and_verify_rejects_pid_zero_and_out_of_range_without_signalling() {
+        // Same wraparound/group-signal hazard `terminate` and `agent_running`
+        // already guard against — never send anything for these values.
+        assert!(!terminate_and_verify(
+            0,
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(10)
+        ));
+        assert!(!terminate_and_verify(
+            u32::MAX,
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(10)
+        ));
+        assert!(!terminate_and_verify(
+            i32::MAX as u32 + 1,
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(10)
+        ));
+    }
+
+    #[test]
+    fn terminate_and_verify_returns_true_immediately_for_a_dead_pid() {
+        // A pid essentially never live: `terminate` fails to signal it at
+        // all, so the function must report "already dead" without waiting
+        // out the ceiling.
+        let start = std::time::Instant::now();
+        let cleared = terminate_and_verify(
+            0x7FFF_FFFE,
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(20),
+        );
+        let elapsed = start.elapsed();
+
+        assert!(
+            cleared,
+            "a pid that cannot be signalled at all must count as already cleared"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "must not wait out the full ceiling when the signal itself fails, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn terminate_and_verify_clears_a_normal_child_before_the_wait_elapses() {
+        // `sleep` has no TERM handler installed, so the default disposition
+        // (terminate) applies — it must exit promptly, well before
+        // escalation would ever be needed.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+
+        let start = std::time::Instant::now();
+        let cleared = terminate_and_verify(
+            pid,
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(20),
+        );
+        let elapsed = start.elapsed();
+
+        assert!(cleared, "a TERM-honouring child must be cleared");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "clearing an ordinary child must complete well before the 5s wait \
+             ceiling, took {elapsed:?} (SIGKILL escalation should not have \
+             been needed)"
+        );
+
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn terminate_and_verify_escalates_to_kill_for_a_term_ignoring_child() {
+        // D-17's regression test: a child that installs an empty TERM
+        // handler and then sleeps must still be cleared, via the SIGKILL
+        // escalation, within the bounded wait.
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("trap '' TERM; sleep 30")
+            .spawn()
+            .expect("spawn TERM-ignoring child");
+        let pid = child.id();
+
+        // Give the shell a moment to install its trap before signalling.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let cleared = terminate_and_verify(
+            pid,
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_millis(20),
+        );
+
+        assert!(
+            cleared,
+            "a TERM-ignoring child must still be cleared via SIGKILL escalation"
+        );
+        assert!(
+            !agent_running(pid),
+            "child must be verified dead after escalation, not merely assumed"
+        );
+
+        let _ = child.wait();
     }
 
     #[test]
