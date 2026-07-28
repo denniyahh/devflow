@@ -1439,7 +1439,7 @@ Plans:
 **Priority:** High | **Size:** L (re-sized at plan time, 2026-07-27 — was M) — six units plus 999.38 folded in. 25b, 25e, 25f and 999.38 are genuinely S as filed; 25a is S–M, option chosen at plan review 2026-07-27 (fetch + fast-forward-when-safe, else refuse — see `25-05-PLAN.md` §`<resolved_decision>`, and CONTEXT.md D-17 as amended); **25c is M, not the S this entry states** — it is a full replacement of `compute_version`'s three inputs plus a new preflight gate plus a previously-unflagged consumer at `pipeline_gate.rs:809-840`. No phase split recommended; see `25-01-PLAN.md` § Phase-level notes for the assessment and the seam if one is ever wanted.
 **Requirements**: TBD — promoted from backlog 999.51, 999.48, 999.49, 999.44, 999.47; plus 25f (CONTRIBUTING release-procedure drift, no backlog entry — found 2026-07-27). Tracked by unit identifier (`25a`–`25f`, `999.38`), not by REQ-ID — this project has no `.planning/REQUIREMENTS.md`.
 **Depends on:** Phase 24
-**Plans:** 15/16 plans executed
+**Plans:** 16/18 plans executed
 
 Gap-closure plans (wave numbering restarts at 1 for this run):
 
@@ -1459,6 +1459,13 @@ Gap-closure plans, round 3 — planned 2026-07-28 against `25-VERIFICATION.md`'s
 - [x] 25-16-PLAN.md — WR-03 (folded in, not deferred): the two tests that drive a real `launch_stage_inner` now reap the detached monitor wrapper they spawn, with verified death, via one shared `#[cfg(test)]` helper (`test_support.rs`, `staleness.rs`, `pipeline_launch.rs`) (wave 1)
 
 **Round-3 wave rationale:** all three run in parallel in wave 1. Their file sets were checked against live source at plan time and are disjoint — `preflight.rs` / (`commands.rs`, `main.rs`, `agent.rs`) / (`test_support.rs`, `staleness.rs`, `pipeline_launch.rs`) — so the same-wave zero-file-overlap rule that forced near-serial waves in Phases 18, 19, 21 and in this phase's own rounds 1–2 does not bind here. 25-14 does not touch `commands.rs` because `ensure_base_ref_current`'s signature and its `commands.rs:154` call site are unchanged by construction. **The `scripts/check-in-container.sh all` push-gate run is a phase-level, post-merge step run ONCE after all three merge — not once per worktree**, because several simultaneous `taskset -c 0,1` container runs manufacture the same load-induced flake 25-11/25-12/25-13 closed.
+
+Gap-closure plans, round 4 — planned 2026-07-28 against `25-UAT.md`'s two gaps, both test-only defects in the `devflow` CLI crate (wave numbering restarts at 1 for this run):
+
+- [ ] 25-17-PLAN.md — G-25-2/WR-06: the monitor reap becomes an RAII `Drop` guard (`test_support::ReapMonitorOnDrop`) bound before the panicking assertions at both sites 25-16 fixed, with a double-panic interlock and a discriminating test plus control (`test_support.rs`, `pipeline_launch.rs`, `staleness.rs`) (wave 1)
+- [ ] 25-18-PLAN.md — G-25-1/WR-05: the two `preflight.rs` tests that reach `monitor::spawn_monitor` through `run_preflight`'s `Advance`/`LoopBack` recursion bind the same guard and assert they really spawned; closes `WINDOWS.md` items 1 and 3 (`preflight.rs`, `.planning/WINDOWS.md`) (wave 2)
+
+**Round-4 wave rationale:** the two gaps' file sets are disjoint (`preflight.rs` alone vs `test_support.rs`/`pipeline_launch.rs`/`staleness.rs`), but they are NOT independent. G-25-1's fix must use the guard G-25-2 introduces — wiring a plain trailing `reap_spawned_monitor(&state)` into `preflight.rs` would knowingly reproduce WR-06 in two new places on the same day it was closed in two others. So 25-18 depends on 25-17's API rather than on its files, and runs in wave 2. The guard's exact signature is pinned verbatim in 25-18's `<interfaces>` so its executor needs no cross-plan SUMMARY read, and 25-18 carries a precondition asserting the guard exists before it edits.
 
 **WR-03 disposition (explicit, per the verifier's request):** folded into round 3 as 25-16 rather than deferred. The justification is not tidiness — 25-15's regression test asserts against a live `/proc` census, and the leak replenishes that census's noise on every `cargo test --workspace` run. The verifier's own words: it *"actively degrades confidence in any future CR-01 fix's own test suite until closed."* WR-01 (`version.rs:338-349`) and WR-04 (`commands.rs:3727-3762`) remain Info-severity and are NOT pulled in: `version.rs` is in no round-3 file set, and while 25-15 does edit `commands.rs`, it does not touch WR-04's lines — the reachability filter is interposed before `reap_stray_candidates`, leaving that function and its test untouched.
 
@@ -1519,6 +1526,8 @@ Plans:
 - [x] 25-14-PLAN.md — 25a/CR-02: compare-and-swap fast-forward + repository-wide checked-out predicate (`preflight.rs`) (round-3 wave 1)
 - [x] 25-15-PLAN.md — 25d/CR-01: registry-reachability filter before both stray surfaces, `--root` ruling, corrected wording (`commands.rs`, `main.rs`, `agent.rs`) (round-3 wave 1)
 - [x] 25-16-PLAN.md — WR-03: launch-driving tests reap the monitor they spawn (`test_support.rs`, `staleness.rs`, `pipeline_launch.rs`) (round-3 wave 1)
+- [ ] 25-17-PLAN.md — G-25-2/WR-06: RAII `ReapMonitorOnDrop` guard bound before the panicking assertions, with a double-panic interlock and a discriminating test plus control (`test_support.rs`, `pipeline_launch.rs`, `staleness.rs`) (round-4 wave 1)
+- [ ] 25-18-PLAN.md — G-25-1/WR-05: the two `preflight.rs` recursion tests bind the same guard and assert they really spawned; closes `WINDOWS.md` items 1 and 3 (`preflight.rs`, `.planning/WINDOWS.md`) (round-4 wave 2)
 
 **Wave 1** *(four plans in parallel — disjoint file sets)*
 
