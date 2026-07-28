@@ -1012,8 +1012,38 @@ mod tests {
     /// bare `Ok(Some(1)) => Stale` mapping hard-blocked a fresher build. Found
     /// live: this phase's own Validate stage was blocked by a binary built
     /// from `feature/phase-17` while the checkout sat on `develop`.
+    ///
+    /// (999.38 / D-14, 25-03 Task 3) This test previously drove its fixture
+    /// reads through the production helper `run_git_stdout`, which resolves
+    /// `git` through the ambient PATH — unguarded, this raced this file's
+    /// PATH-mutating tests under concurrent `cargo test --workspace`
+    /// (the same `ENV_MUTEX`/19i flake class three sibling tests in this
+    /// module already guard against, e.g. `embedded_commit_is_stale_uses_
+    /// worktree_head`). Fixed the same way as those siblings: guarded under
+    /// `ENV_MUTEX` so it never runs concurrently with a PATH mutator (this
+    /// is serialization against PATH mutators, not process-global mutation —
+    /// this test never calls `set_var` itself), and every fixture read now
+    /// goes through `devflow_core::test_support::git_command`'s hermetic
+    /// builder (matching the `git(&[...])` closure this test already uses
+    /// for its other fixture calls) instead of the production
+    /// `run_git_stdout` helper.
+    ///
+    /// **Deliberate residual, recorded rather than silently narrowed:**
+    /// 999.38's broader ambition — converting the five PATH-mutating call
+    /// sites in `pipeline_launch.rs`/`pipeline_outcomes.rs`/`preflight.rs`
+    /// from process-global `std::env::set_var` to per-`Command` `env`,
+    /// which would let `ENV_MUTEX` shrink or disappear — is explicitly out
+    /// of this fold-in's scope (D-14: "one pass over one module"). Per
+    /// 25-RESEARCH.md Pitfall 3, the idiom does NOT transfer cleanly to
+    /// `ensure_agent_binary`/`agent_binary_available`, which read
+    /// `std::env::var_os("PATH")` directly with no `Command` to attach to
+    /// and would need a signature change to accept an injected search path.
+    /// That remainder is scoped out on purpose, not missed — see
+    /// `25-03-SUMMARY.md` for re-filing.
     #[test]
     fn ahead_build_from_descendant_commit_warns_instead_of_blocking() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let git = |args: &[&str]| {
@@ -1026,6 +1056,17 @@ mod tests {
                     .success(),
                 "git {args:?} failed"
             );
+        };
+        // 999.38 (D-14): fixture stdout reads, hermetic like `git` above —
+        // never the production `run_git_stdout` helper, which resolves
+        // `git` through the ambient PATH.
+        let git_stdout = |args: &[&str]| -> String {
+            let output = devflow_core::test_support::git_command(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?} failed");
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
         };
         git(&["init", "-q"]);
         git(&["config", "user.email", "t@e.st"]);
@@ -1041,10 +1082,7 @@ mod tests {
         std::fs::write(root.join("a.txt"), "one").unwrap();
         git(&["add", "."]);
         git(&["commit", "-q", "-m", "workspace init"]);
-        let base_commit = run_git_stdout(root, &["rev-parse", "HEAD"])
-            .expect("rev-parse HEAD")
-            .trim()
-            .to_string();
+        let base_commit = git_stdout(&["rev-parse", "HEAD"]);
 
         // The build is made from the LATER commit...
         std::fs::write(root.join("b.txt"), "two").unwrap();
@@ -1055,16 +1093,13 @@ mod tests {
             "-m",
             "newer work the checkout does not have",
         ]);
-        let embedded_commit = run_git_stdout(root, &["rev-parse", "HEAD"])
-            .expect("rev-parse HEAD")
-            .trim()
-            .to_string();
+        let embedded_commit = git_stdout(&["rev-parse", "HEAD"]);
 
         // ...while the checkout is moved BACK, leaving the embedded commit a
         // strict descendant of HEAD on a clean tree (so the mtime arm stays
         // out of it and ancestry is the sole signal).
         git(&["reset", "--hard", "-q", &base_commit]);
-        let status = run_git_stdout(root, &["status", "--porcelain"]).unwrap();
+        let status = git_stdout(&["status", "--porcelain"]);
         assert!(
             status.trim().is_empty(),
             "fixture must have a clean working tree"
