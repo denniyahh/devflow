@@ -18,7 +18,7 @@ use crate::pipeline_gate::print_dry_run;
 use crate::pipeline_launch::{launch_stage, single_active_phase};
 use crate::pipeline_outcomes::render_gate_context;
 use crate::preflight::{agent_program, ensure_agent_binary, ensure_phase_reachable_on_base};
-use crate::staleness::run_git_stdout;
+use crate::staleness::{enforce_build_staleness, run_git_stdout};
 use devflow_core::agent;
 use devflow_core::agent_result;
 use devflow_core::agents;
@@ -216,6 +216,53 @@ pub(crate) fn start(
             }
         }
     }
+
+    // 25b (D-03): the self-dogfood build-staleness gate, hoisted here from
+    // `pipeline_launch::launch_stage_inner` (17d originally placed it there,
+    // re-running it before every stage launch — which meant a phase that
+    // modified DevFlow's own source could never progress past the first
+    // stage boundary once its own diff tripped the guard). Adjudicated
+    // exactly once per run, here, so it evaluates once and the rest of the
+    // pipeline never re-asks the question.
+    //
+    // Placement is load-bearing: this call sits AFTER `state.worktree_path`
+    // is set by the `if worktree { ... }` branch above, so
+    // `enforce_build_staleness` evaluates against the phase's own worktree
+    // HEAD — not the main checkout, which is what would happen if this ran
+    // any earlier. The block message explicitly promises the operator the
+    // check runs against "this phase's WORKTREE HEAD, not the main
+    // checkout"; placing the call above the worktree fork would silently
+    // break that promise.
+    //
+    // Placement is also deliberately BEFORE `workflow::save_state` below: a
+    // refusal here must never leave persisted state behind for a run that
+    // is not going to start (mirroring the same "don't persist a run that
+    // will never launch" reasoning `ensure_agent_binary` and
+    // `ensure_phase_reachable_on_base` already follow earlier in this
+    // function).
+    //
+    // D-04 (accepted trade, recorded here rather than hidden): this hoist
+    // means `pipeline_launch::resume` (used after a rate-limit or infra
+    // pause) no longer re-adjudicates staleness mid-run — a *different*
+    // binary resuming a phase is never re-checked. This is accepted because
+    // the scenario is already forbidden by 999.48's rejected alternatives
+    // and the operator's standing 2026-07-27 position that only validated,
+    // pushed code should ever drive a run. If this trade proves wrong, the
+    // reversal path is a persisted `staleness_pin` field on `State`,
+    // re-checked at resume — not reintroduced here.
+    //
+    // D-05 (not weakened): the check itself is relocated, not removed or
+    // softened. `is_self_dogfood_workspace` still gates the whole module on
+    // this repository's exact workspace shape and is unmodified by this
+    // plan. Neither of 999.48's rejected alternatives — rebuilding the
+    // driving binary mid-run, or a dogfood bypass flag — is introduced here
+    // or anywhere else in this plan's diff.
+    enforce_build_staleness(
+        project_root,
+        &state,
+        env!("DEVFLOW_BUILD_COMMIT"),
+        env!("DEVFLOW_BUILD_DIRTY") == "true",
+    )?;
 
     // WR-11 (13-REVIEW.md), revised: state must be on disk BEFORE the monitor
     // exists. launch_stage spawns the detached monitor, which runs `devflow
