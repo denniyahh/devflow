@@ -3655,6 +3655,87 @@ mod tests {
         let _ = child.wait();
     }
 
+    /// Task 1's whole point (25-12/999.47, production half): a candidate
+    /// caught inside its own `fork()`->`execve()` window is genuinely the
+    /// same process with genuinely the same recorded start time as its
+    /// parent, so `is_same_process` alone cannot refuse it — the age floor
+    /// must. The assertion that actually matters is not the outcome enum
+    /// alone (a `TooYoung` outcome that still signalled would satisfy an
+    /// enum-only check) but that the fixture is still alive afterwards.
+    #[test]
+    fn reap_stray_candidates_refuses_a_candidate_younger_than_the_minimum_age() {
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("trap cleanup TERM INT; sleep 30")
+            .spawn()
+            .expect("spawn monitor-wrapper-shaped fixture");
+        let pid = child.id();
+
+        // 999.47: cross the exec-visibility barrier before building the
+        // candidate from a cmdline-derived census, or this test races the
+        // fixture's own fork()->execve() window (25-11).
+        assert!(
+            devflow_core::test_support::wait_for_exec_visibility(
+                pid,
+                "sh",
+                devflow_core::test_support::EXEC_VISIBILITY_WAIT,
+                devflow_core::test_support::EXEC_VISIBILITY_POLL,
+            ),
+            "pid {pid}: exec visibility timed out before the fixture became discoverable"
+        );
+
+        let candidate = stray_candidate_for(pid, agent::StrayLayer::MonitorWrapper);
+
+        let results = reap_stray_candidates(&[candidate], false, agent::STRAY_MIN_AGE);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].outcome, StrayReapOutcome::TooYoung);
+        assert!(
+            agent::agent_running(pid),
+            "a candidate refused for youth must never actually be signalled"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// The floor is a floor, not a blanket refusal: the same fixture shape
+    /// as the test above, but with the floor disabled, IS reaped — without
+    /// this, the test above would pass equally well against a reaper that
+    /// refused unconditionally.
+    #[test]
+    fn reap_stray_candidates_reaps_when_the_floor_is_zero() {
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("trap cleanup TERM INT; sleep 30")
+            .spawn()
+            .expect("spawn monitor-wrapper-shaped fixture");
+        let pid = child.id();
+
+        assert!(
+            devflow_core::test_support::wait_for_exec_visibility(
+                pid,
+                "sh",
+                devflow_core::test_support::EXEC_VISIBILITY_WAIT,
+                devflow_core::test_support::EXEC_VISIBILITY_POLL,
+            ),
+            "pid {pid}: exec visibility timed out before the fixture became discoverable"
+        );
+
+        let candidate = stray_candidate_for(pid, agent::StrayLayer::MonitorWrapper);
+
+        let results = reap_stray_candidates(&[candidate], false, std::time::Duration::ZERO);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].outcome, StrayReapOutcome::Reaped);
+        assert!(
+            !agent::agent_running(pid),
+            "with the floor disabled, a genuine candidate must still be reaped and verified dead"
+        );
+
+        let _ = child.wait();
+    }
+
     /// Flag wiring, exercised through the real `gate_sweep` entry point.
     /// `--dry-run` is provably safe to run against the live machine (it
     /// never signals anything, no matter what else is discovered) — this

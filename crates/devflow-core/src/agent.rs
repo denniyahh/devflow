@@ -807,4 +807,56 @@ mod tests {
         // false, never true, when identity cannot be confirmed at all.
         assert!(!looks_like_devflow_process(0x7FFF_FFFE));
     }
+
+    // 25-12/999.47 (production half): `process_age`'s own test group. Test
+    // names all begin `process_age_` so the count-based acceptance
+    // criterion (`cargo test agent::tests::process_age` -> `3 passed`)
+    // resolves unambiguously.
+
+    #[test]
+    fn process_age_returns_some_for_the_current_process() {
+        let age = process_age(std::process::id()).expect("this process's own age must resolve");
+        assert!(
+            age > std::time::Duration::ZERO,
+            "a running process must report nonzero age"
+        );
+        assert!(
+            age < std::time::Duration::from_secs(3600),
+            "the test binary has not been running for an hour"
+        );
+    }
+
+    #[test]
+    fn process_age_returns_none_for_a_dead_pid() {
+        // Same guaranteed-not-to-exist pid the fail-closed tests above use.
+        assert_eq!(process_age(0x7FFF_FFFE), None);
+    }
+
+    #[test]
+    fn process_age_is_below_the_floor_for_a_fresh_child_and_grows_monotonically_for_self() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn fixture");
+        let pid = child.id();
+
+        let child_age = process_age(pid).expect("a freshly spawned child's age must resolve");
+        assert!(
+            child_age < STRAY_MIN_AGE,
+            "a process spawned microseconds ago must be younger than the floor"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let self_pid = std::process::id();
+        let first = process_age(self_pid).expect("this process's own age must resolve");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let second = process_age(self_pid)
+            .expect("this process's own age must resolve after the sleep too");
+        assert!(
+            second >= first,
+            "age must grow monotonically across a sleep, never shrink"
+        );
+    }
 }
