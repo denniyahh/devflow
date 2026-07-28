@@ -87,8 +87,9 @@ change earns 2.0.
 ## Current Position
 
 Phase: 25 (end-to-end-dogfood-blockers) — EXECUTING
-Plan: 12 of 13 executed (25-10 superseded, no SUMMARY will exist; 25-13 complete —
-Tasks 1-3 done, both human sign-offs recorded in 25-13-SUMMARY.md)
+Plan: 12 of 16 executed (25-10 superseded, no SUMMARY will exist; 25-13 complete —
+Tasks 1-3 done, both human sign-offs recorded in 25-13-SUMMARY.md; 25-14/25-15/25-16
+planned 2026-07-28 as gap-closure round 3, not yet executed)
 Status: Ready to execute
 
 **25-10 → 25-13 (2026-07-28):** GAP 1 (25-08) and GAP 2 (25-09) closed and merged. GAP 3
