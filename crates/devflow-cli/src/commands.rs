@@ -3720,203 +3720,79 @@ mod tests {
         let _ = child.wait();
     }
 
-    /// Render `/proc/<pid>/cmdline` readably for failure diagnostics: the
-    /// NUL-separated argv joined with ` | `, or a marker when it cannot be
-    /// read. Test-only; never used in a decision, only in a message.
-    fn debug_cmdline(pid: u32) -> String {
-        match std::fs::read(format!("/proc/{pid}/cmdline")) {
-            Ok(raw) if raw.iter().all(|&byte| byte == 0) => "<empty>".to_string(),
-            Ok(raw) => raw
-                .split(|&byte| byte == 0)
-                .filter(|arg| !arg.is_empty())
-                .map(|arg| String::from_utf8_lossy(arg).into_owned())
-                .collect::<Vec<_>>()
-                .join(" | "),
-            Err(err) => format!("<unreadable: {err}>"),
-        }
-    }
-
-    /// Pull the identity-bearing fields out of `/proc/<pid>/status` for
-    /// failure diagnostics. `PPid` is the decisive one: it says whether the
-    /// pid still belongs to the child we spawned or has been recycled by an
-    /// unrelated process. Test-only; never used in a decision.
-    fn debug_proc_status(pid: u32) -> String {
-        match std::fs::read_to_string(format!("/proc/{pid}/status")) {
-            Ok(text) => {
-                let pick = |key: &str| {
-                    text.lines()
-                        .find(|l| l.starts_with(key))
-                        .map(|l| l.split_whitespace().skip(1).collect::<Vec<_>>().join(" "))
-                        .unwrap_or_else(|| "?".to_string())
-                };
-                format!(
-                    "Name={} State={} Pid={} PPid={} Threads={}",
-                    pick("Name:"),
-                    pick("State:"),
-                    pick("Pid:"),
-                    pick("PPid:"),
-                    pick("Threads:")
-                )
-            }
-            Err(err) => format!("<unreadable: {err}>"),
-        }
-    }
-
-    /// Kernel-level view of what a pid is actually *doing*, for 999.47.
-    /// `wchan` names the kernel function it is blocked in; `syscall` gives the
-    /// current syscall number (or `running` when in userspace); `utime`/`stime`
-    /// are CPU tick counters, so sampling twice shows whether it is burning CPU
-    /// (spinning) or making no progress at all (blocked). Test-only.
+    /// Retargeted (999.47/D-13). This test used to spawn a real `sleep`
+    /// child and assert `stop()` refused to signal it, instrumented with
+    /// the now-deprecated `looks_like_devflow_process` predicate and a page
+    /// of `/proc`-forensics helpers built to diagnose a CI flake
+    /// ("MECHANISM CONFIRMED 2026-07-26": between `spawn()` returning and
+    /// the child completing `execve`, its cmdline transiently reads as its
+    /// parent's, which is what made a cmdline-based guard race). It is the
+    /// serious one of 999.47's two tests: in CI it panicked on the error
+    /// expectation, meaning the identity guard passed and `devflow stop`
+    /// sent `SIGTERM` to an unrelated process — the guard's stated purpose
+    /// failing end-to-end, not merely inferred.
     ///
-    /// `syscall` and `stack` need PTRACE_MODE_ATTACH; unreadable is itself a
-    /// datum, so failures are reported rather than hidden.
-    fn debug_proc_runtime(pid: u32) -> String {
-        let read = |what: &str| {
-            std::fs::read_to_string(format!("/proc/{pid}/{what}"))
-                .map(|s| s.trim().to_string())
-                .unwrap_or_else(|e| format!("<unreadable: {e}>"))
-        };
-        // /proc/<pid>/stat: field 3 = state, 14 = utime, 15 = stime, 22 = starttime.
-        // The comm field is parenthesised and may contain spaces, so split after
-        // the final ')' rather than tokenising the whole line.
-        let stat = read("stat");
-        let (state, utime, stime, starttime) = stat
-            .rfind(')')
-            .map(|i| {
-                let rest: Vec<&str> = stat[i + 1..].split_whitespace().collect();
-                let get = |n: usize| rest.get(n).copied().unwrap_or("?").to_string();
-                // rest[0] is field 3 (state), so field N is rest[N - 3].
-                (get(0), get(11), get(12), get(19))
-            })
-            .unwrap_or_else(|| ("?".into(), "?".into(), "?".into(), "?".into()));
-        format!(
-            "state={state} utime={utime} stime={stime} starttime={starttime} \
-             wchan={} syscall={}",
-            read("wchan"),
-            read("syscall"),
-        )
-    }
-
-    /// Task 2 behavior (T-23-52 fail-closed): a lock file naming a live pid
-    /// that does not identify as a devflow process must be refused, never
-    /// signalled. Constructed against this test binary's own pid when its
-    /// exe name doesn't start with `devflow` (cargo names devflow-cli's own
-    /// test binary `devflow-<hash>`, which WOULD look like devflow — so
-    /// this falls back to a spawned `sleep` child in that case).
+    /// The retarget removes the race by construction rather than making it
+    /// rarer: it asserts the `(pid, starttime)` guard `stop_via_lock`
+    /// ACTUALLY uses today (the deprecated predicate is no longer even
+    /// consulted for a decision — the cmdline-based mechanism it embodied
+    /// was superseded before this retarget, and D-13 records that
+    /// tightening it further to a single argv position was considered and
+    /// rejected as ineffective, since the breaking marker sits inside the
+    /// same inherited data). A LEGACY lock file — recording a pid with no
+    /// start time at all, the format every lock file had before identity
+    /// recording existed — must be refused, because identity cannot be
+    /// confirmed for it. Uses this test's own pid, which is genuinely alive
+    /// throughout, so there is no `spawn()` and therefore no `execve` to
+    /// race.
+    ///
+    /// This is one of `stop_via_lock`'s three fail-closed match arms. The
+    /// other two:
+    /// - a recorded start time that no longer matches — covered
+    ///   deterministically, no-spawn, by
+    ///   `stop_refuses_when_the_recorded_start_time_does_not_match` below.
+    /// - the match's final wildcard arm ("the lock file's holder could not
+    ///   be read back for identity confirmation") — NOT exercised by any
+    ///   test in this file. Source analysis: by the time `stop_via_lock`
+    ///   reaches this match, `lock::holder()` has already confirmed this
+    ///   SAME lock file's first line parses as a pid, via the identical
+    ///   `read_holder_pid` helper `lock::holder_identity` calls again
+    ///   moments later over UNCHANGED file content — so `holder_identity`'s
+    ///   `recorded_pid` is guaranteed to equal the pid already in hand, and
+    ///   its `Option<u64>` half is caught by the `Some((_, None))` arm
+    ///   whenever it's absent. The wildcard arm is reachable only if the
+    ///   lock file's content changes between those two sequential reads —
+    ///   a genuine external race that no deterministic black-box test of
+    ///   `stop()` can construct without reintroducing exactly the class of
+    ///   flake this retarget exists to remove. Recorded here rather than
+    ///   faked with a timing-dependent fixture.
     #[test]
     fn stop_refuses_to_signal_a_live_pid_that_fails_the_identity_check() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let phase = 200;
 
-        let self_exe_is_devflow_named = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-            .is_some_and(|name| name.starts_with("devflow"));
-
-        let mut sleeper: Option<std::process::Child> = None;
-        let pid = if self_exe_is_devflow_named {
-            let child = std::process::Command::new("sleep")
-                .arg("30")
-                .spawn()
-                .expect("spawn sleep");
-            let pid = child.id();
-            sleeper = Some(child);
-            pid
-        } else {
-            std::process::id()
-        };
-
+        // Our own pid is genuinely alive throughout — no spawn, so no
+        // execve to race. The lock records ONLY the pid, matching every
+        // lock file written before start times were recorded (999.47).
+        let pid = std::process::id();
         let lock_path = root.join(".devflow").join(format!("lock-{phase:02}"));
         std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
         std::fs::write(&lock_path, pid.to_string()).unwrap();
 
-        // This assertion has failed intermittently in CI (999.47 / DEN-72) in
-        // the FALSE-POSITIVE direction: `stop()` returned Ok, meaning the
-        // identity guard passed for a pid that is not a devflow process and
-        // `devflow stop` went on to signal it. A bare `expect_err` throws away
-        // every artifact that could name the cause, so capture the guard's own
-        // inputs around the call. Not reproducible locally as of 2026-07-26 —
-        // see the backlog entry for the attempts already ruled out.
-        // CI (2026-07-26) showed the child's cmdline equal to this test
-        // binary's own, stably before and after. cmdline alone cannot say
-        // WHY. /proc/<pid>/status disambiguates: PPid tells us whether this
-        // pid is still our child (if not, it was recycled by an unrelated
-        // process), Name is the post-exec binary name, and State reveals a
-        // zombie whose cmdline reads empty.
-        let status_before = debug_proc_status(pid);
-        let cmdline_before = debug_cmdline(pid);
-        // Two samples ~60ms apart: if utime/stime advance the child is
-        // spinning in userspace; if they are static and wchan names a kernel
-        // function it is genuinely blocked. State=R with a static utime would
-        // mean runnable-but-never-scheduled, i.e. starvation.
-        let runtime_1 = debug_proc_runtime(pid);
-        std::thread::sleep(std::time::Duration::from_millis(60));
-        let runtime_2 = debug_proc_runtime(pid);
-        let predicate_verdict = agent::looks_like_devflow_process(pid);
-        let result = stop(root, phase);
-        let cmdline_after = debug_cmdline(pid);
-        let status_after = debug_proc_status(pid);
-        let runtime_3 = debug_proc_runtime(pid);
-        // Did the spawned child already exit before we ever looked at it?
-        let child_exited = sleeper
-            .as_mut()
-            .map(|c| format!("{:?}", c.try_wait()))
-            .unwrap_or_else(|| "<no child spawned>".to_string());
-        let lock_survived = lock_path.exists();
-
-        // Reap before asserting: a panic here must not leak the sleeper for
-        // its full 30s (this repo already has an orphan problem, 999.44/46).
-        if let Some(mut child) = sleeper {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-
-        let err = match result {
-            Err(err) => err,
-            Ok(()) => panic!(
-                "stop() returned Ok — the identity guard PASSED for pid {pid}, so \
-                 `devflow stop` signalled a process that is not devflow.\n\
-                 \x20 branch taken:        {}\n\
-                 \x20 current_exe():       {:?}\n\
-                 \x20 pid under test:      {pid}\n\
-                 \x20 cmdline before stop: {cmdline_before}\n\
-                 \x20 cmdline after stop:  {cmdline_after}\n\
-                 \x20 status before stop:  {status_before}\n\
-                 \x20 status after stop:   {status_after}\n\
-                 \x20 runtime t0:          {runtime_1}\n\
-                 \x20 runtime t0+60ms:     {runtime_2}\n\
-                 \x20 runtime after stop:  {runtime_3}\n\
-                 \x20 child.try_wait():    {child_exited}\n\
-                 \x20 direct predicate:    looks_like_devflow_process({pid}) = {predicate_verdict}\n\
-                 \x20 lock file survived:  {lock_survived}\n\
-                 \x20 test process:        pid {} cmdline {}\n\
-                 KNOWN (999.47): PPid is this process and Name is the forking test \
-                 thread, so the child forks and never exec's, persistently. The open \
-                 question is WHY, and the runtime samples answer it: utime/stime \
-                 ADVANCING across t0 -> t0+60ms means it is spinning in userspace \
-                 (look at `syscall=running`); STATIC with a named `wchan` means it is \
-                 blocked in the kernel (wchan names the function — a futex points at \
-                 a lock inherited across fork); STATIC with state=R and wchan=0 means \
-                 runnable but never scheduled, i.e. starvation, not a deadlock. \
-                 `syscall` gives the syscall number it is stuck in, if any.",
-                if self_exe_is_devflow_named {
-                    "spawned sleep"
-                } else {
-                    "own pid"
-                },
-                std::env::current_exe(),
-                std::process::id(),
-                debug_cmdline(std::process::id()),
-            ),
-        };
+        let err = stop(root, phase)
+            .expect_err("a legacy lock with no recorded start time must be refused");
         let message = err.to_string();
         assert!(
             message.contains(&pid.to_string()),
             "error must name the pid it refused to signal, got: {message}"
         );
         assert!(
-            lock_survived,
+            message.contains("records no start time"),
+            "error must say identity cannot be confirmed for a legacy lock, got: {message}"
+        );
+        assert!(
+            lock_path.exists(),
             "the lock file must be untouched — stop must not signal anything"
         );
     }
