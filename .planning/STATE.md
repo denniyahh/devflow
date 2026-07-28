@@ -2,10 +2,10 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone (open — no fixed closing phase)
-current_phase: 999.1
+current_phase: 25
 current_phase_name: end-to-end-dogfood-blockers
 status: "Phase 25 shipped — PR #47"
-stopped_at: Phase 25 COMPLETE — verified 10/10 after five gap-closure rounds; unshipped on feature/phase-25
+stopped_at: Phase 25 SHIPPED — PR #47 open against develop; verified 10/10, threats_open 0, ledger 0 open
 last_updated: "2026-07-28T21:38:22.575Z"
 last_activity: 2026-07-28
 progress:
