@@ -402,7 +402,16 @@ impl Drop for ReapMonitorOnDrop {
             // only the complaint is downgraded to stderr, since the panic
             // already in flight is the more informative failure.
             if std::thread::panicking() {
-                eprintln!(
+                // NOT `eprintln!`: that macro routes through `std::io::_eprint`,
+                // which panics ("failed printing to stderr") if the underlying
+                // write fails. On this branch a panic is already unwinding, so
+                // that second panic would `abort()` — the very outcome the
+                // `panicking()` check exists to avoid. Write directly and
+                // discard the result: if we cannot even report the leak, the
+                // in-flight panic is still the more informative failure.
+                use std::io::Write as _;
+                let _ = writeln!(
+                    std::io::stderr(),
                     "ReapMonitorOnDrop: monitor wrapper pid {pid} still alive after reap \
                      during an unwind — not re-panicking because a panic is already in flight"
                 );
