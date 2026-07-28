@@ -3603,7 +3603,10 @@ mod tests {
         let pid = child.id();
         let candidate = stray_candidate_for(pid, agent::StrayLayer::MonitorWrapper);
 
-        let results = reap_stray_candidates(&[candidate], true);
+        // 25-12: floor deliberately disabled (Duration::ZERO) — this test
+        // asserts the dry-run signalling behavior, not the age gate,
+        // which Task 1's dedicated process_age tests cover.
+        let results = reap_stray_candidates(&[candidate], true, std::time::Duration::ZERO);
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].outcome, StrayReapOutcome::Reaped);
@@ -3630,7 +3633,10 @@ mod tests {
         let pid = child.id();
         let candidate = stray_candidate_for(pid, agent::StrayLayer::AdvanceChild);
 
-        let results = reap_stray_candidates(&[candidate], false);
+        // 25-12: floor deliberately disabled (Duration::ZERO) — this test
+        // asserts the signalling behavior, not the age gate, which
+        // Task 1's dedicated process_age tests cover.
+        let results = reap_stray_candidates(&[candidate], false, std::time::Duration::ZERO);
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].outcome, StrayReapOutcome::Reaped);
@@ -3659,7 +3665,10 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(100));
         let candidate = stray_candidate_for(pid, agent::StrayLayer::MonitorWrapper);
 
-        let results = reap_stray_candidates(&[candidate], false);
+        // 25-12: floor deliberately disabled (Duration::ZERO) — this test
+        // asserts the SIGKILL escalation behavior, not the age gate,
+        // which Task 1's dedicated process_age tests cover.
+        let results = reap_stray_candidates(&[candidate], false, std::time::Duration::ZERO);
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].outcome, StrayReapOutcome::Reaped);
@@ -3691,7 +3700,10 @@ mod tests {
             layer: agent::StrayLayer::MonitorWrapper,
         };
 
-        let results = reap_stray_candidates(&[mismatched], false);
+        // 25-12: floor deliberately disabled (Duration::ZERO) — this test
+        // asserts the identity re-confirmation, not the age gate, which
+        // Task 1's dedicated process_age tests cover.
+        let results = reap_stray_candidates(&[mismatched], false, std::time::Duration::ZERO);
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].outcome, StrayReapOutcome::IdentityMismatch);
