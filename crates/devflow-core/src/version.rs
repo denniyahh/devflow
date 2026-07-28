@@ -1142,6 +1142,150 @@ mod tests {
     }
 
     #[test]
+    fn unreachable_highest_tag_refuses_rather_than_falling_back() {
+        // D-10: when the highest semver tag overall is not reachable from
+        // HEAD, compute_version must refuse — never silently fall back to
+        // the highest *reachable* tag (which would compute a version below
+        // the real release history, T-25-04).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        commit_msg(root, "a.txt", "chore: init");
+        tag(root, "v1.0.0");
+        let main_branch = current_branch(root);
+
+        git(root, &["checkout", "--orphan", "orphan-release"]);
+        git(root, &["commit", "--allow-empty", "-q", "-m", "chore: orphan"]);
+        tag(root, "v9.9.9");
+        git(root, &["checkout", &main_branch]);
+
+        let err = compute_version(root).unwrap_err();
+        match err {
+            VersionError::UnreachableBaseline { tag } => {
+                assert_eq!(tag, "v9.9.9", "refusal must name the unreachable tag");
+            }
+            other => panic!(
+                "expected UnreachableBaseline (never a silent smaller Ok), got: {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn range_with_no_bumping_commits_yields_patch_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        commit_msg(root, "a.txt", "chore: init");
+        tag(root, "v1.0.0");
+        commit_msg(root, "b.txt", "docs: update readme");
+        commit_msg(root, "c.txt", "chore: tidy up");
+        commit_msg(root, "d.txt", "ci: tweak workflow");
+
+        let v = compute_version(root).unwrap();
+        assert_eq!(
+            v,
+            Version {
+                major: 1,
+                minor: 0,
+                patch: 1
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_commit_message_yields_patch_not_crash_or_major() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        commit_msg(root, "a.txt", "chore: init");
+        tag(root, "v1.0.0");
+        commit_msg(
+            root,
+            "b.txt",
+            "just a plain message with no conventional type prefix!!!",
+        );
+
+        let v = compute_version(root).unwrap();
+        assert_eq!(
+            v,
+            Version {
+                major: 1,
+                minor: 0,
+                patch: 1
+            }
+        );
+    }
+
+    #[test]
+    fn exclamation_before_colon_yields_major() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        commit_msg(root, "a.txt", "chore: init");
+        tag(root, "v1.0.0");
+        commit_msg(root, "b.txt", "feat(scope)!: drop legacy api");
+
+        let v = compute_version(root).unwrap();
+        assert_eq!(
+            v,
+            Version {
+                major: 2,
+                minor: 0,
+                patch: 0
+            }
+        );
+    }
+
+    #[test]
+    fn breaking_change_footer_yields_major_even_with_fix_subject() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        commit_msg(root, "a.txt", "chore: init");
+        tag(root, "v1.0.0");
+        git(
+            root,
+            &[
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "fix: patch a thing\n\nBREAKING CHANGE: removes an implicit default",
+            ],
+        );
+
+        let v = compute_version(root).unwrap();
+        assert_eq!(
+            v,
+            Version {
+                major: 2,
+                minor: 0,
+                patch: 0
+            }
+        );
+    }
+
+    #[test]
+    fn exclamation_only_in_description_does_not_yield_major() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        commit_msg(root, "a.txt", "chore: init");
+        tag(root, "v1.0.0");
+        commit_msg(root, "b.txt", "fix: stop the crash!!!");
+
+        let v = compute_version(root).unwrap();
+        assert_eq!(
+            v,
+            Version {
+                major: 1,
+                minor: 0,
+                patch: 1
+            }
+        );
+    }
+
+    #[test]
     fn write_version_replaces_in_cargo_toml() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
