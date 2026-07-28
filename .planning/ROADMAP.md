@@ -1423,12 +1423,12 @@ Plans:
 **Priority:** High | **Size:** L (re-sized at plan time, 2026-07-27 — was M) — six units plus 999.38 folded in. 25b, 25e, 25f and 999.38 are genuinely S as filed; 25a is S–M, option chosen at plan review 2026-07-27 (fetch + fast-forward-when-safe, else refuse — see `25-05-PLAN.md` §`<resolved_decision>`, and CONTEXT.md D-17 as amended); **25c is M, not the S this entry states** — it is a full replacement of `compute_version`'s three inputs plus a new preflight gate plus a previously-unflagged consumer at `pipeline_gate.rs:809-840`. No phase split recommended; see `25-01-PLAN.md` § Phase-level notes for the assessment and the seam if one is ever wanted.
 **Requirements**: TBD — promoted from backlog 999.51, 999.48, 999.49, 999.44, 999.47; plus 25f (CONTRIBUTING release-procedure drift, no backlog entry — found 2026-07-27). Tracked by unit identifier (`25a`–`25f`, `999.38`), not by REQ-ID — this project has no `.planning/REQUIREMENTS.md`.
 **Depends on:** Phase 24
-**Plans:** 10 plans — 7/7 original executed; 3 gap-closure plans added 2026-07-28 after `25-VERIFICATION.md` reported `gaps_found` (6/9 truths)
+**Plans:** 9/10 plans executed
 
 Gap-closure plans (wave numbering restarts at 1 for this run):
 
-- [ ] 25-08-PLAN.md — 25c/999.49: the D-09 major-bump gate fires in the default worktree path (CR-01 aggregation + CR-02 execution-root scope + real-worktree regression test) (wave 1)
-- [ ] 25-09-PLAN.md — 25c/999.49: `release_range_start` anchors correctly across realistic release topologies (CR-03 + two topology fixtures) (wave 1)
+- [x] 25-08-PLAN.md — 25c/999.49: the D-09 major-bump gate fires in the default worktree path (CR-01 aggregation + CR-02 execution-root scope + real-worktree regression test) (wave 1)
+- [x] 25-09-PLAN.md — 25c/999.49: `release_range_start` anchors correctly across realistic release topologies (CR-03 + two topology fixtures) (wave 1)
 - [ ] 25-10-PLAN.md — 25e/999.47: observe and record consecutive CI-on-branch green runs in the pinned container, closing the one behavior-unverified truth (wave 2)
 
 *Scoped 2026-07-27 against one criterion — "what does an unattended run need in order to finish?" — after validating every open High in the backlog against the codebase. The four requirements below are the decomposition; each unit maps to exactly one.*
