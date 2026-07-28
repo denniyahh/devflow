@@ -33,7 +33,7 @@
 
 ## Reorganized (June 2026)
 
-- **Conventional commits deprecated** — no commit-message-based versioning
+- **Conventional commits deprecated for versioning (June 2026), ban lifted 2026-07-27** — this bullet originally recorded a bare prohibition on deriving versions from commit messages, with no rationale, incident, or evidence attached anywhere in this file. The operator explicitly authorised deviating from that policy on 2026-07-27 to fully automate versioning (CONTEXT.md D-06); Phase 25 (25c) implements the superseding scheme — baseline from the highest reachable semver tag plus conventional-commit classification of the commits since that baseline (`crates/devflow-core/src/version.rs`)
 - **Phase 10 shipped** — logging + Planning step (Planning known bug, addressed in Phase 11 refactor)
 - **Phase 11 recast** — full architecture refactor to GSD-native execution engine
 - **Phase 12** — Bootstrap (new-project, map-codebase) + versioning automation + publish `devflow` to crates.io (name confirmed available, 2026-07-08)
@@ -1461,7 +1461,7 @@ Plans:
 - **999.5 / DEN-30** (changelog placeholder content) — on the Ship path but cosmetic, M-sized, and deferred three times for want of a content source.
 - **999.39** (production git calls inherit `GIT_DIR`) — a real exposure of the 999.37 class, but `devflow` is not invoked from a git hook on the pipeline's critical path. Considered and excluded, not overlooked.
 
-**Acceptance.** The phase is done when a single `devflow start --phase N --agent claude --mode auto --yes-ship` reaches Ship with no human intervention and `devflow evidence --phase N --require-shipped` exits 0 — the same code-checked oracle Phase 23 used, which has never yet returned success for any phase. Choose a target phase that does **not** modify DevFlow's own source, or 25b must be verified first; Phase 24's selection as "low-stakes by consequence" measured blast radius rather than self-modification, which is what actually disqualified it.
+**Acceptance (revised 2026-07-27 per CONTEXT.md D-15/D-16 — standing policy change, operator-confirmed).** The end-to-end acceptance run this paragraph previously required is now **unofficial and continuous**: it runs when the operator chooses and **gates no phase's completion, until further notice** — not this phase, not later ones. Phase 25 is therefore **complete when 25a–25f are each implemented and verified on their own unit-level merits** — each unit needs its own verifiable acceptance (a test, a closed reproduction) rather than relying on the end-to-end run to backstop it. Anything a future unofficial run surfaces is filed to the backlog the usual way, exactly as Phase 23's runs were. This suspension is deliberately reversible — the single-run closure criterion can be reinstated later if the operator chooses.
 
 **Planned 2026-07-27 — 7 plans across 3 waves.** Ordered by file ownership rather than by the
 spine above: `commands.rs` is touched by four of the six units and `preflight.rs` by two, so the
