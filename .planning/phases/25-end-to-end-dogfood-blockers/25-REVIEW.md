@@ -9,7 +9,8 @@ files_reviewed_list:
   - crates/devflow-cli/src/pipeline_launch.rs
   - crates/devflow-cli/src/staleness.rs
 findings:
-  critical: 1
+  critical: 0
+  critical_resolved: 1
   warning: 3
   info: 4
   total: 8
@@ -75,6 +76,15 @@ confirmed to contain no `unwrap`/`expect`/`assert`/panicking-format call on any 
 half of the interlock holds.
 
 ## Critical Issues
+
+### CR-01 — RESOLVED in `c2f5080` (orchestrator, post-review)
+
+> **Status: FIXED.** The `eprintln!` on the `std::thread::panicking()` branch was replaced with
+> `let _ = writeln!(std::io::stderr(), ...)` plus a comment naming the `std::io::_eprint` panic
+> path, so the unwind branch now has no panicking call of any kind. Verified: `cargo fmt --check`
+> clean, `cargo clippy --workspace --all-targets -- -D warnings` clean, `cargo test --workspace`
+> 696 passed / 0 failed with both discriminating tests confirmed running by name. Original finding
+> retained verbatim below as the record of what was wrong.
 
 ### CR-01: `ReapMonitorOnDrop::drop`'s "safe" branch can itself panic during an in-flight unwind
 
