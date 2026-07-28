@@ -1778,6 +1778,20 @@ mod tests {
 
         let result = run_preflight(root, &mut state, &AlwaysFailAdapter);
 
+        // WR-05 / 999.44 (residual finding, 25-18 verification step 6): the
+        // "approved" response here drives run_preflight's GateAction::Advance
+        // arm, which calls launch_stage_inner UNCONDITIONALLY — skipping the
+        // just-adjudicated check is the entire point of this test, so there
+        // is no recursive re-check to fail first. With a working `codex` +
+        // `sh` stub on PATH (`agent_free_dir_with_agent_stub`), this spawns a
+        // REAL detached monitor wrapper — confirmed empirically while
+        // re-deriving this plan's verification-step-6 enumeration, a leak
+        // this plan's originally-declared scope (the two `_exactly_once`
+        // tests) did not name. The guard must bind here, the first line
+        // after the final `&mut state` use, ahead of every panicking
+        // checkpoint below, for the same reason as the two conversions above.
+        let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
+
         // SAFETY: still serialized under ENV_MUTEX from above.
         unsafe {
             match &original_path {
@@ -1802,6 +1816,13 @@ mod tests {
         assert_eq!(
             state.preflight_retries, 0,
             "a human Advance must reset the retry counter"
+        );
+        assert!(
+            state.monitor_pid.is_some(),
+            "this test's Advance arm is expected to drive a real \
+             monitor::spawn_monitor via launch_stage_inner — None here means \
+             this residual finding's premise was wrong and the guard above \
+             reaped nothing"
         );
     }
 
