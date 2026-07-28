@@ -407,6 +407,7 @@ fn classify_stray_layer(args: &[String]) -> Option<StrayLayer> {
 /// retained only as a secondary, advisory signal; prefer
 /// [`is_same_process`] with a recorded start time, which cannot be fooled
 /// this way. Never let this function alone authorise a signal.
+#[deprecated(note = "unsound alone (999.47) -- use is_same_process with a recorded start time")]
 pub fn looks_like_devflow_process(pid: u32) -> bool {
     let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
         return false;
@@ -713,6 +714,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // D-13: retained, zero-cost-of-call regression coverage for a deprecated-but-not-removed public fn
     fn looks_like_devflow_process_is_true_for_the_current_process() {
         // Cargo names this crate's test binary from its crate name
         // (`devflow-core` → `devflow_core-<hash>` under target/deps
@@ -721,71 +723,34 @@ mod tests {
         assert!(looks_like_devflow_process(std::process::id()));
     }
 
-    /// Render `/proc/<pid>/cmdline` readably for failure diagnostics: the
-    /// NUL-separated argv joined with ` | `, or a marker when it cannot be
-    /// read. Test-only; never used in a decision, only in a message.
-    fn debug_cmdline(pid: u32) -> String {
-        match std::fs::read(format!("/proc/{pid}/cmdline")) {
-            Ok(raw) if raw.iter().all(|&byte| byte == 0) => "<empty>".to_string(),
-            Ok(raw) => raw
-                .split(|&byte| byte == 0)
-                .filter(|arg| !arg.is_empty())
-                .map(|arg| String::from_utf8_lossy(arg).into_owned())
-                .collect::<Vec<_>>()
-                .join(" | "),
-            Err(err) => format!("<unreadable: {err}>"),
-        }
-    }
-
     #[test]
     fn looks_like_devflow_process_is_false_for_a_non_devflow_process() {
-        let mut child = std::process::Command::new("sleep")
-            .arg("5")
-            .spawn()
-            .expect("spawn sleep");
-        let pid = child.id();
-
-        // This assertion has failed intermittently in CI (first seen
-        // 2026-07-26, on commits touching no Rust source) as a FALSE
-        // POSITIVE: the predicate reported a plain `sleep` as a devflow
-        // process. It does not reproduce locally — 40/40 under CPU load —
-        // and a fork/exec cmdline-inheritance theory was disproved at
-        // 0/3000. A bare `assert!` throws away the one artifact that could
-        // name the mechanism, so bracket the predicate with reads of the
-        // same /proc file and report everything on failure.
-        //
-        // Reading the verdict here rather than inside `assert!` keeps the
-        // diagnostics adjacent to the call they describe, and lets the
-        // child be reaped before any panic unwinds (a panic inside the
-        // assert would otherwise leak the `sleep` for its full duration —
-        // this repo already has an orphan-hygiene problem, see 999.44/46).
-        let cmdline_before = debug_cmdline(pid);
-        let verdict = looks_like_devflow_process(pid);
-        let cmdline_after = debug_cmdline(pid);
-        let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|err| format!("<unreadable: {err}>"));
+        // Retargeted (D-13): this test used to assert the deprecated
+        // `looks_like_devflow_process` predicate against a freshly spawned
+        // `sleep`, which raced that child's `execve` and failed
+        // intermittently in CI (999.47, "MECHANISM CONFIRMED 2026-07-26").
+        // It now asserts the `(pid, starttime)` identity guard production
+        // actually uses — `is_same_process` — which needs no `spawn()` and
+        // therefore has no `execve` to race. This is what fixes the flake,
+        // by construction, not by making the old test rarer.
         let self_pid = std::process::id();
-        let self_cmdline = debug_cmdline(self_pid);
-
-        let _ = child.kill();
-        let _ = child.wait();
+        let real_start = process_start_time(self_pid)
+            .expect("must be able to read this process's own recorded start time");
 
         assert!(
-            !verdict,
-            "looks_like_devflow_process({pid}) returned true for a spawned `sleep`.\n\
-             \x20 child cmdline before: {cmdline_before}\n\
-             \x20 child cmdline after:  {cmdline_after}\n\
-             \x20 child /proc/{pid}/exe: {exe}\n\
-             \x20 test process:         pid {self_pid} cmdline {self_cmdline}\n\
-             If both child cmdlines name a devflow binary, the pid is not the \
-             `sleep` we spawned (recycled/misattributed pid). If they differ from \
-             each other, the cmdline changed under the predicate. If they name \
-             `sleep`, the predicate's matching logic is at fault."
+            is_same_process(self_pid, real_start),
+            "the current process must match its own recorded start time"
+        );
+
+        let perturbed_start = real_start.wrapping_add(1);
+        assert!(
+            !is_same_process(self_pid, perturbed_start),
+            "a deliberately wrong start time must not be treated as a match"
         );
     }
 
     #[test]
+    #[allow(deprecated)] // D-13: retained, zero-cost-of-call regression coverage for a deprecated-but-not-removed public fn
     fn looks_like_devflow_process_is_false_when_proc_cannot_be_read() {
         // A pid guaranteed not to exist: the fail-closed default must be
         // false, never true, when identity cannot be confirmed at all.
