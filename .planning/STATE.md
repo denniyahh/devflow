@@ -5,16 +5,16 @@ milestone_name: milestone (open — no fixed closing phase)
 current_phase: 25
 current_phase_name: end-to-end-dogfood-blockers
 status: executing
-stopped_at: Phase 25 gap-closure halted at 25-10 — 999.47 reproduced, truth 7 NOT closed
-last_updated: "2026-07-28T13:35:14.005Z"
+stopped_at: Completed 25-13-PLAN.md (human sign-off recorded, both parts approved)
+last_updated: "2026-07-28T15:54:05.314Z"
 last_activity: 2026-07-28
 last_activity_desc: Phase 25 execution started
 progress:
   total_phases: 14
-  completed_phases: 13
-  total_plans: 107
-  completed_plans: 103
-  percent: 93
+  completed_phases: 14
+  total_plans: 106
+  completed_plans: 106
+  percent: 100
 ---
 
 # DevFlow — Project State
@@ -87,9 +87,9 @@ change earns 2.0.
 ## Current Position
 
 Phase: 25 (end-to-end-dogfood-blockers) — EXECUTING
-Plan: 11 of 13 executed (25-10 superseded, no SUMMARY will exist; 25-13 in progress —
-Tasks 1-2 done, Task 3 human sign-off pending)
-Status: Executing Phase 25
+Plan: 12 of 13 executed (25-10 superseded, no SUMMARY will exist; 25-13 complete —
+Tasks 1-3 done, both human sign-offs recorded in 25-13-SUMMARY.md)
+Status: Executing Phase 25 — plan-level work complete, phase verification pending
 
 **25-10 → 25-13 (2026-07-28):** GAP 1 (25-08) and GAP 2 (25-09) closed and merged. GAP 3
 (truth 7, 25e / 999.47) moved through three states this run: `PRESENT_BEHAVIOR_UNVERIFIED`
@@ -109,22 +109,30 @@ completed CI `Test`-job trials, all green, all at `tested_head_sha`
 pushed. `25-10-PLAN.md` is `status: superseded`, `superseded_by: "25-13"` — it will never
 have a `25-10-SUMMARY.md`.
 
-**`no_reproduction` is not a closure claim.** `25-CI-TRIALS.md`'s `## Limits of this
-evidence` states the residual (`~6.1%` against the pessimistic exact-binomial bound, `~0.05%`
-against the recorded ~50% historical rate) and names the structural argument (25-11 + 25-12)
-as what actually carries the claim. The word that means closed belongs to a human — Task 3 of
-`25-13-PLAN.md` is a `blocking` checkpoint covering BOTH this evidence (Part A) and
-`25-VALIDATION.md`'s three 25f human-judgment documentation rows (Part B), neither of which
-an executor self-report may discharge.
+**`no_reproduction` is not a closure claim — and it still isn't, after sign-off.**
+`25-CI-TRIALS.md`'s `status` field remains `no_reproduction`; Task 3's human sign-off is
+recorded as a decision layered on top of that artifact, not an edit to it. Task 3's two
+required responses (Part A: 25e evidence; Part B: 25f's three `25-VALIDATION.md` rows) were
+both recorded verbatim, dated 2026-07-28, in `25-13-SUMMARY.md`.
+
+**Part A resolution:** the human asked whether the observation shape could move from local
+push-gate to GitHub CI; declined (source change, voids the `tested_head_sha` streak, CI is the
+less sensitive instrument per `## Limits of this evidence` point 3), so the human's stated
+pre-authorised approval applied. **Truth 7 (999.47/DEN-72) is recorded as human-verified
+against `25-CI-TRIALS.md`'s evidence, residuals stated — not proven absent.** A backlog
+follow-up was surfaced (a single native-2-vCPU CI job running `scripts/check.sh all`, to
+convert the local observation into a standing per-push guard) but not implemented here.
+**Part B:** approved, with the orchestrator's independent per-row corroboration recorded
+alongside as corroboration only.
 
 Full evidence: `.planning/phases/25-end-to-end-dogfood-blockers/25-CI-OBSERVATION.md` (the
-2/2 reproduction) and `.planning/phases/25-end-to-end-dogfood-blockers/25-CI-TRIALS.md` (the
-11-observation no-reproduction streak).
+2/2 reproduction), `.planning/phases/25-end-to-end-dogfood-blockers/25-CI-TRIALS.md` (the
+11-observation no-reproduction streak), and
+`.planning/phases/25-end-to-end-dogfood-blockers/25-13-SUMMARY.md` (both verbatim sign-offs).
 
-**Next action:** await the human's Task 3 response (Part A: 25e evidence sign-off; Part B:
-25f's three rows) via the `25-13` checkpoint. No further planning is needed — 25-11/25-12
-already closed the code-level defect class; this phase's remaining work is entirely the
-human sign-off gate.
+**Next action:** plan-level gap-closure work for Phase 25 is complete (25-08, 25-09, 25-11,
+25-12, 25-13; 25-10 superseded). Remaining work is phase-level verification and closure —
+owned by the orchestrator, not this plan.
 
 **23-15 result (second acceptance attempt, 2026-07-26):** `devflow start --phase 24 --agent claude --mode auto --yes-ship` was blocked at launch by the self-dogfood staleness hard block (D-18) — the binary's embedded commit (`0c9dcfe`, built from `feature/phase-23`) and `origin/develop`'s tip (`0dad20d`) are mutually non-ancestors (genuine divergence, confirmed via `git merge-base --is-ancestor` both directions, exit 1 each way), so the block fired before Define ever launched. No `workflow_shipped` event exists for phase 24; `devflow evidence --phase 24 --require-shipped` exits 1 both pre- and post-run — unchanged. See `.planning/phases/23-end-to-end-dogfood/23-ACCEPTANCE-RUN-2.md`.
 
@@ -146,7 +154,7 @@ Last activity: 2026-07-28 — Phase 25 execution started
 
 **Note on the "Plan: 2 of 15" value this replaces:** `gsd-tools state advance-plan` only increments whatever value is already in this field, which had drifted to "2 of 15" (the parallel-worktree waves 23-01…23-09 deliberately never touch STATE.md, and this field was last corrected against reality at "10 of 11 plans complete" before the plan count grew to 15 with the gap-closure plans 23-12…23-15). Corrected directly to "13 of 15" to match reality (23-12 and 23-13 both now executed) rather than trust the tool's naive +1 increment from a stale base.
 
-Progress: [██████████] 99% (15 of 15 plans executed — plan-count only; the phase's behavioural acceptance goal is UNMET and requires plan 23-16 to close)
+Progress: [██████████] 100% (15 of 15 plans executed — plan-count only; the phase's behavioural acceptance goal is UNMET and requires plan 23-16 to close)
 
 *(Machine-readable fields for `gsd-tools state begin-phase` / `advance-plan` —
 this project historically tracked position only in the narrative "Active
@@ -742,6 +750,9 @@ None currently open for Phase 17.
 - [Phase ?]: 24-01: raw inline signingkey allowlist kept to exactly ssh- (D-03), not widened to ecdsa-/sk- as 20-REVIEW.md IN-01 had proposed
 - [Phase ?]: 24-02: RED evidence captured via controlled git show/checkout HEAD -- file overwrite instead of git stash push/pop, since the target file was already committed (not locally modified) and stash pop in that state risks silently applying a sibling worktree's leftover WIP
 - [Phase ?]: 24-02: derived redaction assertions from the generated key's own whitespace tokens (base64 body, comment) rather than only the whole blob, per D-08's whole-or-in-part requirement
+- [Phase ?]: Plan 25-10 superseded (not re-run) — its 'structurally removed' premise was falsified by 25-CI-OBSERVATION.md
+- [Phase ?]: Human declined to substitute CI-shape for local push-gate observation in 25e evidence — CI's Test job lacks the taskset pin and fmt->clippy->test ordering that produced the 2/2 reproduction; conditional pre-authorised approval of truth 7 applied instead
+- [Phase ?]: Truth 7 (999.47/DEN-72) recorded as human-verified against 25-CI-TRIALS.md's 11-observation evidence, residuals stated — not upgraded to a closure claim; 25-VALIDATION.md rows 1-3 (25f) human-approved
 
 ## Roadmap Evolution
 
@@ -814,9 +825,10 @@ None currently open for Phase 17.
 | Phase 23 P15 | 17min | 3 tasks | 1 files |
 | Phase 24 P01 | 7min | 2 tasks | 1 files |
 | Phase 24 P02 | 8min | 2 tasks | 1 files |
+| Phase 25 P13 | ~30min automated + human review turnaround | 3 tasks | 6 files |
 
 ## Session
 
-**Last session:** 2026-07-27T18:39:26.294Z
-**Stopped at:** Phase 25 planned — 7 plans, 3 waves, plan-checker PASS
-**Resume file:** .planning/phases/25-end-to-end-dogfood-blockers/25-01-PLAN.md
+**Last session:** 2026-07-28T15:54:05.268Z
+**Stopped at:** Completed 25-13-PLAN.md (human sign-off recorded, both parts approved)
+**Resume file:** None
