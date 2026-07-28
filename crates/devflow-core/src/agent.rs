@@ -218,6 +218,74 @@ pub fn is_same_process(pid: u32, expected_start: u64) -> bool {
     process_start_time(pid) == Some(expected_start)
 }
 
+/// Resolve the kernel's clock tick rate (`USER_HZ`) via
+/// `sysconf(_SC_CLK_TCK)`, rather than assuming the "conventionally 100"
+/// value [`process_start_time`]'s own doc comment names as a convention,
+/// not a guarantee — a wrong divisor would silently scale
+/// [`process_age`]'s result. Returns `None` when the kernel reports a
+/// non-positive value, so the caller can fail closed instead of dividing
+/// by (or trusting) a nonsensical rate.
+fn clock_ticks_per_second() -> Option<i64> {
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    (ticks > 0).then_some(ticks)
+}
+
+/// How long `pid` has been running: `/proc/uptime` (seconds since boot)
+/// minus [`process_start_time`] (ticks since boot, converted to seconds
+/// via the kernel's own reported tick rate — never a hardcoded divisor).
+///
+/// This is the primitive `reap_stray_candidates`' age floor (25-12/999.47,
+/// the production half of the defect class) is built on: a process
+/// [`discover_stray_devflow_processes`] catches mid-`execve` is genuinely
+/// the same process with genuinely the same recorded start time as its
+/// parent — [`is_same_process`] cannot distinguish the two — but its age
+/// is sub-millisecond, while a genuine orphan is minutes to hours old.
+/// `reap_stray_candidates` (`devflow-cli::commands`) is the one caller
+/// that consumes this to make a signalling decision; see its own doc
+/// comment for how the separation is used.
+///
+/// Returns `None` when age could not be determined at all: `/proc/uptime`
+/// is unreadable or unparseable, the tick rate cannot be resolved, or
+/// [`process_start_time`] itself returns `None`. Callers MUST treat `None`
+/// as "do not act" — never as "old enough" — matching the fail-closed
+/// posture [`process_start_time`] documents for identity.
+///
+/// A negative difference — the two clocks read microseconds apart — is
+/// clamped to zero rather than treated as an error: it is a rounding
+/// artefact, not evidence of anything, and zero keeps the fail-closed
+/// direction (an age of zero sits below any floor).
+pub fn process_age(pid: u32) -> Option<std::time::Duration> {
+    let uptime_raw = std::fs::read_to_string("/proc/uptime").ok()?;
+    let uptime_secs: f64 = uptime_raw.split_whitespace().next()?.parse().ok()?;
+
+    let ticks_per_sec = clock_ticks_per_second()?;
+    let start_ticks = process_start_time(pid)?;
+    let start_secs = start_ticks as f64 / ticks_per_sec as f64;
+
+    let age_secs = (uptime_secs - start_secs).max(0.0);
+    Some(std::time::Duration::from_secs_f64(age_secs))
+}
+
+/// The age floor `reap_stray_candidates` (`devflow-cli::commands`)
+/// refuses to signal a candidate below. **An age floor, not a
+/// classifier**: it refuses every candidate younger than this in BOTH
+/// directions — a mid-`execve` false positive and a genuine stray younger
+/// than the floor are both refused, because [`process_age`] cannot tell
+/// the two apart and does not try to.
+///
+/// The two populations this separates are six orders of magnitude apart:
+/// a `fork()`->`execve()` window, sub-millisecond even under the 2-core
+/// pinned CI load measured in `25-CI-OBSERVATION.md`, versus a genuine
+/// orphan of a *previous* run — a monitor wrapper lives for the duration
+/// of an agent stage, minutes to hours. No value between those two
+/// populations is contentious.
+///
+/// A candidate refused for youth is not lost: `gate_sweep`
+/// (`devflow-cli::commands`) re-runs discovery after its reaping pass and
+/// reports anything still discoverable, so a false refusal is deferred
+/// cleanup — cleared on the next invocation — never a missed one.
+pub const STRAY_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Which structural layer of a DevFlow-spawned process tree
 /// [`discover_stray_devflow_processes`] matched a candidate against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -300,6 +368,23 @@ const ADVANCE_SUBCOMMAND: &str = "advance";
 ///    owning uid is compared against the caller's effective uid, and
 ///    anything that does not match is skipped — the concrete hazard is a
 ///    caller later signalling a stranger's process on a shared machine.
+/// 3. **Structural, not exec-confirmed (25-12/999.47, the production half
+///    of the defect class).** This is a **structural** match over
+///    `/proc/<pid>/cmdline` alone. During a process's own
+///    `fork()`->`execve()` window — [`process_start_time`]'s doc comment
+///    is this codebase's authoritative statement of the mechanism —
+///    `/proc/<pid>/cmdline` transiently reports its PARENT's argv, not its
+///    own. A transient child of the monitor wrapper, or of `devflow
+///    advance`, therefore matches Layer 1 or Layer 2 respectively while
+///    being neither. This census does not — and deliberately should not —
+///    filter that case out: a census that guessed at exec status would
+///    also drop genuine strays, and it has no reliable way to distinguish
+///    the two (see [`process_age`]'s own doc comment for why). It is the
+///    **caller's** obligation not to act on an unqualified census result.
+///    `reap_stray_candidates` (`devflow-cli::commands`) is the one caller
+///    with a destructive consequence, and it discharges that obligation
+///    with [`process_age`] and [`STRAY_MIN_AGE`] — never with this
+///    function.
 ///
 /// Every read failure is tolerated silently (a pid that vanishes between
 /// the directory listing and the cmdline/stat read is normal churn, not an
@@ -806,5 +891,67 @@ mod tests {
         // A pid guaranteed not to exist: the fail-closed default must be
         // false, never true, when identity cannot be confirmed at all.
         assert!(!looks_like_devflow_process(0x7FFF_FFFE));
+    }
+
+    // 25-12/999.47 (production half): `process_age`'s own test group. Test
+    // names all begin `process_age_` so the count-based acceptance
+    // criterion (`cargo test agent::tests::process_age` -> `3 passed`)
+    // resolves unambiguously.
+
+    #[test]
+    fn process_age_returns_some_for_the_current_process() {
+        // Measured directly (not assumed): `/proc/uptime` and this
+        // process's own recorded start time share the same ~10ms USER_HZ
+        // granularity `process_start_time`'s doc comment already caveats
+        // — a process asked for its own age within one tick of its start
+        // (plausible for a freshly launched, fast-starting test binary)
+        // genuinely reads `Duration::ZERO`, reproduced deterministically
+        // running this test in isolation. Sleep past one tick first so
+        // the assertion below tests "age advances," not "the OS finished
+        // its first tick before this line ran."
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let age = process_age(std::process::id()).expect("this process's own age must resolve");
+        assert!(
+            age > std::time::Duration::ZERO,
+            "a running process must report nonzero age once at least one tick has elapsed"
+        );
+        assert!(
+            age < std::time::Duration::from_secs(3600),
+            "the test binary has not been running for an hour"
+        );
+    }
+
+    #[test]
+    fn process_age_returns_none_for_a_dead_pid() {
+        // Same guaranteed-not-to-exist pid the fail-closed tests above use.
+        assert_eq!(process_age(0x7FFF_FFFE), None);
+    }
+
+    #[test]
+    fn process_age_is_below_the_floor_for_a_fresh_child_and_grows_monotonically_for_self() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn fixture");
+        let pid = child.id();
+
+        let child_age = process_age(pid).expect("a freshly spawned child's age must resolve");
+        assert!(
+            child_age < STRAY_MIN_AGE,
+            "a process spawned microseconds ago must be younger than the floor"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let self_pid = std::process::id();
+        let first = process_age(self_pid).expect("this process's own age must resolve");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let second =
+            process_age(self_pid).expect("this process's own age must resolve after the sleep too");
+        assert!(
+            second >= first,
+            "age must grow monotonically across a sleep, never shrink"
+        );
     }
 }
