@@ -2,13 +2,13 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone (open — no fixed closing phase)
-current_phase: 999.1
-current_phase_name: BACKLOG
-status: planning
-stopped_at: Completed 25-13-PLAN.md (human sign-off recorded, both parts approved)
+current_phase: 25
+current_phase_name: end-to-end-dogfood-blockers
+status: complete
+stopped_at: Phase 25 COMPLETE — verified 10/10 after five gap-closure rounds; unshipped on feature/phase-25
 last_updated: "2026-07-28T20:31:33.139Z"
 last_activity: 2026-07-28
-last_activity_desc: Phase 25 complete, transitioned to Phase 999.1
+last_activity_desc: Phase 25 complete (10/10 verified, ledger 0 open). NOT advanced to 999.1 — phase.complete's next-phase detection again picked up the 999.1 backlog heading as if sequential (same bug corrected after Phase 20, recorded in the history log below). Backlog items require /gsd-review-backlog promotion.
 progress:
   total_phases: 14
   completed_phases: 14
