@@ -6,15 +6,15 @@ current_phase: 25
 current_phase_name: end-to-end-dogfood-blockers
 status: executing
 stopped_at: Completed 25-13-PLAN.md (human sign-off recorded, both parts approved)
-last_updated: "2026-07-28T17:19:20.330Z"
+last_updated: "2026-07-28T17:25:43.730Z"
 last_activity: 2026-07-28
 last_activity_desc: Phase 25 execution started
 progress:
   total_phases: 14
-  completed_phases: 14
+  completed_phases: 13
   total_plans: 109
   completed_plans: 106
-  percent: 100
+  percent: 93
 ---
 
 # DevFlow — Project State
@@ -87,10 +87,10 @@ change earns 2.0.
 ## Current Position
 
 Phase: 25 (end-to-end-dogfood-blockers) — EXECUTING
-Plan: 12 of 16 executed (25-10 superseded, no SUMMARY will exist; 25-13 complete —
+Plan: 1 of 16
 Tasks 1-3 done, both human sign-offs recorded in 25-13-SUMMARY.md; 25-14/25-15/25-16
 planned 2026-07-28 as gap-closure round 3, not yet executed)
-Status: Ready to execute
+Status: Executing Phase 25
 
 **25-10 → 25-13 (2026-07-28):** GAP 1 (25-08) and GAP 2 (25-09) closed and merged. GAP 3
 (truth 7, 25e / 999.47) moved through three states this run: `PRESENT_BEHAVIOR_UNVERIFIED`
