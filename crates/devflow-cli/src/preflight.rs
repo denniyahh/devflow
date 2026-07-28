@@ -269,6 +269,218 @@ pub(crate) fn ensure_phase_reachable_on_base(
 }
 
 // ---------------------------------------------------------------------------
+// 25e (999.51/D-18a): base-ref currency probe, siblings of the phase-
+// reachability probe above. `devflow start` forks its worktree from `base`
+// (DEVELOP) — if the local ref is behind its remote-tracking counterpart,
+// the fork happens against stale code while the reachability probe above
+// still passes, because the phase heading and directory exist on the STALE
+// local ref just as they do on the fresh remote one. This is 999.51's
+// explicitly-named "dangerous variant": a green run against the wrong
+// source, arriving through the base ref instead of the binary — the same
+// false-evidence shape D-18 exists to prevent.
+// ---------------------------------------------------------------------------
+
+/// Remote name this probe fetches and compares against — hardcoded, matching
+/// `devflow_core::git::origin_main_ancestor_status`'s existing convention
+/// (this project has no remote-name configuration knob).
+const ORIGIN: &str = "origin";
+
+/// The result of comparing a local base branch to its remote-tracking ref.
+/// Mirrors [`PhaseReachability`]'s shape: `Undeterminable` carries the same
+/// fail-open-where-blind meaning this module already documents for that
+/// sibling probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BaseRefCurrency {
+    /// The local base ref equals its remote-tracking ref.
+    Current,
+    /// The local base ref is strictly AHEAD of its remote-tracking ref
+    /// (unpushed local work) — never treated as staleness.
+    Ahead,
+    /// The local base ref is strictly BEHIND its remote-tracking ref by
+    /// `count` commits, with no local divergence — the remote is a
+    /// lossless fast-forward target.
+    Behind { count: u32 },
+    /// Local and remote have both moved past their common ancestor — mutual
+    /// non-ancestors. A divergent base is never silently forked from.
+    Diverged,
+    /// The remote-tracking ref could not be resolved at all (no remote
+    /// configured, offline clone, or the fetch failed and the ref never
+    /// existed locally either) — the guard fails open in this case, per the
+    /// module's existing fail-open-where-blind contract.
+    Undeterminable,
+}
+
+/// Probe whether `base` is current with its remote-tracking ref in the
+/// repository at `project_root`. Follows `origin_main_ancestor_status`'s
+/// shape verbatim (`git rev-parse --verify --quiet` for ref existence, then
+/// `git merge-base --is-ancestor` — here in both directions, to distinguish
+/// behind/ahead/equal/diverged), but is preceded by a soft-failing
+/// `git fetch` so the comparison is made against a freshly-updated
+/// remote-tracking ref rather than merely "nobody has fetched recently."
+///
+/// The fetch updates ONLY the remote-tracking ref (`git fetch <remote>
+/// <base>`) — it never touches the local branch or the working tree, so it
+/// cannot fail with a "branch is checked out" error the way a refspec fetch
+/// into the local branch would. On spawn error or non-zero exit the fetch
+/// fails SOFT: a warning is printed and the comparison proceeds against
+/// whatever the remote-tracking ref currently holds (Phase 24's inherited
+/// D-06 precedent — a new code path must not introduce a false hard-block
+/// on correct work, and an offline machine is correct work).
+pub(crate) fn base_ref_currency(project_root: &Path, base: &str) -> BaseRefCurrency {
+    let remote_ref = format!("{ORIGIN}/{base}");
+
+    let fetch_ok = std::process::Command::new("git")
+        .args(["fetch", "--quiet", ORIGIN, base])
+        .current_dir(project_root)
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    if !fetch_ok {
+        println!(
+            "warning: could not fetch `{ORIGIN} {base}` — comparing `{base}` against \
+             whatever `{remote_ref}` currently resolves to locally, which may be stale"
+        );
+    }
+
+    let ref_exists = std::process::Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", &remote_ref])
+        .current_dir(project_root)
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    if !ref_exists {
+        return BaseRefCurrency::Undeterminable;
+    }
+
+    let is_ancestor = |ancestor: &str, descendant: &str| {
+        std::process::Command::new("git")
+            .args(["merge-base", "--is-ancestor", ancestor, descendant])
+            .current_dir(project_root)
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false)
+    };
+    let local_is_ancestor_of_remote = is_ancestor(base, &remote_ref);
+    let remote_is_ancestor_of_local = is_ancestor(&remote_ref, base);
+
+    match (local_is_ancestor_of_remote, remote_is_ancestor_of_local) {
+        (true, true) => BaseRefCurrency::Current,
+        (false, true) => BaseRefCurrency::Ahead,
+        (false, false) => BaseRefCurrency::Diverged,
+        (true, false) => {
+            let count = std::process::Command::new("git")
+                .args(["rev-list", "--count", &format!("{base}..{remote_ref}")])
+                .current_dir(project_root)
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .and_then(|out| {
+                    String::from_utf8_lossy(&out.stdout)
+                        .trim()
+                        .parse::<u32>()
+                        .ok()
+                })
+                .unwrap_or(0);
+            BaseRefCurrency::Behind { count }
+        }
+    }
+}
+
+/// Builds the operator-facing refusal message for a `Behind` result that
+/// could not be safely fast-forwarded — modelled on `unreachable_message`:
+/// self-contained, actionable, naming the exact repair command, and
+/// containing **no absolute filesystem path** (WR-02 — on Linux a path
+/// embeds the operator's username, and this string reaches operator
+/// output). Names refs and commands only.
+pub(crate) fn stale_base_message(base: &str, remote_ref: &str, count: u32) -> String {
+    format!(
+        "`{base}` is {count} commit(s) behind `{remote_ref}` and could not be safely \
+         fast-forwarded (it is currently checked out, or the fast-forward itself failed) \
+         — `devflow start` refuses to fork a phase worktree from a stale base. Switch off \
+         `{base}` if it is currently checked out, then run `git fetch {ORIGIN} {base} && \
+         git checkout {base} && git merge --ff-only {remote_ref}`, then re-run `devflow start`."
+    )
+}
+
+/// Refuse before `devflow start` forks anything when `base` is stale
+/// relative to its remote. `Current`, `Ahead` and `Undeterminable` all
+/// return `Ok(())` (the last with a warning — the guard fails open where it
+/// cannot see, mirroring [`ensure_phase_reachable_on_base`]).
+///
+/// The `Behind` arm implements the operator's 2026-07-27 adjudication
+/// (999.51/D-18a): fast-forward when it is safe to do so, else refuse
+/// loudly. The fast-forward is attempted only when the base branch is not
+/// the currently checked-out branch — `Behind` itself already establishes
+/// losslessness (the local ref is a strict ancestor of the remote, so no
+/// divergence and no local commits are at risk). It is performed with
+/// `git update-ref refs/heads/<base> refs/remotes/<remote>/<base>`, which
+/// advances the ref without touching the working tree — the reason the
+/// not-checked-out precondition is sufficient. On ANY failure (checked out,
+/// spawn error, non-zero exit) this falls through to the same refusal —
+/// never proceed silently after a failed fast-forward.
+///
+/// `Diverged` always refuses — a divergent base is never silently forked
+/// from.
+pub(crate) fn ensure_base_ref_current(project_root: &Path, base: &str) -> Result<(), CliError> {
+    match base_ref_currency(project_root, base) {
+        BaseRefCurrency::Current | BaseRefCurrency::Ahead => Ok(()),
+        BaseRefCurrency::Undeterminable => {
+            println!(
+                "warning: could not determine whether `{base}` is current with `{ORIGIN}/{base}` \
+                 — proceeding without a currency check (fail-open, per this module's \
+                 fail-open-where-blind contract)"
+            );
+            Ok(())
+        }
+        BaseRefCurrency::Diverged => {
+            let remote_ref = format!("{ORIGIN}/{base}");
+            Err(CliError::Message(format!(
+                "`{base}` and `{remote_ref}` have diverged — neither is an ancestor of the \
+                 other, so `devflow start` refuses to fork a phase worktree from either. \
+                 Resolve manually (e.g. `git checkout {base} && git rebase {remote_ref}`, or \
+                 `git reset --hard {remote_ref}` if `{base}`'s local commits are disposable), \
+                 then re-run `devflow start`."
+            )))
+        }
+        BaseRefCurrency::Behind { count } => {
+            let remote_ref = format!("{ORIGIN}/{base}");
+            let checked_out_branch = std::process::Command::new("git")
+                .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+                .current_dir(project_root)
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string());
+            let is_checked_out = checked_out_branch.as_deref() == Some(base);
+
+            if !is_checked_out {
+                let fast_forwarded = std::process::Command::new("git")
+                    .args([
+                        "update-ref",
+                        &format!("refs/heads/{base}"),
+                        &format!("refs/remotes/{remote_ref}"),
+                    ])
+                    .current_dir(project_root)
+                    .output()
+                    .map(|out| out.status.success())
+                    .unwrap_or(false);
+                if fast_forwarded {
+                    println!(
+                        "advanced `{base}` to `{remote_ref}` ({count} commit(s) fast-forwarded)"
+                    );
+                    return Ok(());
+                }
+            }
+            Err(CliError::Message(stale_base_message(
+                base,
+                &remote_ref,
+                count,
+            )))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 17c: preflight readiness gate (D-13-D-16) — generic universal checks +
 // adapter hook, run from `launch_stage` before `monitor::spawn_monitor` so a
 // readiness failure is caught before any agent time is spent.
@@ -1123,5 +1335,247 @@ mod tests {
         assert!(!msg.contains(&fixture_root));
         assert!(!msg.contains("/home/"));
         assert!(!msg.contains("/Users/"));
+    }
+
+    // -----------------------------------------------------------------
+    // 25e (999.51/D-18a): base-ref currency probe.
+    // -----------------------------------------------------------------
+
+    /// Runs `args` in `root` via the hermetic `test_support::git_command`
+    /// (never a bare git command) and asserts success.
+    fn run_git(root: &Path, args: &[&str]) {
+        assert!(
+            devflow_core::test_support::git_command(root)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "git {args:?} failed in {root:?}"
+        );
+    }
+
+    /// Builds a real "remote" repository (checked out on `develop`, one
+    /// commit) and a real local clone of it, so `origin/develop` genuinely
+    /// exists in the local clone via git's own clone machinery and can be
+    /// moved independently of the local branch by committing directly in
+    /// the remote's own working tree. Returns `(remote_dir, local_dir)` —
+    /// both `TempDir`s must be kept alive by the caller.
+    fn currency_fixture() -> (tempfile::TempDir, tempfile::TempDir) {
+        let remote_dir = tempfile::tempdir().unwrap();
+        let remote_root = remote_dir.path();
+        run_git(remote_root, &["init", "-q"]);
+        run_git(remote_root, &["config", "user.email", "t@e.st"]);
+        run_git(remote_root, &["config", "user.name", "t"]);
+        run_git(remote_root, &["config", "commit.gpgsign", "false"]);
+        run_git(remote_root, &["config", "core.hooksPath", "/dev/null"]);
+        run_git(remote_root, &["checkout", "-q", "-b", "develop"]);
+        std::fs::write(remote_root.join("f.txt"), "1").unwrap();
+        run_git(remote_root, &["add", "-A"]);
+        run_git(remote_root, &["commit", "-q", "-m", "c1"]);
+
+        let local_dir = tempfile::tempdir().unwrap();
+        let local_root = local_dir.path();
+        run_git(
+            local_root,
+            &["clone", "-q", remote_root.to_str().unwrap(), "."],
+        );
+        run_git(local_root, &["config", "user.email", "t@e.st"]);
+        run_git(local_root, &["config", "user.name", "t"]);
+        run_git(local_root, &["config", "commit.gpgsign", "false"]);
+        run_git(local_root, &["config", "core.hooksPath", "/dev/null"]);
+
+        (remote_dir, local_dir)
+    }
+
+    /// Advances the remote fixture's `develop` branch by one commit, in its
+    /// own working tree — independent of whatever the local clone has done.
+    fn advance_remote(remote_root: &Path, filename: &str) {
+        std::fs::write(remote_root.join(filename), "2").unwrap();
+        run_git(remote_root, &["add", "-A"]);
+        run_git(remote_root, &["commit", "-q", "-m", "c2"]);
+    }
+
+    #[test]
+    fn currency_is_current_when_local_equals_remote() {
+        let (_remote, local) = currency_fixture();
+        let root = local.path();
+        assert_eq!(base_ref_currency(root, "develop"), BaseRefCurrency::Current);
+        assert!(ensure_base_ref_current(root, "develop").is_ok());
+    }
+
+    #[test]
+    fn currency_behind_and_not_checked_out_fast_forwards_and_proceeds() {
+        let (remote, local) = currency_fixture();
+        let remote_root = remote.path();
+        let local_root = local.path();
+        advance_remote(remote_root, "f2.txt");
+
+        // Switch the local clone off `develop` so the fast-forward is safe
+        // to attempt (it does not touch the working tree, but the guard
+        // only attempts it when `develop` is not the checked-out branch).
+        run_git(local_root, &["checkout", "-q", "-b", "other"]);
+
+        assert_eq!(
+            base_ref_currency(local_root, "develop"),
+            BaseRefCurrency::Behind { count: 1 }
+        );
+
+        assert!(
+            ensure_base_ref_current(local_root, "develop").is_ok(),
+            "a safely-behind base must fast-forward and proceed unattended"
+        );
+
+        let rev_parse = |rref: &str| {
+            let out = devflow_core::test_support::git_command(local_root)
+                .args(["rev-parse", rref])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "rev-parse {rref} failed");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_eq!(
+            rev_parse("develop"),
+            rev_parse("origin/develop"),
+            "the local ref must now equal the remote-tracking ref after the fast-forward"
+        );
+    }
+
+    #[test]
+    fn currency_behind_and_checked_out_refuses_with_actionable_message() {
+        let (remote, local) = currency_fixture();
+        let remote_root = remote.path();
+        let local_root = local.path();
+        advance_remote(remote_root, "f2.txt");
+        // `develop` stays checked out (the clone's default checkout).
+
+        assert_eq!(
+            base_ref_currency(local_root, "develop"),
+            BaseRefCurrency::Behind { count: 1 }
+        );
+
+        let err = ensure_base_ref_current(local_root, "develop").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("develop"), "{msg}");
+        assert!(msg.contains("origin/develop"), "{msg}");
+        assert!(msg.contains('1'), "{msg}");
+        assert!(msg.contains("git "), "{msg}");
+        let fixture_root = local_root.to_string_lossy().into_owned();
+        assert!(!msg.contains(&fixture_root), "{msg}");
+    }
+
+    #[test]
+    fn currency_behind_fast_forward_failure_falls_through_to_refusal() {
+        let (remote, local) = currency_fixture();
+        let remote_root = remote.path();
+        let local_root = local.path();
+        advance_remote(remote_root, "f2.txt");
+        run_git(local_root, &["checkout", "-q", "-b", "other"]);
+
+        // Force `git update-ref refs/heads/develop ...` to fail by
+        // pre-seeding its lock file (a stale lock is exactly the shape git
+        // itself reports: "Unable to create '...develop.lock': File exists").
+        std::fs::create_dir_all(local_root.join(".git/refs/heads")).unwrap();
+        std::fs::write(local_root.join(".git/refs/heads/develop.lock"), "").unwrap();
+
+        let result = ensure_base_ref_current(local_root, "develop");
+        assert!(
+            result.is_err(),
+            "a failed fast-forward must fall through to refusal, never a silent proceed"
+        );
+    }
+
+    #[test]
+    fn currency_is_ahead_for_unpushed_local_work() {
+        let (_remote, local) = currency_fixture();
+        let local_root = local.path();
+        std::fs::write(local_root.join("local-only.txt"), "x").unwrap();
+        run_git(local_root, &["add", "-A"]);
+        run_git(local_root, &["commit", "-q", "-m", "unpushed local work"]);
+
+        assert_eq!(
+            base_ref_currency(local_root, "develop"),
+            BaseRefCurrency::Ahead
+        );
+        assert!(
+            ensure_base_ref_current(local_root, "develop").is_ok(),
+            "unpushed local work must not be misreported as staleness"
+        );
+    }
+
+    #[test]
+    fn currency_is_diverged_when_local_and_remote_both_moved_independently() {
+        let (remote, local) = currency_fixture();
+        let remote_root = remote.path();
+        let local_root = local.path();
+
+        // Advance the remote independently...
+        advance_remote(remote_root, "remote-only.txt");
+        // ...and the local branch independently, from the same ancestor.
+        std::fs::write(local_root.join("local-only.txt"), "x").unwrap();
+        run_git(local_root, &["add", "-A"]);
+        run_git(
+            local_root,
+            &["commit", "-q", "-m", "local-only divergent commit"],
+        );
+
+        assert_eq!(
+            base_ref_currency(local_root, "develop"),
+            BaseRefCurrency::Diverged
+        );
+
+        let err = ensure_base_ref_current(local_root, "develop").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("develop"), "{msg}");
+        assert!(msg.contains("origin/develop"), "{msg}");
+    }
+
+    #[test]
+    fn currency_is_undeterminable_with_no_remote_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        assert_eq!(
+            base_ref_currency(root, "develop"),
+            BaseRefCurrency::Undeterminable
+        );
+        assert!(
+            ensure_base_ref_current(root, "develop").is_ok(),
+            "a probe that cannot see the remote at all must never refuse"
+        );
+    }
+
+    /// The fetch subprocess failing must not itself fail the check — the
+    /// comparison proceeds against whatever the remote-tracking ref
+    /// currently resolves to locally (here, still `Current` from the
+    /// initial clone), rather than collapsing to `Undeterminable`.
+    #[test]
+    fn currency_fetch_failure_falls_back_to_existing_remote_ref() {
+        let (remote, local) = currency_fixture();
+        let local_root = local.path();
+        // Delete the remote so any subsequent `git fetch` fails — but
+        // `origin/develop` already resolves locally from the initial clone.
+        drop(remote);
+
+        assert_eq!(
+            base_ref_currency(local_root, "develop"),
+            BaseRefCurrency::Current,
+            "a failing fetch must fall back to the already-resolved remote-tracking ref, \
+             not collapse to Undeterminable"
+        );
+    }
+
+    #[test]
+    fn currency_message_contains_no_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture_root = dir.path().to_string_lossy().into_owned();
+        let msg = stale_base_message("develop", "origin/develop", 3);
+        assert!(!msg.contains(&fixture_root));
+        assert!(!msg.contains("/home/"));
+        assert!(!msg.contains("/Users/"));
+        assert!(msg.contains("develop"));
+        assert!(msg.contains("origin/develop"));
+        assert!(msg.contains('3'));
     }
 }

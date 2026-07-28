@@ -17,7 +17,9 @@ use crate::parallel::ensure_phase_worktree;
 use crate::pipeline_gate::print_dry_run;
 use crate::pipeline_launch::{launch_stage, single_active_phase};
 use crate::pipeline_outcomes::render_gate_context;
-use crate::preflight::{agent_program, ensure_agent_binary, ensure_phase_reachable_on_base};
+use crate::preflight::{
+    agent_program, ensure_agent_binary, ensure_base_ref_current, ensure_phase_reachable_on_base,
+};
 use crate::staleness::{enforce_build_staleness, run_git_stdout};
 use devflow_core::agent;
 use devflow_core::agent_result;
@@ -134,6 +136,22 @@ pub(crate) fn start(
     // 14-CR-05: fail on a missing agent binary BEFORE any branch/worktree is
     // scaffolded (launch_stage re-checks for the advance-time launch paths).
     ensure_agent_binary(agent_program(agent))?;
+
+    // 25e (999.51/D-18a): before even asking whether phase N is reachable,
+    // make sure the base branch itself is current with its remote. A stale
+    // base is the single most common cause of a phase heading appearing
+    // absent — 999.51 recorded local `develop` sitting 21 commits behind
+    // `origin/develop` while the phase heading existed only on the remote —
+    // and the DANGEROUS variant is silent: a stale local `develop` that
+    // still happens to carry the heading passes the reachability guard
+    // below and forks a green run from stale code. Ordering here is
+    // load-bearing for the same reason the comment below already gives for
+    // the Codex leg: running reachability first would misdiagnose the cause
+    // (base is stale) as the symptom (phase not found). `ensure_base_ref_current`
+    // fast-forwards a safely-behind base and proceeds unattended, or refuses
+    // loudly on divergence / an unsafe fast-forward (see that function's own
+    // doc comment for the full decision).
+    ensure_base_ref_current(project_root, DEVELOP)?;
 
     // 23f (gap closure, 23-12): refuse before ANY git mutation when phase N
     // is not reachable from DEVELOP — the exact branch `ensure_phase_worktree`
@@ -1921,7 +1939,10 @@ pub(crate) fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
 
 /// Read-only release-cut preflight. Ceiling is `--check` only (D-03): no
 /// state-mutating helper, no `git tag`/publish, and (once Task 2/3 land) no
-/// `git fetch` — every check here reads already-available local state.
+/// `git fetch` — every check here reads already-available local state. This
+/// no-fetch property is scoped to `release --check`; it does NOT extend to
+/// `devflow start`, whose `ensure_base_ref_current` (999.51) issues its own
+/// `git fetch` on the start path — see that function's doc comment.
 /// Follows `doctor`'s `Check`-list-then-report shape (reuses the same
 /// `Check` struct) so the two commands stay visually consistent.
 pub(crate) fn release_check(project_root: &Path) -> Result<(), CliError> {
@@ -2026,6 +2047,10 @@ fn check_self_pin(project_root: &Path) -> Check {
 /// whether `scripts/sync-main-to-develop.sh` would be a no-op — read
 /// against ALREADY-FETCHED local refs, issuing NO `git fetch` (review:
 /// Codex HIGH — a "read-only" preflight must not depend on the network).
+/// This property is scoped to `release --check`'s read-only preflight, not
+/// a project-wide invariant: `devflow start`'s `ensure_base_ref_current`
+/// (999.51) issues its own `git fetch` before comparing on the start path,
+/// since a trustworthy currency comparison requires one either way.
 fn check_divergence(project_root: &Path) -> Check {
     const NAME: &str = "develop/main divergence (origin/main ancestor)";
     match devflow_core::git::origin_main_ancestor_status(project_root) {
