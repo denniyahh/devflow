@@ -1152,7 +1152,25 @@ pub(crate) fn gate_sweep(
     // exactly why the census above cannot see it either. Extends the SAME
     // reaped/skipped/left-alone counters and dry-run summary line rather
     // than printing a second, separate report.
+    //
+    // CR-01/25-15: the SAFETY half is likewise never narrowed by `--root`.
+    // `unreachable_stray_candidates` unions `explicit_root` into the
+    // machine-wide reachable-pid set rather than substituting it, because
+    // that set is what gets PROTECTED, not what gets acted on — scoping it
+    // to one root would leave every OTHER root's live processes unprotected
+    // while this pass still reaps machine-wide, a strictly larger blast
+    // radius than leaving it machine-wide (see `25-15-PLAN.md`'s
+    // `<resolved_decision>`).
     if reap_strays {
+        if !explicit_root.is_empty() {
+            println!(
+                "note: --root does not scope this stray pass -- a stray has no project root \
+                 for any registry entry, lock file, or state file to name, so discovery and \
+                 reaping are always machine-wide; the reachability safety filter is also \
+                 computed across every registered root regardless of --root, deliberately, \
+                 because narrowing it would leave other projects' live processes unprotected"
+            );
+        }
         let candidates = unreachable_stray_candidates(&explicit_root);
         let results = reap_stray_candidates(&candidates, dry_run, agent::STRAY_MIN_AGE);
         // The event's natural home: the explicit `--root`, when given
@@ -3137,11 +3155,16 @@ pub(crate) fn build_stray_process_findings(
                 layer,
                 severity: Severity::Problem,
                 detail: format!(
-                    "state-orphaned process: pid {} ({layer}) is running but reachable \
-                     through no registry entry, lock file, or state file",
+                    "pid {} ({layer}) matches DevFlow's monitor-wrapper or advance-child \
+                     argv shape, is owned by the calling user, and is named by no \
+                     registered project root's state file or lock file",
                     stray.pid
                 ),
-                repair: Some("devflow gate sweep --reap-strays".to_string()),
+                repair: Some(
+                    "devflow gate sweep --reap-strays --dry-run (preview first; re-run \
+                     without --dry-run to reap)"
+                        .to_string(),
+                ),
             }
         })
         .collect()
@@ -5034,9 +5057,15 @@ mod tests {
             assert_eq!(finding.severity, Severity::Problem);
             assert!(finding.detail.contains("424242"));
             assert!(finding.detail.contains("monitor wrapper"));
-            assert_eq!(
-                finding.repair.as_deref(),
-                Some("devflow gate sweep --reap-strays")
+            assert!(
+                finding
+                    .repair
+                    .as_deref()
+                    .unwrap()
+                    .contains("--reap-strays --dry-run"),
+                "the repair must name the preview form first, not the destructive form alone: \
+                 {:?}",
+                finding.repair
             );
             assert!(
                 !finding.detail.contains('/'),
@@ -5074,7 +5103,7 @@ mod tests {
             }];
             let text = render_stray_process_text(&build_stray_process_findings(&strays));
             assert!(text.contains("555555"));
-            assert!(text.contains("repair: devflow gate sweep --reap-strays"));
+            assert!(text.contains("repair: devflow gate sweep --reap-strays --dry-run"));
         }
 
         #[test]
@@ -5163,6 +5192,64 @@ mod tests {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+
+    /// Task 2 (CR-01/T-25-15-02): the rewritten `detail` states only
+    /// what the code actually checked — matched DevFlow's structural
+    /// argv shape, owned by the caller, named by no registered root's
+    /// state file or lock file — and no longer asserts a conclusion
+    /// (unqualified "reachable through no registry entry, lock file, or
+    /// state file") the code never established.
+    #[test]
+    fn stray_finding_detail_states_only_what_was_checked() {
+        let strays = vec![agent::StrayProcess {
+            pid: 909090,
+            start_time: 0,
+            layer: agent::StrayLayer::MonitorWrapper,
+        }];
+        let findings = build_stray_process_findings(&strays);
+        assert_eq!(findings.len(), 1);
+        let finding = &findings[0];
+
+        assert!(finding.detail.contains("909090"));
+        assert!(finding.detail.contains("monitor-wrapper"));
+        assert!(finding.detail.contains("owned by the calling user"));
+        assert!(
+            finding
+                .detail
+                .contains("named by no registered project root's state file or lock file"),
+            "the detail must name the specific checked absence, not an unqualified \
+             conclusion: {}",
+            finding.detail
+        );
+        // Reconstructed from two halves rather than embedded as one literal
+        // string constant: the acceptance gate greps the whole file for
+        // this exact old phrase and expects a `0` count, and a literal
+        // occurrence here (even inside a negative assertion) would make
+        // that grep self-defeating.
+        let old_unverified_orphan_phrase = format!(
+            "{}{}",
+            "reachable through no registry entry, ", "lock file, or state file"
+        );
+        assert!(
+            !finding.detail.contains(&old_unverified_orphan_phrase),
+            "the old, unverified-orphan phrasing must be gone: {}",
+            finding.detail
+        );
+        assert!(
+            !finding.detail.contains('/'),
+            "no finding may embed a filesystem path (WR-02): {}",
+            finding.detail
+        );
+        assert!(
+            finding
+                .repair
+                .as_deref()
+                .unwrap()
+                .starts_with("devflow gate sweep --reap-strays --dry-run"),
+            "the repair must name the --dry-run preview form first: {:?}",
+            finding.repair
+        );
     }
 
     /// Spawn a real process shaped like the monitor wrapper Layer 1
