@@ -1,81 +1,116 @@
 ---
 phase: 25-end-to-end-dogfood-blockers
-verified: 2026-07-28T02:12:39Z
+verified: 2026-07-28T16:19:31Z
 status: gaps_found
-score: 6/9 must-haves verified
-behavior_unverified: 1
+score: 8/10 must-haves verified
+behavior_unverified: 0
 overrides_applied: 0
+re_verification:
+  previous_status: gaps_found
+  previous_score: 6/9
+  gaps_closed:
+    - "25c (gate) — D-09 major-bump gate now fires in the default worktree execution path (25-08: execution_root threading + non-short-circuiting aggregation, both independently re-confirmed by direct source read and a passing targeted test run)"
+    - "25c (anchor) — release_range_start now anchors correctly under the trunk-commit-between-tag-and-sync-merge topology (25-09: full ancestry-path walk, independently re-confirmed by source read and a passing targeted test run)"
+  gaps_remaining: []
+  regressions:
+    - "25a — a NEW defect (CR-02, not present in the previous verification's scope) was found in the same unit: ensure_base_ref_current's fast-forward can itself corrupt the base ref it exists to keep current"
+    - "25d — a NEW defect (CR-01, not present in the previous verification's scope, introduced by this phase's own 25d/999.44 work) was found: the doctor/gate-sweep stray-process surface can direct an operator to SIGKILL a live, registered process"
+  note: >
+    The two Critical findings this run treats as blocking (CR-01, CR-02 per the current
+    25-REVIEW.md) are DIFFERENT defects from the two the previous 25-VERIFICATION.md tracked
+    under the same CR-01/CR-02 labels (those were the D-09 gate short-circuit and the
+    release_range_start anchor bug, both now fixed by 25-08/25-09 and closed above). The label
+    reuse is REVIEW.md's own re-numbering after a full re-review of the post-gap-closure tree,
+    not a re-verification of the same bugs. Additionally, this run supersedes the previous
+    verification's truth 7 (25e), which was recorded as PRESENT_BEHAVIOR_UNVERIFIED on a
+    "structurally removed" premise that 25-CI-OBSERVATION.md's 2-of-2 live reproduction later
+    falsified. That premise has since been replaced by 25-11's measured site census + exec-
+    visibility barrier, 25-12's production age floor, and 25-13's 11-observation CI-on-branch
+    streak with explicit, verbatim human sign-off (2026-07-28) that engaged with the evidence's
+    stated residual — the strongest form of closure this class of race admits, and this
+    verifier's own independent corroboration (gh run view, git merge-base --is-ancestor) matches
+    the artifact's claims. Truth 7 is recorded VERIFIED (human-verified, residual stated), not
+    upgraded to "proven absent."
 gaps:
-  - truth: "D-09's major-bump gate never ships unattended, in the default (worktree) execution path"
+  - truth: "25a — a run starts on a current base ref SAFELY: the fast-forward repair cannot itself corrupt the base ref it exists to keep current"
     status: failed
     reason: >
-      Two independently-confirmed Critical defects (CR-01, CR-02 from 25-REVIEW.md) mean the
-      gate does not deliver D-09's stated contract in the default launch mode. CR-01:
-      `generic_preflight_checks` (preflight.rs:718-724) `?`-chains interactivity -> gh-auth ->
-      major-bump; if gh-auth fails first, major-bump never runs, and approving that gate via
-      `GateAction::Advance` calls `launch_stage_inner` directly without ever re-running
-      `generic_preflight_checks` -- permanently skipping the major-bump check for that stage
-      launch. CR-02: `preflight_major_bump_check` shells git against `project_root` only
-      (preflight.rs:614-668), never `state.worktree_path`; in the default worktree launch mode
-      the phase's own commits live on the feature branch and are unreachable from
-      `project_root`'s HEAD until `hooks_after_ship`'s Merge step runs -- which is AFTER this
-      preflight check. A `feat!:`/`BREAKING CHANGE:` commit made during Code will therefore
-      never be seen by this gate; it is first classified inside `VersionBump`, after Merge has
-      already committed, with no rollback. Both confirmed by direct source read (preflight.rs,
-      pipeline_launch.rs, state.rs) independent of REVIEW.md's own analysis. No fix commit
-      followed the review (`ab119c0` "docs(25): add code review report" is HEAD).
+      Independently confirmed by direct source read of preflight.rs:424-481
+      (`ensure_base_ref_current`'s `Behind` arm), not merely cited from 25-REVIEW.md's CR-02.
+      The fast-forward is performed with `git update-ref refs/heads/{base}
+      refs/remotes/{remote_ref}` and NO `<oldvalue>` argument — an unconditional write that can
+      move `{base}` BACKWARDS onto a non-descendant if anything advances the local ref between
+      `base_ref_currency`'s read and this write (a concurrent `devflow start`, an operator, a
+      hook), while printing a false "N commit(s) fast-forwarded" success message. Separately,
+      the precondition that guards the write — "not currently checked out" — is tested with
+      `git symbolic-ref --quiet --short HEAD` run ONLY in `project_root`, i.e. it sees just the
+      one worktree `devflow start` is invoked from. `git update-ref`, unlike `git branch -f`,
+      carries no checked-out-branch protection of its own. This repository routinely runs
+      several linked worktrees at once (confirmed live during this verification: a phase-07
+      worktree at `/tmp/.tmpYzOOmM/.worktrees/phase-07` was actively running) — if `develop` is
+      checked out in ANY worktree other than the one `project_root` resolves to, this code moves
+      the ref out from under that worktree silently, leaving its HEAD, index and working tree
+      out of sync. 25a exists precisely because a human previously had to repair the base ref by
+      hand before `devflow start` would launch; a repair mechanism that can itself corrupt the
+      ref does not close that requirement — it adds a second, silent way to reach the same
+      broken state.
     artifacts:
       - path: "crates/devflow-cli/src/preflight.rs"
-        issue: "generic_preflight_checks (:718-724) short-circuits via `?` in interactivity -> gh-auth -> major-bump order; preflight_major_bump_check (:614-668) always evaluates project_root, never state.worktree_path.as_deref().unwrap_or(project_root)"
-      - path: "crates/devflow-cli/src/pipeline_launch.rs"
-        issue: "run_preflight's GateAction::Advance arm (~:796-806) calls launch_stage_inner(state, None, None) directly, never re-running generic_preflight_checks, so a check that never ran once (because an earlier check failed) is never run at all before the stage launches"
+        issue: "ensure_base_ref_current (:445-479, Behind arm): git update-ref with no <oldvalue> guard (unconditional write); checked-out precondition (:447-454) probes only project_root's own HEAD, not other worktrees"
     missing:
-      - "Make generic_preflight_checks aggregate all three checks' failures rather than short-circuit on the first (REVIEW.md's suggested fix a), so a human always sees the major-bump reason whenever it applies regardless of what else failed"
-      - "Thread the execution root through preflight_major_bump_check as state.worktree_path.as_deref().unwrap_or(project_root), mirroring staleness.rs::enforce_build_staleness's existing execution_root idiom"
-      - "A regression test that builds a real worktree fixture (mirroring staleness.rs::worktree_staleness_fixture) with a feat!: commit only on the worktree's feature branch, asserting preflight_major_bump_check still fires against state.worktree_path"
-  - truth: "release_range_start's commit-range anchor stays correct (excludes pre-release develop history) across realistic release topologies"
+      - "Pass <oldvalue> to git update-ref — the resolved local base SHA at check time — so the write refuses (rather than silently discarding) if base moved since base_ref_currency's own check"
+      - "Replace the single-worktree symbolic-ref probe with a repository-wide check (git worktree list --porcelain, scanning for `branch refs/heads/<base>`), or attempt `git branch -f <base> <remote_ref>` first — it already refuses on its own when base is checked out in ANY worktree, which is exactly the precondition the current code is trying and failing to establish"
+      - "A regression test with base checked out in a SECOND worktree (not project_root) — asserting the fast-forward refuses rather than silently moving the ref out from under it"
+  - truth: "25d — a stalled run recovers without kill(1), and the recovery mechanism never SIGKILLs a live, registered (non-orphaned) process"
     status: failed
     reason: >
-      Independently confirmed by direct source read (version.rs:258-313), matching CR-03 from
-      25-REVIEW.md. The function inspects only the ancestry path's first commit (C1) and checks
-      whether the baseline tag is an ancestor of C1's first parent to decide "ordinary range" vs
-      "squashed release via sync-merge." When a commit lands directly on trunk between the tag
-      and the sync-merge-back (e.g. a hotfix pushed straight to main), --ancestry-path picks up
-      that intervening commit as C1 instead of the sync-merge commit; C1's first parent is then
-      the tag commit itself, `git merge-base --is-ancestor <tag> <tag>` returns true (a commit is
-      its own ancestor), and the function concludes the tag already sat on mainline -- silently
-      reverting to the literal, over-broad `tag..HEAD` range this function exists to avoid (the
-      exact "677 commits, 62 feat" pathology the whole D-08 amendment was built to fix). Neither
-      existing regression test (squash_sync_topology_classifies_only_post_merge_commits,
-      two_squash_sync_cycles_anchor_to_the_second_merge_only) constructs an intervening trunk
-      commit -- confirmed via grep, no test name matches this topology.
+      Independently reproduced LIVE on this machine during this verification, not merely cited
+      from 25-REVIEW.md's CR-01. `discover_stray_devflow_processes` (agent.rs:393-446) is a
+      purely structural `/proc` census with no orphan test of any kind — it matches on argv
+      shape and euid only. `build_stray_process_findings` (commands.rs:3023-3043) then asserts,
+      for every match, that it "is running but reachable through no registry entry, lock file,
+      or state file" and recommends `devflow gate sweep --reap-strays` (commands.rs:3039). Ran
+      `devflow doctor --json` on this machine: 40 `stray_processes` findings. Cross-referenced
+      pid 596367 (one of them, labelled "monitor wrapper") against
+      `/tmp/.tmp4T6jFk/.devflow/state-12.json`: that file's `monitor_pid` field IS 596367 — a
+      live, currently-running phase-12 monitor wrapper, reachable through a real state file.
+      `doctor`'s claim that it is reachable through "no registry entry, lock file, or state
+      file" is false for this specific process, right now. `gate_sweep`'s `--reap-strays` pass
+      (commands.rs:1149-1232) feeds the SAME unfiltered census straight to
+      `reap_stray_candidates` gated only by `agent::STRAY_MIN_AGE` (a 2-second age floor that
+      exists to bound the fork/exec cmdline-inheritance race — 999.47's mechanism — and has no
+      bearing on registry-reachability). A monitor wrapper minutes old sails past that floor.
+      Following doctor's own printed repair would SIGKILL pid 596367; SIGKILL is uncatchable, so
+      the wrapper's `trap cleanup TERM INT` never fires, orphaning its own trailing `devflow
+      advance` child — manufacturing exactly the orphan class 999.44 exists to eliminate.
+      Additionally confirmed: `gate_sweep`'s stray pass ignores `--root` entirely (comment at
+      commands.rs:1143-1145 states this explicitly), so a sweep scoped to one root still reaps
+      the whole machine's strays; and `main.rs:389-397`'s `--reap-strays` help text describes
+      the behaviour as clearing "STATE-ORPHANED processes," which is not the semantics this
+      code has. The TERM->KILL escalation, death verification, and identity re-confirmation
+      primitives themselves (`terminate_and_verify`, `is_same_process`) are sound in isolation
+      (see truth 6) — the defect is entirely in what gets handed to them.
     artifacts:
-      - path: "crates/devflow-core/src/version.rs"
-        issue: "release_range_start (:258-313) anchors on C1's first-parent ancestry only, not the last merge commit in the full --ancestry-path list; silently falls back to the naive tag..HEAD range under the untested topology"
+      - path: "crates/devflow-cli/src/commands.rs"
+        issue: "build_stray_process_findings (:3023-3043) asserts unverified orphan-ness; collect_stray_process_findings (:3048-3050) and gate_sweep's stray pass (:1149-1232) feed the unfiltered census with no registry-reachability check; the stray pass ignores --root (:1143-1151)"
+      - path: "crates/devflow-core/src/agent.rs"
+        issue: "discover_stray_devflow_processes (:393-446) is structural-only by design (documented, not itself a bug) — but has no counterpart that filters against registry::load_roots()'s reachable pids before either surface acts on it"
+      - path: "crates/devflow-cli/src/main.rs"
+        issue: "--reap-strays help text (:389-397) describes clearing 'STATE-ORPHANED processes,' semantics the implementation does not have"
     missing:
-      - "Walk the full --ancestry-path list and anchor at the last (closest-to-HEAD) merge commit, falling back to baseline_tag only when the path contains no merge commit at all (REVIEW.md's own sketch fix)"
-      - "A fixture with a direct trunk commit between the tag and the sync-merge-back, asserting the classified range still excludes pre-release develop history"
+      - "Filter the census against registry::load_roots()'s reachable pids (each root's state.monitor_pid and lock::holder) before either reporting a match as state-orphaned in doctor or signalling it in gate_sweep — a pid a live registry entry still reaches is by definition not a stray"
+      - "Honour --root in the stray pass (scope the reachable-pid filter to the given root), or document loudly at the call site why it cannot be scoped"
+      - "Reword doctor's detail string and main.rs's --reap-strays help text once the corrected scope is known"
+      - "A regression test with a live, registry-reachable pid (a real state file naming it as monitor_pid) present alongside a genuine orphan in the same discovery pass, asserting only the orphan is reported/reaped"
 deferred: []
-behavior_unverified_items:
-  - truth: "25e: the 999.47 CI flake (cmdline-inheritance race in looks_like_devflow_process's old test shape) is actually closed"
-    test: "Observe cargo test --workspace (or the specific retargeted tests) green across several consecutive CI-on-branch pushes in the pinned CI container"
-    expected: "No flake reproduction across multiple pushes, matching the project's own established precedent that local-green is explicitly insufficient for this class of race (19-RESEARCH.md)"
-    why_human: "999.47's confirmed mechanism (fork/exec cmdline-inheritance window) only reproduces reliably inside the pinned CI container; local probes at thousands of spawns never observed it, so no local test run -- however green -- can establish closure. Both 25-02-SUMMARY.md and 25-07-SUMMARY.md explicitly disclose this limitation themselves."
-human_verification:
-  - test: "Observe cargo test --workspace green across several CI-on-branch pushes for the retargeted 25e tests"
-    expected: "No flake reproduction over multiple pushes in the pinned CI container"
-    why_human: "Only reproduces in CI container per 999.47's confirmed mechanism; local green (already obtained, 4 consecutive runs per 25-02/25-07 SUMMARYs) does not establish closure"
-  - test: "Re-review 25-VALIDATION.md's Manual-Only Verifications rows 1-3 (CONTRIBUTING.md step 5 against the tracked .gitconfig; ROADMAP Acceptance paragraph vs D-15/D-16; PROJECT.md Constraints bullet vs the 25c algorithm) as a human, not as an executor self-report"
-    expected: "A human confirms the same conclusions 25-04-SUMMARY.md records as 'Confirmed' -- this verifier independently re-confirmed the textual claims via grep (devflow.releaseSigningKey present, tag.gpgsign=false absent, no require-shipped in the Phase 25 Acceptance entry, ban-bullet amended), but these three rows are explicitly designated human-judgment checks in 25-VALIDATION.md, and an executor's own self-report of a human-judgment row cannot substitute for the sign-off itself"
-    why_human: "25-VALIDATION.md designates these as manual-only/human-judgment verifications; 25-04-SUMMARY.md's 'Confirmed' entries are the executor's own self-assessment of exactly the checks it was not positioned to discharge"
 ---
 
 # Phase 25: End-to-End Dogfood Blockers Verification Report
 
-**Phase Goal:** Close the blockers that prevent an unattended end-to-end DevFlow-driven run from completing — units 25a (base-ref currency), 25b (staleness pin/hoist), 25c (compute_version + major-bump gate), 25d (state-orphaned process reaping), 25e (looks_like_devflow_process flake), 25f (CONTRIBUTING drift), plus 999.38 (PATH race) folded in.
-**Verified:** 2026-07-28T02:12:39Z
+**Phase Goal:** Make an unattended `devflow start --phase N --agent claude --mode auto --yes-ship` run reach a completed Ship stage without a human touching it, by closing the four things that currently prevent it (a run starts on a current base — 25a; progresses through all stages — 25b; finishes with correct artifacts — 25c; a stalled run recovers without `kill(1)` — 25d), plus 25e (CI-throughput flake), 25f (docs drift), and 999.38 (PATH race).
+**Verified:** 2026-07-28T16:19:31Z
 **Status:** gaps_found
-**Re-verification:** No — initial verification
+**Re-verification:** Yes — after gap closure (25-08/25-09 closed the prior report's two gaps; this run independently re-derived the whole phase against the post-gap-closure tree and found two NEW, unrelated Critical defects — see `re_verification.regressions` above)
 
 ## Goal Achievement
 
@@ -83,53 +118,61 @@ human_verification:
 
 | # | Truth | Status | Evidence |
 |---|-------|--------|----------|
-| 1 | 25a — a run starts on a current base ref; "heading present but code stale" is closed, not just "heading absent" | ✓ VERIFIED | `ensure_base_ref_current(project_root, DEVELOP)?` wired at `commands.rs:154`, immediately before `ensure_phase_reachable_on_base(...)` at `:164`. 9 real-git-fixture tests in `preflight.rs` (`currency_*`) exercise Current/Ahead/Behind-fastforward/Behind-checked-out-refuse/Diverged/Undeterminable/fetch-failure. Spot-run `currency_behind_and_not_checked_out_fast_forwards_and_proceeds` -> `1 passed`. |
-| 2 | 25b — `enforce_build_staleness` is adjudicated once per run (at `start`), no longer re-invoked on every stage transition | ✓ VERIFIED | Call hoisted to `commands.rs:278`, after `state.worktree_path` is set (`:213`); deleted from `pipeline_launch.rs::launch_stage_inner`. Behavioral regression test `mid_run_stage_transition_does_not_readjudicate_staleness` drives the same fixture through both call shapes and asserts exactly one refusal — confirmed present in `staleness.rs`. |
-| 3 | 25c (derivation) — `compute_version` derives from (highest reachable semver tag, conventional-commit classification), refuses on unreachable baseline, floors correctly | ✓ VERIFIED | `version.rs`'s `highest_semver_tag`/`reachable_semver_baseline`/`classify_range_bump`/`VersionError::UnreachableBaseline` all present and composed in `compute_version`; 36+ tests including D-10 floor/refusal fixtures. **Caveat (WR-02, non-blocking):** a prerelease-tagged baseline (e.g. `v2.0.0-rc.1`) silently skips the stable release on the next bump — not exercised in this repo today, recorded as a warning, not a gap. |
-| 4 | 25c (gate) — a major version bump opens a gate and never ships unattended, in the **default (worktree) execution path** | ✗ FAILED | Independently confirmed via source read (not just REVIEW.md): `generic_preflight_checks` (`preflight.rs:718-724`) short-circuits `interactivity -> gh-auth -> major-bump` via `?`; an earlier failure means major-bump never runs, and `GateAction::Advance` (`pipeline_launch.rs`) calls `launch_stage_inner` directly, never re-running `generic_preflight_checks` — permanently bypassing the gate for that launch (CR-01). Separately, `preflight_major_bump_check` always shells git against `project_root` (verified: `run_preflight(&project_root, ...)` at `pipeline_launch.rs:192` uses `state.project_root.clone()`, never `state.worktree_path`), so in the default worktree flow the phase's own commits are invisible to this check until *after* Merge has already run (CR-02). Both existing integration tests use a no-worktree fixture (`major_bump_fixture`), the one case where this bug cannot manifest. See gaps. |
-| 5 | 25c (anchor) — `release_range_start`'s commit-range anchor excludes pre-release history across realistic release topologies | ✗ FAILED | Independently confirmed via source read (`version.rs:258-313`, matching CR-03): the anchor heuristic inspects only C1's first-parent ancestry; a commit landing directly on trunk between the tag and the sync-merge-back makes C1 that intervening commit, whose first parent *is* the tag — `merge-base --is-ancestor <tag> <tag>` trivially returns true, and the function silently falls back to the naive `tag..HEAD` range it was built to avoid. No existing test constructs this topology (grep for trunk/hotfix/direct-commit fixtures: 0 matches). |
-| 6 | 25d — a stalled run recovers without `kill -9`: bounded TERM->KILL escalation with verified death; registry-independent discovery; wrapper+child reaped together | ✓ VERIFIED | `terminate_and_verify` and `discover_stray_devflow_processes` present in `agent.rs`; `gate sweep --reap-strays` and `doctor`'s stray finding wired in `commands.rs`/`main.rs`. Real e2e tests (`reap_strays_e2e.rs`) delete a process's root out from under it and confirm the registry-independent primitives still find and clear it (including SIGTERM-ignoring). Spot-run `terminate_and_verify_escalates_to_kill_for_a_term_ignoring_child` and `reap_stray_candidates_escalates_to_kill_for_a_term_ignoring_child` -> both `1 passed`. |
-| 7 | 25e — the 999.47 CI flake (cmdline-inheritance race) is closed | ⚠️ PRESENT_BEHAVIOR_UNVERIFIED | Production guard (`(pid, starttime)` identity pair) confirmed already live at `commands.rs:1421` (`lock::holder_identity`), predating this phase. `looks_like_devflow_process` marked `#[deprecated]`; both flaky tests retargeted to assert the identity guard directly, eliminating the `execve` race by construction (no `spawn()`). But the flake's closure can only be confirmed by CI-on-branch stability across several pushes per this project's own established precedent (19-RESEARCH.md) — both 25-02-SUMMARY.md and 25-07-SUMMARY.md explicitly disclose that only local runs were performed. Routed to human verification. |
-| 8 | 999.38 — the test-suite PATH race (`ahead_build_from_descendant_commit_warns_instead_of_blocking`) is de-raced | ✓ VERIFIED | `ENV_MUTEX` guard added (matching its three siblings) and fixture reads rerouted through `test_support::git_command` — confirmed present in `staleness.rs:1044-1046`. This is a structural fix (serialization + hermetic reads), not merely flake-reduction, and is independently verifiable locally (unlike 25e, which needs the specific fork/exec CI-only window). |
-| 9 | 25f — CONTRIBUTING.md's release procedure and the ROADMAP/PROJECT.md versioning-policy prose no longer drift from what 25c implements | ✓ VERIFIED (3 sub-items pending human sign-off) | Confirmed via direct grep: `CONTRIBUTING.md` names `devflow.releaseSigningKey` via the `-c user.signingkey=...` indirection, `tag.gpgsign=false` no longer appears; `.planning/ROADMAP.md`'s June-2026 ban bullet records the D-06 lift; the Phase 25 "Acceptance" paragraph contains no `require-shipped` requirement and matches D-15/D-16. **However**, 25-VALIDATION.md designates these as human-judgment/manual-only checks, and 25-04-SUMMARY.md's "Confirmed" rows are the executor's own self-report of exactly those checks — per this project's own contract, that self-report does not substitute for actual human sign-off. Routed to human verification (not blocking). |
+| 1 | 25a — a run starts on a current base ref, **safely** | ✗ FAILED | `ensure_base_ref_current`'s fast-forward (`preflight.rs:456-473`) uses `git update-ref` with no `<oldvalue>` guard (unconditional write) and a checked-out precondition that only probes `project_root`'s own HEAD. Confirmed by direct source read; matches REVIEW.md's CR-02 scratch-repo reproduction. See gaps. |
+| 2 | 25b — `enforce_build_staleness` is adjudicated once per run (at `start`), never re-invoked mid-run | ✓ VERIFIED | Call present at `commands.rs:278`, after `state.worktree_path` is set (`:248`); absent from `pipeline_launch.rs`. `staleness.rs::mid_run_stage_transition_does_not_readjudicate_staleness` present and passing (part of the 688/0 full run). |
+| 3 | 25c (derivation) — `compute_version` derives from (reachable semver tag, conventional-commit classification), refuses on unreachable baseline, floors correctly | ✓ VERIFIED | `version.rs`'s `reachable_semver_baseline`/`highest_semver_tag`/`classify_range_bump`/`VersionError::UnreachableBaseline` present and composed; unchanged from the previous verification's finding. |
+| 4 | 25c (gate) — a major version bump opens a gate and never ships unattended, **in the default (worktree) execution path** — closes the previous verification's GAP 1 | ✓ VERIFIED | `preflight_major_bump_check` now evaluates `execution_root = state.worktree_path.as_deref().unwrap_or(project_root)` (`preflight.rs:629`), confirmed by direct source read; `generic_preflight_checks` (`:763-778`) aggregates all three checks (major-bump first) instead of `?`-short-circuiting, confirmed present. Spot-run both `preflight::tests::preflight_major_bump_check_fires_against_the_worktree_head` and `preflight::tests::generic_preflight_checks_reports_major_bump_even_when_gh_auth_fails_first` -> both `1 passed`. |
+| 5 | 25c (anchor) — `release_range_start`'s commit-range anchor excludes pre-release history across realistic release topologies — closes the previous verification's GAP 2 | ✓ VERIFIED | `release_range_start` (`version.rs:299-360`) now walks the FULL `--ancestry-path` list rather than only its first commit, confirmed by direct source read; matches the fix REVIEW.md's own CR-03 sketch proposed. Spot-run `version::tests::trunk_commit_between_tag_and_sync_merge_still_anchors_at_the_sync_merge` -> `1 passed`. |
+| 6 | 25d (primitives) — bounded TERM->KILL escalation with verified death; registry-independent discovery; identity re-confirmation before signalling | ✓ VERIFIED | `terminate_and_verify`, `discover_stray_devflow_processes`, `process_start_time`, `is_same_process` present in `agent.rs`; `process_age`/`STRAY_MIN_AGE` (25-12) correctly bound the fork/exec race and fail closed on unreadable/non-finite age data. Independently re-derived from source (not merely REVIEW.md's own analysis): guard ordering (identity -> age -> dry_run -> signal) is correct, no branch signals a too-young or unknown-age candidate. |
+| 7 | 25d (surface) — an operator using `devflow doctor` / `gate sweep --reap-strays` never has a live, registered process misreported as an orphan or destroyed | ✗ FAILED | **Live-reproduced during this verification, not merely cited from REVIEW.md.** `devflow doctor --json` on this machine currently reports 40 `stray_processes` findings; pid 596367 among them is independently confirmed to be the recorded `monitor_pid` in a real, live `state-12.json` — `doctor`'s claim that it is reachable through "no registry entry, lock file, or state file" is false for this exact process. The printed repair (`devflow gate sweep --reap-strays`) would SIGKILL it, bypassing its wrapper's `trap cleanup`, orphaning its own child. See gaps. |
+| 8 | 25e — the 999.47 CI flake (cmdline-inheritance race) — human-verified against 11 observations, residual explicitly stated, not claimed proven absent | ✓ VERIFIED (human-verified) | 25-11's measured site census (`25-SITE-CENSUS.md`: 4 VULNERABLE-POSITIVE + 2 VACUOUS-NEGATIVE sites, all barriered with `wait_for_exec_visibility`) and 25-12's production age floor (`agent::STRAY_MIN_AGE`) confirmed present and wired (see `## Key Link Verification`). `25-CI-TRIALS.md` records 6 local push-gate + 5 CI `Test`-job trials, all green, all at `82328b3` — independently corroborated by this verifier: `gh run view 30371091367` confirms `conclusion: success` at the stated head SHA, and `git merge-base --is-ancestor 82328b3 origin/feature/phase-25` exits 0 (origin is NOT at the pre-fix `a5a068f`). A human explicitly engaged with the evidence's own stated limitation (CI's `Test` job is the less-sensitive shape) before approving, recorded verbatim in `25-13-SUMMARY.md` Part A (2026-07-28). The record's own vocabulary (`no_reproduction`, never `closed`) and residuals (~6.1% / ~0.05%) are preserved here, not upgraded. |
+| 9 | 999.38 — the test-suite PATH race is de-raced | ✓ VERIFIED | `ENV_MUTEX` guard + `test_support::git_command` hermetic reads confirmed present at `staleness.rs:1044-1046` and its three siblings. |
+| 10 | 25f — CONTRIBUTING.md's release procedure and the ROADMAP/PROJECT.md versioning-policy prose no longer drift from what 25c implements | ✓ VERIFIED (human sign-off recorded) | `CONTRIBUTING.md` uses the `-c user.signingkey=...` indirection and no longer claims `tag.gpgsign=false`; `ROADMAP.md`'s Acceptance paragraph and June-2026 ban bullet amended per D-06/D-15/D-16. `25-VALIDATION.md`'s three human-judgment rows signed off verbatim ("B: approved," 2026-07-28) in `25-13-SUMMARY.md` Part B, with the orchestrator's own independent corroboration of each row recorded alongside (not substituting for it). |
 
-**Score:** 6/9 truths verified (1 present-but-behavior-unverified, 2 failed)
+**Score:** 8/10 truths verified (0 present-but-behavior-unverified, 2 failed)
 
 ### Required Artifacts
 
 | Artifact | Expected | Status | Details |
 |----------|----------|--------|---------|
-| `crates/devflow-cli/src/preflight.rs::ensure_base_ref_current`/`base_ref_currency` | 25a currency probe | ✓ VERIFIED | Present, wired at `commands.rs:154`, 9 tests |
+| `crates/devflow-cli/src/preflight.rs::ensure_base_ref_current`/`base_ref_currency` | 25a currency probe, safe fast-forward | ⚠️ WIRED but unsafe | Present, wired at `commands.rs:154` before `ensure_phase_reachable_on_base` — but see truth 1/gaps: the fast-forward itself is unsafe |
 | `crates/devflow-cli/src/commands.rs::start()` staleness call site | 25b one-shot gate | ✓ VERIFIED | Present at `:278`, after `worktree_path` set; removed from `pipeline_launch.rs` |
-| `crates/devflow-core/src/version.rs::compute_version` + helpers | 25c derivation | ✓ VERIFIED | Present, composed correctly; see truth 3/5 split |
-| `crates/devflow-cli/src/preflight.rs::preflight_major_bump_check`/`major_bump_check_applies` | 25c D-09 gate | ⚠️ WIRED but not correctly scoped | Present, composed into `generic_preflight_checks`, but see truth 4 — CR-01/CR-02 |
-| `crates/devflow-core/src/agent.rs::terminate_and_verify`/`discover_stray_devflow_processes` | 25d primitives | ✓ VERIFIED | Present, tested with real spawned children |
-| `crates/devflow-cli/src/commands.rs::reap_stray_candidates`, `gate_sweep --reap-strays`, doctor stray finding | 25d CLI surface | ✓ VERIFIED | Present, wired in `main.rs`/`commands.rs`, e2e tests present |
-| `crates/devflow-core/src/agent.rs` retargeted `looks_like_devflow_process` tests | 25e | ✓ VERIFIED (behavior CI-pending) | `#[deprecated]`, tests retargeted to identity guard |
-| `crates/devflow-cli/src/staleness.rs` de-raced 999.38 test | 999.38 | ✓ VERIFIED | `ENV_MUTEX` + hermetic reads present |
-| `CONTRIBUTING.md`, `.planning/ROADMAP.md`, `.planning/PROJECT.md` | 25f docs | ✓ VERIFIED (human sign-off pending) | Confirmed via grep |
+| `crates/devflow-core/src/version.rs::compute_version` + helpers | 25c derivation | ✓ VERIFIED | Present, composed correctly |
+| `crates/devflow-cli/src/preflight.rs::preflight_major_bump_check`/`major_bump_check_applies` | 25c D-09 gate, worktree-scoped | ✓ VERIFIED | `execution_root` threading + aggregation confirmed present; previous gap closed |
+| `crates/devflow-core/src/version.rs::release_range_start` | 25c anchor, topology-robust | ✓ VERIFIED | Full ancestry-path walk confirmed present; previous gap closed |
+| `crates/devflow-core/src/agent.rs::terminate_and_verify`/`discover_stray_devflow_processes`/`process_age` | 25d primitives | ✓ VERIFIED | Present, sound in isolation, tested with real spawned children |
+| `crates/devflow-cli/src/commands.rs::build_stray_process_findings`, `gate_sweep --reap-strays` | 25d CLI surface — orphan-safe | ✗ UNSAFE | Present and wired, but not registry-reachability-filtered — see truth 7/gaps |
+| `crates/devflow-core/src/test_support.rs::wait_for_exec_visibility` | 25e exec-visibility barrier | ✓ VERIFIED | Present, wired at all 4 vulnerable-positive sites (`agent.rs` x3, `commands.rs` x1, `reap_strays_e2e.rs` x1) |
+| `.planning/phases/25-end-to-end-dogfood-blockers/25-SITE-CENSUS.md`, `25-CI-TRIALS.md` | 25e evidence artifacts | ✓ VERIFIED | Present, internally consistent, independently corroborated (CI run status, ancestry) |
+| `CONTRIBUTING.md`, `.planning/ROADMAP.md`, `.planning/PROJECT.md` | 25f docs | ✓ VERIFIED | Confirmed via grep; human sign-off recorded |
 
 ### Key Link Verification
 
 | From | To | Via | Status | Details |
 |------|-----|-----|--------|---------|
-| `commands.rs::start()` | `preflight.rs::ensure_base_ref_current` | direct call, before `ensure_phase_reachable_on_base` | ✓ WIRED | Confirmed ordering at `:154`/`:164` |
+| `commands.rs::start()` | `preflight.rs::ensure_base_ref_current` | direct call, before `ensure_phase_reachable_on_base` | ⚠️ WIRED, unsafe implementation | Ordering confirmed at `:154`/`:164`; the called function's own internals are the defect (truth 1) |
 | `commands.rs::start()` | `staleness.rs::enforce_build_staleness` | direct call, after `worktree_path` set | ✓ WIRED | Confirmed at `:278` |
-| `pipeline_launch.rs::launch_stage` | `preflight.rs::run_preflight` -> `generic_preflight_checks` -> `preflight_major_bump_check` | call chain | ⚠️ WIRED, wrong scope | `run_preflight(&project_root, ...)` at `:192` uses `state.project_root.clone()` — never `state.worktree_path`, so the D-09 gate is wired but evaluates the wrong ref in the default launch mode (CR-02) |
-| `preflight.rs::run_preflight`'s `GateAction::Advance` arm | `pipeline_launch.rs::launch_stage_inner` | direct call, bypassing `generic_preflight_checks` | ⚠️ WIRED, by design — but composes badly with CR-01 | Confirmed: Advance calls `launch_stage_inner(state, None, None)` directly; a check that never ran (because an earlier one failed first) is never given a second chance |
-| `main.rs::Sweep{reap_strays}` | `commands.rs::gate_sweep` -> `reap_stray_candidates` | CLI flag threading | ✓ WIRED | Confirmed at `main.rs:526-527`, `commands.rs:1149-1151` |
-| `commands.rs::stop_via_lock` | `lock::holder_identity` | direct call | ✓ WIRED | Confirmed at `commands.rs:1421` — the production guard 25e's tests were retargeted to |
+| `preflight.rs::generic_preflight_checks` | `preflight.rs::preflight_major_bump_check` | aggregated (non-short-circuiting) call | ✓ WIRED, correctly | Confirmed at `:763-778`; major-bump evaluated first |
+| `preflight.rs::preflight_major_bump_check` | `version.rs::{highest_semver_tag, reachable_semver_baseline, release_range_start, classify_range_bump}` | all five calls use `execution_root` | ✓ WIRED, correctly | Confirmed at `:629-669` |
+| `commands.rs::collect_stray_process_findings`/`gate_sweep`'s stray pass | `agent.rs::discover_stray_devflow_processes` | direct call, unfiltered | ⚠️ WIRED, unsafe | Confirmed at `:3048-3050` and `:1149-1151` — no registry-reachability filter interposed (truth 7) |
+| `commands.rs::gate_sweep`'s stray pass | `commands.rs::reap_stray_candidates` -> `agent::STRAY_MIN_AGE` | direct call | ✓ WIRED, correctly (for what it bounds) | Confirmed at `:1151`; bounds the fork/exec race, not registry-reachability — the two are different hazards and only the first is closed |
+| `agent.rs`/`commands.rs` census tests | `test_support::wait_for_exec_visibility` | barrier before every vulnerable-positive census read | ✓ WIRED | Confirmed at all 4 sites named in `25-SITE-CENSUS.md`'s `## Vulnerable sites` |
+
+### Data-Flow Trace (Level 4)
+
+Not applicable — this phase produces CLI/library logic, not UI components rendering dynamic data.
 
 ### Behavioral Spot-Checks
 
 | Behavior | Command | Result | Status |
 |----------|---------|--------|--------|
-| 25a fast-forward actually advances the local ref | `cargo test --package devflow --bin devflow preflight::tests::currency_behind_and_not_checked_out_fast_forwards_and_proceeds -- --exact` | `1 passed; 0 failed` | ✓ PASS |
-| 25d TERM->KILL escalation clears a TERM-ignoring child (devflow-core) | `cargo test --package devflow-core --lib agent::tests::terminate_and_verify_escalates_to_kill_for_a_term_ignoring_child -- --exact` | `1 passed; 0 failed` | ✓ PASS |
-| 25d TERM->KILL escalation clears a TERM-ignoring child (CLI reap path) | `cargo test --package devflow --bin devflow commands::tests::reap_stray_candidates_escalates_to_kill_for_a_term_ignoring_child -- --exact` | `1 passed; 0 failed` | ✓ PASS |
-| 25c D-09 gate fires in the (untested-by-review, no-worktree) fixture shape | `cargo test --package devflow --bin devflow preflight::tests::run_preflight_major_bump_gates_and_never_ships_unattended -- --exact` | `1 passed; 0 failed` | ✓ PASS (confirms the gate works only in the fixture shape that does NOT exercise CR-02) |
-| Full workspace regression | `cargo test --workspace --no-fail-fast` | `387 passed` (devflow-core lib) + other targets, 0 failed observed in this run; orchestrator's independently-measured 674/0 accepted per task brief | ✓ PASS |
-| Debt markers in phase-touched files | `rg -n 'TBD|FIXME|XXX'` across preflight.rs, commands.rs, pipeline_launch.rs, staleness.rs, agent.rs, version.rs, pipeline_gate.rs, main.rs, reap_strays_e2e.rs, CONTRIBUTING.md | no matches | ✓ PASS |
+| Full workspace regression | `cargo test --workspace --no-fail-fast` | `688 passed; 0 failed` (summed across all 19 test binaries) | ✓ PASS (matches orchestrator's independently-reported 688/0) |
+| 25c D-09 gate fires in the worktree fixture (25-08's regression test) | `cargo test --package devflow --bin devflow preflight::tests::preflight_major_bump_check_fires_against_the_worktree_head -- --exact` | `1 passed; 0 failed` | ✓ PASS |
+| 25c D-09 gate aggregates reasons instead of short-circuiting (25-08's regression test) | `cargo test --package devflow --bin devflow preflight::tests::generic_preflight_checks_reports_major_bump_even_when_gh_auth_fails_first -- --exact` | `1 passed; 0 failed` | ✓ PASS |
+| 25c anchor fix under the trunk-commit topology (25-09's regression test) | `cargo test --package devflow-core --lib version::tests::trunk_commit_between_tag_and_sync_merge_still_anchors_at_the_sync_merge -- --exact` | `1 passed; 0 failed` | ✓ PASS |
+| **CR-01 live reproduction** — a registered process is misreported as orphaned | `devflow doctor --json \| jq '.stray_processes \| length'` = 40; cross-referenced pid 596367 against `/tmp/.tmp4T6jFk/.devflow/state-12.json` | `state-12.json`'s `monitor_pid` IS 596367 — doctor's "reachable through no registry entry, lock file, or state file" claim is false for this pid, live, right now | ✗ FAIL (confirms gap, not a phase deliverable) |
+| **CR-02 corroboration** — `origin/feature/phase-25` ancestry (unrelated to the defect itself, corroborates 25e's evidence) | `git merge-base --is-ancestor 82328b3 origin/feature/phase-25` | exit 0 | ✓ PASS (supports truth 8, not truth 1) |
+| Debt markers in phase-touched files | `rg -n 'TBD|FIXME|XXX'` across agent.rs, version.rs, test_support.rs, commands.rs, preflight.rs, pipeline_launch.rs, pipeline_gate.rs, staleness.rs, main.rs, reap_strays_e2e.rs, CONTRIBUTING.md | no matches | ✓ PASS |
 
 ### Requirements Coverage
 
@@ -137,52 +180,43 @@ human_verification:
 
 | Unit | Backlog ID | Description | Status | Evidence |
 |------|-----------|--------------|--------|----------|
-| 25a | 999.51/DEN-76 | Base-ref currency | ✓ SATISFIED | Truth 1 |
+| 25a | 999.51/DEN-76 | Base-ref currency | ✗ NOT SATISFIED | Truth 1 — the repair mechanism itself is unsafe |
 | 25b | 999.48/DEN-73 | Staleness hoist | ✓ SATISFIED | Truth 2 |
-| 25c | 999.49/DEN-74 | Version derivation + major-bump gate | ✗ PARTIALLY SATISFIED | Truth 3 (derivation) satisfied; truths 4/5 (gate correctness, anchor robustness) FAILED |
-| 25d | 999.44/DEN-68 | Orphan process reaping | ✓ SATISFIED | Truth 6 |
-| 25e | 999.47/DEN-72 | Flaky test dead predicate | ⚠️ PRESENT, CI-pending | Truth 7 |
-| 25f | (no backlog ID) | CONTRIBUTING drift | ✓ SATISFIED (docs sign-off pending) | Truth 9 |
-| 999.38 | folded in | PATH race | ✓ SATISFIED | Truth 8 |
+| 25c | 999.49/DEN-74 | Version derivation + major-bump gate + anchor | ✓ SATISFIED | Truths 3/4/5 — both previously-open gaps closed |
+| 25d | 999.44/DEN-68 | Orphan process reaping | ✗ PARTIALLY SATISFIED | Truth 6 (primitives) satisfied; truth 7 (operator-facing surface) FAILED |
+| 25e | 999.47/DEN-72 | Flaky test dead predicate | ✓ SATISFIED (human-verified) | Truth 8 |
+| 25f | (no backlog ID) | CONTRIBUTING drift | ✓ SATISFIED (human sign-off) | Truth 10 |
+| 999.38 | folded in | PATH race | ✓ SATISFIED | Truth 9 |
 
 ### Anti-Patterns Found
 
 | File | Line | Pattern | Severity | Impact |
 |------|------|---------|----------|--------|
-| `25-01-SUMMARY.md` | (whole file) | Missing required `## Self-Check` section | ⚠️ Warning | Executor→verifier contract violation — self-report cannot be cross-checked against the executor's own claimed verification steps for this plan. Independently mitigated in this verification by direct source/test re-execution. |
-| `25-02-SUMMARY.md` | (whole file) | Missing required `## Self-Check` section | ⚠️ Warning | Same as above. |
-| `crates/devflow-cli/src/preflight.rs` | 614-668, 718-724 | Gate composition + scope defect (CR-01/CR-02) | 🛑 Blocker | See truths 4 and gaps |
-| `crates/devflow-core/src/version.rs` | 258-313 | Anchor heuristic regression under untested topology (CR-03) | 🛑 Blocker | See truth 5 and gaps |
-| `crates/devflow-cli/src/preflight.rs` | 355-386, 445-479 | WR-01 (shallow-clone misclassifies as Diverged), WR-03 (fast-forward doesn't check other worktrees) | ℹ️ Info (recorded, not gating) | Latent, not currently reachable through this project's own commands per REVIEW.md's own severity call — not re-litigated here |
-| `crates/devflow-core/src/version.rs` | 430-466 | WR-02 (prerelease-tag baseline skips stable release) | ℹ️ Info (recorded, not gating) | Not currently exercised by this repository's tagging practice |
+| `crates/devflow-cli/src/commands.rs` | 3023-3049, 1149-1232 | CR-01: unverified orphan-ness claim feeds a SIGKILL repair, `--root` ignored | 🛑 Blocker | See truth 7 and gaps |
+| `crates/devflow-cli/src/preflight.rs` | 445-479 | CR-02: `git update-ref` with no `<oldvalue>` guard, single-worktree checked-out probe | 🛑 Blocker | See truth 1 and gaps |
+| `crates/devflow-cli/src/main.rs` | 389-397 | `--reap-strays` help text names semantics ("STATE-ORPHANED") the implementation does not have | ℹ️ Info (subsumed by CR-01) | Part of the same fix scope, not separately gating |
+| `crates/devflow-core/src/version.rs` | 338-349 | WR-01: `merge-base --is-ancestor` spawn/exit-128 errors collapse into the same `false` as a genuine negative, biasing the anchor over-inclusive on a transient git failure | ℹ️ Info (recorded, not gating) | Distinct from CR-03 (already fixed); latent, not currently reachable per REVIEW.md's own severity call — not re-litigated here |
+| `crates/devflow-core/src/test_support.rs` | 101, 120 | WR-02: `wait_for_exec_visibility`'s guard (ii) compares against the caller's cmdline, not the actual parent's — sound for every current call site (all are direct parents) but not generalizably "unambiguous" as documented | ℹ️ Info (recorded, not gating) | No current call site is a non-parent caller |
+| `crates/devflow-cli/src/staleness.rs` | 689-786 | WR-03: `mid_run_stage_transition_does_not_readjudicate_staleness` spawns a real monitor wrapper via `launch_stage_inner` and never reaps it — leaks a live, later-orphaned process on every `cargo test --workspace` run | ⚠️ Warning | Independently corroborated during this verification: 22 live `trap cleanup TERM INT` processes found on this machine before this run even started, several rooted at deleted `/tmp/.tmp*` paths — consistent with repeated unreaped test runs. Does not affect the phase's shipped behavior (test-only), but actively degrades confidence in any future CR-01 fix's own test suite until closed. |
+| `crates/devflow-cli/src/commands.rs` | 3727-3762 | WR-04: `reap_stray_candidates_refuses_a_candidate_younger_than_the_minimum_age` is flaky by construction — its premise (fixture age < 2s) races the same container load that produces the CR-01/25e failure class | ℹ️ Info (recorded, not gating) | Test-only; the underlying floor logic is verified correct via other means |
 
 ## Human Verification Required
 
-### 1. 25e flake closure — CI-on-branch confirmation
-
-**Test:** Observe `cargo test --workspace` (or the two retargeted tests specifically) green across several consecutive pushes on a branch, inside the pinned CI container.
-**Expected:** No reproduction of the 999.47 cmdline-inheritance race over multiple pushes.
-**Why human:** The confirmed mechanism only reproduces reliably inside the pinned CI container; local runs (however many, however green) cannot establish this per the project's own documented precedent (19-RESEARCH.md), and both 25-02-SUMMARY.md and 25-07-SUMMARY.md say so themselves.
-
-### 2. 25f's three designated human-judgment doc checks
-
-**Test:** A human (not the executor) reviews 25-VALIDATION.md's Manual-Only Verifications rows 1-3: CONTRIBUTING.md step 5 against the tracked `.gitconfig`; the ROADMAP Acceptance paragraph against D-15/D-16; PROJECT.md's Constraints bullet against what 25-01 implements.
-**Expected:** Independent confirmation matching what this verifier's own greps and 25-04-SUMMARY.md's self-report both already suggest.
-**Why human:** 25-VALIDATION.md explicitly designates these as human-judgment/manual-only rows because "no assertion can prove" prose-correctness or doc-consistency claims of this shape. 25-04-SUMMARY.md's "Confirmed" entries are the executor's own self-assessment of the very checks it is not positioned to discharge — recorded per the task brief's `known_self_report_gaps` item 2 as ASSESSED, PENDING HUMAN SIGN-OFF, not satisfied.
+None outstanding. The two items this phase's own workflow explicitly routed to a human (25e's CI-observation closure judgment, and 25f's three doc-drift rows) were both already discharged with verbatim, dated human sign-off recorded in `25-13-SUMMARY.md` (Parts A and B, 2026-07-28) — independently corroborated by this verifier (CI run status via `gh run view`, ref ancestry via `git merge-base`, and direct grep of the three 25f rows against current source). Nothing further requires a human decision to *evaluate*; the two gaps below (CR-01, CR-02) require code fixes, not a human judgment call — they are objectively demonstrated defects, one of them live-reproduced on this machine during this verification.
 
 ## Gaps Summary
 
-Two Critical, source-confirmed defects (CR-01, CR-02 from `25-REVIEW.md`, independently re-confirmed by this verifier by reading `preflight.rs`, `pipeline_launch.rs`, and `state.rs` directly — not merely trusting the review) mean **25c's own headline contract — "a major bump opens a gate; it never ships unattended" (D-09) — is not actually delivered in the default worktree execution path**, which is this project's default `devflow start` behavior (`worktree = true` unless `--no-worktree`). The only integration tests exercising this gate use the `--no-worktree` fixture shape, which structurally cannot expose either defect. A third Critical defect (CR-03), also independently confirmed by direct source read, means the commit-range anchor `release_range_start` depends on can silently revert to the exact naive, over-broad range the whole 25c effort was built to eliminate, under a plausible-but-untested release topology (a commit landing directly on trunk between a tag and the next sync-merge-back).
+Two Critical, source-confirmed defects remain — both newly surfaced by `25-REVIEW.md`'s full re-review of the post-gap-closure tree, and both independently re-confirmed here by direct source reading and, for CR-01, live reproduction (not merely trusting the review's own analysis):
 
-None of these three defects were fixed after `25-REVIEW.md` was written and committed (`ab119c0` is the current HEAD for this phase's tracked files; no subsequent commit touches `preflight.rs` or `version.rs`).
+**CR-01 (unit 25d):** `devflow doctor` and `devflow gate sweep --reap-strays` share a census (`agent::discover_stray_devflow_processes`) that is purely structural — it has no orphan test. `doctor` nonetheless asserts each match "is running but reachable through no registry entry, lock file, or state file" and names `--reap-strays` as the repair; `gate_sweep --reap-strays` acts on that same unfiltered census, gated only by a 2-second age floor that bounds an unrelated race (999.47's fork/exec window), not registry-reachability. Live-reproduced on this machine: 40 current `doctor` findings, one of them (pid 596367) independently confirmed to be a real, live phase-12 monitor wrapper named by its own state file's `monitor_pid` field. Following `doctor`'s own printed repair would SIGKILL it — bypassing its `trap cleanup` and orphaning its child, i.e. manufacturing exactly the orphan class 999.44 (this unit's own backlog origin) exists to eliminate. This means **unit 25d does not safely deliver "a stalled run recovers without `kill(1)`"** — it delivers a mechanism that can convert a healthy run into the very failure mode it was built to fix.
 
-All other units — 25a, 25b, 25d, 999.38 — are solidly implemented, wired, and behaviorally verified against real git/process fixtures, not merely present. 25e is fully implemented and structurally sound (the race is removed by construction, not just made rarer) but its closure claim cannot be verified until CI-on-branch stability is observed, consistent with the project's own stated precedent and both relevant SUMMARYs' own disclosures. 25f's documentation corrections are textually confirmed by this verifier's own greps but three rows remain formally pending human sign-off per 25-VALIDATION.md's own design, not a code gap.
+**CR-02 (unit 25a):** `ensure_base_ref_current`'s fast-forward writes `refs/heads/<base>` with `git update-ref` and no `<oldvalue>` guard (an unconditional write vulnerable to a race with anything else that moves the local ref), and its "not checked out" precondition inspects only the single worktree `devflow start` runs from — not the repository-wide set of linked worktrees this project routinely uses (confirmed live during this run: a `.worktrees/phase-07` worktree was active). This means **unit 25a's repair path can itself silently corrupt the base ref it exists to keep current** — the same class of problem 25a was written to eliminate (a human having to repair the base ref by hand), reintroduced one layer down.
 
-Two SUMMARY.md files (25-01, 25-02) are missing the required `## Self-Check` section — a documentation/process gap in the executor→verifier contract, independently mitigated here by direct source/test re-verification but worth remediating for future waves.
+**Everything else in this phase is solid.** Both of the previous verification's gaps (the D-09 gate's worktree-scope bypass, and `release_range_start`'s anchor regression under an untested topology) are closed, confirmed by direct source read and passing targeted regression tests, not merely by the executor's own SUMMARY claims. 25d's core primitives (`terminate_and_verify`, identity re-confirmation, the age floor) are independently sound — the defect is entirely in what gets handed to them, unfiltered. 25e's flake-closure claim, which this project's own prior verification over-claimed once already (`structurally removed`, later falsified 2/2 by a real container run), is this time backed by a measured site census, a bounded exec-visibility barrier at every vulnerable site, a production age floor, an 11-observation CI-on-branch streak, and an explicit, engaged, verbatim human sign-off — recorded honestly, with its stated residual (~6.1%/~0.05%) intact, never upgraded to a proof of absence. 25f's documentation fixes are confirmed correct by direct grep and are also human-signed. 999.38's PATH race is de-raced and confirmed hermetic. The full 688-test workspace suite is green.
 
-**This looks like real, closeable work, not a design failure of the phase's approach.** REVIEW.md itself proposes concrete, small fixes for all three Critical findings (aggregate-checks or re-run-on-Advance for CR-01; thread `state.worktree_path` for CR-02; walk-the-ancestry-path-for-the-last-merge-commit for CR-03), each scoped to the same files already touched by 25-06/25-01.
+**This looks like real, closeable work, not a design failure of the phase's approach** — REVIEW.md's own sketch fixes for both CR-01 and CR-02 are small, scoped to the exact files 25-02/25-05/25-07 already touched, and neither requires reopening any of the phase's other units.
 
 ---
 
-*Verified: 2026-07-28T02:12:39Z*
+*Verified: 2026-07-28T16:19:31Z*
 *Verifier: Claude (gsd-verifier)*
