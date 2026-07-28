@@ -39,6 +39,7 @@ use devflow_core::state::{AgentKind, State};
 use devflow_core::version;
 use devflow_core::workflow;
 use devflow_core::worktree;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1060,6 +1061,11 @@ pub(crate) fn gate_sweep(
 ) -> Result<(), CliError> {
     let threshold = max_age_secs.unwrap_or_else(config_parse::gate_max_unattended_age_secs);
 
+    // Cloned before the `match` below moves `root` into `roots` — the stray
+    // pass (below) needs it too, unioned into the machine-wide reachable-pid
+    // safety set rather than substituted for it (CR-01, 25-15).
+    let explicit_root: Vec<PathBuf> = root.clone().into_iter().collect();
+
     let roots: Vec<PathBuf> = match root {
         Some(root) => vec![root],
         None => {
@@ -1147,7 +1153,7 @@ pub(crate) fn gate_sweep(
     // reaped/skipped/left-alone counters and dry-run summary line rather
     // than printing a second, separate report.
     if reap_strays {
-        let candidates = agent::discover_stray_devflow_processes();
+        let candidates = unreachable_stray_candidates(&explicit_root);
         let results = reap_stray_candidates(&candidates, dry_run, agent::STRAY_MIN_AGE);
         // The event's natural home: the explicit `--root`, when given
         // (exactly 999.44's own reproduction shape — an operator who
@@ -2111,7 +2117,7 @@ pub(crate) fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
     // only I/O this adds is `agent::discover_stray_devflow_processes`'s
     // scan, which never signals anything (T-25-62, doctor's read-only
     // contract).
-    let stray_findings = collect_stray_process_findings();
+    let stray_findings = collect_stray_process_findings(project_root);
 
     if json {
         // WR-01 (18-fix): a single top-level JSON document —
@@ -2998,6 +3004,105 @@ fn stray_layer_label(layer: agent::StrayLayer) -> &'static str {
     }
 }
 
+/// The set of pids that a live registry entry still reaches: every
+/// [`devflow_core::state::State::monitor_pid`] recorded under any of
+/// `roots` (via [`workflow::list_states`]) plus every lock holder pid for
+/// those same roots' phases (via [`lock::holder_identity`]). A pid in this
+/// set is by definition not a stray (CR-01, 25-15-PLAN.md) — a live
+/// registry entry, lock file, or state file still names it.
+///
+/// Deliberately excludes the per-phase agent pid file: the `/proc` census
+/// this set filters ([`agent::discover_stray_devflow_processes`]) can only
+/// ever produce a monitor-wrapper or `devflow advance` pid, never a
+/// `claude`/`codex` agent process's own pid, so adding the agent pid file
+/// would widen the safety set with pids the census structurally cannot
+/// produce.
+///
+/// Read-only, always: uses [`lock::holder_identity`] (a pure read), never
+/// [`lock::holder`] (which deletes an empty lock file — a write this
+/// function must never perform, since it also runs on `doctor`'s strictly
+/// read-only path).
+///
+/// RESIDUAL (T-25-15-08, not eliminated): this is a point-in-time read. A
+/// root registered, or a `monitor_pid` written, between this read and a
+/// caller's later signal is not covered by it. The untouched
+/// `agent::is_same_process` identity re-confirmation and
+/// [`agent::STRAY_MIN_AGE`] age floor downstream remain the last line of
+/// defence in that window.
+pub(crate) fn registry_reachable_pids(roots: &[PathBuf]) -> HashSet<u32> {
+    let mut reachable = HashSet::new();
+    let mut scanned = HashSet::new();
+    for root in roots {
+        if !scanned.insert(root.clone()) {
+            // One root with N phases yields N registry entries;
+            // `list_states` already covers every phase in one pass, so a
+            // second entry for the same root would only repeat the scan.
+            continue;
+        }
+        for state in workflow::list_states(root) {
+            if let Some(pid) = state.monitor_pid {
+                reachable.insert(pid);
+            }
+            if let Some((pid, _start_time)) = lock::holder_identity(root, state.phase) {
+                reachable.insert(pid);
+            }
+        }
+    }
+    reachable
+}
+
+/// Pure filter: the entries in `strays` whose pid is absent from
+/// `reachable`. Zero I/O — mirrors [`build_stray_process_findings`]'s own
+/// pure-builder posture (split out the same way
+/// [`collect_stray_process_findings`]'s I/O half is split from it), so this
+/// is directly unit-testable with a synthetic stray list and a synthetic
+/// reachable set, with no real orphan process required on the machine
+/// running the test.
+pub(crate) fn retain_unreachable_strays(
+    strays: &[agent::StrayProcess],
+    reachable: &HashSet<u32>,
+) -> Vec<agent::StrayProcess> {
+    strays
+        .iter()
+        .filter(|stray| !reachable.contains(&stray.pid))
+        .copied()
+        .collect()
+}
+
+/// Every registered root's `project_root` ([`registry::load_roots`]),
+/// unioned with `extra`, deduplicated. NEVER narrowed by a caller's scope
+/// argument (T-25-15-03) — this is a SAFETY set, not a scope. Narrowing it
+/// to one root would un-protect every OTHER root's live processes while
+/// the stray pass itself still acts machine-wide, which is a strictly
+/// LARGER blast radius than leaving it machine-wide (see `25-15-PLAN.md`'s
+/// `<resolved_decision>`).
+///
+/// Read-only: never calls [`registry::prune_missing`], which mutates the
+/// registry and would break `doctor`'s read-only contract.
+fn stray_safety_roots(extra: &[PathBuf]) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = registry::load_roots()
+        .into_iter()
+        .map(|r| r.project_root)
+        .collect();
+    for root in extra {
+        if !roots.contains(root) {
+            roots.push(root.clone());
+        }
+    }
+    roots
+}
+
+/// The ONE composition both `doctor` and `gate sweep --reap-strays` route
+/// through, so the two surfaces' claim and action cannot drift apart
+/// (T-25-15-07): the registry-independent `/proc` census
+/// ([`agent::discover_stray_devflow_processes`]), filtered by
+/// [`retain_unreachable_strays`] against
+/// [`registry_reachable_pids`]`(&`[`stray_safety_roots`]`(extra_roots))`.
+fn unreachable_stray_candidates(extra_roots: &[PathBuf]) -> Vec<agent::StrayProcess> {
+    let reachable = registry_reachable_pids(&stray_safety_roots(extra_roots));
+    retain_unreachable_strays(&agent::discover_stray_devflow_processes(), &reachable)
+}
+
 /// One `doctor` finding for a state-orphaned process (999.44): a process
 /// [`agent::discover_stray_devflow_processes`] matched structurally, but
 /// that no registry entry, lock file, or state file can reach — that
@@ -3044,9 +3149,14 @@ pub(crate) fn build_stray_process_findings(
 
 /// Gather `doctor`'s stray-process finding. The ONLY I/O here is
 /// [`agent::discover_stray_devflow_processes`]'s read-only `/proc` census
-/// (never a signal, T-25-62) — `doctor` stays strictly read-only.
-fn collect_stray_process_findings() -> Vec<StrayProcessFinding> {
-    build_stray_process_findings(&agent::discover_stray_devflow_processes())
+/// (never a signal, T-25-62) and the reachable-pid computation's own
+/// read-only `registry`/`lock`/`workflow` reads (CR-01, 25-15) — `doctor`
+/// stays strictly read-only. `project_root` is `doctor`'s own root, unioned
+/// into the reachable set via [`unreachable_stray_candidates`] so a project
+/// the machine registry has not recorded still has its own live monitors
+/// protected from being reported as orphans.
+fn collect_stray_process_findings(project_root: &Path) -> Vec<StrayProcessFinding> {
+    build_stray_process_findings(&unreachable_stray_candidates(&[project_root.to_path_buf()]))
 }
 
 /// Build `doctor --json`'s `"stray_processes"` array, mirroring
@@ -5019,12 +5129,12 @@ mod tests {
                 "pid {pid}: exec visibility timed out before the fixture became discoverable"
             );
 
-            let first = collect_stray_process_findings();
+            let first = collect_stray_process_findings(dir.path());
             assert!(
                 agent::agent_running(pid),
                 "fixture must still be alive after the first collection"
             );
-            let second = collect_stray_process_findings();
+            let second = collect_stray_process_findings(dir.path());
             assert!(
                 agent::agent_running(pid),
                 "fixture must still be alive after the second collection — doctor's stray \
@@ -5053,6 +5163,224 @@ mod tests {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+
+    /// Spawn a real process shaped like the monitor wrapper Layer 1
+    /// matches, crossing the exec-visibility barrier before returning
+    /// (999.47/25-11) so every caller of this helper is guaranteed the
+    /// fixture's own `execve()` has completed before any census read.
+    fn spawn_wrapper_shaped_fixture() -> std::process::Child {
+        let child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("trap cleanup TERM INT; sleep 30")
+            .spawn()
+            .expect("spawn monitor-wrapper-shaped fixture");
+        let pid = child.id();
+        assert!(
+            devflow_core::test_support::wait_for_exec_visibility(
+                pid,
+                "sh",
+                devflow_core::test_support::EXEC_VISIBILITY_WAIT,
+                devflow_core::test_support::EXEC_VISIBILITY_POLL,
+            ),
+            "pid {pid}: exec visibility timed out before the fixture became discoverable"
+        );
+        child
+    }
+
+    /// Task 1's tracer (CR-01, 999.44/DEN-68): one discovery pass names
+    /// a live `monitor_pid`-recorded pid, a live lock-holder pid, and a
+    /// genuine orphan under no registered root at all. Only the orphan
+    /// may survive `unreachable_stray_candidates`'s filter. All three
+    /// pids are real, spawned processes crossed through
+    /// `wait_for_exec_visibility` — not synthesised numbers — so the
+    /// census and the filter are both exercised for real, in one pass.
+    #[test]
+    fn reachable_pids_are_excluded_from_both_the_findings_and_the_reap_candidates() {
+        let mut state_child = spawn_wrapper_shaped_fixture();
+        let mut lock_child = spawn_wrapper_shaped_fixture();
+        let mut orphan_child = spawn_wrapper_shaped_fixture();
+        let state_pid = state_child.id();
+        let lock_pid = lock_child.id();
+        let orphan_pid = orphan_child.id();
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let project_root_guard = tempfile::tempdir().unwrap();
+        let project_root = project_root_guard.path().to_path_buf();
+
+        // Phase 1: a real `State` naming `state_pid` as its monitor.
+        let mut state = State::new(1, AgentKind::Claude, Mode::Auto, project_root.clone());
+        state.monitor_pid = Some(state_pid);
+        workflow::save_state(&state).unwrap();
+
+        // Phase 2: a real `State` (so `list_states` enumerates the
+        // phase at all — mirrors real operation, where a phase with an
+        // active lock also has a persisted state), deliberately with NO
+        // `monitor_pid`, so this phase's only path into the reachable
+        // set is the lock file below, not the monitor_pid path Phase 1
+        // already exercises.
+        let state_2 = State::new(2, AgentKind::Claude, Mode::Auto, project_root.clone());
+        workflow::save_state(&state_2).unwrap();
+
+        // A lock file for phase 2, written directly in the documented
+        // `.devflow/lock-{phase:02}` shape (lock.rs:4, :236) — pid on
+        // line 1, start time on line 2 — naming `lock_pid` as holder.
+        let lock_start_time = agent::process_start_time(lock_pid)
+            .expect("must read the lock fixture's own recorded start time");
+        let devflow_dir = project_root.join(".devflow");
+        std::fs::create_dir_all(&devflow_dir).unwrap();
+        std::fs::write(
+            devflow_dir.join("lock-02"),
+            format!("{lock_pid}\n{lock_start_time}"),
+        )
+        .unwrap();
+        // Load-bearing: turns the implicit lock-file-format coupling
+        // into a self-checking one — a future format change fails this
+        // test loudly instead of silently exercising only half of it.
+        assert_eq!(
+            lock::holder_identity(&project_root, 2),
+            Some((lock_pid, Some(lock_start_time))),
+            "the directly-written lock file must read back through holder_identity exactly \
+             as one lock::acquire itself wrote would"
+        );
+
+        registry::register_in(cache_dir.path(), &project_root, 1).unwrap();
+        let registered_roots: Vec<PathBuf> = registry::load_roots_in(cache_dir.path())
+            .into_iter()
+            .map(|r| r.project_root)
+            .collect();
+
+        let reachable = registry_reachable_pids(&registered_roots);
+        assert!(
+            reachable.contains(&state_pid),
+            "state_pid must be reachable via its recorded monitor_pid"
+        );
+        assert!(
+            reachable.contains(&lock_pid),
+            "lock_pid must be reachable via the lock file's holder_identity"
+        );
+        assert!(
+            !reachable.contains(&orphan_pid),
+            "orphan_pid is named by no state file and no lock file, so it must not be \
+             reachable"
+        );
+
+        // Without this, the test could pass vacuously because the
+        // census never saw the fixtures at all (T-25-15-11).
+        let census = agent::discover_stray_devflow_processes();
+        for (pid, label) in [
+            (state_pid, "state"),
+            (lock_pid, "lock"),
+            (orphan_pid, "orphan"),
+        ] {
+            assert!(
+                census.iter().any(|p| p.pid == pid),
+                "the {label} fixture (pid {pid}) must be part of the real /proc census"
+            );
+        }
+
+        let retained = retain_unreachable_strays(&census, &reachable);
+        assert!(
+            retained.iter().any(|p| p.pid == orphan_pid),
+            "the orphan must survive the filter"
+        );
+        assert!(
+            !retained.iter().any(|p| p.pid == state_pid),
+            "the state-named pid must be filtered out"
+        );
+        assert!(
+            !retained.iter().any(|p| p.pid == lock_pid),
+            "the lock-held pid must be filtered out"
+        );
+
+        let findings = build_stray_process_findings(&retained);
+        assert!(
+            findings.iter().any(|f| f.pid == orphan_pid),
+            "the orphan must produce a finding"
+        );
+        assert!(
+            !findings.iter().any(|f| f.pid == state_pid),
+            "the state-named pid must produce no finding"
+        );
+        assert!(
+            !findings.iter().any(|f| f.pid == lock_pid),
+            "the lock-held pid must produce no finding"
+        );
+
+        // Reap all three with a VERIFIED signal, never a bare one
+        // (mirrors `reap_strays_e2e.rs:202-223`'s own teardown), plus a
+        // final `wait()` on each to reclaim the zombie regardless.
+        for pid in [state_pid, lock_pid, orphan_pid] {
+            agent::terminate_and_verify(
+                pid,
+                agent::TERMINATE_VERIFY_WAIT,
+                agent::TERMINATE_VERIFY_POLL,
+            );
+        }
+        let _ = state_child.wait();
+        let _ = lock_child.wait();
+        let _ = orphan_child.wait();
+    }
+
+    /// 999.44's originating case, as an executable assertion rather than
+    /// prose (see `25-15-PLAN.md`'s `<why_this_does_not_violate_d17>`):
+    /// once a registered root is deleted off disk, its state file and
+    /// lock file are gone with it, so it contributes ZERO pids to the
+    /// reachable set — even while the OS process it named is still
+    /// alive. The filter is therefore structurally incapable of hiding
+    /// this population.
+    #[test]
+    fn a_deleted_root_contributes_nothing_to_the_reachable_set() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("project-root");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let mut child = spawn_wrapper_shaped_fixture();
+        let pid = child.id();
+
+        let mut state = State::new(1, AgentKind::Claude, Mode::Auto, root.clone());
+        state.monitor_pid = Some(pid);
+        workflow::save_state(&state).unwrap();
+
+        assert!(
+            registry_reachable_pids(std::slice::from_ref(&root)).contains(&pid),
+            "the pid must be reachable while its root and state file still exist"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists(), "the root must actually be gone");
+        assert!(
+            agent::agent_running(pid),
+            "deleting the root must not touch the still-alive process"
+        );
+
+        let reachable_after_deletion = registry_reachable_pids(std::slice::from_ref(&root));
+        assert!(
+            reachable_after_deletion.is_empty(),
+            "a deleted root's state file and lock file are gone with it, so it must \
+             contribute nothing to the reachable set: got {reachable_after_deletion:?}"
+        );
+
+        let census = vec![agent::StrayProcess {
+            pid,
+            start_time: agent::process_start_time(pid)
+                .expect("fixture must still be alive and readable"),
+            layer: agent::StrayLayer::MonitorWrapper,
+        }];
+        let retained = retain_unreachable_strays(&census, &reachable_after_deletion);
+        assert!(
+            retained.iter().any(|p| p.pid == pid),
+            "with the reachable set empty, the pid must still be treated as a stray"
+        );
+
+        // Verified reap (mirrors `reap_strays_e2e.rs:202-223`), plus a
+        // final `wait()` to reclaim the zombie regardless.
+        agent::terminate_and_verify(
+            pid,
+            agent::TERMINATE_VERIFY_WAIT,
+            agent::TERMINATE_VERIFY_POLL,
+        );
+        let _ = child.wait();
     }
 
     /// Unit tests for the pure planning-doc staleness core (21b, D-04/D-05).
