@@ -4,8 +4,8 @@ milestone: v2.0.0
 milestone_name: milestone (open — no fixed closing phase)
 current_phase: 25
 current_phase_name: end-to-end-dogfood-blockers
-status: "Phase 25 shipped — PR #47"
-stopped_at: Phase 25 SHIPPED — PR #47 open against develop; verified 10/10, threats_open 0, ledger 0 open
+status: "Phase 25 shipped and merged — PR #47 → develop"
+stopped_at: Phase 25 SHIPPED AND MERGED — PR #47 merged to develop 2026-07-28 (merge commit 5b39f0c, operator-approved); verified 10/10, threats_open 0, ledger 0 open. Unreleased: develop→main sync PR not yet opened.
 last_updated: "2026-07-28T21:38:22.575Z"
 last_activity: 2026-07-28
 progress:
