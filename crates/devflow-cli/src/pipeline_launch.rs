@@ -28,7 +28,6 @@ use crate::pipeline_outcomes::{
     truncate_reason,
 };
 use crate::preflight::{ensure_agent_binary, run_preflight, worktree_writable_roots};
-use crate::staleness::enforce_build_staleness;
 use devflow_core::config::{GitFlowConfig, capture_retention};
 use devflow_core::outcome_policy::{self, Action};
 use devflow_core::prompt;
@@ -37,8 +36,11 @@ use devflow_core::state::State;
 use devflow_core::{agent_result, agents, events, lock, monitor, workflow};
 use std::path::Path;
 
-/// The post-preflight body of [`launch_stage`]: self-dogfood build-staleness
-/// enforcement, capture archival/rollover, and spawning the monitor.
+/// The post-preflight body of [`launch_stage`]: capture archival/rollover
+/// and spawning the monitor. (25b, D-03: this function no longer performs
+/// self-dogfood build-staleness enforcement — that check is now adjudicated
+/// once, in `commands::start`, before this function's first caller ever
+/// runs. See the module-level history at the removed call site below.)
 /// Extracted (18f, D-18f) so `run_preflight`'s `Advance` arm can call it
 /// directly and skip the just-adjudicated preflight check, while every
 /// other caller keeps going through [`launch_stage`]'s full path (readiness
@@ -58,14 +60,13 @@ pub(crate) fn launch_stage_inner(
     archived_stage: Option<Stage>,
 ) -> Result<(), CliError> {
     // WR-04 (18-fix): clear the prior stage's monitor pid up front, before
-    // any fallible step below (`ensure_agent_binary`, `enforce_build_staleness`)
-    // can return early via `?`. Without this, a failed relaunch left
-    // `state.stage` already advanced (by `transition()`, before this
-    // function was ever called) alongside a stale `monitor_pid` still
-    // naming the PREVIOUS stage's (now-dead) monitor — `liveness()` then
-    // misreports `Stuck → devflow resume`, even when the real remedy is
-    // unrelated (e.g. rebuild after a staleness block). The real pid is
-    // set again below once `monitor::spawn_monitor` actually succeeds.
+    // any fallible step below (`ensure_agent_binary`) can return early via
+    // `?`. Without this, a failed relaunch left `state.stage` already
+    // advanced (by `transition()`, before this function was ever called)
+    // alongside a stale `monitor_pid` still naming the PREVIOUS stage's
+    // (now-dead) monitor — `liveness()` then misreports `Stuck → devflow
+    // resume`, even when the real remedy is unrelated. The real pid is set
+    // again below once `monitor::spawn_monitor` actually succeeds.
     state.monitor_pid = None;
     workflow::save_state(state)?;
 
@@ -85,18 +86,14 @@ pub(crate) fn launch_stage_inner(
     let (program, args) = adapter.exec_command(state.phase, &prompt, &roots);
     ensure_agent_binary(program)?;
 
-    let project_root = state.project_root.clone();
-
-    // 17d (Task 2, D-17-D-19): self-dogfood build-staleness gate — also
-    // before spawn_monitor, so a stale DevFlow-on-itself run never even
-    // reaches the agent.
-    enforce_build_staleness(
-        &project_root,
-        state,
-        env!("DEVFLOW_BUILD_COMMIT"),
-        env!("DEVFLOW_BUILD_DIRTY") == "true",
-    )?;
-
+    // 17d (Task 2, D-17-D-19) originally placed the self-dogfood
+    // build-staleness gate here, before spawn_monitor. 25b (D-03) moved it
+    // out: it is now adjudicated exactly once, in `commands::start`, after
+    // `state.worktree_path` is set and before this whole launch path is ever
+    // entered — so a phase that modifies DevFlow's own source can progress
+    // past every stage boundary instead of being re-blocked at each one. See
+    // `commands::start` for the new call site and its accompanying D-04/D-05
+    // trade-off notes.
     if let Some(stamp) = agent_result::archive_phase_files(
         &state.project_root,
         state
