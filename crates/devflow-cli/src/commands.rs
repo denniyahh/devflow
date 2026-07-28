@@ -1892,18 +1892,25 @@ pub(crate) fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
 
     let facts = collect_phase_facts(project_root);
     let doc_findings = collect_planning_doc_findings(project_root);
+    // 999.44/DEN-68: a registry-independent, read-only /proc census — the
+    // only I/O this adds is `agent::discover_stray_devflow_processes`'s
+    // scan, which never signals anything (T-25-62, doctor's read-only
+    // contract).
+    let stray_findings = collect_stray_process_findings();
 
     if json {
         // WR-01 (18-fix): a single top-level JSON document —
         // `{"environment": [...], "reconciliation": [...],
-        // "planning_doc_staleness": [...]}` — instead of the pre-fix
-        // behavior of printing the tool checks as one top-level `[...]`
-        // array and then printing a SECOND, independent top-level array
-        // right after it. That concatenation is not valid single-document
-        // JSON for any parser that isn't NDJSON-aware (`json.load` raised
-        // "Extra data"). 21b's planning-doc check (D-05) extends this SAME
-        // object with a third key rather than forking a second array.
-        let body = doctor_json_body(&checks, &facts, &doc_findings);
+        // "planning_doc_staleness": [...], "stray_processes": [...]}` —
+        // instead of the pre-fix behavior of printing the tool checks as
+        // one top-level `[...]` array and then printing a SECOND,
+        // independent top-level array right after it. That concatenation
+        // is not valid single-document JSON for any parser that isn't
+        // NDJSON-aware (`json.load` raised "Extra data"). 21b's
+        // planning-doc check (D-05) and this plan's stray-process finding
+        // (999.44) each extend this SAME object with one more key rather
+        // than forking a second array.
+        let body = doctor_json_body(&checks, &facts, &doc_findings, &stray_findings);
         println!(
             "{}",
             serde_json::to_string_pretty(&body).expect("doctor --json body must serialize")
@@ -1928,6 +1935,7 @@ pub(crate) fn doctor(project_root: &Path, json: bool) -> Result<(), CliError> {
         }
         print!("{}", render_reconciliation_text(&facts));
         print!("{}", render_planning_doc_text(&doc_findings));
+        print!("{}", render_stray_process_text(&stray_findings));
     }
 
     Ok(())
@@ -2517,11 +2525,13 @@ fn doctor_json_body(
     checks: &[Check],
     facts: &[PhaseFacts],
     doc_findings: &[PlanningDocFinding],
+    stray_findings: &[StrayProcessFinding],
 ) -> serde_json::Value {
     serde_json::json!({
         "environment": checks_json_value(checks),
         "reconciliation": render_reconciliation_json(facts),
         "planning_doc_staleness": render_planning_doc_findings_json(doc_findings),
+        "stray_processes": render_stray_process_findings_json(stray_findings),
     })
 }
 
@@ -2755,6 +2765,112 @@ fn render_planning_doc_text(findings: &[PlanningDocFinding]) -> String {
             finding.severity.label(),
             finding.detail
         ));
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// doctor stray-process finding (999.44 / DEN-68)
+// ---------------------------------------------------------------------------
+
+/// Human-readable label for a [`agent::StrayLayer`], shared between
+/// `doctor`'s finding and `gate_sweep`'s opt-in reaping path so the two
+/// surfaces never describe the same layer with different words.
+fn stray_layer_label(layer: agent::StrayLayer) -> &'static str {
+    match layer {
+        agent::StrayLayer::MonitorWrapper => "monitor wrapper",
+        agent::StrayLayer::AdvanceChild => "advance child",
+    }
+}
+
+/// One `doctor` finding for a state-orphaned process (999.44): a process
+/// [`agent::discover_stray_devflow_processes`] matched structurally, but
+/// that no registry entry, lock file, or state file can reach — that
+/// absence is exactly why the existing per-phase [`PhaseFinding`]s cannot
+/// describe it. Machine-scoped, not phase-scoped: a stray by definition has
+/// no project root, so this finding is never attached to any
+/// [`PhaseFacts`]. Never carries a filesystem path (T-18-01/WR-02) — a
+/// stray has no meaningful root to name, so there is nothing to redact.
+pub(crate) struct StrayProcessFinding {
+    pub(crate) pid: u32,
+    pub(crate) layer: &'static str,
+    pub(crate) severity: Severity,
+    pub(crate) detail: String,
+    pub(crate) repair: Option<String>,
+}
+
+/// Pure builder: turn already-discovered stray processes into `doctor`
+/// findings — zero I/O, split out from [`collect_stray_process_findings`]
+/// the same way [`reconcile_planning_docs`] is split from
+/// `collect_planning_doc_findings`, so this is directly unit-testable with a
+/// synthetic candidate list instead of requiring a real orphan process to
+/// exist on the machine running the test.
+pub(crate) fn build_stray_process_findings(
+    strays: &[agent::StrayProcess],
+) -> Vec<StrayProcessFinding> {
+    strays
+        .iter()
+        .map(|stray| {
+            let layer = stray_layer_label(stray.layer);
+            StrayProcessFinding {
+                pid: stray.pid,
+                layer,
+                severity: Severity::Problem,
+                detail: format!(
+                    "state-orphaned process: pid {} ({layer}) is running but reachable \
+                     through no registry entry, lock file, or state file",
+                    stray.pid
+                ),
+                repair: Some("devflow gate sweep --reap-strays".to_string()),
+            }
+        })
+        .collect()
+}
+
+/// Gather `doctor`'s stray-process finding. The ONLY I/O here is
+/// [`agent::discover_stray_devflow_processes`]'s read-only `/proc` census
+/// (never a signal, T-25-62) — `doctor` stays strictly read-only.
+fn collect_stray_process_findings() -> Vec<StrayProcessFinding> {
+    build_stray_process_findings(&agent::discover_stray_devflow_processes())
+}
+
+/// Build `doctor --json`'s `"stray_processes"` array, mirroring
+/// [`render_planning_doc_findings_json`]'s shape.
+fn render_stray_process_findings_json(findings: &[StrayProcessFinding]) -> serde_json::Value {
+    serde_json::Value::Array(
+        findings
+            .iter()
+            .map(|f| {
+                serde_json::json!({
+                    "pid": f.pid,
+                    "layer": f.layer,
+                    "severity": f.severity.label(),
+                    "detail": f.detail,
+                    "repair": f.repair,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Build `doctor`'s text stray-process section. Unlike
+/// [`render_reconciliation_text`] (which always prints a per-phase "ok"
+/// line) this prints NOTHING when no stray is found — the no-stray case
+/// must leave `doctor`'s existing output byte-for-byte unchanged, since a
+/// machine-scoped finding with nothing to report is not a standing fact the
+/// way "no active phases" is.
+fn render_stray_process_text(findings: &[StrayProcessFinding]) -> String {
+    if findings.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "\nstray processes (state-orphaned -- no registry/lock/state file reaches them):\n",
+    );
+    for finding in findings {
+        out.push_str(&format!("  {}\n", finding.detail));
+        if let Some(repair) = &finding.repair {
+            out.push_str(&format!("    repair: {repair}\n"));
+        }
     }
     out
 }
@@ -4224,7 +4340,7 @@ mod tests {
             workflow::save_state(&state).unwrap();
             let facts = collect_phase_facts(root);
 
-            let body = doctor_json_body(&checks, &facts, &[]);
+            let body = doctor_json_body(&checks, &facts, &[], &[]);
             let serialized = serde_json::to_string(&body).unwrap();
             let reparsed: serde_json::Value = serde_json::from_str(&serialized)
                 .expect("doctor --json must be single-document JSON, not two concatenated arrays");
@@ -4242,14 +4358,20 @@ mod tests {
                 "21b: must carry the planning-doc findings under a THIRD key, \
                  never a second concatenated array: {reparsed}"
             );
+            assert!(
+                reparsed.get("stray_processes").is_some(),
+                "999.44: must carry the stray-process findings under a FOURTH key, \
+                 never a second concatenated array: {reparsed}"
+            );
             assert_eq!(
                 reparsed.as_object().unwrap().len(),
-                3,
-                "doctor --json must have exactly three top-level keys: {reparsed}"
+                4,
+                "doctor --json must have exactly four top-level keys: {reparsed}"
             );
             assert!(reparsed["environment"].is_array());
             assert!(reparsed["reconciliation"].is_array());
             assert!(reparsed["planning_doc_staleness"].is_array());
+            assert!(reparsed["stray_processes"].is_array());
             let reconciliation = reparsed["reconciliation"].as_array().unwrap();
             assert!(
                 !reconciliation.is_empty(),
@@ -4314,6 +4436,156 @@ mod tests {
                 before_lines, after_lines,
                 "doctor must not append to events.jsonl"
             );
+        }
+    }
+
+    /// Unit tests for `doctor`'s stray-process finding (999.44 / DEN-68).
+    /// `build_stray_process_findings` takes an injected `&[StrayProcess]`
+    /// list, so most of these run with zero I/O and no real orphan process
+    /// on the machine running the test — mirrors `reconcile_planning_docs`'s
+    /// zero-I/O discipline above. The one test that DOES need a real
+    /// process is read-only (`doctor` never signals), so it is safe to run
+    /// on a machine that may have unrelated, legitimate devflow activity
+    /// running concurrently — it only ever asserts the fixture it spawned
+    /// itself is still alive, never acts on anything else `discover_stray_
+    /// devflow_processes` might also see.
+    #[cfg(test)]
+    mod stray_process_finding {
+        use super::*;
+
+        #[test]
+        fn build_stray_process_findings_is_empty_for_no_strays() {
+            assert!(build_stray_process_findings(&[]).is_empty());
+        }
+
+        #[test]
+        fn build_stray_process_findings_names_pid_layer_and_repair() {
+            let strays = vec![agent::StrayProcess {
+                pid: 424242,
+                start_time: 0,
+                layer: agent::StrayLayer::MonitorWrapper,
+            }];
+            let findings = build_stray_process_findings(&strays);
+            assert_eq!(findings.len(), 1);
+            let finding = &findings[0];
+            assert_eq!(finding.severity, Severity::Problem);
+            assert!(finding.detail.contains("424242"));
+            assert!(finding.detail.contains("monitor wrapper"));
+            assert_eq!(
+                finding.repair.as_deref(),
+                Some("devflow gate sweep --reap-strays")
+            );
+            assert!(
+                !finding.detail.contains('/'),
+                "no finding may embed a filesystem path (WR-02): {}",
+                finding.detail
+            );
+        }
+
+        #[test]
+        fn build_stray_process_findings_names_advance_child_layer() {
+            let strays = vec![agent::StrayProcess {
+                pid: 424243,
+                start_time: 0,
+                layer: agent::StrayLayer::AdvanceChild,
+            }];
+            let findings = build_stray_process_findings(&strays);
+            assert!(findings[0].detail.contains("advance child"));
+        }
+
+        /// `doctor`'s existing text output is byte-for-byte unchanged when
+        /// there is no stray to report — the new section must contribute
+        /// NOTHING, not even a header line, unlike the always-present
+        /// reconciliation/planning-docs sections.
+        #[test]
+        fn render_stray_process_text_is_empty_when_no_strays() {
+            assert_eq!(render_stray_process_text(&[]), "");
+        }
+
+        #[test]
+        fn render_stray_process_text_names_pid_and_repair_when_present() {
+            let strays = vec![agent::StrayProcess {
+                pid: 555555,
+                start_time: 0,
+                layer: agent::StrayLayer::MonitorWrapper,
+            }];
+            let text = render_stray_process_text(&build_stray_process_findings(&strays));
+            assert!(text.contains("555555"));
+            assert!(text.contains("repair: devflow gate sweep --reap-strays"));
+        }
+
+        #[test]
+        fn doctor_json_body_carries_stray_processes_as_a_fourth_key() {
+            let checks: Vec<Check> = Vec::new();
+            let facts: Vec<PhaseFacts> = Vec::new();
+            let stray_findings = vec![StrayProcessFinding {
+                pid: 1,
+                layer: "monitor wrapper",
+                severity: Severity::Problem,
+                detail: "detail".to_string(),
+                repair: None,
+            }];
+            let body = doctor_json_body(&checks, &facts, &[], &stray_findings);
+            let obj = body.as_object().unwrap();
+            assert_eq!(obj.len(), 4, "must be exactly four top-level keys: {body}");
+            assert!(obj.contains_key("stray_processes"));
+            let strays = obj["stray_processes"].as_array().unwrap();
+            assert_eq!(strays.len(), 1);
+            assert_eq!(strays[0]["pid"], 1);
+        }
+
+        /// Behavior test (999.44's exact reproduction, Phase 18-01's
+        /// read-only proof extended to strays): a real process shaped
+        /// exactly like the monitor wrapper `discover_stray_devflow_
+        /// processes` matches is spawned, and `doctor` is run TWICE
+        /// against it — directly, and end to end through `doctor()`
+        /// itself. Every run must report it as a finding and leave it
+        /// alive: `doctor` never signals, no matter how many times it
+        /// runs.
+        #[test]
+        fn doctor_finds_a_real_stray_and_never_signals_it_across_two_runs() {
+            let mut child = std::process::Command::new("sh")
+                .arg("-c")
+                .arg("trap cleanup TERM INT; sleep 30")
+                .spawn()
+                .expect("spawn monitor-wrapper-shaped fixture");
+            let pid = child.id();
+
+            let dir = tempfile::tempdir().unwrap();
+
+            let first = collect_stray_process_findings();
+            assert!(
+                agent::agent_running(pid),
+                "fixture must still be alive after the first collection"
+            );
+            let second = collect_stray_process_findings();
+            assert!(
+                agent::agent_running(pid),
+                "fixture must still be alive after the second collection — doctor's stray \
+                 finding must never signal"
+            );
+
+            assert!(
+                first.iter().any(|f| f.pid == pid),
+                "the fixture must be reported by the first run"
+            );
+            assert!(
+                second.iter().any(|f| f.pid == pid),
+                "the fixture must be reported by the second run"
+            );
+
+            // Also exercise doctor() itself, end to end, twice — not just
+            // the pure finding collector — proving the full read-only path.
+            doctor(dir.path(), false).unwrap();
+            assert!(agent::agent_running(pid), "doctor() itself must not signal");
+            doctor(dir.path(), false).unwrap();
+            assert!(
+                agent::agent_running(pid),
+                "doctor() must remain read-only across repeated runs"
+            );
+
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
 
@@ -4609,17 +4881,19 @@ mod tests {
                 detail: "detail".to_string(),
                 repair: None,
             }];
-            let body = doctor_json_body(&checks, &facts, &doc_findings);
+            let body = doctor_json_body(&checks, &facts, &doc_findings, &[]);
             let obj = body.as_object().unwrap();
             assert_eq!(
                 obj.len(),
-                3,
-                "must be exactly {{environment, reconciliation, planning_doc_staleness}}: {body}"
+                4,
+                "must be exactly {{environment, reconciliation, planning_doc_staleness, \
+                 stray_processes}}: {body}"
             );
             assert!(obj.contains_key("environment"));
             assert!(obj.contains_key("reconciliation"));
             let staleness = obj["planning_doc_staleness"].as_array().unwrap();
             assert_eq!(staleness.len(), 1);
+            assert!(obj.contains_key("stray_processes"));
         }
     }
 
