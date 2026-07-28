@@ -285,3 +285,52 @@ pub(crate) fn stage_launched_count(root: &Path, phase: u32) -> usize {
         })
         .count()
 }
+
+/// Reap the detached monitor wrapper a real `launch_stage_inner` call just
+/// spawned, verifying its death rather than assuming it (WR-03, 999.46).
+///
+/// Any test that drives a real `launch_stage_inner` causes it to spawn a
+/// detached monitor wrapper (`monitor::spawn_monitor`) that is DESIGNED to
+/// outlive the call that spawned it — that is exactly what lets a real
+/// `devflow start` invocation return while the monitor keeps watching the
+/// agent. A test that drives the same call path gets the same detached
+/// wrapper, and since nothing else in a test's lifetime ever signals it, the
+/// TEST is the only thing that ever could — so the test owns reaping it.
+///
+/// The pid to reap comes from `state.monitor_pid` on the same `&mut State`
+/// the caller handed to `launch_stage_inner` — the only on-disk-free handle a
+/// test has on what it just caused to exist (`pipeline_launch.rs` writes the
+/// spawned pid there immediately after `monitor::spawn_monitor` returns).
+/// This function never scans `/proc`, never guesses, and never signals a pid
+/// it did not read from that same handle.
+///
+/// Escalates through `terminate_and_verify` (bounded TERM-then-KILL) rather
+/// than a bare `SIGTERM`: 999.44 measured 15 of 15 orphaned monitor wrappers
+/// surviving a bare `SIGTERM` against this exact process shape, so a single
+/// unescalated signal here would leave the leak in place while appearing to
+/// fix it.
+///
+/// Must be called BEFORE the caller's `TempDir` guard drops — reaping after
+/// the project root has already been deleted is 999.44's reproduction shape
+/// with extra steps, not a fix for it.
+///
+/// Tolerates `state.monitor_pid == None` by returning quietly, with no
+/// `unwrap`, no `expect` and no panic: an early-failing `launch_stage_inner`
+/// clears the field before any fallible step (`pipeline_launch.rs:70`), and a
+/// teardown helper that panics on that path would mask the launch's own
+/// failure rather than merely fail to clean up after it.
+pub(crate) fn reap_spawned_monitor(state: &State) {
+    let Some(pid) = state.monitor_pid else {
+        return;
+    };
+    devflow_core::agent::terminate_and_verify(
+        pid,
+        devflow_core::agent::TERMINATE_VERIFY_WAIT,
+        devflow_core::agent::TERMINATE_VERIFY_POLL,
+    );
+    assert!(
+        !devflow_core::agent::agent_running(pid),
+        "monitor wrapper pid {pid}, spawned by this test's own launch_stage_inner call, must be \
+         verified dead after reaping — not merely assumed dead"
+    );
+}

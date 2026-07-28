@@ -794,6 +794,12 @@ mod tests {
             "exactly one self_dogfood_stale_blocked event must exist — the direct \
              start-shaped call's, not a second one from the mid-run stage transition"
         );
+
+        // WR-03 (999.46): the `launch_stage_inner` call above spawned a real
+        // detached monitor wrapper. Reap it, verified, before `outer` drops
+        // below and unlinks the project root out from under it — 999.44's
+        // reproduction shape.
+        reap_spawned_monitor(&state);
     }
 
     /// 18c (T-18-26): the SAME fixture with `worktree_path: None` must fall
