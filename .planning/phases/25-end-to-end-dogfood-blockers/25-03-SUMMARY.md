@@ -181,3 +181,11 @@ None.
 ---
 *Phase: 25-end-to-end-dogfood-blockers*
 *Completed: 2026-07-27*
+
+## Self-Check: PASSED
+
+- FOUND: `.planning/phases/25-end-to-end-dogfood-blockers/25-03-SUMMARY.md`
+- FOUND commit: `7d3b5f3` (Task 1)
+- FOUND commit: `59124ed` (Task 2)
+- FOUND commit: `e2f9fed` (Task 3)
+- FOUND commit: `1692a44` (docs: SUMMARY)
