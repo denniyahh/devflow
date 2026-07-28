@@ -766,6 +766,15 @@ mod tests {
 
         let result = launch_stage_inner(&mut state, None, None);
 
+        // WR-03 / 999.46: the launch_stage_inner call above spawned a real
+        // detached monitor wrapper. Bound here — this test's LAST `&mut
+        // state` use — the guard reaps it, verified, before `outer` drops
+        // below and unlinks the project root out from under it (999.44's
+        // reproduction shape), and it outranks both panicking checkpoints
+        // that follow: `result.expect(...)` and the `assert_eq!` on
+        // `blocked_count` (G-25-2, 25-17).
+        let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
+
         // SAFETY: still serialized under ENV_MUTEX from above.
         unsafe {
             match &original_path {
@@ -794,12 +803,6 @@ mod tests {
             "exactly one self_dogfood_stale_blocked event must exist — the direct \
              start-shaped call's, not a second one from the mid-run stage transition"
         );
-
-        // WR-03 (999.46): the `launch_stage_inner` call above spawned a real
-        // detached monitor wrapper. Reap it, verified, before `outer` drops
-        // below and unlinks the project root out from under it — 999.44's
-        // reproduction shape.
-        reap_spawned_monitor(&state);
     }
 
     /// 18c (T-18-26): the SAME fixture with `worktree_path: None` must fall
