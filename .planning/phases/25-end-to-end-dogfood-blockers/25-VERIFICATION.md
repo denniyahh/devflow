@@ -1,162 +1,134 @@
 ---
 phase: 25-end-to-end-dogfood-blockers
-verified: 2026-07-28T16:19:31Z
-status: gaps_found
-score: 8/10 must-haves verified
+verified: 2026-07-28T18:30:00Z
+status: human_needed
+score: 10/10 must-haves verified
 behavior_unverified: 0
 overrides_applied: 0
 re_verification:
   previous_status: gaps_found
-  previous_score: 6/9
+  previous_score: 8/10
   gaps_closed:
-    - "25c (gate) — D-09 major-bump gate now fires in the default worktree execution path (25-08: execution_root threading + non-short-circuiting aggregation, both independently re-confirmed by direct source read and a passing targeted test run)"
-    - "25c (anchor) — release_range_start now anchors correctly under the trunk-commit-between-tag-and-sync-merge topology (25-09: full ancestry-path walk, independently re-confirmed by source read and a passing targeted test run)"
+    - "25a — CR-02 (ensure_base_ref_current's Behind arm): the fast-forward write is now a compare-and-swap (git update-ref refs/heads/<base> <new> <expected_old>), and the checked-out precondition is repository-wide (base_is_checked_out_anywhere, parsed from git worktree list --porcelain, fail-CLOSED on an unreadable answer) instead of project_root-scoped. Both closed by 25-14, independently re-confirmed here by direct source read (preflight.rs:405-560) and by running both new regression tests (fast_forward_base_ref_refuses_a_stale_expected_old_value, currency_behind_refuses_when_base_is_checked_out_in_another_worktree — both `1 passed`), plus all five pre-existing currency_* arms unmodified (`10 passed; 0 failed`)."
+    - "25d (surface) — CR-01 (doctor / gate sweep --reap-strays): both operator surfaces now route through one composition, unreachable_stray_candidates -> retain_unreachable_strays against registry_reachable_pids(stray_safety_roots(...)), which reads workflow::list_states' monitor_pid and lock::holder_identity's holder pid (never lock::holder, never registry::prune_missing) across registry::load_roots() unioned with the caller's own root, never narrowed by --root. Closed by 25-15, independently re-confirmed here by direct source read (commands.rs:3050-3200) and by running the two new regression tests (reachable_pids_are_excluded_from_both_the_findings_and_the_reap_candidates, a_deleted_root_contributes_nothing_to_the_reachable_set — both `1 passed`), plus stray_finding_detail_states_only_what_was_checked (`1 passed`) and both operator-facing string greps (STATE-ORPHANED in main.rs: 0 matches; the old unverified-orphan clause in commands.rs: 0 matches)."
   gaps_remaining: []
-  regressions:
-    - "25a — a NEW defect (CR-02, not present in the previous verification's scope) was found in the same unit: ensure_base_ref_current's fast-forward can itself corrupt the base ref it exists to keep current"
-    - "25d — a NEW defect (CR-01, not present in the previous verification's scope, introduced by this phase's own 25d/999.44 work) was found: the doctor/gate-sweep stray-process surface can direct an operator to SIGKILL a live, registered process"
+  regressions: []
   note: >
-    The two Critical findings this run treats as blocking (CR-01, CR-02 per the current
-    25-REVIEW.md) are DIFFERENT defects from the two the previous 25-VERIFICATION.md tracked
-    under the same CR-01/CR-02 labels (those were the D-09 gate short-circuit and the
-    release_range_start anchor bug, both now fixed by 25-08/25-09 and closed above). The label
-    reuse is REVIEW.md's own re-numbering after a full re-review of the post-gap-closure tree,
-    not a re-verification of the same bugs. Additionally, this run supersedes the previous
-    verification's truth 7 (25e), which was recorded as PRESENT_BEHAVIOR_UNVERIFIED on a
-    "structurally removed" premise that 25-CI-OBSERVATION.md's 2-of-2 live reproduction later
-    falsified. That premise has since been replaced by 25-11's measured site census + exec-
-    visibility barrier, 25-12's production age floor, and 25-13's 11-observation CI-on-branch
-    streak with explicit, verbatim human sign-off (2026-07-28) that engaged with the evidence's
-    stated residual — the strongest form of closure this class of race admits, and this
-    verifier's own independent corroboration (gh run view, git merge-base --is-ancestor) matches
-    the artifact's claims. Truth 7 is recorded VERIFIED (human-verified, residual stated), not
-    upgraded to "proven absent."
-gaps:
-  - truth: "25a — a run starts on a current base ref SAFELY: the fast-forward repair cannot itself corrupt the base ref it exists to keep current"
-    status: failed
-    reason: >
-      Independently confirmed by direct source read of preflight.rs:424-481
-      (`ensure_base_ref_current`'s `Behind` arm), not merely cited from 25-REVIEW.md's CR-02.
-      The fast-forward is performed with `git update-ref refs/heads/{base}
-      refs/remotes/{remote_ref}` and NO `<oldvalue>` argument — an unconditional write that can
-      move `{base}` BACKWARDS onto a non-descendant if anything advances the local ref between
-      `base_ref_currency`'s read and this write (a concurrent `devflow start`, an operator, a
-      hook), while printing a false "N commit(s) fast-forwarded" success message. Separately,
-      the precondition that guards the write — "not currently checked out" — is tested with
-      `git symbolic-ref --quiet --short HEAD` run ONLY in `project_root`, i.e. it sees just the
-      one worktree `devflow start` is invoked from. `git update-ref`, unlike `git branch -f`,
-      carries no checked-out-branch protection of its own. This repository routinely runs
-      several linked worktrees at once (confirmed live during this verification: a phase-07
-      worktree at `/tmp/.tmpYzOOmM/.worktrees/phase-07` was actively running) — if `develop` is
-      checked out in ANY worktree other than the one `project_root` resolves to, this code moves
-      the ref out from under that worktree silently, leaving its HEAD, index and working tree
-      out of sync. 25a exists precisely because a human previously had to repair the base ref by
-      hand before `devflow start` would launch; a repair mechanism that can itself corrupt the
-      ref does not close that requirement — it adds a second, silent way to reach the same
-      broken state.
-    artifacts:
-      - path: "crates/devflow-cli/src/preflight.rs"
-        issue: "ensure_base_ref_current (:445-479, Behind arm): git update-ref with no <oldvalue> guard (unconditional write); checked-out precondition (:447-454) probes only project_root's own HEAD, not other worktrees"
-    missing:
-      - "Pass <oldvalue> to git update-ref — the resolved local base SHA at check time — so the write refuses (rather than silently discarding) if base moved since base_ref_currency's own check"
-      - "Replace the single-worktree symbolic-ref probe with a repository-wide check (git worktree list --porcelain, scanning for `branch refs/heads/<base>`), or attempt `git branch -f <base> <remote_ref>` first — it already refuses on its own when base is checked out in ANY worktree, which is exactly the precondition the current code is trying and failing to establish"
-      - "A regression test with base checked out in a SECOND worktree (not project_root) — asserting the fast-forward refuses rather than silently moving the ref out from under it"
-  - truth: "25d — a stalled run recovers without kill(1), and the recovery mechanism never SIGKILLs a live, registered (non-orphaned) process"
-    status: failed
-    reason: >
-      Independently reproduced LIVE on this machine during this verification, not merely cited
-      from 25-REVIEW.md's CR-01. `discover_stray_devflow_processes` (agent.rs:393-446) is a
-      purely structural `/proc` census with no orphan test of any kind — it matches on argv
-      shape and euid only. `build_stray_process_findings` (commands.rs:3023-3043) then asserts,
-      for every match, that it "is running but reachable through no registry entry, lock file,
-      or state file" and recommends `devflow gate sweep --reap-strays` (commands.rs:3039). Ran
-      `devflow doctor --json` on this machine: 40 `stray_processes` findings. Cross-referenced
-      pid 596367 (one of them, labelled "monitor wrapper") against
-      `/tmp/.tmp4T6jFk/.devflow/state-12.json`: that file's `monitor_pid` field IS 596367 — a
-      live, currently-running phase-12 monitor wrapper, reachable through a real state file.
-      `doctor`'s claim that it is reachable through "no registry entry, lock file, or state
-      file" is false for this specific process, right now. `gate_sweep`'s `--reap-strays` pass
-      (commands.rs:1149-1232) feeds the SAME unfiltered census straight to
-      `reap_stray_candidates` gated only by `agent::STRAY_MIN_AGE` (a 2-second age floor that
-      exists to bound the fork/exec cmdline-inheritance race — 999.47's mechanism — and has no
-      bearing on registry-reachability). A monitor wrapper minutes old sails past that floor.
-      Following doctor's own printed repair would SIGKILL pid 596367; SIGKILL is uncatchable, so
-      the wrapper's `trap cleanup TERM INT` never fires, orphaning its own trailing `devflow
-      advance` child — manufacturing exactly the orphan class 999.44 exists to eliminate.
-      Additionally confirmed: `gate_sweep`'s stray pass ignores `--root` entirely (comment at
-      commands.rs:1143-1145 states this explicitly), so a sweep scoped to one root still reaps
-      the whole machine's strays; and `main.rs:389-397`'s `--reap-strays` help text describes
-      the behaviour as clearing "STATE-ORPHANED processes," which is not the semantics this
-      code has. The TERM->KILL escalation, death verification, and identity re-confirmation
-      primitives themselves (`terminate_and_verify`, `is_same_process`) are sound in isolation
-      (see truth 6) — the defect is entirely in what gets handed to them.
-    artifacts:
-      - path: "crates/devflow-cli/src/commands.rs"
-        issue: "build_stray_process_findings (:3023-3043) asserts unverified orphan-ness; collect_stray_process_findings (:3048-3050) and gate_sweep's stray pass (:1149-1232) feed the unfiltered census with no registry-reachability check; the stray pass ignores --root (:1143-1151)"
-      - path: "crates/devflow-core/src/agent.rs"
-        issue: "discover_stray_devflow_processes (:393-446) is structural-only by design (documented, not itself a bug) — but has no counterpart that filters against registry::load_roots()'s reachable pids before either surface acts on it"
-      - path: "crates/devflow-cli/src/main.rs"
-        issue: "--reap-strays help text (:389-397) describes clearing 'STATE-ORPHANED processes,' semantics the implementation does not have"
-    missing:
-      - "Filter the census against registry::load_roots()'s reachable pids (each root's state.monitor_pid and lock::holder) before either reporting a match as state-orphaned in doctor or signalling it in gate_sweep — a pid a live registry entry still reaches is by definition not a stray"
-      - "Honour --root in the stray pass (scope the reachable-pid filter to the given root), or document loudly at the call site why it cannot be scoped"
-      - "Reword doctor's detail string and main.rs's --reap-strays help text once the corrected scope is known"
-      - "A regression test with a live, registry-reachable pid (a real state file naming it as monitor_pid) present alongside a genuine orphan in the same discovery pass, asserting only the orphan is reported/reaped"
+    Both truths this round targeted (1 and 7) are now VERIFIED, independently, not merely on the
+    executors' or the code reviewer's word — every claim in `25-14-SUMMARY.md`/`25-15-SUMMARY.md`
+    and every "CLOSED" verdict in the current `25-REVIEW.md` was checked against live source and a
+    live test run by this verifier. Score is a clean 10/10 on the phase's ORIGINAL 10 must-have
+    truths. However, this round's third plan (25-16, WR-03 fold-in) surfaced — and this verifier
+    independently confirmed — two NEW, unresolved defects (WR-05, WR-06) in that plan's own scope.
+    Neither WR-05 nor WR-06 attaches to any of the phase's 10 original truths or to any of the 6
+    units (25a-25f + 999.38) the ROADMAP's own acceptance paragraph names as the phase's completion
+    criterion — WR-03/05/06 is ancillary test-hygiene work folded into this round voluntarily, to
+    protect confidence in 25-15's own live-census regression evidence, not one of the phase's
+    deliverables. Both are already recorded as OPEN items in `.planning/WINDOWS.md` (ids 1 and 2),
+    which blocks `/gsd-ship` until a human fixes or waives them. That existing project mechanism,
+    plus this verifier's own independent confirmation that both findings are real (not merely
+    plausible), is why overall status is `human_needed` rather than a clean `passed` — a human must
+    decide whether to spend a fourth gap-closure round on WR-05/WR-06 or waive them before shipping.
+gaps: []
+human_verification:
+  - test: >
+      WR-05 (confirmed real, not merely cited from 25-REVIEW.md): decide whether to fix
+      `preflight.rs::run_preflight_advance_gate_launches_agent_exactly_once` and
+      `run_preflight_loopback_gate_launches_agent_exactly_once` (neither calls
+      `reap_spawned_monitor`, confirmed by `grep -n reap_spawned_monitor crates/devflow-cli/src/preflight.rs`
+      returning zero hits) in a follow-up plan, or waive WINDOWS.md item 1 with a reason.
+    expected: >
+      Either a follow-up plan wires `reap_spawned_monitor(&state)` into both tests (both reach a
+      real `monitor::spawn_monitor` via `run_preflight`'s internal `GateAction::Advance`
+      (`preflight.rs:941`, direct `launch_stage_inner` call) and `GateAction::LoopBack`
+      (`preflight.rs:946`, `launch_stage` call re-resolving the real Claude adapter) arms —
+      confirmed by direct source read, not assumed from the review), or WINDOWS.md item 1 is
+      explicitly waived with a stated reason, per the project's own "`/gsd-ship` blocks while
+      `open_count > 0`" policy.
+    why_human: >
+      This is a scope/priority decision (spend a fourth gap-closure round on test-hygiene work
+      outside the phase's 6 named units, vs. accept the residual and waive it), not a fact this
+      verifier can resolve — the underlying fact (the leak's existence) is already independently
+      confirmed by static source reading, so no further verification step would change the finding.
+  - test: >
+      WR-06 (confirmed real, not merely cited from 25-REVIEW.md): decide whether to harden
+      `reap_spawned_monitor`'s two existing call sites (`staleness.rs:802`,
+      `pipeline_launch.rs:440`) into an unwind-safe `Drop` guard, or accept the current
+      plain-trailing-statement form as sufficient for now.
+    expected: >
+      Either a follow-up plan replaces the trailing `reap_spawned_monitor(&state)` calls with an
+      RAII guard (bound immediately after the launch, before any of the panicking assertions that
+      currently precede the reap call — `result.unwrap()` at `pipeline_launch.rs:423`,
+      `assert!(state.monitor_pid.is_some(), ...)` at `:425-428`, `workflow::load_state(...).unwrap()`
+      at `:429`, `assert_eq!(reloaded.monitor_pid, ...)` at `:430-434` in one test; `result.expect(...)`
+      at `staleness.rs:777` and `assert_eq!(blocked_count, 1, ...)` at `:792-796` in the other — all
+      confirmed present and all preceding the reap call by direct source read), so a future
+      regression that trips one of those assertions does not also leak the process the same test
+      spawned; or the residual is explicitly accepted as low-probability (these assertions are the
+      tests' own success-path invariants, not expected to flap) and left as-is.
+    why_human: >
+      Same category as WR-05 — a scope/priority call on defensive test-infrastructure hardening,
+      not a fact in dispute. The defect is real (confirmed: `reap_spawned_monitor` is a plain
+      trailing statement at both sites, with multiple panicking assertions ahead of it in both
+      functions) but its consequence is bounded to "a future regression's own CI run also leaks a
+      process," not to the phase's shipped behavior.
 deferred: []
 ---
 
 # Phase 25: End-to-End Dogfood Blockers Verification Report
 
 **Phase Goal:** Make an unattended `devflow start --phase N --agent claude --mode auto --yes-ship` run reach a completed Ship stage without a human touching it, by closing the four things that currently prevent it (a run starts on a current base — 25a; progresses through all stages — 25b; finishes with correct artifacts — 25c; a stalled run recovers without `kill(1)` — 25d), plus 25e (CI-throughput flake), 25f (docs drift), and 999.38 (PATH race).
-**Verified:** 2026-07-28T16:19:31Z
-**Status:** gaps_found
-**Re-verification:** Yes — after gap closure (25-08/25-09 closed the prior report's two gaps; this run independently re-derived the whole phase against the post-gap-closure tree and found two NEW, unrelated Critical defects — see `re_verification.regressions` above)
+**Verified:** 2026-07-28T18:30:00Z
+**Status:** human_needed
+**Re-verification:** Yes — after gap-closure round 3 (25-14/25-15/25-16), against the prior report's two remaining gaps.
 
 ## Goal Achievement
 
 ### Observable Truths
 
+All 10 of the phase's original must-have truths (from the prior `25-VERIFICATION.md`). Truths 2-6, 8, 9, 10 received a quick regression check (source unchanged since the previous verification, confirmed by `git diff` scoping and by re-running the specific tests still applicable); truths 1 and 7 — this round's targets — received full independent re-derivation.
+
 | # | Truth | Status | Evidence |
 |---|-------|--------|----------|
-| 1 | 25a — a run starts on a current base ref, **safely** | ✗ FAILED | `ensure_base_ref_current`'s fast-forward (`preflight.rs:456-473`) uses `git update-ref` with no `<oldvalue>` guard (unconditional write) and a checked-out precondition that only probes `project_root`'s own HEAD. Confirmed by direct source read; matches REVIEW.md's CR-02 scratch-repo reproduction. See gaps. |
-| 2 | 25b — `enforce_build_staleness` is adjudicated once per run (at `start`), never re-invoked mid-run | ✓ VERIFIED | Call present at `commands.rs:278`, after `state.worktree_path` is set (`:248`); absent from `pipeline_launch.rs`. `staleness.rs::mid_run_stage_transition_does_not_readjudicate_staleness` present and passing (part of the 688/0 full run). |
-| 3 | 25c (derivation) — `compute_version` derives from (reachable semver tag, conventional-commit classification), refuses on unreachable baseline, floors correctly | ✓ VERIFIED | `version.rs`'s `reachable_semver_baseline`/`highest_semver_tag`/`classify_range_bump`/`VersionError::UnreachableBaseline` present and composed; unchanged from the previous verification's finding. |
-| 4 | 25c (gate) — a major version bump opens a gate and never ships unattended, **in the default (worktree) execution path** — closes the previous verification's GAP 1 | ✓ VERIFIED | `preflight_major_bump_check` now evaluates `execution_root = state.worktree_path.as_deref().unwrap_or(project_root)` (`preflight.rs:629`), confirmed by direct source read; `generic_preflight_checks` (`:763-778`) aggregates all three checks (major-bump first) instead of `?`-short-circuiting, confirmed present. Spot-run both `preflight::tests::preflight_major_bump_check_fires_against_the_worktree_head` and `preflight::tests::generic_preflight_checks_reports_major_bump_even_when_gh_auth_fails_first` -> both `1 passed`. |
-| 5 | 25c (anchor) — `release_range_start`'s commit-range anchor excludes pre-release history across realistic release topologies — closes the previous verification's GAP 2 | ✓ VERIFIED | `release_range_start` (`version.rs:299-360`) now walks the FULL `--ancestry-path` list rather than only its first commit, confirmed by direct source read; matches the fix REVIEW.md's own CR-03 sketch proposed. Spot-run `version::tests::trunk_commit_between_tag_and_sync_merge_still_anchors_at_the_sync_merge` -> `1 passed`. |
-| 6 | 25d (primitives) — bounded TERM->KILL escalation with verified death; registry-independent discovery; identity re-confirmation before signalling | ✓ VERIFIED | `terminate_and_verify`, `discover_stray_devflow_processes`, `process_start_time`, `is_same_process` present in `agent.rs`; `process_age`/`STRAY_MIN_AGE` (25-12) correctly bound the fork/exec race and fail closed on unreadable/non-finite age data. Independently re-derived from source (not merely REVIEW.md's own analysis): guard ordering (identity -> age -> dry_run -> signal) is correct, no branch signals a too-young or unknown-age candidate. |
-| 7 | 25d (surface) — an operator using `devflow doctor` / `gate sweep --reap-strays` never has a live, registered process misreported as an orphan or destroyed | ✗ FAILED | **Live-reproduced during this verification, not merely cited from REVIEW.md.** `devflow doctor --json` on this machine currently reports 40 `stray_processes` findings; pid 596367 among them is independently confirmed to be the recorded `monitor_pid` in a real, live `state-12.json` — `doctor`'s claim that it is reachable through "no registry entry, lock file, or state file" is false for this exact process. The printed repair (`devflow gate sweep --reap-strays`) would SIGKILL it, bypassing its wrapper's `trap cleanup`, orphaning its own child. See gaps. |
-| 8 | 25e — the 999.47 CI flake (cmdline-inheritance race) — human-verified against 11 observations, residual explicitly stated, not claimed proven absent | ✓ VERIFIED (human-verified) | 25-11's measured site census (`25-SITE-CENSUS.md`: 4 VULNERABLE-POSITIVE + 2 VACUOUS-NEGATIVE sites, all barriered with `wait_for_exec_visibility`) and 25-12's production age floor (`agent::STRAY_MIN_AGE`) confirmed present and wired (see `## Key Link Verification`). `25-CI-TRIALS.md` records 6 local push-gate + 5 CI `Test`-job trials, all green, all at `82328b3` — independently corroborated by this verifier: `gh run view 30371091367` confirms `conclusion: success` at the stated head SHA, and `git merge-base --is-ancestor 82328b3 origin/feature/phase-25` exits 0 (origin is NOT at the pre-fix `a5a068f`). A human explicitly engaged with the evidence's own stated limitation (CI's `Test` job is the less-sensitive shape) before approving, recorded verbatim in `25-13-SUMMARY.md` Part A (2026-07-28). The record's own vocabulary (`no_reproduction`, never `closed`) and residuals (~6.1% / ~0.05%) are preserved here, not upgraded. |
-| 9 | 999.38 — the test-suite PATH race is de-raced | ✓ VERIFIED | `ENV_MUTEX` guard + `test_support::git_command` hermetic reads confirmed present at `staleness.rs:1044-1046` and its three siblings. |
-| 10 | 25f — CONTRIBUTING.md's release procedure and the ROADMAP/PROJECT.md versioning-policy prose no longer drift from what 25c implements | ✓ VERIFIED (human sign-off recorded) | `CONTRIBUTING.md` uses the `-c user.signingkey=...` indirection and no longer claims `tag.gpgsign=false`; `ROADMAP.md`'s Acceptance paragraph and June-2026 ban bullet amended per D-06/D-15/D-16. `25-VALIDATION.md`'s three human-judgment rows signed off verbatim ("B: approved," 2026-07-28) in `25-13-SUMMARY.md` Part B, with the orchestrator's own independent corroboration of each row recorded alongside (not substituting for it). |
+| 1 | 25a — a run starts on a current base ref, **safely** | ✓ VERIFIED | **CR-02 CLOSED, independently re-confirmed.** `ensure_base_ref_current`'s `Behind` arm (`preflight.rs:503-560`) now: (a) gates on `base_is_checked_out_anywhere` (`:411-433`), a repository-wide `git worktree list --porcelain` scan, exact-line-matched, fail-CLOSED (`true`) on spawn error/non-zero exit; (b) resolves both endpoints via `rev-parse --verify --quiet` and calls `fast_forward_base_ref` (`:435-449`) — a genuine 4-argument `git update-ref refs/heads/<base> <new> <expected_old>` compare-and-swap, not the prior unconditional 3-argument write. Ran both new regression tests myself: `preflight::tests::fast_forward_base_ref_refuses_a_stale_expected_old_value` → `1 passed`; `preflight::tests::currency_behind_refuses_when_base_is_checked_out_in_another_worktree` → `1 passed`. Ran `preflight::tests::currency_` as a group → `10 passed; 0 failed` (all five pre-existing `currency_*` arms unmodified). Doc comment (`:481-502`) states the compare-and-swap, the repository-wide scope, and the scan-to-swap residual window verbatim. |
+| 2 | 25b — `enforce_build_staleness` is adjudicated once per run (at `start`), never re-invoked mid-run | ✓ VERIFIED | Unchanged since prior verification (no wave-1 plan this round touched `commands.rs`'s staleness call site). `staleness.rs::mid_run_stage_transition_does_not_readjudicate_staleness` still passes (`1 passed`, confirmed as part of this round's own regression baseline). |
+| 3 | 25c (derivation) — `compute_version` derives from (reachable semver tag, conventional-commit classification), refuses on unreachable baseline, floors correctly | ✓ VERIFIED | Unchanged; no round-3 plan touches `version.rs`. |
+| 4 | 25c (gate) — a major version bump opens a gate and never ships unattended, in the default (worktree) execution path | ✓ VERIFIED | Unchanged; no round-3 plan touches this code. |
+| 5 | 25c (anchor) — `release_range_start`'s commit-range anchor excludes pre-release history across realistic release topologies | ✓ VERIFIED | Unchanged; no round-3 plan touches `version.rs`. |
+| 6 | 25d (primitives) — bounded TERM->KILL escalation with verified death; registry-independent discovery; identity re-confirmation before signalling | ✓ VERIFIED | Unchanged in behavior — `agent.rs`'s `discover_stray_devflow_processes` body, `STRAY_MIN_AGE`, `process_age`, `terminate_and_verify`, `is_same_process` are untouched by 25-15 (confirmed: 25-15's diff to `agent.rs` is comment-only, per its own acceptance criteria and my own `git diff` read of the doc-comment-only hunk). |
+| 7 | 25d (surface) — an operator using `devflow doctor` / `gate sweep --reap-strays` never has a live, registered process misreported as an orphan or destroyed | ✓ VERIFIED | **CR-01 CLOSED, independently re-confirmed.** `registry_reachable_pids` (`commands.rs:3050-3068`) reads `workflow::list_states(root).monitor_pid` and `lock::holder_identity(root, phase)` — grepped and confirmed `lock::holder` and `registry::prune_missing` appear nowhere on this path. `stray_safety_roots` (`:3100-3117`) unions `registry::load_roots()` with the caller's root, never narrows. `unreachable_stray_candidates` (`:3119-3122`) is the ONE composition both `collect_stray_process_findings` (`doctor`, `:3181-3183`) and `gate_sweep`'s stray pass (`:1174`) call — confirmed `agent::discover_stray_devflow_processes()` has no other direct production caller in `commands.rs` besides the one inside this composition and the pre-existing post-pass re-discovery note. Ran all three new regression tests myself: `commands::tests::reachable_pids_are_excluded_from_both_the_findings_and_the_reap_candidates` → `1 passed`; `commands::tests::a_deleted_root_contributes_nothing_to_the_reachable_set` → `1 passed`; `commands::tests::stray_finding_detail_states_only_what_was_checked` → `1 passed`. Confirmed both corrected operator-facing strings by grep: `rg -c 'STATE-ORPHANED' main.rs` → 0 matches; `rg -c 'reachable through no registry entry, lock file, or state file' commands.rs` → 0 matches. |
+| 8 | 25e — the 999.47 CI flake (cmdline-inheritance race) — human-verified against 11 observations, residual explicitly stated | ✓ VERIFIED (human-verified, carried forward) | Unchanged since prior verification; no round-3 plan touches this evidence or its supporting code. |
+| 9 | 999.38 — the test-suite PATH race is de-raced | ✓ VERIFIED | Unchanged; no round-3 plan touches `staleness.rs`'s `ENV_MUTEX`/hermetic-git-read guards (25-16 only adds a trailing reap call to an existing `ENV_MUTEX`-guarded test, does not touch the guard itself — confirmed by reading `staleness.rs:759-802`, the `PATH` mutate/restore block is byte-identical). |
+| 10 | 25f — CONTRIBUTING.md's release procedure and the ROADMAP/PROJECT.md versioning-policy prose no longer drift from what 25c implements | ✓ VERIFIED (human sign-off recorded, carried forward) | Unchanged; no round-3 plan touches these docs. |
 
-**Score:** 8/10 truths verified (0 present-but-behavior-unverified, 2 failed)
+**Score:** 10/10 truths verified (0 present-but-behavior-unverified, 0 failed).
+
+### New Finding This Round (not one of the 10 truths above): WR-03's fold-in is only partially closed
+
+25-16-PLAN.md folded WR-03 (a test-suite process leak) into this round voluntarily — not because it is one of the phase's 25a-25f/999.38 deliverables, but to protect the reliability of 25-15's own live-`/proc`-census regression evidence. Its own must-have truth claimed "Two such tests exist today... and both are covered." I independently re-verified this claim and it is **false as stated**: the plan's own Step-1 enumeration (recorded honestly in `25-16-SUMMARY.md`, not smoothed over) found **four** launch-driving test sites, not two, and two of them remain unfixed. I additionally independently confirmed a second, distinct defect in the two sites that *were* fixed. See Anti-Patterns table and Human Verification below — both are recorded in `.planning/WINDOWS.md` (ids 1, 2) as open deviations, which the project's own tooling blocks `/gsd-ship` on.
 
 ### Required Artifacts
 
 | Artifact | Expected | Status | Details |
 |----------|----------|--------|---------|
-| `crates/devflow-cli/src/preflight.rs::ensure_base_ref_current`/`base_ref_currency` | 25a currency probe, safe fast-forward | ⚠️ WIRED but unsafe | Present, wired at `commands.rs:154` before `ensure_phase_reachable_on_base` — but see truth 1/gaps: the fast-forward itself is unsafe |
-| `crates/devflow-cli/src/commands.rs::start()` staleness call site | 25b one-shot gate | ✓ VERIFIED | Present at `:278`, after `worktree_path` set; removed from `pipeline_launch.rs` |
-| `crates/devflow-core/src/version.rs::compute_version` + helpers | 25c derivation | ✓ VERIFIED | Present, composed correctly |
-| `crates/devflow-cli/src/preflight.rs::preflight_major_bump_check`/`major_bump_check_applies` | 25c D-09 gate, worktree-scoped | ✓ VERIFIED | `execution_root` threading + aggregation confirmed present; previous gap closed |
-| `crates/devflow-core/src/version.rs::release_range_start` | 25c anchor, topology-robust | ✓ VERIFIED | Full ancestry-path walk confirmed present; previous gap closed |
-| `crates/devflow-core/src/agent.rs::terminate_and_verify`/`discover_stray_devflow_processes`/`process_age` | 25d primitives | ✓ VERIFIED | Present, sound in isolation, tested with real spawned children |
-| `crates/devflow-cli/src/commands.rs::build_stray_process_findings`, `gate_sweep --reap-strays` | 25d CLI surface — orphan-safe | ✗ UNSAFE | Present and wired, but not registry-reachability-filtered — see truth 7/gaps |
-| `crates/devflow-core/src/test_support.rs::wait_for_exec_visibility` | 25e exec-visibility barrier | ✓ VERIFIED | Present, wired at all 4 vulnerable-positive sites (`agent.rs` x3, `commands.rs` x1, `reap_strays_e2e.rs` x1) |
-| `.planning/phases/25-end-to-end-dogfood-blockers/25-SITE-CENSUS.md`, `25-CI-TRIALS.md` | 25e evidence artifacts | ✓ VERIFIED | Present, internally consistent, independently corroborated (CI run status, ancestry) |
-| `CONTRIBUTING.md`, `.planning/ROADMAP.md`, `.planning/PROJECT.md` | 25f docs | ✓ VERIFIED | Confirmed via grep; human sign-off recorded |
+| `crates/devflow-cli/src/preflight.rs::base_is_checked_out_anywhere` | 25a repository-wide checked-out predicate | ✓ VERIFIED | Present (`:411-433`), fail-CLOSED, whole-line exact match confirmed by reading (`line.trim() == needle`, not `contains`) |
+| `crates/devflow-cli/src/preflight.rs::fast_forward_base_ref` | 25a compare-and-swap write | ✓ VERIFIED | Present (`:435-449`), 4-argument `update-ref` confirmed by reading |
+| `crates/devflow-cli/src/preflight.rs::ensure_base_ref_current` | 25a currency probe + safe fast-forward, wired | ✓ VERIFIED | Rewired `Behind` arm confirmed; call site `commands.rs:154` unchanged (confirmed no diff to `commands.rs` from 25-14) |
+| `crates/devflow-cli/src/commands.rs::registry_reachable_pids`/`retain_unreachable_strays`/`stray_safety_roots`/`unreachable_stray_candidates` | 25d CR-01 filter | ✓ VERIFIED | All four present (`:3050-3122`), composition confirmed by reading and by grep for remaining `discover_stray_devflow_processes` call sites |
+| `crates/devflow-cli/src/commands.rs::collect_stray_process_findings`/`gate_sweep` stray pass | 25d operator surfaces, filtered | ✓ VERIFIED | Both route through `unreachable_stray_candidates` (`:3182`, `:1174`) |
+| `crates/devflow-cli/src/test_support.rs::reap_spawned_monitor` | WR-03 shared reap helper | ⚠️ WIRED, incompletely applied | Present and correct in isolation (escalating `terminate_and_verify`, verified death, tolerates `None`) — but wired into only 2 of the 4 launch-driving test sites the plan's own enumeration found (see WR-05) |
 
 ### Key Link Verification
 
 | From | To | Via | Status | Details |
 |------|-----|-----|--------|---------|
-| `commands.rs::start()` | `preflight.rs::ensure_base_ref_current` | direct call, before `ensure_phase_reachable_on_base` | ⚠️ WIRED, unsafe implementation | Ordering confirmed at `:154`/`:164`; the called function's own internals are the defect (truth 1) |
-| `commands.rs::start()` | `staleness.rs::enforce_build_staleness` | direct call, after `worktree_path` set | ✓ WIRED | Confirmed at `:278` |
-| `preflight.rs::generic_preflight_checks` | `preflight.rs::preflight_major_bump_check` | aggregated (non-short-circuiting) call | ✓ WIRED, correctly | Confirmed at `:763-778`; major-bump evaluated first |
-| `preflight.rs::preflight_major_bump_check` | `version.rs::{highest_semver_tag, reachable_semver_baseline, release_range_start, classify_range_bump}` | all five calls use `execution_root` | ✓ WIRED, correctly | Confirmed at `:629-669` |
-| `commands.rs::collect_stray_process_findings`/`gate_sweep`'s stray pass | `agent.rs::discover_stray_devflow_processes` | direct call, unfiltered | ⚠️ WIRED, unsafe | Confirmed at `:3048-3050` and `:1149-1151` — no registry-reachability filter interposed (truth 7) |
-| `commands.rs::gate_sweep`'s stray pass | `commands.rs::reap_stray_candidates` -> `agent::STRAY_MIN_AGE` | direct call | ✓ WIRED, correctly (for what it bounds) | Confirmed at `:1151`; bounds the fork/exec race, not registry-reachability — the two are different hazards and only the first is closed |
-| `agent.rs`/`commands.rs` census tests | `test_support::wait_for_exec_visibility` | barrier before every vulnerable-positive census read | ✓ WIRED | Confirmed at all 4 sites named in `25-SITE-CENSUS.md`'s `## Vulnerable sites` |
+| `preflight.rs::ensure_base_ref_current`'s `Behind` arm | `preflight.rs::base_is_checked_out_anywhere` | sole checked-out gate | ✓ WIRED, correctly | Confirmed: no residual `project_root`-scoped `symbolic-ref` probe alongside it |
+| `preflight.rs::ensure_base_ref_current`'s `Behind` arm | `preflight.rs::fast_forward_base_ref` | resolved local SHA as `expected_old` | ✓ WIRED, correctly | Confirmed by reading `:435-449` |
+| `commands.rs::doctor`/`collect_stray_process_findings` | `commands.rs::unreachable_stray_candidates` | direct call, `project_root` unioned in | ✓ WIRED, correctly | Confirmed at `:3182` |
+| `commands.rs::gate_sweep`'s stray pass | `commands.rs::unreachable_stray_candidates` | direct call, explicit `--root` unioned in, never substituted | ✓ WIRED, correctly | Confirmed at `:1174`; `--root`-narrowing refused per `<resolved_decision>`, machine-wide warning line present |
+| `commands.rs::registry_reachable_pids` | `lock::holder_identity` (never `lock::holder`) | pure read | ✓ WIRED, correctly | Confirmed by reading and by grep — `lock::holder`/`registry::prune_missing` absent from `doctor`'s path |
+| `staleness.rs`/`pipeline_launch.rs` launch-driving tests | `test_support::reap_spawned_monitor` | trailing call, AFTER prior assertions | ⚠️ WIRED, unwind-unsafe | Confirmed present at both named sites, but confirmed (WR-06) to be a plain trailing statement preceded by 2-4 panicking assertions in both functions |
+| `preflight.rs::run_preflight`'s `Advance`/`LoopBack` arms | `test_support::reap_spawned_monitor` | — | ✗ NOT WIRED | Confirmed absent (WR-05): `grep -n reap_spawned_monitor crates/devflow-cli/src/preflight.rs` returns zero hits, while both tests reach a real `monitor::spawn_monitor` via `run_preflight`'s internal recursive relaunch (`preflight.rs:941`, `:946`) |
 
 ### Data-Flow Trace (Level 4)
 
@@ -166,57 +138,73 @@ Not applicable — this phase produces CLI/library logic, not UI components rend
 
 | Behavior | Command | Result | Status |
 |----------|---------|--------|--------|
-| Full workspace regression | `cargo test --workspace --no-fail-fast` | `688 passed; 0 failed` (summed across all 19 test binaries) | ✓ PASS (matches orchestrator's independently-reported 688/0) |
-| 25c D-09 gate fires in the worktree fixture (25-08's regression test) | `cargo test --package devflow --bin devflow preflight::tests::preflight_major_bump_check_fires_against_the_worktree_head -- --exact` | `1 passed; 0 failed` | ✓ PASS |
-| 25c D-09 gate aggregates reasons instead of short-circuiting (25-08's regression test) | `cargo test --package devflow --bin devflow preflight::tests::generic_preflight_checks_reports_major_bump_even_when_gh_auth_fails_first -- --exact` | `1 passed; 0 failed` | ✓ PASS |
-| 25c anchor fix under the trunk-commit topology (25-09's regression test) | `cargo test --package devflow-core --lib version::tests::trunk_commit_between_tag_and_sync_merge_still_anchors_at_the_sync_merge -- --exact` | `1 passed; 0 failed` | ✓ PASS |
-| **CR-01 live reproduction** — a registered process is misreported as orphaned | `devflow doctor --json \| jq '.stray_processes \| length'` = 40; cross-referenced pid 596367 against `/tmp/.tmp4T6jFk/.devflow/state-12.json` | `state-12.json`'s `monitor_pid` IS 596367 — doctor's "reachable through no registry entry, lock file, or state file" claim is false for this pid, live, right now | ✗ FAIL (confirms gap, not a phase deliverable) |
-| **CR-02 corroboration** — `origin/feature/phase-25` ancestry (unrelated to the defect itself, corroborates 25e's evidence) | `git merge-base --is-ancestor 82328b3 origin/feature/phase-25` | exit 0 | ✓ PASS (supports truth 8, not truth 1) |
-| Debt markers in phase-touched files | `rg -n 'TBD|FIXME|XXX'` across agent.rs, version.rs, test_support.rs, commands.rs, preflight.rs, pipeline_launch.rs, pipeline_gate.rs, staleness.rs, main.rs, reap_strays_e2e.rs, CONTRIBUTING.md | no matches | ✓ PASS |
+| 25a CR-02 fix: CAS refuses a stale expected-old value | `cargo test --package devflow --bin devflow preflight::tests::fast_forward_base_ref_refuses_a_stale_expected_old_value -- --exact` | `1 passed` | ✓ PASS (run by this verifier) |
+| 25a CR-02 fix: refuses when base is checked out in a second (linked) worktree | `cargo test --package devflow --bin devflow preflight::tests::currency_behind_refuses_when_base_is_checked_out_in_another_worktree -- --exact` | `1 passed` | ✓ PASS (run by this verifier) |
+| 25a: all five pre-existing `currency_*` arms unmodified | `cargo test --package devflow --bin devflow preflight::tests::currency_` | `10 passed; 0 failed` | ✓ PASS (run by this verifier) |
+| 25d CR-01 fix: same-pass discrimination (live state-named pid + live lock-held pid + genuine orphan) | `cargo test --package devflow --bin devflow commands::tests::reachable_pids_are_excluded_from_both_the_findings_and_the_reap_candidates -- --exact` | `1 passed` | ✓ PASS (run by this verifier) |
+| 25d CR-01 fix: 999.44's originating case (deleted root) still surfaces | `cargo test --package devflow --bin devflow commands::tests::a_deleted_root_contributes_nothing_to_the_reachable_set -- --exact` | `1 passed` | ✓ PASS (run by this verifier) |
+| 25d CR-01 fix: `doctor`'s finding string states only checked facts | `cargo test --package devflow --bin devflow commands::tests::stray_finding_detail_states_only_what_was_checked -- --exact` | `1 passed` | ✓ PASS (run by this verifier) |
+| 25d CR-01 wording: old unverified-orphan claim removed | `rg -c 'reachable through no registry entry, lock file, or state file' crates/devflow-cli/src/commands.rs` | 0 matches | ✓ PASS (run by this verifier) |
+| 25d CR-01 wording: `STATE-ORPHANED` claim removed from help text | `rg -c 'STATE-ORPHANED' crates/devflow-cli/src/main.rs` | 0 matches | ✓ PASS (run by this verifier) |
+| WR-05 falsification check: no reap call anywhere in `preflight.rs` | `grep -n reap_spawned_monitor crates/devflow-cli/src/preflight.rs` | no output (zero hits) | ✓ CONFIRMS WR-05 (run by this verifier) |
+| Full workspace regression (established by orchestrator on the merged tree; not independently re-run in full by this verifier, but every targeted test above was independently re-run and all passed) | `cargo test --workspace --no-fail-fast` | `694 passed / 0 failed` | ✓ PASS (orchestrator-reported, spot-checks above corroborate) |
+| `cargo fmt --check` | `cargo fmt --check` | exit 0 | ✓ PASS (run by this verifier) |
+| Debt markers in phase-touched files this round | `rg -n 'TBD|FIXME|XXX'` across `preflight.rs`, `commands.rs`, `main.rs`, `agent.rs`, `test_support.rs`, `staleness.rs`, `pipeline_launch.rs` | no matches | ✓ PASS |
+
+### Probe Execution
+
+Not applicable — this phase has no `scripts/*/tests/probe-*.sh` files, and none are declared in any PLAN/SUMMARY. `SKIPPED (no runnable probe artifacts)`.
 
 ### Requirements Coverage
 
-*This project has no `.planning/REQUIREMENTS.md`; tracked by unit identifier per the phase's own convention. Not reported as a gap.*
+*This project has no `.planning/REQUIREMENTS.md`; tracked by unit identifier per the phase's own convention (`25a`-`25f`, `999.38`). Not reported as a gap.*
 
 | Unit | Backlog ID | Description | Status | Evidence |
 |------|-----------|--------------|--------|----------|
-| 25a | 999.51/DEN-76 | Base-ref currency | ✗ NOT SATISFIED | Truth 1 — the repair mechanism itself is unsafe |
+| 25a | 999.51/DEN-76 | Base-ref currency, safely repaired | ✓ SATISFIED | Truth 1 — CR-02 closed |
 | 25b | 999.48/DEN-73 | Staleness hoist | ✓ SATISFIED | Truth 2 |
-| 25c | 999.49/DEN-74 | Version derivation + major-bump gate + anchor | ✓ SATISFIED | Truths 3/4/5 — both previously-open gaps closed |
-| 25d | 999.44/DEN-68 | Orphan process reaping | ✗ PARTIALLY SATISFIED | Truth 6 (primitives) satisfied; truth 7 (operator-facing surface) FAILED |
+| 25c | 999.49/DEN-74 | Version derivation + major-bump gate + anchor | ✓ SATISFIED | Truths 3/4/5 |
+| 25d | 999.44/DEN-68 | Orphan process reaping | ✓ SATISFIED | Truths 6/7 — CR-01 closed |
 | 25e | 999.47/DEN-72 | Flaky test dead predicate | ✓ SATISFIED (human-verified) | Truth 8 |
 | 25f | (no backlog ID) | CONTRIBUTING drift | ✓ SATISFIED (human sign-off) | Truth 10 |
 | 999.38 | folded in | PATH race | ✓ SATISFIED | Truth 9 |
+| — | WINDOWS.md #1/#2 | WR-03 test-suite leak fold-in (not a unit; ancillary) | ⚠️ PARTIALLY SATISFIED | See Anti-Patterns and Human Verification |
+
+**Note on `25-10-SUMMARY.md`'s absence:** confirmed intentional, not a gap. `25-10-PLAN.md`'s own frontmatter carries `status: superseded` / `superseded_by: "25-13"` and an explicit `<superseded_notice>` stating "No `25-10-SUMMARY.md` will ever be written," corroborated by `ROADMAP.md:1448/1453` ("HALTED at Task 1 Step E; SUPERSEDED by 25-13"). 15 SUMMARY files for 16 plans is the correct, by-design count.
 
 ### Anti-Patterns Found
 
 | File | Line | Pattern | Severity | Impact |
 |------|------|---------|----------|--------|
-| `crates/devflow-cli/src/commands.rs` | 3023-3049, 1149-1232 | CR-01: unverified orphan-ness claim feeds a SIGKILL repair, `--root` ignored | 🛑 Blocker | See truth 7 and gaps |
-| `crates/devflow-cli/src/preflight.rs` | 445-479 | CR-02: `git update-ref` with no `<oldvalue>` guard, single-worktree checked-out probe | 🛑 Blocker | See truth 1 and gaps |
-| `crates/devflow-cli/src/main.rs` | 389-397 | `--reap-strays` help text names semantics ("STATE-ORPHANED") the implementation does not have | ℹ️ Info (subsumed by CR-01) | Part of the same fix scope, not separately gating |
-| `crates/devflow-core/src/version.rs` | 338-349 | WR-01: `merge-base --is-ancestor` spawn/exit-128 errors collapse into the same `false` as a genuine negative, biasing the anchor over-inclusive on a transient git failure | ℹ️ Info (recorded, not gating) | Distinct from CR-03 (already fixed); latent, not currently reachable per REVIEW.md's own severity call — not re-litigated here |
-| `crates/devflow-core/src/test_support.rs` | 101, 120 | WR-02: `wait_for_exec_visibility`'s guard (ii) compares against the caller's cmdline, not the actual parent's — sound for every current call site (all are direct parents) but not generalizably "unambiguous" as documented | ℹ️ Info (recorded, not gating) | No current call site is a non-parent caller |
-| `crates/devflow-cli/src/staleness.rs` | 689-786 | WR-03: `mid_run_stage_transition_does_not_readjudicate_staleness` spawns a real monitor wrapper via `launch_stage_inner` and never reaps it — leaks a live, later-orphaned process on every `cargo test --workspace` run | ⚠️ Warning | Independently corroborated during this verification: 22 live `trap cleanup TERM INT` processes found on this machine before this run even started, several rooted at deleted `/tmp/.tmp*` paths — consistent with repeated unreaped test runs. Does not affect the phase's shipped behavior (test-only), but actively degrades confidence in any future CR-01 fix's own test suite until closed. |
-| `crates/devflow-cli/src/commands.rs` | 3727-3762 | WR-04: `reap_stray_candidates_refuses_a_candidate_younger_than_the_minimum_age` is flaky by construction — its premise (fixture age < 2s) races the same container load that produces the CR-01/25e failure class | ℹ️ Info (recorded, not gating) | Test-only; the underlying floor logic is verified correct via other means |
+| `crates/devflow-cli/src/preflight.rs` | 1543-1595, 1604-1657 | **WR-05 (independently confirmed, not merely cited from `25-REVIEW.md`):** `run_preflight_advance_gate_launches_agent_exactly_once` and `run_preflight_loopback_gate_launches_agent_exactly_once` both drive a real `monitor::spawn_monitor` via `run_preflight`'s internal `GateAction::Advance` (`:941`, direct `launch_stage_inner` call) / `GateAction::LoopBack` (`:946`, `launch_stage` call re-resolving the real Claude adapter) arms, and neither calls `reap_spawned_monitor` — confirmed by `grep -n reap_spawned_monitor crates/devflow-cli/src/preflight.rs` returning zero hits. Recorded as WINDOWS.md item 1 (open). | ⚠️ Warning | Test-suite process leak, load-sensitive (masked on a fast, unloaded machine by the stubbed agent's near-instant exit and the wrapper's trailing `devflow advance` resolving to the test binary and erroring out immediately — a timing accident this verifier's own re-derivation independently confirms, not a structural guarantee). Does not affect `devflow start`'s own shipped behavior; affects future test-suite hygiene and any future live-`/proc`-census assertion's evidence quality. |
+| `crates/devflow-cli/src/pipeline_launch.rs` (`:414-441`), `crates/devflow-cli/src/staleness.rs` (`:689-803`) | reap call at `pipeline_launch.rs:440`, `staleness.rs:802` | **WR-06 (independently confirmed):** `reap_spawned_monitor(&state)` is a plain trailing statement at both sites, preceded in `pipeline_launch.rs` by `result.unwrap()` (`:423`), `assert!(state.monitor_pid.is_some(), ...)` (`:425-428`), `workflow::load_state(...).unwrap()` (`:429`), `assert_eq!(reloaded.monitor_pid, ...)` (`:430-434`); preceded in `staleness.rs` by `result.expect(...)` (`:777`) and `assert_eq!(blocked_count, 1, ...)` (`:792-796`) — any one of which, on failure, unwinds the test and drops its `TempDir` guard without ever reaching the reap call. Confirmed by direct reading of both functions in full. | ⚠️ Warning | If a future regression trips one of these pre-existing assertions, the same test that spawned the monitor wrapper would ALSO fail to reap it — the CI run reports a genuine regression and manufactures a fresh orphan from the very test meant to guard against orphans. Bounded to the failure path of these two specific tests' own success-path invariants. |
+| (carried forward, unresolved, out of round-3 scope) `crates/devflow-core/src/version.rs:338-349` | WR-01 | `merge-base --is-ancestor` spawn/exit-128 errors collapse into the same `false` as a genuine negative | ℹ️ Info | Unchanged from prior review; not touched by this round |
+| (carried forward) `crates/devflow-core/src/test_support.rs:101,120` | WR-02 | `wait_for_exec_visibility`'s guard (ii) compares against the caller, not the actual parent | ℹ️ Info | Unchanged; no current call site is a non-parent caller |
+| (carried forward) `crates/devflow-cli/src/commands.rs:3861-3895` | WR-04 | `reap_stray_candidates_refuses_a_candidate_younger_than_the_minimum_age` flaky by construction | ℹ️ Info | Unchanged; not touched by 25-15 (filter interposed before this function) |
 
 ## Human Verification Required
 
-None outstanding. The two items this phase's own workflow explicitly routed to a human (25e's CI-observation closure judgment, and 25f's three doc-drift rows) were both already discharged with verbatim, dated human sign-off recorded in `25-13-SUMMARY.md` (Parts A and B, 2026-07-28) — independently corroborated by this verifier (CI run status via `gh run view`, ref ancestry via `git merge-base`, and direct grep of the three 25f rows against current source). Nothing further requires a human decision to *evaluate*; the two gaps below (CR-01, CR-02) require code fixes, not a human judgment call — they are objectively demonstrated defects, one of them live-reproduced on this machine during this verification.
+Two items, both stemming from this round's voluntary WR-03 fold-in (25-16), both already independently confirmed as real by this verifier and both already recorded as OPEN items in `.planning/WINDOWS.md` (ids 1 and 2), which the project's own `/gsd-ship` gate blocks on until fixed or waived:
+
+### 1. WR-05 — two `preflight.rs` tests still leak a real monitor wrapper
+
+**Test:** Decide: fix `run_preflight_advance_gate_launches_agent_exactly_once` and `run_preflight_loopback_gate_launches_agent_exactly_once` in a follow-up plan (wire `reap_spawned_monitor(&state)` in after their existing `assert_eq!(launches, 1, ...)`), or waive `WINDOWS.md` item 1 with a stated reason.
+**Expected:** Either both tests reap what they spawn, or the residual is explicitly accepted.
+**Why human:** Priority/scope call (spend a fourth gap-closure round on ancillary test-hygiene work vs. accept and waive) — the underlying fact is already independently confirmed, not in dispute.
+
+### 2. WR-06 — the two "fixed" reap call sites are not unwind-safe
+
+**Test:** Decide: harden `pipeline_launch.rs`'s and `staleness.rs`'s reap calls into an RAII `Drop` guard bound before the panicking assertions that currently precede them (per `25-REVIEW.md`'s own sketch), or accept the current plain-trailing-statement form.
+**Expected:** Either the reap survives a future assertion panic, or the residual (bounded to these two tests' own success-path invariants) is explicitly accepted.
+**Why human:** Same category — a defensive-hardening priority call, not a fact this verifier can resolve differently by looking harder.
 
 ## Gaps Summary
 
-Two Critical, source-confirmed defects remain — both newly surfaced by `25-REVIEW.md`'s full re-review of the post-gap-closure tree, and both independently re-confirmed here by direct source reading and, for CR-01, live reproduction (not merely trusting the review's own analysis):
+None against the phase's 10 original must-have truths — both truths this round targeted (25a's CR-02, 25d's CR-01) are now genuinely closed, independently re-derived and re-tested by this verifier, not accepted on the executors' or the reviewer's word. All 10/10 truths verified; all 6 named units (25a-25f, plus 999.38) satisfied on their own unit-level merits, matching the ROADMAP's own stated completion criterion for this phase.
 
-**CR-01 (unit 25d):** `devflow doctor` and `devflow gate sweep --reap-strays` share a census (`agent::discover_stray_devflow_processes`) that is purely structural — it has no orphan test. `doctor` nonetheless asserts each match "is running but reachable through no registry entry, lock file, or state file" and names `--reap-strays` as the repair; `gate_sweep --reap-strays` acts on that same unfiltered census, gated only by a 2-second age floor that bounds an unrelated race (999.47's fork/exec window), not registry-reachability. Live-reproduced on this machine: 40 current `doctor` findings, one of them (pid 596367) independently confirmed to be a real, live phase-12 monitor wrapper named by its own state file's `monitor_pid` field. Following `doctor`'s own printed repair would SIGKILL it — bypassing its `trap cleanup` and orphaning its child, i.e. manufacturing exactly the orphan class 999.44 (this unit's own backlog origin) exists to eliminate. This means **unit 25d does not safely deliver "a stalled run recovers without `kill(1)`"** — it delivers a mechanism that can convert a healthy run into the very failure mode it was built to fix.
-
-**CR-02 (unit 25a):** `ensure_base_ref_current`'s fast-forward writes `refs/heads/<base>` with `git update-ref` and no `<oldvalue>` guard (an unconditional write vulnerable to a race with anything else that moves the local ref), and its "not checked out" precondition inspects only the single worktree `devflow start` runs from — not the repository-wide set of linked worktrees this project routinely uses (confirmed live during this run: a `.worktrees/phase-07` worktree was active). This means **unit 25a's repair path can itself silently corrupt the base ref it exists to keep current** — the same class of problem 25a was written to eliminate (a human having to repair the base ref by hand), reintroduced one layer down.
-
-**Everything else in this phase is solid.** Both of the previous verification's gaps (the D-09 gate's worktree-scope bypass, and `release_range_start`'s anchor regression under an untested topology) are closed, confirmed by direct source read and passing targeted regression tests, not merely by the executor's own SUMMARY claims. 25d's core primitives (`terminate_and_verify`, identity re-confirmation, the age floor) are independently sound — the defect is entirely in what gets handed to them, unfiltered. 25e's flake-closure claim, which this project's own prior verification over-claimed once already (`structurally removed`, later falsified 2/2 by a real container run), is this time backed by a measured site census, a bounded exec-visibility barrier at every vulnerable site, a production age floor, an 11-observation CI-on-branch streak, and an explicit, engaged, verbatim human sign-off — recorded honestly, with its stated residual (~6.1%/~0.05%) intact, never upgraded to a proof of absence. 25f's documentation fixes are confirmed correct by direct grep and are also human-signed. 999.38's PATH race is de-raced and confirmed hermetic. The full 688-test workspace suite is green.
-
-**This looks like real, closeable work, not a design failure of the phase's approach** — REVIEW.md's own sketch fixes for both CR-01 and CR-02 are small, scoped to the exact files 25-02/25-05/25-07 already touched, and neither requires reopening any of the phase's other units.
+The residual is entirely inside this round's own voluntary, ancillary WR-03 fold-in (25-16): two of four launch-driving test sites remain unfixed (WR-05), and the two that were fixed are not unwind-safe (WR-06). Both are Warning-severity (test-suite hygiene, not production behavior), both are already self-disclosed by the executor (25-16-SUMMARY.md's own "delta discrepancy" and "Findings" sections, not smoothed over), both are independently re-confirmed here by direct source reading rather than trusted from either the executor's SUMMARY or the reviewer's REVIEW.md, and both are already tracked as open items in `.planning/WINDOWS.md`, which the project's own tooling blocks `/gsd-ship` on until a human resolves them one way or the other.
 
 ---
 
-*Verified: 2026-07-28T16:19:31Z*
+*Verified: 2026-07-28T18:30:00Z*
 *Verifier: Claude (gsd-verifier)*
