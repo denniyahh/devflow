@@ -230,6 +230,26 @@ pub fn reachable_semver_baseline(
         .max())
 }
 
+/// Resolve `commit`'s first parent SHA, or `Ok(None)` if `commit` is a root
+/// commit with no first parent.
+///
+/// A non-zero exit from `git rev-parse {commit}^1` means "no such parent"
+/// (root commit), not a genuine spawn/IO failure — those still propagate
+/// via `?` through the `Command::output()` call itself.
+fn first_parent(project_root: &Path, commit: &str) -> Result<Option<String>, VersionError> {
+    let output = Command::new("git")
+        .args(["rev-parse", &format!("{commit}^1")])
+        .current_dir(project_root)
+        .output()
+        .map_err(|err| VersionError::Git(err.to_string()))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    Ok(Some(
+        String::from_utf8_lossy(&output.stdout).trim().to_string(),
+    ))
+}
+
 /// Resolve the commit range start for D-08's conventional-commit classifier,
 /// given the baseline tag name (e.g. `"v2.0.0"`).
 ///
@@ -245,16 +265,39 @@ pub fn reachable_semver_baseline(
 /// `feat`), against 5 (0 `feat`) for the anchored range this function
 /// computes. See 25-01-PLAN.md's `<measured_correction>`.
 ///
-/// Anchor rule:
-/// - `C1` = the earliest commit on the ancestry path from `baseline_tag` to
-///   `HEAD` (`git rev-list --ancestry-path --reverse <tag>..HEAD`, first
-///   line).
-/// - If `C1` does not exist, the tag is at `HEAD` — range start is the tag.
-/// - If the tag is an ancestor of `C1`'s first parent, the tag already sat
-///   on this mainline (the ordinary, non-squashed case, e.g. `v1.8.0..v1.8.1`)
-///   — range start is the tag, unchanged from the literal D-08 rule.
-/// - Otherwise the tag entered `HEAD`'s history through `C1` (the sync
-///   merge-back) — range start is `C1`.
+/// Anchor rule (generalized 2026-07-28 to fix CR-03 — `25-REVIEW.md`,
+/// `25-VERIFICATION.md` GAP 2):
+/// - Walk `git rev-list --ancestry-path --reverse <tag>..HEAD` oldest-first.
+///   For each candidate commit `C` in order: if `C` has no first parent (a
+///   root commit), or the baseline tag is NOT an ancestor of `C`'s first
+///   parent, `C` is where the tag's line joined `HEAD`'s line — return `C`
+///   immediately.
+/// - If every candidate's first parent already descends from the tag, the
+///   tag already sat on this mainline throughout (the ordinary,
+///   non-squashed case, e.g. `v1.8.0..v1.8.1`) — return the tag unchanged.
+/// - If the ancestry path is empty, the tag is at `HEAD` — return the tag.
+///
+/// **CR-03** — the previous rule inspected only the ancestry path's FIRST
+/// commit (`C1`). When a commit lands directly on trunk between the tag and
+/// the sync-merge-back (a hotfix pushed straight to `main`), that
+/// intervening commit becomes `C1`; its first parent IS the tag commit, so
+/// `merge-base --is-ancestor <tag> <tag>` is trivially true, and the old
+/// rule wrongly concluded the tag already sat on mainline — returning the
+/// literal `tag..HEAD` range and re-admitting pre-release `develop` history.
+/// Walking the FULL path instead of just `C1` fixes this: the sync merge
+/// itself still fails the ancestor test and is returned once the walk
+/// reaches it.
+///
+/// **Anchoring at the LAST merge commit instead (a plausible-looking
+/// alternative) is WRONG on this repository.** `GitFlow::merge_feature_into_develop`
+/// (`git.rs:86`) merges every phase branch into `develop` with `git merge
+/// --no-ff`, so ordinary post-release feature work also produces merge
+/// commits on the ancestry path — not just the sync-merge-back. Anchoring at
+/// the last one would silently truncate the range at that later feature
+/// merge instead of the sync merge, dropping any commits between the two
+/// from classification — a `feat!:` in that position would be dropped
+/// unnoticed, the exact false negative D-09 exists to prevent. See
+/// `tests::feature_merge_after_sync_merge_does_not_move_the_anchor`.
 pub fn release_range_start(
     project_root: &Path,
     baseline_tag: &str,
@@ -274,42 +317,43 @@ pub fn release_range_start(
             String::from_utf8_lossy(&ancestry.stderr).trim().to_string(),
         ));
     }
-    let c1 = String::from_utf8_lossy(&ancestry.stdout)
+    let path: Vec<String> = String::from_utf8_lossy(&ancestry.stdout)
         .lines()
-        .next()
-        .map(str::to_string);
-    let Some(c1) = c1 else {
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+    if path.is_empty() {
         // Nothing after the tag — it sits at HEAD.
         return Ok(baseline_tag.to_string());
-    };
-
-    let first_parent = Command::new("git")
-        .args(["rev-parse", &format!("{c1}^1")])
-        .current_dir(project_root)
-        .output()
-        .map_err(|err| VersionError::Git(err.to_string()))?;
-    if !first_parent.status.success() {
-        // C1 is a root commit with no first parent — the tag cannot be an
-        // ancestor of something that doesn't exist; treat C1 itself as the
-        // anchor (same branch as the sync-merge case below).
-        return Ok(c1);
     }
-    let first_parent = String::from_utf8_lossy(&first_parent.stdout)
-        .trim()
-        .to_string();
 
-    let tag_is_ancestor_of_first_parent = Command::new("git")
-        .args(["merge-base", "--is-ancestor", baseline_tag, &first_parent])
-        .current_dir(project_root)
-        .output()
-        .map(|out| out.status.success())
-        .unwrap_or(false);
+    for candidate in &path {
+        let Some(first_parent) = first_parent(project_root, candidate)? else {
+            // `candidate` is a root commit with no first parent — the tag
+            // cannot be an ancestor of something that doesn't exist; this is
+            // where the tag's line joined HEAD's line.
+            return Ok(candidate.clone());
+        };
 
-    if tag_is_ancestor_of_first_parent {
-        Ok(baseline_tag.to_string())
-    } else {
-        Ok(c1)
+        let tag_is_ancestor_of_first_parent = Command::new("git")
+            .args(["merge-base", "--is-ancestor", baseline_tag, &first_parent])
+            .current_dir(project_root)
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false);
+
+        if !tag_is_ancestor_of_first_parent {
+            // `candidate` is where the tag's line joined HEAD's line (the
+            // sync merge-back, or equivalent).
+            return Ok(candidate.clone());
+        }
+        // `candidate` is on the mainline the tag already sat on: keep
+        // walking the path toward HEAD.
     }
+
+    // Every candidate's first parent already descended from the tag — the
+    // ordinary, non-squashed release case.
+    Ok(baseline_tag.to_string())
 }
 
 /// The classified conventional-commit bump for a range of commits (D-08).
