@@ -2,19 +2,19 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone (open — no fixed closing phase)
-current_phase: 25
-current_phase_name: end-to-end-dogfood-blockers
-status: executing
+current_phase: 999.1
+current_phase_name: BACKLOG
+status: planning
 stopped_at: Completed 25-13-PLAN.md (human sign-off recorded, both parts approved)
-last_updated: "2026-07-28T20:25:52.786Z"
+last_updated: "2026-07-28T20:31:33.139Z"
 last_activity: 2026-07-28
+last_activity_desc: Phase 25 complete, transitioned to Phase 999.1
 progress:
   total_phases: 14
-  completed_phases: 13
-  total_plans: 109
-  completed_plans: 106
-  percent: 93
-last_activity_desc: Phase 25 execution started
+  completed_phases: 14
+  total_plans: 112
+  completed_plans: 112
+  percent: 100
 ---
 
 # DevFlow — Project State
@@ -86,11 +86,11 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 25 (end-to-end-dogfood-blockers) — EXECUTING
-Plan: 1 of 16
+Phase: 999.1 — Hermes Support (BACKLOG)
+Plan: Not started
 Tasks 1-3 done, both human sign-offs recorded in 25-13-SUMMARY.md; 25-14/25-15/25-16
 planned 2026-07-28 as gap-closure round 3, not yet executed)
-Status: Executing Phase 25
+Status: Ready to plan
 
 **25-10 → 25-13 (2026-07-28):** GAP 1 (25-08) and GAP 2 (25-09) closed and merged. GAP 3
 (truth 7, 25e / 999.47) moved through three states this run: `PRESENT_BEHAVIOR_UNVERIFIED`
@@ -151,7 +151,7 @@ Scope boundary: 23-16 is the **fix only** (change + regression tests + PR into `
 
 **Recovery-ref disposition:** both `origin` refs (`recovery/pre-23-11-acceptance-e0f87c2`, `recovery/pre-23-15-acceptance-0dad20d`) remain untouched on `origin`; the local copy of the pre-23-11 ref, deleted again by `devflow cleanup`, is deliberately NOT restored (per `23-FINDINGS.md` §B2a); the pre-23-15 ref is now unused (no merge to undo) but retained on `origin` for reuse by the 23-16 retry rather than deleted.
 
-Last activity: 2026-07-28
+Last activity: 2026-07-28 — Phase 25 complete, transitioned to Phase 999.1
 
 **Note on the "Plan: 2 of 15" value this replaces:** `gsd-tools state advance-plan` only increments whatever value is already in this field, which had drifted to "2 of 15" (the parallel-worktree waves 23-01…23-09 deliberately never touch STATE.md, and this field was last corrected against reality at "10 of 11 plans complete" before the plan count grew to 15 with the gap-closure plans 23-12…23-15). Corrected directly to "13 of 15" to match reality (23-12 and 23-13 both now executed) rather than trust the tool's naive +1 increment from a stale base.
 
