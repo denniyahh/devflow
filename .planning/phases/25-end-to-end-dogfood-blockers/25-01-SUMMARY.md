@@ -195,6 +195,18 @@ None — no external service configuration required.
 - Plan 25-06 must: (a) add the D-09 preflight major-bump gate consuming this algorithm, and (b) rewrite `pipeline_gate.rs`'s `finalization_retry_gate_never_auto_approves_even_with_yes_ship_set` fixture, which independently re-derives the old algorithm and now both fails at runtime and fails `cargo clippy -- -D warnings` (deprecated-function use) — both are the same anticipated coupling, not a new regression from this plan.
 - No conventional-commit type in the real measured range (`c92229e..HEAD`, 11 non-merge commits: 10 `docs`, 1 `fix`) fell through D-10's unrecognised-type floor — every commit message parsed as a recognised, listed type (`docs` → `None`, `fix` → `Patch`). The floor's "any other recognised-but-unlisted type → patch" branch and the "malformed/unparseable → patch" branch are both covered only by the new synthetic fixtures, not by this repository's real history at measurement time.
 
+## Self-Check — NOT PROVIDED (retro-recorded 2026-07-28)
+
+**This section records an absence. It is not an executor self-report.** No `## Self-Check`
+section was written at execution time. A later executor (plan 25-13) cannot honestly
+reconstruct what the original executor did or did not verify, and reconstructing one now
+would be the same self-report substitution `25-VERIFICATION.md` already flagged elsewhere in
+this phase (25f's human-judgment rows), one layer down. This omission was independently
+mitigated by `25-VERIFICATION.md`'s direct source re-read and test re-execution for the
+truths this plan covers (truth 3, `version.rs`'s derivation composition — confirmed present
+and correctly composed; see `25-VERIFICATION.md` row 3 and its "Behavioral Spot-Checks"
+table).
+
 ---
 *Phase: 25-end-to-end-dogfood-blockers*
 *Completed: 2026-07-27*

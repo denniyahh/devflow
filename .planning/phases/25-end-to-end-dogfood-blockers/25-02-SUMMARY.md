@@ -168,6 +168,18 @@ None - no external service configuration required.
 - **Blocker for a clean workspace-wide gate:** plan 25-07 must add `#[allow(deprecated)]` (or migrate off the deprecated call) at `crates/devflow-cli/src/commands.rs:3308` before `cargo clippy --workspace --all-targets -- -D warnings` will pass again. Until then, `devflow-core` alone is clean but the workspace is not.
 - 25e (the flaky-test closure requirement) still needs CI-on-branch confirmation across several pushes before it can be declared resolved -- this plan only removes the `execve` race by construction in `devflow-core`'s own test; the CLI's own DEN-72 flaky test (`commands.rs`, the `stop()` guard test) is untouched and is 25-07's stated scope.
 
+## Self-Check — NOT PROVIDED (retro-recorded 2026-07-28)
+
+**This section records an absence. It is not an executor self-report.** No `## Self-Check`
+section was written at execution time. A later executor (plan 25-13) cannot honestly
+reconstruct what the original executor did or did not verify, and reconstructing one now
+would be the same self-report substitution `25-VERIFICATION.md` already flagged elsewhere in
+this phase (25f's human-judgment rows), one layer down. This omission was independently
+mitigated by `25-VERIFICATION.md`'s direct source re-read and test re-execution for the
+truths this plan covers (truth 6, `terminate_and_verify` / `discover_stray_devflow_processes`
+— confirmed present and spot-run passing; see `25-VERIFICATION.md` row 6 and its "Behavioral
+Spot-Checks" table).
+
 ---
 *Phase: 25-end-to-end-dogfood-blockers*
 *Completed: 2026-07-28*
