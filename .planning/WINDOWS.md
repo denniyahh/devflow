@@ -1,10 +1,10 @@
 ---
 schema_version: 1
-open_count: 2
+open_count: 3
 waived_count: 0
 fixed_count: 0
-total_count: 2
-last_updated: 2026-07-28T17:44:55.619Z
+total_count: 3
+last_updated: 2026-07-28T18:27:45.689Z
 ---
 
 # Broken Windows Ledger
@@ -17,6 +17,7 @@ last_updated: 2026-07-28T17:44:55.619Z
 |----|-------|------|------|------|-------------|--------|--------|-------------|-------------|
 | 1 | 25 | deviation | crates/devflow-cli/src/preflight.rs |  | WR-03 reap fix not wired into two additional launch-driving tests found by 25-16's enumeration (run_preflight_advance_gate_launches_agent_exactly_once, run_preflight_loopback_gate_launches_agent_exactly_once); out of scope for 25-16 (owned by 25-15 in same wave) | open |  | 2026-07-28T17:44:48.000Z |  |
 | 2 | 25 | unmet-truth | .planning/phases/25-end-to-end-dogfood-blockers/25-16-SUMMARY.md |  | 25-16 acceptance criterion 'before-delta must be at least 1' not met: every leak measurement (isolated test x6, whole-workspace x1, unfixed and fixed tree) showed delta 0 on this machine/run; fix implemented regardless per review's defensive-teardown reasoning | open |  | 2026-07-28T17:44:55.619Z |  |
+| 3 | 25 | deviation | crates/devflow-cli/src/pipeline_launch.rs |  | WR-06: reap_spawned_monitor is a plain trailing statement at both sites 25-16 fixed (pipeline_launch.rs launch_stage_persists_monitor_pid_for_reload, staleness.rs mid_run_stage_transition_does_not_readjudicate_staleness), preceded by 2-4 panicking assertions. An assertion failure unwinds past the reap and drops TempDir anyway, so 25-16's must-have truth 'on every exit path including paths on which a later assertion panics' is NOT satisfied. Confirmed independently by both gsd-code-reviewer and gsd-verifier. Fix: bind an RAII Drop guard before the assertions (sketch in 25-REVIEW.md WR-06). | open |  | 2026-07-28T18:27:45.689Z |  |
 
 ````json
 [
@@ -42,6 +43,18 @@ last_updated: 2026-07-28T17:44:55.619Z
     "status": "open",
     "reason": "",
     "recorded_at": "2026-07-28T17:44:55.619Z",
+    "resolved_at": null
+  },
+  {
+    "id": 3,
+    "kind": "deviation",
+    "phase": "25",
+    "file": "crates/devflow-cli/src/pipeline_launch.rs",
+    "line": null,
+    "description": "WR-06: reap_spawned_monitor is a plain trailing statement at both sites 25-16 fixed (pipeline_launch.rs launch_stage_persists_monitor_pid_for_reload, staleness.rs mid_run_stage_transition_does_not_readjudicate_staleness), preceded by 2-4 panicking assertions. An assertion failure unwinds past the reap and drops TempDir anyway, so 25-16's must-have truth 'on every exit path including paths on which a later assertion panics' is NOT satisfied. Confirmed independently by both gsd-code-reviewer and gsd-verifier. Fix: bind an RAII Drop guard before the assertions (sketch in 25-REVIEW.md WR-06).",
+    "status": "open",
+    "reason": "",
+    "recorded_at": "2026-07-28T18:27:45.689Z",
     "resolved_at": null
   }
 ]
