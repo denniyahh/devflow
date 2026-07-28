@@ -1423,7 +1423,7 @@ Plans:
 **Priority:** High | **Size:** L (re-sized at plan time, 2026-07-27 — was M) — six units plus 999.38 folded in. 25b, 25e, 25f and 999.38 are genuinely S as filed; 25a is S–M, option chosen at plan review 2026-07-27 (fetch + fast-forward-when-safe, else refuse — see `25-05-PLAN.md` §`<resolved_decision>`, and CONTEXT.md D-17 as amended); **25c is M, not the S this entry states** — it is a full replacement of `compute_version`'s three inputs plus a new preflight gate plus a previously-unflagged consumer at `pipeline_gate.rs:809-840`. No phase split recommended; see `25-01-PLAN.md` § Phase-level notes for the assessment and the seam if one is ever wanted.
 **Requirements**: TBD — promoted from backlog 999.51, 999.48, 999.49, 999.44, 999.47; plus 25f (CONTRIBUTING release-procedure drift, no backlog entry — found 2026-07-27). Tracked by unit identifier (`25a`–`25f`, `999.38`), not by REQ-ID — this project has no `.planning/REQUIREMENTS.md`.
 **Depends on:** Phase 24
-**Plans:** 4/7 plans executed
+**Plans:** 5/7 plans executed
 
 *Scoped 2026-07-27 against one criterion — "what does an unattended run need in order to finish?" — after validating every open High in the backlog against the codebase. The four requirements below are the decomposition; each unit maps to exactly one.*
 
@@ -1481,7 +1481,7 @@ Plans:
 
 **Wave 2** *(blocked on 25-03 — shares `commands.rs`)*
 
-- [ ] 25-05-PLAN.md — 25a: base-ref currency probe wired ahead of the reachability guard; fetch, then fast-forward the local base when safe and refuse loudly otherwise (`preflight.rs`, `commands.rs`)
+- [x] 25-05-PLAN.md — 25a: base-ref currency probe wired ahead of the reachability guard; fetch, then fast-forward the local base when safe and refuse loudly otherwise (`preflight.rs`, `commands.rs`)
 
 **Wave 3** *(two plans in parallel — blocked on 25-01/25-02 and on 25-05's file ownership)*
 
