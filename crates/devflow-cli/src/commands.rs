@@ -1409,8 +1409,8 @@ fn stop_via_lock(project_root: &Path, phase: u32) -> Result<(), CliError> {
         return Ok(());
     }
     // Identity must be MATCHED against what the lock recorded, never inferred
-    // from /proc (999.47). `looks_like_devflow_process` alone returns true for
-    // any freshly forked child of a devflow process that has not finished
+    // from /proc (999.47). A bare cmdline-basename check alone returns true
+    // for any freshly forked child of a devflow process that has not finished
     // execve — during that window the child carries its parent's cmdline and
     // exe — so it would authorise signalling an unrelated process. Confirmed
     // in CI, not theorised.
@@ -3722,8 +3722,8 @@ mod tests {
 
     /// Retargeted (999.47/D-13). This test used to spawn a real `sleep`
     /// child and assert `stop()` refused to signal it, instrumented with
-    /// the now-deprecated `looks_like_devflow_process` predicate and a page
-    /// of `/proc`-forensics helpers built to diagnose a CI flake
+    /// the now-deprecated cmdline-basename predicate and a page of
+    /// `/proc`-forensics helpers built to diagnose a CI flake
     /// ("MECHANISM CONFIRMED 2026-07-26": between `spawn()` returning and
     /// the child completing `execve`, its cmdline transiently reads as its
     /// parent's, which is what made a cmdline-based guard race). It is the
@@ -3779,6 +3779,17 @@ mod tests {
         let lock_path = root.join(".devflow").join(format!("lock-{phase:02}"));
         std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
         std::fs::write(&lock_path, pid.to_string()).unwrap();
+
+        // Confirm the fixture is genuinely the legacy shape this test
+        // exercises — `lock::holder_identity` (what `stop_via_lock` itself
+        // consults) must report the pid with NO recorded start time, the
+        // exact input that drives `stop_via_lock`'s `Some((_, None))` arm.
+        assert_eq!(
+            lock::holder_identity(root, phase),
+            Some((pid, None)),
+            "the fixture must be a legacy lock (pid recorded, no start time) — the shape \
+             stop_via_lock's identity guard treats as unconfirmable"
+        );
 
         let err = stop(root, phase)
             .expect_err("a legacy lock with no recorded start time must be refused");
