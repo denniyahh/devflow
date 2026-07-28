@@ -368,6 +368,23 @@ const ADVANCE_SUBCOMMAND: &str = "advance";
 ///    owning uid is compared against the caller's effective uid, and
 ///    anything that does not match is skipped — the concrete hazard is a
 ///    caller later signalling a stranger's process on a shared machine.
+/// 3. **Structural, not exec-confirmed (25-12/999.47, the production half
+///    of the defect class).** This is a **structural** match over
+///    `/proc/<pid>/cmdline` alone. During a process's own
+///    `fork()`->`execve()` window — [`process_start_time`]'s doc comment
+///    is this codebase's authoritative statement of the mechanism —
+///    `/proc/<pid>/cmdline` transiently reports its PARENT's argv, not its
+///    own. A transient child of the monitor wrapper, or of `devflow
+///    advance`, therefore matches Layer 1 or Layer 2 respectively while
+///    being neither. This census does not — and deliberately should not —
+///    filter that case out: a census that guessed at exec status would
+///    also drop genuine strays, and it has no reliable way to distinguish
+///    the two (see [`process_age`]'s own doc comment for why). It is the
+///    **caller's** obligation not to act on an unqualified census result.
+///    `reap_stray_candidates` (`devflow-cli::commands`) is the one caller
+///    with a destructive consequence, and it discharges that obligation
+///    with [`process_age`] and [`STRAY_MIN_AGE`] — never with this
+///    function.
 ///
 /// Every read failure is tolerated silently (a pid that vanishes between
 /// the directory listing and the cmdline/stat read is normal churn, not an
@@ -930,8 +947,8 @@ mod tests {
         let self_pid = std::process::id();
         let first = process_age(self_pid).expect("this process's own age must resolve");
         std::thread::sleep(std::time::Duration::from_millis(50));
-        let second = process_age(self_pid)
-            .expect("this process's own age must resolve after the sleep too");
+        let second =
+            process_age(self_pid).expect("this process's own age must resolve after the sleep too");
         assert!(
             second >= first,
             "age must grow monotonically across a sleep, never shrink"

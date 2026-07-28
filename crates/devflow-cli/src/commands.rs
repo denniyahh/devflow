@@ -3798,6 +3798,56 @@ mod tests {
         let _ = child.wait();
     }
 
+    /// Task 2 behavior: fail-closed on an unresolvable age. Constructed
+    /// from a dead pid (the same shape
+    /// `stop_is_a_success_no_op_when_the_lock_names_a_dead_pid` uses:
+    /// above the default kernel `pid_max`, guaranteed not alive) — this
+    /// documents the actual interaction rather than assuming one:
+    /// `agent::process_age` DOES return `None` for it, but
+    /// `agent::is_same_process` is evaluated FIRST in
+    /// `reap_stray_candidates` and ALSO fails for the identical reason
+    /// (both derive from `agent::process_start_time`), so this candidate
+    /// is classified `IdentityMismatch`, not `TooYoung` — the age check is
+    /// never reached. That is not a design gap: an unconfirmable identity
+    /// is refused regardless of which guard catches it first.
+    ///
+    /// The `TooYoung`-via-unresolvable-age arm specifically (identity
+    /// re-confirmed alive, but `process_age` itself returns `None`)
+    /// requires `/proc/uptime` or `sysconf(_SC_CLK_TCK)` to fail while
+    /// `/proc/<pid>/stat` succeeds for the SAME live pid — a combination
+    /// no black-box process fixture in this suite can construct without
+    /// faking `/proc`. Left uncovered by assertion, following this file's
+    /// own established precedent for an unreachable-by-black-box-test
+    /// match arm (`stop_via_lock`'s wildcard arm, documented above this
+    /// test group rather than faked). Covered by source reasoning
+    /// instead: `reap_stray_candidates`'s age check —
+    /// `agent::process_age(candidate.pid).is_some_and(|age| age >= min_age)`
+    /// — treats `None` as `false` by construction of `Option::is_some_and`,
+    /// so an unresolvable age can never accidentally satisfy the `>=`
+    /// comparison and fall through to `Reaped`.
+    #[test]
+    fn reap_stray_candidates_refuses_a_dead_pid_as_identity_mismatch_before_the_age_check_runs() {
+        let dead_pid = 9_999_999;
+        assert!(
+            agent::process_age(dead_pid).is_none(),
+            "precondition: a dead pid's age must be unresolvable"
+        );
+        let candidate = agent::StrayProcess {
+            pid: dead_pid,
+            start_time: 0,
+            layer: agent::StrayLayer::MonitorWrapper,
+        };
+
+        let results = reap_stray_candidates(&[candidate], false, agent::STRAY_MIN_AGE);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].outcome,
+            StrayReapOutcome::IdentityMismatch,
+            "is_same_process is evaluated before the age check and fails first for a dead pid"
+        );
+    }
+
     /// Flag wiring, exercised through the real `gate_sweep` entry point.
     /// `--dry-run` is provably safe to run against the live machine (it
     /// never signals anything, no matter what else is discovered) — this
