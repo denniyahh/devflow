@@ -402,6 +402,42 @@ pub(crate) fn stale_base_message(base: &str, remote_ref: &str, count: u32) -> St
     )
 }
 
+/// Whether `base` is checked out in ANY worktree of the repository at
+/// `project_root` — not just `project_root`'s own `HEAD`. `git update-ref`
+/// has no checked-out-branch protection of its own (unlike `git branch -f`,
+/// which refuses on its own for the checked-out branch of any worktree), so
+/// this predicate is the only thing standing between a fast-forward write
+/// and a live worktree whose HEAD, index and working tree are pinned to
+/// `base`.
+///
+/// Parses `git worktree list --porcelain`, whose output is one stanza per
+/// worktree; an attached worktree's stanza carries a line reading exactly
+/// `branch refs/heads/<name>` (a detached worktree emits `detached`, a bare
+/// main repository emits `bare`). A worktree that is registered but
+/// `prunable` (its directory has been deleted but not yet pruned) still
+/// counts as checked out here, matching `git branch -f`'s own behaviour —
+/// deliberately conservative.
+///
+/// Returns `true` (refuse-safe) on a spawn error or a non-zero exit — the
+/// OPPOSITE polarity to this module's fail-open-where-blind contract for
+/// `Undeterminable` elsewhere, because the consequence of a wrong answer
+/// here is a destructive ref write, not a refusal to start.
+pub(crate) fn base_is_checked_out_anywhere(project_root: &Path, base: &str) -> bool {
+    let out = std::process::Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(project_root)
+        .output();
+    match out {
+        Ok(out) if out.status.success() => {
+            let needle = format!("branch refs/heads/{base}");
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .any(|line| line.trim() == needle)
+        }
+        _ => true,
+    }
+}
+
 /// Refuse before `devflow start` forks anything when `base` is stale
 /// relative to its remote. `Current`, `Ahead` and `Undeterminable` all
 /// return `Ok(())` (the last with a warning — the guard fails open where it
@@ -409,10 +445,11 @@ pub(crate) fn stale_base_message(base: &str, remote_ref: &str, count: u32) -> St
 ///
 /// The `Behind` arm implements the operator's 2026-07-27 adjudication
 /// (999.51/D-18a): fast-forward when it is safe to do so, else refuse
-/// loudly. The fast-forward is attempted only when the base branch is not
-/// the currently checked-out branch — `Behind` itself already establishes
-/// losslessness (the local ref is a strict ancestor of the remote, so no
-/// divergence and no local commits are at risk). It is performed with
+/// loudly. The fast-forward is attempted only when `base` is not checked out
+/// in any worktree of the repository (via [`base_is_checked_out_anywhere`])
+/// — `Behind` itself already establishes losslessness (the local ref is a
+/// strict ancestor of the remote, so no divergence and no local commits are
+/// at risk). It is performed with
 /// `git update-ref refs/heads/<base> refs/remotes/<remote>/<base>`, which
 /// advances the ref without touching the working tree — the reason the
 /// not-checked-out precondition is sufficient. On ANY failure (checked out,
@@ -444,16 +481,8 @@ pub(crate) fn ensure_base_ref_current(project_root: &Path, base: &str) -> Result
         }
         BaseRefCurrency::Behind { count } => {
             let remote_ref = format!("{ORIGIN}/{base}");
-            let checked_out_branch = std::process::Command::new("git")
-                .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
-                .current_dir(project_root)
-                .output()
-                .ok()
-                .filter(|out| out.status.success())
-                .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string());
-            let is_checked_out = checked_out_branch.as_deref() == Some(base);
 
-            if !is_checked_out {
+            if !base_is_checked_out_anywhere(project_root, base) {
                 let fast_forwarded = std::process::Command::new("git")
                     .args([
                         "update-ref",
@@ -2111,6 +2140,90 @@ mod tests {
             result.is_err(),
             "a failed fast-forward must fall through to refusal, never a silent proceed"
         );
+    }
+
+    #[test]
+    fn base_is_checked_out_anywhere_sees_a_linked_worktree() {
+        let (_remote, local) = currency_fixture();
+        let local_root = local.path();
+        // Move the local clone off `develop` first — `git worktree add`
+        // requires the branch not already be checked out anywhere.
+        run_git(local_root, &["checkout", "-q", "-b", "other"]);
+
+        let linked = tempfile::tempdir().unwrap();
+        run_git(
+            local_root,
+            &[
+                "worktree",
+                "add",
+                linked.path().to_str().unwrap(),
+                "develop",
+            ],
+        );
+
+        assert!(
+            base_is_checked_out_anywhere(local_root, "develop"),
+            "a linked worktree with `develop` checked out must be seen, even though \
+             `project_root`'s own HEAD is on `other`"
+        );
+        assert!(
+            !base_is_checked_out_anywhere(local_root, "no-such-branch"),
+            "a branch no worktree holds must not be reported as checked out"
+        );
+        // Keep both TempDir guards alive to the end of the test.
+        drop(linked);
+    }
+
+    #[test]
+    fn currency_behind_refuses_when_base_is_checked_out_in_another_worktree() {
+        let (remote, local) = currency_fixture();
+        let remote_root = remote.path();
+        let local_root = local.path();
+        advance_remote(remote_root, "f2.txt");
+
+        // Move the local clone off `develop` FIRST, then add the linked
+        // worktree on `develop` — the reverse order fails `worktree add`.
+        run_git(local_root, &["checkout", "-q", "-b", "other"]);
+        let linked = tempfile::tempdir().unwrap();
+        run_git(
+            local_root,
+            &[
+                "worktree",
+                "add",
+                linked.path().to_str().unwrap(),
+                "develop",
+            ],
+        );
+
+        let rev_parse = |rref: &str| {
+            let out = devflow_core::test_support::git_command(local_root)
+                .args(["rev-parse", rref])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "rev-parse {rref} failed");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let before = rev_parse("develop");
+
+        assert_eq!(
+            base_ref_currency(local_root, "develop"),
+            BaseRefCurrency::Behind { count: 1 }
+        );
+
+        let err = ensure_base_ref_current(local_root, "develop").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("develop"), "{msg}");
+        assert!(msg.contains("origin/develop"), "{msg}");
+        let fixture_root = local_root.to_string_lossy().into_owned();
+        assert!(!msg.contains(&fixture_root), "{msg}");
+
+        assert_eq!(
+            rev_parse("develop"),
+            before,
+            "`develop` must be unmoved when it is checked out in a linked worktree, even \
+             though `project_root`'s own HEAD is on `other`"
+        );
+        drop(linked);
     }
 
     #[test]
