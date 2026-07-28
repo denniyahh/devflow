@@ -362,7 +362,12 @@ pub fn discover_stray_devflow_processes() -> Vec<StrayProcess> {
 
 /// Basename of an argv element, matching the idiom already used by
 /// [`looks_like_devflow_process`].
-fn argv_basename(arg: &str) -> Option<&str> {
+///
+/// `pub(crate)` (widened from private, 25-11/999.47) so
+/// [`crate::test_support::wait_for_exec_visibility`] can reuse this exact
+/// basename idiom instead of growing a second copy of it. Crate-internal
+/// visibility only — not public API of this crate's normal build.
+pub(crate) fn argv_basename(arg: &str) -> Option<&str> {
     std::path::Path::new(arg)
         .file_name()
         .and_then(|n| n.to_str())
