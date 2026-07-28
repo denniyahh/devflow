@@ -438,6 +438,35 @@ pub(crate) fn base_is_checked_out_anywhere(project_root: &Path, base: &str) -> b
     }
 }
 
+/// Compare-and-swap fast-forward of `refs/heads/<base>` to `new`, conditional
+/// on the ref currently equalling `expected_old` — git's `<oldvalue>`
+/// parameter to `update-ref`. Supplying it is what makes this write refuse
+/// when the ref has moved since the caller last observed it; WITHOUT it,
+/// `git update-ref` is an unconditional write that will move a ref
+/// backwards onto a non-descendant if the ref changed between the caller's
+/// read and this write.
+///
+/// Returns `false` on a spawn error or a non-zero exit (including a
+/// mismatched `expected_old`), never panics.
+pub(crate) fn fast_forward_base_ref(
+    project_root: &Path,
+    base: &str,
+    expected_old: &str,
+    new: &str,
+) -> bool {
+    std::process::Command::new("git")
+        .args([
+            "update-ref",
+            &format!("refs/heads/{base}"),
+            new,
+            expected_old,
+        ])
+        .current_dir(project_root)
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
 /// Refuse before `devflow start` forks anything when `base` is stale
 /// relative to its remote. `Current`, `Ahead` and `Undeterminable` all
 /// return `Ok(())` (the last with a warning — the guard fails open where it
@@ -445,16 +474,30 @@ pub(crate) fn base_is_checked_out_anywhere(project_root: &Path, base: &str) -> b
 ///
 /// The `Behind` arm implements the operator's 2026-07-27 adjudication
 /// (999.51/D-18a): fast-forward when it is safe to do so, else refuse
-/// loudly. The fast-forward is attempted only when `base` is not checked out
-/// in any worktree of the repository (via [`base_is_checked_out_anywhere`])
-/// — `Behind` itself already establishes losslessness (the local ref is a
-/// strict ancestor of the remote, so no divergence and no local commits are
-/// at risk). It is performed with
-/// `git update-ref refs/heads/<base> refs/remotes/<remote>/<base>`, which
-/// advances the ref without touching the working tree — the reason the
-/// not-checked-out precondition is sufficient. On ANY failure (checked out,
-/// spawn error, non-zero exit) this falls through to the same refusal —
-/// never proceed silently after a failed fast-forward.
+/// loudly. `Behind` establishes losslessness at the instant it was read — it
+/// says nothing about the instant of the write, since another writer, a
+/// hook, or a concurrent `devflow` may move `base` in between. The
+/// fast-forward is therefore a compare-and-swap:
+/// [`fast_forward_base_ref`] is called with the local base SHA resolved
+/// immediately before the write as `expected_old`, so a base that moved in
+/// that window causes the write to refuse rather than silently discard the
+/// intervening commit(s).
+///
+/// The checked-out precondition is evaluated across EVERY worktree of the
+/// repository via [`base_is_checked_out_anywhere`], not just
+/// `project_root`'s own `HEAD` — necessary because `git update-ref` carries
+/// no checked-out-branch protection of its own, unlike `git branch -f`.
+///
+/// RESIDUAL, documented rather than eliminated: a worktree that checks out
+/// `base` in the window between the repository-wide scan and the
+/// compare-and-swap is not protected by the scan; the compare-and-swap still
+/// prevents a lost update in that window, but it cannot prevent that
+/// worktree from observing a moved HEAD.
+///
+/// On ANY failure (checked out anywhere, either endpoint unresolvable, the
+/// compare-and-swap refusing, spawn error, non-zero exit) this falls
+/// through to the same refusal — never proceed silently after a failed
+/// fast-forward.
 ///
 /// `Diverged` always refuses — a divergent base is never silently forked
 /// from.
@@ -483,21 +526,27 @@ pub(crate) fn ensure_base_ref_current(project_root: &Path, base: &str) -> Result
             let remote_ref = format!("{ORIGIN}/{base}");
 
             if !base_is_checked_out_anywhere(project_root, base) {
-                let fast_forwarded = std::process::Command::new("git")
-                    .args([
-                        "update-ref",
-                        &format!("refs/heads/{base}"),
-                        &format!("refs/remotes/{remote_ref}"),
-                    ])
-                    .current_dir(project_root)
-                    .output()
-                    .map(|out| out.status.success())
-                    .unwrap_or(false);
-                if fast_forwarded {
-                    println!(
-                        "advanced `{base}` to `{remote_ref}` ({count} commit(s) fast-forwarded)"
-                    );
-                    return Ok(());
+                let resolve = |rref: &str| {
+                    std::process::Command::new("git")
+                        .args(["rev-parse", "--verify", "--quiet", rref])
+                        .current_dir(project_root)
+                        .output()
+                        .ok()
+                        .filter(|out| out.status.success())
+                        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+                };
+                let local_sha = resolve(&format!("refs/heads/{base}"));
+                let remote_sha = resolve(&format!("refs/remotes/{remote_ref}"));
+
+                if let (Some(local_sha), Some(remote_sha)) = (local_sha, remote_sha) {
+                    let fast_forwarded =
+                        fast_forward_base_ref(project_root, base, &local_sha, &remote_sha);
+                    if fast_forwarded {
+                        println!(
+                            "advanced `{base}` to `{remote_ref}` ({count} commit(s) fast-forwarded)"
+                        );
+                        return Ok(());
+                    }
                 }
             }
             Err(CliError::Message(stale_base_message(
@@ -2224,6 +2273,53 @@ mod tests {
              though `project_root`'s own HEAD is on `other`"
         );
         drop(linked);
+    }
+
+    #[test]
+    fn fast_forward_base_ref_refuses_a_stale_expected_old_value() {
+        let (remote, local) = currency_fixture();
+        let remote_root = remote.path();
+        let local_root = local.path();
+        advance_remote(remote_root, "f2.txt");
+        run_git(local_root, &["checkout", "-q", "-b", "other"]);
+        // The clone's `origin/develop` remote-tracking ref is stale until
+        // fetched — without this it still equals `develop`, which would
+        // make the "wrong" expected-old value below accidentally correct.
+        run_git(local_root, &["fetch", "-q", "origin", "develop"]);
+
+        let rev_parse = |rref: &str| {
+            let out = devflow_core::test_support::git_command(local_root)
+                .args(["rev-parse", rref])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "rev-parse {rref} failed");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let before = rev_parse("develop");
+        let remote_sha = rev_parse("origin/develop");
+
+        // `remote_sha` is a real, valid object in this fixture — it simply
+        // is not where `develop` currently points. A syntactically valid
+        // but wrong expectation, the exact shape of the race being defended
+        // against.
+        assert!(
+            !fast_forward_base_ref(local_root, "develop", &remote_sha, &remote_sha),
+            "a stale expected-old value must refuse the write"
+        );
+        assert_eq!(
+            rev_parse("develop"),
+            before,
+            "a refused compare-and-swap must leave the ref byte-identical"
+        );
+
+        // Positive control: without a stale expectation, the same call
+        // succeeds and moves the ref — otherwise an always-`false`
+        // implementation would also pass the assertion above.
+        assert!(
+            fast_forward_base_ref(local_root, "develop", &before, &remote_sha),
+            "the correct expected-old value must succeed"
+        );
+        assert_eq!(rev_parse("develop"), remote_sha);
     }
 
     #[test]
