@@ -33,7 +33,7 @@
 
 ## Reorganized (June 2026)
 
-- **Conventional commits deprecated** — no commit-message-based versioning
+- **Conventional commits deprecated for versioning (June 2026), ban lifted 2026-07-27** — this bullet originally recorded a bare prohibition on deriving versions from commit messages, with no rationale, incident, or evidence attached anywhere in this file. The operator explicitly authorised deviating from that policy on 2026-07-27 to fully automate versioning (CONTEXT.md D-06); Phase 25 (25c) implements the superseding scheme — baseline from the highest reachable semver tag plus conventional-commit classification of the commits since that baseline (`crates/devflow-core/src/version.rs`)
 - **Phase 10 shipped** — logging + Planning step (Planning known bug, addressed in Phase 11 refactor)
 - **Phase 11 recast** — full architecture refactor to GSD-native execution engine
 - **Phase 12** — Bootstrap (new-project, map-codebase) + versioning automation + publish `devflow` to crates.io (name confirmed available, 2026-07-08)
@@ -982,6 +982,22 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
+### Phase 999.53: CI Cannot Reproduce the Load Shape That Catches Exec-Visibility Races (BACKLOG)
+
+**Goal:** `.github/workflows/ci.yml` runs `fmt`, `clippy` and `test` as **three separate parallel jobs** on `ubuntu-24.04`, each invoking its own `scripts/check.sh <part>`; the `Test` job runs `scripts/check.sh test` alone. Every observed reproduction of 999.47 required the **sequential** `fmt → clippy → test` ordering on a loaded 2-core box — the shape `scripts/check-in-container.sh all` produces under `taskset -c 0,1`, which is what the `pre-push` hook runs. Splitting the checks into parallel jobs destroys exactly the condition that produces the race.
+
+**CI is therefore structurally incapable of catching this defect class.** It rejected 0 of the pushes the local `pre-push` gate rejected 2 of 2. Phase 25 had to use six local push-gate observations as its sensitive instrument, with the five CI trials discharging a different standard (19-RESEARCH.md D-11's CI-on-branch requirement) rather than bounding the residual — recorded as `## Limits of this evidence` point 3 in `25-CI-TRIALS.md`. The gap is permanent, not phase-scoped: nothing in CI today would catch a regression that reintroduces a spawn-then-cmdline-census site without a barrier.
+
+**Fix direction:** GitHub's `ubuntu-24.04` standard runner is **already 2-vCPU** — the same core count `taskset -c 0,1` simulates — so one added job running `scripts/check.sh all` reproduces the sensitive shape natively, with no `taskset` and no container indirection. Keep the existing three jobs for fast parallel feedback. Verify the 2-vCPU claim at implementation time rather than trusting this entry; if GitHub has moved standard runners to 4-vCPU, an explicit `taskset -c 0,1` wrapper is needed to preserve the load shape. Sensitivity is probabilistic — the historical per-run rate was ~50% — so the job comment should say so, or a future reader will over-trust a green run.
+
+*Surfaced by the operator during Phase 25's 25-13 human sign-off (2026-07-28), while questioning whether the 999.47 closure evidence could be taken from GitHub CI instead of the local push gate. Recorded as a follow-up in `25-13-SUMMARY.md` Part A; explicitly out of scope for 25-13, which changes no source file by design.*
+
+**Priority:** Medium — no active defect and 999.47's sites are now barriered, but this is the only standing guard that would catch a reintroduction, and its absence is why Phase 25's closure evidence had to be gathered by hand. | **Size:** S — one job block in `ci.yml` plus a comment stating the probabilistic limit. Linear: DEN-78.
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
 ### Phase 21: Operator Legibility & Observability
 
 **Shipped as v1.8.0** (2026-07-24) — PR #23 (`develop → main`, squash `cfa9167`), signed tag `v1.8.0`, [GitHub Release](https://github.com/denniyahh/devflow/releases/tag/v1.8.0). `sync-main-to-develop.sh` run via PR #24 (merge `01ad9e4`). Published to crates.io (`devflow-core` then `devflow`, both confirmed live at 1.8.0).
@@ -1420,10 +1436,38 @@ Plans:
 ### Phase 25: End-to-End Dogfood Blockers — Start, Progress, Finish, Recover
 
 **Goal:** Make an unattended `devflow start --phase N --agent claude --mode auto --yes-ship` run reach a completed Ship stage **without a human touching it**, by closing the four things that currently prevent it. Phase 23 proved the goal is not reachable today: its third acceptance attempt drove Define→Plan→Code unattended — the furthest any run has gone — then halted, and two of its three attempts additionally required a human to repair the base ref before `devflow start` would even launch. This phase closes the specific, individually-evidenced blockers rather than re-attempting the run and rediscovering them.
-**Priority:** High | **Size:** M — six units. Five are S or S–M with a filed Linear issue and recorded reproduction; 25f is S and docs-only. No design pass needed; the fix directions are written.
-**Requirements**: TBD — promoted from backlog 999.51, 999.48, 999.49, 999.44, 999.47; plus 25f (CONTRIBUTING release-procedure drift, no backlog entry — found 2026-07-27)
+**Priority:** High | **Size:** L (re-sized at plan time, 2026-07-27 — was M) — six units plus 999.38 folded in. 25b, 25e, 25f and 999.38 are genuinely S as filed; 25a is S–M, option chosen at plan review 2026-07-27 (fetch + fast-forward-when-safe, else refuse — see `25-05-PLAN.md` §`<resolved_decision>`, and CONTEXT.md D-17 as amended); **25c is M, not the S this entry states** — it is a full replacement of `compute_version`'s three inputs plus a new preflight gate plus a previously-unflagged consumer at `pipeline_gate.rs:809-840`. No phase split recommended; see `25-01-PLAN.md` § Phase-level notes for the assessment and the seam if one is ever wanted.
+**Requirements**: TBD — promoted from backlog 999.51, 999.48, 999.49, 999.44, 999.47; plus 25f (CONTRIBUTING release-procedure drift, no backlog entry — found 2026-07-27). Tracked by unit identifier (`25a`–`25f`, `999.38`), not by REQ-ID — this project has no `.planning/REQUIREMENTS.md`.
 **Depends on:** Phase 24
-**Plans:** 0 plans
+**Plans:** 18/19 plans executed
+
+Gap-closure plans (wave numbering restarts at 1 for this run):
+
+- [x] 25-08-PLAN.md — 25c/999.49: the D-09 major-bump gate fires in the default worktree path (CR-01 aggregation + CR-02 execution-root scope + real-worktree regression test) (wave 1)
+- [x] 25-09-PLAN.md — 25c/999.49: `release_range_start` anchors correctly across realistic release topologies (CR-03 + two topology fixtures) (wave 1)
+- [~] 25-10-PLAN.md — HALTED at Task 1 Step E; SUPERSEDED by 25-13
+- [x] 25-11-PLAN.md — 25e/999.47: fresh site census + bounded exec-visibility barrier at every vulnerable spawn-then-cmdline-census site in `crates/` (wave 1)
+- [x] 25-12-PLAN.md — 25e/999.47: production reaper age floor (`agent::STRAY_MIN_AGE`) refusing to `SIGKILL` inside the exec-visibility window (wave 2)
+- [x] 25-13-PLAN.md — 25e/999.47 + 25f: push through the real `pre-push` gate, an 11-observation CI-on-branch streak, and dual human sign-off (wave 3)
+
+**25-10 disposition:** 25-10 halted at Task 1 Step E when its push was rejected 2/2 by the `pre-push` container gate on the very defect its trials were meant to observe, and is superseded by 25-13 — a corrected protocol with a falsified-premise fix, a corrected test list, and a second (local push-gate) verification shape — rather than re-run, because re-running it unchanged would produce evidence about tests that are no longer the risk.
+
+Gap-closure plans, round 3 — planned 2026-07-28 against `25-VERIFICATION.md`'s two remaining gaps (wave numbering restarts at 1 for this run):
+
+- [x] 25-14-PLAN.md — 25a/999.51: CR-02 — the base-ref fast-forward becomes a compare-and-swap (`git update-ref` with `<oldvalue>`) behind a repository-wide checked-out predicate (`git worktree list --porcelain`), plus a second-worktree regression test (`preflight.rs`) (wave 1)
+- [x] 25-15-PLAN.md — 25d/999.44: CR-01 — a registry-reachability filter interposed between the structural `/proc` census and BOTH operator surfaces, an explicit `--root` ruling, corrected `doctor`/`--reap-strays`/census wording, and a three-fixture same-pass regression test (`commands.rs`, `main.rs`, `agent.rs`) (wave 1)
+- [x] 25-16-PLAN.md — WR-03 (folded in, not deferred): the two tests that drive a real `launch_stage_inner` now reap the detached monitor wrapper they spawn, with verified death, via one shared `#[cfg(test)]` helper (`test_support.rs`, `staleness.rs`, `pipeline_launch.rs`) (wave 1)
+
+**Round-3 wave rationale:** all three run in parallel in wave 1. Their file sets were checked against live source at plan time and are disjoint — `preflight.rs` / (`commands.rs`, `main.rs`, `agent.rs`) / (`test_support.rs`, `staleness.rs`, `pipeline_launch.rs`) — so the same-wave zero-file-overlap rule that forced near-serial waves in Phases 18, 19, 21 and in this phase's own rounds 1–2 does not bind here. 25-14 does not touch `commands.rs` because `ensure_base_ref_current`'s signature and its `commands.rs:154` call site are unchanged by construction. **The `scripts/check-in-container.sh all` push-gate run is a phase-level, post-merge step run ONCE after all three merge — not once per worktree**, because several simultaneous `taskset -c 0,1` container runs manufacture the same load-induced flake 25-11/25-12/25-13 closed.
+
+Gap-closure plans, round 4 — planned 2026-07-28 against `25-UAT.md`'s two gaps, both test-only defects in the `devflow` CLI crate (wave numbering restarts at 1 for this run):
+
+- [x] 25-17-PLAN.md — G-25-2/WR-06: the monitor reap becomes an RAII `Drop` guard (`test_support::ReapMonitorOnDrop`) bound before the panicking assertions at both sites 25-16 fixed, with a double-panic interlock and a discriminating test plus control (`test_support.rs`, `pipeline_launch.rs`, `staleness.rs`) (wave 1)
+- [x] 25-18-PLAN.md — G-25-1/WR-05: the two `preflight.rs` tests that reach `monitor::spawn_monitor` through `run_preflight`'s `Advance`/`LoopBack` recursion bind the same guard and assert they really spawned; closes `WINDOWS.md` items 1 and 3 (`preflight.rs`, `.planning/WINDOWS.md`) (wave 2)
+
+**Round-4 wave rationale:** the two gaps' file sets are disjoint (`preflight.rs` alone vs `test_support.rs`/`pipeline_launch.rs`/`staleness.rs`), but they are NOT independent. G-25-1's fix must use the guard G-25-2 introduces — wiring a plain trailing `reap_spawned_monitor(&state)` into `preflight.rs` would knowingly reproduce WR-06 in two new places on the same day it was closed in two others. So 25-18 depends on 25-17's API rather than on its files, and runs in wave 2. The guard's exact signature is pinned verbatim in 25-18's `<interfaces>` so its executor needs no cross-plan SUMMARY read, and 25-18 carries a precondition asserting the guard exists before it edits.
+
+**WR-03 disposition (explicit, per the verifier's request):** folded into round 3 as 25-16 rather than deferred. The justification is not tidiness — 25-15's regression test asserts against a live `/proc` census, and the leak replenishes that census's noise on every `cargo test --workspace` run. The verifier's own words: it *"actively degrades confidence in any future CR-01 fix's own test suite until closed."* WR-01 (`version.rs:338-349`) and WR-04 (`commands.rs:3727-3762`) remain Info-severity and are NOT pulled in: `version.rs` is in no round-3 file set, and while 25-15 does edit `commands.rs`, it does not touch WR-04's lines — the reachability filter is interposed before `reap_stray_candidates`, leaving that function and its test untouched.
 
 *Scoped 2026-07-27 against one criterion — "what does an unattended run need in order to finish?" — after validating every open High in the backlog against the codebase. The four requirements below are the decomposition; each unit maps to exactly one.*
 
@@ -1461,8 +1505,44 @@ Plans:
 - **999.5 / DEN-30** (changelog placeholder content) — on the Ship path but cosmetic, M-sized, and deferred three times for want of a content source.
 - **999.39** (production git calls inherit `GIT_DIR`) — a real exposure of the 999.37 class, but `devflow` is not invoked from a git hook on the pipeline's critical path. Considered and excluded, not overlooked.
 
-**Acceptance.** The phase is done when a single `devflow start --phase N --agent claude --mode auto --yes-ship` reaches Ship with no human intervention and `devflow evidence --phase N --require-shipped` exits 0 — the same code-checked oracle Phase 23 used, which has never yet returned success for any phase. Choose a target phase that does **not** modify DevFlow's own source, or 25b must be verified first; Phase 24's selection as "low-stakes by consequence" measured blast radius rather than self-modification, which is what actually disqualified it.
+**Acceptance (revised 2026-07-27 per CONTEXT.md D-15/D-16 — standing policy change, operator-confirmed).** The end-to-end acceptance run this paragraph previously required is now **unofficial and continuous**: it runs when the operator chooses and **gates no phase's completion, until further notice** — not this phase, not later ones. Phase 25 is therefore **complete when 25a–25f are each implemented and verified on their own unit-level merits** — each unit needs its own verifiable acceptance (a test, a closed reproduction) rather than relying on the end-to-end run to backstop it. Anything a future unofficial run surfaces is filed to the backlog the usual way, exactly as Phase 23's runs were. This suspension is deliberately reversible — the single-run closure criterion can be reinstated later if the operator chooses.
+
+**Planned 2026-07-27 — 7 plans across 3 waves.** Ordered by file ownership rather than by the
+spine above: `commands.rs` is touched by four of the six units and `preflight.rs` by two, so the
+same-wave zero-file-overlap rule forces the sequencing (the same constraint Phases 18, 19 and 21
+each hit). D-15's decoupling of the acceptance run dissolves the spine's observational rationale,
+so the code dependency graph is what orders the work. **25b (plan 25-03) and 25c (plans 25-01 and
+25-06) all land in this phase**, honouring the ship-together constraint below.
 
 Plans:
 
-- [ ] TBD (run /gsd-plan-phase 25 to break down)
+- [x] 25-19-PLAN.md
+
+- [ ] 25-10-PLAN.md
+
+- [~] 25-10-PLAN.md — SUPERSEDED by 25-13 (see the gap-closure list above; this line previously read `[ ]`, contradicting that disposition)
+
+- [x] 25-11-PLAN.md
+- [x] 25-12-PLAN.md
+- [x] 25-13-PLAN.md
+- [x] 25-14-PLAN.md — 25a/CR-02: compare-and-swap fast-forward + repository-wide checked-out predicate (`preflight.rs`) (round-3 wave 1)
+- [x] 25-15-PLAN.md — 25d/CR-01: registry-reachability filter before both stray surfaces, `--root` ruling, corrected wording (`commands.rs`, `main.rs`, `agent.rs`) (round-3 wave 1)
+- [x] 25-16-PLAN.md — WR-03: launch-driving tests reap the monitor they spawn (`test_support.rs`, `staleness.rs`, `pipeline_launch.rs`) (round-3 wave 1)
+- [x] 25-17-PLAN.md — G-25-2/WR-06: RAII `ReapMonitorOnDrop` guard bound before the panicking assertions, with a double-panic interlock and a discriminating test plus control (`test_support.rs`, `pipeline_launch.rs`, `staleness.rs`) (round-4 wave 1)
+- [x] 25-18-PLAN.md — G-25-1/WR-05: the two `preflight.rs` recursion tests bind the same guard and assert they really spawned; closes `WINDOWS.md` items 1 and 3 (`preflight.rs`, `.planning/WINDOWS.md`) (round-4 wave 2)
+
+**Wave 1** *(four plans in parallel — disjoint file sets)*
+
+- [x] 25-01-PLAN.md — 25c derivation: reachable-tag baseline, anchored commit range, conventional-commit classification, rewritten `compute_version` (`version.rs`, `+semver`, `+git-conventional`)
+- [x] 25-02-PLAN.md — 25d/25e core primitives: `terminate_and_verify`, registry-independent stray discovery, `#[deprecated]` on the unsound predicate (`agent.rs`)
+- [x] 25-03-PLAN.md — 25b + 999.38: hoist the staleness adjudication into `start`, prove it is not re-adjudicated mid-run, de-race the descendant-commit test (`pipeline_launch.rs`, `commands.rs`, `staleness.rs`)
+- [x] 25-04-PLAN.md — 25f + D-06 + D-16: CONTRIBUTING release step 5, the versioning constraint in two places, the Acceptance paragraph below (`CONTRIBUTING.md`, `ROADMAP.md`, `PROJECT.md`)
+
+**Wave 2** *(blocked on 25-03 — shares `commands.rs`)*
+
+- [x] 25-05-PLAN.md — 25a: base-ref currency probe wired ahead of the reachability guard; fetch, then fast-forward the local base when safe and refuse loudly otherwise (`preflight.rs`, `commands.rs`)
+
+**Wave 3** *(two plans in parallel — blocked on 25-01/25-02 and on 25-05's file ownership)*
+
+- [x] 25-06-PLAN.md — 25c gate: `preflight_major_bump_check` (D-09) plus the `pipeline_gate.rs` fixture that re-derives the replaced algorithm (`preflight.rs`, `pipeline_gate.rs`)
+- [x] 25-07-PLAN.md — 25d/25e surface: `doctor` stray finding, opt-in `gate sweep` reaping, deleted-root e2e test, retargeted `stop` identity test (`commands.rs`, `main.rs`, new `tests/reap_strays_e2e.rs`)
