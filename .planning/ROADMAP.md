@@ -998,6 +998,24 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
+### Phase 999.54: `release --check` Tag-Signing Viability Reads the Wrong Config Key (BACKLOG)
+
+**Goal:** `check_signing_viability` reads `user.signingkey` (`crates/devflow-core/src/git.rs:812`, `:887`) — the *agent's ordinary commit key* — and never consults `devflow.releaseSigningKey`, the maintainer's release key. It then compares ssh-agent's loaded fingerprints against that key, so on a correctly configured maintainer machine (release key loaded, agent key not) it reports `tag-signing viability ✗ — ssh-agent has keys loaded, but not the configured signing key` and fails the entire `devflow release --check` preflight.
+
+**This is a false negative on a correct setup, in the one check whose whole job is gating release tagging.** CONTRIBUTING § Release signing defines the split it fails to honour: `user.signingkey` signs ordinary commits (the agent's key), `devflow.releaseSigningKey` signs release tags and `main` (the maintainer's — "the only key permitted"). As written the check can only pass when the *agent's* key is loaded, which is the inverse of the policy.
+
+**Measured during the v2.1.0 cut (2026-07-28):** ssh-agent held `SHA256:u84t7Jj…` — byte-identical to `devflow.releaseSigningKey`'s fingerprint — while `user.signingkey` resolved to `SHA256:9BPyx2M…`, which was not loaded. The v2.1.0 tag signed successfully with the release key while the check claimed it was unavailable, and `scripts/hooks/pre-push` independently verified the same fingerprint on push. The hook's logic is correct; only `release --check` reads the wrong value.
+
+**Fix direction:** resolve with release precedence — `devflow.releaseSigningKey` first, falling back to `user.signingkey` when unset. CONTRIBUTING already states that leaving `devflow.releaseSigningKey` unset disables the check entirely for contributors who never cut releases, so the fallback preserves documented behaviour. Regression test: configure the two keys distinctly, load only the release key, assert `SigningViability::Viable` — a test that fails against current code.
+
+*Found by the orchestrating agent during the v2.1.0 release cut, after the check's failure was taken at face value twice and the operator corrected it. Adjacent to Phase 24, which touched the same function's inline-`key::` classification but not its config-key selection.*
+
+**Priority:** Medium — no production impact (the pre-push hook is the real guard and it works), but it fails the release preflight on every correctly-configured cut and misdirects whoever is cutting. | **Size:** S — one config-lookup change plus a regression test. Linear: DEN-79.
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
 ### Phase 21: Operator Legibility & Observability
 
 **Shipped as v1.8.0** (2026-07-24) — PR #23 (`develop → main`, squash `cfa9167`), signed tag `v1.8.0`, [GitHub Release](https://github.com/denniyahh/devflow/releases/tag/v1.8.0). `sync-main-to-develop.sh` run via PR #24 (merge `01ad9e4`). Published to crates.io (`devflow-core` then `devflow`, both confirmed live at 1.8.0).
