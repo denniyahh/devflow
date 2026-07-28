@@ -982,6 +982,22 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
+### Phase 999.53: CI Cannot Reproduce the Load Shape That Catches Exec-Visibility Races (BACKLOG)
+
+**Goal:** `.github/workflows/ci.yml` runs `fmt`, `clippy` and `test` as **three separate parallel jobs** on `ubuntu-24.04`, each invoking its own `scripts/check.sh <part>`; the `Test` job runs `scripts/check.sh test` alone. Every observed reproduction of 999.47 required the **sequential** `fmt → clippy → test` ordering on a loaded 2-core box — the shape `scripts/check-in-container.sh all` produces under `taskset -c 0,1`, which is what the `pre-push` hook runs. Splitting the checks into parallel jobs destroys exactly the condition that produces the race.
+
+**CI is therefore structurally incapable of catching this defect class.** It rejected 0 of the pushes the local `pre-push` gate rejected 2 of 2. Phase 25 had to use six local push-gate observations as its sensitive instrument, with the five CI trials discharging a different standard (19-RESEARCH.md D-11's CI-on-branch requirement) rather than bounding the residual — recorded as `## Limits of this evidence` point 3 in `25-CI-TRIALS.md`. The gap is permanent, not phase-scoped: nothing in CI today would catch a regression that reintroduces a spawn-then-cmdline-census site without a barrier.
+
+**Fix direction:** GitHub's `ubuntu-24.04` standard runner is **already 2-vCPU** — the same core count `taskset -c 0,1` simulates — so one added job running `scripts/check.sh all` reproduces the sensitive shape natively, with no `taskset` and no container indirection. Keep the existing three jobs for fast parallel feedback. Verify the 2-vCPU claim at implementation time rather than trusting this entry; if GitHub has moved standard runners to 4-vCPU, an explicit `taskset -c 0,1` wrapper is needed to preserve the load shape. Sensitivity is probabilistic — the historical per-run rate was ~50% — so the job comment should say so, or a future reader will over-trust a green run.
+
+*Surfaced by the operator during Phase 25's 25-13 human sign-off (2026-07-28), while questioning whether the 999.47 closure evidence could be taken from GitHub CI instead of the local push gate. Recorded as a follow-up in `25-13-SUMMARY.md` Part A; explicitly out of scope for 25-13, which changes no source file by design.*
+
+**Priority:** Medium — no active defect and 999.47's sites are now barriered, but this is the only standing guard that would catch a reintroduction, and its absence is why Phase 25's closure evidence had to be gathered by hand. | **Size:** S — one job block in `ci.yml` plus a comment stating the probabilistic limit. Linear: DEN-78.
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
 ### Phase 21: Operator Legibility & Observability
 
 **Shipped as v1.8.0** (2026-07-24) — PR #23 (`develop → main`, squash `cfa9167`), signed tag `v1.8.0`, [GitHub Release](https://github.com/denniyahh/devflow/releases/tag/v1.8.0). `sync-main-to-develop.sh` run via PR #24 (merge `01ad9e4`). Published to crates.io (`devflow-core` then `devflow`, both confirmed live at 1.8.0).
