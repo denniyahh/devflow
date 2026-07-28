@@ -1032,6 +1032,107 @@ mod tests {
         assert!(err.contains("not reachable"), "{err}");
     }
 
+    /// CR-02 (`25-REVIEW.md`): a real `git worktree add` fixture proving the
+    /// D-09 major-bump gate must classify the WORKTREE's HEAD, not
+    /// `project_root`'s, in `devflow start`'s default (worktree) execution
+    /// mode. Mirrors `staleness.rs::worktree_staleness_fixture`'s
+    /// construction exactly: `project_root` and `worktree_path` are SIBLING
+    /// directories under one outer tempdir (never nested — a nested worktree
+    /// path would contain `project_root`'s path as a string prefix, making
+    /// path-discriminating assertions mutually exclusive), `git init -q -b
+    /// develop` plus the same five config lines `major_bump_fixture` uses,
+    /// one `chore: init` commit tagged `v1.0.0` on `develop`, then `git
+    /// worktree add -b feature/phase-90 <worktree_path> develop` from
+    /// `project_root`. Exactly ONE commit is made, and made ONLY inside
+    /// `worktree_path`, with the message `feat(scope)!: drop legacy api` —
+    /// the identical breaking-marker shape and message
+    /// `major_bump_errs_naming_bump_baseline_and_version_for_major_at_ship`
+    /// uses, so a classification difference cannot be attributed to message
+    /// shape. `project_root`'s HEAD (`develop`) never moves.
+    ///
+    /// Tags live in the shared object database, so `v1.0.0` is visible and
+    /// reachable from the worktree's HEAD (`git tag --merged HEAD` run in the
+    /// worktree returns it) — this is the property that makes the fixture
+    /// meaningful: the baseline resolves identically from either root, only
+    /// the classified range differs.
+    ///
+    /// Returns `(tempdir_guard, worktree_path)`. `project_root` is
+    /// `tempdir_guard.path().join("project")`, matching
+    /// `worktree_staleness_fixture`'s return contract. The guard must be kept
+    /// alive for the duration of the test.
+    fn major_bump_worktree_fixture() -> (tempfile::TempDir, PathBuf) {
+        let outer = tempfile::tempdir().unwrap();
+        let project_root = outer.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let worktree_path = outer.path().join("worktree");
+
+        run_git(&project_root, &["init", "-q", "-b", "develop"]);
+        run_git(&project_root, &["config", "user.email", "t@e.st"]);
+        run_git(&project_root, &["config", "user.name", "t"]);
+        run_git(&project_root, &["config", "commit.gpgsign", "false"]);
+        run_git(&project_root, &["config", "tag.gpgsign", "false"]);
+        run_git(&project_root, &["config", "core.hooksPath", "/dev/null"]);
+        commit_msg(&project_root, "a.txt", "chore: init");
+        tag(&project_root, "v1.0.0");
+
+        run_git(
+            &project_root,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/phase-90",
+                worktree_path.to_str().unwrap(),
+                "develop",
+            ],
+        );
+
+        // ONE commit made ONLY inside the worktree — project_root's HEAD
+        // (develop) never moves. This asymmetry is exactly CR-02's mechanism.
+        commit_msg(&worktree_path, "b.txt", "feat(scope)!: drop legacy api");
+
+        (outer, worktree_path)
+    }
+
+    /// CR-02 (`25-REVIEW.md`): `preflight_major_bump_check` must classify the
+    /// tree the phase's code actually lives in. Before Task 2's fix, this
+    /// check always shells git against `project_root`, so a breaking commit
+    /// that exists ONLY on the worktree's feature branch (the default
+    /// `devflow start` execution mode) is invisible — this test is RED until
+    /// Task 2 lands. Both halves are asserted in one test, exactly as
+    /// `embedded_commit_is_stale_uses_worktree_head` does, because a single
+    /// assertion would pass for the wrong reason if the fixture were built
+    /// incorrectly.
+    #[test]
+    fn preflight_major_bump_check_fires_against_the_worktree_head() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let (outer, worktree_path) = major_bump_worktree_fixture();
+        let project_root = outer.path().join("project");
+
+        let mut state = State::new(76, AgentKind::Claude, Mode::Auto, project_root.clone());
+        state.stage = Stage::Ship;
+        state.worktree_path = Some(worktree_path.clone());
+
+        let err = preflight_major_bump_check(&project_root, &state).unwrap_err();
+        assert!(err.contains("MAJOR"), "{err}");
+        assert!(err.contains("v1.0.0"), "{err}");
+        assert!(err.contains("v2.0.0"), "{err}");
+        assert!(err.contains("drop legacy api"), "{err}");
+
+        // Negative half: with no worktree set, the SAME call classifies
+        // project_root's HEAD (develop), where the breaking commit does not
+        // exist — proving the fixture discriminates on execution root and
+        // that the positive assertion above is not passing for an unrelated
+        // reason.
+        state.worktree_path = None;
+        assert!(
+            preflight_major_bump_check(&project_root, &state).is_ok(),
+            "with no worktree set, the check must classify project_root's own HEAD, which \
+             never received the breaking commit"
+        );
+    }
+
     /// D-09 integration (mirrors `run_preflight_failing_check_gates_and_never_
     /// reaches_spawn_monitor`): a breaking-commit range at Stage::Ship drives
     /// `run_preflight` into the never-silent gate rather than continuing
