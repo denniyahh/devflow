@@ -391,10 +391,12 @@ pub(crate) fn enforce_build_staleness(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline_launch::launch_stage_inner;
     use crate::test_support::*;
     use devflow_core::mode::Mode;
     use devflow_core::stage::Stage;
     use devflow_core::state::AgentKind;
+    use devflow_core::workflow;
     use std::path::PathBuf;
 
     /// D-17: matches only when BOTH exact member paths appear inside the
@@ -652,6 +654,146 @@ mod tests {
             .expect("staleness block must record an event before returning the error");
         assert_eq!(last["reason"], "stale_build_blocked");
         assert_eq!(last["worktree"], true);
+    }
+
+    /// 25-03 (Task 2, D-03/D-04/D-05 regression): the staleness adjudication
+    /// now happens exactly once, in `commands::start` — a mid-run stage
+    /// transition (`pipeline_launch::launch_stage_inner`, the exact function
+    /// 25b's Task 1 deleted the `enforce_build_staleness` call from) must not
+    /// re-invoke it.
+    ///
+    /// Proven behaviourally, not structurally — a test that merely grepped
+    /// `pipeline_launch.rs` for the absent call would pass against a
+    /// re-introduction anywhere else in the launch path. Instead the SAME
+    /// fixture, whose worktree HEAD is build-affecting-ahead of the embedded
+    /// commit, is adjudicated twice: once the way `start` adjudicates it (a
+    /// direct `enforce_build_staleness` call, which still refuses — the
+    /// Phase 16 protection is intact, D-05), and once the way a mid-run
+    /// stage transition adjudicates it (`launch_stage_inner`, driven with a
+    /// stubbed `claude` binary so it can actually complete rather than fail
+    /// for the unrelated reason of a missing agent binary). If the check
+    /// were re-invoked anywhere in `launch_stage_inner`'s path, this second
+    /// call would fail with the identical block error the first call just
+    /// produced — instead it must succeed, and exactly one
+    /// `self_dogfood_stale_blocked` event (the first call's) must exist for
+    /// this phase afterward.
+    ///
+    /// Also re-asserts WR-02 on the first call's persisted event: the
+    /// `reason` field stays a bare, path-free label even though the
+    /// returned `CliError` (terminal-only) still names the worktree path.
+    ///
+    /// Guarded under `ENV_MUTEX` (999.38-class flake): drives
+    /// `worktree_staleness_fixture`'s unguarded real `git` subprocesses AND
+    /// mutates `PATH` for the stubbed `claude` binary.
+    #[test]
+    fn mid_run_stage_transition_does_not_readjudicate_staleness() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let (outer, worktree_path, embedded_commit) = worktree_staleness_fixture();
+        let project_root = outer.path().join("project");
+        std::fs::write(
+            project_root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/devflow-core\", \"crates/devflow-cli\"]\n",
+        )
+        .unwrap();
+        assert!(is_self_dogfood_workspace(&project_root));
+
+        // On top of the fixture's two committed "ahead" commits, leave an
+        // UNCOMMITTED build-affecting edit in the worktree too. This makes
+        // `combined_staleness`'s dirty-flag arm independently reach `Stale`
+        // (`tree_has_modified_build_inputs` sees a modified `.rs` file) even
+        // when a call site's `embedded_commit` is unrelated to this
+        // fixture's own throwaway history — which is exactly what the REAL
+        // production call sites use (`env!("DEVFLOW_BUILD_COMMIT")`, this
+        // binary's own build commit, not this fixture's). Without this, the
+        // RED discrimination check below (reverting Task 1's deletion)
+        // would silently classify `Indeterminate` via a foreign-SHA
+        // ancestry lookup and never actually reproduce the pre-fix block.
+        std::fs::write(
+            worktree_path.join("src/lib.rs"),
+            "// wt uncommitted dirty change (not committed)\n",
+        )
+        .unwrap();
+
+        let phase = 94;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, project_root.clone());
+        state.stage = Stage::Code;
+        state.worktree_path = Some(worktree_path.clone());
+
+        // 1. The `start`-shaped adjudication: called directly, exactly the
+        // way `commands::start` now calls it — once, before any stage is
+        // launched. The Phase 16 protection must still fire on a fresh
+        // start.
+        let err =
+            enforce_build_staleness(&project_root, &state, &embedded_commit, false).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains(&worktree_path.display().to_string()),
+            "block message must name the worktree that was actually evaluated: {message}"
+        );
+        assert!(
+            !message.contains(&project_root.display().to_string()),
+            "block message must not name project_root when a worktree was evaluated: {message}"
+        );
+        let blocked_event = devflow_core::events::last_event_for_phase(&project_root, phase)
+            .expect(
+                "the start-shaped adjudication must record an event before returning the error",
+            );
+        assert_eq!(blocked_event["event"], "self_dogfood_stale_blocked");
+        assert_eq!(blocked_event["reason"], "stale_build_blocked");
+        assert_eq!(blocked_event["worktree"], true);
+        let reason_str = blocked_event["reason"].as_str().unwrap();
+        assert!(
+            !reason_str.contains(&worktree_path.display().to_string())
+                && !reason_str.contains(&project_root.display().to_string()),
+            "persisted reason must never carry an absolute filesystem path (WR-02): {reason_str}"
+        );
+
+        // 2. The SAME fixture, driven through a mid-run stage transition.
+        // `launch_stage_inner` is the exact function 25b's Task 1 deleted
+        // the `enforce_build_staleness` call from — if the check were
+        // re-invoked anywhere in this path, this call would fail with the
+        // identical "self-dogfood stale build blocked" error produced
+        // above; instead it must complete.
+        workflow::save_state(&state).unwrap();
+        let stub_dir = stub_agent_binary("claude");
+        let original_path = std::env::var_os("PATH");
+        let stubbed_path = prepend_path(&stub_dir, &original_path);
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", &stubbed_path);
+        }
+
+        let result = launch_stage_inner(&mut state, None, None);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        result.expect(
+            "a mid-run stage transition must not re-invoke the staleness adjudication — this \
+             same fixture just refused via the direct start-shaped call above",
+        );
+
+        // Exactly one self_dogfood_stale_blocked event must exist for this
+        // phase — the direct start-shaped call's, not a second one fired by
+        // launch_stage_inner.
+        let all_events =
+            std::fs::read_to_string(devflow_core::events::events_path(&project_root)).unwrap();
+        let blocked_count = all_events
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|e| e["phase"] == phase && e["event"] == "self_dogfood_stale_blocked")
+            .count();
+        assert_eq!(
+            blocked_count, 1,
+            "exactly one self_dogfood_stale_blocked event must exist — the direct \
+             start-shaped call's, not a second one from the mid-run stage transition"
+        );
     }
 
     /// 18c (T-18-26): the SAME fixture with `worktree_path: None` must fall
