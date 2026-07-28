@@ -1,8 +1,8 @@
 ---
 phase: 25-end-to-end-dogfood-blockers
-reviewed: 2026-07-28T16:06:43Z
+reviewed: 2026-07-28T00:00:00Z
 depth: standard
-files_reviewed: 11
+files_reviewed: 12
 files_reviewed_list:
   - crates/devflow-cli/src/commands.rs
   - crates/devflow-cli/src/main.rs
@@ -10,511 +10,292 @@ files_reviewed_list:
   - crates/devflow-cli/src/pipeline_launch.rs
   - crates/devflow-cli/src/preflight.rs
   - crates/devflow-cli/src/staleness.rs
+  - crates/devflow-cli/src/test_support.rs
   - crates/devflow-cli/tests/reap_strays_e2e.rs
   - crates/devflow-core/Cargo.toml
   - crates/devflow-core/src/agent.rs
   - crates/devflow-core/src/test_support.rs
   - crates/devflow-core/src/version.rs
 findings:
-  critical: 2
-  warning: 4
+  critical: 0
+  warning: 6
   info: 4
   total: 10
 status: issues_found
 ---
 
-# Phase 25: Code Review Report
+# Phase 25: Code Review Report (re-review after gap-closure round 3)
 
-**Reviewed:** 2026-07-28T16:06:43Z
+**Reviewed:** 2026-07-28T00:00:00Z
 **Depth:** standard
-**Files Reviewed:** 11
+**Files Reviewed:** 12
 **Status:** issues_found
 
-> **This review supersedes the 2026-07-28T02:03:59Z revision in full.** That
-> revision predated plans 25-11/25-12/25-13 and `test_support.rs`; its
-> `critical: 3 / warning: 3` counters were derived against the old tree and are
-> not carried forward. Every finding below was re-derived against the current
-> working tree at `39da531`.
+> **This review supersedes the 2026-07-28T16:06:43Z revision.** That revision's two
+> Critical findings (CR-01, CR-02) and one of its Warnings (WR-03) are re-adjudicated below
+> against plans 25-14/25-15/25-16's gap-closure diff. Its remaining Warnings (WR-01, WR-02,
+> WR-04) and Info items (IN-01–IN-04) were **not** in scope for this round and are carried
+> forward unchanged — re-verified against the current tree, renumbered, not re-derived from
+> scratch.
 
 ## Summary
 
-`cargo check --workspace --all-targets` and `cargo clippy --workspace
---all-targets -- -D warnings` are both clean. The three areas flagged for
-hardest scrutiny largely hold up:
+`git show HEAD:.planning/phases/25-end-to-end-dogfood-blockers/25-REVIEW.md` (the prior
+revision) raised CR-01, CR-02, and WR-03. Plans 25-14 (CR-02), 25-15 (CR-01), and 25-16
+(WR-03) claim to close them. Adjudicated below, explicitly:
 
-- **`wait_for_exec_visibility` (25-11)** — the timeout path is correct and
-  bounded (`deadline` is checked after each read, and the poll sleeps, so no
-  busy-spin and no unbounded wait); the dead-pid short-circuit is sound;
-  `Instant`-based deadlines are monotonic. One latent unsoundness in the
-  self-cmdline guard (WR-02).
-- **`process_age` / `clock_ticks_per_second` (25-12)** — the classic
-  `/proc/<pid>/stat` parsing bug is *correctly avoided*: `process_start_time`
-  splits at `stat.rfind(')')`, not the first `)`, and the field index (`nth(19)`
-  after the final paren = field 22) is right. Tick arithmetic is done in `f64`
-  with a `.max(0.0)` clamp, so no integer underflow. `clock_ticks_per_second()`
-  returning `None` propagates through `?` to `None`, and
-  `reap_stray_candidates` treats `None` as refuse via `Option::is_some_and` —
-  it genuinely fails **closed**. One residual panic path (IN-01).
-- **`StrayReapOutcome::TooYoung` / `reap_stray_candidates` (25-12)** — the guard
-  ordering is correct on every path: identity → age → `dry_run` → signal. There
-  is **no** branch that can signal a too-young or unknown-age candidate, and the
-  `is_same_process` recycling guard composes correctly with the age floor (they
-  are checked in series, both fail-closed, and a pid recycled between them makes
-  the age tiny, which refuses).
+- **CR-02 — CLOSED.** `preflight.rs::ensure_base_ref_current`'s `Behind` arm now calls
+  `fast_forward_base_ref`, a genuine `git update-ref refs/heads/<base> <new> <expected_old>`
+  compare-and-swap (not the old unconditional two-argument write), gated by
+  `base_is_checked_out_anywhere`, which genuinely parses `git worktree list --porcelain`
+  across every worktree of the repository — not just `project_root`'s own `HEAD` (the old
+  bug). Both halves are exercised by real-git fixtures, not mocks:
+  `fast_forward_base_ref_refuses_a_stale_expected_old_value` proves the CAS refuses a stale
+  `expected_old` and leaves the ref byte-identical; `currency_behind_refuses_when_base_is_
+  checked_out_in_another_worktree` proves a `develop` checked out in a *linked* worktree
+  (while `project_root`'s own HEAD sits on an unrelated branch) is still detected and the
+  write is refused, leaving the ref unmoved. The one residual the doc comment documents (a
+  worktree that checks out `base` in the window between the repo-wide scan and the CAS is
+  not protected by the scan) is real but correctly scoped — the CAS still prevents a lost
+  update in that window; it just cannot prevent that worktree from observing a moved HEAD.
+  This is an accepted, explicitly-documented trade, not a silent gap.
 
-The two Critical findings are elsewhere, in the surfaces those primitives feed:
-the `doctor` / `--reap-strays` census makes an **unverified** orphan-ness claim
-about live processes and recommends SIGKILLing them (CR-01, reproduced live on
-this machine), and `ensure_base_ref_current` performs its "safe fast-forward"
-with `git update-ref`, which bypasses the very protections that make it safe
-(CR-02, reproduced in a scratch repo).
+- **CR-01 — CLOSED.** `commands.rs::doctor` and `commands.rs::gate_sweep`'s `--reap-strays`
+  pass both now route through the single composition `unreachable_stray_candidates` →
+  `retain_unreachable_strays` (filtering `agent::discover_stray_devflow_processes()`) against
+  `registry_reachable_pids(&stray_safety_roots(extra_roots))`. Verified point by point:
+  - `registry_reachable_pids` (`commands.rs:3050`) reads `state.monitor_pid` via
+    `workflow::list_states` and the lock holder via `lock::holder_identity` — **never**
+    `lock::holder` (which deletes an empty lock file) and **never**
+    `registry::prune_missing` — so `doctor`'s read-only contract holds structurally, not by
+    convention.
+  - `stray_safety_roots` (`commands.rs:3100`) unions `registry::load_roots()` with the
+    caller's extra roots and never narrows; `gate_sweep`'s `explicit_root` (from `--root`) is
+    likewise only ever unioned in (`commands.rs:1067,1174`), never substituted, and prints an
+    explicit note to that effect when `--root` is passed with `--reap-strays`
+    (`commands.rs:1165-1173`) — confirmed this cannot narrow the protected set, so `gate
+    sweep --root R --reap-strays` cannot un-protect other roots' live processes.
+  - A live monitor's pid recorded in `state.monitor_pid`/the lock file is now provably
+    excluded from both `doctor`'s "stray" finding and `gate sweep --reap-strays`'s kill list
+    — the exact 14-of-38 false-positive reproduction the prior review measured live is
+    structurally closed by the filter, not merely narrowed.
 
-## Critical Issues
+- **WR-03 — PARTIALLY CLOSED.** See WR-05 and WR-06 below: the shared
+  `test_support::reap_spawned_monitor` helper is real, correct, and was wired into the two
+  call sites `25-16-PLAN.md` names (`pipeline_launch.rs`'s
+  `launch_stage_persists_monitor_pid_for_reload`, `staleness.rs`'s
+  `mid_run_stage_transition_does_not_readjudicate_staleness`). But two more pre-existing
+  tests that drive the identical real-monitor-spawning path were left untouched (WR-05), and
+  the two sites that *were* fixed still leak on a panic between the spawn and the reap call,
+  because the reap is a plain trailing statement rather than an unwind-safe guard (WR-06).
 
-### CR-01: `doctor` asserts orphan-ness it never checks, and points the operator at a SIGKILL
-
-**File:** `crates/devflow-cli/src/commands.rs:3023-3049` (`build_stray_process_findings`), `crates/devflow-cli/src/commands.rs:1149-1232` (`gate_sweep`'s stray pass), `crates/devflow-core/src/agent.rs:393-446` (`discover_stray_devflow_processes`)
-
-**Issue:** `discover_stray_devflow_processes` is a purely *structural* `/proc`
-census — it matches `sh -c <script containing MONITOR_WRAPPER_MARKER>` and
-`devflow advance`, filtered only by euid. It performs no orphan test of any
-kind. `build_stray_process_findings` then emits, for every match:
-
-```
-severity: problem
-detail:  "state-orphaned process: pid N (monitor wrapper) is running but
-          reachable through no registry entry, lock file, or state file"
-repair:  "devflow gate sweep --reap-strays"
-```
-
-That `detail` string states a fact the code never established. Reproduced live
-against the current build on this machine:
-
-```
-$ ./target/debug/devflow doctor --json | jq '.stray_processes | length'
-38
-# cross-referenced against ~/.cache/devflow/roots/*.json and each root's
-# .devflow/state-NN.json + .devflow/lock-NN:
-stray pids that ARE named by a registered root's state/lock file: 14
-  pid 596367  named in /tmp/.tmp4T6jFk/.devflow/state-12.json   (live monitor_pid)
-  pid 602181  named in /tmp/.tmp4T6jFk/.devflow/lock-12         (live lock holder)
-  pid 1664537 named in /tmp/.tmpNZddyv/.devflow/state-08.json
-  pid 1667954 named in /tmp/.tmpNZddyv/.devflow/lock-08
-```
-
-14 of 38 findings are demonstrably false: the registry reaches them, their state
-file names them, and one of them is the process **currently holding the phase
-lock**. `doctor` is the read-only command operators trust, and it is now telling
-them 38 healthy-or-not processes are orphans and naming a destructive repair.
-
-`gate_sweep`'s `--reap-strays` then acts on that same unqualified census with
-`terminate_and_verify` (TERM → SIGKILL). Concrete failure scenario, fully
-reachable today with no race and no unusual state:
-
-1. Two DevFlow phases are running (the normal dogfood shape on this machine).
-2. Operator runs `devflow doctor`, sees 38 `problem` findings, and runs the
-   repair `doctor` printed.
-3. Every live monitor wrapper is SIGKILLed. SIGKILL is uncatchable, so the
-   wrapper's `trap cleanup TERM INT` never fires — its backgrounded agent is
-   orphaned and keeps running with nothing left to call `devflow advance`.
-   That is *exactly* the orphan class 999.44 exists to eliminate; the reaper
-   manufactures it.
-4. Any `devflow advance` caught mid-transition (`AdvanceChild`, e.g. pid 602181
-   above) is killed while holding the phase lock, leaving a stale lock and a
-   half-written state machine.
-
-`STRAY_MIN_AGE` does not mitigate this at all — a live monitor wrapper is
-minutes to hours old, far above the 2s floor. The floor defends against
-fork/exec false positives, not against "this process is alive and owned."
-
-Two aggravating factors in the same pass:
-
-- `gate_sweep`'s stray pass ignores `--root` entirely (`commands.rs:1149`, no
-  reference to `roots`), so `devflow gate sweep --root /some/project
-  --reap-strays` still reaps the whole machine. The `--root` flag's own help
-  text says "Restrict the sweep to one project root."
-- `main.rs:389-398`'s flag help describes the behaviour as "discover and clear
-  STATE-ORPHANED processes (999.44)", which is the semantics the implementation
-  does not have.
-
-**Fix:** Filter the census against what the registry *can* reach before either
-reporting it as orphaned or signalling it. `registry::load_roots()` already
-yields `(project_root, phase)` pairs, and both `monitor_pid` and the lock
-holder are readable from them:
-
-```rust
-/// Pids that a live registry entry still reaches — never "state-orphaned",
-/// and never reaped. A stray by definition is NOT in this set, so filtering
-/// it out preserves 999.44's deleted-root case exactly.
-fn registry_reachable_pids() -> std::collections::HashSet<u32> {
-    let mut reachable = std::collections::HashSet::new();
-    for root in registry::load_roots() {
-        if let Ok(state) = workflow::load_state(&root.project_root, root.phase)
-            && let Some(pid) = state.monitor_pid
-        {
-            reachable.insert(pid);
-        }
-        if let Some(holder) = lock::holder(&root.project_root, root.phase) {
-            reachable.insert(holder.pid);
-        }
-    }
-    reachable
-}
-
-// in collect_stray_process_findings() and gate_sweep()'s stray pass:
-let reachable = registry_reachable_pids();
-let candidates: Vec<_> = agent::discover_stray_devflow_processes()
-    .into_iter()
-    .filter(|s| !reachable.contains(&s.pid))
-    .collect();
-```
-
-Additionally: honour `--root` in the stray pass (scope `registry_reachable_pids`
-to the given root, or document loudly at the call site why it cannot be scoped),
-and reword `main.rs`'s `--reap-strays` help to match whatever the final scope
-actually is.
-
-### CR-02: `ensure_base_ref_current` rewrites `develop` with `git update-ref`, defeating both safety checks it relies on
-
-**File:** `crates/devflow-cli/src/preflight.rs:456-473`
-
-**Issue:** The `Behind` arm advances the local base branch with:
-
-```rust
-git update-ref refs/heads/develop refs/remotes/origin/develop
-```
-
-guarded only by `git symbolic-ref --short HEAD` read **in `project_root`**. The
-doc comment argues this is safe because "`Behind` itself already establishes
-losslessness" and "the not-checked-out precondition is sufficient." Both
-arguments fail:
-
-**(a) The checked-out test only sees one worktree.** `git update-ref` — unlike
-`git branch -f` — has no checked-out-branch protection at all. Verified in a
-scratch repo:
-
-```
-$ git update-ref refs/heads/develop $(git rev-parse HEAD)   # from worktree B
-update-ref SUCCEEDED (no checked-out protection)
-$ git branch -f develop $(git rev-parse HEAD)               # same operation, safe API
-fatal: cannot force update the branch 'develop' used by worktree at '/tmp/urtest/repo'
-```
-
-Failure scenario: this repository routinely has several linked worktrees
-(`.worktrees/phase-NN`, `.claude/worktrees/agent-*`). If `develop` is checked
-out in *any* worktree other than the one `project_root` resolves to, `devflow
-start` silently moves the ref out from under it. That worktree's HEAD now points
-at a commit its index and working tree do not match: `git status` there reports
-every intervening change as an uncommitted deletion/modification, and a commit
-made there reverts them.
-
-**(b) There is no old-value guard.** `git update-ref <ref> <new>` with no
-`<oldvalue>` argument is an unconditional write — it will happily move a ref
-*backwards* onto a non-descendant (demonstrated in the same scratch repo).
-`base_ref_currency` establishes ancestry, then `ensure_base_ref_current` writes
-without re-checking it. Any local commit landing on `develop` in that window (a
-concurrent `devflow`, an operator, a hook) is silently discarded — recoverable
-only via reflog, and the operator is told "advanced `develop` to
-`origin/develop` (N commit(s) fast-forwarded)", which is a false description of
-what happened.
-
-**Fix:** Use the API that enforces both invariants, and pass the expected old
-value so the write is atomic against the check:
-
-```rust
-BaseRefCurrency::Behind { count } => {
-    let remote_ref = format!("{ORIGIN}/{base}");
-    // Resolve BOTH endpoints that `base_ref_currency` just compared, so the
-    // write is conditional on the state that was actually validated.
-    let resolve = |rev: &str| {
-        std::process::Command::new("git")
-            .args(["rev-parse", "--verify", "--quiet", rev])
-            .current_dir(project_root)
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-    };
-    let fast_forwarded = match (resolve(base), resolve(&remote_ref)) {
-        (Some(old), Some(new)) => std::process::Command::new("git")
-            .args([
-                "update-ref",
-                &format!("refs/heads/{base}"),
-                &new,
-                &old, // <oldvalue>: refuses if `base` moved since the check
-            ])
-            .current_dir(project_root)
-            .output()
-            .map(|out| out.status.success())
-            .unwrap_or(false),
-        _ => false,
-    };
-    // ...
-}
-```
-
-and replace the single-worktree `symbolic-ref` probe with a repository-wide
-check (`git worktree list --porcelain` scanning for `branch
-refs/heads/<base>`), or simply attempt `git branch -f <base> <remote_ref>` first
-— it refuses on its own when the branch is checked out in *any* worktree, which
-is precisely the precondition the current code is trying (and failing) to
-establish. Both approaches must keep the existing "fall through to
-`stale_base_message` on any failure" behaviour, which is already correct.
+`cargo check --workspace --all-targets` was not re-run as part of this review (read-only,
+static review); no changes were made to any reviewed file.
 
 ## Warnings
 
-### WR-01: `release_range_start` cannot distinguish "not an ancestor" from "git failed", and errs toward an over-inclusive range
+### WR-05: Two `preflight.rs` tests still leak a real detached monitor — WR-03 not fully closed
+
+**File:** `crates/devflow-cli/src/preflight.rs:1543-1595` (`run_preflight_advance_gate_launches_agent_exactly_once`), `crates/devflow-cli/src/preflight.rs:1604-1657` (`run_preflight_loopback_gate_launches_agent_exactly_once`)
+
+**Issue:** Both tests drive `run_preflight` with a `FailOnceAdapter` and a pre-seeded gate
+response, forcing resolution via `GateAction::Advance` or `GateAction::LoopBack`. Traced
+through the actual (not assumed) code path:
+
+- The `Advance` arm (`preflight.rs:935-944`) calls `launch_stage_inner(state, None, None)?`
+  directly.
+- The `LoopBack` arm (`preflight.rs:945-950`) calls `launch_stage(state, None, None)?`, which
+  re-resolves the **real** production adapter via `agents::adapter_for(state.agent)`
+  (Claude — whose default preflight passes, as the test's own comment notes), re-runs
+  `run_preflight` (which now passes against the real adapter), and falls through to
+  `launch_stage_inner` anyway.
+
+Either path reaches `monitor::spawn_monitor` for real (`pipeline_launch.rs:123` →
+`monitor.rs:148-160`, `Command::new("sh").arg("-c").arg(&script)...spawn()`) — a live,
+unwaited child process, exactly the shape `reap_spawned_monitor` exists to clean up. Both
+tests use `stub_agent_binary("claude")` + `prepend_path`, the identical "real program name,
+stubbed binary" construction `launch_stage_persists_monitor_pid_for_reload` uses to make its
+own real spawn happen — there is no test-mode branch anywhere in `launch_stage_inner` or
+`monitor::spawn_monitor` that would make this a no-op for these two tests specifically.
+
+Neither test calls `reap_spawned_monitor` (or anything else) before its `TempDir` (`dir`)
+drops and deletes the project root out from under the still-running wrapper — 999.44's exact
+reproduction shape. This directly contradicts the premise that `reap_spawned_monitor` "now
+covers both" real-launch call sites: it covers the two sites `25-16-PLAN.md` named, not these
+two pre-existing tests (owned by no plan — they date to the 17-08 gap closure) that exercise
+the same launch path via a different route (the `Advance`/`LoopBack` recursion, rather than a
+direct `launch_stage` call).
+
+This is empirically hard to catch by measuring leaked processes after the fact: the stubbed
+`claude` binary exits in well under a millisecond, and the wrapper script's trailing
+`devflow advance ...` invocation resolves `binary = current_exe()` to the **test binary
+itself** under `cargo test` — which rejects the `advance`/`--phase` argument shape as an
+invalid test-filter option and exits almost immediately. The whole `sh -c` wrapper therefore
+tends to have already exited by the time anything checks for it on an unloaded machine — a
+timing accident, not a structural guarantee, and exactly the kind of load-sensitivity this
+project has already measured once for a related defect class (`25-CI-OBSERVATION.md`: 0
+failures across 17 warm runs, 2 failures in 2 attempts under `scripts/check-in-container.sh
+all`'s loaded, 2-core-pinned shape). On a slow or loaded CI host this remains a live
+process-leak source, indistinguishable from the two sites this round fixed.
+
+**Fix:** Add the same trailing call the sibling tests already use, right after the existing
+assertions in both tests:
+
+```rust
+// after `assert_eq!(launches, 1, ...)` in both tests:
+reap_spawned_monitor(&state);
+```
+
+`reap_spawned_monitor` is already `pub(crate)` in `test_support.rs` and already reachable via
+this module's `use crate::test_support::*;` — no new import needed.
+
+### WR-06: `reap_spawned_monitor` is called as a plain trailing statement — a panic between spawn and reap still leaks the process
+
+**File:** `crates/devflow-cli/src/pipeline_launch.rs:414-441` (`launch_stage_persists_monitor_pid_for_reload`), `crates/devflow-cli/src/staleness.rs:689-803` (`mid_run_stage_transition_does_not_readjudicate_staleness`, reap call at `:802`), `crates/devflow-cli/src/test_support.rs:322-336` (`reap_spawned_monitor`)
+
+**Issue:** `reap_spawned_monitor`'s own doc comment states: "Must be called BEFORE the
+caller's `TempDir` guard drops — reaping after the project root has already been deleted is
+999.44's reproduction shape with extra steps, not a fix for it" (`test_support.rs:313-315`).
+At both fixed call sites, the reap call is a plain trailing statement — not a `Drop` guard,
+not `scopeguard`, not inside a `catch_unwind` boundary — so it only runs if every prior
+statement in the test body returns normally.
+
+In `pipeline_launch.rs:414-441`, the reap call (line 440) is preceded by four separate
+panicking checkpoints: `result.unwrap()` (`:423`), `assert!(state.monitor_pid.is_some(), ...)`
+(`:425-428`), `workflow::load_state(root, phase).unwrap()` (`:429`), and
+`assert_eq!(reloaded.monitor_pid, state.monitor_pid, ...)` (`:430-434`) — any one of which, on
+failure, unwinds the test function and drops `dir` (the `TempDir`) without ever reaching the
+reap call. The identical shape recurs in `staleness.rs:689-803`: `result.expect(...)` (`:777`)
+then an `assert_eq!` on `blocked_count` (`:792-796`) both precede the reap call at `:802`.
+
+This defeats the tests' purpose in exactly the scenario where reaping matters most: if a
+future regression reintroduces the bug either test exists to catch (e.g. `launch_stage` stops
+persisting `monitor_pid`, or the staleness check re-fires mid-run), the assertion that
+detects the regression panics *before* the reap call runs, so the real monitor wrapper this
+same test just spawned is left running against a soon-to-be-deleted project root. The
+resulting CI run would report a genuine regression **and** manufacture a fresh orphan process
+from the very test written to guard against orphans. A plain trailing statement cannot
+satisfy "runs on every exit path, including panic paths" — Rust does not execute subsequent
+statements once a panic has begun unwinding.
+
+**Fix:** Reap unconditionally regardless of how the test body exits, e.g. via a small RAII
+guard:
+
+```rust
+/// Reaps `state`'s spawned monitor on drop, including during an unwind —
+/// unlike a trailing `reap_spawned_monitor(&state)` call, which never runs
+/// if an assertion between the spawn and that call panics.
+struct ReapMonitorOnDrop<'a>(&'a State);
+impl Drop for ReapMonitorOnDrop<'_> {
+    fn drop(&mut self) {
+        reap_spawned_monitor(self.0);
+    }
+}
+```
+
+```rust
+result.unwrap();
+let _reap_guard = ReapMonitorOnDrop(&state); // reaps even if a later assertion panics
+assert!(state.monitor_pid.is_some(), /* ... */);
+// ... remaining assertions unchanged ...
+```
+
+(If a later line in either test needs `&mut state` while the guard is alive, hold the pid by
+value — `let _reap_guard = ReapMonitorOnDrop(state.monitor_pid);` with a matching `Drop` that
+takes `Option<u32>` — rather than borrowing the whole `State`.)
+
+### WR-01 (carried forward, unresolved, out of scope for this round): `release_range_start` cannot distinguish "not an ancestor" from "git failed"
 
 **File:** `crates/devflow-core/src/version.rs:338-349`
 
-**Issue:**
+**Issue:** `.map(|out| out.status.success()).unwrap_or(false)` folds a genuine `git
+merge-base --is-ancestor` error (exit 128, or a spawn failure) into the same `false` as a
+legitimate "not an ancestor" (exit 1) answer, both of which anchor the release range at the
+current candidate. Because the walk is oldest-first, a spurious `false` anchors *earlier*
+than correct, producing an over-inclusive range that can inflate `preflight_major_bump_check`
+into a spurious MAJOR gate. Unchanged from the prior review; not addressed by 25-14/25-15/
+25-16 (none of which touch `version.rs`). See the prior revision
+(`git show HEAD~1:.planning/phases/25-end-to-end-dogfood-blockers/25-REVIEW.md`, WR-01) for
+the full fix.
 
-```rust
-let tag_is_ancestor_of_first_parent = Command::new("git")
-    .args(["merge-base", "--is-ancestor", baseline_tag, &first_parent])
-    ...
-    .map(|out| out.status.success())
-    .unwrap_or(false);
-
-if !tag_is_ancestor_of_first_parent {
-    return Ok(candidate.clone());   // anchor here
-}
-```
-
-`merge-base --is-ancestor` exits 1 for "not an ancestor" and 128 for a genuine
-error (bad object, corrupt repo); a spawn failure (EAGAIN/ENOMEM under the
-concurrent-agent load this repository routinely runs) is folded into the same
-`false`. All three collapse to "anchor at this candidate." Because the walk is
-oldest-first, a spurious `false` anchors *earlier* than correct, producing an
-**over-inclusive** range.
-
-Failure scenario: one transient `git` spawn failure on the first candidate makes
-`release_range_start` return C1 instead of the sync merge. The classified range
-then re-admits pre-release `develop` history — exactly the 677-commit / 62-`feat`
-condition the anchor exists to prevent. Downstream, `compute_version` computes an
-inflated bump (e.g. `2.0.0 → 3.0.0` from an old `feat!:`), and
-`preflight_major_bump_check` opens a spurious never-silent MAJOR gate. Note the
-sibling helper `first_parent` (`version.rs:239-251`) already does this correctly,
-propagating spawn errors via `?` and treating only non-zero exit as "no parent" —
-this call site is inconsistent with it.
-
-**Fix:** Propagate the spawn error, and treat only exit code 1 as a real
-negative:
-
-```rust
-let out = Command::new("git")
-    .args(["merge-base", "--is-ancestor", baseline_tag, &first_parent])
-    .current_dir(project_root)
-    .output()
-    .map_err(|err| VersionError::Git(err.to_string()))?;
-let tag_is_ancestor_of_first_parent = match out.status.code() {
-    Some(0) => true,
-    Some(1) => false,
-    // 128 / signal / anything else is an error, not an answer — refuse
-    // rather than silently anchoring the range in the wrong place.
-    _ => {
-        return Err(VersionError::Git(format!(
-            "`git merge-base --is-ancestor {baseline_tag} {first_parent}` failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-};
-```
-
-### WR-02: `wait_for_exec_visibility`'s second guard compares against the CALLER, not the PARENT
+### WR-02 (carried forward, unresolved, out of scope for this round): `wait_for_exec_visibility`'s guard (ii) compares against the caller, not the parent
 
 **File:** `crates/devflow-core/src/test_support.rs:101,120`
 
-**Issue:** The fork-inheritance window makes `/proc/<pid>/cmdline` report the
-**parent's** argv. Guard (ii) is:
+**Issue:** `self_cmdline` is read from the *caller's* `/proc/self/cmdline`, not the target
+pid's actual parent. Every current call site happens to be the direct parent, so the guard
+holds today, but the doc comment's "unambiguous" claim does not survive a future caller
+waiting on a *grandchild* (e.g. the monitor's trailing `devflow advance` invocation, itself
+spawned by a `devflow` process, not by the test binary) — in that shape guard (i) and (ii)
+can both pass during the grandchild's own fork/exec window. Unchanged from the prior review;
+this file is otherwise unmodified by this round's diff. See the prior revision for the full
+fix (compare against `ppid` from `/proc/<pid>/stat`, or rename the function to make the
+parent-only invariant explicit).
 
-```rust
-let self_cmdline = std::fs::read(format!("/proc/{}/cmdline", std::process::id())).ok();
-...
-let differs_from_caller = self_cmdline.as_deref() != Some(raw.as_slice());
-```
+### WR-04 (carried forward, unresolved, out of scope for this round): the `TooYoung` regression test is flaky by construction
 
-which compares against the **caller's** cmdline. Every current call site happens
-to be the direct parent, so the guard holds today — but the doc comment claims
-the barrier's answer is "unambiguous" rather than "probabilistically-correct,"
-and that claim does not survive the first non-parent caller.
+**File:** `crates/devflow-cli/src/commands.rs:3861-3895` (`reap_stray_candidates_refuses_a_candidate_younger_than_the_minimum_age`)
 
-Failure scenario: a test waits on the monitor's trailing `devflow advance` child,
-spawned by a `devflow` process (`monitor.rs:126-130`). During that child's
-fork/exec window its cmdline is the parent `devflow`'s argv, so
-`expected_argv0_basename == "devflow"` satisfies guard (i); the caller is the
-test binary, so guard (ii) also passes. The barrier returns `true` *before* the
-child has exec'd — the precise condition it exists to exclude — and the census
-assertion that follows becomes vacuous again.
-
-Secondary: if `/proc/self/cmdline` is unreadable, `self_cmdline` is `None` and
-`differs_from_caller` is unconditionally `true`, silently degrading the function
-to guard (i) alone. That degradation is undocumented.
-
-**Fix:** Compare against the pid's actual parent, read from `/proc/<pid>/stat`
-field 4 (`ppid`), rather than against `std::process::id()`; or, if the
-parent-only invariant is intended, make it explicit in both the name and the doc
-(e.g. `wait_for_child_exec_visibility`) so a non-parent caller cannot be written
-by accident. Also handle the `None` case explicitly:
-
-```rust
-// A caller that cannot read its own cmdline has no guard (ii) — say so
-// rather than silently proceeding on guard (i) alone.
-let Some(self_cmdline) = std::fs::read(format!("/proc/{}/cmdline", std::process::id())).ok()
-else {
-    return false;
-};
-```
-
-### WR-03: the new staleness regression test leaks a real, detached monitor wrapper on every run
-
-**File:** `crates/devflow-cli/src/staleness.rs:689-786` (`mid_run_stage_transition_does_not_readjudicate_staleness`, spawn at `:767`)
-
-**Issue:** `launch_stage_inner` calls `monitor::spawn_monitor`, which spawns a
-detached `sh -c "...; trap cleanup TERM INT; ..."` (`monitor.rs:135-160`) with
-stdin/stdout/stderr on `/dev/null`. The test asserts `result.expect(...)` and
-then reads events — it never records the spawned pid and never kills or waits
-it. The `TempDir` guard then unlinks the project root out from under the live
-process.
-
-Failure scenario: every `cargo test --workspace` leaves behind a live Layer-1
-monitor wrapper whose project root has been deleted — which is *literally*
-999.44's reproduction shape, manufactured by this phase's own test suite. On this
-machine right now, `ps -eo args | grep -c "trap cleanup TERM INT"` reports 21,
-and `devflow doctor` reports 38 stray findings, most of them rooted at deleted
-`/tmp/.tmp*` paths. This also weakens the sibling census tests: a leaked wrapper
-is a live Layer-1 match that `discover_stray_devflow_processes` will return in
-every subsequent run.
-
-(The same omission exists in the pre-existing
-`launch_stage_persists_monitor_pid_for_reload` at `pipeline_launch.rs:395-424`
-— noted, not attributed to this phase, but it should be fixed at the same time
-since the fix is shared.)
-
-**Fix:** Reap what the test spawns, on every exit path — the same constraint
-`reap_strays_e2e.rs:219-223` already documents and follows:
-
-```rust
-result.expect("a mid-run stage transition must not re-invoke ...");
-
-// 999.46: always reap what this test spawned. `launch_stage_inner`
-// records the monitor pid on the state it was given.
-if let Some(pid) = state.monitor_pid {
-    devflow_core::agent::terminate_and_verify(
-        pid,
-        devflow_core::agent::TERMINATE_VERIFY_WAIT,
-        devflow_core::agent::TERMINATE_VERIFY_POLL,
-    );
-}
-```
-
-Better still, extract that into a shared `test_support` helper so no future test
-that drives a launch path can forget it.
-
-### WR-04: `reap_stray_candidates_refuses_a_candidate_younger_than_the_minimum_age` is flaky by construction
-
-**File:** `crates/devflow-cli/src/commands.rs:3727-3762`
-
-**Issue:** The test spawns a fixture, crosses `wait_for_exec_visibility` with a
-ceiling of `EXEC_VISIBILITY_WAIT` = **10s** (`test_support.rs:61`), and then
-asserts the fixture is younger than `STRAY_MIN_AGE` = **2s** (`agent.rs:287`).
-The barrier's own bound is five times the assertion's budget.
-
-Failure scenario: under the loaded, 2-core-pinned shape
-`scripts/check-in-container.sh all` runs — the exact load profile
-`25-CI-OBSERVATION.md` records as the environment where this defect class
-manifests — the barrier takes >2s to resolve. `process_age` then reports ≥2s,
-`reap_stray_candidates` returns `Reaped` instead of `TooYoung`, and the test both
-fails *and* SIGKILLs its fixture, so the follow-up `agent_running(pid)` assertion
-fails with a misleading message. The failure reads as "the age floor is broken"
-when the floor worked correctly.
-
-**Fix:** Make the assertion independent of wall-clock scheduling — assert the
-premise explicitly before relying on it:
-
-```rust
-let age = agent::process_age(pid).expect("fixture age must resolve");
-assert!(
-    age < agent::STRAY_MIN_AGE,
-    "fixture aged past the floor before the assertion could run ({age:?} >= {:?}) — \
-     this test's premise is time-dependent and must be re-derived, not force-passed",
-    agent::STRAY_MIN_AGE
-);
-let results = reap_stray_candidates(&[candidate], false, agent::STRAY_MIN_AGE);
-```
-
-or pass a large synthetic `min_age` (e.g. `Duration::from_secs(3600)`) so the
-refusal is deterministic regardless of how long the barrier took — which is
-exactly the parameterisation `min_age` was introduced for, per
-`reap_stray_candidates`' own doc comment.
+**Issue:** The fixture crosses `wait_for_exec_visibility` with a 10-second ceiling
+(`EXEC_VISIBILITY_WAIT`, `test_support.rs:61`) and then asserts the fixture is younger than
+`STRAY_MIN_AGE` = 2 seconds (`agent.rs:287`) — the barrier's bound is five times the
+assertion's budget. Under a loaded machine (the exact shape `25-CI-OBSERVATION.md` already
+measured for a related defect class) the barrier can legitimately take long enough that the
+fixture ages past the 2s floor before the assertion runs, at which point the test both fails
+*and* SIGKILLs its own fixture. Unchanged from the prior review; not addressed by this
+round's diff. See the prior revision for the full fix (assert the age premise explicitly
+before relying on it, or use a large synthetic `min_age`).
 
 ## Info
 
-### IN-01: `process_age` can panic where its contract promises `None`
+### IN-01 (carried forward, unresolved): `process_age` can panic where its contract promises `None`
 
 **File:** `crates/devflow-core/src/agent.rs:257-267`
 
-**Issue:** `Duration::from_secs_f64` panics on a non-finite or overflowing
-value. `"inf".parse::<f64>()` succeeds, and `f64::max` only absorbs `NaN`
-(`NAN.max(0.0) == 0.0`), not infinity — so a `/proc/uptime` whose first field
-reads `inf` yields `Duration::from_secs_f64(f64::INFINITY)` and aborts the
-process. The doc comment explicitly promises `None` when "`/proc/uptime` is
-unreadable or unparseable." Not reachable through a real Linux kernel, but the
-function's whole value is its fail-closed posture.
+**Issue:** `Duration::from_secs_f64` panics on a non-finite value; `.max(0.0)` absorbs `NaN`
+but not `+inf`, so a `/proc/uptime` whose first field parses as `inf` would abort the
+process, contradicting the doc comment's promise of `None` on any unparseable input. Not
+reachable through a real Linux kernel; unchanged from the prior review. Fix:
+`Duration::try_from_secs_f64(age_secs).ok()`, or guard with `age_secs.is_finite()`.
 
-**Fix:** `std::time::Duration::try_from_secs_f64(age_secs).ok()`, or guard with
-`age_secs.is_finite()` before constructing the `Duration`.
+### IN-02 (carried forward, unresolved): `gate_sweep`'s `TooYoung` message prints the constant, not the floor actually applied
 
-### IN-02: `gate_sweep`'s `TooYoung` message prints the constant, not the floor that was applied
+**File:** `crates/devflow-cli/src/commands.rs:1175` (call site), `crates/devflow-cli/src/commands.rs:1228-1237` (message)
 
-**File:** `crates/devflow-cli/src/commands.rs:1204-1214`
+**Issue:** The message at `:1232-1236` interpolates `agent::STRAY_MIN_AGE` directly rather
+than the `min_age` value actually passed to `reap_stray_candidates` at `:1175`. They agree
+today only because the one call site passes the constant — exactly the implicit coupling the
+`min_age` parameter exists to remove, per `reap_stray_candidates`'s own doc comment. Unchanged
+from the prior review. Fix: bind `min_age` once above the call and interpolate that binding
+in the message instead of the constant.
 
-**Issue:** The message interpolates `agent::STRAY_MIN_AGE` directly rather than
-the `min_age` value passed to `reap_stray_candidates` at `:1151`. They agree
-today only because the call site passes the constant — which is exactly the
-implicit coupling `reap_stray_candidates`' doc comment says the `min_age`
-parameter exists to remove. Any future call site with a different floor prints a
-message that contradicts the decision it is explaining.
+### IN-03 (carried forward, unresolved): `breaking_commit_subjects` uses a different breaking-change rule than the classifier it explains
 
-**Fix:** Hoist `let min_age = agent::STRAY_MIN_AGE;` above the call at `:1151`,
-pass it, and interpolate the same binding in the message.
+**File:** `crates/devflow-cli/src/preflight.rs:772-810` (subject-detection logic at `:800-804`)
 
-### IN-03: `breaking_commit_subjects` uses a different breaking-change rule than the classifier it explains
+**Issue:** This diagnostic scans `subject.split_once(':')` for `!` in the prefix plus a bare
+substring search for `"BREAKING CHANGE:"`/`"BREAKING-CHANGE:"` anywhere in the message, while
+`version::classify_commit_message` delegates to `git_conventional::Commit::parse().breaking()`
+(footer-aware). The two can disagree in both directions — a body that merely mentions
+`BREAKING CHANGE:` mid-paragraph is listed as a "deciding commit" without being one, and a
+footer form `git_conventional` accepts but this substring check misses yields "classified
+bump is MAJOR" with an empty deciding-commit list in the gate message. Unchanged from the
+prior review. Fix: reuse `git_conventional::Commit::parse(message).map(|c| c.breaking())
+.unwrap_or(false)` instead of re-deriving the rule.
 
-**File:** `crates/devflow-cli/src/preflight.rs:404-408`
-
-**Issue:** The diagnostic scans `subject.split_once(':')` for a `!` in the
-prefix and `message.contains("BREAKING CHANGE:")` anywhere in the body, while
-`version::classify_commit_message` (`version.rs:429-453`) delegates to
-`git_conventional::Commit::parse().breaking()`, which is footer-aware. The two
-can disagree in both directions: a body that merely mentions `BREAKING CHANGE:`
-mid-paragraph is listed as a "deciding commit" without being one, and a footer
-form `git_conventional` accepts but this substring check misses yields
-"classified bump is MAJOR" with an empty deciding-commit list. The doc comment
-claims it re-scans "the same range ... so a human ... can see which commit(s)
-carry a breaking marker."
-
-**Fix:** Reuse the classifier rather than re-deriving it —
-`git_conventional::Commit::parse(message).map(|c| c.breaking()).unwrap_or(false)`
-— so the diagnostic can never contradict the decision.
-
-### IN-04: `test-support` feature doc no longer describes what the feature exposes
+### IN-04 (carried forward, unresolved): `test-support` feature comment is stale
 
 **File:** `crates/devflow-core/Cargo.toml:13-16`
 
-**Issue:** The comment reads "Exposes `test_support` (hermetic git command
-construction, 999.37)". As of 25-11 the same gate also exposes
-`wait_for_exec_visibility`, `EXEC_VISIBILITY_WAIT` and `EXEC_VISIBILITY_POLL`,
-which `crates/devflow-cli/tests/reap_strays_e2e.rs:106-111` depends on
-cross-crate. A reader deciding whether the feature is still needed gets an
-incomplete answer.
-
-**Fix:** Extend the comment to name both hazards the module now covers (999.37
-hermetic git, 999.47 exec-visibility barrier), matching the module doc at
-`test_support.rs:1-31`.
+**Issue:** The comment still describes the feature as exposing only "hermetic git command
+construction, 999.37." Since 25-11 the same gate also exposes `wait_for_exec_visibility`,
+`EXEC_VISIBILITY_WAIT`, and `EXEC_VISIBILITY_POLL` (used cross-crate by
+`crates/devflow-cli/tests/reap_strays_e2e.rs:106-111`). Unchanged from the prior review. Fix:
+extend the comment to name both hazards, matching `devflow-core/src/test_support.rs:1-31`'s
+own module doc.
 
 ---
 
-_Reviewed: 2026-07-28T16:06:43Z_
+_Reviewed: 2026-07-28T00:00:00Z_
 _Reviewer: Claude (gsd-code-reviewer)_
 _Depth: standard_
