@@ -1,39 +1,63 @@
-# Deferred Items — Phase 25 (out of scope for the discovering plan)
+# Deferred Items — Phase 25
 
-Items discovered during plan execution that are pre-existing, unrelated to the
-discovering plan's own diff, and therefore NOT auto-fixed per the executor's
-scope-boundary rule ("only auto-fix issues directly caused by the current
-task's changes").
+Items discovered during plan execution and deliberately not fixed by the
+discovering plan. Each entry records what was resolved at wave close and what
+genuinely remains open.
 
-## `doc_check::doc_referenced_identifiers_exist_in_source` fails on `--stat`
+## RESOLVED — `doc_check::doc_referenced_identifiers_exist_in_source` failed on `--stat`
+
+**Status: fixed by the orchestrator at Wave 3 post-merge.** Retained here because
+the original entry recorded an incorrect attribution that would mislead a later
+phase.
 
 - **Discovered by:** Plan 25-07, running `cargo test --workspace --no-fail-fast`
-  as part of this plan's own `<verification>` step.
-- **Confirmed pre-existing and unrelated to 25-07's diff:** `git diff --stat
-  d2b6865 HEAD -- README.md ARCHITECTURE.md CONTRIBUTING.md docs/guides/
-  doc-check-allowlist.toml crates/devflow-core/src/doc_check.rs` is empty —
-  none of plan 25-07's three task commits touch any of these files.
-  `d2b6865` is the wave's shared base commit, so this failure predates every
-  Wave 3 plan (25-06, 25-07) and was already present when the wave started.
-- **Failure:** `documented CLI flag \`--stat\` does not exist in Rust source`,
-  panicking at `crates/devflow-core/src/doc_check.rs:376`.
-- **Root cause:** `doc_check::documented_flags` extracts ANY bare
-  `--lowercase-with-dashes` token from the scoped docs (README.md,
-  ARCHITECTURE.md, CONTRIBUTING.md, `docs/guides/*.md`) with no context
-  filtering for what command it belongs to, then asserts every such token
-  exists somewhere in Rust source as a devflow CLI flag. `README.md:43`
-  contains an example `git diff --stat origin/main..HEAD` line — `--stat` is
-  `git`'s own flag, not a devflow flag, but the extractor cannot tell the
-  difference and treats it as a claimed devflow flag anyway.
-- **Fix direction (not applied here):** either add `--stat` to
-  `doc-check-allowlist.toml`'s `docs_to_source` exceptions (mirroring the
-  existing allowlist mechanism `doc_check.rs` already reads via
-  `load_allowlist`), or make `documented_flags` context-aware enough to skip
-  tokens inside a `git ...` example line. Scoped to whichever future plan
-  owns `doc_check.rs`/the scoped docs — not in any Wave 3 plan's
-  `files_modified`.
-- **Impact on 25-07:** none. This plan's own success criteria, `<verify>`
-  blocks, and acceptance criteria are all scoped to `commands.rs`/`main.rs`/
-  `tests/reap_strays_e2e.rs`, none of which this failure touches. Recorded
-  here per the scope-boundary rule rather than fixed, since fixing it would
-  mean editing files entirely outside this plan's declared scope.
+  as part of its own `<verification>` step.
+- **Original claim (INCORRECT):** "pre-existing … predates every Wave 3 plan
+  (25-06, 25-07) and was already present when the wave started."
+- **Correction:** the test **passed at `d2b6865`**, the Wave 3 shared base —
+  verified from the orchestrator's Wave 2 post-merge gate log, in which all
+  `doc_check` tests are green and the sole workspace failure is `pipeline_gate`'s.
+  The regression was introduced during Wave 3, not inherited.
+- **Why the original analysis missed it:** 25-07 diffed its commits against
+  `README.md`, `ARCHITECTURE.md`, `CONTRIBUTING.md`, `docs/guides/`,
+  `doc-check-allowlist.toml` and `doc_check.rs`, found the diff empty, and
+  concluded it was not responsible. The coupling ran through a file it *did*
+  edit and did not include in that check:
+  `crates/devflow-cli/src/commands.rs`.
+- **Actual mechanism:** `doc_check` scrapes `--stat` from `README.md:43`'s
+  `git diff --stat origin/main..HEAD` example and asserts it exists in Rust
+  source. The only thing satisfying that assertion was an incidental substring
+  in a *code comment* at `commands.rs:3303`
+  (`// /proc/<pid>/stat: field 3 = state, 14 = utime, 15 = stime, 22 = starttime.`),
+  which matched the extractor's `source.contains("stat:")` fallback. 25-07
+  legitimately rewrote that region as part of its `looks_like_devflow_process`
+  migration at :3308, the comment changed, and the coincidental match vanished.
+- **Fix applied:** added `--stat` to `doc-check-allowlist.toml`'s
+  `docs_to_source` exceptions, with a reason, matching the established pattern
+  for `--no-ff`, `--no-deps`, `--path`, `--release` and `--workspace-folder` —
+  all third-party flags appearing in documentation examples.
+- **Credit where due:** 25-07's root-cause analysis of the extractor was correct
+  and identified the applied fix. Only the attribution was wrong.
+
+## OPEN — `doc_check::documented_flags` has no command context
+
+The underlying brittleness is real and outlived the fix above. `documented_flags`
+extracts any bare `--lowercase-with-dashes` token from the scoped docs with no
+awareness of which command it belongs to, then asserts it is a DevFlow CLI flag.
+Consequences:
+
+1. Every third-party flag appearing in a documentation example must be
+   allowlisted by hand; the allowlist is now six entries of pure false positive.
+2. More seriously, the assertion can be satisfied by **arbitrary unrelated
+   substrings anywhere in Rust source, including comments**. A documented flag
+   can therefore read as "verified" with no corresponding CLI surface at all,
+   and an unrelated comment edit can flip the result — as it just did. That is a
+   false-evidence shape of the same class D-18 exists to prevent: the check
+   reports agreement between docs and code where none was established.
+
+**Fix direction:** make `documented_flags` context-aware (skip tokens inside a
+fenced example whose leading command is not `devflow`), and tighten the source
+side from a bare `contains` to a match against the actual clap flag surface.
+
+**Not filed to the backlog** — no owning plan in Phase 25. Worth a backlog entry
+before this check is relied on as release evidence.

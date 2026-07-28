@@ -32,5 +32,10 @@ reason = "cargo build option in installation docs; not a DevFlow CLI flag."
 
 [[exceptions]]
 kind = "docs_to_source"
+token = "--stat"
+reason = "git diff option in the README pre-push example; not a DevFlow CLI flag."
+
+[[exceptions]]
+kind = "docs_to_source"
 token = "--workspace-folder"
 reason = "Dev Containers CLI option in contributor setup; not a DevFlow CLI flag."
