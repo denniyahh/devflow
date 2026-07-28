@@ -1,9 +1,9 @@
 ---
-status: complete
+status: testing
 phase: 25-end-to-end-dogfood-blockers
 source: [25-VERIFICATION.md]
 started: 2026-07-28T18:35:00Z
-updated: 2026-07-28T18:52:00Z
+updated: 2026-07-28T20:05:00Z
 ---
 
 > **Diagnosis note.** The `diagnose_issues` step's parallel debug agents were not spawned. Both
@@ -15,11 +15,12 @@ updated: 2026-07-28T18:52:00Z
 
 ## Current Test
 
-number: 2
-name: WR-06 — the two "fixed" reap call sites are not unwind-safe
+number: 3
+name: Sixth monitor-leak site on the resume() path (WINDOWS item 5)
 expected: |
-  Either the reap survives a future assertion panic, or the residual is explicitly accepted.
-awaiting: none — session complete
+  Either resume_clears_stop_marker_and_advances_past_stop_point binds the guard like the
+  other five sites, or the residual is explicitly waived with a reason.
+awaiting: user response
 
 ## Tests
 
@@ -35,20 +36,27 @@ result: issue
 reported: "might as well spend another gap-closure round to clean up the tests"
 severity: major
 
+### 3. Sixth monitor-leak site on the resume() path (WINDOWS item 5)
+expected: Either `pipeline_launch.rs::tests::resume_clears_stop_marker_and_advances_past_stop_point` binds `ReapMonitorOnDrop::after_launch(&state)` like the other five sites, or the residual is explicitly waived with a stated reason. Found by gsd-verifier after round 4 (observed pid 852403 under --nocapture) and independently confirmed by the orchestrator: `resume()` reaches `launch_stage` at `pipeline_launch.rs:230`. It is a FOURTH wrapping entry point that neither round's enumeration grep could see. Orchestrator's transitive sweep confirms the enumeration is now COMPLETE — this is the only remaining unguarded site.
+result: [pending]
+
 ## Summary
 
-total: 2
+total: 3
 passed: 0
 issues: 2
-pending: 0
+pending: 1
 skipped: 0
 blocked: 0
 
 ## Gaps
 
 - gap_id: G-25-1
+  status_note: RESOLVED by 25-18-PLAN.md (SUMMARY present); reconciled 2026-07-28
+  resolved_by: 25-18-PLAN.md
+  resolved_at: 2026-07-28
   truth: "Every test that drives a real `launch_stage_inner` reaps the monitor wrapper that launch spawned — including the two `preflight.rs` tests that reach `monitor::spawn_monitor` via `run_preflight`'s internal `Advance`/`LoopBack` recursion."
-  status: failed
+  status: resolved
   reason: "User reported: might as well spend another gap-closure round to clean up the tests. WR-05 — `run_preflight_advance_gate_launches_agent_exactly_once` (preflight.rs:1543) and `run_preflight_loopback_gate_launches_agent_exactly_once` (preflight.rs:1604) both reach a real `monitor::spawn_monitor` (via preflight.rs:941 Advance arm and :946 LoopBack arm) and neither calls `reap_spawned_monitor`. Independently confirmed by gsd-code-reviewer and gsd-verifier. Tracked as WINDOWS.md item 1."
   severity: major
   test: 1
@@ -67,8 +75,11 @@ blocked: 0
     same `stub_agent_binary("claude")` + `prepend_path` construction as the sites 25-16 did fix.
 
 - gap_id: G-25-2
+  status_note: RESOLVED by 25-17-PLAN.md (SUMMARY present); reconciled 2026-07-28
+  resolved_by: 25-17-PLAN.md
+  resolved_at: 2026-07-28
   truth: "At every site that reaps a spawned monitor, the reap runs on EVERY exit path including paths on which a later assertion panics — 25-16's own stated must-have."
-  status: failed
+  status: resolved
   reason: "User reported: might as well spend another gap-closure round to clean up the tests. WR-06 — at both sites 25-16 fixed (`pipeline_launch.rs::launch_stage_persists_monitor_pid_for_reload` reap at :440 behind 4 panicking checkpoints at :423/:425/:429/:430; `staleness.rs::mid_run_stage_transition_does_not_readjudicate_staleness` reap at :802 behind panicking checkpoints at :777/:792) the reap is a plain trailing statement, so a panic unwinds past it and drops the TempDir anyway. Fails precisely when a real regression fires. Independently confirmed by gsd-code-reviewer and gsd-verifier. Fix sketch (RAII Drop guard) in 25-REVIEW.md WR-06. Tracked as WINDOWS.md item 3."
   severity: major
   test: 2
