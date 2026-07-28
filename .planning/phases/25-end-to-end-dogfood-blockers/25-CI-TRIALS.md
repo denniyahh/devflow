@@ -95,8 +95,9 @@ executor directly, and is the one that gated the actual push.
 | 2 | 30371091367 | 2 | 82328b31eb5cbb8d795bc86f048b2602904dc8f4 | success | success | https://github.com/denniyahh/devflow/actions/runs/30371091367 |
 | 3 | 30371091367 | 3 | 82328b31eb5cbb8d795bc86f048b2602904dc8f4 | success | success | https://github.com/denniyahh/devflow/actions/runs/30371091367 |
 | 4 | 30371091367 | 4 | 82328b31eb5cbb8d795bc86f048b2602904dc8f4 | success | success | https://github.com/denniyahh/devflow/actions/runs/30371091367 |
+| 5 | 30371091367 | 5 | 82328b31eb5cbb8d795bc86f048b2602904dc8f4 | success | success | https://github.com/denniyahh/devflow/actions/runs/30371091367 |
 
-Trial 5: pending.
+All 5 CI trials complete.
 
 ## Discarded runs
 
