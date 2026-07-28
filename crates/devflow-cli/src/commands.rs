@@ -3675,6 +3675,19 @@ mod tests {
         let pid = child.id();
         let dir = tempfile::tempdir().unwrap();
 
+        // 999.47: `spawn()` returns after `fork()`, before `execve()` — cross
+        // the exec-visibility barrier before reading the cmdline-derived
+        // census, or this assertion races the child's own exec (25-11).
+        assert!(
+            devflow_core::test_support::wait_for_exec_visibility(
+                pid,
+                "sh",
+                devflow_core::test_support::EXEC_VISIBILITY_WAIT,
+                devflow_core::test_support::EXEC_VISIBILITY_POLL,
+            ),
+            "pid {pid}: exec visibility timed out before the fixture became discoverable"
+        );
+
         assert!(
             agent::discover_stray_devflow_processes()
                 .iter()
@@ -4799,6 +4812,19 @@ mod tests {
             let pid = child.id();
 
             let dir = tempfile::tempdir().unwrap();
+
+            // 999.47: cross the exec-visibility barrier before either census
+            // read below, or both races the fixture's own fork()->execve()
+            // window (25-11).
+            assert!(
+                devflow_core::test_support::wait_for_exec_visibility(
+                    pid,
+                    "sh",
+                    devflow_core::test_support::EXEC_VISIBILITY_WAIT,
+                    devflow_core::test_support::EXEC_VISIBILITY_POLL,
+                ),
+                "pid {pid}: exec visibility timed out before the fixture became discoverable"
+            );
 
             let first = collect_stray_process_findings();
             assert!(

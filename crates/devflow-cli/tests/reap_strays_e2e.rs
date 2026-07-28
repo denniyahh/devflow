@@ -86,13 +86,33 @@ fn nested_root_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
 /// reproduction shape. `sleep 30` is generous relative to this test's own
 /// bounded waits; teardown always kills it explicitly rather than waiting
 /// it out.
+///
+/// The returned child is exec-visible (999.47/25-11): this helper crosses
+/// `wait_for_exec_visibility` before returning, so both callers inherit the
+/// barrier without a per-caller change — the fixture is guaranteed to have
+/// completed its own `execve()` by the time this function returns, closing
+/// the fork/exec window before either caller reads a `/proc`-cmdline census
+/// about it.
 fn spawn_monitor_wrapper_fixture(cwd: &Path) -> std::process::Child {
-    std::process::Command::new("sh")
+    let child = std::process::Command::new("sh")
         .arg("-c")
         .arg("trap cleanup TERM INT; sleep 30")
         .current_dir(cwd)
         .spawn()
-        .expect("spawn monitor-wrapper-shaped fixture")
+        .expect("spawn monitor-wrapper-shaped fixture");
+    let pid = child.id();
+
+    assert!(
+        devflow_core::test_support::wait_for_exec_visibility(
+            pid,
+            "sh",
+            devflow_core::test_support::EXEC_VISIBILITY_WAIT,
+            devflow_core::test_support::EXEC_VISIBILITY_POLL,
+        ),
+        "pid {pid}: exec visibility timed out before the fixture became discoverable"
+    );
+
+    child
 }
 
 /// Task 2's core proof: a real process, structurally shaped like the
