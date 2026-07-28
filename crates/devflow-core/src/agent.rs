@@ -380,10 +380,25 @@ const ADVANCE_SUBCOMMAND: &str = "advance";
 ///    filter that case out: a census that guessed at exec status would
 ///    also drop genuine strays, and it has no reliable way to distinguish
 ///    the two (see [`process_age`]'s own doc comment for why). It is the
-///    **caller's** obligation not to act on an unqualified census result.
+///    **caller's** obligation not to act on an unqualified census result —
+///    and that obligation has TWO parts, bounding two DIFFERENT hazards,
+///    neither of which discharges the other (CR-01, 999.44/DEN-68):
+///
+///    - **The age floor** ([`process_age`]/[`STRAY_MIN_AGE`]) bounds the
+///      fork/exec cmdline-inheritance window above — "is this argv match
+///      even real yet."
+///    - **Registry-reachability** (`commands::unreachable_stray_candidates`,
+///      `devflow-cli::commands`) bounds a different question — "is this
+///      process alive AND OWNED by a live registry entry, lock file, or
+///      state file" — which the age floor says nothing about: a monitor
+///      wrapper minutes old sails straight past it while still being a
+///      live, registered process, not a stray.
+///
 ///    `reap_stray_candidates` (`devflow-cli::commands`) is the one caller
-///    with a destructive consequence, and it discharges that obligation
-///    with [`process_age`] and [`STRAY_MIN_AGE`] — never with this
+///    with a destructive consequence, and it discharges the first with
+///    [`process_age`] and [`STRAY_MIN_AGE`]; `unreachable_stray_candidates`
+///    (`devflow-cli::commands`), interposed before either `doctor` or
+///    `reap_stray_candidates` acts, discharges the second — never this
 ///    function.
 ///
 /// Every read failure is tolerated silently (a pid that vanishes between
