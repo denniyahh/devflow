@@ -486,6 +486,21 @@ mod tests {
                 None => std::env::remove_var("PATH"),
             }
         }
+
+        // `resume()` loads its own `State` from the state file and never writes the
+        // spawned pid back into this test's local `state`, so binding the guard from
+        // that local binding would capture `None` and silently reap nothing. Read the
+        // pid back from disk. `ReapMonitorOnDrop` captures `Option<u32>` by value, so
+        // the guard does not borrow the temporary it is built from.
+        //
+        // Bound here, ahead of `result.unwrap()` below: a `resume()` that spawned the
+        // monitor and then failed a later `?` leaves `result` as `Err` with the pid
+        // nonetheless live.
+        let reloaded_for_reap = workflow::load_state(root, phase).ok();
+        let _reap_guard = reloaded_for_reap
+            .as_ref()
+            .map(ReapMonitorOnDrop::after_launch);
+
         result.unwrap();
 
         let reloaded = workflow::load_state(root, phase).unwrap();
@@ -501,6 +516,12 @@ mod tests {
             reloaded.stop_until, None,
             "resume must clear stop_until so the phase does not immediately re-stop \
              the next time it advances past Plan"
+        );
+        assert!(
+            reloaded.monitor_pid.is_some(),
+            "resume() must have spawned a monitor whose pid is recorded in state — if this \
+             fails, the reap guard above is silently reaping nothing and this test has \
+             stopped covering the launch path it was written to cover"
         );
     }
 
