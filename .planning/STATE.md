@@ -6,15 +6,15 @@ current_phase: 25
 current_phase_name: end-to-end-dogfood-blockers
 status: executing
 stopped_at: Completed 25-13-PLAN.md (human sign-off recorded, both parts approved)
-last_updated: "2026-07-28T17:25:43.730Z"
+last_updated: "2026-07-28T20:25:52.786Z"
 last_activity: 2026-07-28
-last_activity_desc: Phase 25 execution started
 progress:
   total_phases: 14
   completed_phases: 13
   total_plans: 109
   completed_plans: 106
   percent: 93
+last_activity_desc: Phase 25 execution started
 ---
 
 # DevFlow — Project State
@@ -151,7 +151,7 @@ Scope boundary: 23-16 is the **fix only** (change + regression tests + PR into `
 
 **Recovery-ref disposition:** both `origin` refs (`recovery/pre-23-11-acceptance-e0f87c2`, `recovery/pre-23-15-acceptance-0dad20d`) remain untouched on `origin`; the local copy of the pre-23-11 ref, deleted again by `devflow cleanup`, is deliberately NOT restored (per `23-FINDINGS.md` §B2a); the pre-23-15 ref is now unused (no merge to undo) but retained on `origin` for reuse by the 23-16 retry rather than deleted.
 
-Last activity: 2026-07-28 — Phase 25 execution started
+Last activity: 2026-07-28
 
 **Note on the "Plan: 2 of 15" value this replaces:** `gsd-tools state advance-plan` only increments whatever value is already in this field, which had drifted to "2 of 15" (the parallel-worktree waves 23-01…23-09 deliberately never touch STATE.md, and this field was last corrected against reality at "10 of 11 plans complete" before the plan count grew to 15 with the gap-closure plans 23-12…23-15). Corrected directly to "13 of 15" to match reality (23-12 and 23-13 both now executed) rather than trust the tool's naive +1 increment from a stale base.
 
