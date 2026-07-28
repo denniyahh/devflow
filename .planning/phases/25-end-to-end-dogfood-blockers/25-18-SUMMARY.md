@@ -178,6 +178,17 @@ None - no external service configuration required.
 ## Next Phase Readiness
 G-25-1 is closed: both originally-scoped preflight tests reap their spawned monitors on every exit path, and a third, previously-unnamed leak surfaced by this plan's own re-derived enumeration is also closed. `.planning/WINDOWS.md` is at `open_count: 0` (waived: 1, fixed: 3, total: 4), so `/gsd-ship`'s ledger gate no longer blocks on any open defect from this round. The residual noted in the plan (already-accumulated orphaned wrappers on developer machines from prior runs) remains explicitly out of scope — that cleanup is `devflow gate sweep --reap-strays`, run by a human, not by this plan.
 
+## Self-Check: PASSED
+
+- FOUND: `crates/devflow-cli/src/preflight.rs`
+- FOUND: `.planning/WINDOWS.md`
+- FOUND: `.planning/phases/25-end-to-end-dogfood-blockers/25-18-SUMMARY.md`
+- FOUND commit: `ef1d123`
+- FOUND commit: `3bd6d66`
+- FOUND commit: `37442a5`
+- FOUND commit: `b39b000`
+- FOUND commit: `9348da2`
+
 ---
 *Phase: 25-end-to-end-dogfood-blockers*
 *Completed: 2026-07-28*
