@@ -1205,6 +1205,7 @@ this much design attention before planning starts.
 `phases/26-release-cut-automation/999.25-BACKLOG-DOSSIER.md` for the original backlog
 context (possible shapes, publish-ordering constraint, prior deferral
 reasoning from Phase 20 D-03).
+**UI hint**: no
 **Depends on:** Phase 25
 **Plans:** 0 plans
 
