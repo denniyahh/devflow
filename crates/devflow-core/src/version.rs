@@ -484,6 +484,43 @@ impl ChangelogHeading {
     }
 }
 
+/// Maximum length, in characters, of a sanitized changelog bullet
+/// ([`sanitize_changelog_subject`]).
+pub const CHANGELOG_SUBJECT_MAX_CHARS: usize = 200;
+
+/// Neutralize and bound a commit-derived changelog bullet before it reaches
+/// `CHANGELOG.md` or a `tracing` line (D-12, ASVS V7, T-26-05). Commit
+/// subjects are contributor-authored text — the same attacker-influenced
+/// class `T-17-13`/`T-25-52` already redact — so every
+/// [`char::is_control`] character is mapped to a single space, then, if the
+/// result exceeds [`CHANGELOG_SUBJECT_MAX_CHARS`] characters, it is
+/// truncated so the returned string is exactly `CHANGELOG_SUBJECT_MAX_CHARS`
+/// characters including the trailing `… [truncated]` marker. Mirrors
+/// `render_gate_context`'s properties (`pipeline_outcomes.rs:323`) — a
+/// sibling, not a shared function, since that one is `pub(crate)` inside
+/// `devflow-cli` and not importable from `devflow-core`.
+pub fn sanitize_changelog_subject(subject: &str) -> String {
+    const MARKER: &str = "… [truncated]";
+    let sanitized: String = subject
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    if sanitized.chars().count() <= CHANGELOG_SUBJECT_MAX_CHARS {
+        return sanitized;
+    }
+    let marker_len = MARKER.chars().count().min(CHANGELOG_SUBJECT_MAX_CHARS);
+    let head_len = CHANGELOG_SUBJECT_MAX_CHARS.saturating_sub(marker_len);
+    let head: String = sanitized.chars().take(head_len).collect();
+    let marker: String = MARKER.chars().take(marker_len).collect();
+    format!("{head}{marker}")
+}
+
 /// Group `--no-merges` commits in `range_start..HEAD` by [`ChangelogHeading`]
 /// (D-12). Walks the identical range and `git log --no-merges <range>
 /// --format=%H%x1f%B%x1e` argv as [`classify_range_bump`] (same record
@@ -549,10 +586,10 @@ pub fn changelog_sections(
         let message = message.trim();
         let Ok(commit) = git_conventional::Commit::parse(message) else {
             let first_line = message.lines().next().unwrap_or(message);
-            changed.push(first_line.to_string());
+            changed.push(sanitize_changelog_subject(first_line));
             continue;
         };
-        let subject = commit.description().to_string();
+        let subject = sanitize_changelog_subject(commit.description());
         if commit.breaking() {
             breaking.push(subject);
         } else if commit.type_() == git_conventional::Type::FEAT {
@@ -2327,5 +2364,52 @@ mod tests {
         let sections = changelog_sections(root, "v1.0.0").unwrap();
         assert_eq!(sections, Vec::new());
         assert_eq!(render_changelog_body(&sections), "");
+    }
+
+    /// D-12/ASVS V7 (Task 3), mirrors `render_gate_context`'s properties
+    /// (`pipeline_outcomes.rs:323`): every `char::is_control()` character is
+    /// neutralized, an over-length subject is capped at exactly
+    /// `CHANGELOG_SUBJECT_MAX_CHARS` including the truncation marker, and a
+    /// short ordinary subject passes through unchanged.
+    #[test]
+    fn sanitize_changelog_subject_neutralizes_controls_and_caps_length() {
+        let controls = "line 1\u{1b}[2J\tline 2\u{7}";
+        let sanitized = sanitize_changelog_subject(controls);
+        assert!(
+            sanitized.chars().all(|c| !c.is_control()),
+            "expected no control characters, got: {sanitized:?}"
+        );
+
+        let long = "x".repeat(5000);
+        let capped = sanitize_changelog_subject(&long);
+        assert!(capped.chars().count() <= CHANGELOG_SUBJECT_MAX_CHARS);
+        assert!(capped.ends_with("… [truncated]"));
+
+        let short = "add the widget endpoint";
+        assert_eq!(sanitize_changelog_subject(short), short);
+    }
+
+    /// D-12/ASVS V7 (Task 3): asserts on `changelog_sections`' output (the
+    /// public boundary), not on `sanitize_changelog_subject` alone — proving
+    /// the call site exists, not merely the helper.
+    #[test]
+    fn changelog_sections_sanitizes_subjects_before_grouping() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        commit_msg(root, "a.txt", "chore: init");
+        tag(root, "v1.0.0");
+        commit_msg(root, "b.txt", "feat: add \u{1b}[31mcolored\u{1b}[0m widget");
+
+        let sections = changelog_sections(root, "v1.0.0").unwrap();
+        assert_eq!(sections.len(), 1);
+        let (heading, bullets) = &sections[0];
+        assert_eq!(*heading, ChangelogHeading::Added);
+        assert_eq!(bullets.len(), 1);
+        assert!(
+            bullets[0].chars().all(|c| !c.is_control()),
+            "expected no control characters in the grouped bullet, got: {:?}",
+            bullets[0]
+        );
     }
 }
