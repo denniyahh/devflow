@@ -1005,6 +1005,32 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
+### Phase 999.57: An Operator's Checkpoint Answer Can Never Reach the Agent (BACKLOG)
+
+**Goal:** A `gate="blocking-human"` checkpoint is currently a **dead end for any DevFlow-driven run**. The agent stops and asks a question; there is no path by which the operator's answer reaches the agent; every retry spawns a fresh process that asks the identical question again, forever. This is the single largest gap between DevFlow's stated goal (unattended `--yes-ship` / `--yes-release` runs) and what it can actually finish, because a plan that *correctly* gates an irreversible decision becomes a plan that can never complete unattended.
+
+**Evidence — reproduced live during Phase 26's dogfood run, 2026-07-29.** Plan `26-01` consists of exactly two `checkpoint:decision` tasks with `gate="blocking-human"` (authorizing direct pushes to `origin/develop`, and unattended `cargo publish`). The agent stopped correctly. The operator's answers were supplied via `devflow gate approve 26 --stage code --note "<both decisions>"` — the only mechanism the CLI exposes for attaching operator input to a gate. **Two consecutive retries reproduced the identical checkpoint verbatim**, asking Task 1 again from scratch. The run only advanced after a human hand-authored the plan's `26-01-SUMMARY.md` (recording both decisions) and committed it — the "close out manually" fallback `execute-phase.md` documents for a *different* failure shape, applied here because nothing else worked.
+
+**Root cause, verified in source at `76e49f1`:**
+
+1. **The note is written, then never read.** `Gates::respond` persists `note` into `.devflow/gates/{phase}-{stage}.response.json`, but `gates.rs:73-75` only ever inspects it for the substring `"abort"` (`GateAction::Abort`). Every other note is stored and dropped on the floor.
+2. **The relaunch prompt has no input channel for it.** `prompt::stage_prompt` / `stage_prompt_for_project` / `stage_prompt_with_project` (`crates/devflow-core/src/prompt.rs:169`, `:178`, `:182`) derive the entire prompt from `(stage, phase, project_root)`. There is no parameter through which a prior gate's answer could be threaded, so the relaunched `claude -p` starts with zero knowledge that a question was ever asked.
+3. **The protocol assumes a live turn that DevFlow structurally cannot provide.** `gsd-core/references/checkpoints.md`'s `checkpoint:decision` contract ends in `<resume-signal>Select: option-a, or option-b</resume-signal>` — designed for a human typing inline into a live session. DevFlow launches every stage as one-shot `claude -p … --output-format json --dangerously-skip-permissions`, which exits after writing `DEVFLOW_RESULT`. There is no turn to reply into.
+
+**Agreed fix — three parts, operator-decided 2026-07-29:**
+
+- **(A) Resume the real session for Claude — the primary fix.** Every `claude -p --output-format json` result already carries a `session_id` (observed live: `b54a534e-…`), and Claude Code supports `claude -p --resume <session_id> "<answer>"`. On approving a *checkpoint* gate (a class that must be distinguished from a generic transient-error gate), relaunch as a `--resume` of the exact exited session with the operator's answer as the next message, instead of spawning a fresh stage run. This is the only option that gives the checkpoint protocol the live back-and-forth it was written for, and it is dramatically cheaper — no CONTEXT/RESEARCH re-read, no re-running completed tasks, no fresh exposure to the retry hazards this run hit twice.
+- **(B) Keep a structured answer file as the portable fallback — build only if needed.** A `{phase_dir}/{plan}-CHECKPOINT-ANSWERS.json` of `{task_id, selected_option}` pairs that the executor consults *before* re-presenting a checkpoint. Agent-agnostic (no session-resume primitive required), and it is the generalized form of the manual-SUMMARY workaround used to unblock Phase 26. **Deliberately not built up front:** DevFlow also drives Codex and OpenCode, both of which are expected to have equivalent resume primitives; this exists so the design does not *depend* on that assumption. Part of the wiring lives in the GSD skill layer (`execute-phase.md` / `gsd-executor`), outside this repository.
+- **(C) Make checkpoint gates legible — do regardless of A/B.** `truncate_reason` (`crates/devflow-cli/src/pipeline_outcomes.rs:318-342`) caps the gate context, so the operator sees `"…must select direct-push or pr-based-develop… [truncated; full output in .devflow/]"` and has to go read `.devflow/phase-NN-stdout` by hand to find out what the options even are. A checkpoint gate is semantically different from an error gate and should render as an actual menu (numbered options, verbatim, untruncated) in `devflow status` / `devflow gate show`. This is pure discoverability and is independent of how the answer is transmitted.
+
+**Do not fix this by auto-approving.** `checkpoints.md` is explicit that `gate="blocking-human"` is never bypassed in any mode, and Phase 26's own run proved why: the executor found and fixed a plan that had mistakenly tagged these two irreversible authorizations `gate="blocking"` (auto-bypassable, auto-selects the *first* option) — that bug would have silently authorized `cargo publish` with no human input. The gate is correct; only the return path is missing.
+
+**Priority:** High — it is the one defect that makes a *correctly written* plan unable to finish unattended, and the workaround requires an operator who knows an undocumented manual-SUMMARY trick. | **Size:** M — (A) is bounded but touches launch/prompt/gate plumbing and needs a new gate classification; (C) is S; (B) is M and may not be needed. Source: Phase 26 dogfood run (2026-07-29), full write-up in `phases/26-release-cut-automation/26-01-SUMMARY.md` § "Issues Encountered". Linear: DEN-82.
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
 ### Phase 21: Operator Legibility & Observability
 
 **Shipped as v1.8.0** (2026-07-24) — PR #23 (`develop → main`, squash `cfa9167`), signed tag `v1.8.0`, [GitHub Release](https://github.com/denniyahh/devflow/releases/tag/v1.8.0). `sync-main-to-develop.sh` run via PR #24 (merge `01ad9e4`). Published to crates.io (`devflow-core` then `devflow`, both confirmed live at 1.8.0).
