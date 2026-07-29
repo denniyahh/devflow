@@ -528,6 +528,149 @@ pub fn origin_main_ancestor_status(project_root: &Path) -> AncestorStatus {
     }
 }
 
+/// Result of [`release_tag_state`] — whether a tag name already represents
+/// a real, pushed, verified release, or something short of that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReleaseTagState {
+    /// No ref with that name exists at all.
+    Absent,
+    /// A tag with that name exists but is lightweight (not annotated) — an
+    /// object of type `commit`, not `tag`. Never `Released`, regardless of
+    /// what commit it happens to point at. This is the load-bearing case:
+    /// see [`release_tag_state`]'s doc comment.
+    StrayLightweight,
+    /// A tag exists and is annotated, but did not clear a later check:
+    /// `git tag -v` failed to verify its signature, or (once verified and
+    /// matched to the released commit) the tag has not been pushed to
+    /// `origin` yet. `reason` is a bounded, control-character-neutralized
+    /// description (never raw, unbounded git stderr — T-26-08).
+    PresentUnverified {
+        /// Human-readable reason the tag is not (yet) treated as released.
+        reason: String,
+    },
+    /// An annotated, verifying tag exists but does not contain the commit
+    /// being released — it tags a different point in history.
+    Mismatched {
+        /// The commit the existing tag actually points at.
+        tagged_commit: String,
+    },
+    /// An annotated, verifying tag exists, is reachable from the released
+    /// commit, and is present on `origin`. This IS the already-cut release.
+    Released,
+}
+
+/// Whether `tag` already represents a real, pushed, verified release of
+/// `released_commit` (D-06, RESEARCH.md § "Common Pitfalls" Pitfall 2).
+/// Never panics; every subprocess failure degrades to a non-`Released`
+/// variant.
+///
+/// Bare existence of a ref with the right name is NOT sufficient to call a
+/// tag "already released." `hooks_after_ship`'s `version_bump`
+/// (`hooks.rs:268-296`) creates a same-named lightweight `v{version}` tag
+/// in this project's own shared checkout at the end of *every* phase's Ship
+/// stage — a second, independent code path that computes the identical tag
+/// name from the identical `compute_version()` function and calls `git tag`
+/// against the identical ref namespace, with no awareness of this release
+/// executor. That collision is not hypothetical: of this repository's 12
+/// `vMAJOR.MINOR.PATCH` tags, exactly one (`v1.3.69`) is a lightweight tag
+/// (`git cat-file -t` reports `commit`, not `tag`) corresponding to no
+/// released version in `CHANGELOG.md`. If this predicate ever classified
+/// that shape as `Released`, the executor would silently skip creating the
+/// real signed tag and the version would ship with no cryptographic
+/// provenance.
+///
+/// A [`ReleaseTagState::StrayLightweight`] result must be surfaced to a
+/// human and never auto-resolved by this or any caller deleting or
+/// re-pointing the existing tag — that would be an automatic compensating
+/// action, which D-05 forbids.
+///
+/// Evaluated in order, short-circuiting at the first non-`Released` outcome:
+/// 1. Does `refs/tags/<tag>` resolve at all?
+/// 2. Is the tag object's type `tag` (annotated), not `commit` (lightweight)?
+/// 3. Does `git tag -v <tag>` exit successfully (a real, verifying signature)?
+/// 4. Is `released_commit` an ancestor of what the tag points at?
+/// 5. Is the tag present on `origin`?
+pub fn release_tag_state(project_root: &Path, tag: &str, released_commit: &str) -> ReleaseTagState {
+    let tag_ref = format!("refs/tags/{tag}");
+
+    let exists = Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", &tag_ref])
+        .current_dir(project_root)
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    if !exists {
+        return ReleaseTagState::Absent;
+    }
+
+    // A lightweight tag's object type is `commit` (it's just a ref pointing
+    // straight at the commit); an annotated tag's object type is `tag` (a
+    // real tag object git can sign and verify). This is the check that
+    // refuses to treat `v1.3.69`'s shape as a release.
+    let object_type = Command::new("git")
+        .args(["cat-file", "-t", tag])
+        .current_dir(project_root)
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .unwrap_or_default();
+    if object_type != "tag" {
+        return ReleaseTagState::StrayLightweight;
+    }
+
+    let verify = Command::new("git")
+        .args(["tag", "-v", tag])
+        .current_dir(project_root)
+        .output();
+    match verify {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return ReleaseTagState::PresentUnverified {
+                reason: crate::version::sanitize_changelog_subject(&stderr),
+            };
+        }
+        Err(_) => {
+            return ReleaseTagState::PresentUnverified {
+                reason: format!("failed to run `git tag -v {tag}`"),
+            };
+        }
+    }
+
+    let commit_ref = format!("{tag}^{{commit}}");
+    let is_ancestor = Command::new("git")
+        .args(["merge-base", "--is-ancestor", released_commit, &commit_ref])
+        .current_dir(project_root)
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    if !is_ancestor {
+        let tagged_commit = Command::new("git")
+            .args(["rev-parse", &commit_ref])
+            .current_dir(project_root)
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .unwrap_or_default();
+        return ReleaseTagState::Mismatched { tagged_commit };
+    }
+
+    let on_origin = Command::new("git")
+        .args(["ls-remote", "--tags", "origin", &tag_ref])
+        .current_dir(project_root)
+        .output()
+        .map(|out| !String::from_utf8_lossy(&out.stdout).trim().is_empty())
+        .unwrap_or(false);
+    if !on_origin {
+        return ReleaseTagState::PresentUnverified {
+            reason: format!(
+                "{tag} exists locally, verifies, and matches the released commit, \
+                              but is not present on origin"
+            ),
+        };
+    }
+
+    ReleaseTagState::Released
+}
+
 /// Derive the crates.io publish order for a workspace's local-path members
 /// (e.g. `devflow-core` before `devflow`) — sourced from the workspace's own
 /// `[workspace] members` list and each member's own `[dependencies]`
@@ -1045,6 +1188,75 @@ mod tests {
         bare_dir
     }
 
+    /// Configure repo-local SSH tag signing with a throwaway keypair so
+    /// `git tag -s`/`git tag -v` (and `create_signed_release_tag`) produce
+    /// and verify a real signature. Every setting is repo-local
+    /// (`git config` with no `--global`) and every file lives under the
+    /// returned `TempDir` — nothing touches `$HOME` or any config outside
+    /// this fixture. Sets BOTH `user.signingkey` and
+    /// `devflow.releaseSigningKey` to the same throwaway public key so a
+    /// test can sign via a bare `git tag -s` (Task 2's fixtures) or via
+    /// `create_signed_release_tag`'s explicit `-c user.signingkey=`
+    /// override (Task 3) from one setup call.
+    fn configure_ssh_tag_signing(root: &Path) -> TempDir {
+        let key_dir = tempfile::tempdir().unwrap();
+        let key_path = key_dir.path().join("sign_key");
+        let keygen = Command::new("ssh-keygen")
+            .args([
+                "-t",
+                "ed25519",
+                "-N",
+                "",
+                "-C",
+                "test",
+                "-f",
+                key_path.to_str().unwrap(),
+            ])
+            .output()
+            .expect("spawn ssh-keygen");
+        assert!(
+            keygen.status.success(),
+            "ssh-keygen fixture setup failed: {}",
+            String::from_utf8_lossy(&keygen.stderr)
+        );
+        let pub_key_path = key_dir.path().join("sign_key.pub");
+        let pub_key = std::fs::read_to_string(&pub_key_path).unwrap();
+
+        let email = crate::test_support::git_command(root)
+            .args(["config", "--get", "user.email"])
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .expect("read fixture user.email");
+
+        let allowed_signers_path = key_dir.path().join("allowed_signers");
+        std::fs::write(&allowed_signers_path, format!("{email} {pub_key}")).unwrap();
+
+        git(root, &["config", "gpg.format", "ssh"]);
+        git(
+            root,
+            &["config", "user.signingkey", pub_key_path.to_str().unwrap()],
+        );
+        git(
+            root,
+            &[
+                "config",
+                "devflow.releaseSigningKey",
+                pub_key_path.to_str().unwrap(),
+            ],
+        );
+        git(
+            root,
+            &[
+                "config",
+                "gpg.ssh.allowedSignersFile",
+                allowed_signers_path.to_str().unwrap(),
+            ],
+        );
+        git(root, &["config", "tag.gpgsign", "true"]);
+
+        key_dir
+    }
+
     #[test]
     fn push_ref_lands_a_branch_on_the_remote() {
         let repo = init_repo();
@@ -1130,6 +1342,97 @@ mod tests {
             remote_sha_before, remote_sha_after,
             "a rejected push must never move the remote ref — a force push would have"
         );
+    }
+
+    #[test]
+    fn release_tag_state_reports_absent_when_no_tag_exists() {
+        let repo = init_repo();
+        let root = repo.path();
+        let head_sha = rev_parse(root, "HEAD");
+
+        assert_eq!(
+            release_tag_state(root, "v9.9.9", &head_sha),
+            ReleaseTagState::Absent
+        );
+    }
+
+    #[test]
+    fn release_tag_state_refuses_to_treat_a_lightweight_tag_as_released() {
+        let repo = init_repo();
+        let root = repo.path();
+        let head_sha = rev_parse(root, "HEAD");
+
+        // Lightweight — exactly what `GitFlow::tag` produces.
+        git(root, &["tag", "v9.9.9"]);
+
+        assert_eq!(
+            release_tag_state(root, "v9.9.9", &head_sha),
+            ReleaseTagState::StrayLightweight
+        );
+    }
+
+    #[test]
+    fn release_tag_state_reports_present_unverified_for_an_unsigned_annotated_tag() {
+        let repo = init_repo();
+        let root = repo.path();
+        let head_sha = rev_parse(root, "HEAD");
+
+        // Annotated (git cat-file -t reports `tag`) but never signed —
+        // init_repo's `tag.gpgsign=false` keeps `-a` from being upgraded.
+        git(root, &["tag", "-a", "v9.9.9", "-m", "v9.9.9"]);
+
+        match release_tag_state(root, "v9.9.9", &head_sha) {
+            ReleaseTagState::PresentUnverified { reason } => {
+                assert!(!reason.is_empty(), "reason should not be empty");
+            }
+            other => panic!("expected PresentUnverified, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn release_tag_state_reports_mismatched_when_the_tag_points_elsewhere() {
+        let repo = init_repo();
+        let root = repo.path();
+        let _keys = configure_ssh_tag_signing(root);
+
+        git(root, &["tag", "-s", "v9.9.9", "-m", "v9.9.9"]);
+        let expected_tagged_commit = rev_parse(root, "v9.9.9^{commit}");
+
+        // A real commit that is NOT an ancestor of the tag: a sibling branch
+        // never merged into develop.
+        git(root, &["checkout", "-q", "-b", "unrelated"]);
+        commit_file(root, "unrelated.txt");
+        let unrelated_sha = rev_parse(root, "HEAD");
+        git(root, &["checkout", "-q", "develop"]);
+
+        match release_tag_state(root, "v9.9.9", &unrelated_sha) {
+            ReleaseTagState::Mismatched { tagged_commit } => {
+                assert_eq!(tagged_commit, expected_tagged_commit);
+            }
+            other => panic!("expected Mismatched, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn release_tag_state_reports_present_unverified_when_the_tag_is_not_on_origin() {
+        let repo = init_repo();
+        let root = repo.path();
+        let _bare = init_bare_remote(root);
+        let _keys = configure_ssh_tag_signing(root);
+
+        let head_sha = rev_parse(root, "HEAD");
+        git(root, &["tag", "-s", "v9.9.9", "-m", "v9.9.9"]);
+        // Deliberately not pushed.
+
+        match release_tag_state(root, "v9.9.9", &head_sha) {
+            ReleaseTagState::PresentUnverified { reason } => {
+                assert!(
+                    reason.contains("origin"),
+                    "reason should name the missing remote ref: {reason}"
+                );
+            }
+            other => panic!("expected PresentUnverified, got {other:?}"),
+        }
     }
 
     #[test]
