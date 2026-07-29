@@ -224,6 +224,27 @@ impl GitFlow {
         self.git(["push", "-u", "origin", branch])
     }
 
+    /// Push `refname` — a branch name or a tag name — to `origin`, exactly
+    /// as given. No upstream flag (unlike [`push`](Self::push), which is for
+    /// freshly created feature branches): `develop` already tracks `origin`,
+    /// and a tag ref has no upstream concept.
+    ///
+    /// Never passes a force option, mirroring `tag`'s scoped-override
+    /// discipline above but in the opposite direction: `-c tag.gpgSign=false`
+    /// exists to narrow a global setting to one call; this method's absence
+    /// of `--force`/`--force-with-lease` is equally deliberate, not an
+    /// oversight. Every push in the release-cut sequence this method serves
+    /// is fast-forward by construction — a version-bump commit added on top
+    /// of the current tip, a `-X ours` merge that starts from the current
+    /// tip, or a brand-new tag ref — so a rejected non-fast-forward push
+    /// means someone else moved the ref since this call was constructed.
+    /// That is a hard error to surface under D-05's fail-fast policy, never
+    /// a conflict to paper over by forcing.
+    pub fn push_ref(&self, refname: &str) -> Result<(), GitError> {
+        info!("pushing ref: {refname}");
+        self.git(["push", "origin", refname])
+    }
+
     /// Delete local branches already merged into `develop`.
     ///
     /// WR-04 (13-REVIEW.md): passes `develop` explicitly rather than relying
@@ -984,6 +1005,131 @@ mod tests {
 
     fn flow(root: &Path) -> GitFlow {
         GitFlow::new(root)
+    }
+
+    /// `git rev-parse <rev>` in `root`, trimmed. Asserts success.
+    fn rev_parse(root: &Path, rev: &str) -> String {
+        let output = crate::test_support::git_command(root)
+            .args(["rev-parse", rev])
+            .output()
+            .expect("spawn git rev-parse");
+        assert!(
+            output.status.success(),
+            "git rev-parse {rev} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// Create a local bare repository and configure `repo_root`'s `origin`
+    /// to point at it — this project's hermetic way to exercise a real `git
+    /// push` without a network dependency. No production function pushed
+    /// before this phase, so no prior fixture existed for this. Keep the
+    /// returned `TempDir` alive for the whole test: dropping it deletes the
+    /// bare repository out from under `origin`.
+    fn init_bare_remote(repo_root: &Path) -> TempDir {
+        let bare_dir = tempfile::tempdir().unwrap();
+        let output = crate::test_support::git_command(bare_dir.path())
+            .args(["init", "--bare", "-q"])
+            .output()
+            .expect("spawn git init --bare");
+        assert!(
+            output.status.success(),
+            "git init --bare failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        git(
+            repo_root,
+            &["remote", "add", "origin", bare_dir.path().to_str().unwrap()],
+        );
+        bare_dir
+    }
+
+    #[test]
+    fn push_ref_lands_a_branch_on_the_remote() {
+        let repo = init_repo();
+        let root = repo.path();
+        let bare = init_bare_remote(root);
+        let gf = flow(root);
+
+        gf.push_ref("develop").expect("push_ref");
+
+        let local_sha = rev_parse(root, "HEAD");
+        let remote_sha = rev_parse(bare.path(), "refs/heads/develop");
+        assert_eq!(local_sha, remote_sha);
+    }
+
+    #[test]
+    fn push_ref_lands_a_tag_on_the_remote() {
+        let repo = init_repo();
+        let root = repo.path();
+        let _bare = init_bare_remote(root);
+        let gf = flow(root);
+
+        git(root, &["tag", "v9.9.9"]);
+        gf.push_ref("v9.9.9").expect("push_ref tag");
+
+        let output = crate::test_support::git_command(root)
+            .args(["ls-remote", "--tags", "origin", "v9.9.9"])
+            .output()
+            .expect("spawn git ls-remote");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("v9.9.9"),
+            "expected v9.9.9 on the remote, got: {stdout}"
+        );
+    }
+
+    #[test]
+    fn push_ref_refuses_a_non_fast_forward_and_leaves_the_remote_unmoved() {
+        let repo = init_repo();
+        let root = repo.path();
+        let bare = init_bare_remote(root);
+        let gf = flow(root);
+
+        // Establish a known-good baseline on the remote.
+        gf.push_ref("develop").expect("initial push_ref");
+
+        // Clone the bare repo into a second working directory and advance
+        // it there, so the remote's `develop` moves without `root` knowing.
+        let clone_parent = tempfile::tempdir().unwrap();
+        let clone_root = clone_parent.path().join("clone");
+        let clone_output = crate::test_support::git_command(clone_parent.path())
+            .args([
+                "clone",
+                "-q",
+                bare.path().to_str().unwrap(),
+                clone_root.to_str().unwrap(),
+            ])
+            .output()
+            .expect("spawn git clone");
+        assert!(
+            clone_output.status.success(),
+            "git clone failed: {}",
+            String::from_utf8_lossy(&clone_output.stderr)
+        );
+        git(&clone_root, &["checkout", "-q", "develop"]);
+        git(&clone_root, &["config", "user.email", "test@example.com"]);
+        git(&clone_root, &["config", "user.name", "Test"]);
+        git(&clone_root, &["config", "commit.gpgsign", "false"]);
+        commit_file(&clone_root, "diverged.txt");
+        git(&clone_root, &["push", "-q", "origin", "develop"]);
+
+        let remote_sha_before = rev_parse(bare.path(), "refs/heads/develop");
+
+        // `root`'s local `develop` has NOT seen the clone's new commit, so
+        // this push is a non-fast-forward from the remote's point of view.
+        let result = gf.push_ref("develop");
+        assert!(
+            result.is_err(),
+            "push_ref should have been rejected as non-fast-forward"
+        );
+
+        let remote_sha_after = rev_parse(bare.path(), "refs/heads/develop");
+        assert_eq!(
+            remote_sha_before, remote_sha_after,
+            "a rejected push must never move the remote ref — a force push would have"
+        );
     }
 
     #[test]
