@@ -1212,13 +1212,13 @@ context (possible shapes, publish-ordering constraint, prior deferral
 reasoning from Phase 20 D-03).
 **UI hint**: no
 **Depends on:** Phase 25
-**Plans:** 1/3 plans executed
+**Plans:** 3/3 plans executed
 
 Plans:
 
-- [ ] 26-01-PLAN.md
+- [x] 26-01-PLAN.md
 - [x] 26-02-PLAN.md
-- [ ] 26-03-PLAN.md
+- [x] 26-03-PLAN.md
 
 - [ ] TBD (run /gsd-discuss-phase 26, then /gsd-plan-phase 26 to break down)
 
