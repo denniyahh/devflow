@@ -2,19 +2,19 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone (open — no fixed closing phase)
-current_phase: 999.1
-current_phase_name: end-to-end-dogfood-blockers
-status: Phase 25 released as v2.1.0
-stopped_at: Phase 26 context gathered
-last_updated: "2026-07-29T18:24:24.542Z"
-last_activity: 2026-07-28
+current_phase: 26
+current_phase_name: release-cut-automation
+status: executing
+stopped_at: Completed 26-02-PLAN.md
+last_updated: "2026-07-29T21:30:04.993Z"
+last_activity: 2026-07-29
+last_activity_desc: Phase 26 execution resumed (wave continue)
 progress:
   total_phases: 15
   completed_phases: 14
-  total_plans: 112
-  completed_plans: 112
+  total_plans: 115
+  completed_plans: 113
   percent: 93
-last_activity_desc: Phase 25 complete (10/10 verified, ledger 0 open). NOT advanced to 999.1 — phase.complete's next-phase detection again picked up the 999.1 backlog heading as if sequential (same bug corrected after Phase 20, recorded in the history log below). Backlog items require /gsd-review-backlog promotion.
 ---
 
 # DevFlow — Project State
@@ -86,11 +86,11 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 999.1 — Hermes Support (BACKLOG)
-Plan: Not started
+Phase: 26 (release-cut-automation) — EXECUTING
+Plan: 2 of 3
 Tasks 1-3 done, both human sign-offs recorded in 25-13-SUMMARY.md; 25-14/25-15/25-16
 planned 2026-07-28 as gap-closure round 3, not yet executed)
-Status: Phase 25 shipped — PR #47
+Status: Ready to execute
 
 **25-10 → 25-13 (2026-07-28):** GAP 1 (25-08) and GAP 2 (25-09) closed and merged. GAP 3
 (truth 7, 25e / 999.47) moved through three states this run: `PRESENT_BEHAVIOR_UNVERIFIED`
@@ -151,11 +151,11 @@ Scope boundary: 23-16 is the **fix only** (change + regression tests + PR into `
 
 **Recovery-ref disposition:** both `origin` refs (`recovery/pre-23-11-acceptance-e0f87c2`, `recovery/pre-23-15-acceptance-0dad20d`) remain untouched on `origin`; the local copy of the pre-23-11 ref, deleted again by `devflow cleanup`, is deliberately NOT restored (per `23-FINDINGS.md` §B2a); the pre-23-15 ref is now unused (no merge to undo) but retained on `origin` for reuse by the 23-16 retry rather than deleted.
 
-Last activity: 2026-07-28
+Last activity: 2026-07-29 — Phase 26 execution resumed (wave continue)
 
 **Note on the "Plan: 2 of 15" value this replaces:** `gsd-tools state advance-plan` only increments whatever value is already in this field, which had drifted to "2 of 15" (the parallel-worktree waves 23-01…23-09 deliberately never touch STATE.md, and this field was last corrected against reality at "10 of 11 plans complete" before the plan count grew to 15 with the gap-closure plans 23-12…23-15). Corrected directly to "13 of 15" to match reality (23-12 and 23-13 both now executed) rather than trust the tool's naive +1 increment from a stale base.
 
-Progress: [██████████] 100% (15 of 15 plans executed — plan-count only; the phase's behavioural acceptance goal is UNMET and requires plan 23-16 to close)
+Progress: [██████████] 98% (15 of 15 plans executed — plan-count only; the phase's behavioural acceptance goal is UNMET and requires plan 23-16 to close)
 
 *(Machine-readable fields for `gsd-tools state begin-phase` / `advance-plan` —
 this project historically tracked position only in the narrative "Active
@@ -754,6 +754,7 @@ None currently open for Phase 17.
 - [Phase ?]: Plan 25-10 superseded (not re-run) — its 'structurally removed' premise was falsified by 25-CI-OBSERVATION.md
 - [Phase ?]: Human declined to substitute CI-shape for local push-gate observation in 25e evidence — CI's Test job lacks the taskset pin and fmt->clippy->test ordering that produced the 2/2 reproduction; conditional pre-authorised approval of truth 7 applied instead
 - [Phase ?]: Truth 7 (999.47/DEN-72) recorded as human-verified against 25-CI-TRIALS.md's 11-observation evidence, residuals stated — not upgraded to a closure claim; 25-VALIDATION.md rows 1-3 (25f) human-approved
+- [Phase ?]: 26-02: prepend_changelog gains a 4th body:&str param; HookContext.shipped_changelog_body carries VersionBump->ChangelogAppend content computed strictly before git.tag()
 
 ## Roadmap Evolution
 
@@ -827,9 +828,10 @@ None currently open for Phase 17.
 | Phase 24 P01 | 7min | 2 tasks | 1 files |
 | Phase 24 P02 | 8min | 2 tasks | 1 files |
 | Phase 25 P13 | ~30min automated + human review turnaround | 3 tasks | 6 files |
+| Phase 26 P02 | 40min | 3 tasks | 4 files |
 
 ## Session
 
-**Last session:** 2026-07-29T18:24:24.440Z
-**Stopped at:** Phase 26 context gathered
-**Resume file:** .planning/phases/26-release-cut-automation/26-CONTEXT.md
+**Last session:** 2026-07-29T21:30:04.893Z
+**Stopped at:** Completed 26-02-PLAN.md
+**Resume file:** None

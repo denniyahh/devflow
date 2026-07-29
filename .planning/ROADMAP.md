@@ -1144,6 +1144,7 @@ backlog items, each re-verified open at HEAD (`76e49f1`) before promotion:
   `--yes-release` flag (separate from `--yes-ship`) authorizes the whole
   bump→tag→sync→publish sequence, matching the existing dangerous-operation
   pattern.
+
 - **999.54 and 999.50 dropped from this phase AND removed from the backlog
   entirely.** The operator determined DevFlow should never predict
   tag-signing viability at all — the executor's tag step just runs the real
@@ -1152,6 +1153,7 @@ backlog items, each re-verified open at HEAD (`76e49f1`) before promotion:
   maintaining a second "will this work?" implementation that has to stay in
   sync with git's actual behavior (the exact bug class those two items
   were about). See `26-CONTEXT.md` D-10 for the full reasoning.
+
 - **999.4 (concurrent-ship tag race) considered and also removed from the
   backlog entirely.** Its race scenario is specific to `devflow parallel`
   (multiple whole phases concurrently); the operator does not and would
@@ -1159,10 +1161,12 @@ backlog items, each re-verified open at HEAD (`76e49f1`) before promotion:
   `devflow parallel`'s own future (deprecate vs. repurpose for intra-phase
   workstreams vs. leave alone) is captured as a deferred idea for its own
   future phase — explicitly not decided here.
+
 - **999.5 (changelog placeholder) added**, using added capacity from
   dropping 999.54/999.50/999.4 — see `26-CONTEXT.md` D-12. Deferred three
   times previously for want of a content source; Phase 25's
   conventional-commit classifier now provides one for free.
+
 - **Two other backlog items from the same original candidate table**
   (999.31 modular agent driver, 999.15 hermetic shell-entrypoint tests,
   999.21 AI-acceptance wiring) were **considered for the added capacity and
@@ -1190,6 +1194,7 @@ this much design attention before planning starts.
   and is cheap enough to run standalone (`gsd-quick`/`gsd-fast`) rather than
   fold into this phase's scope. Handled outside this phase, separately — not
   excluded for cause.
+
 - **999.39** (production git calls don't scrub `GIT_DIR` etc., Medium/M) —
   confirmed still open: all ~86 production `Command::new("git")` call sites
   pin `current_dir()` but never scrub environment; only the test-only
@@ -1207,9 +1212,13 @@ context (possible shapes, publish-ordering constraint, prior deferral
 reasoning from Phase 20 D-03).
 **UI hint**: no
 **Depends on:** Phase 25
-**Plans:** 0 plans
+**Plans:** 1/3 plans executed
 
 Plans:
+
+- [ ] 26-01-PLAN.md
+- [x] 26-02-PLAN.md
+- [ ] 26-03-PLAN.md
 
 - [ ] TBD (run /gsd-discuss-phase 26, then /gsd-plan-phase 26 to break down)
 
