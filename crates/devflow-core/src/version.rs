@@ -459,15 +459,16 @@ fn classify_commit_message(message: &str) -> Bump {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ChangelogHeading {
     /// A breaking change (`!` marker or `BREAKING CHANGE:`/`BREAKING-CHANGE:`
-    /// footer), regardless of the commit's own type. Locked in Task 2.
+    /// footer), regardless of the commit's own type.
     Breaking,
     /// `feat`.
     Added,
-    /// `fix`/`perf`. Locked in Task 2.
+    /// `fix`/`perf`.
     Fixed,
-    /// Every other conventional-commit type, and any message this task's
-    /// minimal classification does not yet route elsewhere. Task 2 locks the
-    /// complete per-type table.
+    /// Every other conventional-commit type (`docs`, `test`, `chore`, the
+    /// string `"ci"`, `refactor`, `style`, or any other recognized-but-
+    /// unlisted type), and any message that fails to parse as a
+    /// conventional commit at all.
     Changed,
 }
 
@@ -493,9 +494,22 @@ impl ChangelogHeading {
 /// `classify_range_bump`'s returned `Bump` is never used as changelog
 /// content; this is sibling code, not a wrapper around it.
 ///
-/// **This task's classification is intentionally minimal — `feat` → Added,
-/// everything else (including an unparseable message) → Changed.** Task 2
-/// locks the complete per-type table (`Breaking`/`Fixed` routing).
+/// **Complete per-type mapping (D-12, Task 2), evaluated in this order:**
+/// 1. `git_conventional::Commit::parse` fails → [`ChangelogHeading::Changed`],
+///    bullet = the message's first line.
+/// 2. `commit.breaking()` is true → [`ChangelogHeading::Breaking`] — checked
+///    before the type match, mirroring `classify_commit_message`'s own
+///    precedence.
+/// 3. type is `feat` → [`ChangelogHeading::Added`].
+/// 4. type is `fix`/`perf` → [`ChangelogHeading::Fixed`].
+/// 5. every other type (`docs`, `test`, `chore`, `"ci"`, `refactor`, `style`,
+///    or any other recognized-but-unlisted type) → [`ChangelogHeading::Changed`].
+///
+/// **Deliberate divergence from `classify_commit_message`:** an unparseable
+/// message is `Bump::Patch` for versioning (D-10's floor — an unrecognized
+/// commit still bumps *something*) but `Changed` here — a message with no
+/// conventional type has no claim to `Fixed`. Do not "fix" this into
+/// agreement; it is intentional.
 ///
 /// Bullets preserve git-log order (newest first) within each group; groups
 /// are emitted in [`ChangelogHeading`] declaration order, omitting any group
@@ -520,7 +534,9 @@ pub fn changelog_sections(
         ));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut breaking: Vec<String> = Vec::new();
     let mut added: Vec<String> = Vec::new();
+    let mut fixed: Vec<String> = Vec::new();
     let mut changed: Vec<String> = Vec::new();
     for record in stdout.split('\u{1e}') {
         let record = record.trim_matches('\n');
@@ -531,20 +547,33 @@ pub fn changelog_sections(
             continue;
         };
         let message = message.trim();
-        match git_conventional::Commit::parse(message) {
-            Ok(commit) if commit.type_() == git_conventional::Type::FEAT => {
-                added.push(commit.description().to_string());
-            }
-            Ok(commit) => changed.push(commit.description().to_string()),
-            Err(_) => {
-                let first_line = message.lines().next().unwrap_or(message);
-                changed.push(first_line.to_string());
-            }
+        let Ok(commit) = git_conventional::Commit::parse(message) else {
+            let first_line = message.lines().next().unwrap_or(message);
+            changed.push(first_line.to_string());
+            continue;
+        };
+        let subject = commit.description().to_string();
+        if commit.breaking() {
+            breaking.push(subject);
+        } else if commit.type_() == git_conventional::Type::FEAT {
+            added.push(subject);
+        } else if commit.type_() == git_conventional::Type::FIX
+            || commit.type_() == git_conventional::Type::PERF
+        {
+            fixed.push(subject);
+        } else {
+            changed.push(subject);
         }
     }
     let mut sections = Vec::new();
+    if !breaking.is_empty() {
+        sections.push((ChangelogHeading::Breaking, breaking));
+    }
     if !added.is_empty() {
         sections.push((ChangelogHeading::Added, added));
+    }
+    if !fixed.is_empty() {
+        sections.push((ChangelogHeading::Fixed, fixed));
     }
     if !changed.is_empty() {
         sections.push((ChangelogHeading::Changed, changed));
@@ -2178,5 +2207,125 @@ mod tests {
         )];
         let body = render_changelog_body(&sections);
         assert_eq!(body, "### Added\n\n- add the widget endpoint\n");
+    }
+
+    /// D-12 Task 2: fix/perf -> Fixed; docs/chore/test/ci/refactor/style all
+    /// -> one Changed section, in git-log order (newest first). Each
+    /// expected value is written out literally, never recomputed from the
+    /// mapping under test (test-signal-rejection.md rejection pattern 2).
+    #[test]
+    fn changelog_sections_maps_every_recognized_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        commit_msg(root, "a.txt", "chore: init");
+        tag(root, "v1.0.0");
+        commit_msg(root, "b.txt", "fix: correct y");
+        commit_msg(root, "c.txt", "perf: speed up z");
+        commit_msg(root, "d.txt", "docs: clarify readme");
+        commit_msg(root, "e.txt", "chore: bump dep");
+        commit_msg(root, "f.txt", "test: add case");
+        commit_msg(root, "g.txt", "ci: pin image");
+        commit_msg(root, "h.txt", "refactor: extract helper");
+        commit_msg(root, "i.txt", "style: reformat");
+
+        let sections = changelog_sections(root, "v1.0.0").unwrap();
+        assert_eq!(
+            sections,
+            vec![
+                (
+                    ChangelogHeading::Fixed,
+                    vec!["speed up z".to_string(), "correct y".to_string()]
+                ),
+                (
+                    ChangelogHeading::Changed,
+                    vec![
+                        "reformat".to_string(),
+                        "extract helper".to_string(),
+                        "pin image".to_string(),
+                        "add case".to_string(),
+                        "bump dep".to_string(),
+                        "clarify readme".to_string(),
+                    ]
+                ),
+            ]
+        );
+    }
+
+    /// D-12 Task 2: both breaking-change forms (the `!` marker and a
+    /// `BREAKING CHANGE:` footer) route to `Breaking`, never `Added`/`Fixed`,
+    /// regardless of the commit's own type — checked before the type match,
+    /// mirroring `classify_commit_message`'s own precedence.
+    #[test]
+    fn changelog_sections_routes_breaking_changes_to_their_own_heading() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        commit_msg(root, "a.txt", "chore: init");
+        tag(root, "v1.0.0");
+        commit_msg(root, "b.txt", "feat(api)!: drop the legacy flag");
+        git(
+            root,
+            &[
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "fix: patch a thing\n\nBREAKING CHANGE: removes an implicit default",
+            ],
+        );
+
+        let sections = changelog_sections(root, "v1.0.0").unwrap();
+        assert_eq!(
+            sections,
+            vec![(
+                ChangelogHeading::Breaking,
+                vec![
+                    "patch a thing".to_string(),
+                    "drop the legacy flag".to_string()
+                ]
+            )]
+        );
+    }
+
+    /// D-12 Task 2: a message that fails `git_conventional::Commit::parse`
+    /// still contributes a bullet (must_haves.truths) — grouped as `Changed`,
+    /// never dropped. Deliberate divergence from `classify_commit_message`
+    /// (which maps the same failure to `Bump::Patch` for versioning): a
+    /// message with no conventional type has no claim to `Fixed`.
+    #[test]
+    fn changelog_sections_treats_unparseable_messages_as_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        commit_msg(root, "a.txt", "chore: init");
+        tag(root, "v1.0.0");
+        commit_msg(
+            root,
+            "b.txt",
+            "just a plain message with no conventional type prefix!!!",
+        );
+
+        let sections = changelog_sections(root, "v1.0.0").unwrap();
+        assert_eq!(
+            sections,
+            vec![(
+                ChangelogHeading::Changed,
+                vec!["just a plain message with no conventional type prefix!!!".to_string()]
+            )]
+        );
+    }
+
+    #[test]
+    fn changelog_sections_returns_no_sections_for_an_empty_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        commit_msg(root, "a.txt", "chore: init");
+        tag(root, "v1.0.0");
+
+        let sections = changelog_sections(root, "v1.0.0").unwrap();
+        assert_eq!(sections, Vec::new());
+        assert_eq!(render_changelog_body(&sections), "");
     }
 }
