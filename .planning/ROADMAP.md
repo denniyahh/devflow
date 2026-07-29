@@ -426,27 +426,23 @@ Plans:
 
 - [x] Delivered by Phase 21 (21a / 21-02) — absorbed as a unit, not separately promoted
 
-### Phase 999.4: Version-Tag Contention on Concurrent Ship (BACKLOG)
+### Phase 999.4: Version-Tag Contention on Concurrent Ship (REMOVED — 2026-07-29)
 
-**Goal:** Two phases computing the same next version race to create one tag. 17-09 bounded the test-level symptom (2s gate-timeout poll under `ENV_MUTEX`); the product-level race is proven (instrumentation caught both phases ~1.8ms apart) but still open. *(was 19h)*
-**Priority:** Medium | **Size:** M — reviewed 2026-07-21: confirmed still open (no new checkout-lock serialization since 17-09). Real but low-frequency (needs two concurrent ships landing on the identical computed version); sizing skews up on verification difficulty, not code volume. Linear: DEN-29.
-**Requirements:** TBD — see CONTEXT.md
-**Plans:** 0 plans
+**Was:** Two phases computing the same next version race to create one tag under `devflow parallel` (multiple whole phases concurrently). *(was 19h)*
+**Removed during Phase 26 discuss-phase:** the race is specific to `devflow parallel`'s whole-phase concurrency; the operator confirmed they never use, and would never want, a single DevFlow user running multiple phases at once ("that's just asking for trouble"). Since the scenario cannot occur in actual usage, this entry is removed rather than left filed. See `phases/26-release-cut-automation/26-CONTEXT.md` D-11. Linear: DEN-29 (close as won't-do).
+`devflow parallel`'s own future (deprecate whole-phase concurrency vs. repurpose for intra-phase workstreams vs. leave alone) is captured as a deferred idea in that same CONTEXT.md, for its own future phase — not lost, just not a defect record.
 
-Plans:
-
-- [ ] TBD (promote with /gsd-review-backlog when ready)
-
-### Phase 999.5: ChangelogAppend Placeholder Content (BACKLOG)
+### Phase 999.5: ChangelogAppend Placeholder Content (PROMOTED — Phase 26)
 
 **Goal:** Every generated changelog entry reads "Released phase via DevFlow" — deferred twice already (17-10, 17-12). *(was 19j)*
 **Priority:** Low | **Size:** M — reviewed 2026-07-21: confirmed still generic (`ship.rs:431`). Cosmetic by its own admission, but sized M not S — needs a real content source designed (plan diffs? SUMMARY.md extraction?) before implementation, which is why it's been deferred 3 times already. Linear: DEN-30.
-**Requirements:** TBD — see CONTEXT.md
+**Requirements:** TBD — see `phases/26-release-cut-automation/999.5-BACKLOG-DOSSIER.md`
+**Promoted:** Phase 26, 2026-07-29 — added using capacity freed by dropping 999.54/999.50/999.4; content source resolved by reusing Phase 25's conventional-commit classifier (see `26-CONTEXT.md` D-12).
 **Plans:** 0 plans
 
 Plans:
 
-- [ ] TBD (promote with /gsd-review-backlog when ready)
+- [x] Promoted to Phase 26 — see the Phase 26 entry for the active tracking
 
 ### Phase 999.12: Layer 0 Unapproved-Probe Veto Coverage (BACKLOG)
 
@@ -906,47 +902,10 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.50: `release --check` Tag-Signing Gate False-Negatives When the Key Is Not in `ssh-agent` (PROMOTED — Phase 26)
+### Phase 999.50: `release --check` Tag-Signing Gate False-Negatives When the Key Is Not in `ssh-agent` (REMOVED — 2026-07-29)
 
-**Goal:** `check_ssh_signing_viability` (`crates/devflow-core/src/git.rs`) decides viability by looking for the configured key in `ssh-add -l`. When the agent is running but does not hold that specific key it returns `NotViable { reason: "ssh-agent has keys loaded, but not the configured signing key" }` and **fails the whole release preflight**. But git does not require the agent: `ssh-keygen -Y sign` reads the private key from disk, so signing works fine when the private key file exists next to the configured `.pub`. The gate blocks releases that would have signed correctly.
-
-**Evidence — measured 2026-07-27 on this repository, during 2.0.0 release prep.**
-
-```
-$ ssh-add -l
-256 SHA256:u84t7JjK…(truncated)   (github_ed25519 — NOT the signing key)
-$ ssh-keygen -lf "$(git config --get user.signingkey)"
-256 SHA256:9BPyx2Mc…(truncated)   (devflow_signing_ed25519)
-
-$ devflow release --check
-  tag-signing viability  ✗  ssh-agent has keys loaded, but not the configured signing key
-error: release preflight failed
-```
-
-With the agent in that exact state, signing nonetheless succeeds:
-
-```
-$ git tag -s _sigtest2 -m "signing probe 2" HEAD
-$ git tag -v _sigtest2
-Good "git" signature for d10475u5@outlook.com with ED25519 key SHA256:9BPyx2Mc…(truncated)
-$ git cat-file -p _sigtest2 | rg -c 'BEGIN SSH SIGNATURE'
-1
-```
-
-The signature is real (a genuine signature block in the tag object), good, and made by exactly the configured key — while the agent does not hold it. Every commit in this session was signed the same way (`git log --format=%G?` → `G`, key `SHA256:9BPyx2Mc…`). The private key file `~/.ssh/devflow_signing_ed25519` exists, mode `600`, which is the mechanism.
-
-**Why it matters:** this is a **false negative on a release gate** — the failure direction that blocks correct work rather than permitting incorrect work, so it is not dangerous, but it did produce a spurious "blocker" during 2.0.0 prep and would send an operator to run an unnecessary `ssh-add` (and, if the key is passphrase-protected, to type a passphrase for no reason).
-
-**Same function as Phase 24 (DEN-52), different defect.** Phase 24 fixed how the *value* of `user.signingkey` is classified (inline `key::` blob vs filesystem path). This is about how *availability* is determined once the value is understood. Phase 24's tests do not cover it because they exercise the agent-absent and tooling-absent paths, not "agent present, holding other keys, private key on disk."
-
-**Fix direction:** treat the agent as one of several sources, not the only one. If the configured key resolves to a path and a readable private key file exists alongside it, that is viable regardless of `ssh-add -l`. Keep the agent check for the inline-`key::` case, where there is no file to read and the agent genuinely is the only source. The most robust variant is to stop inferring altogether and probe directly — sign a throwaway payload with `ssh-keygen -Y sign` and report viability from its exit code, which cannot disagree with what `git tag -s` will do because it is the same operation.
-
-**Priority:** Medium — blocks release preflight with a spurious failure; no data-integrity risk, and the workaround (`ssh-add`) is obvious once diagnosed. | **Size:** S — one function, plus a test for "agent present, wrong keys, private key on disk". Linear: DEN-75.
-**Promoted:** Phase 26, 2026-07-29 — re-verified open at HEAD `76e49f1` before promotion; bundled with 999.25, 999.54, 999.52 (same function/release-mechanics area).
-
-Plans:
-
-- [x] Promoted to Phase 26 — see the Phase 26 entry for the active tracking
+**Was:** `check_ssh_signing_viability` (`crates/devflow-core/src/git.rs`) false-negatives release preflight when the agent holds other keys but not the configured one, even though the private key file on disk would let `git tag -s` succeed anyway (measured live during the v2.0.0 cut).
+**Removed during Phase 26 discuss-phase, after briefly being promoted there:** the operator determined DevFlow should never predict tag-signing viability at all — a predictor is a second implementation of "will signing work?" that must stay in sync with git's real behavior, which is exactly the bug class this item and 999.54 are about. The executor built in Phase 26 instead runs the real signed `git tag` command directly and reads git's own result — no viability guess needed. Full reasoning: `phases/26-release-cut-automation/26-CONTEXT.md` D-10. Linear: DEN-75 (close as won't-do).
 
 ### Phase 999.51: `devflow start` Resolves Its Base From a Possibly-Stale Local `develop`, and Never Fetches (PROMOTED — Phase 25)
 
@@ -1003,24 +962,10 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.54: `release --check` Tag-Signing Viability Reads the Wrong Config Key (PROMOTED — Phase 26)
+### Phase 999.54: `release --check` Tag-Signing Viability Reads the Wrong Config Key (REMOVED — 2026-07-29)
 
-**Goal:** `check_signing_viability` reads `user.signingkey` (`crates/devflow-core/src/git.rs:812`, `:887`) — the *agent's ordinary commit key* — and never consults `devflow.releaseSigningKey`, the maintainer's release key. It then compares ssh-agent's loaded fingerprints against that key, so on a correctly configured maintainer machine (release key loaded, agent key not) it reports `tag-signing viability ✗ — ssh-agent has keys loaded, but not the configured signing key` and fails the entire `devflow release --check` preflight.
-
-**This is a false negative on a correct setup, in the one check whose whole job is gating release tagging.** CONTRIBUTING § Release signing defines the split it fails to honour: `user.signingkey` signs ordinary commits (the agent's key), `devflow.releaseSigningKey` signs release tags and `main` (the maintainer's — "the only key permitted"). As written the check can only pass when the *agent's* key is loaded, which is the inverse of the policy.
-
-**Measured during the v2.1.0 cut (2026-07-28):** ssh-agent held `SHA256:u84t7Jj…` — byte-identical to `devflow.releaseSigningKey`'s fingerprint — while `user.signingkey` resolved to `SHA256:9BPyx2M…`, which was not loaded. The v2.1.0 tag signed successfully with the release key while the check claimed it was unavailable, and `scripts/hooks/pre-push` independently verified the same fingerprint on push. The hook's logic is correct; only `release --check` reads the wrong value.
-
-**Fix direction:** resolve with release precedence — `devflow.releaseSigningKey` first, falling back to `user.signingkey` when unset. CONTRIBUTING already states that leaving `devflow.releaseSigningKey` unset disables the check entirely for contributors who never cut releases, so the fallback preserves documented behaviour. Regression test: configure the two keys distinctly, load only the release key, assert `SigningViability::Viable` — a test that fails against current code.
-
-*Found by the orchestrating agent during the v2.1.0 release cut, after the check's failure was taken at face value twice and the operator corrected it. Adjacent to Phase 24, which touched the same function's inline-`key::` classification but not its config-key selection.*
-
-**Priority:** Medium — no production impact (the pre-push hook is the real guard and it works), but it fails the release preflight on every correctly-configured cut and misdirects whoever is cutting. | **Size:** S — one config-lookup change plus a regression test. Linear: DEN-79.
-**Promoted:** Phase 26, 2026-07-29 — re-verified open at HEAD `76e49f1` before promotion; bundled with 999.25, 999.50, 999.52 (same function/release-mechanics area).
-
-Plans:
-
-- [x] Promoted to Phase 26 — see the Phase 26 entry for the active tracking
+**Was:** `check_signing_viability` reads `user.signingkey` (the agent's ordinary key) instead of `devflow.releaseSigningKey` (the maintainer's release key), so it false-negatives release preflight on a correctly-configured maintainer machine — measured live during the v2.1.0 cut.
+**Removed during Phase 26 discuss-phase, after briefly being promoted there:** same disposition as 999.50 — the operator does not want DevFlow predicting tag-signing viability at all, ever. Full reasoning: `phases/26-release-cut-automation/26-CONTEXT.md` D-10. Linear: DEN-79 (close as won't-do).
 
 ### Phase 999.55: `phase7_cli::wait_for` Fixed 5s Budget Times Out Under Load (BACKLOG)
 
@@ -1174,52 +1119,68 @@ cleanly, against Phase 17's two silent monitor deaths at ~4h each.
 
 ### Phase 26: Release-Cut Automation
 
-**Goal:** Make `devflow release` *execute* the full release-cut sequence —
-version-bump → merge to `main` → signed tag → sync `develop` → publish
-`devflow-core` then `devflow` — not just the read-only `--check` preflight
-Phase 20's 20d delivered. Finishing this retires the manual release checklist
-that every DevFlow release (through v2.1.0) has still required by hand.
+**Goal:** Make `devflow release` *execute* the release-cut sequence —
+version bump → direct push to `develop` → develop→main release PR
+(human-merged) → signed tag → sync back to `develop` (direct push) →
+publish `devflow-core` then `devflow` — not just the read-only `--check`
+preflight Phase 20's 20d delivered. Adds a real `devflow sync` subcommand
+(999.52, both standalone and executor-internal) and fixes the changelog's
+placeholder content (999.5) by generating it from the conventional-commit
+classification Phase 25's version-bump step already computes.
 
-**Promoted 2026-07-29** from four backlog items, each re-verified open at HEAD
-(`76e49f1`, 2026-07-28) before promotion rather than trusted from their own
-text:
+**Promoted 2026-07-29**, then **re-scoped 2026-07-29 during discuss-phase**
+— see `26-CONTEXT.md` for the full discussion. Originally promoted from four
+backlog items, each re-verified open at HEAD (`76e49f1`) before promotion:
+999.25 (executor), 999.54 + 999.50 (signing-viability predictor fixes), and
+999.52 (sync). Discussion with the operator changed the shape substantially:
 
-- **999.25 / DEN-50** (High/L) — the executor itself. Confirmed still open:
-  `Command::Release` (`main.rs:233`) exposes only `check: bool`; its own doc
-  comment states "Ceiling is `--check` only... a deferred, not-yet-built
-  executor."
-- **999.54 / DEN-79** (Medium/S) — `check_ssh_signing_viability` (`git.rs:811`)
-  reads only `user.signingkey`, never `devflow.releaseSigningKey`, so it fails
-  preflight on a correctly-configured maintainer machine (release key loaded,
-  agent key not). Confirmed still open by direct read.
-- **999.50 / DEN-75** (Medium/S) — same function's `KeysListed` arm
-  (`git.rs:865-873`): if the agent's loaded fingerprints don't match, it
-  returns `NotViable` unconditionally, with no fallback to a readable private
-  key file on disk. Confirmed still open — same reading.
-- **999.52 / DEN-77** (Medium/S–M) — no `sync` subcommand exists anywhere in
-  `main.rs`; `scripts/sync-main-to-develop.sh` still lives outside both
-  crates, unpackaged. Confirmed still open.
+- **Automation ceiling widened, not narrowed.** `develop`-bound merges
+  (version bump, sync-back) are now **direct pushes**, not PRs — the
+  operator wants to eliminate the PR requirement for `develop` specifically
+  (via a GitHub ruleset bypass they'll configure themselves, out of this
+  phase's scope) while keeping `main` PR-gated and human-merged. `cargo
+  publish` for both crates is in scope, driven by the executor itself
+  (previously 100% manual, never run by any DevFlow code). A new
+  `--yes-release` flag (separate from `--yes-ship`) authorizes the whole
+  bump→tag→sync→publish sequence, matching the existing dangerous-operation
+  pattern.
+- **999.54 and 999.50 dropped from this phase AND removed from the backlog
+  entirely.** The operator determined DevFlow should never predict
+  tag-signing viability at all — the executor's tag step just runs the real
+  signed `git tag` command (CONTRIBUTING.md's already-documented explicit
+  key-selection form) and reads git's own real result, rather than
+  maintaining a second "will this work?" implementation that has to stay in
+  sync with git's actual behavior (the exact bug class those two items
+  were about). See `26-CONTEXT.md` D-10 for the full reasoning.
+- **999.4 (concurrent-ship tag race) considered and also removed from the
+  backlog entirely.** Its race scenario is specific to `devflow parallel`
+  (multiple whole phases concurrently); the operator does not and would
+  never use DevFlow that way for a single user. See `26-CONTEXT.md` D-11.
+  `devflow parallel`'s own future (deprecate vs. repurpose for intra-phase
+  workstreams vs. leave alone) is captured as a deferred idea for its own
+  future phase — explicitly not decided here.
+- **999.5 (changelog placeholder) added**, using added capacity from
+  dropping 999.54/999.50/999.4 — see `26-CONTEXT.md` D-12. Deferred three
+  times previously for want of a content source; Phase 25's
+  conventional-commit classifier now provides one for free.
+- **Two other backlog items from the same original candidate table**
+  (999.31 modular agent driver, 999.15 hermetic shell-entrypoint tests,
+  999.21 AI-acceptance wiring) were **considered for the added capacity and
+  explicitly declined** — none share a domain or files with release
+  automation, and bundling them would recreate the multi-domain scope-creep
+  this phase's construction was specifically trying to avoid. Candidates
+  for their own future phase, not lost.
 
-**Why these four together.** 999.54 and 999.50 live inside the exact
-signing-viability check the executor's own preflight step must call —
-building the executor on top of a preflight that's wrong two different ways
-would ship both bugs into the automated path. 999.52 is the `develop`↔`main`
-repair step the executor's sequence needs as its "sync" stage. All four sit
-in the same release-mechanics area of `git.rs`/`commands.rs`, so bundling them
-pays the same-wave file-overlap serialization tax once, on work that's
-sequentially related anyway, rather than spreading it across phases (the
-recurring pattern in Phases 18, 19, 21 and 25).
-
-**Sequencing.** Fix 999.54 + 999.50 first — both small, isolated corrections
-to `check_ssh_signing_viability` in `git.rs`, no design questions outstanding.
-Then build the 999.25 executor on top of a now-correct preflight, with
-999.52's sync logic as one of its steps (or a prerequisite subcommand it
-calls — decide at plan time). 999.25 drives irreversible operations
-(squash-merge to `main`, a signed tag, a crates.io publish that can never be
-un-published or reused) and was deferred specifically because it needs its
-own design pass on failure/rollback semantics (tag lands but publish fails;
-core publishes but cli does not) — that design pass belongs at the start of
-this phase's planning, not assumed away.
+**Sequencing.** Fixed order across the three retained items: build
+`devflow sync` (999.52) first since the executor's sync step calls it
+directly; then the changelog-content change (999.5), since it's small and
+independent; then the 999.25 executor itself, which composes the sync
+subcommand and the changelog generator as two of its steps alongside the
+new develop-push, tag, and publish code. 999.25 remains the largest, riskiest
+unit — it is the first production code anywhere that pushes `develop`,
+creates a release tag, or runs `cargo publish` (all three previously
+100%-manual or nonexistent), which is exactly why the discuss-phase gave it
+this much design attention before planning starts.
 
 **Explicitly excluded, with reasons — do not re-add without revisiting these:**
 
