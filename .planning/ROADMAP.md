@@ -557,16 +557,17 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.25: Release-Cut Executor (`devflow release` that executes) (BACKLOG)
+### Phase 999.25: Release-Cut Executor (`devflow release` that executes) (PROMOTED — Phase 26)
 
 **Goal:** A `devflow release` that *executes* the full release cut — version-bump PR → merge to `main` → signed tag → sync `develop` → publish `devflow-core` then `devflow` to crates.io — not just the read-only preflight. Phase 20's 20d (DEN-38) delivers `--check` only; Phase 20 CONTEXT.md D-03 locked that scope and recorded this executor as the follow-up.
 **Priority:** High | **Size:** L — drives irreversible operations (squash-merge to `main`, signed tag, a crates.io publish that can never be un-published or reused), so it needs its own discuss-phase design pass on failure/rollback semantics (tag lands but publish fails; core publishes but cli does not). Blocks on Phase 20's 20a (self-pin) and 20d (`--check`): the executor's preflight step *is* 20d's check and its `VersionBump` step inherits 20a's correctness. Source: Phase 20 D-03 (2026-07-22). Linear: DEN-50 (blocked by DEN-49, DEN-38).
-**Requirements:** TBD — see CONTEXT.md
+**Requirements:** TBD — see `phases/26-release-cut-automation/999.25-CONTEXT.md`
+**Promoted:** Phase 26, 2026-07-29 — re-verified open at HEAD `76e49f1` before promotion; bundled with 999.54, 999.50, 999.52 (same release-mechanics area).
 **Plans:** 0 plans
 
 Plans:
 
-- [ ] TBD (promote with /gsd-review-backlog when ready)
+- [x] Promoted to Phase 26 — see the Phase 26 entry for the active tracking
 
 ### Phase 999.26: `devflow parallel` Git Object-Store Race (BACKLOG)
 
@@ -685,6 +686,8 @@ Plans:
 **Fix direction:** route production git calls through one scrubbing constructor, mirroring `test_support::git_command`. Decide deliberately whether an operator-set `GIT_DIR` should ever be honoured — the safer default is no.
 
 **Priority:** Medium | **Size:** M — ~86 call sites, mechanical, but production behavior so it needs its own review.
+
+**Considered and deliberately excluded from Phase 26 (2026-07-29).** Confirmed still open at HEAD `76e49f1` — every production call site still pins `current_dir()` only, and `test_support::git_command`'s scrubbing exists solely inside `#[cfg(test)]` code. Real defense-in-depth value (the 999.37 incident class), but its ~86 call sites span most of `crates/` including `git.rs`, where Phase 26's 999.25/999.54/999.50/999.52 cluster is already working — folding it in risks the same file-overlap serialization tax Phase 26 is structured to avoid. Deferred to its own phase (27+), not dropped.
 
 Plans:
 
@@ -903,7 +906,7 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.50: `release --check` Tag-Signing Gate False-Negatives When the Key Is Not in `ssh-agent` (BACKLOG)
+### Phase 999.50: `release --check` Tag-Signing Gate False-Negatives When the Key Is Not in `ssh-agent` (PROMOTED — Phase 26)
 
 **Goal:** `check_ssh_signing_viability` (`crates/devflow-core/src/git.rs`) decides viability by looking for the configured key in `ssh-add -l`. When the agent is running but does not hold that specific key it returns `NotViable { reason: "ssh-agent has keys loaded, but not the configured signing key" }` and **fails the whole release preflight**. But git does not require the agent: `ssh-keygen -Y sign` reads the private key from disk, so signing works fine when the private key file exists next to the configured `.pub`. The gate blocks releases that would have signed correctly.
 
@@ -939,10 +942,11 @@ The signature is real (a genuine signature block in the tag object), good, and m
 **Fix direction:** treat the agent as one of several sources, not the only one. If the configured key resolves to a path and a readable private key file exists alongside it, that is viable regardless of `ssh-add -l`. Keep the agent check for the inline-`key::` case, where there is no file to read and the agent genuinely is the only source. The most robust variant is to stop inferring altogether and probe directly — sign a throwaway payload with `ssh-keygen -Y sign` and report viability from its exit code, which cannot disagree with what `git tag -s` will do because it is the same operation.
 
 **Priority:** Medium — blocks release preflight with a spurious failure; no data-integrity risk, and the workaround (`ssh-add`) is obvious once diagnosed. | **Size:** S — one function, plus a test for "agent present, wrong keys, private key on disk". Linear: DEN-75.
+**Promoted:** Phase 26, 2026-07-29 — re-verified open at HEAD `76e49f1` before promotion; bundled with 999.25, 999.54, 999.52 (same function/release-mechanics area).
 
 Plans:
 
-- [ ] TBD (promote with /gsd-review-backlog when ready)
+- [x] Promoted to Phase 26 — see the Phase 26 entry for the active tracking
 
 ### Phase 999.51: `devflow start` Resolves Its Base From a Possibly-Stale Local `develop`, and Never Fetches (PROMOTED — Phase 25)
 
@@ -964,7 +968,7 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.52: DevFlow Imposes a Branch Model Whose Required Repair Step It Does Not Ship (BACKLOG)
+### Phase 999.52: DevFlow Imposes a Branch Model Whose Required Repair Step It Does Not Ship (PROMOTED — Phase 26)
 
 **Goal:** DevFlow hard-codes a git-flow branch model on every project it drives — `MAIN`, `DEVELOP`, `FEATURE_PREFIX` are constants in `config.rs:15-19`, not configuration. That model has a required maintenance step DevFlow neither performs nor provides: when a user squash-merges `develop` → `main` for a release, the squash commit has **no parent relationship** back to `develop`, so `develop` never learns `main` moved and the *next* release conflicts against a stale merge-base.
 
@@ -977,10 +981,11 @@ Plans:
 **Fix direction:** ship the capability, not just the diagnosis. A `devflow sync` subcommand carrying the script's logic — `-X ours`, verify the resulting tree is byte-identical before proceeding, refuse if it is not — plus a pointer to it from the `release --check` divergence message, so the tool that reports the problem also names the command that fixes it. Folding it into 999.25's release executor is the alternative; doing neither leaves users with a diagnosis and no cure.
 
 **Priority:** Medium — no data loss and the divergence is detected, but it degrades silently into painful merge conflicts at exactly the moment (a release) when a user least wants them, and DevFlow created the condition by imposing the branch model. | **Size:** S–M — the logic already exists in shell and is proven; the work is porting it, wiring the subcommand, and cross-referencing the check. Linear: DEN-77.
+**Promoted:** Phase 26, 2026-07-29 — re-verified open at HEAD `76e49f1` before promotion; bundled with 999.25 as its executor's sync step.
 
 Plans:
 
-- [ ] TBD (promote with /gsd-review-backlog when ready)
+- [x] Promoted to Phase 26 — see the Phase 26 entry for the active tracking
 
 ### Phase 999.53: CI Cannot Reproduce the Load Shape That Catches Exec-Visibility Races (BACKLOG)
 
@@ -998,7 +1003,7 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.54: `release --check` Tag-Signing Viability Reads the Wrong Config Key (BACKLOG)
+### Phase 999.54: `release --check` Tag-Signing Viability Reads the Wrong Config Key (PROMOTED — Phase 26)
 
 **Goal:** `check_signing_viability` reads `user.signingkey` (`crates/devflow-core/src/git.rs:812`, `:887`) — the *agent's ordinary commit key* — and never consults `devflow.releaseSigningKey`, the maintainer's release key. It then compares ssh-agent's loaded fingerprints against that key, so on a correctly configured maintainer machine (release key loaded, agent key not) it reports `tag-signing viability ✗ — ssh-agent has keys loaded, but not the configured signing key` and fails the entire `devflow release --check` preflight.
 
@@ -1011,10 +1016,11 @@ Plans:
 *Found by the orchestrating agent during the v2.1.0 release cut, after the check's failure was taken at face value twice and the operator corrected it. Adjacent to Phase 24, which touched the same function's inline-`key::` classification but not its config-key selection.*
 
 **Priority:** Medium — no production impact (the pre-push hook is the real guard and it works), but it fails the release preflight on every correctly-configured cut and misdirects whoever is cutting. | **Size:** S — one config-lookup change plus a regression test. Linear: DEN-79.
+**Promoted:** Phase 26, 2026-07-29 — re-verified open at HEAD `76e49f1` before promotion; bundled with 999.25, 999.50, 999.52 (same function/release-mechanics area).
 
 Plans:
 
-- [ ] TBD (promote with /gsd-review-backlog when ready)
+- [x] Promoted to Phase 26 — see the Phase 26 entry for the active tracking
 
 ### Phase 999.55: `phase7_cli::wait_for` Fixed 5s Budget Times Out Under Load (BACKLOG)
 
@@ -1029,6 +1035,8 @@ Plans:
 **Fix direction:** make the budget configurable with a longer CI default (e.g. `DEVFLOW_TEST_WAIT_SECS`, 5s locally / ~30s under `CI`), and have the panic report the budget it actually used. Test-only; no production change.
 
 **Priority:** Medium — intermittently blocks pushes and CI on unrelated changes, and each occurrence costs a retry plus the diagnosis of whether it is real. | **Size:** S — one helper plus its call sites. Linear: DEN-80.
+
+**Considered and deliberately excluded from Phase 26 (2026-07-29).** Confirmed still open at HEAD `76e49f1` (`phase7_cli.rs:100-124`, still `200 × 25ms`, 7 call sites). Not folded into Phase 26 because it's test-only, touches no file that phase's release-mechanics cluster touches, and is cheap enough to fix standalone via `gsd-quick`/`gsd-fast` rather than waiting on phase planning. Handled outside the phase sequence, separately — not excluded for cause.
 
 Plans:
 
@@ -1163,6 +1171,85 @@ oracle was deliberately NOT re-pointed at a substitute target. Full disposition 
 Positively: the halt was **not a silent stall** — the failure mode this phase exists
 to eliminate. The guard emitted a typed event and both monitor and agent exited
 cleanly, against Phase 17's two silent monitor deaths at ~4h each.
+
+### Phase 26: Release-Cut Automation
+
+**Goal:** Make `devflow release` *execute* the full release-cut sequence —
+version-bump → merge to `main` → signed tag → sync `develop` → publish
+`devflow-core` then `devflow` — not just the read-only `--check` preflight
+Phase 20's 20d delivered. Finishing this retires the manual release checklist
+that every DevFlow release (through v2.1.0) has still required by hand.
+
+**Promoted 2026-07-29** from four backlog items, each re-verified open at HEAD
+(`76e49f1`, 2026-07-28) before promotion rather than trusted from their own
+text:
+
+- **999.25 / DEN-50** (High/L) — the executor itself. Confirmed still open:
+  `Command::Release` (`main.rs:233`) exposes only `check: bool`; its own doc
+  comment states "Ceiling is `--check` only... a deferred, not-yet-built
+  executor."
+- **999.54 / DEN-79** (Medium/S) — `check_ssh_signing_viability` (`git.rs:811`)
+  reads only `user.signingkey`, never `devflow.releaseSigningKey`, so it fails
+  preflight on a correctly-configured maintainer machine (release key loaded,
+  agent key not). Confirmed still open by direct read.
+- **999.50 / DEN-75** (Medium/S) — same function's `KeysListed` arm
+  (`git.rs:865-873`): if the agent's loaded fingerprints don't match, it
+  returns `NotViable` unconditionally, with no fallback to a readable private
+  key file on disk. Confirmed still open — same reading.
+- **999.52 / DEN-77** (Medium/S–M) — no `sync` subcommand exists anywhere in
+  `main.rs`; `scripts/sync-main-to-develop.sh` still lives outside both
+  crates, unpackaged. Confirmed still open.
+
+**Why these four together.** 999.54 and 999.50 live inside the exact
+signing-viability check the executor's own preflight step must call —
+building the executor on top of a preflight that's wrong two different ways
+would ship both bugs into the automated path. 999.52 is the `develop`↔`main`
+repair step the executor's sequence needs as its "sync" stage. All four sit
+in the same release-mechanics area of `git.rs`/`commands.rs`, so bundling them
+pays the same-wave file-overlap serialization tax once, on work that's
+sequentially related anyway, rather than spreading it across phases (the
+recurring pattern in Phases 18, 19, 21 and 25).
+
+**Sequencing.** Fix 999.54 + 999.50 first — both small, isolated corrections
+to `check_ssh_signing_viability` in `git.rs`, no design questions outstanding.
+Then build the 999.25 executor on top of a now-correct preflight, with
+999.52's sync logic as one of its steps (or a prerequisite subcommand it
+calls — decide at plan time). 999.25 drives irreversible operations
+(squash-merge to `main`, a signed tag, a crates.io publish that can never be
+un-published or reused) and was deferred specifically because it needs its
+own design pass on failure/rollback semantics (tag lands but publish fails;
+core publishes but cli does not) — that design pass belongs at the start of
+this phase's planning, not assumed away.
+
+**Explicitly excluded, with reasons — do not re-add without revisiting these:**
+
+- **999.55 / DEN-80** (`phase7_cli::wait_for` fixed 5s timeout, Medium/S) —
+  confirmed still open (`phase7_cli.rs:100-124`, hardcoded `200 × 25ms`, 7 call
+  sites), but it is test-only, touches no file this phase's cluster touches,
+  and is cheap enough to run standalone (`gsd-quick`/`gsd-fast`) rather than
+  fold into this phase's scope. Handled outside this phase, separately — not
+  excluded for cause.
+- **999.39** (production git calls don't scrub `GIT_DIR` etc., Medium/M) —
+  confirmed still open: all ~86 production `Command::new("git")` call sites
+  pin `current_dir()` but never scrub environment; only the test-only
+  `test_support::git_command` does, and only inside `#[cfg(test)]` blocks.
+  Real defense-in-depth against a repeat of the 999.37 incident class, but it
+  touches most of `crates/` including `git.rs`, where this phase's cluster is
+  already working — bundling it risks the same file-overlap serialization tax
+  this phase is trying to avoid by construction. Deferred to its own phase
+  (27+), not because it's low-value.
+
+**Requirements**: TBD — no REQ-IDs; tracked by backlog identifier (`999.25`,
+`999.54`, `999.50`, `999.52`), not invented REQ-IDs. See
+`phases/26-release-cut-automation/999.25-CONTEXT.md` for the original backlog
+context (possible shapes, publish-ordering constraint, prior deferral
+reasoning from Phase 20 D-03).
+**Depends on:** Phase 25
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (run /gsd-discuss-phase 26, then /gsd-plan-phase 26 to break down)
 
 ---
 

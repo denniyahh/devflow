@@ -5,7 +5,7 @@ milestone_name: milestone (open — no fixed closing phase)
 current_phase: 25
 current_phase_name: end-to-end-dogfood-blockers
 status: "Phase 25 released as v2.1.0"
-stopped_at: Phase 25 RELEASED as v2.1.0 on 2026-07-28 — all seven CONTRIBUTING release steps complete (bump #49, release #50 squashed to main, signed tag v2.1.0, sync #51 merge-committed with ancestry verified, GitHub Release, crates published core→cli). Next: Phase 26 scope not yet defined.
+stopped_at: Phase 25 RELEASED as v2.1.0 on 2026-07-28 — all seven CONTRIBUTING release steps complete (bump #49, release #50 squashed to main, signed tag v2.1.0, sync #51 merge-committed with ancestry verified, GitHub Release, crates published core→cli). Phase 26 (Release-Cut Automation) scoped 2026-07-29 from 999.25/999.54/999.50/999.52, re-verified open at HEAD 76e49f1 — not yet discussed or planned.
 last_updated: "2026-07-28T21:38:22.575Z"
 last_activity: 2026-07-28
 progress:
