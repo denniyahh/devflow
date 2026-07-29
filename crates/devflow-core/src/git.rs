@@ -671,6 +671,66 @@ pub fn release_tag_state(project_root: &Path, tag: &str, released_commit: &str) 
     ReleaseTagState::Released
 }
 
+/// Create the maintainer-signed release tag using CONTRIBUTING.md §
+/// "Cutting a Release" step 5's exact invocation form — never a bare `git
+/// tag -s`, which would sign with whatever `user.signingkey` happens to be
+/// configured on the machine running it (possibly the agent's own key,
+/// D-10; see CONTRIBUTING.md § "Release signing" for why both keys share a
+/// `user.email` and are otherwise indistinguishable).
+///
+/// Resolves `devflow.releaseSigningKey` via the private `git_config`
+/// helper. An unset key returns `Err` naming the config key: this is a
+/// missing required argument, not a viability *prediction* — D-10 forbids
+/// guessing whether signing will succeed, not refusing to run a command
+/// that is missing a value it needs. Once the key is resolved, everything
+/// about whether it actually signs successfully is left to `git`'s own real
+/// exit code, surfaced unmodified via `stderr_or_status`. This function
+/// gains no dependency on this file's existing SSH signing-viability
+/// predictor (D-10) — the answer here is authoritative because it comes
+/// from actually running the operation, not from a second guess about
+/// whether it would work.
+///
+/// Does not push the tag (the caller pushes with
+/// [`GitFlow::push_ref`]) and does not verify it (the caller verifies with
+/// [`release_tag_state`]). Keeping creation, push, and verification as three
+/// separate calls is what lets the executor's idempotent resume re-enter at
+/// any of the three.
+pub fn create_signed_release_tag(
+    project_root: &Path,
+    tag: &str,
+    commit: &str,
+) -> Result<(), GitError> {
+    let Some(key) = git_config(project_root, "devflow.releaseSigningKey") else {
+        return Err(GitError::Command(format!(
+            "devflow.releaseSigningKey is not set — see CONTRIBUTING.md \
+             \"Release signing\" for how to configure it before cutting {tag}"
+        )));
+    };
+
+    // CONTRIBUTING.md step 5's form exactly: `-s` with an explicit
+    // per-invocation `-c user.signingkey=` override, argv array (never a
+    // shell string, since `tag`/`commit` are interpolated values).
+    let output = Command::new("git")
+        .args([
+            "-c",
+            &format!("user.signingkey={key}"),
+            "tag",
+            "-s",
+            tag,
+            commit,
+            "-m",
+            tag,
+        ])
+        .current_dir(project_root)
+        .output()?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(GitError::Command(stderr_or_status(&output)))
+    }
+}
+
 /// Derive the crates.io publish order for a workspace's local-path members
 /// (e.g. `devflow-core` before `devflow`) — sourced from the workspace's own
 /// `[workspace] members` list and each member's own `[dependencies]`
@@ -1433,6 +1493,77 @@ mod tests {
             }
             other => panic!("expected PresentUnverified, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn create_signed_release_tag_names_the_missing_config_key() {
+        let repo = init_repo();
+        let root = repo.path();
+        let head_sha = rev_parse(root, "HEAD");
+
+        let err = create_signed_release_tag(root, "v9.9.9", &head_sha)
+            .expect_err("should fail without devflow.releaseSigningKey configured");
+        assert!(
+            err.to_string().contains("devflow.releaseSigningKey"),
+            "error should name the missing config key: {err}"
+        );
+
+        let tags = crate::test_support::git_command(root)
+            .args(["tag", "-l"])
+            .output()
+            .expect("spawn git tag -l");
+        assert!(
+            String::from_utf8_lossy(&tags.stdout).trim().is_empty(),
+            "no tag should have been created on the failure path"
+        );
+    }
+
+    #[test]
+    fn create_signed_release_tag_produces_a_verifiable_annotated_tag() {
+        let repo = init_repo();
+        let root = repo.path();
+        let _keys = configure_ssh_tag_signing(root);
+        let head_sha = rev_parse(root, "HEAD");
+
+        create_signed_release_tag(root, "v9.9.9", &head_sha).expect("create_signed_release_tag");
+
+        let object_type = crate::test_support::git_command(root)
+            .args(["cat-file", "-t", "v9.9.9"])
+            .output()
+            .expect("spawn git cat-file");
+        assert_eq!(
+            String::from_utf8_lossy(&object_type.stdout).trim(),
+            "tag",
+            "expected an annotated tag object"
+        );
+
+        let verify = crate::test_support::git_command(root)
+            .args(["tag", "-v", "v9.9.9"])
+            .output()
+            .expect("spawn git tag -v");
+        assert!(
+            verify.status.success(),
+            "git tag -v failed: {}",
+            String::from_utf8_lossy(&verify.stderr)
+        );
+    }
+
+    #[test]
+    fn create_signed_release_tag_then_push_is_reported_as_released() {
+        let repo = init_repo();
+        let root = repo.path();
+        let _bare = init_bare_remote(root);
+        let _keys = configure_ssh_tag_signing(root);
+        let gf = flow(root);
+        let head_sha = rev_parse(root, "HEAD");
+
+        create_signed_release_tag(root, "v9.9.9", &head_sha).expect("create_signed_release_tag");
+        gf.push_ref("v9.9.9").expect("push_ref tag");
+
+        assert_eq!(
+            release_tag_state(root, "v9.9.9", &head_sha),
+            ReleaseTagState::Released
+        );
     }
 
     #[test]
