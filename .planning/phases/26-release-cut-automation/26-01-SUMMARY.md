@@ -27,7 +27,7 @@ key-decisions:
   - "Decision 1 (D-01/D-08, direct push to origin/develop): selected direct-push — proceed exactly as locked in 26-CONTEXT.md. Confirmed twice by the operator: once during the original discuss-phase session, and again live during this dogfood run after the checkpoint fired. No change to the design."
   - "Decision 2 (D-04, unattended cargo publish, rated one-way/irreversible): selected automate-publish — proceed exactly as locked in 26-CONTEXT.md. Same double-confirmation as Decision 1."
 
-requirements-completed: ["999.25", "999.52"]
+requirements-completed: []  # Corrected 2026-07-29 by the validate→code fix loop. Was ["999.25", "999.52"]; `26-VERIFICATION.md` flagged that as a self-report overclaim (🛑 blocker-adjacent): this plan's own frontmatter is `files_modified: []` and it produced zero code commits, so it cannot have completed either backlog item. Both remain functionally open — 999.25 has 3 of ~8 primitives and no executor to call them, 999.52 has no implementation at all. What this plan did deliver is the operator authorization recorded in `coverage` D1/D2 below, which this correction does not touch.
 
 coverage:
   - id: D1

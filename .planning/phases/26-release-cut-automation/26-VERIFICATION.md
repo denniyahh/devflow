@@ -139,8 +139,8 @@ goal that primitive was built to serve.
 
 | File | Line | Pattern | Severity | Impact |
 |------|------|---------|----------|--------|
-| `.planning/phases/26-release-cut-automation/26-01-SUMMARY.md` | 30 | `requirements-completed: ["999.25", "999.52"]` on a plan with `files_modified: []` and zero code commits | 🛑 Blocker-adjacent (self-report overclaim) | A plan that only records an authorization decision cannot mark two large, unimplemented backlog items "completed." Both 999.25 and 999.52 remain functionally open at phase end. This SUMMARY field, if trusted uncritically by a downstream `/gsd-ship` or `/gsd-complete-milestone` pass, would misreport the phase as having closed backlog items it did not close. |
-| `.planning/phases/26-release-cut-automation/26-03-SUMMARY.md` | 37 | `requirements-completed: ["999.25"]` after building 3 of ~8 needed primitives, none wired to a caller | ⚠️ Warning (partial-progress overclaim) | 26-03's own `coverage` block (D1/D2/D3) is scoped and accurate as *plan-level* coverage of the primitives it built — but the top-level `requirements-completed: ["999.25"]` field reads as "this backlog item is done," which it is not: no executor exists yet that calls any of these primitives, and the publish-side primitives were never written at all. |
+| `.planning/phases/26-release-cut-automation/26-01-SUMMARY.md` | 30 | `requirements-completed: ["999.25", "999.52"]` on a plan with `files_modified: []` and zero code commits | 🛑 Blocker-adjacent (self-report overclaim) | A plan that only records an authorization decision cannot mark two large, unimplemented backlog items "completed." Both 999.25 and 999.52 remain functionally open at phase end. This SUMMARY field, if trusted uncritically by a downstream `/gsd-ship` or `/gsd-complete-milestone` pass, would misreport the phase as having closed backlog items it did not close. **RESOLVED 2026-07-29 by the validate→code fix loop** — field set to `[]` with an inline rationale comment; the `coverage` D1/D2 authorization records were left intact. |
+| `.planning/phases/26-release-cut-automation/26-03-SUMMARY.md` | 37 | `requirements-completed: ["999.25"]` after building 3 of ~8 needed primitives, none wired to a caller | ⚠️ Warning (partial-progress overclaim) | 26-03's own `coverage` block (D1/D2/D3) is scoped and accurate as *plan-level* coverage of the primitives it built — but the top-level `requirements-completed: ["999.25"]` field reads as "this backlog item is done," which it is not: no executor exists yet that calls any of these primitives, and the publish-side primitives were never written at all. **RESOLVED 2026-07-29 by the validate→code fix loop** — field set to `[]`; the accurate plan-level `coverage` D1/D2/D3 blocks were left intact. |
 | `crates/devflow-core/src/git.rs` | 243, 593, 698 | `push_ref`, `release_tag_state`, `create_signed_release_tag` have zero non-test callers | ⚠️ Warning (orphaned artifact) | Functionally identical to the "zero non-test callers" defect RESEARCH.md identified in the pre-phase `GitFlow::push`/`delete_remote_branch` methods — this phase added new primitives in the same unwired state rather than closing that class of gap. |
 | N/A | N/A | No `TBD`/`FIXME`/`XXX`/`TODO`/`HACK`/`PLACEHOLDER` markers found in any of the 5 files this phase modified (`git.rs`, `version.rs`, `ship.rs`, `hooks.rs`, `pipeline_outcomes.rs`) | ℹ️ Info | Consistent with `26-REVIEW.md`'s own finding of "no `TODO`/debug artifacts." |
 
@@ -181,6 +181,45 @@ recommended path is `/gsd-plan-phase 26 --gaps` to plan the remaining
 26-04..26-07 work (sync module, publish primitives, and the executor itself
 that composes everything already built), rather than treating this as a small
 fix-up pass.
+
+## Fix-Loop Disposition 2026-07-29 (`/gsd-execute-phase 26 --gaps-only`)
+
+DevFlow's validate stage returned verdict `gaps` and looped back to the code
+stage with this phase's fix command. **That command cannot close these gaps, and
+this is not a transient failure — it is a scope mismatch.** Recorded here so a
+subsequent validate→code loop does not re-derive it:
+
+- `--gaps-only` selects plans whose frontmatter carries `gap_closure: true`.
+  `rg 'gap_closure' .planning/phases/26-release-cut-automation/` returns **zero
+  matches**, and 26-01/26-02/26-03 all have SUMMARYs (`incomplete: []`). The
+  filter therefore matches **no plans** — there is nothing for the executor to run.
+- Truths 7–11 were **re-verified independently** during this loop (not taken from
+  this report): no `sync.rs` and no `mod sync`; zero matches for
+  `yes_release`/`--yes-release`; zero matches for the five publish primitives; no
+  `Command::Sync`; zero callers of `push_ref`/`release_tag_state`/
+  `create_signed_release_tag` outside `git.rs`; and `main.rs:572-586` still
+  hard-rejects a bare `devflow release`. All five gaps are genuinely open.
+- Closing them means **writing plans 26-04..26-07**, which is
+  `/gsd-plan-phase 26 --gaps`' job, not `execute-phase`'s. Authoring ~half a
+  phase of new implementation for two irreversible capabilities (direct push to
+  `develop`, `cargo publish`) inside a fix loop would also bypass the plan-review
+  gate those decisions were deliberately routed through in 26-01.
+
+**What this loop did close:** the two `requirements-completed` overclaims in the
+Anti-Patterns table above (26-01, 26-03) — the only reported defects that were
+actually actionable at the code stage. Docs-only; no source file was touched, so
+the phase's green test coverage (22 delivered behaviors, `26-VALIDATION.md`
+Part A) is unchanged. This deliberately does **not** move the score: 6/11 truths
+verified and `status: gaps_found` both remain accurate.
+
+**Operator decision required.** Two viable paths, neither auto-selectable:
+1. `/gsd-plan-phase 26 --gaps` — plan and execute 26-04..26-07, finishing the
+   arc inside Phase 26. `26-VALIDATION.md` Part B's 11 rows are ready-made
+   acceptance criteria.
+2. Close Phase 26 as **PARTIAL** on its genuine deliverable (999.5, fully done
+   and green) and carry 999.25/999.52 into a new phase. Honest given the phase
+   already reports `nyquist_compliant: false`, and it stops the validate→code
+   loop from re-firing on gaps no fix-up pass can reach.
 
 ---
 
