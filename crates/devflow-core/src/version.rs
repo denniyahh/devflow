@@ -452,6 +452,128 @@ fn classify_commit_message(message: &str) -> Bump {
     }
 }
 
+/// Keep-a-Changelog heading a changelog bullet is grouped under (D-12).
+/// Declaration order is the render order [`render_changelog_body`] emits
+/// sections in: breaking changes first, then what's new, then what's fixed,
+/// then everything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ChangelogHeading {
+    /// A breaking change (`!` marker or `BREAKING CHANGE:`/`BREAKING-CHANGE:`
+    /// footer), regardless of the commit's own type. Locked in Task 2.
+    Breaking,
+    /// `feat`.
+    Added,
+    /// `fix`/`perf`. Locked in Task 2.
+    Fixed,
+    /// Every other conventional-commit type, and any message this task's
+    /// minimal classification does not yet route elsewhere. Task 2 locks the
+    /// complete per-type table.
+    Changed,
+}
+
+impl ChangelogHeading {
+    /// This heading's Keep-a-Changelog markdown heading line.
+    pub fn as_markdown_heading(self) -> &'static str {
+        match self {
+            ChangelogHeading::Breaking => "### Breaking",
+            ChangelogHeading::Added => "### Added",
+            ChangelogHeading::Fixed => "### Fixed",
+            ChangelogHeading::Changed => "### Changed",
+        }
+    }
+}
+
+/// Group `--no-merges` commits in `range_start..HEAD` by [`ChangelogHeading`]
+/// (D-12). Walks the identical range and `git log --no-merges <range>
+/// --format=%H%x1f%B%x1e` argv as [`classify_range_bump`] (same record
+/// separators, same [`git_conventional::Commit::parse`] call) — but, unlike
+/// `classify_range_bump` (which folds every commit down to a single
+/// aggregate [`Bump`] value; see RESEARCH.md Pitfall 1), *collects* each
+/// commit's subject into its group instead of discarding it.
+/// `classify_range_bump`'s returned `Bump` is never used as changelog
+/// content; this is sibling code, not a wrapper around it.
+///
+/// **This task's classification is intentionally minimal — `feat` → Added,
+/// everything else (including an unparseable message) → Changed.** Task 2
+/// locks the complete per-type table (`Breaking`/`Fixed` routing).
+///
+/// Bullets preserve git-log order (newest first) within each group; groups
+/// are emitted in [`ChangelogHeading`] declaration order, omitting any group
+/// with no bullets. A range with no commits returns `Ok(Vec::new())`.
+pub fn changelog_sections(
+    project_root: &Path,
+    range_start: &str,
+) -> Result<Vec<(ChangelogHeading, Vec<String>)>, VersionError> {
+    let range = if range_start.is_empty() {
+        "HEAD".to_string()
+    } else {
+        format!("{range_start}..HEAD")
+    };
+    let output = Command::new("git")
+        .args(["log", "--no-merges", &range, "--format=%H%x1f%B%x1e"])
+        .current_dir(project_root)
+        .output()
+        .map_err(|err| VersionError::Git(err.to_string()))?;
+    if !output.status.success() {
+        return Err(VersionError::Git(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut added: Vec<String> = Vec::new();
+    let mut changed: Vec<String> = Vec::new();
+    for record in stdout.split('\u{1e}') {
+        let record = record.trim_matches('\n');
+        if record.is_empty() {
+            continue;
+        }
+        let Some((_hash, message)) = record.split_once('\u{1f}') else {
+            continue;
+        };
+        let message = message.trim();
+        match git_conventional::Commit::parse(message) {
+            Ok(commit) if commit.type_() == git_conventional::Type::FEAT => {
+                added.push(commit.description().to_string());
+            }
+            Ok(commit) => changed.push(commit.description().to_string()),
+            Err(_) => {
+                let first_line = message.lines().next().unwrap_or(message);
+                changed.push(first_line.to_string());
+            }
+        }
+    }
+    let mut sections = Vec::new();
+    if !added.is_empty() {
+        sections.push((ChangelogHeading::Added, added));
+    }
+    if !changed.is_empty() {
+        sections.push((ChangelogHeading::Changed, changed));
+    }
+    Ok(sections)
+}
+
+/// Render `sections` (from [`changelog_sections`]) as Keep-a-Changelog
+/// markdown: each section's heading line, a blank line, then one `- {subject}`
+/// line per bullet, with a blank line between sections. Returns an empty
+/// string when `sections` is empty — the "nothing changed" fallback text is
+/// [`crate::ship::prepend_changelog`]'s responsibility, not this function's.
+pub fn render_changelog_body(sections: &[(ChangelogHeading, Vec<String>)]) -> String {
+    let mut body = String::new();
+    for (index, (heading, bullets)) in sections.iter().enumerate() {
+        if index > 0 {
+            body.push('\n');
+        }
+        body.push_str(heading.as_markdown_heading());
+        body.push_str("\n\n");
+        for bullet in bullets {
+            body.push_str("- ");
+            body.push_str(bullet);
+            body.push('\n');
+        }
+    }
+    body
+}
+
 /// Apply a classified [`Bump`] to a baseline version (D-08/D-10).
 fn apply_bump(baseline: &semver::Version, bump: Bump) -> semver::Version {
     match bump {
@@ -2027,5 +2149,34 @@ mod tests {
                 .contains("devflow-core = { version = \"1.7.0\", path = \"crates/devflow-core\" }"),
             "expected version to be rewritten regardless of key order, got: {contents}"
         );
+    }
+
+    #[test]
+    fn changelog_sections_groups_a_feat_commit_under_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        commit_msg(root, "a.txt", "chore: init");
+        tag(root, "v1.0.0");
+        commit_msg(root, "b.txt", "feat: add the widget endpoint");
+
+        let sections = changelog_sections(root, "v1.0.0").unwrap();
+        assert_eq!(
+            sections,
+            vec![(
+                ChangelogHeading::Added,
+                vec!["add the widget endpoint".to_string()]
+            )]
+        );
+    }
+
+    #[test]
+    fn render_changelog_body_renders_heading_and_bullets() {
+        let sections = vec![(
+            ChangelogHeading::Added,
+            vec!["add the widget endpoint".to_string()],
+        )];
+        let body = render_changelog_body(&sections);
+        assert_eq!(body, "### Added\n\n- add the widget endpoint\n");
     }
 }

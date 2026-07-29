@@ -47,6 +47,15 @@ pub struct HookContext {
     /// particular when there is no version file and `version::read_version`
     /// would otherwise error and fall back to the `unreleased` literal.
     pub shipped_version: Option<String>,
+    /// The Keep-a-Changelog-grouped body `VersionBump` computed, set once it
+    /// runs (D-12, T-26-11). `ChangelogAppend` reads this instead of
+    /// re-deriving it from live git state, for the same reason
+    /// `shipped_version` must be handed forward rather than re-derived:
+    /// once `VersionBump` has created the release tag, the range this body
+    /// was computed over collapses to empty (the tag is now the baseline),
+    /// so a re-derivation after the fact would silently produce an empty
+    /// changelog entry.
+    pub shipped_changelog_body: Option<String>,
 }
 
 /// Errors produced by hooks.
@@ -245,9 +254,10 @@ fn changelog_append(ctx: &mut HookContext) -> Result<(), HookError> {
             .map(|v| v.to_string())
             .unwrap_or_else(|_| "unreleased".to_string())
     });
+    let body = ctx.shipped_changelog_body.as_deref().unwrap_or("");
     let path = ctx.project_root.join("CHANGELOG.md");
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    let updated = crate::ship::prepend_changelog(&existing, &version, &today());
+    let updated = crate::ship::prepend_changelog(&existing, &version, &today(), body);
     std::fs::write(&path, updated)?;
     // Commit the write. Round 2's WR-04 finding: this hook used to write and
     // never commit, and docs_update — the only committing hook — ran first
@@ -268,6 +278,37 @@ fn changelog_append(ctx: &mut HookContext) -> Result<(), HookError> {
 fn version_bump(ctx: &mut HookContext) -> Result<(), HookError> {
     let version = version::compute_version(&ctx.project_root)?;
     let git = GitFlow::new(&ctx.project_root);
+
+    // D-12/T-26-11: compute the changelog body BEFORE `git.tag(&tag)` below.
+    // Once that tag exists, `reachable_semver_baseline` resolves to it and
+    // the range this body is computed over collapses to empty — the same
+    // desync class WR-04/17-12 already documented for `shipped_version`. A
+    // failure to compute the body must not abort the version bump: the
+    // fallback line `prepend_changelog` substitutes for an empty body is a
+    // correct degraded outcome, and a version bump must not fail on a
+    // changelog-content problem.
+    match version::reachable_semver_baseline(&ctx.project_root) {
+        Ok(baseline) => {
+            let range_start = match &baseline {
+                Some(tag) => version::release_range_start(&ctx.project_root, &format!("v{tag}")),
+                None => Ok(String::new()),
+            };
+            match range_start.and_then(|range_start| {
+                version::changelog_sections(&ctx.project_root, &range_start)
+            }) {
+                Ok(sections) => {
+                    ctx.shipped_changelog_body = Some(version::render_changelog_body(&sections));
+                }
+                Err(err) => {
+                    warn!("VersionBump: could not compute changelog body: {err}");
+                }
+            }
+        }
+        Err(err) => {
+            warn!("VersionBump: could not resolve changelog baseline: {err}");
+        }
+    }
+
     // Write the computed version into the version file when one exists, and
     // commit that write before tagging (17-12: previously left uncommitted,
     // so the tag named a version the tagged commit itself didn't contain,
@@ -362,6 +403,7 @@ mod tests {
             stage,
             git_flow: GitFlowConfig::default(),
             shipped_version: None,
+            shipped_changelog_body: None,
         }
     }
 
@@ -726,5 +768,42 @@ mod tests {
             .unwrap();
         assert!(output.status.success(), "git {args:?} failed");
         String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// D-12 end-to-end: `VersionBump` computes and hands forward the
+    /// changelog body, `ChangelogAppend` writes it — a real `feat:` commit
+    /// produces a `### Added` section naming that commit's subject in the
+    /// actual `CHANGELOG.md` file the hook wrote (a file contract, not an
+    /// internal return value). Reverting only `version_bump`'s body-capture
+    /// hunk makes this fail on the `### Added` assertion below, not on a
+    /// compile error or a fixture panic.
+    #[test]
+    fn changelog_append_writes_the_generated_body_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        git(
+            dir.path(),
+            &[
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "feat: add the widget endpoint",
+            ],
+        );
+
+        let mut context = ctx(dir.path(), Stage::Ship);
+        Hook::VersionBump.run(&mut context).unwrap();
+        Hook::ChangelogAppend.run(&mut context).unwrap();
+
+        let changelog = std::fs::read_to_string(dir.path().join("CHANGELOG.md")).unwrap();
+        assert!(
+            changelog.contains("### Added"),
+            "expected a ### Added section, got: {changelog}"
+        );
+        assert!(
+            changelog.contains("add the widget endpoint"),
+            "expected the feat commit's subject, got: {changelog}"
+        );
     }
 }
