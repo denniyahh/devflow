@@ -561,7 +561,7 @@ Plans:
 
 **Goal:** A `devflow release` that *executes* the full release cut — version-bump PR → merge to `main` → signed tag → sync `develop` → publish `devflow-core` then `devflow` to crates.io — not just the read-only preflight. Phase 20's 20d (DEN-38) delivers `--check` only; Phase 20 CONTEXT.md D-03 locked that scope and recorded this executor as the follow-up.
 **Priority:** High | **Size:** L — drives irreversible operations (squash-merge to `main`, signed tag, a crates.io publish that can never be un-published or reused), so it needs its own discuss-phase design pass on failure/rollback semantics (tag lands but publish fails; core publishes but cli does not). Blocks on Phase 20's 20a (self-pin) and 20d (`--check`): the executor's preflight step *is* 20d's check and its `VersionBump` step inherits 20a's correctness. Source: Phase 20 D-03 (2026-07-22). Linear: DEN-50 (blocked by DEN-49, DEN-38).
-**Requirements:** TBD — see `phases/26-release-cut-automation/999.25-CONTEXT.md`
+**Requirements:** TBD — see `phases/26-release-cut-automation/999.25-BACKLOG-DOSSIER.md`
 **Promoted:** Phase 26, 2026-07-29 — re-verified open at HEAD `76e49f1` before promotion; bundled with 999.54, 999.50, 999.52 (same release-mechanics area).
 **Plans:** 0 plans
 
@@ -1241,7 +1241,7 @@ this phase's planning, not assumed away.
 
 **Requirements**: TBD — no REQ-IDs; tracked by backlog identifier (`999.25`,
 `999.54`, `999.50`, `999.52`), not invented REQ-IDs. See
-`phases/26-release-cut-automation/999.25-CONTEXT.md` for the original backlog
+`phases/26-release-cut-automation/999.25-BACKLOG-DOSSIER.md` for the original backlog
 context (possible shapes, publish-ordering constraint, prior deferral
 reasoning from Phase 20 D-03).
 **Depends on:** Phase 25
