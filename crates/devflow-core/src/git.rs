@@ -1301,8 +1301,13 @@ fn stderr_or_status(output: &std::process::Output) -> String {
     }
 }
 
+// `pub(crate)` (rather than private) so the release executor's own tests
+// (`crate::release::tests`) reuse this module's throwaway-keypair signing
+// fixture (`configure_ssh_tag_signing`) instead of building a second one.
+// `init_repo`/`init_bare_remote` for NEW modules live in `crate::sync::tests`
+// instead — see that module's doc comment for why.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use tempfile::TempDir;
 
@@ -1402,7 +1407,7 @@ mod tests {
     /// test can sign via a bare `git tag -s` (Task 2's fixtures) or via
     /// `create_signed_release_tag`'s explicit `-c user.signingkey=`
     /// override (Task 3) from one setup call.
-    fn configure_ssh_tag_signing(root: &Path) -> TempDir {
+    pub(crate) fn configure_ssh_tag_signing(root: &Path) -> TempDir {
         let key_dir = tempfile::tempdir().unwrap();
         let key_path = key_dir.path().join("sign_key");
         let keygen = Command::new("ssh-keygen")
