@@ -1077,6 +1077,37 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
+### Phase 999.58: The Pre-Push Container Gate Cannot Run From a Linked Worktree (BACKLOG)
+
+**Goal:** `scripts/check-in-container.sh` — the pinned-image gate wired in as `core.hooksPath=scripts/hooks`'s `pre-push` — **fails 100% of the time when the push originates from a linked worktree**, for reasons entirely unrelated to the code being pushed. Two tests fail, and one of them fails with a message that reads as a serious security regression. This collides directly with this project's standing practice of doing phase work in worktrees, so the trap is on the default path, not an edge case.
+
+**Evidence — hit live while merging 999.5, 2026-07-30 (PR #54).** The branch `feature/999.5-changelog-body` was built in `.worktrees/999.5` and was green on the host: `cargo test --workspace` 706 passed / 0 failed, `cargo clippy --workspace --all-targets -- -D warnings` clean, `cargo fmt --all --check` clean. `git push` from that worktree was **rejected** by the gate with 2 failures:
+
+- `crates/devflow-cli/tests/build_provenance.rs:102` — `git ls-files` exits 128, `fatal: not a git repository: (null)`
+- `crates/devflow-cli/tests/gitignore_coverage.rs:63` — every one of the 14 `git check-ignore` probes errors, so the test reports **all 14 `.devflow/` runtime-state paths as uncovered by `.gitignore`**, citing 15-REVIEW.md CR-01 and 17-REVIEW.md WR-07. This is a **false alarm that impersonates a telemetry-leak regression** — the most alarming possible failure text for a completely environmental cause.
+
+Removing the worktree, checking the identical commit out in the main checkout, and pushing from there produced `check.sh: all OK` and both tests `ok`. Same code, same image (`mcr.microsoft.com/devcontainers/rust:2.0.13-1-bookworm`), opposite result. CI on PR #54 then passed all four required checks.
+
+**Root cause, verified in source and reproduced deterministically:**
+
+1. `scripts/check-in-container.sh:17` sets `REPO_ROOT="$(git rev-parse --show-toplevel)"`. From a linked worktree that returns the **worktree** path, not the main repository.
+2. `scripts/check-in-container.sh:69` mounts exactly that one directory: `-v "$REPO_ROOT":/workspace`.
+3. A linked worktree's `.git` is a **file**, not a directory, containing an absolute *host* path — `gitdir: /var/home/denniyahh/Github/devflow/.git/worktrees/999.5`. That path is outside the mount and therefore does not exist inside the container, so **every `git` invocation in the container fails**.
+4. Reproduced on the host, byte-identical to the container failure: a directory whose `.git` file names a nonexistent gitdir yields exactly `fatal: not a git repository: (null)`, exit 128. The literal `(null)` is the tell.
+
+**This is not 999.39 (`GIT_DIR` scrubbing, DEN-66), despite the resemblance.** `devflow_core::test_support::git_command` (`crates/devflow-core/src/test_support.rs:175-190`) already `env_remove`s every var in `REPO_LOCAL_GIT_VARS` + `ALSO_REDIRECTING_GIT_VARS` before spawning, and `build_provenance.rs`'s own failure output confirms it (`GIT_CONFIG_GLOBAL=None`). No redirecting variable is involved; the `.git` **file** is.
+
+**Two candidate fixes — pick one, they are not complementary:**
+
+- **(A) Fail fast with an actionable message — S, recommended.** Detect a linked worktree before the `docker run` (`.git` is a file, or `git rev-parse --git-common-dir` differs from `--git-dir`) and exit non-zero telling the operator to push from the main checkout. Matches the script's existing fail-fast-before-any-cargo-invocation contract, already guarded by `ci_parity_guards.rs` (`check_script_fails_fast_before_any_cargo_invocation`, `devcontainer_runcmd_fails_fast_before_any_check`). Costs the operator a checkout switch but never lies.
+- **(B) Make the gate actually work from a worktree — M.** Additionally mount the common git dir at the *same absolute path* it has on the host (so the worktree's `gitdir:` pointer resolves), plus the per-worktree admin directory. Strictly better for the operator, but it widens the container's mount surface to a host-absolute path and needs care that `--show-toplevel`-derived paths inside the container still agree. Note the gate tests whichever working tree it runs in, so (B) must not become an excuse to push branch X from a checkout sitting on branch Y — that silently validates the wrong tree.
+
+**Priority:** Medium — no shipped-code defect and there is a working manual path, but it blocks the gate on this project's normal worktree workflow and its loudest symptom is a fabricated security finding, which costs real investigation time to dismiss. | **Size:** S for (A), M for (B). Source: 999.5 split / PR #54 (2026-07-30). Linear: DEN-83.
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
 ### Phase 21: Operator Legibility & Observability
 
 **Shipped as v1.8.0** (2026-07-24) — PR #23 (`develop → main`, squash `cfa9167`), signed tag `v1.8.0`, [GitHub Release](https://github.com/denniyahh/devflow/releases/tag/v1.8.0). `sync-main-to-develop.sh` run via PR #24 (merge `01ad9e4`). Published to crates.io (`devflow-core` then `devflow`, both confirmed live at 1.8.0).
