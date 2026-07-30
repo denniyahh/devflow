@@ -1816,7 +1816,7 @@ Plans:
 
 **Requirements**: TBD — no REQ-IDs; tracked by backlog identifier (`999.39`), consistent with Phases 21/22/26. Full evidence, escalation rationale and prior-deferral reasoning remain in the **999.39** backlog entry above; this entry does not restate them.
 **Depends on:** Phase 26 (CLOSED PARTIAL — no code dependency, but 999.25's re-attempt depends on this)
-**Plans:** 1/6 plans executed
+**Plans:** 5/6 plans executed
 
 **Scope caution carried from Phase 26's exclusion note:** ~86 call sites spanning most of `crates/` including `git.rs`. Mechanical, but it is production behavior and touches the same files as the unmerged 999.25 cluster — expect file-overlap serialization and plan waves accordingly.
 
@@ -1829,10 +1829,10 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 27-02-PLAN.md — Migrate `git.rs`'s remaining 7 sites (4 of them wrapper chokepoints) and both `worktree.rs` sites (wave 2)
-- [ ] 27-03-PLAN.md — Migrate `version.rs` (10 sites) and `agent_result.rs` (3 sites) (wave 2)
-- [ ] 27-04-PLAN.md — Migrate `staleness.rs` (2 sites) and `commands.rs` (3 git sites + the indirect `sh -c` spawn, RESEARCH Open Question #1 decided in scope) (wave 2)
-- [ ] 27-05-PLAN.md — Migrate `preflight.rs` (11 sites, 2 inside closures, 1 write operation) (wave 2)
+- [x] 27-02-PLAN.md — Migrate `git.rs`'s remaining 7 sites (4 of them wrapper chokepoints) and both `worktree.rs` sites (wave 2)
+- [x] 27-03-PLAN.md — Migrate `version.rs` (10 sites) and `agent_result.rs` (3 sites) (wave 2)
+- [x] 27-04-PLAN.md — Migrate `staleness.rs` (2 sites) and `commands.rs` (3 git sites + the indirect `sh -c` spawn, RESEARCH Open Question #1 decided in scope) (wave 2)
+- [x] 27-05-PLAN.md — Migrate `preflight.rs` (11 sites, 2 inside closures, 1 write operation) (wave 2)
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
