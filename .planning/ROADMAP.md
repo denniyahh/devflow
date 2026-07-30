@@ -1140,6 +1140,37 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
+### Phase 999.60: `resume` Discards an `--until` Cap That Never Fired, and Cannot Re-Specify One (BACKLOG)
+
+**Goal:** `devflow resume --phase N` clears `stop_until` **unconditionally** (`crates/devflow-cli/src/pipeline_launch.rs:226-228`), including when the cap never fired. An operator who started a run with `--until validate` — explicitly declaring Ship out of bounds — and then resumed it after any interruption gets a run with **no cap at all**, silently. `resume` also exposes no `--until` flag, so the boundary cannot be re-established once lost; the only remaining controls are `yes_ship` and `kill`.
+
+**This is NOT "resume drops `stop_until`" — that part is correct and must not be regressed.** Clearing is deliberate, documented (`pipeline_launch.rs:207-214`) and covered by `resume_clears_stop_marker_and_advances_past_stop_point` (`pipeline_launch.rs:457`), which exists because of a 20c review finding: a phase that *halted at* its cap persists `stopped`/`stop_reason`/`stop_until`, and without clearing them `transition()`'s `stop_until == Some(from)` arm would immediately re-stop it, leaving the phase `stopped` forever despite an explicit resume. **That behavior is right. The defect is that the clear is unconditional rather than conditioned on the cap having actually fired.**
+
+**Evidence — reproduced live, 2026-07-30 (Phase 27 dogfood).** `devflow start --phase 27 --agent claude --mode auto --until validate` was killed mid-**Code** by the operator (usage-limit conservation), never reaching the cap. State was verified immediately before resuming: `{'stage': 'code', 'yes_ship': False, 'stop_until': 'validate'}`, and `.devflow/events.jsonl` records **zero** stop events for phase 27 — the cap provably never fired and `stopped` was false. After `devflow resume --phase 27`, state read `{'stage': 'ship', 'yes_ship': False, 'stop_until': None}`. The event log shows the unguarded advance:
+
+```
+{"event":"advance_evaluated","phase":27,"stage":"validate","status":"success","verdict":"pass"}
+{"event":"transition","from":"validate","phase":27,"to":"ship"}
+{"event":"stage_launched","phase":27,"stage":"ship","monitor_pid":3292822}
+```
+
+Ship was killed ~10s after launch. **No external side effects occurred** — branch unpushed, no PR, `develop` untouched, no new tags — but only because `yes_ship: false` forces the Ship gate to block for a human. The control the operator actually named (`--until validate`) contributed nothing; a second, independent guard did all the work.
+
+**Why this matters more than the blast radius suggests.** Ship's terminal hooks are `Merge → VersionBump → ChangelogAppend → BranchCleanup`, fail-fast with **no rollback**. `--until` is the mechanism that makes a dangerous stage structurally unreachable. It holds on `start` and evaporates on `resume` — and `resume` is the documented recovery path after a rate limit or infrastructure pause, i.e. exactly when the operator is *least* likely to be watching. An operator who reasons "I capped this at validate, so Ship cannot happen" is correct on the first run and wrong on every resume, with no warning.
+
+**Fix direction — two parts, (A) is the defect proper:**
+
+- **(A) Condition the clear on the cap having fired — S, recommended.** Clear `stopped`/`stop_reason`/`stop_until` only when `state.stopped` is true. That preserves `resume_clears_stop_marker_and_advances_past_stop_point`'s scenario byte-for-byte (that test sets `stopped = true`), while leaving an unfired cap intact. Add a companion test asserting the mirror case: `stopped == false` + `stop_until == Some(Ship-ward stage)` survives a resume.
+- **(B) Give `resume` an `--until` flag — S, complementary.** Even with (A), an operator who resumes a genuinely-halted phase currently cannot re-impose any boundary. Mirrors `start`'s existing flag; no new concept.
+
+**Do not fix by making `--until` sticky across the halt.** That reintroduces exactly the permanent-`stopped` wedge 20c closed. The distinction to preserve is *fired vs. not fired*, not *set vs. unset*.
+
+**Priority:** High — it silently removes an operator-declared safety boundary on the recovery path, and the stage it exposes drives irreversible operations. Mitigated in practice only by `yes_ship`, which is a different control the operator may also have set. | **Size:** S for (A), S for (B). Source: Phase 27 dogfood (2026-07-30). Linear: DEN-85.
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
 ### Phase 21: Operator Legibility & Observability
 
 **Shipped as v1.8.0** (2026-07-24) — PR #23 (`develop → main`, squash `cfa9167`), signed tag `v1.8.0`, [GitHub Release](https://github.com/denniyahh/devflow/releases/tag/v1.8.0). `sync-main-to-develop.sh` run via PR #24 (merge `01ad9e4`). Published to crates.io (`devflow-core` then `devflow`, both confirmed live at 1.8.0).
