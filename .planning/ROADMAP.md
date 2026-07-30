@@ -1212,7 +1212,7 @@ context (possible shapes, publish-ordering constraint, prior deferral
 reasoning from Phase 20 D-03).
 **UI hint**: no
 **Depends on:** Phase 25
-**Plans:** 5/7 plans executed
+**Plans:** 6/7 plans executed
 
 Plans:
 
@@ -1226,7 +1226,7 @@ five failed truths in `26-VERIFICATION.md` (7, 8, 9, 10, 11). All four carry
 
 - [x] 26-04-PLAN.md *(wave 3)* — `devflow sync`, standalone + executor-internal (999.52; Truth 8)
 - [x] 26-05-PLAN.md *(wave 3)* — `cargo publish` primitives (999.25 D-04; Truth 11)
-- [ ] 26-06-PLAN.md *(wave 4, blocked on wave 3)* — the release executor core (Truth 9)
+- [x] 26-06-PLAN.md *(wave 4, blocked on wave 3)* — the release executor core (Truth 9)
 - [ ] 26-07-PLAN.md *(wave 5, blocked on wave 4)* — `--execute`/`--yes-release` CLI surface (Truths 7, 10)
 
 ---
