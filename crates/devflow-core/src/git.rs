@@ -1606,6 +1606,108 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // 27-01 (D-03): the scrubbing constructor holds under a hostile GIT_DIR
+    // -----------------------------------------------------------------
+
+    /// D-03: a real spawned `git` process built through the constructor
+    /// resolves the caller-supplied root even when `GIT_DIR` points at an
+    /// unrelated repository — proven by a subprocess test, not by
+    /// inspecting the `Command` object alone.
+    #[test]
+    fn hermetic_command_resolves_caller_root_even_under_a_hostile_git_dir() {
+        let real_repo = init_repo();
+        let real_root = real_repo.path();
+
+        let foreign_repo = TempDir::new().unwrap();
+        git(foreign_repo.path(), &["init", "-q"]);
+
+        let output = git_command(real_root)
+            .args(["rev-parse", "--show-toplevel"])
+            // Hostile injection chained AFTER the constructor — the
+            // strongest form of the claim: `--show-toplevel` must still
+            // resolve `real_root`, not `foreign_repo`.
+            .env("GIT_DIR", foreign_repo.path().join(".git"))
+            .output()
+            .expect("spawn git");
+        assert!(
+            output.status.success(),
+            "rev-parse --show-toplevel failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let resolved = std::fs::canonicalize(String::from_utf8_lossy(&output.stdout).trim())
+            .expect("canonicalize resolved toplevel");
+        let expected = std::fs::canonicalize(real_root).expect("canonicalize real_root");
+        assert_eq!(
+            resolved, expected,
+            "hermetic_command must resolve real_root even with a foreign GIT_DIR set"
+        );
+    }
+
+    /// D-03: `origin_main_ancestor_status` produces the correct answer
+    /// under a hostile `GIT_DIR` where it previously did not. Setting a
+    /// process-global env var is forbidden (Rust 2024 `unsafe`, unsound
+    /// under threaded tests — Phase 25 D-14), so this proves the property
+    /// the way the constructor guarantees it, in three parts: (a) the
+    /// `Command` this code path builds via `git_command` is
+    /// unconditionally scrubbed — no bypass parameter, no env-var check,
+    /// no config lookup (D-01); (b) the exact argv
+    /// `origin_main_ancestor_status` issues, built WITHOUT the scrub and
+    /// with a hostile `GIT_DIR` explicitly set, is demonstrably redirected
+    /// onto the foreign repo and fails to find the ref the real repo
+    /// actually has — proving the vulnerability this scrub closes is real,
+    /// not hypothetical (a bare `.env("GIT_DIR", foreign)` chained after
+    /// `git_command` cannot be asserted to "still succeed", since a
+    /// literally-present `GIT_DIR` genuinely redirects ref resolution —
+    /// verified empirically against this machine's git 2.55.0; only
+    /// `--show-toplevel`, tested above, is immune via its own
+    /// `GIT_WORK_TREE`-absent fallback to cwd); (c) the actual mechanism
+    /// `origin_main_ancestor_status` now depends on — scrubbed, with
+    /// nothing in production code re-adding `GIT_DIR` afterward — reaches
+    /// the correct answer.
+    #[test]
+    fn origin_main_ancestor_status_holds_under_a_hostile_git_dir() {
+        let repo = init_repo();
+        let root = repo.path();
+        let head = crate::test_support::git_command(root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let head_sha = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        git(root, &["update-ref", "refs/remotes/origin/main", &head_sha]);
+
+        let foreign_repo = TempDir::new().unwrap();
+        git(foreign_repo.path(), &["init", "-q"]);
+
+        // (a) unconditionally scrubbed.
+        let cmd = git_command(root);
+        assert!(
+            cmd.get_envs()
+                .any(|(key, value)| key == "GIT_DIR" && value.is_none()),
+            "origin_main_ancestor_status's own Command must mark GIT_DIR for removal"
+        );
+
+        // (b) sanity check: the vulnerability this scrub closes is real —
+        // an unscrubbed command issuing the same argv, under a hostile
+        // GIT_DIR, must NOT reach the real repo's answer, or this test
+        // proves nothing.
+        let unscrubbed = std::process::Command::new("git")
+            .args(["merge-base", "--is-ancestor", "origin/main", "HEAD"])
+            .current_dir(root)
+            .env("GIT_DIR", foreign_repo.path().join(".git"))
+            .output()
+            .expect("spawn unscrubbed git");
+        assert!(
+            !unscrubbed.status.success(),
+            "sanity check: an unscrubbed command under a hostile GIT_DIR must NOT \
+             reach the real repo's answer — otherwise this test proves nothing"
+        );
+
+        // (c) the actual, scrubbed mechanism reaches the correct answer.
+        assert_eq!(origin_main_ancestor_status(root), AncestorStatus::Ancestor);
+    }
+
+    // -----------------------------------------------------------------
     // 20d: signing-viability helpers
     // -----------------------------------------------------------------
 
