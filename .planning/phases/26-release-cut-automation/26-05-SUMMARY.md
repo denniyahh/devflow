@@ -150,3 +150,11 @@ None - no external service configuration required. (`cargo_publish`'s real succe
 ---
 *Phase: 26-release-cut-automation*
 *Completed: 2026-07-29*
+
+## Self-Check: PASSED
+
+- FOUND: `crates/devflow-core/src/git.rs`
+- FOUND: `.planning/phases/26-release-cut-automation/26-05-SUMMARY.md`
+- FOUND commit `9788837` (Task 1)
+- FOUND commit `861b1c9` (Task 2)
+- FOUND commit `44d4516` (Task 3)
