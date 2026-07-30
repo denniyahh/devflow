@@ -341,4 +341,98 @@ mod tests {
         let repo = init_repo();
         prune(repo.path()).expect("prune");
     }
+
+    // -----------------------------------------------------------------
+    // 27-02 (D-03/T-27-03): worktree::list is immune to a hostile GIT_DIR
+    // -----------------------------------------------------------------
+
+    /// D-03/T-27-03: `list` does NOT route through the `run` chokepoint and
+    /// so needed its own, independent migration. Proven the same way
+    /// 27-01's `origin_main_ancestor_status_holds_under_a_hostile_git_dir`
+    /// proves immunity (no process-global env mutation — Rust 2024
+    /// `unsafe`, unsound under threaded tests, Phase 25 D-14), in two
+    /// parts: (a) the `Command` `list` builds via
+    /// `git_command(project_root)` is unconditionally scrubbed — no bypass
+    /// parameter, no env-var check, no config lookup (D-01), asserted
+    /// directly on the built `Command`; (b) the actual `list(real_root)`
+    /// production function, called normally with nothing re-adding
+    /// `GIT_DIR` afterward, reaches the correct answer — proven when THIS
+    /// test itself runs under this crate's hostile-`GIT_DIR` harness
+    /// (`GIT_DIR=<hostile>/.git cargo test ... \
+    /// list_resolves_caller_root_under_a_hostile_git_dir`), whose OS-level
+    /// env var this test's own process (and so `list`'s spawned child,
+    /// unless scrubbed) inherits.
+    ///
+    /// A literal chained `.env("GIT_DIR", foreign)`-after-the-constructor
+    /// reproduction of `list`'s own argv (the technique
+    /// `hermetic_command_resolves_caller_root_even_under_a_hostile_git_dir`
+    /// uses for `--show-toplevel`) was deliberately NOT added here:
+    /// empirically verified (this machine, git 2.55.0) that
+    /// `worktree list --porcelain` genuinely IS redirected by an explicit
+    /// `GIT_DIR` override chained after the scrub (`cd <real> && GIT_DIR=
+    /// <foreign>/.git git worktree list --porcelain` enumerates
+    /// `<foreign>`'s own single worktree entry, not `<real>`'s) — unlike
+    /// `--show-toplevel`, which falls back to cwd when `GIT_WORK_TREE` is
+    /// unset. This is exactly T-27-03's threat: an explicit/inherited
+    /// `GIT_DIR` genuinely retargets this command, which is why the fix is
+    /// scrubbing it away before it ever reaches the child, not proving the
+    /// child resists an override that was never removed (same reasoning as
+    /// 27-01's documented deviation for `merge-base --is-ancestor`).
+    #[test]
+    fn list_resolves_caller_root_under_a_hostile_git_dir() {
+        let repo = init_repo();
+        let root = repo.path();
+        let wt_path = phase_path(root, 9);
+        let wt_str = wt_path.to_string_lossy();
+        // Fixture setup goes through the already-scrubbed general
+        // constructor directly (not the production `add()`, which itself
+        // depends on `run()` — kept independent so this test proves only
+        // `list`'s own immunity, not `run`'s).
+        assert!(
+            crate::git::git_command(root)
+                .args([
+                    "worktree",
+                    "add",
+                    "-b",
+                    "feature/phase-09",
+                    &wt_str,
+                    "develop",
+                ])
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "git worktree add fixture setup failed"
+        );
+
+        // (a) unconditionally scrubbed.
+        let cmd = crate::git::git_command(root);
+        assert!(
+            cmd.get_envs()
+                .any(|(key, value)| key == "GIT_DIR" && value.is_none()),
+            "list's own Command must mark GIT_DIR for removal"
+        );
+
+        // (b) the actual, scrubbed mechanism reaches the correct answer.
+        let entries = list(root).expect("list must succeed");
+        let canonical_root = std::fs::canonicalize(root).expect("canonicalize root");
+        assert!(
+            entries.len() >= 2,
+            "expected at least main + added worktree, got: {entries:?}"
+        );
+        for entry in &entries {
+            let canonical_entry =
+                std::fs::canonicalize(&entry.path).expect("canonicalize entry path");
+            assert!(
+                canonical_entry.starts_with(&canonical_root),
+                "worktree entry {canonical_entry:?} must be under real_root {canonical_root:?}"
+            );
+        }
+        assert!(
+            entries
+                .iter()
+                .any(|w| w.branch.as_deref() == Some("feature/phase-09")),
+            "list must include the added worktree, got: {entries:?}"
+        );
+    }
 }
