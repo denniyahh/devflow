@@ -2119,6 +2119,111 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // 27-05 (D-01, T-27-01): phase_reachability_on_base under a hostile
+    // GIT_DIR.
+    // -----------------------------------------------------------------
+
+    /// D-01/T-27-01: `phase_reachability_on_base` must resolve `project_root`
+    /// even when a `GIT_DIR` inherited from the caller's environment points
+    /// at an unrelated repository. The dangerous direction is a foreign
+    /// repository VOUCHING for a phase that does not exist locally, letting
+    /// `devflow start` fork a run with nothing to work on — a preflight that
+    /// answers from a foreign repository reports success, which is worse
+    /// than no preflight at all.
+    ///
+    /// Two proofs, mirroring `origin_main_ancestor_status_holds_under_a_
+    /// hostile_git_dir` (`devflow-core/src/git.rs`, 27-01) rather than
+    /// literally chaining `.env("GIT_DIR", foreign)` onto this function's
+    /// OWN call (impossible from outside its module boundary — the `Command`
+    /// it builds internally is not exposed to callers). Per 27-01's own
+    /// empirically-verified finding, that technique would also prove nothing
+    /// useful here even if it were possible: a hostile `GIT_DIR` chained
+    /// AFTER a scrub genuinely redirects ref/tree resolution for commands
+    /// like `ls-tree`/`rev-parse --verify` (verified directly against this
+    /// machine's git — `GIT_DIR=<foreign> git ls-tree -r --name-only develop
+    /// -- .planning/phases/` run with `cwd` pinned to an unrelated repo
+    /// returns the FOREIGN repo's tree), unlike `--show-toplevel`, which
+    /// falls back to cwd when `GIT_WORK_TREE` is unset.
+    ///
+    /// (a) A direct, unscrubbed reproduction of this function's own
+    /// pre-migration `ls-tree` step — `std::process::Command::new("git")`
+    /// (not `git_command`), cwd pinned to `real_root`, with a hostile
+    /// `GIT_DIR` chained on top pointing at `foreign_root` — is shown to
+    /// report `foreign_root`'s phase directory instead of `real_root`'s
+    /// absence of one. This is the concrete shape of "a foreign repository
+    /// vouching for a phase that does not exist locally," proven without
+    /// ever touching this test process's own environment (child-scoped
+    /// injection, same technique as 27-01's `hermetic_command_resolves_
+    /// caller_root_even_under_a_hostile_git_dir`).
+    ///
+    /// (b) `phase_reachability_on_base(real_root, ...)`, called normally
+    /// with nothing re-adding `GIT_DIR` afterward, is asserted to report
+    /// `real_root`'s own correct answer. Run in a plain environment this
+    /// passes regardless of migration status — there is no ambient hostile
+    /// `GIT_DIR` for an unmigrated call to inherit. The RED-before/
+    /// GREEN-after proof this plan's own `<verify>` block relies on comes
+    /// from running this exact test under `GIT_DIR="$HOSTILE/.git" cargo
+    /// test ... -- preflight::tests::
+    /// phase_reachability_resolves_caller_root_under_a_hostile_git_dir`:
+    /// before migration, the ambient hostile `GIT_DIR` set by that wrapping
+    /// shell is inherited by every unscrubbed `Command::new("git")` this
+    /// function spawns, so step 1 (`rev-parse --verify --quiet develop`
+    /// against the shell's empty, commit-less hostile repo) fails and the
+    /// function falls open to `Undeterminable` instead of the correct
+    /// `Unreachable`; after migration, `git_command`'s `env_remove` strips
+    /// that ambient `GIT_DIR` from every child it spawns, and the assertion
+    /// below passes.
+    #[test]
+    fn phase_reachability_resolves_caller_root_under_a_hostile_git_dir() {
+        let real_dir = reachability_fixture("### Phase 500: Something\n", None);
+        let real_root = real_dir.path();
+
+        let foreign_dir =
+            reachability_fixture("### Phase 500: Something\n", Some((500, "something")));
+        let foreign_root = foreign_dir.path();
+
+        // (a) the vulnerability class, reproduced directly: an unscrubbed
+        // Command, cwd pinned to real_root, with GIT_DIR chained onto the
+        // foreign repository — the exact "vouching" danger T-27-01 closes.
+        let vulnerable = std::process::Command::new("git")
+            .args([
+                "ls-tree",
+                "-r",
+                "--name-only",
+                "develop",
+                "--",
+                ".planning/phases/",
+            ])
+            .current_dir(real_root)
+            .env("GIT_DIR", foreign_root.join(".git"))
+            .output()
+            .expect("spawn git");
+        assert!(
+            vulnerable.status.success(),
+            "the reproduction itself must spawn successfully: {}",
+            String::from_utf8_lossy(&vulnerable.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&vulnerable.stdout).contains(".planning/phases/500-something/"),
+            "an unscrubbed Command must be redirected onto the foreign repository's phase \
+             directory by an inherited GIT_DIR — this is the vulnerability class T-27-01 closes"
+        );
+
+        // (b) the real, migrated function: called normally, resolves
+        // real_root's own (correct) absence of the phase directory. See the
+        // doc comment above for how this becomes RED-before/GREEN-after when
+        // run under this plan's hostile-GIT_DIR-wrapped `<verify>` command.
+        assert_eq!(
+            phase_reachability_on_base(real_root, 500, "develop"),
+            PhaseReachability::Unreachable {
+                roadmap_entry_found: true,
+                phase_dir_found: false,
+            }
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // -----------------------------------------------------------------
     // 25e (999.51/D-18a): base-ref currency probe.
     // -----------------------------------------------------------------
 
