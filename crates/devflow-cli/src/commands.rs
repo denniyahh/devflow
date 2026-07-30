@@ -2230,6 +2230,28 @@ pub(crate) fn release_check(project_root: &Path) -> Result<(), CliError> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// sync (26-04, 999.52 / D-07)
+// ---------------------------------------------------------------------------
+
+/// Standalone entry point for `devflow sync`. Calls
+/// `devflow_core::sync::sync_main_to_develop` — the same function 26-06's
+/// release executor calls internally as its own sync step (D-07): one
+/// implementation, two entry points.
+pub(crate) fn sync_cmd(project_root: &Path) -> Result<(), CliError> {
+    match devflow_core::sync::sync_main_to_develop(project_root) {
+        Ok(devflow_core::sync::SyncOutcome::AlreadyAncestor) => {
+            println!("origin/main is already an ancestor of develop — nothing to sync.");
+            Ok(())
+        }
+        Ok(devflow_core::sync::SyncOutcome::Merged { merge_commit }) => {
+            println!("synced: merge commit {merge_commit} pushed to origin/develop");
+            Ok(())
+        }
+        Err(err) => Err(CliError::Message(err.to_string())),
+    }
+}
+
 /// Self-pin check (asserts 20a's invariant): every local-path
 /// `[workspace.dependencies]` self-pin must equal `[workspace.package]
 /// version`, compared dynamically — never against a hardcoded expected
