@@ -92,6 +92,27 @@ This is disclosed, not hidden, and is explicitly out of the file list assigned f
 
 ---
 
+## Resolution (added 2026-07-30 by execute-phase's code-review gate)
+
+The frontmatter `status`/`findings` counters above are the **review-time**
+record and are deliberately left unchanged — they describe what the review
+found, not what remains open. Current disposition:
+
+| Finding | Severity | Disposition |
+|---|---|---|
+| WR-01 | Warning | **Closed** — `936b371`. Both vacuous tests rewritten with the spawned-child shape; each was falsified (reverting one call site to an unscrubbed `Command::new("git")` makes them fail) and now asserts the child reported `1 passed` rather than merely exiting 0. |
+| WR-02 | Warning | **Closed** — `936b371`. `GIT_CEILING_DIRECTORIES` added to `ALSO_REDIRECTING_GIT_VARS` (deliberately *not* `REPO_LOCAL_GIT_VARS`, which is asserted byte-equal to git's own `--local-env-vars`), rationale recorded in source. |
+| WR-03 | Warning | **Partially closed** — `936b371` closed the highest-consequence site, `monitor.rs:148`, by routing the agent spawn through `hermetic_command` (`.envs(...)` applied *after* construction, so a deliberate adapter override still wins). The remaining **four** edges (`hooks.rs:222`, `gates.rs:323`, `verify.rs:106`, `commands.rs::cmd_check`) are **still open** and carried as the corrected backlog proposal in `27-SPAWN-CENSUS.md` § Proposed backlog entry. |
+| IN-01 | Info | Open — same `commands.rs::cmd_check` site as WR-03's fourth edge; functionally inert (`git --version` resolves no refs). |
+| IN-02 | Info | Open — cosmetic count skew in `ensure_base_ref_current`'s success message; CAS write itself is correct. |
+| IN-03 | Info | Not a defect — restatement of the accepted, documented `build.rs` exclusion (D-02). |
+
+**Net:** 0 critical, 0 warnings fully open (WR-03 partially open as 4 lower-severity
+edges), 2 open info items. No finding blocks phase completion. The open edges are
+tracked for backlog promotion, not silently dropped.
+
+---
+
 _Reviewed: 2026-07-30_
 _Reviewer: Claude (gsd-code-reviewer)_
 _Depth: standard_

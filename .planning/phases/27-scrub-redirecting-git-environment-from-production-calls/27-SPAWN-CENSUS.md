@@ -117,7 +117,7 @@ included for completeness, marked accordingly).
 | Site | Line (this HEAD) | Spawns | Verdict |
 |---|---|---|---|
 | `commands.rs::test_cmd` | ~1955 (`hermetic_command("sh", project_root)`) | `sh -c "cargo …"` | **MITIGATED by 27-04** — verified above, cited in `27-04-PLAN.md`'s recorded IN-SCOPE decision. |
-| `monitor.rs` | 148 | `sh -c …` → agent binary | **UNMITIGATED — highest-consequence candidate**, exactly as the plan's read-first material flagged. |
+| `monitor.rs` | 148 | `sh -c …` → agent binary | ~~**UNMITIGATED — highest-consequence candidate**~~ → **MITIGATED after this census, by `936b371` (review WR-03)**: routed through `hermetic_command`. Flagged here exactly as the plan's read-first material predicted, and closed on that signal. |
 | `agent.rs` | 707, 739, 778 | `sh -c …` | **Confirmed test code**, below the `#[cfg(test)]` boundary at line 532 — verified by direct inspection, not assumed. |
 | `hooks.rs` | 222 | `sh -c …` | **UNMITIGATED.** A git hook context can legitimately have `GIT_DIR` set by git itself when invoking the hook — but `docs_update`'s own spawn (`cargo doc`) is a *DevFlow-issued* child of that hook invocation, not git re-invoking itself, so the "git sets it legitimately" caveat does not exempt this specific site. This needs judgment (per the plan's own instruction), and the judgment call here is: reaches-git, unmitigated, out of this plan's scope to fix. |
 | `gates.rs` | 323 | `sh -c …` | **UNMITIGATED.** |
@@ -128,6 +128,17 @@ included for completeness, marked accordingly).
 ## Assumption A2 verdict
 
 **A2 is OPEN.**
+
+> **Correction, 2026-07-30 (post-census, supersedes the count below).** Site 4
+> (`monitor.rs:148`) was **closed after this census was written**, by the code
+> review's WR-03 finding and commit `936b371` (`fix(27): close review
+> WR-01/WR-02/WR-03`) — the agent spawn is now built through
+> `hermetic_command`, with `.envs(...)` applied after construction so an
+> adapter that deliberately sets one of these vars still wins. **Four** sites
+> remain open, not five, and the highest-consequence one is no longer among
+> them. The enumeration below is preserved as written for provenance; read it
+> with this correction applied. The proposed backlog entry's title, evidence
+> and severity paragraph are corrected in place.
 
 Five unmitigated spawn edges remain that can reach `git`, none of them among
 the 41 counted `Command::new("git")` sites and none in `27-CONTEXT.md`'s
@@ -140,9 +151,10 @@ the 41 counted `Command::new("git")` sites and none in `27-CONTEXT.md`'s
    DEVFLOW_GATE_NOTIFY_CMD>`.
 3. `verify.rs:106` (`run_external_verification`) — `sh -c <operator-approved
    verification command>`.
-4. `monitor.rs:148` (`spawn_monitor_inner`) — `sh -c` that execs the AI agent
+4. ~~`monitor.rs:148` (`spawn_monitor_inner`) — `sh -c` that execs the AI agent
    binary itself, the single highest-consequence site: the agent performs the
-   phase's actual git commits/pushes.
+   phase's actual git commits/pushes.~~ **CLOSED by `936b371` (review WR-03).**
+   Now constructed via `hermetic_command`; no longer open.
 5. `commands.rs:2086` (via `cmd_check`, `doctor`'s environment check) — a
    **direct-git** construction (`git --version`), invisible to a literal
    `Command::new("git")` grep because the program name is threaded through a
@@ -159,21 +171,19 @@ verification step.
 
 ### Proposed backlog entry
 
-**Title:** Scrub the five indirect/dynamic git-reaching spawn edges the
-Phase 27 literal-grep migration could not see (`monitor.rs`, `hooks.rs`,
-`gates.rs`, `verify.rs`, `commands.rs::cmd_check`)
+**Title:** Scrub the four remaining indirect/dynamic git-reaching spawn edges
+the Phase 27 literal-grep migration could not see (`hooks.rs`, `gates.rs`,
+`verify.rs`, `commands.rs::cmd_check`)
 
 **Evidence:** This document, `27-SPAWN-CENSUS.md`, § Full classification
-table and § Assumption A2 verdict — five sites with file, line, program, and
-rationale, all confirmed production-reachable by direct call-graph tracing
-(not assumed).
+table and § Assumption A2 verdict — originally five sites with file, line,
+program, and rationale, all confirmed production-reachable by direct
+call-graph tracing (not assumed). The fifth, `monitor.rs:148`, was closed
+in-phase by `936b371` and is **excluded** from this entry.
 
-**Severity:** high for `monitor.rs:148` (the agent process performs real,
-irreversible git operations — commits, pushes, merges — under whatever
-environment it inherits; this is the same threat class as 999.39/this
-phase's own motivating incident, one process deeper: instead of `devflow`
-itself misresolving a repository, an AI agent `devflow` spawns misresolves
-one). Medium for `hooks.rs:222` (same indirect-compile mechanism 27-04 already
+**Severity:** ~~high for `monitor.rs:148`~~ — **that site is closed; the
+highest-severity item is no longer part of this entry**, which lowers the
+whole entry's ceiling to Medium. Medium for `hooks.rs:222` (same indirect-compile mechanism 27-04 already
 found and fixed once, just at a second call site). Medium for `gates.rs:323`
 and `verify.rs:106` (both are operator-configured/approved commands, so the
 operator already has some control over what runs, but the redirecting
