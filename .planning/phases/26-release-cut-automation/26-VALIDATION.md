@@ -4,17 +4,18 @@ slug: release-cut-automation
 # status lifecycle: draft (seeded by plan-phase) → validated (set by validate-phase §6)
 # audit-milestone §5.5 distinguishes NOT-VALIDATED (draft) from PARTIAL (validated + nyquist_compliant: false) (#2117)
 status: validated
-nyquist_compliant: false
-wave_0_complete: false
+nyquist_compliant: true
+wave_0_complete: true
 created: 2026-07-29
-validated: 2026-07-29
+validated: 2026-07-30
 ---
 
 # Phase 26 — Validation Strategy
 
 > Per-phase validation contract for feedback sampling during execution.
 > Derived from `26-RESEARCH.md` § Validation Architecture.
-> Audited 2026-07-29 by `/gsd-validate-phase 26` — see § Validation Audit.
+> Audited 2026-07-29 (mid-arc, PARTIAL) and re-audited 2026-07-30 after the
+> full 26-01..26-07 arc landed — see § Validation Audit entries below.
 
 ---
 
@@ -26,7 +27,8 @@ validated: 2026-07-29
 | **Config file** | none — `Cargo.toml`'s `[workspace]`/per-crate `[dev-dependencies]` is the only config |
 | **Quick run command** | `cargo test --workspace --features devflow-core/test-support --lib <filter>` |
 | **Full suite command** | `devflow test` / `scripts/check.sh all` / `scripts/check-in-container.sh all` |
-| **Test count (lib target)** | 417 in `devflow-core` lib (406 pre-phase + 11 added by 26-03) |
+| **Test count (lib target)** | 434 in `devflow-core` lib (406 pre-phase + 11 by 26-03 + 5 by 26-04 + 4 by 26-05 + 8 by 26-06) |
+| **CLI integration target** | `crates/devflow-cli/tests/release_execute.rs` — 6 tests (26-07), run via `cargo test -p devflow --test release_execute` |
 | **Estimated runtime** | ~180 seconds full suite; every filter used in this phase's map completes in under 2 seconds |
 
 **Two invocation traps confirmed live during this phase — both recorded here so the commands in the map below are copy-pasteable:**
@@ -95,60 +97,104 @@ validated: 2026-07-29
 
 ---
 
-## Per-Task Verification Map — Part B: Blocked on Missing Implementation
+## Per-Task Verification Map — Part B: Previously Blocked, Now Delivered
 
-> These rows were seeded by plan-phase against the phase's full seven-plan arc
-> (26-01 → 26-07). Only 26-01..26-03 were ever planned and executed, so the code
-> each row targets **does not exist**. They are implementation gaps, already
-> recorded as Truths 7–11 in `26-VERIFICATION.md` — *not* validation gaps.
+> These 11 rows were seeded by plan-phase against the phase's full seven-plan
+> arc and were **🚫 blocked** at the 2026-07-29 mid-arc audit, because only
+> 26-01..26-03 had executed and the code each row targets did not exist. Plans
+> 26-04 (sync module), 26-05 (publish primitives), 26-06 (release executor) and
+> 26-07 (CLI surface) have since landed. **All 11 are now green**, each re-run
+> live during the 2026-07-30 re-audit — not taken from the executing agents'
+> self-reported `status: pass`.
 >
-> **They are deliberately not filled.** A test importing
-> `devflow_core::sync::sync_main_to_develop` (or `cargo_publish`, or a
-> `--yes-release` flag) would not compile, and a non-compiling test target fails
-> the entire workspace build, `scripts/check.sh`, and the pre-push hook. Writing
-> them would convert a clean red "not built" into a broken build. They unblock
-> when their implementation lands, not before.
+> **Module relocation (B6–B8, B11):** the seeded rows named `git::tests::…`
+> because no executor module was foreseen at seed time. The behaviors landed in
+> the new `devflow_core::release` module instead, so their real test paths are
+> `release::tests::…`. Same behaviors, same assertions — recorded here so the
+> seeded name doesn't read as a missing test.
 
-| # | Requirement | Behavior | Blocked By | Planned Command | Status |
-|---|-------------|----------|------------|-----------------|--------|
-| B1 | 999.52 | `devflow sync` refuses on dirty tree | `crates/devflow-core/src/sync.rs` does not exist | `sync::tests::refuses_on_dirty_tree` | 🚫 blocked |
-| B2 | 999.52 | `devflow sync` refuses when not on `develop` | same | `sync::tests::refuses_off_develop` | 🚫 blocked |
-| B3 | 999.52 | Short-circuits when `origin/main` is already an ancestor of `develop` | same | `sync::tests::noop_when_already_synced` | 🚫 blocked |
-| B4 | 999.52 | Tree-identity mismatch aborts, leaves `develop` untouched, no push (D-09) | same | `sync::tests::aborts_on_tree_mismatch` | 🚫 blocked |
-| B5 | 999.52 | Successful sync pushes to origin (D-08) | same | `sync::tests::pushes_on_success` | 🚫 blocked |
-| B6 | 999.25 | Version-bump commit pushes to `develop` (D-01), fast-forward only, never `--force` | no release executor exists to call `push_ref` | `git::tests::version_bump_pushes_develop` | 🚫 blocked |
-| B7 | 999.25 | Idempotent resume: `develop` already at/ahead of computed version → push step skipped (D-06) | same | `git::tests::skips_push_when_already_ahead` | 🚫 blocked |
-| B8 | 999.25 | Tag step: existing annotated+reachable+pushed tag → step is a no-op (D-06) | executor's skip *decision* absent — the underlying `release_tag_state` → `Released` classification it would branch on **is** covered (A14–A17, A20) | `git::tests::skips_tag_when_already_released` | ⚠️ partial — predicate covered, decision blocked |
-| B9 | 999.25 | Pre-publish check: `cargo info` exit 0 → already-published (skip); `could not find` → proceed; other → fail loud, do not guess | `classify_cargo_info_result`/`PublishCheck` never written (zero matches in `crates/`) | `git::tests::publish_check_classifies_exit_codes` | 🚫 blocked |
-| B10 | 999.25 | `--yes-release` required per-invocation, never settable via config/env (D-03, mirrors `--yes-ship`) | flag does not exist — `rg 'yes_release' crates/` zero matches; `crates/devflow-cli/tests/release_execute.rs` absent | new `crates/devflow-cli/tests/release_execute.rs` | 🚫 blocked |
-| B11 | 999.25 | Fail-fast, no rollback (D-05): mid-sequence failure (core publish succeeds, cli publish fails) leaves prior steps landed | no executor, no publish primitives | `release_execute::tests::partial_failure_leaves_prior_steps_landed` | 🚫 blocked |
+| # | Requirement | Behavior | Test Type | Automated Command (filter) | Status |
+|---|-------------|----------|-----------|----------------------------|--------|
+| B1 | 999.52 | `devflow sync` refuses on dirty tree, before the fetch, mutating nothing | unit (bare-remote fixture) | `sync::tests::refuses_on_dirty_tree` | ✅ green |
+| B2 | 999.52 | `devflow sync` refuses when not on `develop` | unit (bare-remote fixture) | `sync::tests::refuses_off_develop` | ✅ green |
+| B3 | 999.52 | Short-circuits when `origin/main` is already an ancestor of `develop` | unit (bare-remote fixture) | `sync::tests::noop_when_already_synced` | ✅ green |
+| B4 | 999.52 | Tree-identity mismatch aborts, leaves `develop` untouched, no push — the remote ref proven byte-identical before and after (D-09) | unit (bare-remote fixture) | `sync::tests::aborts_on_tree_mismatch` | ✅ green |
+| B5 | 999.52 | Successful sync pushes to origin via `push_ref`, no bare `git push` argv anywhere in `sync.rs` (D-08) | unit (bare-remote fixture) | `sync::tests::pushes_on_success` | ✅ green |
+| B6 | 999.25 | Version-bump commit pushes to `develop` (D-01), fast-forward only, never `--force` | unit (bare-remote fixture) | `release::tests::version_bump_pushes_develop` *(seeded as `git::tests::`)* | ✅ green |
+| B7 | 999.25 | Idempotent resume: `develop` already at/ahead of computed version → push step skipped, write and push as two independent predicates (D-06) | unit (bare-remote fixture) | `release::tests::skips_push_when_already_ahead` *(seeded as `git::tests::`)* | ✅ green |
+| B8 | 999.25 | Tag step: existing annotated+reachable+pushed tag → step is a byte-identical no-op (D-06). The blocked *decision* is now covered, not just A14–A17's predicate | unit (bare-remote + SSH-signing fixtures) | `release::tests::skips_tag_when_already_released` *(seeded as `git::tests::`)* | ✅ green |
+| B9 | 999.25 | Pre-publish check: `cargo info` exit 0 → already-published; **both** `could not find` *and* `registry` fragments → proceed; anything else (incl. missing-manifest, absent exit code, empty stderr) → `Ambiguous`, fail loud, never guess | unit (pure classifier, 6 documented cases) | `git::tests::publish_check_classifies_exit_codes` | ✅ green |
+| B10 | 999.25 | `--yes-release` required per-invocation, never settable via `devflow.toml`, env var, or persisted `State` (D-03, mirrors `--yes-ship`) | integration (real binary, isolated HOME) | `release_execute::execute_without_yes_release_is_rejected` + `release_execute::yes_release_is_not_settable_via_config_or_env` | ✅ green |
+| B11 | 999.25 | Fail-fast, no rollback (D-05): mid-sequence failure leaves prior steps landed — version-bump commit stays pushed, no tag exists, no compensating action | unit (bare-remote fixture) | `release::tests::partial_failure_leaves_prior_steps_landed` *(seeded as `release_execute::tests::`)* | ✅ green |
+
+---
+
+## Per-Task Verification Map — Part C: Additional Delivered Behavior (26-04 … 26-07)
+
+> Behaviors the 26-04..26-07 plans delivered that had no seeded Part B row.
+> Included so the map covers what actually shipped, not only what was foreseen.
+
+| # | Plan | Requirement | Behavior | Test Type | Automated Command (filter) | Status |
+|---|------|-------------|----------|-----------|----------------------------|--------|
+| C1 | 26-05 | 999.25 | `cargo info` argv is pinned to the exact `info <name>@<version> --registry crates-io` form without spawning anything | unit | `git::tests::cargo_info_args_targets_the_exact_version_on_crates_io` | ✅ green |
+| C2 | 26-05 | 999.25 | An `Ambiguous` verdict surfaces as `Err`, structurally incapable of degrading into either boolean | unit | `git::tests::crate_already_published_surfaces_an_ambiguous_check_as_an_error` | ✅ green |
+| C3 | 26-05 | 999.25 | `cargo_publish` reports failure without publishing anything; no `--dry-run`, no retry loop (D-04/D-05) | unit (no-manifest fixture — structurally cannot reach the registry) | `git::tests::cargo_publish_reports_a_failure_without_publishing_anything` | ✅ green |
+| C4 | 26-06 | 999.25 | The develop→main human gate is **content-based** (reads `origin/main`'s version-file text via `git show`, never ancestry, because `main` squash-merges) and halts cleanly creating no tag (D-02) | unit (bare-remote fixture) | `release::tests::halts_at_the_human_gate_when_main_does_not_declare_the_release` | ✅ green |
+| C5 | 26-06 | 999.25 | A stray lightweight or mismatched tag is a terminal `TagCollision`, never auto-resolved; the existing tag is provably untouched (D-05) | unit (bare-remote fixture) | `release::tests::refuses_a_stray_lightweight_tag_rather_than_skipping` | ✅ green |
+| C6 | 26-06 | 999.52 | The executor's sync step calls the identical `sync_main_to_develop` the standalone CLI calls (D-07); a refused sync stops the run before any publish is attempted | unit (bare-remote fixture) | `release::tests::a_refused_sync_stops_the_run_before_publishing` | ✅ green |
+| C7 | 26-06 | 999.25 | Full five-step sequence completes in one call, one `StepReport` per `ReleaseStep` in sequence order, `publish_order`'s packages consulted in their own order and never re-sorted (D-04) | unit (bare-remote + SSH-signing fixtures) | `release::tests::completes_the_sequence_and_reports_every_step` | ✅ green |
+| C8 | 26-06 | 999.25 | Truth 9 closure: `push_ref`, `release_tag_state`, `create_signed_release_tag` each have a real production (non-test) caller | guard | `rg -n 'push_ref\|release_tag_state\|create_signed_release_tag' crates/devflow-core/src/release.rs` → matches at 317/401/413–415/435–436, all before the `#[cfg(test)]` boundary at line 583 | ✅ green |
+| C9 | 26-07 | 999.25 | `--execute --yes-release` reaches the real core executor and surfaces its refusal; Truth 7 closure | integration (real binary) | `release_execute::execute_reaches_the_core_executor_and_refuses_off_develop` | ✅ green |
+| C10 | 26-07 | 999.25 | `--check` and `--execute` are mutually exclusive | integration (real binary) | `release_execute::check_and_execute_together_are_rejected` | ✅ green |
+| C11 | 26-07 | 999.25 | Bare `devflow release` names both modes; the old "not yet built"/`DEN-50` deferral phrasing is **absent** (asserted as absence, not merely new-text presence) | integration (real binary) | `release_execute::bare_release_names_both_modes_and_no_deferred_executor` | ✅ green |
+| C12 | 26-07 | 999.25 | `yes_release` has no config/state/env source surface at all | guard (source-surface) | `release_execute::yes_release_has_no_config_state_or_env_surface` | ✅ green |
+| C13 | 26-07 | 999.25 | The phase adds no pull-request capability — `gh` subprocess call sites unchanged at one file (D-02) | guard | `rg -n 'Command::new("gh")' crates/ -g '*.rs'` → exactly `crates/devflow-cli/src/preflight.rs` | ✅ green |
+| C14 | 26-04/26-07 | 999.52 | `devflow sync` and the new release flags are real, documented, `--help`-able subcommands — help snapshot and doc invariants hold | integration | `help_snapshot::help_output_matches_committed_snapshot` + all 6 `doc_check::` tests | ✅ green |
 
 *Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky/partial · 🚫 blocked (no implementation to test)*
+
+**Observed run (2026-07-30, live re-audit):**
+`sync::tests::` **5 passed** · `release::tests::` **8 passed** · publish primitives (B9/C1–C3) **4 passed** ·
+`cargo test -p devflow --test release_execute` **6 passed** · Part A regression filter **23 passed** ·
+full workspace `--lib` **434 passed / 0 failed** · `cargo test -p devflow` **0 failed across all 15 targets**.
+All named tests confirmed present via `-- --list` *before* running (guarding against trap 2 above).
+Guard greps re-run: `Released phase via DevFlow` absent · `check_ssh_signing_viability` still exactly
+`crates/devflow-core/src/git.rs:2` · `gh` call sites still one file · zero `"push"` in `sync.rs` ·
+zero `--dry-run` in `git.rs` · `DEN-50`/`not yet built` present only inside the assertions proving
+their absence.
 
 ---
 
 ## Wave 0 Requirements
 
 - [x] Bare-remote git fixture helper — **DONE.** `init_bare_remote` in `git.rs`'s test module, the project's first hermetic local-bare-remote helper; reused by all 11 tests 26-03 added (A10–A12, A17, A20). Also `configure_ssh_tag_signing` (throwaway repo-local SSH keypair + allowed-signers) and `rev_parse`, neither of which the original Wave 0 list anticipated.
-- [ ] `crates/devflow-core/src/sync.rs` — new module, not created (blocks B1–B5)
-- [ ] `crates/devflow-cli/tests/release_execute.rs` — new integration test file, not created (blocks B10–B11)
-- [ ] A fake/stub `cargo` shim for hermetic classification of `cargo info` exit codes, OR tests against a known-immutable registry version — never chosen or built (blocks B9). The hermeticity-vs-real-tool tradeoff the original note asked the planner to resolve is **still open** and must be decided by whichever plan implements the publish primitives.
+- [x] `crates/devflow-core/src/sync.rs` — **DONE** (26-04). Also became the shared `pub(crate)` fixture home (`init_repo`, `init_bare_remote`) that 26-06 imports rather than building a third copy. Unblocked B1–B5.
+- [x] `crates/devflow-cli/tests/release_execute.rs` — **DONE** (26-07). 6 tests driving the real binary under an isolated `HOME`. Unblocked B10.
+- [x] The hermeticity-vs-real-tool tradeoff for `cargo info` — **RESOLVED** (26-05): *neither* option was taken. No `PATH` shim (mutates process-global state and only covers `Command::spawn`) and no live-registry test (breaks offline/CI runs). Instead all branch logic lives in the pure `classify_cargo_info_result(exit_code, stderr)`, table-tested against 6 captured fixtures; the live tool's real behavior was re-confirmed once out-of-band via an oracle probe (`cargo info devflow-core@2.1.0` exit 0; `@0.0.1` exit 101). Unblocked B9.
+
+**Wave 0 complete — 4 of 4 items built or explicitly resolved.**
 
 ---
 
 ## Manual-Only Verifications
 
-> ⚠️ All three remain **moot as of this audit** — the code paths they would
-> exercise (`create_signed_release_tag`'s production caller, `cargo_publish`,
-> `sync_main_to_develop`) were never built. These are not "verified by hand
-> instead of by test"; they are pending, and become actionable only once the
-> corresponding executor code lands.
+> **No longer moot.** At the 2026-07-29 audit all three were pending on *missing
+> code*. That code now exists and is green, so these are back to being what the
+> section is actually for: **backstop truths that no test can close**, each
+> requiring a real signing key, real registry credentials, or a real `origin`
+> with the operator's own ruleset bypass. They are persisted as the three items
+> in `26-UAT.md` (`status: testing`, 3 pending) and as `human_verification`
+> entries in `26-VERIFICATION.md`. A verifier must **abstain** on these, not
+> pass or fail them.
+>
+> These are *not* Nyquist gaps. Every behavior that is automatable has automated
+> coverage; these three are categorically operator-only irreversible operations.
 
 | Behavior | Requirement | Why Manual | Test Instructions | Status |
 |----------|-------------|------------|-------------------|--------|
-| Signed tag creation with the real operator signing key produces a `git tag -v`-verifiable tag | 999.25 (D-10) | No sandbox in research/CI has real signing keys; the exact `git -c user.signingkey=... tag -s` invocation must be observed against a real key at least once | Operator runs `--yes-release` against a throwaway/non-production repo (or the real repo, operator's call) with their own `devflow.releaseSigningKey` configured, confirms `git tag -v vX.Y.Z` passes | ⬜ pending — no `--yes-release` flag exists yet. Partially de-risked: A19 proves the exact invocation form works against a throwaway SSH key. |
-| `cargo publish` for both crates completes and the packages are live in the correct order | 999.25 (D-04) | Publish credentials and live registry state cannot be faked without risking a real, irreversible publish | Operator observes the first real `--yes-release` run's publish steps end-to-end; verify `devflow-core` lands before `devflow` per `publish_order` | ⬜ pending — no publish code exists to observe |
-| Sync (`devflow sync`) direct-pushes `develop` without a human clicking a GitHub merge-strategy button | 999.52 (D-08) | Requires the operator's own out-of-scope GitHub ruleset bypass to already exist; cannot be simulated against the real `origin` in CI | Operator confirms the ruleset bypass is configured, then runs `devflow sync` once against the real repo and confirms the push lands as a direct push, not a PR | ⬜ pending — no `devflow sync` subcommand exists |
+| Signed tag creation with the real operator signing key produces a `git tag -v`-verifiable tag | 999.25 (D-10) | No sandbox in research/CI has the operator's real (non-throwaway) signing key | Operator runs `devflow release --execute --yes-release` against a real repo with their own `devflow.releaseSigningKey` configured, confirms `git tag -v vX.Y.Z` passes | ⬜ pending operator — **UAT #1**. Reachable now (`--yes-release` exists). De-risked: A19 + `release::tests::skips_tag_when_already_released`/`completes_the_sequence_and_reports_every_step` prove the exact invocation form works against a throwaway SSH key. |
+| `cargo publish` for both crates completes and the packages are live in the correct order | 999.25 (D-04) | Publish credentials and live registry state cannot be faked without risking a real, irreversible publish | Operator observes the first real `--yes-release` run's publish steps end-to-end; verify `devflow-core` lands before `devflow` per `publish_order` | ⬜ pending operator — **UAT #2**. Reachable now. De-risked: C3 proves the failure path; B9/C1–C2 pin the pre-publish classification; A22 pins the order. |
+| Sync (`devflow sync`) direct-pushes `develop` without a human clicking a GitHub merge-strategy button | 999.52 (D-08) | Requires the operator's own out-of-scope GitHub ruleset bypass to already exist; cannot be simulated against the real `origin` in CI | Operator confirms the ruleset bypass is configured, then runs `devflow sync` once against the real repo and confirms the push lands as a direct push, not a PR | ⬜ pending operator — **UAT #3**. Reachable now (`devflow sync` exists). De-risked: B1–B5 prove the direct-push behavior against a local bare remote. |
 | Operator authorization for direct-push-to-develop (D-01/D-08) and unattended `cargo publish` (D-04) | 999.25 | Categorically a human decision about an irreversible-in-effect capability; no test can substitute for the operator's actual authorization | Recorded in `26-01-SUMMARY.md` Decisions 1 & 2 | ✅ obtained — `direct-push` and `automate-publish`, double-confirmed (original discuss-phase session + live re-confirmation this run) |
 
 ---
@@ -193,14 +239,56 @@ those plans — each already names its behavior and intended test filter.
 
 ---
 
+## Validation Audit 2026-07-30 (re-audit, full arc)
+
+| Metric | Count |
+|--------|-------|
+| Gaps found | 0 |
+| Resolved | 0 (all 11 prior gaps closed by implementation, not by this audit) |
+| Escalated | 0 |
+| Prior audit's blocked rows (B1–B11) now green | 11 / 11 |
+| Additional delivered behaviors mapped (Part C) | 14 |
+| Total automated rows in map | 47 (22 Part A + 11 Part B + 14 Part C) |
+| Manual-only backstop truths (operator-pending) | 3 — persisted as `26-UAT.md` #1–#3 |
+| Auditor spawned | No — see rationale |
+| Tests re-run live (not trusted from self-report) | 46 named across 4 filters, plus full suite 434 `--lib` + all `-p devflow` targets, **0 failed** |
+
+**Why no auditor was spawned.** There were no gaps to fill. Between the
+2026-07-29 audit and this one, plans 26-04 (`sync.rs`), 26-05 (publish
+primitives), 26-06 (`release.rs` executor) and 26-07 (`--execute --yes-release`
+CLI surface) landed, and each brought its own tests for the exact rows the prior
+audit had recorded as blocked. `gsd-nyquist-auditor` fills *missing* coverage;
+every automatable behavior in this phase already has green coverage, so
+spawning it would have had nothing to write. This audit's work was therefore
+**verification, not generation**: every named test was confirmed present via
+`-- --list` and then re-run live, rather than trusted from the executing agents'
+self-reported `status: pass`.
+
+**Why `nyquist_compliant: true` is honest here.** The prior audit set it `false`
+and warned that flipping it "on the grounds that nothing was fillable" would be
+an overclaim. That warning does not apply now, and the distinction matters: then,
+11 requirements had **no automated verification because they had no
+implementation**; now they have both, re-run green in this session. The three
+remaining manual-only rows are not un-run tests — they are irreversible
+real-world operations (a real signing key, a real `cargo publish`, a real
+`origin` push) that no test can perform by design, tracked separately as UAT
+items and as `26-VERIFICATION.md`'s `human_verification` block. Corroborated
+independently: `26-VERIFICATION.md` reports `11/11 must-haves verified`,
+`behavior_unverified: 0`, `gaps_remaining: []`.
+
+---
+
 ## Validation Sign-Off
 
-- [x] All *delivered* tasks have `<automated>` verify — 22/22 green (Part A)
+- [x] All delivered tasks have `<automated>` verify — 47/47 green (Parts A + B + C)
 - [x] Sampling continuity: no 3 consecutive delivered tasks without automated verify
-- [ ] Wave 0 covers all MISSING references — 1 of 4 items built (`init_bare_remote`); 3 still open
+- [x] Wave 0 covers all MISSING references — 4 of 4 built or explicitly resolved
 - [x] No watch-mode flags
-- [x] Feedback latency < 180s — every filter used completes in under 2s
-- [ ] `nyquist_compliant: true` — **deliberately false.** 999.5 is fully covered; 999.25 and 999.52 have no automated verification because they have no implementation (11 rows in Part B).
+- [x] Feedback latency < 180s — every filter used completes in under 6s; full `--lib` suite 15.4s
+- [x] `nyquist_compliant: true` — 999.5, 999.25 and 999.52 all have green automated verification
 
-**Approval:** validated — PARTIAL. Phase 26 is Nyquist-complete for what it
-shipped (999.5) and honestly red for what it did not (999.25, 999.52).
+**Approval:** validated — **NYQUIST-COMPLIANT**. Every automatable behavior
+Phase 26 delivered has green automated coverage, re-run live during this audit.
+Three operator-only backstop truths (real signing key, real `cargo publish`,
+real `origin` direct-push) remain open by design and are tracked in `26-UAT.md`,
+not as validation gaps.
