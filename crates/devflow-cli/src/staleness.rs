@@ -122,11 +122,7 @@ fn ancestry_range_affects_build(execution_root: &Path, embedded_commit: &str) ->
 /// binary, non-git directory, non-zero exit) — same argv-array idiom as
 /// `build.rs`'s `run_git`.
 pub(crate) fn run_git_stdout(project_root: &Path, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(project_root)
-        .output()
-        .ok()?;
+    let output = git_command(project_root).args(args).output().ok()?;
     output
         .status
         .success()
