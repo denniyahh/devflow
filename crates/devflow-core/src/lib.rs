@@ -70,6 +70,7 @@ pub mod prompt;
 pub mod recover;
 pub mod registry;
 pub mod release;
+pub mod release_ledger;
 pub mod ship;
 pub mod ship_evidence;
 pub mod stage;
