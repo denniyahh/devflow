@@ -27,7 +27,7 @@ use devflow_core::agents;
 use devflow_core::config::{DEVELOP, FEATURE_PREFIX, MAIN};
 use devflow_core::events;
 use devflow_core::gates::{GateAction, GateError, GateResponse, Gates, OpenGate};
-use devflow_core::git::GitFlow;
+use devflow_core::git::{GitFlow, git_command, hermetic_command};
 use devflow_core::history;
 use devflow_core::lock;
 use devflow_core::mode::Mode;
@@ -88,7 +88,7 @@ pub(crate) fn resolve_gate_target(
 /// specific checks would allow.
 pub(crate) fn phase_artifact_on_develop(project_root: &Path, phase: u32, suffix: &str) -> bool {
     let prefix = format!(".planning/phases/{phase:02}-");
-    let output = std::process::Command::new("git")
+    let output = git_command(project_root)
         .args([
             "ls-tree",
             "-r",
@@ -97,7 +97,6 @@ pub(crate) fn phase_artifact_on_develop(project_root: &Path, phase: u32, suffix:
             "--",
             ".planning/phases/",
         ])
-        .current_dir(project_root)
         .output();
     let Ok(out) = output else { return true };
     if !out.status.success() {
@@ -1953,10 +1952,9 @@ pub(crate) fn test_cmd(project_root: &Path) -> Result<(), CliError> {
     let mut failures = Vec::new();
     for (label, cmd) in checks {
         println!("=== {label} ===");
-        let status = std::process::Command::new("sh")
+        let status = hermetic_command("sh", project_root)
             .arg("-c")
             .arg(cmd)
-            .current_dir(project_root)
             .status()
             .map_err(|err| CliError::Message(format!("could not run `{cmd}`: {err}")))?;
         if status.success() {
@@ -2883,15 +2881,13 @@ pub(crate) fn parse_planning_doc_versions(text: &str, source: &str) -> Vec<(Stri
 /// `staleness::run_git_stdout`'s idiom: existence first, so a missing tag
 /// short-circuits before the (more expensive) ancestry check.
 pub(crate) fn tag_exists_and_reachable(project_root: &Path, tag: &str, base_branch: &str) -> bool {
-    let exists = std::process::Command::new("git")
+    let exists = git_command(project_root)
         .args(["rev-parse", "--verify", &format!("refs/tags/{tag}")])
-        .current_dir(project_root)
         .output()
         .is_ok_and(|o| o.status.success());
     exists
-        && std::process::Command::new("git")
+        && git_command(project_root)
             .args(["merge-base", "--is-ancestor", tag, base_branch])
-            .current_dir(project_root)
             .output()
             .is_ok_and(|o| o.status.success())
 }
