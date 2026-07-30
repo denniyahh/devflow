@@ -25,8 +25,8 @@ use parallel::parallel;
 mod commands;
 use commands::{
     cleanup, doctor, evidence, gate_list, gate_respond, gate_show, gate_sweep, history_cmd, list,
-    logs, recover_cmd, reference, release_check, resolve_gate_target, start, status, stop,
-    sync_cmd, test_cmd,
+    logs, recover_cmd, reference, release_check, release_execute, resolve_gate_target, start,
+    status, stop, sync_cmd, test_cmd,
 };
 
 mod config_parse;
@@ -224,18 +224,35 @@ enum Command {
         #[arg(default_value = ".")]
         project: PathBuf,
     },
-    /// Read-only release-cut preflight: self-pin, develop/main divergence,
-    /// crates.io publish order, and tag-signing viability.
+    /// Cut a release: `--check` runs the read-only preflight (self-pin,
+    /// develop/main divergence, crates.io publish order, and tag-signing
+    /// viability); `--execute --yes-release` runs the real release-cut
+    /// sequence (version bump, signed tag, sync back, crates.io publish).
     ///
-    /// Ceiling is `--check` only (20d) — this command never runs the actual
-    /// merge/tag/sync/publish sequence, which is a deferred, not-yet-built
-    /// executor (DEN-50).
+    /// Shipping ends at merge to `develop`; releasing ends at merge to `main`
+    /// plus a full version release. `--yes-release` authorizes the entire
+    /// bump/tag/sync/publish sequence as one typed act, must be typed on
+    /// every invocation, and cannot be set in `devflow.toml` or any
+    /// environment variable, so an unattended release can never become a
+    /// standing default. `--check` and `--execute` are mutually exclusive.
     Release {
-        /// Run the read-only preflight checks. Required: a bare `devflow
-        /// release` (omitted `--check`) is rejected rather than silently
-        /// treated as a valid run.
+        /// Run the read-only preflight checks only. Mutually exclusive with
+        /// `--execute`.
         #[arg(long)]
         check: bool,
+        /// Run the real release-cut sequence (version bump, signed tag, sync
+        /// back, crates.io publish), halting cleanly at the `develop`->`main`
+        /// human gate if it has not yet been merged. Requires
+        /// `--yes-release`. Mutually exclusive with `--check`.
+        #[arg(long)]
+        execute: bool,
+        /// Authorizes `--execute` to run the release-cut sequence. This is a
+        /// separate authorization from `--yes-ship` — neither implies the
+        /// other. Must be typed on every invocation: it cannot be set in
+        /// `devflow.toml` or any environment variable, so an unattended
+        /// release can never become a standing, silent default.
+        #[arg(long)]
+        yes_release: bool,
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
@@ -582,20 +599,41 @@ fn run() -> Result<(), CliError> {
         } => recover_cmd(&project_root(project)?, clean, phase),
         Command::Test { project } => test_cmd(&project_root(project)?),
         Command::Doctor { json, project } => doctor(&project_root(project)?, json),
-        Command::Release { check, project } => {
-            // D-03 / Codex MEDIUM: an omitted --check is never silently
-            // treated as a valid check run. This phase ships only the
-            // read-only preflight, not the release-cut executor (merge/tag/
-            // sync/publish) — that command is a deferred backlog item.
-            if !check {
-                return Err(CliError::Message(
-                    "devflow release requires --check: only the read-only preflight ships in \
-                     this phase. The release-cut executor (merge PR → tag → sync develop → \
-                     publish) is deferred (DEN-50) and not yet built."
+        Command::Release {
+            check,
+            execute,
+            yes_release,
+            project,
+        } => {
+            // D-03: --yes-release is read ONLY here, from the parsed CLI
+            // flag — never from `devflow.toml`, an environment variable, or
+            // persisted `State`. If it were ever sourced from any of those,
+            // one typed authorization would silently become a standing
+            // default, the exact failure `--yes-ship`'s own design forbids.
+            if check && execute {
+                Err(CliError::Message(
+                    "devflow release: --check and --execute are mutually exclusive — pick one"
                         .to_string(),
-                ));
+                ))
+            } else if check {
+                release_check(&project_root(project)?)
+            } else if execute && !yes_release {
+                Err(CliError::Message(
+                    "devflow release --execute requires --yes-release: this authorizes the \
+                     entire version bump, signed tag, sync, and crates.io publish sequence as \
+                     one typed act, and must be typed on every invocation — it cannot be set in \
+                     devflow.toml or any environment variable."
+                        .to_string(),
+                ))
+            } else if execute {
+                release_execute(&project_root(project)?)
+            } else {
+                Err(CliError::Message(
+                    "devflow release: pass --check for the read-only preflight, or \
+                     --execute --yes-release to run the release-cut sequence"
+                        .to_string(),
+                ))
             }
-            release_check(&project_root(project)?)
         }
         Command::Sync { project } => sync_cmd(&project_root(project)?),
         Command::Ship {

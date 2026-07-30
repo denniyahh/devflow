@@ -2252,6 +2252,98 @@ pub(crate) fn sync_cmd(project_root: &Path) -> Result<(), CliError> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// release --execute --yes-release (26-07, D-03/D-10/999.25)
+// ---------------------------------------------------------------------------
+
+/// Real release-cut executor entry point. Reachable ONLY when `main.rs`'s
+/// dispatch arm has already confirmed `--execute` and `--yes-release` were
+/// both typed on this invocation — this function itself takes no
+/// authorization parameter, so it cannot be called any other way.
+///
+/// Pre-gate: composes `check_self_pin` and `check_publish_order` as blocking
+/// (a `fail` on either refuses before `execute_release` ever runs), and
+/// `check_divergence` as information only — never blocking, since a
+/// diverged `origin/main` is the NORMAL state of an in-flight release
+/// between the human's merge and the sync step, and a blocking gate here
+/// would make resuming a release impossible. `check_signing` is
+/// deliberately NOT called: reusing it here would be exactly "the
+/// signing-viability predictor reused by the executor" that D-10 forbids —
+/// the tag step inside `execute_release` answers the signing question by
+/// running the real command and reading git's own result.
+pub(crate) fn release_execute(project_root: &Path) -> Result<(), CliError> {
+    let pre_gate: Vec<Check> = vec![
+        check_self_pin(project_root),
+        check_publish_order(project_root),
+    ];
+
+    let mut failed = false;
+    for c in &pre_gate {
+        let icon = match c.status.as_str() {
+            "ok" => "✓",
+            "warn" => "⚠",
+            "fail" => "✗",
+            _ => "?",
+        };
+        let detail = c.version.as_deref().unwrap_or("-");
+        println!("  {:<32} {icon}  {detail}", c.name);
+        if matches!(c.status.as_str(), "warn" | "fail")
+            && let Some(hint) = &c.install_hint
+        {
+            println!("      — {hint}");
+        }
+        if c.status == "fail" {
+            failed = true;
+        }
+    }
+
+    // Informational only — never contributes to `failed`.
+    let divergence = check_divergence(project_root);
+    println!(
+        "  {:<32} ℹ  {}",
+        divergence.name,
+        divergence.version.as_deref().unwrap_or("-")
+    );
+
+    if failed {
+        return Err(CliError::Message(
+            "release pre-gate failed — see checks above".into(),
+        ));
+    }
+
+    match devflow_core::release::execute_release(project_root) {
+        Ok(report) => {
+            for step in &report.steps {
+                let icon = match step.status {
+                    devflow_core::release::StepStatus::Completed => "✓",
+                    devflow_core::release::StepStatus::Skipped => "⚠",
+                };
+                println!("  {:<32} {icon}  {}", step.step.label(), step.detail);
+            }
+            match report.outcome {
+                devflow_core::release::ReleaseOutcome::Completed => {
+                    println!(
+                        "\nrelease cut complete: {} (tag {})",
+                        report.version, report.tag
+                    );
+                    Ok(())
+                }
+                devflow_core::release::ReleaseOutcome::HaltedAtHumanGate => {
+                    // A clean, expected halt (exit 0, not a failure) — the
+                    // halt reason and exact next action are already in the
+                    // Tag step's detail printed above.
+                    println!(
+                        "\nhalted at the develop -> main human gate — see above for the exact \
+                         next action"
+                    );
+                    Ok(())
+                }
+            }
+        }
+        Err(err) => Err(CliError::Message(err.to_string())),
+    }
+}
+
 /// Self-pin check (asserts 20a's invariant): every local-path
 /// `[workspace.dependencies]` self-pin must equal `[workspace.package]
 /// version`, compared dynamically — never against a hardcoded expected
