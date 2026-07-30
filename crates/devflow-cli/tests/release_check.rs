@@ -243,6 +243,41 @@ fn release_check_states_publish_order() {
     );
 }
 
+/// C-04 (G3): an empty publish order is a deliberate `warn`, not a `fail` —
+/// a single-crate or non-Rust project legitimately publishes nothing, and
+/// `--check` must not hard-fail it. The workspace's `members` list points at
+/// a path that does not exist on disk, so `publish_order` resolves nothing.
+#[test]
+fn release_check_states_when_the_publish_order_resolves_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/devflow-core\"]\n\n\
+         [workspace.package]\nversion = \"1.0.0\"\nedition = \"2024\"\n\n\
+         [workspace.dependencies]\n\
+         devflow-core = { path = \"crates/devflow-core\", version = \"1.0.0\" }\n",
+    )
+    .unwrap();
+    // Deliberately no crates/devflow-core directory on disk.
+
+    let output = run_release(root, &["--check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "expected an empty publish order to warn, not fail --check, got: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("no packages resolved — nothing would be published by a release"),
+        "expected the empty-publish-order detail, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("release preflight passed"),
+        "expected the warn-only run to still report an overall pass, got: {stdout}"
+    );
+}
+
 /// Task 3 (T-20-04, ASVS V6 / WR-02): the signing-viability check's
 /// rendered output must never contain private-key material or a full
 /// filesystem path — a REAL disposable ed25519 keypair (private + public)
