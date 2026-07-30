@@ -149,6 +149,34 @@ knob description is accurate: the gate is **opt-in and off by default**; trackin
 is not. Two of three documentation surfaces assert a guarantee the default configuration does not
 provide — which misled this session into believing the ledger was gating a ship it never gated.
 
+### 6. `query commit` will commit onto a protected integration branch with no guard
+
+`gsd_run query commit "<msg>" --files <paths>` commits to whatever branch the working tree is
+currently on, with no check against the project's own declared branch model. Observed twice in one
+session on 2026-07-30: `/gsd-discuss-phase 27`'s `git_commit` and `update_state` steps ran
+`query commit` while the main checkout sat on `develop`, landing `docs(27): capture phase context`
+and `docs(state): record phase 27 context session` directly onto the integration branch. Caught
+before push only because the branch was checked manually; recovered with `git branch` + `git reset
+--hard origin/develop`.
+
+`develop` on this repository is protected server-side (`develop-merge-or-squash`,
+`enforcement: active`, empty bypass list), so the push would have been rejected — but that is
+GitHub catching it, not GSD. On a repo without a ruleset, or for any workflow step that pushes
+after committing, this lands silently.
+
+GSD already knows the branch model it should be respecting: `.planning/config.json` carries
+`git.main`, `git.develop`, and `git.feature_prefix`, and `gsd-tools` reads that file for other
+purposes. The fix is to have `query commit` refuse (or warn loudly) when `HEAD` is on
+`config.git.main` or `config.git.develop`, naming the branch and suggesting a feature branch —
+matching the fail-loud posture the rest of the toolchain uses.
+
+**Note this is specifically a GSD-side gap, not DevFlow's.** DevFlow's own production commit
+sites (`hooks::docs_update`'s `commit_all`, `hooks::changelog_append` and `hooks::version_bump`'s
+`commit_path`) commit to `develop` *deliberately*, in the terminal Ship batch after `Merge` has
+already put the main checkout there — that is the designed behavior, and a blanket protected-branch
+refusal would break it. `devflow start --no-worktree` likewise calls `GitFlow::feature_start` and
+checks out `feature/phase-NN` before any agent runs. The unguarded path is GSD's alone.
+
 ---
 
 *Created 2026-07-28 during DevFlow phase 25. Update `Status:` and record the issue link when each
