@@ -1816,7 +1816,7 @@ Plans:
 
 **Requirements**: TBD — no REQ-IDs; tracked by backlog identifier (`999.39`), consistent with Phases 21/22/26. Full evidence, escalation rationale and prior-deferral reasoning remain in the **999.39** backlog entry above; this entry does not restate them.
 **Depends on:** Phase 26 (CLOSED PARTIAL — no code dependency, but 999.25's re-attempt depends on this)
-**Plans:** 5/6 plans executed
+**Plans:** 6/6 plans executed
 
 **Scope caution carried from Phase 26's exclusion note:** ~86 call sites spanning most of `crates/` including `git.rs`. Mechanical, but it is production behavior and touches the same files as the unmerged 999.25 cluster — expect file-overlap serialization and plan waves accordingly.
 
@@ -1836,4 +1836,4 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 27-06-PLAN.md — Workspace spawn-edge census and the phase acceptance run under a hostile `GIT_DIR` (wave 3)
+- [x] 27-06-PLAN.md — Workspace spawn-edge census and the phase acceptance run under a hostile `GIT_DIR` (wave 3)
