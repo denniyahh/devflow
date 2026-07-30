@@ -133,3 +133,187 @@ fn execute_reaches_the_core_executor_and_refuses_off_develop() {
         "the fixture must gain no tag from a refused run"
     );
 }
+
+/// A fixture repo checked out on `develop` with a committed,
+/// self-pin-consistent workspace `Cargo.toml` — used by Task 2's
+/// authorization-contract tests, none of which are expected to reach any
+/// git-touching logic at all (the dispatch arm rejects before calling
+/// `project_root` in every rejected branch), but a real fixture still lets
+/// the "gained no commit and no tag" assertions mean something.
+fn develop_fixture(root: &Path) {
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "test@example.com"]);
+    git(root, &["config", "user.name", "Test"]);
+    git(root, &["config", "commit.gpgsign", "false"]);
+    git(root, &["config", "tag.gpgsign", "false"]);
+    git(root, &["config", "core.hooksPath", "/dev/null"]);
+    git(root, &["checkout", "-q", "-b", "develop"]);
+    write_workspace_fixture(root, "1.0.0", "1.0.0");
+    git(root, &["add", "."]);
+    git(root, &["commit", "-q", "-m", "initial"]);
+}
+
+/// Task 2 (B10, Truths 7/10): `--execute` without `--yes-release` is
+/// rejected before any mutation, naming the authorization flag.
+#[test]
+fn execute_without_yes_release_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    develop_fixture(root);
+    let before_head = rev_parse(root, "HEAD");
+
+    let output = run_release(root, &["--execute"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "expected --execute without --yes-release to be rejected, got success"
+    );
+    assert!(
+        stderr.contains("--yes-release"),
+        "expected the rejection to name --yes-release, got: {stderr}"
+    );
+    assert_eq!(
+        before_head,
+        rev_parse(root, "HEAD"),
+        "the fixture must gain no commit"
+    );
+    assert!(tag_list(root).is_empty(), "the fixture must gain no tag");
+}
+
+/// Task 2 (row B10) — the runtime contract, mirroring `preflight.rs`'s
+/// `run_preflight_major_bump_gate_not_auto_approved_by_yes_ship` proof: the
+/// authorization is withheld from the only channel that can supply it (a
+/// `devflow.toml` authorization key AND plausibly-named environment
+/// variables, both set true), and the run must still refuse. This is the
+/// primary proof of B10 — `yes_release_has_no_config_state_or_env_surface`
+/// below only supplements it, per
+/// `.claude/skills/ai-change-acceptance/rules/test-signal-rejection.md`
+/// § "not every source-grep is rejected".
+#[test]
+fn yes_release_is_not_settable_via_config_or_env() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    develop_fixture(root);
+    let before_head = rev_parse(root, "HEAD");
+
+    std::fs::write(root.join("devflow.toml"), "yes_release = true\n").unwrap();
+
+    let isolated_home = tempfile::tempdir().unwrap();
+    let output = Command::new(devflow_bin())
+        .arg("release")
+        .arg("--execute")
+        .arg(root)
+        .env("HOME", isolated_home.path())
+        .env_remove("SSH_AUTH_SOCK")
+        .env_remove("SSH_AGENT_PID")
+        .env("DEVFLOW_YES_RELEASE", "true")
+        .env("YES_RELEASE", "true")
+        .output()
+        .expect("spawn devflow release");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "expected the run to still be rejected with the authorization withheld from every \
+         channel that could otherwise supply it, got success"
+    );
+    assert!(
+        stderr.contains("--yes-release"),
+        "expected the rejection to still name --yes-release, got: {stderr}"
+    );
+    assert_eq!(
+        before_head,
+        rev_parse(root, "HEAD"),
+        "the fixture must gain no commit"
+    );
+    assert!(tag_list(root).is_empty(), "the fixture must gain no tag");
+}
+
+/// Task 2: `--check` and `--execute` together are rejected as mutually
+/// exclusive; neither mode's work runs.
+#[test]
+fn check_and_execute_together_are_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    develop_fixture(root);
+
+    let output = run_release(root, &["--check", "--execute"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "expected --check and --execute together to be rejected, got success"
+    );
+    assert!(
+        stderr.contains("mutually exclusive"),
+        "expected the rejection to state the two modes cannot be combined, got: {stderr}"
+    );
+}
+
+/// Task 2 (Truth 7's behavioral evidence): a bare `devflow release` (no mode
+/// flag) names both modes and no longer cites the deferred-executor
+/// phrasing or the pre-plan backlog identifier. Asserts the ABSENCES
+/// explicitly, so a future regression that restores the old rejection
+/// fails this test rather than passing silently.
+#[test]
+fn bare_release_names_both_modes_and_no_deferred_executor() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    develop_fixture(root);
+
+    let output = run_release(root, &[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "expected a bare `devflow release` to be rejected, got success"
+    );
+    assert!(
+        stderr.contains("--check"),
+        "expected the rejection to name --check, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("--execute"),
+        "expected the rejection to name --execute, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("not yet built"),
+        "expected the OLD deferred-executor phrasing to be ABSENT, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("DEN-50"),
+        "expected the OLD backlog identifier to be ABSENT, got: {stderr}"
+    );
+}
+
+/// Supplementary source-surface guard (B10) — documented as supplementary
+/// to, never a substitute for, `yes_release_is_not_settable_via_config_or_env`
+/// above, per
+/// `.claude/skills/ai-change-acceptance/rules/test-signal-rejection.md`
+/// § "not every source-grep is rejected": the property genuinely under test
+/// is the absence of a surface, which a runtime test can only sample and a
+/// source check can state exhaustively. All three files are outside this
+/// plan's `files_modified`, so this guard is region-scoped to code the plan
+/// never writes and cannot be self-invalidated by a pasted comment.
+#[test]
+fn yes_release_has_no_config_state_or_env_surface() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .expect("crates/devflow-cli has a workspace root two levels up");
+    for relative in [
+        "crates/devflow-core/src/state.rs",
+        "crates/devflow-core/src/config.rs",
+        "crates/devflow-cli/src/config_parse.rs",
+    ] {
+        let path = workspace_root.join(relative);
+        let contents = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+        assert!(
+            !contents.contains("yes_release"),
+            "{relative} must not mention yes_release — it has no config/state/env surface (D-03)"
+        );
+    }
+}
