@@ -134,6 +134,13 @@ impl ReleaseLedger {
         }
     }
 
+    /// Refresh `updated_unix`. Informational only — nothing branches on it —
+    /// but kept explicit rather than stamped inside [`write`] so a written
+    /// record round-trips byte-for-byte with the value the caller holds.
+    pub fn touch(&mut self) {
+        self.updated_unix = unix_now();
+    }
+
     /// Mark this record complete at the commit `head`, as read from live git by
     /// the caller at that moment.
     pub fn mark_complete(&mut self, head: &str) {

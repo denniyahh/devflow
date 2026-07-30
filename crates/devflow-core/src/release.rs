@@ -8,21 +8,34 @@
 //! from 26-03; `sync_main_to_develop` from 26-04; `crate_already_published`/
 //! `cargo_publish` from 26-05) rather than reimplementing any of them.
 //!
-//! Every step consults a live-state predicate rather than a persisted
-//! progress file (D-06) — resume comes from real git and registry state
-//! only. Nothing is ever rolled back on failure; the fix is always forward
-//! (D-05), matching `hooks_after_ship`'s documented policy. The
+//! **Resume contract (D-06a, amending D-06).** Every step still consults its
+//! own live-state predicate to decide whether it acts — that is unchanged, and
+//! no step is ever skipped because of a persisted file. What D-06a adds is a
+//! narrow persisted record, [`crate::release_ledger`], that supplies the two
+//! facts live git state provably cannot: **which version this cut is for**, and
+//! **whether a cut is in flight at all**. The ledger is authoritative on the
+//! identity of an in-flight release; live git and registry state are
+//! authoritative on what is actually true, and **where the two disagree, live
+//! state wins** — the run refuses and names both rather than silently
+//! preferring either. Nothing is ever rolled back on failure; the fix is
+//! always forward (D-05), matching `hooks_after_ship`'s documented policy. The
 //! `develop`->`main` pull request is opened and merged by a human; this
 //! module never touches it (D-02) — no `gh` subprocess is invoked anywhere
 //! in this file. The publish step is the one irreversible operation in the
 //! sequence; the operator's authorization for running it unattended is
 //! recorded in `26-01-SUMMARY.md` Decision 2 (`automate-publish`).
 //!
-//! Re-running this function after a release has fully completed (its tag
-//! reachable from `develop` after the sync) computes the NEXT version and
-//! begins a new release — this is not a "last release already finished"
-//! no-op detector, for the same `compute_version` reason documented on
-//! [`ReleaseError::TagCollision`]'s call sites below.
+//! Re-running this function after a release has fully completed no longer
+//! begins the next one behind the operator's back (26-REVIEW.md **C-02**). The
+//! completed run records the commit `HEAD` named at that moment; a re-run
+//! corroborates that record against a live `git rev-parse HEAD` and, if the
+//! commit still matches, refuses with
+//! [`ReleaseError::LastReleaseCompleted`] instead of computing
+//! `version + 1`. Once new work lands on `develop`, `HEAD` has moved and a
+//! fresh version is computed exactly as before. A repository with **no**
+//! ledger — a release cut by an older binary, from a second clone, or on
+//! another machine — behaves exactly as it did before this record existed,
+//! including [`ReleaseError::StrayBaselineTag`]'s refusal.
 
 use std::path::Path;
 use std::process::Command;
@@ -183,6 +196,51 @@ pub enum ReleaseError {
         /// The commit the tag actually names, sanitized.
         target: String,
     },
+    /// The release ledger could not be read (unparsable, or written in a
+    /// format this build does not support). Surfaced through the executor's
+    /// single error channel rather than degraded into "no ledger": treating an
+    /// unreadable ledger as absent is exactly the C-02 behavior the ledger
+    /// removes.
+    #[error("release ledger unusable: {0}")]
+    Ledger(#[from] crate::release_ledger::LedgerError),
+    /// The release ledger records the last cut as complete, and live
+    /// `git rev-parse HEAD` still names the commit it completed at — so
+    /// nothing new has landed and there is no release to cut (D-06a's stated
+    /// primary job for the ledger). Refused before any mutation: computing the
+    /// next version here is precisely how a re-run cuts a release nobody asked
+    /// for. Never auto-resolved — the ledger is not deleted or rewritten.
+    #[error(
+        "release {version} already completed at commit {head}, and HEAD still names that \
+         commit — nothing new has landed on develop, so there is no release to cut. The \
+         release ledger recording this is at {ledger}; land new work on develop before \
+         cutting another release"
+    )]
+    LastReleaseCompleted {
+        /// The completed release's version, sanitized.
+        version: String,
+        /// The commit the completed run recorded, sanitized.
+        head: String,
+        /// The ledger file to inspect, sanitized.
+        ledger: String,
+    },
+    /// The ledger claims an in-flight release at a version live git state
+    /// shows is already superseded. Refused rather than silently preferring
+    /// either side: trusting the ledger would cut at a stale version, and
+    /// falling back to a fresh computation would start the second release C-02
+    /// is about. Never auto-corrected, and the ledger is never deleted.
+    #[error(
+        "the release ledger at {ledger} records an in-flight release at version \
+         {ledger_version}, but {live} — refusing to act on either. Inspect the ledger and \
+         the repository; devflow deletes, re-points, and force-updates nothing"
+    )]
+    LedgerContradicted {
+        /// The ledger file to inspect, sanitized.
+        ledger: String,
+        /// The version the ledger pins, sanitized.
+        ledger_version: String,
+        /// The live fact that contradicts it, sanitized.
+        live: String,
+    },
 }
 
 /// A failed [`execute_release`] run: the error that stopped it **plus** the
@@ -302,9 +360,10 @@ fn parse_bare_version(text: &str) -> Result<crate::version::Version, ReleaseErro
 /// registry existence check (step 5, D-04, the one irreversible operation in
 /// the sequence — see `26-01-SUMMARY.md` Decision 2 for the operator's
 /// standing authorization to run it unattended). Every step's own live-state
-/// predicate makes it independently resumable (D-06); nothing is ever rolled
-/// back on any failure (D-05) — see the module doc comment for the complete
-/// contract.
+/// predicate decides whether it acts, and the persisted
+/// [`crate::release_ledger`] supplies only the identity of an in-flight cut
+/// (D-06a); nothing is ever rolled back on any failure (D-05) — see the module
+/// doc comment for the complete contract.
 pub fn execute_release(project_root: &Path) -> Result<ReleaseReport, ReleaseFailure> {
     let mut steps: Vec<StepReport> = Vec::new();
     match run_release(project_root, &mut steps) {
@@ -316,6 +375,127 @@ pub fn execute_release(project_root: &Path) -> Result<ReleaseReport, ReleaseFail
         }),
         Err(error) => Err(ReleaseFailure { error, steps }),
     }
+}
+
+/// Derive the release version from live git state, exactly as the executor did
+/// before the ledger existed.
+///
+/// Reachable **only** from the no-ledger path and the
+/// "ledger says complete but `HEAD` has moved" path (C-02): while a cut is in
+/// flight the executor pins the version from the ledger and never asks this
+/// question, because a partially completed release has already moved the state
+/// the answer is derived from.
+///
+/// `UnreachableBaseline` is the resume signal for an in-flight release (see
+/// the module doc comment and `compute_version`'s own doc comment): once the
+/// release tag lands on `origin/main`'s tip and before the sync lands, a
+/// squash-merged `main` makes that tag unreachable from `develop` by
+/// construction, so this guard fires on exactly the release being resumed.
+///
+/// C-01: that inference is only valid for a tag that really does name
+/// `origin/main`'s tip, and it MUST be checked here, not deferred to step 3.
+/// The original code deferred it on the grounds that "step 3 independently
+/// validates that the tag belongs to origin/main's tip" — but step 1 writes,
+/// commits, and pushes the adopted version to `origin/develop` before step 2 or
+/// 3 ever run, so by then the damage has landed on a shared branch.
+/// Unreachable-but-unrelated tags are the ordinary case, not an exotic one:
+/// `hooks_after_ship`'s `version_bump` creates a `v{version}` tag at the end of
+/// every phase's Ship stage, and squash-merging that phase's branch leaves the
+/// tag permanently unreachable from `develop` and strictly higher than the
+/// reachable baseline (this repository already carries one such orphan,
+/// `v1.3.69`). Adopting one wrote and pushed a version nobody asked for and
+/// reported "the version bump already landed in a prior invocation", which was
+/// simply false.
+fn compute_release_version(
+    project_root: &Path,
+    resume_note: &mut Option<String>,
+) -> Result<crate::version::Version, ReleaseError> {
+    match crate::version::compute_version(project_root) {
+        Ok(version) => Ok(version),
+        Err(crate::version::VersionError::UnreachableBaseline { tag }) => {
+            let main_tip = git_output(project_root, &["rev-parse", "origin/main"])?
+                .trim()
+                .to_string();
+            match tag_target_commit(project_root, &tag) {
+                Some(target) if target == main_tip => {}
+                other => {
+                    return Err(ReleaseError::StrayBaselineTag {
+                        tag: sanitize_changelog_subject(&tag),
+                        main_tip: sanitize_changelog_subject(&main_tip),
+                        target: sanitize_changelog_subject(
+                            other.as_deref().unwrap_or("no resolvable commit"),
+                        ),
+                    });
+                }
+            }
+            let stripped = tag.strip_prefix('v').unwrap_or(tag.as_str());
+            let resumed = parse_bare_version(stripped)?;
+            // W-18/WR-01: the note is folded into step 1's own report below
+            // rather than pushed as a second `VersionBump` entry — the
+            // original pushed one here AND fell through into step 1, so every
+            // resumed run reported `VersionBump` twice, breaking
+            // `ReleaseReport::steps`' documented one-entry-per-step contract.
+            *resume_note = Some(format!(
+                "resuming the in-flight release identified by unreachable tag `{tag}`, \
+                 which names origin/main's tip"
+            ));
+            Ok(resumed)
+        }
+        Err(err) => Err(ReleaseError::Version(err)),
+    }
+}
+
+/// The persisted label for a [`StepStatus`]. A free function rather than a
+/// method so [`StepStatus`] itself is untouched — `devflow-cli` matches it
+/// exhaustively and no variant may be added (26-08's stated prohibition).
+fn step_status_label(status: StepStatus) -> &'static str {
+    match status {
+        StepStatus::Completed => "completed",
+        StepStatus::Skipped => "skipped",
+    }
+}
+
+/// Append `report` to BOTH the in-memory ledger handed back to the caller on
+/// failure (C-03) and the persisted ledger, in one call.
+///
+/// Deliberately a single helper rather than paired calls at each site: the two
+/// lists must not be able to drift, and a future edit that separated them
+/// would silently reintroduce a ledger that disagrees with what was reported.
+/// The in-memory push happens first, so a ledger write failure still hands the
+/// step back through [`ReleaseFailure`].
+fn record_step(
+    project_root: &Path,
+    steps: &mut Vec<StepReport>,
+    ledger: &mut crate::release_ledger::ReleaseLedger,
+    report: StepReport,
+) -> Result<(), ReleaseError> {
+    ledger.steps.push(crate::release_ledger::LedgerStep {
+        step: report.step.label().to_string(),
+        status: step_status_label(report.status).to_string(),
+        detail: report.detail.clone(),
+    });
+    steps.push(report);
+    ledger.touch();
+    crate::release_ledger::write(project_root, ledger)?;
+    Ok(())
+}
+
+/// Record the cut as finished, anchored to the commit live git reports right
+/// now.
+///
+/// Called on the two terminal SUCCESSFUL outcomes only. `HaltedAtHumanGate`
+/// deliberately leaves the record in flight: that halt is the definition of
+/// mid-flight — the human has not merged the release PR yet.
+fn finalize_ledger(
+    project_root: &Path,
+    ledger: &mut crate::release_ledger::ReleaseLedger,
+) -> Result<(), ReleaseError> {
+    let head = git_output(project_root, &["rev-parse", "HEAD"])?
+        .trim()
+        .to_string();
+    ledger.mark_complete(&head);
+    crate::release_ledger::write(project_root, ledger)?;
+    Ok(())
 }
 
 /// The sequence itself. Takes the step ledger by `&mut` rather than owning it
@@ -348,63 +528,110 @@ fn run_release(
         &["fetch", "origin", "main", "develop", "--quiet"],
     )?;
 
-    // Version resolution. `UnreachableBaseline` is the resume signal for an
-    // in-flight release (see module doc comment and `compute_version`'s own
-    // doc comment): once the release tag lands on `origin/main`'s tip and
-    // before the sync lands, a squash-merged `main` makes that tag
-    // unreachable from `develop` by construction, so this guard fires on
-    // exactly the release being resumed.
-    //
-    // C-01: that inference is only valid for a tag that really does name
-    // `origin/main`'s tip, and it MUST be checked here, not deferred to step
-    // 3. The original code deferred it on the grounds that "step 3
-    // independently validates that the tag belongs to origin/main's tip" —
-    // but step 1 writes, commits, and pushes the adopted version to
-    // `origin/develop` before step 2 or 3 ever run, so by then the damage has
-    // landed on a shared branch. Unreachable-but-unrelated tags are the
-    // ordinary case, not an exotic one: `hooks_after_ship`'s `version_bump`
-    // creates a `v{version}` tag at the end of every phase's Ship stage, and
-    // squash-merging that phase's branch leaves the tag permanently
-    // unreachable from `develop` and strictly higher than the reachable
-    // baseline (this repository already carries one such orphan, `v1.3.69`).
-    // Adopting one wrote and pushed a version nobody asked for and reported
-    // "the version bump already landed in a prior invocation", which was
-    // simply false.
+    // C-02 / D-06a: which release IS this run? Read before version
+    // resolution, because on the in-flight path the ledger's pinned version
+    // replaces the computation entirely. An unreadable ledger refuses here
+    // (`?` through `ReleaseError::Ledger`) rather than degrading into "no
+    // ledger" — that degradation is the C-02 behavior itself.
+    let ledger_on_entry = crate::release_ledger::read(project_root)?;
+
     let mut resume_note: Option<String> = None;
-    let version = match crate::version::compute_version(project_root) {
-        Ok(version) => version,
-        Err(crate::version::VersionError::UnreachableBaseline { tag }) => {
-            let main_tip = git_output(project_root, &["rev-parse", "origin/main"])?
+    let version = match &ledger_on_entry {
+        // No ledger: behave exactly as before this record existed, including
+        // C-01's `StrayBaselineTag` refusal. A release cut by an older
+        // binary, from a second clone, or on another machine leaves nothing
+        // behind, and that case must not regress.
+        None => compute_release_version(project_root, &mut resume_note)?,
+
+        // Complete: D-06a's stated primary job for the ledger. Corroborated
+        // against live git rather than trusted — a `Complete` status whose
+        // recorded commit no longer matches `HEAD` means new work landed, and
+        // a new release is then legitimate.
+        Some(ledger) if ledger.status == crate::release_ledger::LedgerStatus::Complete => {
+            let head = git_output(project_root, &["rev-parse", "HEAD"])?
                 .trim()
                 .to_string();
-            match tag_target_commit(project_root, &tag) {
-                Some(target) if target == main_tip => {}
-                other => {
-                    return Err(ReleaseError::StrayBaselineTag {
-                        tag: sanitize_changelog_subject(&tag),
-                        main_tip: sanitize_changelog_subject(&main_tip),
-                        target: sanitize_changelog_subject(
-                            other.as_deref().unwrap_or("no resolvable commit"),
+            match ledger.head_at_completion.as_deref() {
+                Some(recorded) if recorded == head => {
+                    return Err(ReleaseError::LastReleaseCompleted {
+                        version: sanitize_changelog_subject(&ledger.version),
+                        head: sanitize_changelog_subject(&head),
+                        ledger: sanitize_changelog_subject(
+                            &crate::release_ledger::ledger_path(project_root)?
+                                .display()
+                                .to_string(),
                         ),
                     });
                 }
+                _ => compute_release_version(project_root, &mut resume_note)?,
             }
-            let stripped = tag.strip_prefix('v').unwrap_or(tag.as_str());
-            let resumed = parse_bare_version(stripped)?;
-            // W-18/WR-01: the note is folded into step 1's own report below
-            // rather than pushed as a second `VersionBump` entry — the
-            // original pushed one here AND fell through into step 1, so every
-            // resumed run reported `VersionBump` twice, breaking
-            // `ReleaseReport::steps`' documented one-entry-per-step contract.
-            resume_note = Some(format!(
-                "resuming the in-flight release identified by unreachable tag `{tag}`, \
-                 which names origin/main's tip"
-            ));
-            resumed
         }
-        Err(err) => return Err(ReleaseError::Version(err)),
+
+        // In flight: pin the version from the ledger and do NOT ask
+        // `compute_version` for a new one. This is the whole of the C-02 fix
+        // — a partially completed release has already moved the live state
+        // `compute_version` derives from, so asking again always answers
+        // `version + 1`.
+        Some(ledger) => {
+            let pinned = parse_bare_version(ledger.version.trim_start_matches('v'))?;
+            // Corroborate against live state (D-06a: live state wins). A
+            // reachable baseline strictly ABOVE the pinned version means the
+            // ledger describes a release reality has already moved past.
+            // Refuse naming both facts — preferring the ledger would cut at a
+            // stale version, and falling back to a fresh computation would
+            // start the second release C-02 is about.
+            let baseline = crate::version::reachable_semver_baseline(project_root)
+                .map_err(ReleaseError::Version)?;
+            if let Some(baseline) = &baseline
+                && (baseline.major, baseline.minor, baseline.patch)
+                    > (
+                        u64::from(pinned.major),
+                        u64::from(pinned.minor),
+                        u64::from(pinned.patch),
+                    )
+            {
+                return Err(ReleaseError::LedgerContradicted {
+                    ledger: sanitize_changelog_subject(
+                        &crate::release_ledger::ledger_path(project_root)?
+                            .display()
+                            .to_string(),
+                    ),
+                    ledger_version: sanitize_changelog_subject(&ledger.version),
+                    live: sanitize_changelog_subject(&format!(
+                        "the highest semver tag reachable from HEAD is v{baseline}, which is \
+                         already past it"
+                    )),
+                });
+            }
+            resume_note = Some(format!(
+                "resuming the in-flight release {} recorded in the release ledger",
+                ledger.version
+            ));
+            pinned
+        }
     };
     let tag = format!("v{version}");
+
+    // Carry the in-flight record forward so `started_unix` survives a resume,
+    // but report only THIS run's steps — the accumulated list is a record of
+    // the run in progress, not an ever-growing append log.
+    let mut ledger = match ledger_on_entry {
+        Some(existing) if existing.status == crate::release_ledger::LedgerStatus::InFlight => {
+            let mut resumed = existing;
+            resumed.steps.clear();
+            resumed.head_at_completion = None;
+            resumed.version = version.to_string();
+            resumed.tag = tag.clone();
+            resumed
+        }
+        _ => crate::release_ledger::ReleaseLedger::in_flight(&version.to_string(), &tag),
+    };
+    // The single write that IS the C-02 fix: the identity of this cut is
+    // pinned BEFORE step 1's first mutation, so no external state that later
+    // changes can move it. A write failure is an error, never swallowed — a
+    // silently unwritten ledger is indistinguishable from no ledger.
+    ledger.touch();
+    crate::release_ledger::write(project_root, &ledger)?;
 
     // Step 1: version bump, with two independent sub-predicates so a
     // partially-completed step resumes correctly (D-06): writing/committing
@@ -470,11 +697,16 @@ fn run_release(
         Some(note) => format!("{note}; {step1_detail}"),
         None => step1_detail,
     };
-    steps.push(StepReport {
-        step: ReleaseStep::VersionBump,
-        status: step1_status,
-        detail: sanitize_changelog_subject(&step1_detail),
-    });
+    record_step(
+        project_root,
+        steps,
+        &mut ledger,
+        StepReport {
+            step: ReleaseStep::VersionBump,
+            status: step1_status,
+            detail: sanitize_changelog_subject(&step1_detail),
+        },
+    )?;
 
     // Step 2: the human-gated boundary (D-02). Content-based, not
     // ancestry-based, because `main` squash-merges (an ancestry test would
@@ -505,15 +737,20 @@ fn run_release(
         let declared_desc = main_declared
             .map(|v| v.to_string())
             .unwrap_or_else(|| "no readable version".to_string());
-        steps.push(StepReport {
-            step: ReleaseStep::Tag,
-            status: StepStatus::Skipped,
-            detail: sanitize_changelog_subject(&format!(
-                "halted at the human gate: origin/main declares {declared_desc}, release \
-                 version is {version} — open and merge the develop -> main release PR, then \
-                 re-run devflow's release executor"
-            )),
-        });
+        record_step(
+            project_root,
+            steps,
+            &mut ledger,
+            StepReport {
+                step: ReleaseStep::Tag,
+                status: StepStatus::Skipped,
+                detail: sanitize_changelog_subject(&format!(
+                    "halted at the human gate: origin/main declares {declared_desc}, release \
+                     version is {version} — open and merge the develop -> main release PR, then \
+                     re-run devflow's release executor"
+                )),
+            },
+        )?;
         return Ok((version.to_string(), tag, ReleaseOutcome::HaltedAtHumanGate));
     }
 
@@ -528,13 +765,18 @@ fn run_release(
     let tag_state = crate::git::release_tag_state(project_root, &tag, &main_tip);
     match &tag_state {
         crate::git::ReleaseTagState::Released => {
-            steps.push(StepReport {
-                step: ReleaseStep::Tag,
-                status: StepStatus::Skipped,
-                detail: sanitize_changelog_subject(&format!(
-                    "{tag} is already an annotated, verified, pushed release tag — nothing to do"
-                )),
-            });
+            record_step(
+                project_root,
+                steps,
+                &mut ledger,
+                StepReport {
+                    step: ReleaseStep::Tag,
+                    status: StepStatus::Skipped,
+                    detail: sanitize_changelog_subject(&format!(
+                        "{tag} is already an annotated, verified, pushed release tag — nothing to do"
+                    )),
+                },
+            )?;
         }
         crate::git::ReleaseTagState::Absent => {
             crate::git::create_signed_release_tag(project_root, &tag, &main_tip)?;
@@ -549,13 +791,18 @@ fn run_release(
                     )),
                 });
             }
-            steps.push(StepReport {
-                step: ReleaseStep::Tag,
-                status: StepStatus::Completed,
-                detail: sanitize_changelog_subject(&format!(
-                    "created and pushed the signed release tag {tag}"
-                )),
-            });
+            record_step(
+                project_root,
+                steps,
+                &mut ledger,
+                StepReport {
+                    step: ReleaseStep::Tag,
+                    status: StepStatus::Completed,
+                    detail: sanitize_changelog_subject(&format!(
+                        "created and pushed the signed release tag {tag}"
+                    )),
+                },
+            )?;
         }
         crate::git::ReleaseTagState::PresentUnverified { reason } => {
             if local_tag_is_verifiable(project_root, &tag) {
@@ -570,13 +817,18 @@ fn run_release(
                         )),
                     });
                 }
-                steps.push(StepReport {
-                    step: ReleaseStep::Tag,
-                    status: StepStatus::Completed,
-                    detail: sanitize_changelog_subject(&format!(
-                        "pushed the existing verifiable signed release tag {tag}"
-                    )),
-                });
+                record_step(
+                    project_root,
+                    steps,
+                    &mut ledger,
+                    StepReport {
+                        step: ReleaseStep::Tag,
+                        status: StepStatus::Completed,
+                        detail: sanitize_changelog_subject(&format!(
+                            "pushed the existing verifiable signed release tag {tag}"
+                        )),
+                    },
+                )?;
             } else {
                 return Err(ReleaseError::TagCollision {
                     tag: tag.clone(),
@@ -610,22 +862,32 @@ fn run_release(
     // part of the sync logic is reimplemented here.
     match crate::sync::sync_main_to_develop(project_root) {
         Ok(crate::sync::SyncOutcome::AlreadyAncestor) => {
-            steps.push(StepReport {
-                step: ReleaseStep::Sync,
-                status: StepStatus::Skipped,
-                detail: sanitize_changelog_subject(
-                    "origin/main is already an ancestor of develop — nothing to sync",
-                ),
-            });
+            record_step(
+                project_root,
+                steps,
+                &mut ledger,
+                StepReport {
+                    step: ReleaseStep::Sync,
+                    status: StepStatus::Skipped,
+                    detail: sanitize_changelog_subject(
+                        "origin/main is already an ancestor of develop — nothing to sync",
+                    ),
+                },
+            )?;
         }
         Ok(crate::sync::SyncOutcome::Merged { merge_commit }) => {
-            steps.push(StepReport {
-                step: ReleaseStep::Sync,
-                status: StepStatus::Completed,
-                detail: sanitize_changelog_subject(&format!(
-                    "merged origin/main back into develop at {merge_commit}"
-                )),
-            });
+            record_step(
+                project_root,
+                steps,
+                &mut ledger,
+                StepReport {
+                    step: ReleaseStep::Sync,
+                    status: StepStatus::Completed,
+                    detail: sanitize_changelog_subject(&format!(
+                        "merged origin/main back into develop at {merge_commit}"
+                    )),
+                },
+            )?;
         }
         Err(err) => return Err(ReleaseError::Sync(err)),
     }
@@ -645,13 +907,19 @@ fn run_release(
         // tagging and pushing while crates.io received nothing, which is a
         // false green on the one irreversible step. The distinct outcome
         // forces the caller to say so.
-        steps.push(StepReport {
-            step: ReleaseStep::Publish,
-            status: StepStatus::Skipped,
-            detail: sanitize_changelog_subject(
-                "no workspace members were resolved by publish_order — NOTHING was published",
-            ),
-        });
+        record_step(
+            project_root,
+            steps,
+            &mut ledger,
+            StepReport {
+                step: ReleaseStep::Publish,
+                status: StepStatus::Skipped,
+                detail: sanitize_changelog_subject(
+                    "no workspace members were resolved by publish_order — NOTHING was published",
+                ),
+            },
+        )?;
+        finalize_ledger(project_root, &mut ledger)?;
         return Ok((
             version.to_string(),
             tag,
@@ -662,26 +930,39 @@ fn run_release(
     for package in &packages {
         match crate::git::crate_already_published(project_root, package, &version.to_string()) {
             Ok(true) => {
-                steps.push(StepReport {
-                    step: ReleaseStep::Publish,
-                    status: StepStatus::Skipped,
-                    detail: sanitize_changelog_subject(&format!(
-                        "{package}@{version} is already published"
-                    )),
-                });
+                record_step(
+                    project_root,
+                    steps,
+                    &mut ledger,
+                    StepReport {
+                        step: ReleaseStep::Publish,
+                        status: StepStatus::Skipped,
+                        detail: sanitize_changelog_subject(&format!(
+                            "{package}@{version} is already published"
+                        )),
+                    },
+                )?;
             }
             Ok(false) => {
                 crate::git::cargo_publish(project_root, package)?;
-                steps.push(StepReport {
-                    step: ReleaseStep::Publish,
-                    status: StepStatus::Completed,
-                    detail: sanitize_changelog_subject(&format!("published {package}@{version}")),
-                });
+                record_step(
+                    project_root,
+                    steps,
+                    &mut ledger,
+                    StepReport {
+                        step: ReleaseStep::Publish,
+                        status: StepStatus::Completed,
+                        detail: sanitize_changelog_subject(&format!(
+                            "published {package}@{version}"
+                        )),
+                    },
+                )?;
             }
             Err(err) => return Err(ReleaseError::Publish(err)),
         }
     }
 
+    finalize_ledger(project_root, &mut ledger)?;
     Ok((version.to_string(), tag, ReleaseOutcome::Completed))
 }
 
@@ -1390,6 +1671,300 @@ mod tests {
         assert!(
             !rev_parse(root, "HEAD").is_empty(),
             "sanity: the repo is still usable"
+        );
+
+        // C-02 non-regression, per 26-08 Task 2: rather than duplicating this
+        // whole fixture into a separate `a_run_without_a_ledger_still_refuses_
+        // a_stray_unreachable_tag`, the property is asserted here — this test
+        // already runs with no ledger present, and the refusal must both stay
+        // exactly as it was AND leave no record behind, since it happens
+        // before the in-flight write.
+        assert_eq!(
+            crate::release_ledger::read(root).expect("the ledger must be readable"),
+            None,
+            "a refusal before step 1 must not write a ledger"
+        );
+    }
+
+    /// A workspace `Cargo.toml` whose `[workspace] members` list really does
+    /// resolve, so `publish_order` returns a package and step 5's publish loop
+    /// actually runs. The sibling [`workspace_cargo_toml`] deliberately has no
+    /// `members` key (C-04's empty-publish-order case), which is why it cannot
+    /// be reused here.
+    fn workspace_cargo_toml_with_member(version: &str) -> String {
+        format!(
+            "[workspace]\nresolver = \"3\"\nmembers = [\"crates/demo\"]\n\n\
+             [workspace.package]\nversion = \"{version}\"\nedition = \"2024\"\n\n\
+             [workspace.dependencies]\n\
+             devflow-release-fixture-demo = {{ path = \"crates/demo\", \
+             version = \"{version}\" }}\n"
+        )
+    }
+
+    /// Stage (but do not commit) the member crate and the cargo configuration
+    /// that makes the publish step fail deterministically and offline.
+    ///
+    /// The `[source.crates-io] replace-with` redirection points cargo's
+    /// crates-io source at the discard port on loopback, so
+    /// `crate_already_published`'s `cargo info` fails with a connection error
+    /// that `classify_cargo_info_result` classifies as
+    /// [`crate::git::PublishCheck::Ambiguous`] — which is an `Err`, so
+    /// `cargo_publish` is **never reached**. That is the point: no test here
+    /// may contact crates.io or attempt a real publish, and refusing at the
+    /// registry check makes that structural rather than hopeful.
+    fn write_publish_failure_fixture_files(root: &Path, version: &str) {
+        std::fs::create_dir_all(root.join("crates/demo/src")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            workspace_cargo_toml_with_member(version),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("crates/demo/Cargo.toml"),
+            "[package]\nname = \"devflow-release-fixture-demo\"\n\
+             version.workspace = true\nedition.workspace = true\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("crates/demo/src/lib.rs"), "").unwrap();
+        std::fs::create_dir_all(root.join(".cargo")).unwrap();
+        std::fs::write(
+            root.join(".cargo/config.toml"),
+            "[source.crates-io]\nreplace-with = \"devflow-fixture-dead-registry\"\n\n\
+             [source.devflow-fixture-dead-registry]\n\
+             registry = \"sparse+http://127.0.0.1:9/\"\n",
+        )
+        .unwrap();
+    }
+
+    /// A fixture that reaches step 5 and fails there: `develop` is already
+    /// bumped and pushed, `origin/main` declares the release version and is an
+    /// ancestor of `develop` (so the sync is a no-op), no tag exists yet, and
+    /// `publish_order` resolves one package whose registry check cannot be
+    /// classified. Returns `(repo, bare, keys, version)`; `keys` is held only
+    /// for its `Drop`.
+    #[allow(clippy::type_complexity)]
+    fn publish_failure_fixture() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        String,
+    ) {
+        let repo = init_repo();
+        let root = repo.path();
+        let bare = init_bare_remote(root);
+        let keys = crate::git::tests::configure_ssh_tag_signing(root);
+        let flow = GitFlow::new(root);
+
+        write_publish_failure_fixture_files(root, "0.0.1");
+        crate::test_support::git_command(root)
+            .args(["add", "."])
+            .status()
+            .expect("git add");
+        crate::test_support::git_command(root)
+            .args(["commit", "-q", "-m", "chore: add version file"])
+            .status()
+            .expect("git commit");
+        flow.push_ref(DEVELOP)
+            .expect("push develop with version file");
+        commit_file(root, "feature.txt", "feature", "feat: add a feature");
+
+        let version = crate::version::compute_version(root).expect("compute_version");
+        let version_str = version.to_string();
+        crate::version::write_version(root, &version).expect("write_version");
+        GitFlow::new(root)
+            .commit_path(
+                "Cargo.toml",
+                &format!("chore: bump version to {version_str}"),
+            )
+            .expect("commit version bump");
+        flow.push_ref(DEVELOP)
+            .expect("push develop with release version");
+
+        // main fast-forwards to develop's exact tip, so origin/main is
+        // trivially an ancestor of develop and the sync step is a no-op —
+        // keeping the failure squarely on step 5.
+        flow.checkout("main").expect("checkout main");
+        crate::test_support::git_command(root)
+            .args(["merge", "--ff-only", DEVELOP])
+            .status()
+            .expect("fast-forward main to develop");
+        flow.push_ref("main").expect("push main");
+        flow.checkout(DEVELOP).expect("checkout develop");
+
+        (repo, bare, keys, version_str)
+    }
+
+    /// Count the `chore: bump version to` commits reachable from a ref in the
+    /// bare remote — C-02's damage is a SECOND one appearing on a shared
+    /// branch, which a ref comparison alone would not name.
+    fn remote_bump_commits(bare: &Path, git_ref: &str) -> usize {
+        let output = crate::test_support::git_command(bare)
+            .args(["log", "--format=%s", git_ref])
+            .output()
+            .expect("spawn git log");
+        assert!(output.status.success(), "git log must succeed");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| line.starts_with("chore: bump version to"))
+            .count()
+    }
+
+    /// **C-02.** Run 1 gets past the sync step and fails at publish, leaving
+    /// the bump, the signed tag, and the sync landed. The identical re-run must
+    /// FINISH that release, not start a second one: same version, same tag, no
+    /// second bump commit pushed to the shared `develop` branch.
+    ///
+    /// Before the ledger existed this test failed exactly the way the review
+    /// reproduced it: run 2 computed `version + 1` (the tag is reachable once
+    /// the sync lands, and `apply_bump` floors `Bump::None` to patch+1), wrote
+    /// and pushed a bump nobody asked for, and returned `Ok`.
+    #[test]
+    fn resume_after_publish_failure_does_not_start_a_new_release() {
+        let (repo, bare, _keys, version) = publish_failure_fixture();
+        let root = repo.path();
+        let tag = format!("v{version}");
+
+        let first = execute_release(root).expect_err("run 1 must fail at the publish step");
+        // Assert WHICH step failed, so this test cannot silently degrade into
+        // asserting an unrelated earlier failure.
+        assert!(
+            matches!(first.error, ReleaseError::Publish(_)),
+            "run 1 must fail at the publish step, got: {:?}",
+            first.error
+        );
+        let reported: Vec<ReleaseStep> = first.steps.iter().map(|s| s.step).collect();
+        assert_eq!(
+            reported,
+            vec![
+                ReleaseStep::VersionBump,
+                ReleaseStep::Tag,
+                ReleaseStep::Sync
+            ],
+            "run 1 must have landed the bump, the tag, and the sync before failing: {reported:?}"
+        );
+
+        let remote_before = rev_parse(bare.path(), "refs/heads/develop");
+        assert_eq!(
+            remote_bump_commits(bare.path(), "refs/heads/develop"),
+            1,
+            "exactly one bump commit exists on the remote after run 1"
+        );
+
+        let second = execute_release(root).expect_err("run 2 must fail at the publish step too");
+        assert!(
+            matches!(second.error, ReleaseError::Publish(_)),
+            "run 2 must reach the same publish step, got: {:?}",
+            second.error
+        );
+
+        // The C-02 assertions: the shared branch is untouched by run 2 and no
+        // second release was begun.
+        assert_eq!(
+            remote_before,
+            rev_parse(bare.path(), "refs/heads/develop"),
+            "origin/develop must be byte-identical across run 2 — no second bump may be pushed"
+        );
+        assert_eq!(
+            remote_bump_commits(bare.path(), "refs/heads/develop"),
+            1,
+            "run 2 must not push a second `chore: bump version to` commit"
+        );
+
+        // Run 2 resolved the SAME release, not the next one.
+        let details = second
+            .steps
+            .iter()
+            .map(|s| s.detail.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            details.contains(&version),
+            "run 2 must resolve the same version {version}: {details}"
+        );
+        let remote_tags = crate::test_support::git_command(bare.path())
+            .args(["tag", "-l"])
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .unwrap_or_default();
+        assert_eq!(
+            remote_tags, tag,
+            "exactly the one release tag from run 1 may exist on the remote"
+        );
+    }
+
+    /// D-06a's stated primary job for the ledger: a re-run after a release
+    /// that finished cleanly, with nothing new on `develop`, must refuse by
+    /// name instead of computing the next version and cutting a release nobody
+    /// asked for.
+    #[test]
+    fn a_completed_release_is_not_restarted_by_a_re_run() {
+        let fixture = build_tag_fixture(true, true, true);
+        let root = fixture.repo.path();
+
+        let first = execute_release(root).expect("the first run must reach a terminal outcome");
+        assert_ne!(
+            first.outcome,
+            ReleaseOutcome::HaltedAtHumanGate,
+            "the fixture must drive a terminal SUCCESSFUL outcome, not a halt"
+        );
+        assert_eq!(first.version, fixture.version);
+
+        let remote_before = rev_parse(fixture.bare.path(), "refs/heads/develop");
+
+        let err = execute_release(root).expect_err("a completed release must not be restarted");
+        match &err.error {
+            ReleaseError::LastReleaseCompleted { version, .. } => {
+                assert_eq!(
+                    version, &fixture.version,
+                    "the refusal must name the completed version"
+                );
+            }
+            other => panic!("expected LastReleaseCompleted, got {other:?}"),
+        }
+        assert!(
+            err.steps.is_empty(),
+            "the refusal happens before step 1: {:?}",
+            err.steps
+        );
+        assert_eq!(
+            remote_before,
+            rev_parse(fixture.bare.path(), "refs/heads/develop"),
+            "origin/develop must be byte-identical across the refused run"
+        );
+    }
+
+    /// D-06a's live-state-wins clause, as an executable assertion: a ledger
+    /// asserting a step already completed must NOT cause that step to be
+    /// skipped. This is the test that fails if a future edit ever makes the
+    /// ledger a skip source.
+    #[test]
+    fn a_ledger_claiming_a_step_completed_does_not_skip_it() {
+        let fixture = build_tag_fixture(true, true, false);
+        let root = fixture.repo.path();
+
+        let mut planted =
+            crate::release_ledger::ReleaseLedger::in_flight(&fixture.version, &fixture.tag);
+        planted.steps.push(crate::release_ledger::LedgerStep {
+            step: ReleaseStep::Tag.label().to_string(),
+            status: "completed".to_string(),
+            detail: "a lie: no such tag exists in this repository".to_string(),
+        });
+        crate::release_ledger::write(root, &planted).expect("plant the ledger");
+
+        let report = execute_release(root).expect("execute_release must succeed");
+        let tag_step = report
+            .steps
+            .iter()
+            .find(|s| s.step == ReleaseStep::Tag)
+            .expect("a Tag step report must exist");
+        assert_eq!(
+            tag_step.status,
+            StepStatus::Completed,
+            "the tag step must really run despite the ledger claiming it was done"
+        );
+        assert!(
+            !rev_parse(root, &format!("refs/tags/{}", fixture.tag)).is_empty(),
+            "the release tag must really exist afterwards"
         );
     }
 }
