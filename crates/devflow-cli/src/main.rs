@@ -610,6 +610,12 @@ fn run() -> Result<(), CliError> {
             // persisted `State`. If it were ever sourced from any of those,
             // one typed authorization would silently become a standing
             // default, the exact failure `--yes-ship`'s own design forbids.
+            // The two branches resolve their project root by DIFFERENT rules,
+            // on purpose (D-13): `--check` is read-only and legitimately walks
+            // up to the owning `.devflow` from a subdirectory, while
+            // `--execute` is irreversible and must never act on a repository
+            // the operator did not name (C-06). The asymmetry is a decision,
+            // not an oversight.
             if check && execute {
                 Err(CliError::Message(
                     "devflow release: --check and --execute are mutually exclusive — pick one"
@@ -626,7 +632,7 @@ fn run() -> Result<(), CliError> {
                         .to_string(),
                 ))
             } else if execute {
-                release_execute(&project_root(project)?)
+                release_execute(&mutating_project_root(project)?)
             } else {
                 Err(CliError::Message(
                     "devflow release: pass --check for the read-only preflight, or \
@@ -635,7 +641,7 @@ fn run() -> Result<(), CliError> {
                 ))
             }
         }
-        Command::Sync { project } => sync_cmd(&project_root(project)?),
+        Command::Sync { project } => sync_cmd(&mutating_project_root(project)?),
         Command::Ship {
             phase,
             force,
@@ -682,9 +688,193 @@ fn project_root(project: PathBuf) -> Result<PathBuf, CliError> {
     }
 }
 
+/// Resolve the project root for a **mutating** command — one that pushes,
+/// tags, or publishes.
+///
+/// Do not "simplify" this back into [`project_root`]. That resolver walks *up*
+/// to the nearest `.devflow` ancestor, which is correct for pipeline commands
+/// that genuinely need to find their owning project from a subdirectory. For
+/// `release --execute` and `sync` it is a defect (26-REVIEW.md **C-06**): a
+/// phase worktree (`.worktrees/phase-NN/`) has no `.devflow` while the parent
+/// checkout does, so the upward walk silently substituted a repository the
+/// operator never named — and then ran an *irreversible* `git push`, `git tag`,
+/// and `cargo publish` against it. Worse, the executor's four entry guards all
+/// tested the substituted root, so a dirty worktree beside a clean parent made
+/// the executor MORE likely to proceed.
+///
+/// **D-13** requires a mutating command to refuse when the resolved root
+/// differs from the directory it was invoked in, naming both paths. This
+/// resolves via `git rev-parse --show-toplevel` instead — the latitude D-13
+/// explicitly grants — because it makes a silent redirect structurally
+/// impossible rather than merely detected, and because it is what these
+/// commands actually need: neither `release.rs` nor `sync.rs` reads `.devflow`,
+/// `devflow_dir`, or `events::emit` at all. They want a **git repository
+/// root**; the pipeline resolver's `.devflow` marker is not that, and is
+/// deliberately NOT consulted here.
+///
+/// There is intentionally **no bypass flag and no environment variable**: an
+/// escape hatch would recreate C-06 for precisely the operator most likely to
+/// be in a hurry.
+fn mutating_project_root(project: PathBuf) -> Result<PathBuf, CliError> {
+    if !project.exists() {
+        return Err(CliError::Message(format!(
+            "project path does not exist: {}",
+            project.display()
+        )));
+    }
+
+    let start = project
+        .canonicalize()
+        .map_err(|err| CliError::Message(format!("failed to resolve project path: {err}")))?;
+
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(&start)
+        .output()
+        .map_err(|err| {
+            CliError::Message(format!(
+                "could not determine the git repository root for {}: {err}. A mutating release \
+                 command acts only on the repository it was invoked in and never searches \
+                 upward for one.",
+                start.display()
+            ))
+        })?;
+    if !output.status.success() {
+        // Never a fallback to the upward walk — falling back IS the silent
+        // redirect this function removes.
+        return Err(CliError::Message(format!(
+            "{} is not inside a git repository. A mutating release command pushes, tags, and \
+             publishes, so it acts only on the repository it was invoked in and never searches \
+             upward for one.",
+            start.display()
+        )));
+    }
+
+    let reported = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    // Canonicalize BOTH sides before comparing. On a symlinked checkout (and
+    // on macOS's `/tmp`), comparing a raw path against a resolved one produces
+    // a spurious refusal — and a spurious refusal in a release tool teaches
+    // operators to route around the guard.
+    let toplevel = std::path::Path::new(&reported)
+        .canonicalize()
+        .map_err(|err| {
+            CliError::Message(format!(
+                "failed to resolve the git repository root reported as {reported}: {err}"
+            ))
+        })?;
+
+    if toplevel != start {
+        return Err(CliError::Message(format!(
+            "refusing to act on a repository you did not name: you invoked this from {}, but \
+             that is inside the git repository rooted at {}. A mutating release command pushes, \
+             tags, and publishes, so it never substitutes a root for the one you named. Either \
+             `cd {}` and re-run, or pass that path as the command's [PROJECT] argument.",
+            start.display(),
+            toplevel.display(),
+            toplevel.display()
+        )));
+    }
+
+    Ok(toplevel)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a throwaway git repository. Hermetic (999.37): pinning cwd alone
+    /// does not stop an inherited `GIT_DIR` from retargeting the real
+    /// repository — which would retarget the very resolution under test.
+    fn init_repo(root: &std::path::Path) {
+        let output = devflow_core::test_support::git_command(root)
+            .args(["init", "-q"])
+            .output()
+            .expect("spawn git init");
+        assert!(
+            output.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn mutating_project_root_accepts_the_repository_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        init_repo(&root);
+
+        assert_eq!(
+            mutating_project_root(root.clone()).unwrap(),
+            root.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn mutating_project_root_refuses_a_subdirectory_and_names_both_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        init_repo(&root);
+        let nested = root.join("crates/devflow-cli");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let error = mutating_project_root(nested.clone())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&nested.canonicalize().unwrap().display().to_string()),
+            "the refusal must name the invoking path: {error}"
+        );
+        assert!(
+            error.contains(&root.canonicalize().unwrap().display().to_string()),
+            "the refusal must name the resolved repository root: {error}"
+        );
+        assert!(
+            error.contains("cd "),
+            "the refusal must offer the `cd` remedy: {error}"
+        );
+        assert!(
+            error.contains("[PROJECT]"),
+            "the refusal must offer the explicit-target remedy: {error}"
+        );
+    }
+
+    #[test]
+    fn mutating_project_root_refuses_outside_a_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = dir.path().join("not-a-repo");
+        std::fs::create_dir_all(&bare).unwrap();
+
+        let result = mutating_project_root(bare.clone());
+        assert!(
+            result.is_err(),
+            "a directory outside any git repository must not resolve"
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("not inside a git repository"),
+            "the refusal must say so plainly: {error}"
+        );
+    }
+
+    /// The C-06 property at the unit level: the marker that caused the
+    /// redirect no longer participates at all.
+    #[test]
+    fn mutating_project_root_does_not_consult_devflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let ancestor = dir.path().join("owning-project");
+        std::fs::create_dir_all(ancestor.join(".devflow")).unwrap();
+        let nested = ancestor.join("worktrees/phase-99");
+        std::fs::create_dir_all(&nested).unwrap();
+        init_repo(&nested);
+
+        assert_eq!(
+            mutating_project_root(nested.clone()).unwrap(),
+            nested.canonicalize().unwrap(),
+            "the nested repository must win — the `.devflow` ancestor is not consulted"
+        );
+    }
 
     #[test]
     fn project_root_walks_up_to_nearest_devflow_ancestor() {
