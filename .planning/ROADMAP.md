@@ -572,11 +572,13 @@ Plans:
 | CR-05 | An in-flight ledger **permanently bricks the release path**: `HaltedAtHumanGate` (the *designed* first-invocation outcome under D-02) leaves the ledger `inflight`; every ordinary phase Ship then tags `v{next}` and trips `LedgerContradicted` forever. No clear/abandon verb exists; the only escape is deleting the ledger file, which **re-arms C-02** |
 
 **What is genuinely sound and should be carried forward, not rewritten:**
+
 - **The resume ledger's design (D-06a).** Reviewed as the best-built new code in the phase: a planted lying ledger still creates the real tag (live state provably wins), the schema is versioned and checked *before* deserialization, and corrupt or forward-version ledgers refuse loudly. CR-05 is a lifecycle gap — no terminal state for the non-success outcome — not a design flaw.
 - **D-10 held.** No signing-viability predictor was reintroduced anywhere; `check_signing` is deliberately excluded from the execute pre-gate.
 - **C-01's fix is settled** — the stray-unreachable-tag refusal genuinely precedes the ledger write and step 1's first mutation, with a test asserting the remote ref and `Cargo.toml` are byte-identical across the refusal.
 
 **Prerequisites before this is re-attempted:**
+
 1. **999.39 (`GIT_DIR` scrubbing) must land first** — see CR-01. No root guard is trustworthy until it does.
 2. The ledger needs a terminal state for `HaltedAtHumanGate` and an operator-facing clear/abandon verb (CR-05).
 3. **IN-01 escalated from Info to a contributing cause of a Critical**: `hooks_after_ship`'s `VersionBump` and the executor's signed tag share the same `v{version}` namespace via two independent code paths — that collision is precisely CR-05's trigger.
@@ -590,7 +592,6 @@ Plans:
 ---
 
 *Original entry follows, retained for provenance:*
-
 
 **Goal:** A `devflow release` that *executes* the full release cut — version-bump PR → merge to `main` → signed tag → sync `develop` → publish `devflow-core` then `devflow` to crates.io — not just the read-only preflight. Phase 20's 20d (DEN-38) delivers `--check` only; Phase 20 CONTEXT.md D-03 locked that scope and recorded this executor as the follow-up.
 **Priority:** High | **Size:** L — drives irreversible operations (squash-merge to `main`, signed tag, a crates.io publish that can never be un-published or reused), so it needs its own discuss-phase design pass on failure/rollback semantics (tag lands but publish fails; core publishes but cli does not). Blocks on Phase 20's 20a (self-pin) and 20d (`--check`): the executor's preflight step *is* 20d's check and its `VersionBump` step inherits 20a's correctness. Source: Phase 20 D-03 (2026-07-22). Linear: DEN-50 (blocked by DEN-49, DEN-38).
@@ -1233,15 +1234,18 @@ ever caught. Rather than a third fix round, the executor (**999.25**) was
 open Criticals, the carried-forward sound pieces, and the hard prerequisite.
 
 **Delivered and sound:**
+
 - **999.5** — CHANGELOG content generation from the conventional-commit
   classifier. Clean across both reviews, zero findings against it, fully
   tested. This retires a backlog item deferred three times for want of a
   content source.
+
 - **The resume-ledger design (D-06a)** — reviewed as the best-built new code
   in the phase (live state provably wins over the ledger; schema versioned and
   checked before deserialization; corrupt/forward-version ledgers refuse
   loudly). Its lifecycle gap (CR-05) is a missing terminal state, not a design
   flaw.
+
 - **D-10 held throughout** — no signing-viability predictor was reintroduced.
 
 **Built but NOT shippable — carried to 999.25:** the release executor,
@@ -1286,6 +1290,7 @@ backlog items, each re-verified open at HEAD (`76e49f1`) before promotion:
   `--yes-release` flag (separate from `--yes-ship`) authorizes the whole
   bump→tag→sync→publish sequence, matching the existing dangerous-operation
   pattern.
+
 - **999.54 and 999.50 dropped from this phase AND removed from the backlog
   entirely.** The operator determined DevFlow should never predict
   tag-signing viability at all — the executor's tag step just runs the real
@@ -1294,6 +1299,7 @@ backlog items, each re-verified open at HEAD (`76e49f1`) before promotion:
   maintaining a second "will this work?" implementation that has to stay in
   sync with git's actual behavior (the exact bug class those two items
   were about). See `26-CONTEXT.md` D-10 for the full reasoning.
+
 - **999.4 (concurrent-ship tag race) considered and also removed from the
   backlog entirely.** Its race scenario is specific to `devflow parallel`
   (multiple whole phases concurrently); the operator does not and would
@@ -1301,10 +1307,12 @@ backlog items, each re-verified open at HEAD (`76e49f1`) before promotion:
   `devflow parallel`'s own future (deprecate vs. repurpose for intra-phase
   workstreams vs. leave alone) is captured as a deferred idea for its own
   future phase — explicitly not decided here.
+
 - **999.5 (changelog placeholder) added**, using added capacity from
   dropping 999.54/999.50/999.4 — see `26-CONTEXT.md` D-12. Deferred three
   times previously for want of a content source; Phase 25's
   conventional-commit classifier now provides one for free.
+
 - **Two other backlog items from the same original candidate table**
   (999.31 modular agent driver, 999.15 hermetic shell-entrypoint tests,
   999.21 AI-acceptance wiring) were **considered for the added capacity and
@@ -1332,6 +1340,7 @@ this much design attention before planning starts.
   and is cheap enough to run standalone (`gsd-quick`/`gsd-fast`) rather than
   fold into this phase's scope. Handled outside this phase, separately — not
   excluded for cause.
+
 - **999.39** (production git calls don't scrub `GIT_DIR` etc., Medium/M) —
   confirmed still open: all ~86 production `Command::new("git")` call sites
   pin `current_dir()` but never scrub environment; only the test-only
@@ -1814,10 +1823,17 @@ Plans:
 **Planning corrections (2026-07-30, measured — supersede the two figures above).** The `~86` call sites is a double count (an `rg` glob matched each file twice); the grep-confirmed figure is **41** production sites across 7 files, verified independently three times at HEAD. The `37 unit tests` acceptance signal was measured during 999.37 and predates several phases; re-measured live under a hostile `GIT_DIR` it is **54** (devflow-core) **+ 44** (devflow-cli, `pipeline_gate`/`pipeline_outcomes` excluded) **= 98**. A bare `cargo test --workspace` does **not** terminate under a hostile `GIT_DIR`, so the acceptance commands are the two scoped ones. Full detail: `27-RESEARCH.md` § Summary and `27-01-PLAN.md` § "Phase-level recorded decisions and corrections".
 
 Plans:
+**Wave 1**
 
 - [ ] 27-01-PLAN.md — Tracer: the scrubbing constructor in `devflow-core::git`, proven end-to-end through one core caller and one cli caller under a hostile `GIT_DIR` (wave 1)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
 - [ ] 27-02-PLAN.md — Migrate `git.rs`'s remaining 7 sites (4 of them wrapper chokepoints) and both `worktree.rs` sites (wave 2)
 - [ ] 27-03-PLAN.md — Migrate `version.rs` (10 sites) and `agent_result.rs` (3 sites) (wave 2)
 - [ ] 27-04-PLAN.md — Migrate `staleness.rs` (2 sites) and `commands.rs` (3 git sites + the indirect `sh -c` spawn, RESEARCH Open Question #1 decided in scope) (wave 2)
 - [ ] 27-05-PLAN.md — Migrate `preflight.rs` (11 sites, 2 inside closures, 1 write operation) (wave 2)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
 - [ ] 27-06-PLAN.md — Workspace spawn-edge census and the phase acceptance run under a hostile `GIT_DIR` (wave 3)

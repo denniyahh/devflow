@@ -6,15 +6,15 @@ current_phase: 999.1
 current_phase_name: end-to-end-dogfood-blockers
 status: Phase 25 released as v2.1.0
 stopped_at: Phase 27 context gathered
-last_updated: "2026-07-30T17:00:40.143Z"
-last_activity: 2026-07-28
+last_updated: "2026-07-30T18:29:52.094Z"
+last_activity: 2026-07-30
+last_activity_desc: Phase 27 planning complete
 progress:
   total_phases: 16
   completed_phases: 14
-  total_plans: 112
+  total_plans: 118
   completed_plans: 112
   percent: 88
-last_activity_desc: Phase 25 complete (10/10 verified, ledger 0 open). NOT advanced to 999.1 — phase.complete's next-phase detection again picked up the 999.1 backlog heading as if sequential (same bug corrected after Phase 20, recorded in the history log below). Backlog items require /gsd-review-backlog promotion.
 ---
 
 # DevFlow — Project State
@@ -151,7 +151,7 @@ Scope boundary: 23-16 is the **fix only** (change + regression tests + PR into `
 
 **Recovery-ref disposition:** both `origin` refs (`recovery/pre-23-11-acceptance-e0f87c2`, `recovery/pre-23-15-acceptance-0dad20d`) remain untouched on `origin`; the local copy of the pre-23-11 ref, deleted again by `devflow cleanup`, is deliberately NOT restored (per `23-FINDINGS.md` §B2a); the pre-23-15 ref is now unused (no merge to undo) but retained on `origin` for reuse by the 23-16 retry rather than deleted.
 
-Last activity: 2026-07-28
+Last activity: 2026-07-30 — Phase 27 planning complete
 
 **Note on the "Plan: 2 of 15" value this replaces:** `gsd-tools state advance-plan` only increments whatever value is already in this field, which had drifted to "2 of 15" (the parallel-worktree waves 23-01…23-09 deliberately never touch STATE.md, and this field was last corrected against reality at "10 of 11 plans complete" before the plan count grew to 15 with the gap-closure plans 23-12…23-15). Corrected directly to "13 of 15" to match reality (23-12 and 23-13 both now executed) rather than trust the tool's naive +1 increment from a stale base.
 
