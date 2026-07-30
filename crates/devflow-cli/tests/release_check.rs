@@ -137,7 +137,9 @@ fn release_without_check_is_rejected() {
         String::from_utf8_lossy(&output.stdout)
     );
     assert!(
-        stderr.contains("--check") && stderr.contains("--execute") && stderr.contains("--yes-release"),
+        stderr.contains("--check")
+            && stderr.contains("--execute")
+            && stderr.contains("--yes-release"),
         "expected the rejection to name --check, --execute, and --yes-release, got: {stderr}"
     );
 }
