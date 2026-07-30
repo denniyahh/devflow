@@ -24,6 +24,7 @@ use crate::pipeline_launch::launch_stage;
 use crate::pipeline_launch::launch_stage_inner;
 use crate::pipeline_outcomes::truncate_reason;
 use devflow_core::gates::{GateAction, Gates};
+use devflow_core::git::git_command;
 use devflow_core::mode::{self, Mode};
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
@@ -143,9 +144,8 @@ pub(crate) fn phase_reachability_on_base(
     base: &str,
 ) -> PhaseReachability {
     // Step 1: does the base branch even exist here?
-    let verify = std::process::Command::new("git")
+    let verify = git_command(project_root)
         .args(["rev-parse", "--verify", "--quiet", base])
-        .current_dir(project_root)
         .output();
     match verify {
         Ok(out) if out.status.success() => {}
@@ -157,9 +157,8 @@ pub(crate) fn phase_reachability_on_base(
     // reachability — fail open rather than treat "no roadmap" as "phase
     // missing" (this is what keeps `phase7_cli.rs`'s no-ROADMAP fixtures,
     // and any repository that simply doesn't keep a roadmap, unaffected).
-    let roadmap = std::process::Command::new("git")
+    let roadmap = git_command(project_root)
         .args(["show", &format!("{base}:.planning/ROADMAP.md")])
-        .current_dir(project_root)
         .output();
     let roadmap_text = match roadmap {
         Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -180,7 +179,7 @@ pub(crate) fn phase_reachability_on_base(
     // `commands::phase_artifact_on_develop` — a directory holding only a
     // `.gitkeep` still counts as present, and phase numbers are
     // zero-padded (phase 7 is `07-`, phase 24 is `24-`).
-    let ls_tree = std::process::Command::new("git")
+    let ls_tree = git_command(project_root)
         .args([
             "ls-tree",
             "-r",
@@ -189,7 +188,6 @@ pub(crate) fn phase_reachability_on_base(
             "--",
             ".planning/phases/",
         ])
-        .current_dir(project_root)
         .output();
     let phase_dir_found = match ls_tree {
         Ok(out) if out.status.success() => {
@@ -329,9 +327,8 @@ pub(crate) enum BaseRefCurrency {
 pub(crate) fn base_ref_currency(project_root: &Path, base: &str) -> BaseRefCurrency {
     let remote_ref = format!("{ORIGIN}/{base}");
 
-    let fetch_ok = std::process::Command::new("git")
+    let fetch_ok = git_command(project_root)
         .args(["fetch", "--quiet", ORIGIN, base])
-        .current_dir(project_root)
         .output()
         .map(|out| out.status.success())
         .unwrap_or(false);
@@ -342,9 +339,8 @@ pub(crate) fn base_ref_currency(project_root: &Path, base: &str) -> BaseRefCurre
         );
     }
 
-    let ref_exists = std::process::Command::new("git")
+    let ref_exists = git_command(project_root)
         .args(["rev-parse", "--verify", "--quiet", &remote_ref])
-        .current_dir(project_root)
         .output()
         .map(|out| out.status.success())
         .unwrap_or(false);
@@ -353,9 +349,8 @@ pub(crate) fn base_ref_currency(project_root: &Path, base: &str) -> BaseRefCurre
     }
 
     let is_ancestor = |ancestor: &str, descendant: &str| {
-        std::process::Command::new("git")
+        git_command(project_root)
             .args(["merge-base", "--is-ancestor", ancestor, descendant])
-            .current_dir(project_root)
             .output()
             .map(|out| out.status.success())
             .unwrap_or(false)
@@ -368,9 +363,8 @@ pub(crate) fn base_ref_currency(project_root: &Path, base: &str) -> BaseRefCurre
         (false, true) => BaseRefCurrency::Ahead,
         (false, false) => BaseRefCurrency::Diverged,
         (true, false) => {
-            let count = std::process::Command::new("git")
+            let count = git_command(project_root)
                 .args(["rev-list", "--count", &format!("{base}..{remote_ref}")])
-                .current_dir(project_root)
                 .output()
                 .ok()
                 .filter(|out| out.status.success())
@@ -2222,7 +2216,6 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------
     // -----------------------------------------------------------------
     // 25e (999.51/D-18a): base-ref currency probe.
     // -----------------------------------------------------------------
