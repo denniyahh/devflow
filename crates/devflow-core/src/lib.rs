@@ -73,6 +73,7 @@ pub mod ship;
 pub mod ship_evidence;
 pub mod stage;
 pub mod state;
+pub mod sync;
 /// Test-only helpers, also available to other crates' test targets via the
 /// `test-support` feature. Never compiled into a normal build.
 #[cfg(any(test, feature = "test-support"))]
