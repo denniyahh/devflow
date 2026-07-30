@@ -2322,6 +2322,20 @@ pub(crate) fn release_execute(project_root: &Path) -> Result<(), CliError> {
                     );
                     Ok(())
                 }
+                devflow_core::release::ReleaseOutcome::CompletedWithoutPublish => {
+                    // C-04: the tag is cut and pushed but the registry
+                    // received nothing. Never rendered as a plain "release
+                    // cut complete" — that was a false green on the one
+                    // irreversible step.
+                    println!(
+                        "\nrelease tag cut: {} (tag {}) — but NOTHING was published: \
+                         the workspace publish order resolved no packages.\n\
+                         If this project publishes to crates.io, fix the workspace \
+                         `members` list and re-run; if it does not, this is expected.",
+                        report.version, report.tag
+                    );
+                    Ok(())
+                }
                 devflow_core::release::ReleaseOutcome::HaltedAtHumanGate => {
                     // A clean, expected halt (exit 0, not a failure) — the
                     // halt reason and exact next action are already in the
@@ -2466,11 +2480,21 @@ fn check_publish_order(project_root: &Path) -> Check {
     const NAME: &str = "crates.io publish order";
     let order = devflow_core::git::publish_order(project_root);
     if order.is_empty() {
+        // Stays "warn", not "fail": a single-crate or non-Rust project has no
+        // workspace `members` list and legitimately publishes nothing, and
+        // `--execute` serves those too. The detail says plainly what an empty
+        // order means so it cannot read as "checked, fine" (C-04) — the
+        // executor's own `CompletedWithoutPublish` outcome is what stops the
+        // run from being reported as a complete release.
         return Check {
             name: NAME.into(),
             status: "warn".into(),
-            version: Some("could not determine workspace publish order".into()),
-            install_hint: None,
+            version: Some("no packages resolved — nothing would be published by a release".into()),
+            install_hint: Some(
+                "expected for a single-crate or non-Rust project; otherwise check the \
+                 workspace `members` list"
+                    .into(),
+            ),
         };
     }
     Check {

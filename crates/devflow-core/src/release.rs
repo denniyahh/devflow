@@ -89,8 +89,18 @@ pub enum ReleaseOutcome {
     /// created. The operator must merge the release PR and re-run.
     HaltedAtHumanGate,
     /// All five steps ran (or were skipped as already-satisfied) to
-    /// completion.
+    /// completion, **including** a publish step that either published every
+    /// package in [`crate::git::publish_order`]'s sequence or found each one
+    /// already live on the registry.
     Completed,
+    /// Every step ran, but [`crate::git::publish_order`] resolved no packages,
+    /// so the registry received nothing (C-04). Distinct from
+    /// [`ReleaseOutcome::Completed`] on purpose: the tag is cut and pushed, so
+    /// this is not a failure, but a caller that renders it as an unqualified
+    /// "release cut complete" is reporting a false green on the one
+    /// irreversible step. Callers must name the fact that nothing was
+    /// published.
+    CompletedWithoutPublish,
 }
 
 /// The full result of an [`execute_release`] call.
@@ -552,37 +562,48 @@ fn run_release(
     // as permission to proceed (D-05).
     let packages = crate::git::publish_order(project_root);
     if packages.is_empty() {
+        // C-04: an empty publish set is NOT a completed release. It is not an
+        // error either — `publish_order` reads a Cargo workspace's `members`,
+        // so a single-crate or non-Rust project legitimately resolves to
+        // nothing, and this executor also serves those. What it must never do
+        // is let the caller print an unqualified "release cut complete" after
+        // tagging and pushing while crates.io received nothing, which is a
+        // false green on the one irreversible step. The distinct outcome
+        // forces the caller to say so.
         steps.push(StepReport {
             step: ReleaseStep::Publish,
             status: StepStatus::Skipped,
             detail: sanitize_changelog_subject(
-                "no workspace members were resolved by publish_order — nothing to publish",
+                "no workspace members were resolved by publish_order — NOTHING was published",
             ),
         });
-    } else {
-        for package in &packages {
-            match crate::git::crate_already_published(project_root, package, &version.to_string()) {
-                Ok(true) => {
-                    steps.push(StepReport {
-                        step: ReleaseStep::Publish,
-                        status: StepStatus::Skipped,
-                        detail: sanitize_changelog_subject(&format!(
-                            "{package}@{version} is already published"
-                        )),
-                    });
-                }
-                Ok(false) => {
-                    crate::git::cargo_publish(project_root, package)?;
-                    steps.push(StepReport {
-                        step: ReleaseStep::Publish,
-                        status: StepStatus::Completed,
-                        detail: sanitize_changelog_subject(&format!(
-                            "published {package}@{version}"
-                        )),
-                    });
-                }
-                Err(err) => return Err(ReleaseError::Publish(err)),
+        return Ok((
+            version.to_string(),
+            tag,
+            ReleaseOutcome::CompletedWithoutPublish,
+        ));
+    }
+
+    for package in &packages {
+        match crate::git::crate_already_published(project_root, package, &version.to_string()) {
+            Ok(true) => {
+                steps.push(StepReport {
+                    step: ReleaseStep::Publish,
+                    status: StepStatus::Skipped,
+                    detail: sanitize_changelog_subject(&format!(
+                        "{package}@{version} is already published"
+                    )),
+                });
             }
+            Ok(false) => {
+                crate::git::cargo_publish(project_root, package)?;
+                steps.push(StepReport {
+                    step: ReleaseStep::Publish,
+                    status: StepStatus::Completed,
+                    detail: sanitize_changelog_subject(&format!("published {package}@{version}")),
+                });
+            }
+            Err(err) => return Err(ReleaseError::Publish(err)),
         }
     }
 
@@ -927,9 +948,9 @@ mod tests {
             tag_sha_before, tag_sha_after,
             "the tag object's SHA must be byte-identical across the call"
         );
-        assert_eq!(
+        assert_ne!(
             report.outcome,
-            ReleaseOutcome::Completed,
+            ReleaseOutcome::HaltedAtHumanGate,
             "the run must proceed past the tag step rather than halting"
         );
     }
@@ -1105,7 +1126,15 @@ mod tests {
         flow.checkout(DEVELOP).expect("checkout develop");
 
         let report = execute_release(root).expect("execute_release must succeed");
-        assert_eq!(report.outcome, ReleaseOutcome::Completed);
+        // C-04: this fixture's `publish_order` resolves no members, so the
+        // registry receives nothing. That must NOT report as `Completed` —
+        // the whole sequence ran, but a caller rendering this as "release cut
+        // complete" would be announcing a publish that never happened.
+        assert_eq!(
+            report.outcome,
+            ReleaseOutcome::CompletedWithoutPublish,
+            "an empty publish order must be reported distinctly, never as a complete release"
+        );
 
         let step_order: Vec<ReleaseStep> = report.steps.iter().map(|s| s.step).collect();
         assert_eq!(
