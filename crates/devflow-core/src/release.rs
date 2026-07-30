@@ -266,23 +266,79 @@ pub fn execute_release(project_root: &Path) -> Result<ReleaseReport, ReleaseErro
     let tag = format!("v{version}");
 
     // Step 1: version bump, with two independent sub-predicates so a
-    // partially-completed step resumes correctly (D-06). STUB: does not yet
-    // write, commit, or push — Task 1's GREEN commit implements this for
-    // real.
-    let _ = &version;
+    // partially-completed step resumes correctly (D-06): writing/committing
+    // and pushing are checked and acted on independently, so a run that
+    // wrote+committed but failed to push (or vice versa) resumes correctly
+    // next time.
+    let on_disk = crate::version::read_version(project_root)?;
+    let write_needed = (on_disk.major, on_disk.minor, on_disk.patch)
+        < (version.major, version.minor, version.patch);
+    let bumped = if write_needed {
+        crate::version::write_version(project_root, &version)?;
+        let version_file = crate::version::detect_version_file(project_root).ok_or_else(|| {
+            ReleaseError::Version(crate::version::VersionError::Parse(
+                "no version file found".into(),
+            ))
+        })?;
+        let file_name = version_file
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("Cargo.toml");
+        // Scoped to the version file's own path, never `commit_all` — a
+        // caller must never sweep unrelated dirty state into this commit.
+        crate::git::GitFlow::new(project_root)
+            .commit_path(file_name, &format!("chore: bump version to {version}"))?;
+        true
+    } else {
+        false
+    };
+
+    let local_tip = git_output(project_root, &["rev-parse", "HEAD"])?
+        .trim()
+        .to_string();
+    // Different question from `origin_main_ancestor_status` (`git.rs:508`),
+    // which answers `origin/main` versus `HEAD` and is not parameterizable
+    // — this is not a second implementation of the same check.
+    let push_needed = !is_ancestor(project_root, &local_tip, "origin/develop");
+    let pushed = if push_needed {
+        crate::git::GitFlow::new(project_root).push_ref(crate::config::DEVELOP)?;
+        true
+    } else {
+        false
+    };
+
+    let step1_status = if bumped || pushed {
+        StepStatus::Completed
+    } else {
+        StepStatus::Skipped
+    };
+    let step1_detail = match (bumped, pushed) {
+        (true, true) => format!("wrote and committed version {version}, pushed develop to origin"),
+        (true, false) => format!(
+            "wrote and committed version {version}; origin/develop already contains the tip"
+        ),
+        (false, true) => {
+            format!("version file already declared {version}; pushed develop to origin")
+        }
+        (false, false) => format!(
+            "version file already declared {version} and origin/develop already contains \
+             the tip — nothing to do"
+        ),
+    };
     steps.push(StepReport {
         step: ReleaseStep::VersionBump,
-        status: StepStatus::Skipped,
-        detail: "not yet implemented".to_string(),
+        status: step1_status,
+        detail: sanitize_changelog_subject(&step1_detail),
     });
 
     // Step 2: the human-gated boundary (D-02). Content-based, not
     // ancestry-based, because `main` squash-merges (an ancestry test would
     // never become true).
-    let version_file = crate::version::detect_version_file(project_root)
-        .ok_or_else(|| ReleaseError::Version(crate::version::VersionError::Parse(
+    let version_file = crate::version::detect_version_file(project_root).ok_or_else(|| {
+        ReleaseError::Version(crate::version::VersionError::Parse(
             "no version file found".into(),
-        )))?;
+        ))
+    })?;
     let relative = version_file
         .strip_prefix(project_root)
         .unwrap_or(version_file.as_path())
