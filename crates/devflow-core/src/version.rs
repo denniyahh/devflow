@@ -2412,4 +2412,51 @@ mod tests {
             bullets[0]
         );
     }
+
+    // -----------------------------------------------------------------
+    // 27-03 (D-01/D-03): tag reads resolve the caller's own repository
+    // under a hostile GIT_DIR, not an unrelated one.
+    // -----------------------------------------------------------------
+
+    /// D-03: `count_git_tags`/`highest_semver_tag` resolve `root`'s own tags
+    /// even when the process inherited a hostile `GIT_DIR` pointed at an
+    /// unrelated repository — proven with a real spawned `git` process, not
+    /// by inspecting a `Command` object alone. Mirrors
+    /// `origin_main_ancestor_status_holds_under_a_hostile_git_dir`
+    /// (`git.rs`, 27-01): `count_git_tags`/`highest_semver_tag` take only
+    /// `project_root`, so the hostile `GIT_DIR` this test's own `<verify>`
+    /// entries exercise (`GIT_DIR=<hostile>/.git cargo test ... this test`)
+    /// is injected the same way any inherited-env attack reaches these
+    /// functions in production: via the whole process's environment, then
+    /// down into the spawned child unless the constructor scrubs it. Before
+    /// this plan's migration, both bare `Command::new("git")` sites this
+    /// test exercises inherit that `GIT_DIR` unscrubbed and silently read
+    /// the hostile repository instead — an empty repository with zero tags
+    /// is the clearest contrast against `root`'s two, so this test fails
+    /// pre-migration under the hostile harness and passes once
+    /// `git_command` scrubs it.
+    // `count_git_tags` is deprecated (D-07) but still `pub`; this test still
+    // exercises its own scrub, independent of `compute_version`'s supersession.
+    #[test]
+    #[allow(deprecated)]
+    fn tag_reads_resolve_caller_root_under_a_hostile_git_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        commit(root, "a.txt");
+        tag(root, "v0.1.0");
+        commit(root, "b.txt");
+        tag(root, "v0.2.0");
+
+        assert_eq!(
+            count_git_tags(root).unwrap(),
+            2,
+            "count_git_tags must resolve root's own two tags, not a hostile GIT_DIR's repository"
+        );
+        assert_eq!(
+            highest_semver_tag(root).unwrap(),
+            Some(semver::Version::new(0, 2, 0)),
+            "highest_semver_tag must resolve root's own highest tag, not a hostile GIT_DIR's repository"
+        );
+    }
 }
