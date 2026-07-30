@@ -517,6 +517,44 @@ dropped after verification against the live toolchain and repo:
   claims a merge, tag, publish, PR, or deletion that did not happen.** The
   `--help` snapshot matches the binary byte-for-byte.
 
+## Audit-Fix Pass — 2026-07-30 (`/gsd-audit-fix 26`)
+
+Five of the seven Criticals were classified auto-fixable and are fixed, each
+with a test that fails against the prior code, each committed atomically with
+its finding ID. Full gate re-run after the last commit: **436 lib tests**
+(434 + 2 new) / 0 failed, **302 CLI tests across 16 targets** / 0 failed,
+`clippy --workspace --all-targets -D warnings` clean, `fmt --check` clean.
+
+| ID | Status | Commit | Fix |
+|----|--------|--------|-----|
+| C-05 | fixed | `e4a3236` | `members_key_offset` matches the exact `members` key, so `default-members` can no longer truncate the publish set. New test asserts both key orderings and the only-`default-members` case. |
+| C-03 | fixed | `43a7a96` | `execute_release` returns `ReleaseFailure { error, steps }`; the sequence moved into `run_release`, which borrows the ledger, so every failure path reports what already landed. The CLI prints the ledger on both paths and states the steps are not rolled back. |
+| C-04 | fixed | `8f5f2d1` | New `ReleaseOutcome::CompletedWithoutPublish`; the CLI can no longer print an unqualified "release cut complete" when the registry received nothing. Deliberately not an error — `publish_order` reads a Cargo workspace's `members`, so single-crate and non-Rust projects legitimately resolve to none. |
+| C-01 | fixed | `7bd9a37` | The `UnreachableBaseline` arm resolves the tag's target commit and resumes only when it names `origin/main`'s tip; anything else is `StrayBaselineTag`, refused before any mutation. New test asserts the remote `develop` ref and the version file are byte-identical across the refusal. **Also fixes WR-01/W-18** — the resume note folds into step 1's own report instead of a second `VersionBump` entry, and the one-entry-per-step contract is now asserted (the duplicate was reproduced live by the new assertion before the fix). |
+| C-07 | fixed | `0f0e17a` | README's manual repair now fetches, captures `HEAD^{tree}` before and after, aborts on a tree change, and pushes only when the merge is content-neutral. The inverted `git diff --stat` check is called out explicitly so it is not reintroduced. |
+
+**Still blocking — classified manual-only, not attempted:**
+
+- **C-02** (unresumable publish). The recommendation below is a persisted step
+  ledger, which directly contradicts recorded decision **D-06** ("every step
+  consults a live-state predicate rather than a persisted progress file"). An
+  operator has to re-open D-06 before this can be fixed; picking a design here
+  unilaterally would overwrite a recorded decision.
+- **C-06** (`project_root` walks up to an ancestor `.devflow`, so a worktree run
+  retargets the release at the parent checkout). `project_root` is the resolver
+  for *every* command; whether mutating commands should refuse, warn, or scope
+  to the invoking worktree is a cross-cutting policy decision, not a local fix.
+
+The 24 Warnings were classified in scope at `--severity medium` but not
+attempted — `--max 5` was exhausted by the high-severity set. **W-17 deserves
+attention independent of the code**: the live `develop` ruleset is
+`enforcement: active` with an empty bypass list, so the direct push in step 1
+cannot land against this repository and all three `26-UAT.md` items are gated
+on a precondition proven absent. That is a repository-settings action, not a
+code change. The 5 Info findings are below the severity threshold.
+
+---
+
 ## Recommendation
 
 Do not ship. C-01, C-02, C-03, and C-04 are all reachable on the ordinary
