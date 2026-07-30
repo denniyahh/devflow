@@ -1,9 +1,19 @@
 ---
 phase: 26-release-cut-automation
-reviewed: 2026-07-29T00:00:00Z
-depth: standard
-files_reviewed: 13
+reviewed: 2026-07-29T23:59:00Z
+depth: deep
+review_mode: five-angle-parallel
+angles:
+  - doc-accuracy
+  - security-leaked-data
+  - ci-build-correctness
+  - external-state-claims
+  - generalist-deep
+files_reviewed: 16
 files_reviewed_list:
+  - CONTRIBUTING.md
+  - OPERATIONS.md
+  - README.md
   - crates/devflow-cli/src/commands.rs
   - crates/devflow-cli/src/main.rs
   - crates/devflow-cli/src/pipeline_outcomes.rs
@@ -17,417 +27,506 @@ files_reviewed_list:
   - crates/devflow-core/src/ship.rs
   - crates/devflow-core/src/sync.rs
   - crates/devflow-core/src/version.rs
+raw_findings: 49
+merged_duplicates: 13
 findings:
-  critical: 0
-  warning: 7
-  info: 4
-  total: 11
+  critical: 7
+  warning: 24
+  info: 5
+  total: 36
 status: issues_found
+ship_gate: BLOCKED
 ---
 
 # Phase 26: Code Review Report
 
 **Reviewed:** 2026-07-29
-**Depth:** standard
-**Files Reviewed:** 13
-**Status:** issues_found
-
-## Summary
-
-This phase adds the `devflow release --execute --yes-release` release-cut
-executor (`devflow_core::release`), the `devflow sync` standalone command
-(`devflow_core::sync`), and the `cargo_publish`/`release_tag_state`/
-`publish_order` primitives in `devflow_core::git`, plus the CLI wiring and
-authorization gate for all of it. This review supersedes an earlier pass
-recorded at this path; the file list has grown from 5 to 13 files to cover
-the actual diff for this phase (`release.rs` and `sync.rs` are entirely new;
-`git.rs`, `version.rs`, `hooks.rs`, `ship.rs`, `commands.rs`, `main.rs` all
-gained substantial new surface).
-
-**On the primary question this review was scoped to answer — can any code
-path reach a `git push`, `git tag`, or `cargo publish` without the typed
-`--yes-release` flag — the answer is no.** I traced every call site of
-`execute_release`, `cargo_publish`, and the push primitives the release
-sequence uses:
-
-- `execute_release` has exactly one call site (`commands.rs::release_execute`,
-  reached only from `main.rs`'s `Release` dispatch arm, only in the
-  `execute && yes_release` branch — every other combination of `check`/
-  `execute`/`yes_release` returns an `Err` before touching `project_root`).
-- `--yes-release` is read only from the parsed CLI flag; a dedicated
-  integration test (`yes_release_is_not_settable_via_config_or_env`) proves a
-  `devflow.toml` key and two plausible env vars are both ignored, and a
-  source-grep test proves `state.rs`/`config.rs`/`config_parse.rs` never
-  mention `yes_release`.
-- `cargo_publish` has exactly one non-test call site, gated behind
-  `crate_already_published`'s `Ok(false)` arm; the `Ambiguous` verdict routes
-  to `Err`, never to "proceed" (D-05 honored).
-- `GitFlow::push_ref` never accepts a force flag, so every push in the
-  sequence is fast-forward-only; a diverged remote surfaces as a hard error,
-  never a silent overwrite.
-- Partial-failure recoverability is real, not just documented: I traced the
-  version-bump-committed-but-tag-failed case by hand and confirmed the next
-  invocation's live-state predicates (`write_needed`/`push_needed`/
-  `release_tag_state`) correctly resume from exactly where the prior run
-  stopped, matching what `partial_failure_leaves_prior_steps_landed` and
-  `skips_push_when_already_ahead` assert.
-
-The findings below are quality/robustness gaps, not authorization bypasses —
-plus several still-valid findings carried forward from the prior review pass
-on files that are unchanged in the relevant regions.
-
-## Warnings
-
-### WR-01: `execute_release` double-reports the VersionBump step on every resumed run
-
-**File:** `crates/devflow-core/src/release.rs:267-274` and `:341-345`
-
-**Issue:** When `compute_version` returns `VersionError::UnreachableBaseline`
-(the documented resume signal for an in-flight release), the match arm pushes
-its own `StepReport { step: VersionBump, status: Completed, detail:
-"resuming the in-flight release..." }` into `steps` (lines 267-274). Control
-then falls through unconditionally into the ordinary Step-1 logic
-(`write_needed`/`push_needed`), which pushes a *second*
-`StepReport { step: VersionBump, .. }` a few lines later (341-345) —
-this one carrying whatever `Skipped`/`Completed` status the live-state
-predicates compute.
-
-Because a signed release tag can only exist once Step 3 has already run
-(which itself requires Step 1 to have already landed and pushed), by
-construction `write_needed`/`push_needed` are essentially always both
-`false` on the resume path — so this second report is a real
-`StepStatus::Skipped` entry printed immediately after the first
-`StepStatus::Completed` one. Every resumed `devflow release --execute
---yes-release` invocation prints the VersionBump line **twice** in its
-operator-facing table (`commands.rs::release_execute`'s
-`for step in &report.steps { println!(...) }` loop has no dedup), and
-`report.steps` silently violates the one-entry-per-`ReleaseStep` invariant
-`completes_the_sequence_and_reports_every_step`'s
-`step_order == vec![VersionBump, Tag, Sync, Publish]` assertion relies on —
-that test only passes because its fixture never triggers the
-`UnreachableBaseline` path. `skips_tag_when_already_released` and
-`refuses_a_stray_lightweight_tag_rather_than_skipping` DO trigger this path
-(their fixtures pre-create a tag on `main` unreachable from `develop`), but
-neither asserts on `report.steps`'s length or ordering, so the duplication
-ships unnoticed.
-
-This is a reporting/UX defect, not a safety defect — no extra git command
-runs on the duplicated pass, since `bumped`/`pushed` are correctly
-recomputed as `false`. But it is a genuine, reproducible bug in code an
-operator reads to decide whether a release actually completed.
-
-**Fix:** Either `return` immediately after the resume-arm's `StepReport`
-push (skipping the Step-1 recompute entirely, since the resume arm has
-already established the bump landed), or drop the resume arm's own
-`StepReport` push and let the ordinary Step-1 block's `Skipped` report
-(whose `step1_detail` already says "already declared ... — nothing to do")
-carry the message alone.
-
-### WR-02: `release_tag_state`'s reachability check accepts a strict descendant, not just an exact match
-
-**File:** `crates/devflow-core/src/git.rs:639-654`
-
-**Issue:** The check that decides whether an existing annotated tag
-corresponds to *this* release is `merge-base --is-ancestor released_commit
-{tag}^{commit}` — i.e. "is the released commit an ancestor of (or equal to)
-what the tag points at", not "does the tag point exactly at the released
-commit". A tag that happens to point at some later descendant of
-`released_commit` (for example, a signed tag manually re-created against a
-newer `main` tip after further commits landed, while still carrying the
-name of an earlier release) passes this check and is classified `Released`
-(assuming it also verifies and is present on origin) rather than
-`Mismatched`. Since `execute_release`'s Step 3 treats `Released` as
-"nothing to do, proceed past the tag step", a tag that doesn't actually name
-`main_tip` exactly can cause the executor to silently accept it as the
-release artifact for this run and move on to sync/publish against the wrong
-tagged history.
-
-In the normal, single-writer flow this is unreachable (this codebase itself
-never creates a tag pointing anywhere but the exact `main_tip` it computed),
-but it weakens the stated idempotence contract — the equivalent guarantee
-for a *content*-mismatched-but-ancestor-passing annotated tag is not as
-strong as the one already given to `StrayLightweight` — and is exactly the
-"can the already-tagged check mis-classify a real problem as skip" case this
-review was asked to probe.
-
-**Fix:** Compare `git rev-parse {tag}^{commit}` against `released_commit`
-for exact equality rather than (or in addition to) the ancestor check, and
-route anything that is an ancestor-but-not-equal into `Mismatched` (which
-already refuses rather than auto-resolving).
-
-### WR-03: `devflow sync` performs a real, direct push to `origin/develop` with no typed authorization flag at all
-
-**File:** `crates/devflow-cli/src/main.rs:260-272`, `crates/devflow-cli/src/commands.rs:2241-2253`
-
-**Issue:** `devflow release --execute` requires `--yes-release`, and
-`devflow start`'s auto-Ship path requires `--yes-ship` — both documented as
-must-be-typed-every-invocation, never settable via config or env. `devflow
-sync`, added by this same phase and sharing the identical
-`sync_main_to_develop` push primitive the release executor uses internally
-as its own Step 4, has **no authorization flag at all** — a bare `devflow
-sync` (or `devflow sync <project>`) pushes to `origin/develop` the moment it
-determines a merge is needed, with zero operator confirmation.
-
-This is very likely an intentional, lower-risk design choice — the merge is
-content-preserving and independently tree-verified before the push
-(`SyncError::TreeChanged` refuses if the merge changed anything), and the
-module doc frames this as a "standing post-release history-linking step."
-But given this review was specifically asked to scrutinize every push/tag/
-publish surface this phase introduces, the asymmetry is worth flagging
-explicitly: an operator (or a script/cron job invoking `devflow sync`
-unattended, which the CLI does nothing to discourage) can push to a shared
-branch with no typed consent, while the sibling `release --execute` command
-in the very same phase treats an equivalent-risk push as requiring explicit,
-non-persistable authorization.
-
-**Fix:** If the asymmetry is intentional, document it explicitly next to
-`--yes-ship`/`--yes-release`'s design rationale so a future reader doesn't
-"fix" it into requiring a flag inconsistently. If unintentional, consider
-whether `sync` should also require an explicit flag before pushing.
-
-### WR-04: Publish-existence classification depends on fragile, undocumented-by-contract stderr substring matching
-
-**File:** `crates/devflow-core/src/git.rs:920-932`
-
-**Issue:** `classify_cargo_info_result` distinguishes "already published"
-from "not yet published" from "ambiguous" almost entirely from two substring
-checks against `cargo info`'s stderr: `stderr.contains("could not find")`
-and `stderr.contains("registry")`. The function's own doc comment
-acknowledges this is "documented-by-observation ... not documented-by-
-contract, so a future cargo rewording degrades into `Ambiguous`" — which is
-the safe direction for a *false* `NotPublished` becoming ambiguous. But the
-same substring test can also fire on an unrelated, genuinely ambiguous
-failure that happens to mention both words (a registry-index corruption
-error, a proxy/mirror misconfiguration message, a future cargo version that
-reports "could not find a matching registry" for a config problem) — that
-would be misclassified as the confident `NotPublished` verdict and route
-straight into a live `cargo_publish` call rather than the `Ambiguous`/refuse
-path the function's own reasoning says an unrecognized state should take.
-
-This is partially mitigated because crates.io itself rejects a duplicate
-publish of an identical version server-side, so the worst outcome is a
-failed `cargo publish` invocation rather than corrupted registry state —
-but it undermines the "never guess, fail loud" design intent the
-surrounding code explicitly calls out for this exact function, and is worth
-tightening given how central this check is to the one genuinely
-irreversible action in the sequence.
-
-**Fix:** Anchor the classification to the two substrings appearing in the
-expected relative order/proximity, or require an additional distinguishing
-fragment (`in registry`) rather than the bare word `registry` anywhere in
-stderr.
-
-### WR-05: `classify_validate_outcome` accepts `verdict: Pass` without checking `status == Success`
-
-**File:** `crates/devflow-cli/src/pipeline_outcomes.rs:183-195`
-
-**Issue:**
-
-```rust
-pub(crate) fn classify_validate_outcome(result: &agent_result::AgentResult) -> ValidateOutcome {
-    let external = result.decided_by_layer == Some(0) && result.status == AgentStatus::Success;
-    match (external, result.verdict) {
-        (_, Some(Verdict::Pass)) => ValidateOutcome::Passed,
-        ...
-```
-
-The first match arm `(_, Some(Verdict::Pass)) => ValidateOutcome::Passed`
-fires regardless of `result.status`. The doc comment above it explains this
-is deliberate so the arm "wins regardless of which layer decided the
-result" — but that reasoning only covers `decided_by_layer`, never
-`result.status`. If an `AgentResult` is ever constructed with a
-non-`Success` status (e.g. the agent process crashed or was killed *after*
-it had already printed a `DEVFLOW_RESULT` marker containing
-`"verdict":"pass"`, which the parser extracted before the exit code was
-observed to be non-zero), this function still returns `Passed` and the
-pipeline advances straight to Ship — the exact "fail through" class of bug
-the 18d/18e effort (`ValidateOutcome`, `consecutive_failures` reachability)
-was built to close for every *other* combination of signals. None of the
-unit tests in this file construct an `AgentResult` with `status !=
-AgentStatus::Success` and `verdict: Some(Verdict::Pass)` together, so this
-exact combination is untested.
-
-Whether this is reachable in practice depends on invariants enforced in
-`agent_result.rs` (out of this review's file list) that this function does
-not itself defend. Given the amount of hardening this seam has already
-received for other ambiguous-signal cases, the omission of a `status` check
-on the strongest-signal arm looks like an oversight rather than a reviewed
-decision.
-
-**Fix:** Require `result.status == AgentStatus::Success` on the `Passed` arm
-too:
-
-```rust
-let success = result.status == AgentStatus::Success;
-let external = result.decided_by_layer == Some(0) && success;
-match (success, external, result.verdict) {
-    (true, _, Some(Verdict::Pass)) => ValidateOutcome::Passed,
-    ...
-    _ => ValidateOutcome::Failed,
-}
-```
-
-### WR-06: `Merge` hook's idempotent no-op path emits a `merged: false` event even though the branch *is* merged
-
-**File:** `crates/devflow-core/src/hooks.rs:184-193`
-
-**Issue:**
-
-```rust
-if git.is_merged_into_develop(ctx.phase) {
-    info!("Merge: {branch} is already merged; nothing to merge");
-    crate::events::emit(
-        &ctx.project_root,
-        ctx.phase,
-        "merge_result",
-        serde_json::json!({"merged": false, "branch": branch}),
-    );
-    return Ok(());
-}
-```
-
-When the feature branch is already merged into `develop` (the idempotent
-resume case), the emitted `merge_result` event carries `"merged": false`.
-Anyone consuming `events.jsonl` to answer "did phase N's merge succeed?"
-will read `merged: false` as "the merge did not happen / failed", when the
-true state is the opposite: the branch's work **is** on `develop`. This is
-the same event name and same boolean field the success path uses with the
-opposite meaning (`"merged": true`), so there is no way to distinguish
-"already merged" from "merge failed" without also cross-referencing log
-level or a second field.
-
-**Fix:** Give the no-op path an unambiguous value:
-
-```rust
-serde_json::json!({"merged": true, "branch": branch, "already_merged": true})
-```
-
-so the field's meaning ("is the branch's work on develop") stays consistent
-across both branches, and a monitor filtering on `merged == false` reliably
-means "the merge did not happen."
-
-### WR-07: Workspace-dependency self-pin scan does not skip comment lines
-
-**File:** `crates/devflow-core/src/version.rs:811` (`rewrite_workspace_member_pins`) and `crates/devflow-core/src/version.rs:956` (`read_workspace_self_pins`)
-
-**Issue:** Both functions match any line inside `[workspace.dependencies]`
-that contains `{`/`}` and whose parsed fragments include a `path = "crates/
-..."` entry — with no check that the line isn't a full-line TOML comment
-(`# ...`). `workspace_dependency_has_local_path`/`inline_table_fragments`
-operate on `line.find('{')`/`line.rfind('}')` positionally, and comment
-lines are otherwise legal, common TOML (e.g. a developer temporarily
-commenting out a workspace member):
-
-```toml
-[workspace.dependencies]
-# devflow-core = { path = "crates/devflow-core", version = "1.6.0" }
-```
-
-- `write_version`'s additive pass (`rewrite_workspace_member_pins`) will
-  silently rewrite the version string **inside the comment** on every
-  version bump, changing text a maintainer explicitly disabled.
-- `read_workspace_self_pins` (used by `devflow release --check` and as part
-  of `release --execute`'s blocking pre-gate, per `check_self_pin`) will
-  report a phantom `SelfPin` sourced from the commented-out line, which
-  could produce a false "drift" report that blocks a legitimate release, or
-  mask a real drift.
-
-Every other TOML field lookup in this file (`find_version_in_contents`,
-`replace_version_in_contents`) is incidentally safe from this because they
-require the parsed key (left of `=`) to equal the target key exactly — a
-commented line's key is `"# version"` / `"# devflow-core"`, which never
-equals `"version"`. The `[workspace.dependencies]` inline-table scan has no
-equivalent guard.
-
-**Fix:** Skip lines that are comments before running the inline-table checks
-in both functions:
-
-```rust
-if current == "workspace.dependencies"
-    && !trimmed.starts_with('#')
-    && trimmed.contains('{')
-    ...
-```
-
-## Info
-
-### IN-01: `hooks_after_ship`'s `VersionBump` and the release executor's signed tag share the exact same `v{version}` tag namespace via two independent code paths
-
-**File:** `crates/devflow-core/src/git.rs:568-580`, `crates/devflow-core/src/hooks.rs:278-336`
-
-**Issue:** Not a new defect in this phase, but worth restating for the
-record since this review was asked to focus on the tag/publish surface:
-`hooks::version_bump` (run at the end of every phase's Ship stage) creates a
-same-named, unsigned, lightweight `v{version}` tag via `GitFlow::tag`
-independently of anything `devflow_core::release` does, using the identical
-`compute_version()` derivation. `release_tag_state`'s own doc comment
-already documents that this collision is not hypothetical (one real
-lightweight tag, `v1.3.69`, exists in this repository's history from exactly
-this interaction) and that the executor correctly refuses
-(`StrayLightweight`) rather than silently accepting it. No action needed —
-this is confirmed handled — but it's worth keeping visible that this is a
-standing two-writer hazard on the tag namespace, not something this phase
-eliminated.
-
-### IN-02: `commit_all`'s "nothing to commit" fallback can never fire
-
-**File:** `crates/devflow-core/src/git.rs:294-305` (uses `git_raw`, `git.rs:401-419`)
-
-**Issue:** `commit_all` always passes `--allow-empty`, so `git commit` can
-never itself report "nothing to commit" — the comment above the match arm
-("just in case, ignore 'nothing to commit'") is therefore dead code today.
-Even if `--allow-empty` were ever removed, the fallback arm still could not
-fire: `git_raw` (used here) builds its `GitError::Command` from
-`stderr_or_status`, which only inspects `output.stderr`, but git's "nothing
-to commit, working tree clean" message is written to **stdout** — a fact
-this file's own `git_raw_combined` doc comment (`git.rs:421-433`) discovered
-and fixed specifically for `commit_path`. `commit_all` was left on the
-old, stderr-only `git_raw`.
-
-**Fix:** Either delete the now-provably-dead match arm and its comment, or
-switch `commit_all` to `git_raw_combined` for consistency/defense-in-depth
-if `--allow-empty` is ever dropped from this call site.
-
-### IN-03: `compute_version` silently truncates a `semver::Version`'s `u64` fields to `u32`
-
-**File:** `crates/devflow-core/src/version.rs:693-697`
-
-**Issue:**
-
-```rust
-Ok(Version {
-    major: bumped.major as u32,
-    minor: bumped.minor as u32,
-    patch: bumped.patch as u32,
-})
-```
-
-`semver::Version`'s components are `u64`; `Version`'s are `u32`. The `as u32`
-cast truncates rather than erroring on overflow. Unreachable in practice for
-any real project's version numbers, but it is a silent-wraparound cast with
-no bounds check, for a value that will be tagged, published, and diffed
-against for reachability by the very release executor this phase adds.
-Consider `u32::try_from(..)` with an explicit `VersionError` on failure so
-an absurd/corrupted tag value degrades loudly instead of wrapping.
-
-### IN-04: `today()`'s failure fallback reuses the `"unreleased"` sentinel already used for "no version file"
-
-**File:** `crates/devflow-core/src/hooks.rs:340-349`
-
-**Issue:** `today()` returns the literal string `"unreleased"` when the
-`date` command is unavailable or fails, which becomes the CHANGELOG entry's
-*date* field (`## {version} — {date}`). Elsewhere in this same file
-(`changelog_append`, `git.rs`), `"unreleased"` is the fallback used when the
-*version* is unknown. Reusing the same literal for two semantically
-different fallback conditions (a missing date vs. a missing version) means
-a CHANGELOG heading like `## 2.3.4 — unreleased` is ambiguous about which
-part of the release metadata actually failed to resolve. Low practical risk
-(the `date` binary failing is exceedingly unlikely in any environment this
-tool runs in), but worth a distinct sentinel (e.g. `"unknown-date"`) for
-clarity if it is ever hit.
+**Depth:** deep (five parallel finder passes, merged and deduplicated)
+**Files Reviewed:** 16
+**Status:** issues_found — **Ship gate: BLOCKED (7 Critical)**
+
+## Scope
+
+Scope was the 13 source files declared in the phase `SUMMARY` artifacts, plus
+the 3 documentation files this phase changed (`README.md`, `CONTRIBUTING.md`,
+`OPERATIONS.md`) so the doc-accuracy angle had its actual subject matter. This
+supersedes the earlier standard-depth pass recorded at this path (13 files, 0
+Critical / 7 Warning / 4 Info).
+
+Five independent finders ran in parallel — doc-accuracy, security/leaked-data,
+CI-build/false-green, external-state claims, and a generalist deep pass. Each
+was required to attempt to refute its own findings before reporting. They
+produced 49 raw findings; 13 were merged as duplicates across angles, leaving
+36.
+
+## What this phase adds
+
+`devflow release --execute --yes-release`, a release-cut executor
+(`devflow_core::release`, 1151 lines, new), a standalone `devflow sync`
+(`devflow_core::sync`, 575 lines, new), and the `cargo_publish` /
+`release_tag_state` / `publish_order` primitives in `devflow_core::git`
+(+880), with version-bump machinery in `version.rs` (+403) and CLI wiring in
+`main.rs` / `commands.rs`.
+
+## Authorization gate: PASSES
+
+The question this phase was scoped to answer — can any path reach `git push`,
+`git tag`, or `cargo publish` without the typed `--yes-release` flag — is
+answered **no**, and the finders confirmed it independently:
+
+- `main.rs:602-635` is the only dispatch arm for `Command::Release`;
+  `release_execute` is called on exactly one branch (`main.rs:629`), reachable
+  only when `execute && yes_release && !check`.
+- `yes_release` is a plain clap `#[arg(long)] bool` (`main.rs:255`) with no
+  `env`, no `default_value`, no config or `State` read. It appears nowhere in
+  `config.rs`, `state.rs`, or `config_parse.rs`.
+- `release_execute` (`commands.rs:2274`) takes no authorization parameter, so
+  it structurally cannot be invoked with a forged authorization.
+- `execute_release`, `cargo_publish`, and `create_signed_release_tag` have no
+  non-test callers outside this chain.
+- The proving tests are real end-to-end binary drives, not source greps:
+  `execute_without_yes_release_is_rejected` and
+  `yes_release_is_not_settable_via_config_or_env` (which sets
+  `devflow.toml: yes_release = true`, `DEVFLOW_YES_RELEASE=true`, and
+  `YES_RELEASE=true`, and still requires refusal).
+
+Two nuances are **not** gate bypasses but should be stated plainly:
+
+1. `devflow sync` (new subcommand, `main.rs:266`, `commands.rs:2243`) performs a
+   real remote mutation — a `-X ours` merge commit direct-pushed to
+   `origin/develop` — with **no authorization flag of any kind**. That is
+   D-07/D-08's stated intent (it ports a script operators ran by hand), but it
+   means "mutating operation reachable without a typed flag" is true for the
+   sync half of the sequence. Recorded as W-23.
+2. `execute_release` is `pub` in `devflow-core`, a crate published to crates.io.
+   Any downstream library consumer can call it directly; the gate is a
+   CLI-surface gate only. Not a defect for this threat model. Recorded as W-24.
+
+**And** — the gate authorizes the *sequence*, not the *target repository*
+(C-06) and not the *correctness of the version being released* (C-01). The
+gate holding is necessary but not sufficient, and the Criticals below all live
+downstream of it.
+
+**Tooling:** `cargo clippy --all-targets -- -D warnings` exits 0 and
+`cargo fmt --check` is clean — this phase introduces no lint or format
+violations.
 
 ---
 
-_Reviewed: 2026-07-29_
-_Reviewer: Claude (gsd-code-reviewer)_
-_Depth: standard_
+## Critical Findings (7) — all block Ship
+
+### C-01 — A stray unreachable semver tag is adopted as the release version and pushed to `origin/develop`
+
+- **File:** `crates/devflow-core/src/release.rs:262-278` (mutation at `:286-321`)
+- **Angle:** generalist · **Confidence:** high · **Reproduced by execution**
+
+`compute_version` correctly refuses with `VersionError::UnreachableBaseline`
+when the highest semver tag is not reachable from `HEAD` — that refusal is the
+entire point of D-10. The executor catches that refusal and *adopts* the
+unreachable tag's version as an assumed in-flight resume:
+
+```rust
+Err(crate::version::VersionError::UnreachableBaseline { tag }) => {
+    let stripped = tag.strip_prefix('v').unwrap_or(tag.as_str());
+    let resumed = parse_bare_version(stripped)?;
+    steps.push(StepReport { step: ReleaseStep::VersionBump, status: StepStatus::Completed,
+        detail: sanitize_changelog_subject(&format!(
+            "resuming the in-flight release identified by unreachable tag `{tag}` \
+             — the version bump already landed in a prior invocation")) });
+    resumed
+}
+```
+
+It then unconditionally writes, commits, and **pushes** that version.
+
+**Failure scenario (executed, not hypothesized):** repo on `develop` at
+`2.1.0`; a semver tag `v9.9.9` exists on an abandoned or squash-merged branch.
+The executor writes `9.9.9` into `[workspace.package] version` *and* the
+`[workspace.dependencies]` self-pin, commits `chore: bump version to 9.9.9`,
+and pushes it to `origin/develop`, then halts at the human gate:
+
+```
+compute_version correctly refuses: unreachable v9.9.9
+version=9.9.9 tag=v9.9.9 outcome=HaltedAtHumanGate
+  VersionBump Completed resuming the in-flight release identified by unreachable tag `v9.9.9` …
+  VersionBump Completed wrote and committed version 9.9.9, pushed develop to origin
+remote develop log: c2f9d6f chore: bump version to 9.9.9
+```
+
+The reported detail is **false** — no prior invocation existed.
+
+**Why this input is likely, not exotic:** `hooks_after_ship`'s `version_bump`
+(`hooks.rs:327-328`) creates a `v{version}` tag at the end of *every* phase's
+Ship stage, and this project ships from worktrees on feature branches that are
+then squash-merged. A squash merge leaves that tag permanently unreachable from
+`develop` and strictly higher than the reachable baseline — exactly this input.
+`release_tag_state`'s own doc comment records that this repository *already
+carries one such orphan tag* (`v1.3.69`).
+
+**Refutation attempted and failed:** `26-06-PLAN.md:192` designs this branch and
+argues "step 3 independently validates that the tag belongs to `origin/main`'s
+tip, so a stale or foreign tag is caught there." That argument is wrong about
+ordering — step 1's write, commit, and push all execute before step 2/3 run.
+The human gate is step 2 at `:372`, strictly *after* `push_ref` at `:317`.
+
+---
+
+### C-02 — A failed publish step is unresumable: the re-run starts a *new* release, pushes another bump, and exits 0
+
+- **File:** `crates/devflow-core/src/release.rs:229-278` vs `:484-545`; `version.rs:644-651`
+- **Angles:** generalist + external-state (independently found, merged) · **Confidence:** high · **Reproduced by execution**
+
+The module doc claims (`release.rs:226-228`):
+
+```rust
+//! Every step's own live-state predicate makes it independently resumable
+//! (D-06); nothing is ever rolled back on any failure (D-05)
+```
+
+This is false for the one irreversible step. Publish is step 5, *after*
+`sync_main_to_develop` at `:484`. The sync merges `origin/main` — which now
+carries the release tag — into `develop`, making the tag reachable. The next
+`compute_version` therefore uses it as the baseline and returns `version + 1`.
+`apply_bump` (`version.rs:644-651`) compounds this by flooring `Bump::None` to
+patch+1, so a re-run *always* computes a new version:
+
+```rust
+Bump::Patch | Bump::None => {
+    semver::Version::new(baseline.major, baseline.minor, baseline.patch + 1)
+}
+```
+
+**Failure scenario (executed):** release `0.1.0`; bump, signed tag, and sync all
+land; publish then fails — `cargo publish` non-zero, missing
+`CARGO_REGISTRY_TOKEN`, or a `PublishCheck::Ambiguous` network blip at
+`git.rs:995`, all of which `?` straight out at `release.rs:533/542`. The
+operator re-runs the identical command:
+
+```
+RUN 1: version=0.1.0 tag=v0.1.0 outcome=Completed   (bump, tag, sync all landed)
+RUN 2: version=0.1.1 tag=v0.1.1 outcome=HaltedAtHumanGate
+remote log: 16daa2e chore: bump version to 0.1.1
+            dd56fa8 merge: sync main back into develop after release
+            3c42d72 chore: bump version to 0.1.0
+```
+
+`v0.1.0` is tagged, pushed, and synced but **never published and never
+publishable by the tool**. `0.1.1`, which nobody asked for, is pushed to
+`origin/develop`. If `devflow-core@0.1.0` published but `devflow@0.1.0` failed
+— the exact partial failure the two-package ordering makes likely — crates.io
+is left permanently split across two versions with no automated path back, and
+the command returns **exit 0**.
+
+**Refutation attempted and failed:** the publish step *does* have a live-state
+resume predicate (`crate_already_published`), but it is never reached with the
+right version, because the version itself has moved on before step 5 is
+re-entered. The entry guards do not refuse the second run (tree clean, on
+develop, remote present).
+
+---
+
+### C-03 — Every accumulated `StepReport` is discarded on failure: the operator is told nothing about the irreversible steps that already succeeded
+
+- **File:** `crates/devflow-core/src/release.rs:252` (accumulator) vs `:533`, `:542`, and every `?`/`return Err`; surfaced at `commands.rs:2343`
+- **Angle:** external-state · **Confidence:** high · **Independently confirmed during merge**
+
+`execute_release` accumulates `let mut steps: Vec<StepReport>` and moves it into
+`ReleaseReport` only on the success path (`:550`). `ReleaseError` carries no
+`steps` field — the source acknowledges this itself at `release.rs:1146-1147`:
+
+```rust
+// No Ok(ReleaseReport) was ever produced on this path, so — by
+// construction, since `ReleaseError` carries no `steps` field — no
+// Publish step report could possibly have been produced either
+```
+
+Every `?` and `return Err` in the sequence therefore drops the entire record.
+`commands.rs:2343` prints only `err.to_string()`.
+
+**Failure scenario:** the per-package publish loop (`:513-534`) publishes
+`devflow-core` successfully, then `cargo_publish(project_root, package)?` at
+`:533` fails for `devflow`. The operator sees only the second package's error.
+Nothing tells them `devflow-core` is already live on crates.io — an
+irreversible action — so the natural next move is a re-run, which triggers C-02.
+
+---
+
+### C-04 — `release --execute` prints "release cut complete" and exits 0 when the publish step published nothing
+
+- **File:** `crates/devflow-core/src/release.rs:511-519`; gate at `commands.rs:2295`
+- **Angles:** ci-build (reproduced live against the built binary) + generalist · **Confidence:** high
+
+`check_publish_order` returns `"warn"` for an empty order; `release_execute`
+blocks only on `"fail"`; `release.rs:511-519` records Publish as `Skipped` while
+the overall outcome is still `Completed`. The "blocking" publish-order pre-gate
+structurally cannot block.
+
+**Failure scenario (reproduced):** a tag was cut and pushed, crates.io received
+nothing, and the command printed `release cut complete` with `EXIT=0`. The
+operator has no signal that the release is unpublished — this is a textbook
+false green on the single irreversible step.
+
+---
+
+### C-05 — A `default-members` key silently truncates the publish set; the pre-gate reports ✓ and a partial publish is reported as a complete release
+
+- **File:** `crates/devflow-core/src/git.rs:773` (`workspace_member_paths`)
+- **Angle:** ci-build · **Confidence:** high · **Reproduced**
+
+`workspace_member_paths` substring-matches `members`, which also matches
+`default-members`. The parse latches onto the wrong key and silently truncates
+the member list.
+
+**Failure scenario (reproduced):** a workspace whose root manifest declares
+`default-members` yields `publish in order: mycli` where the correct order is
+`mycore -> mycli`. The pre-gate reports ✓, the release reports complete, and
+`mycore` is never published — leaving a published `mycli` depending on an
+unpublished `mycore`.
+
+This does not fire on today's root `Cargo.toml` (no `default-members` key), so
+it is not currently active. It is Critical rather than Warning because the
+affected step is irreversible, the trigger is a single ordinary manifest key
+that any maintainer may add, and the failure is silent in both the pre-gate and
+the final report.
+
+---
+
+### C-06 — `release --execute --yes-release` silently retargets to an ancestor repository: the irreversible `cargo publish` / `git push` / `git tag` can run against a checkout the operator never named
+
+- **File:** `crates/devflow-cli/src/main.rs:629` (dispatch) → `:662-683` (`project_root`)
+- **Angle:** security · **Confidence:** high · **Independently confirmed during merge**
+
+`project_root` walks *up* to the nearest `.devflow` ancestor:
+
+```rust
+let mut probe = start.as_path();
+loop {
+    if probe.join(".devflow").is_dir() { return Ok(probe.to_path_buf()); }
+    match probe.parent() { Some(parent) => probe = parent, None => return Ok(start) }
+}
+```
+
+Verified on disk: this worktree (`.worktrees/phase-26/`) has **no** `.devflow`;
+the parent checkout `/var/home/denniyahh/Github/devflow/` **does**. Phase 26
+newly routes `release_execute` through this resolver (`main.rs:629`, added in
+this diff — the pre-phase code routed only `release_check`), and `Sync` too
+(`:637`).
+
+**Failure scenario:** a maintainer runs `devflow release --execute
+--yes-release` from a phase worktree — the ordinary working posture on this
+project, which dogfoods from worktrees. The command resolves `project_root` to
+the main checkout and cuts a release from *that* tree's state: its branch, its
+commits, its manifest. All four entry guards (clean tree, on-develop,
+has-remote, pre-gate) test the **redirected** root, so a dirty worktree with a
+clean parent makes the executor *more* likely to proceed, not less. The
+operator is never shown the resolved path before the mutation.
+
+---
+
+### C-07 — README's manual history-link repair claims parity with `devflow sync` but omits the one check `sync` calls non-negotiable, and its "verify this changed nothing" command cannot detect the failure
+
+- **File:** `README.md:44-53` (added in this phase) vs `crates/devflow-core/src/sync.rs:187-192`
+- **Angle:** doc-accuracy · **Confidence:** high
+
+The new README snippet asserts it repairs the history link "the same way
+`devflow sync` does". It omits the fetch, and — critically — `sync.rs:187-192`
+gates its push on a `HEAD^{tree}` before/after comparison that the source calls
+"the one check that must never be relaxed". The README has no equivalent.
+
+Its substitute verification step, `git diff --stat origin/main..HEAD`, is an
+**inverted signal**: in the failing case the diff *shrinks*, so an operator
+reading "this changed nothing" as success will read success precisely when the
+merge has clobbered tree state. Following the documented procedure ends in a bad
+push to `develop`.
+
+This is Critical rather than Warning because the documented procedure is
+addressed to an operator performing a manual repair on a shared branch, the
+verification step actively misreports the failure it exists to catch, and the
+outcome is an irreversible bad push.
+
+---
+
+## Warning Findings (24)
+
+**W-01 — Unsanitized subprocess stderr reaches the operator's terminal, contrary to `ReleaseError`'s own doc claim.**
+`release.rs:317`, `:413-414`, `:435`; doc at `release.rs:109-112`. The phase's own
+T-26-37 sanitization control is bypassed on the `GitError` and `VersionError`
+`#[from]` paths — the sanitized sibling at `sync.rs:196-200` shows the intended
+shape. Confirmed empirically that git forwards remote pre-receive hook bytes
+including `ESC`/`BEL` verbatim into `eprintln!("error: {err}")`, at exactly the
+moment the operator is judging a release. Four of six `ReleaseError` variants
+carry raw `stderr_or_status`. *(Merged: security ×2 + doc-accuracy ×1.)*
+
+**W-02 — `sanitize_changelog_subject` strips only Unicode category Cc.**
+`version.rs:504`. Bidi-override (U+202E) and zero-width characters survive into
+`CHANGELOG.md` — a committed, published artifact — and into operator-facing
+release output.
+
+**W-03 — A manifest version ahead of the computed version is never corrected, publishes a version the report does not name, and deadlocks the human gate.**
+`release.rs:286-288`. `write_needed` uses `<` rather than `==`, so when the
+on-disk version is ahead, no write occurs but `cargo publish` still ships
+whatever the manifest declares — a version the report never names. Step 1 then
+reports a false statement about disk state. *(Merged: external-state + generalist.)*
+
+**W-04 — A tag that was successfully created *and pushed* is reported as `TagCollision` when the confirming `ls-remote` transiently fails.**
+`release.rs:417`, `:438`, `:454`, `:461`, `:470`. A network blip converts a
+completed, irreversible remote mutation into an error that tells the operator the
+opposite. *(Merged: external-state + generalist.)*
+
+**W-05 — Steps 1 and 4 report "pushed to origin" from `git push`'s exit code alone.**
+`release.rs:317`, `:484`. `SyncOutcome::Merged.merge_commit` documents itself as
+`origin/develop`'s new tip while reading only local `HEAD`.
+
+**W-06 — `release_tag_state` check 4 asks "is the released commit an ancestor of the tag", not "does the tag point at the released commit".**
+`git.rs:640`. A tag ahead of `origin/main` is reported `Released` and the tag step
+is skipped entirely. The doc comment for `ReleaseTagState::Released` states the
+ancestry relation *backwards*, contradicting step 4 of its own doc block and the
+code. *(Merged: ci-build + security + doc-accuracy.)*
+
+**W-07 — The release tag is bound to `origin/main`'s tip at run time, not to the commit that declares the release version.**
+`release.rs:413`. If `origin/main` advances between the version resolution and the
+tag step, the tag names a commit that does not declare that version.
+
+**W-08 — `HaltedAtHumanGate` exits 0 after mutating `origin/develop`.**
+`release.rs:388`; `commands.rs:2295`. Indistinguishable from a completed release by
+exit code — only by stdout prose. Any script or CI wrapper treating exit 0 as
+"released" is wrong. *(Merged: ci-build + generalist.)*
+
+**W-09 — A git failure reading `origin/main`'s version file is swallowed by `.ok()` and reported as the human gate.**
+`release.rs:361`. Produces a permanent exit-0 halt loop: the condition never
+resolves, and every re-run reports the same benign-looking gate.
+
+**W-10 — The publish step and the pre-gate's blocking branch have zero test coverage.**
+`release_execute.rs`; `release.rs` tests. The only "full sequence completes" test is
+fixtured so the publish step *cannot* run (no workspace members), and
+`off_develop_fixture` actively pins the fail-open behaviour. No test spawns
+`cargo info` or a successful `cargo publish` — the registry-check contract rests
+entirely on hand verification. This is why C-04 and C-05 survived the suite.
+*(Merged: ci-build ×2.)*
+
+**W-11 — `release.rs`'s fixture helpers check that git *spawned*, not that it *succeeded*.**
+`release.rs` `commit_file` / `merge --ff-only` use `.status().expect()`, unlike every
+sibling helper. A fixture whose setup git command fails silently produces a test
+that asserts against the wrong repo state.
+
+**W-12 — A failure to compute the changelog body is swallowed into a `warn!`.**
+The shipped, committed `CHANGELOG.md` then claims "No changes recorded since the
+previous release" on an otherwise-green Ship.
+
+**W-13 — `release_execute.rs` does not scrub redirecting git environment variables.**
+It does not use `hermetic_command`, leaving `GIT_DIR` / `GIT_CONFIG_GLOBAL` able to
+retarget the binary-under-test's git calls at the developer's real repo.
+
+**W-14 — Step 1 pushes the entire local `develop` branch with no currency check against `origin/develop`.**
+`release.rs:317`. Any unrelated local commits on `develop` ride along into the
+release push.
+
+**W-15 — A sync merge that git cannot auto-resolve leaves the repo mid-merge with a conflicted index, and nothing says so.**
+`sync.rs`. The operator is left in a broken state with no diagnostic.
+
+**W-16 — `cargo publish` leaves the tracked `Cargo.lock` modified but uncommitted.**
+The tagged release commit's lockfile disagrees with its manifest.
+
+**W-17 — The live `develop` ruleset blocks this phase's headline capability, and the docs say otherwise.**
+`CONTRIBUTING.md:238`, `README.md:36-39`. The live GitHub ruleset
+`develop-merge-or-squash` is `enforcement: active` with `bypass_actors: []` and
+`current_user_can_bypass: "never"` (unchanged since 2026-07-23), so `develop` is
+still PR-protected and the direct push in step 1 cannot land against this
+repository. Consequently `26-VERIFICATION.md:272-276`'s recommended operator run
+fails at step 1, and all three UAT items are gated on a precondition proven
+absent. *(Merged: external-state ×2.)*
+
+**W-18 — `ReleaseReport::steps`' doc promises one entry per step; the publish loop emits one per package and the resume arm emits a duplicate.**
+`release.rs:104`, `:267`, `:513-534`. Consumers using `steps.iter().find(...)`
+retrieve a stale verdict. *(Merged: doc-accuracy + ci-build + generalist.)*
+
+**W-19 — CONTRIBUTING's "environment preconditions" list omits the two hard entry guards.**
+It omits `DirtyWorkingTree` and `NotOnDevelop`, while step 1 tells you to run
+`cargo build` — which trips the first one on the required re-run.
+
+**W-20 — CONTRIBUTING step 1's "before pushing further work" window does not exist.**
+The executor performs write, commit, and push in a single call.
+
+**W-21 — Both operator docs say "re-run the same command" with no terminal-state caveat.**
+`release.rs:21-25` documents that a re-run after completion pushes a *fresh* bump
+commit. See C-02 for the worse case.
+
+**W-22 — `release_execute`'s doc comment asserts an authorization guarantee nothing enforces.**
+`commands.rs:2274`. It claims "it cannot be called any other way" and cites, as the
+cause, the very fact that removes the guarantee. The gate does hold (see above) —
+but it holds at `main.rs:629`, not here, and this comment would license a future
+caller to bypass it.
+
+**W-23 — `devflow sync` direct-pushes a merge commit to `origin/develop` with no authorization flag of any kind.**
+`main.rs:266`, `commands.rs:2243`. A `-X ours` merge commit is pushed to a shared
+branch on a bare `devflow sync`. This is D-07/D-08's stated intent — it ports a
+script operators previously ran by hand — but it means the "no mutation without a
+typed flag" property holds only for the `release` half of the sequence, not the
+sync half. Worth an explicit decision rather than an inherited one.
+
+**W-24 — `execute_release` is `pub` in `devflow-core`, a crate published to crates.io.**
+The `--yes-release` gate is a CLI-surface gate only; any downstream library
+consumer can call the release sequence directly. Not a defect under this phase's
+threat model, but the API is now public and irreversible.
+
+---
+
+## Info Findings (5)
+
+**I-01** — The signing key identifier is placed in argv (`-c user.signingkey=…`), disclosing the maintainer's key path to any local user via `/proc`. Public key path only; no secret material.
+
+**I-02** — "five steps" appears throughout the release docs; `ReleaseStep` has four variants and a completed report contains four step kinds.
+
+**I-03** — `26-VALIDATION.md:30`'s test ledger calls 406 the pre-phase baseline; the merge-base count is 396, silently absorbing 26-02's 10 tests.
+
+**I-04** — `check_self_pin`'s "could not read Cargo.toml" and "not a workspace Cargo.toml" verdicts are `"warn"`, hence non-blocking on the execute path.
+
+**I-05** — `publish_order` includes workspace members marked `publish = false`.
+
+---
+
+## Hypotheses raised and refuted (recorded so they are not re-litigated)
+
+The finders were required to attempt refutation before reporting. These were
+dropped after verification against the live toolchain and repo:
+
+- **Credentials in the remote URL do not leak.** git 2.55 anonymizes userinfo in
+  both `unable to access` and `Authentication failed for`, verified against a
+  local 401 server. Downgraded to a documentation defect.
+- **No shell interpolation anywhere** — all subprocess calls use argv vectors.
+  No reachable argument injection after enumerating every non-literal argv
+  element. No `git add -A` / `commit_all` in any release path. No new network
+  dependencies, no telemetry, no env capture, no hardcoded secrets.
+- **`cargo info --registry crates-io` does not resolve a same-named local
+  workspace member** (exit 101, `could not find`), and `@X.Y.Z` is exact, not a
+  caret range — so `classify_cargo_info_result` has no live false
+  `AlreadyPublished`.
+- **`commit_path`'s "nothing to commit" → `Ok` masking is unreachable** when
+  `write_needed` is true, since `write_version` errors if the field is missing.
+- **The `.unwrap_or(false)` degradations in `is_ancestor` / `local_tag_is_verifiable`
+  all degrade toward "act"/"refuse", never "skip"** — not fail-open.
+- **CI itself is sound for this angle.** No workflow or script changed.
+  `scripts/check.sh test` runs `cargo test --workspace --no-fail-fast` with no
+  name filter, so the repo's known `cargo test --exact <nonexistent>` false-green
+  trap is absent here. All 13 new core tests and 16 CLI `release_*` tests pass
+  with 0 ignored; none are `#[ignore]`d, cfg'd out, or env-gated.
+- **The phase's own artifacts are honest.** All 17 claimed commit hashes exist,
+  every `26-VERIFICATION.md` line-number citation is exact, `release.rs` really
+  is 1151 lines, all guard greps reproduce, and the suites re-run at the exact
+  claimed counts (434 lib / 0 failed; 16 CLI binaries green). **No SUMMARY
+  claims a merge, tag, publish, PR, or deletion that did not happen.** The
+  `--help` snapshot matches the binary byte-for-byte.
+
+## Recommendation
+
+Do not ship. C-01, C-02, C-03, and C-04 are all reachable on the ordinary
+operator path and all concern the one irreversible step (`cargo publish`) or a
+push to a shared branch; C-01 and C-02 were reproduced by execution. C-06 is
+specific to this project's own worktree-based working posture, which is how the
+release would in fact be run.
+
+The cluster has a common root worth fixing as one design change rather than
+seven patches: the executor treats *issuing* a step as *completing* it, and
+carries no durable record of what has already mutated external state. A
+persisted step ledger that survives failure would address C-02, C-03, and C-04
+together, and would give C-01 a safe refusal point.
