@@ -736,7 +736,7 @@ Plans:
 
 Plans:
 
-- [ ] Tracked in Phase 27 — run /gsd-discuss-phase 27, then /gsd-plan-phase 27
+- [x] Tracked in Phase 27 — **CLOSED 2026-07-30.** All 6 plans executed and verified 7/7 must-haves; the 41 production `Command::new("git")` sites now route through `devflow_core::git::{hermetic_command, git_command}` and Sweep A returns 0. Residual: four indirect `sh -c` spawn edges (`hooks.rs:222`, `gates.rs:323`, `verify.rs:106`, `commands.rs::cmd_check`) are deliberately out of scope with a proposed backlog entry in `27-SPAWN-CENSUS.md`.
 
 <!--
 RENUMBERED 2026-07-26. The four findings below were originally filed as
@@ -1816,7 +1816,7 @@ Plans:
 
 **Requirements**: TBD — no REQ-IDs; tracked by backlog identifier (`999.39`), consistent with Phases 21/22/26. Full evidence, escalation rationale and prior-deferral reasoning remain in the **999.39** backlog entry above; this entry does not restate them.
 **Depends on:** Phase 26 (CLOSED PARTIAL — no code dependency, but 999.25's re-attempt depends on this)
-**Plans:** 6/6 plans executed
+**Plans:** 6/6 plans complete
 
 **Scope caution carried from Phase 26's exclusion note:** ~86 call sites spanning most of `crates/` including `git.rs`. Mechanical, but it is production behavior and touches the same files as the unmerged 999.25 cluster — expect file-overlap serialization and plan waves accordingly.
 
