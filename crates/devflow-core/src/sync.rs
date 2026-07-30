@@ -408,4 +408,97 @@ pub(crate) mod tests {
             "origin/main must be an ancestor of develop after sync"
         );
     }
+
+    fn git_log_oneline(root: &Path) -> String {
+        let output = crate::test_support::git_command(root)
+            .args(["log", "--oneline"])
+            .output()
+            .expect("spawn git log");
+        assert!(
+            output.status.success(),
+            "git log --oneline failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).to_string()
+    }
+
+    /// B1. The dirty-working-tree guard refuses before any mutation,
+    /// including the fetch (script check 1).
+    #[test]
+    fn refuses_on_dirty_tree() {
+        let fixture = init_repo();
+        let root = fixture.path();
+        let _bare = init_bare_remote(root);
+
+        std::fs::write(root.join("uncommitted.txt"), "wip").unwrap();
+
+        let before_head = rev_parse(root, "HEAD");
+        match sync_main_to_develop(root) {
+            Err(SyncError::DirtyWorkingTree) => {}
+            other => panic!("expected Err(SyncError::DirtyWorkingTree), got {other:?}"),
+        }
+        assert_eq!(
+            rev_parse(root, "HEAD"),
+            before_head,
+            "HEAD must be unchanged when the working tree is dirty"
+        );
+    }
+
+    /// B2. The wrong-branch guard also refuses before the fetch (script
+    /// check 2). Matches on the typed variant and its field, never on the
+    /// rendered message string.
+    #[test]
+    fn refuses_off_develop() {
+        let fixture = init_repo();
+        let root = fixture.path();
+        let _bare = init_bare_remote(root);
+        git(root, &["checkout", "-q", "main"]);
+
+        let before_log = git_log_oneline(root);
+        match sync_main_to_develop(root) {
+            Err(SyncError::NotOnDevelop { current }) => {
+                assert_eq!(current, "main", "current branch must be reported as main");
+            }
+            other => panic!("expected Err(SyncError::NotOnDevelop {{ .. }}), got {other:?}"),
+        }
+        assert_eq!(
+            git_log_oneline(root),
+            before_log,
+            "no new commit must be created when refusing off develop"
+        );
+    }
+
+    /// B3. `origin/main` already an ancestor of `develop`'s tip is a pure
+    /// no-op (script check 4, D-06's live-state idempotency shape): no
+    /// commit, no remote mutation. Asserting only the returned variant
+    /// would pass against an implementation that merged and pushed first
+    /// and reported the short-circuit afterwards — this asserts BOTH `HEAD`
+    /// and the remote ref are unchanged too.
+    #[test]
+    fn noop_when_already_synced() {
+        let fixture = init_repo();
+        let root = fixture.path();
+        let bare = init_bare_remote(root);
+        let flow = GitFlow::new(root);
+        flow.push_ref("main").expect("push main to bare remote");
+        flow.push_ref(DEVELOP).expect("push develop to bare remote");
+
+        let before_head = rev_parse(root, "HEAD");
+        let before_remote_develop = rev_parse(bare.path(), "refs/heads/develop");
+
+        let result = sync_main_to_develop(root)
+            .expect("sync_main_to_develop must succeed when already an ancestor");
+        assert_eq!(result, SyncOutcome::AlreadyAncestor);
+
+        assert_eq!(
+            rev_parse(root, "HEAD"),
+            before_head,
+            "HEAD must be unchanged on the already-synced no-op path"
+        );
+        assert_eq!(
+            rev_parse(bare.path(), "refs/heads/develop"),
+            before_remote_develop,
+            "remote develop must be unchanged on the already-synced no-op path"
+        );
+    }
 }
