@@ -81,6 +81,48 @@ removed from the backlog entirely, not merely deferred.
   ancestor? — nothing to do" idempotency check, applied to every step.
   — **Reversibility:** reversible.
 
+- **D-06a — AMENDMENT, operator-decided 2026-07-30. D-06's "live-state
+  predicate only, never a persisted progress file" constraint is RE-OPENED
+  and relaxed for the publish step specifically.**
+
+  **Why it was re-opened.** Phase 26's Ship review raised **C-02** as a
+  Critical: a failed publish step is *unresumable*. Because `compute_version`
+  derives the version from live git state, and a partially-completed release
+  has already moved that state, the re-run does not resume the interrupted
+  release — it computes a **new** version, pushes **another** version bump,
+  and exits 0. The operator gets a silent second release instead of a
+  completed first one. The audit-fix pass deliberately did **not** attempt a
+  fix, because the only workable remedy is a persisted step ledger, which
+  D-06 as originally written forbids; overwriting a recorded decision
+  unilaterally was correctly refused and escalated instead.
+
+  **What is now permitted.** A persisted step ledger may be written and read
+  for the purpose of resuming an interrupted release cut. It is the
+  authority on *what this in-flight release already did*; live-state
+  predicates remain the authority on *what is actually true in git and on
+  the registry*. Where the two disagree, **live state wins** — the ledger
+  may never be used to assert that a step succeeded when git or crates.io
+  says otherwise. This preserves D-06's real intent (never trust a stale
+  file over reality) while removing the constraint that made C-02
+  unfixable.
+
+  **Scope limit — deliberately narrow.** This amendment authorizes a ledger
+  for the release-executor resume path only. It does **not** license
+  progress files elsewhere in DevFlow, and it does not relax D-05's
+  fail-fast, no-automatic-rollback policy: the ledger records what happened,
+  it never triggers a compensating action.
+
+  **A design consequence that must be resolved when C-02 is implemented:**
+  the ledger must distinguish "this release is mid-flight" from "the last
+  release finished cleanly." Without that, the existing gotcha stands —
+  re-running after a *complete* release starts the next one, because
+  `UnreachableBaseline` is by-construction true mid-sequence and
+  indistinguishable from a fresh start. That distinction is the ledger's
+  primary job, not an incidental detail.
+  — **Reversibility:** costly — once a ledger format is persisted by a
+  released binary, changing or removing it means handling ledgers written by
+  older versions. Choose the format deliberately.
+
 ### Sync (999.52)
 
 - **D-07:** `devflow sync` (porting `scripts/sync-main-to-develop.sh`) is
@@ -162,6 +204,54 @@ removed from the backlog entirely, not merely deferred.
   been deferred three times previously: no content source had been chosen
   until Phase 25's classifier gave it one for free).
   — **Reversibility:** reversible.
+
+### Project-root resolution for mutating commands (added 2026-07-30)
+
+- **D-13 — operator-decided 2026-07-30, from Ship review finding C-06.**
+  A **mutating** command (`release --execute`, `sync` — anything that
+  pushes, tags, or publishes) must **refuse** when `project_root` resolves
+  to a directory *different from the one it was invoked in*, printing both
+  paths and directing the operator to `cd` or pass `--project` explicitly.
+  **Read-only commands keep today's upward-walking behavior unchanged**
+  (`status`, `doctor`, `gate`, `release --check`, etc.) — they legitimately
+  need to find the owning `.devflow` from a subdirectory.
+
+  **The defect this closes.** `project_root` (`crates/devflow-cli/src/main.rs:662-683`)
+  walks *up* to the nearest `.devflow` ancestor. A phase worktree
+  (`.worktrees/phase-NN/`) has no `.devflow`; the parent checkout does.
+  Phase 26 newly routed `release --execute` (`main.rs:629`) and `sync`
+  (`:637`) through that resolver — the first *irreversible* commands to use
+  it. So a maintainer running `devflow release --execute --yes-release` from
+  a phase worktree, which is this project's ordinary working posture, cuts a
+  release from the **main checkout's** branch, commits, and manifest,
+  without ever being shown the redirect. **Worse: all four entry guards
+  (clean tree, on-develop, has-remote, pre-gate) test the redirected root**,
+  so a dirty worktree with a clean parent makes the executor *more* likely
+  to proceed, not less — the safety checks validate the wrong repository.
+
+  **Verified, and it simplifies the fix:** neither `release.rs` nor
+  `sync.rs` reads `.devflow` at all — zero references to `devflow_dir`,
+  `.devflow`, or `events::emit` in either module. They need a **git
+  repository root** (branches, tags, remotes, the Cargo manifest), not
+  DevFlow pipeline state. `.devflow` is merely the marker `project_root`
+  happens to search for, because that helper was built for pipeline commands
+  that genuinely do read `events.jsonl` / `state-NN.json` / `gates/`. So
+  refusing on redirect removes nothing these commands actually needed.
+
+  **Implementer's latitude:** resolving mutating commands via
+  `git rev-parse --show-toplevel` (the repository the operator is standing
+  in) instead of the `.devflow` upward walk is an acceptable — arguably
+  cleaner — way to satisfy this, since it makes a silent redirect
+  structurally impossible rather than merely detected. Either shape is fine
+  provided the refusal is loud and names both paths.
+
+  **Note the interaction with the existing on-`develop` guard:** a phase
+  worktree is on `feature/phase-NN`, so the executor would refuse there
+  anyway — but today it refuses for the *wrong* reason (it redirected first
+  and then checked the parent, which may well be on `develop` and pass).
+  D-13 makes it refuse for the honest reason.
+  — **Reversibility:** reversible — a guard plus a resolver change, no
+  persisted state or published contract involved.
 
 ### Claude's Discretion
 
