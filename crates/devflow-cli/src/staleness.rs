@@ -994,6 +994,90 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------
+    // 27-04 (D-01/D-03): embedded_commit_is_stale's two remaining direct
+    // sites (base-commit lines 51, 72) now scrubbed via
+    // git_command(execution_root)
+    // -----------------------------------------------------------------
+
+    /// D-01/D-03: `embedded_commit_is_stale` produces the correct staleness
+    /// verdict for `execution_root` even when a hostile `GIT_DIR` points at
+    /// an unrelated repository. `GIT_DIR` is genuinely present in a
+    /// process's environment for this proof — never via
+    /// `std::env::set_var` on THIS test's own process (Rust 2024 `unsafe`,
+    /// unsound under threaded tests — Phase 25 D-14, and the plan's own
+    /// instruction). Instead it is set only on a freshly spawned CHILD
+    /// process: this same test binary, re-invoked filtered to just this one
+    /// test, with the hostile variable scoped to that one child's
+    /// `Command::env()` call and nothing else — the literal "spawned child
+    /// only" shape 27-01 established for its own hostile-`GIT_DIR` proofs
+    /// (`git.rs`, `run_git_stdout_ignores_a_hostile_git_dir` above),
+    /// extended here from "one child git process" to "one child test
+    /// process" because `embedded_commit_is_stale` is a private function
+    /// with no injection point of its own to chain `.env()` onto directly —
+    /// and because (27-01-SUMMARY.md Deviation 1, empirically verified,
+    /// git 2.55.0) chaining `.env("GIT_DIR", foreign)` directly onto a
+    /// `git_command`-built Command genuinely redirects `merge-base
+    /// --is-ancestor`'s ref resolution, so a literal reproduction of that
+    /// shape would prove nothing about this function specifically.
+    #[test]
+    fn embedded_commit_is_stale_resolves_execution_root_under_a_hostile_git_dir() {
+        const INNER_ROOT: &str = "DEVFLOW_27_04_STALE_INNER_ROOT";
+        const INNER_COMMIT: &str = "DEVFLOW_27_04_STALE_INNER_COMMIT";
+
+        if let Ok(root) = std::env::var(INNER_ROOT) {
+            // Inner mode: this process was spawned by the outer half below
+            // with GIT_DIR pointed at an unrelated foreign repository —
+            // scoped to this child process only.
+            let commit = std::env::var(INNER_COMMIT).expect("inner commit env set by parent");
+            assert_eq!(
+                embedded_commit_is_stale(Path::new(&root), &commit),
+                Staleness::Stale,
+                "a hostile GIT_DIR pointed at an unrelated repository must not \
+                 change embedded_commit_is_stale's verdict for execution_root"
+            );
+            return;
+        }
+
+        // Outer mode: build the real repository (reusing
+        // init_repo_with_diverged_commit's `base` — a build-affecting
+        // strict ancestor of HEAD, a definite Stale verdict, same fixture
+        // as embedded_commit_is_stale_maps_ancestry_exit_codes above) and a
+        // second, unrelated foreign repository whose history does NOT
+        // contain `base` at all.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (base, _side) = init_repo_with_diverged_commit(root);
+
+        let foreign = tempfile::tempdir().unwrap();
+        let foreign_root = foreign.path();
+        assert!(
+            devflow_core::test_support::git_command(foreign_root)
+                .args(["init", "-q"])
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "git init failed in foreign repo"
+        );
+
+        let exe = std::env::current_exe().expect("current_exe for child re-invocation");
+        let status = std::process::Command::new(&exe)
+            .arg("embedded_commit_is_stale_resolves_execution_root_under_a_hostile_git_dir")
+            .arg("--test-threads=1")
+            .env(INNER_ROOT, root.to_str().unwrap())
+            .env(INNER_COMMIT, &base)
+            .env("GIT_DIR", foreign_root.join(".git"))
+            .status()
+            .expect("spawn hostile child test process");
+        assert!(
+            status.success(),
+            "child test process (hostile GIT_DIR pointed at an unrelated \
+             foreign repository) must still report embedded_commit_is_stale \
+             == Stale for execution_root's own history; child exit status {status:?}"
+        );
+    }
+
     /// WR-01 regression (17-06 gap closure): reproduces the verifier's exact
     /// live-reproduction narrative (17-VERIFICATION.md Gap 2 / Truth 10) — a
     /// LINEAR, clean-tree, two-commit fixture where the embedded commit
