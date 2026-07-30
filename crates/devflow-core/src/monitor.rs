@@ -11,9 +11,10 @@
 //! This is the core automation primitive — no cron, no scheduler,
 //! no agent cooperation needed.
 
+use crate::git::hermetic_command;
 use crate::state::State;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 use tracing::{debug, info};
 
@@ -92,12 +93,11 @@ fn spawn_monitor_inner(
     // The agent runs in its worktree when worktree mode is active; otherwise it
     // runs in the project root. Capture/state files and the `devflow check`
     // calls below always use the main project root, regardless of cwd.
-    let workdir = state
+    let workdir_path = state
         .worktree_path
         .as_deref()
-        .unwrap_or(&state.project_root)
-        .to_str()
-        .ok_or(MonitorError::NonUtf8Path)?;
+        .unwrap_or(&state.project_root);
+    let workdir = workdir_path.to_str().ok_or(MonitorError::NonUtf8Path)?;
 
     // Shell script that launches the agent in the background, captures its
     // stdout and exit code, then advances the workflow. Because this process
@@ -145,7 +145,21 @@ fn spawn_monitor_inner(
         pid_file = shell_escape(pid_file),
     );
 
-    let child = Command::new("sh")
+    // 27-REVIEW WR-03: built through `hermetic_command`, not a bare
+    // `Command::new("sh")`. This is the spawn that launches the coding agent
+    // itself, and the comment below is precisely the hazard: whatever
+    // environment this `sh` carries rides down into the agent and into every
+    // git command the agent runs. An inherited `GIT_DIR` here would silently
+    // retarget the phase's real commits at a repository the operator never
+    // named — the worst case this phase exists to prevent, on its
+    // highest-consequence call site.
+    //
+    // Ordering is load-bearing: `hermetic_command` does its `env_remove`s at
+    // construction, and `.envs(...)` below runs after, so an adapter that
+    // deliberately sets one of these variables still wins. Deliberate
+    // configuration survives; inherited pollution does not. That is what
+    // keeps Codex's unsigned-commit override (`GIT_CONFIG_*`) working.
+    let child = hermetic_command("sh", workdir_path)
         .arg("-c")
         .arg(&script)
         .arg("sh")

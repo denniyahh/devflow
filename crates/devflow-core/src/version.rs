@@ -2427,9 +2427,41 @@ mod tests {
     /// `git_command` scrubs it.
     // `count_git_tags` is deprecated (D-07) but still `pub`; this test still
     // exercises its own scrub, independent of `compute_version`'s supersession.
+    /// 27-REVIEW WR-01: this test previously set no hostile environment at
+    /// all — it asserted ordinary-path behavior and claimed a hostile-
+    /// `GIT_DIR` proof, so it passed identically with or without the scrub.
+    /// It now uses the spawned-child shape this phase established in
+    /// `staleness.rs`: `GIT_DIR` is never set on this process (Rust 2024
+    /// `unsafe`, unsound under threaded tests — Phase 25 D-14), only on one
+    /// freshly spawned child re-invoking this binary filtered to this test.
     #[test]
     #[allow(deprecated)]
     fn tag_reads_resolve_caller_root_under_a_hostile_git_dir() {
+        const INNER_ROOT: &str = "DEVFLOW_27_03_TAG_READS_INNER_ROOT";
+
+        if let Ok(root) = std::env::var(INNER_ROOT) {
+            // Inner mode: GIT_DIR points at a foreign repository that has
+            // no tags at all, scoped to this child process only.
+            let root = std::path::PathBuf::from(root);
+
+            assert_eq!(
+                count_git_tags(&root).unwrap(),
+                2,
+                "count_git_tags must resolve root's own two tags, not a \
+                 hostile GIT_DIR's repository"
+            );
+            assert_eq!(
+                highest_semver_tag(&root).unwrap(),
+                Some(semver::Version::new(0, 2, 0)),
+                "highest_semver_tag must resolve root's own highest tag, not \
+                 a hostile GIT_DIR's repository"
+            );
+            return;
+        }
+
+        // Outer mode: the real repository has two tags; the foreign one has
+        // none. Unscrubbed, the child would read the foreign repository and
+        // see zero tags / no baseline.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
@@ -2438,15 +2470,38 @@ mod tests {
         commit(root, "b.txt");
         tag(root, "v0.2.0");
 
-        assert_eq!(
-            count_git_tags(root).unwrap(),
-            2,
-            "count_git_tags must resolve root's own two tags, not a hostile GIT_DIR's repository"
+        let foreign = tempfile::tempdir().unwrap();
+        init_repo(foreign.path());
+
+        let exe = std::env::current_exe().expect("current_exe for child re-invocation");
+        let out = std::process::Command::new(&exe)
+            // Substring filter, NOT `--exact`: the binary's real test name is
+            // module-qualified (`version::tests::tag_reads_...`), so `--exact`
+            // against the bare name matches nothing, runs zero tests, and
+            // still exits 0 — a false green that made the first version of
+            // this fix as vacuous as the test it replaced.
+            .arg("tag_reads_resolve_caller_root_under_a_hostile_git_dir")
+            .arg("--test-threads=1")
+            .env(INNER_ROOT, root.to_str().unwrap())
+            .env("GIT_DIR", foreign.path().join(".git"))
+            .output()
+            .expect("spawn hostile child test process");
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // Assert the child actually RAN the test, not merely that it exited
+        // 0. A filter that matches nothing exits 0 with "0 passed", so the
+        // exit status alone cannot distinguish "proved it" from "ran nothing".
+        assert!(
+            stdout.contains("1 passed"),
+            "child test process must have run exactly the inner test; \
+             stdout:\n{stdout}"
         );
-        assert_eq!(
-            highest_semver_tag(root).unwrap(),
-            Some(semver::Version::new(0, 2, 0)),
-            "highest_semver_tag must resolve root's own highest tag, not a hostile GIT_DIR's repository"
+        assert!(
+            out.status.success(),
+            "child test process (hostile GIT_DIR pointed at an unrelated \
+             foreign repository with no tags) must still resolve root's own \
+             tags; child exit status {:?}\nstdout:\n{stdout}",
+            out.status
         );
     }
 }

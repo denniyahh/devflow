@@ -44,8 +44,19 @@ pub const REPO_LOCAL_GIT_VARS: &[&str] = &[
 
 /// Variables that are not repository-local — and so absent from
 /// `--local-env-vars` — but still redirect where git reads or writes.
-pub const ALSO_REDIRECTING_GIT_VARS: &[&str] =
-    &["GIT_NAMESPACE", "GIT_DISCOVERY_ACROSS_FILESYSTEM"];
+///
+/// `GIT_CEILING_DIRECTORIES` is included for completeness rather than
+/// because a live path needs it (27-REVIEW WR-02): every production call
+/// site passes an explicit `current_dir` that is already a repository root,
+/// so git's upward discovery — the only thing this variable constrains —
+/// never runs. Scrubbing an unset variable costs nothing, and including it
+/// means no future call site that *does* rely on discovery has to
+/// rediscover the reasoning.
+pub const ALSO_REDIRECTING_GIT_VARS: &[&str] = &[
+    "GIT_NAMESPACE",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_CEILING_DIRECTORIES",
+];
 
 /// A `git` command pinned to `repo` **and** stripped of every inherited
 /// variable that could redirect it somewhere else.
