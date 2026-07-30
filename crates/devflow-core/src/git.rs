@@ -162,9 +162,8 @@ impl GitFlow {
             return false;
         }
 
-        Command::new("git")
+        git_command(&self.root)
             .args(["merge-base", "--is-ancestor", &branch, &self.config.develop])
-            .current_dir(&self.root)
             .output()
             .map(|output| output.status.success())
             .unwrap_or(false)
@@ -237,14 +236,13 @@ impl GitFlow {
 
     /// Whether a local branch exists.
     pub fn branch_exists(&self, branch: &str) -> bool {
-        Command::new("git")
+        git_command(&self.root)
             .args([
                 "rev-parse",
                 "--verify",
                 "--quiet",
                 &format!("refs/heads/{branch}"),
             ])
-            .current_dir(&self.root)
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
@@ -449,11 +447,10 @@ impl GitFlow {
         // English-locale output, which a non-English LC_ALL/LANG would
         // localize, silently defeating the match and reopening 19b under a
         // localized environment (T-19-14). Scoped to this one call path only.
-        let output = Command::new("git")
+        let output = git_command(&self.root)
             .args(args)
             .env("LC_ALL", "C")
             .env("LANG", "C")
-            .current_dir(&self.root)
             .output()?;
         if output.status.success() {
             Ok(())
@@ -477,11 +474,10 @@ impl GitFlow {
     /// addition.
     fn git_raw_combined(&self, args: &[&str]) -> Result<(), GitError> {
         debug!("git {}", args.join(" "));
-        let output = Command::new("git")
+        let output = git_command(&self.root)
             .args(args)
             .env("LC_ALL", "C")
             .env("LANG", "C")
-            .current_dir(&self.root)
             .output()?;
         if output.status.success() {
             Ok(())
@@ -500,10 +496,7 @@ impl GitFlow {
 
     fn git<const N: usize>(&self, args: [&str; N]) -> Result<(), GitError> {
         debug!("git {}", args.iter().copied().collect::<Vec<_>>().join(" "));
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(&self.root)
-            .output()?;
+        let output = git_command(&self.root).args(args).output()?;
         if output.status.success() {
             Ok(())
         } else {
@@ -512,10 +505,7 @@ impl GitFlow {
     }
 
     fn git_output<const N: usize>(&self, args: [&str; N]) -> Result<String, GitError> {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(&self.root)
-            .output()?;
+        let output = git_command(&self.root).args(args).output()?;
         if output.status.success() {
             Ok(String::from_utf8_lossy(&output.stdout).to_string())
         } else {
@@ -768,9 +758,8 @@ pub enum SigningViability {
 /// `git config --get <key>`, scoped to `project_root`. `None` if unset or
 /// the command fails (missing `git`, not a repo, etc.) — never panics.
 fn git_config(project_root: &Path, key: &str) -> Option<String> {
-    let output = Command::new("git")
+    let output = git_command(project_root)
         .args(["config", "--get", key])
-        .current_dir(project_root)
         .output()
         .ok()?;
     if !output.status.success() {
