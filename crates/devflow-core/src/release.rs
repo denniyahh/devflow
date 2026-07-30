@@ -377,13 +377,128 @@ pub fn execute_release(project_root: &Path) -> Result<ReleaseReport, ReleaseErro
         });
     }
 
-    // Tasks 2 and 3 add steps 3-5 (tag, sync, publish) here.
+    // Step 3: the signed release tag (D-10, D-06, B8). Reaches here only
+    // once step 2's content-based boundary has confirmed `origin/main`
+    // declares the release version. No signing-viability check of any kind
+    // is added before, during, or after this step — this project's existing
+    // SSH signing-viability predictor gains no new caller here (D-10).
+    let main_tip = git_output(project_root, &["rev-parse", "origin/main"])?
+        .trim()
+        .to_string();
+    let tag_state = crate::git::release_tag_state(project_root, &tag, &main_tip);
+    match &tag_state {
+        crate::git::ReleaseTagState::Released => {
+            steps.push(StepReport {
+                step: ReleaseStep::Tag,
+                status: StepStatus::Skipped,
+                detail: sanitize_changelog_subject(&format!(
+                    "{tag} is already an annotated, verified, pushed release tag — nothing to do"
+                )),
+            });
+        }
+        crate::git::ReleaseTagState::Absent => {
+            crate::git::create_signed_release_tag(project_root, &tag, &main_tip)?;
+            crate::git::GitFlow::new(project_root).push_ref(&tag)?;
+            let requery = crate::git::release_tag_state(project_root, &tag, &main_tip);
+            if requery != crate::git::ReleaseTagState::Released {
+                return Err(ReleaseError::TagCollision {
+                    tag: tag.clone(),
+                    detail: sanitize_changelog_subject(&format!(
+                        "expected Released immediately after creating and pushing the tag, \
+                         got {requery:?}"
+                    )),
+                });
+            }
+            steps.push(StepReport {
+                step: ReleaseStep::Tag,
+                status: StepStatus::Completed,
+                detail: sanitize_changelog_subject(&format!(
+                    "created and pushed the signed release tag {tag}"
+                )),
+            });
+        }
+        crate::git::ReleaseTagState::PresentUnverified { reason } => {
+            if local_tag_is_verifiable(project_root, &tag) {
+                crate::git::GitFlow::new(project_root).push_ref(&tag)?;
+                let requery = crate::git::release_tag_state(project_root, &tag, &main_tip);
+                if requery != crate::git::ReleaseTagState::Released {
+                    return Err(ReleaseError::TagCollision {
+                        tag: tag.clone(),
+                        detail: sanitize_changelog_subject(&format!(
+                            "expected Released immediately after pushing an existing \
+                             verifiable tag, got {requery:?}"
+                        )),
+                    });
+                }
+                steps.push(StepReport {
+                    step: ReleaseStep::Tag,
+                    status: StepStatus::Completed,
+                    detail: sanitize_changelog_subject(&format!(
+                        "pushed the existing verifiable signed release tag {tag}"
+                    )),
+                });
+            } else {
+                return Err(ReleaseError::TagCollision {
+                    tag: tag.clone(),
+                    detail: sanitize_changelog_subject(reason),
+                });
+            }
+        }
+        crate::git::ReleaseTagState::StrayLightweight => {
+            return Err(ReleaseError::TagCollision {
+                tag: tag.clone(),
+                detail: sanitize_changelog_subject(&format!(
+                    "{tag} already exists as a lightweight (non-annotated) tag — refusing to \
+                     delete or re-point it"
+                )),
+            });
+        }
+        crate::git::ReleaseTagState::Mismatched { tagged_commit } => {
+            return Err(ReleaseError::TagCollision {
+                tag: tag.clone(),
+                detail: sanitize_changelog_subject(&format!(
+                    "{tag} already exists and points at {tagged_commit}, not the released \
+                     commit {main_tip} — refusing to delete or re-point it"
+                )),
+            });
+        }
+    }
+
+    // Task 3 adds steps 4-5 (sync, publish) here.
     Ok(ReleaseReport {
         version: version.to_string(),
         tag,
         steps,
         outcome: ReleaseOutcome::Completed,
     })
+}
+
+/// Independently answer two narrow questions about a LOCAL tag with two
+/// cheap real git calls, rather than string-matching
+/// `ReleaseTagState::PresentUnverified`'s `reason` (which deliberately
+/// collapses two distinct causes — see that variant's doc comment):
+/// is the tag object's type `tag` (annotated, not lightweight), and does
+/// `git tag -v` exit successfully? Two real commands answer this directly —
+/// the same "do it and read the real result" principle this project's
+/// D-10 decision states for signing viability, applied here to a narrower
+/// question this file's existing SSH signing-viability predictor does not
+/// answer at all.
+fn local_tag_is_verifiable(project_root: &Path, tag: &str) -> bool {
+    let is_annotated = Command::new("git")
+        .args(["cat-file", "-t", tag])
+        .current_dir(project_root)
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim() == "tag")
+        .unwrap_or(false);
+    if !is_annotated {
+        return false;
+    }
+    Command::new("git")
+        .args(["tag", "-v", tag])
+        .current_dir(project_root)
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -577,5 +692,217 @@ mod tests {
             .map(|out| !String::from_utf8_lossy(&out.stdout).trim().is_empty())
             .unwrap_or(false);
         assert!(!tag_exists, "no tag must be created on a halted run");
+    }
+
+    /// Shared state for Task 2's tag-step fixtures: `develop` and
+    /// `origin/main` both declare the same release version — a "human
+    /// already merged the PR" state — and `origin/main`'s tip is NOT an
+    /// ancestor of `develop` (a squash-shaped commit, mirroring this
+    /// repository's real merge topology). `keys` is kept alive for its
+    /// `Drop` side effect only (the throwaway keypair files it owns), never
+    /// read directly — `#[allow(dead_code)]` records that deliberately.
+    struct TagFixture {
+        repo: tempfile::TempDir,
+        bare: tempfile::TempDir,
+        #[allow(dead_code)]
+        keys: Option<tempfile::TempDir>,
+        version: String,
+        tag: String,
+    }
+
+    /// Build a [`TagFixture`]. `configure_signing` controls whether repo-local
+    /// SSH tag signing is configured (`crate::git::tests::configure_ssh_tag_signing`
+    /// — reused rather than building a second signing fixture, per this
+    /// plan's resolved design note). `pre_bump_develop` controls whether
+    /// `develop`'s version bump (write + commit + push) already landed
+    /// before the fixture returns, versus leaving it for `execute_release`'s
+    /// own step 1 to perform during the call under test. `pre_create_tag`
+    /// controls whether the real signed release tag already exists at
+    /// `origin/main`'s tip (via `create_signed_release_tag`, pushed).
+    fn build_tag_fixture(
+        configure_signing: bool,
+        pre_bump_develop: bool,
+        pre_create_tag: bool,
+    ) -> TagFixture {
+        let repo = init_repo();
+        let root = repo.path();
+        let bare = init_bare_remote(root);
+        let keys = configure_signing.then(|| crate::git::tests::configure_ssh_tag_signing(root));
+        let flow = GitFlow::new(root);
+
+        commit_file(
+            root,
+            "Cargo.toml",
+            &workspace_cargo_toml("0.0.1"),
+            "chore: add version file",
+        );
+        flow.push_ref(DEVELOP)
+            .expect("push develop with version file");
+        commit_file(root, "feature.txt", "feature", "feat: add a feature");
+
+        let version = crate::version::compute_version(root).expect("compute_version");
+        let version_str = version.to_string();
+        let tag_name = format!("v{version_str}");
+
+        // main: a squash-shaped commit declaring the SAME release version —
+        // NOT an ancestor of develop, mirroring this repository's real
+        // squash-merge topology (the resolved D-02 design note).
+        flow.checkout("main").expect("checkout main");
+        commit_file(
+            root,
+            "Cargo.toml",
+            &workspace_cargo_toml(&version_str),
+            &format!("chore: release {version_str} (squash)"),
+        );
+        flow.push_ref("main")
+            .expect("push main with release version");
+        let main_tip = rev_parse(root, "main");
+
+        if pre_create_tag {
+            crate::git::create_signed_release_tag(root, &tag_name, &main_tip)
+                .expect("create_signed_release_tag");
+            flow.push_ref(&tag_name).expect("push release tag");
+        }
+
+        flow.checkout(DEVELOP).expect("checkout develop");
+        if pre_bump_develop {
+            crate::version::write_version(root, &version).expect("write_version");
+            crate::git::GitFlow::new(root)
+                .commit_path(
+                    "Cargo.toml",
+                    &format!("chore: bump version to {version_str}"),
+                )
+                .expect("commit version bump");
+            flow.push_ref(DEVELOP)
+                .expect("push develop with release version");
+        }
+
+        TagFixture {
+            repo,
+            bare,
+            keys,
+            version: version_str,
+            tag: tag_name,
+        }
+    }
+
+    /// B8: an already-released tag is a proven no-op — the tag object's SHA
+    /// is byte-identical across the call, not merely "the step reported
+    /// Skipped" — and the run proceeds past the tag step rather than
+    /// halting.
+    #[test]
+    fn skips_tag_when_already_released() {
+        let fixture = build_tag_fixture(true, true, true);
+        let root = fixture.repo.path();
+
+        let tag_sha_before = rev_parse(root, &format!("refs/tags/{}", fixture.tag));
+
+        let report = execute_release(root).expect("execute_release must succeed");
+
+        let tag_step = report
+            .steps
+            .iter()
+            .find(|s| s.step == ReleaseStep::Tag)
+            .expect("a Tag step report must exist");
+        assert_eq!(tag_step.status, StepStatus::Skipped);
+
+        let tag_sha_after = rev_parse(root, &format!("refs/tags/{}", fixture.tag));
+        assert_eq!(
+            tag_sha_before, tag_sha_after,
+            "the tag object's SHA must be byte-identical across the call"
+        );
+        assert_eq!(
+            report.outcome,
+            ReleaseOutcome::Completed,
+            "the run must proceed past the tag step rather than halting"
+        );
+    }
+
+    /// B11: a mid-sequence failure (no signing key configured) leaves the
+    /// already-completed version-bump step landed — the bump runs for real
+    /// during THIS call (fixture leaves develop un-bumped), then the tag
+    /// step fails, and nothing is rolled back (D-05).
+    #[test]
+    fn partial_failure_leaves_prior_steps_landed() {
+        let fixture = build_tag_fixture(false, false, false);
+        let root = fixture.repo.path();
+
+        let result = execute_release(root);
+        let err = result.expect_err("execute_release must fail without a signing key");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("devflow.releaseSigningKey"),
+            "the rendered error must name the missing config key: {rendered}"
+        );
+
+        let local_tip = rev_parse(root, "HEAD");
+        let remote_tip = rev_parse(fixture.bare.path(), "refs/heads/develop");
+        assert_eq!(
+            local_tip, remote_tip,
+            "the version-bump commit pushed by step 1 must remain on the remote — no rollback"
+        );
+
+        let on_disk = crate::version::read_version(root).expect("read_version");
+        assert_eq!(
+            on_disk.to_string(),
+            fixture.version,
+            "the version file must still declare the release version — step 1 really ran"
+        );
+
+        let tag_list = crate::test_support::git_command(root)
+            .args(["tag", "-l"])
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .unwrap_or_default();
+        assert!(tag_list.is_empty(), "no tag must exist: {tag_list}");
+    }
+
+    /// A stray lightweight tag of the release name is refused, never
+    /// auto-resolved (D-05) — the tag is untouched after the refusal and no
+    /// annotated tag of that name is created.
+    ///
+    /// The stray tag is placed on `main` (off `develop`'s ancestry), not on
+    /// `develop`'s own `HEAD`: any tag whose name parses as semver affects
+    /// `compute_version`'s own tag scan (`highest_semver_tag` is
+    /// reachability-blind by design — RESEARCH.md Pitfall 2) regardless of
+    /// where it points, so placing it at develop's `HEAD` would make
+    /// `compute_version` treat it as an unreachable-baseline resume signal
+    /// with a DIFFERENT derived version, never reaching the tag step with
+    /// the SAME tag name this test means to collide with. Placed on `main`
+    /// instead, `compute_version` correctly resumes to the identical
+    /// `fixture.tag` name via the same `UnreachableBaseline` path — a real,
+    /// intentional interaction with step 1, not a workaround around it.
+    #[test]
+    fn refuses_a_stray_lightweight_tag_rather_than_skipping() {
+        let fixture = build_tag_fixture(true, true, false);
+        let root = fixture.repo.path();
+        let flow = GitFlow::new(root);
+        flow.checkout("main").expect("checkout main");
+        flow.tag(&fixture.tag).expect("create lightweight tag");
+        flow.checkout(DEVELOP).expect("checkout develop");
+        let lightweight_sha = rev_parse(root, &fixture.tag);
+
+        let result = execute_release(root);
+        match result {
+            Err(ReleaseError::TagCollision { tag, .. }) => {
+                assert_eq!(tag, fixture.tag);
+            }
+            other => panic!("expected Err(ReleaseError::TagCollision {{ .. }}), got {other:?}"),
+        }
+
+        let after_sha = rev_parse(root, &fixture.tag);
+        assert_eq!(
+            lightweight_sha, after_sha,
+            "the stray lightweight tag must be untouched"
+        );
+        let object_type = crate::test_support::git_command(root)
+            .args(["cat-file", "-t", &fixture.tag])
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .unwrap_or_default();
+        assert_eq!(
+            object_type, "commit",
+            "the tag must still be lightweight — never turned into an annotated tag"
+        );
     }
 }
