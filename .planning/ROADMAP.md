@@ -1110,6 +1110,36 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
+### Phase 999.59: A Missing CONTEXT.md Is Ambiguous, So Define Attempts an Interview It Cannot Conduct (BACKLOG)
+
+**Goal:** DevFlow's Define stage runs `/gsd-discuss-phase N` under one-shot `claude -p --dangerously-skip-permissions`. But discuss-phase is an **interactive elicitation** — it asks the operator questions via `AskUserQuestion`. Headless, there is nowhere for those questions to go. Today the only thing preventing a deadlock is the idempotency contract in `prompt::idempotent_stage_prompt` (`crates/devflow-core/src/prompt.rs:142-166`): *"if `CONTEXT.md` EXISTS, the stage's work is already done — do NOT run the GSD command, do NOT ask for input."*
+
+**The defect is the other arm.** The **absence** of `CONTEXT.md` is treated as exactly one thing — "run the interview" — when it actually means one of two mutually exclusive things:
+
+1. *"The operator has not run the interview yet and wants DevFlow to run it."* → cannot work headlessly; this is the deadlock arm.
+2. *"The operator deliberately wants no interview for this phase; proceed to Plan."* → perfectly reasonable, and currently inexpressible.
+
+DevFlow cannot distinguish them, so it guesses — and guesses the arm that cannot succeed unattended.
+
+**This is a determinism gap, not a missing capability.** The intended division of labor is sound and should not change: a human runs `/gsd-discuss-phase N` interactively (where `AskUserQuestion` works), then hands off to `devflow start`, and Define no-ops. That handoff is the design. What is missing is a way for the operator to *declare* which mode they are in, rather than DevFlow inferring it from a filesystem side effect.
+
+**Evidence — observed live, 2026-07-30 (Phase 27 dogfood).** `devflow start --phase 27 --agent claude --mode auto --until validate` reached Define and no-op'd in ~13 seconds, correctly, because `27-CONTEXT.md` had been produced by an interactive `/gsd-discuss-phase 27` earlier the same session (three operator decisions: D-01 no-escape-hatch scrub, D-02 build.rs excluded, D-03 acceptance target). The handoff worked exactly as designed. The gap is only visible on the untested path: had that CONTEXT.md not existed, Define would have launched an interactive workflow into a process with no input channel.
+
+**Fix direction — operator-declared, two candidate shapes:**
+
+- **(A) An explicit flag — `devflow start --no-interview` (or `--skip-define`).** Define is declared a no-op success up front. Unambiguous, self-documenting in `--help`, and consistent with how `--yes-ship` already makes a mode explicit rather than inferred. Costs one flag.
+- **(B) Invert the default: a missing `CONTEXT.md` means "no interview wanted", proceed to Plan.** No new flag at all. Simpler, and arguably the honest default given arm 1 cannot work headlessly anyway. The cost is that a genuinely-forgotten Define becomes silent rather than loud — which cuts against this project's fail-loud posture.
+
+**A third option exists and should be considered explicitly rather than by omission:** discuss-phase has an `--auto` mode that auto-selects its recommended option for every question without asking. Define could pass that instead of failing or skipping, producing a CONTEXT.md with Claude-picked decisions. **Recommend against it by default** — a context full of unreviewed auto-picks is worse than no context, because downstream `gsd-planner` treats CONTEXT.md decisions as *locked operator intent*. Worth having as an opt-in (`--auto-interview`), never as the fallback.
+
+**Design constraint carried from the operator, 2026-07-30:** DevFlow's purpose is to add determinism to what Claude and GSD are unreliable at repeating — not to grow judgment of its own. Any fix here must make an existing ambiguity explicit; it must not make DevFlow decide *what* the phase should contain.
+
+**Priority:** Medium — no live failure yet (the handoff path works and is what this project actually uses), but it is an unexploded footgun on the first unattended run of a phase whose Define was forgotten, and the failure shape is a headless hang rather than a clean refusal. | **Size:** S — one flag or one inverted branch, plus the prompt-contract test in `prompt.rs`'s `define_and_plan_prompts_are_idempotent`. Source: Phase 27 dogfood + design discussion (2026-07-30). Linear: DEN-84.
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
 ### Phase 21: Operator Legibility & Observability
 
 **Shipped as v1.8.0** (2026-07-24) — PR #23 (`develop → main`, squash `cfa9167`), signed tag `v1.8.0`, [GitHub Release](https://github.com/denniyahh/devflow/releases/tag/v1.8.0). `sync-main-to-develop.sh` run via PR #24 (merge `01ad9e4`). Published to crates.io (`devflow-core` then `devflow`, both confirmed live at 1.8.0).
