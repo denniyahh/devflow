@@ -934,10 +934,6 @@ pub fn classify_cargo_info_result(exit_code: Option<i32>, stderr: &str) -> Publi
 /// Fixed argv for `cargo info <name>@<version> --registry crates-io`.
 /// Private, pure, returning exactly four elements so the spec form can be
 /// asserted without spawning anything.
-///
-/// `#[allow(dead_code)]`: this task's only caller (`crate_already_published`)
-/// lands in the next task of this same plan; the attribute is removed there.
-#[allow(dead_code)]
 fn cargo_info_args(name: &str, version: &str) -> [String; 4] {
     [
         "info".to_string(),
@@ -945,6 +941,54 @@ fn cargo_info_args(name: &str, version: &str) -> [String; 4] {
         "--registry".to_string(),
         "crates-io".to_string(),
     ]
+}
+
+/// Errors from the `cargo` publish primitives (`crate_already_published`,
+/// `cargo_publish` — D-04/D-05/D-06).
+#[derive(Debug, thiserror::Error)]
+pub enum PublishError {
+    /// Spawning `cargo` failed outright.
+    #[error("failed to execute cargo: {0}")]
+    Io(#[from] std::io::Error),
+    /// The registry existence check could not be classified as published or
+    /// not-published — the registry check could not be classified, and no
+    /// publish was attempted.
+    #[error(
+        "could not determine whether the crate is already published ({0}) — no publish was attempted"
+    )]
+    Ambiguous(String),
+    /// `cargo publish` itself failed.
+    #[error("cargo publish failed: {0}")]
+    Failed(String),
+}
+
+/// D-06's live-state idempotency check for the publish step — the registry
+/// itself is the progress record; no `.devflow` file tracks publish state.
+/// D-04 requires distinguishing "already published at this version, skip"
+/// from a genuine failure, which is exactly why the ambiguous verdict is an
+/// `Err` and not a `false`. A caller must never treat an `Err` as "probably
+/// not published" and proceed — a duplicate publish is unrecoverable
+/// (D-05).
+///
+/// Spawns `cargo info` with [`cargo_info_args`] as an argv array and
+/// `current_dir(project_root)` so the operator's own workspace-scoped cargo
+/// configuration (registry mirrors, index overrides) applies. A spawn error
+/// propagates through the `#[from]` `Io` variant.
+pub fn crate_already_published(
+    project_root: &Path,
+    name: &str,
+    version: &str,
+) -> Result<bool, PublishError> {
+    let output = Command::new("cargo")
+        .args(cargo_info_args(name, version))
+        .current_dir(project_root)
+        .output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    match classify_cargo_info_result(output.status.code(), &stderr) {
+        PublishCheck::AlreadyPublished => Ok(true),
+        PublishCheck::NotPublished => Ok(false),
+        PublishCheck::Ambiguous { detail } => Err(PublishError::Ambiguous(detail)),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2601,6 +2645,32 @@ mod tests {
                 "--registry".to_string(),
                 "crates-io".to_string(),
             ]
+        );
+    }
+
+    /// D-04/D-05/D-06: the ambiguous verdict must surface as a typed `Err`,
+    /// never a boolean, and the detail it carries must already be bounded
+    /// and control-character-free (T-26-29) — asserted on the value the
+    /// error actually stores, not on the sanitizer in isolation.
+    #[test]
+    fn crate_already_published_surfaces_an_ambiguous_check_as_an_error() {
+        let control_heavy_stderr = format!("error: failed to fetch\u{0007}{}", "x".repeat(400));
+        let check = classify_cargo_info_result(Some(101), &control_heavy_stderr);
+        let PublishCheck::Ambiguous { detail } = check else {
+            panic!("expected Ambiguous, got a different PublishCheck variant");
+        };
+        let error = PublishError::Ambiguous(detail);
+        let PublishError::Ambiguous(stored) = error else {
+            unreachable!("just constructed as Ambiguous");
+        };
+        assert!(
+            !stored.chars().any(char::is_control),
+            "stored ambiguous detail retained a control character: {stored:?}"
+        );
+        assert!(
+            stored.chars().count() <= crate::version::CHANGELOG_SUBJECT_MAX_CHARS,
+            "stored ambiguous detail exceeded CHANGELOG_SUBJECT_MAX_CHARS: {} chars",
+            stored.chars().count()
         );
     }
 }
