@@ -505,6 +505,7 @@ pub(crate) fn run_checkout_hooks(
         stage,
         git_flow: git_flow.clone(),
         shipped_version: None,
+        shipped_changelog_body: None,
     };
     for hook in batch {
         let outcome = hook.run(&mut ctx);

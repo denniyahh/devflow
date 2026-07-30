@@ -426,27 +426,23 @@ Plans:
 
 - [x] Delivered by Phase 21 (21a / 21-02) — absorbed as a unit, not separately promoted
 
-### Phase 999.4: Version-Tag Contention on Concurrent Ship (BACKLOG)
+### Phase 999.4: Version-Tag Contention on Concurrent Ship (REMOVED — 2026-07-29)
 
-**Goal:** Two phases computing the same next version race to create one tag. 17-09 bounded the test-level symptom (2s gate-timeout poll under `ENV_MUTEX`); the product-level race is proven (instrumentation caught both phases ~1.8ms apart) but still open. *(was 19h)*
-**Priority:** Medium | **Size:** M — reviewed 2026-07-21: confirmed still open (no new checkout-lock serialization since 17-09). Real but low-frequency (needs two concurrent ships landing on the identical computed version); sizing skews up on verification difficulty, not code volume. Linear: DEN-29.
-**Requirements:** TBD — see CONTEXT.md
-**Plans:** 0 plans
+**Was:** Two phases computing the same next version race to create one tag under `devflow parallel` (multiple whole phases concurrently). *(was 19h)*
+**Removed during Phase 26 discuss-phase:** the race is specific to `devflow parallel`'s whole-phase concurrency; the operator confirmed they never use, and would never want, a single DevFlow user running multiple phases at once ("that's just asking for trouble"). Since the scenario cannot occur in actual usage, this entry is removed rather than left filed. See `phases/26-release-cut-automation/26-CONTEXT.md` D-11. Linear: DEN-29 (close as won't-do).
+`devflow parallel`'s own future (deprecate whole-phase concurrency vs. repurpose for intra-phase workstreams vs. leave alone) is captured as a deferred idea in that same CONTEXT.md, for its own future phase — not lost, just not a defect record.
 
-Plans:
-
-- [ ] TBD (promote with /gsd-review-backlog when ready)
-
-### Phase 999.5: ChangelogAppend Placeholder Content (BACKLOG)
+### Phase 999.5: ChangelogAppend Placeholder Content (PROMOTED — Phase 26)
 
 **Goal:** Every generated changelog entry reads "Released phase via DevFlow" — deferred twice already (17-10, 17-12). *(was 19j)*
 **Priority:** Low | **Size:** M — reviewed 2026-07-21: confirmed still generic (`ship.rs:431`). Cosmetic by its own admission, but sized M not S — needs a real content source designed (plan diffs? SUMMARY.md extraction?) before implementation, which is why it's been deferred 3 times already. Linear: DEN-30.
-**Requirements:** TBD — see CONTEXT.md
+**Requirements:** TBD — see `phases/26-release-cut-automation/999.5-BACKLOG-DOSSIER.md`
+**Promoted:** Phase 26, 2026-07-29 — added using capacity freed by dropping 999.54/999.50/999.4; content source resolved by reusing Phase 25's conventional-commit classifier (see `26-CONTEXT.md` D-12).
 **Plans:** 0 plans
 
 Plans:
 
-- [ ] TBD (promote with /gsd-review-backlog when ready)
+- [x] Promoted to Phase 26 — see the Phase 26 entry for the active tracking
 
 ### Phase 999.12: Layer 0 Unapproved-Probe Veto Coverage (BACKLOG)
 
@@ -557,16 +553,55 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.25: Release-Cut Executor (`devflow release` that executes) (BACKLOG)
+### Phase 999.25: Release-Cut Executor (`devflow release` that executes) (RE-OPENED — Phase 26 delivered it PARTIAL, not shippable)
+
+**RE-OPENED 2026-07-30.** Phase 26 built this end to end and it is **not shippable**. Deliberately re-opened under its original number rather than filed as a new item: it is the same work, still not delivered. The code exists on `feature/phase-26` (unmerged, ~75 commits) and should be treated as a **starting point with known Critical defects**, not as a near-complete implementation.
+
+**Verification passed; review did not.** `26-VERIFICATION.md` scored **11/11 must-haves** — the executor genuinely exists and does what the phase goal described. Two independent review passes then found Critical defects in it: **7 Criticals** (2026-07-29), then after a fix round, **5 more** (2026-07-30, `26-REVIEW.md`, `review_mode: re-review-of-unreviewed-critical-fixes`). Status of the first seven fixes: **1 closed, 5 partially-closed, 1 regressed.**
+
+**The pattern is the finding, and it is why this is re-opened rather than fix-looped again.** Each fix closed the *reported instance* and left the *class* open, and three introduced a **new** hazard on an irreversible surface. Two rounds went 7 Criticals → 5 Criticals, and **every Critical in both rounds was invisible to the test suite** — 763 tests passing, 0 failing, clippy and `fmt` clean throughout. A third automated round has no mechanism to do better.
+
+**The five open Criticals (all reproduced by execution, not inferred):**
+
+| ID | Defect |
+|---|---|
+| CR-01 | `mutating_project_root` bypassed by an inherited `GIT_DIR` — the guard passes while the executor acts on a repository the operator never named. **See 999.39, escalated to High; this gates the whole class.** |
+| CR-02 | `CompletedWithoutPublish` exits 0, marks the ledger Complete, and its own printed remediation ("fix the workspace `members` list and re-run") **starts a second release** — after the signed tag is already pushed, leaving that tag permanently unpublishable |
+| CR-03 | `members_key_offset` still latches a commented-out or non-`[workspace]` `members` key — publish set silently truncated, pre-gate reports ✓. **The original C-05 was never actually fixed**, only narrowed to exclude a `-` prefix |
+| CR-04 | README's repaired manual procedure prescribes `git reset --hard "@{u}"` — resolves to `origin/develop`, not the pre-merge HEAD, destroying un-pushed commits. **A D-05 violation shipped inside the fix for C-07**, in the very document claiming parity with `sync`, whose own source (`sync.rs:46-58`) says "Do not 'fix' this later into a reset." |
+| CR-05 | An in-flight ledger **permanently bricks the release path**: `HaltedAtHumanGate` (the *designed* first-invocation outcome under D-02) leaves the ledger `inflight`; every ordinary phase Ship then tags `v{next}` and trips `LedgerContradicted` forever. No clear/abandon verb exists; the only escape is deleting the ledger file, which **re-arms C-02** |
+
+**What is genuinely sound and should be carried forward, not rewritten:**
+- **The resume ledger's design (D-06a).** Reviewed as the best-built new code in the phase: a planted lying ledger still creates the real tag (live state provably wins), the schema is versioned and checked *before* deserialization, and corrupt or forward-version ledgers refuse loudly. CR-05 is a lifecycle gap — no terminal state for the non-success outcome — not a design flaw.
+- **D-10 held.** No signing-viability predictor was reintroduced anywhere; `check_signing` is deliberately excluded from the execute pre-gate.
+- **C-01's fix is settled** — the stray-unreachable-tag refusal genuinely precedes the ledger write and step 1's first mutation, with a test asserting the remote ref and `Cargo.toml` are byte-identical across the refusal.
+
+**Prerequisites before this is re-attempted:**
+1. **999.39 (`GIT_DIR` scrubbing) must land first** — see CR-01. No root guard is trustworthy until it does.
+2. The ledger needs a terminal state for `HaltedAtHumanGate` and an operator-facing clear/abandon verb (CR-05).
+3. **IN-01 escalated from Info to a contributing cause of a Critical**: `hooks_after_ship`'s `VersionBump` and the executor's signed tag share the same `v{version}` namespace via two independent code paths — that collision is precisely CR-05's trigger.
+4. **WR-04 escalated**: the ledger now supplies the *version* that the fragile `cargo info` stderr-substring predicate is asked about, and the two can diverge from the manifest.
+5. **W-17 — an operator action, not code, but blocking UAT specifically.** The live `develop` ruleset (`develop-merge-or-squash`) is `enforcement: active` with an **empty bypass list** — confirmed live via `gh api repos/.../rulesets`, not just from the review. Every push must go through a PR, including DevFlow's, so this executor's direct-push step cannot land against this repository until the operator adds a bypass. **Deliberately left as-is** — the enforcement is currently the only thing stopping a known-defective executor from reaching `origin`, so configuring the bypass before the five Criticals close would remove a safety net, not add a capability. Do this last, immediately before the re-attempt's UAT pass, never before.
+
+**Design lesson worth keeping.** This phase automated three irreversible operations (`push`, `tag`, `publish`) whose failure modes are invisible to unit tests by construction — every defect was found by reading code, never by a red test. A future attempt should treat adversarial review as the primary gate and the suite as necessary-but-far-from-sufficient, and should consider whether each irreversible step can be made independently re-runnable before composing them into a sequence.
+
+**Priority:** High | **Size:** L — unchanged, but now with a known-defective starting point and a hard prerequisite (999.39). Linear: DEN-50.
+
+---
+
+*Original entry follows, retained for provenance:*
+
 
 **Goal:** A `devflow release` that *executes* the full release cut — version-bump PR → merge to `main` → signed tag → sync `develop` → publish `devflow-core` then `devflow` to crates.io — not just the read-only preflight. Phase 20's 20d (DEN-38) delivers `--check` only; Phase 20 CONTEXT.md D-03 locked that scope and recorded this executor as the follow-up.
 **Priority:** High | **Size:** L — drives irreversible operations (squash-merge to `main`, signed tag, a crates.io publish that can never be un-published or reused), so it needs its own discuss-phase design pass on failure/rollback semantics (tag lands but publish fails; core publishes but cli does not). Blocks on Phase 20's 20a (self-pin) and 20d (`--check`): the executor's preflight step *is* 20d's check and its `VersionBump` step inherits 20a's correctness. Source: Phase 20 D-03 (2026-07-22). Linear: DEN-50 (blocked by DEN-49, DEN-38).
-**Requirements:** TBD — see CONTEXT.md
-**Plans:** 0 plans
+**Requirements:** TBD — see `phases/26-release-cut-automation/999.25-BACKLOG-DOSSIER.md`
+**Promoted:** Phase 26, 2026-07-29 — re-verified open at HEAD `76e49f1` before promotion; bundled with 999.54, 999.50, 999.52 (same release-mechanics area).
+**Re-opened:** 2026-07-30 — Phase 26 delivered it PARTIAL and not shippable; see the RE-OPENED block above for the five open Criticals and the 999.39 prerequisite.
+**Plans:** 7 plans executed in Phase 26 (26-03..26-09), code unmerged on `feature/phase-26`
 
 Plans:
 
-- [ ] TBD (promote with /gsd-review-backlog when ready)
+- [~] Attempted in Phase 26 — built, verified 11/11, then blocked by review (5 open Criticals). Code retained on `feature/phase-26` as a defective starting point; re-attempt gated on 999.39.
 
 ### Phase 999.26: `devflow parallel` Git Object-Store Race (BACKLOG)
 
@@ -684,7 +719,17 @@ Plans:
 
 **Fix direction:** route production git calls through one scrubbing constructor, mirroring `test_support::git_command`. Decide deliberately whether an operator-set `GIT_DIR` should ever be honoured — the safer default is no.
 
-**Priority:** Medium | **Size:** M — ~86 call sites, mechanical, but production behavior so it needs its own review.
+**Priority:** ~~Medium~~ → **HIGH, escalated 2026-07-30** | **Size:** M — ~86 call sites, mechanical, but production behavior so it needs its own review.
+
+**ESCALATED — this is no longer defense-in-depth hygiene; it is now load-bearing for a security guard.** Phase 26's re-review (`26-REVIEW.md`, 2026-07-30, finding **CR-01**) found that `mutating_project_root` — the guard added by 26-09 specifically to stop `release --execute`/`sync` acting on a repository the operator never named (D-13, closing C-06) — **is bypassed by an inherited `GIT_DIR`**. `git rev-parse --show-toplevel` reports the *cwd's work tree* while HEAD, refs and objects come from `GIT_DIR`, so the guard compares two paths, sees a match, and passes — while the executor pushes, tags, and publishes against a different repository. That is C-06's exact shape arriving through a second vector, and it defeats a guard written expressly to prevent it.
+
+**Confirmed during that review:** there is **zero** `GIT_DIR` scrubbing anywhere in production code; the only mention in the entire repository is a doc comment inside a `#[cfg(test)]` block (`crates/devflow-cli/src/main.rs:786`). `crates/devflow-cli/tests/project_root_guard.rs:18-21` names the risk for its own helpers and never tests it against the guard.
+
+**Why this changes the priority.** The original entry reasoned "DevFlow is normally invoked directly, not from a hook, and the observed effect is wrong answers rather than corruption." Both halves are now weaker: git sets `GIT_DIR` for hooks, `rebase --exec`, `bisect run` and `submodule foreach` — and DevFlow *runs git hooks as part of its own workflow* — while the effect is no longer wrong answers but **irreversible operations against the wrong repository** (`git push`, `git tag`, `cargo publish`). This is the same variable behind the 999.37 sandbox-escape incident, on the mutating path this time.
+
+**Sequencing consequence:** **no mutating-command root guard can be trusted until this lands.** Any future work on the release executor (999.25) or `devflow sync` (999.52) that relies on root resolution for safety is building on a foundation with a known hole. Fix this first, or accept that the guard above it is decorative.
+
+**Considered and deliberately excluded from Phase 26 (2026-07-29).** Confirmed still open at HEAD `76e49f1` — every production call site still pins `current_dir()` only, and `test_support::git_command`'s scrubbing exists solely inside `#[cfg(test)]` code. Real defense-in-depth value (the 999.37 incident class), but its ~86 call sites span most of `crates/` including `git.rs`, where Phase 26's 999.25/999.54/999.50/999.52 cluster is already working — folding it in risks the same file-overlap serialization tax Phase 26 is structured to avoid. Deferred to its own phase (27+), not dropped.
 
 Plans:
 
@@ -903,46 +948,10 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.50: `release --check` Tag-Signing Gate False-Negatives When the Key Is Not in `ssh-agent` (BACKLOG)
+### Phase 999.50: `release --check` Tag-Signing Gate False-Negatives When the Key Is Not in `ssh-agent` (REMOVED — 2026-07-29)
 
-**Goal:** `check_ssh_signing_viability` (`crates/devflow-core/src/git.rs`) decides viability by looking for the configured key in `ssh-add -l`. When the agent is running but does not hold that specific key it returns `NotViable { reason: "ssh-agent has keys loaded, but not the configured signing key" }` and **fails the whole release preflight**. But git does not require the agent: `ssh-keygen -Y sign` reads the private key from disk, so signing works fine when the private key file exists next to the configured `.pub`. The gate blocks releases that would have signed correctly.
-
-**Evidence — measured 2026-07-27 on this repository, during 2.0.0 release prep.**
-
-```
-$ ssh-add -l
-256 SHA256:u84t7JjK…(truncated)   (github_ed25519 — NOT the signing key)
-$ ssh-keygen -lf "$(git config --get user.signingkey)"
-256 SHA256:9BPyx2Mc…(truncated)   (devflow_signing_ed25519)
-
-$ devflow release --check
-  tag-signing viability  ✗  ssh-agent has keys loaded, but not the configured signing key
-error: release preflight failed
-```
-
-With the agent in that exact state, signing nonetheless succeeds:
-
-```
-$ git tag -s _sigtest2 -m "signing probe 2" HEAD
-$ git tag -v _sigtest2
-Good "git" signature for d10475u5@outlook.com with ED25519 key SHA256:9BPyx2Mc…(truncated)
-$ git cat-file -p _sigtest2 | rg -c 'BEGIN SSH SIGNATURE'
-1
-```
-
-The signature is real (a genuine signature block in the tag object), good, and made by exactly the configured key — while the agent does not hold it. Every commit in this session was signed the same way (`git log --format=%G?` → `G`, key `SHA256:9BPyx2Mc…`). The private key file `~/.ssh/devflow_signing_ed25519` exists, mode `600`, which is the mechanism.
-
-**Why it matters:** this is a **false negative on a release gate** — the failure direction that blocks correct work rather than permitting incorrect work, so it is not dangerous, but it did produce a spurious "blocker" during 2.0.0 prep and would send an operator to run an unnecessary `ssh-add` (and, if the key is passphrase-protected, to type a passphrase for no reason).
-
-**Same function as Phase 24 (DEN-52), different defect.** Phase 24 fixed how the *value* of `user.signingkey` is classified (inline `key::` blob vs filesystem path). This is about how *availability* is determined once the value is understood. Phase 24's tests do not cover it because they exercise the agent-absent and tooling-absent paths, not "agent present, holding other keys, private key on disk."
-
-**Fix direction:** treat the agent as one of several sources, not the only one. If the configured key resolves to a path and a readable private key file exists alongside it, that is viable regardless of `ssh-add -l`. Keep the agent check for the inline-`key::` case, where there is no file to read and the agent genuinely is the only source. The most robust variant is to stop inferring altogether and probe directly — sign a throwaway payload with `ssh-keygen -Y sign` and report viability from its exit code, which cannot disagree with what `git tag -s` will do because it is the same operation.
-
-**Priority:** Medium — blocks release preflight with a spurious failure; no data-integrity risk, and the workaround (`ssh-add`) is obvious once diagnosed. | **Size:** S — one function, plus a test for "agent present, wrong keys, private key on disk". Linear: DEN-75.
-
-Plans:
-
-- [ ] TBD (promote with /gsd-review-backlog when ready)
+**Was:** `check_ssh_signing_viability` (`crates/devflow-core/src/git.rs`) false-negatives release preflight when the agent holds other keys but not the configured one, even though the private key file on disk would let `git tag -s` succeed anyway (measured live during the v2.0.0 cut).
+**Removed during Phase 26 discuss-phase, after briefly being promoted there:** the operator determined DevFlow should never predict tag-signing viability at all — a predictor is a second implementation of "will signing work?" that must stay in sync with git's real behavior, which is exactly the bug class this item and 999.54 are about. The executor built in Phase 26 instead runs the real signed `git tag` command directly and reads git's own result — no viability guess needed. Full reasoning: `phases/26-release-cut-automation/26-CONTEXT.md` D-10. Linear: DEN-75 (close as won't-do).
 
 ### Phase 999.51: `devflow start` Resolves Its Base From a Possibly-Stale Local `develop`, and Never Fetches (PROMOTED — Phase 25)
 
@@ -964,7 +973,7 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.52: DevFlow Imposes a Branch Model Whose Required Repair Step It Does Not Ship (BACKLOG)
+### Phase 999.52: DevFlow Imposes a Branch Model Whose Required Repair Step It Does Not Ship (PROMOTED — Phase 26)
 
 **Goal:** DevFlow hard-codes a git-flow branch model on every project it drives — `MAIN`, `DEVELOP`, `FEATURE_PREFIX` are constants in `config.rs:15-19`, not configuration. That model has a required maintenance step DevFlow neither performs nor provides: when a user squash-merges `develop` → `main` for a release, the squash commit has **no parent relationship** back to `develop`, so `develop` never learns `main` moved and the *next* release conflicts against a stale merge-base.
 
@@ -977,10 +986,11 @@ Plans:
 **Fix direction:** ship the capability, not just the diagnosis. A `devflow sync` subcommand carrying the script's logic — `-X ours`, verify the resulting tree is byte-identical before proceeding, refuse if it is not — plus a pointer to it from the `release --check` divergence message, so the tool that reports the problem also names the command that fixes it. Folding it into 999.25's release executor is the alternative; doing neither leaves users with a diagnosis and no cure.
 
 **Priority:** Medium — no data loss and the divergence is detected, but it degrades silently into painful merge conflicts at exactly the moment (a release) when a user least wants them, and DevFlow created the condition by imposing the branch model. | **Size:** S–M — the logic already exists in shell and is proven; the work is porting it, wiring the subcommand, and cross-referencing the check. Linear: DEN-77.
+**Promoted:** Phase 26, 2026-07-29 — re-verified open at HEAD `76e49f1` before promotion; bundled with 999.25 as its executor's sync step.
 
 Plans:
 
-- [ ] TBD (promote with /gsd-review-backlog when ready)
+- [x] Promoted to Phase 26 — see the Phase 26 entry for the active tracking
 
 ### Phase 999.53: CI Cannot Reproduce the Load Shape That Catches Exec-Visibility Races (BACKLOG)
 
@@ -998,23 +1008,10 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.54: `release --check` Tag-Signing Viability Reads the Wrong Config Key (BACKLOG)
+### Phase 999.54: `release --check` Tag-Signing Viability Reads the Wrong Config Key (REMOVED — 2026-07-29)
 
-**Goal:** `check_signing_viability` reads `user.signingkey` (`crates/devflow-core/src/git.rs:812`, `:887`) — the *agent's ordinary commit key* — and never consults `devflow.releaseSigningKey`, the maintainer's release key. It then compares ssh-agent's loaded fingerprints against that key, so on a correctly configured maintainer machine (release key loaded, agent key not) it reports `tag-signing viability ✗ — ssh-agent has keys loaded, but not the configured signing key` and fails the entire `devflow release --check` preflight.
-
-**This is a false negative on a correct setup, in the one check whose whole job is gating release tagging.** CONTRIBUTING § Release signing defines the split it fails to honour: `user.signingkey` signs ordinary commits (the agent's key), `devflow.releaseSigningKey` signs release tags and `main` (the maintainer's — "the only key permitted"). As written the check can only pass when the *agent's* key is loaded, which is the inverse of the policy.
-
-**Measured during the v2.1.0 cut (2026-07-28):** ssh-agent held `SHA256:u84t7Jj…` — byte-identical to `devflow.releaseSigningKey`'s fingerprint — while `user.signingkey` resolved to `SHA256:9BPyx2M…`, which was not loaded. The v2.1.0 tag signed successfully with the release key while the check claimed it was unavailable, and `scripts/hooks/pre-push` independently verified the same fingerprint on push. The hook's logic is correct; only `release --check` reads the wrong value.
-
-**Fix direction:** resolve with release precedence — `devflow.releaseSigningKey` first, falling back to `user.signingkey` when unset. CONTRIBUTING already states that leaving `devflow.releaseSigningKey` unset disables the check entirely for contributors who never cut releases, so the fallback preserves documented behaviour. Regression test: configure the two keys distinctly, load only the release key, assert `SigningViability::Viable` — a test that fails against current code.
-
-*Found by the orchestrating agent during the v2.1.0 release cut, after the check's failure was taken at face value twice and the operator corrected it. Adjacent to Phase 24, which touched the same function's inline-`key::` classification but not its config-key selection.*
-
-**Priority:** Medium — no production impact (the pre-push hook is the real guard and it works), but it fails the release preflight on every correctly-configured cut and misdirects whoever is cutting. | **Size:** S — one config-lookup change plus a regression test. Linear: DEN-79.
-
-Plans:
-
-- [ ] TBD (promote with /gsd-review-backlog when ready)
+**Was:** `check_signing_viability` reads `user.signingkey` (the agent's ordinary key) instead of `devflow.releaseSigningKey` (the maintainer's release key), so it false-negatives release preflight on a correctly-configured maintainer machine — measured live during the v2.1.0 cut.
+**Removed during Phase 26 discuss-phase, after briefly being promoted there:** same disposition as 999.50 — the operator does not want DevFlow predicting tag-signing viability at all, ever. Full reasoning: `phases/26-release-cut-automation/26-CONTEXT.md` D-10. Linear: DEN-79 (close as won't-do).
 
 ### Phase 999.55: `phase7_cli::wait_for` Fixed 5s Budget Times Out Under Load (BACKLOG)
 
@@ -1029,6 +1026,8 @@ Plans:
 **Fix direction:** make the budget configurable with a longer CI default (e.g. `DEVFLOW_TEST_WAIT_SECS`, 5s locally / ~30s under `CI`), and have the panic report the budget it actually used. Test-only; no production change.
 
 **Priority:** Medium — intermittently blocks pushes and CI on unrelated changes, and each occurrence costs a retry plus the diagnosis of whether it is real. | **Size:** S — one helper plus its call sites. Linear: DEN-80.
+
+**Considered and deliberately excluded from Phase 26 (2026-07-29).** Confirmed still open at HEAD `76e49f1` (`phase7_cli.rs:100-124`, still `200 × 25ms`, 7 call sites). Not folded into Phase 26 because it's test-only, touches no file that phase's release-mechanics cluster touches, and is cheap enough to fix standalone via `gsd-quick`/`gsd-fast` rather than waiting on phase planning. Handled outside the phase sequence, separately — not excluded for cause.
 
 Plans:
 
@@ -1047,6 +1046,32 @@ Plans:
 **Unsolved design constraint:** the Linux jobs get hermeticity from a pinned Linux container that macOS cannot use, so a naive matrix cannot keep both. Either keep the containerised Linux jobs under their existing names and add separately-named macOS jobs, or restructure while preserving the required-check names exactly — and update both rulesets in the same change if any new required name is introduced.
 
 **Priority:** Low — no known macOS user or reported break; this is preventive. | **Size:** M, not the S the branch's diff suggests — the matrix is easy, preserving required-check names and container parity simultaneously is the actual work. Linear: DEN-81.
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.57: An Operator's Checkpoint Answer Can Never Reach the Agent (BACKLOG)
+
+**Goal:** A `gate="blocking-human"` checkpoint is currently a **dead end for any DevFlow-driven run**. The agent stops and asks a question; there is no path by which the operator's answer reaches the agent; every retry spawns a fresh process that asks the identical question again, forever. This is the single largest gap between DevFlow's stated goal (unattended `--yes-ship` / `--yes-release` runs) and what it can actually finish, because a plan that *correctly* gates an irreversible decision becomes a plan that can never complete unattended.
+
+**Evidence — reproduced live during Phase 26's dogfood run, 2026-07-29.** Plan `26-01` consists of exactly two `checkpoint:decision` tasks with `gate="blocking-human"` (authorizing direct pushes to `origin/develop`, and unattended `cargo publish`). The agent stopped correctly. The operator's answers were supplied via `devflow gate approve 26 --stage code --note "<both decisions>"` — the only mechanism the CLI exposes for attaching operator input to a gate. **Two consecutive retries reproduced the identical checkpoint verbatim**, asking Task 1 again from scratch. The run only advanced after a human hand-authored the plan's `26-01-SUMMARY.md` (recording both decisions) and committed it — the "close out manually" fallback `execute-phase.md` documents for a *different* failure shape, applied here because nothing else worked.
+
+**Root cause, verified in source at `76e49f1`:**
+
+1. **The note is written, then never read.** `Gates::respond` persists `note` into `.devflow/gates/{phase}-{stage}.response.json`, but `gates.rs:73-75` only ever inspects it for the substring `"abort"` (`GateAction::Abort`). Every other note is stored and dropped on the floor.
+2. **The relaunch prompt has no input channel for it.** `prompt::stage_prompt` / `stage_prompt_for_project` / `stage_prompt_with_project` (`crates/devflow-core/src/prompt.rs:169`, `:178`, `:182`) derive the entire prompt from `(stage, phase, project_root)`. There is no parameter through which a prior gate's answer could be threaded, so the relaunched `claude -p` starts with zero knowledge that a question was ever asked.
+3. **The protocol assumes a live turn that DevFlow structurally cannot provide.** `gsd-core/references/checkpoints.md`'s `checkpoint:decision` contract ends in `<resume-signal>Select: option-a, or option-b</resume-signal>` — designed for a human typing inline into a live session. DevFlow launches every stage as one-shot `claude -p … --output-format json --dangerously-skip-permissions`, which exits after writing `DEVFLOW_RESULT`. There is no turn to reply into.
+
+**Agreed fix — three parts, operator-decided 2026-07-29:**
+
+- **(A) Resume the real session for Claude — the primary fix.** Every `claude -p --output-format json` result already carries a `session_id` (observed live: `b54a534e-…`), and Claude Code supports `claude -p --resume <session_id> "<answer>"`. On approving a *checkpoint* gate (a class that must be distinguished from a generic transient-error gate), relaunch as a `--resume` of the exact exited session with the operator's answer as the next message, instead of spawning a fresh stage run. This is the only option that gives the checkpoint protocol the live back-and-forth it was written for, and it is dramatically cheaper — no CONTEXT/RESEARCH re-read, no re-running completed tasks, no fresh exposure to the retry hazards this run hit twice.
+- **(B) Keep a structured answer file as the portable fallback — build only if needed.** A `{phase_dir}/{plan}-CHECKPOINT-ANSWERS.json` of `{task_id, selected_option}` pairs that the executor consults *before* re-presenting a checkpoint. Agent-agnostic (no session-resume primitive required), and it is the generalized form of the manual-SUMMARY workaround used to unblock Phase 26. **Deliberately not built up front:** DevFlow also drives Codex and OpenCode, both of which are expected to have equivalent resume primitives; this exists so the design does not *depend* on that assumption. Part of the wiring lives in the GSD skill layer (`execute-phase.md` / `gsd-executor`), outside this repository.
+- **(C) Make checkpoint gates legible — do regardless of A/B.** `truncate_reason` (`crates/devflow-cli/src/pipeline_outcomes.rs:318-342`) caps the gate context, so the operator sees `"…must select direct-push or pr-based-develop… [truncated; full output in .devflow/]"` and has to go read `.devflow/phase-NN-stdout` by hand to find out what the options even are. A checkpoint gate is semantically different from an error gate and should render as an actual menu (numbered options, verbatim, untruncated) in `devflow status` / `devflow gate show`. This is pure discoverability and is independent of how the answer is transmitted.
+
+**Do not fix this by auto-approving.** `checkpoints.md` is explicit that `gate="blocking-human"` is never bypassed in any mode, and Phase 26's own run proved why: the executor found and fixed a plan that had mistakenly tagged these two irreversible authorizations `gate="blocking"` (auto-bypassable, auto-selects the *first* option) — that bug would have silently authorized `cargo publish` with no human input. The gate is correct; only the return path is missing.
+
+**Priority:** High — it is the one defect that makes a *correctly written* plan unable to finish unattended, and the workaround requires an operator who knows an undocumented manual-SUMMARY trick. | **Size:** M — (A) is bounded but touches launch/prompt/gate plumbing and needs a new gate classification; (C) is S; (B) is M and may not be needed. Source: Phase 26 dogfood run (2026-07-29), full write-up in `phases/26-release-cut-automation/26-01-SUMMARY.md` § "Issues Encountered". Linear: DEN-82.
 
 Plans:
 
@@ -1163,6 +1188,138 @@ oracle was deliberately NOT re-pointed at a substitute target. Full disposition 
 Positively: the halt was **not a silent stall** — the failure mode this phase exists
 to eliminate. The guard emitted a typed event and both monitor and agent exited
 cleanly, against Phase 17's two silent monitor deaths at ~4h each.
+
+### Phase 26: Release-Cut Automation
+
+**STATUS: CLOSED PARTIAL, 2026-07-30 — operator decision.** 9 plans executed,
+verification **11/11**, 763 tests passing — and **not shipped**. Two independent
+review passes found Critical defects in the release executor (7, then 5 after a
+fix round: 1 closed / 5 partially-closed / 1 regressed), none of which any test
+ever caught. Rather than a third fix round, the executor (**999.25**) was
+**re-opened and deferred to its own future phase**; see that entry for the five
+open Criticals, the carried-forward sound pieces, and the hard prerequisite.
+
+**Delivered and sound:**
+- **999.5** — CHANGELOG content generation from the conventional-commit
+  classifier. Clean across both reviews, zero findings against it, fully
+  tested. This retires a backlog item deferred three times for want of a
+  content source.
+- **The resume-ledger design (D-06a)** — reviewed as the best-built new code
+  in the phase (live state provably wins over the ledger; schema versioned and
+  checked before deserialization; corrupt/forward-version ledgers refuse
+  loudly). Its lifecycle gap (CR-05) is a missing terminal state, not a design
+  flaw.
+- **D-10 held throughout** — no signing-viability predictor was reintroduced.
+
+**Built but NOT shippable — carried to 999.25:** the release executor,
+`--execute`/`--yes-release`, the `cargo publish` primitives, and
+`devflow sync` (999.52). **Note `sync` is affected too**: it is a mutating
+command sharing the same `mutating_project_root` guard that CR-01 bypasses via
+an inherited `GIT_DIR`, so it is not independently shippable ahead of 999.39
+either.
+
+**Code is unmerged on `feature/phase-26`** (~75 commits ahead of `develop`).
+Nothing was merged, tagged, version-bumped, or pushed at any point across the
+run — verified repeatedly. The branch is retained as the starting point for
+999.25's re-attempt.
+
+**Also blocked on an operator action (W-17):** the live `develop` ruleset is
+`enforcement: active` with an **empty bypass list**, so the direct push this
+phase's design depends on cannot land against this repository, and all three
+`26-UAT.md` items are gated on that precondition. Repository settings, not code.
+
+**Goal (as scoped):** Make `devflow release` *execute* the release-cut sequence —
+version bump → direct push to `develop` → develop→main release PR
+(human-merged) → signed tag → sync back to `develop` (direct push) →
+publish `devflow-core` then `devflow` — not just the read-only `--check`
+preflight Phase 20's 20d delivered. Adds a real `devflow sync` subcommand
+(999.52, both standalone and executor-internal) and fixes the changelog's
+placeholder content (999.5) by generating it from the conventional-commit
+classification Phase 25's version-bump step already computes.
+
+**Promoted 2026-07-29**, then **re-scoped 2026-07-29 during discuss-phase**
+— see `26-CONTEXT.md` for the full discussion. Originally promoted from four
+backlog items, each re-verified open at HEAD (`76e49f1`) before promotion:
+999.25 (executor), 999.54 + 999.50 (signing-viability predictor fixes), and
+999.52 (sync). Discussion with the operator changed the shape substantially:
+
+- **Automation ceiling widened, not narrowed.** `develop`-bound merges
+  (version bump, sync-back) are now **direct pushes**, not PRs — the
+  operator wants to eliminate the PR requirement for `develop` specifically
+  (via a GitHub ruleset bypass they'll configure themselves, out of this
+  phase's scope) while keeping `main` PR-gated and human-merged. `cargo
+  publish` for both crates is in scope, driven by the executor itself
+  (previously 100% manual, never run by any DevFlow code). A new
+  `--yes-release` flag (separate from `--yes-ship`) authorizes the whole
+  bump→tag→sync→publish sequence, matching the existing dangerous-operation
+  pattern.
+- **999.54 and 999.50 dropped from this phase AND removed from the backlog
+  entirely.** The operator determined DevFlow should never predict
+  tag-signing viability at all — the executor's tag step just runs the real
+  signed `git tag` command (CONTRIBUTING.md's already-documented explicit
+  key-selection form) and reads git's own real result, rather than
+  maintaining a second "will this work?" implementation that has to stay in
+  sync with git's actual behavior (the exact bug class those two items
+  were about). See `26-CONTEXT.md` D-10 for the full reasoning.
+- **999.4 (concurrent-ship tag race) considered and also removed from the
+  backlog entirely.** Its race scenario is specific to `devflow parallel`
+  (multiple whole phases concurrently); the operator does not and would
+  never use DevFlow that way for a single user. See `26-CONTEXT.md` D-11.
+  `devflow parallel`'s own future (deprecate vs. repurpose for intra-phase
+  workstreams vs. leave alone) is captured as a deferred idea for its own
+  future phase — explicitly not decided here.
+- **999.5 (changelog placeholder) added**, using added capacity from
+  dropping 999.54/999.50/999.4 — see `26-CONTEXT.md` D-12. Deferred three
+  times previously for want of a content source; Phase 25's
+  conventional-commit classifier now provides one for free.
+- **Two other backlog items from the same original candidate table**
+  (999.31 modular agent driver, 999.15 hermetic shell-entrypoint tests,
+  999.21 AI-acceptance wiring) were **considered for the added capacity and
+  explicitly declined** — none share a domain or files with release
+  automation, and bundling them would recreate the multi-domain scope-creep
+  this phase's construction was specifically trying to avoid. Candidates
+  for their own future phase, not lost.
+
+**Sequencing.** Fixed order across the three retained items: build
+`devflow sync` (999.52) first since the executor's sync step calls it
+directly; then the changelog-content change (999.5), since it's small and
+independent; then the 999.25 executor itself, which composes the sync
+subcommand and the changelog generator as two of its steps alongside the
+new develop-push, tag, and publish code. 999.25 remains the largest, riskiest
+unit — it is the first production code anywhere that pushes `develop`,
+creates a release tag, or runs `cargo publish` (all three previously
+100%-manual or nonexistent), which is exactly why the discuss-phase gave it
+this much design attention before planning starts.
+
+**Explicitly excluded, with reasons — do not re-add without revisiting these:**
+
+- **999.55 / DEN-80** (`phase7_cli::wait_for` fixed 5s timeout, Medium/S) —
+  confirmed still open (`phase7_cli.rs:100-124`, hardcoded `200 × 25ms`, 7 call
+  sites), but it is test-only, touches no file this phase's cluster touches,
+  and is cheap enough to run standalone (`gsd-quick`/`gsd-fast`) rather than
+  fold into this phase's scope. Handled outside this phase, separately — not
+  excluded for cause.
+- **999.39** (production git calls don't scrub `GIT_DIR` etc., Medium/M) —
+  confirmed still open: all ~86 production `Command::new("git")` call sites
+  pin `current_dir()` but never scrub environment; only the test-only
+  `test_support::git_command` does, and only inside `#[cfg(test)]` blocks.
+  Real defense-in-depth against a repeat of the 999.37 incident class, but it
+  touches most of `crates/` including `git.rs`, where this phase's cluster is
+  already working — bundling it risks the same file-overlap serialization tax
+  this phase is trying to avoid by construction. Deferred to its own phase
+  (27+), not because it's low-value.
+
+**Requirements**: TBD — no REQ-IDs; tracked by backlog identifier (`999.25`,
+`999.54`, `999.50`, `999.52`), not invented REQ-IDs. See
+`phases/26-release-cut-automation/999.25-BACKLOG-DOSSIER.md` for the original backlog
+context (possible shapes, publish-ordering constraint, prior deferral
+reasoning from Phase 20 D-03).
+**Depends on:** Phase 25
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (run /gsd-discuss-phase 26, then /gsd-plan-phase 26 to break down)
 
 ---
 
