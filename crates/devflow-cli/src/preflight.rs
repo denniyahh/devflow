@@ -2495,6 +2495,166 @@ mod tests {
         assert_eq!(rev_parse("develop"), remote_sha);
     }
 
+    /// A minimal repo on `branch`, config'd the same way every other small
+    /// fixture in this module does — shared by the hostile-`GIT_DIR`
+    /// write-containment test below, which needs several small,
+    /// independent repositories rather than the remote/local clone pair
+    /// [`currency_fixture`] builds.
+    fn init_small_repo(root: &Path, branch: &str) {
+        run_git(root, &["init", "-q", "-b", branch]);
+        run_git(root, &["config", "user.email", "t@e.st"]);
+        run_git(root, &["config", "user.name", "t"]);
+        run_git(root, &["config", "commit.gpgsign", "false"]);
+        run_git(root, &["config", "core.hooksPath", "/dev/null"]);
+    }
+
+    /// D-01/T-27-12 (critical — the only WRITE on this surface): a
+    /// compare-and-swap `git update-ref` must never land in a repository the
+    /// operator never named. Two proofs, mirroring the phase-reachability
+    /// test above and 27-01's `origin_main_ancestor_status_holds_under_a_
+    /// hostile_git_dir` (chaining hostile injection directly onto
+    /// `fast_forward_base_ref`'s own internal call is not possible from
+    /// outside its module boundary):
+    ///
+    /// (a) A direct, unscrubbed reproduction of `fast_forward_base_ref`'s
+    /// own pre-migration `update-ref` argv — cwd pinned to a throwaway
+    /// "real" repo, with a hostile `GIT_DIR` chained on top pointing at a
+    /// throwaway "foreign" repo that happens to carry a branch of the SAME
+    /// name — is shown to advance the FOREIGN repository's ref while the
+    /// real repository's own ref is left untouched. This is T-27-12's exact
+    /// concern: the compare-and-swap's `expected_old` guard offers no
+    /// protection here, because under a hostile `GIT_DIR` it is compared
+    /// against the FOREIGN repository's current value, not the real one —
+    /// the environment scrub, not the compare-and-swap, is what makes the
+    /// target repository correct in the first place.
+    ///
+    /// (b) `fast_forward_base_ref(real_root, ...)`, called normally with
+    /// nothing re-adding `GIT_DIR` afterward, is asserted to advance the
+    /// real repository's own ref, and a SEPARATE, unrelated foreign
+    /// repository (never touched by this clean call) is asserted
+    /// byte-identical before and after. Run in a plain environment this
+    /// passes regardless of migration status. The RED-before/GREEN-after
+    /// proof this plan's own `<verify>` block relies on comes from running
+    /// this exact test under `GIT_DIR="$HOSTILE/.git" cargo test ... --
+    /// preflight::tests::fast_forward_base_ref_never_writes_into_a_hostile_git_dir`:
+    /// before migration, the ambient hostile `GIT_DIR` set by that wrapping
+    /// shell redirects the compare-and-swap away from `real_root` entirely
+    /// (the shell's throwaway hostile repo carries no matching branch, so
+    /// the write fails outright against it), and `real_root`'s ref never
+    /// advances to `new` — after migration, `git_command`'s `env_remove`
+    /// strips that ambient `GIT_DIR` from the child, and the write
+    /// correctly targets `real_root`.
+    #[test]
+    fn fast_forward_base_ref_never_writes_into_a_hostile_git_dir() {
+        let rev_parse_in = |root: &Path, rref: &str| {
+            let out = devflow_core::test_support::git_command(root)
+                .args(["rev-parse", rref])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "rev-parse {rref} in {root:?} failed");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        // (a) the vulnerability class, reproduced directly. `git update-ref`
+        // validates its target object against whatever repository `GIT_DIR`
+        // resolves to, so `demo_foreign` — not `demo_real` — needs the two
+        // commits the compare-and-swap actually references. This mirrors
+        // production: `ensure_base_ref_current`'s own `resolve` closure
+        // (migrated by this same task) would, under a real hostile
+        // `GIT_DIR`, resolve `local_sha`/`remote_sha` from that same
+        // foreign repository too — the object always exists where the
+        // write ultimately lands.
+        let demo_real = tempfile::tempdir().unwrap();
+        init_small_repo(demo_real.path(), "develop");
+        std::fs::write(demo_real.path().join("a.txt"), "1").unwrap();
+        run_git(demo_real.path(), &["add", "-A"]);
+        run_git(demo_real.path(), &["commit", "-q", "-m", "c1"]);
+        let demo_real_before = rev_parse_in(demo_real.path(), "develop");
+
+        let demo_foreign = tempfile::tempdir().unwrap();
+        init_small_repo(demo_foreign.path(), "develop");
+        std::fs::write(demo_foreign.path().join("f.txt"), "1").unwrap();
+        run_git(demo_foreign.path(), &["add", "-A"]);
+        run_git(demo_foreign.path(), &["commit", "-q", "-m", "foreign-c1"]);
+        let demo_foreign_old = rev_parse_in(demo_foreign.path(), "develop");
+        std::fs::write(demo_foreign.path().join("f2.txt"), "2").unwrap();
+        run_git(demo_foreign.path(), &["add", "-A"]);
+        run_git(demo_foreign.path(), &["commit", "-q", "-m", "foreign-c2"]);
+        let demo_foreign_new = rev_parse_in(demo_foreign.path(), "develop");
+        run_git(
+            demo_foreign.path(),
+            &["update-ref", "refs/heads/develop", &demo_foreign_old],
+        );
+
+        let git_program = "git";
+        let vulnerable = std::process::Command::new(git_program)
+            .args([
+                "update-ref",
+                "refs/heads/develop",
+                &demo_foreign_new,
+                &demo_foreign_old,
+            ])
+            .current_dir(demo_real.path())
+            .env("GIT_DIR", demo_foreign.path().join(".git"))
+            .output()
+            .expect("spawn git");
+        assert!(
+            vulnerable.status.success(),
+            "the reproduction itself must succeed: {}",
+            String::from_utf8_lossy(&vulnerable.stderr)
+        );
+        assert_eq!(
+            rev_parse_in(demo_foreign.path(), "develop"),
+            demo_foreign_new,
+            "an unscrubbed update-ref, cwd pinned to the real repository, must still land the \
+             write in the foreign repository named by GIT_DIR — the exact hazard T-27-12 closes"
+        );
+        assert_eq!(
+            rev_parse_in(demo_real.path(), "develop"),
+            demo_real_before,
+            "the real repository's own ref must be untouched by the misdirected write"
+        );
+
+        // (b) the real, migrated function: called normally, advances the
+        // real repository's own ref; a SEPARATE, unrelated foreign
+        // repository (never touched by this clean call) is unchanged. See
+        // the doc comment above for how this becomes RED-before/GREEN-after
+        // when run under this plan's hostile-GIT_DIR-wrapped `<verify>`
+        // command.
+        let (remote, local) = currency_fixture();
+        let remote_root = remote.path();
+        let local_root = local.path();
+        advance_remote(remote_root, "f2.txt");
+        run_git(local_root, &["checkout", "-q", "-b", "other"]);
+        run_git(local_root, &["fetch", "-q", "origin", "develop"]);
+
+        let local_before = rev_parse_in(local_root, "develop");
+        let remote_sha = rev_parse_in(local_root, "origin/develop");
+
+        let foreign = tempfile::tempdir().unwrap();
+        init_small_repo(foreign.path(), "develop");
+        std::fs::write(foreign.path().join("x.txt"), "1").unwrap();
+        run_git(foreign.path(), &["add", "-A"]);
+        run_git(foreign.path(), &["commit", "-q", "-m", "unrelated"]);
+        let foreign_before = rev_parse_in(foreign.path(), "develop");
+
+        assert!(
+            fast_forward_base_ref(local_root, "develop", &local_before, &remote_sha),
+            "the correct expected-old value must succeed against the real repository"
+        );
+        assert_eq!(
+            rev_parse_in(local_root, "develop"),
+            remote_sha,
+            "the real repository's ref must advance to `new`"
+        );
+        assert_eq!(
+            rev_parse_in(foreign.path(), "develop"),
+            foreign_before,
+            "an unrelated foreign repository must be byte-identical before and after — \
+             fast_forward_base_ref must never touch it"
+        );
+    }
+
     #[test]
     fn currency_is_ahead_for_unpushed_local_work() {
         let (_remote, local) = currency_fixture();
