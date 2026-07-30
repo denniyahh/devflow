@@ -991,6 +991,36 @@ pub fn crate_already_published(
     }
 }
 
+/// This is the phase's one irreversible operation — a published version can
+/// never be un-published or reused (D-04). The operator's authorization for
+/// running it unattended is recorded in `26-01-SUMMARY.md` Decision 2 as
+/// `automate-publish`, double-confirmed, and is not re-litigated here. A
+/// caller must consult [`crate_already_published`] first, and must treat an
+/// ambiguous result as a stop, never as permission to proceed (D-06, D-05).
+/// The package sequence comes from [`publish_order`] and is never
+/// recomputed here (D-04). On failure nothing is rolled back — whatever
+/// already published stays published, and the fix is forward (D-05).
+///
+/// Never passes `--dry-run`: this primitive exists to actually publish, and
+/// a dry-run default would make the executor silently non-functional while
+/// appearing to work. No retry loop: D-04's discretion note says a single
+/// synchronous check is sufficient, and a retry around an operation that
+/// may have partially succeeded is precisely the compensating-action shape
+/// D-05 forbids.
+pub fn cargo_publish(project_root: &Path, package: &str) -> Result<(), PublishError> {
+    let output = Command::new("cargo")
+        .args(["publish", "-p", package])
+        .current_dir(project_root)
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(PublishError::Failed(
+            crate::version::sanitize_changelog_subject(&stderr_or_status(&output)),
+        ))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // tag-signing viability (20d, Pattern 4)
 // ---------------------------------------------------------------------------
@@ -2672,5 +2702,39 @@ mod tests {
             "stored ambiguous detail exceeded CHANGELOG_SUBJECT_MAX_CHARS: {} chars",
             stored.chars().count()
         );
+    }
+
+    /// Structurally cannot publish anything: the fixture directory contains
+    /// no `Cargo.toml`, so `cargo publish` fails before contacting any
+    /// registry. No test in this repository exercises `cargo_publish`'s
+    /// success path deliberately — `26-VALIDATION.md` § "Manual-Only
+    /// Verifications" row 2 is where that coverage lives, via a real
+    /// operator-run publish.
+    #[test]
+    fn cargo_publish_reports_a_failure_without_publishing_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert!(
+            !root.join("Cargo.toml").exists(),
+            "fixture must contain no Cargo.toml so this test cannot possibly publish"
+        );
+
+        let result = cargo_publish(root, "definitely-not-a-real-package-name");
+
+        match result {
+            Err(PublishError::Failed(detail)) => {
+                assert!(!detail.is_empty(), "expected a non-empty failure detail");
+                assert!(
+                    !detail.chars().any(char::is_control),
+                    "failure detail retained a control character: {detail:?}"
+                );
+                assert!(
+                    detail.chars().count() <= crate::version::CHANGELOG_SUBJECT_MAX_CHARS,
+                    "failure detail exceeded CHANGELOG_SUBJECT_MAX_CHARS: {} chars",
+                    detail.chars().count()
+                );
+            }
+            other => panic!("expected Err(PublishError::Failed(_)), got {other:?}"),
+        }
     }
 }
