@@ -49,9 +49,8 @@ fn embedded_commit_is_stale(execution_root: &Path, embedded_commit: &str) -> Sta
     if embedded_commit.is_empty() {
         return Staleness::Indeterminate;
     }
-    let output = std::process::Command::new("git")
+    let output = git_command(execution_root)
         .args(["merge-base", "--is-ancestor", embedded_commit, "HEAD"])
-        .current_dir(execution_root)
         .output();
     match output.map(|o| o.status.code()) {
         Ok(Some(0)) => match run_git_stdout(execution_root, &["rev-parse", "HEAD"]) {
@@ -70,9 +69,8 @@ fn embedded_commit_is_stale(execution_root: &Path, embedded_commit: &str) -> Sta
         // reverse direction to tell them apart, or an ahead build gets
         // reported as stale and hard-blocked.
         Ok(Some(1)) => {
-            let reverse = std::process::Command::new("git")
+            let reverse = git_command(execution_root)
                 .args(["merge-base", "--is-ancestor", "HEAD", embedded_commit])
-                .current_dir(execution_root)
                 .output();
             match reverse.map(|o| o.status.code()) {
                 Ok(Some(0)) => Staleness::Ahead,
@@ -996,8 +994,8 @@ mod tests {
 
     // -----------------------------------------------------------------
     // 27-04 (D-01/D-03): embedded_commit_is_stale's two remaining direct
-    // sites (base-commit lines 51, 72) now scrubbed via
-    // git_command(execution_root)
+    // sites (base-commit lines 51, 72) now scrubbed via the git_command
+    // constructor, called with execution_root
     // -----------------------------------------------------------------
 
     /// D-01/D-03: `embedded_commit_is_stale` produces the correct staleness
