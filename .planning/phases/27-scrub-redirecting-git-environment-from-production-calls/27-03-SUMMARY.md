@@ -221,6 +221,16 @@ Per the scope boundary, no fixes were made to files outside `version.rs`/`agent_
 - `crates/devflow-cli/build.rs` untouched (D-02, out of scope for this plan and phase).
 - No blockers for 27-04/27-05/27-06, which migrate the remaining files (`staleness.rs`'s 2 sites, `commands.rs`, `preflight.rs`) independently — no shared state introduced by this plan beyond the already-existing `devflow_core::git::git_command` constructor from 27-01.
 
+## Self-Check: PASSED
+
+- FOUND: crates/devflow-core/src/version.rs
+- FOUND: crates/devflow-core/src/agent_result.rs
+- FOUND: .planning/phases/27-scrub-redirecting-git-environment-from-production-calls/27-03-SUMMARY.md
+- FOUND commit: 0af23c7 (test, version.rs RED)
+- FOUND commit: f8902f4 (feat, version.rs GREEN)
+- FOUND commit: eed0a12 (test, agent_result.rs RED)
+- FOUND commit: 205475c (feat, agent_result.rs GREEN)
+
 ---
 *Phase: 27-scrub-redirecting-git-environment-from-production-calls*
 *Completed: 2026-07-30*
