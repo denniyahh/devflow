@@ -710,7 +710,7 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.39: Production Git Calls Inherit a Redirecting Environment (PROMOTED — Phase 27)
+### Phase 999.39: Production Git Calls Inherit a Redirecting Environment (DONE — Phase 27, 2026-07-30)
 
 **Goal:** DevFlow's production git invocations pin `current_dir()` but do **not** clear git's repository-local environment variables. `GIT_DIR` outranks the working directory, so any `devflow` process launched with one set — from a git hook, `git rebase --exec`, or `git bisect run` — silently operates on *that* repository instead of the project root it was given.
 
@@ -1167,6 +1167,31 @@ Ship was killed ~10s after launch. **No external side effects occurred** — bra
 **Do not fix by making `--until` sticky across the halt.** That reintroduces exactly the permanent-`stopped` wedge 20c closed. The distinction to preserve is *fired vs. not fired*, not *set vs. unset*.
 
 **Priority:** High — it silently removes an operator-declared safety boundary on the recovery path, and the stage it exposes drives irreversible operations. Mitigated in practice only by `yes_ship`, which is a different control the operator may also have set. | **Size:** S for (A), S for (B). Source: Phase 27 dogfood (2026-07-30). Linear: DEN-85.
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
+### Phase 999.61: Four Indirect Git-Reaching Spawn Edges a Literal Grep Cannot See (BACKLOG)
+
+**Goal:** Phase 27 scrubbed all 41 production `Command::new("git")` sites, but its own workspace census found **five** further spawn edges that reach `git` *indirectly* — through `sh`, through `cargo`, or through an operator-configured command — and are therefore invisible to a literal grep for `Command::new("git")`. One (`monitor.rs:148`, the agent spawn) was closed in-phase by `936b371`. **Four remain:**
+
+| Site | Mechanism | Severity |
+|---|---|---|
+| `crates/devflow-core/src/hooks.rs:222` | `sh -c "cargo doc …"` → cargo → `build.rs::run_git` | Medium — the *same* indirect-compile mechanism 27-04 already found and fixed once, at a second call site |
+| `crates/devflow-core/src/gates.rs:323` | operator-configured gate-notify command | Medium |
+| `crates/devflow-core/src/verify.rs:106` | operator-approved verification command | Medium |
+| `crates/devflow-cli/src/commands.rs:2086` | `cmd_check("git", "git", …)` — program name reaches `Command::new` through a variable | Low |
+
+**Why this is filed rather than folded into Phase 27.** Phase 27's RESEARCH carried Assumption A2 — that the literal-grep site list was exhaustive — and its census **held that assumption OPEN rather than silently closing it** (`27-SPAWN-CENSUS.md` § Assumption A2 verdict). All five were confirmed production-reachable by direct call-graph tracing, not assumed. Closing the highest-severity one in-phase and filing the rest is the honest split, and it is why this entry's ceiling is Medium rather than High: **the agent-spawn edge is already closed.**
+
+**The `gates.rs` / `verify.rs` pair deserves a deliberate decision, not a reflexive scrub.** Both run commands the *operator* configured. The operator therefore has some control over what executes — but the redirecting variables are still inherited invisibly into a command whose contents nobody audited for env-sensitivity. Decide explicitly whether DevFlow scrubs an operator's own command (safer, but silently changes the environment they may have intended) or documents that it does not.
+
+**`commands.rs:2086` is functionally inert** — `git --version` resolves no refs, so nothing can be redirected. Worth closing anyway for D-01 literal-completeness, and because it is the concrete demonstration that a literal grep is defeated by any indirection through a variable.
+
+**Fix direction:** `hermetic_command(program, dir)` at each site, exactly as 27-04 did for `commands.rs::test_cmd` and `936b371` did for `monitor.rs` — the mechanism already exists and is proven; this is applying it, not designing it. Pair with a regression guard that greps for *spawn constructors reaching git indirectly* rather than for the literal string, so a sixth edge cannot appear unnoticed.
+
+**Priority:** Medium — down from the census's original "high", because the one high-consequence site (the agent spawn) is closed. No remaining edge launches an agent or performs a mutating git operation. | **Size:** S — four one-line changes plus the guard. Source: Phase 27 census (`27-SPAWN-CENSUS.md` § Proposed backlog entry), 2026-07-30. Linear: DEN-86.
 
 Plans:
 
@@ -1863,9 +1888,23 @@ Plans:
 
 ### Phase 27: Scrub Redirecting Git Environment From Production Calls
 
+**STATUS: COMPLETE, 2026-07-30** — merged to `develop` via PR #60 (merge commit `c6192a1`), 47 commits. **Not released**; no tag or version bump was cut, and Ship's terminal hooks never ran (see "How this phase closed" below).
+
+**Delivered:** all **41** production `Command::new("git")` sites across 7 files routed through `devflow_core::git::{git_command, hermetic_command}`, plus two indirect `sh → cargo → git` spawn edges — including **`monitor.rs:148`, the spawn that launches the coding agent itself**, which was the single highest-consequence site in the codebase and was *not* in the original literal-grep scope. Verified on `develop` after merge: **zero** bare `Command::new("git")` remain in production code (every surviving textual match is a comment). `test_support` now re-exports `git.rs`'s constants rather than keeping a second copy, so the two lists cannot drift.
+
+**Acceptance signal met** — the whole point of the phase. 999.37 deliberately left 37 unit tests failing under a dirty environment so the exposure would stay visible. Under a hostile `GIT_DIR` the suite is now `411 passed / 0 failed` (devflow-core) and `188 passed / 0 failed` (devflow-cli); ordinary `cargo test --workspace` is **719 passed / 0 failed**, clippy `-D warnings` and `cargo fmt --check` clean. `27-VERIFICATION.md`: **status `passed`, 7/7 truths**, with the verifier independently re-running the falsification (revert a call site → test fails → restore → passes) rather than trusting the claim.
+
+**Review:** `27-REVIEW.md` — 0 critical, 3 warnings, 3 info. All three warnings closed in `936b371`. WR-01 is worth remembering: two "hostile `GIT_DIR`" tests set no hostile environment at all and passed identically with or without the scrub, and **the first attempt to fix them was itself vacuous** (passed `--exact` against a bare test name, so zero tests ran and the binary still exited 0). Both now assert the child reported `1 passed`, not merely that it exited 0.
+
+**Residual, by design:** four lower-consequence indirect spawn edges remain open — `hooks.rs:222`, `gates.rs:323`, `verify.rs:106`, `commands.rs::cmd_check`. None launches an agent. Found by this phase's own census (`27-SPAWN-CENSUS.md`, RESEARCH Assumption A2 held **OPEN, not silently closed**) and filed as **999.61**. D-02 also held throughout: `crates/devflow-cli/build.rs` is byte-identical to its base state, and the indirect chain behind it was closed at DevFlow's own spawn edge instead.
+
+**How this phase closed — Ship was deliberately not run.** Dogfooded through DevFlow itself (`devflow start --phase 27 --mode auto --until validate`) Define→Plan→Code→Validate. Ship was excluded because its terminal hooks (`Merge → VersionBump → ChangelogAppend → BranchCleanup`) are fail-fast with no rollback and would have merged and tagged directly, and because `develop` is PR-gated (W-17 bypass deliberately unconfigured). The branch was pushed and merged by human review instead. **The run surfaced 999.60/DEN-85 live:** `devflow resume` discarded the never-fired `--until validate` cap and advanced into Ship unguarded; Ship was killed ~10s in with no side effects, held only by `yes_ship: false`.
+
+**Unblocks:** **999.25** (release executor, DEN-50) — this was its prerequisite #1, since `26-REVIEW.md` CR-01 showed `mutating_project_root` is bypassed by an inherited `GIT_DIR` — and **999.52** (`devflow sync`), which shares that guard.
+
 **Promoted:** 2026-07-30 — backlog **999.39 / DEN-66**, re-verified open at HEAD `b3cab1c` before promotion. Promoted to its own phase exactly as Phase 26 anticipated ("Deferred to its own phase (27+), not because it's low-value").
 
-**Goal:** Route every production git invocation through a single scrubbing constructor — mirroring what `test_support::git_command` already does for tests — so that `GIT_DIR`, `GIT_WORK_TREE` and the other repository-local variables cannot silently redirect DevFlow onto a repository the operator never named. Today all ~86 production `Command::new("git")` sites pin `current_dir()` and nothing else; `GIT_DIR` outranks the working directory, so any `devflow` process launched with one set operates on *that* repository instead.
+**Goal:** Route every production git invocation through a single scrubbing constructor — mirroring what `test_support::git_command` already does for tests — so that `GIT_DIR`, `GIT_WORK_TREE` and the other repository-local variables cannot silently redirect DevFlow onto a repository the operator never named. At promotion time all production `Command::new("git")` sites pinned `current_dir()` and nothing else (estimated ~86; the grep-confirmed count was **41**, plus indirect spawn edges the literal grep could not see); `GIT_DIR` outranks the working directory, so any `devflow` process launched with one set operates on *that* repository instead.
 
 **Why this is High, not hygiene.** Phase 26's re-review (`26-REVIEW.md`, finding **CR-01**) found that `mutating_project_root` — the guard written expressly to stop `release --execute`/`sync` acting on an unnamed repository (D-13, closing C-06) — **is bypassed by an inherited `GIT_DIR`**. `git rev-parse --show-toplevel` reports the *cwd's* work tree while HEAD, refs and objects come from `GIT_DIR`, so the guard compares two paths, sees a match, and passes while the executor pushes, tags, and publishes against a different repository. The effect is no longer wrong answers but **irreversible operations against the wrong repository**. Git sets these variables for hooks, `rebase --exec`, `bisect run` and `submodule foreach` — and DevFlow runs git hooks as part of its own workflow.
 
