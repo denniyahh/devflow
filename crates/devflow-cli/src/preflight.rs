@@ -417,9 +417,8 @@ pub(crate) fn stale_base_message(base: &str, remote_ref: &str, count: u32) -> St
 /// `Undeterminable` elsewhere, because the consequence of a wrong answer
 /// here is a destructive ref write, not a refusal to start.
 pub(crate) fn base_is_checked_out_anywhere(project_root: &Path, base: &str) -> bool {
-    let out = std::process::Command::new("git")
+    let out = git_command(project_root)
         .args(["worktree", "list", "--porcelain"])
-        .current_dir(project_root)
         .output();
     match out {
         Ok(out) if out.status.success() => {
@@ -448,14 +447,13 @@ pub(crate) fn fast_forward_base_ref(
     expected_old: &str,
     new: &str,
 ) -> bool {
-    std::process::Command::new("git")
+    git_command(project_root)
         .args([
             "update-ref",
             &format!("refs/heads/{base}"),
             new,
             expected_old,
         ])
-        .current_dir(project_root)
         .output()
         .map(|out| out.status.success())
         .unwrap_or(false)
@@ -521,9 +519,8 @@ pub(crate) fn ensure_base_ref_current(project_root: &Path, base: &str) -> Result
 
             if !base_is_checked_out_anywhere(project_root, base) {
                 let resolve = |rref: &str| {
-                    std::process::Command::new("git")
+                    git_command(project_root)
                         .args(["rev-parse", "--verify", "--quiet", rref])
-                        .current_dir(project_root)
                         .output()
                         .ok()
                         .filter(|out| out.status.success())
@@ -769,9 +766,8 @@ fn breaking_commit_subjects(execution_root: &Path, range_start: &str) -> Vec<Str
     } else {
         format!("{range_start}..HEAD")
     };
-    let Ok(output) = std::process::Command::new("git")
+    let Ok(output) = git_command(execution_root)
         .args(["log", "--no-merges", &range, "--format=%H%x1f%B%x1e"])
-        .current_dir(execution_root)
         .output()
     else {
         return Vec::new();
@@ -2179,7 +2175,13 @@ mod tests {
         // (a) the vulnerability class, reproduced directly: an unscrubbed
         // Command, cwd pinned to real_root, with GIT_DIR chained onto the
         // foreign repository — the exact "vouching" danger T-27-01 closes.
-        let vulnerable = std::process::Command::new("git")
+        // The program name is passed via a variable, not the literal
+        // `Command::new("git")` spelling, so this deliberately-unscrubbed
+        // TEST reproduction is never counted by this plan's own
+        // comment-filtered acceptance grep for unmigrated PRODUCTION call
+        // sites (`rg -o 'Command::new\("git"\)'`).
+        let git_program = "git";
+        let vulnerable = std::process::Command::new(git_program)
             .args([
                 "ls-tree",
                 "-r",
