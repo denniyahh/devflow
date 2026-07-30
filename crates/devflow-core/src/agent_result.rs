@@ -2500,4 +2500,64 @@ mod tests {
         assert_eq!(result.status, AgentStatus::AgentUnavailable);
         assert_eq!(result.exit_code, Some(127));
     }
+
+    // -----------------------------------------------------------------
+    // 27-03 (D-01/D-03): branch-exists + commit-count evidence resolves
+    // the caller's own repository under a hostile GIT_DIR, not an
+    // unrelated one.
+    // -----------------------------------------------------------------
+
+    /// D-03/T-27-08: `evaluate_layer2`'s branch-exists and commit-count
+    /// evidence (the two production sites at what were base-commit lines
+    /// 574/583) resolves `project_root`'s own repository even when the
+    /// process inherited a hostile `GIT_DIR` pointed at an unrelated
+    /// repository — proven with a real spawned `git` process, not by
+    /// inspecting a `Command` object alone. Mirrors
+    /// `version::tests::tag_reads_resolve_caller_root_under_a_hostile_git_dir`
+    /// (27-03) and `origin_main_ancestor_status_holds_under_a_hostile_git_dir`
+    /// (`git.rs`, 27-01): the hostile `GIT_DIR` this test's own `<verify>`
+    /// entries exercise (`GIT_DIR=<hostile>/.git cargo test ... this test`)
+    /// is injected the same way any inherited-env attack reaches
+    /// `evaluate_layer2` in production — via the whole process's
+    /// environment, then down into the spawned child unless the
+    /// constructor scrubs it.
+    ///
+    /// Deliberately tests the mirror direction from the plan's literal
+    /// framing (real repo HAS the feature branch with a real commit;
+    /// the standard hostile-`GIT_DIR` harness's throwaway repository does
+    /// NOT), because the standard harness (`git init -q "$HOSTILE"`, no
+    /// `feature/phase-NN` branch) cannot itself manufacture a false
+    /// *positive* — an empty repository has no branch to spuriously
+    /// report as present. It can, however, still prove the scrub's
+    /// necessity by manufacturing a false *negative*: before this plan's
+    /// migration, the two unmigrated `Command::new("git")` sites inherit
+    /// the poisoned `GIT_DIR` and silently read the hostile repository
+    /// instead of `project_root` — `rev-parse --verify` reports the real
+    /// branch absent, the commit count is undercounted to zero, and a
+    /// real agent's completed work is wrongly classified `Failed`. This
+    /// is the same trust-boundary violation T-27-08 names (a foreign
+    /// repository's state substituting for the real one), reached from
+    /// the opposite direction; the scrub this plan adds removes `GIT_DIR`'s
+    /// ability to redirect the spawned child at all, closing both
+    /// directions identically.
+    #[test]
+    fn branch_evidence_resolves_caller_root_under_a_hostile_git_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase = 27;
+        init_repo_with_feature_commit(dir.path(), phase);
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(exit_code_path(dir.path(), phase), "0").unwrap();
+        let state = state_in(dir.path(), phase);
+
+        let result = evaluate_layer2(dir.path(), phase, &GitFlowConfig::default(), state.stage)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            result.status,
+            AgentStatus::Success,
+            "evaluate_layer2 must see project_root's own branch/commits, not a hostile GIT_DIR's repository: {result:?}"
+        );
+        assert_eq!(result.commits, Some(1));
+    }
 }
