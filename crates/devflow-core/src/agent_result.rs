@@ -8,6 +8,7 @@
 //! 3. Process gone + commits exist (last resort warning)
 
 use crate::config::GitFlowConfig;
+use crate::git::git_command;
 use crate::stage::Stage;
 use crate::state::State;
 use std::path::{Path, PathBuf};
@@ -571,18 +572,16 @@ pub fn evaluate_layer2(
     let branch = format!("{}phase-{:02}", git_flow.feature_prefix, phase);
 
     // Verify branch exists before counting commits.
-    let branch_exists = std::process::Command::new("git")
+    let branch_exists = git_command(project_root)
         .args(["rev-parse", "--verify", &branch])
-        .current_dir(project_root)
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
 
     let commits: u32 = if branch_exists {
         let range = format!("{}..{branch}", git_flow.develop);
-        std::process::Command::new("git")
+        git_command(project_root)
             .args(["rev-list", "--count", &range])
-            .current_dir(project_root)
             .output()
             .ok()
             .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
@@ -661,13 +660,12 @@ pub fn evaluate_layer3(
     git_flow: &GitFlowConfig,
 ) -> Result<AgentResult, ResultError> {
     let branch = format!("{}phase-{:02}", git_flow.feature_prefix, phase);
-    let commits = std::process::Command::new("git")
+    let commits = git_command(project_root)
         .args([
             "rev-list",
             "--count",
             &format!("{}..{branch}", git_flow.develop),
         ])
-        .current_dir(project_root)
         .output()
         .ok()
         .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
