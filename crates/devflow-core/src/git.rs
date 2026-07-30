@@ -878,6 +878,150 @@ fn topo_sort(names: Vec<String>, edges: Vec<(String, String)>) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
+// cargo publish primitives (D-04, 999.25)
+// ---------------------------------------------------------------------------
+
+/// Typed verdict for whether an exact `name@version` is already live on
+/// crates.io, produced by [`classify_cargo_info_result`]. `publish_order`
+/// (above) still owns the package sequence — this composes with it, it does
+/// not replace it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublishCheck {
+    /// `cargo info` exited 0 — the exact version is already live on the
+    /// registry (D-06: the caller should skip publishing this package).
+    AlreadyPublished,
+    /// `cargo info` failed with stderr naming both the missing spec and the
+    /// registry it was looked up in — genuinely not yet published.
+    NotPublished,
+    /// Neither of the above: a network/index failure, a missing-manifest
+    /// error, a signal-terminated process, or unrecognized stderr. Never
+    /// degrades into `NotPublished` (D-05: fail loud, never guess).
+    Ambiguous {
+        /// Bounded, control-character-neutralized detail suitable for a log
+        /// line (T-26-29).
+        detail: String,
+    },
+}
+
+/// Classify a captured `cargo info <name>@<version> --registry crates-io`
+/// result (exit code + stderr) into a [`PublishCheck`]. Pure: no
+/// subprocess, no filesystem, no environment access — the classification
+/// depends only on the two values passed in.
+///
+/// The exit code is coarse — cargo uses `101` for essentially every
+/// non-success outcome (RESEARCH.md Pitfall 3) — so the classification
+/// cannot rest on it; the stderr fragments carry the signal. Those
+/// fragments are documented-by-observation against the pinned toolchain
+/// (`rust-toolchain.toml`), not documented-by-contract, so a future cargo
+/// rewording degrades into `Ambiguous`. That degradation is the safe
+/// direction: `Ambiguous` refuses to publish, while a wrong `NotPublished`
+/// would attempt an irreversible duplicate `cargo publish` (D-05, fail
+/// loud, never guess).
+pub fn classify_cargo_info_result(exit_code: Option<i32>, stderr: &str) -> PublishCheck {
+    if exit_code == Some(0) {
+        return PublishCheck::AlreadyPublished;
+    }
+    let names_missing_spec = stderr.contains("could not find");
+    let names_registry_lookup = stderr.contains("registry");
+    if names_missing_spec && names_registry_lookup {
+        return PublishCheck::NotPublished;
+    }
+    PublishCheck::Ambiguous {
+        detail: crate::version::sanitize_changelog_subject(stderr),
+    }
+}
+
+/// Fixed argv for `cargo info <name>@<version> --registry crates-io`.
+/// Private, pure, returning exactly four elements so the spec form can be
+/// asserted without spawning anything.
+fn cargo_info_args(name: &str, version: &str) -> [String; 4] {
+    [
+        "info".to_string(),
+        format!("{name}@{version}"),
+        "--registry".to_string(),
+        "crates-io".to_string(),
+    ]
+}
+
+/// Errors from the `cargo` publish primitives (`crate_already_published`,
+/// `cargo_publish` — D-04/D-05/D-06).
+#[derive(Debug, thiserror::Error)]
+pub enum PublishError {
+    /// Spawning `cargo` failed outright.
+    #[error("failed to execute cargo: {0}")]
+    Io(#[from] std::io::Error),
+    /// The registry existence check could not be classified as published or
+    /// not-published — the registry check could not be classified, and no
+    /// publish was attempted.
+    #[error(
+        "could not determine whether the crate is already published ({0}) — no publish was attempted"
+    )]
+    Ambiguous(String),
+    /// `cargo publish` itself failed.
+    #[error("cargo publish failed: {0}")]
+    Failed(String),
+}
+
+/// D-06's live-state idempotency check for the publish step — the registry
+/// itself is the progress record; no `.devflow` file tracks publish state.
+/// D-04 requires distinguishing "already published at this version, skip"
+/// from a genuine failure, which is exactly why the ambiguous verdict is an
+/// `Err` and not a `false`. A caller must never treat an `Err` as "probably
+/// not published" and proceed — a duplicate publish is unrecoverable
+/// (D-05).
+///
+/// Spawns `cargo info` with [`cargo_info_args`] as an argv array and
+/// `current_dir(project_root)` so the operator's own workspace-scoped cargo
+/// configuration (registry mirrors, index overrides) applies. A spawn error
+/// propagates through the `#[from]` `Io` variant.
+pub fn crate_already_published(
+    project_root: &Path,
+    name: &str,
+    version: &str,
+) -> Result<bool, PublishError> {
+    let output = Command::new("cargo")
+        .args(cargo_info_args(name, version))
+        .current_dir(project_root)
+        .output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    match classify_cargo_info_result(output.status.code(), &stderr) {
+        PublishCheck::AlreadyPublished => Ok(true),
+        PublishCheck::NotPublished => Ok(false),
+        PublishCheck::Ambiguous { detail } => Err(PublishError::Ambiguous(detail)),
+    }
+}
+
+/// This is the phase's one irreversible operation — a published version can
+/// never be un-published or reused (D-04). The operator's authorization for
+/// running it unattended is recorded in `26-01-SUMMARY.md` Decision 2 as
+/// `automate-publish`, double-confirmed, and is not re-litigated here. A
+/// caller must consult [`crate_already_published`] first, and must treat an
+/// ambiguous result as a stop, never as permission to proceed (D-06, D-05).
+/// The package sequence comes from [`publish_order`] and is never
+/// recomputed here (D-04). On failure nothing is rolled back — whatever
+/// already published stays published, and the fix is forward (D-05).
+///
+/// Never passes `--dry-run`: this primitive exists to actually publish, and
+/// a dry-run default would make the executor silently non-functional while
+/// appearing to work. No retry loop: D-04's discretion note says a single
+/// synchronous check is sufficient, and a retry around an operation that
+/// may have partially succeeded is precisely the compensating-action shape
+/// D-05 forbids.
+pub fn cargo_publish(project_root: &Path, package: &str) -> Result<(), PublishError> {
+    let output = Command::new("cargo")
+        .args(["publish", "-p", package])
+        .current_dir(project_root)
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(PublishError::Failed(
+            crate::version::sanitize_changelog_subject(&stderr_or_status(&output)),
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // tag-signing viability (20d, Pattern 4)
 // ---------------------------------------------------------------------------
 
@@ -2443,5 +2587,154 @@ mod tests {
 
         assert_eq!(inline_key_fingerprint(""), None);
         assert_eq!(inline_key_fingerprint("not a key\n"), None);
+    }
+
+    // -----------------------------------------------------------------
+    // D-04: cargo publish primitives (999.25)
+    // -----------------------------------------------------------------
+
+    /// Row B9 of `26-VALIDATION.md`: table-driven over the six documented
+    /// classification cases, each built from a realistic captured `cargo
+    /// info` stderr, asserting the exact `PublishCheck` variant for each —
+    /// not merely that the ambiguous cases are "not `NotPublished`".
+    #[test]
+    fn publish_check_classifies_exit_codes() {
+        struct Case {
+            label: &'static str,
+            exit_code: Option<i32>,
+            stderr: &'static str,
+            expected: PublishCheck,
+        }
+        let cases = [
+            Case {
+                label: "exit 0 is always AlreadyPublished, whatever stderr says",
+                exit_code: Some(0),
+                stderr: "    Updating crates.io index\nunrelated warning noise",
+                expected: PublishCheck::AlreadyPublished,
+            },
+            Case {
+                label: "non-zero exit with both the missing-spec and registry fragments is NotPublished",
+                exit_code: Some(101),
+                stderr: "error: could not find `devflow-core@0.0.1` in registry `https://github.com/rust-lang/crates.io-index`",
+                expected: PublishCheck::NotPublished,
+            },
+            Case {
+                label: "a fetch/network/index failure is Ambiguous, never NotPublished",
+                exit_code: Some(101),
+                stderr: "error: failed to fetch `https://github.com/rust-lang/crates.io-index`\n\nCaused by:\n  spurious network error",
+                expected: PublishCheck::Ambiguous {
+                    detail: crate::version::sanitize_changelog_subject(
+                        "error: failed to fetch `https://github.com/rust-lang/crates.io-index`\n\nCaused by:\n  spurious network error",
+                    ),
+                },
+            },
+            Case {
+                label: "a missing-manifest error names 'could not find' but not a registry lookup — the discriminating case",
+                exit_code: Some(101),
+                stderr: "error: could not find `Cargo.toml` in `/tmp/somewhere` or any parent directory",
+                expected: PublishCheck::Ambiguous {
+                    detail: "error: could not find `Cargo.toml` in `/tmp/somewhere` or any parent directory".to_string(),
+                },
+            },
+            Case {
+                label: "an absent exit code (signal-terminated) is Ambiguous",
+                exit_code: None,
+                stderr: "cargo: unexpected termination",
+                expected: PublishCheck::Ambiguous {
+                    detail: "cargo: unexpected termination".to_string(),
+                },
+            },
+            Case {
+                label: "an empty stderr is Ambiguous",
+                exit_code: Some(101),
+                stderr: "",
+                expected: PublishCheck::Ambiguous {
+                    detail: String::new(),
+                },
+            },
+        ];
+
+        for case in cases {
+            let actual = classify_cargo_info_result(case.exit_code, case.stderr);
+            assert_eq!(
+                actual, case.expected,
+                "case {:?} failed: got {actual:?}",
+                case.label
+            );
+        }
+    }
+
+    /// Pins the `name@version` spec form without spawning anything.
+    #[test]
+    fn cargo_info_args_targets_the_exact_version_on_crates_io() {
+        assert_eq!(
+            cargo_info_args("devflow-core", "2.1.0"),
+            [
+                "info".to_string(),
+                "devflow-core@2.1.0".to_string(),
+                "--registry".to_string(),
+                "crates-io".to_string(),
+            ]
+        );
+    }
+
+    /// D-04/D-05/D-06: the ambiguous verdict must surface as a typed `Err`,
+    /// never a boolean, and the detail it carries must already be bounded
+    /// and control-character-free (T-26-29) — asserted on the value the
+    /// error actually stores, not on the sanitizer in isolation.
+    #[test]
+    fn crate_already_published_surfaces_an_ambiguous_check_as_an_error() {
+        let control_heavy_stderr = format!("error: failed to fetch\u{0007}{}", "x".repeat(400));
+        let check = classify_cargo_info_result(Some(101), &control_heavy_stderr);
+        let PublishCheck::Ambiguous { detail } = check else {
+            panic!("expected Ambiguous, got a different PublishCheck variant");
+        };
+        let error = PublishError::Ambiguous(detail);
+        let PublishError::Ambiguous(stored) = error else {
+            unreachable!("just constructed as Ambiguous");
+        };
+        assert!(
+            !stored.chars().any(char::is_control),
+            "stored ambiguous detail retained a control character: {stored:?}"
+        );
+        assert!(
+            stored.chars().count() <= crate::version::CHANGELOG_SUBJECT_MAX_CHARS,
+            "stored ambiguous detail exceeded CHANGELOG_SUBJECT_MAX_CHARS: {} chars",
+            stored.chars().count()
+        );
+    }
+
+    /// Structurally cannot publish anything: the fixture directory contains
+    /// no `Cargo.toml`, so `cargo publish` fails before contacting any
+    /// registry. No test in this repository exercises `cargo_publish`'s
+    /// success path deliberately — `26-VALIDATION.md` § "Manual-Only
+    /// Verifications" row 2 is where that coverage lives, via a real
+    /// operator-run publish.
+    #[test]
+    fn cargo_publish_reports_a_failure_without_publishing_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert!(
+            !root.join("Cargo.toml").exists(),
+            "fixture must contain no Cargo.toml so this test cannot possibly publish"
+        );
+
+        let result = cargo_publish(root, "definitely-not-a-real-package-name");
+
+        match result {
+            Err(PublishError::Failed(detail)) => {
+                assert!(!detail.is_empty(), "expected a non-empty failure detail");
+                assert!(
+                    !detail.chars().any(char::is_control),
+                    "failure detail retained a control character: {detail:?}"
+                );
+                assert!(
+                    detail.chars().count() <= crate::version::CHANGELOG_SUBJECT_MAX_CHARS,
+                    "failure detail exceeded CHANGELOG_SUBJECT_MAX_CHARS: {} chars",
+                    detail.chars().count()
+                );
+            }
+            other => panic!("expected Err(PublishError::Failed(_)), got {other:?}"),
+        }
     }
 }
