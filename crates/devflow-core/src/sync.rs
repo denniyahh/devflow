@@ -501,4 +501,75 @@ pub(crate) mod tests {
             "remote develop must be unchanged on the already-synced no-op path"
         );
     }
+
+    /// B4. A merge that changes develop's tree is refused BEFORE pushing
+    /// (script check 8, D-09, D-05) — asserting the remote ref is
+    /// byte-identical before and after, which a warn-and-push
+    /// implementation could not satisfy.
+    #[test]
+    fn aborts_on_tree_mismatch() {
+        let fixture = init_repo();
+        let root = fixture.path();
+        let bare = init_bare_remote(root);
+        let flow = GitFlow::new(root);
+        flow.push_ref("main").expect("push main to bare remote");
+        flow.push_ref(DEVELOP).expect("push develop to bare remote");
+
+        // Clone the bare remote into a second working directory, add a NEW
+        // file that exists on neither branch, commit it on main, and push
+        // it — `-X ours` has no conflict to resolve, so the file merges in
+        // cleanly and changes develop's tree.
+        let clone_dir = tempfile::tempdir().unwrap();
+        let clone_root = clone_dir.path();
+        git(
+            Path::new("."),
+            &[
+                "clone",
+                "-q",
+                bare.path().to_str().unwrap(),
+                clone_root.to_str().unwrap(),
+            ],
+        );
+        git(clone_root, &["config", "user.email", "test@example.com"]);
+        git(clone_root, &["config", "user.name", "Test"]);
+        git(clone_root, &["config", "commit.gpgsign", "false"]);
+        git(clone_root, &["checkout", "-q", "main"]);
+        commit_file(clone_root, "new-from-main.txt", "brand new");
+        GitFlow::new(clone_root)
+            .push_ref("main")
+            .expect("push main from clone");
+
+        let before_remote_develop = rev_parse(bare.path(), "refs/heads/develop");
+
+        let rendered = match sync_main_to_develop(root) {
+            Err(
+                ref err @ SyncError::TreeChanged {
+                    ref before_tree,
+                    ref after_tree,
+                },
+            ) => {
+                assert!(!before_tree.is_empty(), "before_tree must be non-empty");
+                assert!(!after_tree.is_empty(), "after_tree must be non-empty");
+                assert_ne!(
+                    before_tree, after_tree,
+                    "before_tree and after_tree must differ on a tree-changing merge"
+                );
+                let rendered = err.to_string();
+                assert!(
+                    rendered.contains(before_tree.as_str())
+                        && rendered.contains(after_tree.as_str()),
+                    "rendered TreeChanged message must name both SHAs: {rendered}"
+                );
+                rendered
+            }
+            other => panic!("expected Err(SyncError::TreeChanged {{ .. }}), got {other:?}"),
+        };
+        assert!(!rendered.is_empty());
+
+        assert_eq!(
+            rev_parse(bare.path(), "refs/heads/develop"),
+            before_remote_develop,
+            "the remote develop ref must be byte-identical before and after a refused merge — nothing was pushed"
+        );
+    }
 }
