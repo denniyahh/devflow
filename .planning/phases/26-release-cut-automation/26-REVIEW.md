@@ -568,3 +568,33 @@ seven patches: the executor treats *issuing* a step as *completing* it, and
 carries no durable record of what has already mutated external state. A
 persisted step ledger that survives failure would address C-02, C-03, and C-04
 together, and would give C-01 a safe refusal point.
+
+---
+
+## Gap-closure plans filed 2026-07-30 — and what they deliberately leave open
+
+Both escalations above are now unblocked by recorded operator decisions
+(`26-CONTEXT.md`, commit `0e5df91`) and have plans, not fixes:
+
+| Plan | Closes | Unblocked by |
+|------|--------|--------------|
+| `26-08-PLAN.md` | **C-02** — a failed publish step is unresumable | **D-06a**, which amends D-06 to permit a persisted step ledger for the release-executor resume path only, with live git/registry state winning on any disagreement |
+| `26-09-PLAN.md` | **C-06** — `project_root` silently retargets to an ancestor repository | **D-13**, which requires mutating commands to refuse when the resolved root differs from the invoking directory, while read-only commands keep the upward walk |
+
+**Considered and deliberately left out of both plans**, so a later reader knows
+they were not overlooked: **WR-02** (`release_tag_state` accepts a strict
+descendant rather than an exact match), **WR-04** (publish-existence resting on
+fragile `cargo info` stderr substring matching), **WR-05**
+(`classify_validate_outcome` accepting `verdict: Pass` without checking
+`status == Success`), **WR-06**, **WR-07**, and **IN-01**
+(`hooks_after_ship`'s `version_bump` and the executor's signed tag sharing the
+`v{version}` tag namespace through two independent code paths). None of them is
+a prerequisite for C-02 or C-06, and folding any of them in would put these two
+plans in file contention with each other; they remain open and unassigned.
+
+**W-17 remains open and is not a code change.** The live `develop` ruleset is
+`enforcement: active` with an empty bypass list, so the direct push in step 1
+cannot land against this repository today, and all three `26-UAT.md` items are
+gated on that precondition. It is a repository-settings action for the operator.
+Neither 26-08 nor 26-09 changes it, and neither can be UAT-verified against the
+real `origin` until it is resolved.
