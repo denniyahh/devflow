@@ -211,8 +211,21 @@ fn parse_bare_version(text: &str) -> Result<crate::version::Version, ReleaseErro
         .map_err(ReleaseError::Version)
 }
 
-/// Run the release-cut sequence end to end (Tasks 1-3 implement the five
-/// steps incrementally; see the module doc comment for the full contract).
+/// Run the release-cut sequence end to end: compute (or resume) the release
+/// version; write it and push `develop` directly to `origin` (step 1,
+/// D-01/D-08); halt cleanly at the `develop`->`main` human gate until
+/// `origin/main` declares the release version (step 2, D-02); create, push,
+/// and independently re-verify the real signed release tag (step 3, D-10);
+/// sync `origin/main` back into `develop` via the identical
+/// [`crate::sync::sync_main_to_develop`] the standalone `devflow sync`
+/// subcommand calls (step 4, D-07); and publish each
+/// [`crate::git::publish_order`] package to crates.io, gated by a live
+/// registry existence check (step 5, D-04, the one irreversible operation in
+/// the sequence — see `26-01-SUMMARY.md` Decision 2 for the operator's
+/// standing authorization to run it unattended). Every step's own live-state
+/// predicate makes it independently resumable (D-06); nothing is ever rolled
+/// back on any failure (D-05) — see the module doc comment for the complete
+/// contract.
 pub fn execute_release(project_root: &Path) -> Result<ReleaseReport, ReleaseError> {
     // Entry guards, before any mutation, mirroring
     // `crate::sync::sync_main_to_develop`'s own guard order.
@@ -464,7 +477,73 @@ pub fn execute_release(project_root: &Path) -> Result<ReleaseReport, ReleaseErro
         }
     }
 
-    // Task 3 adds steps 4-5 (sync, publish) here.
+    // Step 4: sync origin/main back into develop — D-07's second entry
+    // point into the identical `sync_main_to_develop` implementation the
+    // standalone `devflow sync` subcommand calls. No option is passed and no
+    // part of the sync logic is reimplemented here.
+    match crate::sync::sync_main_to_develop(project_root) {
+        Ok(crate::sync::SyncOutcome::AlreadyAncestor) => {
+            steps.push(StepReport {
+                step: ReleaseStep::Sync,
+                status: StepStatus::Skipped,
+                detail: sanitize_changelog_subject(
+                    "origin/main is already an ancestor of develop — nothing to sync",
+                ),
+            });
+        }
+        Ok(crate::sync::SyncOutcome::Merged { merge_commit }) => {
+            steps.push(StepReport {
+                step: ReleaseStep::Sync,
+                status: StepStatus::Completed,
+                detail: sanitize_changelog_subject(&format!(
+                    "merged origin/main back into develop at {merge_commit}"
+                )),
+            });
+        }
+        Err(err) => return Err(ReleaseError::Sync(err)),
+    }
+
+    // Step 5: publish (D-04) — the one irreversible operation in the
+    // sequence. `publish_order`'s sequence is consulted exactly once and
+    // never sorted or reordered. An unclassifiable registry check stops the
+    // run immediately, before publishing anything further — never treated
+    // as permission to proceed (D-05).
+    let packages = crate::git::publish_order(project_root);
+    if packages.is_empty() {
+        steps.push(StepReport {
+            step: ReleaseStep::Publish,
+            status: StepStatus::Skipped,
+            detail: sanitize_changelog_subject(
+                "no workspace members were resolved by publish_order — nothing to publish",
+            ),
+        });
+    } else {
+        for package in &packages {
+            match crate::git::crate_already_published(project_root, package, &version.to_string()) {
+                Ok(true) => {
+                    steps.push(StepReport {
+                        step: ReleaseStep::Publish,
+                        status: StepStatus::Skipped,
+                        detail: sanitize_changelog_subject(&format!(
+                            "{package}@{version} is already published"
+                        )),
+                    });
+                }
+                Ok(false) => {
+                    crate::git::cargo_publish(project_root, package)?;
+                    steps.push(StepReport {
+                        step: ReleaseStep::Publish,
+                        status: StepStatus::Completed,
+                        detail: sanitize_changelog_subject(&format!(
+                            "published {package}@{version}"
+                        )),
+                    });
+                }
+                Err(err) => return Err(ReleaseError::Publish(err)),
+            }
+        }
+    }
+
     Ok(ReleaseReport {
         version: version.to_string(),
         tag,
@@ -904,5 +983,169 @@ mod tests {
             object_type, "commit",
             "the tag must still be lightweight — never turned into an annotated tag"
         );
+    }
+
+    /// The full sequence, completed in one call: version bump (already
+    /// satisfied — Skipped), tag (Absent — Completed), sync (Skipped — see
+    /// below), publish (empty `publish_order` — Skipped).
+    ///
+    /// `main` is fast-forwarded to `develop`'s own tip (same commit, same
+    /// content) rather than given a separate squash-shaped commit, and NO
+    /// tag is pre-created. Both choices are load-bearing, not arbitrary:
+    /// `compute_version`'s baseline scan is reachability-blind for
+    /// `highest_semver_tag` but reachability-scoped for
+    /// `reachable_semver_baseline` — a tag already reachable from `develop`
+    /// (as any tag on a commit that IS `develop`'s ancestor would be) is
+    /// treated as an ALREADY-COMPLETE prior release, and `compute_version`
+    /// derives the NEXT version past it (see the module doc comment's
+    /// documented consequence) — which `origin/main`'s still-unchanged
+    /// content could then never match at step 2. Avoiding a pre-existing
+    /// tag sidesteps that entirely: this fixture models the ordinary,
+    /// non-squashed case (`develop` and `main` coincide, no release cut yet)
+    /// where `origin/main` being an ancestor of `develop` and the tag being
+    /// `Absent` are simultaneously true and internally consistent.
+    #[test]
+    fn completes_the_sequence_and_reports_every_step() {
+        let repo = init_repo();
+        let root = repo.path();
+        let _bare = init_bare_remote(root);
+        let _keys = crate::git::tests::configure_ssh_tag_signing(root);
+        let flow = GitFlow::new(root);
+
+        commit_file(
+            root,
+            "Cargo.toml",
+            &workspace_cargo_toml("0.0.1"),
+            "chore: add version file",
+        );
+        flow.push_ref(DEVELOP)
+            .expect("push develop with version file");
+        commit_file(root, "feature.txt", "feature", "feat: add a feature");
+
+        let version = crate::version::compute_version(root).expect("compute_version");
+        let version_str = version.to_string();
+        crate::version::write_version(root, &version).expect("write_version");
+        crate::git::GitFlow::new(root)
+            .commit_path(
+                "Cargo.toml",
+                &format!("chore: bump version to {version_str}"),
+            )
+            .expect("commit version bump");
+        flow.push_ref(DEVELOP)
+            .expect("push develop with release version");
+
+        // main: fast-forward to develop's exact tip — origin/main is
+        // trivially an ancestor of develop (self-ancestor), and no tag
+        // exists yet anywhere in the repo.
+        flow.checkout("main").expect("checkout main");
+        crate::test_support::git_command(root)
+            .args(["merge", "--ff-only", DEVELOP])
+            .status()
+            .expect("fast-forward main to develop");
+        flow.push_ref("main").expect("push main");
+        flow.checkout(DEVELOP).expect("checkout develop");
+
+        let report = execute_release(root).expect("execute_release must succeed");
+        assert_eq!(report.outcome, ReleaseOutcome::Completed);
+
+        let step_order: Vec<ReleaseStep> = report.steps.iter().map(|s| s.step).collect();
+        assert_eq!(
+            step_order,
+            vec![
+                ReleaseStep::VersionBump,
+                ReleaseStep::Tag,
+                ReleaseStep::Sync,
+                ReleaseStep::Publish,
+            ],
+            "expected one entry per ReleaseStep in sequence order: {step_order:?}"
+        );
+    }
+
+    /// Reuse 26-04's own tree-mismatch construction (`aborts_on_tree_mismatch`
+    /// in `sync.rs`) on top of Task 2's already-released-tag fixture shape:
+    /// `origin/main` carries one extra file `develop` lacks, added BEFORE the
+    /// release tag is created so the tag correctly names the tip the sync's
+    /// `-X ours` merge will actually pull in (adding the file afterward would
+    /// leave `origin/main`'s freshly-fetched tip ahead of the tag, making
+    /// step 3 see `Mismatched` instead of `Released` and never reach sync at
+    /// all).
+    #[test]
+    fn a_refused_sync_stops_the_run_before_publishing() {
+        let repo = init_repo();
+        let root = repo.path();
+        let _bare = init_bare_remote(root);
+        let _keys = crate::git::tests::configure_ssh_tag_signing(root);
+        let flow = GitFlow::new(root);
+
+        commit_file(
+            root,
+            "Cargo.toml",
+            &workspace_cargo_toml("0.0.1"),
+            "chore: add version file",
+        );
+        flow.push_ref(DEVELOP)
+            .expect("push develop with version file");
+        commit_file(root, "feature.txt", "feature", "feat: add a feature");
+
+        let version = crate::version::compute_version(root).expect("compute_version");
+        let version_str = version.to_string();
+        let tag_name = format!("v{version_str}");
+
+        flow.checkout("main").expect("checkout main");
+        commit_file(
+            root,
+            "Cargo.toml",
+            &workspace_cargo_toml(&version_str),
+            &format!("chore: release {version_str} (squash)"),
+        );
+        // The extra file develop lacks, added BEFORE the tag so the tag
+        // names the tip the sync merge will actually pull in.
+        commit_file(
+            root,
+            "new-from-main.txt",
+            "brand new",
+            "chore: main-only file",
+        );
+        flow.push_ref("main")
+            .expect("push main with release version and extra file");
+        let main_tip = rev_parse(root, "main");
+
+        crate::git::create_signed_release_tag(root, &tag_name, &main_tip)
+            .expect("create_signed_release_tag");
+        flow.push_ref(&tag_name).expect("push release tag");
+
+        flow.checkout(DEVELOP).expect("checkout develop");
+        crate::version::write_version(root, &version).expect("write_version");
+        crate::git::GitFlow::new(root)
+            .commit_path(
+                "Cargo.toml",
+                &format!("chore: bump version to {version_str}"),
+            )
+            .expect("commit version bump");
+        flow.push_ref(DEVELOP)
+            .expect("push develop with release version");
+
+        let result = execute_release(root);
+        let err = result.expect_err("execute_release must fail on a tree-changing sync");
+        match &err {
+            ReleaseError::Sync(crate::sync::SyncError::TreeChanged {
+                before_tree,
+                after_tree,
+            }) => {
+                assert_ne!(before_tree, after_tree);
+                let rendered = err.to_string();
+                assert!(
+                    rendered.contains(before_tree) && rendered.contains(after_tree),
+                    "rendered TreeChanged refusal must name both SHAs: {rendered}"
+                );
+            }
+            other => panic!(
+                "expected Err(ReleaseError::Sync(SyncError::TreeChanged {{ .. }})), got {other:?}"
+            ),
+        }
+        // No Ok(ReleaseReport) was ever produced on this path, so — by
+        // construction, since `ReleaseError` carries no `steps` field — no
+        // Publish step report could possibly have been produced either; the
+        // failure happened at the sync step, before step 5 is ever reached.
     }
 }
