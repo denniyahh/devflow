@@ -5670,6 +5670,107 @@ mod tests {
             assert!(!tag_exists_and_reachable(dir.path(), "v9.9.9", "main"));
         }
 
+        // -----------------------------------------------------------------
+        // 27-04 (D-01/D-03): tag_exists_and_reachable's two direct sites
+        // (base-commit lines 2886, 2892) now scrubbed via the git_command
+        // constructor, called with project_root
+        // -----------------------------------------------------------------
+
+        /// D-01/D-03: `tag_exists_and_reachable` produces the correct,
+        /// non-hijacked answer for `project_root` even when a hostile
+        /// `GIT_DIR` points at an unrelated foreign repository that DOES
+        /// carry a tag by the name under test — the dangerous, false-positive
+        /// direction T-27-01 names explicitly (a foreign repository
+        /// asserting a release tag already exists feeds a release-cut
+        /// decision). `GIT_DIR` is genuinely present in a process's
+        /// environment for this proof — never via `std::env::set_var` on
+        /// THIS test's own process (Rust 2024 `unsafe`, unsound under
+        /// threaded tests — Phase 25 D-14, and the plan's own instruction).
+        /// Instead it is set only on a freshly spawned CHILD process: this
+        /// same test binary, re-invoked filtered to just this one test —
+        /// the same "spawned child only" shape used by
+        /// `staleness::tests::embedded_commit_is_stale_resolves_execution_root_under_a_hostile_git_dir`
+        /// (27-04), needed here for the identical reason:
+        /// `tag_exists_and_reachable` is a private function with no
+        /// injection point of its own, and its two git subcommands
+        /// (`rev-parse --verify`, `merge-base --is-ancestor`) are both
+        /// ref-resolving — the class 27-01-SUMMARY.md Deviation 1 verified
+        /// (git 2.55.0) genuinely honors a `GIT_DIR` chained directly onto a
+        /// `git_command`-built Command, so a literal reproduction of that
+        /// shape against the real function would prove nothing specific to
+        /// it.
+        #[test]
+        fn tag_exists_and_reachable_resolves_caller_root_under_a_hostile_git_dir() {
+            const INNER_ROOT: &str = "DEVFLOW_27_04_TAG_INNER_ROOT";
+            const INNER_TAG: &str = "DEVFLOW_27_04_TAG_INNER_TAG";
+            const INNER_BASE: &str = "DEVFLOW_27_04_TAG_INNER_BASE";
+
+            if let Ok(root) = std::env::var(INNER_ROOT) {
+                // Inner mode: this process was spawned by the outer half
+                // below with GIT_DIR pointed at a foreign repository that
+                // DOES carry the tag under test — scoped to this child
+                // process only.
+                let tag = std::env::var(INNER_TAG).expect("inner tag env set by parent");
+                let base = std::env::var(INNER_BASE).expect("inner base env set by parent");
+                assert!(
+                    !tag_exists_and_reachable(Path::new(&root), &tag, &base),
+                    "a hostile GIT_DIR pointed at a foreign repository that DOES \
+                     carry this tag must not cause tag_exists_and_reachable to \
+                     report it as belonging to project_root"
+                );
+                return;
+            }
+
+            // Outer mode: build the real repository with a base branch and
+            // NO tag by the name under test, plus a second, unrelated
+            // foreign repository (reusing init_tagged_repo verbatim) that
+            // DOES carry that tag, reachable from its own base branch — the
+            // dangerous direction.
+            let real = tempfile::tempdir().unwrap();
+            let real_root = real.path();
+            let git = |args: &[&str]| {
+                assert!(
+                    devflow_core::test_support::git_command(real_root)
+                        .args(args)
+                        .output()
+                        .unwrap()
+                        .status
+                        .success(),
+                    "git {args:?} failed"
+                );
+            };
+            git(&["init", "-q", "-b", "main"]);
+            git(&["config", "user.email", "t@e.st"]);
+            git(&["config", "user.name", "t"]);
+            git(&["config", "commit.gpgsign", "false"]);
+            git(&["config", "core.hooksPath", "/dev/null"]);
+            std::fs::write(real_root.join("a.txt"), "one").unwrap();
+            git(&["add", "."]);
+            git(&["commit", "-q", "-m", "base"]);
+            // real_root deliberately carries no tag named v1.7.0.
+
+            let foreign = tempfile::tempdir().unwrap();
+            init_tagged_repo(foreign.path());
+
+            let exe = std::env::current_exe().expect("current_exe for child re-invocation");
+            let status = std::process::Command::new(&exe)
+                .arg("tag_exists_and_reachable_resolves_caller_root_under_a_hostile_git_dir")
+                .arg("--test-threads=1")
+                .env(INNER_ROOT, real_root.to_str().unwrap())
+                .env(INNER_TAG, "v1.7.0")
+                .env(INNER_BASE, "main")
+                .env("GIT_DIR", foreign.path().join(".git"))
+                .status()
+                .expect("spawn hostile child test process");
+            assert!(
+                status.success(),
+                "child test process (hostile GIT_DIR pointed at a foreign repo \
+                 that DOES carry v1.7.0) must still report \
+                 tag_exists_and_reachable == false for the real repository; \
+                 child exit status {status:?}"
+            );
+        }
+
         /// D-05/D-04: a MISSING `.planning/ROADMAP.md`/`STATE.md` must yield
         /// no findings and never an error — `doctor` must not fabricate a
         /// `Problem` from an absent doc. Proven against a tempdir with no
