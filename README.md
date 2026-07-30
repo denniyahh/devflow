@@ -41,18 +41,40 @@ DevFlow handles all of this. You say `devflow start --phase 3 --agent claude --m
 > `develop` → `main` commit has no parent link back to `develop`, so `develop`
 > never learns `main` moved and your *next* release will conflict against a
 > stale merge-base. `devflow release --check` detects this (`origin/main is
-> NOT an ancestor of HEAD`); repair it the same way `devflow sync` does:
+> NOT an ancestor of HEAD`).
+>
+> **Prefer `devflow sync`.** If you must repair it by hand, the procedure below
+> is what `devflow sync` actually does — including the one check it treats as
+> non-negotiable (`sync.rs`: the merge must not change `develop`'s tree). Do not
+> skip it: `-X ours` resolves *conflicting* hunks in `develop`'s favour, but a
+> file that exists only on `main` is not a conflict and gets pulled in, and a
+> merge that alters `develop`'s tree must be aborted, never pushed.
 >
 > ```bash
 > git checkout develop
-> git merge -X ours origin/main      # -X ours: develop's content wins; history-link only
-> # verify this changed nothing:
-> git diff --stat origin/main..HEAD  # inspect before pushing
+> git fetch origin main develop            # sync operates on fresh refs, not stale ones
+> before=$(git rev-parse 'HEAD^{tree}')    # capture develop's tree BEFORE
+> git merge -X ours origin/main --no-edit -m "merge: sync main back into develop after release"
+> after=$(git rev-parse 'HEAD^{tree}')
+> # The non-negotiable check: the merge must be content-neutral.
+> if [ "$before" != "$after" ]; then
+>   echo "ABORT: the merge changed develop's tree — do not push" >&2
+>   git reset --hard "@{u}"                # discard the merge; investigate by hand
+> else
+>   git push origin develop                # never --force
+> fi
 > ```
 >
 > Confirm it worked with `git merge-base --is-ancestor origin/main origin/develop`.
 > A real merge is required — squashing this step collapses the two parents and
 > discards the link, which is the whole point.
+>
+> Do **not** substitute `git diff --stat origin/main..HEAD` as the verification
+> step. It is an inverted signal here: in the failing case — where the merge
+> pulled `main`-only content into `develop` — that diff gets *smaller*, so
+> reading "this changed nothing" as success reports success precisely when the
+> merge has clobbered tree state. Compare `HEAD^{tree}` before and after, as
+> above.
 
 ## Quick Start
 
