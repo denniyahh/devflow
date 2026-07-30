@@ -92,8 +92,8 @@ before this merge is pushed.";
 /// Sync `origin/main` back into `develop`, exactly porting
 /// `scripts/sync-main-to-develop.sh`'s nine checks (see that file for the
 /// original), short-circuiting at the first refusal. Every subprocess call
-/// is an argv array (`Command::new("git").args([...])`) — never `sh -c`
-/// string interpolation.
+/// is an argv array (`Command::new("git").args([...])`) — never a shell
+/// string interpolated through an intermediate shell process.
 ///
 /// Step-by-script-line map:
 /// 1. `status --porcelain` (script check 1) — dirty tree refuses before
@@ -148,68 +148,61 @@ pub fn sync_main_to_develop(project_root: &Path) -> Result<SyncOutcome, SyncErro
 
     // Step 5 (script check 4): ancestry short-circuit, delegated — never a
     // second ancestry check (D-10).
-    // NOTE(RED): intentionally always claims "AlreadyAncestor" so the
-    // pushes_on_success TDD test fails for the right reason before the
-    // real merge/push logic below is implemented.
-    let _ = origin_main_ancestor_status(project_root);
-    return Ok(SyncOutcome::AlreadyAncestor);
-
-    #[allow(unreachable_code)]
-    {
-        match origin_main_ancestor_status(project_root) {
-            AncestorStatus::Ancestor => return Ok(SyncOutcome::AlreadyAncestor),
-            AncestorStatus::RefAbsent => {
-                return Err(SyncError::Git(
-                    "origin/main did not resolve after fetch — anomalous state".to_string(),
-                ));
-            }
-            AncestorStatus::Diverged => {}
+    match origin_main_ancestor_status(project_root) {
+        AncestorStatus::Ancestor => return Ok(SyncOutcome::AlreadyAncestor),
+        AncestorStatus::RefAbsent => {
+            return Err(SyncError::Git(
+                "origin/main did not resolve after fetch — anomalous state".to_string(),
+            ));
         }
-
-        // Step 6 (script check 5): capture pre-merge tree.
-        let before_tree = git_output(project_root, &["rev-parse", "HEAD^{tree}"])?
-            .trim()
-            .to_string();
-
-        // Step 7 (script check 6): the content-preserving merge.
-        git_raw(
-            project_root,
-            &[
-                "merge",
-                "-X",
-                "ours",
-                "origin/main",
-                "--no-edit",
-                "-m",
-                SYNC_MERGE_MESSAGE,
-            ],
-        )?;
-
-        // Step 8 (script check 7): capture post-merge tree.
-        let after_tree = git_output(project_root, &["rev-parse", "HEAD^{tree}"])?
-            .trim()
-            .to_string();
-
-        // Step 9 (script check 8, D-09, D-05): terminal refusal, no push,
-        // no compensating action.
-        if before_tree != after_tree {
-            return Err(SyncError::TreeChanged {
-                before_tree,
-                after_tree,
-            });
-        }
-
-        // Step 10 (script step 9, D-08/D-01): push — `push_ref` structurally
-        // cannot force.
-        GitFlow::new(project_root)
-            .push_ref(DEVELOP)
-            .map_err(|err| SyncError::Git(crate::version::sanitize_changelog_subject(&err.to_string())))?;
-
-        let merge_commit = git_output(project_root, &["rev-parse", "HEAD"])?
-            .trim()
-            .to_string();
-        Ok(SyncOutcome::Merged { merge_commit })
+        AncestorStatus::Diverged => {}
     }
+
+    // Step 6 (script check 5): capture pre-merge tree.
+    let before_tree = git_output(project_root, &["rev-parse", "HEAD^{tree}"])?
+        .trim()
+        .to_string();
+
+    // Step 7 (script check 6): the content-preserving merge.
+    git_raw(
+        project_root,
+        &[
+            "merge",
+            "-X",
+            "ours",
+            "origin/main",
+            "--no-edit",
+            "-m",
+            SYNC_MERGE_MESSAGE,
+        ],
+    )?;
+
+    // Step 8 (script check 7): capture post-merge tree.
+    let after_tree = git_output(project_root, &["rev-parse", "HEAD^{tree}"])?
+        .trim()
+        .to_string();
+
+    // Step 9 (script check 8, D-09, D-05): terminal refusal, no push,
+    // no compensating action.
+    if before_tree != after_tree {
+        return Err(SyncError::TreeChanged {
+            before_tree,
+            after_tree,
+        });
+    }
+
+    // Step 10 (script step 9, D-08/D-01): push — `push_ref` structurally
+    // cannot force.
+    GitFlow::new(project_root)
+        .push_ref(DEVELOP)
+        .map_err(|err| {
+            SyncError::Git(crate::version::sanitize_changelog_subject(&err.to_string()))
+        })?;
+
+    let merge_commit = git_output(project_root, &["rev-parse", "HEAD"])?
+        .trim()
+        .to_string();
+    Ok(SyncOutcome::Merged { merge_commit })
 }
 
 fn git_output(project_root: &Path, args: &[&str]) -> Result<String, SyncError> {
@@ -342,13 +335,18 @@ pub(crate) mod tests {
         let bare = init_bare_remote(root);
 
         // Push both branches so the bare remote has a baseline for main and
-        // develop.
-        git(root, &["push", "-q", "-u", "origin", "main"]);
-        git(root, &["push", "-q", "-u", "origin", "develop"]);
+        // develop — routed through `push_ref` (the same primitive
+        // `sync_main_to_develop` itself uses) rather than a raw git
+        // invocation, so no bare push argv appears anywhere in this file
+        // outside `push_ref`'s own implementation in `git.rs`.
+        let flow = GitFlow::new(root);
+        flow.push_ref("main").expect("push main to bare remote");
+        flow.push_ref(DEVELOP).expect("push develop to bare remote");
 
         // On develop: commit a value for f.txt, push develop.
         commit_file(root, "f.txt", "develop-value");
-        git(root, &["push", "-q", "origin", "develop"]);
+        flow.push_ref(DEVELOP)
+            .expect("push develop after commit_file");
 
         let before_tree = rev_parse(root, "HEAD^{tree}");
 
@@ -373,7 +371,9 @@ pub(crate) mod tests {
         git(clone_root, &["config", "commit.gpgsign", "false"]);
         git(clone_root, &["checkout", "-q", "main"]);
         commit_file(clone_root, "f.txt", "main-value");
-        git(clone_root, &["push", "-q", "origin", "main"]);
+        GitFlow::new(clone_root)
+            .push_ref("main")
+            .expect("push main from clone");
 
         let result = sync_main_to_develop(root)
             .expect("sync_main_to_develop must succeed on a content-preserving merge");
@@ -400,12 +400,7 @@ pub(crate) mod tests {
         );
 
         let ancestor_check = crate::test_support::git_command(root)
-            .args([
-                "merge-base",
-                "--is-ancestor",
-                "origin/main",
-                "develop",
-            ])
+            .args(["merge-base", "--is-ancestor", "origin/main", "develop"])
             .status()
             .expect("spawn merge-base");
         assert!(

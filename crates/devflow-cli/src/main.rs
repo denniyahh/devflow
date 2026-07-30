@@ -26,7 +26,7 @@ mod commands;
 use commands::{
     cleanup, doctor, evidence, gate_list, gate_respond, gate_show, gate_sweep, history_cmd, list,
     logs, recover_cmd, reference, release_check, resolve_gate_target, start, status, stop,
-    test_cmd,
+    sync_cmd, test_cmd,
 };
 
 mod config_parse;
@@ -236,6 +236,19 @@ enum Command {
         /// treated as a valid run.
         #[arg(long)]
         check: bool,
+        /// Project root.
+        #[arg(default_value = ".")]
+        project: PathBuf,
+    },
+    /// Sync `main` back into `develop` after a release.
+    ///
+    /// Direct-pushes `origin/develop` (D-08) — refuses on a dirty working
+    /// tree or when not checked out on `develop`, and is a no-op when
+    /// `origin/main` is already an ancestor of `develop`. The Rust port of
+    /// `scripts/sync-main-to-develop.sh`; the same `sync_main_to_develop`
+    /// function this subcommand calls is also the release executor's own
+    /// sync step (D-07, 999.52).
+    Sync {
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
@@ -584,6 +597,7 @@ fn run() -> Result<(), CliError> {
             }
             release_check(&project_root(project)?)
         }
+        Command::Sync { project } => sync_cmd(&project_root(project)?),
         Command::Ship {
             phase,
             force,
