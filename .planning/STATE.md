@@ -5,15 +5,15 @@ milestone_name: milestone (open — no fixed closing phase)
 current_phase: 999.1
 current_phase_name: end-to-end-dogfood-blockers
 status: Phase 25 released as v2.1.0
-stopped_at: Phase 26 context gathered
-last_updated: "2026-07-29T18:24:24.542Z"
+stopped_at: Phase 27 context gathered
+last_updated: "2026-07-30T17:00:40.143Z"
 last_activity: 2026-07-28
 progress:
-  total_phases: 15
+  total_phases: 16
   completed_phases: 14
   total_plans: 112
   completed_plans: 112
-  percent: 93
+  percent: 88
 last_activity_desc: Phase 25 complete (10/10 verified, ledger 0 open). NOT advanced to 999.1 — phase.complete's next-phase detection again picked up the 999.1 backlog heading as if sequential (same bug corrected after Phase 20, recorded in the history log below). Backlog items require /gsd-review-backlog promotion.
 ---
 
@@ -831,6 +831,6 @@ None currently open for Phase 17.
 
 ## Session
 
-**Last session:** 2026-07-29T18:24:24.440Z
-**Stopped at:** Phase 26 context gathered
-**Resume file:** .planning/phases/26-release-cut-automation/26-CONTEXT.md
+**Last session:** 2026-07-30T17:00:40.076Z
+**Stopped at:** Phase 27 context gathered
+**Resume file:** .planning/phases/27-scrub-redirecting-git-environment-from-production-calls/27-CONTEXT.md
