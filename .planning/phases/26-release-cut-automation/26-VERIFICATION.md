@@ -1,49 +1,31 @@
 ---
 phase: 26-release-cut-automation
-verified: 2026-07-29T23:45:00Z
-status: gaps_found
-score: 6/11 must-haves verified
+verified: 2026-07-30T03:10:00Z
+status: human_needed
+score: 11/11 must-haves verified
 behavior_unverified: 0
 overrides_applied: 0
-gaps:
-  - truth: "`devflow release` executes the release-cut sequence (version bump -> direct push develop -> release PR -> signed tag -> sync -> publish), not just the read-only `--check` preflight."
-    status: failed
-    reason: "`devflow release` (crates/devflow-cli/src/main.rs:572-586) still hard-rejects any invocation without `--check` with the message \"the release-cut executor (merge PR -> tag -> sync develop -> publish) is deferred (DEN-50) and not yet built.\" Behavior is byte-identical to Phase 20's 20d --check-only preflight; this is the phase's headline deliverable and it does not exist."
-    artifacts:
-      - path: "crates/devflow-cli/src/main.rs"
-        issue: "Command::Release has no --execute path; only `check: bool` exists, and a false value is rejected outright."
-    missing:
-      - "A `--execute` code path on `devflow release` that actually runs version bump -> push -> tag -> sync -> publish."
-      - "The `Release { execute, yes_release }` fields and `--execute`/`--yes-release` flags that 26-03-PLAN.md's own \"Artifacts this phase produces\" section declares as in-scope for this phase."
-  - truth: "A `devflow sync` subcommand exists, both standalone and executor-internal (999.52)."
-    status: failed
-    reason: "No `crates/devflow-core/src/sync.rs` file exists anywhere in the repository. `crates/devflow-core/src/lib.rs` has no `mod sync;` declaration. `crates/devflow-cli/src/main.rs`'s `Command` enum has no `Sync` variant. `commands.rs` has no `sync_cmd`. Every plan in this phase (26-02-PLAN.md, 26-03-PLAN.md) lists `devflow_core::sync::{SyncError, SyncOutcome, SYNC_MERGE_MESSAGE, sync_main_to_develop}` and `Command::Sync { project }` under \"Artifacts this phase produces\" as in-scope for Phase 26 — none of it was built."
-    artifacts:
-      - path: "crates/devflow-core/src/sync.rs"
-        issue: "MISSING — file does not exist"
-    missing:
-      - "crates/devflow-core/src/sync.rs with SyncError, SyncOutcome, SYNC_MERGE_MESSAGE, sync_main_to_develop"
-      - "Command::Sync { project } CLI variant and sync_cmd in commands.rs"
-  - truth: "A `--yes-release` flag exists, separate from `--yes-ship`, that per-invocation authorizes the bump->tag->sync->publish sequence (mirrors the `--yes-ship` dangerous-operation pattern)."
-    status: failed
-    reason: "`rg -n \"yes.release|yes_release\" crates/ -g '*.rs'` returns zero matches anywhere in the workspace. The flag referenced in ROADMAP.md's Phase 26 goal, 999.25-BACKLOG-DOSSIER.md, and both 26-02-PLAN.md/26-03-PLAN.md's must-produce artifact lists does not exist."
-    missing:
-      - "--yes-release CLI flag on Command::Release, independently settable per-invocation only (D-03 parity with --yes-ship)"
-  - truth: "cargo publish primitives (pre-publish existence check, actual publish call) exist and are ready to be driven by the executor (999.25, D-04)."
-    status: failed
-    reason: "`rg -n \"cargo_publish|PublishCheck|PublishError|classify_cargo_info_result|crate_already_published\" crates/ -g '*.rs'` returns zero matches. None of the publish-side primitives 26-01/26-02/26-03's \"Artifacts this phase produces\" sections declare (`PublishCheck`, `PublishError`, `classify_cargo_info_result`, `crate_already_published`, `cargo_publish`) were written. Decision 2 in 26-01-SUMMARY.md explicitly authorized this capability, but no code implementing it exists."
-    missing:
-      - "classify_cargo_info_result, crate_already_published, cargo_publish, PublishCheck, PublishError in devflow_core::git"
-  - truth: "`push_ref`, `release_tag_state`, and `create_signed_release_tag` (added by 26-03) are consumed by production code that assembles them into the release-cut sequence, not merely exercised by their own unit tests."
-    status: failed
-    reason: "`rg -n \"push_ref\" crates/ -g '*.rs'` (11 hits), `release_tag_state` (13 hits), and `create_signed_release_tag` (7 hits) show every call site is inside `crates/devflow-core/src/git.rs`'s own `#[cfg(test)] mod tests` block or a doc-comment cross-reference. No caller exists in `hooks.rs`, `commands.rs`, `main.rs`, or `ship.rs`. These three primitives are exactly as production-uncalled today as `GitFlow::push`/`delete_remote_branch` were before this phase (the state RESEARCH.md identified as the problem to fix) — the phase added new primitives without wiring any of them to a caller."
-    artifacts:
-      - path: "crates/devflow-core/src/git.rs"
-        issue: "push_ref, release_tag_state, create_signed_release_tag exist and are substantively implemented, but have zero non-test callers — orphaned artifacts."
-    missing:
-      - "The executor (26-06/26-07 per 26-03-PLAN.md's own dependency notes) that calls push_ref for the version-bump push, release_tag_state + create_signed_release_tag for the tag step, and sync_main_to_develop for the sync step."
-deferred: []
-human_verification: []
+re_verification:
+  previous_status: gaps_found
+  previous_score: 6/11
+  gaps_closed:
+    - "`devflow release` executes the release-cut sequence (version bump -> direct push develop -> release PR -> signed tag -> sync -> publish), not just the read-only `--check` preflight."
+    - "A `devflow sync` subcommand exists, both standalone and executor-internal (999.52)."
+    - "A `--yes-release` flag exists, separate from `--yes-ship`, that per-invocation authorizes the bump->tag->sync->publish sequence."
+    - "cargo publish primitives (pre-publish existence check, actual publish call) exist and are ready to be driven by the executor (999.25, D-04)."
+    - "`push_ref`, `release_tag_state`, and `create_signed_release_tag` are consumed by production code that assembles them into the release-cut sequence, not merely exercised by their own unit tests."
+  gaps_remaining: []
+  regressions: []
+human_verification:
+  - test: "Run `devflow release --execute --yes-release` against a real repository with the operator's real `devflow.releaseSigningKey` configured (non-throwaway key) and confirm the resulting tag passes `git tag -v vX.Y.Z` against the maintainer's key."
+    expected: "`git tag -v` reports a valid signature from the maintainer's real key, not the throwaway SSH keypair the hermetic tests use."
+    why_human: "Requires the operator's own private signing key and a real git environment; A19/A20 and `create_signed_release_tag_produces_a_verifiable_annotated_tag` only prove the invocation form works against a throwaway key generated inside the test. No sandbox available to this verification has the operator's real key. Recorded as a `backstop` truth in 26-05-PLAN.md/26-06-PLAN.md/26-07-PLAN.md; a verifier must abstain, not pass or fail it."
+  - test: "Run the executor's publish step (or `cargo publish` directly) for `devflow-core` then `devflow` against the live crates.io registry with the operator's real registry credentials, in that order."
+    expected: "Both crates become live on crates.io in the correct order (`devflow-core` before `devflow`), and `crate_already_published` correctly reports `true` on any re-run."
+    why_human: "A real `cargo publish` is irreversible; no test in this phase can or should perform it (D-04/D-05, `cargo_publish_reports_a_failure_without_publishing_anything` deliberately only exercises the failure path against a directory with no Cargo.toml). Recorded as a `backstop` truth in 26-05-PLAN.md/26-06-PLAN.md."
+  - test: "Run `devflow sync` (or let the executor's sync step run) against the real `origin` remote and confirm the resulting push to `origin/develop` lands as a direct push rather than requiring a pull request."
+    expected: "`git merge-base --is-ancestor origin/main origin/develop` succeeds immediately after the run, with no PR having been opened or merged for this step."
+    why_human: "Requires the operator's own out-of-band GitHub ruleset bypass (D-01) to already be configured against the real repository — cannot be simulated against a local bare remote, which every hermetic test in `sync::tests` and `release::tests` uses instead. Recorded as a `backstop` truth in 26-04-PLAN.md/26-07-PLAN.md."
 ---
 
 # Phase 26: Release-Cut Automation Verification Report
@@ -57,171 +39,249 @@ preflight Phase 20's 20d delivered. Adds a real `devflow sync` subcommand
 placeholder content (999.5) by generating it from the conventional-commit
 classification Phase 25's version-bump step already computes.
 
-**Verified:** 2026-07-29T23:45:00Z
-**Status:** gaps_found
-**Re-verification:** No — initial verification
+**Verified:** 2026-07-30T03:10:00Z
+**Status:** human_needed
+**Re-verification:** Yes — gap-closure run after plans 26-04..26-07 executed against the 2026-07-29 `gaps_found` report (6/11)
 
 ## Goal Achievement
+
+This is a re-verification of all 11 original truths against the current
+codebase, not a re-statement of either the prior VERIFICATION.md or the new
+SUMMARY.md files' self-reports. All 5 previously-FAILED truths were
+independently re-checked with fresh `rg`/`cargo test`/`cargo run` evidence
+gathered in this session; all 6 previously-VERIFIED truths were re-run as a
+regression check.
 
 ### Observable Truths
 
 | # | Truth | Status | Evidence |
 |---|-------|--------|----------|
-| 1 | Operator explicitly re-authorized direct-push-to-develop capability (D-01/D-08) before any implementing code exists, with the selected option recorded | ✓ VERIFIED | `26-01-SUMMARY.md` records `direct-push` selected, with operator response text, for both the original discuss-phase session and a live re-confirmation this dogfood run |
-| 2 | Operator explicitly re-authorized unattended `cargo publish` (D-04, one-way/irreversible) before any implementing code exists, with the selected option recorded | ✓ VERIFIED | `26-01-SUMMARY.md` records `automate-publish` selected, same double-confirmation |
-| 3 | A DevFlow-written CHANGELOG entry lists what actually changed, derived from the same conventional-commit classification the version bump computes (999.5), replacing the hardcoded placeholder | ✓ VERIFIED | `crates/devflow-core/src/version.rs` `ChangelogHeading`/`changelog_sections`/`render_changelog_body`/`sanitize_changelog_subject` exist, are wired through `hooks.rs::version_bump` -> `ctx.shipped_changelog_body` -> `hooks.rs::changelog_append` -> `ship.rs::prepend_changelog`; `grep -rn 'Released phase via DevFlow' crates/` returns no matches; `cargo test -p devflow-core --features test-support hooks::tests::changelog_append_writes_the_generated_body_end_to_end -- --exact` passes (spot-checked live) |
-| 4 | DevFlow can push a ref to `origin` with no force flag, and a rejected non-fast-forward push leaves the remote unmoved (D-05 foundation for 999.25) | ✓ VERIFIED (as primitive) | `GitFlow::push_ref` at `git.rs:243`; `cargo test --workspace git::tests::push_ref_lands_a_branch_on_the_remote -- --exact` passes (spot-checked live). See Truth 9 — never called by production code. |
-| 5 | DevFlow correctly classifies an existing tag's release state, refusing to treat a stray lightweight tag as an already-cut release (D-06 foundation for 999.25) | ✓ VERIFIED (as primitive) | `ReleaseTagState`/`release_tag_state` at `git.rs:531-593`, 5 passing unit tests including the lightweight-collision case. See Truth 9 — never called by production code. |
-| 6 | DevFlow can create the maintainer-signed release tag using CONTRIBUTING.md's exact documented invocation form and report git's own real result (D-10 foundation for 999.25) | ✓ VERIFIED (as primitive) | `create_signed_release_tag` at `git.rs:698`, 3 passing unit tests including the end-to-end push+release_tag_state round trip. See Truth 9 — never called by production code. |
-| 7 | `devflow release` *executes* the release-cut sequence, not just the read-only `--check` preflight (the phase's headline goal) | ✗ FAILED | `main.rs:572-586`: a bare `devflow release` (omitted `--check`) is still rejected with the message "the release-cut executor ... is deferred (DEN-50) and not yet built." Behavior is unchanged from Phase 20's 20d. |
-| 8 | A `devflow sync` subcommand exists, both standalone and executor-internal (999.52) | ✗ FAILED | No `crates/devflow-core/src/sync.rs`, no `mod sync;` in `lib.rs`, no `Command::Sync` variant, no `sync_cmd` — confirmed absent by direct grep/find. |
-| 9 | `push_ref`, `release_tag_state`, `create_signed_release_tag` are wired into a production caller (the release executor), not only exercised by their own tests | ✗ FAILED | Every call site of all three symbols is inside `git.rs`'s own `#[cfg(test)]` module or a doc comment. Zero production callers. |
-| 10 | A `--yes-release` flag exists and is required per-invocation to authorize the automated sequence | ✗ FAILED | `rg "yes.release|yes_release" crates/ -g '*.rs'` — zero matches anywhere. |
-| 11 | `cargo publish` primitives (existence check, publish call) exist for the executor's final step (999.25, D-04) | ✗ FAILED | `rg "cargo_publish|PublishCheck|PublishError|classify_cargo_info_result|crate_already_published" crates/ -g '*.rs'` — zero matches. |
+| 1 | Operator explicitly re-authorized direct-push-to-develop capability (D-01/D-08) before any implementing code existed, with the selected option recorded | ✓ VERIFIED (unchanged) | `26-01-SUMMARY.md` still records `direct-push` selected, double-confirmed. Regression-checked this session. |
+| 2 | Operator explicitly re-authorized unattended `cargo publish` (D-04, one-way/irreversible) before any implementing code existed, with the selected option recorded | ✓ VERIFIED (unchanged) | `26-01-SUMMARY.md` still records `automate-publish` selected, double-confirmed. Regression-checked this session. |
+| 3 | A DevFlow-written CHANGELOG entry lists what actually changed, derived from the same conventional-commit classification the version bump computes (999.5), replacing the hardcoded placeholder | ✓ VERIFIED (unchanged) | `rg -n 'Released phase via DevFlow' crates/` still returns no matches; `cargo test ... hooks::tests::changelog_append_writes_the_generated_body_end_to_end -- --exact` re-run live this session: `1 passed; 0 failed`. |
+| 4 | `push_ref` — a fast-forward-only, no-force push primitive — is now genuinely production-used, not just tested in isolation | ✓ VERIFIED (upgraded) | `push_ref` at `git.rs:243`, still passing its own unit tests, AND now called from `crates/devflow-core/src/release.rs:317,414,435` and `crates/devflow-core/src/sync.rs:197` — both outside any `#[cfg(test)]` block. No longer merely a tested-but-orphaned primitive (see Truth 9). |
+| 5 | `release_tag_state` correctly classifies an existing tag's release state and is now genuinely production-used | ✓ VERIFIED (upgraded) | Definition unchanged at `git.rs:531-593`, still 5 passing unit tests; now called from `release.rs:401,415,436`, all inside `execute_release`, all before the `#[cfg(test)]` boundary at `release.rs:583`. |
+| 6 | `create_signed_release_tag` creates the maintainer-signed release tag with the documented invocation form and is now genuinely production-used | ✓ VERIFIED (upgraded) | Definition unchanged at `git.rs:698`, still 3 passing unit tests; now called from `release.rs:413`, inside `execute_release`'s `Absent` branch, before the test-module boundary. |
+| 7 | `devflow release` *executes* the release-cut sequence, not just the read-only `--check` preflight (the phase's headline goal) | ✓ VERIFIED (gap closed) | `rg -n 'not yet built\|DEN-50' crates/devflow-cli/src/main.rs` — no matches. The dispatch arm at `main.rs:602-632` now routes `check`/`execute`/`yes_release` explicitly; `execute && yes_release` calls `release_execute`, which calls `devflow_core::release::execute_release`. Confirmed live: `cargo run -q -p devflow -- release --help` lists both `--execute` and `--yes-release` with accurate descriptions. `execute_reaches_the_core_executor_and_refuses_off_develop` passes (`1 passed; 0 failed`), proving the CLI reaches the real executor, not a stub. |
+| 8 | A `devflow sync` subcommand exists, both standalone and executor-internal (999.52) | ✓ VERIFIED (gap closed) | `crates/devflow-core/src/sync.rs` exists; `lib.rs:77` declares `pub mod sync;`; `main.rs:638` has `Command::Sync { project } => sync_cmd(...)`; `commands.rs:2241` defines `sync_cmd`. Confirmed live: `cargo run -q -p devflow -- sync --help` exits 0 with accurate help text. The same `sync_main_to_develop` is also called from `release.rs:484` (D-07's second entry point) — one implementation, two callers, as designed. |
+| 9 | `push_ref`, `release_tag_state`, `create_signed_release_tag` are wired into a production caller (the release executor), not only exercised by their own tests | ✓ VERIFIED (gap closed) | All three symbols now have call sites in `release.rs` at lines 317/414/435 (`push_ref`), 401/415/436 (`release_tag_state`), and 413 (`create_signed_release_tag`) — every one of these line numbers is above `release.rs`'s `#[cfg(test)]` boundary at line 583, i.e. inside `execute_release` or a helper it calls directly, not inside the test module. This is the exact defect the prior verification flagged as "exactly as production-uncalled as `GitFlow::push`/`delete_remote_branch` were before this phase" — it is now closed. |
+| 10 | A `--yes-release` flag exists and is required per-invocation to authorize the automated sequence | ✓ VERIFIED (gap closed) | `main.rs` declares `yes_release: bool` on `Command::Release` (line 255) and reads it only in the dispatch arm (line 605, 620). `execute && !yes_release` is rejected before any handler runs. `yes_release_is_not_settable_via_config_or_env` (writes a real `devflow.toml` key AND two env vars, still rejects) passes; `yes_release_has_no_config_state_or_env_surface` (source-grep over `state.rs`/`config.rs`/`config_parse.rs`) passes. `--yes-release` never aliases or implies `--yes-ship` (`rg -n 'yes_ship' crates/devflow-cli/src/main.rs` shows it only on `Command::Start`). |
+| 11 | `cargo publish` primitives (existence check, publish call) exist for the executor's final step (999.25, D-04) | ✓ VERIFIED (gap closed) | `PublishCheck`, `PublishError`, `classify_cargo_info_result`, `crate_already_published`, `cargo_publish` all defined in `git.rs` (lines 889/949/920/977/1010). `git::tests::publish_check_classifies_exit_codes` and 3 other publish tests pass. Both primitives are called from `release.rs:522,533` inside `execute_release`'s step 5, gated correctly: `Ok(true)` skips, `Ok(false)` calls `cargo_publish`, any `Err` (including `Ambiguous`) propagates and stops the run before publishing anything further. |
 
-**Score:** 6/11 truths verified (0 present-but-behavior-unverified)
+**Score:** 11/11 truths verified (0 present-but-behavior-unverified)
 
-Note: Truths 1-3 are genuinely, independently complete deliverables. Truths 4-6
-are real, well-tested code, but only as unwired foundation — grouped separately
-from Truths 7-11 (which represent the phase's actual stated goal: an
-*executing* `devflow release`, a real `devflow sync`, and the publish step)
-because presence of a primitive is not the same claim as achievement of the
-goal that primitive was built to serve.
+All 5 previously-FAILED truths (7-11) are closed. All 6 previously-VERIFIED
+truths hold on regression. **Three additional `backstop`-tier truths**,
+explicitly declared as such in 26-05/26-06/26-07's plan frontmatter
+(a real signed tag verifying against the operator's real key; a real `cargo
+publish` of both crates; a real direct push to the live `origin`), remain
+**operator-pending** — see Human Verification Required below. These are not
+counted as failed (the code paths now exist, are wired, and are proven
+against hermetic fixtures) and not counted as verified (no hermetic test can
+or should exercise an irreversible/credentialed live operation) — this
+verifier abstains on them per the honest-verifier backstop convention, and
+they are the reason the overall status is `human_needed` rather than
+`passed`.
 
 ### Required Artifacts
 
 | Artifact | Expected | Status | Details |
 |----------|----------|--------|---------|
-| `crates/devflow-core/src/version.rs` — `ChangelogHeading`, `changelog_sections`, `render_changelog_body`, `sanitize_changelog_subject`, `CHANGELOG_SUBJECT_MAX_CHARS` | 999.5 changelog content | ✓ VERIFIED | Present, substantive (384 new lines), wired end-to-end through hooks.rs/ship.rs, data-flow confirmed by a passing integration test |
-| `crates/devflow-core/src/ship.rs` `prepend_changelog(existing, version, date, body)` | 4th `body` param replacing the hardcoded bullet | ✓ VERIFIED | Signature changed as specified; 3 passing tests |
-| `crates/devflow-core/src/hooks.rs` `HookContext.shipped_changelog_body` | VersionBump -> ChangelogAppend handoff | ✓ VERIFIED | Field present, populated before `git.tag()` per the documented ordering rationale |
-| `crates/devflow-core/src/git.rs` `GitFlow::push_ref` | fast-forward-only push primitive | ✓ VERIFIED (substantive, tested) | ⚠️ ORPHANED — no non-test caller |
-| `crates/devflow-core/src/git.rs` `ReleaseTagState`/`release_tag_state` | already-released predicate | ✓ VERIFIED (substantive, tested) | ⚠️ ORPHANED — no non-test caller |
-| `crates/devflow-core/src/git.rs` `create_signed_release_tag` | signed-tag creator | ✓ VERIFIED (substantive, tested) | ⚠️ ORPHANED — no non-test caller |
-| `crates/devflow-core/src/sync.rs` | new sync module (999.52) | ✗ MISSING | File does not exist |
-| `crates/devflow-cli/tests/release_execute.rs` | integration tests for `--execute`/`--yes-release` | ✗ MISSING | File does not exist |
-| `crates/devflow-core/src/git.rs` `PublishCheck`/`PublishError`/`classify_cargo_info_result`/`crate_already_published`/`cargo_publish` | cargo publish primitives (999.25) | ✗ MISSING | Zero matches anywhere in `crates/` |
-| `crates/devflow-cli/src/main.rs` `Command::Sync`, `Command::Release{execute,yes_release}` | new CLI surface | ✗ MISSING | `main.rs` unmodified by this phase (confirmed via `git diff --stat`) |
+| `crates/devflow-core/src/sync.rs` | `SyncError`, `SyncOutcome`, `SYNC_MERGE_MESSAGE`, `sync_main_to_develop` | ✓ VERIFIED | Present, substantive, wired to both `Command::Sync` and `execute_release`'s step 4. 5/5 own tests pass. |
+| `crates/devflow-core/src/release.rs` | `ReleaseStep`, `StepStatus`, `StepReport`, `ReleaseOutcome`, `ReleaseReport`, `ReleaseError`, `execute_release` | ✓ VERIFIED | Present, substantive (1151 lines incl. tests), wired to `commands::release_execute`. 8/8 own tests pass. |
+| `crates/devflow-core/src/git.rs` — `PublishCheck`/`PublishError`/`classify_cargo_info_result`/`crate_already_published`/`cargo_publish` | cargo publish primitives (999.25) | ✓ VERIFIED | All 5 present and substantive; 4 own tests pass; called from `release.rs` step 5. |
+| `crates/devflow-cli/src/main.rs` `Command::Sync`, `Command::Release{execute,yes_release}` | new CLI surface | ✓ VERIFIED | Both present; confirmed live via `cargo run -- release --help` / `-- sync --help`; help snapshot regenerated and passing. |
+| `crates/devflow-cli/src/commands.rs` `sync_cmd`, `release_execute` | command handlers | ✓ VERIFIED | Both present, call the correct core functions, render `StepReport`/`ReleaseOutcome` correctly. |
+| `crates/devflow-cli/tests/release_execute.rs` | integration tests for `--execute`/`--yes-release` | ✓ VERIFIED | Present, 6/6 tests pass, drives the real binary (`CARGO_BIN_EXE_devflow`). |
+| `crates/devflow-core/src/version.rs` `version_in_contents` | text-based version parsing for the D-02 human-gate boundary | ✓ VERIFIED | Present; `read_version` now delegates to it; `version::tests::read_version_*` regression tests pass. |
 
 ### Key Link Verification
 
 | From | To | Via | Status | Details |
 |------|-----|-----|--------|---------|
-| `hooks.rs::version_bump` | `ctx.shipped_changelog_body` | direct field assignment before `git.tag()` | ✓ WIRED | Ordering rationale documented; end-to-end test passes |
-| `hooks.rs::changelog_append` | `ship::prepend_changelog` | 4th `body` argument | ✓ WIRED | Confirmed by passing test asserting on CHANGELOG.md bytes |
-| release executor | `GitFlow::push_ref` | (does not exist) | ✗ NOT_WIRED | No executor exists to call it |
-| release executor | `release_tag_state` / `create_signed_release_tag` | (does not exist) | ✗ NOT_WIRED | No executor exists to call it |
-| `devflow sync` (executor-internal) | `sync_main_to_develop` | (does not exist) | ✗ NOT_WIRED | Neither side exists |
-| `devflow release --execute` | version bump / push / tag / sync / publish sequence | (does not exist) | ✗ NOT_WIRED | `--execute` flag itself does not exist |
+| `hooks.rs::version_bump` | `ctx.shipped_changelog_body` | direct field assignment before `git.tag()` | ✓ WIRED | Unchanged from initial verification; regression-confirmed. |
+| `devflow sync` (standalone) | `sync_main_to_develop` | `commands::sync_cmd` calls it directly | ✓ WIRED | Confirmed via `cargo run -- sync --help` and `sync_cmd`'s source. |
+| `execute_release` step 4 | `sync_main_to_develop` | direct call, no options passed, D-07's second entry point | ✓ WIRED | `rg -n 'sync_main_to_develop' release.rs` — exactly one call site, no `"-X"` re-implementation in `release.rs`. |
+| `execute_release` step 1 | `GitFlow::push_ref` | direct call for the version-bump push | ✓ WIRED | `release.rs:317`, before `#[cfg(test)]`. |
+| `execute_release` step 3 | `release_tag_state` / `create_signed_release_tag` | direct calls, branching on all 5 `ReleaseTagState` variants | ✓ WIRED | `release.rs:401-478`, before `#[cfg(test)]`. |
+| `execute_release` step 5 | `crate_already_published` / `cargo_publish` | per-package gated call, iterating `publish_order`'s own sequence | ✓ WIRED | `release.rs:511-545`; `publish_order` consulted exactly once, never sorted/reordered (`rg -n '\.sort' release.rs` — no match). |
+| `main.rs` dispatch arm | `commands::release_execute` | `execute && yes_release` branch only | ✓ WIRED | `main.rs:602-635`; every other flag combination returns an `Err` before `project_root` is touched. |
+| `devflow release --execute` (no `--yes-release`) | rejection | typed `CliError::Message` naming the flag | ✓ WIRED | Confirmed by `execute_without_yes_release_is_rejected` and live inspection of the dispatch arm. |
+
+### Data-Flow Trace (Level 4)
+
+Not applicable in the usual sense — this phase's artifacts are a CLI/git/registry
+orchestration layer, not a UI rendering dynamic data from a store. The
+equivalent check performed instead: every step of `execute_release` reads
+*live* git/registry state (not a cached or persisted progress file) via real
+subprocess calls (`git status`, `git rev-parse`, `git show origin/main:<path>`,
+`cargo info`) rather than a static or hardcoded value — confirmed by reading
+each step's source and by the fact that `skips_push_when_already_ahead`,
+`skips_tag_when_already_released`, and the publish step's `Ok(true)` path all
+produce different `Skipped`/`Completed` outcomes depending on *actual* repo
+state constructed differently by each test's fixture, not a fixed return
+value. `rg -n 'release-state|release_state\.json' crates/ -g '*.rs'` —
+no match, confirming no persisted progress file exists (D-06).
 
 ### Behavioral Spot-Checks
 
 | Behavior | Command | Result | Status |
 |----------|---------|--------|--------|
-| `push_ref` lands a branch on a real (bare) remote | `cargo test --workspace git::tests::push_ref_lands_a_branch_on_the_remote -- --exact` | `1 passed; 0 failed` | ✓ PASS |
-| Generated changelog body reaches `CHANGELOG.md` end-to-end via the real hook chain | `cargo test -p devflow-core --features test-support hooks::tests::changelog_append_writes_the_generated_body_end_to_end -- --exact` | `1 passed; 0 failed` | ✓ PASS |
-| Hardcoded changelog placeholder fully retired | `grep -rn 'Released phase via DevFlow' crates/` | no matches (exit 1) | ✓ PASS |
-| `devflow release` executes (vs. only `--check`) | inspection of `main.rs:572-586` | bare invocation still hard-rejected, citing DEN-50 deferred | ✗ FAIL |
-| `devflow sync` subcommand present | `find crates -iname sync.rs`, `rg "Sync" crates/devflow-cli/src/main.rs` | no file, no match | ✗ FAIL |
-| `--yes-release` flag present | `rg "yes.release|yes_release" crates/ -g '*.rs'` | no matches | ✗ FAIL |
+| `devflow release` no longer hard-rejects a bare invocation with the DEN-50 message | `rg -n 'not yet built\|DEN-50' crates/devflow-cli/src/main.rs` | no matches | ✓ PASS |
+| `devflow release --help` documents `--execute` and `--yes-release` on the real binary | `cargo run -q -p devflow -- release --help` | exit 0, both flags listed with accurate descriptions | ✓ PASS |
+| `devflow sync --help` exists on the real binary | `cargo run -q -p devflow -- sync --help` | exit 0, names `[PROJECT]` | ✓ PASS |
+| `devflow --help` snapshot matches the binary | `cargo test -p devflow --test help_snapshot` | `1 passed; 0 failed` | ✓ PASS |
+| The full release-cut sequence completes end to end against a real local bare remote | `cargo test --workspace --features devflow-core/test-support --lib release::tests::completes_the_sequence_and_reports_every_step -- --exact` | `1 passed; 0 failed` | ✓ PASS |
+| A tree-changing sync stops the run before any publish step | `cargo test ... release::tests::a_refused_sync_stops_the_run_before_publishing -- --exact` | `1 passed; 0 failed` | ✓ PASS |
+| A mid-sequence failure (missing signing key) leaves the prior step landed, no rollback | `cargo test ... release::tests::partial_failure_leaves_prior_steps_landed -- --exact` | `1 passed; 0 failed` | ✓ PASS |
+| CLI wiring proof: the executor's own refusal (off-`develop`) reaches the CLI unmutated | `cargo test -p devflow --test release_execute execute_reaches_the_core_executor_and_refuses_off_develop -- --exact` | `1 passed; 0 failed` | ✓ PASS |
+| `--yes-release` cannot be supplied via `devflow.toml` or environment variables (B10) | `cargo test -p devflow --test release_execute yes_release_is_not_settable_via_config_or_env -- --exact` | `1 passed; 0 failed` | ✓ PASS |
+| Full lib test suite, workspace-wide | `cargo test --workspace --features devflow-core/test-support --lib` | `434 passed; 0 failed` | ✓ PASS |
+| Full CLI test suite, all targets | `cargo test -p devflow` | `0 failed` across all 16 test binaries | ✓ PASS |
+| Lint and format gates | `cargo clippy --workspace --all-targets -- -D warnings`; `cargo fmt --check` | both clean | ✓ PASS |
+| D-02 guard: no new `gh` subprocess call sites | `rg -n 'Command::new("gh")' crates/ -g '*.rs'` | exactly one file, `crates/devflow-cli/src/preflight.rs` | ✓ PASS |
+| D-10 guard: signing-viability predictor gained no new caller | `rg -c 'check_ssh_signing_viability' crates/ -g '*.rs'` | exactly `crates/devflow-core/src/git.rs:2`, unchanged from 26-03's baseline | ✓ PASS |
+| No force flags anywhere in the new release/sync code | `rg -n '"--force' release.rs sync.rs`; `rg -n '"--dry-run"' git.rs` | no matches | ✓ PASS |
 
-### Requirements Coverage (backlog IDs, no REQ-IDs in this project)
+### Probe Execution
+
+No `scripts/*/tests/probe-*.sh` probes are declared by any plan in this
+phase, and none exist in the repository's conventional probe locations for
+this feature area. Skipped per Step 7c's discovery contract — visible skip,
+not a silent one.
+
+### Requirements Coverage
+
+This project has **no REQ-IDs** (`.planning/REQUIREMENTS.md` does not exist
+in this repository). Phase 26 is tracked exclusively by backlog identifiers.
+Recording this absence explicitly per the task instructions, not fabricating
+REQ-ID traceability.
 
 | Backlog ID | Source Plan(s) | Description | Status | Evidence |
 |------------|-----------------|-------------|--------|----------|
-| 999.25 | 26-01, 26-03 | Release-cut executor: `devflow release` executes bump->push->PR->tag->sync->publish | ✗ BLOCKED | Only 3 of the ~8 git primitives an executor needs exist (`push_ref`, `release_tag_state`, `create_signed_release_tag`); none are called by any executor; no `--execute`/`--yes-release` CLI surface; `devflow release` behavior is unchanged from Phase 20. `26-01-SUMMARY.md` and `26-03-SUMMARY.md` both list `requirements-completed: ["999.25", ...]` — this is an overclaim (see Anti-Patterns below); the backlog dossier itself (`999.25-BACKLOG-DOSSIER.md`) is still marked `status: backlog`, unresolved. |
-| 999.5 | 26-02 | Changelog placeholder content, generated from conventional-commit classification | ✓ SATISFIED | Fully implemented, tested end-to-end, hardcoded placeholder confirmed removed. `26-02-SUMMARY.md`'s `requirements-completed: ["999.5"]` is accurate. (Note: `999.5-BACKLOG-DOSSIER.md` frontmatter is still `status: backlog` — a documentation-lag issue, not a functional gap.) |
-| 999.52 | (declared in 26-02/26-03 plan frontmatter's `requirements`, but never given its own implementing plan) | `devflow sync` subcommand, standalone and executor-internal | ✗ BLOCKED | Zero implementation. `26-01-SUMMARY.md` lists `requirements-completed: ["999.25", "999.52"]` for a plan whose own frontmatter states `files_modified: []` and that produced no code — this is a clear overclaim (see Anti-Patterns below). |
+| 999.25 | 26-01, 26-03, 26-05, 26-06, 26-07 | Release-cut executor: `devflow release` executes bump->push->PR->tag->sync->publish | ✓ SATISFIED (with operator-pending backstop items) | All primitives, the executor, and the CLI surface exist, are wired, and pass 22+ hermetic tests. Two backstop truths (real signed tag verification, real `cargo publish`) remain operator-pending by design — see Human Verification Required. `26-05-SUMMARY.md`/`26-06-SUMMARY.md`/`26-07-SUMMARY.md`'s `requirements-completed: ["999.25"]` is now an accurate claim, unlike the corrected `26-01`/`26-03` overclaims from the prior verification pass. |
+| 999.5 | 26-02 | Changelog placeholder content, generated from conventional-commit classification | ✓ SATISFIED (unchanged) | Fully implemented, tested end-to-end, hardcoded placeholder confirmed still removed. |
+| 999.52 | 26-04, 26-06 | `devflow sync` subcommand, standalone and executor-internal | ✓ SATISFIED (with one operator-pending backstop item) | `devflow sync` exists as a real, tested CLI subcommand and as the executor's step 4, sharing one implementation (D-07). One backstop truth (a real direct push landing against the live `origin`) remains operator-pending. |
 
-**Orphaned requirements check:** ROADMAP.md's Phase 26 section names only 999.25, 999.5, and 999.52 in scope (999.54/999.50/999.4 explicitly dropped, 999.31/999.15/999.21 explicitly declined). No orphaned requirements found beyond the three already covered above.
+**Documentation lag, not a functional gap:** `999.25-BACKLOG-DOSSIER.md` and
+`999.5-BACKLOG-DOSSIER.md` frontmatter both still read `status: backlog`
+despite both backlog items now being functionally delivered per the
+codebase evidence above (999.5 was already noted as this same lag in the
+prior verification). Not blocking; a housekeeping item for whoever next
+touches those dossiers.
+
+**Orphaned requirements check:** ROADMAP.md's Phase 26 section names only
+999.25, 999.5, and 999.52 in scope. No orphaned requirements found.
 
 ### Anti-Patterns Found
 
 | File | Line | Pattern | Severity | Impact |
 |------|------|---------|----------|--------|
-| `.planning/phases/26-release-cut-automation/26-01-SUMMARY.md` | 30 | `requirements-completed: ["999.25", "999.52"]` on a plan with `files_modified: []` and zero code commits | 🛑 Blocker-adjacent (self-report overclaim) | A plan that only records an authorization decision cannot mark two large, unimplemented backlog items "completed." Both 999.25 and 999.52 remain functionally open at phase end. This SUMMARY field, if trusted uncritically by a downstream `/gsd-ship` or `/gsd-complete-milestone` pass, would misreport the phase as having closed backlog items it did not close. **RESOLVED 2026-07-29 by the validate→code fix loop** — field set to `[]` with an inline rationale comment; the `coverage` D1/D2 authorization records were left intact. |
-| `.planning/phases/26-release-cut-automation/26-03-SUMMARY.md` | 37 | `requirements-completed: ["999.25"]` after building 3 of ~8 needed primitives, none wired to a caller | ⚠️ Warning (partial-progress overclaim) | 26-03's own `coverage` block (D1/D2/D3) is scoped and accurate as *plan-level* coverage of the primitives it built — but the top-level `requirements-completed: ["999.25"]` field reads as "this backlog item is done," which it is not: no executor exists yet that calls any of these primitives, and the publish-side primitives were never written at all. **RESOLVED 2026-07-29 by the validate→code fix loop** — field set to `[]`; the accurate plan-level `coverage` D1/D2/D3 blocks were left intact. |
-| `crates/devflow-core/src/git.rs` | 243, 593, 698 | `push_ref`, `release_tag_state`, `create_signed_release_tag` have zero non-test callers | ⚠️ Warning (orphaned artifact) | Functionally identical to the "zero non-test callers" defect RESEARCH.md identified in the pre-phase `GitFlow::push`/`delete_remote_branch` methods — this phase added new primitives in the same unwired state rather than closing that class of gap. |
-| N/A | N/A | No `TBD`/`FIXME`/`XXX`/`TODO`/`HACK`/`PLACEHOLDER` markers found in any of the 5 files this phase modified (`git.rs`, `version.rs`, `ship.rs`, `hooks.rs`, `pipeline_outcomes.rs`) | ℹ️ Info | Consistent with `26-REVIEW.md`'s own finding of "no `TODO`/debug artifacts." |
+| `crates/devflow-core/src/release.rs` | 267-274, 341-345 | `execute_release` pushes two `StepReport`s labeled `VersionBump` on every resumed run (the `UnreachableBaseline` resume arm's own report, then the ordinary step-1 recompute's report) | ⚠️ Warning (real bug, code-review-confirmed WR-01) | Independently confirmed by reading the source: the resume arm at lines 267-274 pushes a `Completed` `StepReport` and falls through unconditionally into the ordinary step-1 block, which pushes a second `VersionBump` report a few lines later. `completes_the_sequence_and_reports_every_step`'s one-entry-per-`ReleaseStep` assertion only passes because that specific test's fixture never triggers the `UnreachableBaseline` path — `skips_tag_when_already_released` and `refuses_a_stray_lightweight_tag_rather_than_skipping` DO traverse it (per 26-06-SUMMARY.md's own "Decisions Made" note) but neither asserts on `report.steps` length/ordering, so the duplication ships untested. This is a reporting/UX defect only — no extra git command runs, and no truth in this phase's must-haves is falsified by it — but it is a genuine bug an operator would see (a doubled line in the printed step table on every resumed release) and should be fixed, not treated as done. Not a phase-blocker per 26-REVIEW.md's own assessment, which this verifier concurs with after independently reading the code. |
+| `crates/devflow-cli/src/commands.rs` | 2241-2252 | `devflow sync` performs a real direct push to `origin/develop` with no `--yes-*`-style authorization flag at all, unlike `devflow release --execute` (requires `--yes-release`) and `devflow start`'s auto-Ship path (requires `--yes-ship`) | ℹ️ Info (design asymmetry, code-review-confirmed WR-03) | The D-01/D-08 operator authorization already covers direct pushes to `develop` generically (recorded in `26-01-SUMMARY.md`), and the merge itself is independently tree-verified before the push (`TreeChanged` refuses). Not a must-have violation — no plan's frontmatter declares a `--yes-sync` requirement — but worth flagging for a documentation follow-up per 26-REVIEW.md's own recommendation, so a future reader doesn't assume the omission is accidental. |
+| `999.25-BACKLOG-DOSSIER.md`, `999.5-BACKLOG-DOSSIER.md` | frontmatter | `status: backlog` despite both items now functionally delivered | ℹ️ Info | Documentation lag, not a functional gap (same disposition the prior verification gave 999.5's dossier). |
+| N/A | N/A | No `TBD`/`FIXME`/`XXX`/`TODO`/`HACK`/`PLACEHOLDER` markers found in any of the phase's modified/created files (`release.rs`, `sync.rs`, `git.rs`, `version.rs`, `main.rs`, `commands.rs`, `release_execute.rs`) | ℹ️ Info | Confirmed by direct grep this session. |
 
-`26-REVIEW.md` (code review, standard depth) independently found 0 critical, 3 warning, 3 info findings in the code actually written (WR-01 Validate-outcome status/verdict decoupling in `pipeline_outcomes.rs`, WR-02 misleading `merged: false` event on the idempotent merge no-op, WR-03 TOML comment-line scanning gap in workspace-pin rewriting) — these are pre-existing-file issues incidentally touched by this phase's edits, not new debt this phase introduced, and are out of scope for this phase's own goal (they affect Validate/Merge/version-bump machinery, not the release-cut sequence). Recorded here for completeness; not treated as phase-blocking for Phase 26's own goal.
+`26-REVIEW.md` (code review, standard depth, re-scoped to 13 files covering
+the full phase diff) independently found 0 critical, 7 warning, 4 info
+findings. On its primary question — can any code path reach a `git push`,
+`git tag`, or `cargo publish` without the typed `--yes-release` flag — its
+answer, which this verifier's independent tracing (Truths 9-11, Key Link
+Verification above) corroborates, is **no**. WR-02 (a strict-descendant tag
+match slightly weaker than exact-equality, unreachable in this codebase's
+single-writer flow), WR-04 (fragile stderr substring matching in the publish
+classifier, already documented-by-observation as its own known limitation),
+WR-05/WR-06/WR-07 (pre-existing-file issues in `pipeline_outcomes.rs`,
+`hooks.rs`'s Merge event, and TOML comment-line scanning) are real findings
+but are either pre-existing-file issues incidentally touched by this phase
+(WR-05/06/07) or edge cases the review itself characterizes as unreachable
+in this project's actual single-writer, single-operator usage pattern
+(WR-02, WR-04) — none of them falsify any of this phase's 11 must-have
+truths, and none is treated as phase-blocking here, consistent with the
+review's own disposition.
 
 ### Human Verification Required
 
-None. Every gap above is directly observable in the codebase (missing files, missing CLI variants, zero call sites) and required no runtime/visual/external-service judgment to resolve. The `26-VALIDATION.md`'s two documented "Manual-Only Verifications" (real signing-key tag creation, real `cargo publish`) are moot for this verification pass since the code paths that would exercise them (`create_signed_release_tag`'s production caller, `cargo_publish`) were never built.
+Three items — all explicitly declared as `verification: backstop` truths in
+26-05-PLAN.md, 26-06-PLAN.md, and 26-07-PLAN.md's frontmatter, and all listed
+in `26-VALIDATION.md`'s "Manual-Only Verifications" table. Per this task's
+instructions, these are reported as operator-pending rather than passed or
+failed — the code paths that would exercise them are now built, wired, and
+proven against hermetic fixtures, but the operations themselves are
+irreversible/credentialed and cannot be exercised in any test.
+
+### 1. Real signed tag verifies against the operator's real key
+
+**Test:** Run `devflow release --execute --yes-release` against a real
+repository with the operator's real `devflow.releaseSigningKey` configured,
+and inspect the resulting tag.
+**Expected:** `git tag -v vX.Y.Z` reports a valid signature from the
+maintainer's actual signing key.
+**Why human:** Requires the operator's own private key; every hermetic test
+in this phase (A19, A20, `skips_tag_when_already_released`, etc.) uses a
+throwaway repo-local SSH keypair instead.
+
+### 2. Real `cargo publish` of both crates in order
+
+**Test:** Observe the executor's publish step (or run `cargo publish`
+directly) against the live crates.io registry for `devflow-core` then
+`devflow`.
+**Expected:** Both crates become live in that order; a re-run's
+`crate_already_published` check correctly reports `true` for both.
+**Why human:** Irreversible; no test performs or should perform a real
+publish (D-04/D-05). `cargo_publish_reports_a_failure_without_publishing_anything`
+deliberately only exercises the failure path.
+
+### 3. Real direct push lands against `origin/develop`
+
+**Test:** Run `devflow sync` (or let the executor's sync step run) against
+the real `origin` and confirm the push lands directly, without a PR.
+**Expected:** `git merge-base --is-ancestor origin/main origin/develop`
+succeeds immediately afterward, with no PR opened or merged for this step.
+**Why human:** Requires the operator's own out-of-band GitHub ruleset bypass
+(D-01) already configured against the real repository; every hermetic test
+uses a local bare remote instead.
 
 ### Gaps Summary
 
-Phase 26's own upfront planning artifacts (26-01-PLAN.md's `key_links`, 26-03-PLAN.md's
-`key_links` and "Artifacts this phase produces" section, and 26-VALIDATION.md's
-Per-Task Verification Map) all describe a seven-plan arc: 26-01 (authorization) ->
-26-02 (changelog) -> 26-03 (git primitives) -> 26-04 (sync module) -> 26-05
-(publish primitives) -> 26-06 (executor's bump/push/tag step) -> 26-07
-(executor's publish step, `--execute`/`--yes-release` CLI surface). Only 26-01
-through 26-03 were ever planned into `-PLAN.md` files and executed. ROADMAP.md's
-own Phase 26 entry (`Plans: 3/3 plans executed`, followed by
-`- [ ] TBD (run /gsd-discuss-phase 26, then /gsd-plan-phase 26 to break down)`)
-independently confirms the phase was left mid-arc, not closed.
+**No gaps remain.** All 5 truths the prior verification (2026-07-29) marked
+FAILED — the headline `devflow release` executor, the `devflow sync`
+subcommand, the three previously-orphaned git primitives gaining production
+callers, the `--yes-release` authorization flag, and the `cargo publish`
+primitives — are independently confirmed present, substantive, and wired in
+this session, not merely claimed by the SUMMARY.md files. All 6 previously
+`VERIFIED` truths hold on regression. The full workspace test suite (434
+lib tests + 0 failed across every CLI integration-test binary), clippy, and
+fmt are all clean, matching this session's own independent re-run rather
+than the executing agents' self-report.
 
-The result: **999.5 (changelog) is genuinely, fully done.** 999.25 (the executor)
-and 999.52 (`devflow sync`) — the two items the phase's own goal statement leads
-with — are not done. `devflow release` today behaves identically to Phase 20's
-`--check`-only preflight; no `devflow sync` subcommand exists in any form; no
-`--yes-release` flag exists; and the three new git primitives 26-03 built
-(`push_ref`, `release_tag_state`, `create_signed_release_tag`) are fully tested
-but called by nothing outside their own test module. Two SUMMARY.md files
-(`26-01-SUMMARY.md`, `26-03-SUMMARY.md`) mark `requirements-completed: 999.25`
-and/or `999.52` in a way that overstates what was actually delivered against
-those backlog IDs — both remain open by the codebase's own evidence, and both
-backlog dossiers are still frontmatter-tagged `status: backlog`.
+One reproducible bug was found by independent code reading (WR-01: a
+duplicated `VersionBump` step report on the `UnreachableBaseline` resume
+path) — real, but cosmetic (no incorrect git/cargo command runs), and does
+not falsify any of the 11 must-have truths. It is recorded above as a
+warning-level anti-pattern rather than a gap, matching 26-REVIEW.md's own
+"reporting/UX defect, not a safety defect" characterization, which this
+verifier's independent source read confirms.
 
-This is not a "gaps in an otherwise-complete phase" situation — it is a phase
-that stopped after its first three (of seven forward-referenced) plans. The
-recommended path is `/gsd-plan-phase 26 --gaps` to plan the remaining
-26-04..26-07 work (sync module, publish primitives, and the executor itself
-that composes everything already built), rather than treating this as a small
-fix-up pass.
+The overall status is `human_needed`, not `passed`, solely because of the
+three `backstop`-tier truths (real signing key, real `cargo publish`, real
+direct push against the live `origin`) that 26-05/26-06/26-07's own plan
+frontmatter correctly scoped as operator-pending and unable to be exercised
+by any hermetic test. This is not a defect in the phase's delivery — it is
+the honest, by-design boundary of what automated verification can prove
+about three irreversible/credentialed operations. The recommended next step
+is an operator-run `devflow release --execute --yes-release` against the
+real repository (or a controlled first real release), observing the three
+items in Human Verification Required, per `26-VALIDATION.md`'s own
+"Manual-Only Verifications" table.
 
-## Fix-Loop Disposition 2026-07-29 (`/gsd-execute-phase 26 --gaps-only`)
-
-DevFlow's validate stage returned verdict `gaps` and looped back to the code
-stage with this phase's fix command. **That command cannot close these gaps, and
-this is not a transient failure — it is a scope mismatch.** Recorded here so a
-subsequent validate→code loop does not re-derive it:
-
-- `--gaps-only` selects plans whose frontmatter carries `gap_closure: true`.
-  `rg 'gap_closure' .planning/phases/26-release-cut-automation/` returns **zero
-  matches**, and 26-01/26-02/26-03 all have SUMMARYs (`incomplete: []`). The
-  filter therefore matches **no plans** — there is nothing for the executor to run.
-- Truths 7–11 were **re-verified independently** during this loop (not taken from
-  this report): no `sync.rs` and no `mod sync`; zero matches for
-  `yes_release`/`--yes-release`; zero matches for the five publish primitives; no
-  `Command::Sync`; zero callers of `push_ref`/`release_tag_state`/
-  `create_signed_release_tag` outside `git.rs`; and `main.rs:572-586` still
-  hard-rejects a bare `devflow release`. All five gaps are genuinely open.
-- Closing them means **writing plans 26-04..26-07**, which is
-  `/gsd-plan-phase 26 --gaps`' job, not `execute-phase`'s. Authoring ~half a
-  phase of new implementation for two irreversible capabilities (direct push to
-  `develop`, `cargo publish`) inside a fix loop would also bypass the plan-review
-  gate those decisions were deliberately routed through in 26-01.
-
-**What this loop did close:** the two `requirements-completed` overclaims in the
-Anti-Patterns table above (26-01, 26-03) — the only reported defects that were
-actually actionable at the code stage. Docs-only; no source file was touched, so
-the phase's green test coverage (22 delivered behaviors, `26-VALIDATION.md`
-Part A) is unchanged. This deliberately does **not** move the score: 6/11 truths
-verified and `status: gaps_found` both remain accurate.
-
-**Operator decision required.** Two viable paths, neither auto-selectable:
-1. `/gsd-plan-phase 26 --gaps` — plan and execute 26-04..26-07, finishing the
-   arc inside Phase 26. `26-VALIDATION.md` Part B's 11 rows are ready-made
-   acceptance criteria.
-2. Close Phase 26 as **PARTIAL** on its genuine deliverable (999.5, fully done
-   and green) and carry 999.25/999.52 into a new phase. Honest given the phase
-   already reports `nyquist_compliant: false`, and it stops the validate→code
-   loop from re-firing on gaps no fix-up pass can reach.
+Note: one intermittent, unreproduced `devflow-core` lib-suite failure (433
+passed / 1 failed) was observed once during heavy full-suite contention in
+prior investigation and did not recur across 9 subsequent runs, nor during
+this session's own full-suite run (434 passed / 0 failed, twice). Recorded
+as a flakiness risk to watch, not a blocking gap.
 
 ---
 
-*Verified: 2026-07-29T23:45:00Z*
+*Verified: 2026-07-30T03:10:00Z*
 *Verifier: Claude (gsd-verifier)*
