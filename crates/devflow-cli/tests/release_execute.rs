@@ -287,6 +287,251 @@ fn bare_release_names_both_modes_and_no_deferred_executor() {
     );
 }
 
+/// Creates a local bare repository and wires it up as `root`'s `origin` —
+/// the hermetic way to exercise a real `git push`/`git fetch` without a
+/// network dependency, mirroring `devflow_core::git::tests::init_bare_remote`
+/// (that helper is `#[cfg(test)]`-only inside `devflow-core` and unreachable
+/// from this integration test binary, so it is reproduced locally here).
+/// Keep the returned `TempDir` alive for the whole test — dropping it
+/// deletes the bare repository out from under `origin`.
+fn init_bare_remote(root: &Path) -> tempfile::TempDir {
+    let bare = tempfile::tempdir().unwrap();
+    let output = devflow_core::test_support::git_command(bare.path())
+        .args(["init", "--bare", "-q"])
+        .output()
+        .expect("spawn git init --bare");
+    assert!(
+        output.status.success(),
+        "git init --bare failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    git(
+        root,
+        &["remote", "add", "origin", bare.path().to_str().unwrap()],
+    );
+    bare
+}
+
+/// C-03 (G1): the failure path names every step that already landed before
+/// the error, and states plainly that nothing is rolled back — the
+/// operator's only record of irreversible mutations (D-05). The fixture
+/// reaches PAST step 1 (a real `develop` commit + push land against a real
+/// bare `origin`) and is deliberately left WITHOUT
+/// `devflow.releaseSigningKey` configured, so step 3 (the signed tag) is
+/// what fails — not the human gate, which is made to pass by making
+/// `origin/main` declare the exact version step 1 computes and writes.
+#[test]
+fn execute_failure_reports_the_steps_that_already_landed() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "test@example.com"]);
+    git(root, &["config", "user.name", "Test"]);
+    git(root, &["config", "commit.gpgsign", "false"]);
+    git(root, &["config", "tag.gpgsign", "false"]);
+    git(root, &["config", "core.hooksPath", "/dev/null"]);
+    git(root, &["checkout", "-q", "-b", "develop"]);
+    let _bare = init_bare_remote(root);
+
+    // develop, v0.0.1: the low baseline step 1 will bump past.
+    write_workspace_fixture(root, "0.0.1", "0.0.1");
+    git(root, &["add", "."]);
+    git(root, &["commit", "-q", "-m", "chore: add version file"]);
+    git(root, &["push", "-q", "-u", "origin", "develop"]);
+
+    // A feature commit on develop so `compute_version` derives a version
+    // past the 0.0.1 baseline.
+    std::fs::write(root.join("feature.txt"), "feature\n").unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-q", "-m", "feat: add a feature"]);
+    git(root, &["push", "-q", "origin", "develop"]);
+
+    // Compute the release version `execute_release` will itself derive
+    // (read-only — mutates nothing), so `main` can be shaped to declare it
+    // in advance and let the human gate pass.
+    let target = devflow_core::version::compute_version(root)
+        .expect("compute_version")
+        .to_string();
+
+    git(root, &["checkout", "-q", "-b", "main"]);
+    write_workspace_fixture(root, &target, &target);
+    git(root, &["add", "."]);
+    git(
+        root,
+        &[
+            "commit",
+            "-q",
+            "-m",
+            &format!("chore: bump version to {target}"),
+        ],
+    );
+    git(root, &["push", "-q", "-u", "origin", "main"]);
+    git(root, &["checkout", "-q", "develop"]);
+
+    // Deliberately NOT setting `devflow.releaseSigningKey` — step 3 (the
+    // signed tag) must fail naming the missing key.
+
+    let output = run_release(root, &["--execute", "--yes-release"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "expected the missing signing key to fail the run. stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("version bump") && stdout.contains("✓"),
+        "expected the ledger to report the completed VersionBump step, got stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("NOT rolled back"),
+        "expected the advisory that landed steps are not rolled back, got stdout: {stdout}"
+    );
+    assert!(
+        stderr.contains("devflow.releaseSigningKey"),
+        "expected the failure to name the missing config key, got stderr: {stderr}"
+    );
+}
+
+/// Configure repo-local SSH tag signing with a throwaway keypair so `git tag
+/// -s` (and `devflow_core::git::create_signed_release_tag`) produce a real,
+/// verifiable signature — mirroring
+/// `devflow_core::git::tests::configure_ssh_tag_signing`, which is
+/// `#[cfg(test)]`-only inside `devflow-core` and unreachable from this
+/// integration test binary. Every setting is repo-local; nothing touches
+/// `$HOME` or config outside the returned `TempDir`.
+fn configure_ssh_tag_signing(root: &Path) -> tempfile::TempDir {
+    let key_dir = tempfile::tempdir().unwrap();
+    let key_path = key_dir.path().join("sign_key");
+    let keygen = Command::new("ssh-keygen")
+        .args([
+            "-t",
+            "ed25519",
+            "-N",
+            "",
+            "-C",
+            "test",
+            "-f",
+            key_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn ssh-keygen");
+    assert!(
+        keygen.status.success(),
+        "ssh-keygen fixture setup failed: {}",
+        String::from_utf8_lossy(&keygen.stderr)
+    );
+    let pub_key_path = key_dir.path().join("sign_key.pub");
+    let pub_key = std::fs::read_to_string(&pub_key_path).unwrap();
+
+    let email = devflow_core::test_support::git_command(root)
+        .args(["config", "--get", "user.email"])
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .expect("read fixture user.email");
+
+    let allowed_signers_path = key_dir.path().join("allowed_signers");
+    std::fs::write(&allowed_signers_path, format!("{email} {pub_key}")).unwrap();
+
+    git(root, &["config", "gpg.format", "ssh"]);
+    git(
+        root,
+        &["config", "user.signingkey", pub_key_path.to_str().unwrap()],
+    );
+    git(
+        root,
+        &[
+            "config",
+            "devflow.releaseSigningKey",
+            pub_key_path.to_str().unwrap(),
+        ],
+    );
+    git(
+        root,
+        &[
+            "config",
+            "gpg.ssh.allowedSignersFile",
+            allowed_signers_path.to_str().unwrap(),
+        ],
+    );
+    git(root, &["config", "tag.gpgsign", "true"]);
+    key_dir
+}
+
+/// C-04 (G2): a release that tags and pushes but publishes NOTHING (an
+/// empty `publish_order` — the fixture's `members` list points at a path
+/// absent from disk) must never be rendered as the unqualified "release cut
+/// complete" — that would be a false green on the one irreversible step.
+/// Reaches the full sequence: bare `origin`, real SSH tag signing, `main`
+/// fast-forwarded to `develop`'s tip so the human gate passes and no tag
+/// pre-exists.
+#[test]
+fn a_release_that_publishes_nothing_is_never_reported_as_complete() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "test@example.com"]);
+    git(root, &["config", "user.name", "Test"]);
+    git(root, &["config", "commit.gpgsign", "false"]);
+    git(root, &["config", "tag.gpgsign", "false"]);
+    git(root, &["config", "core.hooksPath", "/dev/null"]);
+    git(root, &["checkout", "-q", "-b", "develop"]);
+    let _bare = init_bare_remote(root);
+    let _keys = configure_ssh_tag_signing(root);
+
+    write_workspace_fixture(root, "0.0.1", "0.0.1");
+    git(root, &["add", "."]);
+    git(root, &["commit", "-q", "-m", "chore: add version file"]);
+    git(root, &["push", "-q", "-u", "origin", "develop"]);
+
+    std::fs::write(root.join("feature.txt"), "feature\n").unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-q", "-m", "feat: add a feature"]);
+    git(root, &["push", "-q", "origin", "develop"]);
+
+    let computed = devflow_core::version::compute_version(root).expect("compute_version");
+    let target = computed.to_string();
+    devflow_core::version::write_version(root, &computed).expect("write_version");
+    git(root, &["add", "."]);
+    git(
+        root,
+        &[
+            "commit",
+            "-q",
+            "-m",
+            &format!("chore: bump version to {target}"),
+        ],
+    );
+    git(root, &["push", "-q", "origin", "develop"]);
+
+    // main: fast-forward to develop's exact tip — origin/main is trivially
+    // an ancestor of develop, and no release tag exists anywhere yet.
+    git(root, &["checkout", "-q", "-b", "main"]);
+    git(root, &["merge", "--ff-only", "develop"]);
+    git(root, &["push", "-q", "-u", "origin", "main"]);
+    git(root, &["checkout", "-q", "develop"]);
+
+    let output = run_release(root, &["--execute", "--yes-release"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "expected the full sequence to succeed (tag+push, nothing to publish), got: {stdout}\n\
+         stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("NOTHING was published"),
+        "expected the CompletedWithoutPublish wording, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("release cut complete"),
+        "expected the unqualified 'release cut complete' phrasing to be ABSENT, got: {stdout}"
+    );
+}
+
 /// Supplementary source-surface guard (B10) — documented as supplementary
 /// to, never a substitute for, `yes_release_is_not_settable_via_config_or_env`
 /// above, per
