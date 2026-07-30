@@ -709,7 +709,7 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.39: Production Git Calls Inherit a Redirecting Environment (BACKLOG)
+### Phase 999.39: Production Git Calls Inherit a Redirecting Environment (PROMOTED — Phase 27)
 
 **Goal:** DevFlow's production git invocations pin `current_dir()` but do **not** clear git's repository-local environment variables. `GIT_DIR` outranks the working directory, so any `devflow` process launched with one set — from a git hook, `git rebase --exec`, or `git bisect run` — silently operates on *that* repository instead of the project root it was given.
 
@@ -731,9 +731,11 @@ Plans:
 
 **Considered and deliberately excluded from Phase 26 (2026-07-29).** Confirmed still open at HEAD `76e49f1` — every production call site still pins `current_dir()` only, and `test_support::git_command`'s scrubbing exists solely inside `#[cfg(test)]` code. Real defense-in-depth value (the 999.37 incident class), but its ~86 call sites span most of `crates/` including `git.rs`, where Phase 26's 999.25/999.54/999.50/999.52 cluster is already working — folding it in risks the same file-overlap serialization tax Phase 26 is structured to avoid. Deferred to its own phase (27+), not dropped.
 
+**PROMOTED 2026-07-30 → Phase 27** ("Scrub Redirecting Git Environment From Production Calls"), re-verified open at HEAD `b3cab1c`. Operator decision, taken immediately after Phase 26 closed PARTIAL: 999.25's re-attempt names this its prerequisite #1, so it leads rather than waits. Scope, evidence and rationale live here; the Phase 27 entry carries the plan breakdown and does not restate them.
+
 Plans:
 
-- [ ] TBD (promote with /gsd-review-backlog when ready)
+- [ ] Tracked in Phase 27 — run /gsd-discuss-phase 27, then /gsd-plan-phase 27
 
 <!--
 RENUMBERED 2026-07-26. The four findings below were originally filed as
@@ -1788,3 +1790,27 @@ Plans:
 
 - [x] 25-06-PLAN.md — 25c gate: `preflight_major_bump_check` (D-09) plus the `pipeline_gate.rs` fixture that re-derives the replaced algorithm (`preflight.rs`, `pipeline_gate.rs`)
 - [x] 25-07-PLAN.md — 25d/25e surface: `doctor` stray finding, opt-in `gate sweep` reaping, deleted-root e2e test, retargeted `stop` identity test (`commands.rs`, `main.rs`, new `tests/reap_strays_e2e.rs`)
+
+### Phase 27: Scrub Redirecting Git Environment From Production Calls
+
+**Promoted:** 2026-07-30 — backlog **999.39 / DEN-66**, re-verified open at HEAD `b3cab1c` before promotion. Promoted to its own phase exactly as Phase 26 anticipated ("Deferred to its own phase (27+), not because it's low-value").
+
+**Goal:** Route every production git invocation through a single scrubbing constructor — mirroring what `test_support::git_command` already does for tests — so that `GIT_DIR`, `GIT_WORK_TREE` and the other repository-local variables cannot silently redirect DevFlow onto a repository the operator never named. Today all ~86 production `Command::new("git")` sites pin `current_dir()` and nothing else; `GIT_DIR` outranks the working directory, so any `devflow` process launched with one set operates on *that* repository instead.
+
+**Why this is High, not hygiene.** Phase 26's re-review (`26-REVIEW.md`, finding **CR-01**) found that `mutating_project_root` — the guard written expressly to stop `release --execute`/`sync` acting on an unnamed repository (D-13, closing C-06) — **is bypassed by an inherited `GIT_DIR`**. `git rev-parse --show-toplevel` reports the *cwd's* work tree while HEAD, refs and objects come from `GIT_DIR`, so the guard compares two paths, sees a match, and passes while the executor pushes, tags, and publishes against a different repository. The effect is no longer wrong answers but **irreversible operations against the wrong repository**. Git sets these variables for hooks, `rebase --exec`, `bisect run` and `submodule foreach` — and DevFlow runs git hooks as part of its own workflow.
+
+**Sequencing consequence — this is why the phase exists now.** No mutating-command root guard can be trusted until this lands. It is prerequisite #1 for **999.25** (release executor, DEN-50) and blocks **999.52** (`devflow sync`) from shipping independently, since sync shares the same bypassed guard. Both are held on `feature/phase-26` awaiting it.
+
+**Design decision this phase must settle:** whether an operator-set `GIT_DIR` should ever be honoured. The safer default is **no** — decide deliberately in discuss-phase rather than by omission, and record it.
+
+**Acceptance signal already exists.** With `GIT_DIR` set, 37 unit tests currently fail because production functions under test (e.g. `tag_exists_and_reachable`) resolve to the wrong repository. 999.37 deliberately left these failing rather than papering over them, so they are a ready-made red-to-green target — see the 999.39 backlog entry's "Residual, by design" note. Add a regression test asserting the guard itself holds under a hostile `GIT_DIR`; `crates/devflow-cli/tests/project_root_guard.rs:18-21` names the risk for its own helpers today but never tests it against the guard.
+
+**Requirements**: TBD — no REQ-IDs; tracked by backlog identifier (`999.39`), consistent with Phases 21/22/26. Full evidence, escalation rationale and prior-deferral reasoning remain in the **999.39** backlog entry above; this entry does not restate them.
+**Depends on:** Phase 26 (CLOSED PARTIAL — no code dependency, but 999.25's re-attempt depends on this)
+**Plans:** 0 plans
+
+**Scope caution carried from Phase 26's exclusion note:** ~86 call sites spanning most of `crates/` including `git.rs`. Mechanical, but it is production behavior and touches the same files as the unmerged 999.25 cluster — expect file-overlap serialization and plan waves accordingly.
+
+Plans:
+
+- [ ] TBD (run /gsd-discuss-phase 27, then /gsd-plan-phase 27 to break down)
