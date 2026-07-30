@@ -16,8 +16,8 @@
 //!   [`release_range_start`] to survive this repository's squash-merge +
 //!   sync-back release topology.
 
+use crate::git::git_command;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// A semantic version, whether read from disk or computed from git history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,9 +117,8 @@ pub fn read_major_version(path: &Path) -> Result<u32, VersionError> {
 /// `looks_like_devflow_process`).
 #[deprecated(note = "superseded by `reachable_semver_baseline` (D-07)")]
 pub fn count_git_tags(project_root: &Path) -> Result<u32, VersionError> {
-    let output = Command::new("git")
+    let output = git_command(project_root)
         .arg("tag")
-        .current_dir(project_root)
         .output()
         .map_err(|err| VersionError::Git(err.to_string()))?;
     if !output.status.success() {
@@ -144,9 +143,8 @@ pub fn count_git_tags(project_root: &Path) -> Result<u32, VersionError> {
 /// [`count_git_tags`]'s doc comment.
 #[deprecated(note = "superseded by `classify_range_bump` (D-08)")]
 pub fn commits_since_last_minor_tag(project_root: &Path) -> Result<u32, VersionError> {
-    let last_tag = Command::new("git")
+    let last_tag = git_command(project_root)
         .args(["describe", "--tags", "--abbrev=0"])
-        .current_dir(project_root)
         .output()
         .map_err(|err| VersionError::Git(err.to_string()))?;
 
@@ -157,9 +155,8 @@ pub fn commits_since_last_minor_tag(project_root: &Path) -> Result<u32, VersionE
         "HEAD".to_string()
     };
 
-    let output = Command::new("git")
+    let output = git_command(project_root)
         .args(["rev-list", "--count", &range])
-        .current_dir(project_root)
         .output()
         .map_err(|err| VersionError::Git(err.to_string()))?;
     if !output.status.success() {
@@ -181,9 +178,8 @@ pub fn commits_since_last_minor_tag(project_root: &Path) -> Result<u32, VersionE
 /// excluded via `filter_map(...ok())` rather than erroring — a malformed tag
 /// can never crash this path (T-25-02).
 pub fn highest_semver_tag(project_root: &Path) -> Result<Option<semver::Version>, VersionError> {
-    let output = Command::new("git")
+    let output = git_command(project_root)
         .arg("tag")
-        .current_dir(project_root)
         .output()
         .map_err(|err| VersionError::Git(err.to_string()))?;
     if !output.status.success() {
@@ -213,9 +209,8 @@ pub fn highest_semver_tag(project_root: &Path) -> Result<Option<semver::Version>
 pub fn reachable_semver_baseline(
     project_root: &Path,
 ) -> Result<Option<semver::Version>, VersionError> {
-    let output = Command::new("git")
+    let output = git_command(project_root)
         .args(["tag", "--merged", "HEAD"])
-        .current_dir(project_root)
         .output()
         .map_err(|err| VersionError::Git(err.to_string()))?;
     if !output.status.success() {
@@ -237,9 +232,8 @@ pub fn reachable_semver_baseline(
 /// (root commit), not a genuine spawn/IO failure — those still propagate
 /// via `?` through the `Command::output()` call itself.
 fn first_parent(project_root: &Path, commit: &str) -> Result<Option<String>, VersionError> {
-    let output = Command::new("git")
+    let output = git_command(project_root)
         .args(["rev-parse", &format!("{commit}^1")])
-        .current_dir(project_root)
         .output()
         .map_err(|err| VersionError::Git(err.to_string()))?;
     if !output.status.success() {
@@ -302,14 +296,13 @@ pub fn release_range_start(
     project_root: &Path,
     baseline_tag: &str,
 ) -> Result<String, VersionError> {
-    let ancestry = Command::new("git")
+    let ancestry = git_command(project_root)
         .args([
             "rev-list",
             "--ancestry-path",
             "--reverse",
             &format!("{baseline_tag}..HEAD"),
         ])
-        .current_dir(project_root)
         .output()
         .map_err(|err| VersionError::Git(err.to_string()))?;
     if !ancestry.status.success() {
@@ -335,9 +328,8 @@ pub fn release_range_start(
             return Ok(candidate.clone());
         };
 
-        let tag_is_ancestor_of_first_parent = Command::new("git")
+        let tag_is_ancestor_of_first_parent = git_command(project_root)
             .args(["merge-base", "--is-ancestor", baseline_tag, &first_parent])
-            .current_dir(project_root)
             .output()
             .map(|out| out.status.success())
             .unwrap_or(false);
@@ -396,9 +388,8 @@ pub fn classify_range_bump(project_root: &Path, range_start: &str) -> Result<Bum
     } else {
         format!("{range_start}..HEAD")
     };
-    let output = Command::new("git")
+    let output = git_command(project_root)
         .args(["log", "--no-merges", &range, "--format=%H%x1f%B%x1e"])
-        .current_dir(project_root)
         .output()
         .map_err(|err| VersionError::Git(err.to_string()))?;
     if !output.status.success() {
@@ -560,9 +551,8 @@ pub fn changelog_sections(
     } else {
         format!("{range_start}..HEAD")
     };
-    let output = Command::new("git")
+    let output = git_command(project_root)
         .args(["log", "--no-merges", &range, "--format=%H%x1f%B%x1e"])
-        .current_dir(project_root)
         .output()
         .map_err(|err| VersionError::Git(err.to_string()))?;
     if !output.status.success() {
