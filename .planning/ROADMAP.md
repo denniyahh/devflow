@@ -1054,7 +1054,7 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.57: An Operator's Checkpoint Answer Can Never Reach the Agent (BACKLOG)
+### Phase 999.57: An Operator's Checkpoint Answer Can Never Reach the Agent (PROMOTED — Phase 28, parts A+C; part B deferred)
 
 **Goal:** A `gate="blocking-human"` checkpoint is currently a **dead end for any DevFlow-driven run**. The agent stops and asks a question; there is no path by which the operator's answer reaches the agent; every retry spawns a fresh process that asks the identical question again, forever. This is the single largest gap between DevFlow's stated goal (unattended `--yes-ship` / `--yes-release` runs) and what it can actually finish, because a plan that *correctly* gates an irreversible decision becomes a plan that can never complete unattended.
 
@@ -1111,7 +1111,7 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.59: A Missing CONTEXT.md Is Ambiguous, So Define Attempts an Interview It Cannot Conduct (BACKLOG)
+### Phase 999.59: A Missing CONTEXT.md Is Ambiguous, So Define Attempts an Interview It Cannot Conduct (PROMOTED — Phase 28, unit 28c)
 
 **Goal:** DevFlow's Define stage runs `/gsd-discuss-phase N` under one-shot `claude -p --dangerously-skip-permissions`. But discuss-phase is an **interactive elicitation** — it asks the operator questions via `AskUserQuestion`. Headless, there is nowhere for those questions to go. Today the only thing preventing a deadlock is the idempotency contract in `prompt::idempotent_stage_prompt` (`crates/devflow-core/src/prompt.rs:142-166`): *"if `CONTEXT.md` EXISTS, the stage's work is already done — do NOT run the GSD command, do NOT ask for input."*
 
@@ -1141,7 +1141,7 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.60: `resume` Discards an `--until` Cap That Never Fired, and Cannot Re-Specify One (BACKLOG)
+### Phase 999.60: `resume` Discards an `--until` Cap That Never Fired, and Cannot Re-Specify One (PROMOTED — Phase 28, unit 28d)
 
 **Goal:** `devflow resume --phase N` clears `stop_until` **unconditionally** (`crates/devflow-cli/src/pipeline_launch.rs:226-228`), including when the cap never fired. An operator who started a run with `--until validate` — explicitly declaring Ship out of bounds — and then resumed it after any interruption gets a run with **no cap at all**, silently. `resume` also exposes no `--until` flag, so the boundary cannot be re-established once lost; the only remaining controls are `yes_ship` and `kill`.
 
@@ -1937,3 +1937,49 @@ Plans:
 **Wave 3** *(blocked on Wave 2 completion)*
 
 - [x] 27-06-PLAN.md — Workspace spawn-edge census and the phase acceptance run under a hostile `GIT_DIR` (wave 3)
+
+### Phase 28: Close the Checkpoint Answer Return Path
+
+**Promoted:** 2026-07-30 — bundles **999.57 / DEN-82** (primary), **999.59 / DEN-84**, and **999.60 / DEN-85**. All three re-verified open at HEAD `8072ab6` before promotion (see "Verified at promotion" below). Chosen over 999.25 (release executor), whose own entry lists five prerequisites of which only one — 999.39, delivered by Phase 27 — is now met.
+
+**Goal:** Make an operator's answer reach the agent. A `gate="blocking-human"` checkpoint is currently a **dead end for any DevFlow-driven run**: the agent stops and asks a question, there is no path by which the answer reaches it, and every retry spawns a fresh process that asks the identical question again. This is the single largest gap between DevFlow's stated goal (unattended `--yes-ship` / `--yes-release` runs) and what it can actually finish, because a plan that *correctly* gates an irreversible decision becomes a plan that can never complete unattended. Two adjacent defects in the same gate → prompt → relaunch path are folded in.
+
+**Why this and not 999.25.** 999.25's re-attempt needs prerequisites 2–4 closed (ledger terminal state, the `v{version}` namespace collision, the `cargo info` predicate), and those are findings *inside* code that exists only on the unmerged `feature/phase-26` branch — not schedulable work items. Prerequisite 5 (W-17) is explicitly "do this last, immediately before UAT, never before". And Phase 26's own recorded lesson asks whether each irreversible step can be made independently re-runnable *before* composing them — design work nobody has done. Meanwhile 999.57 blocks 999.25 in practice regardless: plan 26-01 was two `blocking-human` checkpoints authorizing exactly the irreversible operations the executor performs, so any re-attempt hits this immediately.
+
+**Units:**
+
+- **28a — 999.57 (A): session resume, the primary fix.** On approving a *checkpoint* gate (a class that must be distinguished from a generic transient-error gate), relaunch as `claude -p --resume <session_id> "<answer>"` against the exact exited session, instead of spawning a fresh stage run. Gives the checkpoint protocol the live back-and-forth it was written for, and is dramatically cheaper — no CONTEXT/RESEARCH re-read, no re-running completed tasks.
+- **28b — 999.57 (C): make checkpoint gates legible.** `truncate_reason` (`pipeline_outcomes.rs:318`, → `render_gate_context(reason, 300)`) caps gate context, so the operator sees `"…must select direct-push or pr-based-develop… [truncated]"` and must read `.devflow/phase-NN-stdout` by hand to find the options. A checkpoint gate is semantically different from an error gate and should render as a real menu — numbered options, verbatim, untruncated — in `devflow status` / `devflow gate show`. Independent of how the answer is transmitted; **do regardless of 28a's outcome.**
+- **28c — 999.59 / DEN-84: the interview flag.** A missing `CONTEXT.md` is ambiguous — it means either "run the interview" (impossible headlessly) or "no interview wanted" (inexpressible), and Define guesses the arm that cannot succeed. Lands in `prompt.rs`'s `idempotent_stage_prompt`, the sibling of the `stage_prompt*` family 28a must give a new parameter.
+- **28d — 999.60 / DEN-85: preserve an unfired `--until` cap.** `resume` clears `stopped`/`stop_reason`/`stop_until` unconditionally (`pipeline_launch.rs:226-228`), so a cap that never fired is silently discarded. Gate the clear on `state.stopped`. Same resume/relaunch plumbing 28a rewrites.
+
+**Verified at promotion (2026-07-30, HEAD `8072ab6`) — and one entry corrected:**
+
+| Claim | Status |
+|---|---|
+| `gates.rs` reads the note only for `"abort"` | ✅ confirmed, `gates.rs:74` |
+| `stage_prompt*` has no answer channel | ✅ confirmed — all three signatures are `(stage, phase, project_root)` |
+| `truncate_reason` caps gate context | ✅ confirmed, 300 chars |
+| **`session_id` is available for 28a** | ⚠️ **999.57's entry overstates this.** It says the id was "observed live", implying availability. In the codebase `session_id` appears **only inside a test fixture string** (`agent_result.rs:1362`) — never parsed, never stored, never persisted. The Claude adapter has **no `--resume` support**. |
+
+**Scope consequence of that correction:** 28a is not "thread an existing value through". It needs (i) capture `session_id` from the Claude result envelope, (ii) persist it on per-phase state, (iii) add `--resume` to the Claude adapter, (iv) add the checkpoint-vs-error gate classification. Size **M**, and the planner should not inherit the entry's more optimistic framing.
+
+**999.57 part (B) is deliberately NOT in scope.** The structured `{plan}-CHECKPOINT-ANSWERS.json` fallback exists so the design does not *depend* on every agent having a resume primitive — but whether Codex/OpenCode need it is unknown until (A) proves the shape, and part of its wiring lives in the GSD skill layer outside this repository. Build only if (A) demonstrates the need.
+
+**Do not fix 28a by auto-approving.** `checkpoints.md` is explicit that `gate="blocking-human"` is never bypassed in any mode, and Phase 26's run proved why: a plan had mistakenly tagged two irreversible authorizations `gate="blocking"` (auto-bypassable, auto-selects the *first* option), which would have silently authorized `cargo publish` with no human input. The gate is correct; only the return path is missing.
+
+**Explicitly excluded, with reasons — do not re-add without revisiting:**
+
+- **999.31 / Modular Agent Driver (High, Size L).** Genuinely adjacent — it reworks the adapter layer, exactly where 28a adds `--resume`. Excluded because folding an **L** into an M+S+S cluster recreates the multi-domain scope creep Phase 26 was built to avoid, and Phase 26's lesson was that oversized phases hide defects. Better sequenced *after*, inheriting a working `--resume` as a known-good case.
+- **999.28 / `--base` override (Medium, M).** Touches `start` but not the gate/prompt/relaunch path. Adjacent by file, unrelated by concern.
+- **999.61 / DEN-86** (four residual spawn edges) — unrelated mechanism; its own small phase.
+
+**Requirements**: TBD — no REQ-IDs; tracked by backlog identifier (`999.57`, `999.59`, `999.60`), consistent with Phases 21/22/26/27.
+**Depends on:** Phase 27 (no code dependency; sequencing only)
+**Plans:** 0 plans
+
+**Capacity note, recorded rather than assumed.** Three items in one phase is what Phase 26 attempted, and Phase 26 did not ship. The mitigating difference: all four units share one narrow mechanism (gate → prompt → relaunch), none drives an irreversible operation, and 28b/28c/28d are each **S**. If scope pressure appears during planning, drop **28c** first (it is the most independent), then **28d**; 28a+28b are the phase's reason to exist.
+
+Plans:
+
+- [ ] TBD (run /gsd-discuss-phase 28, then /gsd-plan-phase 28 to break down)
