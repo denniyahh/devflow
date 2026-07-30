@@ -715,8 +715,23 @@ pub fn read_version(project_root: &Path) -> Result<Version, VersionError> {
     let path = detect_version_file(project_root)
         .ok_or_else(|| VersionError::Parse("no version file found".into()))?;
     let contents = std::fs::read_to_string(&path)?;
-    let field = field_for(&path, &contents);
-    let version_str = find_version_in_contents(&contents, field)
+    version_in_contents(&path, &contents)
+}
+
+/// Parse the [`Version`] a version file's *text* declares, without touching
+/// disk. Composes the same three private steps [`read_version`] performs
+/// inline against a file it reads itself: [`field_for`] picks the dotted
+/// field for `path`'s file name, [`find_version_in_contents`] locates that
+/// field's raw value in `contents`, and [`parse_version_str`] parses it —
+/// same [`VersionError::Parse`] messages `read_version` produces today.
+///
+/// This exists so a caller can ask what version a manifest's text declares
+/// without checking that ref out first — e.g. 26-06's release executor reads
+/// the version file *as it exists at `origin/main`* via `git show
+/// origin/main:<path>`, which yields text, not a file on disk.
+pub fn version_in_contents(path: &Path, contents: &str) -> Result<Version, VersionError> {
+    let field = field_for(path, contents);
+    let version_str = find_version_in_contents(contents, field)
         .ok_or_else(|| VersionError::Parse(format!("field `{field}` not found in {path:?}")))?;
     parse_version_str(&version_str)
 }

@@ -1,0 +1,525 @@
+//! The release-cut executor (backlog `999.25`/`999.52`).
+//!
+//! [`execute_release`] composes, in order, the five steps of a release cut —
+//! version bump and direct push to `develop`, the human-gated
+//! `develop`->`main` boundary, the signed tag, the sync back, and the
+//! crates.io publish — reusing every primitive this phase already built
+//! (`GitFlow::push_ref`, `release_tag_state`, `create_signed_release_tag`
+//! from 26-03; `sync_main_to_develop` from 26-04; `crate_already_published`/
+//! `cargo_publish` from 26-05) rather than reimplementing any of them.
+//!
+//! Every step consults a live-state predicate rather than a persisted
+//! progress file (D-06) — resume comes from real git and registry state
+//! only. Nothing is ever rolled back on failure; the fix is always forward
+//! (D-05), matching `hooks_after_ship`'s documented policy. The
+//! `develop`->`main` pull request is opened and merged by a human; this
+//! module never touches it (D-02) — no `gh` subprocess is invoked anywhere
+//! in this file. The publish step is the one irreversible operation in the
+//! sequence; the operator's authorization for running it unattended is
+//! recorded in `26-01-SUMMARY.md` Decision 2 (`automate-publish`).
+//!
+//! Re-running this function after a release has fully completed (its tag
+//! reachable from `develop` after the sync) computes the NEXT version and
+//! begins a new release — this is not a "last release already finished"
+//! no-op detector, for the same `compute_version` reason documented on
+//! [`ReleaseError::TagCollision`]'s call sites below.
+
+use std::path::Path;
+use std::process::Command;
+
+use crate::version::sanitize_changelog_subject;
+
+/// One step of the release-cut sequence, in the order [`execute_release`]
+/// runs them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseStep {
+    /// Compute the release version, write it into the version file, commit
+    /// it, and push `develop` directly to `origin` (D-01/D-08).
+    VersionBump,
+    /// Create (or verify the pre-existence of) the signed release tag at
+    /// `origin/main`'s tip, once `origin/main` declares the release version.
+    Tag,
+    /// Merge `origin/main` back into `develop` via
+    /// [`crate::sync::sync_main_to_develop`] — D-07's second entry point.
+    Sync,
+    /// Publish each workspace member to crates.io in
+    /// [`crate::git::publish_order`]'s sequence (D-04).
+    Publish,
+}
+
+impl ReleaseStep {
+    /// A stable, operator-facing label for this step.
+    pub fn label(&self) -> &'static str {
+        match self {
+            ReleaseStep::VersionBump => "version bump",
+            ReleaseStep::Tag => "signed release tag",
+            ReleaseStep::Sync => "sync main back into develop",
+            ReleaseStep::Publish => "crates.io publish",
+        }
+    }
+}
+
+/// Whether a [`ReleaseStep`] actually did something on this run, or found
+/// nothing to do (D-06's live-state idempotency shape).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepStatus {
+    /// The step performed a real action this run.
+    Completed,
+    /// Live state already satisfied this step; nothing was done.
+    Skipped,
+}
+
+/// A single step's outcome, recorded in [`ReleaseReport::steps`].
+#[derive(Debug, Clone)]
+pub struct StepReport {
+    /// Which step this report describes.
+    pub step: ReleaseStep,
+    /// Whether the step acted or was a no-op.
+    pub status: StepStatus,
+    /// A bounded, control-character-neutralized human-readable detail
+    /// ([`sanitize_changelog_subject`]).
+    pub detail: String,
+}
+
+/// The overall result of one [`execute_release`] call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReleaseOutcome {
+    /// The run stopped at the `develop`->`main` human gate (D-02):
+    /// `origin/main` does not yet declare the release version. No tag was
+    /// created. The operator must merge the release PR and re-run.
+    HaltedAtHumanGate,
+    /// All five steps ran (or were skipped as already-satisfied) to
+    /// completion.
+    Completed,
+}
+
+/// The full result of an [`execute_release`] call.
+#[derive(Debug, Clone)]
+pub struct ReleaseReport {
+    /// The computed (or resumed) release version, e.g. `"1.9.0"`.
+    pub version: String,
+    /// The release tag name, e.g. `"v1.9.0"`.
+    pub tag: String,
+    /// One entry per step attempted, in sequence order.
+    pub steps: Vec<StepReport>,
+    /// Whether the run completed or halted at the human gate.
+    pub outcome: ReleaseOutcome,
+}
+
+/// Errors produced by [`execute_release`]. Every string payload is bounded
+/// through [`sanitize_changelog_subject`] before being stored (T-26-37) —
+/// untrusted git/cargo/sync stderr can contain filesystem paths, remote
+/// URLs, and key-file locations.
+#[derive(Debug, thiserror::Error)]
+pub enum ReleaseError {
+    /// A filesystem operation failed.
+    #[error("release I/O failed: {0}")]
+    Io(#[from] std::io::Error),
+    /// A `GitFlow` operation failed.
+    #[error("git operation failed: {0}")]
+    Git(#[from] crate::git::GitError),
+    /// A version operation failed.
+    #[error("version operation failed: {0}")]
+    Version(#[from] crate::version::VersionError),
+    /// The sync-back step failed.
+    #[error("sync step failed: {0}")]
+    Sync(#[from] crate::sync::SyncError),
+    /// The publish step failed.
+    #[error("publish step failed: {0}")]
+    Publish(#[from] crate::git::PublishError),
+    /// The working tree has uncommitted changes. Refuses before any
+    /// mutation, including the fetch.
+    #[error("working tree is not clean — commit, stash, or discard changes first")]
+    DirtyWorkingTree,
+    /// The current checkout is not on `develop`.
+    #[error("must be run from 'develop' (currently on '{current}')")]
+    NotOnDevelop {
+        /// The branch actually checked out, sanitized.
+        current: String,
+    },
+    /// No git remote is configured.
+    #[error("no git remote configured")]
+    NoRemote,
+    /// The release tag already exists in a shape that is neither the
+    /// already-released state nor a shape safe to create over (D-05): a
+    /// stray lightweight tag, a mismatched annotated tag, or a tag that
+    /// could not be pushed and independently re-verified as `Released`.
+    /// Never auto-resolved — no deletion, no re-pointing, no force.
+    #[error("release tag `{tag}` collision: {detail}")]
+    TagCollision {
+        /// The release tag's name.
+        tag: String,
+        /// A bounded, sanitized description of the collision.
+        detail: String,
+    },
+}
+
+fn git_output(project_root: &Path, args: &[&str]) -> Result<String, ReleaseError> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(project_root)
+        .output()?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(ReleaseError::Git(crate::git::GitError::Command(
+            sanitize_changelog_subject(&stderr),
+        )))
+    }
+}
+
+fn git_raw(project_root: &Path, args: &[&str]) -> Result<(), ReleaseError> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(project_root)
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(ReleaseError::Git(crate::git::GitError::Command(
+            sanitize_changelog_subject(&stderr),
+        )))
+    }
+}
+
+/// Whether `ancestor` is an ancestor of (or equal to) `descendant` — a thin
+/// wrapper over `git merge-base --is-ancestor`. Never panics; a spawn
+/// failure degrades to `false` (the caller then treats the step as "not yet
+/// satisfied", which is the safe direction — it means "act", never "skip a
+/// real step").
+fn is_ancestor(project_root: &Path, ancestor: &str, descendant: &str) -> bool {
+    Command::new("git")
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .current_dir(project_root)
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+/// Parse a bare `MAJOR.MINOR.PATCH` string (e.g. the un-prefixed contents of
+/// an `UnreachableBaseline` tag name) via the same parse path
+/// [`crate::version::version_in_contents`] uses for a real version file —
+/// wrapping the text as a synthetic top-level `version = "..."` assignment,
+/// which is exactly what `field_for` resolves for any path whose file name
+/// is not `Cargo.toml`/`pyproject.toml` (falls through to the bare `"version"`
+/// field at the top-level, empty-string section).
+fn parse_bare_version(text: &str) -> Result<crate::version::Version, ReleaseError> {
+    let synthetic = format!("version = \"{text}\"\n");
+    crate::version::version_in_contents(Path::new("release-tag"), &synthetic)
+        .map_err(ReleaseError::Version)
+}
+
+/// Run the release-cut sequence end to end (Tasks 1-3 implement the five
+/// steps incrementally; see the module doc comment for the full contract).
+pub fn execute_release(project_root: &Path) -> Result<ReleaseReport, ReleaseError> {
+    // Entry guards, before any mutation, mirroring
+    // `crate::sync::sync_main_to_develop`'s own guard order.
+    let status = git_output(project_root, &["status", "--porcelain"])?;
+    if !status.trim().is_empty() {
+        return Err(ReleaseError::DirtyWorkingTree);
+    }
+    let current = git_output(project_root, &["rev-parse", "--abbrev-ref", "HEAD"])?
+        .trim()
+        .to_string();
+    if current != crate::config::DEVELOP {
+        return Err(ReleaseError::NotOnDevelop {
+            current: sanitize_changelog_subject(&current),
+        });
+    }
+    if !crate::git::GitFlow::new(project_root).has_remote() {
+        return Err(ReleaseError::NoRemote);
+    }
+    git_raw(
+        project_root,
+        &["fetch", "origin", "main", "develop", "--quiet"],
+    )?;
+
+    let mut steps: Vec<StepReport> = Vec::new();
+
+    // Version resolution. `UnreachableBaseline` is the resume signal for an
+    // in-flight release (see module doc comment and `compute_version`'s own
+    // doc comment): once the release tag lands on `origin/main`'s tip and
+    // before the sync lands, a squash-merged `main` makes that tag
+    // unreachable from `develop` by construction, so this guard fires on
+    // exactly the release being resumed. Step 3 (Task 2) independently
+    // validates that the tag belongs to `origin/main`'s tip, so a stale or
+    // foreign tag is caught there rather than trusted here.
+    let version = match crate::version::compute_version(project_root) {
+        Ok(version) => version,
+        Err(crate::version::VersionError::UnreachableBaseline { tag }) => {
+            let stripped = tag.strip_prefix('v').unwrap_or(tag.as_str());
+            let resumed = parse_bare_version(stripped)?;
+            steps.push(StepReport {
+                step: ReleaseStep::VersionBump,
+                status: StepStatus::Completed,
+                detail: sanitize_changelog_subject(&format!(
+                    "resuming the in-flight release identified by unreachable tag `{tag}` \
+                     — the version bump already landed in a prior invocation"
+                )),
+            });
+            resumed
+        }
+        Err(err) => return Err(ReleaseError::Version(err)),
+    };
+    let tag = format!("v{version}");
+
+    // Step 1: version bump, with two independent sub-predicates so a
+    // partially-completed step resumes correctly (D-06). STUB: does not yet
+    // write, commit, or push — Task 1's GREEN commit implements this for
+    // real.
+    let _ = &version;
+    steps.push(StepReport {
+        step: ReleaseStep::VersionBump,
+        status: StepStatus::Skipped,
+        detail: "not yet implemented".to_string(),
+    });
+
+    // Step 2: the human-gated boundary (D-02). Content-based, not
+    // ancestry-based, because `main` squash-merges (an ancestry test would
+    // never become true).
+    let version_file = crate::version::detect_version_file(project_root)
+        .ok_or_else(|| ReleaseError::Version(crate::version::VersionError::Parse(
+            "no version file found".into(),
+        )))?;
+    let relative = version_file
+        .strip_prefix(project_root)
+        .unwrap_or(version_file.as_path())
+        .to_string_lossy()
+        .replace('\\', "/");
+    let show_ref = format!("origin/main:{relative}");
+    let main_declared = git_output(project_root, &["show", &show_ref])
+        .ok()
+        .and_then(|contents| crate::version::version_in_contents(&version_file, &contents).ok());
+
+    let boundary_passed = matches!(
+        &main_declared,
+        Some(declared)
+            if (declared.major, declared.minor, declared.patch)
+                == (version.major, version.minor, version.patch)
+    );
+
+    if !boundary_passed {
+        let declared_desc = main_declared
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "no readable version".to_string());
+        steps.push(StepReport {
+            step: ReleaseStep::Tag,
+            status: StepStatus::Skipped,
+            detail: sanitize_changelog_subject(&format!(
+                "halted at the human gate: origin/main declares {declared_desc}, release \
+                 version is {version} — open and merge the develop -> main release PR, then \
+                 re-run devflow's release executor"
+            )),
+        });
+        return Ok(ReleaseReport {
+            version: version.to_string(),
+            tag,
+            steps,
+            outcome: ReleaseOutcome::HaltedAtHumanGate,
+        });
+    }
+
+    // Tasks 2 and 3 add steps 3-5 (tag, sync, publish) here.
+    Ok(ReleaseReport {
+        version: version.to_string(),
+        tag,
+        steps,
+        outcome: ReleaseOutcome::Completed,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::DEVELOP;
+    use crate::git::GitFlow;
+    use crate::sync::tests::{init_bare_remote, init_repo};
+
+    /// A minimal workspace `Cargo.toml` fixture carrying a
+    /// `[workspace.package] version` and a `[workspace.dependencies]`
+    /// self-pin, so `write_version`'s two-place rewrite is exercised. No
+    /// `[workspace] members` list, so `publish_order` resolves to no
+    /// members (Task 3's empty-publish-order case) — the literal substring
+    /// "members" never appears in this fixture.
+    fn workspace_cargo_toml(version: &str) -> String {
+        format!(
+            "[workspace.package]\nversion = \"{version}\"\nedition = \"2024\"\n\n\
+             [workspace.dependencies]\n\
+             devflow-core = {{ path = \"crates/devflow-core\", version = \"{version}\" }}\n"
+        )
+    }
+
+    fn commit_file(root: &Path, name: &str, content: &str, message: &str) {
+        std::fs::write(root.join(name), content).unwrap();
+        crate::test_support::git_command(root)
+            .args(["add", name])
+            .status()
+            .expect("git add");
+        crate::test_support::git_command(root)
+            .args(["commit", "-q", "-m", message])
+            .status()
+            .expect("git commit");
+    }
+
+    fn rev_parse(root: &Path, rev: &str) -> String {
+        let output = crate::test_support::git_command(root)
+            .args(["rev-parse", rev])
+            .output()
+            .expect("spawn git rev-parse");
+        assert!(
+            output.status.success(),
+            "git rev-parse {rev} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// Build a fixture on `develop` with a bare `origin`, one `feat:` commit
+    /// (so `compute_version` derives a deterministic minor bump from a zero
+    /// baseline), and a version file declaring `old_version` on BOTH
+    /// `origin/main` and `origin/develop` — older than whatever
+    /// `compute_version` will derive, and identical on both branches so the
+    /// human-gate boundary check (step 2) reads a real, matching value from
+    /// `origin/main`. `develop`'s `feat:` commit lands only on `develop`, not
+    /// pushed yet — `execute_release`'s own step 1 push is what lands it,
+    /// which is the behavior under test.
+    fn fixture_with_older_version(old_version: &str) -> (tempfile::TempDir, tempfile::TempDir) {
+        let repo = init_repo();
+        let root = repo.path();
+        let bare = init_bare_remote(root);
+        let flow = GitFlow::new(root);
+
+        // develop: add the version file, push so origin/develop has it.
+        commit_file(
+            root,
+            "Cargo.toml",
+            &workspace_cargo_toml(old_version),
+            "chore: add version file",
+        );
+        flow.push_ref(DEVELOP)
+            .expect("push develop with version file");
+
+        // main: the identical version file content, as a parallel commit —
+        // origin/main then declares old_version too.
+        flow.checkout("main").expect("checkout main");
+        commit_file(
+            root,
+            "Cargo.toml",
+            &workspace_cargo_toml(old_version),
+            "chore: add version file",
+        );
+        flow.push_ref("main").expect("push main with version file");
+
+        // Back to develop for the feat commit that drives the version bump.
+        flow.checkout(DEVELOP).expect("checkout develop");
+        commit_file(root, "feature.txt", "feature", "feat: add a feature");
+
+        (repo, bare)
+    }
+
+    #[test]
+    fn version_bump_pushes_develop() {
+        let (repo, bare) = fixture_with_older_version("0.0.1");
+        let root = repo.path();
+
+        let remote_before = rev_parse(bare.path(), "refs/heads/develop");
+
+        let report = execute_release(root).expect("execute_release must succeed");
+
+        let version_step = report
+            .steps
+            .iter()
+            .find(|s| s.step == ReleaseStep::VersionBump)
+            .expect("a VersionBump step report must exist");
+        assert_eq!(
+            version_step.status,
+            StepStatus::Completed,
+            "version bump must be Completed when the version file was stale"
+        );
+
+        let remote_after = rev_parse(bare.path(), "refs/heads/develop");
+        assert_ne!(
+            remote_before, remote_after,
+            "the remote develop ref must have advanced"
+        );
+        assert!(
+            is_ancestor(root, &remote_before, &remote_after),
+            "the remote ref must have advanced by fast-forward"
+        );
+
+        let tag_exists = crate::test_support::git_command(root)
+            .args(["tag", "-l", &report.tag])
+            .output()
+            .map(|out| !String::from_utf8_lossy(&out.stdout).trim().is_empty())
+            .unwrap_or(false);
+        assert!(!tag_exists, "no local tag must exist yet");
+        let remote_tag = crate::test_support::git_command(bare.path())
+            .args(["tag", "-l", &report.tag])
+            .output()
+            .map(|out| !String::from_utf8_lossy(&out.stdout).trim().is_empty())
+            .unwrap_or(false);
+        assert!(!remote_tag, "no remote tag must exist yet");
+
+        assert_eq!(report.outcome, ReleaseOutcome::HaltedAtHumanGate);
+    }
+
+    #[test]
+    fn skips_push_when_already_ahead() {
+        let (repo, bare) = fixture_with_older_version("0.0.1");
+        let root = repo.path();
+
+        // Run once to land the bump and push.
+        let first = execute_release(root).expect("first execute_release must succeed");
+        let release_version = first.version.clone();
+
+        let remote_before = rev_parse(bare.path(), "refs/heads/develop");
+
+        let second = execute_release(root).expect("second execute_release must succeed");
+        assert_eq!(second.version, release_version);
+        let version_step = second
+            .steps
+            .iter()
+            .find(|s| s.step == ReleaseStep::VersionBump)
+            .expect("a VersionBump step report must exist");
+        assert_eq!(version_step.status, StepStatus::Skipped);
+
+        let remote_after = rev_parse(bare.path(), "refs/heads/develop");
+        assert_eq!(
+            remote_before, remote_after,
+            "the remote develop ref must be byte-identical on the skip path"
+        );
+    }
+
+    #[test]
+    fn halts_at_the_human_gate_when_main_does_not_declare_the_release() {
+        let (repo, _bare) = fixture_with_older_version("0.0.1");
+        let root = repo.path();
+
+        let report = execute_release(root).expect("execute_release must succeed");
+        assert_eq!(report.outcome, ReleaseOutcome::HaltedAtHumanGate);
+
+        let detail = report
+            .steps
+            .iter()
+            .map(|s| s.detail.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            detail.contains("0.0.1"),
+            "detail must name the version origin/main declares: {detail}"
+        );
+        assert!(
+            detail.contains(&report.version),
+            "detail must name the release version: {detail}"
+        );
+
+        let tag_exists = crate::test_support::git_command(root)
+            .args(["tag", "-l", &report.tag])
+            .output()
+            .map(|out| !String::from_utf8_lossy(&out.stdout).trim().is_empty())
+            .unwrap_or(false);
+        assert!(!tag_exists, "no tag must be created on a halted run");
+    }
+}
