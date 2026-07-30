@@ -480,6 +480,129 @@ mod tests {
         );
     }
 
+    /// Build the fixture repositories through the scrubbing constructor, as
+    /// every other test module in this phase does (`version.rs:1102`).
+    ///
+    /// A bare `Command::new("git")` here would itself inherit an ambient
+    /// hostile `GIT_DIR` — so under this phase's own acceptance command
+    /// (`GIT_DIR=<throwaway>/.git cargo test -p devflow-core ...`) the
+    /// fixture setup would target the throwaway repository instead of
+    /// `root`, and the test below would fail for a reason that has nothing
+    /// to do with the behavior it is guarding.
+    fn git(root: &Path, args: &[&str]) {
+        let ok = crate::test_support::git_command(root)
+            .args(args)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    fn init_repo(root: &Path) {
+        git(root, &["init", "-q"]);
+        git(root, &["config", "user.email", "test@example.com"]);
+        git(root, &["config", "user.name", "Test"]);
+    }
+
+    /// 27-REVIEW WR-03: the `sh` this function spawns owns the coding
+    /// agent, and whatever environment rides down with it reaches every git
+    /// command the agent runs (`sh` -> agent -> agent's git children). This
+    /// proves the scrub with a real spawned agent process, not by
+    /// inspecting the `Command` object: the agent shells out to
+    /// `git rev-parse --absolute-git-dir`, and the resolved path must be
+    /// the caller's own workdir, never a hostile `GIT_DIR` pointed at an
+    /// unrelated foreign repository.
+    ///
+    /// Mirrors `tag_reads_resolve_caller_root_under_a_hostile_git_dir`
+    /// (version.rs, 27-03/WR-01): `GIT_DIR` is never set on this test
+    /// process itself (Rust 2024 `unsafe`, unsound under threaded tests —
+    /// Phase 25 D-14), only on one freshly spawned child re-invoking this
+    /// binary filtered to this test.
+    #[test]
+    fn spawn_monitor_agent_git_calls_resolve_workdir_not_a_hostile_git_dir() {
+        const INNER_ROOT: &str = "DEVFLOW_27_MONITOR_INNER_ROOT";
+
+        if let Ok(root) = std::env::var(INNER_ROOT) {
+            // Inner mode: GIT_DIR points at a foreign repository unrelated
+            // to `root`, scoped to this child process only.
+            let root = std::path::PathBuf::from(root);
+            let state = state_in(&root);
+            let args = vec![
+                "-c".to_string(),
+                "git rev-parse --absolute-git-dir".to_string(),
+            ];
+
+            spawn_monitor(&state, "sh", &args, &[]).unwrap();
+            wait_for_agent_pid(&root, state.phase).expect("monitor should record the agent pid");
+
+            let stdout_path = crate::agent_result::stdout_path(&root, state.phase);
+            let mut captured = String::new();
+            for _ in 0..100 {
+                if let Ok(contents) = std::fs::read_to_string(&stdout_path)
+                    && !contents.trim().is_empty()
+                {
+                    captured = contents;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+
+            let resolved = std::fs::canonicalize(captured.trim())
+                .expect("agent's reported git-dir must exist on disk");
+            let expected =
+                std::fs::canonicalize(root.join(".git")).expect("caller repo .git must exist");
+            assert_eq!(
+                resolved, expected,
+                "agent's git call resolved to a hostile GIT_DIR's \
+                 repository instead of the caller's own workdir: \
+                 got {resolved:?}, want {expected:?}"
+            );
+            return;
+        }
+
+        // Outer mode: a real repository at `root`, and an unrelated
+        // foreign repository whose .git must never leak into the agent's
+        // environment.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("caller-repo");
+        std::fs::create_dir_all(&root).unwrap();
+        init_repo(&root);
+
+        let foreign = tempfile::tempdir().unwrap();
+        init_repo(foreign.path());
+
+        let exe = std::env::current_exe().expect("current_exe for child re-invocation");
+        let out = std::process::Command::new(&exe)
+            // Substring filter, NOT `--exact`: the binary's real test name
+            // is module-qualified (`monitor::tests::spawn_monitor_...`), so
+            // `--exact` against the bare name matches nothing, runs zero
+            // tests, and still exits 0 — a false green.
+            .arg("spawn_monitor_agent_git_calls_resolve_workdir_not_a_hostile_git_dir")
+            .arg("--test-threads=1")
+            .env(INNER_ROOT, root.to_str().unwrap())
+            .env("GIT_DIR", foreign.path().join(".git"))
+            .output()
+            .expect("spawn hostile child test process");
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // Assert the child actually RAN the test, not merely that it
+        // exited 0. A filter that matches nothing exits 0 with "0 passed".
+        assert!(
+            stdout.contains("1 passed"),
+            "child test process must have run exactly the inner test; \
+             stdout:\n{stdout}"
+        );
+        assert!(
+            out.status.success(),
+            "monitor-spawned agent (hostile GIT_DIR pointed at an \
+             unrelated foreign repository) must still resolve its git \
+             calls against the caller's own workdir; child exit status \
+             {:?}\nstdout:\n{stdout}",
+            out.status
+        );
+    }
+
     #[test]
     fn spawn_monitor_treats_agent_args_as_literal_argv() {
         let dir = tempfile::tempdir().unwrap();
