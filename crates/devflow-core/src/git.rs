@@ -770,7 +770,7 @@ pub fn publish_order(project_root: &Path) -> Vec<String> {
 /// TOML parser dependency for its version/workspace tooling — see
 /// `version.rs`).
 fn workspace_member_paths(contents: &str) -> Vec<String> {
-    let Some(start) = contents.find("members") else {
+    let Some(start) = members_key_offset(contents) else {
         return Vec::new();
     };
     let rest = &contents[start..];
@@ -789,6 +789,31 @@ fn workspace_member_paths(contents: &str) -> Vec<String> {
             (!fragment.is_empty()).then(|| fragment.to_string())
         })
         .collect()
+}
+
+/// Byte offset of the real `members` KEY, skipping any key that merely ends
+/// in `members` (C-04/C-05, phase 26 review): a plain `contents.find("members")`
+/// also matches `default-members`, and if that key comes first the scan latches
+/// onto the wrong array and silently truncates the publish set — a partial
+/// publish that both the `release --check` pre-gate and the final report call
+/// complete. A match counts only when `members` starts a key (nothing but
+/// whitespace before it on its line) and is followed by `=`.
+fn members_key_offset(contents: &str) -> Option<usize> {
+    const KEY: &str = "members";
+    let mut from = 0;
+    while let Some(found) = contents[from..].find(KEY) {
+        let at = from + found;
+        let starts_key = contents[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| c == '\n' || c == '\r' || c == ' ' || c == '\t');
+        let is_assignment = contents[at + KEY.len()..].trim_start().starts_with('=');
+        if starts_key && is_assignment {
+            return Some(at);
+        }
+        from = at + KEY.len();
+    }
+    None
 }
 
 /// Extract a member manifest's `[package] name`.
@@ -2195,6 +2220,39 @@ pub(crate) mod tests {
                 "crates/devflow-core".to_string(),
                 "crates/devflow-cli".to_string()
             ]
+        );
+    }
+
+    /// C-05 (phase 26 review): `default-members` must never be mistaken for
+    /// `members`. A substring scan latches onto whichever key appears first,
+    /// so both orderings are asserted — and a manifest carrying ONLY
+    /// `default-members` must resolve to no members rather than to a
+    /// silently truncated set.
+    #[test]
+    fn workspace_member_paths_ignores_default_members() {
+        let default_first = "[workspace]\ndefault-members = [\"crates/devflow-cli\"]\nmembers = [\"crates/devflow-core\", \"crates/devflow-cli\"]\n";
+        assert_eq!(
+            workspace_member_paths(default_first),
+            vec![
+                "crates/devflow-core".to_string(),
+                "crates/devflow-cli".to_string()
+            ],
+            "a leading default-members key must not truncate the member list"
+        );
+
+        let members_first = "[workspace]\nmembers = [\"crates/devflow-core\", \"crates/devflow-cli\"]\ndefault-members = [\"crates/devflow-cli\"]\n";
+        assert_eq!(
+            workspace_member_paths(members_first),
+            vec![
+                "crates/devflow-core".to_string(),
+                "crates/devflow-cli".to_string()
+            ]
+        );
+
+        let only_default = "[workspace]\ndefault-members = [\"crates/devflow-cli\"]\n";
+        assert!(
+            workspace_member_paths(only_default).is_empty(),
+            "default-members alone declares no publishable member set"
         );
     }
 
