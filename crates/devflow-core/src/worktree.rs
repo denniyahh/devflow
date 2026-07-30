@@ -4,8 +4,8 @@
 //! the main repository's object database. DevFlow places them under
 //! `<project_root>/.worktrees/` so they are easy to find and clean up.
 
+use crate::git::git_command;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// Errors produced by worktree operations.
 #[derive(Debug, thiserror::Error)]
@@ -118,9 +118,8 @@ pub fn prune(project_root: &Path) -> Result<(), WorktreeError> {
 
 /// List all worktrees for the repository by parsing `--porcelain` output.
 pub fn list(project_root: &Path) -> Result<Vec<WorktreeInfo>, WorktreeError> {
-    let output = Command::new("git")
+    let output = git_command(project_root)
         .args(["worktree", "list", "--porcelain"])
-        .current_dir(project_root)
         .output()?;
     if !output.status.success() {
         return Err(WorktreeError::Command(stderr_or_status(&output)));
@@ -172,10 +171,7 @@ fn parse_porcelain(text: &str) -> Vec<WorktreeInfo> {
 }
 
 fn run(project_root: &Path, args: &[&str]) -> Result<(), WorktreeError> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(project_root)
-        .output()?;
+    let output = git_command(project_root).args(args).output()?;
     if output.status.success() {
         Ok(())
     } else {
@@ -351,10 +347,10 @@ mod tests {
     /// 27-01's `origin_main_ancestor_status_holds_under_a_hostile_git_dir`
     /// proves immunity (no process-global env mutation — Rust 2024
     /// `unsafe`, unsound under threaded tests, Phase 25 D-14), in two
-    /// parts: (a) the `Command` `list` builds via
-    /// `git_command(project_root)` is unconditionally scrubbed — no bypass
-    /// parameter, no env-var check, no config lookup (D-01), asserted
-    /// directly on the built `Command`; (b) the actual `list(real_root)`
+    /// parts: (a) the `Command` `list` builds via the scrubbing constructor
+    /// is unconditionally scrubbed — no bypass parameter, no env-var check,
+    /// no config lookup (D-01), asserted directly on the built `Command`;
+    /// (b) the actual `list(real_root)`
     /// production function, called normally with nothing re-adding
     /// `GIT_DIR` afterward, reaches the correct answer — proven when THIS
     /// test itself runs under this crate's hostile-`GIT_DIR` harness
