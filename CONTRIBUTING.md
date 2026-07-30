@@ -356,6 +356,14 @@ rather than predicting it:
   configuration; DevFlow does not configure or document how to set it up.
 - Cargo registry credentials (`cargo login` / `CARGO_REGISTRY_TOKEN`) for
   the publish step.
+- Run the mutating release commands (`devflow release --execute
+  --yes-release`, `devflow sync`) from the checkout being released. Unlike
+  the read-only commands, they do not search upward for an owning project —
+  they refuse, naming both paths, when the resolved repository root is not
+  the directory they were invoked in. The remedy is to `cd` to that root or
+  pass it as the command's `[PROJECT]` argument. This matters because this
+  project works from phase worktrees, and an upward search would otherwise
+  have cut the release from the parent checkout.
 
 ## Commit Conventions
 
