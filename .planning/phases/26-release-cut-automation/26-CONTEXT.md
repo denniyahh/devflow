@@ -211,7 +211,26 @@ removed from the backlog entirely, not merely deferred.
   A **mutating** command (`release --execute`, `sync` — anything that
   pushes, tags, or publishes) must **refuse** when `project_root` resolves
   to a directory *different from the one it was invoked in*, printing both
-  paths and directing the operator to `cd` or pass `--project` explicitly.
+  paths and directing the operator to `cd` or name the project root
+  explicitly.
+
+  **CORRECTION, 2026-07-30 — this decision originally said "pass `--project`
+  explicitly". No such flag exists.** `project` is a *positional* argument on
+  both `Release` and `Sync` (`#[arg(default_value = ".")]`, no `long`), so
+  `devflow release --check --project /tmp` fails with clap's `unexpected
+  argument '--project' found`. The correct surface is the positional
+  `[PROJECT]`. 26-09's implementer caught this, used the real surface in both
+  the refusal message and CONTRIBUTING, and explicitly declined to invent a
+  `--project` flag to match this text — the right call, since adding one
+  would change `release --help`, break the positional invocations in two
+  existing test files, and exceed a plan scoped to root resolution. Adding a
+  `--project` long alias remains available as its own separate item if ever
+  wanted; it is deliberately not part of D-13.
+
+  **Worth knowing — the doc guard would not have caught this.**
+  `doc_check`'s flag rule falls back to matching the `project:` field name,
+  so a doc mentioning `--project` passes the check while being unusable in
+  practice. That gap is why this error survived into a recorded decision.
   **Read-only commands keep today's upward-walking behavior unchanged**
   (`status`, `doctor`, `gate`, `release --check`, etc.) — they legitimately
   need to find the owning `.devflow` from a subdirectory.
