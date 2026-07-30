@@ -3,7 +3,7 @@ phase: 27
 slug: scrub-redirecting-git-environment-from-production-calls
 # status lifecycle: draft (seeded by plan-phase) → validated (set by validate-phase §6)
 # audit-milestone §5.5 distinguishes NOT-VALIDATED (draft) from PARTIAL (validated + nyquist_compliant: false) (#2117)
-status: draft
+status: validated
 nyquist_compliant: true
 wave_0_complete: true
 created: 2026-07-30
@@ -194,6 +194,7 @@ spec-less probe fallback skipped: phase has no requirement IDs to probe (visible
 | 27-06-T2 | 27-06 | 3 | D-03 | T-27-02, T-27-16 | Previously-failing devflow-cli tests pass under a hostile `GIT_DIR` (scoped) | regression | `GIT_DIR=<throwaway>/.git cargo test -p devflow --bin devflow -- --skip pipeline_gate --skip pipeline_outcomes` → 0 failed | ✅ | ✅ green (188 passed) |
 | 27-06-T2 | 27-06 | 3 | D-02 | T-27-05 | `build.rs` is untouched by this phase | plan-time check | `git diff --stat $(git merge-base HEAD develop)..HEAD -- crates/devflow-cli/build.rs` is empty | n/a | ✅ green |
 | 27-06-T2 | 27-06 | 3 | — (T-27-17, finding) | T-27-17 | `pipeline_gate`/`pipeline_outcomes` under a hostile `GIT_DIR`, bounded 300s | finding, not a gate | `GIT_DIR=<hostile> timeout 300 cargo test -p devflow --bin devflow -- pipeline_gate pipeline_outcomes` | ✅ | ✅ green — completed clean, 47 passed / 0 failed in ~16s wall (not blocking; recorded as a finding) |
+| WR-03 | 27-REVIEW | post-wave-3 | D-01, D-03 | T-27-03 (highest-consequence spawn edge) | `monitor::spawn_monitor_inner`'s agent spawn (`monitor.rs:162`) routes through `hermetic_command`, so an inherited `GIT_DIR` cannot ride the `sh` → agent → agent's-git-children chain and retarget the phase's real commits at a foreign repository | regression (spawned-child) | `cargo test -p devflow-core --features test-support --lib monitor::tests::spawn_monitor_agent_git_calls_resolve_workdir_not_a_hostile_git_dir` | ✅ | ✅ green — **added by `/gsd-validate-phase` (see § Validation Audit below); this row did not exist before** |
 
 *Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
 
@@ -201,9 +202,9 @@ spec-less probe fallback skipped: phase has no requirement IDs to probe (visible
 
 ## Wave 0 Requirements
 
-- [x] New unit test in `crates/devflow-core/src/git.rs`'s existing `#[cfg(test)] mod tests` — asserts every redirecting variable is marked for removal on the new constructor's output, mirroring `test_support.rs:196-214`. **Present:** `git_command_marks_every_redirecting_var_for_removal` (`git.rs:1750`).
-- [x] New unit test proving a spawned process resolves the caller's root, not a hostile `GIT_DIR`'s target. **Present:** `hermetic_command_resolves_caller_root_even_under_a_hostile_git_dir` (`git.rs:1669`).
-- [x] A variable-list drift test mirroring `test_support::local_env_vars_match_git`, so the production list stays honest against the installed `git rev-parse --local-env-vars`. **Present:** `local_env_vars_match_git` (`git.rs:1784`).
+- [x] New unit test in `crates/devflow-core/src/git.rs`'s existing `#[cfg(test)] mod tests` — asserts every redirecting variable is marked for removal on the new constructor's output, mirroring `test_support.rs:196-214`. **Present:** `git_command_marks_every_redirecting_var_for_removal` (`git.rs:1761`).
+- [x] New unit test proving a spawned process resolves the caller's root, not a hostile `GIT_DIR`'s target. **Present:** `hermetic_command_resolves_caller_root_even_under_a_hostile_git_dir` (`git.rs:1680`).
+- [x] A variable-list drift test mirroring `test_support::local_env_vars_match_git`, so the production list stays honest against the installed `git rev-parse --local-env-vars`. **Present:** `local_env_vars_match_git` (`git.rs:1795`).
 - [x] No framework install needed — `cargo test` is fully functional in this environment. Confirmed throughout this phase's execution.
 
 ---
@@ -223,7 +224,8 @@ spec-less probe fallback skipped: phase has no requirement IDs to probe (visible
 - [x] Wave 0 covers all MISSING references
 - [x] No watch-mode flags
 - [x] Feedback latency < 240s (slowest single target 52.79s, well within budget)
-- [x] Both hostile-`GIT_DIR` commands reach a `test result:` line with 0 failed (not a timeout) — devflow-core 411/0, devflow-cli 188/0
+- [x] Both hostile-`GIT_DIR` commands reach a `test result:` line with 0 failed (not a timeout) — devflow-core 411/0, devflow-cli 188/0 at 27-06; re-measured at HEAD `df36434` by `/gsd-validate-phase` and now **412/0** and 188/0 (see § Validation Audit)
+- [x] Every migrated spawn site carries a hostile-`GIT_DIR` regression guard, including `monitor.rs` (closed by the audit below — it was the one exception)
 - [x] `nyquist_compliant: true` set in frontmatter
 
 **Note on scope:** this sign-off covers the D-01/D-02/D-03 mechanism-proof
@@ -234,5 +236,114 @@ with 5 unmitigated spawn edges named, evidenced, and escalated as a proposed
 backlog entry rather than fixed in this plan (which modifies no source under
 `crates/`, per its own declared scope).
 
-**Approval:** pending — `/gsd-validate-phase` owns advancing `status` from
-`draft` to `validated`, not this plan.
+**Approval:** granted by `/gsd-validate-phase` on 2026-07-30 — `status`
+advanced `draft` → `validated`. See § Validation Audit below for what that
+audit changed; the sign-off above is **not** merely inherited from 27-06.
+
+---
+
+## Validation Audit 2026-07-30
+
+Run by `/gsd-validate-phase 27` (State A — audit existing) against HEAD
+`df36434`, which post-dates both 27-06's own acceptance run (base
+`f539012`) and the review-fix commit `936b371`.
+
+| Metric | Count |
+|--------|-------|
+| Gaps found | 1 |
+| Resolved | 1 |
+| Escalated | 0 |
+
+### Method
+
+The 27-06 numbers were **not** taken on trust. Both hostile-`GIT_DIR`
+acceptance commands were re-run live at current HEAD before any gap analysis:
+devflow-core **411 passed / 0 failed**, devflow-cli **188 passed / 0 failed;
+47 filtered out** — reproducing the recorded figures at a later commit.
+
+### GAP-1 (MISSING → resolved): `monitor.rs`'s WR-03 fix had no regression guard
+
+`27-REVIEW.md` WR-03 named `monitor.rs`'s agent spawn "the highest-consequence
+site in the codebase," and commit `936b371` migrated it to `hermetic_command`.
+But that fix shipped as a constructor swap plus a comment — **no test**. Every
+other migrated module in this phase carries a `*_under_a_hostile_git_dir`
+regression test (`git.rs`, `worktree.rs`, `version.rs`, `agent_result.rs`,
+`staleness.rs`, `commands.rs`, `preflight.rs`); `monitor.rs` carried none.
+Reverting `monitor.rs:162` to a bare `Command::new("sh")` left the entire
+workspace suite green.
+
+This is precisely the defect class WR-01 was raised for — a hostile-`GIT_DIR`
+claim with no standing guard behind it — left open on the one site with the
+worst blast radius. Sweep A (`= 0`) does not cover it either: Sweep A greps for
+`Command::new("git")`, and this edge spawns `sh`.
+
+**Resolved.** Added `monitor::tests::spawn_monitor_agent_git_calls_resolve_workdir_not_a_hostile_git_dir`
+(`monitor.rs:514`), using the spawned-child shape this phase established in
+`version.rs`. It exercises the real chain rather than inspecting a `Command`
+object: the monitor-spawned agent shells out to `git rev-parse --absolute-git-dir`
+and the recorded path must be the caller's own workdir.
+
+**Falsification (performed independently by this workflow, not inherited from
+the subagent's self-report).** Reverting `monitor.rs:162` to
+`std::process::Command::new("sh").current_dir(workdir_path)` makes the test fail
+with the real consequence:
+
+```
+assertion `left == right` failed: agent's git call resolved to a hostile
+GIT_DIR's repository instead of the caller's own workdir:
+got "/tmp/.tmpNUABRl/.git", want "/tmp/.tmpoaM1eb/caller-repo/.git"
+test result: FAILED. 0 passed; 1 failed
+```
+
+`monitor.rs:162` was then restored; `git diff` confirms the only remaining
+change to the file is the added test (single hunk past the `#[cfg(test)]`
+boundary at line 205, 123 insertions, 0 implementation deletions).
+
+### Correction applied to the generated test
+
+The auditor's first version of the test built its fixture repositories with a
+bare `std::process::Command::new("git")`. That passes in a normal environment
+but **breaks this phase's own headline acceptance command**: under
+`GIT_DIR=<throwaway>/.git cargo test -p devflow-core --features test-support`,
+the helper inherits the ambient hostile `GIT_DIR` and initializes the throwaway
+repository instead of the test's own, turning the acceptance signal from
+`411 passed / 0 failed` into `411 passed / 1 failed`. Caught by re-running the
+full acceptance command rather than only the new test in isolation. Fixed to use
+`crate::test_support::git_command(root)`, the convention every other test module
+in this phase already follows (`version.rs:1102`).
+
+### Post-audit acceptance re-measurement
+
+```
+$ GIT_DIR=<hostile>/.git cargo test -p devflow-core --features test-support
+test result: ok. 412 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.81s
+
+$ cargo test -p devflow-core --features test-support --lib monitor::
+test result: ok. 11 passed; 0 failed          (was 10 before this audit)
+
+$ cargo clippy -p devflow-core --all-targets --features test-support -- -D warnings
+   clean
+
+$ cargo fmt --check -p devflow-core
+   clean
+```
+
+The devflow-core acceptance count moves **411 → 412**: the phase's signal is
+one regression test stronger than when 27-06 signed it off, and still 0 failed.
+devflow-cli's 188/0 is unaffected — this audit added no `devflow-cli` code.
+
+### Gate disclosure
+
+This workflow's Step 4 user gate (fix / skip / cancel) could not be presented:
+the stage ran non-interactively under DevFlow's one-shot launch with
+`workflow.text_mode: false`, so `AskUserQuestion` had no way to receive an
+answer. The productive default ("fix all gaps") was taken. No gap was silently
+downgraded to manual-only, and nothing was skipped.
+
+### Scope unchanged
+
+RESEARCH Assumption A2 remains **OPEN** exactly as `27-SPAWN-CENSUS.md` states.
+This audit closed the one `sh` edge that the phase had already *migrated but
+not tested* (`monitor.rs`); it did **not** migrate the 4 still-unmitigated
+edges (`hooks.rs:222`, `gates.rs:323`, `verify.rs:106`,
+`commands.rs::cmd_check`), which stay escalated to the backlog.
