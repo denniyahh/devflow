@@ -24,17 +24,24 @@ You use AI coding agents (Claude Code, Codex, OpenCode) to build features. But e
 
 DevFlow handles all of this. You say `devflow start --phase 3 --agent claude --mode auto` and walk away.
 
-> **Where the automation stops.** Steps 1–6 and 9 are automated end to end. The
-> release cut itself — opening the `develop` → `main` PR, tagging, and publishing
-> — is deliberately still manual; `devflow release --check` runs the preflight but
-> does not execute the release.
+> **Where the automation stops.** Steps 1–6 and 9 are automated end to end.
+> `devflow release --execute --yes-release` (26-07) now also automates most of
+> the release cut itself — version bump, direct push to `develop`, the signed
+> tag, syncing `main` back into `develop`, and the crates.io publish — but
+> opening and merging the `develop` → `main` PR stays human by design (D-02):
+> the executor halts cleanly at that boundary and reports what it is waiting
+> for. Run `devflow release --check` first for the read-only preflight
+> (self-pin, divergence, publish order, tag-signing viability).
 >
-> **If you squash-merge `develop` → `main`,** be aware that the squash commit has
-> no parent link back to `develop`, so `develop` never learns `main` moved and your
-> *next* release will conflict against a stale merge-base. `devflow release --check`
-> detects this (`origin/main is NOT an ancestor of HEAD`), but DevFlow does not yet
-> ship the repair. Until it does, merge `main` back into `develop` after each
-> release with a real merge commit:
+> **The `develop` ↔ `main` history link no longer requires manual repair.**
+> `devflow release --execute --yes-release` syncs `main` back into `develop`
+> for you (the same code `devflow sync` exposes standalone), so the squash-merge
+> divergence problem described below doesn't recur once you're using the
+> executor. If you ever do it by hand instead, be aware that a squash-merged
+> `develop` → `main` commit has no parent link back to `develop`, so `develop`
+> never learns `main` moved and your *next* release will conflict against a
+> stale merge-base. `devflow release --check` detects this (`origin/main is
+> NOT an ancestor of HEAD`); repair it the same way `devflow sync` does:
 >
 > ```bash
 > git checkout develop

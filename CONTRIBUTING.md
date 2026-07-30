@@ -235,28 +235,48 @@ second copy of the contract.
 
 ## Cutting a Release
 
-**Both `develop` and `main` are protected branches** — direct pushes are
-rejected ("Changes must be made through a pull request", plus required status
-checks) even for the maintainer. Every step below that changes a branch goes
-through a PR.
+**`main` is a protected branch** — direct pushes are rejected ("Changes must
+be made through a pull request", plus required status checks) even for the
+maintainer; the `develop` → `main` release PR (steps 3-4) always goes through
+a PR. `devflow release --execute --yes-release` (26-07, `999.25`) now
+performs most of the mechanical steps below directly against `develop` as a
+direct push (D-01/D-08) rather than a PR — see each step's annotation for
+exactly what it does and does not do, and run `devflow release --check`
+first for the read-only self-pin/divergence/publish-order/signing preflight.
 
-1. Bump the version in **two** places in the root `Cargo.toml`: `version`
-   under `[workspace.package]`, **and** `devflow-core`'s `version` under
-   `[workspace.dependencies]`. Bumping only the first is the easy miss;
-   `crates/devflow-cli/tests/workspace_version_pin.rs` guards the pair, but
-   only after the fact. Then `cargo build` to sync `Cargo.lock`, and add a new
-   top `## X.Y.Z` section to `CHANGELOG.md`.
-2. Since `develop` is protected, put step 1 (and any work being released) on a
-   branch and open a PR into `develop`. Merge it once CI is green.
-3. Open a PR from `develop` into `main` titled
-   `release: vX.Y.Z — <short description>`.
-4. Once CI is green, squash-merge it (this repo's branch settings only
-   allow squash merges into `main` — real merge commits are disabled).
-5. Tag the resulting commit on `main` with the maintainer key, using the same
-   explicit key-selection form documented in [§ Release
-   signing](#release-signing) — never a bare `git tag -s`, which signs with
-   whatever `user.signingkey` happens to be on the machine running it (the
-   agent's, on a machine where the agent works):
+1. **Automated (version bump).** The executor's version-bump step bumps the
+   version in **two** places in the root `Cargo.toml`: `version` under
+   `[workspace.package]`, **and** `devflow-core`'s `version` under
+   `[workspace.dependencies]`
+   (`crates/devflow-cli/tests/workspace_version_pin.rs` guards the pair).
+   **Manual sub-step, not automated:** `cargo build` to sync `Cargo.lock` —
+   neither `version::write_version` nor the release executor's bump step has
+   ever done this; run it yourself before pushing further work. The
+   CHANGELOG entry is **not** written here either — it is generated
+   separately, at Ship time, by the conventional-commit classifier (D-12,
+   999.5, see `crates/devflow-core/src/ship.rs`), not by the release
+   executor.
+2. **Automated.** The executor pushes the version-bump commit directly to
+   `origin/develop` (D-01/D-08) — no PR. This requires an **environment
+   precondition**: the credential DevFlow pushes with must be permitted to
+   push `develop` directly (a repository ruleset bypass configured by the
+   operator, out of band — DevFlow does not configure or document how to
+   set this up; see the preconditions list below).
+3. **Still human.** Open a PR from `develop` into `main` titled
+   `release: vX.Y.Z — <short description>`. The executor halts cleanly at
+   this boundary (a content-based check of `origin/main`'s version file,
+   never an ancestry check, since `main` squash-merges) and reports that it
+   is waiting for this PR; re-run the same command once it merges.
+4. **Still human.** Once CI is green, squash-merge it (this repo's branch
+   settings only allow squash merges into `main` — real merge commits are
+   disabled).
+5. **Automated (signed tag).** Re-running `devflow release --execute
+   --yes-release` after step 4 merges creates the signed release tag on the
+   resulting `main` commit, using the same explicit key-selection form
+   documented in [§ Release signing](#release-signing) — never a bare `git
+   tag -s`, which signs with whatever `user.signingkey` happens to be on the
+   machine running it (the agent's, on a machine where the agent works).
+   Equivalent to:
 
    ```bash
    git -c user.signingkey="$(git config --get devflow.releaseSigningKey)" \
@@ -264,61 +284,78 @@ through a PR.
    git push origin vX.Y.Z
    ```
 
-   Use `-s` with the explicit key selection, not `-a`: signing is already on
-   by repository policy (`.gitconfig`'s `[tag] gpgsign = true`), so the risk
-   here is not an unsigned tag but a tag signed with the *wrong* key — one
-   that looks correct in `git log`, `git tag -v`'s signer line, and GitHub's
-   "Verified" badge, because both keys share the same `user.email`. Only the
-   key fingerprint differs, which is why `scripts/hooks/pre-push` compares
-   fingerprints rather than trusting the signer string. Verify with
-   `git tag -v vX.Y.Z`.
-6. **Immediately run `scripts/sync-main-to-develop.sh`** from a clean
-   `develop` checkout. It produces a merge commit locally; because `develop`
-   is protected you cannot push it directly — put it on a `sync/` branch and
-   open a PR into `develop`.
+   The executor runs this real command and reads git's own result — it does
+   not predict whether signing will succeed (D-10: no signing-viability
+   check runs on this path). Signing is already on by repository policy
+   (`.gitconfig`'s `[tag] gpgsign = true`), so the risk is not an unsigned
+   tag but a tag signed with the *wrong* key — one that looks correct in
+   `git log`, `git tag -v`'s signer line, and GitHub's "Verified" badge,
+   because both keys share the same `user.email`. Only the key fingerprint
+   differs, which is why `scripts/hooks/pre-push` compares fingerprints
+   rather than trusting the signer string. Verify with `git tag -v vX.Y.Z`.
+6. **Automated (sync back).** The same call also runs the sync-back step —
+   the identical `sync_main_to_develop` code the standalone `devflow sync`
+   subcommand calls (D-07) — merging `origin/main` back into `develop` with
+   a content-preserving `-X ours` merge (verified byte-identical to
+   `develop`'s pre-merge tree before it is allowed to push) and direct-
+   pushing the result to `origin/develop`, no PR.
 
-   > **The sync PR must be merged with a merge commit, NOT squashed.**
-   > Squashing collapses the two parents into one and discards the ancestry
-   > link, which is the entire point of the step.
-   >
-   > **Do not use auto-merge on this PR.** It defaults to squash, which is
-   > exactly how the v2.0.0 sync failed on 2026-07-27 — the PR merged, the
-   > link was destroyed, and a second PR was needed to repair it. Use the
-   > **"Create a merge commit"** button explicitly. This is not a repository
-   > restriction to work around: `allow_merge_commit` is `true` and the
-   > `develop` ruleset permits `["merge","squash"]`; auto-merge simply does
-   > not pick the one this step requires.
-
-   Confirm the step actually worked — a squashed sync looks successful:
+   > **Historical note, now moot by construction.** Before this executor
+   > existed, this step was a manual `scripts/sync-main-to-develop.sh` run
+   > whose merge commit had to go through a `sync/` branch PR — and that PR
+   > had to be merged with a merge commit, never squashed, since squashing
+   > collapses the two parents and discards the ancestry link that is the
+   > entire point of the step (this is exactly how the v2.0.0 sync failed on
+   > 2026-07-27: the PR auto-merged via squash, the link was destroyed, and
+   > a second PR was needed to repair it). The direct-push path removes that
+   > failure mode by construction — there is no PR merge-strategy choice
+   > left to get wrong. If you ever need to do this by hand instead of via
+   > `devflow release`/`devflow sync`, confirm it worked:
 
    ```bash
    git merge-base --is-ancestor origin/main origin/develop && echo OK
    ```
 
-   If that prints nothing, the link was not created and the sync must be redone.
+   If that prints nothing, the link was not created and the sync must be
+   redone.
+7. **Still human.** Create a GitHub Release for the tag (convention since
+   v1.7.0, and how the CHANGELOG section reaches users who don't read the
+   repo).
 
-7. Create a GitHub Release for the tag (convention since v1.7.0, and how the
-   CHANGELOG section reaches users who don't read the repo).
+Step 6 is not optional — whether run by the executor or by hand. Because
+`main` only accepts squash merges, its new release commit has no parent
+relationship back to `develop`; skip this step and the *next* release PR
+will conflict against a stale merge-base (this happened going into v1.5.0:
+main and develop had silently diverged since v1.4.0, producing conflicts
+across 11 files including core Rust source).
 
-Step 6 is not optional. Because `main` only accepts squash merges, its new
-release commit has no parent relationship back to `develop` — skip this
-step and the *next* release PR will conflict against a stale merge-base
-(this happened going into v1.5.0: main and develop had silently diverged
-since v1.4.0, producing conflicts across 11 files including core Rust
-source). The script performs a content-preserving `-X ours` merge — it
-verifies the resulting tree is byte-identical to develop's before allowing
-itself to proceed — so it only ever links history, never changes content.
-Confirm it worked with `git merge-base --is-ancestor origin/main
-origin/develop`.
-
-To publish to crates.io after tagging: `cargo publish -p devflow-core`
-**first**, then `cargo publish -p devflow`. This ordering is a hard
-requirement, not a convention — `devflow`'s manifest depends on
+**Automated (crates.io publish).** The same executor call publishes each
+workspace member to crates.io in `devflow_core::git::publish_order`'s
+sequence — `devflow-core` **first**, then `devflow` — gated by a live
+registry-existence check before each publish (D-04). This ordering is a hard
+requirement, not a convention: `devflow`'s manifest depends on
 `devflow-core` by version rather than by path once packaged, and as of
 v1.8.1 `devflow-cli` also carries a dev-dependency on it for the
-`test-support` feature. Publishing out of order fails to build. `cargo
-publish` waits for the registry to make the crate available before
-returning, so the second command can follow immediately.
+`test-support` feature. This is the one **irreversible** step in the
+sequence — a published version can never be reused or unpublished; the
+operator's standing authorization to run it unattended under
+`--yes-release` is recorded in `26-01-SUMMARY.md` Decision 2
+(`automate-publish`).
+
+**Environment preconditions a real `devflow release --execute --yes-release`
+run assumes**, and deliberately does not predict — each will fail with
+git's or cargo's own error if absent, consistent with this project's stated
+preference for doing the real operation and reporting the real result
+rather than predicting it:
+
+- A usable `devflow.releaseSigningKey` and a non-interactive signing
+  environment (no `$EDITOR`/passphrase prompt able to block a headless run).
+- Non-interactive `git push` credentials for `origin` (SSH key or
+  token-backed HTTPS) — including the repository ruleset bypass permitting a
+  direct push to `develop` (step 2), which is the operator's own out-of-band
+  configuration; DevFlow does not configure or document how to set it up.
+- Cargo registry credentials (`cargo login` / `CARGO_REGISTRY_TOKEN`) for
+  the publish step.
 
 ## Commit Conventions
 

@@ -137,12 +137,10 @@ fn release_without_check_is_rejected() {
         String::from_utf8_lossy(&output.stdout)
     );
     assert!(
-        stderr.contains("DEN-50"),
-        "expected the rejection to name the deferred release-cut executor (DEN-50), got: {stderr}"
-    );
-    assert!(
-        stderr.contains("--check"),
-        "expected the rejection to mention --check, got: {stderr}"
+        stderr.contains("--check")
+            && stderr.contains("--execute")
+            && stderr.contains("--yes-release"),
+        "expected the rejection to name --check, --execute, and --yes-release, got: {stderr}"
     );
 }
 
