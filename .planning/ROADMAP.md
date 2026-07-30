@@ -1807,10 +1807,17 @@ Plans:
 
 **Requirements**: TBD — no REQ-IDs; tracked by backlog identifier (`999.39`), consistent with Phases 21/22/26. Full evidence, escalation rationale and prior-deferral reasoning remain in the **999.39** backlog entry above; this entry does not restate them.
 **Depends on:** Phase 26 (CLOSED PARTIAL — no code dependency, but 999.25's re-attempt depends on this)
-**Plans:** 0 plans
+**Plans:** 6 plans
 
 **Scope caution carried from Phase 26's exclusion note:** ~86 call sites spanning most of `crates/` including `git.rs`. Mechanical, but it is production behavior and touches the same files as the unmerged 999.25 cluster — expect file-overlap serialization and plan waves accordingly.
 
+**Planning corrections (2026-07-30, measured — supersede the two figures above).** The `~86` call sites is a double count (an `rg` glob matched each file twice); the grep-confirmed figure is **41** production sites across 7 files, verified independently three times at HEAD. The `37 unit tests` acceptance signal was measured during 999.37 and predates several phases; re-measured live under a hostile `GIT_DIR` it is **54** (devflow-core) **+ 44** (devflow-cli, `pipeline_gate`/`pipeline_outcomes` excluded) **= 98**. A bare `cargo test --workspace` does **not** terminate under a hostile `GIT_DIR`, so the acceptance commands are the two scoped ones. Full detail: `27-RESEARCH.md` § Summary and `27-01-PLAN.md` § "Phase-level recorded decisions and corrections".
+
 Plans:
 
-- [ ] TBD (run /gsd-discuss-phase 27, then /gsd-plan-phase 27 to break down)
+- [ ] 27-01-PLAN.md — Tracer: the scrubbing constructor in `devflow-core::git`, proven end-to-end through one core caller and one cli caller under a hostile `GIT_DIR` (wave 1)
+- [ ] 27-02-PLAN.md — Migrate `git.rs`'s remaining 7 sites (4 of them wrapper chokepoints) and both `worktree.rs` sites (wave 2)
+- [ ] 27-03-PLAN.md — Migrate `version.rs` (10 sites) and `agent_result.rs` (3 sites) (wave 2)
+- [ ] 27-04-PLAN.md — Migrate `staleness.rs` (2 sites) and `commands.rs` (3 git sites + the indirect `sh -c` spawn, RESEARCH Open Question #1 decided in scope) (wave 2)
+- [ ] 27-05-PLAN.md — Migrate `preflight.rs` (11 sites, 2 inside closures, 1 write operation) (wave 2)
+- [ ] 27-06-PLAN.md — Workspace spawn-edge census and the phase acceptance run under a hostile `GIT_DIR` (wave 3)
