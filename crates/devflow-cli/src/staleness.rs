@@ -9,6 +9,7 @@
 
 use devflow_core::events;
 use devflow_core::gates;
+use devflow_core::git::git_command;
 use devflow_core::state::State;
 use std::path::Path;
 
@@ -121,11 +122,7 @@ fn ancestry_range_affects_build(execution_root: &Path, embedded_commit: &str) ->
 /// binary, non-git directory, non-zero exit) — same argv-array idiom as
 /// `build.rs`'s `run_git`.
 pub(crate) fn run_git_stdout(project_root: &Path, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(project_root)
-        .output()
-        .ok()?;
+    let output = git_command(project_root).args(args).output().ok()?;
     output
         .status
         .success()
@@ -398,6 +395,78 @@ mod tests {
     use devflow_core::state::AgentKind;
     use devflow_core::workflow;
     use std::path::PathBuf;
+
+    // -----------------------------------------------------------------
+    // 27-01 (D-03): run_git_stdout holds under a hostile GIT_DIR
+    // -----------------------------------------------------------------
+
+    /// D-03: `run_git_stdout` produces correct answers under a hostile
+    /// `GIT_DIR` where it previously did not. Proven the same way
+    /// `devflow_core::git`'s own hostile-`GIT_DIR` tests prove it (no
+    /// process-global env mutation, Rust 2024 `unsafe`/unsound — Phase 25
+    /// D-14): (a) a real spawn of the exact argv `run_git_stdout` issues,
+    /// through the scrubbed `devflow_core::git::git_command`, with a
+    /// foreign `GIT_DIR` chained on top of the scrub (hostile injection
+    /// applied on top, the strongest form of the claim — `--show-toplevel`
+    /// is immune via its own `GIT_WORK_TREE`-absent fallback to cwd), still
+    /// resolves `root`; (b) the actual production function, called
+    /// normally with nothing re-adding `GIT_DIR` afterward, returns the
+    /// same answer.
+    #[test]
+    fn run_git_stdout_ignores_a_hostile_git_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            assert!(
+                devflow_core::test_support::git_command(root)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@e.st"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        git(&["config", "core.hooksPath", "/dev/null"]);
+
+        let foreign = tempfile::tempdir().unwrap();
+        let foreign_root = foreign.path();
+        assert!(
+            devflow_core::test_support::git_command(foreign_root)
+                .args(["init", "-q"])
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "git init failed in foreign repo"
+        );
+
+        // (a) the exact argv run_git_stdout issues, spawned through the
+        // scrubbed constructor with a hostile GIT_DIR chained on top.
+        let output = git_command(root)
+            .args(["rev-parse", "--show-toplevel"])
+            .env("GIT_DIR", foreign_root.join(".git"))
+            .output()
+            .expect("spawn git");
+        let resolved = std::fs::canonicalize(String::from_utf8_lossy(&output.stdout).trim())
+            .expect("canonicalize resolved toplevel");
+        let expected = std::fs::canonicalize(root).expect("canonicalize root");
+        assert_eq!(
+            resolved, expected,
+            "the argv run_git_stdout issues must resolve root even with a foreign GIT_DIR set"
+        );
+
+        // (b) the actual production function returns the same answer.
+        let via_run_git_stdout = run_git_stdout(root, &["rev-parse", "--show-toplevel"])
+            .expect("run_git_stdout must succeed");
+        let resolved_prod = std::fs::canonicalize(via_run_git_stdout.trim())
+            .expect("canonicalize run_git_stdout's result");
+        assert_eq!(resolved_prod, expected);
+    }
 
     /// D-17: matches only when BOTH exact member paths appear inside the
     /// `members = [...]` array — never a package `name` match.
