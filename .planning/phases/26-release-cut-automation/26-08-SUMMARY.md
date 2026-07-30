@@ -78,9 +78,12 @@ coverage:
     description: "A ledger that disagrees with live state loses: an in-flight ledger whose version the highest reachable semver baseline has already passed refuses naming both, with no auto-correction, no deletion, and no fallback to a fresh computation"
     requirement: "26-CONTEXT.md D-06a"
     verification:
+      - kind: unit
+        ref: "crates/devflow-core/src/release.rs#release::tests::an_in_flight_ledger_the_live_baseline_has_passed_refuses_naming_both"
+        status: pass
       - kind: other
-        ref: "crates/devflow-core/src/release.rs ReleaseError::LedgerContradicted — constructed on the in-flight path after `version::reachable_semver_baseline`; no test drives it (see Deviations)"
-        status: partial
+        ref: "crates/devflow-core/src/release.rs ReleaseError::LedgerContradicted — constructed on the in-flight path after `version::reachable_semver_baseline`"
+        status: pass
     human_judgment: false
   - id: D5
     description: "An unreadable, corrupt, or newer-format ledger refuses loudly and is never silently treated as absent; an absent ledger is not an error"
@@ -179,6 +182,8 @@ Real counts, from the commands themselves — not exit statuses.
 | `cargo clippy --workspace --all-targets -- -D warnings` | clean |
 | `cargo fmt --check` | clean |
 
+Counts above are this plan's own run. The later `LedgerContradicted` test (Deviation 2) moved `release::` to **13 passed; 0 failed** and the `devflow-core` lib to **446 passed; 0 failed**, with `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check` still clean.
+
 Source-property checks:
 
 - `rg -n 'compute_version' crates/devflow-core/src/release.rs` — the only non-test call site is inside `compute_release_version`, reachable from the no-ledger and complete-and-HEAD-moved arms only.
@@ -194,7 +199,7 @@ See `key-decisions` in the frontmatter. In short: the C-01 non-regression was ad
 ## Deviations from Plan
 
 1. **[Rule 1] The C-01 non-regression is an added assertion, not a fourth test.** The plan's `<action>` block says: "If that existing test already runs with no ledger present, extend it with an explicit assertion that no ledger was written by the refused run rather than duplicating it, and say so in a comment." The condition holds, so `refuses_a_stray_unreachable_tag_instead_of_adopting_its_version` gained `assert_eq!(release_ledger::read(root), Ok(None))` plus a comment. Its pre-existing assertions are unmodified. Consequence: the plan's artifact list names four new `release.rs` tests; three exist. `release::` went 9 → 12, not 9 → 13.
-2. **[Rule 2] `ReleaseError::LedgerContradicted` has no dedicated test.** The plan's `<action>` requires the corroboration and the refusal (both implemented and exercised on every in-flight run — the *non*-contradicted branch runs in `resume_after_publish_failure_does_not_start_a_new_release`), but its `<tests>` list and acceptance criteria name no test that drives the contradicted branch, and none was added. Recorded as `status: partial` on coverage row D4 rather than claimed. Constructing the case hermetically is straightforward (plant an in-flight ledger at a version below a reachable tag) and would be a one-test follow-up; it is called out here rather than quietly added, since the plan did not ask for it.
+2. **[Rule 2] `ReleaseError::LedgerContradicted` had no dedicated test at plan close — closed by follow-up.** The plan's `<action>` requires the corroboration and the refusal (both implemented and exercised on every in-flight run — the *non*-contradicted branch runs in `resume_after_publish_failure_does_not_start_a_new_release`), but its `<tests>` list and acceptance criteria named no test that drives the contradicted branch, so none was added at the time and coverage row D4 was recorded `status: partial` rather than claimed. **That gap is now closed** by a follow-up commit outside this plan's execution: `release::tests::an_in_flight_ledger_the_live_baseline_has_passed_refuses_naming_both` plants an in-flight ledger pinned at `0.1.0` in a fixture carrying a reachable `v0.5.0` tag, and asserts the run refuses with `ReleaseError::LedgerContradicted` naming both the ledger's version and the live baseline, reports no step, leaves `origin/develop` and the version file byte-identical, and leaves the ledger itself unrewritten (D-05). It was demonstrated RED by inverting the comparison in the guard: the executor then cut at the stale `0.1.0` and pushed `chore: bump version to 0.1.0` to the shared branch — exactly the damage the guard exists to prevent. D4 is now `pass`, and `release::` is 13 passed / 0 failed.
 3. **[Rule 1] The C-02 fixture needed a publish set the existing fixtures cannot provide.** The plan assumed "the existing fixtures cannot publish, so the failure arrives on its own". They cannot — `workspace_cargo_toml` deliberately has no `members` key, so `publish_order` resolves nothing and step 5 returns `CompletedWithoutPublish` rather than failing. A new `publish_failure_fixture` adds a real workspace member plus a committed `.cargo/config.toml` redirecting `[source.crates-io]` at the loopback discard port, so `cargo info` fails with a connection error that `classify_cargo_info_result` classifies as `Ambiguous` — an `Err`, so `cargo_publish` is structurally unreachable. No test contacts crates.io or attempts a real publish, and the test asserts *which* step failed so it cannot degrade into asserting an earlier failure.
 
 ## Issues Encountered
@@ -209,7 +214,7 @@ None. One backstop (D9: a real partial crates.io publish, resumed) remains opera
 
 - 26-REVIEW.md **C-02** is closed: the two-run sequence the review reproduced by execution now ends with the first release being finished instead of a second one being started, and the executor can say which of those two situations it is in.
 - This plan is core-only by construction and shares no file with 26-09 (CLI-only). `crates/devflow-cli/` was not modified.
-- One follow-up worth filing: a test driving `ReleaseError::LedgerContradicted` (Deviation 2).
+- The one follow-up this plan left open — a test driving `ReleaseError::LedgerContradicted` (Deviation 2) — has since been added directly rather than filed; nothing from 26-08 remains outstanding.
 
 ---
 *Phase: 26-release-cut-automation*

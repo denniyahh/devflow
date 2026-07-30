@@ -1967,4 +1967,89 @@ mod tests {
             "the release tag must really exist afterwards"
         );
     }
+
+    /// D-06a's live-state-wins clause applied to the pinned VERSION rather than
+    /// to step skipping (the sibling
+    /// `a_ledger_claiming_a_step_completed_does_not_skip_it` covers the latter):
+    /// an in-flight ledger pinned to a version the repository has already moved
+    /// past must refuse with [`ReleaseError::LedgerContradicted`] naming both
+    /// the ledger's version and the live fact — never silently preferring the
+    /// stale pin, and never falling back to a fresh computation (which is the
+    /// second release C-02 exists to prevent).
+    ///
+    /// The fixture makes the guard load-bearing rather than incidental: with a
+    /// reachable `v0.5.0` and NO ledger, `compute_version` would resolve a
+    /// perfectly ordinary `0.6.0` and step 1 would write, commit, and push it.
+    /// The refusal therefore has to come from the corroboration itself.
+    #[test]
+    fn an_in_flight_ledger_the_live_baseline_has_passed_refuses_naming_both() {
+        let (repo, bare) = fixture_with_older_version("0.0.1");
+        let root = repo.path();
+
+        // A real semver tag reachable from `develop`'s HEAD — this is what
+        // `reachable_semver_baseline` reads (`git tag --merged HEAD`), and it
+        // is strictly above the version the planted ledger pins.
+        GitFlow::new(root)
+            .tag("v0.5.0")
+            .expect("create a reachable semver tag");
+
+        let planted = crate::release_ledger::ReleaseLedger::in_flight("0.1.0", "v0.1.0");
+        crate::release_ledger::write(root, &planted).expect("plant the in-flight ledger");
+
+        let remote_before = rev_parse(bare.path(), "refs/heads/develop");
+        let version_before = std::fs::read_to_string(root.join("Cargo.toml")).expect("read");
+
+        let err =
+            execute_release(root).expect_err("a contradicted ledger must refuse before any step");
+        match &err.error {
+            ReleaseError::LedgerContradicted {
+                ledger_version,
+                live,
+                ledger,
+            } => {
+                assert_eq!(
+                    ledger_version, "0.1.0",
+                    "the refusal must name the version the ledger pins"
+                );
+                assert!(
+                    live.contains("v0.5.0"),
+                    "the refusal must name the live baseline that passed it: {live}"
+                );
+                assert!(
+                    ledger.contains("devflow-release-ledger.json"),
+                    "the refusal must name the ledger file to inspect: {ledger}"
+                );
+            }
+            other => panic!("expected LedgerContradicted, got {other:?}"),
+        }
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("0.1.0") && rendered.contains("v0.5.0"),
+            "the rendered refusal must name BOTH the ledger's version and the live one: {rendered}"
+        );
+
+        // Refused before step 1, and nothing compensated (D-05): no step
+        // reported, the shared branch and the version file are byte-identical,
+        // and the ledger is neither rewritten nor removed.
+        assert!(
+            err.steps.is_empty(),
+            "the refusal happens before step 1, so no step may report: {:?}",
+            err.steps
+        );
+        assert_eq!(
+            remote_before,
+            rev_parse(bare.path(), "refs/heads/develop"),
+            "origin/develop must be byte-identical — nothing may be pushed"
+        );
+        assert_eq!(
+            version_before,
+            std::fs::read_to_string(root.join("Cargo.toml")).expect("read"),
+            "the version file must be byte-identical — nothing may be written"
+        );
+        assert_eq!(
+            crate::release_ledger::read(root).expect("the ledger must still be readable"),
+            Some(planted),
+            "the refusal must leave the ledger exactly as it found it"
+        );
+    }
 }
