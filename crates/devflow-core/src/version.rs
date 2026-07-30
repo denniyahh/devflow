@@ -16,8 +16,8 @@
 //!   [`release_range_start`] to survive this repository's squash-merge +
 //!   sync-back release topology.
 
+use crate::git::git_command;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// A semantic version, whether read from disk or computed from git history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,9 +117,8 @@ pub fn read_major_version(path: &Path) -> Result<u32, VersionError> {
 /// `looks_like_devflow_process`).
 #[deprecated(note = "superseded by `reachable_semver_baseline` (D-07)")]
 pub fn count_git_tags(project_root: &Path) -> Result<u32, VersionError> {
-    let output = Command::new("git")
+    let output = git_command(project_root)
         .arg("tag")
-        .current_dir(project_root)
         .output()
         .map_err(|err| VersionError::Git(err.to_string()))?;
     if !output.status.success() {
@@ -144,9 +143,8 @@ pub fn count_git_tags(project_root: &Path) -> Result<u32, VersionError> {
 /// [`count_git_tags`]'s doc comment.
 #[deprecated(note = "superseded by `classify_range_bump` (D-08)")]
 pub fn commits_since_last_minor_tag(project_root: &Path) -> Result<u32, VersionError> {
-    let last_tag = Command::new("git")
+    let last_tag = git_command(project_root)
         .args(["describe", "--tags", "--abbrev=0"])
-        .current_dir(project_root)
         .output()
         .map_err(|err| VersionError::Git(err.to_string()))?;
 
@@ -157,9 +155,8 @@ pub fn commits_since_last_minor_tag(project_root: &Path) -> Result<u32, VersionE
         "HEAD".to_string()
     };
 
-    let output = Command::new("git")
+    let output = git_command(project_root)
         .args(["rev-list", "--count", &range])
-        .current_dir(project_root)
         .output()
         .map_err(|err| VersionError::Git(err.to_string()))?;
     if !output.status.success() {
@@ -181,9 +178,8 @@ pub fn commits_since_last_minor_tag(project_root: &Path) -> Result<u32, VersionE
 /// excluded via `filter_map(...ok())` rather than erroring — a malformed tag
 /// can never crash this path (T-25-02).
 pub fn highest_semver_tag(project_root: &Path) -> Result<Option<semver::Version>, VersionError> {
-    let output = Command::new("git")
+    let output = git_command(project_root)
         .arg("tag")
-        .current_dir(project_root)
         .output()
         .map_err(|err| VersionError::Git(err.to_string()))?;
     if !output.status.success() {
@@ -213,9 +209,8 @@ pub fn highest_semver_tag(project_root: &Path) -> Result<Option<semver::Version>
 pub fn reachable_semver_baseline(
     project_root: &Path,
 ) -> Result<Option<semver::Version>, VersionError> {
-    let output = Command::new("git")
+    let output = git_command(project_root)
         .args(["tag", "--merged", "HEAD"])
-        .current_dir(project_root)
         .output()
         .map_err(|err| VersionError::Git(err.to_string()))?;
     if !output.status.success() {
@@ -237,9 +232,8 @@ pub fn reachable_semver_baseline(
 /// (root commit), not a genuine spawn/IO failure — those still propagate
 /// via `?` through the `Command::output()` call itself.
 fn first_parent(project_root: &Path, commit: &str) -> Result<Option<String>, VersionError> {
-    let output = Command::new("git")
+    let output = git_command(project_root)
         .args(["rev-parse", &format!("{commit}^1")])
-        .current_dir(project_root)
         .output()
         .map_err(|err| VersionError::Git(err.to_string()))?;
     if !output.status.success() {
@@ -302,14 +296,13 @@ pub fn release_range_start(
     project_root: &Path,
     baseline_tag: &str,
 ) -> Result<String, VersionError> {
-    let ancestry = Command::new("git")
+    let ancestry = git_command(project_root)
         .args([
             "rev-list",
             "--ancestry-path",
             "--reverse",
             &format!("{baseline_tag}..HEAD"),
         ])
-        .current_dir(project_root)
         .output()
         .map_err(|err| VersionError::Git(err.to_string()))?;
     if !ancestry.status.success() {
@@ -335,9 +328,8 @@ pub fn release_range_start(
             return Ok(candidate.clone());
         };
 
-        let tag_is_ancestor_of_first_parent = Command::new("git")
+        let tag_is_ancestor_of_first_parent = git_command(project_root)
             .args(["merge-base", "--is-ancestor", baseline_tag, &first_parent])
-            .current_dir(project_root)
             .output()
             .map(|out| out.status.success())
             .unwrap_or(false);
@@ -396,9 +388,8 @@ pub fn classify_range_bump(project_root: &Path, range_start: &str) -> Result<Bum
     } else {
         format!("{range_start}..HEAD")
     };
-    let output = Command::new("git")
+    let output = git_command(project_root)
         .args(["log", "--no-merges", &range, "--format=%H%x1f%B%x1e"])
-        .current_dir(project_root)
         .output()
         .map_err(|err| VersionError::Git(err.to_string()))?;
     if !output.status.success() {
@@ -560,9 +551,8 @@ pub fn changelog_sections(
     } else {
         format!("{range_start}..HEAD")
     };
-    let output = Command::new("git")
+    let output = git_command(project_root)
         .args(["log", "--no-merges", &range, "--format=%H%x1f%B%x1e"])
-        .current_dir(project_root)
         .output()
         .map_err(|err| VersionError::Git(err.to_string()))?;
     if !output.status.success() {
@@ -2410,6 +2400,108 @@ mod tests {
             bullets[0].chars().all(|c| !c.is_control()),
             "expected no control characters in the grouped bullet, got: {:?}",
             bullets[0]
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // 27-03 (D-01/D-03): tag reads resolve the caller's own repository
+    // under a hostile GIT_DIR, not an unrelated one.
+    // -----------------------------------------------------------------
+
+    /// D-03: `count_git_tags`/`highest_semver_tag` resolve `root`'s own tags
+    /// even when the process inherited a hostile `GIT_DIR` pointed at an
+    /// unrelated repository — proven with a real spawned `git` process, not
+    /// by inspecting a `Command` object alone. Mirrors
+    /// `origin_main_ancestor_status_holds_under_a_hostile_git_dir`
+    /// (`git.rs`, 27-01): `count_git_tags`/`highest_semver_tag` take only
+    /// `project_root`, so the hostile `GIT_DIR` this test's own `<verify>`
+    /// entries exercise (`GIT_DIR=<hostile>/.git cargo test ... this test`)
+    /// is injected the same way any inherited-env attack reaches these
+    /// functions in production: via the whole process's environment, then
+    /// down into the spawned child unless the constructor scrubs it. Before
+    /// this plan's migration, both bare `Command::new("git")` sites this
+    /// test exercises inherit that `GIT_DIR` unscrubbed and silently read
+    /// the hostile repository instead — an empty repository with zero tags
+    /// is the clearest contrast against `root`'s two, so this test fails
+    /// pre-migration under the hostile harness and passes once
+    /// `git_command` scrubs it.
+    // `count_git_tags` is deprecated (D-07) but still `pub`; this test still
+    // exercises its own scrub, independent of `compute_version`'s supersession.
+    /// 27-REVIEW WR-01: this test previously set no hostile environment at
+    /// all — it asserted ordinary-path behavior and claimed a hostile-
+    /// `GIT_DIR` proof, so it passed identically with or without the scrub.
+    /// It now uses the spawned-child shape this phase established in
+    /// `staleness.rs`: `GIT_DIR` is never set on this process (Rust 2024
+    /// `unsafe`, unsound under threaded tests — Phase 25 D-14), only on one
+    /// freshly spawned child re-invoking this binary filtered to this test.
+    #[test]
+    #[allow(deprecated)]
+    fn tag_reads_resolve_caller_root_under_a_hostile_git_dir() {
+        const INNER_ROOT: &str = "DEVFLOW_27_03_TAG_READS_INNER_ROOT";
+
+        if let Ok(root) = std::env::var(INNER_ROOT) {
+            // Inner mode: GIT_DIR points at a foreign repository that has
+            // no tags at all, scoped to this child process only.
+            let root = std::path::PathBuf::from(root);
+
+            assert_eq!(
+                count_git_tags(&root).unwrap(),
+                2,
+                "count_git_tags must resolve root's own two tags, not a \
+                 hostile GIT_DIR's repository"
+            );
+            assert_eq!(
+                highest_semver_tag(&root).unwrap(),
+                Some(semver::Version::new(0, 2, 0)),
+                "highest_semver_tag must resolve root's own highest tag, not \
+                 a hostile GIT_DIR's repository"
+            );
+            return;
+        }
+
+        // Outer mode: the real repository has two tags; the foreign one has
+        // none. Unscrubbed, the child would read the foreign repository and
+        // see zero tags / no baseline.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        commit(root, "a.txt");
+        tag(root, "v0.1.0");
+        commit(root, "b.txt");
+        tag(root, "v0.2.0");
+
+        let foreign = tempfile::tempdir().unwrap();
+        init_repo(foreign.path());
+
+        let exe = std::env::current_exe().expect("current_exe for child re-invocation");
+        let out = std::process::Command::new(&exe)
+            // Substring filter, NOT `--exact`: the binary's real test name is
+            // module-qualified (`version::tests::tag_reads_...`), so `--exact`
+            // against the bare name matches nothing, runs zero tests, and
+            // still exits 0 — a false green that made the first version of
+            // this fix as vacuous as the test it replaced.
+            .arg("tag_reads_resolve_caller_root_under_a_hostile_git_dir")
+            .arg("--test-threads=1")
+            .env(INNER_ROOT, root.to_str().unwrap())
+            .env("GIT_DIR", foreign.path().join(".git"))
+            .output()
+            .expect("spawn hostile child test process");
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // Assert the child actually RAN the test, not merely that it exited
+        // 0. A filter that matches nothing exits 0 with "0 passed", so the
+        // exit status alone cannot distinguish "proved it" from "ran nothing".
+        assert!(
+            stdout.contains("1 passed"),
+            "child test process must have run exactly the inner test; \
+             stdout:\n{stdout}"
+        );
+        assert!(
+            out.status.success(),
+            "child test process (hostile GIT_DIR pointed at an unrelated \
+             foreign repository with no tags) must still resolve root's own \
+             tags; child exit status {:?}\nstdout:\n{stdout}",
+            out.status
         );
     }
 }

@@ -2,19 +2,19 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone (open — no fixed closing phase)
-current_phase: 999.1
-current_phase_name: end-to-end-dogfood-blockers
-status: Phase 25 released as v2.1.0
-stopped_at: Phase 27 context gathered
-last_updated: "2026-07-30T17:00:40.143Z"
-last_activity: 2026-07-28
+current_phase: 27
+current_phase_name: scrub-redirecting-git-environment-from-production-calls
+status: complete
+stopped_at: Phase 27 complete and verified — no Phase 28 defined; next action is backlog review
+last_updated: "2026-07-30T21:59:35.829Z"
+last_activity: 2026-07-30
+last_activity_desc: Phase 27 complete and verified (7/7 must-haves, 6/6 plans)
 progress:
   total_phases: 16
-  completed_phases: 14
-  total_plans: 112
-  completed_plans: 112
-  percent: 88
-last_activity_desc: Phase 25 complete (10/10 verified, ledger 0 open). NOT advanced to 999.1 — phase.complete's next-phase detection again picked up the 999.1 backlog heading as if sequential (same bug corrected after Phase 20, recorded in the history log below). Backlog items require /gsd-review-backlog promotion.
+  completed_phases: 15
+  total_plans: 118
+  completed_plans: 118
+  percent: 94
 ---
 
 # DevFlow — Project State
@@ -86,11 +86,17 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 999.1 — Hermes Support (BACKLOG)
-Plan: Not started
-Tasks 1-3 done, both human sign-offs recorded in 25-13-SUMMARY.md; 25-14/25-15/25-16
-planned 2026-07-28 as gap-closure round 3, not yet executed)
-Status: Phase 25 shipped — PR #47
+Phase: 27 (scrub-redirecting-git-environment-from-production-calls) — COMPLETE
+Plan: 6 of 6 complete
+Status: Verified 7/7 must-haves. No Phase 28 is defined in ROADMAP.md — the next
+real action is `/gsd-review-backlog` to promote a 999.x entry, or `/gsd-ship 27`
+to merge this phase. `phase.complete` auto-advanced this field to "999.1 — Hermes
+Support (BACKLOG)" because its next-phase scan walks into the backlog section;
+corrected here, since that value routes an operator into planning a backlog stub.
+
+(Carried-over Phase 25 remnant, left in place as found: Tasks 1-3 done, both human
+sign-offs recorded in 25-13-SUMMARY.md; 25-14/25-15/25-16 planned 2026-07-28 as
+gap-closure round 3, not yet executed)
 
 **25-10 → 25-13 (2026-07-28):** GAP 1 (25-08) and GAP 2 (25-09) closed and merged. GAP 3
 (truth 7, 25e / 999.47) moved through three states this run: `PRESENT_BEHAVIOR_UNVERIFIED`
@@ -151,7 +157,7 @@ Scope boundary: 23-16 is the **fix only** (change + regression tests + PR into `
 
 **Recovery-ref disposition:** both `origin` refs (`recovery/pre-23-11-acceptance-e0f87c2`, `recovery/pre-23-15-acceptance-0dad20d`) remain untouched on `origin`; the local copy of the pre-23-11 ref, deleted again by `devflow cleanup`, is deliberately NOT restored (per `23-FINDINGS.md` §B2a); the pre-23-15 ref is now unused (no merge to undo) but retained on `origin` for reuse by the 23-16 retry rather than deleted.
 
-Last activity: 2026-07-28
+Last activity: 2026-07-30 — Phase 27 complete, transitioned to Phase 999.1
 
 **Note on the "Plan: 2 of 15" value this replaces:** `gsd-tools state advance-plan` only increments whatever value is already in this field, which had drifted to "2 of 15" (the parallel-worktree waves 23-01…23-09 deliberately never touch STATE.md, and this field was last corrected against reality at "10 of 11 plans complete" before the plan count grew to 15 with the gap-closure plans 23-12…23-15). Corrected directly to "13 of 15" to match reality (23-12 and 23-13 both now executed) rather than trust the tool's naive +1 increment from a stale base.
 

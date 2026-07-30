@@ -8,6 +8,7 @@
 //! 3. Process gone + commits exist (last resort warning)
 
 use crate::config::GitFlowConfig;
+use crate::git::git_command;
 use crate::stage::Stage;
 use crate::state::State;
 use std::path::{Path, PathBuf};
@@ -571,18 +572,16 @@ pub fn evaluate_layer2(
     let branch = format!("{}phase-{:02}", git_flow.feature_prefix, phase);
 
     // Verify branch exists before counting commits.
-    let branch_exists = std::process::Command::new("git")
+    let branch_exists = git_command(project_root)
         .args(["rev-parse", "--verify", &branch])
-        .current_dir(project_root)
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
 
     let commits: u32 = if branch_exists {
         let range = format!("{}..{branch}", git_flow.develop);
-        std::process::Command::new("git")
+        git_command(project_root)
             .args(["rev-list", "--count", &range])
-            .current_dir(project_root)
             .output()
             .ok()
             .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
@@ -661,13 +660,12 @@ pub fn evaluate_layer3(
     git_flow: &GitFlowConfig,
 ) -> Result<AgentResult, ResultError> {
     let branch = format!("{}phase-{:02}", git_flow.feature_prefix, phase);
-    let commits = std::process::Command::new("git")
+    let commits = git_command(project_root)
         .args([
             "rev-list",
             "--count",
             &format!("{}..{branch}", git_flow.develop),
         ])
-        .current_dir(project_root)
         .output()
         .ok()
         .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
@@ -2499,5 +2497,124 @@ mod tests {
 
         assert_eq!(result.status, AgentStatus::AgentUnavailable);
         assert_eq!(result.exit_code, Some(127));
+    }
+
+    // -----------------------------------------------------------------
+    // 27-03 (D-01/D-03): branch-exists + commit-count evidence resolves
+    // the caller's own repository under a hostile GIT_DIR, not an
+    // unrelated one.
+    // -----------------------------------------------------------------
+
+    /// D-03/T-27-08: `evaluate_layer2`'s branch-exists and commit-count
+    /// evidence (the two production sites at what were base-commit lines
+    /// 574/583) resolves `project_root`'s own repository even when the
+    /// process inherited a hostile `GIT_DIR` pointed at an unrelated
+    /// repository — proven with a real spawned `git` process, not by
+    /// inspecting a `Command` object alone. Mirrors
+    /// `version::tests::tag_reads_resolve_caller_root_under_a_hostile_git_dir`
+    /// (27-03) and `origin_main_ancestor_status_holds_under_a_hostile_git_dir`
+    /// (`git.rs`, 27-01): the hostile `GIT_DIR` this test's own `<verify>`
+    /// entries exercise (`GIT_DIR=<hostile>/.git cargo test ... this test`)
+    /// is injected the same way any inherited-env attack reaches
+    /// `evaluate_layer2` in production — via the whole process's
+    /// environment, then down into the spawned child unless the
+    /// constructor scrubs it.
+    ///
+    /// Deliberately tests the mirror direction from the plan's literal
+    /// framing (real repo HAS the feature branch with a real commit;
+    /// the standard hostile-`GIT_DIR` harness's throwaway repository does
+    /// NOT), because the standard harness (`git init -q "$HOSTILE"`, no
+    /// `feature/phase-NN` branch) cannot itself manufacture a false
+    /// *positive* — an empty repository has no branch to spuriously
+    /// report as present. It can, however, still prove the scrub's
+    /// necessity by manufacturing a false *negative*: before this plan's
+    /// migration, the two unmigrated `Command::new("git")` sites inherit
+    /// the poisoned `GIT_DIR` and silently read the hostile repository
+    /// instead of `project_root` — `rev-parse --verify` reports the real
+    /// branch absent, the commit count is undercounted to zero, and a
+    /// real agent's completed work is wrongly classified `Failed`. This
+    /// is the same trust-boundary violation T-27-08 names (a foreign
+    /// repository's state substituting for the real one), reached from
+    /// the opposite direction; the scrub this plan adds removes `GIT_DIR`'s
+    /// ability to redirect the spawned child at all, closing both
+    /// directions identically.
+    /// 27-REVIEW WR-01: this test previously set no hostile environment at
+    /// all — it asserted ordinary-path behavior and claimed a hostile-
+    /// `GIT_DIR` proof, so it passed identically with or without the scrub
+    /// and could never have caught a regression back to a bare
+    /// `Command::new("git")`. It now uses the spawned-child shape this
+    /// phase established in `staleness.rs`
+    /// (`embedded_commit_is_stale_resolves_execution_root_under_a_hostile_git_dir`):
+    /// `GIT_DIR` is never set on this process (Rust 2024 `unsafe`, unsound
+    /// under threaded tests — Phase 25 D-14), only on one freshly spawned
+    /// child that re-invokes this same binary filtered to this one test.
+    #[test]
+    fn branch_evidence_resolves_caller_root_under_a_hostile_git_dir() {
+        const INNER_ROOT: &str = "DEVFLOW_27_03_BRANCH_EVIDENCE_INNER_ROOT";
+
+        if let Ok(root) = std::env::var(INNER_ROOT) {
+            // Inner mode: spawned by the outer half below with GIT_DIR
+            // pointed at an unrelated foreign repository, scoped to this
+            // child process only.
+            let root = std::path::PathBuf::from(root);
+            let phase = 27;
+            let state = state_in(&root, phase);
+
+            let result = evaluate_layer2(&root, phase, &GitFlowConfig::default(), state.stage)
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(
+                result.status,
+                AgentStatus::Success,
+                "evaluate_layer2 must see project_root's own branch/commits, \
+                 not a hostile GIT_DIR's repository: {result:?}"
+            );
+            assert_eq!(result.commits, Some(1));
+            return;
+        }
+
+        // Outer mode: build the real repository (which HAS the feature
+        // branch and its commit) plus a second, unrelated foreign
+        // repository that has neither. Unscrubbed, the child would read the
+        // foreign repo, find no branch, count zero commits, and misreport a
+        // real agent's completed work as Failed.
+        let dir = tempfile::tempdir().unwrap();
+        let phase = 27;
+        init_repo_with_feature_commit(dir.path(), phase);
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(exit_code_path(dir.path(), phase), "0").unwrap();
+
+        let foreign = tempfile::tempdir().unwrap();
+        git(foreign.path(), &["init", "-q"]);
+
+        let exe = std::env::current_exe().expect("current_exe for child re-invocation");
+        let out = std::process::Command::new(&exe)
+            // Substring filter, NOT `--exact`: the binary's real test name is
+            // module-qualified (`agent_result::tests::branch_evidence_...`),
+            // so `--exact` against the bare name matches nothing, runs zero
+            // tests, and still exits 0 — a false green.
+            .arg("branch_evidence_resolves_caller_root_under_a_hostile_git_dir")
+            .arg("--test-threads=1")
+            .env(INNER_ROOT, dir.path().to_str().unwrap())
+            .env("GIT_DIR", foreign.path().join(".git"))
+            .output()
+            .expect("spawn hostile child test process");
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // Assert the child actually RAN the test, not merely that it exited
+        // 0. A filter matching nothing exits 0 with "0 passed".
+        assert!(
+            stdout.contains("1 passed"),
+            "child test process must have run exactly the inner test; \
+             stdout:\n{stdout}"
+        );
+        assert!(
+            out.status.success(),
+            "child test process (hostile GIT_DIR pointed at an unrelated \
+             foreign repository) must still resolve project_root's own \
+             branch and commits; child exit status {:?}\nstdout:\n{stdout}",
+            out.status
+        );
     }
 }
