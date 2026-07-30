@@ -162,6 +162,27 @@ pub enum ReleaseError {
         /// A bounded, sanitized description of the collision.
         detail: String,
     },
+    /// The highest semver tag is unreachable from `develop` — which would
+    /// normally mean "a release is in flight, resume it" — but the tag does
+    /// not name `origin/main`'s tip, so it is a stray tag rather than a
+    /// release being resumed (C-01). Refused before any mutation: adopting it
+    /// would write, commit, and push a version nobody asked for to the shared
+    /// `develop` branch. Never auto-resolved — this module deletes and
+    /// re-points nothing.
+    #[error(
+        "highest semver tag `{tag}` is unreachable from develop but names {target}, not \
+         origin/main's tip {main_tip} — refusing to adopt it as an in-flight release. If a \
+         release really is in flight, merge the develop -> main release PR first; if this is a \
+         leftover tag from a squash-merged branch, it is not a release to resume"
+    )]
+    StrayBaselineTag {
+        /// The unreachable tag's name, sanitized.
+        tag: String,
+        /// `origin/main`'s current tip, sanitized.
+        main_tip: String,
+        /// The commit the tag actually names, sanitized.
+        target: String,
+    },
 }
 
 /// A failed [`execute_release`] run: the error that stopped it **plus** the
@@ -235,6 +256,25 @@ fn is_ancestor(project_root: &Path, ancestor: &str, descendant: &str) -> bool {
         .output()
         .map(|out| out.status.success())
         .unwrap_or(false)
+}
+
+/// The commit a tag names, peeling an annotated tag to its target
+/// (`<tag>^{commit}`). `None` when the tag does not resolve at all. Used to
+/// decide whether an unreachable baseline tag is a release in flight or a
+/// stray leftover (C-01) — asked before any mutation, so a `None` here must
+/// refuse rather than proceed.
+fn tag_target_commit(project_root: &Path, tag: &str) -> Option<String> {
+    let spec = format!("{tag}^{{commit}}");
+    let output = Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", &spec])
+        .current_dir(project_root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!commit.is_empty()).then_some(commit)
 }
 
 /// Parse a bare `MAJOR.MINOR.PATCH` string (e.g. the un-prefixed contents of
@@ -313,22 +353,53 @@ fn run_release(
     // doc comment): once the release tag lands on `origin/main`'s tip and
     // before the sync lands, a squash-merged `main` makes that tag
     // unreachable from `develop` by construction, so this guard fires on
-    // exactly the release being resumed. Step 3 (Task 2) independently
-    // validates that the tag belongs to `origin/main`'s tip, so a stale or
-    // foreign tag is caught there rather than trusted here.
+    // exactly the release being resumed.
+    //
+    // C-01: that inference is only valid for a tag that really does name
+    // `origin/main`'s tip, and it MUST be checked here, not deferred to step
+    // 3. The original code deferred it on the grounds that "step 3
+    // independently validates that the tag belongs to origin/main's tip" —
+    // but step 1 writes, commits, and pushes the adopted version to
+    // `origin/develop` before step 2 or 3 ever run, so by then the damage has
+    // landed on a shared branch. Unreachable-but-unrelated tags are the
+    // ordinary case, not an exotic one: `hooks_after_ship`'s `version_bump`
+    // creates a `v{version}` tag at the end of every phase's Ship stage, and
+    // squash-merging that phase's branch leaves the tag permanently
+    // unreachable from `develop` and strictly higher than the reachable
+    // baseline (this repository already carries one such orphan, `v1.3.69`).
+    // Adopting one wrote and pushed a version nobody asked for and reported
+    // "the version bump already landed in a prior invocation", which was
+    // simply false.
+    let mut resume_note: Option<String> = None;
     let version = match crate::version::compute_version(project_root) {
         Ok(version) => version,
         Err(crate::version::VersionError::UnreachableBaseline { tag }) => {
+            let main_tip = git_output(project_root, &["rev-parse", "origin/main"])?
+                .trim()
+                .to_string();
+            match tag_target_commit(project_root, &tag) {
+                Some(target) if target == main_tip => {}
+                other => {
+                    return Err(ReleaseError::StrayBaselineTag {
+                        tag: sanitize_changelog_subject(&tag),
+                        main_tip: sanitize_changelog_subject(&main_tip),
+                        target: sanitize_changelog_subject(
+                            other.as_deref().unwrap_or("no resolvable commit"),
+                        ),
+                    });
+                }
+            }
             let stripped = tag.strip_prefix('v').unwrap_or(tag.as_str());
             let resumed = parse_bare_version(stripped)?;
-            steps.push(StepReport {
-                step: ReleaseStep::VersionBump,
-                status: StepStatus::Completed,
-                detail: sanitize_changelog_subject(&format!(
-                    "resuming the in-flight release identified by unreachable tag `{tag}` \
-                     — the version bump already landed in a prior invocation"
-                )),
-            });
+            // W-18/WR-01: the note is folded into step 1's own report below
+            // rather than pushed as a second `VersionBump` entry — the
+            // original pushed one here AND fell through into step 1, so every
+            // resumed run reported `VersionBump` twice, breaking
+            // `ReleaseReport::steps`' documented one-entry-per-step contract.
+            resume_note = Some(format!(
+                "resuming the in-flight release identified by unreachable tag `{tag}`, \
+                 which names origin/main's tip"
+            ));
             resumed
         }
         Err(err) => return Err(ReleaseError::Version(err)),
@@ -394,6 +465,10 @@ fn run_release(
             "version file already declared {version} and origin/develop already contains \
              the tip — nothing to do"
         ),
+    };
+    let step1_detail = match resume_note {
+        Some(note) => format!("{note}; {step1_detail}"),
+        None => step1_detail,
     };
     steps.push(StepReport {
         step: ReleaseStep::VersionBump,
@@ -1244,12 +1319,77 @@ mod tests {
             "no Sync or Publish step may be reported: {:?}",
             err.steps
         );
-        for landed in [ReleaseStep::VersionBump, ReleaseStep::Tag] {
-            assert!(
-                err.steps.iter().any(|s| s.step == landed),
-                "the {landed:?} step landed before the refused sync and must be reported: {:?}",
-                err.steps
-            );
+        // W-18/WR-01: exactly one entry per step, in sequence order — the
+        // resume arm used to push a second `VersionBump` report and fall
+        // through into step 1, and this fixture traverses that arm.
+        let reported: Vec<ReleaseStep> = err.steps.iter().map(|s| s.step).collect();
+        assert_eq!(
+            reported,
+            vec![ReleaseStep::VersionBump, ReleaseStep::Tag],
+            "the two steps that landed before the refused sync must each be reported once"
+        );
+    }
+
+    /// C-01: a semver tag that is unreachable from `develop` but does NOT
+    /// name `origin/main`'s tip is a stray leftover (an ordinary
+    /// squash-merged phase tag — `hooks_after_ship` creates one per phase),
+    /// not an in-flight release. It must be refused BEFORE any mutation.
+    ///
+    /// The original code adopted such a tag's version as a resume, then
+    /// wrote, committed, and pushed it to `origin/develop` before step 2's
+    /// human gate ever ran. This asserts the observable consequences a
+    /// deferred check could not satisfy: the remote `develop` ref and the
+    /// on-disk version file are both byte-identical across the refusal.
+    #[test]
+    fn refuses_a_stray_unreachable_tag_instead_of_adopting_its_version() {
+        let (repo, bare) = fixture_with_older_version("0.0.1");
+        let root = repo.path();
+        let flow = GitFlow::new(root);
+
+        // A high semver tag on an abandoned branch: reachable from neither
+        // `develop` nor `origin/main`, exactly what a squash-merged phase
+        // branch leaves behind.
+        flow.checkout("main").expect("checkout main");
+        commit_file(root, "abandoned.txt", "abandoned", "chore: abandoned work");
+        flow.tag("v9.9.9").expect("create the stray semver tag");
+        crate::test_support::git_command(root)
+            .args(["reset", "--hard", "HEAD~1"])
+            .status()
+            .expect("abandon the tagged commit");
+        flow.checkout(DEVELOP).expect("checkout develop");
+
+        let remote_before = rev_parse(bare.path(), "refs/heads/develop");
+        let version_before = std::fs::read_to_string(root.join("Cargo.toml")).expect("read");
+
+        let err = execute_release(root).expect_err("a stray unreachable tag must be refused");
+        match &err.error {
+            ReleaseError::StrayBaselineTag { tag, .. } => assert_eq!(tag, "v9.9.9"),
+            other => panic!("expected StrayBaselineTag, got {other:?}"),
         }
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("v9.9.9"),
+            "the refusal must name the stray tag: {rendered}"
+        );
+        assert!(
+            err.steps.is_empty(),
+            "the refusal happens before step 1, so no step may report: {:?}",
+            err.steps
+        );
+
+        assert_eq!(
+            remote_before,
+            rev_parse(bare.path(), "refs/heads/develop"),
+            "origin/develop must be byte-identical — nothing may be pushed"
+        );
+        assert_eq!(
+            version_before,
+            std::fs::read_to_string(root.join("Cargo.toml")).expect("read"),
+            "the version file must be byte-identical — nothing may be written"
+        );
+        assert!(
+            !rev_parse(root, "HEAD").is_empty(),
+            "sanity: the repo is still usable"
+        );
     }
 }
