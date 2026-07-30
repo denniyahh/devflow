@@ -154,6 +154,35 @@ pub enum ReleaseError {
     },
 }
 
+/// A failed [`execute_release`] run: the error that stopped it **plus** the
+/// step ledger accumulated before it stopped (C-03, phase 26 review).
+///
+/// The ledger is not decoration. Nothing in this sequence is ever rolled
+/// back (D-05), so on any failure the steps that already reported are
+/// precisely the set of external-state mutations — pushed commits, a pushed
+/// signed tag, published crates — that the operator must NOT redo. Returning
+/// a bare [`ReleaseError`] told them only about the step that failed, which
+/// makes a blind re-run the natural next move.
+#[derive(Debug)]
+pub struct ReleaseFailure {
+    /// Why the run stopped.
+    pub error: ReleaseError,
+    /// Every step that reported before the failure, in sequence order.
+    pub steps: Vec<StepReport>,
+}
+
+impl std::fmt::Display for ReleaseFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for ReleaseFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
 fn git_output(project_root: &Path, args: &[&str]) -> Result<String, ReleaseError> {
     let output = Command::new("git")
         .args(args)
@@ -226,7 +255,27 @@ fn parse_bare_version(text: &str) -> Result<crate::version::Version, ReleaseErro
 /// predicate makes it independently resumable (D-06); nothing is ever rolled
 /// back on any failure (D-05) — see the module doc comment for the complete
 /// contract.
-pub fn execute_release(project_root: &Path) -> Result<ReleaseReport, ReleaseError> {
+pub fn execute_release(project_root: &Path) -> Result<ReleaseReport, ReleaseFailure> {
+    let mut steps: Vec<StepReport> = Vec::new();
+    match run_release(project_root, &mut steps) {
+        Ok((version, tag, outcome)) => Ok(ReleaseReport {
+            version,
+            tag,
+            steps,
+            outcome,
+        }),
+        Err(error) => Err(ReleaseFailure { error, steps }),
+    }
+}
+
+/// The sequence itself. Takes the step ledger by `&mut` rather than owning it
+/// so that a failure at any `?` still hands every already-reported step back
+/// to [`execute_release`]'s caller (C-03) — nothing here is rolled back, so
+/// that ledger is the operator's only record of what already landed.
+fn run_release(
+    project_root: &Path,
+    steps: &mut Vec<StepReport>,
+) -> Result<(String, String, ReleaseOutcome), ReleaseError> {
     // Entry guards, before any mutation, mirroring
     // `crate::sync::sync_main_to_develop`'s own guard order.
     let status = git_output(project_root, &["status", "--porcelain"])?;
@@ -248,8 +297,6 @@ pub fn execute_release(project_root: &Path) -> Result<ReleaseReport, ReleaseErro
         project_root,
         &["fetch", "origin", "main", "develop", "--quiet"],
     )?;
-
-    let mut steps: Vec<StepReport> = Vec::new();
 
     // Version resolution. `UnreachableBaseline` is the resume signal for an
     // in-flight release (see module doc comment and `compute_version`'s own
@@ -382,12 +429,7 @@ pub fn execute_release(project_root: &Path) -> Result<ReleaseReport, ReleaseErro
                  re-run devflow's release executor"
             )),
         });
-        return Ok(ReleaseReport {
-            version: version.to_string(),
-            tag,
-            steps,
-            outcome: ReleaseOutcome::HaltedAtHumanGate,
-        });
+        return Ok((version.to_string(), tag, ReleaseOutcome::HaltedAtHumanGate));
     }
 
     // Step 3: the signed release tag (D-10, D-06, B8). Reaches here only
@@ -544,12 +586,7 @@ pub fn execute_release(project_root: &Path) -> Result<ReleaseReport, ReleaseErro
         }
     }
 
-    Ok(ReleaseReport {
-        version: version.to_string(),
-        tag,
-        steps,
-        outcome: ReleaseOutcome::Completed,
-    })
+    Ok((version.to_string(), tag, ReleaseOutcome::Completed))
 }
 
 /// Independently answer two narrow questions about a LOCAL tag with two
@@ -914,6 +951,25 @@ mod tests {
             "the rendered error must name the missing config key: {rendered}"
         );
 
+        // C-03: the failure must carry the ledger of what already landed —
+        // the version-bump step ran for real and was pushed, and a bare
+        // error would leave the operator unable to tell.
+        let version_step = err
+            .steps
+            .iter()
+            .find(|s| s.step == ReleaseStep::VersionBump)
+            .expect("the failure must report the VersionBump step that already landed");
+        assert_eq!(
+            version_step.status,
+            StepStatus::Completed,
+            "the landed version bump must be reported as Completed on the failure path"
+        );
+        assert!(
+            !err.steps.iter().any(|s| s.step == ReleaseStep::Tag),
+            "no Tag step may be reported — the tag step is what failed: {:?}",
+            err.steps
+        );
+
         let local_tip = rev_parse(root, "HEAD");
         let remote_tip = rev_parse(fixture.bare.path(), "refs/heads/develop");
         assert_eq!(
@@ -963,7 +1019,10 @@ mod tests {
 
         let result = execute_release(root);
         match result {
-            Err(ReleaseError::TagCollision { tag, .. }) => {
+            Err(ReleaseFailure {
+                error: ReleaseError::TagCollision { tag, .. },
+                ..
+            }) => {
                 assert_eq!(tag, fixture.tag);
             }
             other => panic!("expected Err(ReleaseError::TagCollision {{ .. }}), got {other:?}"),
@@ -1127,7 +1186,7 @@ mod tests {
 
         let result = execute_release(root);
         let err = result.expect_err("execute_release must fail on a tree-changing sync");
-        match &err {
+        match &err.error {
             ReleaseError::Sync(crate::sync::SyncError::TreeChanged {
                 before_tree,
                 after_tree,
@@ -1143,9 +1202,25 @@ mod tests {
                 "expected Err(ReleaseError::Sync(SyncError::TreeChanged {{ .. }})), got {other:?}"
             ),
         }
-        // No Ok(ReleaseReport) was ever produced on this path, so — by
-        // construction, since `ReleaseError` carries no `steps` field — no
-        // Publish step report could possibly have been produced either; the
-        // failure happened at the sync step, before step 5 is ever reached.
+
+        // C-03: the ledger now survives the failure, so "the run stopped
+        // before publishing" is asserted directly against the reported steps
+        // rather than inferred from `ReleaseError` having had no `steps`
+        // field. The sync step is the one that failed, so it reports nothing
+        // either.
+        assert!(
+            !err.steps
+                .iter()
+                .any(|s| matches!(s.step, ReleaseStep::Publish | ReleaseStep::Sync)),
+            "no Sync or Publish step may be reported: {:?}",
+            err.steps
+        );
+        for landed in [ReleaseStep::VersionBump, ReleaseStep::Tag] {
+            assert!(
+                err.steps.iter().any(|s| s.step == landed),
+                "the {landed:?} step landed before the refused sync and must be reported: {:?}",
+                err.steps
+            );
+        }
     }
 }

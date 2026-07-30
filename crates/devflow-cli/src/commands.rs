@@ -2313,13 +2313,7 @@ pub(crate) fn release_execute(project_root: &Path) -> Result<(), CliError> {
 
     match devflow_core::release::execute_release(project_root) {
         Ok(report) => {
-            for step in &report.steps {
-                let icon = match step.status {
-                    devflow_core::release::StepStatus::Completed => "✓",
-                    devflow_core::release::StepStatus::Skipped => "⚠",
-                };
-                println!("  {:<32} {icon}  {}", step.step.label(), step.detail);
-            }
+            print_release_steps(&report.steps);
             match report.outcome {
                 devflow_core::release::ReleaseOutcome::Completed => {
                     println!(
@@ -2340,7 +2334,32 @@ pub(crate) fn release_execute(project_root: &Path) -> Result<(), CliError> {
                 }
             }
         }
-        Err(err) => Err(CliError::Message(err.to_string())),
+        Err(failure) => {
+            // C-03: print the ledger of steps that already landed BEFORE the
+            // error. Nothing in the release sequence is rolled back (D-05),
+            // so these are the mutations — pushed commits, a pushed signed
+            // tag, published crates — the operator must not redo.
+            print_release_steps(&failure.steps);
+            if !failure.steps.is_empty() {
+                println!(
+                    "\nthe steps above already landed and are NOT rolled back — \
+                     account for them before re-running"
+                );
+            }
+            Err(CliError::Message(failure.error.to_string()))
+        }
+    }
+}
+
+/// Render a release step ledger. Shared by the success and failure paths so a
+/// failed run reports what already landed (C-03).
+fn print_release_steps(steps: &[devflow_core::release::StepReport]) {
+    for step in steps {
+        let icon = match step.status {
+            devflow_core::release::StepStatus::Completed => "✓",
+            devflow_core::release::StepStatus::Skipped => "⚠",
+        };
+        println!("  {:<32} {icon}  {}", step.step.label(), step.detail);
     }
 }
 
