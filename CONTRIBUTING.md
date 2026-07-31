@@ -320,6 +320,21 @@ v1.8.1 `devflow-cli` also carries a dev-dependency on it for the
 publish` waits for the registry to make the crate available before
 returning, so the second command can follow immediately.
 
+**This manual procedure now has an executable equivalent: `devflow release
+cut <version> [project] --yes-release`** (Phase 29). It observes each step
+above before acting, discovers the repository's own merge-method rules
+rather than hardcoding them, and stops at the first step not already done
+with an accurate report of where and why — including steps 5 and 6 (the
+signed tag and the crates.io publish), which the executor does not yet
+perform and reports as such. The manual steps documented here remain
+authoritative: they are exactly what the executor implements, not a
+separate procedure that might drift from it, and a human can still cut a
+release by hand whenever the executor cannot run. `scripts/sync-main-to-develop.sh`
+stays in the repository unmodified as the reference step 6's port was made
+from — the executor's sync-back action is a Rust-plus-pull-request port of
+this same script, preserving every check it performs (the already-an-ancestor
+short circuit, the `-X ours` merge, and the tree-identity refusal).
+
 ## Commit Conventions
 
 DevFlow uses [Conventional Commits](https://www.conventionalcommits.org/):

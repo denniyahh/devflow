@@ -9,12 +9,18 @@
 //! `Absent` checks for an in-flight pull request before running the step's
 //! own action (if this build carries one), then stops either way.
 //! [`ReleaseStep::VersionBumped`] and [`ReleaseStep::ChangelogWritten`] (29-05)
-//! now resolve to [`bump_and_changelog_pr`] — prepare the two-place version
-//! bump and the changelog entry on a release branch in a scratch worktree,
-//! then open and arm a pull request into `develop`. The remaining four
-//! variants still carry no action in this build; `29-06` and `29-07` replace
-//! those arms. [`action_for`]'s match is exhaustive over all six variants
-//! with no wildcard arm, so a new step cannot be silently skipped.
+//! resolve to [`bump_and_changelog_pr`] — prepare the two-place version bump
+//! and the changelog entry on a release branch in a scratch worktree, then
+//! open and arm a pull request into `develop`. [`ReleaseStep::ReleasePrMerged`]
+//! (29-06) resolves to [`release_pr_to_main`] — the release pull request from
+//! `develop` into `main`. [`ReleaseStep::SyncMerged`] (29-06) resolves to
+//! [`sync_back_pr`] — a port of `scripts/sync-main-to-develop.sh` that keeps
+//! `main` a real ancestor of `develop`, landed by a real merge commit rather
+//! than a direct push. [`ReleaseStep::SignedTagPresent`] and
+//! [`ReleaseStep::CratesPublished`] still carry no action in this build;
+//! `29-07` replaces those two remaining arms. [`action_for`]'s match is
+//! exhaustive over all six variants with no wildcard arm, so a new step
+//! cannot be silently skipped.
 //!
 //! This module performs **no writes** to `.devflow/`, to `devflow.toml`, or
 //! to any other DevFlow-owned file, and holds no state across invocations.
@@ -104,9 +110,9 @@ fn action_for(step: ReleaseStep) -> Option<StepAction> {
     match step {
         ReleaseStep::VersionBumped => Some(bump_and_changelog_pr),
         ReleaseStep::ChangelogWritten => Some(bump_and_changelog_pr),
-        ReleaseStep::ReleasePrMerged => None,
+        ReleaseStep::ReleasePrMerged => Some(release_pr_to_main),
         ReleaseStep::SignedTagPresent => None,
-        ReleaseStep::SyncMerged => None,
+        ReleaseStep::SyncMerged => Some(sync_back_pr),
         ReleaseStep::CratesPublished => None,
     }
 }
@@ -148,12 +154,17 @@ pub fn pr_refs(step: ReleaseStep, version: &str) -> Option<(String, String)> {
         }
         ReleaseStep::ReleasePrMerged => Some(("develop".to_string(), "main".to_string())),
         ReleaseStep::SignedTagPresent => None,
-        ReleaseStep::SyncMerged => Some((
-            format!("sync/main-to-develop-v{version}"),
-            "develop".to_string(),
-        )),
+        ReleaseStep::SyncMerged => Some((sync_branch_name(version), "develop".to_string())),
         ReleaseStep::CratesPublished => None,
     }
+}
+
+/// The deterministic sync-back branch name for `version`, matching what
+/// [`pr_refs`] already returns for [`ReleaseStep::SyncMerged`] — a test
+/// asserts the two agree so they cannot drift, mirroring
+/// [`release_branch_name`]'s own agreement guarantee for the bump branch.
+pub fn sync_branch_name(version: &str) -> String {
+    format!("sync/main-to-develop-v{version}")
 }
 
 /// The deterministic release-bump branch name for `version` — a single
@@ -601,6 +612,238 @@ fn bump_and_changelog_pr(project_root: &Path, version: &str) -> Result<String, S
     ))
 }
 
+/// The release pull request's title: begins `release: v<version>`, matching
+/// CONTRIBUTING.md step 3's documented form (`release: vX.Y.Z — <short
+/// description>`), followed by a short description. The prefix is kept
+/// exact — it is the string a human scans the pull-request list for.
+pub fn release_pr_title(version: &str) -> String {
+    format!("release: v{version} — release cut")
+}
+
+/// The action for [`ReleaseStep::ReleasePrMerged`]: opens the release pull
+/// request from `develop` into `main` with [`MergeIntent::ReleaseCut`]. There
+/// is no branch to prepare — `develop` already carries the version bump and
+/// the changelog entry by the time this step is reached, which is precisely
+/// what the [`ReleaseStep::VersionBumped`] and [`ReleaseStep::ChangelogWritten`]
+/// oracles observed before the walk got here. The method is resolved through
+/// [`MergeIntent::ReleaseCut`], never shortcut on the grounds that `main`
+/// happens to allow only squash today — that fact can change without a code
+/// change, and discovery is what keeps this correct when it does.
+fn release_pr_to_main(project_root: &Path, version: &str) -> Result<String, String> {
+    let title = release_pr_title(version);
+    let body = format!(
+        "Release `{version}`. See the `## {version}` section of CHANGELOG.md on \
+         `develop` for details. Opened by `devflow release cut`."
+    );
+    let number = open_and_arm_pr(
+        project_root,
+        "develop",
+        "main",
+        &title,
+        &body,
+        MergeIntent::ReleaseCut,
+    )?;
+    let method = release_policy::required_method(MergeIntent::ReleaseCut);
+    Ok(format!(
+        "opened pull request #{number} from develop into main, armed auto-merge with {method}"
+    ))
+}
+
+/// The sync-back commit message, carried verbatim from
+/// `scripts/sync-main-to-develop.sh` — this is the port, not a redesign.
+fn sync_merge_message() -> &'static str {
+    "merge: sync main back into develop after release\n\n\
+     Standing post-release step (scripts/sync-main-to-develop.sh) — keeps main\n\
+     a real ancestor of develop so the next release PR doesn't conflict against\n\
+     a stale merge-base. -X ours: develop's content is authoritative; this\n\
+     should be a no-op content-wise (verified below)."
+}
+
+/// Whether `origin/main` is already an ancestor of `origin/develop` — the
+/// script's own early exit (`git merge-base --is-ancestor origin/main
+/// origin/develop`), checked immediately after both refs are freshly
+/// fetched. A re-run after a prior successful sync finds this `true` and
+/// makes no branch and no pull request, exactly like the script's own exit
+/// 0 short circuit.
+fn main_already_synced(project_root: &Path) -> Result<bool, String> {
+    let output = git::git_command(project_root)
+        .args([
+            "merge-base",
+            "--is-ancestor",
+            "origin/main",
+            "origin/develop",
+        ])
+        .output()
+        .map_err(|err| format!("failed to spawn git merge-base: {}", err.kind()))?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(format!(
+            "git merge-base --is-ancestor origin/main origin/develop exited with status {}",
+            output.status
+        )),
+    }
+}
+
+/// The outcome of [`merge_main_into_sync_branch_and_push`] — either the
+/// short-circuit (nothing to do) or a successfully pushed sync branch, ready
+/// for [`open_and_arm_pr`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SyncMergeOutcome {
+    AlreadySynced,
+    Pushed { branch: String },
+}
+
+/// Steps 1-6 of the sync-back port, plus the push — everything except
+/// opening the pull request, which is the only step that talks to `gh`
+/// rather than plain `git`. Kept separate from [`sync_back_pr`] so the
+/// merge/tree-identity/cleanup logic is testable against real git fixtures
+/// with no `gh`/GitHub dependency at all.
+///
+/// A port of `scripts/sync-main-to-develop.sh`, moved from
+/// bash-plus-direct-push to Rust-plus-pull-request while preserving every
+/// check the script performs. The two guards the script needs that this
+/// executor does not — a clean tree, and being on the correct branch — are
+/// true by construction here: the merge happens inside a scratch worktree
+/// this function creates, never the operator's own checkout, which is
+/// always left untouched (asserted by this module's own tests on the
+/// success, refusal, and forced-failure paths).
+///
+/// 1. Fetch `main` and `develop` from `origin`.
+/// 2. Short-circuit if `origin/main` is already an ancestor of
+///    `origin/develop` — [`main_already_synced`], the script's own early
+///    exit.
+/// 3. Create (or reuse) a scratch worktree on [`sync_branch_name`] off
+///    `origin/develop`.
+/// 4. Record the pre-merge tree object id.
+/// 5. Merge `origin/main` with `-X ours --no-edit`, using the script's own
+///    commit message ([`sync_merge_message`]).
+/// 6. Record the post-merge tree object id. If it differs from the
+///    pre-merge id, refuse: `main` carried content `develop` genuinely
+///    lacked, and nothing is pushed — the script's own hard exit, never
+///    downgraded to a warning.
+/// 7. Push the branch.
+fn merge_main_into_sync_branch_and_push(
+    project_root: &Path,
+    version: &str,
+) -> Result<SyncMergeOutcome, String> {
+    fetch_ref(project_root, "main")?;
+    fetch_ref(project_root, "develop")?;
+
+    if main_already_synced(project_root)? {
+        return Ok(SyncMergeOutcome::AlreadySynced);
+    }
+
+    let branch = sync_branch_name(version);
+    let already_on_origin = branch_exists_on_origin(project_root, &branch)?;
+    if already_on_origin {
+        fetch_ref(project_root, &branch)?;
+    }
+
+    let scratch_path =
+        worktree::worktrees_dir(project_root).join(format!("release-sync-{version}"));
+    add_scratch_worktree(project_root, &scratch_path, &branch, !already_on_origin)?;
+    let _guard = ScratchWorktreeGuard {
+        project_root,
+        path: scratch_path.clone(),
+    };
+
+    let before_tree = tree_object_id(&scratch_path)?;
+
+    let merge = git::git_command(&scratch_path)
+        .args([
+            "merge",
+            "-X",
+            "ours",
+            "origin/main",
+            "--no-edit",
+            "-m",
+            sync_merge_message(),
+        ])
+        .output()
+        .map_err(|err| format!("failed to spawn git merge: {}", err.kind()))?;
+    if !merge.status.success() {
+        return Err(format!(
+            "git merge -X ours origin/main exited with status {}: {}",
+            merge.status,
+            String::from_utf8_lossy(&merge.stderr).trim()
+        ));
+    }
+
+    let after_tree = tree_object_id(&scratch_path)?;
+    if before_tree != after_tree {
+        return Err(format!(
+            "the sync merge changed develop's tree (before: {before_tree}, after: {after_tree}) \
+             — main carried content develop genuinely lacked; a human must inspect the merge \
+             before anything is pushed"
+        ));
+    }
+
+    let push = git::git_command(&scratch_path)
+        .args(["push", "-u", "origin", &branch])
+        .output()
+        .map_err(|err| format!("failed to spawn git push: {}", err.kind()))?;
+    if !push.status.success() {
+        return Err(format!(
+            "git push origin {branch} exited with status {}: {}",
+            push.status,
+            String::from_utf8_lossy(&push.stderr).trim()
+        ));
+    }
+
+    Ok(SyncMergeOutcome::Pushed { branch })
+}
+
+/// The action for [`ReleaseStep::SyncMerged`]: [`merge_main_into_sync_branch_and_push`]
+/// (the git-only port of `scripts/sync-main-to-develop.sh`), then — if a
+/// branch was actually pushed — open and arm its pull request with
+/// [`MergeIntent::SyncBack`], which resolves to a real merge commit, never
+/// squash, by construction, not by convention (T-29-08).
+fn sync_back_pr(project_root: &Path, version: &str) -> Result<String, String> {
+    match merge_main_into_sync_branch_and_push(project_root, version)? {
+        SyncMergeOutcome::AlreadySynced => Ok(
+            "origin/main is already an ancestor of origin/develop — nothing to sync".to_string(),
+        ),
+        SyncMergeOutcome::Pushed { branch } => {
+            let title = format!("sync: main → develop after v{version}");
+            let body = "Standing post-release sync — links main's release commit as an \
+                        ancestor of develop (scripts/sync-main-to-develop.sh, ported). Must be \
+                        merged with a real merge commit, never squashed: squashing destroys the \
+                        ancestry link this pull request exists to create."
+                .to_string();
+            let number = open_and_arm_pr(
+                project_root,
+                &branch,
+                "develop",
+                &title,
+                &body,
+                MergeIntent::SyncBack,
+            )?;
+            let method = release_policy::required_method(MergeIntent::SyncBack);
+            Ok(format!(
+                "pushed branch `{branch}`, opened pull request #{number} into develop, armed auto-merge with {method}"
+            ))
+        }
+    }
+}
+
+/// `git rev-parse HEAD^{tree}` in `repo` — the working tree's object id,
+/// used by [`sync_back_pr`] to compare the pre-merge and post-merge tree,
+/// exactly as `scripts/sync-main-to-develop.sh` lines 51-62 do.
+fn tree_object_id(repo: &Path) -> Result<String, String> {
+    let output = git::git_command(repo)
+        .args(["rev-parse", "HEAD^{tree}"])
+        .output()
+        .map_err(|err| format!("failed to spawn git rev-parse: {}", err.kind()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git rev-parse HEAD^{{tree}} exited with status {}",
+            output.status
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// The mandate-refusal reason, naming all three ways to grant a release-cut
 /// mandate. Shared by [`cut_with`]'s unauthorized-refusal path so the CLI
 /// layer and every test see byte-identical wording.
@@ -789,12 +1032,7 @@ mod tests {
 
     #[test]
     fn action_for_returns_none_for_every_step_without_an_action_in_this_build() {
-        for step in [
-            ReleaseStep::ReleasePrMerged,
-            ReleaseStep::SignedTagPresent,
-            ReleaseStep::SyncMerged,
-            ReleaseStep::CratesPublished,
-        ] {
+        for step in [ReleaseStep::SignedTagPresent, ReleaseStep::CratesPublished] {
             assert!(
                 action_for(step).is_none(),
                 "expected no action for {step:?} in this build"
@@ -811,6 +1049,22 @@ mod tests {
         assert!(
             action_for(ReleaseStep::ChangelogWritten).is_some(),
             "expected ChangelogWritten to resolve to an action in this build"
+        );
+    }
+
+    #[test]
+    fn action_for_returns_an_action_for_release_pr_merged() {
+        assert!(
+            action_for(ReleaseStep::ReleasePrMerged).is_some(),
+            "expected ReleasePrMerged to resolve to an action in this build"
+        );
+    }
+
+    #[test]
+    fn action_for_returns_an_action_for_sync_merged() {
+        assert!(
+            action_for(ReleaseStep::SyncMerged).is_some(),
+            "expected SyncMerged to resolve to an action in this build"
         );
     }
 
@@ -1476,6 +1730,278 @@ mod tests {
         assert!(
             result.is_err(),
             "expected discovery/resolution failure to refuse before any gh pr create/merge call"
+        );
+    }
+
+    // -- 29-06 Task 1: release_pr_title / release_pr_to_main ----------------
+
+    #[test]
+    fn release_pr_title_starts_with_the_documented_prefix() {
+        assert!(
+            release_pr_title("2.3.0").starts_with("release: v2.3.0"),
+            "got: {}",
+            release_pr_title("2.3.0")
+        );
+    }
+
+    #[test]
+    fn release_pr_to_main_refuses_before_creating_anything_when_resolution_fails() {
+        // A directory `gh` cannot resolve any repository context from —
+        // `discover_allowed_merge_methods` fails immediately, before any `gh
+        // pr create`/`gh pr merge` call is reachable (same early-refusal
+        // shape as `open_and_arm_pr_refuses_before_contacting_github_when_resolution_fails`).
+        let dir = tempfile::tempdir().unwrap();
+        let result = release_pr_to_main(dir.path(), "1.2.3");
+        assert!(
+            result.is_err(),
+            "expected discovery/resolution failure to refuse before creating anything"
+        );
+    }
+
+    /// The action resolves to squash whether `main`'s allowed set is squash
+    /// only, or both merge and squash — the preference comes from the
+    /// `ReleaseCut` intent, never from the fact that `main` happens to
+    /// permit only one method today.
+    #[test]
+    fn release_pr_to_main_resolves_squash_against_squash_only_and_against_both_methods() {
+        for allowed in [
+            vec!["squash".to_string()],
+            vec!["merge".to_string(), "squash".to_string()],
+        ] {
+            assert_eq!(
+                release_policy::resolve_merge_method(MergeIntent::ReleaseCut, &allowed),
+                Ok(MergeMethod::Squash),
+                "expected ReleaseCut to resolve to Squash against allowed set {allowed:?}"
+            );
+        }
+    }
+
+    // -- 29-06 Task 2: sync_branch_name / merge_main_into_sync_branch_and_push
+
+    #[test]
+    fn sync_branch_name_matches_pr_refs_head_for_sync_merged_step() {
+        let version = "2.3.0";
+        let expected = sync_branch_name(version);
+        assert_eq!(
+            pr_refs(ReleaseStep::SyncMerged, version).unwrap().0,
+            expected
+        );
+    }
+
+    /// Build a repo with `main` and `develop` diverged on `origin`: both
+    /// branch from a common commit, `develop` gets a commit unique to it,
+    /// and `main` gets a *different* commit that happens to carry identical
+    /// content for the same path — reproducing what a squash-merged release
+    /// PR actually does (bring develop's own content over to `main`), so
+    /// merging `origin/main` back into `develop` with `-X ours` is a pure
+    /// history link: no conflict, no tree change.
+    fn init_diverged_repo() -> (TempDir, TempDir) {
+        let origin_dir = tempfile::tempdir().unwrap();
+        git_at(origin_dir.path(), &["init", "-q", "--bare"]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git_at(root, &["init", "-q"]);
+        git_at(root, &["config", "user.email", "test@example.com"]);
+        git_at(root, &["config", "user.name", "Test"]);
+        git_at(root, &["config", "commit.gpgsign", "false"]);
+        git_at(root, &["config", "core.hooksPath", "/dev/null"]);
+        git_at(
+            root,
+            &[
+                "remote",
+                "add",
+                "origin",
+                origin_dir.path().to_str().expect("utf-8 tempdir path"),
+            ],
+        );
+
+        std::fs::write(root.join("README.md"), "base\n").unwrap();
+        git_at(root, &["add", "README.md"]);
+        git_at(root, &["commit", "-q", "-m", "feat: base"]);
+        git_at(root, &["branch", "-M", "main"]);
+        git_at(root, &["push", "-q", "-u", "origin", "main"]);
+
+        git_at(root, &["checkout", "-q", "-b", "develop"]);
+        std::fs::write(root.join("shared.txt"), "brought over by the release PR\n").unwrap();
+        git_at(root, &["add", "shared.txt"]);
+        git_at(root, &["commit", "-q", "-m", "feat: develop change"]);
+        git_at(root, &["push", "-q", "-u", "origin", "develop"]);
+
+        git_at(root, &["checkout", "-q", "main"]);
+        std::fs::write(root.join("shared.txt"), "brought over by the release PR\n").unwrap();
+        git_at(root, &["add", "shared.txt"]);
+        git_at(root, &["commit", "-q", "-m", "release: v1.2.3"]);
+        git_at(root, &["push", "-q", "origin", "main"]);
+
+        git_at(root, &["checkout", "-q", "develop"]);
+
+        (dir, origin_dir)
+    }
+
+    /// As [`init_diverged_repo`], but `main`'s release commit also adds a
+    /// file `develop` genuinely lacks — the fixture for the tree-identity
+    /// refusal.
+    fn init_diverged_repo_with_main_only_content() -> (TempDir, TempDir) {
+        let (dir, origin_dir) = init_diverged_repo();
+        let root = dir.path();
+        git_at(root, &["checkout", "-q", "main"]);
+        std::fs::write(root.join("main-only.txt"), "content develop lacks\n").unwrap();
+        git_at(root, &["add", "main-only.txt"]);
+        git_at(root, &["commit", "-q", "-m", "feat: content develop lacks"]);
+        git_at(root, &["push", "-q", "origin", "main"]);
+        git_at(root, &["checkout", "-q", "develop"]);
+        (dir, origin_dir)
+    }
+
+    #[test]
+    fn merge_main_into_sync_branch_and_push_short_circuits_when_already_an_ancestor() {
+        let (repo, origin) = init_diverged_repo();
+        let root = repo.path();
+        // Sync origin/main into origin/develop out of band first, so the
+        // precondition ("already an ancestor") is genuinely true on origin —
+        // mirrors the script's own early exit.
+        git_at(root, &["fetch", "origin", "main", "develop"]);
+        git_at(
+            root,
+            &[
+                "merge",
+                "-X",
+                "ours",
+                "origin/main",
+                "--no-edit",
+                "-m",
+                "pre-sync",
+            ],
+        );
+        git_at(root, &["push", "-q", "origin", "develop"]);
+
+        let outcome = merge_main_into_sync_branch_and_push(root, "1.2.3")
+            .expect("merge_main_into_sync_branch_and_push");
+        assert_eq!(outcome, SyncMergeOutcome::AlreadySynced);
+
+        let listing = worktree::list(root).expect("list");
+        assert_eq!(
+            listing.len(),
+            1,
+            "expected no scratch worktree to be created on the short circuit, got: {listing:?}"
+        );
+
+        let branch = sync_branch_name("1.2.3");
+        let refs = git_output_at(
+            origin.path(),
+            &["for-each-ref", &format!("refs/heads/{branch}")],
+        );
+        assert!(
+            refs.is_empty(),
+            "expected no sync branch to exist on origin after a short circuit, got: {refs}"
+        );
+    }
+
+    #[test]
+    fn merge_main_into_sync_branch_and_push_produces_a_two_parent_merge_commit_when_diverged() {
+        let (repo, origin) = init_diverged_repo();
+        let root = repo.path();
+
+        let before_head = git_output_at(root, &["rev-parse", "HEAD"]);
+        let before_branch = git_output_at(root, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        let before_status = git_output_at(root, &["status", "--porcelain"]);
+
+        let outcome =
+            merge_main_into_sync_branch_and_push(root, "1.2.3").expect("expected Ok(Pushed)");
+        let branch = match outcome {
+            SyncMergeOutcome::Pushed { branch } => branch,
+            other => panic!("expected Pushed, got {other:?}"),
+        };
+        assert_eq!(branch, sync_branch_name("1.2.3"));
+
+        let parents = git_output_at(origin.path(), &["log", "-1", "--pretty=%P", &branch]);
+        assert_eq!(
+            parents.split_whitespace().count(),
+            2,
+            "expected the pushed branch's tip to be a merge commit with two parents, got: {parents}"
+        );
+
+        // The operator's own checkout must be untouched.
+        assert_eq!(before_head, git_output_at(root, &["rev-parse", "HEAD"]));
+        assert_eq!(
+            before_branch,
+            git_output_at(root, &["rev-parse", "--abbrev-ref", "HEAD"])
+        );
+        assert_eq!(
+            before_status,
+            git_output_at(root, &["status", "--porcelain"])
+        );
+
+        let listing = worktree::list(root).expect("list");
+        assert_eq!(
+            listing.len(),
+            1,
+            "expected the scratch worktree to be removed after success, got: {listing:?}"
+        );
+    }
+
+    #[test]
+    fn merge_main_into_sync_branch_and_push_pushes_a_tree_identical_branch_when_diverged() {
+        let (repo, origin) = init_diverged_repo();
+        let root = repo.path();
+
+        let develop_tree_before = git_output_at(root, &["rev-parse", "HEAD^{tree}"]);
+
+        let outcome =
+            merge_main_into_sync_branch_and_push(root, "1.2.3").expect("expected Ok(Pushed)");
+        let branch = match outcome {
+            SyncMergeOutcome::Pushed { branch } => branch,
+            other => panic!("expected Pushed, got {other:?}"),
+        };
+
+        let pushed_tree =
+            git_output_at(origin.path(), &["rev-parse", &format!("{branch}^{{tree}}")]);
+        assert_eq!(
+            develop_tree_before, pushed_tree,
+            "expected the pushed branch's tree to be byte-identical to develop's pre-merge tree"
+        );
+    }
+
+    #[test]
+    fn merge_main_into_sync_branch_and_push_refuses_when_the_merge_changes_the_tree() {
+        let (repo, origin) = init_diverged_repo_with_main_only_content();
+        let root = repo.path();
+
+        let result = merge_main_into_sync_branch_and_push(root, "1.2.3");
+        let err = result.expect_err("expected the tree-identity check to refuse");
+        assert!(
+            err.contains("develop"),
+            "expected the refusal to name develop's tree, got: {err}"
+        );
+
+        let branch = sync_branch_name("1.2.3");
+        let refs = git_output_at(
+            origin.path(),
+            &["for-each-ref", &format!("refs/heads/{branch}")],
+        );
+        assert!(
+            refs.is_empty(),
+            "expected no branch to be pushed on refusal, got: {refs}"
+        );
+
+        let listing = worktree::list(root).expect("list");
+        assert_eq!(
+            listing.len(),
+            1,
+            "expected no scratch worktree to survive the refusal, got: {listing:?}"
+        );
+    }
+
+    /// `resolve_merge_method(MergeIntent::SyncBack, &allowed)` still yields a
+    /// real merge commit even when the allowed set contains both methods —
+    /// the sync PR's method comes from intent, never from convenience.
+    #[test]
+    fn sync_intent_resolves_to_merge_even_when_squash_is_also_allowed() {
+        let allowed = vec!["merge".to_string(), "squash".to_string()];
+        assert_eq!(
+            release_policy::resolve_merge_method(MergeIntent::SyncBack, &allowed),
+            Ok(MergeMethod::Merge)
         );
     }
 }
