@@ -2285,10 +2285,16 @@ fn release_observation_check(
 pub(crate) fn release_status(project_root: &Path, version: &str) -> Result<(), CliError> {
     use devflow_core::release_observe::ReleaseStep;
 
-    let checks: Vec<Check> = vec![release_observation_check(
-        ReleaseStep::SignedTagPresent,
-        devflow_core::release_observe::signed_tag_on_remote(project_root, version),
-    )];
+    let checks: Vec<Check> = vec![
+        release_observation_check(
+            ReleaseStep::SignedTagPresent,
+            devflow_core::release_observe::signed_tag_on_remote(project_root, version),
+        ),
+        release_observation_check(
+            ReleaseStep::CratesPublished,
+            devflow_core::release_observe::crates_published(project_root, version),
+        ),
+    ];
 
     let mut failed = false;
     for c in &checks {

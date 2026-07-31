@@ -149,12 +149,26 @@ fn release_status_no_remote_is_unreachable_not_absent() {
     );
 }
 
+/// Returns the status icon (`✓`/`⚠`/`✗`) printed on the row whose name
+/// contains `row_name`, if any — lets a test assert on one specific
+/// observation's outcome without being coupled to how many OTHER
+/// observations `release status` also happens to print.
+fn row_icon(stdout: &str, row_name: &str) -> Option<char> {
+    stdout
+        .lines()
+        .find(|line| line.contains(row_name))
+        .and_then(|line| line.chars().find(|c| "✓⚠✗".contains(*c)))
+}
+
 /// `devflow release status <version>` against a fixture whose `origin` IS
 /// reachable (a local bare repo, no network needed) but genuinely carries
-/// no such tag: a real negative answer from a reachable oracle must warn
-/// and exit 0 — distinct from the no-remote case above, which must fail.
+/// no such tag: a real negative answer from a reachable oracle must warn on
+/// that row — distinct from the no-remote case above, which must fail on
+/// it. This fixture has no `Cargo.toml`, so the (unrelated) crates-published
+/// row independently reports Unreachable — asserted on its own row, not
+/// conflated with the signed-tag row this test targets.
 #[test]
-fn release_status_absent_tag_on_reachable_remote_warns_and_exits_zero() {
+fn release_status_absent_tag_on_reachable_remote_warns() {
     let origin_dir = tempfile::tempdir().unwrap();
     git(origin_dir.path(), &["init", "-q", "--bare"]);
 
@@ -176,18 +190,11 @@ fn release_status_absent_tag_on_reachable_remote_warns_and_exits_zero() {
 
     let output = run_release_status(work_dir.path(), "1.2.3");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success(),
-        "expected a reachable remote with no matching tag to exit 0, got: {stdout}\nstderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        stdout.contains('⚠'),
-        "expected the absent (warn) icon for a genuinely missing tag, got: {stdout}"
-    );
-    assert!(
-        !stdout.contains('✗'),
-        "a reachable oracle's real negative answer must never render as the unreachable (fail) icon, got: {stdout}"
+    assert_eq!(
+        row_icon(&stdout, "signed tag"),
+        Some('⚠'),
+        "expected the absent (warn) icon on the signed-tag row for a genuinely \
+         missing tag on a reachable remote, got: {stdout}"
     );
 }
 
@@ -205,10 +212,10 @@ fn release_status_summary_line_names_version_and_count() {
         "expected the summary line to name the requested version, got: {stdout}"
     );
     assert!(
-        stdout.contains("0/1"),
-        "expected the summary line to report 0 of 1 question observed complete \
-         (the no-remote fixture makes the sole wired question Unreachable, not \
-         Present), got: {stdout}"
+        stdout.contains("0/2"),
+        "expected the summary line to report 0 of 2 questions observed complete \
+         (this fixture has no remote and no Cargo.toml, so both the signed-tag \
+         and crates-published rows are Unreachable, not Present), got: {stdout}"
     );
 }
 
@@ -270,5 +277,55 @@ fn signed_tag_live_smoke() {
     assert!(
         absent_stdout.contains('⚠'),
         "expected the absent icon for v999.999.999, got: {absent_stdout}"
+    );
+}
+
+/// Real end-to-end run against the real crates.io registry — the one piece
+/// of this phase with no analog anywhere else in the codebase.
+/// `devflow-core@2.2.0` and `devflow-core@999.999.999` are the same two
+/// live-verified probes `29-RESEARCH.md` ran, chosen because both answers
+/// are stable facts. Only network reachability to crates.io is required
+/// (no `gh` credential involved), so this uses the isolated-`HOME` runner
+/// like the deterministic tests above.
+#[test]
+#[ignore]
+fn crates_published_live_smoke() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("crates/devflow-cli has a workspace root two levels up")
+        .to_path_buf();
+
+    let network_ok = Command::new("curl")
+        .args([
+            "-s",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            "--max-time",
+            "20",
+            "https://crates.io",
+        ])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    assert!(
+        network_ok,
+        "crates_published_live_smoke requires network reachability to crates.io — real failure, not skipped"
+    );
+
+    let present = run_release_status(&repo_root, "2.2.0");
+    let present_stdout = String::from_utf8_lossy(&present.stdout);
+    assert!(
+        present_stdout.contains("devflow-core") && present_stdout.contains('✓'),
+        "expected devflow-core@2.2.0 to classify Present against the real registry, got: {present_stdout}"
+    );
+
+    let absent = run_release_status(&repo_root, "999.999.999");
+    let absent_stdout = String::from_utf8_lossy(&absent.stdout);
+    assert!(
+        absent_stdout.contains("devflow-core") && absent_stdout.contains('⚠'),
+        "expected devflow-core@999.999.999 to classify Absent against the real registry, got: {absent_stdout}"
     );
 }

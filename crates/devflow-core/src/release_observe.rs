@@ -248,11 +248,19 @@ fn tag_signature_via_gh(project_root: &Path, tag_object_sha: &str) -> TagSignatu
 /// for "could not connect"), and any other 3xx/4xx/5xx — is Unreachable
 /// with a reason naming the code that was seen.
 pub fn classify_http_status(code: &str) -> Observation {
-    // STUB (RED phase): deliberately wrong — always reports Unreachable
-    // with a fixed reason, regardless of input. Fixed in the GREEN commit.
-    let _ = code;
-    Observation::Unreachable {
-        reason: "stub".into(),
+    match code {
+        "200" => Observation::Present {
+            detail: "published (HTTP 200)".into(),
+        },
+        "404" => Observation::Absent {
+            detail: "not published (HTTP 404)".into(),
+        },
+        "" => Observation::Unreachable {
+            reason: "curl returned an empty HTTP status".into(),
+        },
+        other => Observation::Unreachable {
+            reason: format!("unexpected HTTP status {other}"),
+        },
     }
 }
 
@@ -264,11 +272,41 @@ pub fn classify_http_status(code: &str) -> Observation {
 /// (an empty `publish_order` means the workspace manifest could not be
 /// read, which is a failure to observe, not an answer).
 pub fn combine_crate_observations(per_crate: &[(String, Observation)]) -> Observation {
-    // STUB (RED phase): deliberately wrong — always reports Present,
-    // regardless of input. Fixed in the GREEN commit.
-    let _ = per_crate;
+    if per_crate.is_empty() {
+        return Observation::Unreachable {
+            reason: "no publishable crates found in this workspace".into(),
+        };
+    }
+
+    let unreachable: Vec<&str> = per_crate
+        .iter()
+        .filter_map(|(_, obs)| match obs {
+            Observation::Unreachable { reason } => Some(reason.as_str()),
+            _ => None,
+        })
+        .collect();
+    if !unreachable.is_empty() {
+        return Observation::Unreachable {
+            reason: format!("could not observe every crate: {}", unreachable.join("; ")),
+        };
+    }
+
+    let absent: Vec<&str> = per_crate
+        .iter()
+        .filter_map(|(name, obs)| match obs {
+            Observation::Absent { .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    if !absent.is_empty() {
+        return Observation::Absent {
+            detail: format!("not yet published: {}", absent.join(", ")),
+        };
+    }
+
+    let present: Vec<&str> = per_crate.iter().map(|(name, _)| name.as_str()).collect();
     Observation::Present {
-        detail: "stub".into(),
+        detail: format!("published: {}", present.join(", ")),
     }
 }
 
@@ -276,9 +314,10 @@ pub fn combine_crate_observations(per_crate: &[(String, Observation)]) -> Observ
 /// `project_root`. Builds the URL with `format!` and passes it as a single
 /// `Command::args` element — never through a shell, never with any
 /// interpolation into a shell string (T-29-01). Uses the `/api/v1` JSON
-/// endpoint, never the CDN-cached sparse index (`index.crates.io`), which
+/// endpoint, never the registry's CDN-cached sparse-index mirror, which
 /// lags a real publish by seconds and would reintroduce the exact
-/// absent-versus-unreachable ambiguity this phase exists to eliminate. A
+/// absent-versus-unreachable ambiguity this phase exists to eliminate (see
+/// 29-RESEARCH.md's Pitfall 2). A
 /// spawn error or a non-zero `curl` exit returns `Err` with the failure
 /// text; the caller converts that to `Unreachable`.
 fn crate_version_http_status(
