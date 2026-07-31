@@ -270,65 +270,95 @@ and *gets* none, with no diagnostic anywhere.
 
 ---
 
-## 7. `execute-phase` prescribes `run_in_background: true` for multi-plan waves, orphaning all executor work in any non-interactive runtime
+## 7. No way to express "`Agent` exists, but my session will not outlive this turn"
 
 **Status:** READY — not yet filed
-**Found:** 2026-07-31, DevFlow phase 29 wave 2
-**Component:** `gsd-core/workflows/execute-phase.md` (`:18`, `:31-34`, `:596-599`, `:690`)
-**Severity: critical** — silently loses completed executor work *and reports the stage successful*.
+**Type: compatibility gap / feature request**, not a defect report. GSD's behavior here is correct
+under the runtime it targets; this asks for a distinction it currently cannot make.
+**Found:** 2026-07-31, while running GSD under DevFlow (`denniyahh/devflow` phase 29)
+**Component:** `gsd-core/workflows/execute-phase.md` (`:24-26`, secondary `:18`)
+**Severity:** medium — costs a wave of executor work per occurrence in affected runtimes, but only
+in runtimes GSD does not currently claim to support.
 
-### The contradiction, in one document
+### The ask, in one sentence
 
-- **`:18`** — *"**Claude Code:** Uses `Agent(subagent_type="gsd-executor", …)` — blocks until complete, returns result"*
-- **`:596-599`** — *"**Sequential dispatch for parallel execution (waves with 2+ agents):** Dispatch each `Agent()` call one at a time **with `run_in_background: true`**. Do NOT send all Agent calls in a single message: simultaneous `git worktree add` calls race on `.git/config.lock`."*
+`execute-phase` decides whether to spawn subagents by testing **tool availability**; the property
+that actually matters is **session survivability**, and there is no way to express the difference.
 
-`run_in_background: true` is the negation of "blocks until complete". Both statements are in the same workflow.
+### Why availability is the wrong predicate
 
-### What happens
+`:24-26` states the rule:
 
-Interactively the contradiction is survivable: the orchestrator's turn ends, the executors finish, the completion notification lands in a session that still exists, and the orchestrator resumes and merges — the behavior `:690` assumes (*"After each `Agent()` returns…"*).
+> **Other runtimes:** If `Agent`/`agent` tool is genuinely unavailable (e.g. a backgrounded Claude
+> Code agent per #853, or a non-Claude runtime), use sequential inline execution as the fallback for
+> executor parallelization only. If `Agent` IS available (top-level Claude Code), you MUST spawn
+> gsd-executor agents — inline execution is not authorized. **Check for actual tool availability,
+> not runtime name.**
 
-Under a **non-interactive one-shot launch** (`claude -p`, how DevFlow drives every stage) **ending the turn terminates the process**. The notification has nowhere to arrive. The executors keep running detached, commit real work into their worktrees, and nothing ever merges it.
+Under a **non-interactive one-shot launch** (`claude -p "<prompt>"`), `Agent` *is* available — so
+this rule mandates spawning. But in that launch mode **the agent's turn ending terminates the
+process**. For waves with 2+ plans, `:596-599` correctly prescribes `run_in_background: true` (to
+serialize `git worktree add` against `.git/config.lock`), and a backgrounded executor's completion
+notification is then delivered to a session that no longer exists.
 
-### Evidence — DevFlow phase 29, 2026-07-31
+The distinction is already half-present — #853's "backgrounded Claude Code agent" is exactly a
+session-lifetime concern — it is just keyed off whether the tool exists rather than whether the
+session will still be there to receive a result.
 
-7 plans across 6 waves. Wave 1 = 1 plan, **wave 2 = 2 plans**, waves 3–6 = 1 plan each.
+### Repro (contributed as evidence; the failure itself is the host's fault, not GSD's)
 
-| Wave | Plans | Path taken | Outcome |
+DevFlow drives every GSD stage as one-shot `claude -p`. Phase 29: 7 plans across 6 waves, with
+wave 1 = 1 plan, **wave 2 = 2 plans**, waves 3–6 = 1 plan each.
+
+| Wave | Plans | Path | Outcome |
 |---|---|---|---|
-| 1 | 1 | below the 2+ threshold | **merged** — `934baf6 chore: merge executor worktree` |
-| 2 | 2 | **2+ → `run_in_background: true`** | **orphaned** |
+| 1 | 1 | below the 2+ threshold | merged normally |
+| 2 | 2 | **2+ → `run_in_background: true`** | orphaned |
 
-The orchestrator's final message was verbatim:
+The orchestrator's final message was verbatim *"Wave 2 is running — two executors in isolated
+worktrees, plus a backup completion watcher. I'll pick up when they return."* — then the process
+exited (`stop_reason: end_turn`). The two executors completed **5 commits** on `worktree-agent-*`
+branches and neither wrote its `SUMMARY.md`, having been killed before that step. Wave 2 was the
+only multi-plan wave in the phase and the only one that failed.
 
-> *"Wave 2 is running — two executors in isolated worktrees, plus a backup completion watcher. I'll pick up when they return."*
+**To be explicit about ownership:** the lost work is the *host's* fault. DevFlow chose a launch
+model that kills the session at turn end and then scored the stage successful anyway. GSD is not
+responsible for that, and the host-side fix is tracked separately. What GSD could offer is the
+means for a host like this to opt into the safe path.
 
-…with `stop_reason: end_turn`, `subtype: success`. The process then exited. The two executors completed **5 commits** between them on `worktree-agent-*` branches. **Neither wrote its `SUMMARY.md`** — both were killed before that step, which the dispatch prompt requires to be the last action before returning. Nothing was merged.
+### Why the existing fallback cannot cover it
 
-**Wave 2 was the only multi-plan wave in the phase, and the only one that failed.** That is the mechanism, not a coincidence.
+`:31-34` — *"If a spawned agent completes its work but the orchestrator never receives the completion
+signal, treat it as successful based on spot-checks and continue. Never block indefinitely — always
+verify via filesystem and git state."*
 
-### Why the existing fallback cannot save it
+This is the right instinct and is unreachable here: it presumes the orchestrator is **alive** to
+spot-check. Under one-shot launch it is not.
 
-`:31-34` — *"If a spawned agent completes its work but the orchestrator never receives the completion signal, treat it as successful based on spot-checks and continue. Never block indefinitely — always verify via filesystem and git state."*
+### Suggested shapes (any one would close the gap)
 
-This rule exists for exactly this failure, and it presumes **the orchestrator is alive to spot-check**. Under one-shot launch it is not. The rule is unreachable precisely when it is needed.
+1. **An explicit opt-out** — a config key (e.g. `execution.session_outlives_turn: false`) or a
+   documented env var that forces `run_in_background: false` and/or sequential inline execution,
+   independent of tool availability.
+2. **Serialize what actually races.** The stated rationale for backgrounding is `git worktree add`
+   contending on `.git/config.lock` — which argues for serializing *worktree creation*, then
+   dispatching synchronously. That would make the background path unnecessary for this case entirely.
+3. **Orchestrator-owned `SUMMARY.md`.** Today the requirement is an instruction to an executor that
+   may be killed before honoring it; writing it from the orchestrator after collection makes the
+   partial-work state recoverable rather than ambiguous.
 
-### Compounding: the blocking assumption is stale
+### Secondary, minor — a stale statement worth correcting either way
 
-Current Claude Code runs subagents **in background by default**; `run_in_background: false` is the explicit opt-out. So `:18`'s "blocks until complete" is no longer reliable even for single-agent waves. Wave 1 merging is an observation, not a guarantee — single-plan waves are observed-safe, not structurally safe.
+`:18` states *"**Claude Code:** Uses `Agent(...)` — blocks until complete, returns result."* Current
+Claude Code runs subagents **in background by default** (`run_in_background: false` is the explicit
+opt-out), so this is no longer accurate even for single-agent waves. It loses nothing on its own,
+but it is the basis on which the workflow concludes Claude Code is safe to spawn into.
 
-### Suggested fixes (any one sufficient)
+### Local workaround
 
-1. **Detect non-interactive execution and force `run_in_background: false`.** Cheapest correct fix.
-2. **Serialize the thing that actually races.** The stated rationale is `git worktree add` contending on `.git/config.lock` — that argues for serializing *worktree creation*, not for backgrounding *dispatch*. Create worktrees one at a time, then dispatch synchronously.
-3. **Make `:18` and `:596` agree**, and state explicitly which runtimes support the background path.
-4. **Make the SUMMARY.md-before-return requirement orchestrator-enforced** rather than an instruction to an executor that may be killed before honoring it.
+`"parallelization": false` — serializes within a wave so the 2+ branch is never reached. Costs
+parallelism, and does not address subagents backgrounding by default.
 
-### Local workaround applied
-
-`"parallelization": false` in `.planning/config.json` (commit `0955f97`, on `feature/phase-29`) — serializes within a wave so the 2+ branch is never reached. Costs parallelism and does **not** address the default-background hazard in fix 4's territory.
-
----
 
 ## Preventing recurrence — the meta-finding (2026-07-31)
 
