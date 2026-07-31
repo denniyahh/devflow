@@ -1978,14 +1978,14 @@ Plans:
 
 **Requirements**: TBD — no REQ-IDs; tracked by backlog identifier (`999.57`, `999.59`, `999.60`) plus `28-CONTEXT.md` decision IDs (`D-01`…`D-15`), consistent with Phases 21/22/26/27.
 **Depends on:** Phase 27 (no code dependency; sequencing only)
-**Plans:** 6 plans
+**Plans:** 1/6 plans executed
 
 **Capacity note, recorded rather than assumed.** Three items in one phase is what Phase 26 attempted, and Phase 26 did not ship. The mitigating difference: all four units share one narrow mechanism (gate → prompt → relaunch), none drives an irreversible operation, and 28b/28c/28d are each **S**. If scope pressure appears during planning, drop **28c** first (it is the most independent), then **28d**; 28a+28b are the phase's reason to exist.
 
 Plans:
 **Wave 1**
 
-- [ ] 28-01-PLAN.md — wave 1 · tracer: probe the checkpoint-recognition seam against a live headless run, then encode D-01's static PLAN.md scan
+- [x] 28-01-PLAN.md — wave 1 · tracer: probe the checkpoint-recognition seam against a live headless run, then encode D-01's static PLAN.md scan
 
 **Wave 2** *(blocked on Wave 1 completion)*
 

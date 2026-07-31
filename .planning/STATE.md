@@ -4,15 +4,15 @@ milestone: v2.0.0
 milestone_name: milestone (open — no fixed closing phase)
 current_phase: 28
 current_phase_name: close-the-checkpoint-answer-return-path
-status: Ready to execute
+status: executing
 stopped_at: Phase 28 planned — 6 plans in 3 waves
-last_updated: "2026-07-31T02:05:00.000Z"
+last_updated: "2026-07-31T01:58:23.020Z"
 last_activity: 2026-07-30
-last_activity_desc: Phase 28 planned (6 plans, 3 waves), plan-checker passed
+last_activity_desc: Phase 28 execution started
 progress:
   total_phases: 17
   completed_phases: 15
-  total_plans: 118
+  total_plans: 124
   completed_plans: 118
   percent: 88
 ---
@@ -86,9 +86,9 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 27 (scrub-redirecting-git-environment-from-production-calls) — COMPLETE
-Plan: 6 of 6 complete
-Status: Verified 7/7 must-haves. No Phase 28 is defined in ROADMAP.md — the next
+Phase: 28 (close-the-checkpoint-answer-return-path) — EXECUTING
+Plan: 1 of 6
+Status: Executing Phase 28
 real action is `/gsd-review-backlog` to promote a 999.x entry, or `/gsd-ship 27`
 to merge this phase. `phase.complete` auto-advanced this field to "999.1 — Hermes
 Support (BACKLOG)" because its next-phase scan walks into the backlog section;
@@ -157,7 +157,7 @@ Scope boundary: 23-16 is the **fix only** (change + regression tests + PR into `
 
 **Recovery-ref disposition:** both `origin` refs (`recovery/pre-23-11-acceptance-e0f87c2`, `recovery/pre-23-15-acceptance-0dad20d`) remain untouched on `origin`; the local copy of the pre-23-11 ref, deleted again by `devflow cleanup`, is deliberately NOT restored (per `23-FINDINGS.md` §B2a); the pre-23-15 ref is now unused (no merge to undo) but retained on `origin` for reuse by the 23-16 retry rather than deleted.
 
-Last activity: 2026-07-30 — Phase 27 complete, transitioned to Phase 999.1
+Last activity: 2026-07-30 — Phase 28 execution started
 
 **Note on the "Plan: 2 of 15" value this replaces:** `gsd-tools state advance-plan` only increments whatever value is already in this field, which had drifted to "2 of 15" (the parallel-worktree waves 23-01…23-09 deliberately never touch STATE.md, and this field was last corrected against reality at "10 of 11 plans complete" before the plan count grew to 15 with the gap-closure plans 23-12…23-15). Corrected directly to "13 of 15" to match reality (23-12 and 23-13 both now executed) rather than trust the tool's naive +1 increment from a stale base.
 
