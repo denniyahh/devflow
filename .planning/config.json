@@ -31,5 +31,5 @@
       "antigravity"
     ]
   },
-  "parallelization": false
+  "parallelization": true
 }

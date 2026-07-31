@@ -2221,8 +2221,8 @@ Plans:
 
 **Wave 2** *(parallel pair; no file overlap)*
 
-- [ ] 29-02-PLAN.md — wave 2 · 29a: the four remaining observations, the six-row report, and the mutates-nothing/records-nothing invariants → **29a ships**
-- [ ] 29-03-PLAN.md — wave 2 · 29b: the authorization mandate (`--yes-release` / `yes_release` / `DEVFLOW_YES_RELEASE`, read-only by construction) and merge-intent resolution against a discovered allowed-method set
+- [x] 29-02-PLAN.md — wave 2 · 29a: the four remaining observations, the six-row report, and the mutates-nothing/records-nothing invariants → **29a ships**
+- [x] 29-03-PLAN.md — wave 2 · 29b: the authorization mandate (`--yes-release` / `yes_release` / `DEVFLOW_YES_RELEASE`, read-only by construction) and merge-intent resolution against a discovered allowed-method set
 
 **Wave 3**
 
