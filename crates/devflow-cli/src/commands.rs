@@ -2287,6 +2287,18 @@ pub(crate) fn release_status(project_root: &Path, version: &str) -> Result<(), C
 
     let checks: Vec<Check> = vec![
         release_observation_check(
+            ReleaseStep::VersionBumped,
+            devflow_core::release_observe::version_bumped_on_develop(project_root, version),
+        ),
+        release_observation_check(
+            ReleaseStep::ChangelogWritten,
+            devflow_core::release_observe::changelog_written_on_develop(project_root, version),
+        ),
+        release_observation_check(
+            ReleaseStep::ReleasePrMerged,
+            devflow_core::release_observe::release_pr_merged_to_main(project_root, version),
+        ),
+        release_observation_check(
             ReleaseStep::SignedTagPresent,
             devflow_core::release_observe::signed_tag_on_remote(project_root, version),
         ),

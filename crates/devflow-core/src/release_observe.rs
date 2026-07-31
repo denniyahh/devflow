@@ -370,22 +370,152 @@ pub fn crates_published(project_root: &Path, version: &str) -> Observation {
     combine_crate_observations(&per_crate)
 }
 
-// -- 29-02 Task 1: content-at-ref oracles (stub bodies, RED) --------------
-// TODO(29-02 GREEN): replace with real classification logic.
+// -- 29-02 Task 1: content-at-ref oracles ---------------------------------
+
+/// Read a file's raw content at a specific git ref via `gh api
+/// repos/{owner}/{repo}/contents/<path>?ref=<git_ref>`, requesting the raw
+/// bytes (`Accept: application/vnd.github.raw`) so the response is the
+/// file's literal content rather than an encoded JSON envelope requiring a
+/// decode step.
+///
+/// Reads GitHub's copy of the file rather than fetching into the local
+/// object database on purpose: a `git fetch` writes `FETCH_HEAD` and can
+/// opportunistically update remote-tracking refs, which would make this
+/// observer a mutator (T-29-12). `gh` is pinned to `project_root` via
+/// `.current_dir` (T-29-10) so its `{owner}`/`{repo}` placeholders resolve
+/// to the project under observation, not the ambient shell's repository.
+/// Every argument is a discrete `Command::args` element — never
+/// string-interpolated into a shell (T-29-01). On spawn failure, non-zero
+/// exit, or empty stdout, returns `Err` with a failure-class description
+/// naming `path`/`git_ref` (harmless context, not sensitive) but never
+/// embedding `gh`'s raw stdout or stderr (T-29-03, T-17-13). The caller
+/// converts every `Err` into [`Observation::Unreachable`].
+fn file_at_ref(project_root: &Path, path: &str, git_ref: &str) -> Result<String, String> {
+    let endpoint = format!("repos/{{owner}}/{{repo}}/contents/{path}?ref={git_ref}");
+    let output = Command::new("gh")
+        .current_dir(project_root)
+        .args(["api", &endpoint, "-H", "Accept: application/vnd.github.raw"])
+        .output();
+    match output {
+        Ok(out) if out.status.success() => {
+            let content = String::from_utf8_lossy(&out.stdout).to_string();
+            if content.is_empty() {
+                Err(format!("gh returned empty content for {path}@{git_ref}"))
+            } else {
+                Ok(content)
+            }
+        }
+        Ok(out) => Err(format!(
+            "gh api exited with status {} fetching {path}@{git_ref}",
+            out.status
+        )),
+        Err(err) => Err(format!(
+            "failed to spawn gh fetching {path}@{git_ref}: {}",
+            err.kind()
+        )),
+    }
+}
 
 /// Classify a workspace root `Cargo.toml`'s text against an `expected`
-/// version. STUB — always Unreachable until the GREEN commit.
-pub fn classify_manifest_version(_cargo_toml: &str, _expected: &str) -> Observation {
-    Observation::Unreachable {
-        reason: "not implemented".into(),
+/// version. Pure — no I/O. Calls
+/// [`crate::version::read_workspace_self_pins`] — the same hand-rolled
+/// workspace-manifest parser the existing local self-pin check already
+/// uses, so remote and local agree by construction.
+///
+/// `Unreachable` when the manifest has no `[workspace.package]` version at
+/// all (empty or unparseable input is a failure to observe, not evidence of
+/// absence). `Absent` when the workspace version doesn't match `expected`
+/// (detail names both), or when it matches but any local-path self-pin
+/// doesn't (detail names the drifted pin) — CONTRIBUTING.md step 1 makes the
+/// two-place bump a single fact, and "bumped only the first" is the
+/// documented easy miss, so it must not read as done. `Present` only when
+/// the workspace version and every self-pin equal `expected`.
+pub fn classify_manifest_version(cargo_toml: &str, expected: &str) -> Observation {
+    let (workspace_version, pins) = crate::version::read_workspace_self_pins(cargo_toml);
+    let Some(workspace_version) = workspace_version else {
+        return Observation::Unreachable {
+            reason: "manifest has no [workspace.package] version — empty or unparseable".into(),
+        };
+    };
+    if workspace_version != expected {
+        return Observation::Absent {
+            detail: format!("workspace version is {workspace_version}, expected {expected}"),
+        };
+    }
+    for pin in &pins {
+        if pin.version != expected {
+            return Observation::Absent {
+                detail: format!(
+                    "workspace version matches but self-pin `{}` is {}, expected {expected}",
+                    pin.name, pin.version
+                ),
+            };
+        }
+    }
+    Observation::Present {
+        detail: format!("workspace version and all self-pins match {expected}"),
     }
 }
 
 /// Classify a `CHANGELOG.md`'s text for a top-level `## <version>` heading.
-/// STUB — always Unreachable until the GREEN commit.
-pub fn classify_changelog_heading(_changelog: &str, _version: &str) -> Observation {
-    Observation::Unreachable {
-        reason: "not implemented".into(),
+/// Pure — no I/O. `Unreachable` on empty input (a failure to observe, not
+/// evidence of absence). `Present` when any line, after trimming leading
+/// whitespace, begins with `## ` followed by `version` as its first
+/// whitespace-delimited token — so `## 2.3.0` and `## 2.3.0 - 2026-08-01`
+/// both count, while `##2.3.0` (no space after the hashes) and a bare
+/// inline mention do not. `Absent` otherwise.
+pub fn classify_changelog_heading(changelog: &str, version: &str) -> Observation {
+    if changelog.is_empty() {
+        return Observation::Unreachable {
+            reason: "changelog content is empty".into(),
+        };
+    }
+    for line in changelog.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("## ") {
+            let first_token = rest.split_whitespace().next().unwrap_or("");
+            if first_token == version {
+                return Observation::Present {
+                    detail: format!("found heading `## {version}`"),
+                };
+            }
+        }
+    }
+    Observation::Absent {
+        detail: format!("no `## {version}` heading found"),
+    }
+}
+
+/// I/O wrapper: is `Cargo.toml` on `develop` bumped to `version` in both
+/// required places? Reads GitHub's copy of the file via [`file_at_ref`] —
+/// never a local fetch — then classifies it with [`classify_manifest_version`].
+pub fn version_bumped_on_develop(project_root: &Path, version: &str) -> Observation {
+    match file_at_ref(project_root, "Cargo.toml", "develop") {
+        Ok(contents) => classify_manifest_version(&contents, version),
+        Err(reason) => Observation::Unreachable { reason },
+    }
+}
+
+/// I/O wrapper: does `CHANGELOG.md` on `develop` carry a top-level `##
+/// <version>` heading? Reads GitHub's copy of the file via [`file_at_ref`]
+/// then classifies it with [`classify_changelog_heading`].
+pub fn changelog_written_on_develop(project_root: &Path, version: &str) -> Observation {
+    match file_at_ref(project_root, "CHANGELOG.md", "develop") {
+        Ok(contents) => classify_changelog_heading(&contents, version),
+        Err(reason) => Observation::Unreachable { reason },
+    }
+}
+
+/// I/O wrapper: has the release PR landed on `main` — i.e. does `main`'s own
+/// `Cargo.toml` already carry `version`? The observable is the outcome
+/// (`main` carrying version X), not the pull request object itself — a
+/// merged PR is only the means by which it became true, and querying the PR
+/// list instead would make the answer depend on a mutable GitHub search
+/// index (RD-8).
+pub fn release_pr_merged_to_main(project_root: &Path, version: &str) -> Observation {
+    match file_at_ref(project_root, "Cargo.toml", "main") {
+        Ok(contents) => classify_manifest_version(&contents, version),
+        Err(reason) => Observation::Unreachable { reason },
     }
 }
 
