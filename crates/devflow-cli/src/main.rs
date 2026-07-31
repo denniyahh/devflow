@@ -25,8 +25,8 @@ use parallel::parallel;
 mod commands;
 use commands::{
     cleanup, doctor, evidence, gate_list, gate_respond, gate_show, gate_sweep, history_cmd, list,
-    logs, recover_cmd, reference, release_check, resolve_gate_target, start, status, stop,
-    test_cmd,
+    logs, recover_cmd, reference, release_check, release_status, resolve_gate_target, start,
+    status, stop, test_cmd,
 };
 
 mod config_parse;
@@ -227,16 +227,20 @@ enum Command {
         #[arg(default_value = ".")]
         project: PathBuf,
     },
-    /// Read-only release-cut preflight: self-pin, develop/main divergence,
-    /// crates.io publish order, and tag-signing viability.
+    /// Read-only release-cut preflight/observation: `--check` runs the
+    /// self-pin/divergence/publish-order/signing-viability preflight (20d);
+    /// the `status <version>` subcommand observes the release-cut questions
+    /// themselves against authoritative external sources (29a).
     ///
-    /// Ceiling is `--check` only (20d) — this command never runs the actual
-    /// merge/tag/sync/publish sequence, which is a deferred, not-yet-built
-    /// executor (DEN-50).
+    /// Ceiling is observation only (20d/29a) — this command never runs the
+    /// actual merge/tag/sync/publish sequence, which is a deferred,
+    /// not-yet-built executor (DEN-50).
     Release {
-        /// Run the read-only preflight checks. Required: a bare `devflow
-        /// release` (omitted `--check`) is rejected rather than silently
-        /// treated as a valid run.
+        #[command(subcommand)]
+        action: Option<ReleaseAction>,
+        /// Run the read-only preflight checks. Required when `action` is
+        /// omitted: a bare `devflow release` (no subcommand, no `--check`)
+        /// is rejected rather than silently treated as a valid run.
         #[arg(long)]
         check: bool,
         /// Project root.
@@ -410,6 +414,25 @@ enum GateCmd {
     },
 }
 
+/// `devflow release <action>` — the observation-only subcommand family
+/// (29a). Only `Status` exists so far; the recoverable-action and
+/// commit-point verbs (29b/29c) are deferred to later plans in this phase.
+#[derive(Debug, Subcommand)]
+enum ReleaseAction {
+    /// Observe the release-cut questions for `version` against
+    /// authoritative external sources (remote git refs, the GitHub API, the
+    /// crates.io registry) — mutates nothing.
+    Status {
+        /// The release version to check (e.g. `2.2.0`, no leading `v`).
+        /// Never re-derived from `compute_version` — a second version
+        /// source would be a second implementation that can drift.
+        version: String,
+        /// Project root.
+        #[arg(default_value = ".")]
+        project: PathBuf,
+    },
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CliError {
     #[error(transparent)]
@@ -572,21 +595,31 @@ fn run() -> Result<(), CliError> {
         } => recover_cmd(&project_root(project)?, clean, phase),
         Command::Test { project } => test_cmd(&project_root(project)?),
         Command::Doctor { json, project } => doctor(&project_root(project)?, json),
-        Command::Release { check, project } => {
-            // D-03 / Codex MEDIUM: an omitted --check is never silently
-            // treated as a valid check run. This phase ships only the
-            // read-only preflight, not the release-cut executor (merge/tag/
-            // sync/publish) — that command is a deferred backlog item.
-            if !check {
-                return Err(CliError::Message(
-                    "devflow release requires --check: only the read-only preflight ships in \
-                     this phase. The release-cut executor (merge PR → tag → sync develop → \
-                     publish) is deferred (DEN-50) and not yet built."
-                        .to_string(),
-                ));
+        Command::Release {
+            action,
+            check,
+            project,
+        } => match action {
+            Some(ReleaseAction::Status { version, project }) => {
+                release_status(&project_root(project)?, &version)
             }
-            release_check(&project_root(project)?)
-        }
+            None => {
+                // D-03 / Codex MEDIUM: an omitted --check is never silently
+                // treated as a valid check run. This phase ships only the
+                // read-only preflight and the read-only `status` observer,
+                // not the release-cut executor (merge/tag/sync/publish) —
+                // that command is a deferred backlog item.
+                if !check {
+                    return Err(CliError::Message(
+                        "devflow release requires --check: only the read-only preflight ships \
+                         in this phase. The release-cut executor (merge PR → tag → sync develop \
+                         → publish) is deferred (DEN-50) and not yet built."
+                            .to_string(),
+                    ));
+                }
+                release_check(&project_root(project)?)
+            }
+        },
         Command::Ship {
             phase,
             force,

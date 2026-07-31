@@ -2241,6 +2241,90 @@ pub(crate) fn release_check(project_root: &Path) -> Result<(), CliError> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// release status (29a)
+// ---------------------------------------------------------------------------
+
+/// Convert a release-cut [`devflow_core::release_observe::Observation`] plus
+/// the [`devflow_core::release_observe::ReleaseStep`] it answers into a
+/// `Check` row. Mapping `Unreachable` to `"fail"` is deliberate and diverges
+/// from 29-PATTERNS.md's softer suggestion, because RD-8 requires an
+/// unreachable oracle to refuse rather than let the run proceed on a
+/// partial answer.
+fn release_observation_check(
+    step: devflow_core::release_observe::ReleaseStep,
+    observation: devflow_core::release_observe::Observation,
+) -> Check {
+    use devflow_core::release_observe::Observation;
+    let name = step.label().to_string();
+    match observation {
+        Observation::Present { detail } => Check {
+            name,
+            status: "ok".into(),
+            version: Some(detail),
+            install_hint: None,
+        },
+        Observation::Absent { detail } => Check {
+            name,
+            status: "warn".into(),
+            version: Some(detail),
+            install_hint: None,
+        },
+        Observation::Unreachable { reason } => Check {
+            name,
+            status: "fail".into(),
+            version: Some(reason),
+            install_hint: None,
+        },
+    }
+}
+
+/// `devflow release status <version>` (29a) — observation only, mutates
+/// nothing. Reuses `release_check`'s `Check`-list-then-report shape
+/// verbatim so the two commands stay visually identical.
+pub(crate) fn release_status(project_root: &Path, version: &str) -> Result<(), CliError> {
+    use devflow_core::release_observe::ReleaseStep;
+
+    let checks: Vec<Check> = vec![release_observation_check(
+        ReleaseStep::SignedTagPresent,
+        devflow_core::release_observe::signed_tag_on_remote(project_root, version),
+    )];
+
+    let mut failed = false;
+    for c in &checks {
+        let icon = match c.status.as_str() {
+            "ok" => "✓",
+            "warn" => "⚠",
+            "fail" => "✗",
+            _ => "?",
+        };
+        let detail = c.version.as_deref().unwrap_or("-");
+        println!("  {:<32} {icon}  {detail}", c.name);
+        if matches!(c.status.as_str(), "warn" | "fail")
+            && let Some(hint) = &c.install_hint
+        {
+            println!("      — {hint}");
+        }
+        if c.status == "fail" {
+            failed = true;
+        }
+    }
+
+    let complete = checks.iter().filter(|c| c.status == "ok").count();
+    println!(
+        "\n{version}: {complete}/{} question(s) observed complete",
+        checks.len()
+    );
+
+    if failed {
+        Err(CliError::Message(format!(
+            "release status for {version} could not observe every question — see checks above"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
 /// Self-pin check (asserts 20a's invariant): every local-path
 /// `[workspace.dependencies]` self-pin must equal `[workspace.package]
 /// version`, compared dynamically — never against a hardcoded expected
