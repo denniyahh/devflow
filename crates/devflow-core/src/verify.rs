@@ -96,6 +96,21 @@ fn command_from_frontmatter(contents: &str) -> Option<String> {
     None
 }
 
+/// Return `true` if any plan declared for `phase` carries a task with the
+/// human-blocking checkpoint gate attribute.
+///
+/// Reads declared plan content only — never any runtime capture or agent
+/// output (D-02: no re-implementation of "what does the agent mean"). This
+/// is the PRIMARY gate for the auto-decide path added in plan 28-03: an
+/// agent cannot route itself into that path for a phase whose plans never
+/// declared a `gate="blocking-human"` checkpoint, because this scan runs
+/// first and is read from `.planning/phases/`. Those files are agent-writable
+/// during Code, but that is the SAME trust boundary [`external_verify_commands`]
+/// already documents and accepts — reused, not newly introduced.
+pub fn phase_has_blocking_human_checkpoint(_project_root: &Path, _phase: u32) -> bool {
+    unimplemented!("GREEN phase not yet implemented")
+}
+
 /// Run one explicitly operator-approved external verification command.
 ///
 /// `sh -c` is intentional because probes may contain pipelines. The caller
@@ -201,5 +216,96 @@ mod tests {
             "test -f missing.txt",
             dir.path()
         ));
+    }
+
+    // The gate value is assembled at runtime from this const, not written as a
+    // literal in fixture bodies below, so this test file itself never contains
+    // the raw `gate="blocking-human"` string (28-01 Task 2 action note).
+    const HUMAN_GATE_VALUE: &str = "blocking-human";
+    const PLAIN_GATE_VALUE: &str = "blocking";
+
+    fn write_phase_file(root: &std::path::Path, phase_dir: &str, file_name: &str, contents: &str) {
+        let dir = root.join(".planning/phases").join(phase_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(file_name), contents).unwrap();
+    }
+
+    #[test]
+    fn phase_has_blocking_human_checkpoint_detects_declared_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            "---\nphase: 91\n---\n\n<task type=\"checkpoint:human-verify\" gate=\"{HUMAN_GATE_VALUE}\">\n</task>\n"
+        );
+        write_phase_file(dir.path(), "91-probe", "91-01-PLAN.md", &body);
+
+        assert!(phase_has_blocking_human_checkpoint(dir.path(), 91));
+    }
+
+    #[test]
+    fn phase_has_blocking_human_checkpoint_false_for_plain_blocking_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            "---\nphase: 91\n---\n\n<task type=\"checkpoint:decision\" gate=\"{PLAIN_GATE_VALUE}\">\n</task>\n"
+        );
+        write_phase_file(dir.path(), "91-probe", "91-01-PLAN.md", &body);
+
+        assert!(
+            !phase_has_blocking_human_checkpoint(dir.path(), 91),
+            "the plain `blocking` gate (no -human suffix) must not match — Phase 26 near-miss distinction"
+        );
+    }
+
+    #[test]
+    fn phase_has_blocking_human_checkpoint_false_when_no_gate_attribute() {
+        let dir = tempfile::tempdir().unwrap();
+        write_phase_file(
+            dir.path(),
+            "91-probe",
+            "91-01-PLAN.md",
+            "---\nphase: 91\n---\n\n<task type=\"auto\">\n</task>\n",
+        );
+
+        assert!(!phase_has_blocking_human_checkpoint(dir.path(), 91));
+    }
+
+    #[test]
+    fn phase_has_blocking_human_checkpoint_false_for_missing_phase_directory() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert!(!phase_has_blocking_human_checkpoint(dir.path(), 404));
+    }
+
+    #[test]
+    fn phase_has_blocking_human_checkpoint_true_when_only_second_plan_carries_attribute() {
+        let dir = tempfile::tempdir().unwrap();
+        write_phase_file(
+            dir.path(),
+            "91-probe",
+            "91-01-PLAN.md",
+            "---\nphase: 91\n---\n\n<task type=\"auto\">\n</task>\n",
+        );
+        let body = format!(
+            "---\nphase: 91\n---\n\n<task type=\"checkpoint:human-verify\" gate=\"{HUMAN_GATE_VALUE}\">\n</task>\n"
+        );
+        write_phase_file(dir.path(), "91-probe", "91-02-PLAN.md", &body);
+
+        assert!(
+            phase_has_blocking_human_checkpoint(dir.path(), 91),
+            "every plan must be inspected, not just the first"
+        );
+    }
+
+    #[test]
+    fn phase_has_blocking_human_checkpoint_ignores_non_plan_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            "---\nphase: 91\n---\n\nRecorded checkpoint gate=\"{HUMAN_GATE_VALUE}\" in the executor return.\n"
+        );
+        write_phase_file(dir.path(), "91-probe", "91-01-SUMMARY.md", &body);
+
+        assert!(
+            !phase_has_blocking_human_checkpoint(dir.path(), 91),
+            "only *-PLAN.md files are scanned, not SUMMARY/RESEARCH files"
+        );
     }
 }
