@@ -61,11 +61,19 @@ impl ClaudeAgent {
     /// test guarding this specifically — do not delete it as "obviously
     /// redundant" with `claude_wraps_prompt_in_noninteractive_flags` above;
     /// it guards a DIFFERENT command construction path.
-    pub fn exec_resume_command(
-        _session_id: &str,
-        _instruction: &str,
-    ) -> (&'static str, Vec<String>) {
-        unimplemented!("RED: 28-03 Task 1 — exec_resume_command not yet implemented")
+    pub fn exec_resume_command(session_id: &str, instruction: &str) -> (&'static str, Vec<String>) {
+        (
+            "claude",
+            vec![
+                "-p".into(),
+                instruction.to_string(),
+                "--resume".into(),
+                session_id.to_string(),
+                "--output-format".into(),
+                "json".into(),
+                "--dangerously-skip-permissions".into(),
+            ],
+        )
     }
 }
 

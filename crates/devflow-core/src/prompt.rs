@@ -260,8 +260,18 @@ fn stage_prompt_with_project(stage: Stage, phase: u32, project_root: Option<&Pat
 /// this exact instruction without churning on every resume. `phase` is
 /// included only for operator legibility in the captured stdout — the
 /// instruction's meaning does not depend on it.
-pub fn checkpoint_auto_decide_prompt(_phase: u32) -> String {
-    unimplemented!("RED: 28-03 Task 1 — checkpoint_auto_decide_prompt not yet implemented")
+pub fn checkpoint_auto_decide_prompt(phase: u32) -> String {
+    format!(
+        "This is phase {phase} of a headless DevFlow run. You previously \
+        stopped at a human-blocking checkpoint, but no human operator is \
+        available to answer it — this run is unattended, and none is \
+        coming. DevFlow's policy is for you to resolve the checkpoint \
+        yourself, using your own best judgment, and continue the work. You \
+        MUST record your reasoning for the decision you made in your final \
+        message, so the decision is auditable after the fact.\n\
+        \n\
+        {COMPLETION_PROTOCOL}"
+    )
 }
 
 /// Build a fix prompt used on Code → Validate loop-backs.
