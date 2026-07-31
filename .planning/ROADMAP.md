@@ -2196,12 +2196,39 @@ failed loudly — the release quietly stopped one step short, and it took an ad-
 notice. The executor's value is **consistency and completeness, not speed**; 29a alone would
 have caught this the moment it happened.
 
-**Requirements:** TBD — no REQ-IDs; tracked by unit identifier (`29a`–`29c`) plus
-`29-CONTEXT.md` decision IDs, consistent with Phases 21/22/26/27/28.
+**Requirements:** no REQ-IDs; tracked by unit identifier (`29a`–`29c`) only. No
+`29-CONTEXT.md` exists — the Define stage deliberately did not run the interview because this
+roadmap section carries the phase context inline, so its "Operator decisions" subsection above
+IS the locked-decision record. The plans refer to those bullets as `RD-1`…`RD-9` for
+readability; `RD-N` is a pointer into this section, not a tracked decision ID.
 **Depends on:** Phase 27 (999.39, `GIT_DIR` scrubbing — CR-01's prerequisite, delivered).
 **Priority:** High | **Size:** L — but with two points at which it can stop and still have
 delivered something. Linear: DEN-50.
+**Plans:** 7 plans across 6 waves (planned 2026-07-31)
 
 Plans:
 
-- [ ] TBD — pending `/gsd-discuss-phase 29` and `/gsd-plan-phase 29`
+**Wave 1** *(tracer — verified before any expansion)*
+
+- [ ] 29-01-PLAN.md — wave 1 · **tracer** (29a): `devflow release status <version>` end to end, answering the signed-tag-on-remote question, then the crates.io publish oracle
+
+**Wave 2** *(parallel pair; no file overlap)*
+
+- [ ] 29-02-PLAN.md — wave 2 · 29a: the four remaining observations, the six-row report, and the mutates-nothing/records-nothing invariants → **29a ships**
+- [ ] 29-03-PLAN.md — wave 2 · 29b: the authorization mandate (`--yes-release` / `yes_release` / `DEVFLOW_YES_RELEASE`, read-only by construction) and merge-intent resolution against a discovered allowed-method set
+
+**Wave 3**
+
+- [ ] 29-04-PLAN.md — wave 3 · 29b: the `ReleaseStep` walk (observe → refuse on unreachable → detect in flight → act once → stop), `devflow release cut`, and the unattended/no-presence invariant
+
+**Wave 4**
+
+- [ ] 29-05-PLAN.md — wave 4 · 29b: the two-place version bump and changelog prepared in a scratch worktree, landed by a pull request whose method was resolved for the version-bump intent
+
+**Wave 5**
+
+- [ ] 29-06-PLAN.md — wave 5 · 29b: the release PR into `main` and the sync-back port (ancestor short circuit, `-X ours`, tree-identity refusal) landed by a real merge commit → **29b ships**
+
+**Wave 6**
+
+- [ ] 29-07-PLAN.md — wave 6 · 29c: `checkpoint:decision` (one-way gate) → the signed tag with all four local-tag collision branches → the two publishes in `publish_order()` → line-by-line review checkpoint → **29c ships**
