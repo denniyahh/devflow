@@ -173,3 +173,72 @@ context where `--dangerously-skip-permissions` is not classifier-blocked
 (e.g. DevFlow's own actual monitor process, which is not a Claude Code agent
 session and is not subject to this classifier), remains the outstanding way
 to convert this unconfirmed default into a genuinely CONFIRMED one.
+
+---
+
+## A1 RESOLVED — live run, 2026-07-31 (supersedes the DIVERGENT verdict above)
+
+Everything above this line records the *first* probe attempt, which never
+reached a checkpoint because its own `claude -p` invocation was denied at the
+executing agent-session's Bash-tool permission classifier. That verdict —
+`DIVERGENT`, with the reader contract flagged as an unconfirmed default — was
+correct for what it observed, and is preserved unedited.
+
+A1 has since been closed by a real run performed from the orchestrator context,
+driving `devflow start` so that DevFlow's own monitor spawned the agent. That is
+the distinction that mattered: DevFlow passes `--dangerously-skip-permissions`
+from inside its own process, so nothing in the agent-session tool boundary
+applies to it.
+
+### Observed literal (supersedes `## Observed literal`)
+
+Captured from `.devflow/phase-91-stdout`, inside the JSON envelope's `result`
+text, quoted byte-for-byte after unescaping:
+
+```
+**Gate:** `blocking-human`
+```
+
+The VALUE is `blocking-human` — the predicted constant was right. The
+**RENDERING** was not: the value arrives wrapped in a markdown **code span**,
+which RESEARCH.md did not predict because it derived the literal by reading the
+emitting source rather than by observing output.
+
+### A1 verdict (supersedes `## A1 verdict`)
+
+**CONFIRMED — with a defect found.**
+
+The predicted rendering would have matched; the real one did not.
+`text_reports_human_gate` trimmed only `*` and space before reading the value
+token, so the leading backtick survived and `take_while(alnum || '-')`
+terminated immediately, producing an EMPTY token. The reader returned `false`
+and a genuine checkpoint fell through to the generic gate — the exact dead-end
+this phase exists to close.
+
+### Reader contract (supersedes `## Reader contract`)
+
+The reader must match a `Gate` label followed by `:` and the value
+`blocking-human`, **tolerating markdown code-span backticks as well as emphasis
+asterisks and whitespace** on both the label and the value. This is no longer an
+unconfirmed default — it is transcribed from a live capture.
+
+Implemented in `b22e6cf`: backtick added to both trim sets in
+`agent_result.rs::text_reports_human_gate`, with three regression tests built
+from the verbatim capture (bare, escaped-in-envelope, and a negative asserting a
+code-spanned plain `blocking` still does not match). All three confirmed RED
+before the fix.
+
+### End-to-end confirmation after the fix
+
+| Observation | Result |
+|---|---|
+| Checkpoint recognized | ✅ `(Task 1, Gate: blocking-human)` |
+| Routed to auto-decide, not the generic gate | ✅ `gate_fired: 0` |
+| `checkpoint_auto_decided` emitted exactly once | ✅ count = 1 |
+| Real session id in the audit record | ✅ `cd55079f-ebe5-432b-81e2-037b1daef86a` |
+| Relaunched via `--resume`, agent resolved it | ✅ `checkpoint_resumes: 1` |
+| Work completed | ✅ `probe-marker.txt` = `probe-ok` |
+
+**Lesson worth keeping:** reading the emitting source tells you the *value*. Only
+a live capture tells you the *rendering*. A tracer that cannot run is not a
+tracer that passed.

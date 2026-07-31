@@ -1,12 +1,16 @@
 ---
 phase: 28-close-the-checkpoint-answer-return-path
 verified: 2026-07-31T00:00:00Z
-status: human_needed
-score: 8/9 must-haves verified
-behavior_unverified: 1
+status: passed
+score: 9/9 must-haves verified
+behavior_unverified: 0
 overrides_applied: 0
+reverified: 2026-07-31T08:30:00Z
+reverification_note: "A1 closed by a live end-to-end run; the check found and fixed a real defect (b22e6cf). See '## A1 Closure' at the end of this report."
 human_verification:
-  - test: "Run one real headless phase whose plan carries a genuine `gate=\"blocking-human\"` task via `devflow start`, from a context not subject to a Claude Code agent-session permission classifier (i.e. DevFlow's own actual `monitor` process, not a worktree sub-agent), and capture `.devflow/phase-NN-stdout`."
+  - status: RESOLVED 2026-07-31 — run performed; found and fixed a real defect (b22e6cf), then confirmed the full path end-to-end. See "## A1 Closure".
+    outcome: "Observed rendering was ``**Gate:** `blocking-human` `` (value in a markdown code span), NOT the predicted bare `**Gate:** blocking-human`. The reader returned false and the checkpoint fell through to the generic gate. After the fix: recognized, routed to auto-decide, exactly one checkpoint_auto_decided event with a real session_id, resumed, resolved, work completed."
+    test: "Run one real headless phase whose plan carries a genuine `gate=\"blocking-human\"` task via `devflow start`, from a context not subject to a Claude Code agent-session permission classifier (i.e. DevFlow's own actual `monitor` process, not a worktree sub-agent), and capture `.devflow/phase-NN-stdout`."
     expected: "The captured stdout contains the literal substring `**Gate:** blocking-human` (case-insensitive label, exact value), so `agent_result::blocking_human_checkpoint_reported` returns `true` and the checkpoint is auto-resolved via `relaunch_checkpoint_session`, recorded by exactly one `checkpoint_auto_decided` event in `.devflow/events.jsonl`."
     why_human: "RESEARCH.md's Assumption A1 / Pitfall 2: the `Gate:` field crosses two indirections (gsd-executor subagent emission → execute-phase.md orchestrator relay → DevFlow's captured top-level stdout) that no unit test can exercise, because it depends on Claude Code's own orchestrator-session rendering under a real headless run with no human present. 28-PROBE.md's own live-probe attempt was denied at the probing executor's Bash-tool permission classifier before the `claude` subprocess ever spawned (verdict: DIVERGENT, not CONFIRMED or HUNG). Every unit test in this phase proves the READER logic is correct against the *documented/predicted* literal, not that the literal is what a real run actually produces. WINDOWS.md entry #6 tracks this open."
 ---
@@ -16,8 +20,15 @@ human_verification:
 **Phase Goal (as narrowed by 28-CONTEXT.md):** Recognize a `gate="blocking-human"` checkpoint correctly, and let DevFlow resolve it unattended, so a checkpoint stops being a dead end for a headless DevFlow-driven run. Building a human-answer relay or notification interface is explicitly out of scope (D-08–D-11).
 
 **Verified:** 2026-07-31
-**Status:** human_needed
-**Re-verification:** No — initial verification
+**Status:** passed (re-verified 2026-07-31 — see [A1 Closure](#a1-closure-2026-07-31-post-verification) at the end)
+**Re-verification:** Yes — A1 closed by a live end-to-end run
+
+> **⚠ Read the A1 Closure section before the Central Finding below.** Everything
+> from here to that section was written while A1 was still open and is preserved
+> as the record of what was known at initial verification. A1 has since been
+> closed by a live run, which **found and fixed a real defect** (`b22e6cf`): the
+> executor renders the gate value as a markdown code span, which the reader did
+> not match. Truth 2 below is now VERIFIED, but only after that fix.
 
 ## Central Finding First
 
@@ -162,3 +173,81 @@ There is exactly one substantive gap, and it is the phase's own headline claim: 
 
 _Verified: 2026-07-31_
 _Verifier: Claude (gsd-verifier)_
+
+---
+
+## A1 Closure (2026-07-31, post-verification)
+
+The single `human_needed` item is resolved. A real `devflow start` run drove a
+synthetic project (phase 91) whose plan declared a genuine human-blocking task,
+executed through DevFlow's own monitor process using a binary rebuilt from this
+phase's merged code — the context the original probe could not reach.
+
+**The check did not rubber-stamp the phase. It found a real defect.**
+
+### What was wrong
+
+The checkpoint fired and reached DevFlow's capture, but the reader did not
+recognize it. The executor renders the gate value as a **markdown code span**:
+
+```
+**Gate:** `blocking-human`
+```
+
+`text_reports_human_gate` trimmed only `*` and space before reading the value,
+so the leading backtick survived and `take_while(alnum || '-')` terminated
+immediately, yielding an empty token. The reader returned `false` and the run
+fell through to the generic gate — the exact dead-end this phase exists to close.
+
+Confirmed by replaying the matcher against both strings: predicted form → `true`,
+observed form → `false`.
+
+**Why 776 green tests missed it.** Every fixture was built from RESEARCH.md's
+predicted rendering, which was derived by reading the *emitting* source
+(`gsd-executor.md`, `execute-phase.md`) rather than by observing output. The
+emitting source told us the value; it did not tell us the rendering. This is
+precisely the gap the tracer existed to close, and precisely what was lost when
+the probe was blocked and the phase proceeded on the documented default.
+
+### What was right
+
+The **safe-direction property held exactly as designed**. The reader's own doc
+comment promised that a false negative degrades to the never-silent generic
+gate, and that is what happened: `gate_fired` with `unexpected: true`, human
+review requested, nothing silently authorized. The security posture never
+depended on the literal being correct — which is why `28-SECURITY.md` remains
+`SECURED` with `threats_open: 0` and no disposition changed. The controls
+worked; the feature did not.
+
+The honesty discipline also held: no artifact, doc comment, or test name ever
+claimed this was confirmed. The caveat was propagated faithfully everywhere,
+which is why the defect was findable rather than buried.
+
+### The fix and the retest
+
+Fixed in `b22e6cf`: backtick added to both trim sets, plus three regression
+tests built from the **verbatim captured output** — bare, inside the escaped
+JSON envelope (the real production path), and a negative asserting a
+code-spanned plain `blocking` still does not match, preserving the Phase 26
+near-miss distinction. All three confirmed RED before the fix.
+
+Retested live end-to-end. The full D-01 → D-03 → D-04 → D-07 path now works:
+
+| Observation | Result |
+|---|---|
+| Checkpoint recognized | ✅ reason reads `(Task 1, Gate: blocking-human)` |
+| Routed to auto-decide, not the generic gate | ✅ `gate_fired: 0` |
+| `checkpoint_auto_decided` emitted, exactly once | ✅ count = 1 |
+| Audit record carries a real session id | ✅ `cd55079f-ebe5-432b-81e2-037b1daef86a` |
+| Policy attribution recorded | ✅ `D-03: unconditional agent auto-decide, no flag/config toggle` |
+| Relaunched via `--resume` and resolved | ✅ `checkpoint_resumes: 1`, agent decided |
+| Work actually completed | ✅ `probe-marker.txt` written, contents `probe-ok` |
+
+**Independently confirmed as a side effect:** D-14 (T-28-08) observed working in
+production — DevFlow's generated Define prompt states *"you must NOT run an
+interactive discuss-phase or interview command… this run is headless"* — and
+D-04's envelope capture, since the top-level `session_id` was present and used.
+
+**Status:** `passed`. `WINDOWS.md` entry #6 closed. The lesson worth carrying
+forward: reading the emitting source yields the value, not the rendering. Only a
+live capture yields the rendering.

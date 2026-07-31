@@ -49,7 +49,7 @@ and independently re-ran every cited test plus the full workspace suite.
 | T-28-06 | Elevation of Privilege | `config::yes_ship` + `commands::start` combine | **high** | accept | Default `false`; OR-combine with never-silent notice (`commands.rs:133-142`); dry-run reports resolved state; D-13 untouched. CLI-boundary test `yes_ship_config.rs` (5/5, real process, real stdout) | closed (PROVEN) |
 | T-28-08 | Denial of Service | `prompt::define_stage_prompt` | **high** | mitigate | Headless-hang branch deleted (`prompt.rs:181-194`); test `define_prompt_never_invokes_discuss_phase`. **Independently confirmed live** — see Live Verification below | closed (PROVEN + observed live) |
 | T-28-11 | Elevation of Privilege | `pipeline_launch::resume` erasing an unfired `--until` cap | **high** | mitigate | Clear gated on `if state.stopped` (`pipeline_launch.rs:316-320`); test `resume_preserves_unfired_until_cap` asserts reloaded on-disk state | closed (PROVEN) |
-| T-28-01 | Spoofing / EoP | `Action::GateReview` guard ordering | medium | mitigate + accept | Rust short-circuit `&&` at `pipeline_launch.rs:489-491` guarantees the agent-uncontrollable static PLAN.md scan runs strictly before the agent-controlled stdout confirmation | closed — ordering PROVEN; **literal-correctness DISPROVEN, see Live Verification** |
+| T-28-01 | Spoofing / EoP | `Action::GateReview` guard ordering | medium | mitigate + accept | Rust short-circuit `&&` at `pipeline_launch.rs:489-491` guarantees the agent-uncontrollable static PLAN.md scan runs strictly before the agent-controlled stdout confirmation | closed — ordering PROVEN; literal-correctness now PROVEN after `b22e6cf` (was DISPROVEN on first live run) |
 | T-28-04 | Spoofing | `agent_result::claude_session_id` | medium | mitigate | Direct `value.get("session_id")` on the top-level envelope only, never nested traversal; `AgentResult` carries no `session_id` field; test `session_id_in_devflow_result_marker_is_not_returned` uses differing top-level/embedded ids | closed (PROVEN) |
 | T-28-05 | Information Disclosure | Session id at rest | low | accept | `.gitignore:26`, `:34`; same local-filesystem boundary as existing captures of equal or greater capability | closed |
 | T-28-07 | Tampering (self-inflicted) | Phase 28's own PLAN.md files | medium | mitigate | `rg -l 'gate="blocking[-]human"' .planning/phases/28-*/28-*-PLAN.md` → exit 1, no matches; fixtures build the literal via `const`/`format!` | closed (PROVEN) |
@@ -98,7 +98,12 @@ yields an empty token. The reader returns `false` and the run fell through to th
 gate. Verified by replaying the exact matcher algorithm against both strings: predicted
 form → `true`, observed form → `false`.
 
-**Security assessment of that defect: it is a functional failure, not a security
+**Status: FIXED in `b22e6cf`** — backtick added to the matcher's trim sets, three
+regression tests built from the verbatim capture (confirmed RED first), and the full
+path retested live: recognized → auto-decide → exactly one `checkpoint_auto_decided`
+event with a real session id → resumed → resolved. Zero generic gate fires.
+
+**Security assessment of that defect: it was a functional failure, not a security
 regression.** The reader's documented safe-direction property held exactly as designed —
 a false negative falls back to the never-silent generic gate. The live run's event log
 shows `gate_fired` with `unexpected: true` and a human-review-needed context. Nothing was
@@ -135,4 +140,4 @@ capture design.
 - [x] `threats_open: 0` confirmed
 - [x] D-05 invariant verified (`agents/mod.rs` untouched)
 - [x] Self-referential hazard re-checked (no gate literal in phase 28's own plans)
-- [ ] **Open follow-up (functional, not security):** the confirmation reader does not match the real-world rendering — see Live Verification finding 2
+- [x] **Follow-up CLOSED (functional, not security):** the confirmation reader now matches the real-world code-span rendering — fixed in `b22e6cf`, retested live end-to-end (recognized → auto-decide → one audit event → resumed → resolved). Security dispositions were unaffected throughout; `threats_open` stayed 0 because the safe-direction fallback held while the defect was live.
