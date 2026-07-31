@@ -71,6 +71,34 @@ pub struct DevflowConfig {
     /// the CLI flag via logical OR rather than replacing it, because the
     /// flag has no negative form — passing `--yes-ship` always wins.
     pub yes_ship: bool,
+    /// Standing authorization mandate for the release-cut executor's whole
+    /// sequence, including its irreversible steps (RD-2, RD-4) — granted
+    /// once by the operator via `--yes-release`, this key, or
+    /// `DEVFLOW_YES_RELEASE`, mirroring `yes_ship`'s three-source
+    /// precedent (D-12) exactly. One mandate covers the whole sequence: a
+    /// second, narrower flag for the irreversible steps would be a
+    /// self-imposed gate no repository rule imposes, which RD-2 forbids.
+    ///
+    /// Four properties make this a mandate rather than a ledger, each
+    /// asserted by a test in this module:
+    /// - **Read-only to DevFlow.** No code path here, or anywhere else in
+    ///   this crate, writes `devflow.toml` or any file under `.devflow/`
+    ///   for release purposes (RD-8) — the structural reason this cannot
+    ///   become a progress ledger.
+    /// - **Not consumed.** Reading this value does not clear or decrement
+    ///   it; it is a standing grant, so re-running is free.
+    /// - **A single boolean carrying no progress.** It cannot express
+    ///   "step 3 done", so it cannot drift into meaning that.
+    /// - **Defaults to false.** An absent `devflow.toml`, or one that
+    ///   omits this key, never authorizes a release — relaxing this later
+    ///   is easy, tightening it after operators depend on a persisted
+    ///   setting is not.
+    ///
+    /// Deliberately not a field on [`crate::state::State`]: `State` is a
+    /// file DevFlow writes, and a release record living there would be
+    /// the beginning of exactly the progress ledger this design exists to
+    /// avoid.
+    pub yes_release: bool,
 }
 
 impl Default for DevflowConfig {
@@ -80,6 +108,7 @@ impl Default for DevflowConfig {
             review_angles: None,
             external_verify_enabled: true,
             yes_ship: false,
+            yes_release: false,
         }
     }
 }
@@ -103,6 +132,13 @@ impl DevflowConfig {
     /// Return whether the Ship gate is standing pre-authorized (D-12).
     pub fn yes_ship(&self) -> bool {
         self.yes_ship
+    }
+
+    /// Return whether the release-cut executor's whole sequence is
+    /// standing pre-authorized (RD-2, RD-4). See the `yes_release` field's
+    /// doc comment for the boundary this accessor exposes.
+    pub fn yes_release(&self) -> bool {
+        self.yes_release
     }
 }
 
@@ -202,6 +238,19 @@ pub fn yes_ship(project_root: &Path) -> bool {
         }
     }
     load_config(project_root).yes_ship
+}
+
+/// Resolve the release-cut executor's standing authorization mandate
+/// (RD-2, RD-4) with `DEVFLOW_YES_RELEASE` taking precedence over
+/// `devflow.toml` and the built-in `false` default. Mirrors `yes_ship`'s
+/// resolver shape exactly — same precedence, same fail-soft parse
+/// warning, same false default. Unlike `yes_ship`, no CLI flag is ORed in
+/// here; that combination happens at the release-cut command's own call
+/// site, exactly as `commands::start` ORs in `--yes-ship`.
+pub fn yes_release(project_root: &Path) -> bool {
+    // RED stub: intentionally wrong so the behavior tests below fail for
+    // the intended reason before the GREEN implementation lands.
+    todo!("yes_release resolver not yet implemented")
 }
 
 fn env_value(key: &str) -> Option<String> {
@@ -371,5 +420,114 @@ mod tests {
         let _env = EnvOverride::set("DEVFLOW_YES_SHIP", "true");
 
         assert!(yes_ship(dir.path()));
+    }
+
+    // -- 29-03 Task 1: the release authorization mandate ------------------
+    //
+    // Mirrors the yes_ship test block above field for field. The two cases
+    // that carry the design's weight — independence from yes_ship, and
+    // not-consumed-by-reading — are marked below.
+
+    /// RD-8: an absent `devflow.toml`, or one omitting the key, must never
+    /// authorize a release — the same asymmetry `yes_ship` established.
+    #[test]
+    fn yes_release_defaults_to_false() {
+        assert!(!DevflowConfig::default().yes_release());
+    }
+
+    /// No `devflow.toml` present → the resolver falls through to the
+    /// built-in `false` default.
+    #[test]
+    fn yes_release_missing_file_returns_false() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!yes_release(dir.path()));
+    }
+
+    /// `devflow.toml` setting the key `true` → the resolver returns `true`.
+    #[test]
+    fn yes_release_file_sets_true() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("devflow.toml"), "yes_release = true\n").unwrap();
+
+        assert!(yes_release(dir.path()));
+    }
+
+    /// `devflow.toml` setting the key `false` → the resolver returns
+    /// `false`.
+    #[test]
+    fn yes_release_file_sets_false() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("devflow.toml"), "yes_release = false\n").unwrap();
+
+        assert!(!yes_release(dir.path()));
+    }
+
+    /// A `devflow.toml` with only unrelated keys still loads, and the
+    /// resolver returns the default.
+    #[test]
+    fn yes_release_unrelated_keys_returns_default() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("devflow.toml"), "capture_retention = 9\n").unwrap();
+
+        assert!(!yes_release(dir.path()));
+    }
+
+    /// `DEVFLOW_YES_RELEASE=true` overrides a file value of `false`.
+    #[test]
+    fn env_overrides_file_yes_release() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("devflow.toml"), "yes_release = false\n").unwrap();
+        let _env = EnvOverride::set("DEVFLOW_YES_RELEASE", "true");
+
+        assert!(yes_release(dir.path()));
+    }
+
+    /// An unparseable `DEVFLOW_YES_RELEASE` value warns and falls back to
+    /// the file value rather than panicking.
+    #[test]
+    fn yes_release_unparseable_env_falls_back_to_file() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("devflow.toml"), "yes_release = true\n").unwrap();
+        let _env = EnvOverride::set("DEVFLOW_YES_RELEASE", "not-a-bool");
+
+        assert!(yes_release(dir.path()));
+    }
+
+    /// Design weight #1: the two mandates are independent. Setting
+    /// `yes_release` to `true` leaves `yes_ship` at its own resolved value
+    /// (`false`, the default), and vice versa is exercised implicitly by
+    /// every other `yes_ship` test in this file continuing to pass
+    /// unaffected by this module's new field.
+    #[test]
+    fn yes_release_and_yes_ship_are_independent() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("devflow.toml"), "yes_release = true\n").unwrap();
+
+        assert!(yes_release(dir.path()));
+        assert!(!yes_ship(dir.path()));
+    }
+
+    /// Design weight #2: reading the mandate does not consume it. Calling
+    /// `yes_release(dir)` twice returns the same value both times, and
+    /// `devflow.toml`'s bytes are unchanged afterward — proving the config
+    /// module only reads this file for release purposes, never writes it.
+    #[test]
+    fn yes_release_reading_twice_does_not_consume_or_mutate_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("devflow.toml");
+        let original_contents = "yes_release = true\n";
+        std::fs::write(&config_path, original_contents).unwrap();
+
+        let first = yes_release(dir.path());
+        let second = yes_release(dir.path());
+
+        assert!(first);
+        assert_eq!(first, second);
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            original_contents
+        );
     }
 }
