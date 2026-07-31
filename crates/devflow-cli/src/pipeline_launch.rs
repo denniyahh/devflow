@@ -74,8 +74,16 @@ pub(crate) fn launch_stage_inner(
         .unwrap_or_default();
     let (program, args) = adapter.exec_command(state.phase, &prompt, &roots);
 
-    // RED (28-03 Task 2): counter reset temporarily removed to prove the new
-    // test fails for the right reason.
+    // 28-03 (D-03/D-04): every ORDINARY fresh stage launch starts the
+    // checkpoint-resume budget over, including a human-approved gate retry
+    // (which also routes through this function). Only `launch_stage_inner`
+    // resets this counter, and only `relaunch_checkpoint_session` increments
+    // it — that pairing is what makes `mode::MAX_CHECKPOINT_RESUMES` bound
+    // one stage's resume attempts, not a phase's entire lifetime (the same
+    // distinction `MAX_INFRA_FAILURES`'s doc comment draws for
+    // `infra_failures`). Persisted below by `spawn_agent_and_record`'s own
+    // `save_state` calls — no extra save needed here.
+    state.checkpoint_resumes = 0;
 
     spawn_agent_and_record(state, program, &args, &adapter.extra_env(), archived_stage)
 }
@@ -198,9 +206,25 @@ pub(crate) fn relaunch_checkpoint_session(
     state: &mut State,
     session_id: &str,
 ) -> Result<(), CliError> {
-    // RED (28-03 Task 2): counter increment and audit event temporarily
-    // removed to prove the new tests fail for the right reason.
+    state.checkpoint_resumes = state.checkpoint_resumes.saturating_add(1);
     let instruction = prompt::checkpoint_auto_decide_prompt(state.phase);
+
+    // D-07: recorded BEFORE the relaunch spawns, so a spawn failure still
+    // leaves the decision on record — with no flag and no human in the loop
+    // beforehand, this event is the ONLY way anyone learns after the fact
+    // what the agent decided on its own.
+    events::emit(
+        &state.project_root,
+        state.phase,
+        "checkpoint_auto_decided",
+        serde_json::json!({
+            "stage": state.stage.to_string(),
+            "session_id": session_id,
+            "instruction": truncate_reason(&instruction),
+            "attempt": state.checkpoint_resumes,
+            "policy": "D-03: unconditional agent auto-decide, no flag/config toggle",
+        }),
+    );
 
     let (program, args) = agents::ClaudeAgent::exec_resume_command(session_id, &instruction);
 
@@ -1033,7 +1057,11 @@ mod tests {
 
         result.unwrap();
 
-        assert_eq!(state.stage, Stage::Code, "a checkpoint resume must not advance the stage");
+        assert_eq!(
+            state.stage,
+            Stage::Code,
+            "a checkpoint resume must not advance the stage"
+        );
     }
 
     /// 28-03 (Task 2): an ordinary stage launch resets the checkpoint-resume
