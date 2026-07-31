@@ -1623,7 +1623,9 @@ mod tests {
         let inner = format!(
             "## CHECKPOINT REACHED\\n\\n**Gate:** {HUMAN_GATE_VALUE} — copy the task's `gate` attribute verbatim so the orchestrator's carve-out sees it\\n"
         );
-        let stdout = format!(r#"{{"type":"result","subtype":"success","result":"{inner}","session_id":"abc"}}"#);
+        let stdout = format!(
+            r#"{{"type":"result","subtype":"success","result":"{inner}","session_id":"abc"}}"#
+        );
         assert!(blocking_human_checkpoint_reported(&stdout));
     }
 
