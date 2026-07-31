@@ -358,6 +358,75 @@ mod tests {
         assert_eq!(loaded.monitor_pid, None);
     }
 
+    /// `session_id` round-trips through serde as an exact `Option<String>`
+    /// (D-04, 28-02) — mirrors the `monitor_pid` pair above.
+    #[test]
+    fn session_id_round_trips_through_serde() {
+        let mut state = State::new(1, AgentKind::Claude, Mode::Auto, PathBuf::from("/repo"));
+        state.session_id = Some("cf29bfec-69e8-45df-a4f3-3da08ab6f66e".to_string());
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(
+            json.contains("session_id"),
+            "session_id must appear in persisted JSON"
+        );
+        let loaded: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            loaded.session_id.as_deref(),
+            Some("cf29bfec-69e8-45df-a4f3-3da08ab6f66e"),
+            "session_id must round-trip through serde"
+        );
+    }
+
+    /// A serde-absent `session_id` (state written by a pre-28-02 binary) must
+    /// deserialize to `None`, not fail to deserialize.
+    #[test]
+    fn session_id_absent_from_json_defaults_to_none() {
+        let json = r#"{
+            "stage": "code",
+            "phase": 1,
+            "agent": "claude",
+            "mode": "auto",
+            "started_at": "0",
+            "project_root": "/repo"
+        }"#;
+        let loaded: State = serde_json::from_str(json).unwrap();
+        assert_eq!(loaded.session_id, None);
+    }
+
+    /// `checkpoint_resumes` round-trips through serde as an exact `u32`
+    /// (D-04, 28-02).
+    #[test]
+    fn checkpoint_resumes_round_trips_through_serde() {
+        let mut state = State::new(1, AgentKind::Claude, Mode::Auto, PathBuf::from("/repo"));
+        state.checkpoint_resumes = 2;
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(
+            json.contains("checkpoint_resumes"),
+            "checkpoint_resumes must appear in persisted JSON"
+        );
+        let loaded: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            loaded.checkpoint_resumes, 2,
+            "checkpoint_resumes must round-trip through serde"
+        );
+    }
+
+    /// A serde-absent `checkpoint_resumes` (state written by a pre-28-02
+    /// binary) must deserialize to `0`, not fail to deserialize.
+    #[test]
+    fn checkpoint_resumes_absent_from_json_defaults_to_zero() {
+        let json = r#"{
+            "stage": "code",
+            "phase": 1,
+            "agent": "claude",
+            "mode": "auto",
+            "started_at": "0",
+            "project_root": "/repo"
+        }"#;
+        let loaded: State = serde_json::from_str(json).unwrap();
+        assert_eq!(loaded.checkpoint_resumes, 0);
+    }
+
     /// 23-09 Task 1: `yes_ship` round-trips through serde as an exact `bool`
     /// — its own key appears in the persisted JSON, and a fresh deserialize
     /// recovers the value set, mirroring the `monitor_pid` pair above.
