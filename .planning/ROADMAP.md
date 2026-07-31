@@ -553,7 +553,17 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.25: Release-Cut Executor (`devflow release` that executes) (RE-OPENED — Phase 26 delivered it PARTIAL, not shippable)
+### Phase 999.25: Release-Cut Executor (`devflow release` that executes) (PROMOTED — Phase 29)
+
+**PROMOTED 2026-07-31 → Phase 29.** Re-attempted as a redesign, not a rebase. The
+`feature/phase-26` code is **reference material only** (operator decision, 2026-07-31) — it
+is not carried forward, because its five open Criticals are one *lifecycle* defect rather
+than five independent bugs. The prerequisite list below is superseded: 999.39 landed in
+Phase 27; prerequisites 2–4 dissolve under Phase 29's derived-state model (there is no
+ledger to give a terminal state to); and prerequisite 5 (W-17) is retired outright —
+required approvals are **0** on both protected branches, so the PR route needs no bypass and
+Phase 26's direct-push design was fighting a rule it could simply have followed. See Phase
+29's entry for the full reasoning and the live ruleset measurement.
 
 **RE-OPENED 2026-07-30.** Phase 26 built this end to end and it is **not shippable**. Deliberately re-opened under its original number rather than filed as a new item: it is the same work, still not delivered. The code exists on `feature/phase-26` (unmerged, ~75 commits) and should be treated as a **starting point with known Critical defects**, not as a near-complete implementation.
 
@@ -1997,3 +2007,159 @@ Plans:
 **Wave 3** *(blocked on Wave 2 completion)*
 
 - [x] 28-03-PLAN.md — wave 3 · the resume primitive, the bounded relaunch path, the `checkpoint_auto_decided` audit record, and the dispatch guard (D-03/D-04/D-05/D-07)
+
+### Phase 29: Release-Cut Executor — Observe, Then Act Within the Repo's Rules
+
+**Promoted:** 2026-07-31 — **999.25 / DEN-50**, re-attempted after Phase 26 delivered it
+PARTIAL and unshippable. Phase 26's code on `feature/phase-26` (74 commits, unmerged) is
+**reference material only** — operator decision, 2026-07-31. It is not rebased and not
+carried forward. Rationale: its five open Criticals are not five independent bugs but one
+*lifecycle* defect — no terminal state for the non-success outcome, two code paths owning
+one `v{version}` namespace, and a printed remediation that re-arms the failure it reports.
+Rebasing would carry that lifecycle forward and force the redesign to argue its way out of
+it; starting from the state model frees it to ask "what are the states" first.
+
+**Goal:** A `devflow release` that *executes* the release cut instead of only checking it —
+version bump → changelog → release PR to `main` → signed tag → sync back to `develop` →
+publish `devflow-core` then `devflow`.
+
+---
+
+#### The design rule (operator, 2026-07-31) — governs every unit below
+
+> **DevFlow discovers the repo's rules, advances as far as they permit, and stops at the
+> first hard gate with an accurate report of where it stopped and why.** It never predicts
+> a gate, never routes around one, and never treats stopping at one as failure.
+
+This is **D-10 generalized**. D-10 banned predicting *tag-signing* viability, because a
+predictor is a second implementation of git's behavior that must stay in sync with it —
+the exact bug class that got 999.50 and 999.54 deleted rather than fixed. "Will this push
+be allowed?" is the same question aimed at a different operation, and answering it by
+prediction would mean reimplementing GitHub's ruleset engine, including bypass lists and
+org-level rules layered above repo-level ones.
+
+The resolution is **deterministic at one layer, adaptive at another**:
+
+| Layer | Behavior |
+|---|---|
+| Action set | **Fixed and enumerable.** The executor never invents a route at runtime. |
+| Route selection | **Adaptive.** May be informed by discovered facts (allowed merge methods, required checks). |
+| Outcome | **Authoritative only from performing the operation** and reading the real result — never from a prediction. |
+
+**Discovery informs the route; the attempt decides the outcome.** Corollary: do not hardcode
+"squash on `main`, merge on `develop`" — that is a copy of live config that goes stale, the
+same failure mode as CONTRIBUTING.md drifting in 25f. Ask which methods are allowed, apply a
+fixed internal policy to choose among them, and refuse loudly if the preferred method is not
+in the allowed set rather than silently taking the other one.
+
+---
+
+#### Ruleset finding (measured live 2026-07-31, `gh api repos/denniyahh/devflow/rulesets`)
+
+| | `develop` | `main` |
+|---|---|---|
+| PR required | yes | yes |
+| **Required approvals** | **0** | **0** |
+| Allowed merge methods | `merge`, `squash` | `squash` only |
+| Required checks | Test, Clippy, Format, devcontainer build | same |
+| Branch must be current with base (`strict`) | yes | yes |
+| Bypass actors | none | none |
+
+**Required approvals are zero on both branches, so the PR route is fully automatable today** —
+open a PR, wait for the four checks, merge it. No exemption, no bypass, no ruleset change.
+
+**This retires W-17 and reclassifies it as self-inflicted.** Phase 26's D-01/D-08 chose
+*direct push to `develop`* — the one route this repository forbids — and W-17 then recorded
+that the executor "cannot land until the operator adds a bypass." The permitted route
+needed no bypass at all. The tool was designed to fight the rules instead of following them.
+**Do not add a ruleset bypass for this phase.** It is not required, and W-17's own reasoning
+(the enforcement is the only thing stopping a known-defective executor from reaching
+`origin`) still holds.
+
+Both rulesets target `branch`, not `tag`, and `cargo publish` touches no refs — so neither
+the tag step nor the publish steps are gated by them.
+
+---
+
+#### Units — split by reversibility, not by step count, and each independently shippable
+
+The split's purpose is **not tidiness**. Phase 26 produced 74 commits and delivered nothing
+usable, because one indivisible blob means a failure at the last gate makes the whole thing
+unshippable. Each unit below can ship on its own; a stall in 29c still leaves 29a and 29b
+delivered.
+
+- **29a — the observer (foundation, build first).** A read-only `devflow release status`
+  answering, for a given version, six questions by *looking*: version bumped, changelog
+  written, release PR merged, signed tag present on the remote, sync merged, both crates
+  published. Sources are **remote refs and the crates.io API** — never a local progress
+  file. Touches nothing, useful shipped alone, and the only part of this feature that is
+  straightforwardly testable, because pure observation is what tests are good at.
+  **Ships first because it is architecture, not sequencing:** 29b and 29c act only on what
+  29a reports missing.
+- **29b — the recoverable actions.** Version bump (two places), changelog, release PR to
+  `main`, sync PR back to `develop`. Every one is a commit or a PR: if it goes wrong, fix
+  and re-run. Unlocked by the zero-approvals finding above.
+- **29c — the commit point.** Signed tag and the two publishes, in order. Two steps,
+  permanent consequences, and where every one of Phase 26's worst defects lived. Small
+  enough to review line by line — which is the gate that actually works on this code.
+
+**State is derived, never recorded.** Every irreversible step has an authoritative external
+oracle: remote ref SHA for merges and tags, the registry API for publishes. Phase 26 built a
+*ledger* — a local file recording intent, which then became the source of truth — and that
+choice generated its two worst Criticals (CR-05: an in-flight ledger permanently bricks the
+release path, escapable only by deleting the file, which re-arms CR-02; CR-02: ledger says
+Complete while nothing is published). The review's own praise for the ledger is the tell:
+*"a planted lying ledger still creates the real tag — live state provably wins."* The
+design's best property is that observed state overrides it. Make observation the only
+primitive.
+
+What falls out: CR-05 dissolves (no in-flight state to get stuck in, so no clear/abandon verb
+is needed); CR-02 dissolves ("complete" is computed — tag exists **and** both crates at
+version N — never asserted); **resume becomes free**, because re-running *is* re-observing,
+which is precisely the "independently re-runnable" property Phase 26's lesson asked for,
+achieved by subtraction; and IN-01's `v{version}` namespace collision between
+`hooks_after_ship` and the executor stops being a corruption path and becomes an ordinary
+observation ("the tag exists, so do not create it").
+
+**The honest cost, to be designed for explicitly:** the oracle is remote, so a network
+partition is indistinguishable from "not done." Every observe step needs an explicit
+**unreachable ≠ absent** arm that refuses rather than proceeds. Index lag is real and was
+observed during the v2.2.0 publish (`cargo publish` printed *"waiting for devflow-core 2.2.0
+to be available"*). The one thing that genuinely cannot be observed is **operator
+authorization**, so a minimal persisted record may survive — for *authorization only*, never
+for *progress*. Pinning that boundary is a discuss-phase task.
+
+---
+
+#### Decided going in
+
+- **Always operator-present. Never unattended, no exceptions.** The tag step requires the
+  maintainer's signing key, so the executor cannot complete a release unattended even in
+  principle. Consistent with D-02 and with Phase 28's finding that DevFlow has no channel to
+  deliver a human's answer to a running job.
+- **Review is the gate; tests are necessary and far from sufficient.** Phase 26 had 763
+  passing tests and scored 11/11 on its own verification, and still carried twelve Criticals
+  across two rounds — **every one found by a human reading code, zero by a test.** Fix rounds
+  went 7 → 5. **One fix round maximum**, then reassess the design rather than the bug list.
+- **D-10 carried unchanged.** No signing-viability predictor, ever. The tag step runs the
+  real `git -c user.signingkey="$(git config --get devflow.releaseSigningKey)" tag -s` and
+  reports git's own exit code.
+- **D-05 carried and strengthened.** Fail-fast, no automatic rollback — trivially safe once
+  every step is independently re-runnable.
+- **D-06 superseded** by derived state (it specified ledger-based resume/idempotency).
+
+**Motivating evidence, measured this session.** The v2.2.0 cut was performed by hand on
+2026-07-31: crates published core-then-cli, and the signed tag **never created**. Nothing
+failed loudly — the release quietly stopped one step short, and it took an ad-hoc query to
+notice. The executor's value is **consistency and completeness, not speed**; 29a alone would
+have caught this the moment it happened.
+
+**Requirements:** TBD — no REQ-IDs; tracked by unit identifier (`29a`–`29c`) plus
+`29-CONTEXT.md` decision IDs, consistent with Phases 21/22/26/27/28.
+**Depends on:** Phase 27 (999.39, `GIT_DIR` scrubbing — CR-01's prerequisite, delivered).
+**Priority:** High | **Size:** L — but with two points at which it can stop and still have
+delivered something. Linear: DEN-50.
+
+Plans:
+
+- [ ] TBD — pending `/gsd-discuss-phase 29` and `/gsd-plan-phase 29`
