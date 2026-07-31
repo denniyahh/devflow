@@ -370,6 +370,25 @@ pub fn crates_published(project_root: &Path, version: &str) -> Observation {
     combine_crate_observations(&per_crate)
 }
 
+// -- 29-02 Task 1: content-at-ref oracles (stub bodies, RED) --------------
+// TODO(29-02 GREEN): replace with real classification logic.
+
+/// Classify a workspace root `Cargo.toml`'s text against an `expected`
+/// version. STUB — always Unreachable until the GREEN commit.
+pub fn classify_manifest_version(_cargo_toml: &str, _expected: &str) -> Observation {
+    Observation::Unreachable {
+        reason: "not implemented".into(),
+    }
+}
+
+/// Classify a `CHANGELOG.md`'s text for a top-level `## <version>` heading.
+/// STUB — always Unreachable until the GREEN commit.
+pub fn classify_changelog_heading(_changelog: &str, _version: &str) -> Observation {
+    Observation::Unreachable {
+        reason: "not implemented".into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -621,6 +640,103 @@ mod tests {
         assert!(matches!(
             combine_crate_observations(&[]),
             Observation::Unreachable { .. }
+        ));
+    }
+
+    // -- 29-02 Task 1: content-at-ref oracles ---------------------------
+
+    #[test]
+    fn classify_manifest_version_present_when_workspace_and_pins_match() {
+        assert!(matches!(
+            classify_manifest_version("[workspace.package]\nversion = \"2.3.0\"\n", "2.3.0"),
+            Observation::Present { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_manifest_version_absent_when_workspace_version_differs() {
+        let manifest = "[workspace.package]\nversion = \"2.2.0\"\n";
+        match classify_manifest_version(manifest, "2.3.0") {
+            Observation::Absent { detail } => {
+                assert!(
+                    detail.contains("2.2.0") && detail.contains("2.3.0"),
+                    "expected the detail to name both versions, got: {detail}"
+                );
+            }
+            other => panic!("expected Absent naming both versions, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_manifest_version_empty_is_unreachable() {
+        assert!(matches!(
+            classify_manifest_version("", "2.3.0"),
+            Observation::Unreachable { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_manifest_version_absent_when_self_pin_drifted() {
+        let manifest = "[workspace]\nmembers = [\"crates/devflow-core\"]\n\n\
+             [workspace.package]\nversion = \"2.3.0\"\nedition = \"2024\"\n\n\
+             [workspace.dependencies]\n\
+             devflow-core = { path = \"crates/devflow-core\", version = \"2.2.0\" }\n";
+        match classify_manifest_version(manifest, "2.3.0") {
+            Observation::Absent { detail } => {
+                assert!(
+                    detail.contains("devflow-core"),
+                    "expected the detail to name the drifted pin, got: {detail}"
+                );
+            }
+            other => panic!("expected Absent naming the drifted pin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_changelog_heading_present_with_body_after() {
+        assert!(matches!(
+            classify_changelog_heading("## 2.3.0\n\n### Added\n", "2.3.0"),
+            Observation::Present { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_changelog_heading_absent_when_version_mismatches() {
+        assert!(matches!(
+            classify_changelog_heading("## 2.2.0\n", "2.3.0"),
+            Observation::Absent { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_changelog_heading_absent_for_bare_inline_mention() {
+        assert!(matches!(
+            classify_changelog_heading("Some prose mentioning 2.3.0 inline\n", "2.3.0"),
+            Observation::Absent { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_changelog_heading_empty_is_unreachable() {
+        assert!(matches!(
+            classify_changelog_heading("", "2.3.0"),
+            Observation::Unreachable { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_changelog_heading_no_space_after_hashes_is_absent() {
+        assert!(matches!(
+            classify_changelog_heading("##2.3.0\n", "2.3.0"),
+            Observation::Absent { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_changelog_heading_leading_whitespace_still_matches() {
+        assert!(matches!(
+            classify_changelog_heading("  ## 2.3.0\n", "2.3.0"),
+            Observation::Present { .. }
         ));
     }
 }
