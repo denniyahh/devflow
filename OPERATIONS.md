@@ -109,6 +109,7 @@ only because a stage failed unexpectedly).
 | `DEVFLOW_REVIEW_ANGLES` | built-in five-angle list | Comma-separated Ship review angles; overrides `devflow.toml` |
 | `DEVFLOW_EXTERNAL_VERIFY_ENABLED` | true | Enable PLAN-declared external post-condition probes; overrides `devflow.toml` |
 | `DEVFLOW_YES_SHIP` | false | Standing Ship gate pre-authorization (D-12, `28-CONTEXT.md`); overrides `devflow.toml`'s `yes_ship` key, which itself is OR-combined with `--yes-ship` at `devflow start` |
+| `DEVFLOW_YES_RELEASE` | false | Standing authorization mandate for the release-cut executor's whole sequence, including its irreversible steps (RD-2, RD-4, `29-03-PLAN.md`); overrides `devflow.toml`'s `yes_release` key. DevFlow reads this value and never writes it — the structural boundary that keeps it a mandate, not a progress ledger |
 | `RUST_LOG` | `info` | Log verbosity (stderr) |
 | `DEVFLOW_LOG_FORMAT` | plain | `json` for machine-readable log lines |
 | `DEVFLOW_E2E_CHILD_TIMEOUT_SECS` | 90 | Test-only: bounds `gate_sweep_e2e.rs`'s patience with a spawned `devflow advance` child so CI cannot hang indefinitely; not read by any production code path |
