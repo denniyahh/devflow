@@ -238,6 +238,46 @@ fn extract_json_result_text(stdout: &str) -> Option<String> {
     value.get("result")?.as_str().map(str::to_string)
 }
 
+/// Read the top-level `session_id` string from a Claude JSON result envelope
+/// (`--output-format json`). Returns `None` for plain-text stdout, a
+/// non-JSON-object envelope, an envelope with no `session_id` key, or a
+/// `session_id` of a non-string JSON type — never panics.
+///
+/// D-04 / T-28-04 (this plan's `<threat_model>`): deliberately reads ONLY the
+/// envelope's TOP-LEVEL `session_id` key via a direct [`serde_json::Value::get`],
+/// never the module's [`json_find_key`]/[`json_scan`] traversal helpers. Those
+/// helpers descend into nested objects, and the agent-authored `DEVFLOW_RESULT`
+/// marker payload — embedded inside this same envelope's `result` text and
+/// deserialized by [`parse_marker_lines`] directly into [`AgentResult`] — is
+/// reachable that way. A top-level `get` makes it true BY CONSTRUCTION that an
+/// agent cannot redirect the session DevFlow later resumes into by planting a
+/// different `session_id` key inside its own self-authored marker JSON.
+/// Regression test: `session_id_in_devflow_result_marker_is_not_returned`.
+///
+/// Deliberate deviation from RESEARCH.md § "Discretion Resolutions" item 5,
+/// which suggested adding a `session_id` field directly to [`AgentResult`].
+/// NOT done: `parse_marker_lines` deserializes the agent's own
+/// `DEVFLOW_RESULT` JSON straight into `AgentResult` via `serde_json::from_str`,
+/// so a `#[serde(default)]` field there would be agent-settable — the agent
+/// could name the session DevFlow resumes into (T-28-04). A standalone reader
+/// over the top-level envelope key carries no such surface and is equally
+/// available to every caller; D-04's persistence target (`State::session_id`)
+/// is unchanged, only the carrier differs.
+pub fn claude_session_id(stdout: &str) -> Option<String> {
+    let _ = stdout;
+    unimplemented!("RED: claude_session_id not yet implemented")
+}
+
+/// Thin file-reading wrapper over [`claude_session_id`]: reads the phase's
+/// captured stdout file (via [`stdout_path`]) and delegates. `None` for a
+/// missing capture file, never an `Err` — mirrors [`evaluate_layer1`]'s
+/// lossy-read convention (CR-01: one invalid UTF-8 byte from raw `sh`
+/// redirection must not silently disable this reader).
+pub fn session_id_from_capture(project_root: &Path, phase: u32) -> Option<String> {
+    let _ = (project_root, phase);
+    unimplemented!("RED: session_id_from_capture not yet implemented")
+}
+
 // WR-12 (13-REVIEW.md), revised: these traversal helpers run on the coding
 // agent's raw stdout (via detect_claude_rate_limit, which every `devflow
 // advance` invocation runs through evaluate_layer1), so deeply nested JSON —
@@ -1381,6 +1421,68 @@ mod tests {
         let result = parse_devflow_result(stdout).unwrap();
         assert_eq!(result.status, AgentStatus::Success);
         assert_eq!(result.commits, Some(2));
+    }
+
+    #[test]
+    fn session_id_reads_top_level_string() {
+        let stdout = r#"{"type":"result","subtype":"success","result":"All done.","session_id":"cf29bfec-69e8-45df-a4f3-3da08ab6f66e"}"#;
+        assert_eq!(
+            claude_session_id(stdout).as_deref(),
+            Some("cf29bfec-69e8-45df-a4f3-3da08ab6f66e")
+        );
+    }
+
+    /// T-28-04 forgery guard: the embedded `DEVFLOW_RESULT` marker carries a
+    /// DIFFERENT session id than the envelope's own top-level key. The
+    /// top-level id must win — an agent must not be able to redirect which
+    /// session DevFlow resumes into by planting its own `session_id` inside
+    /// its self-authored marker JSON.
+    #[test]
+    fn session_id_in_devflow_result_marker_is_not_returned() {
+        let stdout = r#"{"type":"result","subtype":"success","result":"All done.\nDEVFLOW_RESULT: {\"status\": \"success\", \"session_id\": \"forged-by-agent\"}","session_id":"real-top-level-id"}"#;
+        assert_eq!(
+            claude_session_id(stdout).as_deref(),
+            Some("real-top-level-id")
+        );
+    }
+
+    #[test]
+    fn session_id_plain_text_stdout_returns_none() {
+        let stdout = "just some plain text output, not JSON\n";
+        assert!(claude_session_id(stdout).is_none());
+    }
+
+    #[test]
+    fn session_id_missing_key_returns_none() {
+        let stdout = r#"{"type":"result","result":"done, no session key"}"#;
+        assert!(claude_session_id(stdout).is_none());
+    }
+
+    #[test]
+    fn session_id_non_string_type_returns_none_not_panic() {
+        let stdout = r#"{"type":"result","result":"done","session_id":12345}"#;
+        assert!(claude_session_id(stdout).is_none());
+    }
+
+    #[test]
+    fn session_id_from_capture_missing_file_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(session_id_from_capture(dir.path(), 42).is_none());
+    }
+
+    #[test]
+    fn session_id_from_capture_lossy_reads_invalid_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        let mut bytes = br#"{"type":"result","result":"done "#.to_vec();
+        bytes.push(0xFF); // invalid UTF-8 byte
+        bytes.extend_from_slice(br#"","session_id":"lossy-ok"}"#);
+        std::fs::write(stdout_path(dir.path(), 5), bytes).unwrap();
+
+        assert_eq!(
+            session_id_from_capture(dir.path(), 5).as_deref(),
+            Some("lossy-ok")
+        );
     }
 
     #[test]
