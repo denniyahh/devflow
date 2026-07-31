@@ -4,8 +4,8 @@ milestone: v2.0.0
 milestone_name: milestone (open — no fixed closing phase)
 current_phase: 28
 current_phase_name: close-the-checkpoint-answer-return-path
-status: complete
-stopped_at: Phase 28 complete — A1 closed, verification passed
+status: shipped — PR #63 open to develop
+stopped_at: Phase 28 shipped — PR #63 (feature/phase-28 → develop), awaiting CI + merge
 last_updated: "2026-07-31T08:35:00.000Z"
 last_activity: 2026-07-30
 last_activity_desc: "Phase 28 complete: 6/6 plans, 779 tests green, SECURED (threats_open 0), verification passed. A1 closed by a live run that found and fixed a real defect (b22e6cf) — the executor renders the gate value as a markdown code span, which the reader did not match; checkpoints now recognize, auto-decide, audit, resume, and resolve end-to-end"
