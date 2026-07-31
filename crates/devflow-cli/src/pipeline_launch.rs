@@ -32,8 +32,8 @@ use devflow_core::config::{GitFlowConfig, capture_retention};
 use devflow_core::outcome_policy::{self, Action};
 use devflow_core::prompt;
 use devflow_core::stage::Stage;
-use devflow_core::state::State;
-use devflow_core::{agent_result, agents, events, lock, monitor, workflow};
+use devflow_core::state::{AgentKind, State};
+use devflow_core::{agent_result, agents, events, lock, mode, monitor, verify, workflow};
 use std::path::Path;
 
 /// The post-preflight body of [`launch_stage`]: capture archival/rollover
@@ -349,6 +349,21 @@ pub(crate) fn resolve_sole_active_phase(project_root: &Path) -> Result<u32, CliE
         .ok_or_else(|| CliError::Message("no active DevFlow state — nothing to advance".into()))
 }
 
+/// T-28-16 (28-03, Task 3): a CONFIRMED human-blocking checkpoint that could
+/// not be auto-resolved (no session id on record, or the resume ceiling
+/// already exhausted) must not read as a generic stage failure once it
+/// falls through to the never-silent gate below — `why` names the exact
+/// precondition that failed, appended to whatever reason the agent itself
+/// reported (or standing alone, if the agent reported none).
+fn augment_unresolved_checkpoint_reason(reason: Option<String>, why: &str) -> String {
+    match reason {
+        Some(r) if !r.is_empty() => {
+            format!("{r} — confirmed checkpoint could not auto-resolve: {why}")
+        }
+        _ => format!("confirmed checkpoint could not auto-resolve: {why}"),
+    }
+}
+
 /// Advance the stage machine after a monitored agent for `state.stage` exits.
 /// Invoked by the monitor process; not normally run by a human.
 pub(crate) fn advance(project_root: &Path, phase: Option<u32>) -> Result<(), CliError> {
@@ -418,6 +433,18 @@ pub(crate) fn advance(project_root: &Path, phase: Option<u32>) -> Result<(), Cli
         }),
     );
 
+    // D-04 (28-03): record the session id for EVERY evaluated stage, not
+    // only ones that turn out to be checkpoints — by the time any later
+    // process (a checkpoint auto-decide relaunch) needs it, the value is
+    // already durable. `session_id_from_capture` returns `None` for a
+    // non-Claude agent's stdout (no `session_id` key at the JSON envelope's
+    // top level) or a missing capture, so this is a safe no-op for every
+    // non-Claude run.
+    if let Some(session_id) = agent_result::session_id_from_capture(project_root, phase) {
+        state.session_id = Some(session_id);
+        workflow::save_state(&state)?;
+    }
+
     // D-01/D-06: dispatch on the exhaustive outcome_policy::decide_action
     // table (no wildcard arm upstream) so a new/unhandled AgentStatus variant
     // is a compile error here rather than a silent advance. Replaces the old
@@ -445,19 +472,65 @@ pub(crate) fn advance(project_root: &Path, phase: Option<u32>) -> Result<(), Cli
             }
             Stage::Ship => handle_ship_outcome(project_root, &mut state),
         },
-        Action::GateReview => match stage {
-            // Validate failures drive the Code↔Validate loop (or a gate).
-            Stage::Validate => {
-                handle_validate_outcome(project_root, &mut state, ValidateOutcome::Failed)
+        Action::GateReview => {
+            // D-01/D-03/D-05 (28-03): before the ordinary per-stage failure
+            // dispatch, check whether this failure is actually a confirmed
+            // human-blocking checkpoint DevFlow can resolve unattended by
+            // resuming the exact session that raised it. Evaluated IN THIS
+            // ORDER — load-bearing — (1) agent is Claude (D-05); (2) the
+            // phase's plans statically declare a blocking-human checkpoint —
+            // the PRIMARY, agent-uncontrollable gate, checked BEFORE
+            // anything agent-controlled (T-28-01); (3) the capture confirms
+            // one was reported; (4) a session id is on record; (5) the
+            // resume ceiling has not been exhausted. All five true -> resume
+            // and return. Any false -> fall through to the unchanged
+            // per-stage dispatch below.
+            let mut reason = result.reason.clone();
+            let checkpoint_confirmed = state.agent == AgentKind::Claude
+                && verify::phase_has_blocking_human_checkpoint(project_root, phase)
+                && agent_result::checkpoint_reported_in_capture(project_root, phase);
+            if checkpoint_confirmed {
+                let ceiling_ok = state.checkpoint_resumes < mode::MAX_CHECKPOINT_RESUMES;
+                match (&state.session_id, ceiling_ok) {
+                    (Some(session_id), true) => {
+                        let session_id = session_id.clone();
+                        return relaunch_checkpoint_session(&mut state, &session_id);
+                    }
+                    (Some(_), false) => {
+                        // T-28-16: a confirmed checkpoint that could not be
+                        // auto-resolved must not read as a generic stage
+                        // failure — name the exhausted precondition in the
+                        // reason the never-silent gate below renders.
+                        reason = Some(augment_unresolved_checkpoint_reason(
+                            reason,
+                            &format!(
+                                "resume ceiling ({}) exhausted",
+                                mode::MAX_CHECKPOINT_RESUMES
+                            ),
+                        ));
+                    }
+                    (None, _) => {
+                        reason = Some(augment_unresolved_checkpoint_reason(
+                            reason,
+                            "no session id on record",
+                        ));
+                    }
+                }
             }
-            // Ship distinguishes an agent crash (AgentFailed) from a review
-            // rejection (ReviewFailed, `review:`-prefixed reason).
-            Stage::Ship => handle_ship_failure(project_root, &mut state, result.reason),
-            // Every other non-Validate failure (incl. Unknown, D-06) is
-            // never silent (WR-11): it always fires a gate + notify instead
-            // of returning a bare error or silently advancing.
-            _ => handle_stage_failure(project_root, &mut state, stage, result.reason),
-        },
+            match stage {
+                // Validate failures drive the Code↔Validate loop (or a gate).
+                Stage::Validate => {
+                    handle_validate_outcome(project_root, &mut state, ValidateOutcome::Failed)
+                }
+                // Ship distinguishes an agent crash (AgentFailed) from a
+                // review rejection (ReviewFailed, `review:`-prefixed reason).
+                Stage::Ship => handle_ship_failure(project_root, &mut state, reason),
+                // Every other non-Validate failure (incl. Unknown, D-06) is
+                // never silent (WR-11): it always fires a gate + notify
+                // instead of returning a bare error or silently advancing.
+                _ => handle_stage_failure(project_root, &mut state, stage, reason),
+            }
+        }
         // ResourceKilled/AgentUnavailable: a dedicated infra path, identical
         // for every stage (including Validate/Ship) — MUST NOT route through
         // handle_validate_outcome/handle_ship_failure, which would bump
@@ -1110,5 +1183,277 @@ mod tests {
         );
         let reloaded = workflow::load_state(root, phase).unwrap();
         assert_eq!(reloaded.checkpoint_resumes, 0);
+    }
+
+    // D-01/D-03/D-05 (28-03, Task 3): the dispatch guard's six named
+    // scenarios. The gate value is assembled from a const/format! rather
+    // than a bare source literal (28-01's precedent) so this file itself
+    // never contains the literal `gate="blocking-human"`.
+    const HUMAN_GATE_VALUE_FOR_TEST: &str = "blocking-human";
+
+    /// Write a synthetic phase's plan declaring a `blocking-human`
+    /// checkpoint task, matching `verify::phase_plan_files`'s discovery
+    /// pattern (`.planning/phases/{NN}-*/{NN}-*-PLAN.md`).
+    fn write_declared_checkpoint_plan(root: &Path, phase: u32) {
+        let dir = root
+            .join(".planning/phases")
+            .join(format!("{phase:02}-checkpoint-fixture"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = format!(
+            "---\nphase: {phase}\n---\n\n<task type=\"checkpoint:human-verify\" gate=\"{HUMAN_GATE_VALUE_FOR_TEST}\">\n</task>\n"
+        );
+        std::fs::write(dir.join(format!("{phase:02}-01-PLAN.md")), body).unwrap();
+    }
+
+    /// Write a captured stdout containing BOTH the `**Gate:**
+    /// blocking-human` confirmation literal and a `DEVFLOW_RESULT` failed
+    /// marker, so `advance()`'s Layer 1 deterministically classifies the
+    /// outcome as `Failed` (-> `Action::GateReview`) with no exit-code/pid
+    /// file or background thread needed.
+    fn write_confirmed_checkpoint_capture(root: &Path, phase: u32) {
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        let stdout = format!(
+            "## CHECKPOINT REACHED\n\n**Type:** human-verify\n**Gate:** {HUMAN_GATE_VALUE_FOR_TEST}\n\nDEVFLOW_RESULT: {{\"status\": \"failed\", \"reason\": \"checkpoint pending\"}}\n"
+        );
+        std::fs::write(agent_result::stdout_path(root, phase), stdout).unwrap();
+    }
+
+    /// A capture whose `DEVFLOW_RESULT` marker fails but never reports the
+    /// human-blocking `Gate:` literal — an ordinary failure, not a
+    /// checkpoint.
+    fn write_unreported_failure_capture(root: &Path, phase: u32) {
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        std::fs::write(
+            agent_result::stdout_path(root, phase),
+            "DEVFLOW_RESULT: {\"status\": \"failed\", \"reason\": \"ordinary failure\"}\n",
+        )
+        .unwrap();
+    }
+
+    /// Pre-write a rejected gate response so `run_gate`'s poll (invoked by
+    /// the fall-through path's `handle_stage_failure`) returns immediately
+    /// instead of blocking — mirrors
+    /// `advance_evaluated_emits_wire_status_and_decided_by_layer_for_resource_killed`'s
+    /// fixture pattern.
+    fn write_abort_gate_response(root: &Path, phase: u32, stage: Stage) {
+        let response_path = Gates::response_path(root, phase, stage);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+        )
+        .unwrap();
+    }
+
+    /// The positive case: declared + reported + Claude + session id + under
+    /// the ceiling -> resumes and records exactly one audit event, with no
+    /// `gate_fired` for this stage.
+    #[test]
+    fn advance_with_declared_checkpoint_and_reported_gate_relaunches_and_records() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 88;
+        write_declared_checkpoint_plan(root, phase);
+        write_confirmed_checkpoint_capture(root, phase);
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        state.session_id = Some("sess-checkpoint-1".to_string());
+        workflow::save_state(&state).unwrap();
+
+        let stub_dir = stub_agent_binary("claude");
+        let original_path = std::env::var_os("PATH");
+        let stubbed_path = prepend_path(&stub_dir, &original_path);
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", &stubbed_path);
+        }
+
+        let result = advance(root, Some(phase));
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        let reloaded_for_reap = workflow::load_state(root, phase).ok();
+        let _reap_guard = reloaded_for_reap
+            .as_ref()
+            .map(ReapMonitorOnDrop::after_launch);
+
+        result.unwrap();
+
+        let auto_decided = events_of_kind(root, "checkpoint_auto_decided");
+        assert_eq!(
+            auto_decided.len(),
+            1,
+            "expected exactly one checkpoint_auto_decided event: {auto_decided:?}"
+        );
+        assert_eq!(auto_decided[0]["session_id"], "sess-checkpoint-1");
+        assert_eq!(auto_decided[0]["stage"], "code");
+
+        let gate_fired = events_of_kind(root, "gate_fired");
+        assert!(
+            gate_fired.iter().all(|e| e["stage"] != "code"),
+            "a confirmed, auto-resolved checkpoint must never also fire the \
+             generic gate for the same stage: {gate_fired:?}"
+        );
+    }
+
+    /// D-01 primary-gate proof (T-28-01): the SAME reported capture, but no
+    /// plan for this phase declares a checkpoint at all -> must fall through
+    /// to the ordinary never-silent gate. Zero checkpoint_auto_decided, at
+    /// least one gate_fired.
+    #[test]
+    fn advance_without_declared_checkpoint_falls_through_to_generic_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 89;
+        // Deliberately no write_declared_checkpoint_plan call.
+        write_confirmed_checkpoint_capture(root, phase);
+        write_abort_gate_response(root, phase, Stage::Code);
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        state.session_id = Some("sess-should-not-resume".to_string());
+        workflow::save_state(&state).unwrap();
+
+        advance(root, Some(phase)).unwrap();
+
+        assert!(
+            events_of_kind(root, "checkpoint_auto_decided").is_empty(),
+            "a phase whose plans never declared a checkpoint must never auto-resume, \
+             even if its capture LOOKS like it reported one"
+        );
+        assert!(
+            !events_of_kind(root, "gate_fired").is_empty(),
+            "the ordinary never-silent gate must still fire"
+        );
+    }
+
+    /// Declared, but the capture does not confirm it — an ordinary failure
+    /// in a phase that happens to declare a checkpoint elsewhere.
+    #[test]
+    fn advance_with_declared_checkpoint_but_unreported_gate_falls_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 90;
+        write_declared_checkpoint_plan(root, phase);
+        write_unreported_failure_capture(root, phase);
+        write_abort_gate_response(root, phase, Stage::Code);
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        state.session_id = Some("sess-unreported".to_string());
+        workflow::save_state(&state).unwrap();
+
+        advance(root, Some(phase)).unwrap();
+
+        assert!(events_of_kind(root, "checkpoint_auto_decided").is_empty());
+        assert!(!events_of_kind(root, "gate_fired").is_empty());
+    }
+
+    /// Declared + reported, but no session id on record -> falls through,
+    /// and the never-silent gate's context names the missing precondition.
+    #[test]
+    fn advance_with_confirmed_checkpoint_and_no_session_id_falls_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 91;
+        write_declared_checkpoint_plan(root, phase);
+        write_confirmed_checkpoint_capture(root, phase);
+        write_abort_gate_response(root, phase, Stage::Code);
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        state.session_id = None;
+        workflow::save_state(&state).unwrap();
+
+        advance(root, Some(phase)).unwrap();
+
+        assert!(events_of_kind(root, "checkpoint_auto_decided").is_empty());
+        let gate_fired = events_of_kind(root, "gate_fired");
+        assert!(!gate_fired.is_empty());
+        assert!(
+            gate_fired.iter().any(|e| e["context"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("session id")),
+            "the never-silent gate's context must name the missing session id: {gate_fired:?}"
+        );
+    }
+
+    /// Declared + reported + session id present, but the resume ceiling is
+    /// already exhausted -> falls through, and the gate context names the
+    /// exhaustion.
+    #[test]
+    fn advance_at_checkpoint_resume_ceiling_falls_through_to_generic_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 92;
+        write_declared_checkpoint_plan(root, phase);
+        write_confirmed_checkpoint_capture(root, phase);
+        write_abort_gate_response(root, phase, Stage::Code);
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        state.session_id = Some("sess-at-ceiling".to_string());
+        state.checkpoint_resumes = mode::MAX_CHECKPOINT_RESUMES;
+        workflow::save_state(&state).unwrap();
+
+        advance(root, Some(phase)).unwrap();
+
+        assert!(events_of_kind(root, "checkpoint_auto_decided").is_empty());
+        let gate_fired = events_of_kind(root, "gate_fired");
+        assert!(!gate_fired.is_empty());
+        assert!(
+            gate_fired.iter().any(|e| e["context"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("ceiling")),
+            "the never-silent gate's context must name the exhausted ceiling: {gate_fired:?}"
+        );
+    }
+
+    /// D-05: declared + reported + session id present, but the agent is NOT
+    /// Claude -> must never resume, regardless of the other four
+    /// preconditions.
+    #[test]
+    fn advance_with_non_claude_agent_never_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 93;
+        write_declared_checkpoint_plan(root, phase);
+        write_confirmed_checkpoint_capture(root, phase);
+        write_abort_gate_response(root, phase, Stage::Code);
+
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        state.session_id = Some("sess-non-claude".to_string());
+        workflow::save_state(&state).unwrap();
+
+        advance(root, Some(phase)).unwrap();
+
+        assert!(
+            events_of_kind(root, "checkpoint_auto_decided").is_empty(),
+            "a non-Claude agent must never take the resume path (D-05)"
+        );
+        assert!(!events_of_kind(root, "gate_fired").is_empty());
     }
 }
