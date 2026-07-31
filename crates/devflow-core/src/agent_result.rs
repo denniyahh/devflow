@@ -404,6 +404,73 @@ fn detect_claude_envelope_failure(stdout: &str) -> Option<AgentResult> {
     })
 }
 
+/// The rendered VALUE of a human-blocking checkpoint's `**Gate:**` line, as
+/// predicted by RESEARCH.md § "Architecture Patterns / Pattern 2" (the exact
+/// literal `gsd-executor.md:356` emits and `execute-phase.md:1053` keys its
+/// own carve-out on) and recorded as an **UNCONFIRMED DEFAULT** in
+/// `28-PROBE.md § Reader contract`.
+///
+/// **This literal was NEVER confirmed against a live end-to-end run.**
+/// `28-PROBE.md`'s A1 probe (a real `claude -p "/gsd-execute-phase 91"
+/// --output-format json --dangerously-skip-permissions` invocation against a
+/// synthetic phase declaring a `blocking-human` checkpoint) recorded verdict
+/// `DIVERGENT`: the command was denied at this executor's own Bash-tool
+/// permission classifier *before the `claude` subprocess ever spawned* — a
+/// restriction on this specific execution environment, not on DevFlow's own
+/// runtime. No captured rendering, confirmed or otherwise, was ever observed.
+/// What would confirm it: a live probe run from a context the classifier does
+/// not restrict — e.g. DevFlow's own actual `monitor` process (not a Claude
+/// Code agent session), driving a real headless `gate="blocking-human"`
+/// checkpoint end-to-end and inspecting `.devflow/phase-NN-stdout` for this
+/// literal. Until that happens, this matcher is built against RESEARCH's
+/// prediction, not an observed fact — treat it accordingly.
+const HUMAN_GATE_VALUE: &str = "blocking-human";
+
+/// The plain (non-human) `**Gate:**` VALUE — must be distinguished from
+/// [`HUMAN_GATE_VALUE`] exactly (the Phase 26 near-miss: routing an ordinary
+/// `blocking` gate into the auto-decide relaunch as if it were
+/// `blocking-human`).
+const PLAIN_GATE_VALUE: &str = "blocking";
+
+/// Confirm whether captured stdout reports a human-blocking checkpoint, by
+/// searching for a `**Gate:**`-labeled line whose VALUE is exactly
+/// [`HUMAN_GATE_VALUE`] — see that constant's doc comment for the
+/// unconfirmed-default caveat and the `28-PROBE.md` observation it is built
+/// from.
+///
+/// This is the CONFIRMATION half of D-01: it is only ever consulted AFTER
+/// [`crate::verify::phase_has_blocking_human_checkpoint`] has already
+/// returned `true` for the stage's plan(s) (D-01's static half, plan 28-01).
+/// A false negative here is the SAFE direction — it falls back to today's
+/// never-silent generic gate, losing nothing. A false positive is bounded by
+/// the resume ceiling (`mode::MAX_CHECKPOINT_RESUMES`, plan 28-03) and
+/// unconditionally recorded by the `checkpoint_auto_decided` audit event
+/// (plan 28-03) — it can never silently authorize anything.
+///
+/// Searches BOTH the raw stdout text and — when the stdout is a Claude JSON
+/// result envelope — the unescaped inner `result` text obtained via
+/// [`extract_json_result_text`], because the `Gate:` line typically crosses
+/// into the capture escaped inside that envelope (RESEARCH § "Common
+/// Pitfalls / Pitfall 2": two indirections, subagent emission → orchestrator
+/// relay → DevFlow's captured top-level stdout). Matching is
+/// case-insensitive on the `Gate` LABEL and tolerates surrounding markdown
+/// emphasis (`*`) and whitespace, but the VALUE comparison is exact — this
+/// deliberately does NOT widen into a general "does this look like a
+/// checkpoint" heuristic (D-02 rejected that class of predicate); the scope
+/// is one declared field label with one enumerated value.
+pub fn blocking_human_checkpoint_reported(stdout: &str) -> bool {
+    let _ = stdout;
+    unimplemented!("RED: blocking_human_checkpoint_reported not yet implemented")
+}
+
+/// Thin file-reading wrapper over [`blocking_human_checkpoint_reported`]:
+/// reads the phase's captured stdout file (via [`stdout_path`]) and
+/// delegates. `false` for a missing capture file, never an error.
+pub fn checkpoint_reported_in_capture(project_root: &Path, phase: u32) -> bool {
+    let _ = (project_root, phase);
+    unimplemented!("RED: checkpoint_reported_in_capture not yet implemented")
+}
+
 /// Determine whether a set of parsed JSONL lines look like a Codex `--json`
 /// event stream (as opposed to a single-document Claude envelope or plain
 /// text) — i.e. at least one line is a `thread.started` or `turn.*` event.
@@ -1488,6 +1555,69 @@ mod tests {
             session_id_from_capture(dir.path(), 5).as_deref(),
             Some("lossy-ok")
         );
+    }
+
+    /// Positive fixture built from RESEARCH's predicted `**Gate:**` rendering
+    /// (28-PROBE.md's A1 verdict is DIVERGENT — no live-captured literal
+    /// exists to build this from; see `HUMAN_GATE_VALUE`'s doc comment).
+    #[test]
+    fn blocking_human_checkpoint_reported_detects_human_gate_line() {
+        let stdout = format!(
+            "## CHECKPOINT REACHED\n\n**Type:** human-verify\n**Gate:** {HUMAN_GATE_VALUE} — copy the task's `gate` attribute verbatim so the orchestrator's carve-out sees it\n"
+        );
+        assert!(blocking_human_checkpoint_reported(&stdout));
+    }
+
+    /// The Phase 26 near-miss distinction: a plain `blocking` gate must NOT
+    /// be classified as a human-blocking checkpoint.
+    #[test]
+    fn blocking_human_checkpoint_reported_false_for_plain_blocking() {
+        let stdout = format!(
+            "## CHECKPOINT REACHED\n\n**Type:** human-verify\n**Gate:** {PLAIN_GATE_VALUE} — copy the task's `gate` attribute verbatim so the orchestrator's carve-out sees it\n"
+        );
+        assert!(!blocking_human_checkpoint_reported(&stdout));
+    }
+
+    #[test]
+    fn blocking_human_checkpoint_reported_false_when_no_gate_field() {
+        let stdout = "some ordinary agent failure output, no checkpoint at all\n";
+        assert!(!blocking_human_checkpoint_reported(stdout));
+    }
+
+    /// The `Gate:` line arrives inside an escaped Claude JSON result
+    /// envelope's `result` field — must be found via the unescaped inner
+    /// text, not the raw (escaped) JSON string.
+    #[test]
+    fn blocking_human_checkpoint_reported_true_inside_escaped_envelope() {
+        let inner = format!(
+            "## CHECKPOINT REACHED\\n\\n**Gate:** {HUMAN_GATE_VALUE} — copy the task's `gate` attribute verbatim so the orchestrator's carve-out sees it\\n"
+        );
+        let stdout = format!(r#"{{"type":"result","subtype":"success","result":"{inner}","session_id":"abc"}}"#);
+        assert!(blocking_human_checkpoint_reported(&stdout));
+    }
+
+    #[test]
+    fn blocking_human_checkpoint_reported_tolerates_whitespace_and_emphasis() {
+        let stdout = format!("  **Gate:**   {HUMAN_GATE_VALUE}   \n");
+        assert!(blocking_human_checkpoint_reported(&stdout));
+    }
+
+    #[test]
+    fn checkpoint_reported_in_capture_missing_file_returns_false() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!checkpoint_reported_in_capture(dir.path(), 42));
+    }
+
+    #[test]
+    fn checkpoint_reported_in_capture_reads_true_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 11),
+            format!("**Gate:** {HUMAN_GATE_VALUE}\n"),
+        )
+        .unwrap();
+        assert!(checkpoint_reported_in_capture(dir.path(), 11));
     }
 
     #[test]
