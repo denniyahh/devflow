@@ -76,13 +76,16 @@ enum Command {
         #[arg(long)]
         until: Option<Stage>,
         /// Pre-authorize the Ship gate so this run can reach a completed
-        /// Ship stage unattended (D-04/D-05/D-06, 23-09). The Ship gate
-        /// still fires and is still answered through the normal gate
-        /// protocol — this only supplies the approval automatically,
-        /// attributed to `--yes-ship` in the gate ledger. Must be typed on
-        /// every invocation: it cannot be set in `devflow.toml` or any
-        /// environment variable (D-05), so an unattended auto-merge can
-        /// never become a standing, silent default.
+        /// Ship stage unattended (D-04/D-05/D-06, 23-09; provenance widened
+        /// by D-12, `28-CONTEXT.md`). The Ship gate still fires and is
+        /// still answered through the normal gate protocol — this only
+        /// supplies the approval automatically, attributed to `--yes-ship`
+        /// in the gate ledger. This flag ORs with a standing `yes_ship =
+        /// true` in `devflow.toml` (or `DEVFLOW_YES_SHIP`) rather than
+        /// replacing it — passing it here always wins, and a run whose
+        /// authorization came from config instead prints a notice naming
+        /// `devflow.toml` as the source, so a persisted default is never a
+        /// silent one.
         #[arg(long)]
         yes_ship: bool,
         /// Project root.
