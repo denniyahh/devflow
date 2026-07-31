@@ -320,7 +320,12 @@ pub fn combine_crate_observations(per_crate: &[(String, Observation)]) -> Observ
 /// 29-RESEARCH.md's Pitfall 2). A
 /// spawn error or a non-zero `curl` exit returns `Err` with the failure
 /// text; the caller converts that to `Unreachable`.
-fn crate_version_http_status(
+///
+/// `pub(crate)` (29-07): `release_publish::publish_all`'s per-crate
+/// pre-publish observation reuses this exact query rather than a second
+/// crates.io HTTP client, then classifies the result with
+/// [`classify_http_status`] itself — never re-derived.
+pub(crate) fn crate_version_http_status(
     project_root: &Path,
     name: &str,
     version: &str,

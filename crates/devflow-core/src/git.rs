@@ -768,7 +768,11 @@ pub enum SigningViability {
 
 /// `git config --get <key>`, scoped to `project_root`. `None` if unset or
 /// the command fails (missing `git`, not a repo, etc.) — never panics.
-fn git_config(project_root: &Path, key: &str) -> Option<String> {
+///
+/// `pub(crate)` (29-07): `release_publish::create_and_push_tag` reuses this
+/// exact helper to read `devflow.releaseSigningKey`, rather than a second
+/// `git config --get` implementation.
+pub(crate) fn git_config(project_root: &Path, key: &str) -> Option<String> {
     let output = git_command(project_root)
         .args(["config", "--get", key])
         .output()

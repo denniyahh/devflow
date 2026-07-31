@@ -72,6 +72,7 @@ pub mod registry;
 pub mod release_execute;
 pub mod release_observe;
 pub mod release_policy;
+pub mod release_publish;
 pub mod ship;
 pub mod ship_evidence;
 pub mod stage;

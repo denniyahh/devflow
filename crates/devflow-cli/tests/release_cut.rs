@@ -408,18 +408,27 @@ exit 1
     bin_dir
 }
 
+/// With unit 29c landed, `SignedTagPresent` and `CratesPublished` both carry
+/// real actions — this replaces `29-06`'s `cut_walks_to_the_signed_tag_step_and_stops`,
+/// which pinned the (now-closed) gap that the walk stopped there naming unit
+/// `29c` as not-yet-implemented.
+///
 /// Against a fixture where steps 1 (version bump), 2 (changelog), 3
 /// (release PR merged), and 5 (sync merged) all observe as already done —
-/// via a fake `gh` standing in for GitHub, since none of this phase's units
-/// implement a fake registry — the walk stops on step 4, the signed tag,
-/// naming unit `29c`. `SignedTagPresent`'s own oracle is a real, local `git
-/// ls-remote` against a real (tag-less) origin, so it genuinely observes
-/// absent rather than being faked away — this is the one step under test,
-/// and this pins the unit boundary as a tested fact. This assertion will
-/// need updating — deliberately — when `29-07` lands and gives
-/// `SignedTagPresent` a real action.
+/// via a fake `gh` standing in for GitHub — the walk reaches step 4, the
+/// signed tag, and genuinely *attempts* it: `SignedTagPresent`'s own oracle
+/// is a real, local `git ls-remote` against a real (tag-less) origin, so it
+/// observes absent, and the real action (`sign_release_tag` ->
+/// `release_publish::create_and_push_tag`) runs the documented `git tag -s`
+/// command for real. In this isolated-`HOME` fixture (no gnupg keyring, no
+/// `devflow.releaseSigningKey`) that command fails for a genuine reason —
+/// git cannot find a secret key to sign with — proving the walk no longer
+/// reports "no action in this build" for this step. No live tag is ever
+/// pushed and no live `cargo publish` is ever reached: the fixture's isolated
+/// signing environment stops the walk before either irreversible network
+/// side effect could occur.
 #[test]
-fn cut_walks_to_the_signed_tag_step_and_stops() {
+fn cut_reaches_every_step_when_all_are_implemented() {
     let dir = tempfile::tempdir().unwrap();
     init_repo(dir.path());
     let origin_dir = tempfile::tempdir().unwrap();
@@ -434,6 +443,12 @@ fn cut_walks_to_the_signed_tag_step_and_stops() {
         ],
     );
     git(dir.path(), &["push", "-q", "origin", "develop"]);
+    // `sign_release_tag` resolves its target commit as the tip of
+    // `origin/main` (the commit the release PR produces) — give the fixture
+    // a `main` ref on origin so that resolution succeeds and the walk
+    // genuinely reaches the tag command itself, rather than stopping one
+    // step earlier on a missing ref.
+    git(dir.path(), &["push", "-q", "origin", "develop:main"]);
 
     let fake_bin_dir = write_fake_gh_reporting_prs_landed(dir.path(), "1.2.3");
     let isolated_home = tempfile::tempdir().unwrap();
@@ -462,7 +477,11 @@ fn cut_walks_to_the_signed_tag_step_and_stops() {
         "expected the walk to stop before completion, got: {combined}"
     );
     assert!(
-        combined.contains("supplied by unit 29c"),
-        "expected the walk to stop at the signed-tag step naming unit 29c, got: {combined}"
+        !combined.contains("supplied by unit 29c") && !combined.contains("no action in this build"),
+        "expected every step to have a real action wired now that 29-07 is complete, got: {combined}"
+    );
+    assert!(
+        combined.contains("stopped:"),
+        "expected a real, non-fabricated stop reason, got: {combined}"
     );
 }
