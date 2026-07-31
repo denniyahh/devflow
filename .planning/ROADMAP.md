@@ -1197,6 +1197,30 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
+### Phase 999.62: `release --check`'s Tag-Signing Gate Validates the Wrong Key, in the Wrong Process (BACKLOG)
+
+**Goal:** `devflow release --check`'s fourth check is named **tag-signing viability**. Its job is to answer one question — *can this machine produce the signed release tag?* It currently answers a different question, in three separable ways, and can be wrong in both directions.
+
+**Found:** 2026-07-31, during the v2.2.0 release prep, when the check reported `✗ ssh-agent reachable but has no identities loaded` on a machine that was — at that exact moment — successfully signing every commit.
+
+| # | Defect | Evidence |
+|---|---|---|
+| 1 | **Validates `user.signingkey`, not `devflow.releaseSigningKey`.** `check_ssh_signing_viability` reads `user.signingkey` (`git.rs:875`). But CONTRIBUTING § Release signing designates `devflow.releaseSigningKey` as *"the only key permitted"* on release tags, and the two are different keys that deliberately share a `user.email`. | On this machine: `user.signingkey` = `devflow_signing_ed25519.pub` (the agent's commit key), `devflow.releaseSigningKey` = `github_ed25519.pub` (the maintainer key). The check validates the former and never reads the latter. |
+| 2 | **Agent-only — ignores keys usable without an agent.** Viability is decided solely by `ssh-add -l`'s exit code (`git.rs:901-916`). SSH signing does not require an agent: `ssh-keygen -Y sign` uses an unencrypted private key file directly. | `devflow_signing_ed25519` is unencrypted on disk; `ssh-add -l` reported *"The agent has no identities"* while `git log -1 --format='%G?'` returned **`G`** (good signature) for a commit made seconds earlier. |
+| 3 | **Process-local, reported as machine-wide.** `Command::new("ssh-add")` inherits the *calling process's* `SSH_AUTH_SOCK`. The conclusion therefore describes whichever agent happened to invoke `devflow`, not the machine or the operator. | `~/.ssh/agent/` held **14** distinct agent sockets. The operator's interactive shell had the release key loaded; the tool context that ran the preflight saw an empty agent and reported failure. |
+
+**Why the false-positive direction is the dangerous one.** Defects 1 and 2 together produce a check that says ✓ **Viable** when the *commit* key is loaded in the agent — greenlighting a release whose tag, if cut with a bare `git tag -s`, would then be signed with that wrong key. The wrong-key tag looks correct in `git log`, in `git tag -v`'s signer line, and in GitHub's "Verified" badge, because both keys share a `user.email` and differ only by fingerprint. This is precisely the hazard `scripts/hooks/pre-push` compares fingerprints to catch, and precisely the hazard CONTRIBUTING's explicit key-selection form exists to prevent — so the preflight would be at its most reassuring exactly when it is most wrong.
+
+**Fix direction.** For the release-tag question specifically, check the key the release procedure will actually use: prefer `devflow.releaseSigningKey`, falling back to `user.signingkey` only when the former is unset (CONTRIBUTING already documents that unset disables the maintainer-key check entirely, so the fallback is a deliberate, documented state — not a silent one). Then decide viability by whether that key can *sign*, not by whether an agent holds it: an unencrypted on-disk key is viable with no agent at all, and the honest probe is a trial signature (`ssh-keygen -Y sign` over a scratch buffer) rather than an `ssh-add -l` exit code. Where the answer genuinely depends on the caller's environment, say so in the message — *"no signing-capable key in THIS process's agent"* — rather than asserting a machine-wide fact from a process-local socket.
+
+**Worth preserving from the current implementation:** `classify_ssh_add_status`'s pure exit-code classification is well-factored and unit-tested for all three documented codes, and the redaction discipline (fingerprint only, never a path or key material — T-20-04) is correct and should survive any rewrite.
+
+**Priority:** Medium — the check is advisory preflight, not an enforcement gate, and the real protection (`scripts/hooks/pre-push`'s fingerprint comparison) is unaffected. Raised from Low because the false-positive direction actively reassures at the moment of maximum risk. | **Size:** S — one function, plus tests for the on-disk-key and wrong-key cases. Source: v2.2.0 release prep, 2026-07-31. Linear: DEN-87.
+
+Plans:
+
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
 ### Phase 21: Operator Legibility & Observability
 
 **Shipped as v1.8.0** (2026-07-24) — PR #23 (`develop → main`, squash `cfa9167`), signed tag `v1.8.0`, [GitHub Release](https://github.com/denniyahh/devflow/releases/tag/v1.8.0). `sync-main-to-develop.sh` run via PR #24 (merge `01ad9e4`). Published to crates.io (`devflow-core` then `devflow`, both confirmed live at 1.8.0).
