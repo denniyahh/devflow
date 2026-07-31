@@ -248,9 +248,17 @@ pub fn yes_ship(project_root: &Path) -> bool {
 /// here; that combination happens at the release-cut command's own call
 /// site, exactly as `commands::start` ORs in `--yes-ship`.
 pub fn yes_release(project_root: &Path) -> bool {
-    // RED stub: intentionally wrong so the behavior tests below fail for
-    // the intended reason before the GREEN implementation lands.
-    todo!("yes_release resolver not yet implemented")
+    if let Some(value) = env_value("DEVFLOW_YES_RELEASE") {
+        match value.parse() {
+            Ok(enabled) => return enabled,
+            Err(error) => tracing::warn!(
+                value,
+                %error,
+                "invalid DEVFLOW_YES_RELEASE; using devflow.toml or default"
+            ),
+        }
+    }
+    load_config(project_root).yes_release
 }
 
 fn env_value(key: &str) -> Option<String> {
