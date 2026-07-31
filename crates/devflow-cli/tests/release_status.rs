@@ -212,10 +212,11 @@ fn release_status_summary_line_names_version_and_count() {
         "expected the summary line to name the requested version, got: {stdout}"
     );
     assert!(
-        stdout.contains("0/2"),
-        "expected the summary line to report 0 of 2 questions observed complete \
-         (this fixture has no remote and no Cargo.toml, so both the signed-tag \
-         and crates-published rows are Unreachable, not Present), got: {stdout}"
+        stdout.contains("0/6"),
+        "expected the summary line to report 0 of 6 questions observed complete \
+         (this fixture has no remote and no Cargo.toml, so all six rows — \
+         version bumped, changelog written, release PR merged, signed tag, \
+         sync merged, crates published — are Unreachable, not Present), got: {stdout}"
     );
 }
 

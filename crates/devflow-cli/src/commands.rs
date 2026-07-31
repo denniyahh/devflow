@@ -2281,32 +2281,15 @@ fn release_observation_check(
 
 /// `devflow release status <version>` (29a) — observation only, mutates
 /// nothing. Reuses `release_check`'s `Check`-list-then-report shape
-/// verbatim so the two commands stay visually identical.
+/// verbatim so the two commands stay visually identical. Builds its check
+/// list from `observe_all`, the single dispatcher over all six
+/// `ReleaseStep` variants — this is the only place that knows the question
+/// list.
 pub(crate) fn release_status(project_root: &Path, version: &str) -> Result<(), CliError> {
-    use devflow_core::release_observe::ReleaseStep;
-
-    let checks: Vec<Check> = vec![
-        release_observation_check(
-            ReleaseStep::VersionBumped,
-            devflow_core::release_observe::version_bumped_on_develop(project_root, version),
-        ),
-        release_observation_check(
-            ReleaseStep::ChangelogWritten,
-            devflow_core::release_observe::changelog_written_on_develop(project_root, version),
-        ),
-        release_observation_check(
-            ReleaseStep::ReleasePrMerged,
-            devflow_core::release_observe::release_pr_merged_to_main(project_root, version),
-        ),
-        release_observation_check(
-            ReleaseStep::SignedTagPresent,
-            devflow_core::release_observe::signed_tag_on_remote(project_root, version),
-        ),
-        release_observation_check(
-            ReleaseStep::CratesPublished,
-            devflow_core::release_observe::crates_published(project_root, version),
-        ),
-    ];
+    let checks: Vec<Check> = devflow_core::release_observe::observe_all(project_root, version)
+        .into_iter()
+        .map(|(step, observation)| release_observation_check(step, observation))
+        .collect();
 
     let mut failed = false;
     for c in &checks {

@@ -522,19 +522,82 @@ pub fn release_pr_merged_to_main(project_root: &Path, version: &str) -> Observat
 // -- 29-02 Task 2: sync-ancestry oracle (stub body, RED) ------------------
 // TODO(29-02 GREEN): replace with real classification logic.
 
-/// Classify GitHub's compare API `status` field. STUB — always Unreachable
-/// until the GREEN commit.
-pub fn classify_compare_status(_status: &str) -> Observation {
-    Observation::Unreachable {
-        reason: "not implemented".into(),
+/// Classify GitHub's compare API `status` field (`compare/main...develop`),
+/// answering whether `main` is an ancestor of `develop` — i.e. whether the
+/// post-release sync has landed. Pure — no I/O. `ahead`/`identical` are
+/// Present (base `main` is an ancestor of head `develop`); `behind`/
+/// `diverged` are Absent; anything else, including empty, is Unreachable
+/// naming the value seen.
+pub fn classify_compare_status(status: &str) -> Observation {
+    match status {
+        "ahead" | "identical" => Observation::Present {
+            detail: format!("compare status: {status}"),
+        },
+        "behind" | "diverged" => Observation::Absent {
+            detail: format!("compare status: {status}"),
+        },
+        "" => Observation::Unreachable {
+            reason: "compare status was empty".into(),
+        },
+        other => Observation::Unreachable {
+            reason: format!("unexpected compare status `{other}`"),
+        },
     }
 }
 
-/// Dispatch one of the six release-cut questions to its own oracle. STUB —
-/// always Unreachable with an identical reason until the GREEN commit.
-pub fn observe(_project_root: &Path, _step: ReleaseStep, _version: &str) -> Observation {
-    Observation::Unreachable {
-        reason: "not implemented".into(),
+/// I/O wrapper: has `main` been synced back into `develop`
+/// (`scripts/sync-main-to-develop.sh`'s own question, asked remotely)? Runs
+/// `gh api repos/{owner}/{repo}/compare/main...develop --jq .status`, pinned
+/// to `project_root` (T-29-10), then [`classify_compare_status`].
+///
+/// This is deliberately a DIFFERENT function from
+/// [`crate::git::origin_main_ancestor_status`], which reads already-fetched
+/// local refs with no network access and must keep that no-fetch behavior
+/// for `release --check` (20d) — collapsing the two would silently change
+/// that command's documented no-network property. One function answers
+/// "what is true on the remote right now"; the other answers "what does
+/// this checkout already know."
+pub fn sync_merged(project_root: &Path) -> Observation {
+    let output = Command::new("gh")
+        .current_dir(project_root)
+        .args([
+            "api",
+            "repos/{owner}/{repo}/compare/main...develop",
+            "--jq",
+            ".status",
+        ])
+        .output();
+    match output {
+        Ok(out) if out.status.success() => {
+            let status = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            classify_compare_status(&status)
+        }
+        Ok(out) => Observation::Unreachable {
+            reason: format!(
+                "gh api exited with status {} for compare/main...develop",
+                out.status
+            ),
+        },
+        Err(err) => Observation::Unreachable {
+            reason: format!(
+                "failed to spawn gh for compare/main...develop: {}",
+                err.kind()
+            ),
+        },
+    }
+}
+
+/// Dispatch one of the six release-cut questions to its own oracle.
+/// Exhaustive — no wildcard arm — so a future seventh [`ReleaseStep`]
+/// variant fails to compile rather than silently returning a default.
+pub fn observe(project_root: &Path, step: ReleaseStep, version: &str) -> Observation {
+    match step {
+        ReleaseStep::VersionBumped => version_bumped_on_develop(project_root, version),
+        ReleaseStep::ChangelogWritten => changelog_written_on_develop(project_root, version),
+        ReleaseStep::ReleasePrMerged => release_pr_merged_to_main(project_root, version),
+        ReleaseStep::SignedTagPresent => signed_tag_on_remote(project_root, version),
+        ReleaseStep::SyncMerged => sync_merged(project_root),
+        ReleaseStep::CratesPublished => crates_published(project_root, version),
     }
 }
 
@@ -986,7 +1049,9 @@ mod tests {
                     assert!(!reason.is_empty(), "{step:?} produced an empty reason");
                     reasons.push(reason);
                 }
-                other => panic!("expected {step:?} to be Unreachable with no remote, got {other:?}"),
+                other => {
+                    panic!("expected {step:?} to be Unreachable with no remote, got {other:?}")
+                }
             }
         }
         let mut deduped = reasons.clone();
