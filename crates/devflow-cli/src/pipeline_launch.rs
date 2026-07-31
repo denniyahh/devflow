@@ -212,6 +212,15 @@ pub(crate) fn launch_stage(
 /// even though the operator explicitly asked to resume past it. Cleared and
 /// persisted BEFORE `launch_stage`, so a reload mid-relaunch already sees
 /// the phase as no longer stopped.
+///
+/// D-15 (999.60): that clear is now gated on `state.stopped`. `resume` is
+/// also the recovery verb for a rate-limited or infra-paused phase, and in
+/// that case `stop_until` is a cap the operator set that has NOT fired —
+/// `stopped` is the exact discriminator between "the cap fired and the
+/// operator is overriding it" (clear it, per the 20c paragraph above) and
+/// "the cap is still pending" (leave it alone, or the run silently sails
+/// past a boundary the operator named). The save/relaunch ordering is
+/// unchanged either way.
 pub(crate) fn resume(project_root: &Path, phase: u32) -> Result<(), CliError> {
     let _lock = match lock::acquire(project_root, phase) {
         Ok(guard) => guard,
@@ -223,9 +232,11 @@ pub(crate) fn resume(project_root: &Path, phase: u32) -> Result<(), CliError> {
         Err(err) => return Err(CliError::Message(format!("lock error: {err}"))),
     };
     let mut state = workflow::load_state(project_root, phase)?;
-    state.stopped = false;
-    state.stop_reason = None;
-    state.stop_until = None;
+    if state.stopped {
+        state.stopped = false;
+        state.stop_reason = None;
+        state.stop_until = None;
+    }
     workflow::save_state(&state)?;
     launch_stage(&mut state, None, None)
 }
