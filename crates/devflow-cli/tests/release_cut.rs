@@ -270,6 +270,71 @@ fn release_cut_writes_no_devflow_state() {
     );
 }
 
+// -- 29-05: real reasons, never invented -------------------------------------
+
+/// The step stops with the real tool failure text, never an invented one,
+/// when the remote is unreachable. Points `origin` at a path that does not
+/// exist — `gh` cannot resolve any repository context from it, and the
+/// walk's first oracle (`VersionBumped`) fails immediately and locally, no
+/// network needed.
+#[test]
+fn cut_stops_with_a_real_reason_when_the_remote_is_unreachable() {
+    let dir = tempfile::tempdir().unwrap();
+    init_repo(dir.path());
+    git(
+        dir.path(),
+        &["remote", "add", "origin", "/nonexistent/origin.git"],
+    );
+
+    let output = run_cut(dir.path(), "1.2.3", &["--yes-release"]);
+    assert!(
+        !output.status.success(),
+        "expected the walk to stop rather than succeed against an unreachable remote"
+    );
+    let combined = combined_output(&output);
+    assert!(
+        combined.contains("stopped:"),
+        "expected a `stopped:` line naming the real failure, got: {combined}"
+    );
+    assert!(
+        !combined.trim().is_empty(),
+        "expected a real, non-empty failure reason to be printed"
+    );
+}
+
+/// A reachable-but-unauthenticated remote (a real, local bare repo, so `gh`
+/// has genuine repository context but no credentials in the isolated
+/// `HOME`) also stops with a real, non-crashing failure rather than a
+/// fabricated one.
+#[test]
+fn cut_stops_without_crashing_when_gh_is_unauthenticated_against_a_real_remote() {
+    let dir = tempfile::tempdir().unwrap();
+    init_repo(dir.path());
+    let origin_dir = tempfile::tempdir().unwrap();
+    git(origin_dir.path(), &["init", "-q", "--bare"]);
+    git(
+        dir.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            origin_dir.path().to_str().expect("utf-8 tempdir path"),
+        ],
+    );
+    git(dir.path(), &["push", "-q", "origin", "develop"]);
+
+    let output = run_cut(dir.path(), "1.2.3", &["--yes-release"]);
+    assert!(
+        !output.status.success(),
+        "expected the walk to stop rather than succeed with gh unauthenticated"
+    );
+    let combined = combined_output(&output);
+    assert!(
+        combined.contains("stopped:"),
+        "expected a `stopped:` line naming the real failure, got: {combined}"
+    );
+}
+
 /// Re-running is re-observing: two consecutive, identical invocations
 /// against the same fixture produce identical reports — nothing is carried
 /// between runs.

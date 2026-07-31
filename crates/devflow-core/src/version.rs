@@ -713,7 +713,14 @@ pub fn read_version(project_root: &Path) -> Result<Version, VersionError> {
 
 /// Parse a `MAJOR.MINOR.PATCH` string (optionally followed by `-`/`+`
 /// metadata) into a [`Version`].
-fn parse_version_str(version: &str) -> Result<Version, VersionError> {
+///
+/// `pub` (29-05): the release-cut executor's `prepare_bump_branch` parses the
+/// operator-supplied `<version>` positional with this exact function rather
+/// than a second hand-rolled parser — the operator's positional is this
+/// phase's single version source, and a second parsing implementation is
+/// exactly the kind of second implementation that can drift (see
+/// `release_execute.rs`'s module doc comment on `compute_version`).
+pub fn parse_version_str(version: &str) -> Result<Version, VersionError> {
     let mut parts = version.split(['.', '+', '-']);
     let mut next =
         |label: &str| -> Result<u32, VersionError> {

@@ -337,7 +337,11 @@ fn version_bump(ctx: &mut HookContext) -> Result<(), HookError> {
 }
 
 /// Today's date as YYYY-MM-DD (best-effort via the `date` command).
-fn today() -> String {
+///
+/// `pub(crate)` (29-05): the release-cut executor's `prepare_bump_branch`
+/// reuses this exact helper for its own changelog entry's date, rather than
+/// a second `date`-shelling implementation.
+pub(crate) fn today() -> String {
     Command::new("date")
         .arg("+%Y-%m-%d")
         .output()
