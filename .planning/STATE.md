@@ -2,13 +2,13 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone (open — no fixed closing phase)
-current_phase: 27
-current_phase_name: scrub-redirecting-git-environment-from-production-calls
-status: complete
-stopped_at: Phase 28 context gathered
-last_updated: "2026-07-31T01:06:18.191Z"
+current_phase: 28
+current_phase_name: close-the-checkpoint-answer-return-path
+status: Ready to execute
+stopped_at: Phase 28 planned — 6 plans in 3 waves
+last_updated: "2026-07-31T02:05:00.000Z"
 last_activity: 2026-07-30
-last_activity_desc: Phase 27 complete, transitioned to Phase 999.1
+last_activity_desc: Phase 28 planned (6 plans, 3 waves), plan-checker passed
 progress:
   total_phases: 17
   completed_phases: 15

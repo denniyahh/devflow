@@ -117,26 +117,33 @@ Four units, reshaped from the original 999.57/999.59/999.60 promotion:
 
 ### Why not build a human-answer path (the reasoning, for the record)
 
-- **D-08:** DevFlow has no built-in, zero-config notification. The only
+> **All four decisions in this subsection are `[informational]`.** They record the
+> reasoning behind a deliberate *non*-decision — why no human-answer path is built
+> this phase — and are superseded in effect by D-03. None of them describes work to
+> implement, so none is tracked by the decision-coverage gate. The substantive
+> outcomes they lead to are carried by D-03 (unconditional auto-decide) and by
+> `<deferred>` (what a future phase would need to build first).
+
+- **D-08 [informational]:** DevFlow has no built-in, zero-config notification. The only
   push mechanism is `fire_gate_notify` / `DEVFLOW_GATE_NOTIFY_CMD`, an
   operator-supplied shell command; unset, it's a silent no-op
   (`gates.rs`). The only pull mechanism is manually running `devflow
   status` / `devflow gate list`.
-- **D-09:** The existing gate-response mechanism (`Gates::poll_response`)
+- **D-09 [informational]:** The existing gate-response mechanism (`Gates::poll_response`)
   is a real blocking loop inside the process that fired the gate, with a
   **7-day production timeout** (`gates.rs`, test constant `SEVEN_DAYS`).
   This is the documented cause of DevFlow's known "gates hang forever"
   failure class (leaked monitor/process pairs). Routing a new checkpoint-
   answer mechanism through this same primitive would have inherited that
   weakness.
-- **D-10:** Considered and rejected: routing checkpoint pauses through the
+- **D-10 [informational]:** Considered and rejected: routing checkpoint pauses through the
   `stopped`/`stop_reason`/`resume` primitive instead of the blocking-poll
   gate primitive (no live process, pull-based discovery via `devflow
   status`). This removes the blocking-process problem but is still
   fundamentally human-in-the-loop — it still requires a human to notice and
   act for the phase to complete, which does not meet the actual goal
   (a process that doesn't require a human at all). Superseded by D-03.
-- **D-11:** Given D-08–D-10, a human-answer path for checkpoints (a
+- **D-11 [informational]:** Given D-08–D-10, a human-answer path for checkpoints (a
   dedicated `devflow gate answer <phase> "<text>"` verb, or reusing
   `approve --note`) is explicitly **not built this phase** — deferred to a
   future phase that builds real notification/response infrastructure first

@@ -57,10 +57,22 @@ bare `cargo test --exact <name>` that matches nothing still exits 0 — assert o
 | TBD | TBD | TBD | 999.59 (D-14) | — | Define with missing CONTEXT.md no-ops without invoking `/gsd-discuss-phase` | unit | `cargo test -p devflow-core prompt::tests::` | ✅ split existing `define_and_plan_prompts_are_idempotent` (`prompt.rs:365-388`) | ⬜ pending |
 | TBD | TBD | TBD | 999.59 (D-14) | — | Plan stage's existing idempotent-artifact behavior is unaffected | unit | `cargo test -p devflow-core prompt::tests::` | ✅ existing coverage, preserve | ⬜ pending |
 | TBD | TBD | TBD | 999.60 (D-15) | — | `resume` does NOT clear an unfired `--until` cap when `state.stopped == false` | unit | `cargo test -p devflow-cli pipeline_launch::tests::` | ❌ new sibling to `resume_clears_stop_marker_and_advances_past_stop_point` (`pipeline_launch.rs:456-526`) | ⬜ pending |
-| TBD | TBD | TBD | D-12 | — | `yes_ship` config file key sets `state.yes_ship` when CLI flag omitted | integration | `cargo test -p devflow-cli pipeline_outcomes::tests::` | ✅ **`config_file_with_yes_ship_key_loads_but_never_sets_the_flag` (`pipeline_outcomes.rs:1631`) assertion must flip** | ⬜ pending |
+| TBD | TBD | TBD | D-12 | — | `yes_ship` config file key sets `state.yes_ship` when CLI flag omitted | integration | new test at the `commands::start` level (e.g. `crates/devflow-cli/tests/yes_ship_config.rs`) | ❌ new test — see correction note below | ⬜ pending |
 | TBD | TBD | TBD | D-12 | — | CLI flag still wins/ORs correctly over the config value | integration | `cargo test -p devflow-cli pipeline_outcomes::tests::` | ❌ new test alongside the flipped one | ⬜ pending |
 
 *Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
+
+> **Correction (post-pattern-mapping).** An earlier revision of this table, written
+> from RESEARCH.md § Validation Architecture, claimed the pre-existing test
+> `config_file_with_yes_ship_key_loads_but_never_sets_the_flag`
+> (`pipeline_outcomes.rs:1630-1648`) must have its assertion **flipped** for D-12.
+> `28-PATTERNS.md` checked this against live source and found that test's premise —
+> that `State::new` *alone* ignores config — **still holds** after D-12. Its assertion
+> must be **preserved**; only the test's name / doc-comment / failure message need
+> updating to stop reading as a blanket "config never sets this" claim. The new
+> positive case (config key → `state.yes_ship`) belongs in a **new** test at the
+> `commands::start` level. `28-06-PLAN.md` Task 3 implements the corrected shape and
+> is authoritative over this file where they differ.
 
 ---
 
