@@ -248,6 +248,22 @@ fn stage_prompt_with_project(stage: Stage, phase: u32, project_root: Option<&Pat
     )
 }
 
+/// The synthesized instruction sent into a resumed Claude session when a
+/// confirmed human-blocking checkpoint has nobody available to answer it
+/// (D-03, 28-CONTEXT.md): DevFlow's default, unconditional policy — no flag,
+/// no config toggle — is for the agent to resolve the checkpoint itself,
+/// using its own judgment, and record why.
+///
+/// Deliberately deterministic: no timestamp, no random content, no varying
+/// state. Two calls for the same `phase` produce byte-identical strings, so
+/// the `checkpoint_auto_decided` audit event (D-07, plan 28-03) can quote
+/// this exact instruction without churning on every resume. `phase` is
+/// included only for operator legibility in the captured stdout — the
+/// instruction's meaning does not depend on it.
+pub fn checkpoint_auto_decide_prompt(_phase: u32) -> String {
+    unimplemented!("RED: 28-03 Task 1 — checkpoint_auto_decide_prompt not yet implemented")
+}
+
 /// Build a fix prompt used on Code → Validate loop-backs.
 pub fn fix_prompt(fix_type: FixType, phase: u32) -> String {
     let command = match fix_type {
@@ -468,5 +484,50 @@ mod tests {
         assert!(fix_prompt(FixType::AuditFix, 11).contains("/gsd-audit-fix 11"));
         assert!(fix_prompt(FixType::GapsOnly, 11).contains("--gaps-only"));
         assert!(fix_prompt(FixType::AuditFix, 11).contains("DEVFLOW_RESULT"));
+    }
+
+    /// D-03/D-07 (28-03): the audit event quotes this instruction verbatim,
+    /// so it must be byte-identical across calls for the same phase — no
+    /// timestamp, no random content that would churn the recorded string.
+    #[test]
+    fn checkpoint_auto_decide_prompt_is_deterministic() {
+        assert_eq!(
+            checkpoint_auto_decide_prompt(28),
+            checkpoint_auto_decide_prompt(28)
+        );
+    }
+
+    #[test]
+    fn checkpoint_auto_decide_prompt_terminates_with_completion_protocol() {
+        let prompt = checkpoint_auto_decide_prompt(28);
+        assert!(
+            prompt.ends_with(COMPLETION_PROTOCOL),
+            "the resumed session's exit must still be parseable by the same \
+             Layer 1 path as any other stage"
+        );
+        assert!(prompt.contains("DEVFLOW_RESULT"));
+    }
+
+    #[test]
+    fn checkpoint_auto_decide_prompt_states_no_operator_judgment_and_record_reasoning() {
+        let prompt = checkpoint_auto_decide_prompt(28).to_lowercase();
+        assert!(
+            prompt.contains("no human operator") || prompt.contains("nobody"),
+            "must state plainly that no operator is available"
+        );
+        assert!(
+            prompt.contains("judgment") || prompt.contains("judgement"),
+            "must instruct the agent to use its own judgment"
+        );
+        assert!(
+            prompt.contains("record") && prompt.contains("reasoning"),
+            "must require recording the reasoning in the final message, since \
+             this is the ONLY record of what was decided (D-07)"
+        );
+    }
+
+    #[test]
+    fn checkpoint_auto_decide_prompt_substitutes_phase_for_legibility() {
+        assert!(checkpoint_auto_decide_prompt(42).contains("phase 42"));
     }
 }
