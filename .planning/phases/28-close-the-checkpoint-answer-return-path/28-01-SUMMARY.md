@@ -149,6 +149,15 @@ None - no external service configuration required.
 - `verify::phase_has_blocking_human_checkpoint` and `verify::phase_plan_files` are ready for plan 28-02's D-01 dispatch insertion (`pipeline_launch::advance`'s `Action::GateReview` arm) and D-04's `session_id` capture work.
 - **Blocker/concern for 28-02 Task 2:** the confirmation-reader's target string (`**Gate:** blocking-human`) is an unconfirmed default, not a live-observed fact. 28-02 should either (a) proceed with the RESEARCH-predicted rendering as documented in `28-PROBE.md § Reader contract`, explicitly flagged as unconfirmed through the phase's verification step, or (b) attempt the live probe again from a context not subject to this executor's classifier (e.g., an actual DevFlow monitor-launched run, which is not a Claude Code agent session and is not classifier-restricted).
 
+## Self-Check: PASSED
+
+- FOUND: `.planning/phases/28-close-the-checkpoint-answer-return-path/28-PROBE.md`
+- FOUND: `.planning/phases/28-close-the-checkpoint-answer-return-path/deferred-items.md`
+- FOUND: `pub fn phase_plan_files` and `pub fn phase_has_blocking_human_checkpoint` in `crates/devflow-core/src/verify.rs`
+- FOUND commit `e62862d` (Task 1)
+- FOUND commit `30b46bf` (Task 2 RED)
+- FOUND commit `46627a5` (Task 2 GREEN)
+
 ---
 *Phase: 28-close-the-checkpoint-answer-return-path*
 *Completed: 2026-07-30*
