@@ -190,8 +190,18 @@ pub fn external_verify_enabled(project_root: &Path) -> bool {
 /// `state.yes_ship` becomes `true` — `commands::start` also ORs in the
 /// `--yes-ship` CLI flag; this function reports only the config/env-derived
 /// half of that combination.
-pub fn yes_ship(_project_root: &Path) -> bool {
-    unimplemented!("D-12 Task 1 RED: resolver not yet implemented")
+pub fn yes_ship(project_root: &Path) -> bool {
+    if let Some(value) = env_value("DEVFLOW_YES_SHIP") {
+        match value.parse() {
+            Ok(enabled) => return enabled,
+            Err(error) => tracing::warn!(
+                value,
+                %error,
+                "invalid DEVFLOW_YES_SHIP; using devflow.toml or default"
+            ),
+        }
+    }
+    load_config(project_root).yes_ship
 }
 
 fn env_value(key: &str) -> Option<String> {
