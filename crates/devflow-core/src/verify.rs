@@ -25,13 +25,15 @@ fn parse_external_verification_approval(value: &str) -> Option<Vec<String>> {
         .then_some(commands)
 }
 
-/// Return external verification commands declared by this phase's plans.
+/// Discover a phase's declared plan files: `.planning/phases/{NN}-*/{NN}-*-PLAN.md`,
+/// sorted. Returns an empty vec if the phase directory is missing or
+/// unreadable — never panics, never errors.
 ///
-/// Only the first YAML frontmatter block is inspected. This intentionally
-/// small parser recognizes the scalar shape established by Phase 16:
-/// `external_verify: "command"` (single-quoted and unquoted scalars are also
-/// accepted). Runtime captures and agent output are never read here.
-pub fn external_verify_commands(project_root: &Path, phase: u32) -> Vec<String> {
+/// Shared by [`external_verify_commands`] and
+/// [`phase_has_blocking_human_checkpoint`] so PLAN.md discovery lives in
+/// exactly one place; a second, slightly-different implementation would
+/// drift the moment one is updated and the other isn't.
+pub fn phase_plan_files(project_root: &Path, phase: u32) -> Vec<PathBuf> {
     let phases_dir = project_root.join(".planning/phases");
     let phase_prefix = format!("{phase:02}-");
     let plan_prefix = format!("{phase:02}-");
@@ -58,8 +60,17 @@ pub fn external_verify_commands(project_root: &Path, phase: u32) -> Vec<String> 
         }));
     }
     plans.sort();
-
     plans
+}
+
+/// Return external verification commands declared by this phase's plans.
+///
+/// Only the first YAML frontmatter block is inspected. This intentionally
+/// small parser recognizes the scalar shape established by Phase 16:
+/// `external_verify: "command"` (single-quoted and unquoted scalars are also
+/// accepted). Runtime captures and agent output are never read here.
+pub fn external_verify_commands(project_root: &Path, phase: u32) -> Vec<String> {
+    phase_plan_files(project_root, phase)
         .into_iter()
         .filter_map(|path| std::fs::read_to_string(path).ok())
         .filter_map(|contents| command_from_frontmatter(&contents))
@@ -107,8 +118,12 @@ fn command_from_frontmatter(contents: &str) -> Option<String> {
 /// first and is read from `.planning/phases/`. Those files are agent-writable
 /// during Code, but that is the SAME trust boundary [`external_verify_commands`]
 /// already documents and accepts — reused, not newly introduced.
-pub fn phase_has_blocking_human_checkpoint(_project_root: &Path, _phase: u32) -> bool {
-    unimplemented!("GREEN phase not yet implemented")
+pub fn phase_has_blocking_human_checkpoint(project_root: &Path, phase: u32) -> bool {
+    const HUMAN_BLOCKING_GATE: &str = r#"gate="blocking-human""#;
+    phase_plan_files(project_root, phase)
+        .into_iter()
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .any(|contents| contents.contains(HUMAN_BLOCKING_GATE))
 }
 
 /// Run one explicitly operator-approved external verification command.
