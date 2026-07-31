@@ -404,33 +404,37 @@ fn detect_claude_envelope_failure(stdout: &str) -> Option<AgentResult> {
     })
 }
 
-/// The rendered VALUE of a human-blocking checkpoint's `**Gate:**` line, as
-/// predicted by RESEARCH.md § "Architecture Patterns / Pattern 2" (the exact
-/// literal `gsd-executor.md:356` emits and `execute-phase.md:1053` keys its
-/// own carve-out on) and recorded as an **UNCONFIRMED DEFAULT** in
-/// `28-PROBE.md § Reader contract`.
+/// The rendered VALUE of a human-blocking checkpoint's `**Gate:**` line.
 ///
-/// **This literal was NEVER confirmed against a live end-to-end run.**
-/// `28-PROBE.md`'s A1 probe (a real `claude -p "/gsd-execute-phase 91"
-/// --output-format json --dangerously-skip-permissions` invocation against a
-/// synthetic phase declaring a `blocking-human` checkpoint) recorded verdict
-/// `DIVERGENT`: the command was denied at this executor's own Bash-tool
-/// permission classifier *before the `claude` subprocess ever spawned* — a
-/// restriction on this specific execution environment, not on DevFlow's own
-/// runtime. No captured rendering, confirmed or otherwise, was ever observed.
-/// What would confirm it: a live probe run from a context the classifier does
-/// not restrict — e.g. DevFlow's own actual `monitor` process (not a Claude
-/// Code agent session), driving a real headless `gate="blocking-human"`
-/// checkpoint end-to-end and inspecting `.devflow/phase-NN-stdout` for this
-/// literal. Until that happens, this matcher is built against RESEARCH's
-/// prediction, not an observed fact — treat it accordingly.
+/// **CONFIRMED against a live end-to-end run (2026-07-31).** Assumption A1 is
+/// closed. A real `devflow start` run drove a synthetic phase declaring a
+/// `gate="blocking-human"` task through DevFlow's own monitor process (not a
+/// Claude Code agent session, which is what blocked `28-PROBE.md`'s original
+/// attempt at the Bash-tool permission classifier). The checkpoint fired and
+/// `.devflow/phase-NN-stdout` captured it inside the JSON envelope's `result`
+/// text as:
+///
+/// ```text
+/// **Gate:** `blocking-human`
+/// ```
+///
+/// The VALUE is what this constant holds. The surrounding markdown — bold
+/// label, and a **code span around the value** — is handled by
+/// [`text_reports_human_gate`]'s trim set, not by this constant.
+///
+/// The code span is the part RESEARCH.md did not predict. Its § "Architecture
+/// Patterns / Pattern 2" derived the literal by reading the *emitting* source
+/// (`gsd-executor.md:356`, `execute-phase.md:1053`) and predicted a bare
+/// `**Gate:** blocking-human`. The real relay renders the value as a code
+/// span, which defeated the original matcher entirely — see
+/// [`text_reports_human_gate`] for that failure and its fix. Lesson worth
+/// keeping: the emitting source told us the value, not the rendering.
 const HUMAN_GATE_VALUE: &str = "blocking-human";
 
 /// Confirm whether captured stdout reports a human-blocking checkpoint, by
 /// searching for a `**Gate:**`-labeled line whose VALUE is exactly
-/// [`HUMAN_GATE_VALUE`] — see that constant's doc comment for the
-/// unconfirmed-default caveat and the `28-PROBE.md` observation it is built
-/// from.
+/// [`HUMAN_GATE_VALUE`] — see that constant's doc comment for the live
+/// observation (2026-07-31) the matched rendering is built from.
 ///
 /// This is the CONFIRMATION half of D-01: it is only ever consulted AFTER
 /// [`crate::verify::phase_has_blocking_human_checkpoint`] has already
@@ -464,17 +468,31 @@ pub fn blocking_human_checkpoint_reported(stdout: &str) -> bool {
 /// Core matcher shared by both search targets (raw stdout and the unescaped
 /// inner envelope text) in [`blocking_human_checkpoint_reported`]. Scans for
 /// a case-insensitive `gate` label, tolerating surrounding markdown emphasis
-/// (`*`) and whitespace up to the following `:`, then compares the VALUE
-/// token immediately after the colon exactly against [`HUMAN_GATE_VALUE`].
+/// (`*`), code-span backticks (`` ` ``), and whitespace up to the following
+/// `:`, then compares the VALUE token immediately after the colon exactly
+/// against [`HUMAN_GATE_VALUE`].
+///
+/// The backtick tolerance is not speculative — it is the single reason this
+/// matcher failed against the first real checkpoint ever observed. The live
+/// A1 run (2026-07-31) captured the value as a markdown code span,
+/// ``**Gate:** `blocking-human` ``, and the original trim set (`*` and space
+/// only) left the leading backtick in place, so the `take_while` below
+/// terminated immediately and produced an EMPTY value token. The reader
+/// returned `false` and a genuine checkpoint fell through to the generic
+/// gate. Trimming the backtick is what makes the observed rendering match;
+/// do not narrow this set back without re-running that live probe.
+///
+/// Note the closing backtick needs no handling: `take_while` already stops
+/// at it, since a backtick is neither alphanumeric nor `-`.
 fn text_reports_human_gate(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     let mut search_from = 0;
     while let Some(rel_idx) = lower[search_from..].find("gate") {
         let idx = search_from + rel_idx;
         let after_label = &lower[idx + "gate".len()..];
-        let after_label = after_label.trim_start_matches(['*', ' ']);
+        let after_label = after_label.trim_start_matches(['*', ' ', '`']);
         if let Some(rest) = after_label.strip_prefix(':') {
-            let value_region = rest.trim_start_matches(['*', ' ']);
+            let value_region = rest.trim_start_matches(['*', ' ', '`']);
             let value_token: String = value_region
                 .chars()
                 .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
@@ -1585,9 +1603,12 @@ mod tests {
         );
     }
 
-    /// Positive fixture built from RESEARCH's predicted `**Gate:**` rendering
-    /// (28-PROBE.md's A1 verdict is DIVERGENT — no live-captured literal
-    /// exists to build this from; see `HUMAN_GATE_VALUE`'s doc comment).
+    /// Positive fixture built from RESEARCH's *predicted* `**Gate:**`
+    /// rendering (a bare, un-spanned value). Kept as a tolerated shape, but
+    /// note this is NOT what a real run emits — see
+    /// `blocking_human_checkpoint_reported_matches_live_observed_rendering`
+    /// for the rendering actually captured on 2026-07-31, which this
+    /// prediction missed.
     #[test]
     fn blocking_human_checkpoint_reported_detects_human_gate_line() {
         let stdout = format!(
@@ -1633,6 +1654,59 @@ mod tests {
     fn blocking_human_checkpoint_reported_tolerates_whitespace_and_emphasis() {
         let stdout = format!("  **Gate:**   {HUMAN_GATE_VALUE}   \n");
         assert!(blocking_human_checkpoint_reported(&stdout));
+    }
+
+    /// REGRESSION — the rendering a real headless run actually produces.
+    ///
+    /// Transcribed verbatim from `.devflow/phase-91-stdout` of the live A1
+    /// run on 2026-07-31 (a genuine `gate="blocking-human"` task driven
+    /// through DevFlow's own monitor). The value arrives as a markdown CODE
+    /// SPAN, not the bare token RESEARCH.md predicted.
+    ///
+    /// Before the backtick was added to `text_reports_human_gate`'s trim set
+    /// this returned `false`: the leading backtick survived the trim, so the
+    /// value `take_while` terminated at once and yielded an empty token. A
+    /// real checkpoint was therefore never recognized, and the run fell
+    /// through to the generic gate. If this test ever goes red, DevFlow has
+    /// stopped recognizing real checkpoints — do not "fix" it by relaxing
+    /// the assertion.
+    #[test]
+    fn blocking_human_checkpoint_reported_matches_live_observed_rendering() {
+        let stdout = format!(
+            "---\n\n## Checkpoint: Decision\n\n**Plan:** 91-01 Emit the checkpoint\n**Gate:** `{HUMAN_GATE_VALUE}`\n**Progress:** 0/1 tasks complete\n**Task:** Task 1 — Ask the operator to authorize writing the marker file\n"
+        );
+        assert!(
+            blocking_human_checkpoint_reported(&stdout),
+            "the live-observed code-span rendering must be recognized; \
+             a false negative here means real checkpoints fall through to \
+             the generic gate (the 2026-07-31 A1 defect)"
+        );
+    }
+
+    /// The same live rendering as it actually crosses into DevFlow's capture:
+    /// escaped inside the Claude JSON result envelope. This is the exact
+    /// path `checkpoint_reported_in_capture` reads in production.
+    #[test]
+    fn blocking_human_checkpoint_reported_matches_live_rendering_in_envelope() {
+        let inner = format!(
+            "## Checkpoint: Decision\\n\\n**Gate:** `{HUMAN_GATE_VALUE}`\\n**Progress:** 0/1 tasks complete\\n"
+        );
+        let stdout = format!(
+            r#"{{"type":"result","subtype":"success","result":"{inner}","session_id":"live-a1"}}"#
+        );
+        assert!(
+            blocking_human_checkpoint_reported(&stdout),
+            "the code-span rendering must also be found inside the escaped envelope"
+        );
+    }
+
+    /// The backtick tolerance must not erode the Phase 26 near-miss
+    /// distinction: a code-spanned PLAIN `blocking` gate is still not a
+    /// human-blocking checkpoint.
+    #[test]
+    fn blocking_human_checkpoint_reported_false_for_code_spanned_plain_blocking() {
+        let stdout = "## Checkpoint: Decision\n\n**Gate:** `blocking`\n";
+        assert!(!blocking_human_checkpoint_reported(stdout));
     }
 
     #[test]
