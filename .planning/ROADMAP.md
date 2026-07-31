@@ -1978,7 +1978,7 @@ Plans:
 
 **Requirements**: TBD — no REQ-IDs; tracked by backlog identifier (`999.57`, `999.59`, `999.60`) plus `28-CONTEXT.md` decision IDs (`D-01`…`D-15`), consistent with Phases 21/22/26/27.
 **Depends on:** Phase 27 (no code dependency; sequencing only)
-**Plans:** 1/6 plans executed
+**Plans:** 5/6 plans executed
 
 **Capacity note, recorded rather than assumed.** Three items in one phase is what Phase 26 attempted, and Phase 26 did not ship. The mitigating difference: all four units share one narrow mechanism (gate → prompt → relaunch), none drives an irreversible operation, and 28b/28c/28d are each **S**. If scope pressure appears during planning, drop **28c** first (it is the most independent), then **28d**; 28a+28b are the phase's reason to exist.
 
@@ -1989,10 +1989,10 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 28-02-PLAN.md — wave 2 · capture the Claude session id and confirm a reported checkpoint from stdout; persist both new `State` fields (D-01/D-04)
-- [ ] 28-04-PLAN.md — wave 2 · Define must never invoke the interview headlessly; delete the branch, keep Plan's intact (999.59 / D-14)
-- [ ] 28-05-PLAN.md — wave 2 · `resume` must not clear an unfired `--until` cap (999.60 / D-15)
-- [ ] 28-06-PLAN.md — wave 2 · persistent `yes_ship` config option with a never-silent notice; CLI flag still wins (D-12/D-13)
+- [x] 28-02-PLAN.md — wave 2 · capture the Claude session id and confirm a reported checkpoint from stdout; persist both new `State` fields (D-01/D-04)
+- [x] 28-04-PLAN.md — wave 2 · Define must never invoke the interview headlessly; delete the branch, keep Plan's intact (999.59 / D-14)
+- [x] 28-05-PLAN.md — wave 2 · `resume` must not clear an unfired `--until` cap (999.60 / D-15)
+- [x] 28-06-PLAN.md — wave 2 · persistent `yes_ship` config option with a never-silent notice; CLI flag still wins (D-12/D-13)
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
