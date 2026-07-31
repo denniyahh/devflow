@@ -1182,6 +1182,28 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
+### Phase 999.63: The Phase-Reachability Guard Demands Define's Own Output as Define's Precondition (DELIVERED — patch, 2026-07-31)
+
+**Found live 2026-07-31**, launching the Phase 29 dogfood: `devflow start --phase 29` refused with `phase 29 is not reachable from \`develop\`` / `missing: a \`.planning/phases/29-*/\` directory`, on a phase whose ROADMAP heading was present and correctly merged.
+
+**The defect.** `ensure_phase_reachable_on_base` (`preflight.rs`) refused unless **both** the `### Phase N:` ROADMAP heading **and** a `.planning/phases/{NN}-*/` directory were present on `develop`. That directory is **Define's own output** — `/gsd-discuss-phase N` is what creates it. The guard therefore demanded the product of the pipeline's first stage as a precondition for running the first stage, which structurally prevented DevFlow from **ever** driving GSD discussion mode for a newly-promoted phase. Every phase had to have its Define performed by a human, out of band, before DevFlow could be handed the work.
+
+**Origin.** Commit `fdc0a3d`, `feat(23-12): refuse devflow start when phase is unreachable from develop` — gap closure 23f, written after the 2026-07-26 acceptance-run failure in which a phase promoted only on another branch was invisible to its own run and floundered silently through Define (`23-FINDINGS.md` §B1).
+
+**Why the original fix over-reached.** For the failure class it targeted, **the heading check alone is sufficient** — a phase promoted only on another branch has no heading on `develop` either. The directory conjunct added *no detection power* for that class while creating a false-positive class whose only members are legitimate bootstrap states. It has no true positives that the heading check does not already catch.
+
+**Corroborating evidence that this was unintended, not a policy choice.** Thirty lines below this guard's call site (`commands.rs`), the Codex leg refuses a missing `CONTEXT.md` with *"codex cannot run an interactive discussion headless. Run /gsd-discuss-phase N interactively first (any agent), **or use `--agent claude`**."* That message is only coherent if Claude driving Define to *produce* the discussion was intended to work. The reachability guard runs first and silently revoked it for every agent — a regression the Codex leg's own wording contradicts.
+
+**Fix (surgical, enforcement-only).** `phase_reachability_on_base` is left untouched — it remains a pure two-field probe, so 27-05's hostile-`GIT_DIR` regression test keeps discriminating on the directory half. Only `ensure_phase_reachable_on_base` changed: a missing directory alone no longer refuses; a missing heading still does, and still names itself in the refusal. The directory is still reported when the heading is *also* absent, where it is useful diagnostic detail.
+
+**Tests.** `enforcement_does_not_refuse_when_only_the_phase_dir_is_absent` (the named regression, with a precondition assertion so it cannot pass on a fixture that satisfies the guard some other way) and `enforcement_still_refuses_when_the_roadmap_heading_is_absent` (the control, pinning that 23-12's real failure class does not regress open). The `start_reachability_e2e.rs` fixtures omit *both* halves, so they still refuse and were unaffected.
+
+**Priority:** High — blocked the Phase 29 dogfood outright and silently narrowed DevFlow's mandate. | **Size:** S.
+
+Plans:
+
+- [x] Delivered as an out-of-band patch, 2026-07-31 (no phase — emergency unblock for the Phase 29 dogfood)
+
 ### Phase 999.61: Four Indirect Git-Reaching Spawn Edges a Literal Grep Cannot See (BACKLOG)
 
 **Goal:** Phase 27 scrubbed all 41 production `Command::new("git")` sites, but its own workspace census found **five** further spawn edges that reach `git` *indirectly* — through `sh`, through `cargo`, or through an operator-configured command — and are therefore invisible to a literal grep for `Command::new("git")`. One (`monitor.rs:148`, the agent spawn) was closed in-phase by `936b371`. **Four remain:**
