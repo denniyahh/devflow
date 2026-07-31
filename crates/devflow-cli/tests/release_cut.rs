@@ -353,3 +353,116 @@ fn release_cut_is_idempotent_across_runs() {
         "two consecutive identical runs must produce identical reports"
     );
 }
+
+// -- 29-06: the unit boundary is a tested fact, not a claim ------------------
+
+/// Write a fake `gh` executable that answers only the handful of `gh api`
+/// invocations `release_observe::observe` makes for
+/// `VersionBumped`/`ChangelogWritten`/`ReleasePrMerged`/`SyncMerged`,
+/// reporting each as already done for `version`. This is a fixture double
+/// standing in for a real GitHub repository — not a general-purpose `gh`
+/// mock — and every other invocation exits non-zero.
+fn write_fake_gh_reporting_prs_landed(dir: &Path, version: &str) -> std::path::PathBuf {
+    let bin_dir = dir.join("fake-bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let template = r#"#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = "api" ]; then
+  case "${2:-}" in
+    "repos/{owner}/{repo}/contents/Cargo.toml?ref=develop"|"repos/{owner}/{repo}/contents/Cargo.toml?ref=main")
+      cat <<'CARGOEOF'
+[workspace.package]
+version = "VERSION_PLACEHOLDER"
+CARGOEOF
+      exit 0
+      ;;
+    "repos/{owner}/{repo}/contents/CHANGELOG.md?ref=develop")
+      cat <<'CHANGEEOF'
+# Changelog
+
+## VERSION_PLACEHOLDER
+
+### Added
+- test
+CHANGEEOF
+      exit 0
+      ;;
+    "repos/{owner}/{repo}/compare/main...develop")
+      echo "identical"
+      exit 0
+      ;;
+  esac
+fi
+echo "fake gh: unhandled invocation: $*" >&2
+exit 1
+"#;
+    let script = template.replace("VERSION_PLACEHOLDER", version);
+    let gh_path = bin_dir.join("gh");
+    std::fs::write(&gh_path, script).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&gh_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&gh_path, perms).unwrap();
+    }
+    bin_dir
+}
+
+/// Against a fixture where steps 1 (version bump), 2 (changelog), 3
+/// (release PR merged), and 5 (sync merged) all observe as already done —
+/// via a fake `gh` standing in for GitHub, since none of this phase's units
+/// implement a fake registry — the walk stops on step 4, the signed tag,
+/// naming unit `29c`. `SignedTagPresent`'s own oracle is a real, local `git
+/// ls-remote` against a real (tag-less) origin, so it genuinely observes
+/// absent rather than being faked away — this is the one step under test,
+/// and this pins the unit boundary as a tested fact. This assertion will
+/// need updating — deliberately — when `29-07` lands and gives
+/// `SignedTagPresent` a real action.
+#[test]
+fn cut_walks_to_the_signed_tag_step_and_stops() {
+    let dir = tempfile::tempdir().unwrap();
+    init_repo(dir.path());
+    let origin_dir = tempfile::tempdir().unwrap();
+    git(origin_dir.path(), &["init", "-q", "--bare"]);
+    git(
+        dir.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            origin_dir.path().to_str().expect("utf-8 tempdir path"),
+        ],
+    );
+    git(dir.path(), &["push", "-q", "origin", "develop"]);
+
+    let fake_bin_dir = write_fake_gh_reporting_prs_landed(dir.path(), "1.2.3");
+    let isolated_home = tempfile::tempdir().unwrap();
+    let path_var = format!(
+        "{}:{}",
+        fake_bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let output = Command::new(devflow_bin())
+        .arg("release")
+        .arg("cut")
+        .arg("1.2.3")
+        .arg(dir.path())
+        .arg("--yes-release")
+        .env("HOME", isolated_home.path())
+        .env("PATH", path_var)
+        .env_remove("SSH_AUTH_SOCK")
+        .env_remove("SSH_AGENT_PID")
+        .output()
+        .expect("spawn devflow release cut");
+
+    let combined = combined_output(&output);
+    assert!(
+        !output.status.success(),
+        "expected the walk to stop before completion, got: {combined}"
+    );
+    assert!(
+        combined.contains("supplied by unit 29c"),
+        "expected the walk to stop at the signed-tag step naming unit 29c, got: {combined}"
+    );
+}
