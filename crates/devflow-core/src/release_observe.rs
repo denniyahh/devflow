@@ -519,6 +519,34 @@ pub fn release_pr_merged_to_main(project_root: &Path, version: &str) -> Observat
     }
 }
 
+// -- 29-02 Task 2: sync-ancestry oracle (stub body, RED) ------------------
+// TODO(29-02 GREEN): replace with real classification logic.
+
+/// Classify GitHub's compare API `status` field. STUB — always Unreachable
+/// until the GREEN commit.
+pub fn classify_compare_status(_status: &str) -> Observation {
+    Observation::Unreachable {
+        reason: "not implemented".into(),
+    }
+}
+
+/// Dispatch one of the six release-cut questions to its own oracle. STUB —
+/// always Unreachable with an identical reason until the GREEN commit.
+pub fn observe(_project_root: &Path, _step: ReleaseStep, _version: &str) -> Observation {
+    Observation::Unreachable {
+        reason: "not implemented".into(),
+    }
+}
+
+/// Answer all six release-cut questions, preserving `ReleaseStep::ALL`'s
+/// order.
+pub fn observe_all(project_root: &Path, version: &str) -> Vec<(ReleaseStep, Observation)> {
+    ReleaseStep::ALL
+        .iter()
+        .map(|&step| (step, observe(project_root, step, version)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -868,5 +896,116 @@ mod tests {
             classify_changelog_heading("  ## 2.3.0\n", "2.3.0"),
             Observation::Present { .. }
         ));
+    }
+
+    // -- 29-02 Task 2: sync-ancestry oracle and dispatcher --------------
+
+    #[test]
+    fn classify_compare_status_ahead_is_present() {
+        assert!(matches!(
+            classify_compare_status("ahead"),
+            Observation::Present { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_compare_status_identical_is_present() {
+        assert!(matches!(
+            classify_compare_status("identical"),
+            Observation::Present { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_compare_status_behind_is_absent() {
+        assert!(matches!(
+            classify_compare_status("behind"),
+            Observation::Absent { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_compare_status_diverged_is_absent() {
+        assert!(matches!(
+            classify_compare_status("diverged"),
+            Observation::Absent { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_compare_status_empty_is_unreachable_naming_the_value() {
+        match classify_compare_status("") {
+            Observation::Unreachable { reason } => assert!(!reason.is_empty()),
+            other => panic!("expected Unreachable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_compare_status_unexpected_value_is_unreachable_naming_it() {
+        match classify_compare_status("unexpected") {
+            Observation::Unreachable { reason } => assert!(
+                reason.contains("unexpected"),
+                "expected the reason to name the value seen, got: {reason}"
+            ),
+            other => panic!("expected Unreachable, got {other:?}"),
+        }
+    }
+
+    /// Initialize a bare git repo with no remote — every oracle in
+    /// `observe` must independently fail to observe.
+    fn init_repo_without_remote() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let output = crate::test_support::git_command(root)
+                .args(args)
+                .output()
+                .expect("spawn git");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        git(&["config", "core.hooksPath", "/dev/null"]);
+        dir
+    }
+
+    #[test]
+    fn observe_dispatches_all_six_variants_to_distinct_unreachable_reasons_with_no_remote() {
+        let dir = init_repo_without_remote();
+        let root = dir.path();
+        let mut reasons = Vec::new();
+        for step in ReleaseStep::ALL {
+            match observe(root, step, "1.2.3") {
+                Observation::Unreachable { reason } => {
+                    assert!(!reason.is_empty(), "{step:?} produced an empty reason");
+                    reasons.push(reason);
+                }
+                other => panic!("expected {step:?} to be Unreachable with no remote, got {other:?}"),
+            }
+        }
+        let mut deduped = reasons.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(
+            deduped.len(),
+            reasons.len(),
+            "expected six distinct reasons (no arm falling through to a shared \
+             default), got: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn observe_all_preserves_release_step_all_order() {
+        let dir = init_repo_without_remote();
+        let root = dir.path();
+        let results = observe_all(root, "1.2.3");
+        let steps: Vec<ReleaseStep> = results.iter().map(|(step, _)| *step).collect();
+        assert_eq!(steps, ReleaseStep::ALL.to_vec());
     }
 }
