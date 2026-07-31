@@ -270,6 +270,66 @@ and *gets* none, with no diagnostic anywhere.
 
 ---
 
+## 7. `execute-phase` prescribes `run_in_background: true` for multi-plan waves, orphaning all executor work in any non-interactive runtime
+
+**Status:** READY — not yet filed
+**Found:** 2026-07-31, DevFlow phase 29 wave 2
+**Component:** `gsd-core/workflows/execute-phase.md` (`:18`, `:31-34`, `:596-599`, `:690`)
+**Severity: critical** — silently loses completed executor work *and reports the stage successful*.
+
+### The contradiction, in one document
+
+- **`:18`** — *"**Claude Code:** Uses `Agent(subagent_type="gsd-executor", …)` — blocks until complete, returns result"*
+- **`:596-599`** — *"**Sequential dispatch for parallel execution (waves with 2+ agents):** Dispatch each `Agent()` call one at a time **with `run_in_background: true`**. Do NOT send all Agent calls in a single message: simultaneous `git worktree add` calls race on `.git/config.lock`."*
+
+`run_in_background: true` is the negation of "blocks until complete". Both statements are in the same workflow.
+
+### What happens
+
+Interactively the contradiction is survivable: the orchestrator's turn ends, the executors finish, the completion notification lands in a session that still exists, and the orchestrator resumes and merges — the behavior `:690` assumes (*"After each `Agent()` returns…"*).
+
+Under a **non-interactive one-shot launch** (`claude -p`, how DevFlow drives every stage) **ending the turn terminates the process**. The notification has nowhere to arrive. The executors keep running detached, commit real work into their worktrees, and nothing ever merges it.
+
+### Evidence — DevFlow phase 29, 2026-07-31
+
+7 plans across 6 waves. Wave 1 = 1 plan, **wave 2 = 2 plans**, waves 3–6 = 1 plan each.
+
+| Wave | Plans | Path taken | Outcome |
+|---|---|---|---|
+| 1 | 1 | below the 2+ threshold | **merged** — `934baf6 chore: merge executor worktree` |
+| 2 | 2 | **2+ → `run_in_background: true`** | **orphaned** |
+
+The orchestrator's final message was verbatim:
+
+> *"Wave 2 is running — two executors in isolated worktrees, plus a backup completion watcher. I'll pick up when they return."*
+
+…with `stop_reason: end_turn`, `subtype: success`. The process then exited. The two executors completed **5 commits** between them on `worktree-agent-*` branches. **Neither wrote its `SUMMARY.md`** — both were killed before that step, which the dispatch prompt requires to be the last action before returning. Nothing was merged.
+
+**Wave 2 was the only multi-plan wave in the phase, and the only one that failed.** That is the mechanism, not a coincidence.
+
+### Why the existing fallback cannot save it
+
+`:31-34` — *"If a spawned agent completes its work but the orchestrator never receives the completion signal, treat it as successful based on spot-checks and continue. Never block indefinitely — always verify via filesystem and git state."*
+
+This rule exists for exactly this failure, and it presumes **the orchestrator is alive to spot-check**. Under one-shot launch it is not. The rule is unreachable precisely when it is needed.
+
+### Compounding: the blocking assumption is stale
+
+Current Claude Code runs subagents **in background by default**; `run_in_background: false` is the explicit opt-out. So `:18`'s "blocks until complete" is no longer reliable even for single-agent waves. Wave 1 merging is an observation, not a guarantee — single-plan waves are observed-safe, not structurally safe.
+
+### Suggested fixes (any one sufficient)
+
+1. **Detect non-interactive execution and force `run_in_background: false`.** Cheapest correct fix.
+2. **Serialize the thing that actually races.** The stated rationale is `git worktree add` contending on `.git/config.lock` — that argues for serializing *worktree creation*, not for backgrounding *dispatch*. Create worktrees one at a time, then dispatch synchronously.
+3. **Make `:18` and `:596` agree**, and state explicitly which runtimes support the background path.
+4. **Make the SUMMARY.md-before-return requirement orchestrator-enforced** rather than an instruction to an executor that may be killed before honoring it.
+
+### Local workaround applied
+
+`"parallelization": false` in `.planning/config.json` (commit `0955f97`, on `feature/phase-29`) — serializes within a wave so the 2+ branch is never reached. Costs parallelism and does **not** address the default-background hazard in fix 4's territory.
+
+---
+
 ## Preventing recurrence — the meta-finding (2026-07-31)
 
 Two entries in this file (**1** and **6**) recurred in phase 28, three days after being written up

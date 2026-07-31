@@ -1182,6 +1182,52 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
+### Phase 999.64: One-Shot Launch Kills the Session at Turn End, Orphaning Any Delegated Work (BACKLOG)
+
+**Found:** 2026-07-31, Phase 29 wave 2. Companion to `UPSTREAM-GSD-ISSUES.md` § 7 — **that entry is the GSD half; this is DevFlow's.** GSD can be fixed upstream and this defect still stands, because it is a property of how DevFlow launches agents, not of what they do.
+
+**The defect in one sentence:** DevFlow launches every stage as `claude -p "<prompt>"`, where **the agent's turn ending terminates the process** — so any work the agent delegated that outlives its turn is orphaned, and DevFlow cannot tell that from success.
+
+**Observed:** the Code stage's orchestrator dispatched two executors, said *"I'll pick up when they return"*, and exited with `stop_reason: end_turn`, `subtype: success`. The executors completed 5 commits on `worktree-agent-*` branches, wrote no `SUMMARY.md`, and were never merged. DevFlow advanced to Validate.
+
+**Why DevFlow's own backstop missed it.** `agent_result.rs` judges a stage in three layers: (1) the `DEVFLOW_RESULT` marker, (2) exit code + commit count, (3) process existence + commits. The orchestrator emitted **no marker** — it printed prose — so Layer 1 found nothing and Layer 2 saw `exit 0` plus wave 1's commits and returned **Success**. Layers 2–3 were designed against *"agent died having done nothing"* (zero commits). They have no answer for *"agent did some work, delegated the rest, and reported success."*
+
+Note the mis-scoped commit count (counting commits ahead of `develop` rather than commits made during this attempt) is **not** the hole here: the same Code invocation genuinely committed wave 1's work, so attempt-scoping would still have passed.
+
+---
+
+#### The structural fix — keep the session alive past turn end
+
+**`--input-format stream-json` keeps the process alive until stdin closes. Measured, not assumed:**
+
+```
+t+2   system/init        session starts
+t+3   assistant          turn completes
+t+21  process exits      ← only when stdin was closed, 18s later
+```
+
+Under this mode DevFlow writes the prompt and **holds the pipe open**. The orchestrator ending its turn no longer kills anything: backgrounded executors finish, their completion notifications land in a session that still exists, and the orchestrator resumes and merges — the behavior GSD's workflow already assumes. DevFlow closes stdin when it sees `DEVFLOW_RESULT` in the output stream, making the completion protocol it already depends on the stream terminator. Requires a wall-clock timeout so an agent that never declares cannot hold the pipe open forever.
+
+**This addresses two defect classes with one change.** Both of DevFlow's hardest problems have the same root — **turn end equals process death**. That is why a `blocking-human` checkpoint was a dead end (999.57) and why delegated work orphans. Phase 28 solved the checkpoint case with `claude --resume`, reconstructing a session after killing it. Streaming input means never killing it. 999.57's part (B) fallback may become unnecessary.
+
+**Not yet proven, and this is the feasibility gate.** The lifetime property is **necessary but not shown sufficient**: it is proven that the process survives its turn; it is **not** proven that a backgrounded subagent's completion notification is delivered into that surviving session and that the orchestrator wakes to merge. One cheap experiment decides it — a scratch directory, no GSD, no worktrees, a trivial prompt that spawns a background `Agent`, ends its turn, and waits. **Run this before committing DevFlow to the approach.**
+
+#### Options considered and rejected, with reasons
+
+| Option | Verdict |
+|---|---|
+| **`--resume <session_id>` on detecting orphans** | **Keep as a complement, not the fix.** Phase 28 already built both halves (28-02 captures the id, 28-03 added `--resume`). Reactive, but it is the *only* option that can rescue sessions that have already exited. |
+| **`--bg` + `claude agents --json`** | Plausible — the JSON listing is scriptable and TTY-free. Moves session lifetime into a surface DevFlow does not control, and it is unverified whether it changes turn-end semantics at all. |
+| **DevFlow drives waves via `--wave N`** | **Does not fix it.** Wave 2 *itself* contained 2 plans, so it hits the background branch regardless of who drives the outer loop. Ruled out explicitly. |
+| **`parallelization: false`** | The stopgap actually applied (`0955f97`). Serializes within a wave so the 2+ branch is never reached. Changes nothing structural, and does not address subagents backgrounding **by default** in current Claude Code. |
+| **Harden the completion oracle** (missing `DEVFLOW_RESULT` → hard failure) | Worth doing as defence-in-depth, but it detects the symptom after the work is already lost. Not a fix. |
+
+**Priority:** High — it silently discards completed work and reports success, and it is the shared root of 999.57's class. | **Size:** M for the streaming-input launch path; S for the experiment that gates it.
+
+Plans:
+
+- [ ] TBD — run the feasibility experiment first, then promote
+
 ### Phase 999.63: The Phase-Reachability Guard Demands Define's Own Output as Define's Precondition (DELIVERED — patch, 2026-07-31)
 
 **Found live 2026-07-31**, launching the Phase 29 dogfood: `devflow start --phase 29` refused with `phase 29 is not reachable from \`develop\`` / `missing: a \`.planning/phases/29-*/\` directory`, on a phase whose ROADMAP heading was present and correctly merged.
