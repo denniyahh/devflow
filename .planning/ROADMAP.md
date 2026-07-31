@@ -2234,7 +2234,7 @@ Plans:
 
 **Wave 5**
 
-- [ ] 29-06-PLAN.md — wave 5 · 29b: the release PR into `main` and the sync-back port (ancestor short circuit, `-X ours`, tree-identity refusal) landed by a real merge commit → **29b ships**
+- [x] 29-06-PLAN.md — wave 5 · 29b: the release PR into `main` and the sync-back port (ancestor short circuit, `-X ours`, tree-identity refusal) landed by a real merge commit → **29b ships**
 
 **Wave 6**
 
