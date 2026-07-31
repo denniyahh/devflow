@@ -1614,36 +1614,42 @@ mod tests {
         assert!(!prompt.contains("--gaps-only"));
     }
 
-    /// 23-09 Task 2 (D-05, cross-AI review finding: this project's config
-    /// loader ignores unknown keys and would accept the key silently, so a
-    /// parse-only test would pass vacuously). Framed as absence of
-    /// *behaviour*, not absence of a parse error: a `devflow.toml`
-    /// containing a key literally named `yes_ship` must load without
-    /// erroring (proving the file was accepted, not rejected), AND a fresh
-    /// `State` — built the same way `commands::start` builds one when
-    /// `--yes-ship` is NOT passed — must still have `yes_ship == false`.
-    /// `DevflowConfig` (`devflow-core/src/config.rs`) has no field of that
-    /// name, so nothing in `load_config`'s output could ever reach `State`
-    /// even if a caller tried to wire it — the two systems are disconnected
-    /// by construction, and this test asserts that outcome rather than
-    /// assuming it.
+    /// 23-09 Task 2 origin (D-05), corrected for D-12 (`28-CONTEXT.md`).
+    /// D-12 reversed D-05: `devflow.toml`'s `yes_ship` key now DOES reach
+    /// `state.yes_ship`, via `commands::start`'s new OR-combine
+    /// (`config::yes_ship(project_root) || --yes-ship`,
+    /// `crates/devflow-cli/src/commands.rs`). But this test constructs
+    /// `State::new` directly, never going through `commands::start` — and
+    /// `State::new` takes no project config and reads none, so its own
+    /// assertion (a bare `State::new` never derives `yes_ship` from config)
+    /// remains true both before and after D-12. What *is* now false is the
+    /// old doc comment's broader premise ("`DevflowConfig` has no field of
+    /// that name, so nothing ... could ever reach `State`") — `config.rs`
+    /// gained exactly that field in this same plan (Task 1). The only path
+    /// from `devflow.toml` to `state.yes_ship` is the explicit combine in
+    /// `commands::start`, covered by `crates/devflow-cli/tests/
+    /// yes_ship_config.rs`, not by this unit-level test.
     #[test]
-    fn config_file_with_yes_ship_key_loads_but_never_sets_the_flag() {
+    fn state_new_alone_never_derives_yes_ship_from_config() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::write(root.join("devflow.toml"), "yes_ship = true\n").unwrap();
 
-        // The config loader must accept the file — an unknown key must not
-        // be a load failure (fail-soft is the existing contract; this just
-        // proves this specific key doesn't somehow special-case that).
+        // The config loader must accept the file — an unknown-to-State-new
+        // key must not be a load failure (fail-soft is the existing
+        // contract; this just proves this specific key doesn't somehow
+        // special-case that).
         let _config = devflow_core::config::load_config(root);
 
-        // The same construction `commands::start` performs when `--yes-ship`
-        // is omitted: no code path derives `yes_ship` from `devflow.toml`.
+        // State::new takes no project_root-derived config input at all, so
+        // no devflow.toml key — including yes_ship, now a real config field
+        // — can reach it through this constructor.
         let state = State::new(1, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         assert!(
             !state.yes_ship,
-            "no devflow.toml key may ever set the Ship pre-authorization (D-05)"
+            "State::new alone must never derive the Ship pre-authorization from \
+             devflow.toml (D-05, narrowed post-D-12: only commands::start's explicit \
+             OR-combine may do that — see yes_ship_config.rs)"
         );
     }
 
