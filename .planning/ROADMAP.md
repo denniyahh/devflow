@@ -2230,7 +2230,7 @@ Plans:
 
 **Wave 4**
 
-- [ ] 29-05-PLAN.md — wave 4 · 29b: the two-place version bump and changelog prepared in a scratch worktree, landed by a pull request whose method was resolved for the version-bump intent
+- [x] 29-05-PLAN.md — wave 4 · 29b: the two-place version bump and changelog prepared in a scratch worktree, landed by a pull request whose method was resolved for the version-bump intent
 
 **Wave 5**
 
