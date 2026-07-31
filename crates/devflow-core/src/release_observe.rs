@@ -242,6 +242,95 @@ fn tag_signature_via_gh(project_root: &Path, tag_object_sha: &str) -> TagSignatu
     }
 }
 
+/// Classify a `curl -w '%{http_code}'` result into an [`Observation`]. Pure
+/// — no I/O. Exactly `"200"` is Present, exactly `"404"` is Absent, and
+/// every other value — including empty, non-numeric, `"000"` (curl's code
+/// for "could not connect"), and any other 3xx/4xx/5xx — is Unreachable
+/// with a reason naming the code that was seen.
+pub fn classify_http_status(code: &str) -> Observation {
+    // STUB (RED phase): deliberately wrong — always reports Unreachable
+    // with a fixed reason, regardless of input. Fixed in the GREEN commit.
+    let _ = code;
+    Observation::Unreachable {
+        reason: "stub".into(),
+    }
+}
+
+/// Fold each workspace member's own crates.io [`Observation`] into one
+/// answer for "are all published crates live at this version." Pure — no
+/// I/O. `Unreachable` dominates everything (an unreachable registry can
+/// never be summarized as "not published"); otherwise `Absent` dominates
+/// `Present`; all-`Present` is `Present`; an empty slice is `Unreachable`
+/// (an empty `publish_order` means the workspace manifest could not be
+/// read, which is a failure to observe, not an answer).
+pub fn combine_crate_observations(per_crate: &[(String, Observation)]) -> Observation {
+    // STUB (RED phase): deliberately wrong — always reports Present,
+    // regardless of input. Fixed in the GREEN commit.
+    let _ = per_crate;
+    Observation::Present {
+        detail: "stub".into(),
+    }
+}
+
+/// `curl -s -o /dev/null -w '%{http_code}' <crates.io API URL>`, pinned to
+/// `project_root`. Builds the URL with `format!` and passes it as a single
+/// `Command::args` element — never through a shell, never with any
+/// interpolation into a shell string (T-29-01). Uses the `/api/v1` JSON
+/// endpoint, never the CDN-cached sparse index (`index.crates.io`), which
+/// lags a real publish by seconds and would reintroduce the exact
+/// absent-versus-unreachable ambiguity this phase exists to eliminate. A
+/// spawn error or a non-zero `curl` exit returns `Err` with the failure
+/// text; the caller converts that to `Unreachable`.
+fn crate_version_http_status(
+    project_root: &Path,
+    name: &str,
+    version: &str,
+) -> Result<String, String> {
+    let url = format!("https://crates.io/api/v1/crates/{name}/{version}");
+    let output = Command::new("curl")
+        .current_dir(project_root)
+        .args([
+            "-s",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            "--max-time",
+            "20",
+            "-A",
+            "devflow-release-executor (https://github.com/denniyahh/devflow)",
+            &url,
+        ])
+        .output();
+    match output {
+        Ok(out) if out.status.success() => {
+            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        }
+        Ok(out) => Err(format!("curl exited with status {}", out.status)),
+        Err(err) => Err(format!("failed to spawn curl: {err}")),
+    }
+}
+
+/// I/O wrapper: are all of this workspace's publishable crates live on
+/// crates.io at `version`? Calls [`crate::git::publish_order`] for the
+/// member list — never hardcodes the crate names — queries each member in
+/// that order, classifies each with [`classify_http_status`], and folds
+/// with [`combine_crate_observations`].
+pub fn crates_published(project_root: &Path, version: &str) -> Observation {
+    let members = crate::git::publish_order(project_root);
+    let per_crate: Vec<(String, Observation)> = members
+        .into_iter()
+        .map(|name| {
+            let observation = match crate_version_http_status(project_root, &name, version) {
+                Ok(code) => classify_http_status(&code),
+                Err(reason) => Observation::Unreachable { reason },
+            };
+            (name, observation)
+        })
+        .collect();
+    combine_crate_observations(&per_crate)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,5 +461,127 @@ mod tests {
             detail: "network unreachable".into(),
         };
         assert_ne!(unreachable, absent);
+    }
+
+    // -- Task 2: crates.io publish oracle -----------------------------
+
+    #[test]
+    fn classify_http_status_200_is_present() {
+        assert!(matches!(
+            classify_http_status("200"),
+            Observation::Present { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_http_status_404_is_absent() {
+        assert!(matches!(
+            classify_http_status("404"),
+            Observation::Absent { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_http_status_000_is_unreachable() {
+        // curl's own code for "could not connect".
+        assert!(matches!(
+            classify_http_status("000"),
+            Observation::Unreachable { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_http_status_other_values_are_unreachable_naming_the_code() {
+        for code in ["500", "403", "", "not-a-number"] {
+            match classify_http_status(code) {
+                Observation::Unreachable { reason } => {
+                    assert!(
+                        reason.contains(code) || (code.is_empty() && reason.contains("empty")),
+                        "expected the reason to name the status code {code:?}, got: {reason}"
+                    );
+                }
+                other => panic!("expected Unreachable for {code:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn combine_crate_observations_two_present_is_present() {
+        let per_crate = vec![
+            (
+                "a".to_string(),
+                Observation::Present {
+                    detail: "live".into(),
+                },
+            ),
+            (
+                "b".to_string(),
+                Observation::Present {
+                    detail: "live".into(),
+                },
+            ),
+        ];
+        assert!(matches!(
+            combine_crate_observations(&per_crate),
+            Observation::Present { .. }
+        ));
+    }
+
+    #[test]
+    fn combine_crate_observations_present_and_absent_is_absent() {
+        let per_crate = vec![
+            (
+                "a".to_string(),
+                Observation::Present {
+                    detail: "live".into(),
+                },
+            ),
+            (
+                "b".to_string(),
+                Observation::Absent {
+                    detail: "not yet".into(),
+                },
+            ),
+        ];
+        assert!(matches!(
+            combine_crate_observations(&per_crate),
+            Observation::Absent { .. }
+        ));
+    }
+
+    #[test]
+    fn combine_crate_observations_any_unreachable_dominates() {
+        let per_crate = vec![
+            (
+                "a".to_string(),
+                Observation::Present {
+                    detail: "live".into(),
+                },
+            ),
+            (
+                "b".to_string(),
+                Observation::Absent {
+                    detail: "not yet".into(),
+                },
+            ),
+            (
+                "c".to_string(),
+                Observation::Unreachable {
+                    reason: "timed out".into(),
+                },
+            ),
+        ];
+        assert!(matches!(
+            combine_crate_observations(&per_crate),
+            Observation::Unreachable { .. }
+        ));
+    }
+
+    #[test]
+    fn combine_crate_observations_empty_slice_is_unreachable() {
+        assert!(matches!(
+            combine_crate_observations(&[]),
+            Observation::Unreachable { .. }
+        ));
     }
 }
