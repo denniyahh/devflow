@@ -4,16 +4,16 @@ milestone: v2.0.0
 milestone_name: milestone (open — no fixed closing phase)
 current_phase: 28
 current_phase_name: close-the-checkpoint-answer-return-path
-status: executing
-stopped_at: Phase 28 planned — 6 plans in 3 waves
-last_updated: "2026-07-31T01:58:23.020Z"
+status: needs human verification
+stopped_at: Phase 28 executed 6/6 — verification human_needed (A1 unconfirmed)
+last_updated: "2026-07-31T02:40:00.000Z"
 last_activity: 2026-07-30
-last_activity_desc: Phase 28 execution started
+last_activity_desc: Phase 28 executed 6/6 plans, 776 tests green; verification returned human_needed — the end-to-end checkpoint-recognition path is implemented and unit-tested but never observed against a live checkpoint (see 28-VERIFICATION.md, WINDOWS.md #6)
 progress:
   total_phases: 17
   completed_phases: 15
   total_plans: 124
-  completed_plans: 118
+  completed_plans: 124
   percent: 88
 ---
 
