@@ -421,19 +421,26 @@ pub fn publish_order(project_root: &Path) -> Vec<String> {
 
 **If this table is empty:** N/A — see above; none of these are HIGH risk, and none contradict a locked decision.
 
-## Open Questions
+## Open Questions (all RESOLVED during planning — see the resolving plan named on each)
 
-1. **Where exactly does the authorization-only persisted record live, and what does it contain?**
+> Resolution status added by `/gsd-plan-phase 29` after the plans were written. Each question below
+> was answered in a PLAN.md `design_notes` "OPEN QUESTION N, RESOLVED" subsection; the recommendation
+> text is preserved verbatim as the research-time input to that decision.
+
+1. **RESOLVED in `29-03-PLAN.md`** — Where exactly does the authorization-only persisted record live, and what does it contain?
+   - **Resolution:** *DevFlow reads the authorization record; DevFlow never writes it.* A single boolean `yes_release`, readable from exactly the three places the shipped `yes_ship` precedent established (`--yes-release`, a hand-written `devflow.toml` key, `DEVFLOW_YES_RELEASE`), defaulting to false, not consumed by being read, and deliberately **not** a `State` field (`State` is a file DevFlow writes). The write-asymmetry is what makes it structurally incapable of becoming a progress ledger. **Scope: one mandate covers the whole sequence including 29c** — RD-4's "proceeds as far as the repo's rules and the environment permit" settles the D-03 question the note below raised; a narrower per-unit flag would be a self-imposed gate no repo rule imposes.
    - What we know: ROADMAP.md explicitly names this as the one thing that may be persisted ("a minimal persisted record may survive — for authorization only, never for progress") and explicitly defers pinning its shape to "a discuss-phase task."
    - What's unclear: No `29-CONTEXT.md` exists, so this discuss-phase task never ran. The exact shape (a flag on `State`? a separate file? reuse of the existing `--yes-ship`-style gate-ledger attribution pattern?) is undecided.
    - Recommendation: The planner should treat this as the first design decision to make, likely via a `checkpoint:decision` task early in the phase, rather than inferring a shape from the `--yes-ship` precedent without confirming scope (e.g., does one `--yes-release` cover bump-through-publish, matching Phase 26's D-03, or does the reversible/irreversible unit split (29a/29b/29c) imply a narrower per-unit authorization instead? Nothing in the current ROADMAP.md text re-confirms D-03's "one flag, whole sequence" framing under the new unit-split design — it predates the redesign).
 
-2. **Should 29a's HTTP and `gh`/`cargo` invocations go through the same hermetic-environment-scrubbing discipline as `git_command`/`hermetic_command`?**
+2. **RESOLVED in `29-01-PLAN.md`** (recommendation adopted as written) — Should 29a's HTTP and `gh`/`cargo` invocations go through the same hermetic-environment-scrubbing discipline as `git_command`/`hermetic_command`?
+   - **Resolution:** `cargo publish` goes through `hermetic_command`; `gh`/`curl` need no scrubbing but pin `current_dir` to the resolved project root — that pin is load-bearing, not cosmetic, because it is what makes `gh`'s `{owner}/{repo}` resolve to the project rather than the ambient shell (threat T-29-10).
    - What we know: Phase 27 built `hermetic_command` specifically because "the redirecting variables are inherited all the way down a process tree" and named `cargo`'s own git-invoking build scripts as "the motivating case." `curl` and `gh` are new production call sites this phase introduces.
    - What's unclear: Whether `GIT_DIR`/`GIT_WORK_TREE` etc. can meaningfully redirect a `curl` HTTP call (almost certainly not — they're git-specific) or a `gh` API call (also almost certainly not, `gh` doesn't consult git-repo-local env vars for API calls, only for repo-context resolution like `gh pr create` inferring the current repo). `cargo publish`, however, explicitly IS the "motivating case" already named in `git.rs`'s doc comment — cargo's build scripts and its own git-based operations (e.g. for git-dependency resolution) could be redirected by an inherited `GIT_DIR`.
    - Recommendation: Use `hermetic_command("cargo", dir)` for every `cargo publish` invocation in 29c (already directly supported by the existing function signature). For `curl`/`gh`, no scrubbing is architecturally necessary, but running them via `Command::new` with an explicit `current_dir` pinned to the resolved project root (the same discipline used everywhere else in this codebase) costs nothing and keeps the pattern consistent.
 
-3. **"Review as primary gate, one automated fix round maximum" — explicitly NOT an operator decision.**
+3. **RESOLVED in `29-03-PLAN.md` / `29-07-PLAN.md` — carried as a flagged assumption, deliberately NOT encoded.** "Review as primary gate, one automated fix round maximum" — explicitly NOT an operator decision.
+   - **Resolution:** Not written into any plan as a binding constraint. It is recorded as a flagged assumption in `29-03` and `29-07`, and `29-07`'s `checkpoint:decision` puts the question to the operator explicitly. This is the recommendation below, followed exactly.
    - What we know: ROADMAP.md is explicit that this is "a proposal awaiting confirmation, not a ruling" and instructs future work not to treat it as locked.
    - What's unclear: Whether this phase's own planning/execution should adopt it as a working practice anyway (given it's evidence-backed: two review rounds on Phase 26 found 12 Criticals across two passes, zero of which any of 763 passing tests caught).
    - Recommendation: Note it prominently for the planner and for `/gsd-discuss-phase` (if run before planning) as a question to put to the operator explicitly, rather than silently building it into the plan's verification-loop structure. Do not encode "one fix round maximum" as a hard rule in PLAN.md's verification section without an explicit operator confirmation — per the roadmap's own warning about an earlier draft that promoted an assistant recommendation into a locked decision and was caught and reversed.
