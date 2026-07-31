@@ -2131,22 +2131,42 @@ for *progress*. Pinning that boundary is a discuss-phase task.
 
 ---
 
-#### Decided going in
+#### Operator decisions (stated by the operator; treat as locked)
 
-- **Always operator-present. Never unattended, no exceptions.** The tag step requires the
-  maintainer's signing key, so the executor cannot complete a release unattended even in
-  principle. Consistent with D-02 and with Phase 28's finding that DevFlow has no channel to
-  deliver a human's answer to a running job.
-- **Review is the gate; tests are necessary and far from sufficient.** Phase 26 had 763
-  passing tests and scored 11/11 on its own verification, and still carried twelve Criticals
-  across two rounds — **every one found by a human reading code, zero by a test.** Fix rounds
-  went 7 → 5. **One fix round maximum**, then reassess the design rather than the bug list.
+- **`feature/phase-26` is reference material only.** Not rebased, not carried forward.
+- **The design rule above**, verbatim: discover the rules, advance as far as they permit,
+  stop at the first hard gate and report accurately.
+- **NO OPERATOR-PRESENCE REQUIREMENT.** The executor **must not** carry a rule requiring a
+  human at the keyboard, and **must not** refuse to run unattended. Explicitly ruled by the
+  operator 2026-07-31, correcting an earlier draft of this entry that recorded the opposite.
+  The reasoning that produced that draft — *"the tag step needs the maintainer's signing key,
+  so it cannot complete unattended"* — is **a prediction about the environment, which D-10
+  bans**. If the key resolves, `git tag -s` succeeds; if it does not, git fails and the
+  executor stops and reports git's own error. Attempt, do not predict. A human-presence
+  precondition is also a self-imposed gate that no repo rule imposes, which the design rule
+  forbids by construction.
+- **Authorization is a mandate, not a presence check.** The operator grants intent once (a
+  flag, e.g. the `--yes-ship` precedent); thereafter the executor proceeds as far as the
+  repo's rules and the environment permit. Do not convert authorization into a requirement
+  for a live human during execution.
 - **D-10 carried unchanged.** No signing-viability predictor, ever. The tag step runs the
   real `git -c user.signingkey="$(git config --get devflow.releaseSigningKey)" tag -s` and
   reports git's own exit code.
 - **D-05 carried and strengthened.** Fail-fast, no automatic rollback — trivially safe once
   every step is independently re-runnable.
 - **D-06 superseded** by derived state (it specified ledger-based resume/idempotency).
+
+#### Recommendations carried into discuss-phase (NOT operator decisions — confirm or reject)
+
+*Provenance matters here: an earlier draft of this entry promoted an assistant recommendation
+into a locked decision, which the operator caught and reversed. Everything in this subsection
+is a proposal awaiting confirmation, not a ruling.*
+
+- **Review as the primary gate, tests as necessary-but-insufficient.** Evidence: Phase 26 had
+  763 passing tests and scored 11/11 on its own verification while carrying twelve Criticals
+  across two rounds — every one found by a human reading code, zero by a test; fix rounds went
+  7 → 5. Proposed consequence: one automated fix round maximum, then reassess the design
+  rather than the bug list. **Operator has not ruled on this.**
 
 **Motivating evidence, measured this session.** The v2.2.0 cut was performed by hand on
 2026-07-31: crates published core-then-cli, and the signed tag **never created**. Nothing
