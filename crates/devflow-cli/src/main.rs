@@ -25,8 +25,8 @@ use parallel::parallel;
 mod commands;
 use commands::{
     cleanup, doctor, evidence, gate_list, gate_respond, gate_show, gate_sweep, history_cmd, list,
-    logs, recover_cmd, reference, release_check, release_status, resolve_gate_target, start,
-    status, stop, test_cmd,
+    logs, recover_cmd, reference, release_check, release_cut, release_status, resolve_gate_target,
+    start, status, stop, test_cmd,
 };
 
 mod config_parse;
@@ -414,9 +414,8 @@ enum GateCmd {
     },
 }
 
-/// `devflow release <action>` — the observation-only subcommand family
-/// (29a). Only `Status` exists so far; the recoverable-action and
-/// commit-point verbs (29b/29c) are deferred to later plans in this phase.
+/// `devflow release <action>` — the observation-only (`status`, 29a) and
+/// release-cut-walker (`cut`, 29b/29c scaffolding) subcommand family.
 #[derive(Debug, Subcommand)]
 enum ReleaseAction {
     /// Observe the release-cut questions for `version` against
@@ -430,6 +429,30 @@ enum ReleaseAction {
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
+    },
+    /// Walk the six release-cut steps in order, observing each before
+    /// acting on it, and stop at the first step that is not already done —
+    /// reporting exactly where it stopped and why. Requires an explicit
+    /// mandate; never prompts, never reads stdin, never waits for a human.
+    /// This build carries no step actions yet (`29-05`/`29-06`/`29-07`
+    /// supply them); every step this walk reaches that is not already done
+    /// stops the run naming the unit that will close the gap.
+    Cut {
+        /// The release version to cut (e.g. `2.2.0`, no leading `v`). Never
+        /// re-derived from `compute_version` — a second version source
+        /// would be a second implementation that can drift, and here it
+        /// would drive irreversible steps.
+        version: String,
+        /// Project root.
+        #[arg(default_value = ".")]
+        project: PathBuf,
+        /// Grants the release-cut mandate for this run. ORs with a
+        /// standing `yes_release = true` in `devflow.toml` or
+        /// `DEVFLOW_YES_RELEASE` — this flag has no negative form, so
+        /// passing it always wins (mirrors `commands::start`'s
+        /// `--yes-ship` precedent).
+        #[arg(long)]
+        yes_release: bool,
     },
 }
 
@@ -603,6 +626,11 @@ fn run() -> Result<(), CliError> {
             Some(ReleaseAction::Status { version, project }) => {
                 release_status(&project_root(project)?, &version)
             }
+            Some(ReleaseAction::Cut {
+                version,
+                project,
+                yes_release,
+            }) => release_cut(&project_root(project)?, &version, yes_release),
             None => {
                 // D-03 / Codex MEDIUM: an omitted --check is never silently
                 // treated as a valid check run. This phase ships only the
