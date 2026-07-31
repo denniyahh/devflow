@@ -13,7 +13,24 @@ use crate::mode::Mode;
 use crate::stage::Stage;
 
 /// Full workflow state persisted to `.devflow/state.json`.
+///
+/// # Construction
+///
+/// Marked `#[non_exhaustive]`: downstream crates must build this through
+/// [`State::new`] and then assign the fields they care about, rather than by
+/// struct literal. Deserialization is unaffected — the `Deserialize` derive
+/// and every `#[serde(default)]` field keep working exactly as before, so
+/// state files written by older binaries still load.
+///
+/// This exists because `State` accumulates a field roughly every phase that
+/// adds a run-scoped concept (`worktree_path`, `monitor_pid`, `stop_until`,
+/// `yes_ship`, and — in phase 28 — `session_id` and `checkpoint_resumes`).
+/// Without `non_exhaustive`, each of those additions is a semver-breaking
+/// change for any consumer that used a struct literal, which would force a
+/// major bump for what is really an internal bookkeeping change. Paying that
+/// cost once here makes every future field additive.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct State {
     /// Current workflow stage.
     pub stage: Stage,

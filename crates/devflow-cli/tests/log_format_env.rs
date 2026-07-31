@@ -38,26 +38,13 @@ fn project_with_legacy_state() -> tempfile::TempDir {
     let devflow_dir = dir.path().join(".devflow");
     std::fs::create_dir_all(&devflow_dir).expect("create .devflow dir");
 
-    let state = State {
-        stage: Stage::Code,
-        phase: 1,
-        agent: AgentKind::Claude,
-        mode: Mode::Auto,
-        gate_pending: false,
-        consecutive_failures: 0,
-        infra_failures: 0,
-        preflight_retries: 0,
-        started_at: "0".to_string(),
-        project_root: dir.path().to_path_buf(),
-        worktree_path: None,
-        monitor_pid: None,
-        session_id: None,
-        checkpoint_resumes: 0,
-        stop_until: None,
-        stopped: false,
-        stop_reason: None,
-        yes_ship: false,
-    };
+    // `State` is `#[non_exhaustive]`, so a downstream crate (this one) builds it
+    // via `State::new` and overrides only what this fixture actually depends on.
+    // `new` already supplies every other field with the same value the previous
+    // struct literal spelled out by hand.
+    let mut state = State::new(1, AgentKind::Claude, Mode::Auto, dir.path().to_path_buf());
+    state.stage = Stage::Code; // `new` starts at Define; this fixture needs Code
+    state.started_at = "0".to_string(); // fixed, not `timestamp_now()`, so the fixture is deterministic
     let json = serde_json::to_string_pretty(&state).expect("serialize legacy state");
     std::fs::write(devflow_dir.join("state.json"), json).expect("write legacy state.json");
 
