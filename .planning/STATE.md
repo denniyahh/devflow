@@ -2,19 +2,19 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone (open — no fixed closing phase)
-current_phase: 28
-current_phase_name: close-the-checkpoint-answer-return-path
+current_phase: 29
+current_phase_name: release-cut-executor-observe-then-act-within-the-repo-s-rule
 status: executing
 stopped_at: "Phase 28 shipped — PR #63 (feature/phase-28 → develop), awaiting CI + merge"
-last_updated: "2026-07-31T15:46:07.441Z"
-last_activity: 2026-07-30
-last_activity_desc: Phase 28 execution started
+last_updated: "2026-07-31T15:50:37.737Z"
+last_activity: 2026-07-31
+last_activity_desc: Phase 29 execution started
 progress:
   total_phases: 18
-  completed_phases: 15
+  completed_phases: 16
   total_plans: 131
   completed_plans: 124
-  percent: 88
+  percent: 89
 ---
 
 # DevFlow — Project State
@@ -86,9 +86,9 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 28 (close-the-checkpoint-answer-return-path) — EXECUTING
-Plan: 1 of 6
-Status: Ready to execute
+Phase: 29 (release-cut-executor-observe-then-act-within-the-repo-s-rule) — EXECUTING
+Plan: 1 of 7
+Status: Executing Phase 29
 real action is `/gsd-review-backlog` to promote a 999.x entry, or `/gsd-ship 27`
 to merge this phase. `phase.complete` auto-advanced this field to "999.1 — Hermes
 Support (BACKLOG)" because its next-phase scan walks into the backlog section;
@@ -157,7 +157,7 @@ Scope boundary: 23-16 is the **fix only** (change + regression tests + PR into `
 
 **Recovery-ref disposition:** both `origin` refs (`recovery/pre-23-11-acceptance-e0f87c2`, `recovery/pre-23-15-acceptance-0dad20d`) remain untouched on `origin`; the local copy of the pre-23-11 ref, deleted again by `devflow cleanup`, is deliberately NOT restored (per `23-FINDINGS.md` §B2a); the pre-23-15 ref is now unused (no merge to undo) but retained on `origin` for reuse by the 23-16 retry rather than deleted.
 
-Last activity: 2026-07-30 — Phase 28 execution started
+Last activity: 2026-07-31 — Phase 29 execution started
 
 **Note on the "Plan: 2 of 15" value this replaces:** `gsd-tools state advance-plan` only increments whatever value is already in this field, which had drifted to "2 of 15" (the parallel-worktree waves 23-01…23-09 deliberately never touch STATE.md, and this field was last corrected against reality at "10 of 11 plans complete" before the plan count grew to 15 with the gap-closure plans 23-12…23-15). Corrected directly to "13 of 15" to match reality (23-12 and 23-13 both now executed) rather than trust the tool's naive +1 increment from a stale base.
 

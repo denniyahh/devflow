@@ -2118,9 +2118,11 @@ delivered.
   straightforwardly testable, because pure observation is what tests are good at.
   **Ships first because it is architecture, not sequencing:** 29b and 29c act only on what
   29a reports missing.
+
 - **29b — the recoverable actions.** Version bump (two places), changelog, release PR to
   `main`, sync PR back to `develop`. Every one is a commit or a PR: if it goes wrong, fix
   and re-run. Unlocked by the zero-approvals finding above.
+
 - **29c — the commit point.** Signed tag and the two publishes, in order. Two steps,
   permanent consequences, and where every one of Phase 26's worst defects lived. Small
   enough to review line by line — which is the gate that actually works on this code.
@@ -2158,6 +2160,7 @@ for *progress*. Pinning that boundary is a discuss-phase task.
 - **`feature/phase-26` is reference material only.** Not rebased, not carried forward.
 - **The design rule above**, verbatim: discover the rules, advance as far as they permit,
   stop at the first hard gate and report accurately.
+
 - **NO OPERATOR-PRESENCE REQUIREMENT.** The executor **must not** carry a rule requiring a
   human at the keyboard, and **must not** refuse to run unattended. Explicitly ruled by the
   operator 2026-07-31, correcting an earlier draft of this entry that recorded the opposite.
@@ -2167,15 +2170,19 @@ for *progress*. Pinning that boundary is a discuss-phase task.
   executor stops and reports git's own error. Attempt, do not predict. A human-presence
   precondition is also a self-imposed gate that no repo rule imposes, which the design rule
   forbids by construction.
+
 - **Authorization is a mandate, not a presence check.** The operator grants intent once (a
   flag, e.g. the `--yes-ship` precedent); thereafter the executor proceeds as far as the
   repo's rules and the environment permit. Do not convert authorization into a requirement
   for a live human during execution.
+
 - **D-10 carried unchanged.** No signing-viability predictor, ever. The tag step runs the
   real `git -c user.signingkey="$(git config --get devflow.releaseSigningKey)" tag -s` and
   reports git's own exit code.
+
 - **D-05 carried and strengthened.** Fail-fast, no automatic rollback — trivially safe once
   every step is independently re-runnable.
+
 - **D-06 superseded** by derived state (it specified ledger-based resume/idempotency).
 
 #### Recommendations carried into discuss-phase (NOT operator decisions — confirm or reject)
@@ -2210,7 +2217,7 @@ Plans:
 
 **Wave 1** *(tracer — verified before any expansion)*
 
-- [ ] 29-01-PLAN.md — wave 1 · **tracer** (29a): `devflow release status <version>` end to end, answering the signed-tag-on-remote question, then the crates.io publish oracle
+- [x] 29-01-PLAN.md — wave 1 · **tracer** (29a): `devflow release status <version>` end to end, answering the signed-tag-on-remote question, then the crates.io publish oracle
 
 **Wave 2** *(parallel pair; no file overlap)*
 
