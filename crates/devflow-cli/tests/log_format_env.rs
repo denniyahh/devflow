@@ -51,6 +51,8 @@ fn project_with_legacy_state() -> tempfile::TempDir {
         project_root: dir.path().to_path_buf(),
         worktree_path: None,
         monitor_pid: None,
+        session_id: None,
+        checkpoint_resumes: 0,
         stop_until: None,
         stopped: false,
         stop_reason: None,

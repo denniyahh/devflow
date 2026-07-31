@@ -70,6 +70,30 @@ pub struct State {
     /// liveness probe reports Unknown, never Stuck.
     #[serde(default)]
     pub monitor_pid: Option<u32>,
+    /// The Claude session id captured from the most recent captured stdout
+    /// envelope for this phase's current stage (D-04, 28-02), read via
+    /// [`crate::agent_result::session_id_from_capture`]. `None` means EITHER
+    /// "no session has been captured for this state yet" OR "the state was
+    /// written by a binary predating this field" — both cases behave
+    /// identically (no relaunch target to address). Recorded so a checkpoint
+    /// auto-decide relaunch (plan 28-03) can `--resume` the exact session
+    /// that hit the checkpoint rather than spawning a fresh one, which would
+    /// lose the original session's conversation context and permission mode.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// How many times the current stage's agent has been relaunched via a
+    /// checkpoint auto-decide resume (D-04, 28-03). Bounds a stuck
+    /// checkpoint loop against `mode::MAX_CHECKPOINT_RESUMES` (added in plan
+    /// 28-03) the same way [`Self::infra_failures`] bounds an infra-fault
+    /// loop against `mode::MAX_INFRA_FAILURES`. Reset to 0 by every ordinary fresh stage
+    /// launch, so the ceiling bounds one stage's resume budget, not a
+    /// phase's lifetime (the same distinction `MAX_INFRA_FAILURES`' doc
+    /// comment draws for `infra_failures`). Any increment must use
+    /// `saturating_add` so a stuck loop cannot overflow `u32`. A
+    /// serde-absent value (state written by a binary predating this field)
+    /// defaults to 0.
+    #[serde(default)]
+    pub checkpoint_resumes: u32,
     /// The stage `devflow start --until <stage>` requests as the last stage
     /// to run before halting (20c). `None` means no stop point was
     /// requested (the pipeline runs to Ship), OR the state was written by a
@@ -158,6 +182,8 @@ impl State {
             project_root,
             worktree_path: None,
             monitor_pid: None,
+            session_id: None,
+            checkpoint_resumes: 0,
             stop_until: None,
             stopped: false,
             stop_reason: None,
