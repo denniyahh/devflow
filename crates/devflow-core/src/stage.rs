@@ -49,6 +49,14 @@ impl Stage {
     }
 
     /// The GSD slash command for this stage, with `{N}` as the phase placeholder.
+    ///
+    /// D-14 note: as of the fix for the headless Define hang, DevFlow's own
+    /// launch path no longer builds a `Stage::Define` prompt from this
+    /// mapping — `prompt::define_stage_prompt` is what the Define stage
+    /// actually runs, and never names or invokes this entry's command. This
+    /// mapping's `Stage::Define` arm remains the canonical value for
+    /// human-facing preview/documentation output (e.g. a dry-run pipeline
+    /// listing) only.
     pub fn gsd_command(self) -> &'static str {
         match self {
             Stage::Define => "/gsd-discuss-phase {N}",

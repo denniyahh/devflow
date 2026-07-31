@@ -128,23 +128,26 @@ fn validate_stage_prompt(phase: u32) -> String {
     )
 }
 
-/// The Define and Plan stages' idempotency contract.
+/// The Plan stage's idempotency contract.
 ///
 /// Headless-safety rationale (13-06 dogfood finding, Codex leg): GSD's
-/// discuss-phase demands an interactive "Overwrite/Append/Cancel" decision
-/// when the phase's CONTEXT.md already exists, and headless Codex cannot
+/// plan-phase demands an interactive "Overwrite/Append/Cancel" decision
+/// when the phase's PLAN.md already exists, and headless Codex cannot
 /// answer it (`request_user_input is unavailable`) — the stage would fail on
 /// every retry, forever. When the stage's deliverable already exists, the
 /// stage's work is done: re-running it must be a no-op success, not an
 /// interactive dead end. This is idempotency for a completed stage, NOT the
 /// v1 skip-stage config flags removed by the 2026-06-19 architecture
 /// decision — a stage with no pre-existing artifact still runs in full.
-fn idempotent_stage_prompt(stage: Stage, phase: u32) -> String {
-    let artifact = match stage {
-        Stage::Define => "CONTEXT.md",
-        _ => "PLAN.md",
-    };
-    let command = gsd_command_for(stage, phase);
+///
+/// D-14 update: Define used to share this branch (dispatched by a `stage`
+/// parameter), but its missing-artifact arm ran an interactive interview
+/// command that cannot be answered headlessly. That branch was deleted
+/// rather than made conditional — see [`define_stage_prompt`] for Define's
+/// actual (always-no-op) contract. This function now serves only Plan.
+fn idempotent_stage_prompt(phase: u32) -> String {
+    let artifact = "PLAN.md";
+    let command = gsd_command_for(Stage::Plan, phase);
     let padded = format!("{phase:02}");
     format!(
         "First check whether this stage's deliverable already exists:\n\
@@ -160,6 +163,31 @@ fn idempotent_stage_prompt(stage: Stage, phase: u32) -> String {
         - If it does NOT exist: run the GSD workflow command for this stage:\n\
         \n\
         \x20   {command}\n\
+        \n\
+        {COMPLETION_PROTOCOL}"
+    )
+}
+
+/// The Define stage's dedicated prompt (D-14).
+///
+/// Headless-safety rationale: `idempotent_stage_prompt`'s missing-artifact
+/// arm used to run an interactive interview command for Define — one that
+/// hangs or errors under `claude -p` with no operator present to answer it
+/// (T-28-08). D-14 settles the fix as deletion, not disambiguation: the
+/// Define stage never runs that command in a DevFlow launch, whether or not
+/// CONTEXT.md already exists. The operator decides whether to run the
+/// interview before invoking `devflow start`; DevFlow makes no runtime
+/// accommodation for that choice.
+fn define_stage_prompt(phase: u32) -> String {
+    format!(
+        "This is the Define stage of a headless DevFlow run for phase {phase}.\n\
+        \n\
+        There is no agent work to perform here. Whether or not this phase's \
+        CONTEXT.md already exists, you must NOT run an interactive \
+        discuss-phase or interview command, and you must NOT ask for input \
+        — this run is headless and no operator is available to answer \
+        interactive questions. Do NOT modify any existing planning \
+        artifacts.\n\
         \n\
         {COMPLETION_PROTOCOL}"
     )
@@ -194,8 +222,11 @@ fn stage_prompt_with_project(stage: Stage, phase: u32, project_root: Option<&Pat
     if stage == Stage::Validate {
         return validate_stage_prompt(phase);
     }
-    if matches!(stage, Stage::Define | Stage::Plan) {
-        return idempotent_stage_prompt(stage, phase);
+    if stage == Stage::Define {
+        return define_stage_prompt(phase);
+    }
+    if stage == Stage::Plan {
+        return idempotent_stage_prompt(phase);
     }
     let command = gsd_command_for(stage, phase);
     if stage == Stage::Code {
@@ -234,8 +265,9 @@ mod tests {
 
     #[test]
     fn each_stage_prompt_carries_its_gsd_command_and_marker() {
+        // Define is excluded here (D-14): its prompt never contains its GSD
+        // command — see `define_prompt_never_invokes_discuss_phase` below.
         let cases = [
-            (Stage::Define, "/gsd-discuss-phase 11"),
             (Stage::Plan, "/gsd-plan-phase 11"),
             (Stage::Code, "/gsd-execute-phase 11"),
             (Stage::Validate, "/gsd-validate-phase 11"),
@@ -332,8 +364,10 @@ mod tests {
         // Validate is excluded here (Task 2, 13-05): it now gets its own
         // dedicated prompt requiring a verdict — see
         // `validate_stage_prompt_requires_verdict` below. Define and Plan
-        // are excluded too (13-06 dogfood): they carry the idempotency
-        // contract — see `define_and_plan_prompts_are_idempotent` below.
+        // are excluded too: Plan carries the idempotency contract (see
+        // `plan_prompt_is_idempotent` below); Define carries its own D-14
+        // always-no-op contract (see `define_prompt_never_invokes_discuss_phase`
+        // below).
         let prompt = stage_prompt(Stage::Code, 9);
         assert!(prompt.contains("/gsd-execute-phase 9"));
         assert!(prompt.contains("DEVFLOW_RESULT"));
@@ -358,33 +392,56 @@ mod tests {
         assert!(!prompt.contains("request_user_input"));
     }
 
-    /// 13-06 dogfood regression (Codex leg): GSD's discuss-phase demands an
-    /// interactive decision when CONTEXT.md already exists, which headless
-    /// Codex can never answer — Define/Plan must no-op with success when
-    /// their deliverable pre-exists.
+    /// 13-06 dogfood regression (Codex leg), Plan half only after the D-14
+    /// split: GSD's plan-phase demands an interactive decision when PLAN.md
+    /// already exists, which headless Codex can never answer — Plan must
+    /// no-op with success when its deliverable pre-exists. See T-28-09.
     #[test]
-    fn define_and_plan_prompts_are_idempotent() {
-        let cases = [
-            (Stage::Define, "/gsd-discuss-phase 9", "09-*CONTEXT.md"),
-            (Stage::Plan, "/gsd-plan-phase 9", "09-*PLAN.md"),
-        ];
-        for (stage, command, artifact_glob) in cases {
-            let prompt = stage_prompt(stage, 9);
-            assert!(prompt.contains(command), "{stage} prompt missing {command}");
-            assert!(
-                prompt.contains(artifact_glob),
-                "{stage} prompt must check for its pre-existing artifact"
-            );
-            assert!(
-                prompt.contains("Do NOT run the GSD command"),
-                "{stage} prompt must no-op when the artifact exists"
-            );
-            assert!(
-                prompt.contains("do NOT ask for input"),
-                "{stage} prompt must forbid interactive input"
-            );
-            assert!(prompt.contains("DEVFLOW_RESULT"));
-        }
+    fn plan_prompt_is_idempotent() {
+        let prompt = stage_prompt(Stage::Plan, 9);
+        assert!(
+            prompt.contains("/gsd-plan-phase 9"),
+            "Plan prompt missing /gsd-plan-phase 9"
+        );
+        assert!(
+            prompt.contains("09-*PLAN.md"),
+            "Plan prompt must check for its pre-existing artifact"
+        );
+        assert!(
+            prompt.contains("Do NOT run the GSD command"),
+            "Plan prompt must no-op when the artifact exists"
+        );
+        assert!(
+            prompt.contains("do NOT ask for input"),
+            "Plan prompt must forbid interactive input"
+        );
+        assert!(prompt.contains("DEVFLOW_RESULT"));
+    }
+
+    /// D-14: the Define stage must never invoke the interactive
+    /// discuss-phase command, whether or not CONTEXT.md exists — the branch
+    /// that did so is deleted, not disambiguated. Regression guard for
+    /// T-28-08 (a headless run has no operator to answer it).
+    #[test]
+    fn define_prompt_never_invokes_discuss_phase() {
+        let prompt = stage_prompt(Stage::Define, 9);
+        assert!(
+            !prompt.contains("/gsd-discuss-phase"),
+            "Define prompt must never invoke the interactive discuss-phase command (D-14)"
+        );
+        assert!(
+            prompt.contains("must NOT run") || prompt.contains("do NOT run"),
+            "Define prompt must forbid running an interactive interview headlessly"
+        );
+        assert!(
+            prompt.contains("do NOT ask for input") || prompt.contains("must NOT ask for input"),
+            "Define prompt must forbid requesting input"
+        );
+        assert!(
+            prompt.to_lowercase().contains("modify"),
+            "Define prompt must forbid modifying existing planning artifacts"
+        );
+        assert!(prompt.contains("DEVFLOW_RESULT"));
     }
 
     #[test]
