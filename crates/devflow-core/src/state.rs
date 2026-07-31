@@ -13,7 +13,24 @@ use crate::mode::Mode;
 use crate::stage::Stage;
 
 /// Full workflow state persisted to `.devflow/state.json`.
+///
+/// # Construction
+///
+/// Marked `#[non_exhaustive]`: downstream crates must build this through
+/// [`State::new`] and then assign the fields they care about, rather than by
+/// struct literal. Deserialization is unaffected — the `Deserialize` derive
+/// and every `#[serde(default)]` field keep working exactly as before, so
+/// state files written by older binaries still load.
+///
+/// This exists because `State` accumulates a field roughly every phase that
+/// adds a run-scoped concept (`worktree_path`, `monitor_pid`, `stop_until`,
+/// `yes_ship`, and — in phase 28 — `session_id` and `checkpoint_resumes`).
+/// Without `non_exhaustive`, each of those additions is a semver-breaking
+/// change for any consumer that used a struct literal, which would force a
+/// major bump for what is really an internal bookkeeping change. Paying that
+/// cost once here makes every future field additive.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct State {
     /// Current workflow stage.
     pub stage: Stage,
@@ -70,6 +87,30 @@ pub struct State {
     /// liveness probe reports Unknown, never Stuck.
     #[serde(default)]
     pub monitor_pid: Option<u32>,
+    /// The Claude session id captured from the most recent captured stdout
+    /// envelope for this phase's current stage (D-04, 28-02), read via
+    /// [`crate::agent_result::session_id_from_capture`]. `None` means EITHER
+    /// "no session has been captured for this state yet" OR "the state was
+    /// written by a binary predating this field" — both cases behave
+    /// identically (no relaunch target to address). Recorded so a checkpoint
+    /// auto-decide relaunch (plan 28-03) can `--resume` the exact session
+    /// that hit the checkpoint rather than spawning a fresh one, which would
+    /// lose the original session's conversation context and permission mode.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// How many times the current stage's agent has been relaunched via a
+    /// checkpoint auto-decide resume (D-04, 28-03). Bounds a stuck
+    /// checkpoint loop against `mode::MAX_CHECKPOINT_RESUMES` (added in plan
+    /// 28-03) the same way [`Self::infra_failures`] bounds an infra-fault
+    /// loop against `mode::MAX_INFRA_FAILURES`. Reset to 0 by every ordinary fresh stage
+    /// launch, so the ceiling bounds one stage's resume budget, not a
+    /// phase's lifetime (the same distinction `MAX_INFRA_FAILURES`' doc
+    /// comment draws for `infra_failures`). Any increment must use
+    /// `saturating_add` so a stuck loop cannot overflow `u32`. A
+    /// serde-absent value (state written by a binary predating this field)
+    /// defaults to 0.
+    #[serde(default)]
+    pub checkpoint_resumes: u32,
     /// The stage `devflow start --until <stage>` requests as the last stage
     /// to run before halting (20c). `None` means no stop point was
     /// requested (the pipeline runs to Ship), OR the state was written by a
@@ -158,6 +199,8 @@ impl State {
             project_root,
             worktree_path: None,
             monitor_pid: None,
+            session_id: None,
+            checkpoint_resumes: 0,
             stop_until: None,
             stopped: false,
             stop_reason: None,
@@ -356,6 +399,75 @@ mod tests {
         }"#;
         let loaded: State = serde_json::from_str(json).unwrap();
         assert_eq!(loaded.monitor_pid, None);
+    }
+
+    /// `session_id` round-trips through serde as an exact `Option<String>`
+    /// (D-04, 28-02) — mirrors the `monitor_pid` pair above.
+    #[test]
+    fn session_id_round_trips_through_serde() {
+        let mut state = State::new(1, AgentKind::Claude, Mode::Auto, PathBuf::from("/repo"));
+        state.session_id = Some("cf29bfec-69e8-45df-a4f3-3da08ab6f66e".to_string());
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(
+            json.contains("session_id"),
+            "session_id must appear in persisted JSON"
+        );
+        let loaded: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            loaded.session_id.as_deref(),
+            Some("cf29bfec-69e8-45df-a4f3-3da08ab6f66e"),
+            "session_id must round-trip through serde"
+        );
+    }
+
+    /// A serde-absent `session_id` (state written by a pre-28-02 binary) must
+    /// deserialize to `None`, not fail to deserialize.
+    #[test]
+    fn session_id_absent_from_json_defaults_to_none() {
+        let json = r#"{
+            "stage": "code",
+            "phase": 1,
+            "agent": "claude",
+            "mode": "auto",
+            "started_at": "0",
+            "project_root": "/repo"
+        }"#;
+        let loaded: State = serde_json::from_str(json).unwrap();
+        assert_eq!(loaded.session_id, None);
+    }
+
+    /// `checkpoint_resumes` round-trips through serde as an exact `u32`
+    /// (D-04, 28-02).
+    #[test]
+    fn checkpoint_resumes_round_trips_through_serde() {
+        let mut state = State::new(1, AgentKind::Claude, Mode::Auto, PathBuf::from("/repo"));
+        state.checkpoint_resumes = 2;
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(
+            json.contains("checkpoint_resumes"),
+            "checkpoint_resumes must appear in persisted JSON"
+        );
+        let loaded: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            loaded.checkpoint_resumes, 2,
+            "checkpoint_resumes must round-trip through serde"
+        );
+    }
+
+    /// A serde-absent `checkpoint_resumes` (state written by a pre-28-02
+    /// binary) must deserialize to `0`, not fail to deserialize.
+    #[test]
+    fn checkpoint_resumes_absent_from_json_defaults_to_zero() {
+        let json = r#"{
+            "stage": "code",
+            "phase": 1,
+            "agent": "claude",
+            "mode": "auto",
+            "started_at": "0",
+            "project_root": "/repo"
+        }"#;
+        let loaded: State = serde_json::from_str(json).unwrap();
+        assert_eq!(loaded.checkpoint_resumes, 0);
     }
 
     /// 23-09 Task 1: `yes_ship` round-trips through serde as an exact `bool`

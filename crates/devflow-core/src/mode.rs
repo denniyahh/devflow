@@ -48,6 +48,42 @@ pub const MAX_INFRA_FAILURES: u32 = 5;
 /// (`devflow-cli/src/main.rs`).
 pub const MAX_PREFLIGHT_RETRIES: u32 = 3;
 
+/// Ceiling for [`crate::state::State::checkpoint_resumes`] before a
+/// checkpoint auto-decide relaunch (D-03/D-04, 28-03) stops resuming and
+/// falls through to the never-silent gate instead, its context naming the
+/// exhaustion. Bounds consecutive `claude --resume` relaunches for one
+/// stage's agent run against a checkpoint that keeps re-firing.
+///
+/// Takes the tighter [`MAX_CONSECUTIVE_FAILURES`]-style ceiling rather than
+/// the more lenient [`MAX_INFRA_FAILURES`]: a re-firing checkpoint is a
+/// decision the agent is failing to close on its own, not a transient
+/// infrastructure blip, so it does not deserve the same tolerance an OOM
+/// blip or a missing binary gets. An unbounded resume loop here would be
+/// structurally the same "gates hang forever" failure class D-09
+/// (`28-CONTEXT.md`) documents — this ceiling is what keeps it from becoming
+/// that.
+///
+/// Any increment of `checkpoint_resumes` must use `saturating_add`, exactly
+/// like [`Self::infra_failures`] and [`Self::preflight_retries`], so a stuck
+/// loop cannot overflow `u32`. Reset to 0 by every ORDINARY fresh stage
+/// launch (`pipeline_launch::launch_stage_inner`) — never by `transition()`
+/// — so the ceiling bounds one stage's resume budget, not a phase's entire
+/// lifetime, the same distinction [`MAX_INFRA_FAILURES`]'s doc comment draws
+/// for `infra_failures`. On exhaustion: fall through to the never-silent
+/// gate with a reason naming the exhaustion — never a silent stop, never an
+/// unbounded loop.
+pub const MAX_CHECKPOINT_RESUMES: u32 = 3;
+
+/// 28-03 (Task 1): the ceiling must be a small, positive, bounded number —
+/// greater than zero (or a checkpoint could never resume even once) and no
+/// larger than the more lenient infra ceiling (a re-firing checkpoint gets
+/// LESS tolerance than a transient infra blip, not more). A compile-time
+/// assertion rather than a runtime `#[test]` because both operands are
+/// `const` — clippy's `assertions_on_constants` correctly flags a runtime
+/// test here as unable to ever fail at runtime; this const block still
+/// fails the BUILD if a future edit violates the invariant.
+const _: () = assert!(MAX_CHECKPOINT_RESUMES > 0 && MAX_CHECKPOINT_RESUMES <= MAX_INFRA_FAILURES);
+
 /// Whether `transition()` should zero
 /// [`crate::state::State::consecutive_failures`] when moving from `from` to
 /// `to`.

@@ -1,5 +1,58 @@
 # Changelog
 
+## 2.2.0 — 2026-07-31
+
+Phase 27 (hermetic git invocation) and phase 28 (the checkpoint answer return
+path). Phase 26 remains unmerged and is not in this release.
+
+The headline is phase 28: a `gate="blocking-human"` checkpoint used to be a dead
+end for any DevFlow-driven run. The agent stopped, asked a question, and no path
+existed by which an answer could reach it — every retry spawned a fresh process
+that asked the identical question again. A plan that *correctly* gated an
+irreversible decision became a plan that could never finish unattended.
+
+### ⚠ Behavior change: human-blocking checkpoints are now resolved by the agent
+
+**This is unconditional and there is no flag or config toggle to disable it.**
+When a stage halts at a task declared `gate="blocking-human"`, DevFlow now
+relaunches the exact exited Claude session with an instruction to decide the
+checkpoint itself, and records what it decided.
+
+This deliberately overrides `checkpoints.md` rule 6 (`blocking-human` is never
+auto-approved, in any mode). It was adopted because DevFlow has no usable
+notification or response channel — the only push mechanism is an
+operator-supplied `DEVFLOW_GATE_NOTIFY_CMD` that is a silent no-op when unset,
+and the only pull mechanism is running `devflow status` by hand. A "wait for a
+human" default would not degrade gracefully; it would hang. Given that, a flag
+implying a working "off" state would have been misleading.
+
+What bounds it: the path is reachable **only** for a checkpoint that the
+operator's own approved plan declared — the authorizing check is a static scan
+of the phase's `PLAN.md` files, which an agent cannot influence at runtime, and
+it is evaluated strictly before any agent-controlled signal. Resumes are capped
+(`MAX_CHECKPOINT_RESUMES`), and exhaustion falls through to the existing
+never-silent gate. Every auto-decision writes a `checkpoint_auto_decided` event
+to `.devflow/events.jsonl` naming the session, the instruction, and the policy —
+with no human in the loop beforehand, that record is the only way anyone learns
+after the fact what the agent decided.
+
+### Fixed
+- **A `blocking-human` checkpoint no longer strands a headless run (999.57).** DevFlow statically scans the stage's plans for a declared human-blocking task before launching, confirms from captured stdout that one actually fired, and resolves it by resuming the exact exited session rather than spawning a fresh one — no CONTEXT/RESEARCH re-read, no re-running completed tasks
+- **The checkpoint confirmation reader now matches what a real run actually emits.** The reader was built against a rendering predicted by reading the *emitting* source, and shipped with that caveat recorded rather than hidden. A live end-to-end run then showed the executor renders the value as a markdown code span — ``**Gate:** `blocking-human` `` — and the matcher, which trimmed only `*` and whitespace, terminated on the backtick and produced an empty token. Genuine checkpoints fell through to the generic gate. The unit suite could not catch it: every fixture was built from the same prediction. Regression tests are now transcribed from the live capture. The reader's documented safe-direction property held throughout — a false negative degrades to the never-silent gate, so nothing was ever silently authorized
+- **`devflow resume` no longer discards an unfired `--until` cap (999.60).** The stop-marker clear was unconditional, so a cap the operator set that had not yet fired was silently dropped and the pipeline ran past the stage they named — observed live during phase 27's own dogfood run, which advanced into Ship unguarded. The clear is now gated on the pipeline having actually stopped
+- **The Define stage no longer invokes an interactive interview headlessly (999.59).** When `CONTEXT.md` was absent, Define issued `/gsd-discuss-phase`, which hangs on `AskUserQuestion` under `claude -p` with no operator present. The branch is deleted rather than flag-gated: whether to run an interview is decided before `devflow start` is ever invoked, so there is no runtime accommodation to make
+- **All 41 production `git` invocations are hermetic (phase 27).** Every `Command::new("git")` in production code now routes through `git_command`/`hermetic_command`, including two indirect `sh → cargo → git` edges and `monitor.rs`'s spawn of the coding agent itself — the highest-consequence site, and one that was not in the original grep scope. Under a hostile `GIT_DIR` the suite went from 37 deliberately-failing tests to 0
+
+### Added
+- **`yes_ship` is settable in `devflow.toml`** (and via `DEVFLOW_YES_SHIP`), in addition to the existing `--yes-ship` flag. The flag ORs with the config value rather than replacing it, so passing it always wins. A run whose authorization came from config prints a line naming `devflow.toml` as the source — a standing default, but never a silent one
+- **`checkpoint_auto_decided` events** in `.devflow/events.jsonl`, emitted before the relaunch spawns so a crash mid-relaunch still leaves the decision recorded
+- **`devflow-core` public API:** `verify::phase_plan_files`, `verify::phase_has_blocking_human_checkpoint`, `agent_result::{claude_session_id, session_id_from_capture, blocking_human_checkpoint_reported, checkpoint_reported_in_capture}`, `config::yes_ship`, and `State::{session_id, checkpoint_resumes}`
+
+### Changed
+- **`State` is now `#[non_exhaustive]`.** Downstream crates must construct it through `State::new` and assign fields afterward, rather than by struct literal. Deserialization is unaffected — every `#[serde(default)]` field still loads state written by older binaries. `State` gains a field roughly every phase that introduces a run-scoped concept; without this, each addition is a semver-breaking change for any consumer using a literal. Paying that cost once here makes every future field additive
+- **`--yes-ship` may now come from configuration**, deliberately reversing the phase 23 decision that made it per-run only *"so a standing unattended auto-merge can never become the silent default."* That decision's own stated cost applies: relaxing this is easy, re-tightening it after operators depend on the persisted setting is not. The never-silent notice above is the compensating control. What did **not** change: the Ship gate still fires and still records an explicit, attributed approval rather than being bypassed
+- **`session_id` is read only from the result envelope's top-level key**, never from the agent-authored `DEVFLOW_RESULT` marker, and is deliberately *not* a deserialized field on `AgentResult` — otherwise an agent could nominate which session DevFlow resumes into
+
 ## 2.1.0 — 2026-07-28
 
 Phase 25 — the blockers that stopped an unattended `devflow start` run from

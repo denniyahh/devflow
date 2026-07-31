@@ -150,6 +150,8 @@ items require `/gsd-review-backlog` promotion.)*
 | Split `main.rs` as flat sibling modules, not a `commands/` subdirectory (Phase 19) | Mapping Phase 18's plans onto proposed clusters showed pipeline state machine absorbed 3 of 7 plans vs. commands' 2 — a subdirectory buys zero wave reduction | ✓ Good |
 | Tighten `cleanup --force`'s liveness guard to fail-closed on ANY live agent pid, not just Healthy/BetweenStages monitor states (Phase 20b, cross-AI review) | `Liveness::Unknown` (no recorded monitor) and `Stuck` (dead monitor) both still mean the agent process could be alive; a monitor-state-only guard left a real deletion-race hole | ✓ Good |
 | Reuse `finish_workflow` verbatim for the manual `ship --phase` override rather than reimplementing Ship logic (Phase 20e) | The existing fail-closed terminal-Ship contract (retry-gate-reopen, `workflow_finished` emission) already does exactly what a second out-of-process trigger needs; reimplementing risks drift between the monitor-driven and manual paths | ✓ Good |
+| Never honour an operator-set `GIT_DIR` — scrub the repository-local git vars unconditionally at `Command` construction (Phase 27, D-03) | `GIT_DIR` outranks `current_dir()`, so `mutating_project_root` — the guard added expressly to stop `release --execute`/`sync` acting on an unnamed repo — compared two paths, saw a match, and passed while the executor pushed and published against a different repository. Honouring the variable would have preserved that bypass | ✓ Good |
+| Scrub at construction, apply `.envs(...)` after (Phase 27, WR-03 fix) | Ordering is load-bearing: it makes the scrub the default while still letting an adapter that *deliberately* sets one of these vars win — which is what keeps Codex's unsigned-commit override working | ✓ Good |
 
 ## Key Files
 
@@ -161,7 +163,17 @@ items require `/gsd-review-backlog` promotion.)*
 
 ---
 *Last updated: 2026-07-28 after Phase 25 (End-to-End Dogfood Blockers)
-completed — 18/19 plans (25-10 superseded by 25-13), verified 10/10 across five
-gap-closure rounds, broken-windows ledger at 0 open / 1 waived / 4 fixed. Not
-yet shipped: the work sits on `feature/phase-25`, unreleased. The v2.0.0
-milestone stays open (no fixed closing phase)*
+shipped as v2.1.0 — 18/19 plans (25-10 superseded by 25-13), verified 10/10
+across five gap-closure rounds, 129/129 threats closed, broken-windows ledger at
+0 open / 1 waived / 4 fixed. PR #47 → develop, #50 squash-merged to main,
+signed tag `v2.1.0` (maintainer key, fingerprint verified), main→develop sync
+merge-committed (#51), GitHub Release published, and both crates published to
+crates.io in order (devflow-core → devflow). The v2.0.0 milestone stays open (no
+fixed closing phase)*
+
+*Phase 27 (Scrub Redirecting Git Environment From Production Calls) completed and
+verified 2026-07-30 — 6/6 plans, 7/7 must-haves, all 41 production
+`Command::new("git")` sites routed through `devflow_core::git::{hermetic_command,
+git_command}`, Sweep A at 0, both hostile-`GIT_DIR` acceptance commands green at
+HEAD (411/0 core, 188/0 cli). This unblocks 999.25 (release executor) and 999.52
+(`devflow sync`), which named it prerequisite #1. Not yet shipped/merged.*

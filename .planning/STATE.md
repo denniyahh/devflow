@@ -2,19 +2,19 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone (open — no fixed closing phase)
-current_phase: 25
-current_phase_name: end-to-end-dogfood-blockers
-status: "Phase 25 shipped and merged — PR #47 → develop"
-stopped_at: Phase 25 SHIPPED AND MERGED — PR #47 merged to develop 2026-07-28 (merge commit 5b39f0c, operator-approved); verified 10/10, threats_open 0, ledger 0 open. Unreleased: develop→main sync PR not yet opened.
-last_updated: "2026-07-28T21:38:22.575Z"
-last_activity: 2026-07-28
+current_phase: 28
+current_phase_name: close-the-checkpoint-answer-return-path
+status: shipped — PR #63 open to develop
+stopped_at: Phase 28 shipped — PR #63 (feature/phase-28 → develop), awaiting CI + merge
+last_updated: "2026-07-31T08:35:00.000Z"
+last_activity: 2026-07-30
+last_activity_desc: "Phase 28 complete: 6/6 plans, 779 tests green, SECURED (threats_open 0), verification passed. A1 closed by a live run that found and fixed a real defect (b22e6cf) — the executor renders the gate value as a markdown code span, which the reader did not match; checkpoints now recognize, auto-decide, audit, resume, and resolve end-to-end"
 progress:
-  total_phases: 14
-  completed_phases: 14
-  total_plans: 112
-  completed_plans: 112
-  percent: 100
-last_activity_desc: Phase 25 complete (10/10 verified, ledger 0 open). NOT advanced to 999.1 — phase.complete's next-phase detection again picked up the 999.1 backlog heading as if sequential (same bug corrected after Phase 20, recorded in the history log below). Backlog items require /gsd-review-backlog promotion.
+  total_phases: 17
+  completed_phases: 15
+  total_plans: 124
+  completed_plans: 124
+  percent: 88
 ---
 
 # DevFlow — Project State
@@ -86,11 +86,17 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 999.1 — Hermes Support (BACKLOG)
-Plan: Not started
-Tasks 1-3 done, both human sign-offs recorded in 25-13-SUMMARY.md; 25-14/25-15/25-16
-planned 2026-07-28 as gap-closure round 3, not yet executed)
-Status: Phase 25 shipped — PR #47
+Phase: 28 (close-the-checkpoint-answer-return-path) — EXECUTING
+Plan: 1 of 6
+Status: Executing Phase 28
+real action is `/gsd-review-backlog` to promote a 999.x entry, or `/gsd-ship 27`
+to merge this phase. `phase.complete` auto-advanced this field to "999.1 — Hermes
+Support (BACKLOG)" because its next-phase scan walks into the backlog section;
+corrected here, since that value routes an operator into planning a backlog stub.
+
+(Carried-over Phase 25 remnant, left in place as found: Tasks 1-3 done, both human
+sign-offs recorded in 25-13-SUMMARY.md; 25-14/25-15/25-16 planned 2026-07-28 as
+gap-closure round 3, not yet executed)
 
 **25-10 → 25-13 (2026-07-28):** GAP 1 (25-08) and GAP 2 (25-09) closed and merged. GAP 3
 (truth 7, 25e / 999.47) moved through three states this run: `PRESENT_BEHAVIOR_UNVERIFIED`
@@ -151,7 +157,7 @@ Scope boundary: 23-16 is the **fix only** (change + regression tests + PR into `
 
 **Recovery-ref disposition:** both `origin` refs (`recovery/pre-23-11-acceptance-e0f87c2`, `recovery/pre-23-15-acceptance-0dad20d`) remain untouched on `origin`; the local copy of the pre-23-11 ref, deleted again by `devflow cleanup`, is deliberately NOT restored (per `23-FINDINGS.md` §B2a); the pre-23-15 ref is now unused (no merge to undo) but retained on `origin` for reuse by the 23-16 retry rather than deleted.
 
-Last activity: 2026-07-28
+Last activity: 2026-07-30 — Phase 28 execution started
 
 **Note on the "Plan: 2 of 15" value this replaces:** `gsd-tools state advance-plan` only increments whatever value is already in this field, which had drifted to "2 of 15" (the parallel-worktree waves 23-01…23-09 deliberately never touch STATE.md, and this field was last corrected against reality at "10 of 11 plans complete" before the plan count grew to 15 with the gap-closure plans 23-12…23-15). Corrected directly to "13 of 15" to match reality (23-12 and 23-13 both now executed) rather than trust the tool's naive +1 increment from a stale base.
 
@@ -757,6 +763,8 @@ None currently open for Phase 17.
 
 ## Roadmap Evolution
 
+- Phase 28 added (2026-07-30): **Close the Checkpoint Answer Return Path** (dir `28-close-the-checkpoint-answer-return-path`) — bundles **999.57/DEN-82** (parts A+C; part B deferred), **999.59/DEN-84**, **999.60/DEN-85**, all re-verified open at HEAD `8072ab6`. Chosen over 999.25, which has only 1 of 5 prerequisites met and whose remaining ones are findings inside unmerged `feature/phase-26` code rather than schedulable work. **999.57's entry was corrected during promotion:** it implies `session_id` is available for the session-resume fix, but `session_id` exists only in a test fixture string (`agent_result.rs:1362`) — never parsed or persisted — and the Claude adapter has no `--resume` support, so unit 28a must add all of that plumbing. 999.31 (Modular Agent Driver, High/L) was considered as a fourth unit and excluded: it reworks the same adapter layer, but folding an L into an M+S+S cluster recreates Phase 26's scope-creep shape.
+- Phase 27 added (2026-07-30): **Scrub Redirecting Git Environment From Production Calls** (dir `27-scrub-redirecting-git-environment-from-production-calls`) — promotes backlog **999.39 / DEN-66**, re-verified open at HEAD `b3cab1c`. Promoted immediately after Phase 26 closed PARTIAL: `26-REVIEW.md` CR-01 showed `mutating_project_root` is bypassed by an inherited `GIT_DIR`, making this prerequisite #1 for 999.25's re-attempt and blocking 999.52 (`sync`) from shipping independently. Appended at end-of-milestone rather than after Phase 26's entry, because a stray Phase 23 historical-record block sits between Phase 26 and Phase 24 in document order and would have mis-attributed to 27.
 - Phase 18 reprioritized, fixed Phase 19 eliminated (2026-07-20): Dogfood Reliability Hardening (dir `18-dogfood-reliability-hardening`) takes Phase 18's slot from Hermes Support (dir renamed to `999.1-hermes-support`); the fixed "Phase 19: Operator Observability" entry is replaced entirely — its content is absorbed into 18, confirmed already fixed, or moved to backlog dirs `999.2`–`999.5`. See 2026-07-20 decision entry.
 - Phase 14 split (2026-07-16): Hermes work (adapter, skill rewrite, plugin) moved out of 14 to new Phase 16 (`16-hermes-support`); 14 retitled Parallel Safety + Observability (dir `14-parallel-safety-observability`), leading with the deferred CR-03 flaw. See 2026-07-16 decision entry.
 - MVP restructure (2026-07-14): Phase 13 repurposed as MVP Core Loop (dir `13-mvp-core-loop`); old Phase 13 OSS/Hermes content moved to new Phase 15; Phase 14 rescoped to observability. Later same day: Hermes work moved 15 → 14 (now `14-observability-hermes`), 15 slimmed to OSS Readiness (`15-oss-readiness`). See 2026-07-14 decision entries.
@@ -830,6 +838,6 @@ None currently open for Phase 17.
 
 ## Session
 
-**Last session:** 2026-07-28T15:54:05.268Z
-**Stopped at:** Completed 25-13-PLAN.md (human sign-off recorded, both parts approved)
-**Resume file:** None
+**Last session:** 2026-07-31T01:06:18.064Z
+**Stopped at:** Phase 28 context gathered
+**Resume file:** .planning/phases/28-close-the-checkpoint-answer-return-path/28-CONTEXT.md

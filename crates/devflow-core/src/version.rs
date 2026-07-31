@@ -16,8 +16,8 @@
 //!   [`release_range_start`] to survive this repository's squash-merge +
 //!   sync-back release topology.
 
+use crate::git::git_command;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// A semantic version, whether read from disk or computed from git history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,9 +117,8 @@ pub fn read_major_version(path: &Path) -> Result<u32, VersionError> {
 /// `looks_like_devflow_process`).
 #[deprecated(note = "superseded by `reachable_semver_baseline` (D-07)")]
 pub fn count_git_tags(project_root: &Path) -> Result<u32, VersionError> {
-    let output = Command::new("git")
+    let output = git_command(project_root)
         .arg("tag")
-        .current_dir(project_root)
         .output()
         .map_err(|err| VersionError::Git(err.to_string()))?;
     if !output.status.success() {
@@ -144,9 +143,8 @@ pub fn count_git_tags(project_root: &Path) -> Result<u32, VersionError> {
 /// [`count_git_tags`]'s doc comment.
 #[deprecated(note = "superseded by `classify_range_bump` (D-08)")]
 pub fn commits_since_last_minor_tag(project_root: &Path) -> Result<u32, VersionError> {
-    let last_tag = Command::new("git")
+    let last_tag = git_command(project_root)
         .args(["describe", "--tags", "--abbrev=0"])
-        .current_dir(project_root)
         .output()
         .map_err(|err| VersionError::Git(err.to_string()))?;
 
@@ -157,9 +155,8 @@ pub fn commits_since_last_minor_tag(project_root: &Path) -> Result<u32, VersionE
         "HEAD".to_string()
     };
 
-    let output = Command::new("git")
+    let output = git_command(project_root)
         .args(["rev-list", "--count", &range])
-        .current_dir(project_root)
         .output()
         .map_err(|err| VersionError::Git(err.to_string()))?;
     if !output.status.success() {
@@ -181,9 +178,8 @@ pub fn commits_since_last_minor_tag(project_root: &Path) -> Result<u32, VersionE
 /// excluded via `filter_map(...ok())` rather than erroring — a malformed tag
 /// can never crash this path (T-25-02).
 pub fn highest_semver_tag(project_root: &Path) -> Result<Option<semver::Version>, VersionError> {
-    let output = Command::new("git")
+    let output = git_command(project_root)
         .arg("tag")
-        .current_dir(project_root)
         .output()
         .map_err(|err| VersionError::Git(err.to_string()))?;
     if !output.status.success() {
@@ -213,9 +209,8 @@ pub fn highest_semver_tag(project_root: &Path) -> Result<Option<semver::Version>
 pub fn reachable_semver_baseline(
     project_root: &Path,
 ) -> Result<Option<semver::Version>, VersionError> {
-    let output = Command::new("git")
+    let output = git_command(project_root)
         .args(["tag", "--merged", "HEAD"])
-        .current_dir(project_root)
         .output()
         .map_err(|err| VersionError::Git(err.to_string()))?;
     if !output.status.success() {
@@ -237,9 +232,8 @@ pub fn reachable_semver_baseline(
 /// (root commit), not a genuine spawn/IO failure — those still propagate
 /// via `?` through the `Command::output()` call itself.
 fn first_parent(project_root: &Path, commit: &str) -> Result<Option<String>, VersionError> {
-    let output = Command::new("git")
+    let output = git_command(project_root)
         .args(["rev-parse", &format!("{commit}^1")])
-        .current_dir(project_root)
         .output()
         .map_err(|err| VersionError::Git(err.to_string()))?;
     if !output.status.success() {
@@ -302,14 +296,13 @@ pub fn release_range_start(
     project_root: &Path,
     baseline_tag: &str,
 ) -> Result<String, VersionError> {
-    let ancestry = Command::new("git")
+    let ancestry = git_command(project_root)
         .args([
             "rev-list",
             "--ancestry-path",
             "--reverse",
             &format!("{baseline_tag}..HEAD"),
         ])
-        .current_dir(project_root)
         .output()
         .map_err(|err| VersionError::Git(err.to_string()))?;
     if !ancestry.status.success() {
@@ -335,9 +328,8 @@ pub fn release_range_start(
             return Ok(candidate.clone());
         };
 
-        let tag_is_ancestor_of_first_parent = Command::new("git")
+        let tag_is_ancestor_of_first_parent = git_command(project_root)
             .args(["merge-base", "--is-ancestor", baseline_tag, &first_parent])
-            .current_dir(project_root)
             .output()
             .map(|out| out.status.success())
             .unwrap_or(false);
@@ -396,9 +388,8 @@ pub fn classify_range_bump(project_root: &Path, range_start: &str) -> Result<Bum
     } else {
         format!("{range_start}..HEAD")
     };
-    let output = Command::new("git")
+    let output = git_command(project_root)
         .args(["log", "--no-merges", &range, "--format=%H%x1f%B%x1e"])
-        .current_dir(project_root)
         .output()
         .map_err(|err| VersionError::Git(err.to_string()))?;
     if !output.status.success() {
@@ -450,6 +441,193 @@ fn classify_commit_message(message: &str) -> Bump {
         // Any other recognised-but-unlisted type — D-10's same floor.
         Bump::Patch
     }
+}
+
+/// Keep-a-Changelog heading a changelog bullet is grouped under (D-12).
+/// Declaration order is the render order [`render_changelog_body`] emits
+/// sections in: breaking changes first, then what's new, then what's fixed,
+/// then everything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ChangelogHeading {
+    /// A breaking change (`!` marker or `BREAKING CHANGE:`/`BREAKING-CHANGE:`
+    /// footer), regardless of the commit's own type.
+    Breaking,
+    /// `feat`.
+    Added,
+    /// `fix`/`perf`.
+    Fixed,
+    /// Every other conventional-commit type (`docs`, `test`, `chore`, the
+    /// string `"ci"`, `refactor`, `style`, or any other recognized-but-
+    /// unlisted type), and any message that fails to parse as a
+    /// conventional commit at all.
+    Changed,
+}
+
+impl ChangelogHeading {
+    /// This heading's Keep-a-Changelog markdown heading line.
+    pub fn as_markdown_heading(self) -> &'static str {
+        match self {
+            ChangelogHeading::Breaking => "### Breaking",
+            ChangelogHeading::Added => "### Added",
+            ChangelogHeading::Fixed => "### Fixed",
+            ChangelogHeading::Changed => "### Changed",
+        }
+    }
+}
+
+/// Maximum length, in characters, of a sanitized changelog bullet
+/// ([`sanitize_changelog_subject`]).
+pub const CHANGELOG_SUBJECT_MAX_CHARS: usize = 200;
+
+/// Neutralize and bound a commit-derived changelog bullet before it reaches
+/// `CHANGELOG.md` or a `tracing` line (D-12, ASVS V7, T-26-05). Commit
+/// subjects are contributor-authored text — the same attacker-influenced
+/// class `T-17-13`/`T-25-52` already redact — so every
+/// [`char::is_control`] character is mapped to a single space, then, if the
+/// result exceeds [`CHANGELOG_SUBJECT_MAX_CHARS`] characters, it is
+/// truncated so the returned string is exactly `CHANGELOG_SUBJECT_MAX_CHARS`
+/// characters including the trailing `… [truncated]` marker. Mirrors
+/// `render_gate_context`'s properties (`pipeline_outcomes.rs:323`) — a
+/// sibling, not a shared function, since that one is `pub(crate)` inside
+/// `devflow-cli` and not importable from `devflow-core`.
+pub fn sanitize_changelog_subject(subject: &str) -> String {
+    const MARKER: &str = "… [truncated]";
+    let sanitized: String = subject
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    if sanitized.chars().count() <= CHANGELOG_SUBJECT_MAX_CHARS {
+        return sanitized;
+    }
+    let marker_len = MARKER.chars().count().min(CHANGELOG_SUBJECT_MAX_CHARS);
+    let head_len = CHANGELOG_SUBJECT_MAX_CHARS.saturating_sub(marker_len);
+    let head: String = sanitized.chars().take(head_len).collect();
+    let marker: String = MARKER.chars().take(marker_len).collect();
+    format!("{head}{marker}")
+}
+
+/// Group `--no-merges` commits in `range_start..HEAD` by [`ChangelogHeading`]
+/// (D-12). Walks the identical range and `git log --no-merges <range>
+/// --format=%H%x1f%B%x1e` argv as [`classify_range_bump`] (same record
+/// separators, same [`git_conventional::Commit::parse`] call) — but, unlike
+/// `classify_range_bump` (which folds every commit down to a single
+/// aggregate [`Bump`] value; see RESEARCH.md Pitfall 1), *collects* each
+/// commit's subject into its group instead of discarding it.
+/// `classify_range_bump`'s returned `Bump` is never used as changelog
+/// content; this is sibling code, not a wrapper around it.
+///
+/// **Complete per-type mapping (D-12, Task 2), evaluated in this order:**
+/// 1. `git_conventional::Commit::parse` fails → [`ChangelogHeading::Changed`],
+///    bullet = the message's first line.
+/// 2. `commit.breaking()` is true → [`ChangelogHeading::Breaking`] — checked
+///    before the type match, mirroring `classify_commit_message`'s own
+///    precedence.
+/// 3. type is `feat` → [`ChangelogHeading::Added`].
+/// 4. type is `fix`/`perf` → [`ChangelogHeading::Fixed`].
+/// 5. every other type (`docs`, `test`, `chore`, `"ci"`, `refactor`, `style`,
+///    or any other recognized-but-unlisted type) → [`ChangelogHeading::Changed`].
+///
+/// **Deliberate divergence from `classify_commit_message`:** an unparseable
+/// message is `Bump::Patch` for versioning (D-10's floor — an unrecognized
+/// commit still bumps *something*) but `Changed` here — a message with no
+/// conventional type has no claim to `Fixed`. Do not "fix" this into
+/// agreement; it is intentional.
+///
+/// Bullets preserve git-log order (newest first) within each group; groups
+/// are emitted in [`ChangelogHeading`] declaration order, omitting any group
+/// with no bullets. A range with no commits returns `Ok(Vec::new())`.
+pub fn changelog_sections(
+    project_root: &Path,
+    range_start: &str,
+) -> Result<Vec<(ChangelogHeading, Vec<String>)>, VersionError> {
+    let range = if range_start.is_empty() {
+        "HEAD".to_string()
+    } else {
+        format!("{range_start}..HEAD")
+    };
+    let output = git_command(project_root)
+        .args(["log", "--no-merges", &range, "--format=%H%x1f%B%x1e"])
+        .output()
+        .map_err(|err| VersionError::Git(err.to_string()))?;
+    if !output.status.success() {
+        return Err(VersionError::Git(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut breaking: Vec<String> = Vec::new();
+    let mut added: Vec<String> = Vec::new();
+    let mut fixed: Vec<String> = Vec::new();
+    let mut changed: Vec<String> = Vec::new();
+    for record in stdout.split('\u{1e}') {
+        let record = record.trim_matches('\n');
+        if record.is_empty() {
+            continue;
+        }
+        let Some((_hash, message)) = record.split_once('\u{1f}') else {
+            continue;
+        };
+        let message = message.trim();
+        let Ok(commit) = git_conventional::Commit::parse(message) else {
+            let first_line = message.lines().next().unwrap_or(message);
+            changed.push(sanitize_changelog_subject(first_line));
+            continue;
+        };
+        let subject = sanitize_changelog_subject(commit.description());
+        if commit.breaking() {
+            breaking.push(subject);
+        } else if commit.type_() == git_conventional::Type::FEAT {
+            added.push(subject);
+        } else if commit.type_() == git_conventional::Type::FIX
+            || commit.type_() == git_conventional::Type::PERF
+        {
+            fixed.push(subject);
+        } else {
+            changed.push(subject);
+        }
+    }
+    let mut sections = Vec::new();
+    if !breaking.is_empty() {
+        sections.push((ChangelogHeading::Breaking, breaking));
+    }
+    if !added.is_empty() {
+        sections.push((ChangelogHeading::Added, added));
+    }
+    if !fixed.is_empty() {
+        sections.push((ChangelogHeading::Fixed, fixed));
+    }
+    if !changed.is_empty() {
+        sections.push((ChangelogHeading::Changed, changed));
+    }
+    Ok(sections)
+}
+
+/// Render `sections` (from [`changelog_sections`]) as Keep-a-Changelog
+/// markdown: each section's heading line, a blank line, then one `- {subject}`
+/// line per bullet, with a blank line between sections. Returns an empty
+/// string when `sections` is empty — the "nothing changed" fallback text is
+/// [`crate::ship::prepend_changelog`]'s responsibility, not this function's.
+pub fn render_changelog_body(sections: &[(ChangelogHeading, Vec<String>)]) -> String {
+    let mut body = String::new();
+    for (index, (heading, bullets)) in sections.iter().enumerate() {
+        if index > 0 {
+            body.push('\n');
+        }
+        body.push_str(heading.as_markdown_heading());
+        body.push_str("\n\n");
+        for bullet in bullets {
+            body.push_str("- ");
+            body.push_str(bullet);
+            body.push('\n');
+        }
+    }
+    body
 }
 
 /// Apply a classified [`Bump`] to a baseline version (D-08/D-10).
@@ -2026,6 +2204,304 @@ mod tests {
             contents
                 .contains("devflow-core = { version = \"1.7.0\", path = \"crates/devflow-core\" }"),
             "expected version to be rewritten regardless of key order, got: {contents}"
+        );
+    }
+
+    #[test]
+    fn changelog_sections_groups_a_feat_commit_under_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        commit_msg(root, "a.txt", "chore: init");
+        tag(root, "v1.0.0");
+        commit_msg(root, "b.txt", "feat: add the widget endpoint");
+
+        let sections = changelog_sections(root, "v1.0.0").unwrap();
+        assert_eq!(
+            sections,
+            vec![(
+                ChangelogHeading::Added,
+                vec!["add the widget endpoint".to_string()]
+            )]
+        );
+    }
+
+    #[test]
+    fn render_changelog_body_renders_heading_and_bullets() {
+        let sections = vec![(
+            ChangelogHeading::Added,
+            vec!["add the widget endpoint".to_string()],
+        )];
+        let body = render_changelog_body(&sections);
+        assert_eq!(body, "### Added\n\n- add the widget endpoint\n");
+    }
+
+    /// D-12 Task 2: fix/perf -> Fixed; docs/chore/test/ci/refactor/style all
+    /// -> one Changed section, in git-log order (newest first). Each
+    /// expected value is written out literally, never recomputed from the
+    /// mapping under test (test-signal-rejection.md rejection pattern 2).
+    #[test]
+    fn changelog_sections_maps_every_recognized_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        commit_msg(root, "a.txt", "chore: init");
+        tag(root, "v1.0.0");
+        commit_msg(root, "b.txt", "fix: correct y");
+        commit_msg(root, "c.txt", "perf: speed up z");
+        commit_msg(root, "d.txt", "docs: clarify readme");
+        commit_msg(root, "e.txt", "chore: bump dep");
+        commit_msg(root, "f.txt", "test: add case");
+        commit_msg(root, "g.txt", "ci: pin image");
+        commit_msg(root, "h.txt", "refactor: extract helper");
+        commit_msg(root, "i.txt", "style: reformat");
+
+        let sections = changelog_sections(root, "v1.0.0").unwrap();
+        assert_eq!(
+            sections,
+            vec![
+                (
+                    ChangelogHeading::Fixed,
+                    vec!["speed up z".to_string(), "correct y".to_string()]
+                ),
+                (
+                    ChangelogHeading::Changed,
+                    vec![
+                        "reformat".to_string(),
+                        "extract helper".to_string(),
+                        "pin image".to_string(),
+                        "add case".to_string(),
+                        "bump dep".to_string(),
+                        "clarify readme".to_string(),
+                    ]
+                ),
+            ]
+        );
+    }
+
+    /// D-12 Task 2: both breaking-change forms (the `!` marker and a
+    /// `BREAKING CHANGE:` footer) route to `Breaking`, never `Added`/`Fixed`,
+    /// regardless of the commit's own type — checked before the type match,
+    /// mirroring `classify_commit_message`'s own precedence.
+    #[test]
+    fn changelog_sections_routes_breaking_changes_to_their_own_heading() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        commit_msg(root, "a.txt", "chore: init");
+        tag(root, "v1.0.0");
+        commit_msg(root, "b.txt", "feat(api)!: drop the legacy flag");
+        git(
+            root,
+            &[
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "fix: patch a thing\n\nBREAKING CHANGE: removes an implicit default",
+            ],
+        );
+
+        let sections = changelog_sections(root, "v1.0.0").unwrap();
+        assert_eq!(
+            sections,
+            vec![(
+                ChangelogHeading::Breaking,
+                vec![
+                    "patch a thing".to_string(),
+                    "drop the legacy flag".to_string()
+                ]
+            )]
+        );
+    }
+
+    /// D-12 Task 2: a message that fails `git_conventional::Commit::parse`
+    /// still contributes a bullet (must_haves.truths) — grouped as `Changed`,
+    /// never dropped. Deliberate divergence from `classify_commit_message`
+    /// (which maps the same failure to `Bump::Patch` for versioning): a
+    /// message with no conventional type has no claim to `Fixed`.
+    #[test]
+    fn changelog_sections_treats_unparseable_messages_as_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        commit_msg(root, "a.txt", "chore: init");
+        tag(root, "v1.0.0");
+        commit_msg(
+            root,
+            "b.txt",
+            "just a plain message with no conventional type prefix!!!",
+        );
+
+        let sections = changelog_sections(root, "v1.0.0").unwrap();
+        assert_eq!(
+            sections,
+            vec![(
+                ChangelogHeading::Changed,
+                vec!["just a plain message with no conventional type prefix!!!".to_string()]
+            )]
+        );
+    }
+
+    #[test]
+    fn changelog_sections_returns_no_sections_for_an_empty_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        commit_msg(root, "a.txt", "chore: init");
+        tag(root, "v1.0.0");
+
+        let sections = changelog_sections(root, "v1.0.0").unwrap();
+        assert_eq!(sections, Vec::new());
+        assert_eq!(render_changelog_body(&sections), "");
+    }
+
+    /// D-12/ASVS V7 (Task 3), mirrors `render_gate_context`'s properties
+    /// (`pipeline_outcomes.rs:323`): every `char::is_control()` character is
+    /// neutralized, an over-length subject is capped at exactly
+    /// `CHANGELOG_SUBJECT_MAX_CHARS` including the truncation marker, and a
+    /// short ordinary subject passes through unchanged.
+    #[test]
+    fn sanitize_changelog_subject_neutralizes_controls_and_caps_length() {
+        let controls = "line 1\u{1b}[2J\tline 2\u{7}";
+        let sanitized = sanitize_changelog_subject(controls);
+        assert!(
+            sanitized.chars().all(|c| !c.is_control()),
+            "expected no control characters, got: {sanitized:?}"
+        );
+
+        let long = "x".repeat(5000);
+        let capped = sanitize_changelog_subject(&long);
+        assert!(capped.chars().count() <= CHANGELOG_SUBJECT_MAX_CHARS);
+        assert!(capped.ends_with("… [truncated]"));
+
+        let short = "add the widget endpoint";
+        assert_eq!(sanitize_changelog_subject(short), short);
+    }
+
+    /// D-12/ASVS V7 (Task 3): asserts on `changelog_sections`' output (the
+    /// public boundary), not on `sanitize_changelog_subject` alone — proving
+    /// the call site exists, not merely the helper.
+    #[test]
+    fn changelog_sections_sanitizes_subjects_before_grouping() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        commit_msg(root, "a.txt", "chore: init");
+        tag(root, "v1.0.0");
+        commit_msg(root, "b.txt", "feat: add \u{1b}[31mcolored\u{1b}[0m widget");
+
+        let sections = changelog_sections(root, "v1.0.0").unwrap();
+        assert_eq!(sections.len(), 1);
+        let (heading, bullets) = &sections[0];
+        assert_eq!(*heading, ChangelogHeading::Added);
+        assert_eq!(bullets.len(), 1);
+        assert!(
+            bullets[0].chars().all(|c| !c.is_control()),
+            "expected no control characters in the grouped bullet, got: {:?}",
+            bullets[0]
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // 27-03 (D-01/D-03): tag reads resolve the caller's own repository
+    // under a hostile GIT_DIR, not an unrelated one.
+    // -----------------------------------------------------------------
+
+    /// D-03: `count_git_tags`/`highest_semver_tag` resolve `root`'s own tags
+    /// even when the process inherited a hostile `GIT_DIR` pointed at an
+    /// unrelated repository — proven with a real spawned `git` process, not
+    /// by inspecting a `Command` object alone. Mirrors
+    /// `origin_main_ancestor_status_holds_under_a_hostile_git_dir`
+    /// (`git.rs`, 27-01): `count_git_tags`/`highest_semver_tag` take only
+    /// `project_root`, so the hostile `GIT_DIR` this test's own `<verify>`
+    /// entries exercise (`GIT_DIR=<hostile>/.git cargo test ... this test`)
+    /// is injected the same way any inherited-env attack reaches these
+    /// functions in production: via the whole process's environment, then
+    /// down into the spawned child unless the constructor scrubs it. Before
+    /// this plan's migration, both bare `Command::new("git")` sites this
+    /// test exercises inherit that `GIT_DIR` unscrubbed and silently read
+    /// the hostile repository instead — an empty repository with zero tags
+    /// is the clearest contrast against `root`'s two, so this test fails
+    /// pre-migration under the hostile harness and passes once
+    /// `git_command` scrubs it.
+    // `count_git_tags` is deprecated (D-07) but still `pub`; this test still
+    // exercises its own scrub, independent of `compute_version`'s supersession.
+    /// 27-REVIEW WR-01: this test previously set no hostile environment at
+    /// all — it asserted ordinary-path behavior and claimed a hostile-
+    /// `GIT_DIR` proof, so it passed identically with or without the scrub.
+    /// It now uses the spawned-child shape this phase established in
+    /// `staleness.rs`: `GIT_DIR` is never set on this process (Rust 2024
+    /// `unsafe`, unsound under threaded tests — Phase 25 D-14), only on one
+    /// freshly spawned child re-invoking this binary filtered to this test.
+    #[test]
+    #[allow(deprecated)]
+    fn tag_reads_resolve_caller_root_under_a_hostile_git_dir() {
+        const INNER_ROOT: &str = "DEVFLOW_27_03_TAG_READS_INNER_ROOT";
+
+        if let Ok(root) = std::env::var(INNER_ROOT) {
+            // Inner mode: GIT_DIR points at a foreign repository that has
+            // no tags at all, scoped to this child process only.
+            let root = std::path::PathBuf::from(root);
+
+            assert_eq!(
+                count_git_tags(&root).unwrap(),
+                2,
+                "count_git_tags must resolve root's own two tags, not a \
+                 hostile GIT_DIR's repository"
+            );
+            assert_eq!(
+                highest_semver_tag(&root).unwrap(),
+                Some(semver::Version::new(0, 2, 0)),
+                "highest_semver_tag must resolve root's own highest tag, not \
+                 a hostile GIT_DIR's repository"
+            );
+            return;
+        }
+
+        // Outer mode: the real repository has two tags; the foreign one has
+        // none. Unscrubbed, the child would read the foreign repository and
+        // see zero tags / no baseline.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        commit(root, "a.txt");
+        tag(root, "v0.1.0");
+        commit(root, "b.txt");
+        tag(root, "v0.2.0");
+
+        let foreign = tempfile::tempdir().unwrap();
+        init_repo(foreign.path());
+
+        let exe = std::env::current_exe().expect("current_exe for child re-invocation");
+        let out = std::process::Command::new(&exe)
+            // Substring filter, NOT `--exact`: the binary's real test name is
+            // module-qualified (`version::tests::tag_reads_...`), so `--exact`
+            // against the bare name matches nothing, runs zero tests, and
+            // still exits 0 — a false green that made the first version of
+            // this fix as vacuous as the test it replaced.
+            .arg("tag_reads_resolve_caller_root_under_a_hostile_git_dir")
+            .arg("--test-threads=1")
+            .env(INNER_ROOT, root.to_str().unwrap())
+            .env("GIT_DIR", foreign.path().join(".git"))
+            .output()
+            .expect("spawn hostile child test process");
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // Assert the child actually RAN the test, not merely that it exited
+        // 0. A filter that matches nothing exits 0 with "0 passed", so the
+        // exit status alone cannot distinguish "proved it" from "ran nothing".
+        assert!(
+            stdout.contains("1 passed"),
+            "child test process must have run exactly the inner test; \
+             stdout:\n{stdout}"
+        );
+        assert!(
+            out.status.success(),
+            "child test process (hostile GIT_DIR pointed at an unrelated \
+             foreign repository with no tags) must still resolve root's own \
+             tags; child exit status {:?}\nstdout:\n{stdout}",
+            out.status
         );
     }
 }

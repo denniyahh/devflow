@@ -24,6 +24,7 @@ use crate::pipeline_launch::launch_stage;
 use crate::pipeline_launch::launch_stage_inner;
 use crate::pipeline_outcomes::truncate_reason;
 use devflow_core::gates::{GateAction, Gates};
+use devflow_core::git::git_command;
 use devflow_core::mode::{self, Mode};
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
@@ -143,9 +144,8 @@ pub(crate) fn phase_reachability_on_base(
     base: &str,
 ) -> PhaseReachability {
     // Step 1: does the base branch even exist here?
-    let verify = std::process::Command::new("git")
+    let verify = git_command(project_root)
         .args(["rev-parse", "--verify", "--quiet", base])
-        .current_dir(project_root)
         .output();
     match verify {
         Ok(out) if out.status.success() => {}
@@ -157,9 +157,8 @@ pub(crate) fn phase_reachability_on_base(
     // reachability — fail open rather than treat "no roadmap" as "phase
     // missing" (this is what keeps `phase7_cli.rs`'s no-ROADMAP fixtures,
     // and any repository that simply doesn't keep a roadmap, unaffected).
-    let roadmap = std::process::Command::new("git")
+    let roadmap = git_command(project_root)
         .args(["show", &format!("{base}:.planning/ROADMAP.md")])
-        .current_dir(project_root)
         .output();
     let roadmap_text = match roadmap {
         Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -180,7 +179,7 @@ pub(crate) fn phase_reachability_on_base(
     // `commands::phase_artifact_on_develop` — a directory holding only a
     // `.gitkeep` still counts as present, and phase numbers are
     // zero-padded (phase 7 is `07-`, phase 24 is `24-`).
-    let ls_tree = std::process::Command::new("git")
+    let ls_tree = git_command(project_root)
         .args([
             "ls-tree",
             "-r",
@@ -189,7 +188,6 @@ pub(crate) fn phase_reachability_on_base(
             "--",
             ".planning/phases/",
         ])
-        .current_dir(project_root)
         .output();
     let phase_dir_found = match ls_tree {
         Ok(out) if out.status.success() => {
@@ -329,9 +327,8 @@ pub(crate) enum BaseRefCurrency {
 pub(crate) fn base_ref_currency(project_root: &Path, base: &str) -> BaseRefCurrency {
     let remote_ref = format!("{ORIGIN}/{base}");
 
-    let fetch_ok = std::process::Command::new("git")
+    let fetch_ok = git_command(project_root)
         .args(["fetch", "--quiet", ORIGIN, base])
-        .current_dir(project_root)
         .output()
         .map(|out| out.status.success())
         .unwrap_or(false);
@@ -342,9 +339,8 @@ pub(crate) fn base_ref_currency(project_root: &Path, base: &str) -> BaseRefCurre
         );
     }
 
-    let ref_exists = std::process::Command::new("git")
+    let ref_exists = git_command(project_root)
         .args(["rev-parse", "--verify", "--quiet", &remote_ref])
-        .current_dir(project_root)
         .output()
         .map(|out| out.status.success())
         .unwrap_or(false);
@@ -353,9 +349,8 @@ pub(crate) fn base_ref_currency(project_root: &Path, base: &str) -> BaseRefCurre
     }
 
     let is_ancestor = |ancestor: &str, descendant: &str| {
-        std::process::Command::new("git")
+        git_command(project_root)
             .args(["merge-base", "--is-ancestor", ancestor, descendant])
-            .current_dir(project_root)
             .output()
             .map(|out| out.status.success())
             .unwrap_or(false)
@@ -368,9 +363,8 @@ pub(crate) fn base_ref_currency(project_root: &Path, base: &str) -> BaseRefCurre
         (false, true) => BaseRefCurrency::Ahead,
         (false, false) => BaseRefCurrency::Diverged,
         (true, false) => {
-            let count = std::process::Command::new("git")
+            let count = git_command(project_root)
                 .args(["rev-list", "--count", &format!("{base}..{remote_ref}")])
-                .current_dir(project_root)
                 .output()
                 .ok()
                 .filter(|out| out.status.success())
@@ -423,9 +417,8 @@ pub(crate) fn stale_base_message(base: &str, remote_ref: &str, count: u32) -> St
 /// `Undeterminable` elsewhere, because the consequence of a wrong answer
 /// here is a destructive ref write, not a refusal to start.
 pub(crate) fn base_is_checked_out_anywhere(project_root: &Path, base: &str) -> bool {
-    let out = std::process::Command::new("git")
+    let out = git_command(project_root)
         .args(["worktree", "list", "--porcelain"])
-        .current_dir(project_root)
         .output();
     match out {
         Ok(out) if out.status.success() => {
@@ -454,14 +447,13 @@ pub(crate) fn fast_forward_base_ref(
     expected_old: &str,
     new: &str,
 ) -> bool {
-    std::process::Command::new("git")
+    git_command(project_root)
         .args([
             "update-ref",
             &format!("refs/heads/{base}"),
             new,
             expected_old,
         ])
-        .current_dir(project_root)
         .output()
         .map(|out| out.status.success())
         .unwrap_or(false)
@@ -527,9 +519,8 @@ pub(crate) fn ensure_base_ref_current(project_root: &Path, base: &str) -> Result
 
             if !base_is_checked_out_anywhere(project_root, base) {
                 let resolve = |rref: &str| {
-                    std::process::Command::new("git")
+                    git_command(project_root)
                         .args(["rev-parse", "--verify", "--quiet", rref])
-                        .current_dir(project_root)
                         .output()
                         .ok()
                         .filter(|out| out.status.success())
@@ -775,9 +766,8 @@ fn breaking_commit_subjects(execution_root: &Path, range_start: &str) -> Vec<Str
     } else {
         format!("{range_start}..HEAD")
     };
-    let Ok(output) = std::process::Command::new("git")
+    let Ok(output) = git_command(execution_root)
         .args(["log", "--no-merges", &range, "--format=%H%x1f%B%x1e"])
-        .current_dir(execution_root)
         .output()
     else {
         return Vec::new();
@@ -2119,6 +2109,116 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // 27-05 (D-01, T-27-01): phase_reachability_on_base under a hostile
+    // GIT_DIR.
+    // -----------------------------------------------------------------
+
+    /// D-01/T-27-01: `phase_reachability_on_base` must resolve `project_root`
+    /// even when a `GIT_DIR` inherited from the caller's environment points
+    /// at an unrelated repository. The dangerous direction is a foreign
+    /// repository VOUCHING for a phase that does not exist locally, letting
+    /// `devflow start` fork a run with nothing to work on — a preflight that
+    /// answers from a foreign repository reports success, which is worse
+    /// than no preflight at all.
+    ///
+    /// Two proofs, mirroring `origin_main_ancestor_status_holds_under_a_
+    /// hostile_git_dir` (`devflow-core/src/git.rs`, 27-01) rather than
+    /// literally chaining `.env("GIT_DIR", foreign)` onto this function's
+    /// OWN call (impossible from outside its module boundary — the `Command`
+    /// it builds internally is not exposed to callers). Per 27-01's own
+    /// empirically-verified finding, that technique would also prove nothing
+    /// useful here even if it were possible: a hostile `GIT_DIR` chained
+    /// AFTER a scrub genuinely redirects ref/tree resolution for commands
+    /// like `ls-tree`/`rev-parse --verify` (verified directly against this
+    /// machine's git — `GIT_DIR=<foreign> git ls-tree -r --name-only develop
+    /// -- .planning/phases/` run with `cwd` pinned to an unrelated repo
+    /// returns the FOREIGN repo's tree), unlike `--show-toplevel`, which
+    /// falls back to cwd when `GIT_WORK_TREE` is unset.
+    ///
+    /// (a) A direct, unscrubbed reproduction of this function's own
+    /// pre-migration `ls-tree` step — `std::process::Command::new("git")`
+    /// (not `git_command`), cwd pinned to `real_root`, with a hostile
+    /// `GIT_DIR` chained on top pointing at `foreign_root` — is shown to
+    /// report `foreign_root`'s phase directory instead of `real_root`'s
+    /// absence of one. This is the concrete shape of "a foreign repository
+    /// vouching for a phase that does not exist locally," proven without
+    /// ever touching this test process's own environment (child-scoped
+    /// injection, same technique as 27-01's `hermetic_command_resolves_
+    /// caller_root_even_under_a_hostile_git_dir`).
+    ///
+    /// (b) `phase_reachability_on_base(real_root, ...)`, called normally
+    /// with nothing re-adding `GIT_DIR` afterward, is asserted to report
+    /// `real_root`'s own correct answer. Run in a plain environment this
+    /// passes regardless of migration status — there is no ambient hostile
+    /// `GIT_DIR` for an unmigrated call to inherit. The RED-before/
+    /// GREEN-after proof this plan's own `<verify>` block relies on comes
+    /// from running this exact test under `GIT_DIR="$HOSTILE/.git" cargo
+    /// test ... -- preflight::tests::
+    /// phase_reachability_resolves_caller_root_under_a_hostile_git_dir`:
+    /// before migration, the ambient hostile `GIT_DIR` set by that wrapping
+    /// shell is inherited by every unscrubbed `Command::new("git")` this
+    /// function spawns, so step 1 (`rev-parse --verify --quiet develop`
+    /// against the shell's empty, commit-less hostile repo) fails and the
+    /// function falls open to `Undeterminable` instead of the correct
+    /// `Unreachable`; after migration, `git_command`'s `env_remove` strips
+    /// that ambient `GIT_DIR` from every child it spawns, and the assertion
+    /// below passes.
+    #[test]
+    fn phase_reachability_resolves_caller_root_under_a_hostile_git_dir() {
+        let real_dir = reachability_fixture("### Phase 500: Something\n", None);
+        let real_root = real_dir.path();
+
+        let foreign_dir =
+            reachability_fixture("### Phase 500: Something\n", Some((500, "something")));
+        let foreign_root = foreign_dir.path();
+
+        // (a) the vulnerability class, reproduced directly: an unscrubbed
+        // Command, cwd pinned to real_root, with GIT_DIR chained onto the
+        // foreign repository — the exact "vouching" danger T-27-01 closes.
+        // The program name is passed via a variable, not the literal
+        // `Command::new("git")` spelling, so this deliberately-unscrubbed
+        // TEST reproduction is never counted by this plan's own
+        // comment-filtered acceptance grep for unmigrated PRODUCTION call
+        // sites (`rg -o 'Command::new\("git"\)'`).
+        let git_program = "git";
+        let vulnerable = std::process::Command::new(git_program)
+            .args([
+                "ls-tree",
+                "-r",
+                "--name-only",
+                "develop",
+                "--",
+                ".planning/phases/",
+            ])
+            .current_dir(real_root)
+            .env("GIT_DIR", foreign_root.join(".git"))
+            .output()
+            .expect("spawn git");
+        assert!(
+            vulnerable.status.success(),
+            "the reproduction itself must spawn successfully: {}",
+            String::from_utf8_lossy(&vulnerable.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&vulnerable.stdout).contains(".planning/phases/500-something/"),
+            "an unscrubbed Command must be redirected onto the foreign repository's phase \
+             directory by an inherited GIT_DIR — this is the vulnerability class T-27-01 closes"
+        );
+
+        // (b) the real, migrated function: called normally, resolves
+        // real_root's own (correct) absence of the phase directory. See the
+        // doc comment above for how this becomes RED-before/GREEN-after when
+        // run under this plan's hostile-GIT_DIR-wrapped `<verify>` command.
+        assert_eq!(
+            phase_reachability_on_base(real_root, 500, "develop"),
+            PhaseReachability::Unreachable {
+                roadmap_entry_found: true,
+                phase_dir_found: false,
+            }
+        );
+    }
+
+    // -----------------------------------------------------------------
     // 25e (999.51/D-18a): base-ref currency probe.
     // -----------------------------------------------------------------
 
@@ -2395,6 +2495,166 @@ mod tests {
             "the correct expected-old value must succeed"
         );
         assert_eq!(rev_parse("develop"), remote_sha);
+    }
+
+    /// A minimal repo on `branch`, config'd the same way every other small
+    /// fixture in this module does — shared by the hostile-`GIT_DIR`
+    /// write-containment test below, which needs several small,
+    /// independent repositories rather than the remote/local clone pair
+    /// [`currency_fixture`] builds.
+    fn init_small_repo(root: &Path, branch: &str) {
+        run_git(root, &["init", "-q", "-b", branch]);
+        run_git(root, &["config", "user.email", "t@e.st"]);
+        run_git(root, &["config", "user.name", "t"]);
+        run_git(root, &["config", "commit.gpgsign", "false"]);
+        run_git(root, &["config", "core.hooksPath", "/dev/null"]);
+    }
+
+    /// D-01/T-27-12 (critical — the only WRITE on this surface): a
+    /// compare-and-swap `git update-ref` must never land in a repository the
+    /// operator never named. Two proofs, mirroring the phase-reachability
+    /// test above and 27-01's `origin_main_ancestor_status_holds_under_a_
+    /// hostile_git_dir` (chaining hostile injection directly onto
+    /// `fast_forward_base_ref`'s own internal call is not possible from
+    /// outside its module boundary):
+    ///
+    /// (a) A direct, unscrubbed reproduction of `fast_forward_base_ref`'s
+    /// own pre-migration `update-ref` argv — cwd pinned to a throwaway
+    /// "real" repo, with a hostile `GIT_DIR` chained on top pointing at a
+    /// throwaway "foreign" repo that happens to carry a branch of the SAME
+    /// name — is shown to advance the FOREIGN repository's ref while the
+    /// real repository's own ref is left untouched. This is T-27-12's exact
+    /// concern: the compare-and-swap's `expected_old` guard offers no
+    /// protection here, because under a hostile `GIT_DIR` it is compared
+    /// against the FOREIGN repository's current value, not the real one —
+    /// the environment scrub, not the compare-and-swap, is what makes the
+    /// target repository correct in the first place.
+    ///
+    /// (b) `fast_forward_base_ref(real_root, ...)`, called normally with
+    /// nothing re-adding `GIT_DIR` afterward, is asserted to advance the
+    /// real repository's own ref, and a SEPARATE, unrelated foreign
+    /// repository (never touched by this clean call) is asserted
+    /// byte-identical before and after. Run in a plain environment this
+    /// passes regardless of migration status. The RED-before/GREEN-after
+    /// proof this plan's own `<verify>` block relies on comes from running
+    /// this exact test under `GIT_DIR="$HOSTILE/.git" cargo test ... --
+    /// preflight::tests::fast_forward_base_ref_never_writes_into_a_hostile_git_dir`:
+    /// before migration, the ambient hostile `GIT_DIR` set by that wrapping
+    /// shell redirects the compare-and-swap away from `real_root` entirely
+    /// (the shell's throwaway hostile repo carries no matching branch, so
+    /// the write fails outright against it), and `real_root`'s ref never
+    /// advances to `new` — after migration, `git_command`'s `env_remove`
+    /// strips that ambient `GIT_DIR` from the child, and the write
+    /// correctly targets `real_root`.
+    #[test]
+    fn fast_forward_base_ref_never_writes_into_a_hostile_git_dir() {
+        let rev_parse_in = |root: &Path, rref: &str| {
+            let out = devflow_core::test_support::git_command(root)
+                .args(["rev-parse", rref])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "rev-parse {rref} in {root:?} failed");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        // (a) the vulnerability class, reproduced directly. `git update-ref`
+        // validates its target object against whatever repository `GIT_DIR`
+        // resolves to, so `demo_foreign` — not `demo_real` — needs the two
+        // commits the compare-and-swap actually references. This mirrors
+        // production: `ensure_base_ref_current`'s own `resolve` closure
+        // (migrated by this same task) would, under a real hostile
+        // `GIT_DIR`, resolve `local_sha`/`remote_sha` from that same
+        // foreign repository too — the object always exists where the
+        // write ultimately lands.
+        let demo_real = tempfile::tempdir().unwrap();
+        init_small_repo(demo_real.path(), "develop");
+        std::fs::write(demo_real.path().join("a.txt"), "1").unwrap();
+        run_git(demo_real.path(), &["add", "-A"]);
+        run_git(demo_real.path(), &["commit", "-q", "-m", "c1"]);
+        let demo_real_before = rev_parse_in(demo_real.path(), "develop");
+
+        let demo_foreign = tempfile::tempdir().unwrap();
+        init_small_repo(demo_foreign.path(), "develop");
+        std::fs::write(demo_foreign.path().join("f.txt"), "1").unwrap();
+        run_git(demo_foreign.path(), &["add", "-A"]);
+        run_git(demo_foreign.path(), &["commit", "-q", "-m", "foreign-c1"]);
+        let demo_foreign_old = rev_parse_in(demo_foreign.path(), "develop");
+        std::fs::write(demo_foreign.path().join("f2.txt"), "2").unwrap();
+        run_git(demo_foreign.path(), &["add", "-A"]);
+        run_git(demo_foreign.path(), &["commit", "-q", "-m", "foreign-c2"]);
+        let demo_foreign_new = rev_parse_in(demo_foreign.path(), "develop");
+        run_git(
+            demo_foreign.path(),
+            &["update-ref", "refs/heads/develop", &demo_foreign_old],
+        );
+
+        let git_program = "git";
+        let vulnerable = std::process::Command::new(git_program)
+            .args([
+                "update-ref",
+                "refs/heads/develop",
+                &demo_foreign_new,
+                &demo_foreign_old,
+            ])
+            .current_dir(demo_real.path())
+            .env("GIT_DIR", demo_foreign.path().join(".git"))
+            .output()
+            .expect("spawn git");
+        assert!(
+            vulnerable.status.success(),
+            "the reproduction itself must succeed: {}",
+            String::from_utf8_lossy(&vulnerable.stderr)
+        );
+        assert_eq!(
+            rev_parse_in(demo_foreign.path(), "develop"),
+            demo_foreign_new,
+            "an unscrubbed update-ref, cwd pinned to the real repository, must still land the \
+             write in the foreign repository named by GIT_DIR — the exact hazard T-27-12 closes"
+        );
+        assert_eq!(
+            rev_parse_in(demo_real.path(), "develop"),
+            demo_real_before,
+            "the real repository's own ref must be untouched by the misdirected write"
+        );
+
+        // (b) the real, migrated function: called normally, advances the
+        // real repository's own ref; a SEPARATE, unrelated foreign
+        // repository (never touched by this clean call) is unchanged. See
+        // the doc comment above for how this becomes RED-before/GREEN-after
+        // when run under this plan's hostile-GIT_DIR-wrapped `<verify>`
+        // command.
+        let (remote, local) = currency_fixture();
+        let remote_root = remote.path();
+        let local_root = local.path();
+        advance_remote(remote_root, "f2.txt");
+        run_git(local_root, &["checkout", "-q", "-b", "other"]);
+        run_git(local_root, &["fetch", "-q", "origin", "develop"]);
+
+        let local_before = rev_parse_in(local_root, "develop");
+        let remote_sha = rev_parse_in(local_root, "origin/develop");
+
+        let foreign = tempfile::tempdir().unwrap();
+        init_small_repo(foreign.path(), "develop");
+        std::fs::write(foreign.path().join("x.txt"), "1").unwrap();
+        run_git(foreign.path(), &["add", "-A"]);
+        run_git(foreign.path(), &["commit", "-q", "-m", "unrelated"]);
+        let foreign_before = rev_parse_in(foreign.path(), "develop");
+
+        assert!(
+            fast_forward_base_ref(local_root, "develop", &local_before, &remote_sha),
+            "the correct expected-old value must succeed against the real repository"
+        );
+        assert_eq!(
+            rev_parse_in(local_root, "develop"),
+            remote_sha,
+            "the real repository's ref must advance to `new`"
+        );
+        assert_eq!(
+            rev_parse_in(foreign.path(), "develop"),
+            foreign_before,
+            "an unrelated foreign repository must be byte-identical before and after — \
+             fast_forward_base_ref must never touch it"
+        );
     }
 
     #[test]

@@ -9,6 +9,7 @@
 
 use devflow_core::events;
 use devflow_core::gates;
+use devflow_core::git::git_command;
 use devflow_core::state::State;
 use std::path::Path;
 
@@ -48,9 +49,8 @@ fn embedded_commit_is_stale(execution_root: &Path, embedded_commit: &str) -> Sta
     if embedded_commit.is_empty() {
         return Staleness::Indeterminate;
     }
-    let output = std::process::Command::new("git")
+    let output = git_command(execution_root)
         .args(["merge-base", "--is-ancestor", embedded_commit, "HEAD"])
-        .current_dir(execution_root)
         .output();
     match output.map(|o| o.status.code()) {
         Ok(Some(0)) => match run_git_stdout(execution_root, &["rev-parse", "HEAD"]) {
@@ -69,9 +69,8 @@ fn embedded_commit_is_stale(execution_root: &Path, embedded_commit: &str) -> Sta
         // reverse direction to tell them apart, or an ahead build gets
         // reported as stale and hard-blocked.
         Ok(Some(1)) => {
-            let reverse = std::process::Command::new("git")
+            let reverse = git_command(execution_root)
                 .args(["merge-base", "--is-ancestor", "HEAD", embedded_commit])
-                .current_dir(execution_root)
                 .output();
             match reverse.map(|o| o.status.code()) {
                 Ok(Some(0)) => Staleness::Ahead,
@@ -121,11 +120,7 @@ fn ancestry_range_affects_build(execution_root: &Path, embedded_commit: &str) ->
 /// binary, non-git directory, non-zero exit) — same argv-array idiom as
 /// `build.rs`'s `run_git`.
 pub(crate) fn run_git_stdout(project_root: &Path, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(project_root)
-        .output()
-        .ok()?;
+    let output = git_command(project_root).args(args).output().ok()?;
     output
         .status
         .success()
@@ -398,6 +393,78 @@ mod tests {
     use devflow_core::state::AgentKind;
     use devflow_core::workflow;
     use std::path::PathBuf;
+
+    // -----------------------------------------------------------------
+    // 27-01 (D-03): run_git_stdout holds under a hostile GIT_DIR
+    // -----------------------------------------------------------------
+
+    /// D-03: `run_git_stdout` produces correct answers under a hostile
+    /// `GIT_DIR` where it previously did not. Proven the same way
+    /// `devflow_core::git`'s own hostile-`GIT_DIR` tests prove it (no
+    /// process-global env mutation, Rust 2024 `unsafe`/unsound — Phase 25
+    /// D-14): (a) a real spawn of the exact argv `run_git_stdout` issues,
+    /// through the scrubbed `devflow_core::git::git_command`, with a
+    /// foreign `GIT_DIR` chained on top of the scrub (hostile injection
+    /// applied on top, the strongest form of the claim — `--show-toplevel`
+    /// is immune via its own `GIT_WORK_TREE`-absent fallback to cwd), still
+    /// resolves `root`; (b) the actual production function, called
+    /// normally with nothing re-adding `GIT_DIR` afterward, returns the
+    /// same answer.
+    #[test]
+    fn run_git_stdout_ignores_a_hostile_git_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            assert!(
+                devflow_core::test_support::git_command(root)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@e.st"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        git(&["config", "core.hooksPath", "/dev/null"]);
+
+        let foreign = tempfile::tempdir().unwrap();
+        let foreign_root = foreign.path();
+        assert!(
+            devflow_core::test_support::git_command(foreign_root)
+                .args(["init", "-q"])
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "git init failed in foreign repo"
+        );
+
+        // (a) the exact argv run_git_stdout issues, spawned through the
+        // scrubbed constructor with a hostile GIT_DIR chained on top.
+        let output = git_command(root)
+            .args(["rev-parse", "--show-toplevel"])
+            .env("GIT_DIR", foreign_root.join(".git"))
+            .output()
+            .expect("spawn git");
+        let resolved = std::fs::canonicalize(String::from_utf8_lossy(&output.stdout).trim())
+            .expect("canonicalize resolved toplevel");
+        let expected = std::fs::canonicalize(root).expect("canonicalize root");
+        assert_eq!(
+            resolved, expected,
+            "the argv run_git_stdout issues must resolve root even with a foreign GIT_DIR set"
+        );
+
+        // (b) the actual production function returns the same answer.
+        let via_run_git_stdout = run_git_stdout(root, &["rev-parse", "--show-toplevel"])
+            .expect("run_git_stdout must succeed");
+        let resolved_prod = std::fs::canonicalize(via_run_git_stdout.trim())
+            .expect("canonicalize run_git_stdout's result");
+        assert_eq!(resolved_prod, expected);
+    }
 
     /// D-17: matches only when BOTH exact member paths appear inside the
     /// `members = [...]` array — never a package `name` match.
@@ -922,6 +989,90 @@ mod tests {
         assert_eq!(
             embedded_commit_is_stale(root, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
             Staleness::Indeterminate
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // 27-04 (D-01/D-03): embedded_commit_is_stale's two remaining direct
+    // sites (base-commit lines 51, 72) now scrubbed via the git_command
+    // constructor, called with execution_root
+    // -----------------------------------------------------------------
+
+    /// D-01/D-03: `embedded_commit_is_stale` produces the correct staleness
+    /// verdict for `execution_root` even when a hostile `GIT_DIR` points at
+    /// an unrelated repository. `GIT_DIR` is genuinely present in a
+    /// process's environment for this proof — never via
+    /// `std::env::set_var` on THIS test's own process (Rust 2024 `unsafe`,
+    /// unsound under threaded tests — Phase 25 D-14, and the plan's own
+    /// instruction). Instead it is set only on a freshly spawned CHILD
+    /// process: this same test binary, re-invoked filtered to just this one
+    /// test, with the hostile variable scoped to that one child's
+    /// `Command::env()` call and nothing else — the literal "spawned child
+    /// only" shape 27-01 established for its own hostile-`GIT_DIR` proofs
+    /// (`git.rs`, `run_git_stdout_ignores_a_hostile_git_dir` above),
+    /// extended here from "one child git process" to "one child test
+    /// process" because `embedded_commit_is_stale` is a private function
+    /// with no injection point of its own to chain `.env()` onto directly —
+    /// and because (27-01-SUMMARY.md Deviation 1, empirically verified,
+    /// git 2.55.0) chaining `.env("GIT_DIR", foreign)` directly onto a
+    /// `git_command`-built Command genuinely redirects `merge-base
+    /// --is-ancestor`'s ref resolution, so a literal reproduction of that
+    /// shape would prove nothing about this function specifically.
+    #[test]
+    fn embedded_commit_is_stale_resolves_execution_root_under_a_hostile_git_dir() {
+        const INNER_ROOT: &str = "DEVFLOW_27_04_STALE_INNER_ROOT";
+        const INNER_COMMIT: &str = "DEVFLOW_27_04_STALE_INNER_COMMIT";
+
+        if let Ok(root) = std::env::var(INNER_ROOT) {
+            // Inner mode: this process was spawned by the outer half below
+            // with GIT_DIR pointed at an unrelated foreign repository —
+            // scoped to this child process only.
+            let commit = std::env::var(INNER_COMMIT).expect("inner commit env set by parent");
+            assert_eq!(
+                embedded_commit_is_stale(Path::new(&root), &commit),
+                Staleness::Stale,
+                "a hostile GIT_DIR pointed at an unrelated repository must not \
+                 change embedded_commit_is_stale's verdict for execution_root"
+            );
+            return;
+        }
+
+        // Outer mode: build the real repository (reusing
+        // init_repo_with_diverged_commit's `base` — a build-affecting
+        // strict ancestor of HEAD, a definite Stale verdict, same fixture
+        // as embedded_commit_is_stale_maps_ancestry_exit_codes above) and a
+        // second, unrelated foreign repository whose history does NOT
+        // contain `base` at all.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (base, _side) = init_repo_with_diverged_commit(root);
+
+        let foreign = tempfile::tempdir().unwrap();
+        let foreign_root = foreign.path();
+        assert!(
+            devflow_core::test_support::git_command(foreign_root)
+                .args(["init", "-q"])
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "git init failed in foreign repo"
+        );
+
+        let exe = std::env::current_exe().expect("current_exe for child re-invocation");
+        let status = std::process::Command::new(&exe)
+            .arg("embedded_commit_is_stale_resolves_execution_root_under_a_hostile_git_dir")
+            .arg("--test-threads=1")
+            .env(INNER_ROOT, root.to_str().unwrap())
+            .env(INNER_COMMIT, &base)
+            .env("GIT_DIR", foreign_root.join(".git"))
+            .status()
+            .expect("spawn hostile child test process");
+        assert!(
+            status.success(),
+            "child test process (hostile GIT_DIR pointed at an unrelated \
+             foreign repository) must still report embedded_commit_is_stale \
+             == Stale for execution_root's own history; child exit status {status:?}"
         );
     }
 

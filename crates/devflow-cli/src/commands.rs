@@ -24,10 +24,10 @@ use crate::staleness::{enforce_build_staleness, run_git_stdout};
 use devflow_core::agent;
 use devflow_core::agent_result;
 use devflow_core::agents;
-use devflow_core::config::{DEVELOP, FEATURE_PREFIX, MAIN};
+use devflow_core::config::{self, DEVELOP, FEATURE_PREFIX, MAIN};
 use devflow_core::events;
 use devflow_core::gates::{GateAction, GateError, GateResponse, Gates, OpenGate};
-use devflow_core::git::GitFlow;
+use devflow_core::git::{GitFlow, git_command, hermetic_command};
 use devflow_core::history;
 use devflow_core::lock;
 use devflow_core::mode::Mode;
@@ -88,7 +88,7 @@ pub(crate) fn resolve_gate_target(
 /// specific checks would allow.
 pub(crate) fn phase_artifact_on_develop(project_root: &Path, phase: u32, suffix: &str) -> bool {
     let prefix = format!(".planning/phases/{phase:02}-");
-    let output = std::process::Command::new("git")
+    let output = git_command(project_root)
         .args([
             "ls-tree",
             "-r",
@@ -97,7 +97,6 @@ pub(crate) fn phase_artifact_on_develop(project_root: &Path, phase: u32, suffix:
             "--",
             ".planning/phases/",
         ])
-        .current_dir(project_root)
         .output();
     let Ok(out) = output else { return true };
     if !out.status.success() {
@@ -124,10 +123,23 @@ pub(crate) fn start(
     let mut state = State::new(phase, agent, mode, project_root.to_path_buf());
     state.stop_until = until;
     // The only assignment in the crate that ever sets `yes_ship` to a
-    // non-default value — from the parsed `--yes-ship` CLI flag, before the
-    // first `save_state` below, so the persisted authorization exists before
-    // the detached monitor that will later consult it is ever spawned.
-    state.yes_ship = yes_ship;
+    // non-default value. Provenance (D-12, `28-CONTEXT.md`): the typed
+    // `--yes-ship` CLI flag OR a standing `yes_ship = true` in
+    // `devflow.toml`, combined here with logical OR since the flag has no
+    // negative form. Combined before the first `save_state` below, so the
+    // persisted authorization exists before the detached monitor that will
+    // later consult it is ever spawned. `run_gate_with_timeout` must never
+    // re-derive this from `state` itself — see its own comment.
+    let config_yes_ship = config::yes_ship(project_root);
+    // D-12's compensating control: a standing default is never silent. Only
+    // fires when config alone supplied the authorization — a typed flag
+    // needs no explanation of where it came from.
+    if config_yes_ship && !yes_ship {
+        println!(
+            "note: Ship gate pre-authorized by devflow.toml (yes_ship = true) — see D-12, 28-CONTEXT.md"
+        );
+    }
+    state.yes_ship = yes_ship || config_yes_ship;
 
     if dry_run {
         print_dry_run(&state);
@@ -1953,10 +1965,9 @@ pub(crate) fn test_cmd(project_root: &Path) -> Result<(), CliError> {
     let mut failures = Vec::new();
     for (label, cmd) in checks {
         println!("=== {label} ===");
-        let status = std::process::Command::new("sh")
+        let status = hermetic_command("sh", project_root)
             .arg("-c")
             .arg(cmd)
-            .current_dir(project_root)
             .status()
             .map_err(|err| CliError::Message(format!("could not run `{cmd}`: {err}")))?;
         if status.success() {
@@ -2883,15 +2894,13 @@ pub(crate) fn parse_planning_doc_versions(text: &str, source: &str) -> Vec<(Stri
 /// `staleness::run_git_stdout`'s idiom: existence first, so a missing tag
 /// short-circuits before the (more expensive) ancestry check.
 pub(crate) fn tag_exists_and_reachable(project_root: &Path, tag: &str, base_branch: &str) -> bool {
-    let exists = std::process::Command::new("git")
+    let exists = git_command(project_root)
         .args(["rev-parse", "--verify", &format!("refs/tags/{tag}")])
-        .current_dir(project_root)
         .output()
         .is_ok_and(|o| o.status.success());
     exists
-        && std::process::Command::new("git")
+        && git_command(project_root)
             .args(["merge-base", "--is-ancestor", tag, base_branch])
-            .current_dir(project_root)
             .output()
             .is_ok_and(|o| o.status.success())
 }
@@ -5668,6 +5677,107 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             init_tagged_repo(dir.path());
             assert!(!tag_exists_and_reachable(dir.path(), "v9.9.9", "main"));
+        }
+
+        // -----------------------------------------------------------------
+        // 27-04 (D-01/D-03): tag_exists_and_reachable's two direct sites
+        // (base-commit lines 2886, 2892) now scrubbed via the git_command
+        // constructor, called with project_root
+        // -----------------------------------------------------------------
+
+        /// D-01/D-03: `tag_exists_and_reachable` produces the correct,
+        /// non-hijacked answer for `project_root` even when a hostile
+        /// `GIT_DIR` points at an unrelated foreign repository that DOES
+        /// carry a tag by the name under test — the dangerous, false-positive
+        /// direction T-27-01 names explicitly (a foreign repository
+        /// asserting a release tag already exists feeds a release-cut
+        /// decision). `GIT_DIR` is genuinely present in a process's
+        /// environment for this proof — never via `std::env::set_var` on
+        /// THIS test's own process (Rust 2024 `unsafe`, unsound under
+        /// threaded tests — Phase 25 D-14, and the plan's own instruction).
+        /// Instead it is set only on a freshly spawned CHILD process: this
+        /// same test binary, re-invoked filtered to just this one test —
+        /// the same "spawned child only" shape used by
+        /// `staleness::tests::embedded_commit_is_stale_resolves_execution_root_under_a_hostile_git_dir`
+        /// (27-04), needed here for the identical reason:
+        /// `tag_exists_and_reachable` is a private function with no
+        /// injection point of its own, and its two git subcommands
+        /// (`rev-parse --verify`, `merge-base --is-ancestor`) are both
+        /// ref-resolving — the class 27-01-SUMMARY.md Deviation 1 verified
+        /// (git 2.55.0) genuinely honors a `GIT_DIR` chained directly onto a
+        /// `git_command`-built Command, so a literal reproduction of that
+        /// shape against the real function would prove nothing specific to
+        /// it.
+        #[test]
+        fn tag_exists_and_reachable_resolves_caller_root_under_a_hostile_git_dir() {
+            const INNER_ROOT: &str = "DEVFLOW_27_04_TAG_INNER_ROOT";
+            const INNER_TAG: &str = "DEVFLOW_27_04_TAG_INNER_TAG";
+            const INNER_BASE: &str = "DEVFLOW_27_04_TAG_INNER_BASE";
+
+            if let Ok(root) = std::env::var(INNER_ROOT) {
+                // Inner mode: this process was spawned by the outer half
+                // below with GIT_DIR pointed at a foreign repository that
+                // DOES carry the tag under test — scoped to this child
+                // process only.
+                let tag = std::env::var(INNER_TAG).expect("inner tag env set by parent");
+                let base = std::env::var(INNER_BASE).expect("inner base env set by parent");
+                assert!(
+                    !tag_exists_and_reachable(Path::new(&root), &tag, &base),
+                    "a hostile GIT_DIR pointed at a foreign repository that DOES \
+                     carry this tag must not cause tag_exists_and_reachable to \
+                     report it as belonging to project_root"
+                );
+                return;
+            }
+
+            // Outer mode: build the real repository with a base branch and
+            // NO tag by the name under test, plus a second, unrelated
+            // foreign repository (reusing init_tagged_repo verbatim) that
+            // DOES carry that tag, reachable from its own base branch — the
+            // dangerous direction.
+            let real = tempfile::tempdir().unwrap();
+            let real_root = real.path();
+            let git = |args: &[&str]| {
+                assert!(
+                    devflow_core::test_support::git_command(real_root)
+                        .args(args)
+                        .output()
+                        .unwrap()
+                        .status
+                        .success(),
+                    "git {args:?} failed"
+                );
+            };
+            git(&["init", "-q", "-b", "main"]);
+            git(&["config", "user.email", "t@e.st"]);
+            git(&["config", "user.name", "t"]);
+            git(&["config", "commit.gpgsign", "false"]);
+            git(&["config", "core.hooksPath", "/dev/null"]);
+            std::fs::write(real_root.join("a.txt"), "one").unwrap();
+            git(&["add", "."]);
+            git(&["commit", "-q", "-m", "base"]);
+            // real_root deliberately carries no tag named v1.7.0.
+
+            let foreign = tempfile::tempdir().unwrap();
+            init_tagged_repo(foreign.path());
+
+            let exe = std::env::current_exe().expect("current_exe for child re-invocation");
+            let status = std::process::Command::new(&exe)
+                .arg("tag_exists_and_reachable_resolves_caller_root_under_a_hostile_git_dir")
+                .arg("--test-threads=1")
+                .env(INNER_ROOT, real_root.to_str().unwrap())
+                .env(INNER_TAG, "v1.7.0")
+                .env(INNER_BASE, "main")
+                .env("GIT_DIR", foreign.path().join(".git"))
+                .status()
+                .expect("spawn hostile child test process");
+            assert!(
+                status.success(),
+                "child test process (hostile GIT_DIR pointed at a foreign repo \
+                 that DOES carry v1.7.0) must still report \
+                 tag_exists_and_reachable == false for the real repository; \
+                 child exit status {status:?}"
+            );
         }
 
         /// D-05/D-04: a MISSING `.planning/ROADMAP.md`/`STATE.md` must yield
