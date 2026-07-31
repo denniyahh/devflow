@@ -426,12 +426,6 @@ fn detect_claude_envelope_failure(stdout: &str) -> Option<AgentResult> {
 /// prediction, not an observed fact — treat it accordingly.
 const HUMAN_GATE_VALUE: &str = "blocking-human";
 
-/// The plain (non-human) `**Gate:**` VALUE — must be distinguished from
-/// [`HUMAN_GATE_VALUE`] exactly (the Phase 26 near-miss: routing an ordinary
-/// `blocking` gate into the auto-decide relaunch as if it were
-/// `blocking-human`).
-const PLAIN_GATE_VALUE: &str = "blocking";
-
 /// Confirm whether captured stdout reports a human-blocking checkpoint, by
 /// searching for a `**Gate:**`-labeled line whose VALUE is exactly
 /// [`HUMAN_GATE_VALUE`] — see that constant's doc comment for the
@@ -459,16 +453,50 @@ const PLAIN_GATE_VALUE: &str = "blocking";
 /// checkpoint" heuristic (D-02 rejected that class of predicate); the scope
 /// is one declared field label with one enumerated value.
 pub fn blocking_human_checkpoint_reported(stdout: &str) -> bool {
-    let _ = stdout;
-    unimplemented!("RED: blocking_human_checkpoint_reported not yet implemented")
+    if text_reports_human_gate(stdout) {
+        return true;
+    }
+    extract_json_result_text(stdout)
+        .as_deref()
+        .is_some_and(text_reports_human_gate)
+}
+
+/// Core matcher shared by both search targets (raw stdout and the unescaped
+/// inner envelope text) in [`blocking_human_checkpoint_reported`]. Scans for
+/// a case-insensitive `gate` label, tolerating surrounding markdown emphasis
+/// (`*`) and whitespace up to the following `:`, then compares the VALUE
+/// token immediately after the colon exactly against [`HUMAN_GATE_VALUE`].
+fn text_reports_human_gate(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let mut search_from = 0;
+    while let Some(rel_idx) = lower[search_from..].find("gate") {
+        let idx = search_from + rel_idx;
+        let after_label = &lower[idx + "gate".len()..];
+        let after_label = after_label.trim_start_matches(['*', ' ']);
+        if let Some(rest) = after_label.strip_prefix(':') {
+            let value_region = rest.trim_start_matches(['*', ' ']);
+            let value_token: String = value_region
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                .collect();
+            if value_token == HUMAN_GATE_VALUE {
+                return true;
+            }
+        }
+        search_from = idx + "gate".len();
+    }
+    false
 }
 
 /// Thin file-reading wrapper over [`blocking_human_checkpoint_reported`]:
 /// reads the phase's captured stdout file (via [`stdout_path`]) and
 /// delegates. `false` for a missing capture file, never an error.
 pub fn checkpoint_reported_in_capture(project_root: &Path, phase: u32) -> bool {
-    let _ = (project_root, phase);
-    unimplemented!("RED: checkpoint_reported_in_capture not yet implemented")
+    let Ok(bytes) = std::fs::read(stdout_path(project_root, phase)) else {
+        return false;
+    };
+    let stdout = String::from_utf8_lossy(&bytes);
+    blocking_human_checkpoint_reported(&stdout)
 }
 
 /// Determine whether a set of parsed JSONL lines look like a Codex `--json`
@@ -1569,9 +1597,12 @@ mod tests {
     }
 
     /// The Phase 26 near-miss distinction: a plain `blocking` gate must NOT
-    /// be classified as a human-blocking checkpoint.
+    /// be classified as a human-blocking checkpoint. `PLAIN_GATE_VALUE` is
+    /// local to this test (not a module-level const) — it has no production
+    /// use, only this negative fixture's.
     #[test]
     fn blocking_human_checkpoint_reported_false_for_plain_blocking() {
+        const PLAIN_GATE_VALUE: &str = "blocking";
         let stdout = format!(
             "## CHECKPOINT REACHED\n\n**Type:** human-verify\n**Gate:** {PLAIN_GATE_VALUE} — copy the task's `gate` attribute verbatim so the orchestrator's carve-out sees it\n"
         );
