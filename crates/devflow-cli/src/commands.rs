@@ -2326,6 +2326,125 @@ pub(crate) fn release_status(project_root: &Path, version: &str) -> Result<(), C
     }
 }
 
+// ---------------------------------------------------------------------------
+// release cut (29-04) — the walker: observe, act, re-observe, stop
+// ---------------------------------------------------------------------------
+
+/// Convert one [`devflow_core::release_execute::StepOutcome`] into a `Check`
+/// row, reusing the same `Check`-list-then-report shape as `release_status`
+/// and `release_check` so all three commands stay visually consistent.
+fn step_outcome_check(
+    step: devflow_core::release_observe::ReleaseStep,
+    outcome: &devflow_core::release_execute::StepOutcome,
+) -> Check {
+    use devflow_core::release_execute::StepOutcome;
+    let name = step.label().to_string();
+    match outcome {
+        StepOutcome::AlreadyDone { detail } => Check {
+            name,
+            status: "ok".into(),
+            version: Some(detail.clone()),
+            install_hint: None,
+        },
+        StepOutcome::InFlight { detail } => Check {
+            name,
+            status: "warn".into(),
+            version: Some(detail.clone()),
+            install_hint: None,
+        },
+        StepOutcome::Performed { detail } => Check {
+            name,
+            status: "ok".into(),
+            version: Some(detail.clone()),
+            install_hint: None,
+        },
+        StepOutcome::Stopped { reason } => Check {
+            name,
+            status: "fail".into(),
+            version: Some(reason.clone()),
+            install_hint: None,
+        },
+        StepOutcome::NoActionInThisBuild { unit } => Check {
+            name,
+            status: "warn".into(),
+            version: Some(format!(
+                "no action in this build yet — supplied by unit {unit}"
+            )),
+            install_hint: None,
+        },
+    }
+}
+
+/// Print one row per reported step (the same icon-printing loop shape as
+/// `release_status`/`release_check`) then a prominent final line stating
+/// where the walk stopped and why, or that every step was already done.
+fn print_cut_report(report: &devflow_core::release_execute::CutReport) {
+    use devflow_core::release_execute::StepOutcome;
+
+    for (step, outcome) in &report.steps {
+        let c = step_outcome_check(*step, outcome);
+        let icon = match c.status.as_str() {
+            "ok" => "✓",
+            "warn" => "⚠",
+            "fail" => "✗",
+            _ => "?",
+        };
+        let detail = c.version.as_deref().unwrap_or("-");
+        println!("  {:<32} {icon}  {detail}", c.name);
+    }
+
+    match report.stopped_at() {
+        Some((_, StepOutcome::Stopped { reason })) => println!("\nstopped: {reason}"),
+        Some((_, StepOutcome::InFlight { detail })) => {
+            println!("\nstopped: pull request already in flight — {detail}")
+        }
+        Some((_, StepOutcome::Performed { detail })) => {
+            println!("\nstopped: performed this run, outcome is asynchronous — {detail}")
+        }
+        Some((_, StepOutcome::NoActionInThisBuild { unit })) => {
+            println!("\nstopped: no action in this build yet — supplied by unit {unit}")
+        }
+        Some((_, StepOutcome::AlreadyDone { .. })) | None => {
+            println!("\nall six release-cut steps are already done")
+        }
+    }
+}
+
+/// `devflow release cut <version>` (29-04) — the release-cut walker.
+/// Combines `--yes-release` with the standing `config::yes_release`
+/// mandate via logical OR, exactly as `commands::start` ORs `--yes-ship`
+/// with its config value (D-12 precedent) — the flag has no negative form,
+/// so passing it always wins. An authorized run walks all six release-cut
+/// steps via [`devflow_core::release_execute::cut`], printing one row per
+/// reported step and a final line stating exactly where the walk stopped
+/// and why. Never prompts, never reads stdin, never waits for a human
+/// (RD-3) — an unauthorized run refuses immediately without touching the
+/// network at all. No separate `gh` authentication pre-check exists here:
+/// `cut`'s own walk already stops at the very first `Unreachable` oracle
+/// (an unauthenticated `gh` fails that very first call with its own real
+/// failure text), so a second, CLI-level gate would only duplicate — never
+/// shorten — the same single-stop behavior, while making the walk itself
+/// harder to exercise end to end.
+pub(crate) fn release_cut(
+    project_root: &Path,
+    version: &str,
+    yes_release_flag: bool,
+) -> Result<(), CliError> {
+    let authorized = yes_release_flag || config::yes_release(project_root);
+
+    let report = devflow_core::release_execute::cut(project_root, version, authorized);
+
+    print_cut_report(&report);
+
+    if report.all_done() {
+        Ok(())
+    } else {
+        Err(CliError::Message(format!(
+            "release cut for {version} stopped before completion — see report above"
+        )))
+    }
+}
+
 /// Self-pin check (asserts 20a's invariant): every local-path
 /// `[workspace.dependencies]` self-pin must equal `[workspace.package]
 /// version`, compared dynamically — never against a hardcoded expected
