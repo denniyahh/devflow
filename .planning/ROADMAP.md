@@ -2226,7 +2226,7 @@ Plans:
 
 **Wave 3**
 
-- [ ] 29-04-PLAN.md — wave 3 · 29b: the `ReleaseStep` walk (observe → refuse on unreachable → detect in flight → act once → stop), `devflow release cut`, and the unattended/no-presence invariant
+- [x] 29-04-PLAN.md — wave 3 · 29b: the `ReleaseStep` walk (observe → refuse on unreachable → detect in flight → act once → stop), `devflow release cut`, and the unattended/no-presence invariant
 
 **Wave 4**
 
