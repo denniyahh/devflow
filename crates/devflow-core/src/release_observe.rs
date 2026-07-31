@@ -370,6 +370,246 @@ pub fn crates_published(project_root: &Path, version: &str) -> Observation {
     combine_crate_observations(&per_crate)
 }
 
+// -- 29-02 Task 1: content-at-ref oracles ---------------------------------
+
+/// Read a file's raw content at a specific git ref via `gh api
+/// repos/{owner}/{repo}/contents/<path>?ref=<git_ref>`, requesting the raw
+/// bytes (`Accept: application/vnd.github.raw`) so the response is the
+/// file's literal content rather than an encoded JSON envelope requiring a
+/// decode step.
+///
+/// Reads GitHub's copy of the file rather than fetching into the local
+/// object database on purpose: a `git fetch` writes `FETCH_HEAD` and can
+/// opportunistically update remote-tracking refs, which would make this
+/// observer a mutator (T-29-12). `gh` is pinned to `project_root` via
+/// `.current_dir` (T-29-10) so its `{owner}`/`{repo}` placeholders resolve
+/// to the project under observation, not the ambient shell's repository.
+/// Every argument is a discrete `Command::args` element — never
+/// string-interpolated into a shell (T-29-01). On spawn failure, non-zero
+/// exit, or empty stdout, returns `Err` with a failure-class description
+/// naming `path`/`git_ref` (harmless context, not sensitive) but never
+/// embedding `gh`'s raw stdout or stderr (T-29-03, T-17-13). The caller
+/// converts every `Err` into [`Observation::Unreachable`].
+fn file_at_ref(project_root: &Path, path: &str, git_ref: &str) -> Result<String, String> {
+    let endpoint = format!("repos/{{owner}}/{{repo}}/contents/{path}?ref={git_ref}");
+    let output = Command::new("gh")
+        .current_dir(project_root)
+        .args(["api", &endpoint, "-H", "Accept: application/vnd.github.raw"])
+        .output();
+    match output {
+        Ok(out) if out.status.success() => {
+            let content = String::from_utf8_lossy(&out.stdout).to_string();
+            if content.is_empty() {
+                Err(format!("gh returned empty content for {path}@{git_ref}"))
+            } else {
+                Ok(content)
+            }
+        }
+        Ok(out) => Err(format!(
+            "gh api exited with status {} fetching {path}@{git_ref}",
+            out.status
+        )),
+        Err(err) => Err(format!(
+            "failed to spawn gh fetching {path}@{git_ref}: {}",
+            err.kind()
+        )),
+    }
+}
+
+/// Classify a workspace root `Cargo.toml`'s text against an `expected`
+/// version. Pure — no I/O. Calls
+/// [`crate::version::read_workspace_self_pins`] — the same hand-rolled
+/// workspace-manifest parser the existing local self-pin check already
+/// uses, so remote and local agree by construction.
+///
+/// `Unreachable` when the manifest has no `[workspace.package]` version at
+/// all (empty or unparseable input is a failure to observe, not evidence of
+/// absence). `Absent` when the workspace version doesn't match `expected`
+/// (detail names both), or when it matches but any local-path self-pin
+/// doesn't (detail names the drifted pin) — CONTRIBUTING.md step 1 makes the
+/// two-place bump a single fact, and "bumped only the first" is the
+/// documented easy miss, so it must not read as done. `Present` only when
+/// the workspace version and every self-pin equal `expected`.
+pub fn classify_manifest_version(cargo_toml: &str, expected: &str) -> Observation {
+    let (workspace_version, pins) = crate::version::read_workspace_self_pins(cargo_toml);
+    let Some(workspace_version) = workspace_version else {
+        return Observation::Unreachable {
+            reason: "manifest has no [workspace.package] version — empty or unparseable".into(),
+        };
+    };
+    if workspace_version != expected {
+        return Observation::Absent {
+            detail: format!("workspace version is {workspace_version}, expected {expected}"),
+        };
+    }
+    for pin in &pins {
+        if pin.version != expected {
+            return Observation::Absent {
+                detail: format!(
+                    "workspace version matches but self-pin `{}` is {}, expected {expected}",
+                    pin.name, pin.version
+                ),
+            };
+        }
+    }
+    Observation::Present {
+        detail: format!("workspace version and all self-pins match {expected}"),
+    }
+}
+
+/// Classify a `CHANGELOG.md`'s text for a top-level `## <version>` heading.
+/// Pure — no I/O. `Unreachable` on empty input (a failure to observe, not
+/// evidence of absence). `Present` when any line, after trimming leading
+/// whitespace, begins with `## ` followed by `version` as its first
+/// whitespace-delimited token — so `## 2.3.0` and `## 2.3.0 - 2026-08-01`
+/// both count, while `##2.3.0` (no space after the hashes) and a bare
+/// inline mention do not. `Absent` otherwise.
+pub fn classify_changelog_heading(changelog: &str, version: &str) -> Observation {
+    if changelog.is_empty() {
+        return Observation::Unreachable {
+            reason: "changelog content is empty".into(),
+        };
+    }
+    for line in changelog.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("## ") {
+            let first_token = rest.split_whitespace().next().unwrap_or("");
+            if first_token == version {
+                return Observation::Present {
+                    detail: format!("found heading `## {version}`"),
+                };
+            }
+        }
+    }
+    Observation::Absent {
+        detail: format!("no `## {version}` heading found"),
+    }
+}
+
+/// I/O wrapper: is `Cargo.toml` on `develop` bumped to `version` in both
+/// required places? Reads GitHub's copy of the file via [`file_at_ref`] —
+/// never a local fetch — then classifies it with [`classify_manifest_version`].
+pub fn version_bumped_on_develop(project_root: &Path, version: &str) -> Observation {
+    match file_at_ref(project_root, "Cargo.toml", "develop") {
+        Ok(contents) => classify_manifest_version(&contents, version),
+        Err(reason) => Observation::Unreachable { reason },
+    }
+}
+
+/// I/O wrapper: does `CHANGELOG.md` on `develop` carry a top-level `##
+/// <version>` heading? Reads GitHub's copy of the file via [`file_at_ref`]
+/// then classifies it with [`classify_changelog_heading`].
+pub fn changelog_written_on_develop(project_root: &Path, version: &str) -> Observation {
+    match file_at_ref(project_root, "CHANGELOG.md", "develop") {
+        Ok(contents) => classify_changelog_heading(&contents, version),
+        Err(reason) => Observation::Unreachable { reason },
+    }
+}
+
+/// I/O wrapper: has the release PR landed on `main` — i.e. does `main`'s own
+/// `Cargo.toml` already carry `version`? The observable is the outcome
+/// (`main` carrying version X), not the pull request object itself — a
+/// merged PR is only the means by which it became true, and querying the PR
+/// list instead would make the answer depend on a mutable GitHub search
+/// index (RD-8).
+pub fn release_pr_merged_to_main(project_root: &Path, version: &str) -> Observation {
+    match file_at_ref(project_root, "Cargo.toml", "main") {
+        Ok(contents) => classify_manifest_version(&contents, version),
+        Err(reason) => Observation::Unreachable { reason },
+    }
+}
+
+// -- 29-02 Task 2: sync-ancestry oracle (stub body, RED) ------------------
+// TODO(29-02 GREEN): replace with real classification logic.
+
+/// Classify GitHub's compare API `status` field (`compare/main...develop`),
+/// answering whether `main` is an ancestor of `develop` — i.e. whether the
+/// post-release sync has landed. Pure — no I/O. `ahead`/`identical` are
+/// Present (base `main` is an ancestor of head `develop`); `behind`/
+/// `diverged` are Absent; anything else, including empty, is Unreachable
+/// naming the value seen.
+pub fn classify_compare_status(status: &str) -> Observation {
+    match status {
+        "ahead" | "identical" => Observation::Present {
+            detail: format!("compare status: {status}"),
+        },
+        "behind" | "diverged" => Observation::Absent {
+            detail: format!("compare status: {status}"),
+        },
+        "" => Observation::Unreachable {
+            reason: "compare status was empty".into(),
+        },
+        other => Observation::Unreachable {
+            reason: format!("unexpected compare status `{other}`"),
+        },
+    }
+}
+
+/// I/O wrapper: has `main` been synced back into `develop`
+/// (`scripts/sync-main-to-develop.sh`'s own question, asked remotely)? Runs
+/// `gh api repos/{owner}/{repo}/compare/main...develop --jq .status`, pinned
+/// to `project_root` (T-29-10), then [`classify_compare_status`].
+///
+/// This is deliberately a DIFFERENT function from
+/// [`crate::git::origin_main_ancestor_status`], which reads already-fetched
+/// local refs with no network access and must keep that no-fetch behavior
+/// for `release --check` (20d) — collapsing the two would silently change
+/// that command's documented no-network property. One function answers
+/// "what is true on the remote right now"; the other answers "what does
+/// this checkout already know."
+pub fn sync_merged(project_root: &Path) -> Observation {
+    let output = Command::new("gh")
+        .current_dir(project_root)
+        .args([
+            "api",
+            "repos/{owner}/{repo}/compare/main...develop",
+            "--jq",
+            ".status",
+        ])
+        .output();
+    match output {
+        Ok(out) if out.status.success() => {
+            let status = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            classify_compare_status(&status)
+        }
+        Ok(out) => Observation::Unreachable {
+            reason: format!(
+                "gh api exited with status {} for compare/main...develop",
+                out.status
+            ),
+        },
+        Err(err) => Observation::Unreachable {
+            reason: format!(
+                "failed to spawn gh for compare/main...develop: {}",
+                err.kind()
+            ),
+        },
+    }
+}
+
+/// Dispatch one of the six release-cut questions to its own oracle.
+/// Exhaustive — no wildcard arm — so a future seventh [`ReleaseStep`]
+/// variant fails to compile rather than silently returning a default.
+pub fn observe(project_root: &Path, step: ReleaseStep, version: &str) -> Observation {
+    match step {
+        ReleaseStep::VersionBumped => version_bumped_on_develop(project_root, version),
+        ReleaseStep::ChangelogWritten => changelog_written_on_develop(project_root, version),
+        ReleaseStep::ReleasePrMerged => release_pr_merged_to_main(project_root, version),
+        ReleaseStep::SignedTagPresent => signed_tag_on_remote(project_root, version),
+        ReleaseStep::SyncMerged => sync_merged(project_root),
+        ReleaseStep::CratesPublished => crates_published(project_root, version),
+    }
+}
+
+/// Answer all six release-cut questions, preserving `ReleaseStep::ALL`'s
+/// order.
+pub fn observe_all(project_root: &Path, version: &str) -> Vec<(ReleaseStep, Observation)> {
+    ReleaseStep::ALL
+        .iter()
+        .map(|&step| (step, observe(project_root, step, version)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -622,5 +862,215 @@ mod tests {
             combine_crate_observations(&[]),
             Observation::Unreachable { .. }
         ));
+    }
+
+    // -- 29-02 Task 1: content-at-ref oracles ---------------------------
+
+    #[test]
+    fn classify_manifest_version_present_when_workspace_and_pins_match() {
+        assert!(matches!(
+            classify_manifest_version("[workspace.package]\nversion = \"2.3.0\"\n", "2.3.0"),
+            Observation::Present { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_manifest_version_absent_when_workspace_version_differs() {
+        let manifest = "[workspace.package]\nversion = \"2.2.0\"\n";
+        match classify_manifest_version(manifest, "2.3.0") {
+            Observation::Absent { detail } => {
+                assert!(
+                    detail.contains("2.2.0") && detail.contains("2.3.0"),
+                    "expected the detail to name both versions, got: {detail}"
+                );
+            }
+            other => panic!("expected Absent naming both versions, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_manifest_version_empty_is_unreachable() {
+        assert!(matches!(
+            classify_manifest_version("", "2.3.0"),
+            Observation::Unreachable { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_manifest_version_absent_when_self_pin_drifted() {
+        let manifest = "[workspace]\nmembers = [\"crates/devflow-core\"]\n\n\
+             [workspace.package]\nversion = \"2.3.0\"\nedition = \"2024\"\n\n\
+             [workspace.dependencies]\n\
+             devflow-core = { path = \"crates/devflow-core\", version = \"2.2.0\" }\n";
+        match classify_manifest_version(manifest, "2.3.0") {
+            Observation::Absent { detail } => {
+                assert!(
+                    detail.contains("devflow-core"),
+                    "expected the detail to name the drifted pin, got: {detail}"
+                );
+            }
+            other => panic!("expected Absent naming the drifted pin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_changelog_heading_present_with_body_after() {
+        assert!(matches!(
+            classify_changelog_heading("## 2.3.0\n\n### Added\n", "2.3.0"),
+            Observation::Present { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_changelog_heading_absent_when_version_mismatches() {
+        assert!(matches!(
+            classify_changelog_heading("## 2.2.0\n", "2.3.0"),
+            Observation::Absent { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_changelog_heading_absent_for_bare_inline_mention() {
+        assert!(matches!(
+            classify_changelog_heading("Some prose mentioning 2.3.0 inline\n", "2.3.0"),
+            Observation::Absent { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_changelog_heading_empty_is_unreachable() {
+        assert!(matches!(
+            classify_changelog_heading("", "2.3.0"),
+            Observation::Unreachable { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_changelog_heading_no_space_after_hashes_is_absent() {
+        assert!(matches!(
+            classify_changelog_heading("##2.3.0\n", "2.3.0"),
+            Observation::Absent { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_changelog_heading_leading_whitespace_still_matches() {
+        assert!(matches!(
+            classify_changelog_heading("  ## 2.3.0\n", "2.3.0"),
+            Observation::Present { .. }
+        ));
+    }
+
+    // -- 29-02 Task 2: sync-ancestry oracle and dispatcher --------------
+
+    #[test]
+    fn classify_compare_status_ahead_is_present() {
+        assert!(matches!(
+            classify_compare_status("ahead"),
+            Observation::Present { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_compare_status_identical_is_present() {
+        assert!(matches!(
+            classify_compare_status("identical"),
+            Observation::Present { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_compare_status_behind_is_absent() {
+        assert!(matches!(
+            classify_compare_status("behind"),
+            Observation::Absent { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_compare_status_diverged_is_absent() {
+        assert!(matches!(
+            classify_compare_status("diverged"),
+            Observation::Absent { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_compare_status_empty_is_unreachable_naming_the_value() {
+        match classify_compare_status("") {
+            Observation::Unreachable { reason } => assert!(!reason.is_empty()),
+            other => panic!("expected Unreachable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_compare_status_unexpected_value_is_unreachable_naming_it() {
+        match classify_compare_status("unexpected") {
+            Observation::Unreachable { reason } => assert!(
+                reason.contains("unexpected"),
+                "expected the reason to name the value seen, got: {reason}"
+            ),
+            other => panic!("expected Unreachable, got {other:?}"),
+        }
+    }
+
+    /// Initialize a bare git repo with no remote — every oracle in
+    /// `observe` must independently fail to observe.
+    fn init_repo_without_remote() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let output = crate::test_support::git_command(root)
+                .args(args)
+                .output()
+                .expect("spawn git");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        git(&["config", "core.hooksPath", "/dev/null"]);
+        dir
+    }
+
+    #[test]
+    fn observe_dispatches_all_six_variants_to_distinct_unreachable_reasons_with_no_remote() {
+        let dir = init_repo_without_remote();
+        let root = dir.path();
+        let mut reasons = Vec::new();
+        for step in ReleaseStep::ALL {
+            match observe(root, step, "1.2.3") {
+                Observation::Unreachable { reason } => {
+                    assert!(!reason.is_empty(), "{step:?} produced an empty reason");
+                    reasons.push(reason);
+                }
+                other => {
+                    panic!("expected {step:?} to be Unreachable with no remote, got {other:?}")
+                }
+            }
+        }
+        let mut deduped = reasons.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(
+            deduped.len(),
+            reasons.len(),
+            "expected six distinct reasons (no arm falling through to a shared \
+             default), got: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn observe_all_preserves_release_step_all_order() {
+        let dir = init_repo_without_remote();
+        let root = dir.path();
+        let results = observe_all(root, "1.2.3");
+        let steps: Vec<ReleaseStep> = results.iter().map(|(step, _)| *step).collect();
+        assert_eq!(steps, ReleaseStep::ALL.to_vec());
     }
 }

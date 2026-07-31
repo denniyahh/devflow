@@ -4,6 +4,14 @@
 //! handlers directly (same discipline as `release_check.rs`), and
 //! separately proves the pre-existing `devflow release --check` contract is
 //! untouched by this plan.
+//!
+//! Live-remote behavior — whether GitHub's compare and contents endpoints
+//! keep their documented semantics — is deliberately NOT covered by this
+//! hermetic suite. That coverage lives in the `#[ignore]`-gated smoke tests
+//! below (`signed_tag_live_smoke`, `crates_published_live_smoke`) and in
+//! `29-VALIDATION.md`'s Manual-Only Verifications table. This is a recorded
+//! boundary, not a coverage gap: a hermetic fixture cannot observe whether a
+//! third-party API's contract has drifted.
 
 use std::path::Path;
 use std::process::{Command, Output};
@@ -74,6 +82,43 @@ fn git(root: &Path, args: &[&str]) {
         "git {args:?} failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn commit(root: &Path, name: &str) {
+    std::fs::write(root.join(name), name).unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-q", "-m", &format!("add {name}")]);
+}
+
+fn rev_parse(root: &Path, rev: &str) -> String {
+    let output = devflow_core::test_support::git_command(root)
+        .args(["rev-parse", rev])
+        .output()
+        .expect("git rev-parse");
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn git_status_porcelain(root: &Path) -> String {
+    let output = devflow_core::test_support::git_command(root)
+        .args(["status", "--porcelain"])
+        .output()
+        .expect("git status");
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+/// Sorted `git for-each-ref` listing — changes if any fetch, tag creation,
+/// or ref update occurs, regardless of what kind.
+fn sorted_ref_listing(root: &Path) -> String {
+    let output = devflow_core::test_support::git_command(root)
+        .args(["for-each-ref", "--format=%(refname)"])
+        .output()
+        .expect("git for-each-ref");
+    let mut lines: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|s| s.to_string())
+        .collect();
+    lines.sort();
+    lines.join("\n")
 }
 
 fn init_repo(root: &Path) {
@@ -212,10 +257,11 @@ fn release_status_summary_line_names_version_and_count() {
         "expected the summary line to name the requested version, got: {stdout}"
     );
     assert!(
-        stdout.contains("0/2"),
-        "expected the summary line to report 0 of 2 questions observed complete \
-         (this fixture has no remote and no Cargo.toml, so both the signed-tag \
-         and crates-published rows are Unreachable, not Present), got: {stdout}"
+        stdout.contains("0/6"),
+        "expected the summary line to report 0 of 6 questions observed complete \
+         (this fixture has no remote and no Cargo.toml, so all six rows — \
+         version bumped, changelog written, release PR merged, signed tag, \
+         sync merged, crates published — are Unreachable, not Present), got: {stdout}"
     );
 }
 
@@ -327,5 +373,159 @@ fn crates_published_live_smoke() {
     assert!(
         absent_stdout.contains("devflow-core") && absent_stdout.contains('⚠'),
         "expected devflow-core@999.999.999 to classify Absent against the real registry, got: {absent_stdout}"
+    );
+}
+
+// -- 29-02 Task 3: invariants that make unit 29a shippable on its own -----
+
+/// `devflow release status` mutates NOTHING: HEAD, the working tree, the
+/// index, the full ref listing (no fetch, no new tag), and every file under
+/// `.devflow/`/`devflow.toml` are all byte-identical before and after a run.
+/// This is the executable form of RD-8's "state is derived, never
+/// recorded" — the assertion goes red the instant any future change
+/// introduces a progress file, a cache, or a fetch.
+#[test]
+fn status_leaves_the_repository_untouched() {
+    // A real `origin` remote (a local bare repo) is required so that a
+    // regression reintroducing a `git fetch` would be observable in the ref
+    // listing below (creating `refs/remotes/origin/*`) — a fixture with no
+    // remote at all would make a `fetch` a silent no-op, defeating the
+    // mutation-testing check this test exists to satisfy.
+    let origin_dir = tempfile::tempdir().unwrap();
+    git(origin_dir.path(), &["init", "-q", "--bare"]);
+
+    let dir = tempfile::tempdir().unwrap();
+    init_repo(dir.path());
+    commit(dir.path(), "README.md");
+    git(
+        dir.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            origin_dir.path().to_str().expect("utf-8 tempdir path"),
+        ],
+    );
+    git(dir.path(), &["push", "-q", "origin", "develop"]);
+
+    std::fs::write(dir.path().join("devflow.toml"), "# devflow config\n").unwrap();
+    std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+    std::fs::write(
+        dir.path().join(".devflow").join("state.json"),
+        "{\"stage\":\"ship\"}",
+    )
+    .unwrap();
+
+    // A fetch always writes `.git/FETCH_HEAD`, regardless of whether it
+    // introduces any new ref — this catches a regression even in a fixture
+    // shape where the fetched content happens to match what's already known
+    // locally (where `for-each-ref` alone would not change).
+    let fetch_head_path = dir.path().join(".git").join("FETCH_HEAD");
+
+    let before_head = rev_parse(dir.path(), "HEAD");
+    let before_status = git_status_porcelain(dir.path());
+    let before_refs = sorted_ref_listing(dir.path());
+    let before_fetch_head_exists = fetch_head_path.exists();
+    let before_devflow_toml = std::fs::read(dir.path().join("devflow.toml")).unwrap();
+    let before_state_json = std::fs::read(dir.path().join(".devflow").join("state.json")).unwrap();
+    let before_devflow_entries: Vec<_> = std::fs::read_dir(dir.path().join(".devflow"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+
+    let _ = run_release_status(dir.path(), "1.2.3");
+
+    let after_head = rev_parse(dir.path(), "HEAD");
+    let after_status = git_status_porcelain(dir.path());
+    let after_refs = sorted_ref_listing(dir.path());
+    let after_fetch_head_exists = fetch_head_path.exists();
+    let after_devflow_toml = std::fs::read(dir.path().join("devflow.toml")).unwrap();
+    let after_state_json = std::fs::read(dir.path().join(".devflow").join("state.json")).unwrap();
+    let after_devflow_entries: Vec<_> = std::fs::read_dir(dir.path().join(".devflow"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+
+    assert_eq!(before_head, after_head, "HEAD must not move");
+    assert_eq!(before_status, after_status, "working tree must not change");
+    assert_eq!(
+        before_refs, after_refs,
+        "ref listing must not change — no fetch, no new tag, no remote-tracking ref"
+    );
+    assert_eq!(
+        before_fetch_head_exists, after_fetch_head_exists,
+        "no fetch was ever expected — FETCH_HEAD must not appear"
+    );
+    assert!(
+        !after_fetch_head_exists,
+        "FETCH_HEAD must never exist after a release status run — a fetch occurred"
+    );
+    assert_eq!(
+        before_devflow_toml, after_devflow_toml,
+        "devflow.toml must be byte-identical"
+    );
+    assert_eq!(
+        before_state_json, after_state_json,
+        "every file under .devflow/ must be byte-identical"
+    );
+    assert_eq!(
+        before_devflow_entries.len(),
+        after_devflow_entries.len(),
+        "no new file must appear under .devflow/"
+    );
+}
+
+/// Observation grants no mandate and must not accept one — a flag accepted
+/// here would be the first step toward observation implying permission.
+#[test]
+fn status_rejects_an_authorization_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    init_repo(dir.path());
+
+    let isolated_home = tempfile::tempdir().unwrap();
+    let output = Command::new(devflow_bin())
+        .arg("release")
+        .arg("status")
+        .arg("1.2.3")
+        .arg("--yes-release")
+        .arg(dir.path())
+        .env("HOME", isolated_home.path())
+        .env_remove("SSH_AUTH_SOCK")
+        .env_remove("SSH_AGENT_PID")
+        .output()
+        .expect("spawn devflow release status --yes-release");
+
+    assert!(
+        !output.status.success(),
+        "expected --yes-release to be rejected by argument parsing, got success. stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// With no `origin` configured at all, every one of the six questions is
+/// unanswerable — asserts both the non-zero exit AND the absence of any `⚠`
+/// row. Any absent-shaped row in this scenario would be exactly the
+/// `unreachable != absent` collapse this phase exists to prevent.
+#[test]
+fn status_reports_unreachable_not_absent_without_a_remote() {
+    let dir = tempfile::tempdir().unwrap();
+    init_repo(dir.path());
+
+    let output = run_release_status(dir.path(), "1.2.3");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        !output.status.success(),
+        "expected a repo with no remote at all to exit non-zero, got success. stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains('✗'),
+        "expected at least one unreachable row, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains('⚠'),
+        "with no remote at all, every question is unanswerable — any absent-shaped \
+         row would be the unreachable != absent collapse this phase exists to prevent, got: {stdout}"
     );
 }
