@@ -2,19 +2,19 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone (open — no fixed closing phase)
-current_phase: 27
-current_phase_name: scrub-redirecting-git-environment-from-production-calls
-status: complete
-stopped_at: Phase 27 complete and verified — no Phase 28 defined; next action is backlog review
-last_updated: "2026-07-30T21:59:35.829Z"
+current_phase: 28
+current_phase_name: close-the-checkpoint-answer-return-path
+status: shipped — PR #63 open to develop
+stopped_at: Phase 28 shipped — PR #63 (feature/phase-28 → develop), awaiting CI + merge
+last_updated: "2026-07-31T08:35:00.000Z"
 last_activity: 2026-07-30
-last_activity_desc: Phase 27 complete and verified (7/7 must-haves, 6/6 plans)
+last_activity_desc: "Phase 28 complete: 6/6 plans, 779 tests green, SECURED (threats_open 0), verification passed. A1 closed by a live run that found and fixed a real defect (b22e6cf) — the executor renders the gate value as a markdown code span, which the reader did not match; checkpoints now recognize, auto-decide, audit, resume, and resolve end-to-end"
 progress:
-  total_phases: 16
+  total_phases: 17
   completed_phases: 15
-  total_plans: 118
-  completed_plans: 118
-  percent: 94
+  total_plans: 124
+  completed_plans: 124
+  percent: 88
 ---
 
 # DevFlow — Project State
@@ -86,9 +86,9 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 27 (scrub-redirecting-git-environment-from-production-calls) — COMPLETE
-Plan: 6 of 6 complete
-Status: Verified 7/7 must-haves. No Phase 28 is defined in ROADMAP.md — the next
+Phase: 28 (close-the-checkpoint-answer-return-path) — EXECUTING
+Plan: 1 of 6
+Status: Executing Phase 28
 real action is `/gsd-review-backlog` to promote a 999.x entry, or `/gsd-ship 27`
 to merge this phase. `phase.complete` auto-advanced this field to "999.1 — Hermes
 Support (BACKLOG)" because its next-phase scan walks into the backlog section;
@@ -157,7 +157,7 @@ Scope boundary: 23-16 is the **fix only** (change + regression tests + PR into `
 
 **Recovery-ref disposition:** both `origin` refs (`recovery/pre-23-11-acceptance-e0f87c2`, `recovery/pre-23-15-acceptance-0dad20d`) remain untouched on `origin`; the local copy of the pre-23-11 ref, deleted again by `devflow cleanup`, is deliberately NOT restored (per `23-FINDINGS.md` §B2a); the pre-23-15 ref is now unused (no merge to undo) but retained on `origin` for reuse by the 23-16 retry rather than deleted.
 
-Last activity: 2026-07-30 — Phase 27 complete, transitioned to Phase 999.1
+Last activity: 2026-07-30 — Phase 28 execution started
 
 **Note on the "Plan: 2 of 15" value this replaces:** `gsd-tools state advance-plan` only increments whatever value is already in this field, which had drifted to "2 of 15" (the parallel-worktree waves 23-01…23-09 deliberately never touch STATE.md, and this field was last corrected against reality at "10 of 11 plans complete" before the plan count grew to 15 with the gap-closure plans 23-12…23-15). Corrected directly to "13 of 15" to match reality (23-12 and 23-13 both now executed) rather than trust the tool's naive +1 increment from a stale base.
 
@@ -838,6 +838,6 @@ None currently open for Phase 17.
 
 ## Session
 
-**Last session:** 2026-07-30T17:00:40.076Z
-**Stopped at:** Phase 27 context gathered
-**Resume file:** .planning/phases/27-scrub-redirecting-git-environment-from-production-calls/27-CONTEXT.md
+**Last session:** 2026-07-31T01:06:18.064Z
+**Stopped at:** Phase 28 context gathered
+**Resume file:** .planning/phases/28-close-the-checkpoint-answer-return-path/28-CONTEXT.md

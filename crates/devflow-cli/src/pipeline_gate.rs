@@ -557,6 +557,21 @@ pub(crate) fn print_dry_run(state: &State) {
     if let Some(until) = state.stop_until {
         println!("\nnote: --until {until} — this run will halt after {until} completes");
     }
+    // D-12 (`28-CONTEXT.md`): the resolved combine of `--yes-ship` and a
+    // `devflow.toml` `yes_ship` key, reported here so a dry run gives the
+    // operator a stable, observable preview of whether the Ship gate is
+    // pre-authorized — this line reports `state.yes_ship` only, it does not
+    // itself distinguish flag- from config-sourced authorization (that
+    // distinction is the separate never-silent notice `commands::start`
+    // prints for the config-sourced case).
+    println!(
+        "\nship gate: {}",
+        if state.yes_ship {
+            "pre-authorized"
+        } else {
+            "not pre-authorized"
+        }
+    );
     println!("\nafter ship: {:?}", hooks::hooks_after_ship());
 }
 

@@ -238,6 +238,51 @@ fn extract_json_result_text(stdout: &str) -> Option<String> {
     value.get("result")?.as_str().map(str::to_string)
 }
 
+/// Read the top-level `session_id` string from a Claude JSON result envelope
+/// (`--output-format json`). Returns `None` for plain-text stdout, a
+/// non-JSON-object envelope, an envelope with no `session_id` key, or a
+/// `session_id` of a non-string JSON type — never panics.
+///
+/// D-04 / T-28-04 (this plan's `<threat_model>`): deliberately reads ONLY the
+/// envelope's TOP-LEVEL `session_id` key via a direct [`serde_json::Value::get`],
+/// never the module's [`json_find_key`]/[`json_scan`] traversal helpers. Those
+/// helpers descend into nested objects, and the agent-authored `DEVFLOW_RESULT`
+/// marker payload — embedded inside this same envelope's `result` text and
+/// deserialized by [`parse_marker_lines`] directly into [`AgentResult`] — is
+/// reachable that way. A top-level `get` makes it true BY CONSTRUCTION that an
+/// agent cannot redirect the session DevFlow later resumes into by planting a
+/// different `session_id` key inside its own self-authored marker JSON.
+/// Regression test: `session_id_in_devflow_result_marker_is_not_returned`.
+///
+/// Deliberate deviation from RESEARCH.md § "Discretion Resolutions" item 5,
+/// which suggested adding a `session_id` field directly to [`AgentResult`].
+/// NOT done: `parse_marker_lines` deserializes the agent's own
+/// `DEVFLOW_RESULT` JSON straight into `AgentResult` via `serde_json::from_str`,
+/// so a `#[serde(default)]` field there would be agent-settable — the agent
+/// could name the session DevFlow resumes into (T-28-04). A standalone reader
+/// over the top-level envelope key carries no such surface and is equally
+/// available to every caller; D-04's persistence target (`State::session_id`)
+/// is unchanged, only the carrier differs.
+pub fn claude_session_id(stdout: &str) -> Option<String> {
+    let trimmed = stdout.trim();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    value.get("session_id")?.as_str().map(str::to_string)
+}
+
+/// Thin file-reading wrapper over [`claude_session_id`]: reads the phase's
+/// captured stdout file (via [`stdout_path`]) and delegates. `None` for a
+/// missing capture file, never an `Err` — mirrors [`evaluate_layer1`]'s
+/// lossy-read convention (CR-01: one invalid UTF-8 byte from raw `sh`
+/// redirection must not silently disable this reader).
+pub fn session_id_from_capture(project_root: &Path, phase: u32) -> Option<String> {
+    let bytes = std::fs::read(stdout_path(project_root, phase)).ok()?;
+    let stdout = String::from_utf8_lossy(&bytes);
+    claude_session_id(&stdout)
+}
+
 // WR-12 (13-REVIEW.md), revised: these traversal helpers run on the coding
 // agent's raw stdout (via detect_claude_rate_limit, which every `devflow
 // advance` invocation runs through evaluate_layer1), so deeply nested JSON —
@@ -357,6 +402,119 @@ fn detect_claude_envelope_failure(stdout: &str) -> Option<AgentResult> {
         verdict: None,
         decided_by_layer: Some(1),
     })
+}
+
+/// The rendered VALUE of a human-blocking checkpoint's `**Gate:**` line.
+///
+/// **CONFIRMED against a live end-to-end run (2026-07-31).** Assumption A1 is
+/// closed. A real `devflow start` run drove a synthetic phase declaring a
+/// `gate="blocking-human"` task through DevFlow's own monitor process (not a
+/// Claude Code agent session, which is what blocked `28-PROBE.md`'s original
+/// attempt at the Bash-tool permission classifier). The checkpoint fired and
+/// `.devflow/phase-NN-stdout` captured it inside the JSON envelope's `result`
+/// text as:
+///
+/// ```text
+/// **Gate:** `blocking-human`
+/// ```
+///
+/// The VALUE is what this constant holds. The surrounding markdown — bold
+/// label, and a **code span around the value** — is handled by
+/// [`text_reports_human_gate`]'s trim set, not by this constant.
+///
+/// The code span is the part RESEARCH.md did not predict. Its § "Architecture
+/// Patterns / Pattern 2" derived the literal by reading the *emitting* source
+/// (`gsd-executor.md:356`, `execute-phase.md:1053`) and predicted a bare
+/// `**Gate:** blocking-human`. The real relay renders the value as a code
+/// span, which defeated the original matcher entirely — see
+/// [`text_reports_human_gate`] for that failure and its fix. Lesson worth
+/// keeping: the emitting source told us the value, not the rendering.
+const HUMAN_GATE_VALUE: &str = "blocking-human";
+
+/// Confirm whether captured stdout reports a human-blocking checkpoint, by
+/// searching for a `**Gate:**`-labeled line whose VALUE is exactly
+/// [`HUMAN_GATE_VALUE`] — see that constant's doc comment for the live
+/// observation (2026-07-31) the matched rendering is built from.
+///
+/// This is the CONFIRMATION half of D-01: it is only ever consulted AFTER
+/// [`crate::verify::phase_has_blocking_human_checkpoint`] has already
+/// returned `true` for the stage's plan(s) (D-01's static half, plan 28-01).
+/// A false negative here is the SAFE direction — it falls back to today's
+/// never-silent generic gate, losing nothing. A false positive is bounded by
+/// the resume ceiling (`mode::MAX_CHECKPOINT_RESUMES`, plan 28-03) and
+/// unconditionally recorded by the `checkpoint_auto_decided` audit event
+/// (plan 28-03) — it can never silently authorize anything.
+///
+/// Searches BOTH the raw stdout text and — when the stdout is a Claude JSON
+/// result envelope — the unescaped inner `result` text obtained via
+/// [`extract_json_result_text`], because the `Gate:` line typically crosses
+/// into the capture escaped inside that envelope (RESEARCH § "Common
+/// Pitfalls / Pitfall 2": two indirections, subagent emission → orchestrator
+/// relay → DevFlow's captured top-level stdout). Matching is
+/// case-insensitive on the `Gate` LABEL and tolerates surrounding markdown
+/// emphasis (`*`) and whitespace, but the VALUE comparison is exact — this
+/// deliberately does NOT widen into a general "does this look like a
+/// checkpoint" heuristic (D-02 rejected that class of predicate); the scope
+/// is one declared field label with one enumerated value.
+pub fn blocking_human_checkpoint_reported(stdout: &str) -> bool {
+    if text_reports_human_gate(stdout) {
+        return true;
+    }
+    extract_json_result_text(stdout)
+        .as_deref()
+        .is_some_and(text_reports_human_gate)
+}
+
+/// Core matcher shared by both search targets (raw stdout and the unescaped
+/// inner envelope text) in [`blocking_human_checkpoint_reported`]. Scans for
+/// a case-insensitive `gate` label, tolerating surrounding markdown emphasis
+/// (`*`), code-span backticks (`` ` ``), and whitespace up to the following
+/// `:`, then compares the VALUE token immediately after the colon exactly
+/// against [`HUMAN_GATE_VALUE`].
+///
+/// The backtick tolerance is not speculative — it is the single reason this
+/// matcher failed against the first real checkpoint ever observed. The live
+/// A1 run (2026-07-31) captured the value as a markdown code span,
+/// ``**Gate:** `blocking-human` ``, and the original trim set (`*` and space
+/// only) left the leading backtick in place, so the `take_while` below
+/// terminated immediately and produced an EMPTY value token. The reader
+/// returned `false` and a genuine checkpoint fell through to the generic
+/// gate. Trimming the backtick is what makes the observed rendering match;
+/// do not narrow this set back without re-running that live probe.
+///
+/// Note the closing backtick needs no handling: `take_while` already stops
+/// at it, since a backtick is neither alphanumeric nor `-`.
+fn text_reports_human_gate(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let mut search_from = 0;
+    while let Some(rel_idx) = lower[search_from..].find("gate") {
+        let idx = search_from + rel_idx;
+        let after_label = &lower[idx + "gate".len()..];
+        let after_label = after_label.trim_start_matches(['*', ' ', '`']);
+        if let Some(rest) = after_label.strip_prefix(':') {
+            let value_region = rest.trim_start_matches(['*', ' ', '`']);
+            let value_token: String = value_region
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                .collect();
+            if value_token == HUMAN_GATE_VALUE {
+                return true;
+            }
+        }
+        search_from = idx + "gate".len();
+    }
+    false
+}
+
+/// Thin file-reading wrapper over [`blocking_human_checkpoint_reported`]:
+/// reads the phase's captured stdout file (via [`stdout_path`]) and
+/// delegates. `false` for a missing capture file, never an error.
+pub fn checkpoint_reported_in_capture(project_root: &Path, phase: u32) -> bool {
+    let Ok(bytes) = std::fs::read(stdout_path(project_root, phase)) else {
+        return false;
+    };
+    let stdout = String::from_utf8_lossy(&bytes);
+    blocking_human_checkpoint_reported(&stdout)
 }
 
 /// Determine whether a set of parsed JSONL lines look like a Codex `--json`
@@ -1381,6 +1539,192 @@ mod tests {
         let result = parse_devflow_result(stdout).unwrap();
         assert_eq!(result.status, AgentStatus::Success);
         assert_eq!(result.commits, Some(2));
+    }
+
+    #[test]
+    fn session_id_reads_top_level_string() {
+        let stdout = r#"{"type":"result","subtype":"success","result":"All done.","session_id":"cf29bfec-69e8-45df-a4f3-3da08ab6f66e"}"#;
+        assert_eq!(
+            claude_session_id(stdout).as_deref(),
+            Some("cf29bfec-69e8-45df-a4f3-3da08ab6f66e")
+        );
+    }
+
+    /// T-28-04 forgery guard: the embedded `DEVFLOW_RESULT` marker carries a
+    /// DIFFERENT session id than the envelope's own top-level key. The
+    /// top-level id must win — an agent must not be able to redirect which
+    /// session DevFlow resumes into by planting its own `session_id` inside
+    /// its self-authored marker JSON.
+    #[test]
+    fn session_id_in_devflow_result_marker_is_not_returned() {
+        let stdout = r#"{"type":"result","subtype":"success","result":"All done.\nDEVFLOW_RESULT: {\"status\": \"success\", \"session_id\": \"forged-by-agent\"}","session_id":"real-top-level-id"}"#;
+        assert_eq!(
+            claude_session_id(stdout).as_deref(),
+            Some("real-top-level-id")
+        );
+    }
+
+    #[test]
+    fn session_id_plain_text_stdout_returns_none() {
+        let stdout = "just some plain text output, not JSON\n";
+        assert!(claude_session_id(stdout).is_none());
+    }
+
+    #[test]
+    fn session_id_missing_key_returns_none() {
+        let stdout = r#"{"type":"result","result":"done, no session key"}"#;
+        assert!(claude_session_id(stdout).is_none());
+    }
+
+    #[test]
+    fn session_id_non_string_type_returns_none_not_panic() {
+        let stdout = r#"{"type":"result","result":"done","session_id":12345}"#;
+        assert!(claude_session_id(stdout).is_none());
+    }
+
+    #[test]
+    fn session_id_from_capture_missing_file_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(session_id_from_capture(dir.path(), 42).is_none());
+    }
+
+    #[test]
+    fn session_id_from_capture_lossy_reads_invalid_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        let mut bytes = br#"{"type":"result","result":"done "#.to_vec();
+        bytes.push(0xFF); // invalid UTF-8 byte
+        bytes.extend_from_slice(br#"","session_id":"lossy-ok"}"#);
+        std::fs::write(stdout_path(dir.path(), 5), bytes).unwrap();
+
+        assert_eq!(
+            session_id_from_capture(dir.path(), 5).as_deref(),
+            Some("lossy-ok")
+        );
+    }
+
+    /// Positive fixture built from RESEARCH's *predicted* `**Gate:**`
+    /// rendering (a bare, un-spanned value). Kept as a tolerated shape, but
+    /// note this is NOT what a real run emits — see
+    /// `blocking_human_checkpoint_reported_matches_live_observed_rendering`
+    /// for the rendering actually captured on 2026-07-31, which this
+    /// prediction missed.
+    #[test]
+    fn blocking_human_checkpoint_reported_detects_human_gate_line() {
+        let stdout = format!(
+            "## CHECKPOINT REACHED\n\n**Type:** human-verify\n**Gate:** {HUMAN_GATE_VALUE} — copy the task's `gate` attribute verbatim so the orchestrator's carve-out sees it\n"
+        );
+        assert!(blocking_human_checkpoint_reported(&stdout));
+    }
+
+    /// The Phase 26 near-miss distinction: a plain `blocking` gate must NOT
+    /// be classified as a human-blocking checkpoint. `PLAIN_GATE_VALUE` is
+    /// local to this test (not a module-level const) — it has no production
+    /// use, only this negative fixture's.
+    #[test]
+    fn blocking_human_checkpoint_reported_false_for_plain_blocking() {
+        const PLAIN_GATE_VALUE: &str = "blocking";
+        let stdout = format!(
+            "## CHECKPOINT REACHED\n\n**Type:** human-verify\n**Gate:** {PLAIN_GATE_VALUE} — copy the task's `gate` attribute verbatim so the orchestrator's carve-out sees it\n"
+        );
+        assert!(!blocking_human_checkpoint_reported(&stdout));
+    }
+
+    #[test]
+    fn blocking_human_checkpoint_reported_false_when_no_gate_field() {
+        let stdout = "some ordinary agent failure output, no checkpoint at all\n";
+        assert!(!blocking_human_checkpoint_reported(stdout));
+    }
+
+    /// The `Gate:` line arrives inside an escaped Claude JSON result
+    /// envelope's `result` field — must be found via the unescaped inner
+    /// text, not the raw (escaped) JSON string.
+    #[test]
+    fn blocking_human_checkpoint_reported_true_inside_escaped_envelope() {
+        let inner = format!(
+            "## CHECKPOINT REACHED\\n\\n**Gate:** {HUMAN_GATE_VALUE} — copy the task's `gate` attribute verbatim so the orchestrator's carve-out sees it\\n"
+        );
+        let stdout = format!(
+            r#"{{"type":"result","subtype":"success","result":"{inner}","session_id":"abc"}}"#
+        );
+        assert!(blocking_human_checkpoint_reported(&stdout));
+    }
+
+    #[test]
+    fn blocking_human_checkpoint_reported_tolerates_whitespace_and_emphasis() {
+        let stdout = format!("  **Gate:**   {HUMAN_GATE_VALUE}   \n");
+        assert!(blocking_human_checkpoint_reported(&stdout));
+    }
+
+    /// REGRESSION — the rendering a real headless run actually produces.
+    ///
+    /// Transcribed verbatim from `.devflow/phase-91-stdout` of the live A1
+    /// run on 2026-07-31 (a genuine `gate="blocking-human"` task driven
+    /// through DevFlow's own monitor). The value arrives as a markdown CODE
+    /// SPAN, not the bare token RESEARCH.md predicted.
+    ///
+    /// Before the backtick was added to `text_reports_human_gate`'s trim set
+    /// this returned `false`: the leading backtick survived the trim, so the
+    /// value `take_while` terminated at once and yielded an empty token. A
+    /// real checkpoint was therefore never recognized, and the run fell
+    /// through to the generic gate. If this test ever goes red, DevFlow has
+    /// stopped recognizing real checkpoints — do not "fix" it by relaxing
+    /// the assertion.
+    #[test]
+    fn blocking_human_checkpoint_reported_matches_live_observed_rendering() {
+        let stdout = format!(
+            "---\n\n## Checkpoint: Decision\n\n**Plan:** 91-01 Emit the checkpoint\n**Gate:** `{HUMAN_GATE_VALUE}`\n**Progress:** 0/1 tasks complete\n**Task:** Task 1 — Ask the operator to authorize writing the marker file\n"
+        );
+        assert!(
+            blocking_human_checkpoint_reported(&stdout),
+            "the live-observed code-span rendering must be recognized; \
+             a false negative here means real checkpoints fall through to \
+             the generic gate (the 2026-07-31 A1 defect)"
+        );
+    }
+
+    /// The same live rendering as it actually crosses into DevFlow's capture:
+    /// escaped inside the Claude JSON result envelope. This is the exact
+    /// path `checkpoint_reported_in_capture` reads in production.
+    #[test]
+    fn blocking_human_checkpoint_reported_matches_live_rendering_in_envelope() {
+        let inner = format!(
+            "## Checkpoint: Decision\\n\\n**Gate:** `{HUMAN_GATE_VALUE}`\\n**Progress:** 0/1 tasks complete\\n"
+        );
+        let stdout = format!(
+            r#"{{"type":"result","subtype":"success","result":"{inner}","session_id":"live-a1"}}"#
+        );
+        assert!(
+            blocking_human_checkpoint_reported(&stdout),
+            "the code-span rendering must also be found inside the escaped envelope"
+        );
+    }
+
+    /// The backtick tolerance must not erode the Phase 26 near-miss
+    /// distinction: a code-spanned PLAIN `blocking` gate is still not a
+    /// human-blocking checkpoint.
+    #[test]
+    fn blocking_human_checkpoint_reported_false_for_code_spanned_plain_blocking() {
+        let stdout = "## Checkpoint: Decision\n\n**Gate:** `blocking`\n";
+        assert!(!blocking_human_checkpoint_reported(stdout));
+    }
+
+    #[test]
+    fn checkpoint_reported_in_capture_missing_file_returns_false() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!checkpoint_reported_in_capture(dir.path(), 42));
+    }
+
+    #[test]
+    fn checkpoint_reported_in_capture_reads_true_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 11),
+            format!("**Gate:** {HUMAN_GATE_VALUE}\n"),
+        )
+        .unwrap();
+        assert!(checkpoint_reported_in_capture(dir.path(), 11));
     }
 
     #[test]

@@ -1974,12 +1974,26 @@ Plans:
 - **999.28 / `--base` override (Medium, M).** Touches `start` but not the gate/prompt/relaunch path. Adjacent by file, unrelated by concern.
 - **999.61 / DEN-86** (four residual spawn edges) — unrelated mechanism; its own small phase.
 
-**Requirements**: TBD — no REQ-IDs; tracked by backlog identifier (`999.57`, `999.59`, `999.60`), consistent with Phases 21/22/26/27.
+**Scope narrowed during discussion (2026-07-30) — `28-CONTEXT.md` is authoritative over this entry's original framing.** The goal that survived is *"recognize a checkpoint correctly, and let DevFlow resolve it unattended"*, not *"get an operator's answer back to the agent"*: no usable notification/response channel exists to build a human-answer path on (D-08/D-09), and building one is explicitly deferred (D-11). Consequently **28b was repurposed** from "render checkpoint gates as a legible menu" to "keep a durable audit record of what was auto-decided" (D-07), and **28c's framing changed** from "add an interview flag" to "delete the branch that runs the interview headlessly" (D-14). A fifth item, a persistent `yes_ship` config option (D-12/D-13, a deliberate reversal of Phase 23's D-05), was added during the discussion.
+
+**Requirements**: TBD — no REQ-IDs; tracked by backlog identifier (`999.57`, `999.59`, `999.60`) plus `28-CONTEXT.md` decision IDs (`D-01`…`D-15`), consistent with Phases 21/22/26/27.
 **Depends on:** Phase 27 (no code dependency; sequencing only)
-**Plans:** 0 plans
+**Plans:** 6/6 plans executed
 
 **Capacity note, recorded rather than assumed.** Three items in one phase is what Phase 26 attempted, and Phase 26 did not ship. The mitigating difference: all four units share one narrow mechanism (gate → prompt → relaunch), none drives an irreversible operation, and 28b/28c/28d are each **S**. If scope pressure appears during planning, drop **28c** first (it is the most independent), then **28d**; 28a+28b are the phase's reason to exist.
 
 Plans:
+**Wave 1**
 
-- [ ] TBD (run /gsd-discuss-phase 28, then /gsd-plan-phase 28 to break down)
+- [x] 28-01-PLAN.md — wave 1 · tracer: probe the checkpoint-recognition seam against a live headless run, then encode D-01's static PLAN.md scan
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
+- [x] 28-02-PLAN.md — wave 2 · capture the Claude session id and confirm a reported checkpoint from stdout; persist both new `State` fields (D-01/D-04)
+- [x] 28-04-PLAN.md — wave 2 · Define must never invoke the interview headlessly; delete the branch, keep Plan's intact (999.59 / D-14)
+- [x] 28-05-PLAN.md — wave 2 · `resume` must not clear an unfired `--until` cap (999.60 / D-15)
+- [x] 28-06-PLAN.md — wave 2 · persistent `yes_ship` config option with a never-silent notice; CLI flag still wins (D-12/D-13)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
+- [x] 28-03-PLAN.md — wave 3 · the resume primitive, the bounded relaunch path, the `checkpoint_auto_decided` audit record, and the dispatch guard (D-03/D-04/D-05/D-07)

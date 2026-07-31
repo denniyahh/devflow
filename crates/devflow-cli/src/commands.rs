@@ -24,7 +24,7 @@ use crate::staleness::{enforce_build_staleness, run_git_stdout};
 use devflow_core::agent;
 use devflow_core::agent_result;
 use devflow_core::agents;
-use devflow_core::config::{DEVELOP, FEATURE_PREFIX, MAIN};
+use devflow_core::config::{self, DEVELOP, FEATURE_PREFIX, MAIN};
 use devflow_core::events;
 use devflow_core::gates::{GateAction, GateError, GateResponse, Gates, OpenGate};
 use devflow_core::git::{GitFlow, git_command, hermetic_command};
@@ -123,10 +123,23 @@ pub(crate) fn start(
     let mut state = State::new(phase, agent, mode, project_root.to_path_buf());
     state.stop_until = until;
     // The only assignment in the crate that ever sets `yes_ship` to a
-    // non-default value — from the parsed `--yes-ship` CLI flag, before the
-    // first `save_state` below, so the persisted authorization exists before
-    // the detached monitor that will later consult it is ever spawned.
-    state.yes_ship = yes_ship;
+    // non-default value. Provenance (D-12, `28-CONTEXT.md`): the typed
+    // `--yes-ship` CLI flag OR a standing `yes_ship = true` in
+    // `devflow.toml`, combined here with logical OR since the flag has no
+    // negative form. Combined before the first `save_state` below, so the
+    // persisted authorization exists before the detached monitor that will
+    // later consult it is ever spawned. `run_gate_with_timeout` must never
+    // re-derive this from `state` itself — see its own comment.
+    let config_yes_ship = config::yes_ship(project_root);
+    // D-12's compensating control: a standing default is never silent. Only
+    // fires when config alone supplied the authorization — a typed flag
+    // needs no explanation of where it came from.
+    if config_yes_ship && !yes_ship {
+        println!(
+            "note: Ship gate pre-authorized by devflow.toml (yes_ship = true) — see D-12, 28-CONTEXT.md"
+        );
+    }
+    state.yes_ship = yes_ship || config_yes_ship;
 
     if dry_run {
         print_dry_run(&state);
