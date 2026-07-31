@@ -264,8 +264,12 @@ fn extract_json_result_text(stdout: &str) -> Option<String> {
 /// available to every caller; D-04's persistence target (`State::session_id`)
 /// is unchanged, only the carrier differs.
 pub fn claude_session_id(stdout: &str) -> Option<String> {
-    let _ = stdout;
-    unimplemented!("RED: claude_session_id not yet implemented")
+    let trimmed = stdout.trim();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    value.get("session_id")?.as_str().map(str::to_string)
 }
 
 /// Thin file-reading wrapper over [`claude_session_id`]: reads the phase's
@@ -274,8 +278,9 @@ pub fn claude_session_id(stdout: &str) -> Option<String> {
 /// lossy-read convention (CR-01: one invalid UTF-8 byte from raw `sh`
 /// redirection must not silently disable this reader).
 pub fn session_id_from_capture(project_root: &Path, phase: u32) -> Option<String> {
-    let _ = (project_root, phase);
-    unimplemented!("RED: session_id_from_capture not yet implemented")
+    let bytes = std::fs::read(stdout_path(project_root, phase)).ok()?;
+    let stdout = String::from_utf8_lossy(&bytes);
+    claude_session_id(&stdout)
 }
 
 // WR-12 (13-REVIEW.md), revised: these traversal helpers run on the coding
