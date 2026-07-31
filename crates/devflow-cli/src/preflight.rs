@@ -247,6 +247,36 @@ pub(crate) fn unreachable_message(
 /// Refuse before `devflow start` forks anything when `phase` is not
 /// reachable from `base`. `Reachable` and `Undeterminable` both return
 /// `Ok(())` — the guard fails open where it cannot see.
+///
+/// **Only the ROADMAP heading is load-bearing for the refusal (999.63).**
+/// A missing `.planning/phases/{NN}-*/` directory is reported when the
+/// heading is *also* missing — it is useful diagnostic detail there — but it
+/// never refuses on its own.
+///
+/// The reason is a bootstrap inversion. That directory is **Define's own
+/// output**: `/gsd-discuss-phase N` is what creates it. Requiring it as a
+/// precondition for `devflow start` therefore demanded the product of the
+/// first stage in order to run the first stage, which structurally prevented
+/// DevFlow from ever driving GSD discussion mode for a newly-promoted phase.
+///
+/// 23-12 added the conjunction to catch a real failure — a phase promoted
+/// only on another branch is invisible to its own run and floundered silently
+/// through Define (the 2026-07-26 acceptance-run failure, `23-FINDINGS.md`
+/// §B1). **The heading check alone still catches that class**: a phase
+/// promoted only on another branch has no heading on `base` either. The
+/// directory conjunct added no detection power for it, while creating a
+/// false-positive class — heading present, directory absent — whose only
+/// members are legitimate bootstrap states, never failures.
+///
+/// Corroborating intent: the Codex leg immediately below this guard's call
+/// site refuses a missing `CONTEXT.md` with *"codex cannot run an interactive
+/// discussion headless … or use `--agent claude`"* — a message that only
+/// makes sense if Claude driving Define to *produce* the discussion was meant
+/// to work. This guard ran first and silently revoked that for every agent.
+///
+/// `phase_reachability_on_base` is deliberately left alone: it stays a pure
+/// two-field probe, so 27-05's hostile-`GIT_DIR` test keeps discriminating on
+/// the directory half.
 pub(crate) fn ensure_phase_reachable_on_base(
     project_root: &Path,
     phase: u32,
@@ -254,6 +284,11 @@ pub(crate) fn ensure_phase_reachable_on_base(
 ) -> Result<(), CliError> {
     match phase_reachability_on_base(project_root, phase, base) {
         PhaseReachability::Reachable | PhaseReachability::Undeterminable => Ok(()),
+        // The directory half alone must never refuse — see the doc comment.
+        PhaseReachability::Unreachable {
+            roadmap_entry_found: true,
+            ..
+        } => Ok(()),
         PhaseReachability::Unreachable {
             roadmap_entry_found,
             phase_dir_found,
@@ -1993,6 +2028,53 @@ mod tests {
                 roadmap_entry_found: true,
                 phase_dir_found: false,
             }
+        );
+    }
+
+    /// 999.63 — the named regression. The phase directory is Define's own
+    /// output (`/gsd-discuss-phase N` creates it), so requiring it to run
+    /// Define was a bootstrap inversion: no newly-promoted phase could ever
+    /// be driven through GSD discussion mode by DevFlow.
+    ///
+    /// The probe still *reports* the absent directory (asserted by
+    /// `reachability_is_unreachable_when_the_phase_dir_is_absent_from_base`
+    /// directly above, and relied on by 27-05's hostile-`GIT_DIR` test) —
+    /// this pins that the *enforcement* no longer refuses on it.
+    #[test]
+    fn enforcement_does_not_refuse_when_only_the_phase_dir_is_absent() {
+        let dir = reachability_fixture("### Phase 24: Something\n", None);
+        let root = dir.path();
+
+        // Precondition: this is genuinely the dir-only-missing shape, not a
+        // fixture that accidentally satisfies the guard some other way.
+        assert_eq!(
+            phase_reachability_on_base(root, 24, "develop"),
+            PhaseReachability::Unreachable {
+                roadmap_entry_found: true,
+                phase_dir_found: false,
+            }
+        );
+
+        assert!(
+            ensure_phase_reachable_on_base(root, 24, "develop").is_ok(),
+            "a present ROADMAP heading with no phase directory is the legitimate \
+             bootstrap state — Define has not run yet, and running it is what \
+             creates that directory. The guard must not refuse it (999.63)."
+        );
+    }
+
+    /// The control for the test above: the heading half must still refuse, or
+    /// 23-12's actual failure class (a phase promoted only on another branch,
+    /// invisible to its own run) would regress open.
+    #[test]
+    fn enforcement_still_refuses_when_the_roadmap_heading_is_absent() {
+        let dir = reachability_fixture("### Phase 1: Something else\n", Some((24, "something")));
+        let root = dir.path();
+        let err = ensure_phase_reachable_on_base(root, 24, "develop")
+            .expect_err("a missing ROADMAP heading must still refuse (23-12's failure class)");
+        assert!(
+            err.to_string().contains("### Phase 24:"),
+            "the refusal must still name the missing heading, got:\n{err}"
         );
     }
 
