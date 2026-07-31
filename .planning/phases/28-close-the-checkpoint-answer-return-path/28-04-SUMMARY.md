@@ -139,3 +139,12 @@ None - no external service configuration required.
 ---
 *Phase: 28-close-the-checkpoint-answer-return-path*
 *Completed: 2026-07-31*
+
+## Self-Check: PASSED
+
+- FOUND: `crates/devflow-core/src/prompt.rs`
+- FOUND: `crates/devflow-core/src/stage.rs`
+- FOUND: `.planning/phases/28-close-the-checkpoint-answer-return-path/28-04-SUMMARY.md`
+- FOUND commit: `838c746` (test(28-04): split Define/Plan idempotency test for D-14)
+- FOUND commit: `55f47fd` (feat(28-04): delete Define's headless-hang branch (D-14))
+- FOUND commit: `eb9d694` (docs(28-04): note Define's gsd_command is preview-only after D-14)
