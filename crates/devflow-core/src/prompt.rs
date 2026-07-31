@@ -358,33 +358,56 @@ mod tests {
         assert!(!prompt.contains("request_user_input"));
     }
 
-    /// 13-06 dogfood regression (Codex leg): GSD's discuss-phase demands an
-    /// interactive decision when CONTEXT.md already exists, which headless
-    /// Codex can never answer — Define/Plan must no-op with success when
-    /// their deliverable pre-exists.
+    /// 13-06 dogfood regression (Codex leg), Plan half only after the D-14
+    /// split: GSD's plan-phase demands an interactive decision when PLAN.md
+    /// already exists, which headless Codex can never answer — Plan must
+    /// no-op with success when its deliverable pre-exists. See T-28-09.
     #[test]
-    fn define_and_plan_prompts_are_idempotent() {
-        let cases = [
-            (Stage::Define, "/gsd-discuss-phase 9", "09-*CONTEXT.md"),
-            (Stage::Plan, "/gsd-plan-phase 9", "09-*PLAN.md"),
-        ];
-        for (stage, command, artifact_glob) in cases {
-            let prompt = stage_prompt(stage, 9);
-            assert!(prompt.contains(command), "{stage} prompt missing {command}");
-            assert!(
-                prompt.contains(artifact_glob),
-                "{stage} prompt must check for its pre-existing artifact"
-            );
-            assert!(
-                prompt.contains("Do NOT run the GSD command"),
-                "{stage} prompt must no-op when the artifact exists"
-            );
-            assert!(
-                prompt.contains("do NOT ask for input"),
-                "{stage} prompt must forbid interactive input"
-            );
-            assert!(prompt.contains("DEVFLOW_RESULT"));
-        }
+    fn plan_prompt_is_idempotent() {
+        let prompt = stage_prompt(Stage::Plan, 9);
+        assert!(
+            prompt.contains("/gsd-plan-phase 9"),
+            "Plan prompt missing /gsd-plan-phase 9"
+        );
+        assert!(
+            prompt.contains("09-*PLAN.md"),
+            "Plan prompt must check for its pre-existing artifact"
+        );
+        assert!(
+            prompt.contains("Do NOT run the GSD command"),
+            "Plan prompt must no-op when the artifact exists"
+        );
+        assert!(
+            prompt.contains("do NOT ask for input"),
+            "Plan prompt must forbid interactive input"
+        );
+        assert!(prompt.contains("DEVFLOW_RESULT"));
+    }
+
+    /// D-14: the Define stage must never invoke the interactive
+    /// discuss-phase command, whether or not CONTEXT.md exists — the branch
+    /// that did so is deleted, not disambiguated. Regression guard for
+    /// T-28-08 (a headless run has no operator to answer it).
+    #[test]
+    fn define_prompt_never_invokes_discuss_phase() {
+        let prompt = stage_prompt(Stage::Define, 9);
+        assert!(
+            !prompt.contains("/gsd-discuss-phase"),
+            "Define prompt must never invoke the interactive discuss-phase command (D-14)"
+        );
+        assert!(
+            prompt.contains("must NOT run") || prompt.contains("do NOT run"),
+            "Define prompt must forbid running an interactive interview headlessly"
+        );
+        assert!(
+            prompt.contains("do NOT ask for input") || prompt.contains("must NOT ask for input"),
+            "Define prompt must forbid requesting input"
+        );
+        assert!(
+            prompt.to_lowercase().contains("modify"),
+            "Define prompt must forbid modifying existing planning artifacts"
+        );
+        assert!(prompt.contains("DEVFLOW_RESULT"));
     }
 
     #[test]
