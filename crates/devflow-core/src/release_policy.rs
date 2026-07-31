@@ -112,10 +112,27 @@ pub fn resolve_merge_method(
     intent: MergeIntent,
     allowed: &[String],
 ) -> Result<MergeMethod, MergePolicyError> {
-    // RED stub: intentionally wrong so the behavior tests below fail for
-    // the intended reason before the GREEN implementation lands.
-    let _ = (intent, allowed);
-    unimplemented!("resolve_merge_method not yet implemented")
+    if allowed.is_empty() {
+        return Err(MergePolicyError::AllowedSetUnknown {
+            reason: "discovered allowed-method set is empty".into(),
+        });
+    }
+
+    let required = required_method(intent);
+    let required_name = required.api_name();
+    let is_allowed = allowed
+        .iter()
+        .any(|entry| entry.trim().eq_ignore_ascii_case(required_name));
+
+    if is_allowed {
+        Ok(required)
+    } else {
+        Err(MergePolicyError::NotAllowed {
+            intent,
+            required,
+            allowed: allowed.to_vec(),
+        })
+    }
 }
 
 /// The effective allowed set is the intersection of what the repository's
@@ -123,10 +140,15 @@ pub fn resolve_merge_method(
 /// can forbid a method independently. Pure — no I/O. If either input is
 /// empty, the result is empty.
 pub fn intersect_allowed(repo_level: &[String], branch_level: &[String]) -> Vec<String> {
-    // RED stub: intentionally wrong so the behavior tests below fail for
-    // the intended reason before the GREEN implementation lands.
-    let _ = (repo_level, branch_level);
-    unimplemented!("intersect_allowed not yet implemented")
+    repo_level
+        .iter()
+        .filter(|entry| {
+            branch_level
+                .iter()
+                .any(|other| other.trim().eq_ignore_ascii_case(entry.trim()))
+        })
+        .cloned()
+        .collect()
 }
 
 /// Discover the allowed merge methods for `branch` by querying the live
@@ -143,7 +165,10 @@ pub fn intersect_allowed(repo_level: &[String], branch_level: &[String]) -> Vec<
 /// operation, never to whatever repository the ambient shell sits in
 /// (T-29-10). Every failure returns a failure-class description; `gh`'s raw
 /// stdout/stderr is never embedded (T-29-03).
-pub fn discover_allowed_merge_methods(project_root: &Path, branch: &str) -> Result<Vec<String>, String> {
+pub fn discover_allowed_merge_methods(
+    project_root: &Path,
+    branch: &str,
+) -> Result<Vec<String>, String> {
     let repo_level = repo_level_allowed_methods(project_root)?;
     let branch_level = branch_level_allowed_methods(project_root, branch)?;
     if branch_level.is_empty() {
@@ -307,8 +332,7 @@ mod tests {
 
     #[test]
     fn resolve_merge_method_release_cut_on_merge_only_refuses_naming_squash() {
-        let result =
-            resolve_merge_method(MergeIntent::ReleaseCut, &hypothetical_merge_only());
+        let result = resolve_merge_method(MergeIntent::ReleaseCut, &hypothetical_merge_only());
         let err = result.expect_err("release-cut must refuse when squash is unavailable");
         assert!(err.to_string().contains("squash"));
     }
@@ -362,11 +386,17 @@ mod tests {
 
     #[test]
     fn intersect_allowed_empty_repo_level_is_empty() {
-        assert_eq!(intersect_allowed(&[], &strings(&["squash"])), Vec::<String>::new());
+        assert_eq!(
+            intersect_allowed(&[], &strings(&["squash"])),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
     fn intersect_allowed_empty_branch_level_is_empty() {
-        assert_eq!(intersect_allowed(&strings(&["merge", "squash"]), &[]), Vec::<String>::new());
+        assert_eq!(
+            intersect_allowed(&strings(&["merge", "squash"]), &[]),
+            Vec::<String>::new()
+        );
     }
 }
