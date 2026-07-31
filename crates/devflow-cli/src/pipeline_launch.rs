@@ -212,6 +212,15 @@ pub(crate) fn launch_stage(
 /// even though the operator explicitly asked to resume past it. Cleared and
 /// persisted BEFORE `launch_stage`, so a reload mid-relaunch already sees
 /// the phase as no longer stopped.
+///
+/// D-15 (999.60): that clear is now gated on `state.stopped`. `resume` is
+/// also the recovery verb for a rate-limited or infra-paused phase, and in
+/// that case `stop_until` is a cap the operator set that has NOT fired —
+/// `stopped` is the exact discriminator between "the cap fired and the
+/// operator is overriding it" (clear it, per the 20c paragraph above) and
+/// "the cap is still pending" (leave it alone, or the run silently sails
+/// past a boundary the operator named). The save/relaunch ordering is
+/// unchanged either way.
 pub(crate) fn resume(project_root: &Path, phase: u32) -> Result<(), CliError> {
     let _lock = match lock::acquire(project_root, phase) {
         Ok(guard) => guard,
@@ -223,9 +232,11 @@ pub(crate) fn resume(project_root: &Path, phase: u32) -> Result<(), CliError> {
         Err(err) => return Err(CliError::Message(format!("lock error: {err}"))),
     };
     let mut state = workflow::load_state(project_root, phase)?;
-    state.stopped = false;
-    state.stop_reason = None;
-    state.stop_until = None;
+    if state.stopped {
+        state.stopped = false;
+        state.stop_reason = None;
+        state.stop_until = None;
+    }
     workflow::save_state(&state)?;
     launch_stage(&mut state, None, None)
 }
@@ -522,6 +533,138 @@ mod tests {
             "resume() must have spawned a monitor whose pid is recorded in state — if this \
              fails, the reap guard above is silently reaping nothing and this test has \
              stopped covering the launch path it was written to cover"
+        );
+    }
+
+    /// D-15 (999.60): `resume` is also the recovery verb for a rate-limited
+    /// or infra-paused phase — a case where `stopped` is `false` and
+    /// `stop_until` is a cap the operator set that has NOT yet fired. Before
+    /// this fix, `resume()` unconditionally cleared `stop_until` alongside
+    /// `stopped`/`stop_reason`, so an unfired `--until` cap was silently
+    /// discarded and the run sailed past the stage the operator capped, with
+    /// nothing in the record saying it was ever dropped. Asserts on the
+    /// persisted (reloaded) state, mirroring
+    /// `resume_clears_stop_marker_and_advances_past_stop_point` above, since
+    /// `transition()`'s `stop_until == Some(from)` interception only sees
+    /// what was actually written to disk.
+    #[test]
+    fn resume_preserves_unfired_until_cap() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 67;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        // Current stage is earlier than the cap (Define < Plan), and the
+        // phase was NOT stopped by the cap — this is the rate-limit/infra
+        // recovery shape, not the "cap already fired" shape.
+        state.stop_until = Some(Stage::Plan);
+        state.stopped = false;
+        state.stop_reason = None;
+        workflow::save_state(&state).unwrap();
+
+        let stub_dir = stub_agent_binary("claude");
+        let original_path = std::env::var_os("PATH");
+        let stubbed_path = prepend_path(&stub_dir, &original_path);
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", &stubbed_path);
+        }
+
+        let result = resume(root, phase);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        // Same reap-before-unwrap ordering as the sibling test above: read
+        // the pid back from disk, since `resume()` loads its own `State`
+        // internally and never writes the spawned pid into this test's
+        // local `state` binding.
+        let reloaded_for_reap = workflow::load_state(root, phase).ok();
+        let _reap_guard = reloaded_for_reap
+            .as_ref()
+            .map(ReapMonitorOnDrop::after_launch);
+
+        result.unwrap();
+
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert_eq!(
+            reloaded.stop_until,
+            Some(Stage::Plan),
+            "resume must NOT discard an unfired --until cap: stopped was false, so the \
+             cap has not yet done its job and the operator's boundary must survive"
+        );
+        assert!(
+            !reloaded.stopped,
+            "an unfired cap must not itself flip stopped to true — resume only relaunches"
+        );
+        assert!(
+            reloaded.monitor_pid.is_some(),
+            "resume() must still have spawned a monitor whose pid is recorded in state"
+        );
+    }
+
+    /// D-15 (999.60) third case: an ordinary rate-limit/infra resume with no
+    /// `--until` cap at all (`stop_until: None`) must remain unaffected by
+    /// gating the clear on `state.stopped` — nothing to preserve, nothing to
+    /// clear, and the relaunch must still happen.
+    #[test]
+    fn resume_without_a_cap_is_unchanged() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 68;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stop_until = None;
+        state.stopped = false;
+        state.stop_reason = None;
+        workflow::save_state(&state).unwrap();
+
+        let stub_dir = stub_agent_binary("claude");
+        let original_path = std::env::var_os("PATH");
+        let stubbed_path = prepend_path(&stub_dir, &original_path);
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", &stubbed_path);
+        }
+
+        let result = resume(root, phase);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        let reloaded_for_reap = workflow::load_state(root, phase).ok();
+        let _reap_guard = reloaded_for_reap
+            .as_ref()
+            .map(ReapMonitorOnDrop::after_launch);
+
+        result.unwrap();
+
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert_eq!(
+            reloaded.stop_until, None,
+            "no cap was ever set, so none must appear after resume"
+        );
+        assert!(!reloaded.stopped);
+        assert_eq!(reloaded.stop_reason, None);
+        assert!(
+            reloaded.monitor_pid.is_some(),
+            "resume() must still relaunch and record a monitor pid with no cap present"
         );
     }
 
