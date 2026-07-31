@@ -59,17 +59,6 @@ pub(crate) fn launch_stage_inner(
     prompt_override: Option<String>,
     archived_stage: Option<Stage>,
 ) -> Result<(), CliError> {
-    // WR-04 (18-fix): clear the prior stage's monitor pid up front, before
-    // any fallible step below (`ensure_agent_binary`) can return early via
-    // `?`. Without this, a failed relaunch left `state.stage` already
-    // advanced (by `transition()`, before this function was ever called)
-    // alongside a stale `monitor_pid` still naming the PREVIOUS stage's
-    // (now-dead) monitor — `liveness()` then misreports `Stuck → devflow
-    // resume`, even when the real remedy is unrelated. The real pid is set
-    // again below once `monitor::spawn_monitor` actually succeeds.
-    state.monitor_pid = None;
-    workflow::save_state(state)?;
-
     let prompt = prompt_override.unwrap_or_else(|| {
         prompt::stage_prompt_for_project(state.stage, state.phase, &state.project_root)
     });
@@ -84,6 +73,43 @@ pub(crate) fn launch_stage_inner(
         .map(|wt| worktree_writable_roots(&state.project_root, wt))
         .unwrap_or_default();
     let (program, args) = adapter.exec_command(state.phase, &prompt, &roots);
+
+    // RED (28-03 Task 2): counter reset temporarily removed to prove the new
+    // test fails for the right reason.
+
+    spawn_agent_and_record(state, program, &args, &adapter.extra_env(), archived_stage)
+}
+
+/// The tail of [`launch_stage_inner`]: clear the stale monitor pid, validate
+/// the agent binary, archive the prior capture, spawn the monitor, and
+/// record the launch. Extracted (28-03, Task 2) so
+/// [`relaunch_checkpoint_session`] can share this EXACT tail for a
+/// checkpoint auto-decide resume — a resume is a continuation of the same
+/// stage's agent run, not a fresh stage entry, so it must not duplicate this
+/// bookkeeping nor drift from it over time.
+///
+/// Emits no events beyond `capture_archived` and `stage_launched` — a
+/// checkpoint resume is distinguished from an ordinary launch by its own
+/// separate `checkpoint_auto_decided` event, emitted by the caller BEFORE
+/// this function ever runs, not by mutating either event's shape here.
+fn spawn_agent_and_record(
+    state: &mut State,
+    program: &str,
+    args: &[String],
+    extra_env: &[(String, String)],
+    archived_stage: Option<Stage>,
+) -> Result<(), CliError> {
+    // WR-04 (18-fix): clear the prior stage's monitor pid up front, before
+    // any fallible step below (`ensure_agent_binary`) can return early via
+    // `?`. Without this, a failed relaunch left `state.stage` already
+    // advanced (by `transition()`, before this function was ever called)
+    // alongside a stale `monitor_pid` still naming the PREVIOUS stage's
+    // (now-dead) monitor — `liveness()` then misreports `Stuck → devflow
+    // resume`, even when the real remedy is unrelated. The real pid is set
+    // again below once `monitor::spawn_monitor` actually succeeds.
+    state.monitor_pid = None;
+    workflow::save_state(state)?;
+
     ensure_agent_binary(program)?;
 
     // 17d (Task 2, D-17-D-19) originally placed the self-dogfood
@@ -120,7 +146,7 @@ pub(crate) fn launch_stage_inner(
             }),
         );
     }
-    let pid = monitor::spawn_monitor(state, program, &args, &adapter.extra_env())
+    let pid = monitor::spawn_monitor(state, program, args, extra_env)
         .map_err(|err| CliError::Message(format!("could not spawn monitor: {err}")))?;
     // `transition()` calls `workflow::save_state` BEFORE `launch_stage`, so a
     // pid recorded only in memory here is lost unless it is written again
@@ -145,9 +171,40 @@ pub(crate) fn launch_stage_inner(
     println!(
         "stage {} → launched {} (monitor pid {pid})",
         state.stage,
-        adapter.name()
+        agents::adapter_for(state.agent).name()
     );
     Ok(())
+}
+
+/// Resume the exited Claude session that raised a confirmed human-blocking
+/// checkpoint (D-03/D-04), continuing the SAME stage rather than launching a
+/// fresh one.
+///
+/// D-04: resuming preserves the original session's conversation context and
+/// completed-task history — a fresh stage spawn would re-read CONTEXT.md/
+/// RESEARCH.md and re-run already-completed tasks, which a resume must
+/// avoid. [`monitor::spawn_monitor`] always launches from
+/// `state.worktree_path` (unchanged across relaunches within one phase run),
+/// so the directory scope `--resume` requires needs no new plumbing here.
+/// The monitor's own `devflow advance --phase N` tail is what re-enters the
+/// loop for this same stage once the resumed session exits — a checkpoint
+/// the agent resolves simply continues from wherever `advance()` picks up
+/// next.
+///
+/// Does NOT call [`run_preflight`] and does NOT change `state.stage` — this
+/// is a continuation of the current stage's agent run, not a new stage
+/// entry.
+pub(crate) fn relaunch_checkpoint_session(
+    state: &mut State,
+    session_id: &str,
+) -> Result<(), CliError> {
+    // RED (28-03 Task 2): counter increment and audit event temporarily
+    // removed to prove the new tests fail for the right reason.
+    let instruction = prompt::checkpoint_auto_decide_prompt(state.phase);
+
+    let (program, args) = agents::ClaudeAgent::exec_resume_command(session_id, &instruction);
+
+    spawn_agent_and_record(state, program, &args, &[], None)
 }
 
 /// Spawn the background monitor that owns the agent for `state.stage`. The
@@ -830,5 +887,200 @@ mod tests {
         assert_eq!(event["status"], "resource_killed");
         assert_ne!(event["status"], "resourcekilled");
         assert_eq!(event["decided_by_layer"], 2);
+    }
+
+    /// Collect every event of `kind` for the phase recorded in `root`'s
+    /// event log, oldest-first.
+    fn events_of_kind(root: &Path, kind: &str) -> Vec<serde_json::Value> {
+        let contents = std::fs::read_to_string(events::events_path(root)).unwrap_or_default();
+        contents
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| event["event"] == kind)
+            .collect()
+    }
+
+    /// D-04/D-07 (28-03, Task 2): a checkpoint resume records the
+    /// `checkpoint_auto_decided` audit event exactly once, carrying the
+    /// session id and stage — the only durable record of an unattended
+    /// checkpoint decision.
+    #[test]
+    fn relaunch_checkpoint_session_emits_exactly_one_audit_event() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 84;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+
+        let stub_dir = stub_agent_binary("claude");
+        let original_path = std::env::var_os("PATH");
+        let stubbed_path = prepend_path(&stub_dir, &original_path);
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", &stubbed_path);
+        }
+
+        let result = relaunch_checkpoint_session(&mut state, "sess-abc-123");
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
+
+        result.unwrap();
+
+        let matches = events_of_kind(root, "checkpoint_auto_decided");
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected exactly one checkpoint_auto_decided event: {matches:?}"
+        );
+        assert_eq!(matches[0]["session_id"], "sess-abc-123");
+        assert_eq!(matches[0]["stage"], "code");
+        assert_eq!(matches[0]["attempt"], 1);
+    }
+
+    /// D-04 (28-03, Task 2): the resume ceiling increments with saturating
+    /// arithmetic and the incremented value is persisted to disk, since a
+    /// relaunch and its bookkeeping cross separate `devflow advance`
+    /// invocations.
+    #[test]
+    fn relaunch_checkpoint_session_increments_and_persists_counter() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 85;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        state.checkpoint_resumes = 1;
+        workflow::save_state(&state).unwrap();
+
+        let stub_dir = stub_agent_binary("claude");
+        let original_path = std::env::var_os("PATH");
+        let stubbed_path = prepend_path(&stub_dir, &original_path);
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", &stubbed_path);
+        }
+
+        let result = relaunch_checkpoint_session(&mut state, "sess-xyz");
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
+
+        result.unwrap();
+
+        assert_eq!(state.checkpoint_resumes, 2);
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert_eq!(
+            reloaded.checkpoint_resumes, 2,
+            "the incremented counter must persist to disk"
+        );
+    }
+
+    /// D-03/D-04 (28-03, Task 2): a checkpoint resume must not re-run
+    /// preflight or move the phase to a new stage — it is a continuation of
+    /// the current stage's agent run, not a new stage entry.
+    #[test]
+    fn relaunch_checkpoint_session_does_not_change_stage() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 86;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+
+        let stub_dir = stub_agent_binary("claude");
+        let original_path = std::env::var_os("PATH");
+        let stubbed_path = prepend_path(&stub_dir, &original_path);
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", &stubbed_path);
+        }
+
+        let result = relaunch_checkpoint_session(&mut state, "sess-stage");
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
+
+        result.unwrap();
+
+        assert_eq!(state.stage, Stage::Code, "a checkpoint resume must not advance the stage");
+    }
+
+    /// 28-03 (Task 2): an ordinary stage launch resets the checkpoint-resume
+    /// budget to zero, including in a state that carried a nonzero count
+    /// from a prior stage's resume attempts — this is what makes the
+    /// ceiling bound one stage's resume budget rather than a phase's entire
+    /// lifetime.
+    #[test]
+    fn launch_stage_inner_resets_checkpoint_resumes_counter() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 87;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        state.checkpoint_resumes = 2;
+        workflow::save_state(&state).unwrap();
+
+        let stub_dir = stub_agent_binary("claude");
+        let original_path = std::env::var_os("PATH");
+        let stubbed_path = prepend_path(&stub_dir, &original_path);
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", &stubbed_path);
+        }
+
+        let result = launch_stage_inner(&mut state, None, None);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
+
+        result.unwrap();
+
+        assert_eq!(
+            state.checkpoint_resumes, 0,
+            "an ordinary stage launch must reset the checkpoint-resume budget"
+        );
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert_eq!(reloaded.checkpoint_resumes, 0);
     }
 }
