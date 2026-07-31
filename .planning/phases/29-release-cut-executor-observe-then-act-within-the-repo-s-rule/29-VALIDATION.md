@@ -199,3 +199,58 @@ each plan brought tests for the exact rows Part B had named.
 > string.** Phase 26's Part B rows were seeded as `git::tests::…` and landed in a
 > new `release` module as `release::tests::…`; a covered row then reads as a
 > missing test. Confirm every name via `cargo test -- --list` first.
+
+---
+
+## Fix-Loop Attempt 2026-07-31 — `/gsd-execute-phase 29 --gaps-only`
+
+DevFlow routed the PARTIAL verdict above into its gap-closure fix loop. **The
+command matches zero plans and is a no-op here.** Recorded so the next iteration
+does not re-derive it.
+
+`--gaps-only` selects plans carrying `gap_closure: true` in frontmatter
+(`execute-phase.md` § filtering). Applying that filter to Phase 29:
+
+| Plan | `has_summary` | `gap_closure` | Selected |
+|------|---------------|---------------|----------|
+| 29-01 | ✅ (executed) | — | no — already complete |
+| 29-02 … 29-07 | ❌ | **absent** | no — not gap-closure plans |
+
+`rg gap_closure .planning/phases/29-*/` → **0 matches**. Selection set is empty →
+the orchestrator's documented behavior is "No matching incomplete plans" → exit.
+
+**Why the precondition is unmet.** The gap-closure cycle is
+`/gsd-plan-phase 29 --gaps` (reads `29-VERIFICATION.md`) → mints `gap_closure: true`
+plans → `--gaps-only` executes them. Phase 29 has **no `29-VERIFICATION.md`** —
+`/gsd-verify-work` has never run, because the phase is mid-arc at wave 1 of 6.
+What produced the PARTIAL was `/gsd-validate-phase`, and all 9 of its findings are
+Part B rows meaning *"the implementation does not exist yet"* — not a
+gap-closure-shaped defect. Minting gap plans for them would duplicate
+29-02 … 29-07, which already exist and already carry tests for those exact rows.
+
+**Re-verified live during this fix-loop attempt (not carried over):**
+
+- `cargo test --workspace` → **0 failed** across every target. No regression is
+  hiding behind the PARTIAL; the verdict is purely missing implementation.
+- `crates/devflow-core/src/` contains `release_observe.rs` only —
+  `release_policy.rs`, `release_execute.rs`, `release_publish.rs` still absent.
+- `resolve_merge_method` / `discover_allowed_merge_methods` / `fn yes_release` →
+  **0 matches** repo-wide. `crates/devflow-cli/tests/` has `release_check.rs` and
+  `release_status.rs` only; `release_cut.rs` absent.
+
+Part B is unchanged and remains closable only by finishing the arc.
+
+**Escalation — operator decision required.** Two routes, and this loop cannot
+pick between them:
+
+1. **Finish the arc** — `/gsd-execute-phase 29` (no flag) runs waves 2→6, plans
+   29-02 … 29-07. This is the route § Operator action names, and Phase 26's
+   precedent says re-running `/gsd-validate-phase 29` afterward returns zero
+   gaps. Note 29-07 is `autonomous: false` and carries a
+   `checkpoint:human-verify` gate over genuinely irreversible steps (`git tag -s`,
+   `cargo publish`) — it will not run unattended.
+2. **Close Phase 29 as PARTIAL** at wave 1, and re-scope waves 2–6.
+
+Route 1 is a six-wave build, not a fix; running it from inside a fix loop would
+be a scope expansion this loop was not authorized to make. Hence: **failed**, with
+the arc left intact and nothing fabricated.
