@@ -2212,28 +2212,117 @@ operation performed roughly monthly, deliberately, by an operator who wants to w
 cost two phases. Removing it eliminates — not fixes, *eliminates* — the entire defect class, and
 frees all capacity for the reliability work that actually serves the project's stated purpose.
 
+#### Adversarial review of this plan (Fable, 2026-08-01) — the gate Phases 26/29 skipped
+
+This scope was adversarially reviewed **before planning** by Claude Fable 5, instructed to verify
+every claim against live source and to kill the plan if it deserved it. Verdict:
+**APPROVE-WITH-CHANGES — 4 Critical, 4 High, 4 Medium findings against the plan as drafted.** All
+are folded into the units below; the four Criticals were: (C1) the `compute_version` fork was
+false — the D-09 gate is built on the `semver`/`git-conventional` crates, so "delete the deps"
+does not compile, and D-09's own fate had never been ruled; (C2) emptying the hooks silently
+inverts what `workflow_shipped` means while `ship_evidence` — mechanically read-only but
+*semantically defined by that event* — keeps vouching for the old meaning; (C3) the acceptance
+run as drafted would have **performed the old hooks on the real repo** (the driving binary is the
+installed one, not the branch under test); (C4) `GitFlow::release_start`/`release_finish`/
+`feature_finish` are the same release-acting class, compiled and public, and the draft never
+mentioned them — "fixed the instance, left the class open," again. The review also proved the
+draft's 30d fixture could not catch the historical defect (the incoherent code never pushes, so a
+pre-receive hook never fires) and ratified the premise and the 30a-before-999.64 sequencing.
+
+#### Operator rulings (2026-08-01, all three confirmed)
+
+- **R5 — D-09 survives as awareness, not action.** The major-bump gate is kept, reworded as a
+  breaking-change *awareness* gate: commit classification is a deterministic local fact, not a
+  D-10-class environment prediction. **DevFlow may still notice release-significant facts; it may
+  no longer act on them.** `compute_version`, `apply_bump`, `write_version` are deleted; the
+  `semver`/`git-conventional` dependencies stay (D-09 needs them). Most of Phase 25's 25c work
+  survives through D-09. The "advisory version row" alternative is rejected — a predictor
+  presented to the operator as truth is the class D-10 generalized against.
+- **R6 — `workflow_shipped` is re-documented, not renamed.** New meaning: *"phase run completed
+  through Ship approval; PR open; the DevFlow binary performed zero git mutation."* The event
+  name is kept because the event log is append-only — a rename would split its history into two
+  vocabularies. `ship_evidence.rs` doc comments, the `--require-shipped` failure text, and the
+  tests asserting hook-success-before-emission are all updated in the same change.
+- **R7 — `BranchCleanup` is deleted** (supersedes this entry's earlier "retained" text, which is
+  hereby amended): with `Merge` gone, its non-force `git branch -d` refuses every unmerged branch
+  and the hook degrades to a permanent warning no-op. GitHub deletes branches on PR merge.
+
 #### Units
 
-- **30a — remove release *acting* from `hooks_after_ship`.** `Merge`, `VersionBump`,
-  `ChangelogAppend` are shipped release automation running today, and `VersionBump`'s tagging is
-  literally Phase 29's finding 5 (the `v{version}` namespace collision with the executor). This is
-  the unit that matters: the defect class is in the *shipped* product, not only in the abandoned
-  branches. `BranchCleanup` is not release-acting and is retained.
-- **30b — keep read-only release *reporting*.** `devflow release --check` already exists, is
-  read-only, and is harmless. Retain it, and be explicit in its output about what it cannot
-  determine. As an advisory checklist for a human doing the manual release it does not need
-  executor-grade correctness — only honesty about its own limits. **This is the thing that would
-  have caught the missing `v2.2.0` tag on 2026-07-31.**
-- **30c — documentation.** CONTRIBUTING.md's release procedure becomes the sole authority again.
-  Remove any text implying DevFlow performs release steps.
+- **30a — remove release *acting*, the class and not the instance.** The deletion list, per the
+  review's C4/H3/M3 extensions:
+  - Hooks: `Merge`, `VersionBump`, `ChangelogAppend`, `BranchCleanup` (R7) — the fns, the `Hook`
+    variants (serialization-safe: the enum derives no `Serialize`; events store debug strings),
+    and the GAP-7 `shipped_version`/changelog-body threading in `HookContext`.
+  - **Library primitives of the same class:** `GitFlow::tag`, `GitFlow::release_start`,
+    `GitFlow::release_finish`, `GitFlow::feature_finish` — public, compiled, only test callers,
+    and `release_finish` is a full local release cut. An uncalled capability is an affordance for
+    the next caller; withdrawing means the library *cannot express* release-acting.
+  - **The entire signing-predictor chain** (H3): `check_signing`, `check_signing_viability`,
+    `check_ssh_signing_viability`, `SigningViability`, and their tests. No production consumer
+    remains; D-10 says this must never exist; it carries two live-measured false negatives.
+  - Orphans (M3): `ship::prepend_changelog`, `version::write_version`,
+    `version::detect_version_file`/`hooks::has_version_file`, and `Hook::BranchCreate` (zero
+    production callers *today* — flagged now rather than discovered mid-execution).
+  - **Blast radius includes `pipeline_gate.rs`, the real production caller** (H1, absent from the
+    draft): the finalization-retry loop and its reopened never-silent Ship gate, the Ship gate
+    text "Ship complete — approve merge?" (there is no merge to approve), "phase N shipped —
+    workflow complete", `ship_override`'s "re-running the terminal hooks" contract, and
+    `hook_context_root`'s terminal-batch arm. The checkout lock **stays** — it serves every batch
+    including the surviving `DocsUpdate` (the draft's "machinery is dead" claim was wrong).
+  - `workflow_shipped`/`ship_evidence` re-documentation per R6 — an explicit task, not a side
+    effect (C2).
+- **30b — `release --check` keeps facts, loses predictions.** Publish-order check retained.
+  `check_signing` row removed (H3). Stale text rewritten: `check_self_pin`'s "VersionBump should
+  have rewritten this" hint and `workspace_version_pin`'s framing (M2) — the pin test itself
+  stays, it guards CONTRIBUTING step 1. The D-14 `gh auth` preflight keeps its check but fixes
+  its rationale comment — the hooks never pushed; the check's real justification is
+  `/gsd-ship`'s `gh pr create` (M1).
+- **30c — documentation.** CONTRIBUTING.md becomes the sole release authority. Verified
+  non-regression (review, Info): zero hook-authored changelog commits exist in all history — the
+  entries were stranded on the unpushable local `develop` — and CONTRIBUTING step 1 already has
+  the operator hand-writing CHANGELOG.md, so removing `ChangelogAppend` regresses nothing real.
+- **30d — hermetic remote fixture, divergence-first (H4 rewrite).** A local bare repo as
+  `origin`. **The load-bearing assertion is divergence: after driving the real production Ship
+  path (`finish_workflow`/`advance`, never a hand-rolled loop), `git rev-list
+  origin/develop..develop` is empty** — the incoherent code merged locally and never pushed, so
+  a push-rejecting hook alone would never fire against it. All four acting artifacts are
+  asserted: no divergence, no local `v*` tag, feature branch intact, no changelog commit. The
+  `pre-receive` reject on `refs/heads/develop` is retained as belt-and-suspenders against
+  *future* push-based acting, explicitly not as the mechanism. **The test must be demonstrated
+  red against pre-30a HEAD once, and that run recorded** — a test that has never been red is a
+  hope, not a proof.
 
-**Explicitly NOT in scope:** rebuilding the observer to executor grade. Phase 29's `release_observe.rs`
-is defective (findings 2, 3, 6) and is **not** being merged or salvaged here. `release --check` as it
-exists on `develop` today is what is retained.
+#### Acceptance (rewritten per C3 — must be executable today)
 
-**Requirements:** TBD — tracked by unit identifier (`30a`–`30c`), consistent with Phases 21/22/26/27/28/29.
+1. **30d red-then-green:** the fixture test fails against pre-30a HEAD, passes after.
+2. **Foreground terminal-path run:** `devflow ship` (`ship_override`) driven against a real clone
+   with a real `origin`, phase state at Ship, pre-written gate response — exercising the exact
+   production finalization path with a remote present. End state: PR open, feature branch
+   intact, local `develop` not ahead of `origin/develop`, no local tag.
+3. **Any live dogfood Ship requires the binary rebuilt from the 30a branch first** — with the
+   installed binary, the acceptance run itself would execute the old hooks against the real
+   repo (C3). Recorded as a hard prerequisite, same class as the standing rebuild-before-
+   revalidate rule.
+4. Tests-pass is explicitly **not** acceptance (the hooks' tests were green for their entire
+   defective life; the fixture had no remote — the property was inexpressible).
+
+**Explicitly NOT in scope:** rebuilding the observer to executor grade — Phase 29's
+`release_observe.rs` carries findings 2/3/6 and is not salvaged. The real-GitHub E2E harness
+(30e) — deferred until 999.64 lands (R4); a harness cannot test a successful Ship until DevFlow
+can produce one.
+
+**Sequencing (ratified by review, axis 7):** 30a before 999.64 is correct and now urgent-adjacent:
+every future 999.64 dogfood that accidentally reaches Ship with the current binary corrupts the
+operator's local `develop` and tag namespace. Removing the hazard first makes all subsequent
+reliability work safer. 999.64 lives in the launch/session machinery, orthogonal to
+`finish_workflow` — no rework coupling.
+
+**Requirements:** TBD — tracked by unit identifier (`30a`–`30d`) plus rulings (`R1`–`R7`),
+consistent with Phases 21/22/26/27/28/29.
 **Depends on:** nothing.
-**Priority:** High | **Size:** S–M — subtractive, no new irreversible surface.
+**Priority:** High | **Size:** M — subtractive in intent, but the blast radius now includes
+`pipeline_gate.rs`'s finalization path and the `workflow_shipped` semantic migration.
 
 Plans:
 
