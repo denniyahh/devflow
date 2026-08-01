@@ -2324,7 +2324,11 @@ consistent with Phases 21/22/26/27/28/29.
 **Priority:** High | **Size:** M — subtractive in intent, but the blast radius now includes
 `pipeline_gate.rs`'s finalization path and the `workflow_shipped` semantic migration.
 
-**Plans:** 4 plans, 4 waves (fully sequential — every pair shares an owned file).
+**Plans:** 4 plans, 4 waves, fully sequential. Waves 1→2→3 are serialised by shared file
+ownership (`commands.rs` and `git.rs` each span two plans). Wave 4 is serialised by a
+content dependency instead — it touches only markdown and 30-03 touches only Rust, but
+its job is to document the code's final state, which does not exist until every earlier
+plan has landed.
 
 Plans:
 
