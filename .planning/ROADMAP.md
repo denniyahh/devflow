@@ -553,7 +553,104 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.25: Release-Cut Executor (`devflow release` that executes) (PROMOTED — Phase 29)
+### Phase 999.25: Release-Cut Executor (`devflow release` that executes) (RE-OPENED — Phase 29 blocked at review, second failed attempt)
+
+**RE-OPENED 2026-07-31, after the SECOND failed attempt.** Phase 29 built all 7 plans, merged
+6 waves, and reached 921 passing tests with clean clippy and fmt. An independent cross-AI code
+review (Codex `gpt-5.6-sol`, high reasoning effort, read-only sandbox, all 6,136 source lines)
+returned **REQUEST CHANGES / BLOCK — 5 Criticals and 1 High.** `feature/phase-29` is unmerged
+and unpushed. Do not merge it.
+
+**Do not attempt a third implementation from the same premise.** Operator decision, 2026-07-31:
+reduce scope first. The constraints in "What a third attempt must promise" below are the shape
+of the next attempt; anything wider has now failed twice.
+
+---
+
+#### The fundamental diagnosis: the code passes *locations* where it must pass *identities*
+
+A release is defined by **a commit**. Every oracle in Phase 29 asks a *name*-shaped question —
+"does a tag called `v2.3.0` exist?", "does `Cargo.toml` on `main` say 2.3.0?", "is version
+2.3.0 on crates.io?" — and every action runs against **a directory** (`project_root`). Nothing
+binds either the question or the action to the specific commit being released.
+
+| # | Finding | Sev | Unit |
+|---|---|---|---|
+| 1 | `cargo publish` runs in `project_root`, not at the observed release commit. Scratch worktrees release `2.3.0`; publish packages whatever the checkout holds. A checkout holding an unpublished `2.4.0` **irreversibly consumes 2.4.0 while cutting 2.3.0** | Critical | 29b/29c |
+| 2 | `signed_tag_on_remote` accepts a signed `v{version}` without comparing its peeled commit to `origin/main` — tag at A, main at B, reports Present, skips tagging | Critical | **29a** |
+| 3 | `crates_published` consumes `git::publish_order` directly, bypassing `publish_plan`'s completeness guard — an unreadable member manifest makes the observer report the whole workspace Present | Critical | **29a** |
+| 4 | `open_and_arm_pr` creates before arming; a failure between them leaves an open, unarmed PR that every later run reads as InFlight and stops on, forever. Also discards `gh` stderr | Critical | 29b |
+| 5 | The Ship hook's `VersionBump` and the executor claim the same `v{version}` namespace incompatibly — this is **IN-01, which this entry already listed as a prerequisite**, recurring | Critical | 29c |
+| 6 | "Release PR merged" inferred solely from the version field on `main`; a cherry-pick satisfies it, then an irreversible tag is pushed at an incomplete commit | High | 29a/29b |
+
+**Findings 1, 2 and 6 are one mistake wearing three hats.** `project_root` is only its most
+visible face — findings 2 and 6 involve no worktree at all.
+
+**Read-only was not safer, and this is the most important lesson in the entry.** Three of six
+findings are in `release_observe.rs`, the pure-observation unit with no irreversible operations,
+which the assistant had called "genuinely sound" and proposed landing on its own. **That
+recommendation was wrong and is withdrawn.** The difficulty was never in the *acting*; it is in
+*specifying which question to ask*. A wrong observer fails quietly instead of destructively —
+which is worse, because it is the foundation the acting layer trusts.
+
+#### "Derive state, never record it" was half right, and the half that was wrong cost the phase
+
+The premise is correct for **completion** — is this tag pushed, is this crate published. It is
+insufficient for two things the review found:
+
+- **Intermediate intent** (finding 4). A PR created but not armed. *Partially* recoverable after
+  all: `gh pr view --json autoMergeRequest` reports auto-merge state directly, and the code
+  simply never consulted it — it observed only "is a PR open?". The genuinely unobservable
+  residue is narrower than first stated: "is this *my* PR, from *this* release?"
+- **Concurrent actors** (finding 5). Observation reports that a tag exists, never who created it
+  or why, so the executor cannot choose between deferring, replacing, and refusing.
+
+This entry's own earlier text said "the one thing that cannot be observed is operator
+authorization." That was too narrow. It is **any intent that has not yet become an observable
+fact**. The seam was identified and then under-scoped.
+
+#### The requirement nobody chose, which is what actually made this hard
+
+Releases are not complicated. **"Resumable from an arbitrary partial failure" is a genuinely hard
+distributed-systems property**, and the derive-don't-record premise silently committed the phase
+to it: every step must be safe to re-enter from any world state, including states produced by
+other actors, mid-flight failures, and races. Nobody decided to take that on. It arrived as a
+consequence.
+
+#### What a third attempt must promise — and must not
+
+1. **Thread the release commit explicitly.** Every step takes `(release_commit, version)`.
+   Publishing happens from a worktree checked out at that commit, never from `project_root`.
+   Oracles compare **commit identity**, not names. Closes 1, 2, 6.
+2. **Refuse to start rather than handle every state.** Require a clean tree, the expected branch,
+   no pre-existing `v{version}` anywhere, and no open release PR. Converts 4 and 5 from
+   "disambiguate this" into "do not begin in it."
+3. **Do not automate steps whose intent has no oracle.** The PR arm/merge dance is the clearest
+   case — leave the merge click to a human. Ten seconds, one fewer Critical.
+4. **Drop arbitrary resumability.** "Runs to completion, or refuses to start and reports exactly
+   where the world is" is far cheaper and sufficient for a monthly operation.
+
+#### Process failures, recorded so the third attempt does not repeat them
+
+- **The design premise was never adversarially tested.** `/gsd-review` — cross-AI review of
+  *plans*, with `review.default_reviewers` already configured — **exists and was not run.** An
+  adversarial pass asks of a premise "what states can this not represent? which actors can
+  interfere? does the oracle answer the question we need or a similar-looking one?" Run against
+  derive-don't-record, that pass surfaces all six findings **before any code**. Cost: minutes.
+- **Six of seven plans merged with no independent review.** Only 29-07 carried a review gate. It
+  found a real Critical. There was never a reason to believe the other six were cleaner.
+- **A fix closed the instance and left the class open — again.** The 29-07 review found the
+  CR-03 truncation in `publish_plan` and fixed it; Codex then found the identical class alive at
+  a second site (`crates_published`). This is verbatim the Phase 26 pattern this entry already
+  records. **Treat "fixed" as "fixed at one site" until the class is searched.**
+- **"921 tests green" was reported as if it were validation.** It is not, and this entry has said
+  so since Phase 26. `29-VERIFICATION.md`, `29-REVIEW.md` and a security audit were never
+  produced; `29-VALIDATION.md` is a stale wave-1 artifact.
+
+**Priority:** High | **Size:** M for the reduced scope above (was L). Two failed attempts at the
+wider scope. Linear: DEN-50.
+
+---
 
 **PROMOTED 2026-07-31 → Phase 29.** Re-attempted as a redesign, not a rebase. The
 `feature/phase-26` code is **reference material only** (operator decision, 2026-07-31) — it
