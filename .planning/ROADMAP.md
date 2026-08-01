@@ -553,7 +553,9 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.25: Release-Cut Executor (`devflow release` that executes) (RE-OPENED — Phase 29 blocked at review, second failed attempt)
+### Phase 999.25: Release-Cut Executor (`devflow release` that executes) (CLOSED — WON'T DO, superseded by Phase 30)
+
+**CLOSED 2026-07-31 as won't-do**, after two failed attempts (Phases 26 and 29, ~120 commits, neither shipped). DevFlow is withdrawing from release automation entirely — see **Phase 30**. Code from both attempts is archived on `origin` at `archive/phase-26-release-executor` and `archive/phase-29-release-executor`. Everything below is retained as the record of why, and as the brief any future attempt would have to answer. Linear: DEN-50 — close as won't-do.
 
 **RE-OPENED 2026-07-31, after the SECOND failed attempt.** Phase 29 built all 7 plans, merged
 6 waves, and reached 921 passing tests with clean clippy and fmt. An independent cross-AI code
@@ -2173,7 +2175,215 @@ Plans:
 
 - [x] 28-03-PLAN.md — wave 3 · the resume primitive, the bounded relaunch path, the `checkpoint_auto_decided` audit record, and the dispatch guard (D-03/D-04/D-05/D-07)
 
-### Phase 29: Release-Cut Executor — Observe, Then Act Within the Repo's Rules
+### Phase 30: Withdraw DevFlow From the Release Business
+
+**Scoped 2026-07-31**, immediately after Phase 29 was aborted. **Subtractive phase — it deletes
+capability rather than adding it.** That is the point.
+
+**Goal:** DevFlow's mandate ends when a **reviewable pull request exists**. It drives
+Define → Plan → Code → Validate, pushes the branch, opens the PR, and stops. The operator merges,
+versions, tags, and publishes. Every irreversible operation leaves DevFlow's surface.
+
+#### Why, from this project's own evidence
+
+Two full phases (26 and 29, ~120 commits) attempted release automation. Neither shipped. Both
+died to the same class of defect — irreversible operations whose failure modes are invisible to
+tests by construction. Phase 26: 763 green tests, 11/11 self-verification, 12 Criticals. Phase 29:
+921 green tests, clean lint, 5 Criticals + 1 High from an independent cross-AI review, three of
+them in the *read-only* unit.
+
+**Meanwhile the actual goal — run a development phase autonomously — has never been met, and the
+2026-07-31 dogfood run failed at it four separate times, none release-related:**
+
+| Stage | Outcome |
+|---|---|
+| Define | no-op'd correctly, 13s |
+| Plan | succeeded, produced sound plans |
+| **Code** | **failed** — backgrounded executors orphaned, stage reported success (999.64) |
+| Validate | worked correctly, found the phase incomplete, looped back |
+| **Loop-back** | **failed** — `--gaps-only` matches zero plans mid-arc, gated |
+| Ship | never reached |
+
+Plus two latent defects surfaced while investigating (the failure counter that gates healthy
+multi-wave progress at wave 3; 49 leaked fixture processes, 999.46).
+
+**The trade is bad and always was.** The executor's remaining value is saving ~15 minutes on an
+operation performed roughly monthly, deliberately, by an operator who wants to watch it. It has
+cost two phases. Removing it eliminates — not fixes, *eliminates* — the entire defect class, and
+frees all capacity for the reliability work that actually serves the project's stated purpose.
+
+#### Adversarial review of this plan (Fable, 2026-08-01) — the gate Phases 26/29 skipped
+
+This scope was adversarially reviewed **before planning** by Claude Fable 5, instructed to verify
+every claim against live source and to kill the plan if it deserved it. Verdict:
+**APPROVE-WITH-CHANGES — 4 Critical, 4 High, 4 Medium findings against the plan as drafted.** All
+are folded into the units below; the four Criticals were: (C1) the `compute_version` fork was
+false — the D-09 gate is built on the `semver`/`git-conventional` crates, so "delete the deps"
+does not compile, and D-09's own fate had never been ruled; (C2) emptying the hooks silently
+inverts what `workflow_shipped` means while `ship_evidence` — mechanically read-only but
+*semantically defined by that event* — keeps vouching for the old meaning; (C3) the acceptance
+run as drafted would have **performed the old hooks on the real repo** (the driving binary is the
+installed one, not the branch under test); (C4) `GitFlow::release_start`/`release_finish`/
+`feature_finish` are the same release-acting class, compiled and public, and the draft never
+mentioned them — "fixed the instance, left the class open," again. The review also proved the
+draft's 30d fixture could not catch the historical defect (the incoherent code never pushes, so a
+pre-receive hook never fires) and ratified the premise and the 30a-before-999.64 sequencing.
+
+#### Operator rulings (2026-08-01, all three confirmed)
+
+- **R5 — D-09 survives as awareness, not action.** The major-bump gate is kept, reworded as a
+  breaking-change *awareness* gate: commit classification is a deterministic local fact, not a
+  D-10-class environment prediction. **DevFlow may still notice release-significant facts; it may
+  no longer act on them.** `compute_version`, `apply_bump`, `write_version` are deleted; the
+  `semver`/`git-conventional` dependencies stay (D-09 needs them). Most of Phase 25's 25c work
+  survives through D-09. The "advisory version row" alternative is rejected — a predictor
+  presented to the operator as truth is the class D-10 generalized against.
+- **R6 — `workflow_shipped` is re-documented, not renamed.** New meaning: *"phase run completed
+  through Ship approval; PR open; the DevFlow binary performed zero git mutation."* The event
+  name is kept because the event log is append-only — a rename would split its history into two
+  vocabularies. `ship_evidence.rs` doc comments, the `--require-shipped` failure text, and the
+  tests asserting hook-success-before-emission are all updated in the same change.
+- **R7 — `BranchCleanup` is deleted** (supersedes this entry's earlier "retained" text, which is
+  hereby amended): with `Merge` gone, its non-force `git branch -d` refuses every unmerged branch
+  and the hook degrades to a permanent warning no-op. GitHub deletes branches on PR merge.
+
+#### Units
+
+- **30a — remove release *acting*, the class and not the instance.** The deletion list, per the
+  review's C4/H3/M3 extensions:
+  - Hooks: `Merge`, `VersionBump`, `ChangelogAppend`, `BranchCleanup` (R7) — the fns, the `Hook`
+    variants (serialization-safe: the enum derives no `Serialize`; events store debug strings),
+    and the GAP-7 `shipped_version`/changelog-body threading in `HookContext`.
+  - **Library primitives of the same class:** `GitFlow::tag`, `GitFlow::release_start`,
+    `GitFlow::release_finish`, `GitFlow::feature_finish` — public, compiled, only test callers,
+    and `release_finish` is a full local release cut. An uncalled capability is an affordance for
+    the next caller; withdrawing means the library *cannot express* release-acting.
+  - **The entire signing-predictor chain** (H3): `check_signing`, `check_signing_viability`,
+    `check_ssh_signing_viability`, `SigningViability`, and their tests. No production consumer
+    remains; D-10 says this must never exist; it carries two live-measured false negatives.
+  - Orphans (M3): `ship::prepend_changelog`, `version::write_version`,
+    `version::detect_version_file`/`hooks::has_version_file`, and `Hook::BranchCreate` (zero
+    production callers *today* — flagged now rather than discovered mid-execution).
+  - **Blast radius includes `pipeline_gate.rs`, the real production caller** (H1, absent from the
+    draft): the finalization-retry loop and its reopened never-silent Ship gate, the Ship gate
+    text "Ship complete — approve merge?" (there is no merge to approve), "phase N shipped —
+    workflow complete", `ship_override`'s "re-running the terminal hooks" contract, and
+    `hook_context_root`'s terminal-batch arm. The checkout lock **stays** — it serves every batch
+    including the surviving `DocsUpdate` (the draft's "machinery is dead" claim was wrong).
+  - `workflow_shipped`/`ship_evidence` re-documentation per R6 — an explicit task, not a side
+    effect (C2).
+- **30b — `release --check` keeps facts, loses predictions.** Publish-order check retained.
+  `check_signing` row removed (H3). Stale text rewritten: `check_self_pin`'s "VersionBump should
+  have rewritten this" hint and `workspace_version_pin`'s framing (M2) — the pin test itself
+  stays, it guards CONTRIBUTING step 1. The D-14 `gh auth` preflight keeps its check but fixes
+  its rationale comment — the hooks never pushed; the check's real justification is
+  `/gsd-ship`'s `gh pr create` (M1).
+- **30c — documentation.** CONTRIBUTING.md becomes the sole release authority. Verified
+  non-regression (review, Info): zero hook-authored changelog commits exist in all history — the
+  entries were stranded on the unpushable local `develop` — and CONTRIBUTING step 1 already has
+  the operator hand-writing CHANGELOG.md, so removing `ChangelogAppend` regresses nothing real.
+- **30d — hermetic remote fixture, divergence-first (H4 rewrite).** A local bare repo as
+  `origin`. **The load-bearing assertion is divergence: after driving the real production Ship
+  path (`finish_workflow`/`advance`, never a hand-rolled loop), `git rev-list
+  origin/develop..develop` is empty** — the incoherent code merged locally and never pushed, so
+  a push-rejecting hook alone would never fire against it. All four acting artifacts are
+  asserted: no divergence, no local `v*` tag, feature branch intact, no changelog commit. The
+  `pre-receive` reject on `refs/heads/develop` is retained as belt-and-suspenders against
+  *future* push-based acting, explicitly not as the mechanism. **The test must be demonstrated
+  red against pre-30a HEAD once, and that run recorded** — a test that has never been red is a
+  hope, not a proof.
+
+#### Acceptance (rewritten per C3 — must be executable today)
+
+1. **30d red-then-green:** the fixture test fails against pre-30a HEAD, passes after.
+2. **Foreground terminal-path run:** `devflow ship` (`ship_override`) driven against a real clone
+   with a real `origin`, phase state at Ship, pre-written gate response — exercising the exact
+   production finalization path with a remote present. End state: PR open, feature branch
+   intact, local `develop` not ahead of `origin/develop`, no local tag.
+3. **Any live dogfood Ship requires the binary rebuilt from the 30a branch first** — with the
+   installed binary, the acceptance run itself would execute the old hooks against the real
+   repo (C3). Recorded as a hard prerequisite, same class as the standing rebuild-before-
+   revalidate rule.
+4. Tests-pass is explicitly **not** acceptance (the hooks' tests were green for their entire
+   defective life; the fixture had no remote — the property was inexpressible).
+
+**Explicitly NOT in scope:** rebuilding the observer to executor grade — Phase 29's
+`release_observe.rs` carries findings 2/3/6 and is not salvaged. The real-GitHub E2E harness
+(30e) — deferred until 999.64 lands (R4); a harness cannot test a successful Ship until DevFlow
+can produce one.
+
+**Sequencing (ratified by review, axis 7):** 30a before 999.64 is correct and now urgent-adjacent:
+every future 999.64 dogfood that accidentally reaches Ship with the current binary corrupts the
+operator's local `develop` and tag namespace. Removing the hazard first makes all subsequent
+reliability work safer. 999.64 lives in the launch/session machinery, orthogonal to
+`finish_workflow` — no rework coupling.
+
+**Requirements:** TBD — tracked by unit identifier (`30a`–`30d`) plus rulings (`R1`–`R7`),
+consistent with Phases 21/22/26/27/28/29.
+**Depends on:** nothing.
+**Priority:** High | **Size:** M — subtractive in intent, but the blast radius now includes
+`pipeline_gate.rs`'s finalization path and the `workflow_shipped` semantic migration.
+
+Plans:
+
+- [ ] TBD — promote with `/gsd-plan-phase 30`
+
+---
+
+#### The reliability queue this unblocks — the project's actual purpose
+
+Ranked by what stands between DevFlow and a single autonomous phase. **Not part of Phase 30**;
+recorded here so the sequence is not rediscovered.
+
+1. **999.64 — one-shot launch kills the session at turn end.** THE blocker. GSD delegates to
+   subagents by design; `claude -p` cannot survive the orchestrator's turn ending, so any wave with
+   2+ plans orphans its work. **Until this is fixed, no phase containing a multi-plan wave can
+   complete autonomously.** Has a measured candidate fix (`--input-format stream-json` keeps the
+   process alive until stdin closes) and a cheap feasibility experiment that **must run first**.
+2. **The loop-back issues an impossible command.** Validate → Code always loops with
+   `/gsd-execute-phase N --gaps-only`, which selects only `gap_closure: true` plans. A mid-arc phase
+   has none, so the fix loop matches zero plans by construction and the Code↔Validate loop cannot
+   advance an unfinished phase. Second recorded occurrence.
+3. **`consecutive_failures` accumulates on healthy progress.** Monotonic inside the Code↔Validate
+   loop — `(Code, Validate)` is excluded from the reset predicate and the loop-back path bypasses
+   `transition()` entirely. A six-wave phase trips the 3-strike gate around wave 3 reporting
+   "Validation failed 3 time(s)" about a phase that never failed.
+4. **999.46 — leaked fixture processes.** 49 live on 2026-07-31, self-inflicted by the test suite.
+
+**Fixing 1 and 2 makes an autonomous phase possible for the first time.** Neither is large.
+
+**The encouraging finding, recorded because it is easy to lose in a day of failures:** every failure
+on 2026-07-31 was in the *harness*, not the capability. Plan produced good plans. The executors
+produced working, tested, documented code — the Codex findings are *design* defects in code that
+compiled, passed its tests, and did what it claimed. Nothing observed suggests the agents cannot do
+this work. It says DevFlow cannot yet reliably drive them. That is a better problem, and it is the
+one this project is about.
+
+---
+
+### Phase 29: Release-Cut Executor — Observe, Then Act Within the Repo's Rules (ABORTED — 2026-07-31)
+
+**ABORTED 2026-07-31, after review.** All 7 plans executed, 6 waves merged, 921 tests passing with
+clean clippy and fmt. An independent cross-AI review (Codex `gpt-5.6-sol`, high reasoning effort,
+read-only sandbox, all 6,136 source lines) returned **REQUEST CHANGES / BLOCK — 5 Criticals + 1
+High**, three of them in the read-only observer. `feature/phase-29` was never merged and never
+pushed as a feature branch.
+
+**Code preserved, not deleted** — operator decision, 2026-07-31:
+
+| Attempt | Archive branch | Tip |
+|---|---|---|
+| Phase 26 (first) | `archive/phase-26-release-executor` | `f1b885d` (74 commits) |
+| Phase 29 (second) | `archive/phase-29-release-executor` | `ac9d28c` (47 commits) |
+
+Both are pushed to `origin`. They are **archives, not starting points** — the premise is defective
+in both. Full diagnosis, the four constraints any third attempt must promise, and the process
+failures that let this happen twice are in **999.25**. Superseded by **Phase 30**, which withdraws
+DevFlow from release automation entirely.
+
+*Original entry follows, retained for provenance:*
+
+### Phase 29 (original scope): Release-Cut Executor — Observe, Then Act Within the Repo's Rules
 
 **Promoted:** 2026-07-31 — **999.25 / DEN-50**, re-attempted after Phase 26 delivered it
 PARTIAL and unshippable. Phase 26's code on `feature/phase-26` (74 commits, unmerged) is
