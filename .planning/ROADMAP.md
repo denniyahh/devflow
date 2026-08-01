@@ -2238,4 +2238,4 @@ Plans:
 
 **Wave 6**
 
-- [ ] 29-07-PLAN.md — wave 6 · 29c: `checkpoint:decision` (one-way gate) → the signed tag with all four local-tag collision branches → the two publishes in `publish_order()` → line-by-line review checkpoint → **29c ships**
+- [x] 29-07-PLAN.md — wave 6 · 29c: `checkpoint:decision` (one-way gate) → the signed tag with all four local-tag collision branches → the two publishes in `publish_order()` → line-by-line review checkpoint → **29c ships**
