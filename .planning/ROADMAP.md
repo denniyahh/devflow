@@ -553,7 +553,9 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 999.25: Release-Cut Executor (`devflow release` that executes) (RE-OPENED — Phase 29 blocked at review, second failed attempt)
+### Phase 999.25: Release-Cut Executor (`devflow release` that executes) (CLOSED — WON'T DO, superseded by Phase 30)
+
+**CLOSED 2026-07-31 as won't-do**, after two failed attempts (Phases 26 and 29, ~120 commits, neither shipped). DevFlow is withdrawing from release automation entirely — see **Phase 30**. Code from both attempts is archived on `origin` at `archive/phase-26-release-executor` and `archive/phase-29-release-executor`. Everything below is retained as the record of why, and as the brief any future attempt would have to answer. Linear: DEN-50 — close as won't-do.
 
 **RE-OPENED 2026-07-31, after the SECOND failed attempt.** Phase 29 built all 7 plans, merged
 6 waves, and reached 921 passing tests with clean clippy and fmt. An independent cross-AI code
@@ -2173,7 +2175,126 @@ Plans:
 
 - [x] 28-03-PLAN.md — wave 3 · the resume primitive, the bounded relaunch path, the `checkpoint_auto_decided` audit record, and the dispatch guard (D-03/D-04/D-05/D-07)
 
-### Phase 29: Release-Cut Executor — Observe, Then Act Within the Repo's Rules
+### Phase 30: Withdraw DevFlow From the Release Business
+
+**Scoped 2026-07-31**, immediately after Phase 29 was aborted. **Subtractive phase — it deletes
+capability rather than adding it.** That is the point.
+
+**Goal:** DevFlow's mandate ends when a **reviewable pull request exists**. It drives
+Define → Plan → Code → Validate, pushes the branch, opens the PR, and stops. The operator merges,
+versions, tags, and publishes. Every irreversible operation leaves DevFlow's surface.
+
+#### Why, from this project's own evidence
+
+Two full phases (26 and 29, ~120 commits) attempted release automation. Neither shipped. Both
+died to the same class of defect — irreversible operations whose failure modes are invisible to
+tests by construction. Phase 26: 763 green tests, 11/11 self-verification, 12 Criticals. Phase 29:
+921 green tests, clean lint, 5 Criticals + 1 High from an independent cross-AI review, three of
+them in the *read-only* unit.
+
+**Meanwhile the actual goal — run a development phase autonomously — has never been met, and the
+2026-07-31 dogfood run failed at it four separate times, none release-related:**
+
+| Stage | Outcome |
+|---|---|
+| Define | no-op'd correctly, 13s |
+| Plan | succeeded, produced sound plans |
+| **Code** | **failed** — backgrounded executors orphaned, stage reported success (999.64) |
+| Validate | worked correctly, found the phase incomplete, looped back |
+| **Loop-back** | **failed** — `--gaps-only` matches zero plans mid-arc, gated |
+| Ship | never reached |
+
+Plus two latent defects surfaced while investigating (the failure counter that gates healthy
+multi-wave progress at wave 3; 49 leaked fixture processes, 999.46).
+
+**The trade is bad and always was.** The executor's remaining value is saving ~15 minutes on an
+operation performed roughly monthly, deliberately, by an operator who wants to watch it. It has
+cost two phases. Removing it eliminates — not fixes, *eliminates* — the entire defect class, and
+frees all capacity for the reliability work that actually serves the project's stated purpose.
+
+#### Units
+
+- **30a — remove release *acting* from `hooks_after_ship`.** `Merge`, `VersionBump`,
+  `ChangelogAppend` are shipped release automation running today, and `VersionBump`'s tagging is
+  literally Phase 29's finding 5 (the `v{version}` namespace collision with the executor). This is
+  the unit that matters: the defect class is in the *shipped* product, not only in the abandoned
+  branches. `BranchCleanup` is not release-acting and is retained.
+- **30b — keep read-only release *reporting*.** `devflow release --check` already exists, is
+  read-only, and is harmless. Retain it, and be explicit in its output about what it cannot
+  determine. As an advisory checklist for a human doing the manual release it does not need
+  executor-grade correctness — only honesty about its own limits. **This is the thing that would
+  have caught the missing `v2.2.0` tag on 2026-07-31.**
+- **30c — documentation.** CONTRIBUTING.md's release procedure becomes the sole authority again.
+  Remove any text implying DevFlow performs release steps.
+
+**Explicitly NOT in scope:** rebuilding the observer to executor grade. Phase 29's `release_observe.rs`
+is defective (findings 2, 3, 6) and is **not** being merged or salvaged here. `release --check` as it
+exists on `develop` today is what is retained.
+
+**Requirements:** TBD — tracked by unit identifier (`30a`–`30c`), consistent with Phases 21/22/26/27/28/29.
+**Depends on:** nothing.
+**Priority:** High | **Size:** S–M — subtractive, no new irreversible surface.
+
+Plans:
+
+- [ ] TBD — promote with `/gsd-plan-phase 30`
+
+---
+
+#### The reliability queue this unblocks — the project's actual purpose
+
+Ranked by what stands between DevFlow and a single autonomous phase. **Not part of Phase 30**;
+recorded here so the sequence is not rediscovered.
+
+1. **999.64 — one-shot launch kills the session at turn end.** THE blocker. GSD delegates to
+   subagents by design; `claude -p` cannot survive the orchestrator's turn ending, so any wave with
+   2+ plans orphans its work. **Until this is fixed, no phase containing a multi-plan wave can
+   complete autonomously.** Has a measured candidate fix (`--input-format stream-json` keeps the
+   process alive until stdin closes) and a cheap feasibility experiment that **must run first**.
+2. **The loop-back issues an impossible command.** Validate → Code always loops with
+   `/gsd-execute-phase N --gaps-only`, which selects only `gap_closure: true` plans. A mid-arc phase
+   has none, so the fix loop matches zero plans by construction and the Code↔Validate loop cannot
+   advance an unfinished phase. Second recorded occurrence.
+3. **`consecutive_failures` accumulates on healthy progress.** Monotonic inside the Code↔Validate
+   loop — `(Code, Validate)` is excluded from the reset predicate and the loop-back path bypasses
+   `transition()` entirely. A six-wave phase trips the 3-strike gate around wave 3 reporting
+   "Validation failed 3 time(s)" about a phase that never failed.
+4. **999.46 — leaked fixture processes.** 49 live on 2026-07-31, self-inflicted by the test suite.
+
+**Fixing 1 and 2 makes an autonomous phase possible for the first time.** Neither is large.
+
+**The encouraging finding, recorded because it is easy to lose in a day of failures:** every failure
+on 2026-07-31 was in the *harness*, not the capability. Plan produced good plans. The executors
+produced working, tested, documented code — the Codex findings are *design* defects in code that
+compiled, passed its tests, and did what it claimed. Nothing observed suggests the agents cannot do
+this work. It says DevFlow cannot yet reliably drive them. That is a better problem, and it is the
+one this project is about.
+
+---
+
+### Phase 29: Release-Cut Executor — Observe, Then Act Within the Repo's Rules (ABORTED — 2026-07-31)
+
+**ABORTED 2026-07-31, after review.** All 7 plans executed, 6 waves merged, 921 tests passing with
+clean clippy and fmt. An independent cross-AI review (Codex `gpt-5.6-sol`, high reasoning effort,
+read-only sandbox, all 6,136 source lines) returned **REQUEST CHANGES / BLOCK — 5 Criticals + 1
+High**, three of them in the read-only observer. `feature/phase-29` was never merged and never
+pushed as a feature branch.
+
+**Code preserved, not deleted** — operator decision, 2026-07-31:
+
+| Attempt | Archive branch | Tip |
+|---|---|---|
+| Phase 26 (first) | `archive/phase-26-release-executor` | `f1b885d` (74 commits) |
+| Phase 29 (second) | `archive/phase-29-release-executor` | `ac9d28c` (47 commits) |
+
+Both are pushed to `origin`. They are **archives, not starting points** — the premise is defective
+in both. Full diagnosis, the four constraints any third attempt must promise, and the process
+failures that let this happen twice are in **999.25**. Superseded by **Phase 30**, which withdraws
+DevFlow from release automation entirely.
+
+*Original entry follows, retained for provenance:*
+
+### Phase 29 (original scope): Release-Cut Executor — Observe, Then Act Within the Repo's Rules
 
 **Promoted:** 2026-07-31 — **999.25 / DEN-50**, re-attempted after Phase 26 delivered it
 PARTIAL and unshippable. Phase 26's code on `feature/phase-26` (74 commits, unmerged) is
