@@ -2298,8 +2298,21 @@ pre-receive hook never fires) and ratified the premise and the 30a-before-999.64
 1. **30d red-then-green:** the fixture test fails against pre-30a HEAD, passes after.
 2. **Foreground terminal-path run:** `devflow ship` (`ship_override`) driven against a real clone
    with a real `origin`, phase state at Ship, pre-written gate response — exercising the exact
-   production finalization path with a remote present. End state: PR open, feature branch
-   intact, local `develop` not ahead of `origin/develop`, no local tag.
+   production finalization path with a remote present. End state: **no merge performed, feature
+   branch intact, local `develop` not ahead of `origin/develop`, no local tag.**
+
+   > **Amended 2026-08-01** (planning, after an independent Codex review of the Phase 30 plans,
+   > finding H4). As originally written this criterion also required "PR open", and that was
+   > **not executable by this path**: `devflow ship` routes to `ship_override`
+   > (`main.rs:590` → `pipeline_gate.rs:506`), which launches no agent and invokes no `gh`. The
+   > only `gh` call in the workspace is the Ship preflight probe at `preflight.rs:639`, which
+   > this path bypasses. The run reaches its git assertions *precisely because* no GitHub
+   > operation happens. The criterion now asserts only what the terminal path can actually
+   > produce — the binary's zero-mutation contract. **PR-open is observable only in a live
+   > agent-driven run (criterion 3) or the deferred 30e harness**, and R6's "PR open" clause is
+   > therefore asserted by workflow design rather than verified by the binary at emission time;
+   > `ship_evidence.rs` is required to say so in its own doc comment (30-01, section 2d).
+   > Everything else in this entry is unchanged.
 3. **Any live dogfood Ship requires the binary rebuilt from the 30a branch first** — with the
    installed binary, the acceptance run itself would execute the old hooks against the real
    repo (C3). Recorded as a hard prerequisite, same class as the standing rebuild-before-
@@ -2334,7 +2347,7 @@ Plans:
 
 - [ ] 30-01-PLAN.md — [wave 1, tracer] hermetic divergence-first fixture captured RED,
   then the release-acting hook class deleted and its production callers rewired;
-  `workflow_shipped` re-documented in the same change (30d, 30a, R6, R7, C2, C3, H1, H4)
+  `workflow_shipped` re-documented in the SAME COMMIT (30d, 30a, R6, R7, C2, C3, H1, H4)
 - [ ] 30-02-PLAN.md — [wave 2] `GitFlow`'s release-acting primitives and the entire
   signing-viability predictor chain deleted, root and consumer (30a, 30b, C4, H3)
 - [ ] 30-03-PLAN.md — [wave 3] version-computation, version-file and changelog-render
