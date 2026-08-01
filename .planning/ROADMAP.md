@@ -2324,9 +2324,21 @@ consistent with Phases 21/22/26/27/28/29.
 **Priority:** High | **Size:** M — subtractive in intent, but the blast radius now includes
 `pipeline_gate.rs`'s finalization path and the `workflow_shipped` semantic migration.
 
+**Plans:** 4 plans, 4 waves (fully sequential — every pair shares an owned file).
+
 Plans:
 
-- [ ] TBD — promote with `/gsd-plan-phase 30`
+- [ ] 30-01-PLAN.md — [wave 1, tracer] hermetic divergence-first fixture captured RED,
+  then the release-acting hook class deleted and its production callers rewired;
+  `workflow_shipped` re-documented in the same change (30d, 30a, R6, R7, C2, C3, H1, H4)
+- [ ] 30-02-PLAN.md — [wave 2] `GitFlow`'s release-acting primitives and the entire
+  signing-viability predictor chain deleted, root and consumer (30a, 30b, C4, H3)
+- [ ] 30-03-PLAN.md — [wave 3] version-computation, version-file and changelog-render
+  layers deleted; D-09 reworded as breaking-change awareness; `release --check` states
+  what it cannot determine (30a, 30b, R5, M1, M2, M3)
+- [ ] 30-04-PLAN.md — [wave 4] CONTRIBUTING.md established as the sole release
+  authority; ARCHITECTURE/OPERATIONS/README corrected; repo-wide dangling-reference
+  sweep (30c)
 
 ---
 
