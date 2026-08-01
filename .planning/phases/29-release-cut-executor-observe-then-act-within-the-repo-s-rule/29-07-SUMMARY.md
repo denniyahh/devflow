@@ -40,6 +40,7 @@ key-decisions:
   - "plan_local_tag always peels to the tag's target commit via `<tag>^{commit}` regardless of annotated/lightweight, then compares that single commit against target_commit before branching on annotated-vs-lightweight — simpler than conditionally re-deriving the commit per branch, and it means the Refuse (different-commit) check runs identically for both tag shapes."
   - "sign_release_tag (release_execute.rs) resolves the signed tag's target commit by fetching and rev-parsing origin/main fresh on every call, rather than accepting a caller-supplied commit — this is what makes the action re-runnable and keeps it consistent with the observe-fresh-every-time design; the release PR step (ReleasePrMerged) is what actually produced that commit, and this action re-derives it rather than threading it through CutReport."
   - "git::git_config and release_observe::crate_version_http_status widened from private to pub(crate) rather than reimplemented — the same widen-don't-duplicate pattern 29-05 established for version::parse_version_str and hooks::today()."
+  - "Task 4 review finding (Phase 26's CR-03 class — publish_plan accepted a silently truncated publish set): git::workspace_member_paths and git::package_name ALSO widened from private to pub(crate), so publish_plan can detect when git::publish_order's own per-member 'unreadable manifest -> skip' behavior has silently dropped a declared member, without a second TOML-members-scan implementation. git::publish_order's own behavior is unchanged — the fix is entirely in publish_plan's post-check."
 
 patterns-established:
   - "publish_members(project_root, version, members, reobserve_attempts, reobserve_interval, observe, publish): the injectable core behind publish_all, with the bound and interval also parameterized so tests exercise the bounded-reobservation-exhausted path without any real wall-clock wait."
@@ -72,6 +73,14 @@ coverage:
         status: pass
       - kind: other
         ref: "rg -n 'devflow-core' crates/devflow-core/src/release_publish.rs | rg -v '^\\s*[0-9]+:\\s*//' (zero matches outside a doc-comment path reference)"
+        status: pass
+    human_judgment: false
+  - id: D8
+    description: "publish_plan refuses a silently truncated publish set — a workspace member whose manifest git::publish_order could not read is never allowed to disappear from the plan unnoticed; the refusal names the specific declared path(s) missing"
+    requirement: "29c"
+    verification:
+      - kind: unit
+        ref: "crates/devflow-core/src/release_publish.rs#release_publish::tests::publish_plan_refuses_a_silently_truncated_publish_set_naming_the_missing_path (RED confirmed pre-fix — returned [\"a\"] instead of refusing), ::publish_plan_control_returns_every_declared_member_when_all_manifests_are_readable"
         status: pass
     human_judgment: false
   - id: D4
@@ -109,24 +118,24 @@ coverage:
     requirement: "29c"
     verification: []
     human_judgment: true
-    rationale: "This is Task 4's explicit checkpoint:human-verify gate (gate=\"blocking\") — a build-time review requirement the plan itself states cannot be discharged by any automated check, precisely because Phase 26 had 763 passing tests and an 11/11 self-verification while carrying twelve Criticals, every one found by a human reading code. Not yet performed as of this SUMMARY; the executor halts here per the plan's own design."
+    rationale: "Task 4's checkpoint:human-verify gate (gate=\"blocking\"). PERFORMED: the human reviewer read the complete diff and returned one finding (D8, the truncated-publish-set gap) plus explicit confirmation of six other properties as independently verified correct (Unreachable-before-publish, Err-on-every-failure-path, no production-code progress record, unsorted publish order with no crate-name literal, injected observe/publish for network-free testability, and the git_config pub(crate) widening). Verdict, verbatim: 'one finding, fix it, then the checkpoint is approved.' The finding was fixed (commit aa33b29, TDD RED-then-GREEN), re-verified (workspace suite/clippy/fmt all clean, unattended-stdin-closed still green), and is recorded as approved on that basis — this is a human-rendered verdict, not a self-assessment."
 
 # Metrics
-duration: ~1h 10min
+duration: ~1h 55min
 completed: 2026-07-31
 status: complete
 ---
 
 # Phase 29 Plan 07: The Commit Point — Signed Tag and Crates.io Publish Summary
 
-**`devflow_core::release_publish` (new): `plan_local_tag`/`tag_argv`/`create_and_push_tag` for the signed release tag, `publish_plan`/`publish_all` for the two crates.io publishes in `publish_order`'s computed sequence — wired into `release_execute::action_for`'s last two arms, so `devflow release cut` now walks all six release-cut steps end to end. Task 4's line-by-line human review is the pending gate before this code can ever fire against a real repository.**
+**`devflow_core::release_publish` (new): `plan_local_tag`/`tag_argv`/`create_and_push_tag` for the signed release tag, `publish_plan`/`publish_all` for the two crates.io publishes in `publish_order`'s computed sequence — wired into `release_execute::action_for`'s last two arms, so `devflow release cut` now walks all six release-cut steps end to end. Human-reviewed (Task 4): one finding (a Phase-26-CR-03-class silently-truncated publish set), fixed and re-verified; approved.**
 
 ## Performance
 
-- **Duration:** ~1h 10min
+- **Duration:** ~1h 55min (implementation ~1h 10min; Task 4 review + one fix round ~45min)
 - **Completed:** 2026-07-31
-- **Tasks:** Task 1 (checkpoint:decision) resolved by explicit operator instruction, no code; Task 2 (signed tag) and Task 3 (publishes) implemented, tested, and committed together; Task 4 (checkpoint:human-verify) reached and halted on, per plan design
-- **Files modified:** 7 (1 created, 6 modified)
+- **Tasks:** Task 1 (checkpoint:decision) resolved by explicit operator instruction, no code; Task 2 (signed tag) and Task 3 (publishes) implemented, tested, and committed together; Task 4 (checkpoint:human-verify) — reviewed by a human, one finding, fixed in a single round, approved
+- **Files modified:** 8 (1 created, 7 modified — `git.rs` touched twice, across the implementation commit and the review-fix commit)
 
 ## Accomplishments
 
@@ -137,20 +146,46 @@ status: complete
 - **Every irreversible step is independently re-runnable — no progress record of any kind.** Both `plan_local_tag` and the per-crate crates.io observation are freshly evaluated on every call; `publish_members`' injectable design let every stop condition — unreachable-before-publish, failed-publish-with-no-rollback, bounded-reobservation-exhaustion — be proven with zero network dependency.
 - **`cut_reaches_every_step_when_all_are_implemented`** (replacing `29-06`'s now-obsolete `cut_walks_to_the_signed_tag_step_and_stops`) proves the walk genuinely *attempts* the signed-tag step in an isolated-signing-key CLI fixture — it fails for a real git reason (no secret key resolvable), not because the arm was unimplemented — while `release_cut_runs_unattended_with_stdin_closed` stays green, confirming RD-3 (no operator-presence requirement) still holds.
 - **`devflow release status 2.2.0 .`**, re-run live against this repository (read-only, no side effects), still reports the exact motivating-incident state: both crates published, signed tag correctly absent.
+- **Task 4's human review found and closed the exact defect class Phase 26 was retired for.** `publish_plan` previously guarded only against an *empty* `publish_order` result, never a *short* one — `git::publish_order` silently skips any declared workspace member whose manifest cannot be read, so a two-member workspace readable in only one place would have returned a valid-looking one-crate plan and silently never published the second. `publish_plan` now re-derives the workspace's own declared member paths (reusing `git::workspace_member_paths`/`git::package_name`, both newly `pub(crate)` — never a second parser) and refuses, naming the missing path(s), when fewer members made it into the order than were declared. See "Review Finding and Resolution" below.
 
 ## Task Commits
 
 1. **Task 1: Decide whether to build the commit point now (checkpoint:decision)** — resolved by explicit operator instruction this session, recorded above under Key Decisions. No code artifact; no commit.
 2. **Task 2 + Task 3 (committed together — see Deviations): the signed tag; the publishes**
    - `bc2b889` `feat(29-07): the commit point — signed tag and crates.io publish` — `release_publish.rs` (new: `TagPlan`, `plan_local_tag`, `tag_argv`, `create_and_push_tag`, `publish_plan`, `publish_all`, `publish_members`, 21 tests), `release_execute.rs` (`sign_release_tag`/`publish_crates` wired into `action_for`, module doc updated, two tests updated for the new wiring), `lib.rs` (`pub mod release_publish;`), `git.rs` (`git_config` → `pub(crate)`), `release_observe.rs` (`crate_version_http_status` → `pub(crate)`), `release_cut.rs` (`cut_reaches_every_step_when_all_are_implemented` replacing the obsolete `cut_walks_to_the_signed_tag_step_and_stops`), `29-VALIDATION.md` (Manual-Only Verifications row updated for unit 29c)
-4. **Task 4: Line-by-line review of the complete unit-29c diff (checkpoint:human-verify) — REACHED, NOT YET PERFORMED.** The executor halts here per the plan's own design; see the CHECKPOINT REACHED block returned alongside this SUMMARY.
+3. **Task 4: Line-by-line review of the complete unit-29c diff (checkpoint:human-verify) — reviewed, one finding, fixed in one round, approved.**
+   - `aa33b29` `fix(29-07): publish_plan refuses a silently truncated publish set` — `release_publish.rs` (`publish_plan` rewritten with the declared-vs-returned-members check, 2 new tests), `git.rs` (`workspace_member_paths`/`package_name` → `pub(crate)`)
+
+## Review Finding and Resolution (Task 4, single fix round)
+
+A human read the complete unit-29c diff line by line, per the plan's `checkpoint:human-verify` gate, and returned a verdict: six properties independently confirmed correct as-is, one finding that had to be fixed before approval.
+
+**Independently confirmed correct (no change made):**
+- `Unreachable` stops before any publish is attempted, with the reasoning inline.
+- Every failure path returns `Err`; no exit-0-while-incomplete.
+- No progress record in production code — every `fs::write` in `release_publish.rs` is inside `#[cfg(test)] mod tests` (8 occurrences after this fix's own new test fixtures added 2 more; all 8 are past the `#[cfg(test)]` boundary, none in production code — `rg -n 'fs::write' crates/devflow-core/src/release_publish.rs` returns 8 matches, all at line numbers greater than the module's `#[cfg(test)]` line).
+- Publish order consumed unsorted; no crate name as a source literal.
+- `observe`/`publish` injected, so the loop is testable with no network.
+- The `git.rs` `pub(crate) git_config` widening is reuse, not a second implementation.
+
+**Finding (must-fix): `publish_plan` accepted a silently truncated publish set — Phase 26's CR-03 class, verbatim: "publish set silently truncated, pre-gate reports ✓."**
+
+`git::publish_order` skips — rather than errors on — any declared workspace member whose `Cargo.toml` cannot be read (`let Ok(contents) = std::fs::read_to_string(&manifest) else { continue; }`). `publish_plan` previously guarded only against an *empty* result, never a *short* one. On the irreversible path, the consequence is: publish `devflow-core`, silently skip `devflow`, report success.
+
+**Fix applied (commit `aa33b29`):** `publish_plan` re-derives the workspace's own declared member paths via `git::workspace_member_paths` — the exact source `publish_order` itself starts from — and, for each declared path, looks up its package name via `git::package_name` against that path's own manifest. Both helpers were widened from private to `pub(crate)` (matching the `git_config` precedent the reviewer already confirmed correct) rather than a second TOML-members-scan implementation. When fewer members made it into the returned order than were declared, `publish_plan` refuses, naming every declared path whose manifest could not be read or whose package name never appears in the order. `git::publish_order`'s own behavior is unchanged — the fix is entirely in `publish_plan`'s post-check.
+
+**TDD, as required:** a failing test (`publish_plan_refuses_a_silently_truncated_publish_set_naming_the_missing_path`, a two-member workspace where `crates/b` has no `Cargo.toml`) was written first and confirmed RED against the pre-fix code (`publish_plan` returned `["a"]` instead of refusing — captured verbatim in the panic message: `expected a truncated publish order to be refused, not silently returned: ["a"]`), then GREEN after the fix, naming `crates/b` in the error. A control test (`publish_plan_control_returns_every_declared_member_when_all_manifests_are_readable`) confirms an intact two-member workspace still returns both members, in order.
+
+**Re-verification after the fix:** `cargo test --workspace` — 578 devflow-core lib tests (+2 from this fix), 0 failed across the whole workspace (24 test binaries). `cargo clippy --workspace --all-targets -- -D warnings` clean. `cargo fmt --check` clean. `release_cut_runs_unattended_with_stdin_closed` re-run individually and still green. No live `git tag -s`, tag push, or `cargo publish` was run against the real repo or registry at any point, including during this fix round.
+
+**Corrected recipe note:** the CHECKPOINT REACHED response accompanying the prior version of this SUMMARY suggested `rg -n 'fs::write|File::create|OpenOptions' crates/devflow-core/src/release_publish.rs` would return zero matches. That was imprecise — the file's test fixtures do call `std::fs::write` (originally 6 occurrences, now 8 after this fix's 2 new test fixtures), all inside `#[cfg(test)] mod tests`. The accurate claim, confirmed above, is "zero matches in production code, all matches are past the `#[cfg(test)]` boundary" — not "zero matches in the file."
 
 ## Files Created/Modified
 
-- `crates/devflow-core/src/release_publish.rs` (new) — `TagPlan` (`CreateNew`/`ReplaceLocal`/`LeaveAlone`/`Refuse`), `plan_local_tag`, `tag_argv`, `create_and_push_tag` (the signed-tag commit point); `publish_plan`, `publish_all`, `publish_members` (the injectable publish core), `observe_crate_published`, `run_cargo_publish` (the publish commit point); 21 tests
+- `crates/devflow-core/src/release_publish.rs` (new) — `TagPlan` (`CreateNew`/`ReplaceLocal`/`LeaveAlone`/`Refuse`), `plan_local_tag`, `tag_argv`, `create_and_push_tag` (the signed-tag commit point); `publish_plan` (rewritten in the review-fix commit to refuse a truncated order), `publish_all`, `publish_members` (the injectable publish core), `observe_crate_published`, `run_cargo_publish` (the publish commit point); 23 tests total (21 from the implementation commit + 2 from the review-fix commit)
 - `crates/devflow-core/src/release_execute.rs` — module doc comment updated; `sign_release_tag` (resolves `origin/main`'s tip, calls `create_and_push_tag`) and `publish_crates` (calls `publish_all`, joins the report) wired into `action_for`; `action_for_returns_none_for_every_step_without_an_action_in_this_build` renamed to `action_for_returns_an_action_for_every_step_in_this_build`; `absent_step_with_no_pr_backing_and_no_action_stops_naming_the_supplying_unit` renamed and rewritten to `absent_signed_tag_step_now_attempts_its_real_action_instead_of_reporting_no_action`
 - `crates/devflow-core/src/lib.rs` — `pub mod release_publish;` declared alphabetically after `release_policy`
-- `crates/devflow-core/src/git.rs` — `git_config` visibility widened to `pub(crate)` for `create_and_push_tag`'s reuse
+- `crates/devflow-core/src/git.rs` — `git_config` visibility widened to `pub(crate)` for `create_and_push_tag`'s reuse (implementation commit); `workspace_member_paths`/`package_name` also widened to `pub(crate)` for `publish_plan`'s reuse (review-fix commit)
 - `crates/devflow-core/src/release_observe.rs` — `crate_version_http_status` visibility widened to `pub(crate)` for `observe_crate_published`'s reuse
 - `crates/devflow-cli/tests/release_cut.rs` — `cut_reaches_every_step_when_all_are_implemented` (new), replacing `cut_walks_to_the_signed_tag_step_and_stops`
 - `.planning/phases/29-release-cut-executor-observe-then-act-within-the-repo-s-rule/29-VALIDATION.md` — Manual-Only Verifications row for unit 29c updated from "not yet performable, blocked on 29-07" to "implemented, still manual-only by design, gated by Task 4's review"
@@ -163,6 +198,7 @@ See `key-decisions` in the frontmatter above — summarized:
 3. `plan_local_tag` always peels to the tag's target commit via `<tag>^{commit}` before branching on annotated-vs-lightweight.
 4. `sign_release_tag` re-derives its target commit fresh from `origin/main` on every call rather than threading it through `CutReport`.
 5. `git::git_config` and `release_observe::crate_version_http_status` widened to `pub(crate)`, matching 29-05's precedent for `version::parse_version_str`/`hooks::today()`.
+6. `git::workspace_member_paths` and `git::package_name` also widened to `pub(crate)` for the Task 4 review-fix, so `publish_plan` could detect a silently-truncated `publish_order` result without a second TOML-members-scan implementation.
 
 ## Deviations from Plan
 
@@ -198,14 +234,14 @@ None beyond the three documented process deviations above.
 
 ## User Setup Required
 
-None — no external service configuration required for the code delivered by this plan. **However, this code is not yet cleared to run against a real repository or registry**: Task 4's `checkpoint:human-verify` (line-by-line review of the complete unit-29c diff) has not been performed. No live `git tag -s`, tag push, or `cargo publish` was run anywhere in this plan's execution — every test is hermetic.
+None — no external service configuration required for the code delivered by this plan. No live `git tag -s`, tag push, or `cargo publish` was run anywhere in this plan's execution, including during the review-fix round — every test is hermetic.
 
 ## Next Phase Readiness
 
-- **All three units of Phase 29 (29a observer, 29b recoverable actions, 29c commit point) are now code-complete.** `devflow release cut <version> [project] --yes-release` can, once Task 4's review is approved, carry a release all the way from a version bump to two published crates; `devflow release status` can prove afterward that it did.
-- **Blocked on Task 4:** the plan's own `checkpoint:human-verify` gate — a human must read the complete `release_publish.rs` diff (and the two `action_for` arms in `release_execute.rs`) line by line before this code is merge-ready, per the roadmap's own conclusion that Phase 26 carried twelve Criticals under a fully green test suite. See the CHECKPOINT REACHED block for the specific review checklist.
-- The first real exercise of this code — a genuine `git tag -s`, `git push` of a tag, or `cargo publish` — should be a deliberate, attended release cut against the next real version, run only after Task 4's review is approved, with `devflow release status` run before and after (per `29-VALIDATION.md`'s Manual-Only Verifications table).
-- No blockers beyond Task 4's pending human review.
+- **All three units of Phase 29 (29a observer, 29b recoverable actions, 29c commit point) are now code-complete and human-reviewed.** `devflow release cut <version> [project] --yes-release` can carry a release all the way from a version bump to two published crates; `devflow release status` can prove afterward that it did.
+- **Task 4 is closed: reviewed, one finding, fixed in a single round, approved.** The verdict was explicit and conditional — "one finding, fix it, then the checkpoint is approved" — and the fix (commit `aa33b29`) has been applied, TDD-verified (RED confirmed before the fix, GREEN after), and re-verified against the full workspace suite/clippy/fmt. See "Review Finding and Resolution" above for the complete record.
+- The first real exercise of this code — a genuine `git tag -s`, `git push` of a tag, or `cargo publish` — should still be a deliberate, attended release cut against the next real version (not an unattended automated run), with `devflow release status` run before and after (per `29-VALIDATION.md`'s Manual-Only Verifications table). Approval of the diff is not itself a live-run event.
+- No blockers.
 
 ## Self-Check: PASSED
 
@@ -217,3 +253,4 @@ None — no external service configuration required for the code delivered by th
 - FOUND: `crates/devflow-cli/tests/release_cut.rs`
 - FOUND: `.planning/phases/29-release-cut-executor-observe-then-act-within-the-repo-s-rule/29-VALIDATION.md`
 - FOUND commit `bc2b889` (feat: the commit point — signed tag and crates.io publish, Tasks 2+3)
+- FOUND commit `aa33b29` (fix: publish_plan refuses a silently truncated publish set, Task 4 review-fix)
