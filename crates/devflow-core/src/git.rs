@@ -609,7 +609,14 @@ pub fn publish_order(project_root: &Path) -> Vec<String> {
 /// Hand-rolled, single-array-only scan (this project deliberately avoids a
 /// TOML parser dependency for its version/workspace tooling — see
 /// `version.rs`).
-fn workspace_member_paths(contents: &str) -> Vec<String> {
+///
+/// `pub(crate)` (29-07 review fix): `release_publish::publish_plan` reuses
+/// this exact scan — the same source `publish_order` itself starts from —
+/// to detect when `publish_order`'s own per-member `let Ok(contents) = ...
+/// else { continue; }` has silently dropped an unreadable member from the
+/// returned order, rather than a second, drifting implementation of the
+/// members scan.
+pub(crate) fn workspace_member_paths(contents: &str) -> Vec<String> {
     let Some(start) = contents.find("members") else {
         return Vec::new();
     };
@@ -632,7 +639,12 @@ fn workspace_member_paths(contents: &str) -> Vec<String> {
 }
 
 /// Extract a member manifest's `[package] name`.
-fn package_name(contents: &str) -> Option<String> {
+///
+/// `pub(crate)` (29-07 review fix): `release_publish::publish_plan` reuses
+/// this exact extraction to determine, for each declared member path,
+/// whether its package name actually made it into `publish_order`'s
+/// returned sequence — never a second name-parsing implementation.
+pub(crate) fn package_name(contents: &str) -> Option<String> {
     let mut current = String::new();
     for line in contents.lines() {
         let trimmed = line.trim();

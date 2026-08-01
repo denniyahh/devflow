@@ -281,17 +281,66 @@ pub fn create_and_push_tag(
 /// in this module. An empty result means the workspace `Cargo.toml` could
 /// not be read or declares no local-path members, which is a failure to
 /// determine the plan, not "nothing to publish."
+///
+/// Also refuses a **silently truncated** order (review fix, Phase 26's CR-03
+/// class verbatim: "publish set silently truncated, pre-gate reports ✓").
+/// `git::publish_order` skips — rather than errors on — any declared member
+/// whose manifest cannot be read (`let Ok(contents) = ... else { continue;
+/// }`), so a workspace declaring two members but able to read only one would
+/// otherwise return a valid-looking one-crate order; acted on, that publishes
+/// the first crate and silently never publishes the second. This function
+/// re-derives the workspace's own *declared* member paths with
+/// [`crate::git::workspace_member_paths`] — the exact source
+/// `publish_order` itself starts from, never a second parser — and refuses
+/// when fewer members made it into the order than were declared, naming
+/// every declared path whose manifest could not be read or whose package
+/// name never appears in the order.
 pub fn publish_plan(project_root: &Path) -> Result<Vec<String>, String> {
     let order = git::publish_order(project_root);
     if order.is_empty() {
-        Err(
+        return Err(
             "publish_order returned no crates — the workspace Cargo.toml could not be read \
              or declares no local-path members"
                 .to_string(),
-        )
-    } else {
-        Ok(order)
+        );
     }
+
+    let Ok(root_contents) = std::fs::read_to_string(project_root.join("Cargo.toml")) else {
+        // publish_order() itself already succeeded above (a non-empty
+        // order requires having read this same file), so this branch is
+        // unreachable in practice — kept as a real error rather than a
+        // panic in case that invariant ever changes.
+        return Err(
+            "could not re-read the workspace Cargo.toml to verify the publish plan is complete"
+                .to_string(),
+        );
+    };
+    let declared_paths = git::workspace_member_paths(&root_contents);
+
+    let missing: Vec<&str> = declared_paths
+        .iter()
+        .filter(|path| {
+            let manifest = project_root.join(path).join("Cargo.toml");
+            let name = std::fs::read_to_string(&manifest)
+                .ok()
+                .and_then(|contents| git::package_name(&contents));
+            !matches!(name, Some(name) if order.contains(&name))
+        })
+        .map(String::as_str)
+        .collect();
+
+    if !missing.is_empty() {
+        return Err(format!(
+            "publish_order returned {} of {} declared workspace member(s) — refusing to \
+             publish a silently truncated set. Missing (manifest unreadable or package name \
+             not found in the computed order): {}",
+            order.len(),
+            declared_paths.len(),
+            missing.join(", ")
+        ));
+    }
+
+    Ok(order)
 }
 
 /// Bounded re-observation window after a successful publish: a handful of
@@ -719,6 +768,58 @@ mod tests {
             publish_plan(dir.path()).is_err(),
             "expected an error when no workspace Cargo.toml exists"
         );
+    }
+
+    // -- publish_plan: refuse a silently truncated publish set (review fix) ---
+    //
+    // Phase 26's CR-03 class, verbatim: "publish set silently truncated,
+    // pre-gate reports ✓." `git::publish_order` skips any member whose
+    // manifest cannot be read (`let Ok(contents) = ... else { continue; }`)
+    // rather than erroring — a workspace declaring two members but able to
+    // read only one would otherwise report a valid one-crate plan, publish
+    // it, and silently never publish the second.
+
+    /// A two-member workspace where `crates/b`'s directory exists but its
+    /// `Cargo.toml` does not — `git::publish_order` silently drops it, so
+    /// `publish_plan` must refuse rather than return the truncated set.
+    fn init_workspace_with_one_unreadable_member() -> TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("crates/a")).unwrap();
+        std::fs::create_dir_all(root.join("crates/b")).unwrap();
+        std::fs::write(
+            root.join("crates/a/Cargo.toml"),
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        // `crates/b/Cargo.toml` is deliberately absent.
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/a\", \"crates/b\"]\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn publish_plan_refuses_a_silently_truncated_publish_set_naming_the_missing_path() {
+        let dir = init_workspace_with_one_unreadable_member();
+        let err = publish_plan(dir.path())
+            .expect_err("expected a truncated publish order to be refused, not silently returned");
+        assert!(
+            err.contains("crates/b"),
+            "expected the error to name the missing declared path crates/b, got: {err}"
+        );
+    }
+
+    /// The control: an intact two-member workspace where every manifest is
+    /// readable still returns both members, in `publish_order`'s own order —
+    /// the fix must not reject a genuinely complete plan.
+    #[test]
+    fn publish_plan_control_returns_every_declared_member_when_all_manifests_are_readable() {
+        let dir = init_two_crate_workspace();
+        let plan = publish_plan(dir.path()).expect("expected a complete plan, got an error");
+        assert_eq!(plan, vec!["a".to_string(), "b".to_string()]);
     }
 
     // -- publish_order_respected: the consumer follows, never corrects --------
