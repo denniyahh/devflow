@@ -16,11 +16,17 @@
 //! `develop` into `main`. [`ReleaseStep::SyncMerged`] (29-06) resolves to
 //! [`sync_back_pr`] — a port of `scripts/sync-main-to-develop.sh` that keeps
 //! `main` a real ancestor of `develop`, landed by a real merge commit rather
-//! than a direct push. [`ReleaseStep::SignedTagPresent`] and
-//! [`ReleaseStep::CratesPublished`] still carry no action in this build;
-//! `29-07` replaces those two remaining arms. [`action_for`]'s match is
-//! exhaustive over all six variants with no wildcard arm, so a new step
-//! cannot be silently skipped.
+//! than a direct push. [`ReleaseStep::SignedTagPresent`] (29-07) resolves to
+//! [`sign_release_tag`] — the target commit is resolved as the tip of
+//! `origin/main`, then [`crate::release_publish::create_and_push_tag`] runs
+//! the exact command CONTRIBUTING.md documents and reports git's own result.
+//! [`ReleaseStep::CratesPublished`] (29-07) resolves to [`publish_crates`] —
+//! [`crate::release_publish::publish_all`], consuming
+//! [`crate::git::publish_order`]'s computed sequence exactly. With this
+//! plan, all six variants carry a real action: [`action_for`]'s match is
+//! exhaustive over all six with no wildcard arm, so a new step cannot be
+//! silently skipped, and `unit_for`'s naming (`29b`/`29c`) is now purely
+//! historical — every step in this build has an action.
 //!
 //! This module performs **no writes** to `.devflow/`, to `devflow.toml`, or
 //! to any other DevFlow-owned file, and holds no state across invocations.
@@ -100,20 +106,23 @@ impl CutReport {
 /// real failure text.
 type StepAction = fn(&Path, &str) -> Result<String, String>;
 
-/// The action this build carries for `step`, if any. `VersionBumped` and
-/// `ChangelogWritten` (29-05) both resolve to [`bump_and_changelog_pr`]; the
-/// remaining four variants still return `None` in this build — `29-06` and
-/// `29-07` each replace one of those arms. Exhaustive with no wildcard arm: a
-/// seventh [`ReleaseStep`] variant fails to compile here rather than
-/// silently falling through to `None`.
+/// The action this build carries for `step`. `VersionBumped` and
+/// `ChangelogWritten` (29-05) both resolve to [`bump_and_changelog_pr`];
+/// `ReleasePrMerged` and `SyncMerged` (29-06) resolve to
+/// [`release_pr_to_main`]/[`sync_back_pr`]; `SignedTagPresent` and
+/// `CratesPublished` (29-07) resolve to
+/// [`sign_release_tag`]/[`publish_crates`] — the two irreversible
+/// commit-point operations. Every arm now returns `Some`: exhaustive with no
+/// wildcard arm, a seventh [`ReleaseStep`] variant fails to compile here
+/// rather than silently falling through to `None`.
 fn action_for(step: ReleaseStep) -> Option<StepAction> {
     match step {
         ReleaseStep::VersionBumped => Some(bump_and_changelog_pr),
         ReleaseStep::ChangelogWritten => Some(bump_and_changelog_pr),
         ReleaseStep::ReleasePrMerged => Some(release_pr_to_main),
-        ReleaseStep::SignedTagPresent => None,
+        ReleaseStep::SignedTagPresent => Some(sign_release_tag),
         ReleaseStep::SyncMerged => Some(sync_back_pr),
-        ReleaseStep::CratesPublished => None,
+        ReleaseStep::CratesPublished => Some(publish_crates),
     }
 }
 
@@ -844,6 +853,39 @@ fn tree_object_id(repo: &Path) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// The action for [`ReleaseStep::SignedTagPresent`] (unit 29c, the first of
+/// the two irreversible commit-point operations): resolve the target commit
+/// as the current tip of `origin/main` — the commit the release pull request
+/// ([`ReleaseStep::ReleasePrMerged`]) produced — then call
+/// [`crate::release_publish::create_and_push_tag`]. No signing-viability
+/// prediction happens here or in `release_publish` (D-10): the tag command
+/// runs for real and git's own exit code and stderr are the report.
+fn sign_release_tag(project_root: &Path, version: &str) -> Result<String, String> {
+    fetch_ref(project_root, "main")?;
+    let output = git::git_command(project_root)
+        .args(["rev-parse", "origin/main"])
+        .output()
+        .map_err(|err| format!("failed to spawn git rev-parse: {}", err.kind()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git rev-parse origin/main exited with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let target_commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    crate::release_publish::create_and_push_tag(project_root, version, &target_commit)
+}
+
+/// The action for [`ReleaseStep::CratesPublished`] (unit 29c, the second and
+/// most irreversible commit-point operation):
+/// [`crate::release_publish::publish_all`], joined into the single-line
+/// detail [`StepAction`] requires.
+fn publish_crates(project_root: &Path, version: &str) -> Result<String, String> {
+    let published = crate::release_publish::publish_all(project_root, version)?;
+    Ok(published.join("; "))
+}
+
 /// The mandate-refusal reason, naming all three ways to grant a release-cut
 /// mandate. Shared by [`cut_with`]'s unauthorized-refusal path so the CLI
 /// layer and every test see byte-identical wording.
@@ -1031,11 +1073,14 @@ mod tests {
     // -- action_for / unit_for --------------------------------------------
 
     #[test]
-    fn action_for_returns_none_for_every_step_without_an_action_in_this_build() {
-        for step in [ReleaseStep::SignedTagPresent, ReleaseStep::CratesPublished] {
+    fn action_for_returns_an_action_for_every_step_in_this_build() {
+        // 29-07 wires the last two remaining arms (SignedTagPresent,
+        // CratesPublished) — with unit 29c complete, no step in
+        // `ReleaseStep::ALL` returns `None` anymore.
+        for step in ReleaseStep::ALL {
             assert!(
-                action_for(step).is_none(),
-                "expected no action for {step:?} in this build"
+                action_for(step).is_some(),
+                "expected {step:?} to resolve to an action now that unit 29c is complete"
             );
         }
     }
@@ -1227,10 +1272,14 @@ mod tests {
     }
 
     #[test]
-    fn absent_step_with_no_pr_backing_and_no_action_stops_naming_the_supplying_unit() {
+    fn absent_signed_tag_step_now_attempts_its_real_action_instead_of_reporting_no_action() {
         // SignedTagPresent is not pull-request-backed (`pr_refs` returns
         // `None`), so the in-flight check is skipped entirely and the walk
-        // goes straight to `action_for`, which is `None` in this build.
+        // goes straight to `action_for` — which, as of 29-07, is `Some`.
+        // Against a nonexistent project root the real action
+        // (`sign_release_tag`) fails to even spawn `git fetch`, so the walk
+        // stops with a real, non-empty failure reason rather than the old
+        // `NoActionInThisBuild` outcome this test used to assert on.
         let report = cut_with(
             Path::new("/nonexistent"),
             "1.2.3",
@@ -1245,10 +1294,13 @@ mod tests {
         );
         assert_eq!(report.steps.len(), 4);
         match &report.steps[3] {
-            (ReleaseStep::SignedTagPresent, StepOutcome::NoActionInThisBuild { unit }) => {
-                assert_eq!(*unit, "29c");
+            (ReleaseStep::SignedTagPresent, StepOutcome::Stopped { reason }) => {
+                assert!(
+                    !reason.is_empty(),
+                    "expected a real, non-empty failure reason from the real action"
+                );
             }
-            other => panic!("expected NoActionInThisBuild naming 29c, got {other:?}"),
+            other => panic!("expected the real action to be attempted and fail, got {other:?}"),
         }
     }
 

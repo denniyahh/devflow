@@ -144,11 +144,12 @@ criteria for waves 2–6.
 | crates.io `/api/v1/crates/{name}/{version}` 200/404 semantics still hold | 29a | External API contract; can rot silently | **Satisfied and now automated** — `crates_published_live_smoke` (`#[ignore]`) re-run live during this audit, passing against the real registry |
 | Signed-tag verification via `gh api .../git/tags/<sha>` returns a usable `.verification` field | 29a | GitHub server-side contract; the tag-object-vs-peeled-sha distinction is invisible to a fake | **Satisfied and now automated** — `signed_tag_live_smoke` (`#[ignore]`) re-run live during this audit, passing against this repo's real `origin` |
 | `gh pr merge --auto <method>` actually waits for green checks and then merges with the requested method | 29b | GitHub server-side behavior; faking it removes the property under test | **Not yet performable** — blocked on 29-05/29-06 (no executor exists to run the merge step) |
-| Real `git tag -s` → `git push origin vX.Y.Z` → `cargo publish` core-then-cli, including interaction with `scripts/hooks/pre-push` | 29c | Genuinely irreversible against the live world | **Not yet performable** — blocked on 29-07. `checkpoint:human-verify` gate; line-by-line review before the run, not a test |
+| Real `git tag -s` → `git push origin vX.Y.Z` → `cargo publish` core-then-cli, including interaction with `scripts/hooks/pre-push` | 29c | Genuinely irreversible against the live world | **Implemented in 29-07, still manual-only by design.** `release_publish::create_and_push_tag`/`publish_all` exist and are hermetically unit/integration-tested (no real tag push, no real `cargo publish`, anywhere in the suite — `cut_reaches_every_step_when_all_are_implemented` proves the walk *attempts* the tag step in an isolated-signing-key fixture and stops on a real, local git failure before any network side effect). The real run against the live remote/registry remains gated by `29-07-PLAN.md` Task 4's `checkpoint:human-verify` line-by-line review — a first deliberate, attended, human-supervised release cut, not this automated suite |
 
-> The two "not yet performable" rows are recorded here because they are
-> manual-**by design**, but they are **not** claims that a human has verified them.
-> Nothing in Part B has been verified by any means.
+> The row above is recorded as "implemented, still manual-only by design" rather
+> than "verified": no automated test in this suite executes a real tag push or a
+> real `cargo publish`, and Task 4's human review — not the test suite — is the
+> gate applied to this code before its first live use.
 
 ---
 
