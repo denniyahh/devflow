@@ -2417,10 +2417,14 @@ mod tests {
     ///
     /// This event is routine quota telemetry, not a block. Classifying its mere
     /// presence as a rate limit would route EVERY healthy Claude stream stage
-    /// into `Action::AutoResume` (`crates/devflow-cli/src/outcome_policy.rs:41`
-    /// maps `AgentStatus::RateLimited` to it) against a fabricated retry time,
-    /// instead of advancing the pipeline. That is a denial of service on the
-    /// whole product, produced by a one-line "detect the event type" shortcut.
+    /// into `Action::AutoResume` against a fabricated retry time, instead of
+    /// advancing the pipeline. That mapping is
+    /// `crates/devflow-core/src/outcome_policy.rs:41` — `AgentStatus::RateLimited
+    /// => Action::AutoResume`, re-read in this crate at execution time; 30-03's
+    /// plan and threat register cite it as `outcome_policy.rs:41` without a
+    /// crate, and it is NOT in `devflow-cli`. This is a denial of service on
+    /// the whole product, produced by a one-line "detect the event type"
+    /// shortcut.
     ///
     /// Two independent guards must both hold here, and the second assertion
     /// pins the one the positioning guard alone would hide: the event is placed
