@@ -1389,6 +1389,71 @@ Plans:
 
 - [x] Delivered as an out-of-band patch, 2026-07-31 (no phase — emergency unblock for the Phase 29 dogfood)
 
+### Phase 999.68: Planning-Artifact Architecture — Requirements, a Constitution, and the Linear Boundary (BACKLOG)
+
+**Linear:** [DEN-89](https://linear.app/denniskim/issue/DEN-89/99968-planning-artifact-architecture-requirements-a-constitution-and)
+**Found:** 2026-08-02, operator review of long-horizon tracking during Phase 30. Not a code defect —
+a planning-system gap. Filed because the symptom ("GSD doesn't track long-term product requirements")
+has a different cause than it appears to.
+
+**The finding in one sentence:** GSD's requirements machinery is not missing, it is dormant because
+this project never supplied the data that activates it — and the parts that *are* genuinely missing
+are a normative principles document and a stated boundary against Linear.
+
+#### Part 1 — Requirements are dormant, not absent. There is no toggle.
+
+Verified in source, 2026-08-02: `init.cjs:283` matches `REQUIREMENTS_HEADER_RE` against a ROADMAP
+phase section's `**Requirements**:` line; `phase_req_ids` becomes `null` when that text is missing
+**or literally `TBD`**, and a null value silently skips the coverage gate. There is **no config key**
+for this — `config-loader.cjs` has none. The only adjacent key, `workflow.context_coverage_gate`,
+governs the *decision* gate.
+
+What is therefore sitting unused: categorized REQ-IDs, a v1/v2 split, an explicit Out-of-Scope table
+with reasons, a phase→requirement traceability matrix (`templates/requirements.md`), the blocking
+requirements coverage gate (plan-phase §13) and the blocking decision coverage gate (§13a). This
+project runs none of them — `PROJECT.md` records the opt-out, and every phase carries
+`**Requirements:** TBD`.
+
+Activation is two files, no config: create `.planning/REQUIREMENTS.md`, and replace `TBD` with real
+IDs in each phase's `**Requirements**:` line. Infrastructure phases can keep the unit convention;
+the value is for product-facing work. Note `/gsd-new-milestone` has a "Generate REQUIREMENTS.md"
+step — the hand-declared v2.3.0 milestone (2026-08-02) bypassed it.
+
+#### Part 2 — There is no normative document that outlives a milestone.
+
+`PROJECT.md` is *descriptive* and drifts: on 2026-08-02 it claimed workspace version `1.8.0` while
+the actual version was `2.2.0`, and stated the milestone-open decision three different ways. GitHub
+Spec Kit's `.specify/memory/constitution.md` is the model worth copying — immutable principles every
+plan is checked against, with a "Complexity Tracking" table requiring written justification for any
+deviation. GSD has no equivalent. Candidate: `.planning/CONSTITUTION.md`, referenced by PROJECT.md
+and read at plan time, carrying rules this project already learned the hard way (e.g. "never predict
+a gate or route around one", "a document is not a control").
+
+#### Part 3 — The long-horizon tracker already exists and is underused.
+
+The DevFlow Linear project holds 88+ issues and the 999.x backlog is already mirrored into it
+(999.67 → DEN-88). The missing piece is a stated boundary, not a tool. Proposed: **Linear owns
+product goals, features, and anything outliving a milestone; GSD owns execution of the current
+milestone; ROADMAP.md becomes a view of the backlog rather than its store.** Today ROADMAP.md is
+~2,750 lines doing five jobs — active phases, backlog, milestone framing, architecture decisions,
+and historical narrative — which is why long-term items feel untracked: they are buried in an
+execution document that gets archived at milestone close.
+
+**Considered and rejected: adopting GitHub Spec Kit alongside GSD.** Its specs are per-feature
+directories (`specs/[###-feature]/`), and its documented "Flow-Forward" persistence model creates new
+directories on requirement change, with the docs naming the tradeoff as "potential duplication and
+fragmented context." Spec Kit's own Feb/March 2026 newsletters list spec lifecycle management — "move
+beyond feature-branch-specific specs", "address spec drift" — as *future* work, i.e. this exact
+problem is unsolved there too. Running two planning systems also costs an authority ambiguity this
+project has already been bitten by. Worth re-checking whether the lifecycle work has landed since.
+
+**Priority:** Medium. **Size:** S for Part 1, S for Part 2, M for Part 3 (the ROADMAP split is the
+bulk). Parts are independently landable.
+**Depends on:** nothing. Best sequenced at a milestone boundary, where REQUIREMENTS.md is normally
+generated anyway.
+
+---
+
 ### Phase 999.67: `parse_devflow_result` Lets an Agent Plant Its Own Layer-0 Provenance (BACKLOG — shortlisted for Phase 31)
 
 **Linear:** [DEN-88](https://linear.app/denniskim/issue/DEN-88/99967-parse-devflow-result-lets-an-agent-plant-its-own-layer-0)
