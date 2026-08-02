@@ -360,6 +360,271 @@ but it is the basis on which the workflow concludes Claude Code is safe to spawn
 parallelism, and does not address subagents backgrounding by default.
 
 
+## 8. `query commit --files <path>` silently drops any absolute path, because it double-joins it onto `cwd`
+
+**Status:** READY — not yet filed
+**Found:** 2026-07-25, DevFlow phase 23 planning (`23-VALIDATION.md`, `23-PATTERNS.md`)
+**RECURRED:** 2026-08-02, DevFlow phase 30 planning (`30-VALIDATION.md`) — same call shape,
+confirmed and root-caused this time instead of just observed. See "Root cause" below.
+**Component:** `gsd-core/bin/lib/commands.cjs`, `cmdCommit` (`:664-693`)
+**Severity:** high — the command reports a normal-looking `{"committed": false, "reason":
+"nothing_to_commit"}` on exit 0 for a file that plainly exists and plainly has changes; nothing
+distinguishes this from the legitimate "nothing changed" case, so a caller that doesn't diff
+`git status` afterward believes the commit succeeded.
+**Reproducibility: confirmed 2/2**, and the mechanism is unconditional in the source — not a race
+or an environment quirk.
+
+### What happens
+
+`plan-phase.md` (and other workflow steps) resolve `PHASE_DIR` from `init.plan-phase`'s JSON,
+which returns an **absolute path**:
+
+```json
+"phase_dir": "/var/home/denniyahh/Github/devflow/.planning/phases/30-keep-the-session-alive-past-turn-end"
+```
+
+Every workflow step that commits a freshly-written phase artifact naturally builds its `--files`
+argument from that variable, e.g. step 5.5:
+
+```bash
+gsd_run query commit "docs(phase-${PHASE}): add validation strategy" --files "${PHASE_DIR}/${PADDED_PHASE}-VALIDATION.md"
+```
+
+`cmdCommit` then does, unconditionally:
+
+```js
+const fullPath = node_path_1.default.join(cwd, file);   // commands.cjs:668
+if (!node_fs_1.default.existsSync(fullPath)) {           // commands.cjs:669
+    if (explicitFiles) { continue; }                      // silently skipped, no warning
+    ...
+}
+```
+
+`path.join` does **not** special-case an absolute second argument — it concatenates and
+normalizes. When `file` is already absolute and equals (or is under) `cwd`, the result is `cwd`
+duplicated onto itself, which never exists on disk:
+
+```
+$ node -e "console.log(require('path').join(
+    '/var/home/denniyahh/Github/devflow',
+    '/var/home/denniyahh/Github/devflow/.planning/phases/30-.../30-VALIDATION.md'))"
+/var/home/denniyahh/Github/devflow/var/home/denniyahh/Github/devflow/.planning/phases/30-.../30-VALIDATION.md
+```
+
+`existsSync` on that doubled path is `false`, so the file is treated exactly like a caller-declared
+file that doesn't exist — `continue`, no `git add`, nothing pushed to `stagedPaths`. Every file in
+the `--files` list can fail this way independently; if all of them do, `stagedPaths.length === 0`
+and `cmdCommit` returns `{"committed": false, "hash": null, "reason": "nothing_to_commit"}`
+(`commands.cjs:692-694`) — indistinguishable in shape from "there were genuinely no changes."
+
+### Root cause is a real path resolution bug, not specifically an "untracked files" issue
+
+An earlier write-up of this symptom (project-local notes, not filed) attributed it to untracked
+files specifically — that was a mis-diagnosis by correlation, corrected here. The doubling happens
+purely from the absolute-path collision; it does not consult git's index at all, and would equally
+silently drop an **already-tracked** file if `--files` were passed its absolute path (unverified
+live, since no reproduction case surfaced with a tracked absolute path, but the code path is
+unconditional and has no track-status branch before the `existsSync` check).
+
+**The codebase already has the correct idiom elsewhere in the same file**, just not applied here:
+
+```js
+// commands.cjs:306, a different function
+const fullPath = node_path_1.default.isAbsolute(targetPath) ? targetPath : node_path_1.default.join(cwd, targetPath);
+```
+
+### Reproduction
+
+```bash
+cd <repo root>          # cwd == repo root, the normal orchestrator launch condition
+touch .planning/phases/NN-slug/NN-NEWFILE.md
+gsd-tools query commit "docs: test" --files "$(pwd)/.planning/phases/NN-slug/NN-NEWFILE.md"
+# → {"committed": false, "hash": null, "reason": "nothing_to_commit"}
+git status --porcelain .planning/phases/NN-slug/NN-NEWFILE.md
+# → ?? .planning/phases/NN-slug/NN-NEWFILE.md   (still untracked — commit never touched it)
+```
+
+### Suggested fixes (any one is sufficient)
+
+1. **Apply the existing idiom.** Change `commands.cjs:668` to
+   `node_path_1.default.isAbsolute(file) ? file : node_path_1.default.join(cwd, file)`, matching
+   `commands.cjs:306`. Minimal, one-line, no behavior change for the common relative-path case.
+2. **Fail loud instead of silent-skip.** If `explicitFiles` and a declared file resolves to a path
+   that doesn't exist, emit a warning naming the exact resolved path checked — would have surfaced
+   the doubled path immediately instead of reading as "no changes."
+3. **Workflow-side normalization.** `plan-phase.md` and other workflow files could relativize
+   `PHASE_DIR`-based paths before passing them to `--files`, but this only hides the underlying bug
+   for GSD's own call sites — any other host or hand-invocation with an absolute path still breaks.
+
+### Local workaround
+
+After any `query commit` call whose `--files` argument could be absolute, check
+`git status --porcelain <path>` — if the file still shows as untracked/modified, fall back to
+`git add <path> && git commit -m "<msg>"` directly.
+
+---
+
+## 9. `state.planned-phase` silently rewrites unrelated frontmatter via a body→frontmatter resync that has no preserve-guard for `status` or `last_activity_desc`
+
+**Status:** READY — not yet filed
+**Found:** 2026-07-31, DevFlow phase 29 planning (`/gsd-plan-phase 29`)
+**RECURRED:** 2026-08-02, DevFlow phase 30 planning (`/gsd-plan-phase 30`) — identical symptom,
+identical stray text (`last_activity_desc` overwritten with the exact same stale string on both
+occasions, three days apart, for two different phase numbers). Root-caused this time.
+**Component:** `gsd-core/bin/lib/state-transition.cjs` (`plannedPhaseCore`, `:764-826`),
+`gsd-core/bin/lib/state.cjs` (`syncStateFrontmatter`, `:1581-1660`; `buildStateFrontmatter`,
+`:1353-1365`), `gsd-core/bin/lib/state-document.cjs` (`normalizeStateStatus`, `:112-134`)
+**Severity:** high — every `/gsd-plan-phase` run silently destroys the frontmatter completion
+record of whatever phase most recently finished, and reports only `{"updated": ["Status"]}`,
+massively under-reporting the actual blast radius.
+**Reproducibility: confirmed 2/2**, with the exact same corrupted value both times.
+
+### What happens
+
+After planning completes, plan-phase.md step 13b runs:
+
+```bash
+gsd_run query state.planned-phase --phase "${PHASE_NUMBER}" --name "${PHASE_NAME}" --plans "${PLAN_COUNT}"
+```
+
+This reported `{"updated": ["Status"], "phase": "30", "plan_count": 5}` on 2026-08-02 — implying a
+single, narrow body-field change. The actual `git diff` on `.planning/STATE.md` immediately after:
+
+```diff
+-status: shipped — PR #63 open to develop
++status: executing
+-last_updated: "2026-07-31T08:35:00.000Z"
++last_updated: "2026-08-02T11:50:33.571Z"
+-last_activity: 2026-07-30
++last_activity: 2026-07-30
+-last_activity_desc: "Phase 28 complete: 6/6 plans, 779 tests green, SECURED (threats_open 0), ..."
++last_activity_desc: "Phase 28 execution started"
+-  total_phases: 17
++  total_phases: 21
+-  total_plans: 124
++  total_plans: 129
+```
+
+Five frontmatter fields changed; one was reported. `status` and `last_activity_desc` are the
+damaging ones — both replace an accurate, hand/executor-authored completion record with stale or
+wrong text, and nothing in the tool's own output signals that this happened.
+
+**Identical recurrence, three days and one phase-number apart:** planning phase 29 on 2026-07-31
+produced `last_activity_desc: "Phase 28 execution started"` in frontmatter. Planning phase 30 on
+2026-08-02 produced the **exact same string**, byte for byte, even though the intent object in
+both calls carried a different `phaseNumber`/`planCount`. This is the strongest evidence that the
+value is not being freshly derived from the current call's intent at all — it's a stale value found
+somewhere else in the document and copied forward unchanged, twice.
+
+### Root cause — a two-part mechanism, both parts confirmed against live source and live document state
+
+**Part 1 — `plannedPhaseCore` targets body fields that partially don't exist in this project's
+`STATE.md` shape.** It calls `stateReplaceField` (unconditional) targeting a field literally named
+`'Last Activity Description'` (`state-transition.cjs:817`). DevFlow's `STATE.md` has no such field
+— `grep -n '^Last Activity Description' STATE.md` returns nothing. It only has a combined prose
+line:
+
+```
+Last activity: 2026-07-30 — Phase 28 execution started      (STATE.md:160)
+```
+
+`stateReplaceField` finds no match, returns null, and the replace is a silent no-op — consistent
+with `plannedPhaseCore`'s own `updated` array never including `'Last Activity Description'` in
+either observed run. Separately, `plannedPhaseCore` calls `stateReplaceFieldIfTemplate` for
+`'Last Activity'` (`:809`), which is **template-aware**: it only replaces the field when the
+existing value matches a known placeholder default. `"2026-07-30 — Phase 28 execution started"` is
+real content, not a placeholder, so this replace also no-ops and the line is left untouched —
+which is exactly why it is still reading a stale 2026-07-30 date and description on 2026-08-02.
+
+**Part 2 — the wrapping `readModifyWriteStateMd` re-derives frontmatter from the body on every
+write, and two fields have no preserve-guard.** After the body transform, `readModifyWriteStateMd`
+(`state.cjs:2002`) always calls `syncStateFrontmatter(modified, cwd)`, which calls
+`buildStateFrontmatter(body, cwd)` to compute fresh frontmatter values purely from body content,
+then selectively falls back to the pre-existing frontmatter value when the derived one looks wrong
+— but only for a specific allowlist:
+
+```js
+// state.cjs:1590 — only guard for status, and only the 'unknown' case:
+if (derivedFm['status'] === 'unknown' && existingFm['status'] && existingFm['status'] !== 'unknown') {
+    derivedFm['status'] = existingFm['status'];
+}
+// stopped_at, paused_at, current_phase, current_phase_name, current_plan,
+// progress (if fully absent), milestone/milestone_name all have their own
+// explicit "prefer existing when derived is empty" guards (:1631-1660).
+// last_activity_desc has NO such guard anywhere in this file.
+```
+
+Since `buildStateFrontmatter` re-derives `lastActivityDesc` straight from the stale body line
+(`state.cjs:1365`: `stateExtractField(bodyContent, 'Last Activity Description') ??
+proseLastActivity.description` — the second branch fires, extracting `"Phase 28 execution
+started"` from the untouched prose line), and there is no guard protecting it, the frontmatter's
+detailed, accurate completion description is unconditionally overwritten by that stale fragment —
+every single time `readModifyWriteStateMd` runs and the no-op-detection allows the write through
+(which it does here, because the *`Status`* body field, a separate line under `## Current
+Position`, genuinely did change).
+
+**The `status` corruption has a second, independent contributing bug: a substring conflation in
+`normalizeStateStatus`.** `plannedPhaseCore` deliberately sets the body's `## Current Position`
+`Status:` line to the literal string `"Ready to execute"` (`:801-804`, meaning "planning just
+finished, nothing is running yet"). `buildStateFrontmatter` extracts that string and normalizes it
+via `normalizeStateStatus` (`state-document.cjs:112`):
+
+```js
+else if (statusLower.includes('executing') || statusLower.includes('in progress')) {
+    normalizedStatus = 'executing';
+}
+...
+else if (statusLower.includes('ready to execute')) {
+    normalizedStatus = 'executing';        // state-document.cjs:130-132
+}
+```
+
+`"ready to execute"` and `"executing"` are opposite states — one means *nothing has started*, the
+other means *mid-run* — but the substring-based classifier folds them into the same normalized
+value, so a phase that just finished planning gets stamped into frontmatter as `status: executing`,
+overwriting a correct `status: shipped — PR #63 open to develop` for a *different, already-shipped*
+phase.
+
+### Why this is worse than it looks
+
+The intent-level `updated` report (`{"updated": ["Status"]}`) reflects only what `plannedPhaseCore`
+itself changed on the **body**. It has no visibility into what `syncStateFrontmatter` changes on
+the **frontmatter** afterward as a side effect of the same write — so the report is not merely
+incomplete, it is structurally incapable of describing the actual damage, because the two layers
+that make the change don't share an accounting mechanism.
+
+### Suggested fixes (any one materially helps; 1+2 together close it)
+
+1. **Add a preserve-guard for `last_activity_desc`**, matching the existing pattern for
+   `stopped_at`/`paused_at`/etc. (`state.cjs:1631-1660`): if the derived value looks identical to
+   what a stale, unrelated body line would produce (or simply: prefer existing frontmatter when the
+   *specific* transition being applied — `plannedPhase` — never actually touched the description
+   field), don't overwrite it.
+2. **Fix the `normalizeStateStatus` conflation.** `"ready to execute"` should map to a distinct
+   normalized status (e.g. `'planned'` or `'ready'`), not collapse into `'executing'`. This is a
+   one-line, low-risk change (`state-document.cjs:130-132`) that removes an actively misleading
+   state transition.
+3. **Make `plannedPhaseCore` and `syncStateFrontmatter` share one accounting.** Either have
+   `readModifyWriteStateMd` report every field the *resync* changed (not just the caller's own
+   transform), or have `plannedPhaseCore` write directly to frontmatter for the fields it owns
+   (`status`, `last_activity_desc`) instead of relying on body→frontmatter re-derivation to infer
+   them indirectly.
+4. **Give `plannedPhaseCore` a real `'Last Activity Description'` body target**, or update
+   `buildStateFrontmatter`'s prose fallback to not silently treat a years-old unrelated line as
+   "the latest activity" when a more specific transition (like `plannedPhase`) is what triggered the
+   write.
+
+### Local workaround
+
+After `query state.planned-phase` (or any `readModifyWriteStateMd`-wrapped verb), diff
+`.planning/STATE.md`'s frontmatter block specifically — not just the reported `updated` array — and
+hand-restore `status` / `last_activity_desc` in the same commit as any legitimate changes from that
+call. Both recorded occurrences were caught and fixed this way with no data loss (git preserves the
+pre-corruption value), but it must be checked every time; the tool's own report cannot be trusted to
+surface it.
+
+---
+
 ## Preventing recurrence — the meta-finding (2026-07-31)
 
 Two entries in this file (**1** and **6**) recurred in phase 28, three days after being written up
@@ -379,12 +644,15 @@ accurate issue log did not catch a repeat defect, because logging is not enforce
 | Same, as a backstop | A `pre-commit` hook that refuses a commit touching `.planning/phases/**` while `HEAD` is on `main`/`develop` |
 | `[ci skip]` wedging a PR | After `/gsd-ship`, assert `gh pr view <n> --json mergeStateStatus` is not `BLOCKED` with an empty rollup; if it is, amend the ship note and force-push with lease |
 
-**Filing status: none of these six entries has been filed upstream.** That is the single highest-
-leverage action remaining — entries 1 and 6 are now each confirmed reproducible (2/2 and 4/4
-respectively), which is the evidence an upstream maintainer needs.
+**Filing status: none of these nine entries has been filed upstream.** That is the single highest-
+leverage action remaining — entries 1, 6, 8, and 9 are now each confirmed reproducible (2/2, 4/4,
+2/2, 2/2 respectively), which is the evidence an upstream maintainer needs.
 
 ---
 
 *Created 2026-07-28 during DevFlow phase 25. Updated 2026-07-31 during phase 28 with recurrence
-records for entries 1 and 6, and the "Preventing recurrence" section. Update `Status:` and record
+records for entries 1 and 6, and the "Preventing recurrence" section. Updated 2026-08-02 during
+phase 30 planning with entries 8 (`query commit` double-joins absolute `--files` paths) and 9
+(`state.planned-phase` frontmatter resync has no preserve-guard for `status`/`last_activity_desc`),
+both root-caused against live source and both confirmed 2/2 recurring. Update `Status:` and record
 the issue link when each entry is filed upstream.*
