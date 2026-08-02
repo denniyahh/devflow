@@ -2618,8 +2618,18 @@ draining to `[]` is the authoritative "all children returned" signal; the `resul
 indicates the orchestrator declared. Trial 2's shape is *superficially indistinguishable* from "one
 child delivered, one lost" — one result event either way — and the drain is the only thing that
 separates them. **Do not simplify the close rule to a single arm.** A future reader is likely to
-read the second arm as belt-and-braces; it is load-bearing, and this is the measurement that proves
-it.
+read the second arm as belt-and-braces — and per 30-04 below, **it is** belt-and-braces (defensive,
+not load-bearing), which is a deliberate reason to keep it, not license to drop it.
+
+**REVISED 2026-08-02 by 30-04** (`30-04-SUMMARY.md`, `30d-MEASUREMENTS.md`): re-run across 7 fresh
+trials (5 Mode A + 2 Mode B) plus a recomputation of 30c's own published logs found the drain gate
+is **defensive, not load-bearing** — n=2 Mode B trials both delivered every completion even though
+the monitor closed on the marker alone, children still running. **Keep the `AND`, but rewrite its
+justification**: the gate is nearly free (the CLI outlived the close by ~40s anyway), n=2 only
+proves the benign path exists rather than that it's the only one, and it removes a class of
+question about an undocumented code path. Also: a monitor must not read process exit as a
+completion signal after an early close, and 999.64's failure mode is not reproduced by this
+mechanism — if Phase 31 loses child work, early stdin close is not the cause.
 
 **BINDING CONSTRAINT (constraint 8), added 2026-08-02 from the 30c reliability set — the idle
 timeout must not be set below ~12s, and the drain is NOT a stop signal.** Measured across all seven
@@ -2634,6 +2644,17 @@ against this — but constraint 5's idle timeout is the mechanism that could sti
 floor is a hard input, not a tuning preference. Treat ~12s as a measured lower bound from a
 two-child wave and size the real timeout above it with margin; a wave with more children or slower
 work will have longer quiet gaps.
+
+**REVISED 2026-08-02 by 30-04 — the ~12s floor is too low; raise it to ≥30s.** A second, independent
+7-trial set (30d) reproduced the milestone-event quiet-gap measure (7.70–13.73s, pooled max 13.73s
+across 30c+30d) and added a stricter every-stream-line measure an idle timer would actually see
+(6.02–7.09s). **A 12-second idle timeout would have killed a live, healthy run in 2 of the 7 30d
+trials** (13.638s and 13.728s) — worse than 30c's own band suggested. Mode-A trial 1 shows the
+mechanism: a coalesced run (2 `result` events merged into one delivered turn, per constraint 7)
+lengthens the quiet interval, and coalescing occurred in 1 of 7 trials here, matching 30c's rate
+exactly. **New floor: ≥30s** — ~2.2x the pooled observed maximum on the milestone definition and
+~4x on the every-line one. Direction (set a floor, don't let it tune below the observed maximum)
+was right in the original constraint; the number was not.
 
 **Explicitly out of scope, on the operator's instruction — do not fold in even though they are
 adjacent and were found the same day:**
