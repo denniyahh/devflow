@@ -393,12 +393,17 @@ def reap_process_group(
 class Watcher:
     """Reads the staged capture and records facts. No interpretation.
 
-    ``local_bash``-typed task events are RECORDED, never filtered out, while the
-    drain gate considers only ``local_agent`` entries. RESEARCH.md's Pitfall 6
-    records an extra ``local_bash`` ``task_started``/``task_notification`` pair
-    per child that never appears in ``background_tasks_changed`` at all, and
-    assumption A2 is that it is informational. Recording it gives that
-    assumption evidence instead of another restatement.
+    ``local_bash`` task events are RECORDED, never filtered out, while the drain
+    gate considers only ``local_agent`` entries. RESEARCH.md's Pitfall 6 records
+    an extra ``local_bash`` ``task_started``/``task_notification`` pair per child
+    that never appears in ``background_tasks_changed`` at all, and assumption A2
+    is that it is informational. Recording it gives that assumption evidence
+    instead of another restatement.
+
+    Attribution is by task_id correlation, not by reading a field: only
+    ``task_started`` carries ``task_type``. A later ``task_notification`` or
+    ``task_updated`` is attributed to the local_bash flavour by matching the
+    task_id first seen in a local_bash ``task_started``.
     """
 
     def __init__(self, module: Any, stdout_path: str, signal_paths: dict[str, str], t0: float) -> None:
@@ -410,6 +415,11 @@ class Watcher:
         self.notifications: list[dict[str, Any]] = []
         self.btc: list[dict[str, Any]] = []
         self.local_bash_events: list[dict[str, Any]] = []
+        #: ``task_started`` carries ``task_type``; ``task_notification`` and
+        #: ``task_updated`` do NOT (RESEARCH.md's event-field table). The only
+        #: way to attribute a later event to the local_bash flavour is to
+        #: correlate on the task_id first seen in a local_bash task_started.
+        self.local_bash_task_ids: set[str] = set()
         self.outstanding: list[str] = []
         self.untyped_task_entries = 0
         self.drained_at: Optional[float] = None
@@ -478,34 +488,56 @@ class Watcher:
                 flush=True,
             )
         elif subtype == "task_started":
-            compact["task_id"] = event.get("task_id")
+            task_id = event.get("task_id")
+            compact["task_id"] = task_id
             compact["task_type"] = event.get("task_type")
             if event.get("task_type") == "local_bash":
+                if task_id:
+                    self.local_bash_task_ids.add(task_id)
                 self.local_bash_events.append(
                     {
                         "at": round(at, 3),
                         "subtype": "task_started",
-                        "task_id": event.get("task_id"),
+                        "task_id": task_id,
                         "description": event.get("description"),
                     }
                 )
         elif subtype == "task_notification":
+            task_id = event.get("task_id")
+            is_local_bash = task_id in self.local_bash_task_ids
             self.notifications.append(
                 {
                     "at": round(at, 3),
-                    "task_id": event.get("task_id"),
+                    "task_id": task_id,
                     "status": event.get("status"),
-                    "task_type": event.get("task_type"),
+                    "flavour": "local_bash" if is_local_bash else "local_agent_or_unknown",
+                    # RESEARCH.md Pitfall 6: local_agent notifications carry
+                    # `usage`, local_bash ones do not. Recorded so that claim is
+                    # checkable rather than restated.
+                    "has_usage": event.get("usage") is not None,
                 }
             )
-            compact["task_id"] = event.get("task_id")
-            if event.get("task_type") == "local_bash":
+            compact["task_id"] = task_id
+            if is_local_bash:
                 self.local_bash_events.append(
                     {
                         "at": round(at, 3),
                         "subtype": "task_notification",
-                        "task_id": event.get("task_id"),
+                        "task_id": task_id,
                         "status": event.get("status"),
+                        "has_usage": event.get("usage") is not None,
+                    }
+                )
+        elif subtype == "task_updated":
+            task_id = event.get("task_id")
+            compact["task_id"] = task_id
+            if task_id in self.local_bash_task_ids:
+                self.local_bash_events.append(
+                    {
+                        "at": round(at, 3),
+                        "subtype": "task_updated",
+                        "task_id": task_id,
+                        "status": (event.get("patch") or {}).get("status"),
                     }
                 )
         elif subtype == "background_tasks_changed":
