@@ -18,6 +18,17 @@ harness: 30c-monitor-env-harness.py
 
 # 30c — Does `task-notification` delivery survive DevFlow's production launch environment?
 
+> **This is trial 1 of two. Read `30c-VERDICT-scrubbed.md` alongside it.**
+> This trial ran with nine `CLAUDE_*`/`AI_AGENT` markers inherited from the
+> surrounding Claude Code session (see `## Residual environment` below, which
+> flagged exactly this as the open confound). Trial 2 re-ran the experiment with
+> all eleven `CLAUDE*`/`ANTHROPIC*`/`AI_AGENT*` variables removed and reached
+> the **same** verdict, retiring the nested-session hypothesis. Trial 2 also
+> found that the count of notification-origin `result` events is not a count of
+> delivered children — the CLI can coalesce two completions into one resumed
+> turn. Nothing in this document was changed by that follow-up; only this
+> banner was added.
+
 **Yes, on a single trial.** Both delegated children were independently delivered
 into a live CLI session running inside a replica of `spawn_monitor`'s process
 environment — detached in its own session, launched through `sh -c`, with the
