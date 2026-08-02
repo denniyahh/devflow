@@ -508,7 +508,24 @@ const HUMAN_GATE_VALUE: &str = "blocking-human";
 /// deliberately does NOT widen into a general "does this look like a
 /// checkpoint" heuristic (D-02 rejected that class of predicate); the scope
 /// is one declared field label with one enumerated value.
+///
+/// **A Claude `stream-json` capture takes a separate branch** and is answered
+/// by [`claude_stream_reports_human_gate`] ALONE — it never consults raw stdout.
+/// That is not an oversight to be "completed" later: under a stream capture the
+/// raw stdout contains the operator's prompt echoed back as a `user` event, so
+/// also scanning it would reinstate the exact false positive the branch exists
+/// to remove (review constraint 3 — the unbounded raw scan is the reader that
+/// "survives by accident" once the single-document invariant is gone). See that
+/// function for which events are eligible and why.
+///
+/// The branch is gated on [`is_claude_event_stream`], so a single-document
+/// envelope, plain text and a Codex stream all fall through to the two-target
+/// logic below, unchanged (T-30-25).
 pub fn blocking_human_checkpoint_reported(stdout: &str) -> bool {
+    let events = claude_stream_events(stdout);
+    if is_claude_event_stream(&events) {
+        return claude_stream_reports_human_gate(&events);
+    }
     if text_reports_human_gate(stdout) {
         return true;
     }
@@ -727,6 +744,81 @@ fn last_top_level_result(events: &[serde_json::Value]) -> Option<&serde_json::Va
         .iter()
         .rev()
         .find(|v| v.get("type").and_then(serde_json::Value::as_str) == Some("result"))
+}
+
+/// Whether any AGENT-AUTHORED text in a Claude stream capture declares a
+/// human-blocking gate. The stream-capture half of
+/// [`blocking_human_checkpoint_reported`]; the pure matcher it delegates to,
+/// [`text_reports_human_gate`], is unchanged.
+///
+/// **Why this exists (review constraint 3).** Scanning raw stdout is safe under
+/// the single-document envelope, because the only place gate text can appear
+/// there is the one `result` field the agent authored. A stream capture breaks
+/// that invariant: the operator's prompt is echoed back into the same stdout as
+/// a `user` event, so a prompt that merely DOCUMENTS a checkpoint gate
+/// rendering becomes textually indistinguishable from a live declaration. The
+/// failure is silent — a checkpoint auto-decide fires, or the resume ceiling is
+/// consumed, on a stage whose prompt only discussed checkpoints. DevFlow's own
+/// planning documents are exactly that kind of prompt content.
+///
+/// Two independent filters, both required, neither a substitute for the other:
+///
+/// 1. **Type — keep ONLY `result` events.** `user` events are always either the
+///    echoed prompt or a `task_notification` summary re-injected as user-role
+///    content; neither is the agent declaring anything. `system` events carry
+///    the `init` tool and agent inventory, inert text with no business in a gate
+///    scan. `assistant` events are excluded too, and that exclusion is
+///    deliberate — do NOT "restore" it for completeness. Turn-FINAL assistant
+///    text is duplicated verbatim into the `result` event that follows it
+///    (`30a-evidence/raw_output_v3.jsonl` lines 17→19, 36→37, 53→54), so
+///    admitting the class buys no detection the `result` events do not already
+///    give. What it buys is a new false-positive surface: v3 line 6's top-level
+///    assistant narration ("I'll spawn both subagents in the background now.")
+///    reaches no `result` event at all, so an agent narrating "next I'll handle
+///    the task whose gate the plan declares" would recreate the prompt-echo
+///    false positive one layer inward.
+/// 2. **Provenance — keep only top-level events.** An event is top-level when
+///    `parent_tool_use_id` is JSON null OR the key is absent entirely. The
+///    absent case is load-bearing: `result` events carry no such key at all
+///    (confirmed across all three archived captures), so a naive presence check
+///    would drop exactly the events that matter most. Mistaking
+///    subagent-forwarded narration for orchestrator output is the error that
+///    invalidated the v1 experiment outright. Kept even though filter 1 already
+///    makes it redundant for today's captures — the two guards are meant to
+///    fail independently, so a future widening of the type filter cannot
+///    silently inherit subagent content.
+///
+/// **ALL eligible `result` events are scanned, not only the last.** This
+/// deliberately diverges from [`last_top_level_result`]'s last-result-wins
+/// verdict semantics, and the two conventions must not be "harmonised": a
+/// verdict is a single final answer, whereas this asks whether a gate was
+/// reported ANYWHERE in the stage's output. A gate declared in turn N followed
+/// by task-notification wake-up turns N+1/N+2 — the exact turn shape the v3
+/// capture archives — would be silently dropped by last-result-only, losing a
+/// human authorization request to the generic gate. That is the
+/// opposite-direction harm, and the worse of the two.
+///
+/// Text is read with a direct [`serde_json::Value::get`] chain. Never route
+/// this through [`json_scan`]/[`json_find_key`]: a recursive traversal descends
+/// straight back into the nested message content both filters just excluded,
+/// silently undoing the fix while the tests on the outer shape still pass
+/// (T-30-23).
+///
+/// Returns `bool` and short-circuits on the first match rather than collecting
+/// the eligible text: this runs on every `devflow advance` over a capture that
+/// grows for the whole stage, and there is no reason to allocate a copy of it.
+fn claude_stream_reports_human_gate(events: &[serde_json::Value]) -> bool {
+    events
+        .iter()
+        .filter(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("result"))
+        .filter(|event| {
+            matches!(
+                event.get("parent_tool_use_id"),
+                None | Some(serde_json::Value::Null)
+            )
+        })
+        .filter_map(|event| event.get("result").and_then(serde_json::Value::as_str))
+        .any(text_reports_human_gate)
 }
 
 /// The `rate_limit_info.status` values that mean the CLI DENIED the request.
