@@ -4,12 +4,19 @@ milestone: v2.3.0
 milestone_name: the unattended run (999.64 arc — closes after Phase 31)
 current_phase: 30
 current_phase_name: keep-the-session-alive-past-turn-end
-status: "executing — wave 1 complete (2/5 plans)"
-stopped_at: "Phase 30 wave 1 complete: 30-01 (Claude stream Layer-1 parser, 97 tests) and 30-02 (30c delivery experiment, operator-approved on 8 trials across 3 environments). Wave 2 next: 30-03, 30-04"
-last_updated: "2026-08-02T15:14:11.856Z"
+status: "all 5 plans executed — phase 30 ready for verification"
+stopped_at: "Phase 30 complete through wave 3: 30-01 + 30-02 (wave 1), 30-03 + 30-04 (wave 2), 30-05 (wave 3, stream gate-scoping, 116 agent_result tests). Host and pinned-container checks green. Nothing pushed. Next: verify/close phase 30; Phase 31 owns the launch-path flip that makes 30b's parser reachable."
+last_updated: "2026-08-02T23:20:00Z"
 last_activity: 2026-08-02
-last_activity_desc: "Phase 30 planned: 5 plans, 3 waves (30b parser tracer + expansions, 30c delivery experiment, 30d exit-timing evidence); plan-checker passed"
+last_activity_desc: "Phase 30 wave 3 executed: 30-05 scoped stream checkpoint-gate scanning to top-level result events, closing the prompt-echo false positive (review constraint 3)"
 progress:
+  # STALE AND UNVERIFIED — do not trust these five values.
+  # `state.update-progress` is the tool that owns them and it is not usable here:
+  # run 2026-08-02 it regressed current_phase 30 -> 28 from the stale body, rewrote
+  # an unrelated phase-23 historical note, and reported completed:132/total:138 in
+  # its own JSON while writing 131/137 to these fields. Left at their last
+  # hand-trusted values rather than replaced with numbers that cannot be defended.
+  # See .planning/UPSTREAM-GSD-ISSUES.md entries 9 and 11.
   total_phases: 21
   completed_phases: 15
   total_plans: 129
@@ -33,6 +40,27 @@ is the exit-timing measurement (30-04). A Codex review (`30-REVIEWS.md`) raised
 phase goal was split from the 999.64 arc goal so Phase 30 can satisfy it —
 Phase 31 owns the launch-path change. 30-03 and 30-05 are gated on 30-02's
 verdict and will not land if delivery is refuted.
+
+**Status 2026-08-02 — all 5 plans executed; ready for verification.** All three
+waves are complete: wave 1 = 30-01 + 30-02, wave 2 = 30-03 + 30-04, wave 3 =
+30-05. The 30-02 delivery gate resolved `delivery: confirmed`, which is what
+allowed 30-03 and 30-05 to land.
+
+`cargo test -p devflow-core --lib agent_result::` reports 116 passed / 0 failed.
+`scripts/check.sh all` (host) and `scripts/check-in-container.sh all` (pinned CI
+image) both exit 0. Nothing has been pushed.
+
+Two limits carried forward deliberately, both recorded in `30-05-SUMMARY.md`:
+the stream parser is **unreachable in production** until Phase 31 flips the
+launch path off `--output-format json`, and **no fixture is a real capture** —
+no archived capture contains checkpoint gate text, and none contains a prompt
+echo at all, so the prompt-echo false positive is closed as reasoned rather than
+witnessed.
+
+30-04 also revised two binding review constraints against measurement: the
+idle-timeout floor moved from ~12s to ≥30s, and the drain gate is now
+characterised as defensive rather than load-bearing (kept as an `AND`
+regardless — see ROADMAP.md constraints 7 and 8).
 
 ---
 
@@ -104,9 +132,9 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 28 (close-the-checkpoint-answer-return-path) — EXECUTING
-Plan: 1 of 6
-Status: Ready to execute
+Phase: 30 (keep-the-session-alive-past-turn-end) — ALL PLANS EXECUTED
+Plan: 5 of 5
+Status: Ready for verification
 real action is `/gsd-review-backlog` to promote a 999.x entry, or `/gsd-ship 27`
 to merge this phase. `phase.complete` auto-advanced this field to "999.1 — Hermes
 Support (BACKLOG)" because its next-phase scan walks into the backlog section;
