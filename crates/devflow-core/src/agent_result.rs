@@ -611,13 +611,120 @@ fn parse_codex_event_result(stdout: &str) -> Option<AgentResult> {
     })
 }
 
-/// TDD RED stub (30-01) — replaced by the real implementation in the next
-/// commit. Returns `None` so the wiring below compiles and the new tests fail
-/// on their assertions rather than on a compile error (this repository's
-/// acceptance rule 3 rejects a compile failure as evidence of RED).
+/// Parse a captured stdout as JSONL: one `serde_json::Value` per non-blank,
+/// parseable line. Lines that are not valid JSON are dropped, so a stream
+/// interleaved with plain-text progress noise still yields its events.
+///
+/// Shared by [`is_claude_event_stream`] and [`last_top_level_result`], which
+/// both need the same parsed vector. Deliberately NOT retrofitted into
+/// [`parse_codex_event_result`], which open-codes the identical idiom: that
+/// parser is correct and shipping, and rewriting it would put an unrelated
+/// adapter's behavior at risk for a cosmetic dedupe.
+fn claude_stream_events(stdout: &str) -> Vec<serde_json::Value> {
+    stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .collect()
+}
+
+/// Determine whether parsed JSONL lines are a Claude `--output-format
+/// stream-json` event stream, as opposed to a single-document Claude envelope,
+/// a Codex `--json` stream, or plain text.
+///
+/// **Gates on `type: "system"` + `subtype: "init"` and NOTHING ELSE.**
+/// 30-RESEARCH.md offered an alternative — also gate on `type: "result"`
+/// carrying a `session_id` — and that alternative is WRONG; do not "restore"
+/// it. The single-document envelope that ships today is literally
+/// `{"type":"result",...,"session_id":"abc"}`, so a `result`-keyed gate would
+/// swallow every production capture in use and silently displace
+/// [`parse_devflow_result`] in the [`evaluate_layer1`] cascade — a change to
+/// the shipped Layer-1 verdict path, disguised as adding stream support
+/// (T-30-02). The `init` event is both stronger and earlier: it opens the
+/// stream and is present in all three archived captures
+/// (`30a-evidence/raw_output_v3.jsonl` lines 5, 32 and 47).
+///
+/// `single_doc_envelope_not_consumed_by_claude_stream_parser` is the test that
+/// fails if this gate is widened.
+fn is_claude_event_stream(events: &[serde_json::Value]) -> bool {
+    events.iter().any(|v| {
+        v.get("type").and_then(serde_json::Value::as_str) == Some("system")
+            && v.get("subtype").and_then(serde_json::Value::as_str) == Some("init")
+    })
+}
+
+/// The LAST top-level `type: "result"` event in a Claude stream capture.
+///
+/// One capture can hold several: a session kept alive across turns emits one
+/// terminal `result` per turn (the archived v3 stream carries three, at lines
+/// 19, 37 and 54, produced across task-notification wake-ups). The last is the
+/// session's final verdict, so an earlier turn must never decide the stage.
+///
+/// T-30-01: selection runs over TOP-LEVEL objects only — each value here is one
+/// whole JSONL line. A `result`-shaped structure the agent writes inside its own
+/// message text is inert string content and structurally unreachable from this
+/// scan. Never route this through [`json_scan`]/[`json_find_key`], which descend
+/// into nested objects; that is the same protection class as D-04/T-28-04's
+/// top-level-only `session_id` read.
+///
+/// A missing `parent_tool_use_id` is treated as top-level rather than required.
+/// Verified against the archived captures: no `result` event carries the key at
+/// all — it appears only on subagent `assistant`/`user` events.
+fn last_top_level_result(events: &[serde_json::Value]) -> Option<&serde_json::Value> {
+    events
+        .iter()
+        .rev()
+        .find(|v| v.get("type").and_then(serde_json::Value::as_str) == Some("result"))
+}
+
+/// Parse a Claude `--output-format stream-json` JSONL capture and read the
+/// `DEVFLOW_RESULT` marker out of its LAST `result` event.
+///
+/// The new sibling of [`parse_codex_event_result`], mirroring its shape. Only
+/// decisive when the capture is actually a Claude event stream (per
+/// [`is_claude_event_stream`]); every other shape returns `None` and falls
+/// through to the parser that owns it. Before this existed, a JSONL capture
+/// returned `None` from all four single-document parsers —
+/// `serde_json::from_str` on the whole multi-line document is a hard "trailing
+/// characters" error — so every Claude-driven stage fell through to Layer 2's
+/// coarse exit-code+commit heuristic.
+///
+/// A last `result` event with no marker returns `None` (defer to Layer 2)
+/// rather than an unconditional Success, matching the `turn.completed`
+/// convention: a marker-less turn must never silently advance a stage.
+///
+/// Passing the isolated `result` text to [`parse_marker_lines`] is the correct
+/// scoping, not a workaround. The marker is JSON-escaped inside a
+/// `"result":"..."` string value, so it can never appear as a line starting
+/// with `DEVFLOW_RESULT:` in the raw capture, and that parser's 4000-character
+/// tail window is smaller than a single stream `result` line. Once serde
+/// decodes the field the escaped newlines become real newlines and the existing
+/// tail scan works on it as designed.
 fn parse_claude_event_result(stdout: &str) -> Option<AgentResult> {
-    let _ = stdout;
-    None
+    let events = claude_stream_events(stdout);
+    if !is_claude_event_stream(&events) {
+        return None;
+    }
+
+    let result_text = last_top_level_result(&events)?
+        .get("result")
+        .and_then(serde_json::Value::as_str)?;
+
+    let mut result = parse_marker_lines(result_text)?;
+
+    // T-30-26: overwrite the agent-supplied `decided_by_layer` unconditionally.
+    // `parse_marker_lines` deserializes the agent's own marker JSON straight
+    // into `AgentResult`, and the field is `#[serde(default)]`, so an ordinary
+    // `{"status":"success"}` marker leaves it `None` while a hostile
+    // `{"status":"success","decided_by_layer":0}` leaves it `Some(0)`. Neither
+    // is acceptable: every other Layer-1 constructor in this module sets
+    // `Some(1)` explicitly, and `Some(0)` is a Layer-0 external-probe
+    // provenance that `classify_validate_outcome` (devflow-cli's
+    // `pipeline_outcomes.rs`) reads as `external` when classifying a Validate
+    // stage. An agent must not be able to claim a probe verdict it did not
+    // earn, so the value is derived here rather than trusted.
+    result.decided_by_layer = Some(1);
+    Some(result)
 }
 
 /// Scan the last ~4000 characters of `stdout` in reverse line order.
@@ -662,10 +769,20 @@ fn parse_marker_lines(stdout: &str) -> Option<AgentResult> {
 /// outrank the generic `is_error` check — rate-limit envelopes carry
 /// `is_error: true`, and classifying them `Failed` would kill the primary
 /// rate-limit resume cron path) → Claude envelope `is_error: true` (authoritative,
-/// overrides a success marker) → DEVFLOW_RESULT marker (portable; works for
-/// plain text and a Claude envelope's unwrapped `result` text) → Codex JSONL
-/// event stream (`turn.failed` decisive; `turn.completed` defers) → Codex
-/// plain-text rate-limit heuristic (least authoritative, stays last).
+/// overrides a success marker) → Claude `stream-json` JSONL event stream (the
+/// last `result` event's marker decides; a marker-less last turn defers) →
+/// DEVFLOW_RESULT marker (portable; works for plain text and a Claude
+/// envelope's unwrapped `result` text) → Codex JSONL event stream
+/// (`turn.failed` decisive; `turn.completed` defers) → Codex plain-text
+/// rate-limit heuristic (least authoritative, stays last).
+///
+/// The Claude stream parser's position is load-bearing in BOTH directions
+/// (T-30-03). The two single-document detectors stay ahead of it because they
+/// remain authoritative for the `--output-format json` envelope that ships
+/// today. It goes ahead of `parse_devflow_result` so that an adapter-specific
+/// stream capture is owned whole by the parser that understands its framing,
+/// rather than letting the generic 4000-character tail scan take a bite of a
+/// mid-line window of JSONL first.
 pub fn evaluate_layer1(project_root: &Path, phase: u32) -> Option<AgentResult> {
     let stdout_path = devflow_dir(project_root).join(format!("phase-{:02}-stdout", phase));
     // Read lossily: in monitor mode the agent's stdout reaches this file via
