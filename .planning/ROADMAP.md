@@ -2397,10 +2397,36 @@ consistent with this project's convention for infrastructure phases.
 **Depends on:** nothing structurally; 30a is closed; 30c is the gate on Phase 31 ever being
 planned.
 
+**Plans:** 5 plans across 3 waves (planned 2026-08-02). Waves 1 and 2 each run one Rust plan
+and one experiment plan in parallel — disjoint file sets, no overlap. Wave 3 is single-plan by
+construction, since all three 30b plans edit `agent_result.rs`.
+
 Plans:
 
-- [ ] TBD — `/gsd-plan-phase 30`; the planner MUST treat the review constraints as locked
-  design inputs and MUST NOT pull Phase 31's monitor/adapter work forward into this phase
+- [ ] 30-01-PLAN.md — 30b tracer: the end-to-end Claude stream slice. `claude_stream_events`,
+  `is_claude_event_stream`, `last_top_level_result`, `parse_claude_event_result`, wired into
+  `evaluate_layer1`, plus the isolation tests proving neither shipped capture shape is hijacked.
+  (wave 1)
+- [ ] 30-02-PLAN.md — 30c: the production-environment experiment. A standalone harness
+  replicating `spawn_monitor`'s process shape (read-only w.r.t. DevFlow source), its archived
+  evidence, and `30c-VERDICT.md`'s binary `delivery:` field — the gate on Phase 31. Ends in a
+  blocking operator sign-off. (wave 1, `autonomous: false`)
+- [ ] 30-03-PLAN.md — 30b expansion: `rate_limit_event`, stream envelope-failure, and
+  `claude_stream_session_id` wired into `session_id_from_capture`, preserving D-04's
+  top-level-only read discipline. (wave 2)
+- [ ] 30-04-PLAN.md — 30d: re-measure and archive exit timing as a multi-trial distribution,
+  plus the first observation of the undefined close-with-pending-tasks case. (wave 2)
+- [ ] 30-05-PLAN.md — 30b expansion: scope the checkpoint gate scan to top-level
+  `assistant`/`result` text, closing review constraint 3's prompt-echo false positive. (wave 3)
+
+Planner notes: the review constraints were treated as locked design inputs. Constraints 2, 3
+and 6 are implemented here; constraints 1, 4 and 5 are represented but NOT implemented — every
+plan carries a `<scope_fence>` forbidding any change to `monitor.rs`, `agents/claude.rs` or
+`pipeline_launch.rs`. Three citation errors in the phase's own source documents were found and
+corrected at plan time (see 30-01's `<corrections_to_source_documents>`), the most consequential
+being 30-RESEARCH.md's suggestion that the stream gate could key on `type: "result"` — which
+would have swallowed every shipped single-document envelope. That alternative is explicitly
+rejected in 30-01 and guarded by a regression test.
 
 ---
 
