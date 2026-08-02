@@ -518,12 +518,16 @@ const HUMAN_GATE_VALUE: &str = "blocking-human";
 /// "survives by accident" once the single-document invariant is gone). See that
 /// function for which events are eligible and why.
 ///
-/// The branch is gated on [`is_claude_event_stream`], so a single-document
+/// The branch is gated on [`claude_stream_gate_shape`], so a single-document
 /// envelope, plain text and a Codex stream all fall through to the two-target
-/// logic below, unchanged (T-30-25).
+/// logic below, unchanged (T-30-25). That predicate is deliberately weaker than
+/// [`is_claude_event_stream`]: requiring a parsed `system`/`init` here made a
+/// single torn line fail OPEN back to the raw scan, reinstating the echoed-prompt
+/// false positive this branch exists to remove. See it for why the verdict path
+/// keeps the stricter gate.
 pub fn blocking_human_checkpoint_reported(stdout: &str) -> bool {
     let events = claude_stream_events(stdout);
-    if is_claude_event_stream(&events) {
+    if claude_stream_gate_shape(&events) {
         return claude_stream_reports_human_gate(&events);
     }
     if text_reports_human_gate(stdout) {
@@ -719,6 +723,45 @@ fn is_claude_event_stream(events: &[serde_json::Value]) -> bool {
     events.iter().any(|v| {
         v.get("type").and_then(serde_json::Value::as_str) == Some("system")
             && v.get("subtype").and_then(serde_json::Value::as_str) == Some("init")
+    })
+}
+
+/// Evidence that a capture is a Claude `stream-json` capture for GATE-SCANNING
+/// purposes, tolerating a torn or absent `system`/`init` line.
+///
+/// **Why this is not [`is_claude_event_stream`], and must not be folded into
+/// it.** That predicate also gates the VERDICT cascade
+/// ([`parse_claude_event_result`]); widening it would let more shapes displace
+/// [`parse_devflow_result`] and change shipped Layer-1 behaviour, which is
+/// exactly what T-30-02 forbids. It must keep requiring a parsed `init`.
+///
+/// The gate path needs a weaker precondition because its failure directions are
+/// asymmetric. [`claude_stream_events`] drops any line that fails to parse, so a
+/// single torn `init` — a truncated write, a concurrent read of a capture still
+/// being appended to — made the whole capture unrecognised and sent
+/// [`blocking_human_checkpoint_reported`] back to scanning RAW STDOUT, which
+/// under a stream capture contains the operator's prompt echoed back as a `user`
+/// event. The scoping added for review constraint 3 therefore failed OPEN, into
+/// the very false positive it exists to close (cross-AI code review, gpt-5.6-sol,
+/// 2026-08-02, High finding 2).
+///
+/// Keeps only `system`/`user`/`assistant`. `result` is deliberately EXCLUDED:
+/// the single-document envelope that ships today is literally
+/// `{"type":"result",…}`, and admitting it here would divert every production
+/// capture off the raw-scan path (T-30-25). Codex streams are excluded for free
+/// — their top-level types are dotted (`thread.started`, `item.completed`,
+/// `turn.completed`), so a Codex capture still falls through to the two-target
+/// logic unchanged.
+///
+/// Residual, accepted: a Claude stream carrying ONLY `result` events and a torn
+/// `init` is still unrecognised. Such a capture's raw stdout holds only
+/// agent-authored result text, so the echoed-prompt surface is absent anyway.
+fn claude_stream_gate_shape(events: &[serde_json::Value]) -> bool {
+    events.iter().any(|v| {
+        matches!(
+            v.get("type").and_then(serde_json::Value::as_str),
+            Some("system" | "user" | "assistant")
+        )
     })
 }
 
@@ -2376,6 +2419,114 @@ mod tests {
             checkpoint_reported_in_capture(dir.path(), 31),
             "a genuine declaration read from the capture file must still \
              report a checkpoint"
+        );
+    }
+
+    /// **The fail-open regression.** A torn `system`/`init` line must not send
+    /// gate scanning back to raw stdout.
+    ///
+    /// `claude_stream_events` silently drops any line that fails to parse, and
+    /// recognition used to require a successfully parsed `init`. So one
+    /// truncated first line — a partial write, or a read of a capture still
+    /// being appended to — made the whole capture unrecognised, and
+    /// `blocking_human_checkpoint_reported` fell back to scanning raw stdout,
+    /// which under a stream capture contains the echoed prompt. The constraint-3
+    /// scoping failed OPEN, into the exact false positive it exists to close.
+    /// Found by cross-AI code review (gpt-5.6-sol, 2026-08-02, High finding 2).
+    ///
+    /// Envelopes are real (v3 `user` + `result`); the `init` line is a real one
+    /// truncated mid-token, and the gate text payload is synthetic — no archived
+    /// capture contains gate text or a prompt echo.
+    #[test]
+    fn blocking_human_checkpoint_reported_false_when_init_is_torn() {
+        let torn_init = &V3_INIT_EVENT[..40];
+        assert!(
+            serde_json::from_str::<serde_json::Value>(torn_init).is_err(),
+            "fixture precondition: the truncated init must actually fail to parse"
+        );
+
+        let capture = format!(
+            "{}\n{}\n{}\n",
+            torn_init,
+            v3_message_event(V3_USER_EVENT, &gate_documenting_text()),
+            v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+        );
+        assert!(
+            !blocking_human_checkpoint_reported(&capture),
+            "a torn init must not re-enable the raw-stdout scan and let the \
+             echoed prompt read as a gate declaration"
+        );
+
+        // Same capture, init intact — proves the negative above is the torn-init
+        // path being handled, not the fixture simply lacking gate text.
+        let intact = stream_capture_of(&[
+            &v3_message_event(V3_USER_EVENT, &gate_documenting_text()),
+            &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+        ]);
+        assert!(
+            !blocking_human_checkpoint_reported(&intact),
+            "control: the same capture with a valid init is also false"
+        );
+
+        // And a real declaration is still detected with the init torn, so the
+        // fix did not degenerate into always-false (T-30-24).
+        let declared = format!(
+            "{}\n{}\n{}\n",
+            torn_init,
+            v3_message_event(V3_USER_EVENT, &gate_documenting_text()),
+            v3_result_event(V3_RESULT_TURN1, &gate_declaration_text()),
+        );
+        assert!(
+            blocking_human_checkpoint_reported(&declared),
+            "a genuine declaration must still be detected when init is torn"
+        );
+    }
+
+    /// A stream with NO `init` at all is likewise scoped rather than raw-scanned.
+    /// Same fail-open class as the torn-init case; reported by the same review.
+    #[test]
+    fn blocking_human_checkpoint_reported_false_when_init_is_absent() {
+        let capture = format!(
+            "{}\n{}\n",
+            v3_message_event(V3_USER_EVENT, &gate_documenting_text()),
+            v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+        );
+        assert!(
+            !blocking_human_checkpoint_reported(&capture),
+            "an init-less stream must still scope the gate scan to result events"
+        );
+    }
+
+    /// **The mandatory over-correction controls.** Widening stream recognition
+    /// must not divert the three non-stream inputs off the raw-scan path they
+    /// have always used (T-30-25). Each carries genuine gate text and must
+    /// still report `true`; if any flips to `false`, the widening has started
+    /// suppressing real gates.
+    #[test]
+    fn non_stream_captures_still_use_the_raw_scan_after_widening() {
+        let plain = format!("Some narration.\n{}\n", gate_declaration_text());
+        assert!(
+            blocking_human_checkpoint_reported(&plain),
+            "plain text must still be raw-scanned"
+        );
+
+        let single_doc = v3_result_event(V3_RESULT_TURN1, &gate_declaration_text());
+        assert!(
+            blocking_human_checkpoint_reported(&single_doc),
+            "a single-document envelope must still be raw-scanned — it is \
+             `{{\"type\":\"result\"}}`, which claude_stream_gate_shape excludes"
+        );
+
+        let codex = format!(
+            "{{\"type\":\"thread.started\",\"thread_id\":\"t1\"}}\n\
+             {{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\
+             \"text\":\"{}\"}}}}\n",
+            gate_declaration_text().replace('"', "\\\"")
+        );
+        assert!(
+            blocking_human_checkpoint_reported(&codex),
+            "a Codex stream must still be raw-scanned — its top-level types are \
+             dotted, so claude_stream_gate_shape excludes it"
         );
     }
 
