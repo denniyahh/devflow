@@ -2192,6 +2192,193 @@ mod tests {
         assert!(checkpoint_reported_in_capture(dir.path(), 11));
     }
 
+    // ---- stream-capture gate scoping (plan 30-05) --------------------------
+    //
+    // Fixtures for this cluster live with the other v3 envelopes further down:
+    // `V3_USER_EVENT`, `V3_ASSISTANT_TOP_LEVEL_EVENT`,
+    // `V3_ASSISTANT_SUBAGENT_EVENT`, `gate_declaration_text` and
+    // `gate_documenting_text`. Read their doc comments before adding a case —
+    // they record which capture line each envelope came from and that every
+    // gate payload is synthetic.
+    //
+    // Each negative asserts a NEGATIVE CONTROL first: `text_reports_human_gate`
+    // must still match the raw capture. Without it a negative would also pass
+    // against a fixture that simply contains no gate text, and would keep
+    // passing if someone deleted the gate line from the fixture.
+
+    /// **REGRESSION — review constraint 3, the prompt-echo false positive.**
+    ///
+    /// Under a single-document envelope the only place gate text can appear is
+    /// the one `result` field the agent authored, so scanning raw stdout is
+    /// safe. A stream capture breaks that invariant: text DevFlow never
+    /// authored is echoed back into the same stdout, and a substring scan
+    /// cannot tell which event it is inside.
+    ///
+    /// A failure here means a checkpoint auto-decide can fire, or the resume
+    /// ceiling be consumed, on a stage whose prompt merely DISCUSSED
+    /// checkpoints — and DevFlow's own planning documents are exactly that kind
+    /// of prompt content.
+    #[test]
+    fn blocking_human_checkpoint_reported_false_for_gate_text_in_user_event() {
+        let capture = stream_capture_of(&[
+            &v3_message_event(V3_USER_EVENT, &gate_documenting_text()),
+            &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+        ]);
+        assert!(
+            text_reports_human_gate(&capture),
+            "negative control: the raw capture must still contain matchable \
+             gate text, or this test asserts nothing"
+        );
+        assert!(
+            !blocking_human_checkpoint_reported(&capture),
+            "gate text inside a `user` event is echoed input, not an agent \
+             declaration (review constraint 3)"
+        );
+    }
+
+    /// **REGRESSION — T-30-22.** Gate text forwarded from a subagent is not the
+    /// orchestrator declaring a gate. Mistaking subagent-forwarded content for
+    /// orchestrator output is the error that invalidated the v1 experiment
+    /// outright and got its whole capture discarded.
+    ///
+    /// Two independent guards reject this event — the type filter (it is an
+    /// `assistant` event) and the provenance filter (its `parent_tool_use_id`
+    /// is non-null). The case is kept even though either alone suffices: they
+    /// are meant to fail independently, so a future widening of the type filter
+    /// cannot silently inherit subagent content.
+    #[test]
+    fn blocking_human_checkpoint_reported_false_for_subagent_forwarded_gate_text() {
+        let capture = stream_capture_of(&[
+            &v3_message_event(V3_ASSISTANT_SUBAGENT_EVENT, &gate_documenting_text()),
+            &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+        ]);
+        assert!(
+            text_reports_human_gate(&capture),
+            "negative control: the raw capture must still contain matchable \
+             gate text, or this test asserts nothing"
+        );
+        assert!(
+            !blocking_human_checkpoint_reported(&capture),
+            "a subagent's forwarded text cannot present as the orchestrator's \
+             own gate declaration"
+        );
+    }
+
+    /// **REGRESSION — T-30-26, the surface cross-AI review found.**
+    ///
+    /// Narration is not declaration. The envelope is v3 line 6, whose captured
+    /// payload is mid-turn narration appearing in NO `result` event of the
+    /// capture — so admitting top-level `assistant` events would add a
+    /// genuinely new trusted surface, not merely duplicate the result text.
+    /// An agent narrating the checkpoint task it is about to work on would then
+    /// trip the gate: the prompt-echo false positive, recreated one layer
+    /// inward.
+    ///
+    /// Nothing observed is lost by excluding the class: turn-FINAL assistant
+    /// text is duplicated verbatim into the `result` event that follows it
+    /// (v3 lines 17→19, 36→37, 53→54).
+    #[test]
+    fn blocking_human_checkpoint_reported_false_for_top_level_assistant_narration() {
+        let capture = stream_capture_of(&[
+            &v3_message_event(V3_ASSISTANT_TOP_LEVEL_EVENT, &gate_documenting_text()),
+            &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+        ]);
+        assert!(
+            text_reports_human_gate(&capture),
+            "negative control: the raw capture must still contain matchable \
+             gate text, or this test asserts nothing"
+        );
+        assert!(
+            !blocking_human_checkpoint_reported(&capture),
+            "intermediate assistant narration discussing a gate is not a live \
+             gate declaration"
+        );
+    }
+
+    /// The positive that stops the scoping from degenerating into always-false
+    /// — which would pass every negative above while silently dropping every
+    /// real human authorization request (T-30-24).
+    #[test]
+    fn blocking_human_checkpoint_reported_true_for_top_level_result_declaration() {
+        let capture = stream_capture_of(&[
+            &v3_message_event(V3_USER_EVENT, "Execute the plan."),
+            &v3_result_event(V3_RESULT_TURN1, &gate_declaration_text()),
+        ]);
+        assert!(
+            blocking_human_checkpoint_reported(&capture),
+            "a gate declared in a top-level `result` event's own result text \
+             must still be detected under a stream capture"
+        );
+    }
+
+    /// **T-30-27.** Detection asks whether a gate fired ANYWHERE in the stage,
+    /// so it deliberately does NOT inherit plan 30-01's last-result-wins
+    /// verdict semantics. A gate declared in turn 1 followed by
+    /// task-notification wake-up turns — the exact turn shape the v3 capture
+    /// archives — must not be dropped in favour of the later, silent results.
+    ///
+    /// Losing a checkpoint report is the opposite-direction harm from the false
+    /// positive this plan closes, and the worse of the two: it silently drops a
+    /// request for human authorization to the generic gate.
+    #[test]
+    fn blocking_human_checkpoint_reported_true_when_only_first_result_declares_gate() {
+        let capture = v3_stream_capture(&gate_declaration_text(), NO_MARKER, NO_MARKER);
+        assert!(
+            blocking_human_checkpoint_reported(&capture),
+            "detection must scan every top-level `result` event, not only the \
+             last one"
+        );
+    }
+
+    /// The overcorrection guard: an echo and a genuine declaration can coexist
+    /// in one capture, and the scoping must resolve per event rather than
+    /// suppressing any capture that contains an echo.
+    #[test]
+    fn blocking_human_checkpoint_reported_true_when_echo_co_occurs_with_declaration() {
+        let capture = stream_capture_of(&[
+            &v3_message_event(V3_USER_EVENT, &gate_documenting_text()),
+            &v3_result_event(V3_RESULT_TURN1, &gate_declaration_text()),
+        ]);
+        assert!(
+            blocking_human_checkpoint_reported(&capture),
+            "an echoed prompt in the same capture must not suppress a genuine \
+             declaration"
+        );
+    }
+
+    /// The same scoping, proven on the path production actually consumes —
+    /// `checkpoint_reported_in_capture` reading `.devflow/phase-NN-stdout` from
+    /// disk. Both directions are asserted in one test on purpose: the negative
+    /// alone cannot distinguish correct scoping from a wrapper that stopped
+    /// reading the file at all.
+    #[test]
+    fn checkpoint_reported_in_capture_scopes_stream_gate_text_to_result_events() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+
+        let echo_only = stream_capture_of(&[
+            &v3_message_event(V3_USER_EVENT, &gate_documenting_text()),
+            &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+        ]);
+        std::fs::write(stdout_path(dir.path(), 30), &echo_only).unwrap();
+        assert!(
+            !checkpoint_reported_in_capture(dir.path(), 30),
+            "an echoed gate mention read from the capture file must not report \
+             a checkpoint"
+        );
+
+        let declared = stream_capture_of(&[
+            &v3_message_event(V3_USER_EVENT, &gate_documenting_text()),
+            &v3_result_event(V3_RESULT_TURN1, &gate_declaration_text()),
+        ]);
+        std::fs::write(stdout_path(dir.path(), 31), &declared).unwrap();
+        assert!(
+            checkpoint_reported_in_capture(dir.path(), 31),
+            "a genuine declaration read from the capture file must still \
+             report a checkpoint"
+        );
+    }
+
     #[test]
     fn codex_event_stream_parses_turn_failed() {
         let stdout = concat!(
@@ -2405,6 +2592,98 @@ mod tests {
     /// v3 line 54 — the THIRD and LAST turn's terminal `result` event. This is
     /// the one whose marker must decide the stage.
     const V3_RESULT_TURN3: &str = r#"{"is_error":false,"duration_api_ms":39273,"num_turns":2,"stop_reason":"end_turn","session_id":"559fef4d-2053-459e-b7a7-f3200c3b3790","total_cost_usd":0.6599295,"usage":{"input_tokens":4,"cache_creation_input_tokens":999,"cache_read_input_tokens":77871,"output_tokens":302,"service_tier":"standard","inference_geo":"not_available","speed":"standard"},"permission_denials":[],"terminal_reason":"completed","fast_mode_state":"off","origin":{"kind":"task-notification"},"subtype":"success","api_error_status":null,"result":"__MARKER__","ttft_ms":2099,"time_to_request_ms":14,"type":"result","duration_ms":5276,"uuid":"dc76186e-3e9a-4d52-9152-27aa5012bc41"}"#;
+
+    // ---- prompt-echo regression fixtures (plan 30-05) ----------------------
+    //
+    // Message-event envelopes from the same archived capture. Same sentinel
+    // discipline as the `result` envelopes above — the innermost text payload
+    // is replaced with `__MARKER__` and each test fills it — plus a third
+    // documented modification noted per constant where inert bulk is dropped.
+    // The ENVELOPE is real: every `type`, `parent_tool_use_id`, `session_id`
+    // and `uuid` value, and the nesting shape the extraction path walks, is
+    // exactly as captured.
+    //
+    // NO archived capture contains checkpoint gate text at all — the 30a
+    // harness prompt was about background tasks and never mentioned gates. So
+    // every gate payload below is SYNTHETIC and must not be described as an
+    // observed rendering. What IS observed is the gate VALUE's markdown
+    // code-span rendering, transcribed from the live 2026-07-31 A1 run (see
+    // `HUMAN_GATE_VALUE`), which every fixture here reproduces.
+
+    /// v3 line 10 — a TOP-LEVEL `user` event (`parent_tool_use_id` null).
+    ///
+    /// Modification 3: the trailing `tool_use_result` object is dropped. It is
+    /// inert for every function under test and embeds both a developer home
+    /// directory and the child agent's full prompt; `devflow-core` is published
+    /// to crates.io.
+    ///
+    /// **The archived capture contains no echoed prompt.** Every `user` event
+    /// in it is a `tool_result` relay, because the 30a harness ran a single
+    /// prompt with no re-injection. This fixture's payload therefore STANDS IN
+    /// for an echoed prompt rather than reproducing one. The substitution is
+    /// sound for what is under test: the scan's first filter keys on the
+    /// event's `type`, which is `user` in both cases, and
+    /// `claude_stream_reports_human_gate` excludes that whole class — an echoed
+    /// prompt and a re-injected notification summary are the two members of it.
+    const V3_USER_EVENT: &str = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_01FVk15W8zxiazXutJYn8rsv","type":"tool_result","content":[{"type":"text","text":"__MARKER__"}]}]},"parent_tool_use_id":null,"session_id":"559fef4d-2053-459e-b7a7-f3200c3b3790","uuid":"60c5839e-40b3-492a-83e7-00882189f1d3","timestamp":"2026-08-02T00:22:22.603Z"}"#;
+
+    /// v3 line 6 — a TOP-LEVEL `assistant` event (`parent_tool_use_id` null).
+    ///
+    /// Its captured payload is `I'll spawn both subagents in the background
+    /// now.` — mid-turn narration that appears in NO `result` event of the
+    /// capture, re-confirmed by re-parsing all 54 lines at execution time. That
+    /// property is the entire reason this envelope was chosen: it proves
+    /// top-level assistant text is not merely a preview of the result text, so
+    /// admitting the class would add a genuinely new trusted surface.
+    ///
+    /// Modification 3: the `usage.cache_creation` sub-object is dropped (inert).
+    const V3_ASSISTANT_TOP_LEVEL_EVENT: &str = r#"{"type":"assistant","message":{"model":"claude-opus-5","id":"msg_011Cdcy3oC1a4rcmbp3avDYX","type":"message","role":"assistant","content":[{"type":"text","text":"__MARKER__"}],"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":2,"cache_creation_input_tokens":18673,"cache_read_input_tokens":15273,"output_tokens":1,"service_tier":"standard","inference_geo":"not_available"},"diagnostics":null,"context_management":null},"parent_tool_use_id":null,"session_id":"559fef4d-2053-459e-b7a7-f3200c3b3790","uuid":"85e8747b-e551-47b7-af38-fcd3bb1e06f8","timestamp":"2026-08-02T00:22:18.742Z","request_id":"req_011Cdcy3ngzpMCk3bijt1nkE"}"#;
+
+    /// v3 line 11 — a SUBAGENT-forwarded `assistant` event. Its captured
+    /// `parent_tool_use_id` (`toolu_01FVk15W8zxiazXutJYn8rsv`, the Task call
+    /// that spawned child A) is preserved verbatim: it is the whole point of
+    /// the fixture, and the discrimination whose absence invalidated the v1
+    /// experiment outright.
+    ///
+    /// Modification 3: the `usage.cache_creation` sub-object is dropped (inert).
+    const V3_ASSISTANT_SUBAGENT_EVENT: &str = r#"{"type":"assistant","message":{"model":"claude-opus-5","id":"msg_011Cdcy4BNkfziogNMFM8V7K","type":"message","role":"assistant","content":[{"type":"text","text":"__MARKER__"}],"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":2,"cache_creation_input_tokens":17705,"cache_read_input_tokens":0,"output_tokens":1,"service_tier":"standard","inference_geo":"not_available"},"diagnostics":null,"context_management":null},"parent_tool_use_id":"toolu_01FVk15W8zxiazXutJYn8rsv","session_id":"559fef4d-2053-459e-b7a7-f3200c3b3790","uuid":"3fb37d43-86af-48b1-ace4-55147ed47b15","timestamp":"2026-08-02T00:22:23.850Z","request_id":"req_011Cdcy4ASSvG8gf8fRwiWZW","subagent_type":"general-purpose","task_description":"Signal A after 10s"}"#;
+
+    /// Fill a message envelope's innermost text payload. Mirrors
+    /// [`v3_result_event`] and is kept separate from it so the assertion names
+    /// the right fixture family when a sentinel is lost.
+    fn v3_message_event(envelope: &str, text: &str) -> String {
+        assert!(
+            envelope.contains("__MARKER__"),
+            "fixture envelope lost its message-text sentinel"
+        );
+        envelope.replace("__MARKER__", text)
+    }
+
+    /// A checkpoint DECLARATION, as an agent's final message would render it,
+    /// escaped for a JSON string field (literal `\n`, the way `claude` emits
+    /// an agent's result text).
+    ///
+    /// The gate value carries the markdown CODE SPAN the live 2026-07-31 run
+    /// captured — see [`HUMAN_GATE_VALUE`]. A bare unquoted value would test a
+    /// rendering that has never been observed in production.
+    fn gate_declaration_text() -> String {
+        format!(
+            "## CHECKPOINT REACHED\\n\\n**Type:** decision\\n**Gate:** `{HUMAN_GATE_VALUE}`\\n**Plan:** 30-05\\n"
+        )
+    }
+
+    /// Text that merely DOCUMENTS a gate rendering — the shape a plan file, a
+    /// GSD reference document, or an agent narrating its next task carries.
+    /// Same code-span rendering as a real declaration, which is precisely why a
+    /// substring scan cannot tell the two apart and the EVENT must decide.
+    ///
+    /// Single line, no double quotes, so it drops into a JSON string field
+    /// without further escaping.
+    fn gate_documenting_text() -> String {
+        format!(
+            "The next task is declared **Gate:** `{HUMAN_GATE_VALUE}` in the plan, so the executor must stop rather than auto-select."
+        )
+    }
 
     // Synthetic `result`-text payloads (modification 1). Written exactly as
     // they appear INSIDE the envelope's `result` JSON string — escaped quotes
