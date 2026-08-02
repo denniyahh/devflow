@@ -3,11 +3,13 @@ phase: 30
 slug: keep-the-session-alive-past-turn-end
 # status lifecycle: draft (seeded by plan-phase) → validated (set by validate-phase §6)
 # audit-milestone §5.5 distinguishes NOT-VALIDATED (draft) from PARTIAL (validated + nyquist_compliant: false) (#2117)
-status: draft
-nyquist_compliant: false
+status: validated
+nyquist_compliant: true
 wave_0_complete: true
 created: 2026-08-02
 updated: 2026-08-02
+validated_at: "2026-08-02T23:50:00Z"
+validated_by: "manual re-execution of every mapped command; no nyquist auditor spawned"
 ---
 
 # Phase 30 — Validation Strategy
@@ -42,19 +44,57 @@ updated: 2026-08-02
 
 | Task ID | Plan | Wave | Unit | Threat Ref | Secure Behavior | Test Type | Automated Command | File Exists | Status |
 |---------|------|------|------|------------|-----------------|-----------|-------------------|-------------|--------|
-| 30-01-01 | 01 | 1 | 30b | T-30-01 / T-30-02 | Last-result selection reads only top-level JSONL objects; an agent-authored `origin`-shaped structure inside `result` text is inert | unit (end-to-end through `evaluate_layer1`) | `cargo test -p devflow-core --lib agent_result::tests::evaluate_layer1_parses_claude_stream_capture -- --exact` | ❌ W0 | ⬜ pending |
-| 30-01-02 | 01 | 1 | 30b | T-30-02 / T-30-03 | The stream gate cannot consume a single-document envelope or a Codex stream | unit (isolation) | `cargo test -p devflow-core --lib agent_result::` then `scripts/check.sh all` | ❌ W0 | ⬜ pending |
-| 30-02-01 | 02 | 1 | 30c | T-30-08 | Env-scrub list parsed from live `git.rs`; aborts rather than running an empty scrub | script parse + inspection | `python3 -c "import ast; ast.parse(open('.../30c-monitor-env-harness.py').read())"` | ❌ W0 | ⬜ pending |
-| 30-02-02 | 02 | 1 | 30c | T-30-06 / T-30-09 | No home paths or usernames in committed evidence; verdict derived from raw JSONL, not console output | manual-only (experiment) — see below | `test -s .../30c-evidence/raw_output.jsonl && rg -q '^delivery: (confirmed\|refuted)$' .../30c-VERDICT.md` | ❌ W0 | ⬜ pending |
-| 30-02-03 | 02 | 1 | 30c | T-30-09 | Operator independently recounts before the verdict gates Phase 31 | checkpoint:human-verify (blocking) | human | n/a | ⬜ pending |
-| 30-03-01 | 03 | 2 | 30b | T-30-12 / T-30-13 / T-30-15 | Rate-limit outranks marker and envelope-failure; `rate_limit_info` read via direct `.get()` | unit | `cargo test -p devflow-core --lib agent_result::tests::claude_stream` | ❌ W0 | ⬜ pending |
-| 30-03-02 | 03 | 2 | 30b | T-30-11 / T-30-14 | A `session_id` planted in agent-authored marker text is never returned; no `session_id` field added to `AgentResult` | unit (regression) | `cargo test -p devflow-core --lib agent_result::tests::claude_stream_session_id -- --exact` | ❌ W0 | ⬜ pending |
-| 30-04-01 | 04 | 2 | 30d | T-30-17 / T-30-19 | Children reaped on every exit path; monotonic clock for intervals | script parse + inspection | `python3 -c "import ast; ast.parse(open('.../30d-exit-timing-harness.py').read())"` | ❌ W0 | ⬜ pending |
-| 30-04-02 | 04 | 2 | 30d | T-30-16 / T-30-18 | Aggregates recomputable from archived per-trial files; no paths or usernames | manual-only (experiment) — see below | `rg -q '^mode_b_outcome: ' .../30d-MEASUREMENTS.md` | ❌ W0 | ⬜ pending |
-| 30-05-01 | 05 | 3 | 30b | T-30-21 / T-30-22 / T-30-23 | Gate scan excludes `user`/`system` events and non-top-level events; no `json_scan` traversal | unit | `cargo test -p devflow-core --lib agent_result::tests::blocking_human` | ❌ W0 | ⬜ pending |
-| 30-05-02 | 05 | 3 | 30b | T-30-21 / T-30-24 / T-30-25 | Prompt echo does not read as a live gate; a real declaration co-occurring with an echo still does | unit (regression cluster) | `cargo test -p devflow-core --lib agent_result::tests::blocking_human` then `scripts/check.sh all` | ❌ W0 | ⬜ pending |
+| 30-01-01 | 01 | 1 | 30b | T-30-01 / T-30-02 | Last-result selection reads only top-level JSONL objects; an agent-authored `origin`-shaped structure inside `result` text is inert | unit (end-to-end through `evaluate_layer1`) | `cargo test -p devflow-core --lib agent_result::tests::evaluate_layer1_parses_claude_stream_capture -- --exact` | ✅ | ✅ green |
+| 30-01-02 | 01 | 1 | 30b | T-30-02 / T-30-03 | The stream gate cannot consume a single-document envelope or a Codex stream | unit (isolation) | `cargo test -p devflow-core --lib agent_result::` then `scripts/check.sh all` | ✅ | ✅ green |
+| 30-02-01 | 02 | 1 | 30c | T-30-08 | Env-scrub list parsed from live `git.rs`; aborts rather than running an empty scrub | script parse + inspection | `python3 -c "import ast; ast.parse(open('.../30c-monitor-env-harness.py').read())"` | ✅ | ✅ green |
+| 30-02-02 | 02 | 1 | 30c | T-30-06 / T-30-09 | No home paths or usernames in committed evidence; verdict derived from raw JSONL, not console output | manual-only (experiment) — see below | `test -s .../30c-evidence/raw_output.jsonl && rg -q '^delivery: (confirmed\|refuted)$' .../30c-VERDICT.md` | ✅ | ✅ green |
+| 30-02-03 | 02 | 1 | 30c | T-30-09 | Operator independently recounts before the verdict gates Phase 31 | checkpoint:human-verify (blocking) | human | n/a | ✅ approved |
+| 30-03-01 | 03 | 2 | 30b | T-30-12 / T-30-13 / T-30-15 | Rate-limit outranks marker and envelope-failure; `rate_limit_info` read via direct `.get()` | unit | `cargo test -p devflow-core --lib agent_result::tests::claude_stream` | ✅ | ✅ green |
+| 30-03-02 | 03 | 2 | 30b | T-30-11 / T-30-14 | A `session_id` planted in agent-authored marker text is never returned; no `session_id` field added to `AgentResult` | unit (regression) | `cargo test -p devflow-core --lib agent_result::tests::claude_stream_session_id_` **(corrected at validation — see note A)** | ✅ | ✅ green |
+| 30-04-01 | 04 | 2 | 30d | T-30-17 / T-30-19 | Children reaped on every exit path; monotonic clock for intervals | script parse + inspection | `python3 -c "import ast; ast.parse(open('.../30d-exit-timing-harness.py').read())"` | ✅ | ✅ green |
+| 30-04-02 | 04 | 2 | 30d | T-30-16 / T-30-18 | Aggregates recomputable from archived per-trial files; no paths or usernames | manual-only (experiment) — see below | `rg -q '^mode_b_summary: ' .../30d-MEASUREMENTS.md` **(corrected at validation — see note B)** | ✅ | ✅ green |
+| 30-05-01 | 05 | 3 | 30b | T-30-21 / T-30-22 / T-30-23 | Gate scan excludes `user`/`system` events and non-top-level events; no `json_scan` traversal | unit | `cargo test -p devflow-core --lib agent_result::tests::blocking_human` | ✅ | ✅ green |
+| 30-05-02 | 05 | 3 | 30b | T-30-21 / T-30-24 / T-30-25 | Prompt echo does not read as a live gate; a real declaration co-occurring with an echo still does | unit (regression cluster) | `cargo test -p devflow-core --lib agent_result::tests::blocking_human` then `scripts/check.sh all` | ✅ | ✅ green |
 
 *Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
+
+### Validation run — 2026-08-02, every command re-executed
+
+Each row above was filled by **running its command and reading the reported count**, never
+its exit code. Measured results:
+
+| Task | Command result |
+|---|---|
+| 30-01-01 | `1 passed; 0 failed; 484 filtered out` |
+| 30-01-02 | `agent_result::` 119 passed; `scripts/check.sh all` exit 0; container parity `485 passed`, 22/22 result lines `0 failed` |
+| 30-02-01 | `ast.parse` exit 0 |
+| 30-02-02 | evidence non-empty AND `delivery: confirmed` matched |
+| 30-02-03 | operator-approved on 8 trials across 3 environments (recorded in `30-02-SUMMARY.md`) |
+| 30-03-01 | `16 passed; 0 failed; 469 filtered out` |
+| 30-03-02 | `4 passed; 0 failed; 481 filtered out` **after correction** |
+| 30-04-01 | `ast.parse` exit 0 |
+| 30-04-02 | `mode_b_summary: exits_cleanly` matched **after correction** |
+| 30-05-01 | `16 passed; 0 failed; 469 filtered out` |
+| 30-05-02 | as 30-05-01, plus `scripts/check.sh all` exit 0 |
+
+**Note A — 30-03-02's seeded command matched ZERO tests and still exited 0.** The literal
+`agent_result::tests::claude_stream_session_id -- --exact` reports
+`0 passed; 0 failed; 485 filtered out`. This is the standing `--exact` trap named in this
+very document, caught here by asserting on the count. Plan 30-03 had already found and
+documented it (`30-03-SUMMARY.md`: *"matches ZERO tests (proven by running it), because a
+test of that exact name would shadow the glob-imported function under test"*) but the map
+row was never updated. Corrected to the `claude_stream_session_id_` prefix, which matches
+the four real tests. **No coverage was missing — only the recorded command was wrong.**
+
+**Note B — 30-04-02 checked a field that was deliberately renamed.** `mode_b_outcome` does
+not exist in `30d-MEASUREMENTS.md`. Cross-AI review finding M2 required Mode B's result not
+be collapsed into a single token, so 30-04 replaced it with eleven independent per-trial
+fields plus a secondary `mode_b_summary`. The substance is **stronger** than the seeded
+check demanded; the check itself was stale. Corrected to `mode_b_summary`.
+
+Both notes are the same class of drift: a verification command written at plan time, made
+obsolete by a deliberate change during execution, and never re-run until validation. Both
+would have read as green to anyone checking exit codes.
 
 **Sampling continuity:** no three consecutive tasks lack an automated verify. The two
 experiment plans (30-02, 30-04) have script-parse automation on their build tasks and
@@ -104,6 +144,28 @@ each test's doc comment must say so. They may not be labelled "real capture".
 - [x] Wave 0 covers all MISSING references (fixture strategy resolved at plan time)
 - [x] No watch-mode flags
 - [x] Feedback latency < 1s for the scoped command (measured 0.39s wall)
-- [ ] `nyquist_compliant: true` — set by `/gsd-validate-phase` after execution, not here
+- [x] `nyquist_compliant: true` — set 2026-08-02 after execution. All 11 mapped rows verified
+      by re-running their commands and reading reported counts; two stale commands corrected
+      (notes A and B). Sampling continuity holds: no three consecutive tasks lack an
+      automated verify.
 
-**Approval:** pending — this contract is seeded by plan-phase and is validated after execution.
+**Approval:** validated 2026-08-02.
+
+### What this validation does NOT establish
+
+Recorded because `nyquist_compliant: true` is easy to over-read as "the feature is proven":
+
+- **Sampling adequacy, not production correctness.** Nyquist compliance says the phase was
+  sampled densely enough during execution. It says nothing about whether the code works in
+  production — and phase 30's stream parser is **unreachable in production** until Phase 31
+  flips the launch path off `--output-format json`.
+- **No fixture is a real capture.** No archived capture contains checkpoint gate text, and
+  none contains a prompt echo at all. Every gate assertion uses a real event envelope with a
+  synthetic payload. The prompt-echo false positive is closed as *reasoned*, not *witnessed*.
+- **The suite did not catch what the code review did.** All rows were green *before* the
+  cross-AI review found two High defects (`30-CODE-REVIEW.md`); one was a live fail-open,
+  fixed in `06675da`. Green rows here did not, and do not, imply defect-free. Two confirmed
+  defects remain open behind `evaluate_layer1` as ROADMAP constraint 9.
+- **No nyquist auditor was spawned.** Validation was done by re-executing the mapped
+  commands directly. This repo has previously had that agent write non-compiling tests on a
+  mid-arc phase; running the commands is the cheaper and more honest check.
