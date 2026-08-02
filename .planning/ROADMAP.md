@@ -1391,7 +1391,7 @@ Plans:
 
 ### Phase 999.70: Checkpoint Detection Cannot Tell a Gate DECLARATION From a Gate MENTION (BACKLOG)
 
-**Linear:** TBD — needs an issue
+**Linear:** [DEN-91](https://linear.app/denniskim/issue/DEN-91/99970-checkpoint-detection-cannot-tell-a-gate-declaration-from-a-gate)
 **Found:** 2026-08-02, cross-AI code review of phase 30 (codex/gpt-5.6-sol, high effort), Medium
 finding 1. Recorded in `30-CODE-REVIEW.md`.
 
