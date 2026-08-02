@@ -4,9 +4,9 @@ milestone: v2.0.0
 milestone_name: milestone (open — no fixed closing phase)
 current_phase: 28
 current_phase_name: close-the-checkpoint-answer-return-path
-status: shipped — PR #63 open to develop
+status: "shipped — PR #63 open to develop"
 stopped_at: "Phase 28 shipped — PR #63 (feature/phase-28 → develop), awaiting CI + merge"
-last_updated: "2026-08-02T11:50:33.571Z"
+last_updated: "2026-08-02T15:14:11.856Z"
 last_activity: 2026-08-02
 last_activity_desc: "Phase 30 planned: 5 plans, 3 waves (30b parser tracer + expansions, 30c delivery experiment, 30d exit-timing evidence); plan-checker passed"
 progress:

@@ -2464,8 +2464,10 @@ Plans:
 - The archived evidence contains no absolute home paths, OS usernames, session identifiers, or
   credentials. Raw CLI output is staged outside `.planning/` and published only after
   validation, structural redaction, and a secret scan.
+
 - No file under `crates/devflow-core/src/monitor.rs`, `crates/devflow-core/src/agents/`, or
   `crates/devflow-cli/src/` is modified by any plan in this phase.
+
 - `30c-VERDICT.md`'s `delivery:` field gates Phase 31, and — per cross-AI review finding 5 —
   also gates whether the 30b expansion plans (30-03, 30-05) land at all, since the shipped
   Claude adapter still emits single-document JSON (`agents/claude.rs`, `--output-format json`)
