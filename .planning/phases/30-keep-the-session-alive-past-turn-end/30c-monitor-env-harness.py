@@ -73,6 +73,10 @@ REPO_ROOT = os.path.abspath(os.path.join(HARNESS_DIR, os.pardir, os.pardir, os.p
 GIT_RS_PATH = os.path.join(REPO_ROOT, "crates", "devflow-core", "src", "git.rs")
 EVIDENCE_DIR = os.path.join(HARNESS_DIR, "30c-evidence")
 
+#: Trial 2 publishes here. Trial 1's evidence is never overwritten — the
+#: contaminated run is the comparison arm that makes trial 2 interpretable.
+EVIDENCE_DIR_SCRUBBED = os.path.join(HARNESS_DIR, "30c-evidence-scrubbed")
+
 #: The const names whose string literals form production's env-scrub list.
 SCRUB_CONST_NAMES = ("REPO_LOCAL_GIT_VARS", "ALSO_REDIRECTING_GIT_VARS")
 
@@ -143,6 +147,27 @@ def build_child_env(
     env = dict(os.environ if base is None else base)
     removed = [name for name in scrub_names if env.pop(name, None) is not None]
     return env, removed
+
+
+def discover_agent_session_markers(env: Optional[dict[str, str]] = None) -> list[str]:
+    """Every ``CLAUDE*`` / ``ANTHROPIC*`` / ``AI_AGENT*`` name present.
+
+    Trial 1 left these in place and recorded them, because production's env
+    scrub (the ``git.rs`` lists) does not touch them. That left one hypothesis
+    alive: ``CLAUDECODE`` / ``CLAUDE_CODE_ENTRYPOINT`` could plausibly trigger
+    nested-session detection, so trial 1 would have proven delivery works
+    INSIDE an agent session rather than in production's plain shell.
+
+    Trial 2 removes them to kill that hypothesis. Credential-named members
+    (``ANTHROPIC_API_KEY``, ``ANTHROPIC_TOKEN``) are NOT special-cased here:
+    both this run's and the 30a baseline's ``init`` events report
+    ``apiKeySource: "none"``, i.e. the CLI authenticates from stored
+    credentials and is already ignoring those variables. If removing them
+    nonetheless breaks authentication, that is a reportable result — not
+    something to quietly restore.
+    """
+    env = os.environ if env is None else env
+    return sorted(name for name in env if CLAUDE_MARKER_PATTERN.match(name))
 
 
 def describe_env_residue(env: dict[str, str]) -> dict[str, Any]:
@@ -245,6 +270,8 @@ class LaunchedRun:
     scrubbed_vars: list[str]
     residue: dict[str, Any]
     started_at: float
+    #: Agent-session markers removed beyond the git list (trial 2 only).
+    scrubbed_markers: list[str] = field(default_factory=list)
 
 
 def make_stage_dir() -> str:
@@ -266,12 +293,18 @@ def launch_in_monitor_env(
     argv: Optional[list[str]] = None,
     stage_dir: Optional[str] = None,
     git_rs_path: str = GIT_RS_PATH,
+    extra_scrub_names: Optional[Iterable[str]] = None,
 ) -> LaunchedRun:
     """Launch the CLI inside a replica of ``spawn_monitor``'s environment.
 
     Returns the launched process together with the staged paths it writes to.
     The caller owns ``proc.stdin`` and is responsible for closing it — holding
     it open is the variable under test.
+
+    ``extra_scrub_names`` removes variables BEYOND production's git lists. It
+    is empty by default, so the production replica is unchanged and plan
+    30-04's reuse is unaffected; trial 2 passes the agent-session markers
+    through it to test whether those markers were carrying the trial-1 result.
     """
     stage_dir = stage_dir or make_stage_dir()
     paths = {
@@ -287,7 +320,10 @@ def launch_in_monitor_env(
         workdir, paths["stdout_path"], paths["stderr_path"], paths["pid_path"], paths["exit_path"]
     )
     scrub_names = parse_git_scrub_vars(git_rs_path)
-    child_env, removed = build_child_env(scrub_names)
+    extra = sorted(set(extra_scrub_names or ()))
+    child_env, removed_all = build_child_env(list(scrub_names) + extra)
+    removed = [name for name in removed_all if name not in extra]
+    removed_markers = [name for name in removed_all if name in extra]
     argv = list(argv or DEFAULT_CLI_ARGV)
 
     started_at = time.time()
@@ -311,6 +347,7 @@ def launch_in_monitor_env(
         workdir=workdir,
         argv=argv,
         scrubbed_vars=removed,
+        scrubbed_markers=removed_markers,
         residue=describe_env_residue(child_env),
         started_at=started_at,
         **paths,
@@ -786,8 +823,10 @@ def _run_log_lines(run: LaunchedRun, obs: Observations, version: str, stage_dir:
         "harness_holds_child_stdin_open: true",
         "",
         "## Environment scrub (names only)",
+        f"trial: {'2 — agent-session markers ALSO scrubbed' if run.scrubbed_markers else '1 — production git scrub only'}",
         f"scrub_list_source: crates/devflow-core/src/git.rs ({len(run.scrubbed_vars)} of the parsed names were present and removed)",
         f"removed_variables: {', '.join(run.scrubbed_vars) or '(none were set)'}",
+        f"removed_agent_session_markers: {', '.join(run.scrubbed_markers) or '(none — trial 1 leaves these in place)'}",
         "",
         "## Residual environment the scrub cannot remove (names only, never values)",
         f"parent_process: {residue['parent_process']}",
@@ -820,7 +859,12 @@ def _run_log_lines(run: LaunchedRun, obs: Observations, version: str, stage_dir:
     return lines
 
 
-def main() -> int:
+def main(argv: Optional[list[str]] = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    scrub_markers = "--scrub-agent-markers" in argv
+    evidence_dir = EVIDENCE_DIR_SCRUBBED if scrub_markers else EVIDENCE_DIR
+    markers = discover_agent_session_markers() if scrub_markers else []
+
     version = resolve_cli_version()
     if version != EXPECTED_CLI_VERSION:
         raise HarnessError(
@@ -836,9 +880,16 @@ def main() -> int:
     }
     prompt = PROMPT_TEMPLATE.format(signal_a=signal_paths["A"], signal_b=signal_paths["B"])
 
+    print(f"[harness] trial {'2 (agent-session markers scrubbed)' if scrub_markers else '1 (production git scrub only)'}", flush=True)
+    if scrub_markers:
+        print(f"[harness] extra scrub targets: {markers}", flush=True)
     print(f"[harness] staging raw output in {stage_dir}", flush=True)
-    run = launch_in_monitor_env(REPO_ROOT, prompt, stage_dir=stage_dir)
-    print(f"[harness] launched; scrubbed {len(run.scrubbed_vars)} git vars; prompt sent, stdin HELD OPEN", flush=True)
+    run = launch_in_monitor_env(REPO_ROOT, prompt, stage_dir=stage_dir, extra_scrub_names=markers)
+    print(
+        f"[harness] launched; scrubbed {len(run.scrubbed_vars)} git vars + "
+        f"{len(run.scrubbed_markers)} agent markers; prompt sent, stdin HELD OPEN",
+        flush=True,
+    )
 
     obs = observe_run(run, signal_paths)
 
@@ -848,11 +899,11 @@ def main() -> int:
 
     ctx = RedactionContext.build()
     published = [
-        publish_jsonl(run.stdout_path, os.path.join(EVIDENCE_DIR, "raw_output.jsonl"), ctx),
-        publish_text(run.stderr_path, os.path.join(EVIDENCE_DIR, "stderr.log"), ctx),
+        publish_jsonl(run.stdout_path, os.path.join(evidence_dir, "raw_output.jsonl"), ctx),
+        publish_text(run.stderr_path, os.path.join(evidence_dir, "stderr.log"), ctx),
     ]
     log_body = "\n".join(_run_log_lines(run, obs, version, stage_dir)) + "\n"
-    published.append(publish_text(log_body, os.path.join(EVIDENCE_DIR, "run.log"), ctx, is_text=True))
+    published.append(publish_text(log_body, os.path.join(evidence_dir, "run.log"), ctx, is_text=True))
 
     print("\n[harness] published (sanitised) —")
     for entry in published:
