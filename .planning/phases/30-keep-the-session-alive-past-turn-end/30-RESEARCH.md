@@ -685,7 +685,7 @@ Phase 31's adapter switch).
 consistent with the review's own explicit flags (M2, M4) plus two new findings from
 this session's fresh read of the captures (A2, A3).
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **Does `local_bash`-typed task tracking (Pitfall 6) ever appear in
    `background_tasks_changed`, under a different shape than observed in these 2
@@ -698,9 +698,13 @@ this session's fresh read of the captures (A2, A3).
      specific experiment's simple `sleep N` shape — real GSD plan/code work
      involves many more `Bash` tool calls per subagent, any of which could
      plausibly generate similar internal tracking.
-   - Recommendation: 30b's parser should not need to resolve this (it only needs
-     `local_agent` drain for the marker/last-result logic); flag explicitly for
-     Phase 31's monitor-close-gate design, which DOES depend on drain-completeness.
+   - **RESOLVED: deferred to Phase 31, not silently dropped.** 30b's parser does
+     not need to resolve this (it only needs `local_agent` drain for the
+     marker/last-result logic). Flagged explicitly for Phase 31's
+     monitor-close-gate design, which DOES depend on drain-completeness. 30-04's
+     Mode B harness additionally records every `local_bash` event it observes
+     (RESEARCH.md Assumption A2), so Phase 31 inherits more evidence than this
+     answer alone, not less.
 
 2. **What does the CLI do on close-with-pending-background-tasks (review H2, M4's
    sibling)?**
@@ -710,18 +714,19 @@ this session's fresh read of the captures (A2, A3).
    - What's unclear: Everything — does the process hang, does it deliver a final
      truncated result, does the orphaned subagent's work simply vanish (the
      original bug, reproduced by construction)?
-   - Recommendation: Out of this phase's explicit unit list (30a-30d), but 30c or
-     30d's harness could cheaply add ONE additional trial closing early, since the
-     harness scaffolding already exists — Claude's discretion whether to fold this
-     into 30d's re-measurement run or leave it fully to Phase 31.
+   - **RESOLVED: folded into this phase, not deferred.** Plan 30-04 Task 1 builds
+     a Mode B trial that closes stdin early with a pending background task and
+     archives the observed outcome (`exits_with_truncated_result`,
+     `child_work_lost`, or the alternative it actually measures) alongside the
+     Mode A exit-timing distribution. See 30-04-PLAN.md lines 108, 173, 180, 222.
 
 3. **Is the `thinking_tokens` event type ever decision-relevant?**
    - What we know: Appears twice per `init` recurrence (right after each of the 3
      `init` events in v3), no field payload observed beyond `type`/`subtype`.
    - What's unclear: Whether it ever carries content this parser should extract.
-   - Recommendation: Treat as ignorable (fall through, no match) in 30b's parser
-     unless a future capture shows otherwise — low risk, do not over-build against
-     an unknown.
+   - **RESOLVED: treat as ignorable, by explicit decision, not oversight.** 30b's
+     parser falls through on `thinking_tokens` (no match) unless a future capture
+     shows otherwise — low risk, do not over-build against an unknown.
 
 ## Environment Availability
 
