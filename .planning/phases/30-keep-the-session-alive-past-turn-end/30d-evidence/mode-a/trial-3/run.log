@@ -4,7 +4,7 @@ harness: 30d-exit-timing-harness.py (launcher imported from 30c-monitor-env-harn
 launcher_source: 30c-monitor-env-harness.py
 launcher_function: launch_in_monitor_env
 invocation: 30d-exit-timing-harness.py mode-a --iterations 3 --start-index 1
-staged_output_dir: /tmp/devflow-30c-p154cy1v
+staged_output_dir: /tmp/devflow-30c-ax5rbdj_
 clock: time.monotonic (not wall-clock: NTP adjustment shows up exactly at sub-second scale)
 
 ## Replicated from spawn_monitor (via 30c's launcher)
@@ -28,66 +28,69 @@ credential_named_var_count: 11 (names withheld per T-30-07)
 total_env_vars_in_child: 149
 
 ## Observation window
-observation_window_s: 61.748
+observation_window_s: 60.067
 observation_window_floor_s: None
-window_after_last_dispatch_s: 35.215
+window_after_last_dispatch_s: 30.198
 slowest_child_deadline_s: 22.0
 delivery_buffer_s: 30.0
 
 ## Close and exit
-stdin_closed_at_s: 56.467
+stdin_closed_at_s: 54.785
 close_precondition_met: True
 outstanding_local_agent_tasks_at_close: []
 process_exited: True
-exit_latency_ms: 241.5 (the CLI process itself)
-wrapper_exit_latency_ms: 246.3 (the sh wrapper that waits on it)
+exit_latency_ms: 242.0 (the CLI process itself)
+wrapper_exit_latency_ms: 267.8 (the sh wrapper that waits on it)
 exit_code: 0
 
 ## Stream facts
 result_events: 3
-results_after_close: 0
+results_at_close: 3
+results_after_close: 0 (counted, not timestamp-compared)
 final_result_truncated: False
-final_result_truncation_basis: the capture ends on a complete result event (is_error false, 219 chars) with no trailing assistant events
+final_result_truncation_basis: the capture ends on a complete result event (is_error false, 306 chars) with no trailing assistant events
 drained_event_observed: True
-drained_at_s: 36.946107537998614
-longest_quiet_gap_milestone_s: 10.672 (30c's definition — comparable to constraint 8)
-longest_quiet_gap_all_events_s: 5.974 (every parsed line — what an idle timer sees)
+drained_at_s: 36.993680276002124
+longest_quiet_gap_milestone_s: 11.235 (30c's definition — comparable to constraint 8)
+longest_quiet_gap_all_events_s: 7.046 (every parsed line — what an idle timer sees)
 unparseable_lines: 0
 untyped_task_entries: 0
-local_bash_events_recorded: 2
+local_bash_events_recorded: 4
 stderr_nonempty: False
 
 ## Children
 child_a_signal_file: present
 child_b_signal_file: present
-child_a_signal_at_s: 23.229
-child_b_signal_at_s: 32.868
+child_a_signal_at_s: 25.802
+child_b_signal_at_s: 34.392
 child_a_signal_contents: 'CHILD-A-DONE'
 child_b_signal_contents: 'CHILD-B-DONE'
 
 ## Cleanup (T-30-17)
-cleanup_action: process group 1063761 signalled (SIGTERM: skipped, group already empty); survivor check completed: True; no survivors
-cleanup_pgid: 1063761
-cleanup_census_pids_seen: 9
-cleanup_census_comms: claude, node-MainThread, npm exec @model, sh, sleep, zsh
+cleanup_action: process group 1131916 signalled (SIGTERM: skipped, group already empty); survivor check completed: True; no survivors
+cleanup_pgid: 1131916
+cleanup_census_pids_seen: 11
+cleanup_census_comms: bash, claude, hostnamectl, node-MainThread, npm exec @model, sh, sleep, zsh
 cleanup_steps: SIGTERM: skipped, group already empty
 cleanup_survivors_after_reap: []
 cleanup_survivor_check_completed: True
 
 ## Result events (origin verbatim)
-result[1]: at=t+9.203 origin=None turns=3 is_error=False stop_reason='end_turn' chars=28
-result[2]: at=t+36.795 origin='task-notification' turns=2 is_error=False stop_reason='end_turn' chars=236
-result[3]: at=t+41.421 origin='task-notification' turns=2 is_error=False stop_reason='end_turn' chars=219
+result[1]: at=t+11.181 origin=None turns=3 is_error=False stop_reason='end_turn' chars=28
+result[2]: at=t+35.774 origin='task-notification' turns=1 is_error=False stop_reason='end_turn' chars=512
+result[3]: at=t+39.784 origin='task-notification' turns=1 is_error=False stop_reason='end_turn' chars=306
 
 ## background_tasks_changed (local_agent entries only)
-btc: at=t+6.213 local_agent=1 ids=['a9f5014131307f4ee']
-btc: at=t+7.319 local_agent=2 ids=['a9f5014131307f4ee', 'ae3683deb7da116d2']
-btc: at=t+26.533 local_agent=1 ids=['ae3683deb7da116d2']
-btc: at=t+36.946 local_agent=0 ids=[]
+btc: at=t+7.828 local_agent=1 ids=['a2bd96eecc187f783']
+btc: at=t+9.114 local_agent=2 ids=['a2bd96eecc187f783', 'ae85101ecdf3aa27b']
+btc: at=t+29.869 local_agent=1 ids=['ae85101ecdf3aa27b']
+btc: at=t+36.994 local_agent=0 ids=[]
 
 ## local_bash events (recorded, never used for the drain gate — Pitfall 6)
-local_bash: at=t+12.867 {'at': 12.867, 'subtype': 'task_started', 'task_id': 'bm387hmpm', 'description': 'Wait 10 seconds'}
-local_bash: at=t+13.901 {'at': 13.901, 'subtype': 'task_started', 'task_id': 'buk0fq07w', 'description': 'Sleep 22s then write signal file'}
+local_bash: at=t+15.370 {'at': 15.37, 'subtype': 'task_started', 'task_id': 'brpd0kdas', 'description': 'Wait 10 seconds'}
+local_bash: at=t+15.370 {'at': 15.37, 'subtype': 'task_started', 'task_id': 'bi4vi28e0', 'description': 'Sleep 22s then write signal file'}
+local_bash: at=t+22.416 {'at': 22.416, 'subtype': 'task_notification', 'task_id': 'brpd0kdas', 'status': 'completed', 'has_usage': False}
+local_bash: at=t+34.442 {'at': 34.442, 'subtype': 'task_notification', 'task_id': 'bi4vi28e0', 'status': 'completed', 'has_usage': False}
 
 # No verdict is printed here by design: 30a records that the
 # harness-printed verdict was wrong in v1 and unreliable in v2.
