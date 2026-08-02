@@ -272,6 +272,13 @@ pub fn claude_session_id(stdout: &str) -> Option<String> {
     value.get("session_id")?.as_str().map(str::to_string)
 }
 
+/// TDD RED stub (plan 30-03 Task 2) — always declines, so the new tests fail
+/// on their assertions rather than on a compile error. Replaced in the GREEN
+/// commit.
+pub fn claude_stream_session_id(_stdout: &str) -> Option<String> {
+    None
+}
+
 /// Thin file-reading wrapper over [`claude_session_id`]: reads the phase's
 /// captured stdout file (via [`stdout_path`]) and delegates. `None` for a
 /// missing capture file, never an `Err` — mirrors [`evaluate_layer1`]'s
@@ -2563,6 +2570,146 @@ mod tests {
         assert_eq!(
             parse_claude_event_result(&healthy).map(|r| r.status),
             Some(AgentStatus::Success)
+        );
+    }
+
+    // ---- session id from a stream capture (plan 30-03 Task 2) -------------
+
+    /// The single `session_id` every event in the archived v3 capture carries —
+    /// all three `init` events (lines 5, 32 and 47) and all three `result`
+    /// events agree on it, confirmed by reading the capture.
+    const V3_SESSION_ID: &str = "559fef4d-2053-459e-b7a7-f3200c3b3790";
+
+    /// The real `init` event with its `session_id` substituted. Used only to
+    /// build a SYNTHETIC mid-stream rotation — no archived capture rotates.
+    fn v3_init_event_with_session(session_id: &str) -> String {
+        assert!(
+            V3_INIT_EVENT.contains(V3_SESSION_ID),
+            "fixture lost its session_id"
+        );
+        V3_INIT_EVENT.replace(V3_SESSION_ID, session_id)
+    }
+
+    /// `claude_stream_session_id` reads the CLI-emitted id out of a JSONL
+    /// capture built from the archived `init` events (v3 lines 5, 32 and 47 —
+    /// all three carry this same value).
+    ///
+    /// The second half pins LAST-init-wins with a synthetic rotation: the real
+    /// capture's three `init` events are identical, so first-wins and last-wins
+    /// agree on today's evidence and a fixture built only from it cannot tell
+    /// the two apart. Three `init` events do NOT mean three sessions.
+    #[test]
+    fn claude_stream_session_id_reads_cli_emitted_init_value() {
+        let capture = stream_capture_of(&[
+            &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+            V3_INIT_EVENT,
+            &v3_result_event(V3_RESULT_TURN2, NO_MARKER),
+            V3_INIT_EVENT,
+            &v3_result_event(V3_RESULT_TURN3, MARKER_SUCCESS),
+        ]);
+        assert_eq!(
+            claude_stream_session_id(&capture).as_deref(),
+            Some(V3_SESSION_ID)
+        );
+
+        let rotated = stream_capture_of(&[
+            &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+            &v3_init_event_with_session("second-session-id"),
+            &v3_result_event(V3_RESULT_TURN2, MARKER_SUCCESS),
+        ]);
+        assert_eq!(
+            claude_stream_session_id(&rotated).as_deref(),
+            Some("second-session-id")
+        );
+    }
+
+    /// D-04 / T-28-04 forgery guard for the stream path — the analog of
+    /// `session_id_in_devflow_result_marker_is_not_returned`, which pins the
+    /// same contract for the single-document envelope.
+    ///
+    /// The fixture defeats BOTH plausible wrong implementations at once: a
+    /// nested traversal (`json_find_key`/`json_scan`) would reach the
+    /// `session_id` the agent planted inside its own `DEVFLOW_RESULT` marker
+    /// text, and a "last event carrying a `session_id`" scan would return the
+    /// final `result` event's own key. Both are wrong; only the `init` event's
+    /// top-level value is CLI-emitted. The divergence between the `result`
+    /// event's id and the `init` event's is synthetic — no archived capture
+    /// diverges — and exists purely so those two implementations cannot pass.
+    #[test]
+    fn claude_stream_session_id_ignores_agent_planted_value() {
+        const PLANTED_MARKER: &str =
+            r#"Done.\nDEVFLOW_RESULT: {\"status\":\"success\",\"session_id\":\"forged-by-agent\"}"#;
+
+        let last_result = v3_result_event(V3_RESULT_TURN3, PLANTED_MARKER)
+            .replace(V3_SESSION_ID, "result-event-session-id");
+        let capture =
+            stream_capture_of(&[&v3_result_event(V3_RESULT_TURN1, NO_MARKER), &last_result]);
+
+        // Non-vacuity: both decoys really are present in the capture text, so a
+        // wrong implementation has something wrong to find.
+        assert!(capture.contains("forged-by-agent"));
+        assert!(capture.contains("result-event-session-id"));
+
+        assert_eq!(
+            claude_stream_session_id(&capture).as_deref(),
+            Some(V3_SESSION_ID)
+        );
+    }
+
+    /// The stream reader does not shadow or duplicate `claude_session_id`: it
+    /// declines the single-document envelope (the exact literal
+    /// `session_id_reads_top_level_string` asserts on) and plain text, so the
+    /// wrapper's stream-first ordering cannot change today's behavior.
+    #[test]
+    fn claude_stream_session_id_declines_non_stream_shapes() {
+        let envelope = r#"{"type":"result","subtype":"success","result":"All done.","session_id":"cf29bfec-69e8-45df-a4f3-3da08ab6f66e"}"#;
+        assert!(claude_stream_session_id(envelope).is_none());
+        // ...and the shipped reader still owns it, so declining costs nothing.
+        assert_eq!(
+            claude_session_id(envelope).as_deref(),
+            Some("cf29bfec-69e8-45df-a4f3-3da08ab6f66e")
+        );
+
+        assert!(claude_stream_session_id("just some plain text output\n").is_none());
+    }
+
+    /// The wiring that matters: `session_id_from_capture` — the Phase 28
+    /// checkpoint-resume reader (`claude --resume` needs an id DevFlow can
+    /// read) — returns an id for a JSONL capture, where before this plan it
+    /// returned `None` for every stream capture.
+    #[test]
+    fn claude_stream_session_id_from_capture_reads_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 30),
+            v3_stream_capture(NO_MARKER, NO_MARKER, MARKER_SUCCESS),
+        )
+        .unwrap();
+
+        assert_eq!(
+            session_id_from_capture(dir.path(), 30).as_deref(),
+            Some(V3_SESSION_ID)
+        );
+    }
+
+    /// The other half of the wiring claim: a single-document envelope capture
+    /// still yields exactly what it did before the stream reader was inserted
+    /// ahead of `claude_session_id` in the fallback chain.
+    #[test]
+    fn claude_stream_wiring_leaves_single_document_capture_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        let envelope = r#"{"type":"result","subtype":"success","result":"All done.","session_id":"cf29bfec-69e8-45df-a4f3-3da08ab6f66e"}"#;
+        std::fs::write(stdout_path(dir.path(), 8), envelope).unwrap();
+
+        assert_eq!(
+            session_id_from_capture(dir.path(), 8).as_deref(),
+            claude_session_id(envelope).as_deref()
+        );
+        assert_eq!(
+            session_id_from_capture(dir.path(), 8).as_deref(),
+            Some("cf29bfec-69e8-45df-a4f3-3da08ab6f66e")
         );
     }
 
