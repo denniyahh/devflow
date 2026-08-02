@@ -2342,18 +2342,41 @@ are the same fact) and then destroyed the proposed implementation shape. Its fin
    environment test — **run the v3 harness once through `spawn_monitor` itself** — is cheap and
    closes the interactive-vs-production question completely.
 
-#### Remaining units
+#### Remaining units — SPLIT ACROSS TWO PHASES (operator sizing cap, 2026-08-01)
 
-- **30b — the launch path, three plans per C2 above.** Parser first (pure functions, testable
-  against the archived v2/v3 logs as fixtures), then the pipe-owning monitor (close rule per
-  H2, idle timeout per H3), then the adapter switch (always-on per C1). The spawn_monitor
-  harness re-run (M4) and the E4 re-measurement land with the monitor plan.
-- **30c — verification against the real failure.** Re-run the Phase 29 wave-2 shape — a wave
-  with 2+ plans, driven through DevFlow — and confirm both executors' work merges. **This
-  remains the phase's acceptance criterion and is not substitutable by integration tests**
-  (H4): a mocked CLI validates plumbing, not the delivery premise, and the premise is exactly
-  the undocumented behavior in question. Passing tests are necessary and not sufficient, per
-  this project's own repeated lesson.
+**Operator ruling: no phase exceeds M.** The review's honest re-size of the full launch-path
+work was M–L, which violates the cap — so the work splits along the seam the review's own
+constraint 2 identified, instead of relabeling the same scope. The split is not arbitrary: it
+puts the *premise-refuting* experiments before the *expensive* rewrite, so if the production
+environment refutes what the interactive experiments showed, the monitor rewrite is never paid
+for.
+
+**This phase (30) — the parser and the de-risking experiments. Size M, no launch-path change,
+no deployment risk:**
+
+- **30b — the Claude stream-event parsing layer.** Pure functions in `agent_result.rs`
+  (public API in `devflow-core`, so no dead-code conflict with `-D warnings`), mirroring the
+  existing Codex event-stream pattern: marker extraction from top-level `result` events with
+  **last-result semantics**, `session_id`, `rate_limit_event` handling, failure envelopes,
+  checkpoint detection hardened against the stream's prompt-echo false-positive surface
+  (review constraint 3). **Test fixtures are the archived v2/v3 raw logs in
+  `30a-evidence/`** — real captures, not synthetic.
+- **30c — the production-environment experiment (review M4).** Run the v3 harness once
+  *through `spawn_monitor` itself* — scrubbed env, separated stderr, detached launch. This is
+  the deciding test for whether task-notification delivery exists in DevFlow's real launch
+  context. **If it refutes delivery, Phase 31 is cancelled before it is planned** and 999.64
+  re-scopes around the rejected-options table.
+- **30d — re-measure and archive the exit-timing evidence (review M1),** including the
+  untested close-with-pending-tasks case, whose behavior is currently undefined.
+
+**Next phase (31) — the launch path itself. Size M. Planned only after 30c confirms:**
+the pipe-owning monitor replacing the `sh` script for the Claude adapter (close rule: marker
+in a top-level `result` event AND `background_tasks_changed` drained to empty — constraint 4;
+idle timeout writing an authoritative first-class result — constraint 5), the always-on
+adapter switch (constraint 1: no launch-time prediction), and the live Phase 29 wave-2 re-run
+as the acceptance criterion (constraint on H4: not substitutable by integration tests — a
+mocked CLI validates plumbing, not the delivery premise). Near-simultaneous-completion
+behavior (review M3) and CLI-version smoke-detection (review M2) land here.
 
 **Explicitly out of scope, on the operator's instruction — do not fold in even though they are
 adjacent and were found the same day:**
@@ -2364,20 +2387,20 @@ adjacent and were found the same day:**
   reliability.
 - Anything release-related — see the shelved entry below.
 
-**Priority:** Highest — the standing blocker on the operator's stated objective. **Size:**
-30a complete (informal spike, evidence archived); **M–L for 30b** — honestly re-sized from M
-after the review established it is a monitor rewrite plus a new parsing layer, not a flag
-change; S for 30c.
+**Priority:** Highest — the standing blocker on the operator's stated objective. **Size: M**
+(30a complete; 30b is the only substantial unit, and it is pure functions against archived
+fixtures; 30c/30d are S experiments). Phase 31 carries the monitor rewrite as its own M.
 
-**Requirements:** TBD — tracked by unit (`30a`–`30c`) plus the six binding review constraints
-above; no REQ-IDs, consistent with this project's convention for infrastructure phases.
-**Depends on:** nothing structurally; 30a is closed, 30b's three plans are ordered
-parser → monitor → adapter, 30c gates phase completion.
+**Requirements:** TBD — tracked by unit (`30a`–`30d`) plus the six binding review constraints
+above (constraints 1, 4, 5 bind Phase 31; constraints 2, 3, 6 bind this phase); no REQ-IDs,
+consistent with this project's convention for infrastructure phases.
+**Depends on:** nothing structurally; 30a is closed; 30c is the gate on Phase 31 ever being
+planned.
 
 Plans:
 
-- [ ] TBD — `/gsd-plan-phase 30`; the planner MUST treat the six review constraints as locked
-  design inputs, and 30b decomposes as three plans per constraint 2
+- [ ] TBD — `/gsd-plan-phase 30`; the planner MUST treat the review constraints as locked
+  design inputs and MUST NOT pull Phase 31's monitor/adapter work forward into this phase
 
 ---
 
