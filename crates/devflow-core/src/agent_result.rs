@@ -272,22 +272,67 @@ pub fn claude_session_id(stdout: &str) -> Option<String> {
     value.get("session_id")?.as_str().map(str::to_string)
 }
 
-/// TDD RED stub (plan 30-03 Task 2) — always declines, so the new tests fail
-/// on their assertions rather than on a compile error. Replaced in the GREEN
-/// commit.
-pub fn claude_stream_session_id(_stdout: &str) -> Option<String> {
-    None
+/// Read the CLI-emitted `session_id` from a Claude `--output-format
+/// stream-json` JSONL capture: the top-level `session_id` of the LAST
+/// `system`/`init` event. `None` for any other capture shape.
+///
+/// The stream sibling of [`claude_session_id`], and it carries that function's
+/// D-04 / T-28-04 discipline **for the same reason** — read its doc comment
+/// before changing anything here. Only the event's TOP-LEVEL `session_id` is
+/// read, via a direct [`serde_json::Value::get`]; the
+/// [`json_find_key`]/[`json_scan`] traversal helpers are NOT to be used. They
+/// descend into nested objects, and a stream carries agent-authored text in
+/// every `result` event — including the `DEVFLOW_RESULT` marker JSON that
+/// [`parse_marker_lines`] deserializes. A traversal would make a `session_id`
+/// the agent planted in its own marker reachable, handing it the ability to
+/// name the session DevFlow later resumes into (T-30-11). Regression test:
+/// `claude_stream_session_id_ignores_agent_planted_value`.
+///
+/// The LAST `init` event wins, consistent with the last-`result`-wins
+/// convention. Verified against the archived capture: its three `init` events
+/// (lines 5, 32 and 47) all carry the same `session_id`, so last-wins and
+/// first-wins agree on today's evidence — but only last-wins stays correct if a
+/// future capture rotates the value mid-stream. Three `init` events do NOT mean
+/// three sessions: session continuity must never be keyed off "have I seen an
+/// `init` event".
+///
+/// No `session_id` field is added to [`AgentResult`] — see
+/// [`claude_session_id`]'s doc comment for why that design stays rejected.
+pub fn claude_stream_session_id(stdout: &str) -> Option<String> {
+    let events = claude_stream_events(stdout);
+    if !is_claude_event_stream(&events) {
+        return None;
+    }
+
+    events
+        .iter()
+        .rev()
+        .find(|v| {
+            v.get("type").and_then(serde_json::Value::as_str) == Some("system")
+                && v.get("subtype").and_then(serde_json::Value::as_str) == Some("init")
+        })?
+        .get("session_id")?
+        .as_str()
+        .map(str::to_string)
 }
 
-/// Thin file-reading wrapper over [`claude_session_id`]: reads the phase's
+/// Thin file-reading wrapper over the two session-id readers: reads the phase's
 /// captured stdout file (via [`stdout_path`]) and delegates. `None` for a
 /// missing capture file, never an `Err` — mirrors [`evaluate_layer1`]'s
 /// lossy-read convention (CR-01: one invalid UTF-8 byte from raw `sh`
 /// redirection must not silently disable this reader).
+///
+/// [`claude_stream_session_id`] is tried FIRST, then [`claude_session_id`].
+/// Stream-first is safe and behavior-preserving: the stream gate
+/// ([`is_claude_event_stream`]) declines a single-document envelope, so every
+/// capture shape that ships today still resolves through `claude_session_id`
+/// bit-for-bit. Without this chain the Phase 28 checkpoint-resume path — whose
+/// whole delivery is reconstructing a session via `claude --resume` — returns
+/// `None` for every `stream-json` capture.
 pub fn session_id_from_capture(project_root: &Path, phase: u32) -> Option<String> {
     let bytes = std::fs::read(stdout_path(project_root, phase)).ok()?;
     let stdout = String::from_utf8_lossy(&bytes);
-    claude_session_id(&stdout)
+    claude_stream_session_id(&stdout).or_else(|| claude_session_id(&stdout))
 }
 
 // WR-12 (13-REVIEW.md), revised: these traversal helpers run on the coding
