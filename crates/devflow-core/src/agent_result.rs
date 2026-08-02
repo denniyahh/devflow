@@ -677,6 +677,13 @@ fn last_top_level_result(events: &[serde_json::Value]) -> Option<&serde_json::Va
         .find(|v| v.get("type").and_then(serde_json::Value::as_str) == Some("result"))
 }
 
+/// TDD RED stub (plan 30-03 Task 1) — always declines, so the new tests fail
+/// on their assertions rather than on a compile error. Replaced in the GREEN
+/// commit.
+fn detect_claude_stream_rate_limit(_events: &[serde_json::Value]) -> Option<String> {
+    None
+}
+
 /// Parse a Claude `--output-format stream-json` JSONL capture and read the
 /// `DEVFLOW_RESULT` marker out of its LAST `result` event.
 ///
@@ -704,6 +711,10 @@ fn parse_claude_event_result(stdout: &str) -> Option<AgentResult> {
     let events = claude_stream_events(stdout);
     if !is_claude_event_stream(&events) {
         return None;
+    }
+
+    if let Some(retry) = detect_claude_stream_rate_limit(&events) {
+        return Some(rate_limited_result(retry));
     }
 
     let result_text = last_top_level_result(&events)?
@@ -2103,6 +2114,275 @@ mod tests {
         )
     }
 
+    // ---- rate-limit / envelope-failure fixtures (plan 30-03) --------------
+
+    /// v3 line 15, **VERBATIM** — the only `rate_limit_event` in any archived
+    /// capture, and the reason this plan exists in its current form.
+    ///
+    /// Read it before touching [`detect_claude_stream_rate_limit`]: its
+    /// `rate_limit_info.status` is **`allowed`**. The CLI emits these events as
+    /// routine quota telemetry on healthy streams — this one sits at line 15 of
+    /// a capture that then completed three turns successfully (results at 19,
+    /// 37 and 54). Presence of the event type carries NO information about
+    /// whether the run was blocked.
+    ///
+    /// Note the second trap one level down: `overageStatus` is `rejected`. Any
+    /// nested search for the token `rejected` (e.g. via [`json_find_key`]) also
+    /// misclassifies this healthy event, which is why the classifier reads
+    /// `rate_limit_info.status` and nothing else, by direct `.get()`.
+    const V3_RATE_LIMIT_EVENT_ALLOWED: &str = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1785645600,"rateLimitType":"five_hour","overageStatus":"rejected","overageDisabledReason":"out_of_credits","isUsingOverage":false},"uuid":"e73e6774-a79d-4cdf-90bd-53a695f44f5a","session_id":"559fef4d-2053-459e-b7a7-f3200c3b3790"}"#;
+
+    /// A `rate_limit_event` with the given `rate_limit_info.status`, built by
+    /// substituting one field of the real archived event above.
+    ///
+    /// **SYNTHETIC for every status except `allowed`.** No archived capture
+    /// contains a blocked stream — the denial fixtures below are constructed,
+    /// not observed, and are labelled as such at each use. Every other field
+    /// (including `resetsAt`, which supplies the retry hint) is exactly as
+    /// captured.
+    fn v3_rate_limit_event(status: &str) -> String {
+        assert!(
+            V3_RATE_LIMIT_EVENT_ALLOWED.contains(r#""status":"allowed""#),
+            "fixture lost its status field"
+        );
+        V3_RATE_LIMIT_EVENT_ALLOWED
+            .replace(r#""status":"allowed""#, &format!(r#""status":"{status}""#))
+    }
+
+    /// One real `result` envelope with its captured `is_error":false` flipped
+    /// to `true`, every other field untouched. The assertion makes the
+    /// substitution non-silent: if the fixture text ever changes, the test
+    /// fails loudly rather than quietly testing an `is_error: false` envelope.
+    fn v3_result_event_is_error(envelope: &str, escaped_result_text: &str) -> String {
+        let filled = v3_result_event(envelope, escaped_result_text);
+        assert!(
+            filled.contains(r#""is_error":false"#),
+            "fixture envelope lost its is_error field"
+        );
+        filled.replace(r#""is_error":false"#, r#""is_error":true"#)
+    }
+
+    /// Assemble a capture from the real `init` event followed by the given
+    /// lines in order. Unlike [`v3_stream_capture`] this lets a test position a
+    /// `rate_limit_event` at an arbitrary index, which is the whole point of
+    /// the final-turn scoping assertions.
+    fn stream_capture_of(lines: &[&str]) -> String {
+        let mut out = String::from(V3_INIT_EVENT);
+        for line in lines {
+            out.push('\n');
+            out.push_str(line);
+        }
+        out.push('\n');
+        out
+    }
+
+    /// **The mandatory negative regression.** The real archived stream — whose
+    /// `rate_limit_event` says `status: "allowed"` and which then completed
+    /// three turns — must NOT classify as `RateLimited`.
+    ///
+    /// This event is routine quota telemetry, not a block. Classifying its mere
+    /// presence as a rate limit would route EVERY healthy Claude stream stage
+    /// into `Action::AutoResume` (`crates/devflow-cli/src/outcome_policy.rs:41`
+    /// maps `AgentStatus::RateLimited` to it) against a fabricated retry time,
+    /// instead of advancing the pipeline. That is a denial of service on the
+    /// whole product, produced by a one-line "detect the event type" shortcut.
+    ///
+    /// Two independent guards must both hold here, and the second assertion
+    /// pins the one the positioning guard alone would hide: the event is placed
+    /// at its real position (before the first `result`, mirroring line 15 vs
+    /// 19), AND its status is not a denial. `detect_claude_stream_rate_limit`
+    /// is asserted directly on a final-turn placement of the same real event so
+    /// the status guard cannot be dropped without this test failing.
+    #[test]
+    fn claude_stream_real_allowed_rate_limit_event_is_not_rate_limited() {
+        let capture = stream_capture_of(&[
+            V3_RATE_LIMIT_EVENT_ALLOWED,
+            &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+            &v3_result_event(V3_RESULT_TURN2, NO_MARKER),
+            &v3_result_event(V3_RESULT_TURN3, MARKER_SUCCESS),
+        ]);
+
+        let result = parse_claude_event_result(&capture)
+            .expect("the final turn's success marker still decides this stream");
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_ne!(result.status, AgentStatus::RateLimited);
+
+        // The status guard on its own: the SAME real event moved into the final
+        // turn (after the second-to-last `result`) is still not a rate limit.
+        // Without this, deleting the status check would leave the test green.
+        let final_turn = stream_capture_of(&[
+            &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+            &v3_result_event(V3_RESULT_TURN2, NO_MARKER),
+            V3_RATE_LIMIT_EVENT_ALLOWED,
+            &v3_result_event(V3_RESULT_TURN3, MARKER_SUCCESS),
+        ]);
+        assert!(detect_claude_stream_rate_limit(&claude_stream_events(&final_turn)).is_none());
+    }
+
+    /// The positive: an explicit quota DENIAL inside the final turn classifies
+    /// as `RateLimited`, so the rate-limit resume path stays reachable under
+    /// `stream-json`.
+    ///
+    /// **The denial fixture is SYNTHETIC.** No archived capture contains a
+    /// blocked stream, so the `rejected` status is constructed from the
+    /// observed vocabulary of this schema rather than observed in the wild —
+    /// the same honest-fixture rule this phase applies to marker payloads. The
+    /// retry hint comes from the real `resetsAt` value.
+    #[test]
+    fn claude_stream_final_turn_denial_rate_limit_event_is_rate_limited() {
+        let denial = v3_rate_limit_event("rejected");
+        let capture = stream_capture_of(&[
+            &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+            &v3_result_event(V3_RESULT_TURN2, NO_MARKER),
+            &denial,
+            &v3_result_event(V3_RESULT_TURN3, NO_MARKER),
+        ]);
+
+        let result = parse_claude_event_result(&capture)
+            .expect("a final-turn quota denial must produce a Layer-1 verdict");
+        assert_eq!(result.status, AgentStatus::RateLimited);
+        assert_eq!(
+            result.reason.as_deref(),
+            Some("rate limited until 1785645600")
+        );
+        assert_eq!(result.decided_by_layer, Some(1));
+
+        // Fewer than two `result` events means the whole stream IS the final
+        // turn — a run blocked before it ever completed a turn must still
+        // classify, or the boundary logic silently swallows the common case.
+        let single_turn =
+            stream_capture_of(&[&denial, &v3_result_event(V3_RESULT_TURN1, NO_MARKER)]);
+        assert_eq!(
+            parse_claude_event_result(&single_turn).map(|r| r.status),
+            Some(AgentStatus::RateLimited)
+        );
+    }
+
+    /// Scoping: a denial that predates the final turn cannot outrank the final
+    /// turn's own outcome. Rate-limit chatter from an earlier turn must not
+    /// decide a stream that later completed — in the real capture the rate
+    /// event (line 15) precedes all three results, so an unscoped detector
+    /// would let a first-turn event decide a stream that finished forty seconds
+    /// later.
+    ///
+    /// The denial status here is the SAME one the positive test proves does
+    /// classify, so this test can only pass because of the POSITION guard.
+    #[test]
+    fn claude_stream_denial_before_final_turn_does_not_outrank_final_result() {
+        let capture = stream_capture_of(&[
+            &v3_rate_limit_event("rejected"),
+            &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+            &v3_result_event(V3_RESULT_TURN2, NO_MARKER),
+            &v3_result_event(V3_RESULT_TURN3, MARKER_SUCCESS),
+        ]);
+
+        let result = parse_claude_event_result(&capture)
+            .expect("the final turn's success marker decides this stream");
+        assert_eq!(result.status, AgentStatus::Success);
+    }
+
+    /// An unrecognised `rate_limit_info.status` DEFERS rather than classifying.
+    ///
+    /// Deferring is the deliberately safe direction: an unknown denial status
+    /// falls through to the envelope/marker paths and is reported `Failed` — a
+    /// real degradation (the operator loses automatic resume) but a never-silent
+    /// one that still gates. The opposite error auto-resumes a healthy stream
+    /// against a retry time the parser invented.
+    ///
+    /// Positioned in the FINAL turn, so only the status check can decline it.
+    #[test]
+    fn claude_stream_unrecognised_rate_limit_status_defers() {
+        let capture = stream_capture_of(&[
+            &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+            &v3_result_event(V3_RESULT_TURN2, NO_MARKER),
+            &v3_rate_limit_event("some_future_status"),
+            &v3_result_event(V3_RESULT_TURN3, MARKER_SUCCESS),
+        ]);
+
+        assert!(detect_claude_stream_rate_limit(&claude_stream_events(&capture)).is_none());
+        let result = parse_claude_event_result(&capture)
+            .expect("the parser must fall through to the marker path");
+        assert_eq!(result.status, AgentStatus::Success);
+    }
+
+    /// Precedence (T-30-13): when the detector fires, rate limit outranks the
+    /// marker path. A rate-limited run classified as generic `Failed` kills the
+    /// primary rate-limit resume cron — the one path that exists to recover
+    /// from it — which is exactly why `evaluate_layer1` already orders
+    /// `detect_claude_rate_limit` ahead of `detect_claude_envelope_failure` for
+    /// the single-document path.
+    ///
+    /// Non-vacuous: the same capture WITHOUT the rate event yields `Failed`, so
+    /// this test fails the moment the ordering is reshuffled.
+    #[test]
+    fn claude_stream_final_turn_denial_outranks_failed_marker() {
+        let with_denial = stream_capture_of(&[
+            &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+            &v3_result_event(V3_RESULT_TURN2, NO_MARKER),
+            &v3_rate_limit_event("rejected"),
+            &v3_result_event(V3_RESULT_TURN3, MARKER_FAILED),
+        ]);
+        assert_eq!(
+            parse_claude_event_result(&with_denial).map(|r| r.status),
+            Some(AgentStatus::RateLimited)
+        );
+
+        let without_denial = v3_stream_capture(NO_MARKER, NO_MARKER, MARKER_FAILED);
+        assert_eq!(
+            parse_claude_event_result(&without_denial).map(|r| r.status),
+            Some(AgentStatus::Failed)
+        );
+    }
+
+    /// A last `result` event with `is_error: true` and NO marker is an
+    /// authoritative Layer-1 failure, not a deferral to Layer 2's coarse
+    /// exit-code heuristic — matching `detect_claude_envelope_failure` for the
+    /// single-document envelope. The reason is drawn from the event's own
+    /// `result` text with the `num_turns` suffix, the same shape that function
+    /// produces.
+    #[test]
+    fn claude_stream_last_result_is_error_without_marker_is_failed() {
+        let capture = stream_capture_of(&[
+            &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+            &v3_result_event(V3_RESULT_TURN2, NO_MARKER),
+            &v3_result_event_is_error(V3_RESULT_TURN3, r#"Execution error: context exhausted"#),
+        ]);
+
+        let result = parse_claude_event_result(&capture)
+            .expect("is_error on the last result must not defer to Layer 2");
+        assert_eq!(result.status, AgentStatus::Failed);
+        assert_eq!(
+            result.reason.as_deref(),
+            Some("Execution error: context exhausted (num_turns: 2)")
+        );
+        assert_eq!(result.decided_by_layer, Some(1));
+    }
+
+    /// Envelope-over-marker (T-30-15): `is_error: true` overrides a SUCCESS
+    /// marker in the same event, matching `detect_claude_envelope_failure`'s
+    /// documented precedence over a stale or echoed success marker.
+    ///
+    /// Non-vacuous: the identical capture with `is_error: false` yields
+    /// `Success`, so the assertion below can only pass because the envelope
+    /// check overrode the marker.
+    #[test]
+    fn claude_stream_is_error_overrides_success_marker() {
+        let capture = stream_capture_of(&[
+            &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+            &v3_result_event(V3_RESULT_TURN2, NO_MARKER),
+            &v3_result_event_is_error(V3_RESULT_TURN3, MARKER_SUCCESS),
+        ]);
+        let result = parse_claude_event_result(&capture)
+            .expect("is_error must produce a verdict even with a success marker");
+        assert_eq!(result.status, AgentStatus::Failed);
+
+        let healthy = v3_stream_capture(NO_MARKER, NO_MARKER, MARKER_SUCCESS);
+        assert_eq!(
+            parse_claude_event_result(&healthy).map(|r| r.status),
+            Some(AgentStatus::Success)
+        );
+    }
+
     /// The tracer: a real archived `stream-json` capture written to
     /// `.devflow/phase-NN-stdout` produces a Layer-1 verdict out of
     /// `evaluate_layer1`. Before plan 30-01 this returned `None` for every
@@ -2197,9 +2477,19 @@ mod tests {
     /// The FIRST turn carries a success marker, so this also proves the parser
     /// does not fall back to an earlier turn's marker when the last one has
     /// none.
+    ///
+    /// Plan 30-03 addendum: the deferral must hold specifically for
+    /// `is_error: false`, which is what the real captured envelope carries —
+    /// asserted below so this reads as a deliberate is_error case rather than
+    /// an incidental one. Only `is_error: true` may promote a marker-less turn
+    /// to `Failed`.
     #[test]
     fn claude_stream_last_result_without_marker_defers() {
         let capture = v3_stream_capture(MARKER_SUCCESS, NO_MARKER, NO_MARKER);
+        assert!(
+            capture.contains(r#""is_error":false"#),
+            "the archived envelopes carry is_error:false; this test is about that case"
+        );
         assert!(parse_claude_event_result(&capture).is_none());
     }
 
