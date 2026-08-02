@@ -1389,6 +1389,46 @@ Plans:
 
 - [x] Delivered as an out-of-band patch, 2026-07-31 (no phase — emergency unblock for the Phase 29 dogfood)
 
+### Phase 999.70: Checkpoint Detection Cannot Tell a Gate DECLARATION From a Gate MENTION (BACKLOG)
+
+**Linear:** TBD — needs an issue
+**Found:** 2026-08-02, cross-AI code review of phase 30 (codex/gpt-5.6-sol, high effort), Medium
+finding 1. Recorded in `30-CODE-REVIEW.md`.
+
+**The issue:** 30-05 scoped stream gate scanning to the `result` text of top-level `result` events,
+which establishes **authorship** — the text came from the orchestrator, not an echoed prompt, a
+subagent, or mid-turn narration. It does not establish **intent**. A result that merely *documents*
+a gate still trips the matcher:
+
+```
+"The plan documents **Gate:** `blocking-human`; no checkpoint was reached."
+```
+
+returns `true`. And because detection deliberately scans ALL top-level results rather than only the
+last (T-30-27), one documentary mention stays decisive through later quiet task-notification turns.
+
+**Why it was not fixed in 30-05.** That plan's scope fence explicitly forbade modifying
+`text_reports_human_gate` or `HUMAN_GATE_VALUE`. The matcher encodes a hard-won live observation —
+the Phase 28 run that discovered the value rendered as a markdown code span, which defeated the
+original matcher entirely. Widening or narrowing it is its own change with its own regression risk,
+not a rider on a scoping fix.
+
+**The shape of the fix:** require declaration *framing* rather than the bare token — the
+`## CHECKPOINT REACHED` heading together with the `**Gate:**` field, as the live Phase 28 rendering
+actually emits — instead of matching the gate field wherever it appears. Note the opposite-direction
+hazard (T-30-24): over-tightening silently drops a real human authorization request, which is worse
+than the false positive. Any change here needs positives and negatives in the same commit.
+
+**Severity: medium.** Reachable only once the launch path emits `stream-json` (Phase 31). The
+consequence is a checkpoint auto-decide firing, or the resume ceiling being consumed, on a stage
+whose output merely discussed a gate — and DevFlow's own planning documents are exactly that kind of
+content. Bounded by the fact that a false gate normally falls through to the generic human gate
+rather than authorizing anything.
+
+**Size: S.** One matcher, its call sites, and a regression cluster covering both directions.
+
+---
+
 ### Phase 999.69: Re-Publish the Three Committed `30a-evidence` Captures Through the Redaction Pipeline (BACKLOG)
 
 **Linear:** [DEN-90](https://linear.app/denniskim/issue/DEN-90/99969-re-publish-the-three-committed-30a-evidence-captures-through-the)
@@ -2655,6 +2695,37 @@ lengthens the quiet interval, and coalescing occurred in 1 of 7 trials here, mat
 exactly. **New floor: ≥30s** — ~2.2x the pooled observed maximum on the milestone definition and
 ~4x on the every-line one. Direction (set a floor, don't let it tune below the observed maximum)
 was right in the original constraint; the number was not.
+
+**BINDING CONSTRAINT (constraint 9), added 2026-08-02 from the phase-30 cross-AI CODE review
+(codex/gpt-5.6-sol, high effort — `30-CODE-REVIEW.md`) — Phase 31 must not wire up
+`evaluate_layer1` until two confirmed defects behind it are closed.** Both were verified against
+source, and both are latent rather than live *only* because `evaluate_layer1` currently has **zero
+callers anywhere in the workspace**. Phase 31 is the phase that gives it one.
+
+1. **A torn terminal line resurrects an earlier turn's success.** `claude_stream_events` silently
+   drops any line that fails to parse, so a truncated final `result` makes `last_top_level_result`
+   return an *earlier* result. If that one said success, `parse_claude_event_result` returns
+   `Some(Success)`, and because `evaluate_layer1` is an `.or_else()` cascade that stale success
+   short-circuits the exit-code fallback. **A stage advances after the real terminal turn failed or
+   raised a gate.** This is not exotic: the capture is written by raw `sh` redirection and read
+   while the agent may still be appending, which is precisely when a last line is torn. Malformed
+   input after the last valid terminal result must make the stream indeterminate or failed — it
+   must never let an earlier result become authoritative.
+
+2. **`last_top_level_result` does not enforce top-level provenance.** Despite its name and its
+   doc comment's T-30-01 claim, it selects solely on `type == "result"` and never consults
+   `parent_tool_use_id`. Gate scanning enforces provenance; verdict selection does not. A
+   subagent-origin `result` would be admitted and would decide the stage. Share ONE explicit
+   top-level predicate between gate and verdict selection rather than keeping two divergent notions.
+
+The review also corrected plan 30-05's own wording: "absent `parent_tool_use_id` confirmed across
+all three archived captures" is **partly vacuous** — independently re-counted, the three captures
+hold 12/25/54 events and **0**/2/3 `result` events, so the first capture evidences nothing. Absent
+being treated as top-level remains *necessary* for today's results and *unproven safe*.
+
+The review's third finding (a documentary gate mention reading as a declaration) is **not** a
+Phase 31 blocker and is filed as backlog **999.70**. Its High finding 2 — gate scoping failing open
+to the raw scan on a torn `init` — was fixed in phase 30 itself (`06675da`).
 
 **Explicitly out of scope, on the operator's instruction — do not fold in even though they are
 adjacent and were found the same day:**
