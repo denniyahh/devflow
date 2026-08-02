@@ -2600,6 +2600,27 @@ open only because 30-01's scope fence forbids touching the shipped path. XS: a o
 plus a mirror test, in a file Phase 31 is already editing. Folding it in here closes the defect class
 rather than the single instance.
 
+**BINDING CONSTRAINT (constraint 7), added 2026-08-02 from 30c trial 2 — the monitor MUST NOT treat
+the count of `result` events as the count of children that returned.** The CLI **coalesces**
+completions: when two children finish close together while the orchestrator is still working, both
+notifications are absorbed into a *single* resumed turn producing *one* `result` event. Measured in
+`30c-VERDICT-scrubbed.md` — two children delivered, one notification-origin result, notifications
+4.75s apart (t+30.62, t+35.37); trial 1's completions arrived 5.5s apart *after* the first resume had
+finished, so that run produced two. The resumed turn states it unprompted: *"Both subagents completed
+and both notifications were delivered to this orchestrator turn."*
+
+A monitor counting result events to decide how many children came back would therefore **silently
+undercount any wave whose completions cluster** — the exact silent-miscount class this whole phase
+exists to eliminate.
+
+**This is why constraint 4's close rule is an `AND`, not a redundancy.** `background_tasks_changed`
+draining to `[]` is the authoritative "all children returned" signal; the `result` marker only
+indicates the orchestrator declared. Trial 2's shape is *superficially indistinguishable* from "one
+child delivered, one lost" — one result event either way — and the drain is the only thing that
+separates them. **Do not simplify the close rule to a single arm.** A future reader is likely to
+read the second arm as belt-and-braces; it is load-bearing, and this is the measurement that proves
+it.
+
 **Explicitly out of scope, on the operator's instruction — do not fold in even though they are
 adjacent and were found the same day:**
 
