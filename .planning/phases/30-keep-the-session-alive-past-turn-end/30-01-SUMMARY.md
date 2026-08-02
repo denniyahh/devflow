@@ -282,6 +282,17 @@ Explicitly left for 30-03, as the plan required — started here would have been
 
 Phase 31 remains blocked on its own work — the adapter argv is still `--output-format json` and was not touched here.
 
+## Self-Check: PASSED
+
+Claims in this SUMMARY were verified on disk rather than asserted:
+
+- `crates/devflow-core/src/agent_result.rs` — present; contains all four named functions (`rg -c` returned 4).
+- `.planning/phases/30-keep-the-session-alive-past-turn-end/30-01-SUMMARY.md` — present.
+- Commits `7190e4a`, `3aac6e6`, `85a2878` — all present in `git log`.
+- `git diff --name-only 56e6378..HEAD` — exactly one source file; scope fence intact.
+- Working tree clean at the time of the check (no uncommitted work, no mutation residue).
+- Test counts and every `1 passed` line quoted above were copied from runs made in this session, not recalled.
+
 ---
 *Phase: 30-keep-the-session-alive-past-turn-end*
 *Completed: 2026-08-02*
