@@ -421,13 +421,24 @@ staged captures, so a clean result on the published tree is a real negative
 rather than a tautology. The control line is what makes it one: the scanner
 still matches on unsanitised input.
 
-**One scanner false positive to know about before you re-run this.** Scanning
-`30d-exit-timing-harness.py` itself — outside the scope above, but an easy thing
-to include — matches `credential_named_assignment` on the line
-`except KeyboardInterrupt:`. The pattern is case-insensitive and
-`KeyboardInterrupt` contains `Key`, followed by a colon and six-plus non-space
-characters. It is a Python keyword, not a credential. Recorded here so the next
-person does not spend time on it or, worse, "fix" it.
+**A class of scanner false positive to know about before you re-run this.** The
+`credential_named_assignment` pattern is case-insensitive and fires on any word
+*containing* `key`, `token`, `secret` or `password` when it is followed by a
+colon and six-plus non-space characters. Two harmless instances turned up while
+writing this unit up:
+
+- `30d-exit-timing-harness.py` (outside the scope above, but an easy thing to
+  include) matches on `except KeyboardInterrupt:` — `KeyboardInterrupt` contains
+  `Key`. It is a Python keyword, not a credential, and must not be "fixed".
+- English prose matches too. A heading of the form `Outcome token` followed
+  immediately by a colon and a value fires on the word `token` alone.
+  `30-04-SUMMARY.md` originally had exactly that and was reworded to name the
+  `mode_b_summary` field instead, rather than leaving a standing false positive
+  in the phase tree.
+
+Recorded so the next person does not spend time re-deriving this — and note that
+writing the offending example out verbatim makes the document describing it fail
+its own scan, which is how this second instance was found.
 
 `git status --porcelain crates/` was empty at every task boundary. No file under
 `crates/` was modified by this plan.
