@@ -577,9 +577,6 @@ class Watcher:
             return None
         return round(max(b - a for a, b in zip(stamps, stamps[1:])), 3)
 
-    def results_after(self, at: float) -> list[dict[str, Any]]:
-        return [r for r in self.results if r["at"] > at]
-
     def events_after(self, at: float) -> list[dict[str, Any]]:
         return [e for e in self.events if e["at"] > at]
 
@@ -715,7 +712,8 @@ def run_log_lines(run: Any, record: dict[str, Any], version: str) -> list[str]:
         "",
         "## Stream facts",
         f"result_events: {len(record['results'])}",
-        f"results_after_close: {record['results_after_close']}",
+        f"results_at_close: {record.get('results_at_close')}",
+        f"results_after_close: {record['results_after_close']} (counted, not timestamp-compared)",
         f"final_result_truncated: {record['final_result_truncated']}",
         f"final_result_truncation_basis: {record['final_result_truncation_basis']}",
         f"drained_event_observed: {record['drained_event_observed']}",
@@ -910,6 +908,11 @@ def run_trial(
 
         # -- phase 2: close stdin and time the exit ----------------------
         close_at = watcher.now()
+        # Counted, not timestamp-compared. In Mode B the close is TRIGGERED by
+        # a result event, so that result's timestamp and the close instant are
+        # the same to within rounding — a `> close_at` comparison counts the
+        # trigger itself as a post-close delivery.
+        results_at_close = len(watcher.results)
         print(
             f"[30d] t+{close_at:6.2f} closing stdin "
             f"(outstanding local_agent tasks: {len(watcher.outstanding)})",
@@ -970,7 +973,7 @@ def run_trial(
         record["observation_window_s"] = round(watcher.now(), 3)
 
         # -- derived facts ----------------------------------------------
-        _finalise(record, watcher, run, signal_paths, close_at)
+        _finalise(record, watcher, run, signal_paths, close_at, results_at_close)
 
     except BaseException as exc:  # noqa: BLE001 — recorded, re-raised below
         record["aborted_with"] = f"{type(exc).__name__}: {exc}"
@@ -1009,6 +1012,7 @@ def _finalise(
     run: Any,
     signal_paths: dict[str, str],
     close_at: float,
+    results_at_close: int,
 ) -> None:
     """Fill the derived observation fields. Independent facts stay independent."""
     window = record["observation_window_s"] or watcher.now()
@@ -1030,8 +1034,8 @@ def _finalise(
         round(window - watcher.last_dispatch_at, 3) if watcher.last_dispatch_at is not None else None
     )
 
-    after = watcher.results_after(close_at)
-    record["results_after_close"] = len(after)
+    record["results_at_close"] = results_at_close
+    record["results_after_close"] = len(watcher.results) - results_at_close
 
     # Truncation basis, stated rather than asserted: assistant/stream events
     # continuing past the last result means a turn was in flight when the
