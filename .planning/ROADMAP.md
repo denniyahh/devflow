@@ -1389,6 +1389,45 @@ Plans:
 
 - [x] Delivered as an out-of-band patch, 2026-07-31 (no phase — emergency unblock for the Phase 29 dogfood)
 
+### Phase 999.67: `parse_devflow_result` Lets an Agent Plant Its Own Layer-0 Provenance (BACKLOG — shortlisted for Phase 31)
+
+**Linear:** [DEN-88](https://linear.app/denniskim/issue/DEN-88/99967-parse-devflow-result-lets-an-agent-plant-its-own-layer-0)
+**Found:** 2026-08-02, Phase 30 plan 30-01 execution (finding F-1). Surfaced *by* the fix for the
+same defect class on the new stream path, and deliberately not fixed there: 30-01's scope fence
+forbids touching the shipped single-document path.
+
+**The defect in one sentence:** `parse_devflow_result` returns `parse_marker_lines`' output
+unnormalised, so an agent that writes `"decided_by_layer": 0` into its own `DEVFLOW_RESULT` marker
+reaches `classify_validate_outcome` carrying a Layer-0 external-probe provenance it did not earn.
+
+**Confirmed at runtime, not by reading** (30-01, 2026-08-02):
+`parse_marker_lines(r#"DEVFLOW_RESULT: {"status":"success","decided_by_layer":0}"#).unwrap().decided_by_layer`
+is `Some(0)`. That assertion is now a permanent non-vacuity guard inside
+`claude_stream_overwrites_agent_planted_decided_by_layer` (`agent_result.rs:2174`), so the surface
+stays visible in the test suite until it is closed.
+
+**Why it matters.** `pipeline_outcomes.rs:184` computes
+`external = result.decided_by_layer == Some(0) && result.status == AgentStatus::Success` — the
+predicate for *"an independent Layer-0 probe decided this, not the agent's self-report."* An agent
+deciding its own provenance is the precise trust inversion DevFlow's layered result model exists to
+prevent, and 30-01 closed exactly this hole on the new stream path (T-30-26).
+
+**Blast radius is bounded — this is why it is a backlog entry and not a `WINDOWS.md` blocker.** It
+can flip a Validate `Failed` to `Ambiguous`, which still gates and still requires a human. It
+**cannot** manufacture a pass. The 30-01 executor correctly declined to file it in the ledger
+unilaterally, since an open entry there blocks `/gsd-ship` and this defect predates Phase 30.
+
+**Fix:** a one-line overwrite in `parse_devflow_result` mirroring what 30-01 added to
+`parse_claude_event_result`, plus a mirror test. Folding it into Phase 30's own 30-03 was considered
+and rejected — it would breach the same scope fence mid-phase.
+
+**Priority:** Medium — a real trust-boundary hole on the currently shipped path, but non-silent and
+incapable of fabricating success. **Size:** XS.
+**Depends on:** nothing structurally. Independent of the 999.64 arc, shortlisted for Phase 31
+because that phase is already editing this file's neighbourhood.
+
+---
+
 ### Phase 999.66: `consecutive_failures` Accumulates on Healthy Multi-Wave Progress, Not Just Repeated Failure (BACKLOG)
 
 **Found:** 2026-07-31, investigating the Phase 29 dogfood gate, before 999.65 was found to have
@@ -2442,6 +2481,12 @@ adapter switch (constraint 1: no launch-time prediction), and the live Phase 29 
 as the acceptance criterion (constraint on H4: not substitutable by integration tests — a
 mocked CLI validates plumbing, not the delivery premise). Near-simultaneous-completion
 behavior (review M3) and CLI-version smoke-detection (review M2) land here.
+
+**Shortlisted, added 2026-08-02:** **999.67** — `parse_devflow_result` lets an agent plant its own
+Layer-0 provenance. Found by 30-01 while closing the identical hole on the new stream path, and left
+open only because 30-01's scope fence forbids touching the shipped path. XS: a one-line overwrite
+plus a mirror test, in a file Phase 31 is already editing. Folding it in here closes the defect class
+rather than the single instance.
 
 **Explicitly out of scope, on the operator's instruction — do not fold in even though they are
 adjacent and were found the same day:**
