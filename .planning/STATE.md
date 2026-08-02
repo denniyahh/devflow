@@ -2,10 +2,10 @@
 gsd_state_version: 1.0
 milestone: v2.0.0
 milestone_name: milestone (open — no fixed closing phase)
-current_phase: 28
-current_phase_name: close-the-checkpoint-answer-return-path
-status: "shipped — PR #63 open to develop"
-stopped_at: "Phase 28 shipped — PR #63 (feature/phase-28 → develop), awaiting CI + merge"
+current_phase: 30
+current_phase_name: keep-the-session-alive-past-turn-end
+status: "planned — ready to execute"
+stopped_at: "Phase 30 planned and cross-AI reviewed (5 plans, 3 waves) — ready for /gsd-execute-phase 30"
 last_updated: "2026-08-02T15:14:11.856Z"
 last_activity: 2026-08-02
 last_activity_desc: "Phase 30 planned: 5 plans, 3 waves (30b parser tracer + expansions, 30c delivery experiment, 30d exit-timing evidence); plan-checker passed"
@@ -19,12 +19,30 @@ progress:
 
 # DevFlow — Project State
 
-> Last updated: 2026-07-25
+> Last updated: 2026-08-02
 
 ## Active Phase
 
+**Phase 30 — Keep the Session Alive Past Turn End (999.64)** — **planned and
+cross-AI reviewed 2026-08-02; ready to execute.** 5 plans across 3 waves on
+`feature/phase-30`: 30b is the Claude stream parser (30-01 tracer, 30-03 rate
+limit / envelope failure / `session_id`, 30-05 checkpoint prompt-echo
+hardening), 30c is the production-environment delivery experiment (30-02), 30d
+is the exit-timing measurement (30-04). A Codex review (`30-REVIEWS.md`) raised
+4 HIGH findings; 15 of 16 were incorporated, 1 rejected with rationale, and the
+phase goal was split from the 999.64 arc goal so Phase 30 can satisfy it —
+Phase 31 owns the launch-path change. 30-03 and 30-05 are gated on 30-02's
+verdict and will not land if delivery is refuted.
+
+---
+
+### Historical — superseded phase notes
+
+The entries below describe earlier phases and are retained for context. They are
+**not** the active phase; the frontmatter `current_phase` above is authoritative.
+
 **Phase 23 — End-to-End Dogfood: One Phase, Define→Ship, Unattended, With
-Claude** — **scoped 2026-07-25, not yet discussed or planned.** The goal is the
+Claude** — **scoped 2026-07-25.** The goal was the
 "basic development workflow works end to end" milestone: `devflow start --phase
 N` drives one real phase Define→Ship with Claude, unattended, with no manual
 `ps`, no manual `devflow advance`, and no silent stall.
