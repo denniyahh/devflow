@@ -48,3 +48,6 @@ Thumbs.db
 
 # Tracked in the gsd-core repo; symlinked here for convenience
 .planning/UPSTREAM-GSD-ISSUES.md
+
+# Bytecode cache from importing the Phase 30 experiment harnesses under .planning/
+__pycache__/
