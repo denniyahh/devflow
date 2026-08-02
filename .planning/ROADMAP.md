@@ -2621,6 +2621,20 @@ separates them. **Do not simplify the close rule to a single arm.** A future rea
 read the second arm as belt-and-braces; it is load-bearing, and this is the measurement that proves
 it.
 
+**BINDING CONSTRAINT (constraint 8), added 2026-08-02 from the 30c reliability set — the idle
+timeout must not be set below ~12s, and the drain is NOT a stop signal.** Measured across all seven
+trials: the longest quiet gap inside a *healthy* run was 10.52–11.51s. **An idle timeout under ~12s
+would have killed every one of the seven.** Separately, the interval from `background_tasks_changed`
+draining to `[]` until the final `result` arrived ranged 4.54s to 11.51s — a 2.5x spread, and the
+least stable interval measured anywhere in 30c. A monitor that treats the drain as "nothing more is
+coming" and closes there would have truncated the final orchestrator turn in **all seven** trials.
+
+Constraint 4's close rule already requires the marker *and* the drain, which is what protects
+against this — but constraint 5's idle timeout is the mechanism that could still fire early, so the
+floor is a hard input, not a tuning preference. Treat ~12s as a measured lower bound from a
+two-child wave and size the real timeout above it with margin; a wave with more children or slower
+work will have longer quiet gaps.
+
 **Explicitly out of scope, on the operator's instruction — do not fold in even though they are
 adjacent and were found the same day:**
 
