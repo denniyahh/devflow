@@ -611,6 +611,15 @@ fn parse_codex_event_result(stdout: &str) -> Option<AgentResult> {
     })
 }
 
+/// TDD RED stub (30-01) — replaced by the real implementation in the next
+/// commit. Returns `None` so the wiring below compiles and the new tests fail
+/// on their assertions rather than on a compile error (this repository's
+/// acceptance rule 3 rejects a compile failure as evidence of RED).
+fn parse_claude_event_result(stdout: &str) -> Option<AgentResult> {
+    let _ = stdout;
+    None
+}
+
 /// Scan the last ~4000 characters of `stdout` in reverse line order.
 ///
 /// `DEVFLOW_RESULT` markers are ASCII. Searching the bounded tail and returning
@@ -669,6 +678,7 @@ pub fn evaluate_layer1(project_root: &Path, phase: u32) -> Option<AgentResult> {
     detect_claude_rate_limit(&stdout)
         .map(rate_limited_result)
         .or_else(|| detect_claude_envelope_failure(&stdout))
+        .or_else(|| parse_claude_event_result(&stdout))
         .or_else(|| parse_devflow_result(&stdout))
         .or_else(|| parse_codex_event_result(&stdout))
         .or_else(|| detect_codex_rate_limit(&stdout).map(rate_limited_result))
@@ -1820,6 +1830,185 @@ mod tests {
     fn claude_envelope_not_consumed_by_codex_parser() {
         let stdout = r#"{"type":"result","subtype":"success","is_error":false,"num_turns":4,"result":"All done.","session_id":"abc"}"#;
         assert!(parse_codex_event_result(stdout).is_none());
+    }
+
+    // ---- Claude `--output-format stream-json` fixtures (plan 30-01) --------
+    //
+    // Sourced from the archived capture
+    // `.planning/phases/30-keep-the-session-alive-past-turn-end/30a-evidence/raw_output_v3.jsonl`,
+    // a real 54-line stream from a session that survived three orchestrator
+    // turns via task-notification wake-ups. The `init` event is line 5; the
+    // three `result` events are lines 19, 37 and 54.
+    //
+    // TWO documented modifications, both labelled where they occur:
+    //   1. Each envelope's `result` string value is replaced with the sentinel
+    //      `__MARKER__`, which each test fills in. NO archived capture contains
+    //      a real `DEVFLOW_RESULT` marker — the v3 harness produced
+    //      acknowledgment prose, not GSD stage output — so every marker payload
+    //      below is SYNTHETIC. Envelope shape is real; marker text is not.
+    //   2. The `init` event's three inert array payloads are truncated and its
+    //      `cwd` is redacted (see `V3_INIT_EVENT`).
+    // Everything else is byte-for-byte as captured, including field ORDER —
+    // note that `"type":"result"` appears near the END of each result line,
+    // long after `result` itself, which is exactly why the parser must key on
+    // the parsed object rather than on textual position.
+
+    /// v3 line 5 — the `system`/`init` event that opens the stream and is the
+    /// ONLY thing `is_claude_event_stream` gates on.
+    ///
+    /// Modification 2: verbatim except that `tools`, `mcp_servers` and
+    /// `slash_commands` are truncated to a real prefix (verbatim they run to
+    /// 5,523 characters of tool and slash-command names that no code path here
+    /// reads) and `cwd` is redacted to a neutral path — the captured value
+    /// embeds a developer's home directory, and `devflow-core` is published to
+    /// crates.io. Both fields are inert for every function under test.
+    const V3_INIT_EVENT: &str = r#"{"type":"system","subtype":"init","cwd":"/tmp/scratchpad/999.64-experiment","session_id":"559fef4d-2053-459e-b7a7-f3200c3b3790","tools":["Task","Bash","Read","Write"],"mcp_servers":[{"name":"github","status":"pending"}],"model":"claude-opus-5[1m]","permissionMode":"bypassPermissions","slash_commands":["gsd-execute-phase"],"capabilities":["interrupt_receipt_v1","interrupt_cancel_queued_v1","msg_lifecycle_v1"],"uuid":"597e1613-77cb-4cdd-a716-2aa75dc58c0b"}"#;
+
+    /// v3 line 19 — the FIRST turn's terminal `result` event.
+    const V3_RESULT_TURN1: &str = r#"{"is_error":false,"duration_api_ms":8087,"num_turns":3,"stop_reason":"end_turn","session_id":"559fef4d-2053-459e-b7a7-f3200c3b3790","total_cost_usd":0.2401795,"usage":{"input_tokens":4,"cache_creation_input_tokens":20120,"cache_read_input_tokens":49219,"output_tokens":574,"service_tier":"standard","inference_geo":"not_available","speed":"standard"},"permission_denials":[],"terminal_reason":"completed","fast_mode_state":"off","subtype":"success","api_error_status":null,"result":"__MARKER__","ttft_ms":1381,"time_to_request_ms":91,"type":"result","duration_ms":8315,"uuid":"3dce3044-2d33-4c4d-bfcb-80e1756a5522"}"#;
+
+    /// v3 line 37 — the SECOND turn's terminal `result` event, produced after a
+    /// task-notification wake-up. Carries the `origin` key the later turns have
+    /// and the first does not.
+    const V3_RESULT_TURN2: &str = r#"{"is_error":false,"duration_api_ms":27809,"num_turns":1,"stop_reason":"end_turn","session_id":"559fef4d-2053-459e-b7a7-f3200c3b3790","total_cost_usd":0.53654625,"usage":{"input_tokens":2,"cache_creation_input_tokens":3147,"cache_read_input_tokens":35393,"output_tokens":124,"service_tier":"standard","inference_geo":"not_available","speed":"standard"},"permission_denials":[],"terminal_reason":"completed","fast_mode_state":"off","origin":{"kind":"task-notification"},"subtype":"success","api_error_status":null,"result":"__MARKER__","ttft_ms":5476,"time_to_request_ms":18,"type":"result","duration_ms":6195,"uuid":"ca58693c-2599-4eb6-955b-e9d1e7444255"}"#;
+
+    /// v3 line 54 — the THIRD and LAST turn's terminal `result` event. This is
+    /// the one whose marker must decide the stage.
+    const V3_RESULT_TURN3: &str = r#"{"is_error":false,"duration_api_ms":39273,"num_turns":2,"stop_reason":"end_turn","session_id":"559fef4d-2053-459e-b7a7-f3200c3b3790","total_cost_usd":0.6599295,"usage":{"input_tokens":4,"cache_creation_input_tokens":999,"cache_read_input_tokens":77871,"output_tokens":302,"service_tier":"standard","inference_geo":"not_available","speed":"standard"},"permission_denials":[],"terminal_reason":"completed","fast_mode_state":"off","origin":{"kind":"task-notification"},"subtype":"success","api_error_status":null,"result":"__MARKER__","ttft_ms":2099,"time_to_request_ms":14,"type":"result","duration_ms":5276,"uuid":"dc76186e-3e9a-4d52-9152-27aa5012bc41"}"#;
+
+    // Synthetic `result`-text payloads (modification 1). Written exactly as
+    // they appear INSIDE the envelope's `result` JSON string — escaped quotes
+    // and an escaped newline — because that is how `claude` emits an agent's
+    // final message. Once serde decodes the field the `\n` becomes a real
+    // newline and `parse_marker_lines`' line scan works on it unmodified.
+    const MARKER_SUCCESS: &str = r#"Plan complete.\nDEVFLOW_RESULT: {\"status\":\"success\"}"#;
+    const MARKER_FAILED: &str =
+        r#"Blocked.\nDEVFLOW_RESULT: {\"status\":\"failed\",\"reason\":\"earlier turn aborted\"}"#;
+    const MARKER_PLANTED_LAYER: &str =
+        r#"Done.\nDEVFLOW_RESULT: {\"status\":\"success\",\"decided_by_layer\":0}"#;
+    const NO_MARKER: &str = r#"Acknowledged; nothing to report."#;
+
+    /// Fill one real envelope's `result` field with a synthetic payload.
+    fn v3_result_event(envelope: &str, escaped_result_text: &str) -> String {
+        assert!(
+            envelope.contains("__MARKER__"),
+            "fixture envelope lost its result-text sentinel"
+        );
+        envelope.replace("__MARKER__", escaped_result_text)
+    }
+
+    /// Assemble a three-turn Claude stream capture: the real `init` event
+    /// followed by all three real `result` envelopes, each carrying the given
+    /// payload. Three result events (not two) is load-bearing — a two-event
+    /// fixture cannot tell "last wins" apart from "highest index of two".
+    fn v3_stream_capture(turn1: &str, turn2: &str, turn3: &str) -> String {
+        format!(
+            "{}\n{}\n{}\n{}\n",
+            V3_INIT_EVENT,
+            v3_result_event(V3_RESULT_TURN1, turn1),
+            v3_result_event(V3_RESULT_TURN2, turn2),
+            v3_result_event(V3_RESULT_TURN3, turn3),
+        )
+    }
+
+    /// The tracer: a real archived `stream-json` capture written to
+    /// `.devflow/phase-NN-stdout` produces a Layer-1 verdict out of
+    /// `evaluate_layer1`. Before plan 30-01 this returned `None` for every
+    /// JSONL capture — `serde_json::from_str` on the whole multi-line document
+    /// is a hard "trailing characters" error, so all four single-document
+    /// parsers declined it and the stage fell through to Layer 2's coarse
+    /// exit-code+commit heuristic.
+    ///
+    /// Fixture provenance and its two modifications are documented on
+    /// `V3_INIT_EVENT` / `V3_RESULT_TURN1..3` above.
+    #[test]
+    fn evaluate_layer1_parses_claude_stream_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 30),
+            v3_stream_capture(NO_MARKER, NO_MARKER, MARKER_SUCCESS),
+        )
+        .unwrap();
+
+        let result = evaluate_layer1(dir.path(), 30).unwrap();
+
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(result.decided_by_layer, Some(1));
+
+        // Non-vacuity guard for the assertion above: this marker omits
+        // `decided_by_layer`, and the field is `#[serde(default)]`, so
+        // `parse_marker_lines` alone yields `None`. `Some(1)` can therefore
+        // only have come from the parser's explicit overwrite.
+        assert_eq!(
+            parse_marker_lines(r#"DEVFLOW_RESULT: {"status":"success"}"#)
+                .unwrap()
+                .decided_by_layer,
+            None
+        );
+    }
+
+    /// Last-result-wins. A session kept alive across turns emits one `result`
+    /// event per turn; only the final one is the session's verdict.
+    ///
+    /// Asserts BOTH directions so the test cannot pass by a parser that merely
+    /// prefers `success`: failed-then-success yields Success, and
+    /// success-then-failed yields Failed. The middle event carries the same
+    /// payload as the first, so a parser that stopped at index 1 would also
+    /// fail.
+    #[test]
+    fn claude_stream_last_result_event_wins_over_earlier_results() {
+        let last_success = v3_stream_capture(MARKER_FAILED, MARKER_FAILED, MARKER_SUCCESS);
+        let result = parse_claude_event_result(&last_success).unwrap();
+        assert_eq!(result.status, AgentStatus::Success);
+
+        let last_failed = v3_stream_capture(MARKER_SUCCESS, MARKER_SUCCESS, MARKER_FAILED);
+        let result = parse_claude_event_result(&last_failed).unwrap();
+        assert_eq!(result.status, AgentStatus::Failed);
+        assert_eq!(result.reason.as_deref(), Some("earlier turn aborted"));
+    }
+
+    /// T-30-26: `decided_by_layer` is provenance, not decoration.
+    /// `crates/devflow-cli/src/pipeline_outcomes.rs` (`classify_validate_outcome`)
+    /// computes `external = decided_by_layer == Some(0) && status == Success`
+    /// and uses it to tell an externally-probe-verified Validate stage apart
+    /// from an ordinary one. An agent that writes `"decided_by_layer": 0` into
+    /// its own marker is claiming a Layer-0 probe provenance it did not earn,
+    /// so the stream parser overwrites the field unconditionally.
+    ///
+    /// This is a runtime assertion on the returned struct, not a source grep —
+    /// it fails the moment the overwrite is dropped.
+    #[test]
+    fn claude_stream_overwrites_agent_planted_decided_by_layer() {
+        // Non-vacuity guard: prove the planted value really would survive
+        // deserialization, so the `Some(1)` below is the overwrite at work and
+        // not an artifact of a marker that failed to parse.
+        assert_eq!(
+            parse_marker_lines(r#"DEVFLOW_RESULT: {"status":"success","decided_by_layer":0}"#)
+                .unwrap()
+                .decided_by_layer,
+            Some(0)
+        );
+
+        let capture = v3_stream_capture(NO_MARKER, NO_MARKER, MARKER_PLANTED_LAYER);
+        let result = parse_claude_event_result(&capture).unwrap();
+
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(result.decided_by_layer, Some(1));
+    }
+
+    /// A marker-less final turn defers to Layer 2 rather than reporting an
+    /// unconditional Success — the same convention `parse_codex_event_result`
+    /// applies to a bare `turn.completed`. A marker-less turn must never
+    /// silently advance a stage.
+    ///
+    /// The FIRST turn carries a success marker, so this also proves the parser
+    /// does not fall back to an earlier turn's marker when the last one has
+    /// none.
+    #[test]
+    fn claude_stream_last_result_without_marker_defers() {
+        let capture = v3_stream_capture(MARKER_SUCCESS, NO_MARKER, NO_MARKER);
+        assert!(parse_claude_event_result(&capture).is_none());
     }
 
     #[test]
