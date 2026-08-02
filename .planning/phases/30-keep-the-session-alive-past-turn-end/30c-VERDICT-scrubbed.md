@@ -157,6 +157,27 @@ through the same replica with all eleven removed returned `PROBE-OK`, exit code
 authentication failure occurred, so there is nothing to report under that
 heading — and nothing was quietly restored.
 
+> **CORRECTION (2026-08-02, from the operator's plain-shell trial,
+> `30c-evidence-operator/`).** The inference above is over-read by one step and
+> is corrected here rather than restated.
+>
+> `apiKeySource: "none"` establishes that the CLI does not **authenticate** from
+> `ANTHROPIC_API_KEY`. It does **not** establish that the variable is inert. The
+> operator's trial kept it — their mise config sets it globally, so production
+> genuinely carries it — and its stderr shows a warning the scrubbed trials
+> never produced:
+>
+> `⚠ claude.ai connectors are disabled because ANTHROPIC_API_KEY or another auth
+> source is set and takes precedence over your claude.ai login`
+>
+> So trials 2 through 7 **over-scrubbed**: they removed a variable production
+> carries, and ran with connectors loaded where production runs with them
+> disabled. Delivery succeeded in both conditions — 6 scrubbed trials and the
+> operator's unscrubbed one — so the verdict is unaffected. The defective part
+> was the reasoning, not the result: a verified check (`apiKeySource`) was
+> extended to a claim it does not support (that the CLI "was already ignoring"
+> the variable).
+
 ## Residual environment
 
 After the scrub the child carried **139** variables and **zero**
