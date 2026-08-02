@@ -46,9 +46,18 @@ waves are complete: wave 1 = 30-01 + 30-02, wave 2 = 30-03 + 30-04, wave 3 =
 30-05. The 30-02 delivery gate resolved `delivery: confirmed`, which is what
 allowed 30-03 and 30-05 to land.
 
-`cargo test -p devflow-core --lib agent_result::` reports 116 passed / 0 failed.
+`cargo test -p devflow-core --lib agent_result::` reports 119 passed / 0 failed.
 `scripts/check.sh all` (host) and `scripts/check-in-container.sh all` (pinned CI
 image) both exit 0. Nothing has been pushed.
+
+**A cross-AI code review followed execution** (`30-CODE-REVIEW.md`,
+codex/gpt-5.6-sol at high effort): verdict REQUEST CHANGES, 2 High + 2 Medium,
+all four independently re-verified. One High was a real fail-open — gate scoping
+reverted to the raw-stdout scan whenever a capture's `init` line was torn — and
+is **fixed** in `06675da` with both regressions verified RED first. The other
+High and one Medium are confirmed but sit behind `evaluate_layer1`, which has
+zero callers; they are now ROADMAP **constraint 9** binding Phase 31. The last
+Medium is backlog **999.70**.
 
 Two limits carried forward deliberately, both recorded in `30-05-SUMMARY.md`:
 the stream parser is **unreachable in production** until Phase 31 flips the
