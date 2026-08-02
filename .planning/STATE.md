@@ -1,7 +1,7 @@
 ---
 gsd_state_version: 1.0
-milestone: v2.0.0
-milestone_name: milestone (open — no fixed closing phase)
+milestone: v2.3.0
+milestone_name: the unattended run (999.64 arc — closes after Phase 31)
 current_phase: 30
 current_phase_name: keep-the-session-alive-past-turn-end
 status: "planned — ready to execute"
@@ -278,8 +278,9 @@ Phase" section above, which `advance-plan` cannot parse (backlog 12,
   **PR #20** (`feat/... → develop`) opened, CI green (8/8 checks), squash-
   merged to `develop` (`e78bc82`) 2026-07-23. **Ships as v1.7.0, not
   v2.0.0** — decided at ship time: nothing across the five units is
-  breaking, and the v2.0.0 milestone stays open rather than closing here
-  (see ROADMAP.md "Milestone stays open," 2026-07-23).
+  breaking, and the v2.0.0 milestone stayed open rather than closing here
+  (see ROADMAP.md "Milestone stays open," 2026-07-23 — superseded 2026-08-02
+  when v2.0.0 closed and the bounded v2.3.0 milestone was declared).
 
   **Fully released 2026-07-23.** `sync-main-to-develop.sh` run first (had
   not been run after v1.6.0 — `origin/main` had diverged from `develop`;

@@ -2,7 +2,33 @@
 
 > Phase plan source of truth. Each phase drives a `devflow start` agent session.
 
-## v2.0.0 milestone (open — no fixed closing phase)
+## v2.3.0 milestone (ACTIVE — bounded, closes when the 999.64 arc lands)
+
+**Declared 2026-08-02.** Deliberately **bounded**: this milestone closes when 999.64 is
+delivered — Phase 30 (the parser and the feasibility gate) plus Phase 31 (the launch path
+itself, planned only if `30c-VERDICT.md` confirms delivery). 999.65 and 999.66 become
+observable only once 999.64 is fixed, and may be folded in before close.
+
+**Milestone goal** — the operator's stated objective for this stretch: a DevFlow-driven
+phase containing a multi-plan wave completes that wave without orphaning delegated work.
+This is the 999.64 arc goal, owned by Phase 31.
+
+The open-ended framing used for v2.0.0 is deliberately **not** repeated here. That decision
+(2026-07-23, below) let the milestone drift across three releases and leave stale milestone
+state behind — surfaced 2026-08-02 when a new statusline began rendering it.
+
+| Phase | Name | Status | Version |
+|---|---|---|---|
+| 30 | Keep the Session Alive Past Turn End | Planned — ready to execute | — |
+| 31 | The Launch Path Itself | Not yet declared — gated on 30c | — |
+
+## v2.0.0 milestone (CLOSED 2026-08-02 — spanned releases 2.0.0, 2.1.0, 2.2.0)
+
+**Closed 2026-08-02.** The label named an open-ended milestone rather than a bounded arc
+(see "Milestone stays open" below), so it never had a scheduled endpoint and continued past
+the 2.0.0 release through 2.1.0 and 2.2.0. Closed by operator decision once Phase 29 aborted
+and Phase 30 was rescoped to the 999.64 arc, which is a distinct unit of work. Phase table
+below is historical — what shipped under this label.
 
 | Phase | Name | Status | Version |
 |---|---|---|---|
@@ -68,7 +94,14 @@
 - **999.13 blocks on 999.24.** Its highest-value check is the workspace self-pin invariant; it must assert against 999.24's fix rather than encode today's manual patch as the expected state.
 - **v2.0.0 is not yet earned.** The milestone reserves 2.0.0 for this phase, but nothing in the five units is inherently breaking, and Phase 19 already declined to burn the 2.0 slot on a non-breaking changeset. Decide at ship time: either the phase earns a breaking change or the milestone closes at 1.7.0 and the slot stays unspent.
 
-## Milestone stays open (2026-07-23)
+## Milestone stays open (2026-07-23) — SUPERSEDED 2026-08-02
+
+> **Superseded.** The open-ended framing recorded below governed v2.0.0 from 2026-07-23 until
+> 2026-08-02, when the milestone was closed and the bounded v2.3.0 milestone was declared above.
+> The lesson is recorded rather than the decision reversed silently: an open milestone with no
+> closing condition drifted three releases and left `.planning/STATE.md` advertising a merged PR
+> as open. v2.3.0 carries an explicit closing condition for that reason. The notes below remain
+> accurate as history for v2.0.0.
 
 - **Decided at Phase 20 ship time:** ships as **v1.7.0**, not v2.0.0 — nothing across the five units is breaking, consistent with Phase 19's earlier call not to spend the 2.0 slot on a non-breaking changeset.
 - **The v2.0.0 milestone does NOT close at Phase 20 or at any other fixed phase.** Earlier notes above ("the milestone now runs Phase 11–20 and genuinely closes at v2.0.0," "the v2.0.0 milestone closes at Phase 20," "the milestone reserves 2.0.0 for this phase") described a *bounded* Phase 11–20 arc culminating in a 2.0.0 release. That framing is superseded: the milestone continues past Phase 20 with no predetermined phase count or closing version — 2.0.0 remains an eventual aspiration, not a scheduled endpoint. Future phases keep numbering forward (21, 22, …) under the same open milestone until a genuinely breaking change actually earns the 2.0 slot; `/gsd-complete-milestone` is not run at Phase 20.
