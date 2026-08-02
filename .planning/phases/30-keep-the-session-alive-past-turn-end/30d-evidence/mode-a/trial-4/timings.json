@@ -1,0 +1,194 @@
+{
+  "aborted_with": null,
+  "agent_session_markers_scrubbed": false,
+  "background_tasks_changed": [
+    {
+      "at": 8.868,
+      "local_agent_count": 1,
+      "task_ids": [
+        "a8533710a1b9eb154"
+      ],
+      "total_entries": 1
+    },
+    {
+      "at": 9.12,
+      "local_agent_count": 2,
+      "task_ids": [
+        "a8533710a1b9eb154",
+        "a9f1641f05779234c"
+      ],
+      "total_entries": 2
+    },
+    {
+      "at": 34.033,
+      "local_agent_count": 1,
+      "task_ids": [
+        "a9f1641f05779234c"
+      ],
+      "total_entries": 1
+    },
+    {
+      "at": 41.387,
+      "local_agent_count": 0,
+      "task_ids": [],
+      "total_entries": 0
+    }
+  ],
+  "child_a_signal_at_s": 29.503,
+  "child_a_signal_contents": "CHILD-A-DONE",
+  "child_a_signal_file": "present",
+  "child_b_signal_at_s": 39.33,
+  "child_b_signal_contents": "CHILD-B-DONE",
+  "child_b_signal_file": "present",
+  "claude_code_version": "2.1.220",
+  "cleanup": {
+    "census_comms": [
+      "2.1.220",
+      "bash",
+      "claude",
+      "gh",
+      "node",
+      "node-MainThread",
+      "npm exec @model",
+      "python3",
+      "sh",
+      "sleep",
+      "zsh"
+    ],
+    "census_pids_seen": 26,
+    "clean": true,
+    "pgid": 1068935,
+    "pre_kill_alive": [],
+    "steps": [
+      "SIGTERM: skipped, group already empty"
+    ],
+    "survivor_check_completed": true,
+    "survivors_after_reap": []
+  },
+  "cleanup_action": "process group 1068935 signalled (SIGTERM: skipped, group already empty); survivor check completed: True; no survivors",
+  "cli_pid_recorded": true,
+  "clock": "time.monotonic (not wall-clock: NTP adjustment shows up exactly at sub-second scale)",
+  "close_precondition_met": true,
+  "delivery_buffer_s": 30.0,
+  "drained_at_s": 41.38738571400245,
+  "drained_before_close": true,
+  "drained_event_observed": true,
+  "event_count": 56,
+  "exit_code": 0,
+  "exit_latency_ms": 159.1,
+  "final_result_truncated": false,
+  "final_result_truncation_basis": "the capture ends on a complete result event (is_error false, 462 chars) with no trailing assistant events",
+  "first_dispatch_at_s": 8.867594413000916,
+  "invocation": "30d-exit-timing-harness.py mode-a --iterations 2 --start-index 4",
+  "last_dispatch_at_s": 34.03285725599926,
+  "launcher": {
+    "function": "launch_in_monitor_env",
+    "git_scrub_list_parsed": [
+      "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+      "GIT_CONFIG",
+      "GIT_CONFIG_PARAMETERS",
+      "GIT_CONFIG_COUNT",
+      "GIT_OBJECT_DIRECTORY",
+      "GIT_DIR",
+      "GIT_WORK_TREE",
+      "GIT_IMPLICIT_WORK_TREE",
+      "GIT_GRAFT_FILE",
+      "GIT_INDEX_FILE",
+      "GIT_NO_REPLACE_OBJECTS",
+      "GIT_REPLACE_REF_BASE",
+      "GIT_PREFIX",
+      "GIT_SHALLOW_FILE",
+      "GIT_COMMON_DIR",
+      "GIT_NAMESPACE",
+      "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+      "GIT_CEILING_DIRECTORIES"
+    ],
+    "module_path": "30c-monitor-env-harness.py",
+    "reimplemented": false
+  },
+  "local_bash_events": [
+    {
+      "at": 17.276,
+      "description": "Wait 22 seconds",
+      "subtype": "task_started",
+      "task_id": "bevtt4642"
+    },
+    {
+      "at": 17.276,
+      "description": "Wait 10 seconds",
+      "subtype": "task_started",
+      "task_id": "byuyqgz2r"
+    }
+  ],
+  "longest_quiet_gap_all_events_s": 7.0,
+  "longest_quiet_gap_milestone_s": 11.938,
+  "mode": "mode-a",
+  "notifications": [
+    {
+      "at": 24.276,
+      "status": "completed",
+      "task_id": "byuyqgz2r",
+      "task_type": null
+    },
+    {
+      "at": 34.033,
+      "status": "completed",
+      "task_id": "a8533710a1b9eb154",
+      "task_type": null
+    },
+    {
+      "at": 36.273,
+      "status": "completed",
+      "task_id": "bevtt4642",
+      "task_type": null
+    },
+    {
+      "at": 41.387,
+      "status": "completed",
+      "task_id": "a9f1641f05779234c",
+      "task_type": null
+    }
+  ],
+  "observation_window_floor_s": null,
+  "observation_window_s": 69.978,
+  "outstanding_local_agent_tasks_at_close": [],
+  "process_exited": true,
+  "results": [
+    {
+      "at": 12.338,
+      "is_error": false,
+      "num_turns": 3,
+      "origin_kind": null,
+      "parent_tool_use_id": null,
+      "result_chars": 28,
+      "stop_reason": "end_turn"
+    },
+    {
+      "at": 40.317,
+      "is_error": false,
+      "num_turns": 1,
+      "origin_kind": "task-notification",
+      "parent_tool_use_id": null,
+      "result_chars": 140,
+      "stop_reason": "end_turn"
+    },
+    {
+      "at": 49.739,
+      "is_error": false,
+      "num_turns": 2,
+      "origin_kind": "task-notification",
+      "parent_tool_use_id": null,
+      "result_chars": 462,
+      "stop_reason": "end_turn"
+    }
+  ],
+  "results_after_close": 0,
+  "slowest_child_deadline_s": 22.0,
+  "stderr_nonempty": false,
+  "stdin_closed_at_s": 64.775,
+  "trial": 4,
+  "unparseable_lines": 0,
+  "untyped_task_entries": 0,
+  "window_after_last_dispatch_s": 35.945,
+  "wrapper_exit_latency_ms": 182.0
+}
