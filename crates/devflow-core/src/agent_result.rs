@@ -1949,6 +1949,81 @@ mod tests {
         assert!(parse_codex_event_result(stdout).is_none());
     }
 
+    /// The highest-value isolation test in plan 30-01 (T-30-02).
+    ///
+    /// The single-document `--output-format json` envelope that ships TODAY
+    /// carries `type: "result"` AND a `session_id` — precisely the gate shape
+    /// 30-RESEARCH.md offered as an alternative to `system`/`init`. If anyone
+    /// widens [`is_claude_event_stream`] to accept it, the stream parser starts
+    /// consuming every production capture in use and silently displaces
+    /// `parse_devflow_result` in the Layer-1 cascade. This test fails first.
+    ///
+    /// The first literal is reused verbatim from
+    /// `claude_envelope_not_consumed_by_codex_parser` above so the two read as
+    /// a matched pair.
+    #[test]
+    fn single_doc_envelope_not_consumed_by_claude_stream_parser() {
+        let stdout = r#"{"type":"result","subtype":"success","is_error":false,"num_turns":4,"result":"All done.","session_id":"abc"}"#;
+        assert!(parse_claude_event_result(stdout).is_none());
+
+        // Non-vacuity: the literal above carries no marker, so it would return
+        // None even from a WRONGLY-widened gate — on its own it proves little.
+        // This envelope does carry one, so it can only return None because the
+        // gate declined the document, not because the marker scan came up dry.
+        let with_marker = r#"{"type":"result","subtype":"success","is_error":false,"num_turns":4,"result":"Done.\nDEVFLOW_RESULT: {\"status\":\"success\"}","session_id":"abc"}"#;
+        assert!(parse_claude_event_result(with_marker).is_none());
+
+        // ...and the shipped path still owns it, so declining costs no verdict.
+        assert_eq!(
+            parse_devflow_result(with_marker).unwrap().status,
+            AgentStatus::Success
+        );
+    }
+
+    /// Cross-adapter isolation: a Codex `--json` event stream is not consumed
+    /// by the Claude stream parser. The two gates are mutually exclusive by
+    /// construction — Codex keys on `thread.started`/`turn.*`, Claude on
+    /// `system`/`init` — and this pins that.
+    #[test]
+    fn codex_stream_not_consumed_by_claude_stream_parser() {
+        let stdout = concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"t1\"}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_2\",\"type\":\"agent_message\",\"text\":\"DEVFLOW_RESULT: {\\\"status\\\": \\\"success\\\"}\"}}\n",
+            "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}\n",
+        );
+        assert!(parse_claude_event_result(stdout).is_none());
+
+        // The Codex parser still decides it — isolation costs no verdict.
+        assert_eq!(
+            parse_codex_event_result(stdout).unwrap().status,
+            AgentStatus::Success
+        );
+    }
+
+    /// The same isolation claim in the other direction: a Claude stream capture
+    /// is not consumed by the Codex parser, so the two never collide.
+    #[test]
+    fn claude_stream_not_consumed_by_codex_parser() {
+        let capture = v3_stream_capture(NO_MARKER, NO_MARKER, MARKER_SUCCESS);
+        assert!(parse_codex_event_result(&capture).is_none());
+    }
+
+    /// Plain-text stdout is not consumed by the Claude stream parser.
+    ///
+    /// Non-vacuous by construction: the text carries a real marker, so a gate
+    /// that wrongly fired on non-JSON input would change the verdict rather
+    /// than merely returning None. The second assertion pins that the marker
+    /// path still decides it — the cascade must lose nothing.
+    #[test]
+    fn plain_text_not_consumed_by_claude_stream_parser() {
+        let stdout = "Running the plan...\nDEVFLOW_RESULT: {\"status\":\"success\"}\n";
+        assert!(parse_claude_event_result(stdout).is_none());
+        assert_eq!(
+            parse_devflow_result(stdout).unwrap().status,
+            AgentStatus::Success
+        );
+    }
+
     // ---- Claude `--output-format stream-json` fixtures (plan 30-01) --------
     //
     // Sourced from the archived capture
