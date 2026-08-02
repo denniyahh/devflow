@@ -2663,12 +2663,12 @@ construction, since all three 30b plans edit `agent_result.rs`.
 
 Plans:
 
-- [ ] 30-01-PLAN.md — 30b tracer: the end-to-end Claude stream slice. `claude_stream_events`,
+- [x] 30-01-PLAN.md — 30b tracer: the end-to-end Claude stream slice. `claude_stream_events`,
   `is_claude_event_stream`, `last_top_level_result`, `parse_claude_event_result`, wired into
   `evaluate_layer1`, plus the isolation tests proving neither shipped capture shape is hijacked.
   (wave 1)
 
-- [ ] 30-02-PLAN.md — 30c: the production-environment experiment. A standalone harness
+- [x] 30-02-PLAN.md — 30c: the production-environment experiment. A standalone harness
   replicating `spawn_monitor`'s process shape (read-only w.r.t. DevFlow source), its archived
   evidence, and `30c-VERDICT.md`'s binary `delivery:` field — the gate on Phase 31. Ends in a
   blocking operator sign-off. (wave 1, `autonomous: false`)

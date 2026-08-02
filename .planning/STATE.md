@@ -4,8 +4,8 @@ milestone: v2.3.0
 milestone_name: the unattended run (999.64 arc — closes after Phase 31)
 current_phase: 30
 current_phase_name: keep-the-session-alive-past-turn-end
-status: "planned — ready to execute"
-stopped_at: "Phase 30 planned and cross-AI reviewed (5 plans, 3 waves) — ready for /gsd-execute-phase 30"
+status: "executing — wave 1 complete (2/5 plans)"
+stopped_at: "Phase 30 wave 1 complete: 30-01 (Claude stream Layer-1 parser, 97 tests) and 30-02 (30c delivery experiment, operator-approved on 8 trials across 3 environments). Wave 2 next: 30-03, 30-04"
 last_updated: "2026-08-02T15:14:11.856Z"
 last_activity: 2026-08-02
 last_activity_desc: "Phase 30 planned: 5 plans, 3 waves (30b parser tracer + expansions, 30c delivery experiment, 30d exit-timing evidence); plan-checker passed"
