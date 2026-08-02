@@ -2268,9 +2268,25 @@ even though all three surfaced from the same 2026-07-31 dogfood run: 999.64 is t
 for the other two ever being *observable* in an autonomous run (999.65 needs a second loop-back
 to fire; 999.66 needs a third), so fixing it first is not a preference, it's a dependency order.
 
-**Goal:** a DevFlow-driven phase containing a multi-plan wave completes that wave without
-orphaning delegated work — the specific failure that has blocked every attempt at an unattended
-run through this project's history.
+**Arc goal (999.64 — spans Phase 30 AND Phase 31, owned by Phase 31):** a DevFlow-driven phase
+containing a multi-plan wave completes that wave without orphaning delegated work — the specific
+failure that has blocked every attempt at an unattended run through this project's history.
+
+**Goal:** the parser and the feasibility gate — Layer 1 can read a Claude `stream-json` (JSONL)
+capture (verdict, rate limit, envelope failure, `session_id`, checkpoint detection) without
+regressing the shipped single-document path by a single test, and the two premises Phase 31
+would rest on each have archived evidence and a recorded verdict: (a) whether
+`task-notification` delivery survives DevFlow's real launch environment (`30c-VERDICT.md`), and
+(b) what the CLI does on stdin close, both drained and with pending background tasks
+(`30d-MEASUREMENTS.md`).
+
+**Goal reconciliation (2026-08-02, cross-AI review finding 4).** The arc goal above was
+previously stated as this phase's own goal line while this same entry forbids any launch-path
+change — so Phase 30 could not satisfy its own stated goal and phase verification would have
+failed it by construction. The two goals are now stated separately: Phase 30 is verified against
+the phase goal directly above; the arc goal is Phase 31's acceptance criterion (the live Phase 29
+wave-2 re-run). Nothing about the scope of either phase changed — only which goal each is
+measured against.
 
 **The defect, unchanged from its backlog filing:** DevFlow launches every stage as `claude -p
 "<prompt>"`. The agent's turn ending terminates the process. GSD's `execute-phase` workflow
@@ -2423,10 +2439,6 @@ construction, since all three 30b plans edit `agent_result.rs`.
 Plans:
 
 - [ ] 30-01-PLAN.md — 30b tracer: the end-to-end Claude stream slice. `claude_stream_events`,
-
-**Cross-cutting constraints:**
-
-- The archived evidence contains no absolute home paths, OS usernames, or credentials.
   `is_claude_event_stream`, `last_top_level_result`, `parse_claude_event_result`, wired into
   `evaluate_layer1`, plus the isolation tests proving neither shipped capture shape is hijacked.
   (wave 1)
@@ -2443,8 +2455,22 @@ Plans:
 - [ ] 30-04-PLAN.md — 30d: re-measure and archive exit timing as a multi-trial distribution,
   plus the first observation of the undefined close-with-pending-tasks case. (wave 2)
 
-- [ ] 30-05-PLAN.md — 30b expansion: scope the checkpoint gate scan to top-level
-  `assistant`/`result` text, closing review constraint 3's prompt-echo false positive. (wave 3)
+- [ ] 30-05-PLAN.md — 30b expansion: scope the checkpoint gate scan to the `result` text of
+  top-level `result` events ONLY, closing review constraint 3's prompt-echo false positive
+  without admitting intermediate assistant narration as trusted gate text. (wave 3)
+
+**Cross-cutting constraints (all five plans):**
+
+- The archived evidence contains no absolute home paths, OS usernames, session identifiers, or
+  credentials. Raw CLI output is staged outside `.planning/` and published only after
+  validation, structural redaction, and a secret scan.
+- No file under `crates/devflow-core/src/monitor.rs`, `crates/devflow-core/src/agents/`, or
+  `crates/devflow-cli/src/` is modified by any plan in this phase.
+- `30c-VERDICT.md`'s `delivery:` field gates Phase 31, and — per cross-AI review finding 5 —
+  also gates whether the 30b expansion plans (30-03, 30-05) land at all, since the shipped
+  Claude adapter still emits single-document JSON (`agents/claude.rs`, `--output-format json`)
+  and a refuted delivery premise leaves the stream parser with no operational producer. That
+  branch is an operator decision recorded at 30-02's Task 3 checkpoint, not an automatic one.
 
 Planner notes: the review constraints were treated as locked design inputs. Constraints 2, 3
 and 6 are implemented here; constraints 1, 4 and 5 are represented but NOT implemented — every
