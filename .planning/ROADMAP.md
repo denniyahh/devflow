@@ -2276,29 +2276,84 @@ executors produced 5 real commits on orphaned branches, neither wrote a `SUMMARY
 merged, and DevFlow's own completion oracle scored the stage Success because it has no marker for
 "the agent delegated to a process it can no longer see."
 
-**Units:**
+#### 30a — the feasibility experiment: RUN and CONFIRMED (2026-08-01), then adversarially reviewed
 
-- **30a — the feasibility experiment. Blocking; run before any implementation.** Does a
-  backgrounded subagent's completion notification actually get delivered into a session kept
-  alive past its own turn end via `--input-format stream-json`? The lifetime property is
-  measured (a `claude -p --input-format stream-json` process survives its turn and exits only
-  when stdin closes) but delivery-into-a-live-session is **not yet proven**. Isolated: a scratch
-  directory, no GSD, no worktrees, no this-repo state — a trivial prompt that spawns one
-  backgrounded `Agent`, ends its turn, and waits. Two outcomes, both informative: confirmed →
-  proceed to 30b on a validated premise; refuted → 999.64's proposed fix is wrong and this phase
-  re-scopes around whichever of the rejected options (`--resume`-on-detect, `--bg` +
-  `claude agents --json`) the experiment's failure mode points to.
-- **30b — the launch path.** Contingent on 30a. DevFlow's stage-launch code switches to
-  `--input-format stream-json --output-format stream-json --verbose`, writes the prompt, holds
-  the pipe open, and closes stdin on observing `DEVFLOW_RESULT` in the output stream — making the
-  completion protocol DevFlow already depends on the stream terminator. Requires a wall-clock
-  timeout so an agent that never declares cannot hold the pipe open forever (a new failure mode
-  this design introduces and must handle, not inherit silently).
-- **30c — verification against the real failure.** Re-run (or a scoped equivalent of) the
-  Phase 29 wave-2 shape — a wave with 2+ plans, driven through DevFlow, one-shot launch — and
-  confirm both executors' work merges. This is the phase's actual acceptance criterion; passing
-  tests on the launch-path code is necessary and not sufficient, per this project's own repeated
-  lesson.
+Three experiment iterations (artifacts in the session scratchpad, `999.64-experiment/`;
+raw JSONL logs are the evidence of record, not the harness's own printed verdicts):
+
+- **v1 — invalid, kept as a recorded pitfall.** Its turn-detection heuristic mistook
+  *subagent-forwarded narration* (`parent_tool_use_id` set) for orchestrator resumption. Any
+  future consumer of these streams must discriminate on `parent_tool_use_id == null`.
+- **v2 — single background child.** After the CLI's `result` event fired (the point where a
+  plain `claude -p` exits), the process stayed alive on open stdin; the child completed real
+  work ~19s later; a **new top-level orchestrator turn followed, and its `result` event carried
+  `origin: {kind: "task-notification"}`** — the CLI itself attributing the turn to the child's
+  completion, not an inference from timing. (Harness hung afterward on a blocking `readline` —
+  harness bug, post-evidence, fixed in v3 with `select()`.)
+- **v3 — TWO CONCURRENT children (10s / 22s), the actual Phase 29 wave-2 shape.** Both
+  completions delivered independently as separate `task-notification`-origin results, each
+  triggering a real orchestrator turn that acted on the completion; both signal files verified
+  on disk. Process exited **0.38s** after stdin close.
+
+**Adversarial review of the assessment built on these results (Claude Fable 5, 2026-08-01):
+"the evidence survives; the plan is destroyed in its two central claims."** The review
+re-parsed both raw logs independently (confirming E-claims, including defeating its own
+multiple-`init` counter-reading: same `session_id` throughout, resumed turns retain prior
+knowledge, so "runtime-injected new turn in the same live session" and "orchestrator resumed"
+are the same fact) and then destroyed the proposed implementation shape. Its findings are
+**binding constraints on 30b's plans**:
+
+1. **No launch-time prediction (C1).** Scoping stream-json to "stages that will background" is
+   a D-10-class prediction of GSD's dispatch behavior — and already falsified by the record
+   (subagents background *by default*; a Plan-stage background loss is on record). The mode is
+   **always-on for the Claude adapter**, or rolled out per-stage as a sequencing choice; never
+   selected by predicting agent behavior.
+2. **This is a monitor rewrite, not a flag change, and it splits into three plans (C2).**
+   `spawn_monitor` is a detached `sh` script with `stdin(Stdio::null())` and the prompt as
+   argv — it cannot hold a pipe open. The real shape: (i) a Claude stream-event parsing layer
+   in `agent_result.rs` (mirroring the existing Codex event-stream pattern), (ii) a
+   pipe-owning monitor path replacing the `sh` script for this adapter, (iii) the adapter
+   flag/argv switch. Each independently landable and testable.
+3. **The parse layer mostly dies under JSONL capture (H1).** Verified against source:
+   `parse_devflow_result`'s whole-doc path, `claude_session_id` (breaks 28-03 checkpoint
+   resume), `detect_claude_rate_limit`, and envelope-failure detection all fail on JSONL;
+   `blocking_human_checkpoint_reported` survives *by accident* and gains a false-positive
+   surface (stream echoes the full prompt back, so prompt text documenting a gate reads as a
+   live gate); the marker scan's 4000-char tail window is smaller than a single stream `result`
+   event line. The parser plan owns all of these, plus the newly observed `rate_limit_event`
+   stream type. **Multiple `result` events per process is the new normal — last-result
+   semantics, never first-result.**
+4. **Stdin-close must gate on marker AND drained task set (H2).** Closing on first
+   `DEVFLOW_RESULT` alone re-creates the orphaning by DevFlow's own hand (orchestrator declares
+   while children still run). The stream provides `background_tasks_changed` events that drain
+   to `[]` — close only on *marker observed in a top-level `result` event AND background task
+   set empty*. What close-with-pending-tasks does is untested and must be treated as undefined.
+5. **Idle timeout, not wall-clock; and the timeout writes its own authoritative result (H3).**
+   No fixed wall-clock is safe for both hangs and legitimate ~47-minute stages. The stream is a
+   per-event heartbeat: time out on stream *idleness* inside a generous outer bound. On firing,
+   the monitor must record an authoritative first-class failure — a graceful close falls
+   through to Layer 2, which would score partial commits as Success (999.64 reborn inside its
+   own fix), and a kill mis-classifies as OOM/`ResourceKilled`.
+6. **Evidence gaps to close in-phase (M1–M4):** the 0.38s exit timing is unarchived (harness
+   stdout only — re-measure and archive, including close-with-pending-tasks); the
+   task-notification resume behavior is unpinned, undocumented CLI behavior observed on
+   `claude_code_version 2.1.220` (smoke-detect it in a canary or pin the CLI); near-simultaneous
+   completions are untested (real executors finish at correlated times); and the deciding
+   environment test — **run the v3 harness once through `spawn_monitor` itself** — is cheap and
+   closes the interactive-vs-production question completely.
+
+#### Remaining units
+
+- **30b — the launch path, three plans per C2 above.** Parser first (pure functions, testable
+  against the archived v2/v3 logs as fixtures), then the pipe-owning monitor (close rule per
+  H2, idle timeout per H3), then the adapter switch (always-on per C1). The spawn_monitor
+  harness re-run (M4) and the E4 re-measurement land with the monitor plan.
+- **30c — verification against the real failure.** Re-run the Phase 29 wave-2 shape — a wave
+  with 2+ plans, driven through DevFlow — and confirm both executors' work merges. **This
+  remains the phase's acceptance criterion and is not substitutable by integration tests**
+  (H4): a mocked CLI validates plumbing, not the delivery premise, and the premise is exactly
+  the undocumented behavior in question. Passing tests are necessary and not sufficient, per
+  this project's own repeated lesson.
 
 **Explicitly out of scope, on the operator's instruction — do not fold in even though they are
 adjacent and were found the same day:**
@@ -2309,17 +2364,20 @@ adjacent and were found the same day:**
   reliability.
 - Anything release-related — see the shelved entry below.
 
-**Priority:** Highest — the standing blocker on the operator's stated objective. **Size:** S for
-30a (must run first and gates everything else), M for 30b, S for 30c.
+**Priority:** Highest — the standing blocker on the operator's stated objective. **Size:**
+30a complete (informal spike, evidence archived); **M–L for 30b** — honestly re-sized from M
+after the review established it is a monitor rewrite plus a new parsing layer, not a flag
+change; S for 30c.
 
-**Requirements:** TBD — tracked by unit (`30a`–`30c`); no REQ-IDs, consistent with this project's
-convention for infrastructure phases.
-**Depends on:** nothing structurally; 30a gates 30b/30c internally.
+**Requirements:** TBD — tracked by unit (`30a`–`30c`) plus the six binding review constraints
+above; no REQ-IDs, consistent with this project's convention for infrastructure phases.
+**Depends on:** nothing structurally; 30a is closed, 30b's three plans are ordered
+parser → monitor → adapter, 30c gates phase completion.
 
 Plans:
 
-- [ ] TBD — 30a first via `/gsd-plan-phase 30` or a direct spike, then promote 30b/30c only if
-  30a confirms the premise
+- [ ] TBD — `/gsd-plan-phase 30`; the planner MUST treat the six review constraints as locked
+  design inputs, and 30b decomposes as three plans per constraint 2
 
 ---
 
