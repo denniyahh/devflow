@@ -5,14 +5,14 @@ milestone_name: milestone (open — no fixed closing phase)
 current_phase: 28
 current_phase_name: close-the-checkpoint-answer-return-path
 status: shipped — PR #63 open to develop
-stopped_at: Phase 28 shipped — PR #63 (feature/phase-28 → develop), awaiting CI + merge
-last_updated: "2026-07-31T08:35:00.000Z"
-last_activity: 2026-07-30
-last_activity_desc: "Phase 28 complete: 6/6 plans, 779 tests green, SECURED (threats_open 0), verification passed. A1 closed by a live run that found and fixed a real defect (b22e6cf) — the executor renders the gate value as a markdown code span, which the reader did not match; checkpoints now recognize, auto-decide, audit, resume, and resolve end-to-end"
+stopped_at: "Phase 28 shipped — PR #63 (feature/phase-28 → develop), awaiting CI + merge"
+last_updated: "2026-08-02T11:50:33.571Z"
+last_activity: 2026-08-02
+last_activity_desc: "Phase 30 planned: 5 plans, 3 waves (30b parser tracer + expansions, 30c delivery experiment, 30d exit-timing evidence); plan-checker passed"
 progress:
-  total_phases: 17
+  total_phases: 21
   completed_phases: 15
-  total_plans: 124
+  total_plans: 129
   completed_plans: 124
   percent: 88
 ---
@@ -88,7 +88,7 @@ change earns 2.0.
 
 Phase: 28 (close-the-checkpoint-answer-return-path) — EXECUTING
 Plan: 1 of 6
-Status: Executing Phase 28
+Status: Ready to execute
 real action is `/gsd-review-backlog` to promote a 999.x entry, or `/gsd-ship 27`
 to merge this phase. `phase.complete` auto-advanced this field to "999.1 — Hermes
 Support (BACKLOG)" because its next-phase scan walks into the backlog section;
