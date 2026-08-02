@@ -1,0 +1,65 @@
+# 30c run log — monitor-environment replication harness
+claude_cli_version: 2.1.220
+expected_cli_version: 2.1.220
+workdir: ~/Github/devflow
+staged_output_dir: /tmp/devflow-30c-6dm_okfq
+staged_dir_outside_repo: True
+argv: claude -p --input-format stream-json --output-format stream-json --verbose --dangerously-skip-permissions
+
+## Replicated from spawn_monitor
+launch_via_sh_c: true
+detached_start_new_session: true
+stdin_tty: false / stdout_tty: false / stderr_tty: false
+stderr_separate_file: true
+
+## Deliberate deviation (the variable under test)
+harness_holds_child_stdin_open: true
+
+## Environment scrub (names only)
+trial: 2 — agent-session markers ALSO scrubbed
+scrub_list_source: crates/devflow-core/src/git.rs (2 of the parsed names were present and removed)
+removed_variables: GIT_DIR, GIT_WORK_TREE
+removed_agent_session_markers: AI_AGENT, ANTHROPIC_API_KEY, ANTHROPIC_TOKEN, CLAUDECODE, CLAUDE_CODE_BRIDGE_SESSION_ID, CLAUDE_CODE_CHILD_SESSION, CLAUDE_CODE_ENTRYPOINT, CLAUDE_CODE_EXECPATH, CLAUDE_CODE_SESSION_ID, CLAUDE_EFFORT, CLAUDE_PID
+
+## Residual environment the scrub cannot remove (names only, never values)
+parent_process: zsh
+launched_from_agent_session: False
+claude_session_markers: (none)
+credential_named_var_count: 9 (names withheld per T-30-07)
+total_env_vars_in_child: 139
+
+## Timeline (seconds from launch)
+launch: t+0.00
+result#1: t+9.80
+result#2: t+30.84
+result#3: t+44.35
+stdin_close: t+75.12
+process_exit: t+75.62
+signal_A: 23.83
+signal_B: 34.09
+signal_A_contents: 'CHILD-A-DONE'
+signal_B_contents: 'CHILD-B-DONE'
+wall_clock_duration_s: 75.62
+exit_delay_after_stdin_close: 0.5
+process_killed_by_harness: False
+sh_exit_code: 0
+
+## Observed result events (origin verbatim)
+result[1]: at=t+9.80 origin=null num_turns=3 is_error=False
+result[2]: at=t+30.84 origin={"kind": "task-notification"} num_turns=1 is_error=False
+result[3]: at=t+44.35 origin={"kind": "task-notification"} num_turns=2 is_error=False
+
+## Observed task notifications
+notification: at=t+20.83 task_id=bw7l1lr6q status=completed
+notification: at=t+26.59 task_id=a9e9e38afe4ff6d78 status=completed
+notification: at=t+34.09 task_id=bkcmo0dfa status=completed
+notification: at=t+36.84 task_id=ab50dd838f897c849 status=completed
+
+## Observed background_tasks_changed
+background_tasks_changed: at=t+7.03 count=1 ids=['a9e9e38afe4ff6d78']
+background_tasks_changed: at=t+8.28 count=2 ids=['a9e9e38afe4ff6d78', 'ab50dd838f897c849']
+background_tasks_changed: at=t+26.59 count=1 ids=['ab50dd838f897c849']
+background_tasks_changed: at=t+36.84 count=0 ids=[]
+
+# No verdict is printed here by design: 30a records that the
+# harness-printed verdict was wrong in v1 and unreliable in v2.

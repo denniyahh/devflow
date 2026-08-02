@@ -77,6 +77,20 @@ EVIDENCE_DIR = os.path.join(HARNESS_DIR, "30c-evidence")
 #: contaminated run is the comparison arm that makes trial 2 interpretable.
 EVIDENCE_DIR_SCRUBBED = os.path.join(HARNESS_DIR, "30c-evidence-scrubbed")
 
+#: The replication set publishes to `trial-{n}/` beneath this. Trials 1 and 2
+#: are never overwritten.
+EVIDENCE_DIR_RELIABILITY = os.path.join(HARNESS_DIR, "30c-evidence-reliability")
+
+#: Planted in the parent before each replication trial so production's git
+#: scrub does real work DURING the measured run, not only in a separate
+#: mechanism check. Both point at paths that do not exist: if the scrub ever
+#: failed to remove them, git inside the child would fail loudly rather than
+#: silently acting on the wrong repository.
+RELIABILITY_DECOY_GIT_ENV = {
+    "GIT_DIR": "/tmp/devflow-30c-decoy-git-dir",
+    "GIT_WORK_TREE": "/tmp/devflow-30c-decoy-work-tree",
+}
+
 #: The const names whose string literals form production's env-scrub list.
 SCRUB_CONST_NAMES = ("REPO_LOCAL_GIT_VARS", "ALSO_REDIRECTING_GIT_VARS")
 
@@ -404,6 +418,8 @@ class Observations:
     exit_delay_after_stdin_close: Optional[float] = None
     exit_code: Optional[int] = None
     killed: bool = False
+    duration_s: Optional[float] = None
+    signal_contents: dict[str, Optional[str]] = field(default_factory=dict)
 
     def mark(self, label: str, elapsed: float) -> None:
         self.timeline.append((label, elapsed))
@@ -839,7 +855,9 @@ def _run_log_lines(run: LaunchedRun, obs: Observations, version: str, stage_dir:
     ]
     lines += [f"{label}: t+{at:.2f}" for label, at in obs.timeline]
     lines += [f"signal_{label}: {value}" for label, value in sorted(obs.signals.items())]
+    lines += [f"signal_{label}_contents: {value!r}" for label, value in sorted(obs.signal_contents.items())]
     lines += [
+        f"wall_clock_duration_s: {obs.duration_s:.2f}" if obs.duration_s is not None else "wall_clock_duration_s: (not recorded)",
         f"exit_delay_after_stdin_close: {obs.exit_delay_after_stdin_close}",
         f"process_killed_by_harness: {obs.killed}",
         f"sh_exit_code: {obs.exit_code}",
@@ -859,20 +877,21 @@ def _run_log_lines(run: LaunchedRun, obs: Observations, version: str, stage_dir:
     return lines
 
 
-def main(argv: Optional[list[str]] = None) -> int:
-    argv = sys.argv[1:] if argv is None else argv
-    scrub_markers = "--scrub-agent-markers" in argv
-    evidence_dir = EVIDENCE_DIR_SCRUBBED if scrub_markers else EVIDENCE_DIR
+def run_single_trial(
+    evidence_dir: str,
+    version: str,
+    *,
+    scrub_markers: bool = False,
+    expected_results: int = 3,
+    read_deadline: float = 60.0,
+    straggler_window: float = 5.0,
+) -> dict[str, Any]:
+    """Launch, observe and publish exactly one trial.
+
+    Returns a summary of what was observed. It is deliberately NOT a verdict:
+    the verdict is derived later by re-reading the published capture.
+    """
     markers = discover_agent_session_markers() if scrub_markers else []
-
-    version = resolve_cli_version()
-    if version != EXPECTED_CLI_VERSION:
-        raise HarnessError(
-            f"claude CLI is {version!r}, expected {EXPECTED_CLI_VERSION!r} — the "
-            "version every archived 30a capture recorded. A different CLI makes "
-            "comparison against the baseline invalid."
-        )
-
     stage_dir = make_stage_dir()
     signal_paths = {
         "A": os.path.join(stage_dir, "signalA_30c.txt"),
@@ -880,10 +899,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     }
     prompt = PROMPT_TEMPLATE.format(signal_a=signal_paths["A"], signal_b=signal_paths["B"])
 
-    print(f"[harness] trial {'2 (agent-session markers scrubbed)' if scrub_markers else '1 (production git scrub only)'}", flush=True)
-    if scrub_markers:
-        print(f"[harness] extra scrub targets: {markers}", flush=True)
     print(f"[harness] staging raw output in {stage_dir}", flush=True)
+    started = time.time()
     run = launch_in_monitor_env(REPO_ROOT, prompt, stage_dir=stage_dir, extra_scrub_names=markers)
     print(
         f"[harness] launched; scrubbed {len(run.scrubbed_vars)} git vars + "
@@ -891,10 +908,18 @@ def main(argv: Optional[list[str]] = None) -> int:
         flush=True,
     )
 
-    obs = observe_run(run, signal_paths)
+    obs = observe_run(
+        run,
+        signal_paths,
+        expected_results=expected_results,
+        read_deadline=read_deadline,
+        straggler_window=straggler_window,
+    )
+    obs.duration_s = time.time() - started
 
     for label, path in signal_paths.items():
         content = open(path, encoding="utf-8").read().strip() if os.path.exists(path) else None
+        obs.signal_contents[label] = content
         print(f"[harness] signal {label}: exists={os.path.exists(path)} content={content!r}", flush=True)
 
     ctx = RedactionContext.build()
@@ -909,7 +934,86 @@ def main(argv: Optional[list[str]] = None) -> int:
     for entry in published:
         print(f"  {entry}", flush=True)
     print(f"[harness] staged raw output retained at {stage_dir} (outside .planning/)", flush=True)
-    print("[harness] observations only; Task 2 interprets them from the PUBLISHED file.", flush=True)
+    print("[harness] observations only; the verdict is derived from the PUBLISHED file.", flush=True)
+    return {
+        "evidence_dir": evidence_dir,
+        "stage_dir": stage_dir,
+        "duration_s": obs.duration_s,
+        "git_vars_removed": len(run.scrubbed_vars),
+        "markers_removed": len(run.scrubbed_markers),
+        "result_events": len(obs.results),
+        "signal_contents": dict(obs.signal_contents),
+        "published": published,
+    }
+
+
+def _run_replication_set(version: str, count: int) -> int:
+    """`count` trials in the trial-2 scrubbed configuration, held fixed.
+
+    Two things are deliberate here. The git decoys are planted so production's
+    scrub does real work during each measured run. And every trial gets an
+    IDENTICAL observation window — `expected_results` is set beyond reach so no
+    trial early-stops. A variable window would confound a replication set,
+    because a trial that stopped early could look like it delivered fewer
+    events than one that ran longer.
+    """
+    os.environ.update(RELIABILITY_DECOY_GIT_ENV)
+    print(f"[harness] planted git decoys: {sorted(RELIABILITY_DECOY_GIT_ENV)}", flush=True)
+    summaries = []
+    for index in range(1, count + 1):
+        print(f"\n{'=' * 70}\n[harness] replication trial {index}/{count}\n{'=' * 70}", flush=True)
+        summary = run_single_trial(
+            os.path.join(EVIDENCE_DIR_RELIABILITY, f"trial-{index}"),
+            version,
+            scrub_markers=True,
+            expected_results=10**6,  # never trips: fixed observation window
+            read_deadline=75.0,
+        )
+        summary["trial"] = index
+        summaries.append(summary)
+        print(
+            f"[harness] trial {index} done in {summary['duration_s']:.1f}s; "
+            f"git vars removed={summary['git_vars_removed']} "
+            f"markers removed={summary['markers_removed']} "
+            f"result events={summary['result_events']} "
+            f"signals={summary['signal_contents']}",
+            flush=True,
+        )
+    print(f"\n[harness] {count} trials complete. Derive verdicts from the published captures.", flush=True)
+    return 0
+
+
+def _int_flag(argv: list[str], name: str) -> Optional[int]:
+    if name not in argv:
+        return None
+    position = argv.index(name)
+    if position + 1 >= len(argv):
+        raise HarnessError(f"{name} requires a count")
+    return int(argv[position + 1])
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+
+    version = resolve_cli_version()
+    if version != EXPECTED_CLI_VERSION:
+        raise HarnessError(
+            f"claude CLI is {version!r}, expected {EXPECTED_CLI_VERSION!r} — the "
+            "version every archived 30a capture recorded. A different CLI makes "
+            "comparison against the baseline invalid."
+        )
+
+    replicate = _int_flag(argv, "--replicate")
+    if replicate:
+        return _run_replication_set(version, replicate)
+
+    scrub_markers = "--scrub-agent-markers" in argv
+    print(f"[harness] trial {'2 (agent-session markers scrubbed)' if scrub_markers else '1 (production git scrub only)'}", flush=True)
+    run_single_trial(
+        EVIDENCE_DIR_SCRUBBED if scrub_markers else EVIDENCE_DIR,
+        version,
+        scrub_markers=scrub_markers,
+    )
     return 0
 
 
