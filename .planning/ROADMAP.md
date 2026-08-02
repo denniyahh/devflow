@@ -1389,6 +1389,53 @@ Plans:
 
 - [x] Delivered as an out-of-band patch, 2026-07-31 (no phase — emergency unblock for the Phase 29 dogfood)
 
+### Phase 999.69: Re-Publish the Three Committed `30a-evidence` Captures Through the Redaction Pipeline (BACKLOG)
+
+**Linear:** [DEN-90](https://linear.app/denniskim/issue/DEN-90/99969-re-publish-the-three-committed-30a-evidence-captures-through-the)
+**Found:** 2026-08-02, Phase 30 plan 30-02 Task 1, while proving the new publish pipeline against a
+real capture rather than only a synthetic fixture. Logged in the phase's `deferred-items.md`.
+
+**The issue:** all three archived 30a captures were committed before a redaction pipeline existed,
+and all three match the same three patterns under 30c's own scanner:
+
+| Capture | Lines | Scan result |
+|---|---|---|
+| `30a-evidence/raw_output.jsonl` | 12 | `home_path`, `os_username`, `session_identifier` |
+| `30a-evidence/raw_output_v2.jsonl` | 25 | `home_path`, `os_username`, `session_identifier` |
+| `30a-evidence/raw_output_v3.jsonl` | 54 | `home_path`, `os_username`, `session_identifier` |
+
+Concretely: the `init` events carry an absolute `cwd` under the operator's home directory, every line
+carries the same real `session_id`, and `task_notification` events carry absolute `output_file`
+paths. This is the live instance the cross-AI review cited when it rejected 30-02's original
+single-step evidence write as unsafe.
+
+**Severity: low-but-real.** The operator's GitHub username is already public in this repository's
+commit metadata and the session id is a local identifier with no credential value — **nothing
+credential-shaped matched**. It is nonetheless the same leak class as backlog 999.10 and Phase 18
+review finding WR-02, and this repository publishes to crates.io.
+
+**Why it was not fixed in Phase 30.** 30-02's `files_modified` lists only the three 30c paths and the
+plan carries an explicit scope fence. More substantively, rewriting a sibling unit's committed
+evidence would invalidate the line-number citations that `30-01-PLAN.md`, `30-02-PLAN.md`,
+`30-01-SUMMARY.md` and `30-REVIEWS.md` all make into `raw_output_v3.jsonl` — a change with real blast
+radius that should be taken deliberately, not as a drive-by.
+
+**The fix is already written and already proven against these exact files.** 30c's
+`publish_jsonl()` (in `30c-monitor-env-harness.py`) is importable. During 30-02 verification all
+three captures were re-published through it into a scratch directory and all three returned `CLEAN`
+with `unparseable=0` and zero line loss (12/12, 25/25, 54/54). What remains is the companion pass
+over the line-number citations in the four documents above.
+
+**Deliberately NOT in `.planning/WINDOWS.md`** — an open ledger entry blocks `/gsd-ship`, and
+blocking a phase's ship on a pre-existing artifact it scoped out is a policy call. Operator decided
+2026-08-02: file for a future fix, do not block Phase 30.
+
+**Priority:** Low-Medium. **Size:** S — the sanitisation is mechanical; the citation pass is the work.
+**Depends on:** nothing. Should NOT run while Phase 30 or 31 is mid-flight, since both cite into
+`raw_output_v3.jsonl`.
+
+---
+
 ### Phase 999.68: Planning-Artifact Architecture — Requirements, a Constitution, and the Linear Boundary (BACKLOG)
 
 **Linear:** [DEN-89](https://linear.app/denniskim/issue/DEN-89/99968-planning-artifact-architecture-requirements-a-constitution-and)
