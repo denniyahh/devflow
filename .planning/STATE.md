@@ -2,13 +2,13 @@
 gsd_state_version: 1.0
 milestone: v2.3.0
 milestone_name: the unattended run (999.64 arc — closes after Phase 31)
-current_phase: 30
-current_phase_name: keep-the-session-alive-past-turn-end
-status: "complete — UAT 13/13 passed, security verified 0 threats open, ready to plan Phase 31"
+current_phase: 31
+current_phase_name: claude-adapter-launch-path-pipe-owning-monitor-999-64-arc-cl
+status: "Phase 30 closed; Phase 31 context gathered, ready to plan"
 stopped_at: "Phase 31 context gathered (31-CONTEXT.md, D-01..D-19) on feature/phase-31. Phase 30 remains fully closed: 5/5 plans, root-cause refactor a557805 closed constraint 9 items 1+2, 30-UAT.md 13/13, 30-SECURITY.md 0 threats open. Phase 31 owns the launch-path flip that makes 30b's parser reachable; next step is /gsd-plan-phase 31."
 last_updated: "2026-08-03T14:05:39Z"
 last_activity: 2026-08-03
-last_activity_desc: "Phase 31 context gathered — idle timeout, timeout-firing behaviour, rollout shape, CLI-behaviour guard, acceptance mechanics"
+last_activity_desc: "Phase 30 closed via phase.complete; Phase 31 context gathered — idle timeout, timeout-firing behaviour, rollout shape, CLI-behaviour guard, acceptance mechanics"
 progress:
   # STALE AND UNVERIFIED — do not trust these five values.
   # `state.update-progress` is the tool that owns them and it is not usable here:
@@ -151,9 +151,15 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 30 (keep-the-session-alive-past-turn-end) — COMPLETE
-Plan: 5 of 5
-Status: Complete — ready to plan Phase 31
+Phase: 31 (claude-adapter-launch-path-pipe-owning-monitor-999-64-arc-cl)
+Plan: Not started
+Status: Ready to plan — 31-CONTEXT.md captured (D-01..D-19)
+
+Phase 30 closed 2026-08-03 via `phase.complete 30`. Note what that did NOT do:
+ROADMAP.md was unchanged (it reported `roadmap_updated: true` while changing
+nothing), so plans 30-03/04/05 still show `[ ]` in the phase entry despite all
+five having summaries, and the entry carries no `**STATUS: COMPLETE**` line of
+the kind Phase 27 has. The milestone table row was already `Complete`.
 real action is `/gsd-review-backlog` to promote a 999.x entry, or `/gsd-ship 27`
 to merge this phase. `phase.complete` auto-advanced this field to "999.1 — Hermes
 Support (BACKLOG)" because its next-phase scan walks into the backlog section;
@@ -222,7 +228,7 @@ Scope boundary: 23-16 is the **fix only** (change + regression tests + PR into `
 
 **Recovery-ref disposition:** both `origin` refs (`recovery/pre-23-11-acceptance-e0f87c2`, `recovery/pre-23-15-acceptance-0dad20d`) remain untouched on `origin`; the local copy of the pre-23-11 ref, deleted again by `devflow cleanup`, is deliberately NOT restored (per `23-FINDINGS.md` §B2a); the pre-23-15 ref is now unused (no merge to undo) but retained on `origin` for reuse by the 23-16 retry rather than deleted.
 
-Last activity: 2026-07-30 — Phase 28 execution started
+Last activity: 2026-08-03 — Phase 30 closed, transitioned to Phase 31
 
 **Note on the "Plan: 2 of 15" value this replaces:** `gsd-tools state advance-plan` only increments whatever value is already in this field, which had drifted to "2 of 15" (the parallel-worktree waves 23-01…23-09 deliberately never touch STATE.md, and this field was last corrected against reality at "10 of 11 plans complete" before the plan count grew to 15 with the gap-closure plans 23-12…23-15). Corrected directly to "13 of 15" to match reality (23-12 and 23-13 both now executed) rather than trust the tool's naive +1 increment from a stale base.
 
