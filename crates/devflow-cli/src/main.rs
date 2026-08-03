@@ -88,6 +88,27 @@ enum Command {
         /// silent one.
         #[arg(long)]
         yes_ship: bool,
+        /// Force the pre-31 single-document Claude launch: the prompt
+        /// positionally in argv, `--output-format json`, and the `sh` monitor
+        /// (D-11, `31-CONTEXT.md`). Off by default.
+        ///
+        /// It exists so an operator can recover from a defect in the
+        /// `stream-json` transport without waiting for a release. Its use is
+        /// logged loudly — on stdout, in the phase's monitor log, and as a
+        /// `claude_legacy_launch_forced` event in `.devflow/events.jsonl` —
+        /// because an escape hatch used routinely erodes what it protects.
+        ///
+        /// Understand what it gives up: the legacy path cannot deliver
+        /// background-task notifications, so a multi-plan wave may orphan
+        /// delegated work. That is 999.64, the defect Phase 31 exists to fix.
+        ///
+        /// ORs with the environment override `DEVFLOW_CLAUDE_LEGACY_LAUNCH`
+        /// (parsed as a bool — `=false` does NOT enable it) rather than
+        /// replacing it; a run authorized by the environment alone prints a
+        /// notice naming that source. Once set for a run it is never cleared by
+        /// `devflow resume`; edit `.devflow/state-NN.json` to turn it off.
+        #[arg(long)]
+        legacy_claude_launch: bool,
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
@@ -142,6 +163,13 @@ enum Command {
         /// Phase to resume.
         #[arg(long)]
         phase: u32,
+        /// Force the pre-31 single-document Claude launch for the rest of this
+        /// run (D-11, `31-CONTEXT.md`). Same semantics as `devflow start
+        /// --legacy-claude-launch`, offered here so a run already in flight can
+        /// be moved onto the legacy path without restarting it. Never cleared
+        /// by a later plain `devflow resume`.
+        #[arg(long)]
+        legacy_claude_launch: bool,
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
@@ -496,6 +524,7 @@ fn run() -> Result<(), CliError> {
             dry_run,
             until,
             yes_ship,
+            legacy_claude_launch,
             project,
         } => {
             // Worktree is now the default; the deprecated `--worktree` flag is
@@ -524,6 +553,7 @@ fn run() -> Result<(), CliError> {
                 dry_run,
                 until,
                 yes_ship,
+                legacy_claude_launch,
             )
         }
         Command::Advance { project, phase } => advance(&project_root(project)?, phase),
@@ -542,7 +572,11 @@ fn run() -> Result<(), CliError> {
             idle_timeout_secs,
             &argv,
         ),
-        Command::Resume { phase, project } => resume(&project_root(project)?, phase),
+        Command::Resume {
+            phase,
+            legacy_claude_launch,
+            project,
+        } => resume(&project_root(project)?, phase, legacy_claude_launch),
         Command::Gate { action } => match action {
             GateCmd::List { all_roots, project } => gate_list(&project_root(project)?, all_roots),
             GateCmd::Approve {

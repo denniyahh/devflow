@@ -119,6 +119,7 @@ pub(crate) fn start(
     dry_run: bool,
     until: Option<Stage>,
     yes_ship: bool,
+    legacy_claude_launch: bool,
 ) -> Result<(), CliError> {
     let mut state = State::new(phase, agent, mode, project_root.to_path_buf());
     state.stop_until = until;
@@ -140,6 +141,19 @@ pub(crate) fn start(
         );
     }
     state.yes_ship = yes_ship || config_yes_ship;
+
+    // D-11's opt-out (31-04), combined on the same shape and for the same
+    // reasons as `yes_ship` directly above: OR-ed with an environment override
+    // rather than replacing it, before the first `save_state` below so the
+    // persisted value exists before any detached monitor consults it, and with
+    // a notice when the environment ALONE supplied it — a standing default is
+    // never a silent one.
+    if crate::pipeline_launch::apply_legacy_launch_opt_out(&mut state, legacy_claude_launch) {
+        println!(
+            "note: legacy Claude launch forced by DEVFLOW_CLAUDE_LEGACY_LAUNCH \
+             (D-11, 31-CONTEXT.md) — a persisted default is never a silent one"
+        );
+    }
 
     if dry_run {
         print_dry_run(&state);

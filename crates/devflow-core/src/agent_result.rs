@@ -2131,6 +2131,135 @@ fn reconcile_layer0_verdict(
     AgentResult { verdict, ..result }
 }
 
+/// Refuse to let a stream-derived `Success` outrank a contradicting exit code
+/// (constraint 9's residual, T-31-15, 31-04).
+///
+/// # Why this cannot be a parser assertion
+///
+/// Constraint 9's items 1 and 2 — a torn line at or after the last surviving
+/// top-level `result`, and provenance on verdict selection — were closed at the
+/// root by the `a557805` refactor that made lossiness and capture kind
+/// first-class ([`ParsedCapture`], [`classify`]). What survives is precisely
+/// the case no parser can detect: **a capture cut at an exact line boundary is
+/// byte-identical to a healthy shorter run.** There is nothing in the bytes to
+/// assert on. The writer that died between flushing turn N and turn N+1 also
+/// died non-zero, so the exit code is the only remaining signal — and it lives
+/// one layer up, in the wiring, which is where this defence had to go.
+///
+/// # Why the fix is narrow rather than a cascade reordering
+///
+/// [`evaluate_agent_result_inner`] consults Layer 2 only when Layer 1 abstains,
+/// which is why a Layer 1 `Success` wins over a contradicting exit code today.
+/// That ordering is correct in the ordinary case: Layer 1 is authoritative
+/// precisely so it does not need Layer 2's slower `git rev-list` fallback.
+/// Making Layer 2 run first would trade a rare wrong answer for a slow one on
+/// every stage. So this arbitrates one verdict rather than reordering anything.
+///
+/// # Scope
+///
+/// Fires ONLY on `AgentStatus::Success`. `RateLimited`, `IdleTimeout`,
+/// `ResourceKilled`, `AgentUnavailable`, `Failed` and `Unknown` all return
+/// untouched, each with a named test. Two of those exclusions are load-bearing
+/// rather than tidy: a `RateLimited` downgraded to `Failed` would route the run
+/// to a human gate instead of the auto-resume cron it needs, and an
+/// `IdleTimeout` downgraded to `Failed` would erase the distinction plan 31-02
+/// exists to create — 999.64 reborn inside its own fix.
+///
+/// 31-02 audit convention (non-exhaustive equality site): the `!= Success`
+/// guard below is correct as-is for every current and future variant. Anything
+/// that is not an affirmative claimed success has nothing to arbitrate, so
+/// passing it through unchanged is the right default for a variant added later.
+///
+/// # `verdict: None` is load-bearing — do not carry it over for symmetry
+///
+/// `classify_validate_outcome` (`devflow-cli/src/pipeline_outcomes.rs`) matches
+/// `(_, Some(Verdict::Pass)) => ValidateOutcome::Passed` FIRST, with `_`
+/// discarding the status entirely. A downgraded result that kept
+/// `verdict: Pass` would carry `status: Failed` and still classify Validate as
+/// **Passed** — making this whole function a no-op at the one stage where it
+/// matters most. [`idle_timeout_result`] dodges the same trap the same way, and
+/// says so. A downgraded result has no verdict to offer and must not invent
+/// one. The underlying defect (an agent's self-reported verdict outranking the
+/// status the cascade derived) is filed as **999.74 / DEN-95** and deliberately
+/// not fixed here: changing that match arm silently re-routes `Failed`,
+/// `Unknown` and `ResourceKilled`, whose behaviour nothing has audited.
+///
+/// # Exit-code fidelity
+///
+/// 137 → `ResourceKilled` and 127 → `AgentUnavailable` are preserved rather
+/// than collapsed into `Failed`, mirroring [`evaluate_layer2`] exactly:
+/// `outcome_policy::decide_action` routes those two to `GateInfra` rather than
+/// `GateReview`, and the same exit code must not reach two different operator
+/// gates depending on whether a stale Layer 1 success happened to be present.
+///
+/// Note the `ResourceKilled` arm is currently **unreachable via the
+/// `MonitorLaunch::PipeOwning` path**: `run_pipe_owning_monitor` records
+/// `status.code().unwrap_or(-1)`, so a SIGKILLed child writes `-1`, not `137`.
+/// Recorded rather than silently relabelling a real OOM as `Failed` — the arm
+/// is still reachable from the `Legacy` arm's `sh` monitor, whose `$?` does
+/// carry `128 + signal`.
+///
+/// Unreadable or unparseable exit-file content is tolerated exactly as
+/// [`evaluate_layer2`] tolerates it — a missing file returns the result
+/// unchanged (an absent file is not evidence of failure), and garbage parses to
+/// `-1`. Neither is invented behaviour; both match the sibling reader.
+fn reconcile_stream_success_against_exit_code(
+    project_root: &Path,
+    phase: u32,
+    result: AgentResult,
+) -> AgentResult {
+    if result.status != AgentStatus::Success {
+        return result;
+    }
+
+    let Ok(raw) = std::fs::read_to_string(exit_code_path(project_root, phase)) else {
+        return result;
+    };
+    let exit_code: i32 = raw.trim().parse().unwrap_or(-1);
+    if exit_code == 0 {
+        return result;
+    }
+
+    let (status, lead) = if exit_code == 137 {
+        (
+            AgentStatus::ResourceKilled,
+            format!(
+                "the agent's output stream reported SUCCESS but the process was killed \
+                 (exit code {exit_code}, likely OOM)"
+            ),
+        )
+    } else if exit_code == 127 {
+        (
+            AgentStatus::AgentUnavailable,
+            format!(
+                "the agent's output stream reported SUCCESS but the agent command was \
+                 unavailable (exit code {exit_code}, command not found)"
+            ),
+        )
+    } else {
+        (
+            AgentStatus::Failed,
+            format!(
+                "the agent's output stream reported SUCCESS but the agent exited with \
+                 code {exit_code}"
+            ),
+        )
+    };
+
+    AgentResult {
+        status,
+        exit_code: Some(exit_code),
+        reason: Some(format!(
+            "{lead}. A capture cut at an exact line boundary is byte-identical to a healthy \
+             shorter run, so no parser assertion can tell the two apart — the exit code is the \
+             only remaining signal, and it contradicts the claim. Review the phase branch before \
+             deciding what to keep; nothing was rolled back."
+        )),
+        verdict: None,
+        ..result
+    }
+}
+
 /// Full four-layer evaluation: returns the best available AgentResult.
 pub fn evaluate_agent_result(
     project_root: &Path,
@@ -2153,8 +2282,18 @@ fn evaluate_agent_result_inner(
     }
 
     // Layer 1: DEVFLOW_RESULT marker (authoritative)
+    //
+    // Authoritative, but not unconditionally: a CLAIMED success is arbitrated
+    // against the recorded exit code before it is returned (31-04, T-31-15).
+    // The cascade below is deliberately NOT reordered — see
+    // `reconcile_stream_success_against_exit_code` for why Layer 2 running
+    // first would be the wrong trade.
     if let Some(result) = evaluate_layer1(project_root, state.phase) {
-        return Ok(result);
+        return Ok(reconcile_stream_success_against_exit_code(
+            project_root,
+            state.phase,
+            result,
+        ));
     }
 
     // Layer 2: Exit code + commit gate
@@ -5643,6 +5782,263 @@ mod tests {
         assert_eq!(result.status, AgentStatus::Success);
         assert_eq!(result.commits, Some(2));
         assert_eq!(result.summary.as_deref(), Some("ok"));
+    }
+
+    // ---- exit-code arbitration on a claimed success (31-04, T-31-15) -----
+    //
+    // Every test below drives the FULL cascade through
+    // `evaluate_agent_result_inner`, never the parser's own return value.
+    // 31-RESEARCH.md § Pitfall 4 records why: a truncation-boundary test that
+    // checks only `parse_claude_event_result` exercises constraint 9's items 1
+    // and 2, which the `a557805` root-cause refactor already closed. The
+    // residual this arbitration exists for lives in the WIRING — Layer 1
+    // returning before Layer 2 is ever consulted — and only the cascade
+    // exercises it.
+
+    /// A success marker that also claims `verdict: pass` — the shape that made
+    /// the naive "carry every other field over" downgrade a no-op at Validate
+    /// (`classify_validate_outcome` matches `Some(Verdict::Pass)` FIRST, with
+    /// `_` discarding the status). Used to prove `verdict` is dropped.
+    const MARKER_SUCCESS_CLAIMING_PASS: &str =
+        r#"Done.\nDEVFLOW_RESULT: {\"status\":\"success\",\"verdict\":\"pass\"}"#;
+
+    /// The residual of constraint 9 that no parser assertion can reach.
+    ///
+    /// A capture cut at an exact line boundary is byte-identical to a healthy
+    /// shorter run, so the stream itself carries no evidence of the tear. The
+    /// writer that died between flushing turn N and turn N+1 also died
+    /// non-zero, and that exit code is the only signal left.
+    #[test]
+    fn stream_success_cannot_stand_against_nonzero_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 31),
+            v3_stream_capture(NO_MARKER, NO_MARKER, MARKER_SUCCESS_CLAIMING_PASS),
+        )
+        .unwrap();
+
+        // NEGATIVE CONTROL, encoded in the test rather than described in prose:
+        // Layer 1 on its own decides Success here AND reports `verdict: Pass`.
+        // Without this the assertions below cannot distinguish "the arbitration
+        // downgraded a success" from "nothing ever claimed success", nor
+        // "`verdict` was dropped" from "`verdict` was never set".
+        let layer1 = evaluate_layer1(dir.path(), 31).unwrap();
+        assert_eq!(layer1.status, AgentStatus::Success);
+        assert_eq!(layer1.verdict, Some(Verdict::Pass));
+
+        std::fs::write(exit_code_path(dir.path(), 31), "1\n").unwrap();
+        let state = state_in(dir.path(), 31);
+
+        let result =
+            evaluate_agent_result_inner(dir.path(), &state, &GitFlowConfig::default(), None)
+                .unwrap();
+
+        assert_eq!(result.status, AgentStatus::Failed);
+        assert_eq!(result.exit_code, Some(1));
+        assert!(
+            result.reason.as_deref().is_some_and(|r| r.contains("1")),
+            "the reason must name the exit code: {:?}",
+            result.reason
+        );
+        // Layer 1 still decided this — the arbitration corrects its verdict, it
+        // does not hand the decision to Layer 2.
+        assert_eq!(result.decided_by_layer, Some(1));
+        // Load-bearing: a downgraded result has no verdict to offer. Carrying
+        // `Some(Verdict::Pass)` over would leave Validate classified Passed and
+        // make this whole test's premise false at the stage that matters most
+        // (999.74 / DEN-95).
+        assert_eq!(result.verdict, None);
+    }
+
+    /// The matched negative control for the test above. Without it, that test
+    /// cannot tell "the arbitration works" from "the arbitration fires on
+    /// everything".
+    #[test]
+    fn stream_success_stands_when_the_exit_code_is_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 32),
+            v3_stream_capture(NO_MARKER, NO_MARKER, MARKER_SUCCESS_CLAIMING_PASS),
+        )
+        .unwrap();
+        std::fs::write(exit_code_path(dir.path(), 32), "0\n").unwrap();
+        let state = state_in(dir.path(), 32);
+
+        let result =
+            evaluate_agent_result_inner(dir.path(), &state, &GitFlowConfig::default(), None)
+                .unwrap();
+
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(result.decided_by_layer, Some(1));
+        // The verdict survives an untouched result — proof that the `None`
+        // asserted in the downgrade test is the arbitration's doing and not a
+        // property of the fixture.
+        assert_eq!(result.verdict, Some(Verdict::Pass));
+    }
+
+    /// A missing exit file is not evidence of failure. This matches
+    /// `evaluate_layer2`'s own tolerance (`Err(_) => return Ok(None)`); a
+    /// stricter reading here would fail every stage whose monitor had not yet
+    /// written the file.
+    #[test]
+    fn stream_success_stands_when_no_exit_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 33),
+            v3_stream_capture(NO_MARKER, NO_MARKER, MARKER_SUCCESS),
+        )
+        .unwrap();
+        assert!(
+            !exit_code_path(dir.path(), 33).exists(),
+            "fixture precondition: there must be no exit file"
+        );
+        let state = state_in(dir.path(), 33);
+
+        let result =
+            evaluate_agent_result_inner(dir.path(), &state, &GitFlowConfig::default(), None)
+                .unwrap();
+
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(result.decided_by_layer, Some(1));
+    }
+
+    /// Only a *claimed success* is arbitrated. Downgrading a rate limit to a
+    /// generic failure would route the run to a human gate instead of the
+    /// auto-resume cron it needs — the exact harm `rate_limited_result`'s
+    /// precedence over `detect_claude_envelope_failure` exists to prevent.
+    #[test]
+    fn rate_limited_verdict_is_not_arbitrated_by_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 34),
+            r#"{"type":"result","subtype":"error_rate_limit","is_error":true,"retry_after":"2026-06-18T15:45:30Z"}"#,
+        )
+        .unwrap();
+        std::fs::write(exit_code_path(dir.path(), 34), "1\n").unwrap();
+        let state = state_in(dir.path(), 34);
+
+        let result =
+            evaluate_agent_result_inner(dir.path(), &state, &GitFlowConfig::default(), None)
+                .unwrap();
+
+        assert_eq!(result.status, AgentStatus::RateLimited);
+        assert_eq!(
+            result.reason.as_deref(),
+            Some("rate limited until 2026-06-18T15:45:30Z"),
+            "the rate-limit reason must survive verbatim — the resume cron reads it"
+        );
+    }
+
+    /// Plan 31-02's side-channel verdict survives arbitration unchanged. An
+    /// `IdleTimeout` collapsed into `Failed` would lose exactly the distinction
+    /// 31-02 exists to create, and the monitor writes a NON-zero exit for a
+    /// child it killed, so this is not a hypothetical pairing.
+    #[test]
+    fn idle_timeout_verdict_is_not_arbitrated_by_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 35),
+            v3_stream_capture(MARKER_SUCCESS, MARKER_SUCCESS, MARKER_SUCCESS),
+        )
+        .unwrap();
+        write_idle_timeout_record(
+            dir.path(),
+            35,
+            &[("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "feat: partial")],
+        );
+        std::fs::write(exit_code_path(dir.path(), 35), "143\n").unwrap();
+        let state = state_in(dir.path(), 35);
+
+        let result =
+            evaluate_agent_result_inner(dir.path(), &state, &GitFlowConfig::default(), None)
+                .unwrap();
+
+        assert_eq!(result.status, AgentStatus::IdleTimeout);
+        assert_eq!(
+            result.exit_code, None,
+            "the arbitration must not graft an exit code onto a timeout verdict"
+        );
+    }
+
+    /// Exit-code fidelity (adversarial review of 31-04, W1). A blanket `Failed`
+    /// would flatten the two codes `evaluate_layer2` classifies specially, and
+    /// `outcome_policy::decide_action` routes those to `GateInfra` rather than
+    /// `GateReview`. The same exit code must not reach two different operator
+    /// gates depending on whether a stale Layer 1 success happened to be there.
+    #[test]
+    fn arbitration_preserves_layer2s_resource_and_unavailable_codes() {
+        for (code, expected) in [
+            (137, AgentStatus::ResourceKilled),
+            (127, AgentStatus::AgentUnavailable),
+            (2, AgentStatus::Failed),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+            std::fs::write(
+                stdout_path(dir.path(), 36),
+                v3_stream_capture(NO_MARKER, NO_MARKER, MARKER_SUCCESS),
+            )
+            .unwrap();
+            std::fs::write(exit_code_path(dir.path(), 36), format!("{code}\n")).unwrap();
+            let state = state_in(dir.path(), 36);
+
+            let arbitrated =
+                evaluate_agent_result_inner(dir.path(), &state, &GitFlowConfig::default(), None)
+                    .unwrap();
+
+            assert_eq!(
+                arbitrated.status, expected,
+                "exit {code} must arbitrate to {expected:?}, matching evaluate_layer2"
+            );
+            assert_eq!(arbitrated.exit_code, Some(code));
+        }
+    }
+
+    /// D-12's inverse assertion, and the mirror of
+    /// [`single_doc_envelope_not_consumed_by_claude_stream_parser`].
+    ///
+    /// That test pins one direction: today's shipped `--output-format json`
+    /// envelope must NOT be consumed by the stream parser. This pins the other:
+    /// a capture produced by plan 31-01's new `stream-json` argv classifies as
+    /// [`CaptureKind::ClaudeStream`] and is NOT consumed by the
+    /// single-document envelope path. Without both directions, widening either
+    /// gate is only half-guarded.
+    ///
+    /// Cites `classify()` / `CaptureKind::ClaudeStream` deliberately: the gate
+    /// predicate `31-CONTEXT.md` and `30-VERIFICATION.md` W-02 still name is no
+    /// longer a live function — the `a557805` refactor replaced it.
+    #[test]
+    fn stream_json_capture_is_not_consumed_by_the_single_document_path() {
+        let capture = v3_stream_capture(NO_MARKER, NO_MARKER, MARKER_SUCCESS);
+
+        // The classifier owns it.
+        assert!(capture_is_claude_stream(&capture));
+
+        // Every single-document reader declines it...
+        assert!(claude_session_id(&capture).is_none());
+        assert!(detect_claude_envelope_failure(&capture).is_none());
+        assert!(detect_claude_rate_limit(&capture).is_none());
+
+        // ...and the stream parser still owns it, so declining costs no verdict.
+        assert_eq!(
+            parse_claude_event_result(&capture).unwrap().status,
+            AgentStatus::Success
+        );
+
+        // Non-vacuity: the single-document readers are not simply broken — the
+        // same three answer a real envelope. Without this, the `is_none()`
+        // assertions above would pass against a reader that returned `None` for
+        // everything.
+        let envelope = r#"{"type":"result","subtype":"error_rate_limit","is_error":true,"retry_after":"2026-06-18T15:45:30Z","session_id":"abc"}"#;
+        assert_eq!(claude_session_id(envelope).as_deref(), Some("abc"));
+        assert!(detect_claude_envelope_failure(envelope).is_some());
+        assert!(detect_claude_rate_limit(envelope).is_some());
+        assert!(!capture_is_claude_stream(envelope));
     }
 
     #[test]
