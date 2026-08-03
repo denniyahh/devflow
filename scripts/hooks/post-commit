@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# Warns when a plan SUMMARY lands but STATE.md's authored prose has not moved.
+#
+# STATE.md mixes two kinds of content. Its counters are derived and mechanically
+# computable; its `status:` / `stopped_at:` prose is authored judgment ("wave 2
+# next", "gated on 30-02's verdict"). GSD assigns the write to the execute-phase
+# orchestrator, and executors are explicitly forbidden from touching it. Any run
+# that bypasses the orchestrator — a bare gsd-executor, /gsd-quick, a hand-fixed
+# plan — therefore leaves nobody owning the update, and the prose silently
+# describes an earlier wave. `gsd_run query state.validate` cannot catch this:
+# its entire disk scan is gated on a `Current Phase` field the shipped template
+# never emits, so it returns `valid: true` unconditionally. See
+# .planning/UPSTREAM-GSD-ISSUES.md entry 12.
+#
+# A landed `*-SUMMARY.md` is the one signal that is present on every path,
+# whoever did the work. That makes post-commit the right seam.
+#
+# This hook deliberately does NOT edit STATE.md. Plans in this repo carry scope
+# fences asserting `git diff --name-only` lists only their own files; a hook
+# that dirtied a tracked file mid-phase would break them, and a wave-closing
+# commit would sweep the change in unreviewed. It warns and records instead.
+# The marker lives under .devflow/, which is gitignored with `*`.
+set -uo pipefail
+
+# `git show` (rather than diff-tree) so a root commit still reports its files.
+changed=$(git show --pretty=format: --name-only HEAD 2>/dev/null) || changed=""
+summaries=$(printf '%s\n' "$changed" | grep -E '^\.planning/phases/.*SUMMARY\.md$' || true)
+
+if [ -n "$summaries" ]; then
+  root=$(git rev-parse --show-toplevel 2>/dev/null || echo .)
+  state="$root/.planning/STATE.md"
+  status_line=$(grep -m1 '^status:' "$state" 2>/dev/null || echo 'status: <unreadable>')
+  updated=$(grep -m1 '^last_updated:' "$state" 2>/dev/null || echo 'last_updated: <absent>')
+
+  {
+    printf '\n\033[33m── STATE.md may now be stale ──\033[0m\n'
+    printf 'This commit landed:\n'
+    printf '  %s\n' $summaries
+    printf 'STATE.md still says:\n  %s\n  %s\n' "$status_line" "$updated"
+  } >&2
+
+  # Per-phase counts, so the warning says how far behind the prose is. Matches
+  # both naming conventions: old phases use a bare PLAN.md, not NN-PLAN.md.
+  # Deduped by phase — a wave-closing commit lands several summaries at once and
+  # would otherwise repeat the identical line per file.
+  for s in $summaries; do dirname "$s"; done | sort -u | while read -r rel; do
+    dir="$root/$rel"
+    plans=$(find "$dir" -maxdepth 1 -name '*PLAN.md' 2>/dev/null | wc -l)
+    done_=$(find "$dir" -maxdepth 1 -name '*SUMMARY.md' 2>/dev/null | wc -l)
+    printf '  %s: %s/%s plans have summaries\n' "$(basename "$dir")" "$done_" "$plans" >&2
+  done
+
+  printf 'Derived counters:  gsd_run query state.update-progress\n' >&2
+  printf 'Authored prose (status:/stopped_at:) has to be written by hand.\n\n' >&2
+
+  mkdir -p "$root/.devflow" 2>/dev/null
+  [ -f "$root/.devflow/.gitignore" ] || printf '*\n' > "$root/.devflow/.gitignore" 2>/dev/null
+  {
+    printf '{\n  "stale_since_commit": "%s",\n' "$(git rev-parse --short HEAD 2>/dev/null)"
+    printf '  "summaries_landed": ['
+    printf '"%s",' $summaries | sed 's/,$//'
+    printf '],\n  "state_status_at_detection": %s\n}\n' \
+      "$(printf '%s' "${status_line#status: }" | sed 's/^"//; s/"$//; s/.*/"&"/')"
+  } > "$root/.devflow/state-stale.json" 2>/dev/null
+fi
+
+# Chain to whatever post-commit was active before core.hooksPath displaced it,
+# matching the pre-commit hook's delegation rather than shadowing silently.
+global_hooks=$(git config --global --get core.hooksPath || true)
+if [ -n "$global_hooks" ]; then
+  global_hooks="${global_hooks/#\~/$HOME}"
+  if [ -x "$global_hooks/post-commit" ]; then
+    exec "$global_hooks/post-commit" "$@"
+  fi
+fi
+
+repo_hook="$(git rev-parse --git-common-dir)/hooks/post-commit"
+if [ -x "$repo_hook" ]; then
+  exec "$repo_hook" "$@"
+fi
+
+exit 0

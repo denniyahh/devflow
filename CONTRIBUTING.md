@@ -35,6 +35,11 @@ Two things this hook does that are load-bearing:
   hooks directory wholesale, so without that shim the command above would
   silently switch off a global secret scanner. It is a no-op if you have no
   such hook.
+- [`scripts/hooks/post-commit`](scripts/hooks/post-commit) warns when a commit
+  lands a plan `*-SUMMARY.md` while `.planning/STATE.md`'s authored prose still
+  describes an earlier wave. It only warns — it never edits a tracked file, so
+  it cannot break a plan's `git diff --name-only` scope fence. It delegates to a
+  prior `post-commit` the same way. Silent on commits that land no summary.
 
 ### Repository git policy
 

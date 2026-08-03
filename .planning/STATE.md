@@ -1,30 +1,95 @@
 ---
 gsd_state_version: 1.0
-milestone: v2.0.0
-milestone_name: milestone (open — no fixed closing phase)
-current_phase: 28
-current_phase_name: close-the-checkpoint-answer-return-path
-status: shipped — PR #63 open to develop
-stopped_at: Phase 28 shipped — PR #63 (feature/phase-28 → develop), awaiting CI + merge
-last_updated: "2026-07-31T08:35:00.000Z"
-last_activity: 2026-07-30
-last_activity_desc: "Phase 28 complete: 6/6 plans, 779 tests green, SECURED (threats_open 0), verification passed. A1 closed by a live run that found and fixed a real defect (b22e6cf) — the executor renders the gate value as a markdown code span, which the reader did not match; checkpoints now recognize, auto-decide, audit, resume, and resolve end-to-end"
+milestone: v2.3.0
+milestone_name: the unattended run (999.64 arc — closes after Phase 31)
+current_phase: 30
+current_phase_name: keep-the-session-alive-past-turn-end
+status: "complete — UAT 13/13 passed, security verified 0 threats open, ready to plan Phase 31"
+stopped_at: "Phase 30 fully closed: 5/5 plans executed, root-cause refactor (a557805) closed constraint 9 items 1+2 after 7 adversarial passes (6 codex + 1 gemini, 8 defects found and fixed, final pass clean), 30-UAT.md 13/13 passed, 30-SECURITY.md 0 threats open (33 modeled + 8 retroactive). Host and pinned-container checks green throughout. Nothing pushed. Phase 31 (not yet planned) owns the launch-path flip that makes 30b's parser reachable."
+last_updated: "2026-08-03T10:30:00Z"
+last_activity: 2026-08-03
+last_activity_desc: "Phase 30 closed: UAT and security review both passed, ROADMAP marked Complete"
 progress:
-  total_phases: 17
+  # STALE AND UNVERIFIED — do not trust these five values.
+  # `state.update-progress` is the tool that owns them and it is not usable here:
+  # run 2026-08-02 it regressed current_phase 30 -> 28 from the stale body, rewrote
+  # an unrelated phase-23 historical note, and reported completed:132/total:138 in
+  # its own JSON while writing 131/137 to these fields. Left at their last
+  # hand-trusted values rather than replaced with numbers that cannot be defended.
+  # See .planning/UPSTREAM-GSD-ISSUES.md entries 9 and 11.
+  total_phases: 21
   completed_phases: 15
-  total_plans: 124
+  total_plans: 129
   completed_plans: 124
   percent: 88
 ---
 
 # DevFlow — Project State
 
-> Last updated: 2026-07-25
+> Last updated: 2026-08-02
 
 ## Active Phase
 
+**Phase 30 — Keep the Session Alive Past Turn End (999.64)** — **planned and
+cross-AI reviewed 2026-08-02; ready to execute.** 5 plans across 3 waves on
+`feature/phase-30`: 30b is the Claude stream parser (30-01 tracer, 30-03 rate
+limit / envelope failure / `session_id`, 30-05 checkpoint prompt-echo
+hardening), 30c is the production-environment delivery experiment (30-02), 30d
+is the exit-timing measurement (30-04). A Codex review (`30-REVIEWS.md`) raised
+4 HIGH findings; 15 of 16 were incorporated, 1 rejected with rationale, and the
+phase goal was split from the 999.64 arc goal so Phase 30 can satisfy it —
+Phase 31 owns the launch-path change. 30-03 and 30-05 are gated on 30-02's
+verdict and will not land if delivery is refuted.
+
+**Status 2026-08-02 — all 5 plans executed; ready for verification.** All three
+waves are complete: wave 1 = 30-01 + 30-02, wave 2 = 30-03 + 30-04, wave 3 =
+30-05. The 30-02 delivery gate resolved `delivery: confirmed`, which is what
+allowed 30-03 and 30-05 to land.
+
+`cargo test -p devflow-core --lib agent_result::` reports 132 passed / 0 failed / 0
+ignored — the constraint-9 sweep is live, no longer `#[ignore]`d.
+`scripts/check.sh all` (host) and `scripts/check-in-container.sh all` (pinned CI
+image) both exit 0. Nothing has been pushed.
+
+**Four adversarial passes followed execution, and their findings drove a
+root-cause refactor** (`a557805`; full trail in `30-CODE-REVIEW.md`,
+`30-VERIFICATION.md`, and the pass-3/pass-4 fix commits `f34756c`, `4867207`).
+Eight defects across the passes traced to three root causes, all three now
+structural: `ParsedCapture` makes dropped lines representable (R1), `classify()`
+decides capture kind once instead of per-call-site heuristics (R2), and
+`is_top_level` is the single provenance predicate for gate and verdict paths
+(R3). Constraint 9's two deferred items are **CLOSED in phase 30**; what
+survives for Phase 31 is the boundary-truncation residual — a stream-derived
+Success must not short-circuit a contradicting exit code, because a capture cut
+at an exact line boundary is content-indistinguishable from a healthy shorter
+run. The last code-review Medium is backlog **999.70**; the torn-line frequency
+measurement is **999.71**.
+
+**A correction on reachability, twice wrong before it was right:** the claim
+"`evaluate_layer1` has zero callers" was false — `evaluate_agent_result` runs it
+on every result evaluation from `pipeline_launch.rs:416`. What kept the two
+deferred defects latent was the capture FORMAT (the stream branch requires a
+parsed `init`, which only `stream-json` emits), not a missing caller. Checkpoint
+detection and `claude_stream_session_id` were live the whole time, which is why
+the gate findings were urgent. And **no fixture is a real capture** — no
+archived capture contains checkpoint gate text, and none contains a prompt echo
+at all, so the prompt-echo false positive is closed as reasoned rather than
+witnessed.
+
+30-04 also revised two binding review constraints against measurement: the
+idle-timeout floor moved from ~12s to ≥30s, and the drain gate is now
+characterised as defensive rather than load-bearing (kept as an `AND`
+regardless — see ROADMAP.md constraints 7 and 8).
+
+---
+
+### Historical — superseded phase notes
+
+The entries below describe earlier phases and are retained for context. They are
+**not** the active phase; the frontmatter `current_phase` above is authoritative.
+
 **Phase 23 — End-to-End Dogfood: One Phase, Define→Ship, Unattended, With
-Claude** — **scoped 2026-07-25, not yet discussed or planned.** The goal is the
+Claude** — **scoped 2026-07-25.** The goal was the
 "basic development workflow works end to end" milestone: `devflow start --phase
 N` drives one real phase Define→Ship with Claude, unattended, with no manual
 `ps`, no manual `devflow advance`, and no silent stall.
@@ -86,9 +151,9 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 28 (close-the-checkpoint-answer-return-path) — EXECUTING
-Plan: 1 of 6
-Status: Executing Phase 28
+Phase: 30 (keep-the-session-alive-past-turn-end) — COMPLETE
+Plan: 5 of 5
+Status: Complete — ready to plan Phase 31
 real action is `/gsd-review-backlog` to promote a 999.x entry, or `/gsd-ship 27`
 to merge this phase. `phase.complete` auto-advanced this field to "999.1 — Hermes
 Support (BACKLOG)" because its next-phase scan walks into the backlog section;
@@ -260,8 +325,9 @@ Phase" section above, which `advance-plan` cannot parse (backlog 12,
   **PR #20** (`feat/... → develop`) opened, CI green (8/8 checks), squash-
   merged to `develop` (`e78bc82`) 2026-07-23. **Ships as v1.7.0, not
   v2.0.0** — decided at ship time: nothing across the five units is
-  breaking, and the v2.0.0 milestone stays open rather than closing here
-  (see ROADMAP.md "Milestone stays open," 2026-07-23).
+  breaking, and the v2.0.0 milestone stayed open rather than closing here
+  (see ROADMAP.md "Milestone stays open," 2026-07-23 — superseded 2026-08-02
+  when v2.0.0 closed and the bounded v2.3.0 milestone was declared).
 
   **Fully released 2026-07-23.** `sync-main-to-develop.sh` run first (had
   not been run after v1.6.0 — `origin/main` had diverged from `develop`;
