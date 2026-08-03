@@ -4,11 +4,11 @@ milestone: v2.3.0
 milestone_name: the unattended run (999.64 arc — closes after Phase 31)
 current_phase: 30
 current_phase_name: keep-the-session-alive-past-turn-end
-status: "root-cause refactor landed after 4 adversarial passes; constraint 9 items closed; awaiting a clean pass-5 before phase close"
-stopped_at: "Phase 30 complete through wave 3: 30-01 + 30-02 (wave 1), 30-03 + 30-04 (wave 2), 30-05 (wave 3, stream gate-scoping, 116 agent_result tests). Host and pinned-container checks green. Nothing pushed. Next: verify/close phase 30; Phase 31 owns the launch-path flip that makes 30b's parser reachable."
-last_updated: "2026-08-02T23:20:00Z"
-last_activity: 2026-08-02
-last_activity_desc: "Phase 30 wave 3 executed: 30-05 scoped stream checkpoint-gate scanning to top-level result events, closing the prompt-echo false positive (review constraint 3)"
+status: "complete — UAT 13/13 passed, security verified 0 threats open, ready to plan Phase 31"
+stopped_at: "Phase 30 fully closed: 5/5 plans executed, root-cause refactor (a557805) closed constraint 9 items 1+2 after 7 adversarial passes (6 codex + 1 gemini, 8 defects found and fixed, final pass clean), 30-UAT.md 13/13 passed, 30-SECURITY.md 0 threats open (33 modeled + 8 retroactive). Host and pinned-container checks green throughout. Nothing pushed. Phase 31 (not yet planned) owns the launch-path flip that makes 30b's parser reachable."
+last_updated: "2026-08-03T10:30:00Z"
+last_activity: 2026-08-03
+last_activity_desc: "Phase 30 closed: UAT and security review both passed, ROADMAP marked Complete"
 progress:
   # STALE AND UNVERIFIED — do not trust these five values.
   # `state.update-progress` is the tool that owns them and it is not usable here:
@@ -151,9 +151,9 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 30 (keep-the-session-alive-past-turn-end) — ALL PLANS EXECUTED
+Phase: 30 (keep-the-session-alive-past-turn-end) — COMPLETE
 Plan: 5 of 5
-Status: Ready for verification
+Status: Complete — ready to plan Phase 31
 real action is `/gsd-review-backlog` to promote a 999.x entry, or `/gsd-ship 27`
 to merge this phase. `phase.complete` auto-advanced this field to "999.1 — Hermes
 Support (BACKLOG)" because its next-phase scan walks into the backlog section;
