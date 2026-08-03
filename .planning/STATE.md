@@ -5,10 +5,10 @@ milestone_name: the unattended run (999.64 arc — closes after Phase 31)
 current_phase: 30
 current_phase_name: keep-the-session-alive-past-turn-end
 status: "complete — UAT 13/13 passed, security verified 0 threats open, ready to plan Phase 31"
-stopped_at: "Phase 30 fully closed: 5/5 plans executed, root-cause refactor (a557805) closed constraint 9 items 1+2 after 7 adversarial passes (6 codex + 1 gemini, 8 defects found and fixed, final pass clean), 30-UAT.md 13/13 passed, 30-SECURITY.md 0 threats open (33 modeled + 8 retroactive). Host and pinned-container checks green throughout. Nothing pushed. Phase 31 (not yet planned) owns the launch-path flip that makes 30b's parser reachable."
-last_updated: "2026-08-03T10:30:00Z"
+stopped_at: "Phase 31 context gathered (31-CONTEXT.md, D-01..D-19) on feature/phase-31. Phase 30 remains fully closed: 5/5 plans, root-cause refactor a557805 closed constraint 9 items 1+2, 30-UAT.md 13/13, 30-SECURITY.md 0 threats open. Phase 31 owns the launch-path flip that makes 30b's parser reachable; next step is /gsd-plan-phase 31."
+last_updated: "2026-08-03T14:05:39Z"
 last_activity: 2026-08-03
-last_activity_desc: "Phase 30 closed: UAT and security review both passed, ROADMAP marked Complete"
+last_activity_desc: "Phase 31 context gathered — idle timeout, timeout-firing behaviour, rollout shape, CLI-behaviour guard, acceptance mechanics"
 progress:
   # STALE AND UNVERIFIED — do not trust these five values.
   # `state.update-progress` is the tool that owns them and it is not usable here:
@@ -910,6 +910,6 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 
 ## Session
 
-**Last session:** 2026-07-31T01:06:18.064Z
-**Stopped at:** Phase 28 context gathered
-**Resume file:** .planning/phases/28-close-the-checkpoint-answer-return-path/28-CONTEXT.md
+**Last session:** 2026-08-03T14:05:39Z
+**Stopped at:** Phase 31 context gathered
+**Resume file:** .planning/phases/31-claude-adapter-launch-path-pipe-owning-monitor-999-64-arc-cl/31-CONTEXT.md
