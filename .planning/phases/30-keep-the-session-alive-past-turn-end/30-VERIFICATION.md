@@ -252,3 +252,28 @@ over-read — and this phase has already been burned once by a green suite over 
 _Verified: 2026-08-02 · HEAD `cbe8ec3`_
 _Verifier: Claude (gsd-verifier) — every count above was read from a re-executed command, never
 from a SUMMARY, and every scan carries a negative control._
+
+---
+
+## Addendum — 2026-08-02, after the root-cause refactor (`a557805`)
+
+Two rows above are corrected; the rest of this report stands.
+
+1. **"`evaluate_layer1` really has zero callers — ✓ PASS" was a false pass.** The scan excluded
+   `agent_result.rs` itself, and `evaluate_agent_result` — in that file — runs `evaluate_layer1`
+   on every result evaluation, called live from `pipeline_launch.rs:416`. The negative control was
+   sound for the claim "no references outside the file"; the row's conclusion claimed more than
+   the control covered. What actually kept H1/M2 latent was the capture format (init-gated stream
+   branch vs shipped single-document `json`), not a missing caller. This report's own W-01 warning
+   ("unreachable in production is too broad") was the same error surviving one layer down.
+
+2. **V-01's disposition changed after this report.** It was fixed (`f34756c`), that fix was found
+   defective by the fourth adversarial pass, and both were subsumed by the refactor: classification
+   is now a single `classify()` with the majority-json-shaped rule. The refactor also CLOSED
+   constraint 9 items 1 and 2 (deferred at verification time) and named the surviving residual:
+   boundary-clean truncation is undetectable from capture content, so Phase 31 must not let a
+   stream-derived Success short-circuit a contradicting exit code.
+
+The base-rate observation in the original report — "two findings from two passes argues a third
+pass would find a third" — was borne out: pass 3 found three (one live-High), pass 4 found five
+(one High), and the refactor closed the class rather than the instances.

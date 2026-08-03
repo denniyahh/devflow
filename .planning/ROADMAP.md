@@ -1418,8 +1418,9 @@ rate and under which exit paths (clean exit, timeout, kill, still-running backgr
 
 **What it changes.** Priority, not exposure. Nothing in phase 30 is gated on the answer: the gate
 path is fixed and swept, the session-id path is fail-closed by construction (reads only
-`system`/`init`, so truncation yields `None`, never a forged id), and the verdict path has zero
-callers. The answer sets how urgently **Phase 31** must close constraint 9 before wiring the launch
+`system`/`init`, so truncation yields `None`, never a forged id), and the verdict path is inert on today's captures — its stream branch
+requires a parsed `init` that only `stream-json` emits (the earlier "zero callers"
+phrasing was wrong; `evaluate_agent_result` calls it on every evaluation). The answer sets how urgently **Phase 31** must close constraint 9 before wiring the launch
 path — a measured "never observed" makes it a hygiene fix, a measured "happens on kill" makes it a
 prerequisite.
 
@@ -2735,26 +2736,44 @@ exactly. **New floor: ≥30s** — ~2.2x the pooled observed maximum on the mile
 was right in the original constraint; the number was not.
 
 **BINDING CONSTRAINT (constraint 9), added 2026-08-02 from the phase-30 cross-AI CODE review
-(codex/gpt-5.6-sol, high effort — `30-CODE-REVIEW.md`) — Phase 31 must not wire up
-`evaluate_layer1` until two confirmed defects behind it are closed.** Both were verified against
-source, and both are latent rather than live *only* because `evaluate_layer1` currently has **zero
-callers anywhere in the workspace**. Phase 31 is the phase that gives it one.
+(codex/gpt-5.6-sol, high effort — `30-CODE-REVIEW.md`); REVISED same day, twice.**
 
-1. **A torn terminal line resurrects an earlier turn's success.** `claude_stream_events` silently
-   drops any line that fails to parse, so a truncated final `result` makes `last_top_level_result`
-   return an *earlier* result. If that one said success, `parse_claude_event_result` returns
-   `Some(Success)`, and because `evaluate_layer1` is an `.or_else()` cascade that stale success
-   short-circuits the exit-code fallback. **A stage advances after the real terminal turn failed or
-   raised a gate.** This is not exotic: the capture is written by raw `sh` redirection and read
-   while the agent may still be appending, which is precisely when a last line is torn. Malformed
-   input after the last valid terminal result must make the stream indeterminate or failed — it
-   must never let an earlier result become authoritative.
+*Correction to the original justification.* Items 1 and 2 were first deferred as "latent because
+`evaluate_layer1` has zero callers." **That claim was false**: `evaluate_agent_result` — the live
+Layer-1 entry called from `pipeline_launch.rs:416` on every result evaluation — runs
+`evaluate_layer1` inside its layer cascade, in the same file. The verification grep excluded
+`agent_result.rs` itself, so its negative control validated only "no references outside the file"
+while the conclusion claimed "no callers." What actually kept these two defects latent is the
+CAPTURE FORMAT: `parse_claude_event_result` requires a parsed `system`/`init` line, which only
+`--output-format stream-json` emits, and production ships single-document `json`. The deferral
+survived on the format argument; the caller argument was wrong. (The file's own WR-12 comment
+says "every `devflow advance` invocation runs through evaluate_layer1" — pass 3's UTF-8 High was
+reachable precisely because of it.)
 
-2. **`last_top_level_result` does not enforce top-level provenance.** Despite its name and its
-   doc comment's T-30-01 claim, it selects solely on `type == "result"` and never consults
-   `parent_tool_use_id`. Gate scanning enforces provenance; verdict selection does not. A
-   subagent-origin `result` would be admitted and would decide the stage. Share ONE explicit
-   top-level predicate between gate and verdict selection rather than keeping two divergent notions.
+*Status after the root-cause refactor (`a557805`), pulled back into phase 30 on the operator's
+"fix root causes before proceeding" instruction:*
+
+1. **CLOSED — a torn terminal line can no longer resurrect an earlier turn's success.**
+   `ParsedCapture` records every non-empty line (parsed / torn-JSON / noise); a torn JSON line
+   after the last surviving top-level result yields an indeterminate **Failed** — never the
+   pre-tear result, and never `None` (which would fall through to the raw tail scan and resurrect
+   the stale marker text through the back door). Live truncation sweep:
+   `truncation_sweep_never_upgrades_verdict_to_success`, no longer `#[ignore]`d. The same rule
+   guards the **Codex** parser, whose adapter is live today (a torn superseding marker cannot
+   resurrect an earlier success marker).
+
+2. **CLOSED — provenance is one predicate.** `is_top_level` (parent JSON-null or absent) is shared
+   by gate scanning and `last_top_level_result`; a subagent-origin `result` cannot decide the
+   stage. Regression: `subagent_result_event_never_decides_the_verdict`.
+
+**What REMAINS binding on Phase 31 — the boundary-truncation residual.** A capture truncated at an
+exact line boundary is a well-formed capture: no torn line survives, and a stream ending in an
+earlier turn's success is byte-identical to a healthy shorter run. The evidence of loss is in the
+bytes that never arrived, so NO parser assertion can exist for it — the sweep's doc comment records
+this with the exercised counter-case. The defense belongs to the layer holding the missing
+information: **Phase 31's wiring must not let a stream-derived Success short-circuit a
+contradicting exit code** (a writer that died between flushing turn N and turn N+1 also died with a
+non-zero exit). Treat that as constraint 9's surviving obligation.
 
 The review also corrected plan 30-05's own wording: "absent `parent_tool_use_id` confirmed across
 all three archived captures" is **partly vacuous** — independently re-counted, the three captures

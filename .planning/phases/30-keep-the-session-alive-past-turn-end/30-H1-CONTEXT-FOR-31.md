@@ -10,6 +10,22 @@ line_refs_valid_at: 4763fb5
 
 # H1 handoff — verdict resurrection on a torn terminal line
 
+> **SUPERSEDED 2026-08-02, later the same day — CLOSED in phase 30 itself.** The
+> operator's "fix root causes before proceeding" decision pulled this back in;
+> the root-cause refactor (`a557805`) implements the fix conditions below and
+> un-ignores the sweep test. **Two corrections to this document's original
+> claims:** (1) "zero callers" was FALSE — `evaluate_agent_result`
+> (`pipeline_launch.rs:416`) runs `evaluate_layer1` on every result evaluation;
+> the grep behind that claim excluded the defining file itself. The defect was
+> latent only because the stream branch is init-gated and production ships
+> single-document `json`. (2) One fix condition below is UNACHIEVABLE as
+> stated: truncation at an exact line boundary leaves a well-formed capture
+> with no malformed content to detect. That residual — and the exit-code
+> defense Phase 31 owes for it — is recorded in ROADMAP constraint 9, which is
+> now the authoritative statement. This file stays as the investigation record.
+
+**Original text follows.**
+
 **Deliberately not fixed in Phase 30.** Deferred because the defect is latent: the
 only entry point that reaches it, `evaluate_layer1`, currently has **zero callers
 anywhere in the workspace**. Phase 31 is the phase that gives it one, so Phase 31

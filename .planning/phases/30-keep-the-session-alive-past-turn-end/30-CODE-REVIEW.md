@@ -58,7 +58,8 @@ against the old predicate before the fix, and three over-correction controls
 (plain text, single-document envelope, Codex stream) assert those inputs still
 take the raw path and still detect a real gate.
 
-### H1 — verdict resurrection on a torn terminal line — DEFERRED, and downgraded
+### H1 — verdict resurrection on a torn terminal line — CLOSED by `a557805`
+*(originally DEFERRED on a justification that proved wrong — correction below)*
 
 Confirmed at mechanism level: a truncated terminal `result` is dropped,
 `last_top_level_result` returns an *earlier* turn's result, and because
@@ -66,22 +67,31 @@ Confirmed at mechanism level: a truncated terminal `result` is dropped,
 short-circuits the exit-code fallback. A stage would advance after the real
 terminal turn failed.
 
-**However — `evaluate_layer1` has zero callers anywhere in the workspace**
-(verified by `grep` with an identical-shape negative control against
-`checkpoint_reported_in_capture`, which has one). The reviewer rated this High
-without checking reachability. It is a `pub` function with no consumer today, so
-this is a **latent trap for whoever wires it up**, not a live defect. It belongs
-to Phase 31, which owns the launch-path flip.
+> **CORRECTION 2026-08-02, same day.** The original disposition said
+> "`evaluate_layer1` has zero callers anywhere in the workspace." **False.**
+> `evaluate_agent_result` — same file — runs it on every result evaluation,
+> called live from `pipeline_launch.rs:416`. The grep excluded
+> `agent_result.rs` itself, so its negative control proved only "no textual
+> references outside the file"; the disposition claimed more than the control
+> covered. The deferral was still defensible — the stream branch is init-gated
+> and production ships single-document `json`, so the FORMAT kept it latent —
+> but the recorded reason was wrong, and pass 3's UTF-8 High was live through
+> exactly the caller this note said did not exist. Closed regardless by the
+> root-cause refactor: torn tail after the last top-level result → Failed
+> (indeterminate), sweep test live. Boundary-clean truncation remains
+> undetectable from content; that residual and its exit-code defense are
+> constraint 9's surviving Phase 31 obligation.
 
-### M2 — `last_top_level_result` name/behaviour mismatch — DEFERRED
+### M2 — `last_top_level_result` name/behaviour mismatch — CLOSED by `a557805`
 
 Confirmed by direct read (line 742): it selects solely on `type == "result"` and
 never consults `parent_tool_use_id`, despite the name and the doc comment's
 top-level claim. So **gate scanning enforces provenance while verdict selection
-does not** — a subagent-origin `result` would be admitted. Same reachability
-caveat as H1. No archived capture contains a subagent-origin `result`, so
-likelihood is unverified; the wrong behaviour is deterministic if that shape
-occurs.
+does not** — a subagent-origin `result` would be admitted. No archived capture
+contains a subagent-origin `result`, so likelihood is unverified; the wrong
+behaviour was deterministic if that shape occurred. Closed by the shared
+`is_top_level` predicate; regression
+`subagent_result_event_never_decides_the_verdict`.
 
 ### M1 — documentary mention vs declaration — BACKLOG
 

@@ -4,7 +4,7 @@ milestone: v2.3.0
 milestone_name: the unattended run (999.64 arc — closes after Phase 31)
 current_phase: 30
 current_phase_name: keep-the-session-alive-past-turn-end
-status: "verified PARTIAL — goal achieved, one verification finding fixed; phase 30 ready to close"
+status: "root-cause refactor landed after 4 adversarial passes; constraint 9 items closed; awaiting a clean pass-5 before phase close"
 stopped_at: "Phase 30 complete through wave 3: 30-01 + 30-02 (wave 1), 30-03 + 30-04 (wave 2), 30-05 (wave 3, stream gate-scoping, 116 agent_result tests). Host and pinned-container checks green. Nothing pushed. Next: verify/close phase 30; Phase 31 owns the launch-path flip that makes 30b's parser reachable."
 last_updated: "2026-08-02T23:20:00Z"
 last_activity: 2026-08-02
@@ -46,30 +46,34 @@ waves are complete: wave 1 = 30-01 + 30-02, wave 2 = 30-03 + 30-04, wave 3 =
 30-05. The 30-02 delivery gate resolved `delivery: confirmed`, which is what
 allowed 30-03 and 30-05 to land.
 
-`cargo test -p devflow-core --lib agent_result::` reports 119 passed / 0 failed.
+`cargo test -p devflow-core --lib agent_result::` reports 132 passed / 0 failed / 0
+ignored — the constraint-9 sweep is live, no longer `#[ignore]`d.
 `scripts/check.sh all` (host) and `scripts/check-in-container.sh all` (pinned CI
 image) both exit 0. Nothing has been pushed.
 
-**A cross-AI code review followed execution** (`30-CODE-REVIEW.md`,
-codex/gpt-5.6-sol at high effort): verdict REQUEST CHANGES, 2 High + 2 Medium,
-all four independently re-verified. One High was a real fail-open — gate scoping
-reverted to the raw-stdout scan whenever a capture's `init` line was torn — and
-is **fixed** in `06675da` with both regressions verified RED first. The other
-High and one Medium are confirmed but sit behind `evaluate_layer1`, which has
-zero callers; they are now ROADMAP **constraint 9** binding Phase 31. The last
-Medium is backlog **999.70**.
+**Four adversarial passes followed execution, and their findings drove a
+root-cause refactor** (`a557805`; full trail in `30-CODE-REVIEW.md`,
+`30-VERIFICATION.md`, and the pass-3/pass-4 fix commits `f34756c`, `4867207`).
+Eight defects across the passes traced to three root causes, all three now
+structural: `ParsedCapture` makes dropped lines representable (R1), `classify()`
+decides capture kind once instead of per-call-site heuristics (R2), and
+`is_top_level` is the single provenance predicate for gate and verdict paths
+(R3). Constraint 9's two deferred items are **CLOSED in phase 30**; what
+survives for Phase 31 is the boundary-truncation residual — a stream-derived
+Success must not short-circuit a contradicting exit code, because a capture cut
+at an exact line boundary is content-indistinguishable from a healthy shorter
+run. The last code-review Medium is backlog **999.70**; the torn-line frequency
+measurement is **999.71**.
 
-Two limits carried forward deliberately, both recorded in `30-05-SUMMARY.md`:
-the stream **verdict** path (`evaluate_layer1` / `parse_claude_event_result`) is
-unreachable in production until Phase 31 flips the launch path off
-`--output-format json` — it has zero callers today. **This does not extend to the
-whole parser**, a correction from phase-30 verification: checkpoint detection
-(`checkpoint_reported_in_capture`) and `claude_stream_session_id` are wired live
-at `pipeline_launch.rs:491`, which is exactly why the code review's gate findings
-mattered and the verdict findings could be deferred. And **no fixture is a real
-capture** —
-no archived capture contains checkpoint gate text, and none contains a prompt
-echo at all, so the prompt-echo false positive is closed as reasoned rather than
+**A correction on reachability, twice wrong before it was right:** the claim
+"`evaluate_layer1` has zero callers" was false — `evaluate_agent_result` runs it
+on every result evaluation from `pipeline_launch.rs:416`. What kept the two
+deferred defects latent was the capture FORMAT (the stream branch requires a
+parsed `init`, which only `stream-json` emits), not a missing caller. Checkpoint
+detection and `claude_stream_session_id` were live the whole time, which is why
+the gate findings were urgent. And **no fixture is a real capture** — no
+archived capture contains checkpoint gate text, and none contains a prompt echo
+at all, so the prompt-echo false positive is closed as reasoned rather than
 witnessed.
 
 30-04 also revised two binding review constraints against measurement: the
