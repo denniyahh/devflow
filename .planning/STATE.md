@@ -4,7 +4,7 @@ milestone: v2.3.0
 milestone_name: the unattended run (999.64 arc — closes after Phase 31)
 current_phase: 30
 current_phase_name: keep-the-session-alive-past-turn-end
-status: "all 5 plans executed — phase 30 ready for verification"
+status: "verified PARTIAL — goal achieved, one verification finding fixed; phase 30 ready to close"
 stopped_at: "Phase 30 complete through wave 3: 30-01 + 30-02 (wave 1), 30-03 + 30-04 (wave 2), 30-05 (wave 3, stream gate-scoping, 116 agent_result tests). Host and pinned-container checks green. Nothing pushed. Next: verify/close phase 30; Phase 31 owns the launch-path flip that makes 30b's parser reachable."
 last_updated: "2026-08-02T23:20:00Z"
 last_activity: 2026-08-02
