@@ -393,6 +393,45 @@ Unsequenced items — not part of the active phase sequence. Promote with
 `/gsd-review-backlog` when ready; each carries accumulated context in its
 own `phases/999.N-*/CONTEXT.md`.
 
+### Phase 999.73: Widen `STREAM_JSON_STAGES` Beyond `Stage::Code` (BACKLOG)
+
+**Linear:** [DEN-94](https://linear.app/denniskim/issue/DEN-94/99973-widen-stream-json-stages-beyond-stagecode-once-the-phase-31)
+**Deferred:** 2026-08-03 by operator decision, during Phase 31 planning. Explicitly **not** in
+Phase 31; a future phase owns it.
+
+**State at Phase 31 close.** `STREAM_JSON_STAGES: &[Stage] = &[Stage::Code]` in
+`crates/devflow-cli/src/pipeline_launch.rs`, gating `claude_stream_launch_enabled`. Only the Code
+stage launches the Claude adapter through the pipe-owning monitor with `--input-format stream-json
+--output-format stream-json`; Define, Plan, Validate and Ship keep the single-document path. Plan
+31-04 requires the summary to state that the constant still lists exactly one stage and why, and
+31-05 carries the same as a `must_haves` item — so the narrow list is a recorded, verified end
+state, not an oversight.
+
+**Why deferred rather than widened.** D-09 sequences the rollout (one stage first, then widen) —
+an explicit sequencing choice, which binding constraint 1 permits, unlike a launch-time prediction
+of which stages will background, which it forbids. D-10 makes Code first: it is where 999.64 was
+observed (Phase 29 wave 2 dispatched two executors from Code and orphaned both) and it is the only
+stage that actually backgrounds, so it is the only one exercising task-notification delivery and
+the drain gate at all. The Phase 31 acceptance run witnesses **Code only**; widening now would
+extend the adapter to four stages on zero evidence.
+
+**What would evidence it.** A passing Phase 31 acceptance run produces the first real production
+capture of the stream path. Until then the parser's production correctness is reasoned, not
+witnessed — every gate fixture is labelled SYNTHETIC in-source and no archived capture contains a
+prompt echo.
+
+**Proposed work:** widen the constant (a one-line change to a named constant, built that way
+deliberately by 31-01); confirm each added stage against a real capture rather than a synthetic
+fixture; and re-check the close rule's `AND` arm per stage — constraint 4's drain arm was measured
+*defensive, not load-bearing* on Code (n=2 Mode B trials delivered everything without it), and a
+non-backgrounding stage has different drain behaviour, so that reasoning does not transfer.
+
+**Blocked on:** Phase 31 closing with a passing acceptance run (D-19: a failing run means 999.64
+is not closed whatever the unit tests say).
+
+**Related:** CONTEXT.md D-14 (per-child declared tokens) is the adjacent deferral from the same
+planning session — deferred on size, not merit. Strong candidate to pair with this one.
+
 ### Phase 999.72: ROADMAP.md Layout Hides Every Phase From `gsd-tools`' Milestone-Scoped Parsers (BACKLOG)
 
 **Linear:** [DEN-93](https://linear.app/denniskim/issue/DEN-93/99972-roadmapmd-layout-hides-every-phase-from-gsd-tools-milestone)
