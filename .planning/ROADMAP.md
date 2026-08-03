@@ -393,6 +393,48 @@ Unsequenced items — not part of the active phase sequence. Promote with
 `/gsd-review-backlog` when ready; each carries accumulated context in its
 own `phases/999.N-*/CONTEXT.md`.
 
+### Phase 999.72: ROADMAP.md Layout Hides Every Phase From `gsd-tools`' Milestone-Scoped Parsers (BACKLOG)
+
+**Linear:** [DEN-93](https://linear.app/denniskim/issue/DEN-93/99972-roadmapmd-layout-hides-every-phase-from-gsd-tools-milestone)
+**Found:** 2026-08-03, creating Phase 31. Not blocking Phase 31.
+
+**The symptom:** `gsd-tools query roadmap.analyze` reports `phase_count: 0` for this repository
+while 30 phase directories sit on disk. Two layout choices cause it, and **both are ours** — the
+upstream half (that the tool reports this silently, with no error) is filed separately as GSD
+issue 14.
+
+**Cause 1 — a closed milestone heading separates the active milestone from every phase entry.**
+`extractCurrentMilestone` ends the active section at the next version-bearing heading of level
+≤ 2. Here that is `## v2.0.0 milestone (CLOSED …)` at line 25, while `## v2.3.0 milestone
+(ACTIVE …)` is at line 5 and the first `### Phase N:` is at line 113. The active window is
+therefore lines 5–24: prose, no phases.
+
+Isolated with a negative control — demoting **only** line 25 to `###`, nothing else changed,
+yields `phase_count: 22` and `next_phase: "31"`. Recorded because the obvious control is the
+wrong one: a first attempt demoted all *non-milestone* `##` headings, changed nothing, and
+briefly read as a refutation. It had excluded the single heading that mattered.
+
+**Cause 2 — `### Phase N:` is reused for historical entries.** The SHELVED Phase 30, the ABORTED
+Phase 29, and `Phase 29 (original scope)` all match the phase-heading regex; in the control run
+they produced duplicate numbers (30 twice, 29 twice) and `current_phase: null`.
+
+**Why it matters.** `workflows/next.md` Route 0 — the hard invariant that catches a phase left
+mid-execution when `current_phase` has moved past it — iterates `.phases[]` from
+`roadmap.analyze`. An empty array means the loop never runs and `INCOMPLETE_PHASE` stays empty,
+which is indistinguishable from a clean scan. `/gsd:progress --next` then routes as though the
+safety check passed. The check is not wrong; it is absent.
+
+**Proposed work:** move the historical/closed-milestone blocks below the active milestone's phase
+entries (or the entries under the active heading); retitle historical entries so they no longer
+match the regex (`### Archived — Phase 30 …` suffices, since `Phase` must follow an optional
+bracket tag directly); then re-verify `roadmap.analyze` for non-zero `phase_count`, no duplicate
+numbers, and non-null `current_phase`.
+
+**Priority:** Medium — a disarmed safety gate, but one that has not yet been observed to cause a
+loss. **Size: M** — a several-hundred-line reorganisation of a ~3300-line document; mechanical
+but easy to corrupt, so verify with a diff that removes zero lines of substance.
+**Depends on:** nothing.
+
 ### Phase 25 candidates — all open High items, validated 2026-07-27
 
 > **Outcome:** Phase 25 was scoped from this analysis the same day. Five of these
