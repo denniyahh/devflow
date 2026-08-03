@@ -13,10 +13,13 @@
 
 use crate::git::hermetic_command;
 use crate::state::State;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::mpsc;
 use std::time::Duration;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Errors produced by monitor operations.
 #[derive(Debug, thiserror::Error)]
@@ -30,16 +33,55 @@ pub enum MonitorError {
     /// Could not determine the current executable path.
     #[error("could not determine devflow binary path")]
     NoBinaryPath,
+    /// A child spawned with piped stdio did not expose one of its pipes.
+    #[error("supervised child exposed no {0} pipe")]
+    NoChildPipe(&'static str),
+}
+
+/// Idle-timeout default in seconds (D-02): the measured constraint-8 floor.
+///
+/// Plan 31-02 supplies the configurable-and-clamped reader that can only raise
+/// this. Until then `spawn_monitor` passes this literal to the monitor process.
+///
+/// Do NOT "correct" this upward on the assumption it is tight. The ≥30s floor
+/// was derived from the *milestone* signal (pooled max 13.73s); against the
+/// every-line signal this monitor actually uses, the observed max is 7.09s, so
+/// 30s is ~4.2x margin.
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30;
+
+/// Which supervision shape [`spawn_monitor`] should launch.
+///
+/// This is a MODE selection on one supervisor, not two monitors: both arms
+/// write the same capture, exit-code and agent-pid files under `.devflow/`,
+/// and both end by advancing the same stage machine. Nothing downstream needs
+/// to know which arm ran.
+pub enum MonitorLaunch {
+    /// Phase 31: a Rust supervisor that owns BOTH of the child's pipes,
+    /// delivers `prompt` as a JSON user turn on the child's stdin, and holds
+    /// that stdin open past the child's first turn so a task-notification turn
+    /// can still be delivered (constraint 4).
+    PipeOwning {
+        /// The stage prompt, delivered on the child's stdin rather than argv.
+        prompt: String,
+    },
+    /// The pre-31 detached `sh` script: stdin is `/dev/null`, stdout is
+    /// redirected to the capture file by the shell, and the script waits on
+    /// the agent then runs `devflow advance`. Every non-Claude adapter, every
+    /// stage not yet widened by D-09/D-10's rollout, and the checkpoint-resume
+    /// relaunch all run through here, unchanged.
+    Legacy,
 }
 
 /// Spawn a background monitor that owns the agent for the given workflow state.
 ///
-/// The monitor is a detached shell process that:
-/// 1. Launches the agent (`program` + `args`) with stdout redirected to the
+/// The monitor is a detached process that:
+/// 1. Launches the agent (`program` + `args`) with stdout captured to the
 ///    phase stdout file, recording the agent PID to the agent-pid file
 /// 2. Waits for the agent to exit and records its exit code to the exit file
 /// 3. Runs `devflow advance --phase N` to advance the workflow through its
 ///    remaining stages
+///
+/// `launch` selects the supervision shape — see [`MonitorLaunch`].
 ///
 /// Returns the PID of the spawned monitor.
 pub fn spawn_monitor(
@@ -47,8 +89,9 @@ pub fn spawn_monitor(
     program: &str,
     args: &[String],
     envs: &[(String, String)],
+    launch: MonitorLaunch,
 ) -> Result<u32, MonitorError> {
-    spawn_monitor_inner(state, program, args, envs, true)
+    spawn_monitor_inner(state, program, args, envs, launch, true)
 }
 
 fn spawn_monitor_inner(
@@ -56,6 +99,7 @@ fn spawn_monitor_inner(
     program: &str,
     args: &[String],
     envs: &[(String, String)],
+    launch: MonitorLaunch,
     run_advance: bool,
 ) -> Result<u32, MonitorError> {
     let project_root = state
@@ -98,6 +142,77 @@ fn spawn_monitor_inner(
         .as_deref()
         .unwrap_or(&state.project_root);
     let workdir = workdir_path.to_str().ok_or(MonitorError::NonUtf8Path)?;
+
+    if let MonitorLaunch::PipeOwning { prompt } = launch {
+        // `run_advance` is not consulted on this arm: the `__monitor`
+        // subcommand always advances after reaping, and `spawn_monitor` is the
+        // only caller of this function — it hardcodes `true`. Adding a
+        // `--no-advance` flag for a case nothing exercises would be an
+        // untested branch; add it when a caller actually needs it.
+        let _ = run_advance;
+
+        // The adapter's extra env rides down by INHERITANCE here (set via
+        // `.envs(...)` on the `__monitor` process below), and that is only
+        // sufficient because the sole adapter routed through this arm —
+        // Claude — declares no extra env at all
+        // (`codex_disables_signing_via_env_others_do_not` asserts this).
+        // Widening this arm to an adapter that DOES set env requires
+        // threading it explicitly to `run_pipe_owning_monitor`: the inner
+        // `hermetic_command` scrubs `GIT_CONFIG_COUNT`, which neutralises any
+        // inherited `GIT_CONFIG_KEY_n` pair (Codex's unsigned-commit
+        // override is exactly that shape). Loud rather than silent, and in
+        // the CLI process where an operator can actually see it.
+        if !envs.is_empty() {
+            warn!(
+                "pipe-owning monitor: {} adapter env var(s) will not survive the \
+                 inner hermetic_command scrub — thread them explicitly before \
+                 routing an env-setting adapter through this arm",
+                envs.len()
+            );
+        }
+
+        // The prompt travels as a FILE, not argv: argv has a hard length
+        // ceiling and DevFlow stage prompts routinely exceed what is safe to
+        // pass positionally.
+        let prompt_file = crate::agent_result::prompt_path(&state.project_root, state.phase);
+        std::fs::write(&prompt_file, &prompt)?;
+        let prompt_file = prompt_file.to_str().ok_or(MonitorError::NonUtf8Path)?;
+
+        // Re-exec THIS binary as its hidden `__monitor` subcommand. The
+        // monitor must outlive `devflow start`/`advance`, so it has to be a
+        // distinct OS process; re-exec needs no daemonization primitive beyond
+        // `spawn()`-without-`wait()`, which is exactly what the `sh` monitor
+        // below already relies on.
+        //
+        // Ordering is load-bearing for the same reason the Legacy arm's
+        // comment gives: `hermetic_command` does its `env_remove`s at
+        // construction and `.envs(...)` runs after, so deliberate
+        // configuration survives while inherited pollution does not.
+        let child = hermetic_command(&binary, workdir_path)
+            .arg("__monitor")
+            .arg("--project")
+            .arg(project_root)
+            .arg("--phase")
+            .arg(state.phase.to_string())
+            .arg("--workdir")
+            .arg(workdir)
+            .arg("--prompt-file")
+            .arg(prompt_file)
+            .arg("--idle-timeout-secs")
+            .arg(DEFAULT_IDLE_TIMEOUT_SECS.to_string())
+            .arg("--")
+            .arg(program)
+            .args(args)
+            .envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+
+        let pid = child.id();
+        info!("pipe-owning monitor spawned with pid {pid}");
+        return Ok(pid);
+    }
 
     // Shell script that launches the agent in the background, captures its
     // stdout and exit code, then advances the workflow. Because this process
@@ -178,6 +293,269 @@ fn spawn_monitor_inner(
     Ok(pid)
 }
 
+/// Constraint 4's close rule as a pure, line-fed state machine: stdin may be
+/// released only once a `DEVFLOW_RESULT` marker has appeared inside a
+/// TOP-LEVEL `result` event **and** the background-task list has drained.
+///
+/// An `AND` of two arms, neither sufficient alone:
+///
+/// - **Marker arm.** Satisfied only by
+///   [`crate::agent_result::event_is_top_level_result_marker`] — a composition
+///   of the existing `is_top_level` predicate and the existing marker parser,
+///   never a looser text search. The CLI echoes the operator's prompt back
+///   into the same stdout, and DevFlow's own stage prompts discuss
+///   `DEVFLOW_RESULT` markers at length, so marker text alone is not evidence
+///   (T-31-01; the same echo produced the checkpoint false positive 30-05
+///   fixed).
+/// - **Drain arm.** Satisfied when no `background_tasks_changed` event has
+///   ever announced anything (vacuous — the common single-plan case) or when
+///   the most recent one carried an empty list.
+///
+/// **The drain alone is never a stop signal.** 30c/30d measured the
+/// drain-to-final-`result` lag at 4.54–11.51s across 14 trials; closing at the
+/// drain would have truncated the final orchestrator turn in all seven 30d
+/// trials.
+///
+/// **Never count `result` events.** Constraint 7: the CLI coalesces
+/// completions, so a wave whose children finish together produces one `result`
+/// for several of them — a shape superficially indistinguishable from "one
+/// child delivered, one lost". The drained list is the only thing separating
+/// those two. Per 30-04 the drain arm is *defensive rather than load-bearing*
+/// (n=2 Mode B trials delivered everything without it); that is the recorded
+/// reason to keep it cheaply, not a reason to drop it.
+///
+/// **A line that does not parse as JSON is ignored by this rule** — it can
+/// neither satisfy nor block either arm — but it is still teed verbatim to the
+/// capture file by the reader thread. A torn line therefore cannot silently
+/// decide anything, and cannot be silently lost either.
+#[derive(Default)]
+pub struct CloseRule {
+    marker_seen: bool,
+    /// `None` = nothing was ever announced; `Some(n)` = the last announcement
+    /// carried `n` tasks. The two are deliberately distinguishable: `None` is
+    /// vacuously drained, and conflating it with `Some(0)` would erase the
+    /// difference between "no children" and "children, all finished".
+    pending_background_tasks: Option<usize>,
+}
+
+impl CloseRule {
+    /// Fold one raw stdout line into the rule.
+    pub fn observe(&mut self, line: &str) {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+            return;
+        };
+        if crate::agent_result::event_is_top_level_result_marker(&event) {
+            self.marker_seen = true;
+        }
+        if event.get("type").and_then(serde_json::Value::as_str) == Some("system")
+            && event.get("subtype").and_then(serde_json::Value::as_str)
+                == Some("background_tasks_changed")
+            && let Some(tasks) = event.get("tasks").and_then(serde_json::Value::as_array)
+        {
+            // Only a readable `tasks` array updates the count. An announcement
+            // whose list cannot be read leaves the previous state standing
+            // rather than being treated as a drain — the conservative
+            // direction, since an early close truncates while a late one
+            // merely costs an idle timeout.
+            self.pending_background_tasks = Some(tasks.len());
+        }
+    }
+
+    /// Whether both arms hold and the child's stdin may be released.
+    pub fn should_close(&self) -> bool {
+        self.marker_seen && matches!(self.pending_background_tasks, None | Some(0))
+    }
+}
+
+/// The single place the stdin wire shape is constructed: one line of JSON
+/// carrying the initial user turn for a `--input-format stream-json` child.
+///
+/// Shape (`{"type":"user","message":{"role":"user","content":<prompt>}}`) is
+/// reproduced from the three archived Phase 30 harnesses, which all wrote
+/// exactly this and got a working turn back.
+///
+/// Built with `serde_json` rather than `format!` so the prompt is ESCAPED, not
+/// interpolated. A stage prompt is arbitrary text containing quotes, newlines
+/// and backslashes; interpolating it would produce a torn JSON line the CLI
+/// rejects, and a prompt could then alter the surrounding document's structure.
+pub fn user_turn_line(prompt: &str) -> String {
+    serde_json::json!({
+        "type": "user",
+        "message": { "role": "user", "content": prompt },
+    })
+    .to_string()
+}
+
+/// Supervise a `stream-json` child, owning both of its pipes, until the close
+/// rule is satisfied and the child exits. Returns the child's exit code, which
+/// is also written to the phase exit file.
+///
+/// This runs INSIDE the detached `__monitor` process, not in the CLI.
+///
+/// Threading model (constraint 4 / T-31-04). Three participants:
+/// - a **writer thread** owning the child's stdin: it writes the initial user
+///   turn, then BLOCKS on a channel rather than returning. It drops stdin only
+///   when told to, because constraint 4's `AND` can never be honoured if stdin
+///   is already gone — a task-notification turn arriving after the child's
+///   first turn would have nowhere to be delivered.
+/// - a **reader thread** owning the child's stdout: it tees each line verbatim
+///   to the capture file and forwards it to the supervisor. Dropping its
+///   sender at EOF is what surfaces `Disconnected` below.
+/// - the **supervisor** (this function's own thread), which applies the close
+///   rule and reaps.
+///
+/// The write and the read MUST be on independent threads. Writing the prompt
+/// synchronously before reading stdout is the textbook two-pipe deadlock: it
+/// passes every short-prompt smoke test and hangs on exactly the context-heavy
+/// production stages that matter (the Linux pipe buffer is commonly 64KiB and
+/// a DevFlow stage prompt can exceed that in one write).
+#[allow(clippy::too_many_arguments)]
+pub fn run_pipe_owning_monitor(
+    project_root: &Path,
+    phase: u32,
+    workdir: &Path,
+    prompt: &str,
+    idle_timeout: Duration,
+    program: &str,
+    args: &[String],
+    envs: &[(String, String)],
+) -> Result<i32, MonitorError> {
+    let stdout_file = crate::agent_result::stdout_path(project_root, phase);
+    let stderr_file = crate::agent_result::stderr_path(project_root, phase);
+    let exit_file = crate::agent_result::exit_code_path(project_root, phase);
+    let pid_file = crate::agent_result::agent_pid_path(project_root, phase);
+    if let Some(parent) = stdout_file.parent() {
+        crate::workflow::ensure_devflow_dir(parent)?;
+    }
+
+    // stderr goes to its own file so it cannot corrupt the JSONL stdout
+    // capture DevFlow parses — the same separation the Legacy script's
+    // `2>{stderr_file}` provides.
+    let stderr_handle = std::fs::File::create(&stderr_file)?;
+    // One handle, opened once, truncating at open and appending line by line.
+    // Truncate-at-open reproduces the Legacy arm's `>` redirection exactly, so
+    // a capture from a previous attempt can never be mixed into this one's
+    // (the launch path archives the prior capture first, but relying on that
+    // to make an append-mode open safe would be an unstated coupling).
+    let mut capture = std::fs::File::create(&stdout_file)?;
+
+    let mut child = hermetic_command(program, workdir)
+        .args(args)
+        .envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(stderr_handle))
+        // T-31-05: make the child its own process-group leader so a later
+        // group signal cannot reach this monitor's own ancestors. Verified
+        // source shows the pre-31 `spawn_monitor` had NO session or group
+        // configuration at all — detachment came only from the parent not
+        // waiting — so this closes a gap rather than preserving one.
+        // Full `setsid()` session detachment is deliberately NOT done: no
+        // forensics record cites a SIGHUP-related monitor loss, so there is
+        // no evidence it buys anything. `pre_exec` calling `libc::setsid()`
+        // is the one-line follow-on if such a loss ever surfaces.
+        .process_group(0)
+        .spawn()?;
+
+    // Recorded immediately, before any pipe work: `wait_for_agent_pid` polls
+    // for this and the rest of DevFlow's liveness reporting depends on it.
+    let child_pid = child.id();
+    std::fs::write(&pid_file, format!("{child_pid}\n"))?;
+
+    let mut child_stdin = child
+        .stdin
+        .take()
+        .ok_or(MonitorError::NoChildPipe("stdin"))?;
+    let child_stdout = child
+        .stdout
+        .take()
+        .ok_or(MonitorError::NoChildPipe("stdout"))?;
+
+    let (close_tx, close_rx) = mpsc::channel::<()>();
+    let turn = user_turn_line(prompt);
+    let writer = std::thread::spawn(move || {
+        let wrote = child_stdin
+            .write_all(turn.as_bytes())
+            .and_then(|()| child_stdin.write_all(b"\n"))
+            .and_then(|()| child_stdin.flush());
+        if let Err(err) = wrote {
+            warn!("could not write the initial user turn to the child's stdin: {err}");
+            return;
+        }
+        // Deliberately NOT dropping stdin here — see this function's doc.
+        // Either signal (an explicit close, or the supervisor dropping its
+        // sender) means the same thing: stop holding the pipe open.
+        let _ = close_rx.recv();
+        drop(child_stdin);
+    });
+
+    let (line_tx, line_rx) = mpsc::channel::<String>();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(child_stdout).lines() {
+            let Ok(line) = line else {
+                // A read error is EOF for supervision purposes.
+                break;
+            };
+            // Tee VERBATIM before any interpretation: the whole Layer 1
+            // cascade reads this file, and a line the close rule ignores
+            // (unparseable noise, interleaved prose) must still reach it.
+            if let Err(err) = writeln!(capture, "{line}") {
+                warn!("could not append to the capture file: {err}");
+            }
+            let _ = capture.flush();
+            if line_tx.send(line).is_err() {
+                break;
+            }
+        }
+        // Dropping `line_tx` here is what surfaces `Disconnected` below.
+    });
+
+    // Constraint 4's close rule lives in `CloseRule` so it can be unit-tested
+    // by feeding it lines, with no child process per case.
+    let mut rule = CloseRule::default();
+    let mut close_signalled = false;
+
+    loop {
+        match line_rx.recv_timeout(idle_timeout) {
+            Ok(line) => {
+                if close_signalled {
+                    continue;
+                }
+                rule.observe(&line);
+                if rule.should_close() {
+                    let _ = close_tx.send(());
+                    close_signalled = true;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Plan 31-02 owns what this arm must actually do: write the
+                // authoritative IdleTimeout result to its OWN side-channel
+                // file first, then terminate the child's process group via
+                // `crate::agent::terminate_and_verify` (D-05/D-06, and
+                // RESEARCH Pitfall 3 on why the side channel cannot be the
+                // stdout capture). Falling through to reaping here is a
+                // placeholder, not a partial implementation of that.
+                break;
+            }
+        }
+    }
+
+    // Guarantee stdin is released before waiting. A child still holding an
+    // open stdin may never exit, and `child.wait()` would then block forever.
+    drop(close_tx);
+
+    let status = child.wait()?;
+    let code = status.code().unwrap_or(-1);
+    std::fs::write(&exit_file, format!("{code}\n"))?;
+
+    let _ = writer.join();
+    let _ = reader.join();
+
+    info!("supervised child {child_pid} exited with code {code}");
+    Ok(code)
+}
+
 /// Poll for the agent PID that the monitor records, for up to ~1 second.
 ///
 /// Returns the PID once the monitor has launched the agent, or `None` if it
@@ -215,11 +593,356 @@ mod tests {
         state
     }
 
+    // ---- close-rule fixtures ------------------------------------------
+    //
+    // Key names, nesting and event types are taken from the real archived
+    // capture at
+    // `.planning/phases/30-keep-the-session-alive-past-turn-end/30a-evidence/raw_output_v3.jsonl`
+    // (lines 5, 8, 19, 44 and 54), not invented: `tasks` is an array of
+    // objects with `task_id`/`task_type`/`description`, the drained event is
+    // the same event with `tasks":[]`, and a coalesced completion carries
+    // `origin.kind == "task-notification"` on an ordinary `result`. Volumes
+    // and identifiers are generalized; shapes are not.
+
+    const INIT_LINE: &str = r#"{"type":"system","subtype":"init","cwd":"/tmp/work","session_id":"s-1","tools":["Task","Bash"],"uuid":"u-init"}"#;
+
+    /// A `system`/`background_tasks_changed` event announcing `count` tasks.
+    /// `count == 0` is the DRAINED shape (v3 line 44).
+    fn bg_tasks_line(count: usize) -> String {
+        let tasks: Vec<String> = (0..count)
+            .map(|i| {
+                format!(
+                    r#"{{"task_id":"t{i}","task_type":"local_agent","description":"child {i}"}}"#
+                )
+            })
+            .collect();
+        format!(
+            r#"{{"type":"system","subtype":"background_tasks_changed","tasks":[{}],"uuid":"u-bg{count}","session_id":"s-1"}}"#,
+            tasks.join(",")
+        )
+    }
+
+    /// A top-level `result` event. `marker` is the `result` field's text —
+    /// the agent's own final message, where a `DEVFLOW_RESULT:` line lives.
+    fn result_line(marker: &str) -> String {
+        format!(
+            r#"{{"type":"result","subtype":"success","is_error":false,"num_turns":3,"stop_reason":"end_turn","session_id":"s-1","uuid":"u-res","result":"{marker}"}}"#
+        )
+    }
+
+    /// The v3 line-54 shape: ONE `result` closing out work that several
+    /// children contributed to, tagged with the task-notification origin.
+    fn coalesced_result_line(marker: &str) -> String {
+        format!(
+            r#"{{"type":"result","subtype":"success","is_error":false,"num_turns":2,"stop_reason":"end_turn","origin":{{"kind":"task-notification"}},"session_id":"s-1","uuid":"u-res-coalesced","result":"{marker}"}}"#
+        )
+    }
+
+    /// Same envelope, forwarded from a subagent rather than authored by the
+    /// orchestrator session.
+    fn subagent_result_line(marker: &str) -> String {
+        result_line(marker).replacen('{', r#"{"parent_tool_use_id":"toolu_child","#, 1)
+    }
+
+    /// A success marker as it appears INSIDE a `result` string field — the
+    /// quotes are escaped because the field is itself JSON.
+    const MARKER: &str = r#"All done.\nDEVFLOW_RESULT: {\"status\":\"success\",\"commits\":3}"#;
+    const NO_MARKER: &str = "Acknowledged; nothing to report.";
+
+    fn observe_all(lines: &[String]) -> CloseRule {
+        let mut rule = CloseRule::default();
+        for line in lines {
+            rule.observe(line);
+        }
+        rule
+    }
+
+    /// Constraint 4 is an `AND`, and neither arm is sufficient alone. Both
+    /// halves are asserted here because a rule that accidentally became an
+    /// `OR` still passes any test that only ever feeds it both.
+    #[test]
+    fn close_rule_requires_both_marker_and_drained_background_tasks() {
+        // Arm A: the drain lands, but no marker ever appears in a top-level
+        // result. Closing here truncates the run before its verdict exists.
+        // The torn line carrying marker TEXT is the negative control: a line
+        // that does not parse as JSON must not be able to satisfy the marker
+        // arm through the back door.
+        let drained_but_unmarked = observe_all(&[
+            INIT_LINE.to_string(),
+            bg_tasks_line(1),
+            bg_tasks_line(0),
+            r#"{"type":"result","result":"DEVFLOW_RESULT: {\"status\":\"succ"#.to_string(),
+            "progress: still working".to_string(),
+            result_line(NO_MARKER),
+        ]);
+        assert!(
+            !drained_but_unmarked.should_close(),
+            "the drain alone must never close stdin: 30c/30d measured the \
+             drain-to-final-result lag at 4.54-11.51s across 14 trials, and \
+             closing at the drain would have truncated the final orchestrator \
+             turn in all seven 30d trials"
+        );
+
+        // Arm B: the marker lands while a child is still pending.
+        let marked_but_pending =
+            observe_all(&[INIT_LINE.to_string(), bg_tasks_line(1), result_line(MARKER)]);
+        assert!(
+            !marked_but_pending.should_close(),
+            "a marker while a background task is still announced must not \
+             close stdin — the pending child's task-notification turn would \
+             have nowhere to be delivered"
+        );
+    }
+
+    /// The common case: a single-plan stage that never dispatches anything.
+    /// The drain arm is satisfied VACUOUSLY, because nothing was ever
+    /// announced — an implementation that waited for a literal empty-list
+    /// event would hang every such stage until the idle timeout.
+    ///
+    /// The interleaved noise lines also pin the other half of the rule's
+    /// tolerance: a torn JSON line and a prose line are ignored for the rule
+    /// (they can neither satisfy nor block it) while still being teed to the
+    /// capture by the reader thread.
+    #[test]
+    fn close_rule_is_vacuously_drained_when_no_background_tasks_event_appears() {
+        let rule = observe_all(&[
+            INIT_LINE.to_string(),
+            "starting up".to_string(),
+            r#"{"type":"assist"#.to_string(),
+            result_line(MARKER),
+        ]);
+        assert!(
+            rule.should_close(),
+            "a stage that never announced a background task is drained by \
+             definition; only the marker arm has anything to satisfy"
+        );
+    }
+
+    /// Constraint 7. The CLI COALESCES completions: two children can finish
+    /// into one `result` event, and two announced tasks can drain to an empty
+    /// list in a single `background_tasks_changed`. Counting `result` events
+    /// therefore silently undercounts any wave whose completions cluster —
+    /// and that shape is superficially indistinguishable from "one child
+    /// delivered, one lost". The drained list is the only thing separating
+    /// them, so the rule asserts on the list state and never on a count.
+    ///
+    /// Per 30-04 the drain arm is DEFENSIVE rather than load-bearing: n=2
+    /// Mode B trials delivered everything without it. That is the documented
+    /// reason to keep it cheaply — "defensive" is not "removable".
+    #[test]
+    fn coalesced_completions_do_not_undercount_children() {
+        let rule = observe_all(&[
+            INIT_LINE.to_string(),
+            bg_tasks_line(2),
+            // BOTH children drain in ONE event...
+            bg_tasks_line(0),
+            // ...and complete into ONE result.
+            coalesced_result_line(MARKER),
+        ]);
+        assert!(
+            rule.should_close(),
+            "two announced children, one drain event and one coalesced result \
+             must still close — a rule that matched result events against \
+             child count would stall here forever"
+        );
+
+        // Negative control: the SAME single coalesced result with the drain
+        // withheld must NOT close. Without this, the assertion above is also
+        // satisfied by a rule that simply closes on any result event, and the
+        // test would be measuring nothing.
+        let undrained = observe_all(&[
+            INIT_LINE.to_string(),
+            bg_tasks_line(2),
+            coalesced_result_line(MARKER),
+        ]);
+        assert!(
+            !undrained.should_close(),
+            "control: it is the drained list that decides, not the arrival of \
+             a result event"
+        );
+    }
+
+    /// T-31-01. The CLI echoes the operator's prompt back into the same
+    /// stdout, and DevFlow's own stage prompts discuss `DEVFLOW_RESULT`
+    /// markers at length — so marker TEXT is not evidence of a verdict. Only
+    /// a marker inside an event that is both `type: "result"` and top-level
+    /// counts, reusing the one provenance predicate rather than inventing a
+    /// second notion of trustworthiness.
+    #[test]
+    fn marker_inside_a_non_top_level_result_does_not_satisfy_the_close_rule() {
+        let subagent = observe_all(&[INIT_LINE.to_string(), subagent_result_line(MARKER)]);
+        assert!(
+            !subagent.should_close(),
+            "a subagent-origin result carrying a marker must not close the \
+             stream — same provenance hole constraint 9 item 2 closed for the \
+             stage verdict"
+        );
+
+        // Control: the identical envelope WITHOUT the planted parent id is
+        // top-level and legitimately closes. Without this the assertion above
+        // would also pass against a rule that never closes at all.
+        let top_level = observe_all(&[INIT_LINE.to_string(), result_line(MARKER)]);
+        assert!(
+            top_level.should_close(),
+            "control: the same event without a parent id is authoritative"
+        );
+    }
+
     #[test]
     fn shell_escape_wraps_basic_strings() {
         assert_eq!(shell_escape("hello"), "'hello'");
         assert_eq!(shell_escape("hello world"), "'hello world'");
         assert_eq!(shell_escape("/tmp/devflow"), "'/tmp/devflow'");
+    }
+
+    /// The Phase 31 tracer: ONE Claude-shaped stage driven end to end through
+    /// the pipe-owning supervisor.
+    ///
+    /// The stub behaves like the real CLI on the two axes under test and no
+    /// others: it takes its initial turn from stdin, and it keeps stdin open
+    /// as a channel it can still be spoken to on. It is a `sh` script because
+    /// the wire behaviour is the subject, not the binary.
+    ///
+    /// **The early-close negative control is the point of the probe files.**
+    /// A stub that merely blocks on stdin EOF before exiting cannot fail:
+    /// whether the monitor closes stdin immediately after the write or only
+    /// after the close rule is satisfied, the stub still eventually sees EOF
+    /// and still exits 0. So the stub instead SAMPLES stdin liveness at a
+    /// moment when a correct monitor provably has not closed it — after the
+    /// drain, before any marker — and records `EARLY` if it is already gone.
+    /// Two files that must disagree: `eof` must exist at the end, `early`
+    /// must never exist.
+    ///
+    /// **The prompt sentinel is a negative control on JSON escaping.** The
+    /// sentinel sits on the SECOND line of a multi-line prompt containing a
+    /// double quote. `user_turn_line` escapes it, so the whole prompt arrives
+    /// as one physical line and the stub's single `read` sees the sentinel. A
+    /// `format!`-interpolated implementation would emit a torn two-line
+    /// document, the stub's `read` would return only the first line, and the
+    /// sentinel check would fail — which is exactly what should happen.
+    #[test]
+    fn pipe_owning_monitor_delivers_prompt_via_stdin_and_captures_stream() {
+        const SENTINEL: &str = "TRACER-PROMPT-SENTINEL";
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 4u32;
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        let eof_file = root.join("stdin-eof");
+        let early_file = root.join("stdin-closed-early");
+
+        // A quote on line one, the sentinel on line two — see the doc above.
+        let prompt = format!("first line with a \" quote\n{SENTINEL}");
+
+        let script = format!(
+            r#"
+set -u
+IFS= read -r turn || {{ echo "NO_INITIAL_TURN_ON_STDIN" >&2; exit 91; }}
+case "$turn" in
+  *{SENTINEL}*) ;;
+  *) echo "INITIAL_TURN_MISSING_PROMPT: $turn" >&2; exit 92 ;;
+esac
+
+# Probe: block on stdin until EOF, then record it. stdout is redirected so
+# this subshell does not hold the capture pipe open after the main shell exits.
+#
+# `exec 3<&0` then `cat <&3` is load-bearing, not a flourish: POSIX assigns
+# /dev/null to a BACKGROUNDED list's stdin before any explicit redirection
+# when job control is off. A bare `( cat > /dev/null ) &` therefore reads EOF
+# instantly and reports an early close that never happened. The explicit
+# `<&3` is applied after that default and overrides it.
+exec 3<&0
+( cat <&3 > /dev/null; printf 'EOF\n' > '{eof}' ) > /dev/null 2>&1 &
+
+printf '%s\n' '{{"type":"system","subtype":"init","session_id":"tracer-1"}}'
+printf '%s\n' '{{"type":"system","subtype":"background_tasks_changed","tasks":[{{"task_id":"t1","task_type":"local_agent"}}]}}'
+printf '%s\n' '{{"type":"system","subtype":"background_tasks_changed","tasks":[]}}'
+
+# The drain has landed but no marker has. A correct monitor is still holding
+# stdin open here; sample it and record the violation if it is not.
+sleep 0.5
+if [ -f '{eof}' ]; then printf 'EARLY\n' > '{early}'; fi
+
+printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"session_id":"tracer-1","result":"DEVFLOW_RESULT: {{\"status\":\"success\",\"commits\":2}}"}}'
+
+# Bounded wait for EOF: a monitor that never closes stdin must fail the
+# assertions below, not hang the suite.
+i=0
+while [ $i -lt 100 ] && [ ! -f '{eof}' ]; do
+  sleep 0.1
+  i=$((i+1))
+done
+exit 0
+"#,
+            eof = eof_file.display(),
+            early = early_file.display(),
+        );
+
+        let code = run_pipe_owning_monitor(
+            root,
+            phase,
+            root,
+            &prompt,
+            Duration::from_secs(20),
+            "sh",
+            &["-c".to_string(), script],
+            &[],
+        )
+        .expect("pipe-owning monitor should supervise the stub to completion");
+
+        let stderr = std::fs::read_to_string(crate::agent_result::stderr_path(root, phase))
+            .unwrap_or_default();
+        assert_eq!(
+            code, 0,
+            "stub exited {code}; 91 = no initial turn arrived on stdin, \
+             92 = the turn arrived but did not carry the prompt (a JSON \
+             escaping regression tears it across lines). stderr: {stderr:?}"
+        );
+
+        assert!(
+            !early_file.exists(),
+            "the monitor closed the child's stdin BEFORE the close rule was \
+             satisfied — the drain had landed but no DEVFLOW_RESULT marker had. \
+             Constraint 4's AND cannot be honoured once stdin is gone: a \
+             task-notification turn would have nowhere to be delivered."
+        );
+        assert!(
+            eof_file.exists(),
+            "the monitor never closed the child's stdin at all; the close rule \
+             should have fired once the marker arrived with the task list drained"
+        );
+
+        let capture =
+            std::fs::read_to_string(crate::agent_result::stdout_path(root, phase)).unwrap();
+        for expected in [
+            r#""subtype":"init""#,
+            r#""task_id":"t1""#,
+            r#""tasks":[]"#,
+            r#""type":"result""#,
+        ] {
+            assert!(
+                capture.contains(expected),
+                "capture is missing {expected}; got:\n{capture}"
+            );
+        }
+        assert!(
+            crate::agent_result::capture_is_claude_stream(&capture),
+            "the capture must classify as a Claude stream-json document — \
+             this is what makes 30b's stream parser reachable at all:\n{capture}"
+        );
+
+        let result = crate::agent_result::evaluate_layer1(root, phase)
+            .expect("Layer 1 must decide this capture");
+        assert_eq!(
+            result.status,
+            crate::agent_result::AgentStatus::Success,
+            "Layer 1 verdict from the stream capture: {result:?}"
+        );
+
+        let exit = std::fs::read_to_string(crate::agent_result::exit_code_path(root, phase))
+            .expect("the monitor must record the child's exit code");
+        assert_eq!(exit.trim(), "0", "exit file contents: {exit:?}");
     }
 
     #[test]
@@ -273,7 +996,7 @@ mod tests {
         // Stub agent: write a known marker to stdout, then exit cleanly.
         let args = vec!["-c".to_string(), "echo MONITOR_READY".to_string()];
 
-        let monitor_pid = spawn_monitor(&state, "sh", &args, &[]).unwrap();
+        let monitor_pid = spawn_monitor(&state, "sh", &args, &[], MonitorLaunch::Legacy).unwrap();
         assert!(monitor_pid > 0);
 
         // Observable side effect #1: the monitor records the agent PID to its
@@ -351,7 +1074,7 @@ mod tests {
         // window this test needs to send SIGTERM and check liveness.
         let args = vec!["-c".to_string(), "sleep 30".to_string()];
 
-        let monitor_pid = spawn_monitor(&state, "sh", &args, &[]).unwrap();
+        let monitor_pid = spawn_monitor(&state, "sh", &args, &[], MonitorLaunch::Legacy).unwrap();
         let agent_pid = wait_for_agent_pid(dir.path(), state.phase)
             .expect("monitor should record the agent pid");
         assert!(
@@ -447,7 +1170,7 @@ mod tests {
         // directories before launching the agent.
         let args = vec!["-c".to_string(), "pwd; echo WORKTREE_READY".to_string()];
 
-        let monitor_pid = spawn_monitor(&state, "sh", &args, &[]).unwrap();
+        let monitor_pid = spawn_monitor(&state, "sh", &args, &[], MonitorLaunch::Legacy).unwrap();
         assert!(monitor_pid > 0);
 
         let agent_pid = wait_for_agent_pid(dir.path(), state.phase)
@@ -533,7 +1256,7 @@ mod tests {
                 "git rev-parse --absolute-git-dir".to_string(),
             ];
 
-            spawn_monitor(&state, "sh", &args, &[]).unwrap();
+            spawn_monitor(&state, "sh", &args, &[], MonitorLaunch::Legacy).unwrap();
             wait_for_agent_pid(&root, state.phase).expect("monitor should record the agent pid");
 
             let stdout_path = crate::agent_result::stdout_path(&root, state.phase);
@@ -614,7 +1337,7 @@ mod tests {
             payload.to_string(),
         ];
 
-        spawn_monitor(&state, "sh", &args, &[]).unwrap();
+        spawn_monitor(&state, "sh", &args, &[], MonitorLaunch::Legacy).unwrap();
         wait_for_agent_pid(dir.path(), state.phase).expect("monitor should record the agent pid");
 
         let stdout_path = crate::agent_result::stdout_path(dir.path(), state.phase);

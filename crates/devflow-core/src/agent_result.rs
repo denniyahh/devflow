@@ -1046,6 +1046,20 @@ fn classify(capture: &ParsedCapture) -> CaptureKind {
     }
 }
 
+/// Test-only accessor: does [`classify`] call this capture text a Claude
+/// `stream-json` capture?
+///
+/// Exists so `monitor.rs`'s end-to-end tracer test can assert on the REAL
+/// classifier rather than re-deriving "looks like a stream" with its own
+/// heuristic — which is precisely the per-call-site divergence [`classify`]
+/// was introduced to end. `classify`/`CaptureKind`/`ParsedCapture` stay
+/// private; only this yes/no question crosses the module boundary, and only
+/// under `cfg(test)`.
+#[cfg(test)]
+pub(crate) fn capture_is_claude_stream(capture: &str) -> bool {
+    classify(&ParsedCapture::parse(capture)) == CaptureKind::ClaudeStream
+}
+
 /// Whether an event is TOP-LEVEL — authored by the orchestrator session, not
 /// forwarded from a subagent. `parent_tool_use_id` JSON-null or absent.
 ///
@@ -1089,6 +1103,77 @@ fn last_top_level_result(events: &[serde_json::Value]) -> Option<&serde_json::Va
     events.iter().rev().find(|v| {
         v.get("type").and_then(serde_json::Value::as_str) == Some("result") && is_top_level(v)
     })
+}
+
+/// Whether a declared canary `token` came back inside a TOP-LEVEL `result`
+/// event of this capture (D-13).
+///
+/// **Why this takes capture TEXT rather than a project root and phase**, unlike
+/// its siblings [`checkpoint_reported_in_capture`] and
+/// [`session_id_from_capture`]: the delivery canary runs against its own
+/// throwaway capture file, not the phase capture. A canary that read (and
+/// therefore implied writing) `stdout_path(project_root, phase)` would clobber
+/// the stage's own capture — the one artifact the entire Layer 1 cascade
+/// decides on.
+///
+/// **D-13 trap 1 — this may not be a NEW trust path.** The CLI echoes the
+/// operator's prompt back into the same stdout as a `user` event, so the
+/// planted token *will* appear in the stream regardless of whether anything was
+/// delivered. That echo is exactly what produced the checkpoint false positive
+/// 30-05 fixed. Matching is therefore confined to events that are both
+/// `type: "result"` and [`is_top_level`] — the same provenance predicate
+/// [`last_top_level_result`] enforces, reused rather than reinvented.
+///
+/// **D-13 trap 2 — a match proves DELIVERY, never WORK.** The agent can see the
+/// token in its own prompt and emit it without doing anything (999.67's shape).
+/// A hit means "the task-notification path is alive"; it never means the
+/// dispatched work happened. Summaries and merges remain the evidence of work
+/// (D-16/D-18).
+///
+/// Scans EVERY top-level `result`, not just the last one, which is the one
+/// place this deliberately differs from [`last_top_level_result`]. That
+/// function selects the session's final *verdict*, so later turns must
+/// supersede earlier ones. The canary asks a different question — "did the
+/// token ever come back?" — and a token returned on an earlier
+/// task-notification turn is a complete answer to it.
+pub fn token_reported_in_capture(capture: &str, token: &str) -> bool {
+    ParsedCapture::parse(capture)
+        .events
+        .iter()
+        .filter(|v| {
+            v.get("type").and_then(serde_json::Value::as_str) == Some("result") && is_top_level(v)
+        })
+        .any(|v| {
+            v.get("result")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|text| text.contains(token))
+        })
+}
+
+/// Whether ONE parsed stream event is a top-level `result` carrying a
+/// `DEVFLOW_RESULT` marker in its `result` text.
+///
+/// Exposed for the pipe-owning monitor's close rule (Phase 31, constraint 4),
+/// which must decide line-by-line and in real time whether the marker arm is
+/// satisfied — it cannot wait for a whole capture and re-parse it.
+///
+/// This is a COMPOSITION of the two existing predicates, deliberately not a
+/// second implementation of either. T-31-01: the CLI echoes the operator's
+/// prompt back into the same stdout as a `user` event — that echo is what
+/// produced the checkpoint false positive 30-05 fixed — so a marker seen
+/// anywhere but inside an event that is BOTH `type: "result"` AND
+/// [`is_top_level`] must not close the stream. Reusing [`parse_marker_lines`]
+/// keeps the marker grammar (case-insensitive prefix, edge-corruption
+/// stripping, JSON body) in one place rather than letting the monitor grow a
+/// looser `contains("DEVFLOW_RESULT")` of its own.
+pub(crate) fn event_is_top_level_result_marker(event: &serde_json::Value) -> bool {
+    event.get("type").and_then(serde_json::Value::as_str) == Some("result")
+        && is_top_level(event)
+        && event
+            .get("result")
+            .and_then(serde_json::Value::as_str)
+            .and_then(parse_marker_lines)
+            .is_some()
 }
 
 /// Whether any AGENT-AUTHORED text in a Claude stream capture declares a
@@ -1901,6 +1986,28 @@ pub fn exit_code_path(project_root: &Path, phase: u32) -> PathBuf {
 /// Path to the file where the monitor records the launched agent's PID.
 pub fn agent_pid_path(project_root: &Path, phase: u32) -> PathBuf {
     devflow_dir(project_root).join(format!("phase-{:02}-agent-pid", phase))
+}
+
+/// Path to the file holding the stage prompt handed to the pipe-owning
+/// monitor (Phase 31).
+///
+/// The prompt travels `spawn_monitor` → detached monitor process as a FILE,
+/// never as argv: DevFlow stage prompts are large and argv has a hard length
+/// ceiling, so a prompt passed positionally would fail on exactly the
+/// context-heavy stages that matter most.
+pub fn prompt_path(project_root: &Path, phase: u32) -> PathBuf {
+    devflow_dir(project_root).join(format!("phase-{:02}-prompt", phase))
+}
+
+/// Path to the pipe-owning monitor's own log for a phase (Phase 31).
+///
+/// The monitor is a detached process whose stdio is not the operator's
+/// terminal — anything it prints to its own stdout goes nowhere. Every "log
+/// loudly" obligation in this phase (the D-04 idle-timeout clamp, the D-11
+/// opt-out notice) writes here instead, so a loud message is actually
+/// readable after the fact.
+pub fn monitor_log_path(project_root: &Path, phase: u32) -> PathBuf {
+    devflow_dir(project_root).join(format!("phase-{:02}-monitor.log", phase))
 }
 
 /// Path to the archived-capture-history directory for a phase (16b).
@@ -3197,6 +3304,62 @@ mod tests {
             parse_claude_event_result(&top_level).map(|r| r.status),
             Some(AgentStatus::Success),
             "control: the same event without a parent id is the final verdict"
+        );
+    }
+
+    /// D-13 trap 1, pinned: the delivery canary's declared token appears in the
+    /// stream as a PROMPT ECHO before it can ever appear as an answer, so a
+    /// naive text scan reports delivery on every run — including runs where the
+    /// notification path is dead. That echo is what produced the checkpoint
+    /// false positive 30-05 fixed.
+    ///
+    /// Three cases, and the first two are the negative controls that give the
+    /// third its meaning: the same token, in the same capture shape, must read
+    /// `false` from an echo and from a subagent-origin result, and `true` only
+    /// from a top-level `result`.
+    #[test]
+    fn token_matches_only_inside_top_level_result() {
+        const TOKEN: &str = "DEVFLOW-CANARY-7f3a";
+
+        // 1. Echo only: the token is in the operator's own turn, forwarded back
+        //    into stdout, and in no result at all.
+        let echoed = format!(
+            "{}\n{}\n{}\n",
+            V3_INIT_EVENT,
+            V3_USER_EVENT.replace("__MARKER__", &format!("please return {TOKEN} when done")),
+            v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+        );
+        assert!(
+            !token_reported_in_capture(&echoed, TOKEN),
+            "a token echoed back in the prompt is not delivery evidence — \
+             the CLI forwards the operator's own turn into the same stdout"
+        );
+
+        // 2. Subagent-origin result: right event type, wrong provenance.
+        let subagent = format!(
+            "{}\n{}\n",
+            V3_INIT_EVENT,
+            v3_result_event(V3_RESULT_TURN2, TOKEN).replacen(
+                "{",
+                "{\"parent_tool_use_id\":\"toolu_child\",",
+                1,
+            ),
+        );
+        assert!(
+            !token_reported_in_capture(&subagent, TOKEN),
+            "a subagent-origin result must not satisfy the canary — it is the \
+             same provenance hole constraint 9 item 2 closed for the verdict"
+        );
+
+        // 3. Authoritative: a top-level `result` carrying the token.
+        let authoritative = format!(
+            "{}\n{}\n",
+            V3_INIT_EVENT,
+            v3_result_event(V3_RESULT_TURN1, TOKEN),
+        );
+        assert!(
+            token_reported_in_capture(&authoritative, TOKEN),
+            "a token inside a top-level result IS the canary's answer"
         );
     }
 

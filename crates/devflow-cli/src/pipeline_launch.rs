@@ -72,7 +72,24 @@ pub(crate) fn launch_stage_inner(
         .as_deref()
         .map(|wt| worktree_writable_roots(&state.project_root, wt))
         .unwrap_or_default();
-    let (program, args) = adapter.exec_command(state.phase, &prompt, &roots);
+    // D-09/D-10 sequencing gate. `ClaudeAgent::exec_command` is itself
+    // unconditional and stage-blind (constraint 1 forbids predicting at launch
+    // time which stages background work); the choice of which stages have been
+    // widened to it *yet* is a rollout-order choice, made here at the call
+    // site, which constraint 1 permits.
+    let (program, args, launch) = if claude_stream_launch_enabled(state.agent, state.stage) {
+        let (program, args) = adapter.exec_command(state.phase, &prompt, &roots);
+        (program, args, monitor::MonitorLaunch::PipeOwning { prompt })
+    } else if state.agent == AgentKind::Claude {
+        // Claude on a stage the rollout has not reached: the explicitly named
+        // pre-31 builder, NOT `exec_command` — which now returns the
+        // stream-json shape for every stage.
+        let (program, args) = agents::ClaudeAgent::exec_command_single_document(&prompt);
+        (program, args, monitor::MonitorLaunch::Legacy)
+    } else {
+        let (program, args) = adapter.exec_command(state.phase, &prompt, &roots);
+        (program, args, monitor::MonitorLaunch::Legacy)
+    };
 
     // 28-03 (D-03/D-04): every ORDINARY fresh stage launch starts the
     // checkpoint-resume budget over, including a human-approved gate retry
@@ -85,7 +102,90 @@ pub(crate) fn launch_stage_inner(
     // `save_state` calls — no extra save needed here.
     state.checkpoint_resumes = 0;
 
-    spawn_agent_and_record(state, program, &args, &adapter.extra_env(), archived_stage)
+    spawn_agent_and_record(
+        state,
+        program,
+        &args,
+        &adapter.extra_env(),
+        archived_stage,
+        launch,
+    )
+}
+
+/// The stages the Claude `stream-json` launch has been widened to.
+///
+/// `Stage::Code` first (D-10): it is where 999.64 was observed — Phase 29 wave
+/// 2 dispatched two executors from Code and orphaned both — and it is the
+/// stage that actually backgrounds work, so it is the only one that exercises
+/// task-notification delivery and the drain gate at all. Define would have
+/// been a proxy measurement.
+const STREAM_JSON_STAGES: &[Stage] = &[Stage::Code];
+
+/// Whether this launch should use the `stream-json` transport and the
+/// pipe-owning monitor.
+///
+/// **This is a SEQUENCING choice, not a behaviour prediction.** Constraint 1
+/// forbids deciding at launch time which stages will background work; it
+/// permits rolling a change out one stage at a time. The reason for
+/// sequencing at all is evidentiary (D-09): every gate fixture today is
+/// labelled SYNTHETIC in-source and no archived capture contains a prompt
+/// echo, so the stream parser's production correctness is currently
+/// *reasoned, not witnessed*.
+///
+/// **What widens [`STREAM_JSON_STAGES`]:** a passing acceptance run (D-16/D-18
+/// — a two-plan wave where both plans produce a `SUMMARY.md` and merge)
+/// producing the first real production `stream-json` capture to verify the
+/// parser against. Not a green unit suite, and not "the stage reported
+/// Success" — the completion oracle already scored the orphaned Phase 29 stage
+/// as Success.
+fn claude_stream_launch_enabled(agent: AgentKind, stage: Stage) -> bool {
+    agent == AgentKind::Claude && STREAM_JSON_STAGES.contains(&stage)
+}
+
+/// The detached pipe-owning monitor's own process body (Phase 31): supervise
+/// the child, then advance the stage machine exactly as the shell monitor's
+/// `devflow advance` tail did.
+///
+/// Runs in the `__monitor` process, never in the operator's CLI.
+///
+/// `envs` is deliberately empty here — the adapter's extra env was applied to
+/// THIS process by `spawn_monitor` and rides down by inheritance. That is
+/// sufficient only because the sole adapter routed through the pipe-owning arm
+/// (Claude) declares no extra env; see the note at `spawn_monitor`'s
+/// `PipeOwning` arm before widening it.
+pub(crate) fn run_monitor(
+    project_root: &Path,
+    phase: u32,
+    workdir: &Path,
+    prompt_file: &Path,
+    idle_timeout_secs: u64,
+    argv: &[String],
+) -> Result<(), CliError> {
+    let prompt = std::fs::read_to_string(prompt_file).map_err(|err| {
+        CliError::Message(format!(
+            "monitor could not read the prompt file {}: {err}",
+            prompt_file.display()
+        ))
+    })?;
+    let Some((program, args)) = argv.split_first() else {
+        return Err(CliError::Message(
+            "monitor was given no child program to supervise".to_string(),
+        ));
+    };
+
+    monitor::run_pipe_owning_monitor(
+        project_root,
+        phase,
+        workdir,
+        &prompt,
+        std::time::Duration::from_secs(idle_timeout_secs),
+        program,
+        args,
+        &[],
+    )
+    .map_err(|err| CliError::Message(format!("pipe-owning monitor failed: {err}")))?;
+
+    advance(project_root, Some(phase))
 }
 
 /// The tail of [`launch_stage_inner`]: clear the stale monitor pid, validate
@@ -106,6 +206,7 @@ fn spawn_agent_and_record(
     args: &[String],
     extra_env: &[(String, String)],
     archived_stage: Option<Stage>,
+    launch: monitor::MonitorLaunch,
 ) -> Result<(), CliError> {
     // WR-04 (18-fix): clear the prior stage's monitor pid up front, before
     // any fallible step below (`ensure_agent_binary`) can return early via
@@ -154,7 +255,7 @@ fn spawn_agent_and_record(
             }),
         );
     }
-    let pid = monitor::spawn_monitor(state, program, args, extra_env)
+    let pid = monitor::spawn_monitor(state, program, args, extra_env, launch)
         .map_err(|err| CliError::Message(format!("could not spawn monitor: {err}")))?;
     // `transition()` calls `workflow::save_state` BEFORE `launch_stage`, so a
     // pid recorded only in memory here is lost unless it is written again
@@ -228,7 +329,19 @@ pub(crate) fn relaunch_checkpoint_session(
 
     let (program, args) = agents::ClaudeAgent::exec_resume_command(session_id, &instruction);
 
-    spawn_agent_and_record(state, program, &args, &[], None)
+    // `Legacy`, deliberately: `exec_resume_command` builds the pre-31
+    // single-document shape (positional instruction, `--output-format json`),
+    // so its capture is a `SingleDocEnvelope` and there is no stdin turn to
+    // deliver. Routing it through the pipe-owning arm would hand that
+    // single-document child a stdin document it never reads.
+    spawn_agent_and_record(
+        state,
+        program,
+        &args,
+        &[],
+        None,
+        monitor::MonitorLaunch::Legacy,
+    )
 }
 
 /// Spawn the background monitor that owns the agent for `state.stage`. The
