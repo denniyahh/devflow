@@ -1389,6 +1389,44 @@ Plans:
 
 - [x] Delivered as an out-of-band patch, 2026-07-31 (no phase — emergency unblock for the Phase 29 dogfood)
 
+### Phase 999.71: Measure Whether the Capture Writer Actually Leaves Torn Terminal Lines (BACKLOG)
+
+**Linear:** [DEN-92](https://linear.app/denniskim/issue/DEN-92/99971-measure-whether-the-capture-writer-actually-leaves-torn-terminal)
+**Found:** 2026-08-02, phase 30 adversarial pass over the malformed-input defect class. Flagged as
+unmeasured by the cross-AI code review (`30-CODE-REVIEW.md`) and again in
+`30-H1-CONTEXT-FOR-31.md`.
+
+**The question, in one line:** when DevFlow reads `.devflow/phase-NN-stdout`, can the last line ever
+be torn?
+
+**Why it is open.** `claude_stream_events` silently drops unparseable lines, and every consumer
+assumes what survived is complete. Phase 30 fixed the gate consumer and swept it at every truncation
+offset; the verdict consumer is confirmed broken under truncation (constraint 9 item 1, reproduced
+at byte offset 1120 by `truncation_sweep_never_upgrades_verdict_to_success`). What nobody has
+established is **how often, if ever, a torn line actually reaches a reader in production.**
+
+**Why source reading cannot answer it.** The live gate read
+(`checkpoint_reported_in_capture`, `pipeline_launch.rs:491`) sits in the post-result dispatch path
+rather than a polling loop, so it is not continuously racing the writer. But the capture is written
+by raw `sh` redirection from the monitor, and this milestone's entire premise is sessions outliving
+turn end with background tasks still running — precisely the condition where a process could still
+be appending when a reader arrives. Neither "safe" nor "exposed" follows from the code alone.
+
+**The experiment.** Same family as 30c/30d: instrument a live run, read the capture at the moment
+DevFlow would, and record whether the final line ever fails to parse — plus, if it does, at what
+rate and under which exit paths (clean exit, timeout, kill, still-running background children).
+
+**What it changes.** Priority, not exposure. Nothing in phase 30 is gated on the answer: the gate
+path is fixed and swept, the session-id path is fail-closed by construction (reads only
+`system`/`init`, so truncation yields `None`, never a forged id), and the verdict path has zero
+callers. The answer sets how urgently **Phase 31** must close constraint 9 before wiring the launch
+path — a measured "never observed" makes it a hygiene fix, a measured "happens on kill" makes it a
+prerequisite.
+
+**Size: S.** One harness in the 30c/30d mould, plus a short archived measurements file.
+
+---
+
 ### Phase 999.70: Checkpoint Detection Cannot Tell a Gate DECLARATION From a Gate MENTION (BACKLOG)
 
 **Linear:** [DEN-91](https://linear.app/denniskim/issue/DEN-91/99970-checkpoint-detection-cannot-tell-a-gate-declaration-from-a-gate)
