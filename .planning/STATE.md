@@ -4,11 +4,11 @@ milestone: v2.3.0
 milestone_name: the unattended run (999.64 arc — closes after Phase 31)
 current_phase: 31
 current_phase_name: claude-adapter-launch-path-pipe-owning-monitor-999-64-arc-cl
-status: "Phase 30 closed; Phase 31 context gathered, ready to plan"
-stopped_at: "Phase 31 context gathered (31-CONTEXT.md, D-01..D-19) on feature/phase-31. Phase 30 remains fully closed: 5/5 plans, root-cause refactor a557805 closed constraint 9 items 1+2, 30-UAT.md 13/13, 30-SECURITY.md 0 threats open. Phase 31 owns the launch-path flip that makes 30b's parser reachable; next step is /gsd-plan-phase 31."
-last_updated: "2026-08-03T14:05:39Z"
+status: "Phase 31 planned — 5 plans in 4 waves, ready to execute"
+stopped_at: "Phase 31 planned on feature/phase-31: 31-RESEARCH.md, 31-PATTERNS.md, 31-VALIDATION.md and 5 PLAN.md files (4 waves, DAG-consistent, wave-2 pair file-disjoint). plan-checker returned VERIFICATION PASSED; decision-coverage gate 19/19 after a D-04 citation fix. ROADMAP scope item 6 (999.67) dropped at planning time — verified already closed by a557805. Next step is /gsd-execute-phase 31."
+last_updated: "2026-08-03T15:42:29.681Z"
 last_activity: 2026-08-03
-last_activity_desc: "Phase 30 closed via phase.complete; Phase 31 context gathered — idle timeout, timeout-firing behaviour, rollout shape, CLI-behaviour guard, acceptance mechanics"
+last_activity_desc: "Phase 31 planned — research, pattern map, validation strategy, 5 plans; 999.67 dropped on evidence, D-04 precedent correction recorded"
 progress:
   # STALE AND UNVERIFIED — do not trust these five values.
   # `state.update-progress` is the tool that owns them and it is not usable here:
@@ -17,6 +17,9 @@ progress:
   # its own JSON while writing 131/137 to these fields. Left at their last
   # hand-trusted values rather than replaced with numbers that cannot be defended.
   # See .planning/UPSTREAM-GSD-ISSUES.md entries 9 and 11.
+  # 2026-08-03: `state.planned-phase` (plan-phase §13b) silently deleted this comment
+  # and rewrote total_phases 21->47 and total_plans 129->142. Restored by hand; the
+  # tool's numbers are no more defensible than the ones it replaced.
   total_phases: 21
   completed_phases: 15
   total_plans: 129

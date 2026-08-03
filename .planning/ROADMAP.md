@@ -3017,11 +3017,21 @@ infrastructure phases; tracked by the constraint numbers above.
 **Plans:** 5 plans in 4 waves
 
 Plans:
+**Wave 1**
 
 - [ ] 31-01-PLAN.md — Tracer: a Claude Code stage runs end-to-end through the pipe-owning monitor (wave 1)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
 - [ ] 31-02-PLAN.md — Idle timeout: a stuck stage fails loudly instead of silently (wave 2)
 - [ ] 31-03-PLAN.md — Startup delivery canary: refuse to run when task-notification delivery is gone (wave 2)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
 - [ ] 31-04-PLAN.md — Guards: exit-code arbitration and the loud opt-out (wave 3)
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
 - [ ] 31-05-PLAN.md — Acceptance run: the live two-plan wave that gates the 999.64 arc (wave 4)
 
 **Scope item 6 (999.67) dropped at planning time — already closed.** `parse_devflow_result`
