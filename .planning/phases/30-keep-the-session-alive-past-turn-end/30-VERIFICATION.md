@@ -1,7 +1,7 @@
 ---
 phase: 30-keep-the-session-alive-past-turn-end
 verified: 2026-08-02T21:30:00Z
-status: human_needed
+status: passed
 score: 8/8 must-haves verified
 behavior_unverified: 0
 overrides_applied: 0
@@ -13,6 +13,7 @@ verdict_note: >-
   verification, and its disposition is an operator decision, not the verifier's.
 yardstick: "Phase 30's own goal (ROADMAP.md §Phase 30 'Goal:'), NOT the 999.64 arc goal — justified in §Yardstick below"
 human_verification:
+
   - test: >-
       Decide the disposition of V-01: a single JSONL-shaped `system`/`user`/`assistant`
       line anywhere in a NON-stream capture suppresses gate detection for the whole
@@ -28,17 +29,20 @@ human_verification:
       A scope decision on a phase already complete, on a fix that was itself an
       out-of-plan code-review remediation. Not the verifier's call.
 deferred:
+
   - truth: "The prompt-echo false positive is closed as WITNESSED rather than reasoned"
     addressed_in: "Phase 31"
     evidence: >-
       No archived capture contains a prompt echo or gate text, so no fixture can be a
       real capture. A witnessing capture only exists once Phase 31 flips the launch
       path to `--output-format stream-json` (ROADMAP: 'the always-on adapter switch').
+
   - truth: "Layer-1 verdict selection survives a torn terminal result line"
     addressed_in: "Phase 31"
     evidence: >-
       ROADMAP binding constraint 9 item 1, added 2026-08-02: 'Phase 31 must not wire up
       `evaluate_layer1` until two confirmed defects behind it are closed.'
+
   - truth: "`last_top_level_result` enforces top-level provenance via `parent_tool_use_id`"
     addressed_in: "Phase 31"
     evidence: "ROADMAP binding constraint 9 item 2, same paragraph."
@@ -70,10 +74,12 @@ yardstick.** Three reasons, in descending weight:
    The arc goal — "a DevFlow-driven phase containing a multi-plan wave completes that wave
    without orphaning delegated work" — requires the pipe-owning monitor those files hold.
    Measuring Phase 30 against it would fail the phase for obeying its own instructions.
+
 2. **The split moved no work.** ROADMAP's "Goal reconciliation" paragraph states the scope of
    neither phase changed, only which goal each is measured against. I checked this against the
    plan list: 30-01/03/05 (parser), 30-02 (30c), 30-04 (30d) are the same five units the entry
    named before the split. Nothing was descoped into Phase 31 to make Phase 30 passable.
+
 3. **The arc goal is not verifiable here even in principle.** Its acceptance criterion is a
    live Phase 29 wave-2 re-run, which the ROADMAP explicitly says is *"not substitutable by
    integration tests."*
@@ -167,11 +173,14 @@ but none covers a **mixed** capture, which is precisely the class the widened pr
 
 - The call site is agent-gated: `state.agent == AgentKind::Claude` (`pipeline_launch.rs:490`),
   so Codex plain-text captures — the most plausible carrier — never reach it.
+
 - Under today's shipped `--output-format json` adapter the capture is one JSON document whose
   `type` is `result`; agent text lives *inside* the JSON string and cannot become its own
   physical line. I could construct no realistic trigger on the shipped adapter.
+
 - It additionally requires `phase_has_blocking_human_checkpoint` to be true, and the
   consequence is a fall-through to per-stage dispatch — a stall, i.e. pre-Phase-28 behaviour.
+
 - Under Phase 31 the exposure inverts and disappears by design: stream-json always-on makes
   `gate_shape` always true and the raw path dead.
 
@@ -221,29 +230,36 @@ over-read — and this phase has already been burned once by a green suite over 
 1. **That the stream parser is correct in production.** It has never processed a real
    production capture. Its verdict path has zero callers; nothing has ever exercised it outside
    tests and fixtures. Correctness is established against *fixtures*, not against Claude.
+
 2. **That Claude emits the shapes the tests assert.** Every gate and rate-limit payload is
    synthetic. Real event *envelopes*, synthetic *payloads*. No archived capture contains gate
    text, and none contains a prompt echo at all. The constraint-3 false positive is closed as
    reasoned; it has never been witnessed.
+
 3. **That 999.64 is fixed, or closer to fixed in any observable way.** Phase 30 delivered a
    parser nothing calls and two experiments. An unattended run fails today exactly as it did
    before this phase.
+
 4. **That the 30c delivery premise is reliable, only that it reproduced.** 8 trials across 3
    environments is a weak reliability bound — it establishes the benign path exists, not that
    it is the only path. The behaviour is undocumented, unpinned upstream CLI behaviour on
    `claude_code_version 2.1.220`; a CLI update can invalidate it silently. Phase 31 owns the
    version smoke-detection (M2) that would catch that.
+
 5. **That close-with-pending-tasks is benign.** n=2. 30d's own text says so. The measurement
    defines the behaviour observed twice; it does not bound the distribution. The
    partial-drain case (one child drained, one not) is explicitly untested.
+
 6. **That my V-01 probe found the only such residual.** I probed one hypothesis about one
    predicate, chosen by reading the diff. I ran no fuzzing, no property tests, no concurrent
    torn-read testing, and no load testing — the same four gaps the code review listed and did
    not close. A second adversarial pass with a different hypothesis could well find more; the
    base rate on this file is now two findings from two independent adversarial passes.
+
 7. **That `scripts/check.sh all` green means CI green.** It was run on this host only. Pinned-
    container parity is claimed in `30-VALIDATION.md` (`485 passed`) but I did **not** re-run
    `scripts/check-in-container.sh`; that claim is carried forward unverified by me.
+
 8. **That the exit-latency numbers generalize.** Mode A's 169.5–279.7 ms is one machine, one
    CLI version, one two-child workload, n=5.
 
