@@ -231,6 +231,13 @@ Every artifact the later plans in this phase attach to now exists:
 - **31-04 (D-11 opt-out)** — `exec_command_single_document` + `MonitorLaunch::Legacy` are the path the flag selects, and `single_document_command_preserves_pre31_shape` guards it from drifting.
 - **31-05 (acceptance run)** — this is the blocker. **Nothing in this plan has run the real `claude` binary.** D-09's sequencing exists precisely because the parser's production correctness is reasoned rather than witnessed, and D-19 is explicit that a failing acceptance run means 999.64 is not closed whatever the unit tests say. `STREAM_JSON_STAGES` must not be widened beyond `Stage::Code` until that run produces a real production capture.
 
+## Self-Check: PASSED
+
+All six claimed files exist on disk (`ls -1`), and all four claimed commits exist in
+`git log 924466b..HEAD`: `b3bec76`, `f3bd279`, `3879642`, `ba05a79`. Working tree clean, no
+untracked files. STATE.md and ROADMAP.md deliberately untouched — the orchestrator owns those
+writes after the wave merges, and the post-commit hook's staleness notice is expected here.
+
 ---
 *Phase: 31-claude-adapter-launch-path-pipe-owning-monitor-999-64-arc-cl*
 *Completed: 2026-08-03*
