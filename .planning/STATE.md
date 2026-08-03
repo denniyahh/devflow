@@ -3,18 +3,18 @@ gsd_state_version: 1.0
 milestone: v2.3.0
 milestone_name: the unattended run (999.64 arc — closes after Phase 31)
 current_phase: 97
-current_phase_name: acceptance-two-plan-wave
-status: executing
-stopped_at: "Phase 31 planned on feature/phase-31: 31-RESEARCH.md, 31-PATTERNS.md, 31-VALIDATION.md and 5 PLAN.md files (4 waves, DAG-consistent, wave-2 pair file-disjoint). plan-checker returned VERIFICATION PASSED; decision-coverage gate 19/19 after a D-04 citation fix. ROADMAP scope item 6 (999.67) dropped at planning time — verified already closed by a557805. Next step is /gsd-execute-phase 31."
-last_updated: "2026-08-03T20:42:35.064Z"
+status: completed
+stopped_at: Phase 31 context gathered
+last_updated: "2026-08-03T20:53:29.772Z"
 last_activity: 2026-08-03
-last_activity_desc: Phase 97 execution started
+last_activity_desc: Phase 97 complete
 progress:
   total_phases: 48
-  completed_phases: 19
+  completed_phases: 20
   total_plans: 144
-  completed_plans: 135
-  percent: 40
+  completed_plans: 137
+  percent: 42
+current_phase_name: acceptance-two-plan-wave
 ---
 
 # DevFlow — Project State
@@ -144,9 +144,9 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 97 (acceptance-two-plan-wave) — EXECUTING
-Plan: 1 of 2
-Status: Executing Phase 97
+Phase: 97
+Plan: Not started
+Status: All phases complete
 
 Phase 30 closed 2026-08-03 via `phase.complete 30`. Note what that did NOT do:
 ROADMAP.md was unchanged (it reported `roadmap_updated: true` while changing
@@ -221,7 +221,7 @@ Scope boundary: 23-16 is the **fix only** (change + regression tests + PR into `
 
 **Recovery-ref disposition:** both `origin` refs (`recovery/pre-23-11-acceptance-e0f87c2`, `recovery/pre-23-15-acceptance-0dad20d`) remain untouched on `origin`; the local copy of the pre-23-11 ref, deleted again by `devflow cleanup`, is deliberately NOT restored (per `23-FINDINGS.md` §B2a); the pre-23-15 ref is now unused (no merge to undo) but retained on `origin` for reuse by the 23-16 retry rather than deleted.
 
-Last activity: 2026-08-03 — Phase 97 execution started
+Last activity: 2026-08-03 — Phase 97 complete
 
 **Note on the "Plan: 2 of 15" value this replaces:** `gsd-tools state advance-plan` only increments whatever value is already in this field, which had drifted to "2 of 15" (the parallel-worktree waves 23-01…23-09 deliberately never touch STATE.md, and this field was last corrected against reality at "10 of 11 plans complete" before the plan count grew to 15 with the gap-closure plans 23-12…23-15). Corrected directly to "13 of 15" to match reality (23-12 and 23-13 both now executed) rather than trust the tool's naive +1 increment from a stale base.
 
