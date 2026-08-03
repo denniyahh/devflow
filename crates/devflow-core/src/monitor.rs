@@ -293,6 +293,80 @@ fn spawn_monitor_inner(
     Ok(pid)
 }
 
+/// Constraint 4's close rule as a pure, line-fed state machine: stdin may be
+/// released only once a `DEVFLOW_RESULT` marker has appeared inside a
+/// TOP-LEVEL `result` event **and** the background-task list has drained.
+///
+/// An `AND` of two arms, neither sufficient alone:
+///
+/// - **Marker arm.** Satisfied only by
+///   [`crate::agent_result::event_is_top_level_result_marker`] — a composition
+///   of the existing `is_top_level` predicate and the existing marker parser,
+///   never a looser text search. The CLI echoes the operator's prompt back
+///   into the same stdout, and DevFlow's own stage prompts discuss
+///   `DEVFLOW_RESULT` markers at length, so marker text alone is not evidence
+///   (T-31-01; the same echo produced the checkpoint false positive 30-05
+///   fixed).
+/// - **Drain arm.** Satisfied when no `background_tasks_changed` event has
+///   ever announced anything (vacuous — the common single-plan case) or when
+///   the most recent one carried an empty list.
+///
+/// **The drain alone is never a stop signal.** 30c/30d measured the
+/// drain-to-final-`result` lag at 4.54–11.51s across 14 trials; closing at the
+/// drain would have truncated the final orchestrator turn in all seven 30d
+/// trials.
+///
+/// **Never count `result` events.** Constraint 7: the CLI coalesces
+/// completions, so a wave whose children finish together produces one `result`
+/// for several of them — a shape superficially indistinguishable from "one
+/// child delivered, one lost". The drained list is the only thing separating
+/// those two. Per 30-04 the drain arm is *defensive rather than load-bearing*
+/// (n=2 Mode B trials delivered everything without it); that is the recorded
+/// reason to keep it cheaply, not a reason to drop it.
+///
+/// **A line that does not parse as JSON is ignored by this rule** — it can
+/// neither satisfy nor block either arm — but it is still teed verbatim to the
+/// capture file by the reader thread. A torn line therefore cannot silently
+/// decide anything, and cannot be silently lost either.
+#[derive(Default)]
+pub struct CloseRule {
+    marker_seen: bool,
+    /// `None` = nothing was ever announced; `Some(n)` = the last announcement
+    /// carried `n` tasks. The two are deliberately distinguishable: `None` is
+    /// vacuously drained, and conflating it with `Some(0)` would erase the
+    /// difference between "no children" and "children, all finished".
+    pending_background_tasks: Option<usize>,
+}
+
+impl CloseRule {
+    /// Fold one raw stdout line into the rule.
+    pub fn observe(&mut self, line: &str) {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+            return;
+        };
+        if crate::agent_result::event_is_top_level_result_marker(&event) {
+            self.marker_seen = true;
+        }
+        if event.get("type").and_then(serde_json::Value::as_str) == Some("system")
+            && event.get("subtype").and_then(serde_json::Value::as_str)
+                == Some("background_tasks_changed")
+            && let Some(tasks) = event.get("tasks").and_then(serde_json::Value::as_array)
+        {
+            // Only a readable `tasks` array updates the count. An announcement
+            // whose list cannot be read leaves the previous state standing
+            // rather than being treated as a drain — the conservative
+            // direction, since an early close truncates while a late one
+            // merely costs an idle timeout.
+            self.pending_background_tasks = Some(tasks.len());
+        }
+    }
+
+    /// Whether both arms hold and the child's stdin may be released.
+    pub fn should_close(&self) -> bool {
+        self.marker_seen && matches!(self.pending_background_tasks, None | Some(0))
+    }
+}
+
 /// The single place the stdin wire shape is constructed: one line of JSON
 /// carrying the initial user turn for a `--input-format stream-json` child.
 ///
@@ -436,9 +510,9 @@ pub fn run_pipe_owning_monitor(
         // Dropping `line_tx` here is what surfaces `Disconnected` below.
     });
 
-    // --- Close rule (constraint 4): an AND of two arms, neither sufficient ---
-    let mut marker_seen = false;
-    let mut pending_background_tasks: Option<usize> = None;
+    // Constraint 4's close rule lives in `CloseRule` so it can be unit-tested
+    // by feeding it lines, with no child process per case.
+    let mut rule = CloseRule::default();
     let mut close_signalled = false;
 
     loop {
@@ -447,27 +521,8 @@ pub fn run_pipe_owning_monitor(
                 if close_signalled {
                     continue;
                 }
-                if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
-                    if crate::agent_result::event_is_top_level_result_marker(&event) {
-                        marker_seen = true;
-                    }
-                    if event.get("type").and_then(serde_json::Value::as_str) == Some("system")
-                        && event.get("subtype").and_then(serde_json::Value::as_str)
-                            == Some("background_tasks_changed")
-                        && let Some(tasks) =
-                            event.get("tasks").and_then(serde_json::Value::as_array)
-                    {
-                        pending_background_tasks = Some(tasks.len());
-                    }
-                }
-                // Vacuously satisfied when nothing was ever announced — the
-                // common single-plan case.
-                let drained = matches!(pending_background_tasks, None | Some(0));
-                if marker_seen && drained {
-                    // The drain ALONE is never a stop signal: 30d measured the
-                    // drain-to-final-`result` lag at 4.54–11.51s across 14
-                    // trials, and closing at the drain would have truncated
-                    // the final orchestrator turn in all seven 30d trials.
+                rule.observe(&line);
+                if rule.should_close() {
                     let _ = close_tx.send(());
                     close_signalled = true;
                 }
@@ -536,6 +591,201 @@ mod tests {
         let mut state = State::new(4, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
         state
+    }
+
+    // ---- close-rule fixtures ------------------------------------------
+    //
+    // Key names, nesting and event types are taken from the real archived
+    // capture at
+    // `.planning/phases/30-keep-the-session-alive-past-turn-end/30a-evidence/raw_output_v3.jsonl`
+    // (lines 5, 8, 19, 44 and 54), not invented: `tasks` is an array of
+    // objects with `task_id`/`task_type`/`description`, the drained event is
+    // the same event with `tasks":[]`, and a coalesced completion carries
+    // `origin.kind == "task-notification"` on an ordinary `result`. Volumes
+    // and identifiers are generalized; shapes are not.
+
+    const INIT_LINE: &str = r#"{"type":"system","subtype":"init","cwd":"/tmp/work","session_id":"s-1","tools":["Task","Bash"],"uuid":"u-init"}"#;
+
+    /// A `system`/`background_tasks_changed` event announcing `count` tasks.
+    /// `count == 0` is the DRAINED shape (v3 line 44).
+    fn bg_tasks_line(count: usize) -> String {
+        let tasks: Vec<String> = (0..count)
+            .map(|i| {
+                format!(
+                    r#"{{"task_id":"t{i}","task_type":"local_agent","description":"child {i}"}}"#
+                )
+            })
+            .collect();
+        format!(
+            r#"{{"type":"system","subtype":"background_tasks_changed","tasks":[{}],"uuid":"u-bg{count}","session_id":"s-1"}}"#,
+            tasks.join(",")
+        )
+    }
+
+    /// A top-level `result` event. `marker` is the `result` field's text —
+    /// the agent's own final message, where a `DEVFLOW_RESULT:` line lives.
+    fn result_line(marker: &str) -> String {
+        format!(
+            r#"{{"type":"result","subtype":"success","is_error":false,"num_turns":3,"stop_reason":"end_turn","session_id":"s-1","uuid":"u-res","result":"{marker}"}}"#
+        )
+    }
+
+    /// The v3 line-54 shape: ONE `result` closing out work that several
+    /// children contributed to, tagged with the task-notification origin.
+    fn coalesced_result_line(marker: &str) -> String {
+        format!(
+            r#"{{"type":"result","subtype":"success","is_error":false,"num_turns":2,"stop_reason":"end_turn","origin":{{"kind":"task-notification"}},"session_id":"s-1","uuid":"u-res-coalesced","result":"{marker}"}}"#
+        )
+    }
+
+    /// Same envelope, forwarded from a subagent rather than authored by the
+    /// orchestrator session.
+    fn subagent_result_line(marker: &str) -> String {
+        result_line(marker).replacen('{', r#"{"parent_tool_use_id":"toolu_child","#, 1)
+    }
+
+    /// A success marker as it appears INSIDE a `result` string field — the
+    /// quotes are escaped because the field is itself JSON.
+    const MARKER: &str = r#"All done.\nDEVFLOW_RESULT: {\"status\":\"success\",\"commits\":3}"#;
+    const NO_MARKER: &str = "Acknowledged; nothing to report.";
+
+    fn observe_all(lines: &[String]) -> CloseRule {
+        let mut rule = CloseRule::default();
+        for line in lines {
+            rule.observe(line);
+        }
+        rule
+    }
+
+    /// Constraint 4 is an `AND`, and neither arm is sufficient alone. Both
+    /// halves are asserted here because a rule that accidentally became an
+    /// `OR` still passes any test that only ever feeds it both.
+    #[test]
+    fn close_rule_requires_both_marker_and_drained_background_tasks() {
+        // Arm A: the drain lands, but no marker ever appears in a top-level
+        // result. Closing here truncates the run before its verdict exists.
+        // The torn line carrying marker TEXT is the negative control: a line
+        // that does not parse as JSON must not be able to satisfy the marker
+        // arm through the back door.
+        let drained_but_unmarked = observe_all(&[
+            INIT_LINE.to_string(),
+            bg_tasks_line(1),
+            bg_tasks_line(0),
+            r#"{"type":"result","result":"DEVFLOW_RESULT: {\"status\":\"succ"#.to_string(),
+            "progress: still working".to_string(),
+            result_line(NO_MARKER),
+        ]);
+        assert!(
+            !drained_but_unmarked.should_close(),
+            "the drain alone must never close stdin: 30c/30d measured the \
+             drain-to-final-result lag at 4.54-11.51s across 14 trials, and \
+             closing at the drain would have truncated the final orchestrator \
+             turn in all seven 30d trials"
+        );
+
+        // Arm B: the marker lands while a child is still pending.
+        let marked_but_pending =
+            observe_all(&[INIT_LINE.to_string(), bg_tasks_line(1), result_line(MARKER)]);
+        assert!(
+            !marked_but_pending.should_close(),
+            "a marker while a background task is still announced must not \
+             close stdin — the pending child's task-notification turn would \
+             have nowhere to be delivered"
+        );
+    }
+
+    /// The common case: a single-plan stage that never dispatches anything.
+    /// The drain arm is satisfied VACUOUSLY, because nothing was ever
+    /// announced — an implementation that waited for a literal empty-list
+    /// event would hang every such stage until the idle timeout.
+    ///
+    /// The interleaved noise lines also pin the other half of the rule's
+    /// tolerance: a torn JSON line and a prose line are ignored for the rule
+    /// (they can neither satisfy nor block it) while still being teed to the
+    /// capture by the reader thread.
+    #[test]
+    fn close_rule_is_vacuously_drained_when_no_background_tasks_event_appears() {
+        let rule = observe_all(&[
+            INIT_LINE.to_string(),
+            "starting up".to_string(),
+            r#"{"type":"assist"#.to_string(),
+            result_line(MARKER),
+        ]);
+        assert!(
+            rule.should_close(),
+            "a stage that never announced a background task is drained by \
+             definition; only the marker arm has anything to satisfy"
+        );
+    }
+
+    /// Constraint 7. The CLI COALESCES completions: two children can finish
+    /// into one `result` event, and two announced tasks can drain to an empty
+    /// list in a single `background_tasks_changed`. Counting `result` events
+    /// therefore silently undercounts any wave whose completions cluster —
+    /// and that shape is superficially indistinguishable from "one child
+    /// delivered, one lost". The drained list is the only thing separating
+    /// them, so the rule asserts on the list state and never on a count.
+    ///
+    /// Per 30-04 the drain arm is DEFENSIVE rather than load-bearing: n=2
+    /// Mode B trials delivered everything without it. That is the documented
+    /// reason to keep it cheaply — "defensive" is not "removable".
+    #[test]
+    fn coalesced_completions_do_not_undercount_children() {
+        let rule = observe_all(&[
+            INIT_LINE.to_string(),
+            bg_tasks_line(2),
+            // BOTH children drain in ONE event...
+            bg_tasks_line(0),
+            // ...and complete into ONE result.
+            coalesced_result_line(MARKER),
+        ]);
+        assert!(
+            rule.should_close(),
+            "two announced children, one drain event and one coalesced result \
+             must still close — a rule that matched result events against \
+             child count would stall here forever"
+        );
+
+        // Negative control: the SAME single coalesced result with the drain
+        // withheld must NOT close. Without this, the assertion above is also
+        // satisfied by a rule that simply closes on any result event, and the
+        // test would be measuring nothing.
+        let undrained = observe_all(&[
+            INIT_LINE.to_string(),
+            bg_tasks_line(2),
+            coalesced_result_line(MARKER),
+        ]);
+        assert!(
+            !undrained.should_close(),
+            "control: it is the drained list that decides, not the arrival of \
+             a result event"
+        );
+    }
+
+    /// T-31-01. The CLI echoes the operator's prompt back into the same
+    /// stdout, and DevFlow's own stage prompts discuss `DEVFLOW_RESULT`
+    /// markers at length — so marker TEXT is not evidence of a verdict. Only
+    /// a marker inside an event that is both `type: "result"` and top-level
+    /// counts, reusing the one provenance predicate rather than inventing a
+    /// second notion of trustworthiness.
+    #[test]
+    fn marker_inside_a_non_top_level_result_does_not_satisfy_the_close_rule() {
+        let subagent = observe_all(&[INIT_LINE.to_string(), subagent_result_line(MARKER)]);
+        assert!(
+            !subagent.should_close(),
+            "a subagent-origin result carrying a marker must not close the \
+             stream — same provenance hole constraint 9 item 2 closed for the \
+             stage verdict"
+        );
+
+        // Control: the identical envelope WITHOUT the planted parent id is
+        // top-level and legitimately closes. Without this the assertion above
+        // would also pass against a rule that never closes at all.
+        let top_level = observe_all(&[INIT_LINE.to_string(), result_line(MARKER)]);
+        assert!(
+            top_level.should_close(),
+            "control: the same event without a parent id is authoritative"
+        );
     }
 
     #[test]
