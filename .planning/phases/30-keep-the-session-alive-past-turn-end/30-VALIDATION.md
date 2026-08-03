@@ -157,8 +157,12 @@ Recorded because `nyquist_compliant: true` is easy to over-read as "the feature 
 
 - **Sampling adequacy, not production correctness.** Nyquist compliance says the phase was
   sampled densely enough during execution. It says nothing about whether the code works in
-  production — and phase 30's stream parser is **unreachable in production** until Phase 31
-  flips the launch path off `--output-format json`.
+  production — and phase 30's stream **verdict** path (`evaluate_layer1` /
+  `parse_claude_event_result`, zero callers today) is unreachable until Phase 31 flips the
+  launch path off `--output-format json`. **Corrected by phase-30 verification: that does
+  NOT extend to the whole parser.** Checkpoint detection and `claude_stream_session_id` are
+  wired live at `pipeline_launch.rs:491`. Two of the three live-path defects found this
+  phase (H2, and V-01 in the H2 remediation itself) were on that reachable path.
 - **No fixture is a real capture.** No archived capture contains checkpoint gate text, and
   none contains a prompt echo at all. Every gate assertion uses a real event envelope with a
   synthetic payload. The prompt-echo false positive is closed as *reasoned*, not *witnessed*.

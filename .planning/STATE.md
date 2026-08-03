@@ -60,8 +60,14 @@ zero callers; they are now ROADMAP **constraint 9** binding Phase 31. The last
 Medium is backlog **999.70**.
 
 Two limits carried forward deliberately, both recorded in `30-05-SUMMARY.md`:
-the stream parser is **unreachable in production** until Phase 31 flips the
-launch path off `--output-format json`, and **no fixture is a real capture** —
+the stream **verdict** path (`evaluate_layer1` / `parse_claude_event_result`) is
+unreachable in production until Phase 31 flips the launch path off
+`--output-format json` — it has zero callers today. **This does not extend to the
+whole parser**, a correction from phase-30 verification: checkpoint detection
+(`checkpoint_reported_in_capture`) and `claude_stream_session_id` are wired live
+at `pipeline_launch.rs:491`, which is exactly why the code review's gate findings
+mattered and the verdict findings could be deferred. And **no fixture is a real
+capture** —
 no archived capture contains checkpoint gate text, and none contains a prompt
 echo at all, so the prompt-echo false positive is closed as reasoned rather than
 witnessed.

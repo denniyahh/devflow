@@ -86,6 +86,16 @@ function short-circuits via `.any()` — no `String` accumulation.
 `is_claude_event_stream`. Its signature is unchanged and it remains `pub`. The
 `else` path is the pre-existing two-target logic, byte-identical.
 
+> **Superseded 2026-08-02, after this plan closed.** The branch is no longer gated
+> on `is_claude_event_stream` — that predicate required a successfully parsed
+> `system`/`init`, so one torn line reverted the whole capture to the raw-stdout
+> scan and reinstated the prompt-echo false positive this plan exists to close
+> (code review High 2, fixed in `06675da`). It is now gated on
+> `claude_stream_gate_shape`, corrected again in `f34756c` after verification
+> found it could be tripped by a single stray JSON line (V-01). See
+> `30-CODE-REVIEW.md` and `30-VERIFICATION.md`. `is_claude_event_stream` still
+> gates the verdict cascade, deliberately unchanged (T-30-02).
+
 ## Verification
 
 ### Conditional-gate and scope-fence checks
