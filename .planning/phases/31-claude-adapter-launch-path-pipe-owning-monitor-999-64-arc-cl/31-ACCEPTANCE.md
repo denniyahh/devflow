@@ -505,5 +505,22 @@ Read this section before the result, not after it.
 
 ---
 
+## Post-run repository health
+
+Run after cleanup, on `feature/phase-31` at `62e3a72`. Each command's own exit code was captured
+directly — not a pipeline's, per CLAUDE.md.
+
+| Command | Exit | Result |
+|---|---|---|
+| `cargo test --workspace` | **0** | 22 suites, **876 passed, 0 failed** |
+| `bash scripts/check.sh all` | **0** | `==> check.sh: all OK` |
+| `git status --porcelain` | — | *(empty)* |
+
+The pass/fail claim rests on two independent measures that agree: the process exit code, and a
+summed parse of all 22 `test result:` lines. A single one of those could look clean while being
+wrong; both agreeing is the check.
+
+---
+
 *Evidence file for plan 31-05, task 2. The phase-close decision is task 3's, and it is the
 operator's (D-19).*
