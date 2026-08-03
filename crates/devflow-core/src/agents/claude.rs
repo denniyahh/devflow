@@ -125,8 +125,11 @@ impl ClaudeAgent {
     /// prompt is not guaranteed to even reach the captured stdout.
     /// `resume_command_includes_permission_bypass` is the named regression
     /// test guarding this specifically — do not delete it as "obviously
-    /// redundant" with `claude_wraps_prompt_in_noninteractive_flags` above;
-    /// it guards a DIFFERENT command construction path.
+    /// redundant" with the launch-contract tests above; it guards a DIFFERENT
+    /// command construction path. Note the resume argv keeps `--output-format
+    /// json` and a POSITIONAL instruction even though `exec_command` no longer
+    /// does: a resumed session is a single-document relaunch, not a
+    /// stream-json one.
     pub fn exec_resume_command(session_id: &str, instruction: &str) -> (&'static str, Vec<String>) {
         (
             "claude",
@@ -146,6 +149,89 @@ impl ClaudeAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stand-in for the stage prompt's one invariant substring. Every real
+    /// stage prompt carries the `DEVFLOW_RESULT` contract, so its presence in
+    /// an argument is what identifies that argument as the prompt.
+    const PROMPT: &str = "do the work, then emit DEVFLOW_RESULT: {...}";
+
+    /// Both directions, or neither works. Flipping only `--output-format`
+    /// leaves the CLI with no first turn (the prompt has left argv but nothing
+    /// is writing it to stdin) and it stalls headless — the failure RESEARCH
+    /// Pitfall 1 names, whose warning sign is an `init` event followed by the
+    /// agent asking what to do.
+    #[test]
+    fn exec_command_uses_stream_json_on_both_input_and_output() {
+        let (program, args) = ClaudeAgent.exec_command(7, PROMPT, &[]);
+        assert_eq!(program, "claude");
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--input-format" && w[1] == "stream-json"),
+            "the input format is what moves the initial turn onto stdin: {args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--output-format" && w[1] == "stream-json"),
+            "the output format is what makes the capture a JSONL event stream: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "--verbose"),
+            "every archived Phase 30 trial that produced a usable capture \
+             carried --verbose; dropping it is untested territory: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "--dangerously-skip-permissions"),
+            "a headless launch with no operator present cannot answer a \
+             permission prompt: {args:?}"
+        );
+    }
+
+    /// The half of the change that is easy to miss. RESEARCH Pitfall 1: the
+    /// ROADMAP and CONTEXT both describe Phase 31 as "the argv flip", which
+    /// reads as flags-only — but leaving the prompt at `args[1]` under
+    /// `--input-format stream-json` is not documented to work, and was never
+    /// tested in Phase 30.
+    #[test]
+    fn exec_command_carries_no_positional_prompt() {
+        let (_program, args) = ClaudeAgent.exec_command(7, PROMPT, &[]);
+        assert!(
+            !args.iter().any(|arg| arg.contains("DEVFLOW_RESULT")),
+            "the prompt must not appear in argv at all — it travels as a JSON \
+             user turn on the child's stdin, written by the monitor: {args:?}"
+        );
+    }
+
+    /// The pre-31 shape must stay REACHABLE, not merely present. Two live
+    /// selectors depend on it: D-11's opt-out (recovery without a release) and
+    /// the D-09/D-10 sequencing gate (every stage the rollout has not reached
+    /// yet). If this builder silently drifted toward the stream-json shape,
+    /// both would land on a launch that is not pre-31 at all, and the D-12
+    /// isolation guarantee for the shipped single-document capture would go
+    /// with it.
+    #[test]
+    fn single_document_command_preserves_pre31_shape() {
+        let (program, args) = ClaudeAgent::exec_command_single_document(PROMPT);
+        assert_eq!(program, "claude");
+        assert!(
+            args.windows(2).any(|w| w[0] == "-p" && w[1] == PROMPT),
+            "the prompt must follow -p POSITIONALLY, as it did pre-31: {args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--output-format" && w[1] == "json"),
+            "the single-document envelope is what makes this capture classify \
+             as SingleDocEnvelope and keep the raw-scan path: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "--dangerously-skip-permissions"),
+            "the opt-out path is still headless: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "--input-format"),
+            "this builder must NOT drift toward the stream-json shape — that \
+             would leave D-11's opt-out with nothing to opt out to: {args:?}"
+        );
+    }
 
     #[test]
     fn resume_command_names_claude_program() {
