@@ -1616,8 +1616,157 @@ fn parse_marker_lines(stdout: &str) -> Option<AgentResult> {
     None
 }
 
+/// One commit the agent made before its stream went silent (D-07, 31-02).
+///
+/// The subject is carried alongside the sha because a bare sha list is not
+/// operator-actionable — D-07's requirement is that the commits be *named*, so
+/// that a silent miscount becomes something a human can act on.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct IdleTimeoutCommit {
+    /// Full commit sha, as `git log --format=%H` emits it.
+    pub sha: String,
+    /// Commit subject line (`%s`).
+    pub subject: String,
+}
+
+/// The pipe-owning monitor's authoritative idle-timeout verdict, as written to
+/// [`idle_timeout_path`] BEFORE the child is terminated (D-05, 31-02).
+///
+/// This is a SIDE CHANNEL, deliberately not the stdout capture. See
+/// [`parse_idle_timeout_side_channel`] for why that distinction is a
+/// correctness requirement rather than a filing preference.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct IdleTimeoutRecord {
+    /// Always [`AgentStatus::IdleTimeout`]'s wire string. Recorded so the file
+    /// is self-describing to a human reading `.devflow/` by hand.
+    pub status: String,
+    /// The idle window that elapsed with no line on the child's stdout.
+    pub idle_secs: u64,
+    /// The supervised child's pid, from the in-memory `Child` handle — never
+    /// re-read from the on-disk pid file, which is exposed to pid reuse
+    /// (T-31-07).
+    pub agent_pid: u32,
+    /// Unix seconds at which the monitor wrote this record.
+    pub written_at: u64,
+    /// Every commit on the phase branch when the timeout fired. NONE of these
+    /// is rolled back — see [`parse_idle_timeout_side_channel`].
+    pub commits: Vec<IdleTimeoutCommit>,
+}
+
+/// Read the monitor's own idle-timeout verdict, if it wrote one.
+///
+/// **This is consulted as the FIRST statement of [`evaluate_layer1`], before
+/// `read_capture` and before every marker parser. That placement is
+/// load-bearing and must not be "tidied" into the `.or_else` chain below it.**
+///
+/// The obvious-looking alternative — appending the verdict to the stdout
+/// capture — is a real correctness bug, not a style choice.
+/// `evaluate_layer1`'s chain reaches `parse_devflow_result`'s tail scan only
+/// when `parse_claude_event_result` returns `None`, and that parser resolves to
+/// the LAST top-level `result` event regardless of what text follows it. On any
+/// stream that already completed one successful turn — the normal shape of a
+/// run long enough to idle out at all — an appended verdict is therefore never
+/// reached, and a stale success stands as the recorded outcome of a run DevFlow
+/// itself killed (T-31-06, 31-RESEARCH Pitfall 3).
+///
+/// Reading before `read_capture` matters for a second reason: that call is an
+/// early `return None` when the capture is missing, so a timeout that fired
+/// before the child emitted anything at all would otherwise be discarded
+/// entirely.
+///
+/// `decided_by_layer` stays `1`. This is a Layer-1-CLASS authoritative verdict
+/// — it just comes from the monitor that supervised the run rather than from
+/// parsing what the agent said about itself. It is emphatically not `0`, which
+/// is reserved for operator-authored external probe provenance that
+/// `classify_validate_outcome` reads as `external`.
+///
+/// **The file's PRESENCE is the signal; its contents are enrichment.** A record
+/// that exists but cannot be read still returns an `IdleTimeout` verdict,
+/// carrying a reason that says the details were lost. Returning `None` there
+/// would drop the verdict back into the cascade and let precisely the stale
+/// success above win — turning a corrupt file into a silent wrong advance,
+/// which is the exact failure this function exists to prevent. The asymmetry is
+/// the one this whole module is built around: a false failure surfaces as a
+/// gate, never as a wrong advance.
+///
+/// **Nothing here rolls anything back** (D-07, T-31-09). The commits are read
+/// and named, never reverted: an idle timeout may be a false positive, and
+/// destroying real work on a false positive is unrecoverable.
+fn parse_idle_timeout_side_channel(project_root: &Path, phase: u32) -> Option<AgentResult> {
+    let path = idle_timeout_path(project_root, phase);
+    let raw = read_capture(&path)?;
+
+    let Ok(record) = serde_json::from_str::<IdleTimeoutRecord>(&raw) else {
+        return Some(idle_timeout_result(
+            format!(
+                "idle timeout: DevFlow's monitor recorded a timeout verdict at {} but the \
+                 record itself is unreadable, so the commit list and idle duration are lost. \
+                 The timeout stands regardless — the file's presence is the authoritative \
+                 signal. Inspect the phase branch by hand; nothing was rolled back.",
+                path.display()
+            ),
+            None,
+        ));
+    };
+
+    let named: Vec<String> = record
+        .commits
+        .iter()
+        .map(|commit| {
+            let short: String = commit.sha.chars().take(7).collect();
+            format!("{short} {}", commit.subject)
+        })
+        .collect();
+
+    let commit_phrase = if named.is_empty() {
+        "No commits were found on the phase branch.".to_string()
+    } else {
+        format!(
+            "The agent made {} commit(s) before going quiet and NONE of them were rolled \
+             back: {}.",
+            named.len(),
+            named.join("; ")
+        )
+    };
+
+    Some(idle_timeout_result(
+        format!(
+            "idle timeout: the agent's output stream was silent for {}s, so DevFlow \
+             terminated it (agent pid {}). {commit_phrase} Review the branch before deciding \
+             what to keep — this run is TERMINAL and is not retried automatically.",
+            record.idle_secs, record.agent_pid
+        ),
+        Some(record.commits.len() as u32),
+    ))
+}
+
+/// Build the `IdleTimeout` verdict Layer 1 reports for a monitor-recorded
+/// timeout.
+///
+/// `verdict` stays `None` deliberately: at `Stage::Validate`,
+/// `classify_validate_outcome` matches `Some(Verdict::Pass)` FIRST and would
+/// classify the stage as passed on the strength of that field alone, whatever
+/// the status says. A timeout has no verdict to offer, and inventing one here
+/// would advance a run that never reported.
+fn idle_timeout_result(reason: String, commits: Option<u32>) -> AgentResult {
+    AgentResult {
+        status: AgentStatus::IdleTimeout,
+        exit_code: None,
+        reason: Some(reason),
+        commits,
+        summary: None,
+        verdict: None,
+        decided_by_layer: Some(1),
+    }
+}
+
 /// Layer 1: Try to detect agent result from the native per-adapter envelope
 /// or the DEVFLOW_RESULT marker in stdout.
+///
+/// The monitor's own idle-timeout side channel is consulted FIRST, ahead of
+/// everything below including `read_capture` itself — see
+/// [`parse_idle_timeout_side_channel`], where that ordering is a correctness
+/// requirement rather than a preference.
 ///
 /// Precedence: Claude rate-limit envelope (a SPECIFIC failure that must
 /// outrank the generic `is_error` check — rate-limit envelopes carry
@@ -1638,6 +1787,15 @@ fn parse_marker_lines(stdout: &str) -> Option<AgentResult> {
 /// rather than letting the generic 4000-character tail scan take a bite of a
 /// mid-line window of JSONL first.
 pub fn evaluate_layer1(project_root: &Path, phase: u32) -> Option<AgentResult> {
+    // FIRST STATEMENT, before `read_capture` and before every parser below.
+    // Do not move this into the `.or_else` chain: `parse_claude_event_result`
+    // resolves the LAST top-level `result` event and would shadow it on any
+    // stream that already had one successful turn. See
+    // `parse_idle_timeout_side_channel`'s doc comment (T-31-06).
+    if let Some(timed_out) = parse_idle_timeout_side_channel(project_root, phase) {
+        return Some(timed_out);
+    }
+
     let stdout = read_capture(&stdout_path(project_root, phase))?;
     detect_claude_rate_limit(&stdout)
         .map(rate_limited_result)
@@ -2054,6 +2212,21 @@ pub fn prompt_path(project_root: &Path, phase: u32) -> PathBuf {
 /// readable after the fact.
 pub fn monitor_log_path(project_root: &Path, phase: u32) -> PathBuf {
     devflow_dir(project_root).join(format!("phase-{:02}-monitor.log", phase))
+}
+
+/// Path to the pipe-owning monitor's idle-timeout verdict for a phase
+/// (D-05/D-06, 31-02).
+///
+/// A SIDE CHANNEL, deliberately separate from the stdout capture: the capture
+/// is the agent's own narration, and a verdict appended to it is shadowed by
+/// any earlier genuine `result` event the stream already contained. See
+/// [`parse_idle_timeout_side_channel`] — that separation is a correctness
+/// requirement (T-31-06), not a filing convention.
+///
+/// Holds a JSON [`IdleTimeoutRecord`]. Written and fsynced by the monitor
+/// BEFORE the child is signalled, so nothing can race the verdict.
+pub fn idle_timeout_path(project_root: &Path, phase: u32) -> PathBuf {
+    devflow_dir(project_root).join(format!("phase-{:02}-idle-timeout", phase))
 }
 
 /// Path to the archived-capture-history directory for a phase (16b).
@@ -4505,6 +4678,206 @@ mod tests {
                 .decided_by_layer,
             None
         );
+    }
+
+    // ---- idle-timeout side channel (31-02, D-05/D-06/D-07) ---------------
+
+    /// Write a monitor-shaped idle-timeout record. Field names and types match
+    /// `IdleTimeoutRecord` exactly; the monitor writes it via serde, so a drift
+    /// between the two shows up as a failing deserialize here.
+    fn write_idle_timeout_record(root: &Path, phase: u32, commits: &[(&str, &str)]) {
+        let record = IdleTimeoutRecord {
+            status: AgentStatus::IdleTimeout.as_wire_str().to_string(),
+            idle_secs: 30,
+            agent_pid: 4242,
+            written_at: 1_700_000_000,
+            commits: commits
+                .iter()
+                .map(|(sha, subject)| IdleTimeoutCommit {
+                    sha: (*sha).to_string(),
+                    subject: (*subject).to_string(),
+                })
+                .collect(),
+        };
+        std::fs::write(
+            idle_timeout_path(root, phase),
+            serde_json::to_string(&record).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// T-31-06, and the single most important test in plan 31-02.
+    ///
+    /// The fixture is a REAL archived three-turn capture in which every
+    /// top-level `result` event carries a success marker — the normal shape of
+    /// a run that got far enough to idle out. A fixture without a prior
+    /// `result` event would pass vacuously while the same mechanism silently
+    /// failed in production.
+    ///
+    /// The negative control is encoded INSIDE the test rather than described in
+    /// prose: the same fixture is evaluated first WITHOUT the side channel and
+    /// must return `Success`. If that ever stops holding, the `IdleTimeout`
+    /// assertion below is proving a verdict nothing was competing with.
+    #[test]
+    fn idle_timeout_side_channel_wins_over_stale_stream_result() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 40),
+            v3_stream_capture(MARKER_SUCCESS, MARKER_SUCCESS, MARKER_SUCCESS),
+        )
+        .unwrap();
+
+        // NEGATIVE CONTROL — must produce the OPPOSITE result.
+        assert_eq!(
+            evaluate_layer1(dir.path(), 40).unwrap().status,
+            AgentStatus::Success,
+            "negative control: without the side channel this fixture must decide Success, \
+             otherwise the assertion below is vacuous"
+        );
+
+        write_idle_timeout_record(
+            dir.path(),
+            40,
+            &[("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "feat: partial")],
+        );
+
+        let result = evaluate_layer1(dir.path(), 40).unwrap();
+        assert_eq!(
+            result.status,
+            AgentStatus::IdleTimeout,
+            "a stale success already in the capture must not shadow the monitor's verdict"
+        );
+        assert_eq!(result.decided_by_layer, Some(1));
+    }
+
+    /// The read must precede `read_capture`'s early `return None`, so a
+    /// timeout that fired before the child emitted anything at all is still
+    /// authoritative rather than discarded.
+    #[test]
+    fn idle_timeout_side_channel_is_read_even_when_the_capture_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        assert!(
+            !stdout_path(dir.path(), 41).exists(),
+            "fixture precondition: there must be no capture at all"
+        );
+
+        // NEGATIVE CONTROL: with neither file present Layer 1 abstains, so the
+        // verdict below can only have come from the side channel.
+        assert!(evaluate_layer1(dir.path(), 41).is_none());
+
+        write_idle_timeout_record(dir.path(), 41, &[]);
+
+        let result = evaluate_layer1(dir.path(), 41).unwrap();
+        assert_eq!(result.status, AgentStatus::IdleTimeout);
+        assert_eq!(result.commits, Some(0));
+    }
+
+    /// D-07: the verdict names the commits, and says they were not rolled back.
+    #[test]
+    fn idle_timeout_result_carries_the_commits_it_enumerated() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        write_idle_timeout_record(
+            dir.path(),
+            42,
+            &[
+                ("1111111abcdef0000000000000000000000000000", "feat: first"),
+                ("2222222abcdef0000000000000000000000000000", "fix: second"),
+            ],
+        );
+
+        let result = evaluate_layer1(dir.path(), 42).unwrap();
+
+        assert_eq!(result.commits, Some(2));
+        let reason = result.reason.expect("an idle timeout must explain itself");
+        for fragment in [
+            "1111111",     // short sha, first commit
+            "feat: first", // its subject
+            "2222222",
+            "fix: second",
+            "30s",                           // how long the stream was silent
+            "NONE of them were rolled back", // D-07's non-destruction promise
+        ] {
+            assert!(
+                reason.contains(fragment),
+                "reason must name {fragment:?}; got: {reason}"
+            );
+        }
+        // The full sha must not be what is printed — a 40-char sha in a gate
+        // message is noise, and the short form is what an operator pastes.
+        assert!(!reason.contains("1111111abcdef0000000000000000000000000000"));
+    }
+
+    /// Nothing about the pre-existing cascade changes when no timeout fired.
+    /// Three shapes, each asserted against the verdict it produced before this
+    /// plan existed, with the side channel confirmed absent in every one.
+    #[test]
+    fn absent_side_channel_leaves_the_cascade_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+
+        std::fs::write(
+            stdout_path(dir.path(), 43),
+            v3_stream_capture(NO_MARKER, NO_MARKER, MARKER_SUCCESS),
+        )
+        .unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 44),
+            v3_stream_capture(MARKER_SUCCESS, MARKER_SUCCESS, MARKER_FAILED),
+        )
+        .unwrap();
+
+        for (phase, expected) in [
+            (43, Some(AgentStatus::Success)),
+            (44, Some(AgentStatus::Failed)),
+            (45, None), // no capture, no side channel
+        ] {
+            assert!(
+                !idle_timeout_path(dir.path(), phase).exists(),
+                "fixture precondition: phase {phase} must have no side channel"
+            );
+            assert_eq!(
+                evaluate_layer1(dir.path(), phase).map(|r| r.status),
+                expected,
+                "the cascade changed for phase {phase} with no timeout on disk"
+            );
+        }
+    }
+
+    /// The file's PRESENCE is the signal; its contents are enrichment.
+    ///
+    /// A corrupt record must NOT fall back into the cascade — that would let
+    /// the stale success in the capture win, converting a damaged file into a
+    /// silent wrong advance. This is the same fixture as
+    /// `idle_timeout_side_channel_wins_over_stale_stream_result`, so the
+    /// Success it would otherwise decide is real and not hypothetical.
+    #[test]
+    fn an_unreadable_idle_timeout_record_still_produces_the_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 46),
+            v3_stream_capture(MARKER_SUCCESS, MARKER_SUCCESS, MARKER_SUCCESS),
+        )
+        .unwrap();
+
+        // NEGATIVE CONTROL: this capture decides Success on its own.
+        assert_eq!(
+            evaluate_layer1(dir.path(), 46).unwrap().status,
+            AgentStatus::Success
+        );
+
+        std::fs::write(idle_timeout_path(dir.path(), 46), "{ this is not json").unwrap();
+
+        let result = evaluate_layer1(dir.path(), 46).unwrap();
+        assert_eq!(result.status, AgentStatus::IdleTimeout);
+        assert_eq!(
+            result.commits, None,
+            "an unreadable record must not invent a commit count"
+        );
+        assert!(result.reason.unwrap().contains("unreadable"));
     }
 
     /// Last-result-wins. A session kept alive across turns emits one `result`
