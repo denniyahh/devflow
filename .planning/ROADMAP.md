@@ -3014,11 +3014,21 @@ infrastructure phases; tracked by the constraint numbers above.
 **Depends on:** Phase 30 (parser + confirmed delivery verdict). Structurally gated on
 `30c-VERDICT.md`, which is satisfied.
 
-**Plans:** 0 plans
+**Plans:** 5 plans in 4 waves
 
 Plans:
 
-- [ ] TBD (run /gsd-plan-phase 31 to break down)
+- [ ] 31-01-PLAN.md — Tracer: a Claude Code stage runs end-to-end through the pipe-owning monitor (wave 1)
+- [ ] 31-02-PLAN.md — Idle timeout: a stuck stage fails loudly instead of silently (wave 2)
+- [ ] 31-03-PLAN.md — Startup delivery canary: refuse to run when task-notification delivery is gone (wave 2)
+- [ ] 31-04-PLAN.md — Guards: exit-code arbitration and the loud opt-out (wave 3)
+- [ ] 31-05-PLAN.md — Acceptance run: the live two-plan wave that gates the 999.64 arc (wave 4)
+
+**Scope item 6 (999.67) dropped at planning time — already closed.** `parse_devflow_result`
+(`agent_result.rs:147-162`) applies `normalise_stream_marker_provenance` on both arms as of
+commit `a557805` (2026-08-02), one day before this entry was written; the named regression test
+returns `1 passed; 501 filtered out` against a bogus-name control of `0 passed; 502 filtered
+out`. Recorded in `31-01-PLAN.md` § planning_provenance rather than silently omitted.
 
 ---
 
