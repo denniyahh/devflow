@@ -430,9 +430,42 @@ match the regex (`### Archived — Phase 30 …` suffices, since `Phase` must fo
 bracket tag directly); then re-verify `roadmap.analyze` for non-zero `phase_count`, no duplicate
 numbers, and non-null `current_phase`.
 
+**Sub-item 999.72a — add the missing `## Progress` table. Size S, independently landable, do this
+one first.** Added 2026-08-03 after it was traced as the cause of a *second*, separate misverdict.
+
+`isComplete()` prefers ROADMAP-derived counts and falls back to a legacy STATE.md comparison
+"when the roadmap has no Progress table". We have never had one: the table is absent from **all
+239 commits** that have touched ROADMAP.md, because this file was hand-authored at GSD-init
+(`4f2b849`, 2026-06-17) rather than generated from `templates/roadmap.md`. The fallback then
+compares `current_phase: 30` against STATE.md's `progress.total_phases: 21` — a global phase
+number against a milestone-scoped count, which gsd-core's own source calls "the two-scale bug" —
+concludes the project is past its last phase, and with a `status:` beginning "complete" returns
+`situation: complete` / `recommended: /gsd:new-milestone` while Phase 31 is outstanding.
+
+Measured: from a blockers-cleared base, correcting *either* input alone drops the `complete`
+verdict. Neither produces a Phase-31 route, because `smart-entry` has no next-phase situation at
+all — that is `/gsd:progress --next` Route 6's job.
+
+**Why this is separable from the restructure above:** `deriveProgressFromRoadmap` scopes to the
+`## Progress` heading and does **not** go through `extractCurrentMilestone`, so the table works
+regardless of the milestone-window problem. It is a genuinely independent, much cheaper fix.
+
+**Why it cannot self-heal:** the table is written once by `gsd-roadmapper` at
+`/gsd:new-project` / `/gsd:new-milestone`, then maintained incrementally by `phase.complete`,
+whose edits are gated on `content.match(/^##[ \t]+Progress\b/im)`. With no heading the block is
+skipped silently — no warning, no creation. There is no repair verb;
+`state.update-progress` writes STATE.md frontmatter, not this table.
+
+Shape required by `deriveProgressFromRoadmap`: a `## Progress` section containing a table with
+columns `Phase`, `Plans Complete`, `Status`, `Completed` (any order, extra columns ignored).
+Completed is counted as rows whose `Status` is exactly `complete`. Either hand-author it once
+(~22 rows) and let `phase.complete` maintain it, or take it at the v2.3.0 → next milestone
+boundary, which is the idiomatic creation point.
+
 **Priority:** Medium — a disarmed safety gate, but one that has not yet been observed to cause a
-loss. **Size: M** — a several-hundred-line reorganisation of a ~3300-line document; mechanical
-but easy to corrupt, so verify with a diff that removes zero lines of substance.
+loss. **Size: M overall** — a several-hundred-line reorganisation of a ~3300-line document;
+mechanical but easy to corrupt, so verify with a diff that removes zero lines of substance.
+Sub-item 999.72a is **S** and can land alone.
 **Depends on:** nothing.
 
 ### Phase 25 candidates — all open High items, validated 2026-07-27

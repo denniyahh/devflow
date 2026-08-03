@@ -704,32 +704,37 @@ item, already fixed and committed (`b1dcec7`), not a promotion candidate.
 
 ## Blockers
 
-None currently open for Phase 17.
+None currently open.
 
-- **RESOLVED 2026-07-19 (17-09, `cb9359f`):**
-  `concurrent_ship_advances_finish_both_phases_independently` no longer hangs.
-  Mechanism (confirmed directly via temporary debug instrumentation, not just
-  inferred from timing): the test ships phases 31 and 32 concurrently, and on
-  a genuinely intermittent race (~33-40% of isolated runs, measured across
-  three independent audits plus this fix's own 25-run verification), both
-  `VersionBump` hooks compute the identical next version and race to create
-  the same tag (`cannot lock ref 'refs/tags/...'`); the loser's ship failure
-  reopens its Ship gate, and since the test only ever pre-wrote **one**
-  response per phase, the reopened gate previously polled forever with no
-  timeout. Fix: `DEVFLOW_GATE_TIMEOUT_SECS` is bounded to 2 seconds for this
-  test's poll only (under the file's `ENV_MUTEX` guard, restored
-  immediately after) — the 7-day production default is untouched. The test
-  now asserts either legitimate outcome deterministically (no collision:
-  both phases finish; collision: the loser's bounded timeout + intact,
-  still-gated state). 25 consecutive isolated runs under a 120s external
-  timeout: 0 hangs, 9 of which hit the race and resolved via the bounded
-  path. **The underlying product-level version-tag contention (why the
-  checkout lock occasionally doesn't fully serialize the two threads'
-  terminal hooks) remains open and out of scope** — belongs to future
-  ship/version-bump concurrency work, not Phase 17 or 18. See
-  `17-VALIDATION.md` GAP-2 and `17-09-SUMMARY.md`.
+<!-- This section is a LIVE SET, not a log. GSD's smart-entry scan promotes EVERY hyphen-bullet
+     here to an open blocker and returns situation:"blocked" — including one whose text begins
+     with RESOLVED. It matches on `^-\s+` alone and reads nothing else, so a resolved record
+     retained "for the archive" gates the whole project. Resolved entries must be REMOVED, not
+     annotated or reworded in place (gsd-core templates/state.md: "Clear resolved blockers",
+     "Cleared when addressed"). Do not reintroduce hyphen-bullets here for history.
 
-- Phase 23 behavioral acceptance criterion (one phase Define-to-Ship, unattended) NOT met — 23-11 acceptance run stopped at Define; requires Phase 23 merged to develop before Phase 24 (or any new target) is reachable for a retry
+     A first draft of this very cleanup kept both notes as bullets under a "Resolved" sub-heading
+     and measured identically broken: blockers=2, still "blocked". The scan does not care what a
+     bullet says. Provenance has to leave the section, not be relabelled inside it.
+
+     Two stale entries removed 2026-08-03; provenance below, full investigation in
+     .planning/debug/stale-blockers-gate-gsd-next.md.
+
+     Do not use `gsd-tools state resolve-blocker` on this section: it reported success for a
+     string that appears nowhere in the document, and orphaned the body of a multi-line entry. -->
+
+Provenance for the two entries removed 2026-08-03, neither of which was a live blocker:
+
+(a) 17-09 concurrent-ship hang, RESOLVED 2026-07-19 (`cb9359f`). Full record retained in
+    `17-VALIDATION.md` GAP-2 and `17-09-SUMMARY.md`. Its still-open remainder — product-level
+    version-tag contention on concurrent ship — was tracked as backlog 999.4 and closed
+    `(REMOVED — 2026-07-29)`; it does not block current work.
+
+(b) Phase 23 acceptance item. Stale as written: it required Phase 23 merged before Phase 24 was
+    reachable, and Phases 24-28 and 30 have since completed. Its live concern — one phase
+    Define-to-Ship unattended — is now owned by **Phase 31's acceptance criterion** (the live
+    Phase 29 wave-2 re-run), i.e. tracked as phase scope rather than as a blocker. Removing the
+    entry does not drop the concern.
 
 ## Decisions
 
