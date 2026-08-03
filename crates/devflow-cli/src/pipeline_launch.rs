@@ -33,7 +33,7 @@ use devflow_core::outcome_policy::{self, Action};
 use devflow_core::prompt;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
-use devflow_core::{agent_result, agents, events, lock, mode, monitor, verify, workflow};
+use devflow_core::{agent_result, agents, canary, events, lock, mode, monitor, verify, workflow};
 use std::path::Path;
 
 /// The post-preflight body of [`launch_stage`]: capture archival/rollover
@@ -77,7 +77,37 @@ pub(crate) fn launch_stage_inner(
     // time which stages background work); the choice of which stages have been
     // widened to it *yet* is a rollout-order choice, made here at the call
     // site, which constraint 1 permits.
-    let (program, args, launch) = if claude_stream_launch_enabled(state.agent, state.stage) {
+    //
+    // Evaluated ONCE and reused by the canary gate below, so a single predicate
+    // governs both the launch shape and the guard that protects it — the guard
+    // must fire on exactly the launches whose premise it checks, and two
+    // separate evaluations of "is this the stream path?" would be free to drift.
+    let stream_launch = claude_stream_launch_enabled(state.agent, state.stage);
+
+    // D-15: refuse before any launch work if the undocumented CLI behaviour
+    // this transport depends on is not backed by observed behaviour. Placed
+    // ahead of `spawn_agent_and_record` so a refusal costs no archival rollover
+    // and spawns no monitor.
+    // Resolved into owned values BEFORE the gate takes `&mut State`. The
+    // canary's child runs where the stage's agent would (the worktree when
+    // there is one), and its throwaway capture lands beside the run's other
+    // runtime files — never on the phase capture the Layer 1 cascade reads.
+    let canary_workdir = state
+        .worktree_path
+        .as_deref()
+        .unwrap_or(&state.project_root)
+        .to_path_buf();
+    let canary_capture_dir = state.project_root.join(".devflow");
+    canary_gate(state, stream_launch, move || {
+        canary::run_delivery_canary(
+            &canary::ClaudeCanaryLauncher {
+                workdir: canary_workdir,
+            },
+            &canary_capture_dir,
+        )
+    })?;
+
+    let (program, args, launch) = if stream_launch {
         let (program, args) = adapter.exec_command(state.phase, &prompt, &roots);
         (program, args, monitor::MonitorLaunch::PipeOwning { prompt })
     } else if state.agent == AgentKind::Claude {
@@ -110,6 +140,129 @@ pub(crate) fn launch_stage_inner(
         archived_stage,
         launch,
     )
+}
+
+/// The D-15 gate: run the delivery canary at most once per run, record what it
+/// found, and refuse to launch when it did not confirm.
+///
+/// `run_canary` is a parameter rather than a direct call so the gate's own
+/// wiring — once-per-run, stream-path-only, refuse-on-failure, persist, emit —
+/// is testable without spending a real agent invocation per case. The
+/// production call site binds it to [`canary::ClaudeCanaryLauncher`].
+///
+/// **Both alternatives to refusing were considered and rejected by D-15.**
+/// Warning and proceeding fails in unattended mode, which is DevFlow's normal
+/// mode — the warning scrolls past and the run orphans its work anyway. Falling
+/// back to the sequential single-document path is a silent capability
+/// downgrade, the exact invisible-degradation class this phase exists to
+/// eliminate.
+///
+/// A recorded `Absent`/`Unverified` refuses on EVERY later launch in the run,
+/// not just the one that discovered it; only the canary RUN is once-per-run.
+fn canary_gate<F>(state: &mut State, stream_launch: bool, run_canary: F) -> Result<(), CliError>
+where
+    F: FnOnce() -> canary::CanaryOutcome,
+{
+    // The guard protects one specific premise: that a live `stream-json`
+    // session is woken back up when a background task finishes. A launch that
+    // resolved to the legacy single-document path does not rely on that
+    // premise, so checking it there would spend an agent invocation to answer a
+    // question the launch never asks.
+    if !stream_launch {
+        return Ok(());
+    }
+
+    let outcome = match &state.canary {
+        Some(recorded) => recorded.clone(),
+        None => {
+            let outcome = run_canary();
+            // Persisted IMMEDIATELY, before the refusal below can return early
+            // — the `session_id_from_capture` idiom. A refusal that did not
+            // record what it found would re-run the guard on the next launch
+            // and lose the evidence of what was verified when.
+            state.canary = Some(outcome.clone());
+            workflow::save_state(state)?;
+            emit_canary_outcome(state, &outcome);
+            outcome
+        }
+    };
+
+    match outcome {
+        canary::CanaryOutcome::Confirmed => Ok(()),
+        canary::CanaryOutcome::Absent => refuse_launch(
+            state,
+            "background-task notification delivery is ABSENT: a token DevFlow planted in a \
+             throwaway startup task did not come back inside a top-level `result` event.\n\
+             \n\
+             DevFlow's multi-plan wave guarantee is NOT currently backed by observed \
+             behaviour. With delivery gone, a wave that dispatches several plans \
+             concurrently silently orphans their work — refusing to launch rather than \
+             discovering that after the fact.\n\
+             \n\
+             This is undocumented CLI behaviour, last observed on claude_code_version \
+             2.1.220; a CLI update can withdraw it. The capture the guard read is at \
+             `.devflow/delivery-canary.jsonl`."
+                .to_string(),
+        ),
+        canary::CanaryOutcome::Unverified(reason) => refuse_launch(
+            state,
+            format!(
+                "the delivery canary COULD NOT RUN, so background-task notification \
+                 delivery is unverified for this run. This is not a report that the \
+                 behaviour is gone — the guard reached no conclusion either way.\n\
+                 \n\
+                 Reason: {reason}\n\
+                 \n\
+                 Refusing to launch: the multi-plan wave guarantee depends on that \
+                 behaviour and this run has no evidence about it."
+            ),
+        ),
+    }
+}
+
+/// Abort a launch the canary refused, leaving no half-launched stage behind.
+///
+/// Clearing `monitor_pid` applies WR-04's rationale (see
+/// [`spawn_agent_and_record`]) to an aborted launch: `transition()` has already
+/// advanced `state.stage` and saved it by the time this runs, so a refusal that
+/// left the PREVIOUS stage's monitor pid standing would make `liveness()`
+/// report `Stuck → devflow resume` and send the operator after the wrong
+/// problem entirely. The right remedy is the message below.
+fn refuse_launch(state: &mut State, message: String) -> Result<(), CliError> {
+    state.monitor_pid = None;
+    workflow::save_state(state)?;
+    Err(CliError::Message(message))
+}
+
+/// Record a canary outcome in the run's provenance (D-15).
+///
+/// The payload carries the token's PREFIX and the CLI version, never the token
+/// itself (T-31-13): the token is a per-run nonce with no value once the run is
+/// over, and this repository already has a tracked evidence-leak class from
+/// committed capture files (ROADMAP §999.69) that a guard should not add to.
+/// The version is context for a later forensic read — which CLI the behaviour
+/// was or was not witnessed on — and never the guard itself, which is the
+/// distinction D-13 turns on.
+fn emit_canary_outcome(state: &State, outcome: &canary::CanaryOutcome) {
+    let (event, reason) = match outcome {
+        canary::CanaryOutcome::Confirmed => ("claude_delivery_canary_confirmed", None),
+        canary::CanaryOutcome::Absent => ("claude_delivery_canary_absent", None),
+        canary::CanaryOutcome::Unverified(reason) => (
+            "claude_delivery_canary_unverified",
+            Some(truncate_reason(reason)),
+        ),
+    };
+    events::emit(
+        &state.project_root,
+        state.phase,
+        event,
+        serde_json::json!({
+            "stage": state.stage.to_string(),
+            "token_prefix": canary::TOKEN_PREFIX,
+            "cli_version": canary::claude_cli_version(),
+            "reason": reason,
+        }),
+    );
 }
 
 /// The stages the Claude `stream-json` launch has been widened to.
@@ -1267,6 +1420,13 @@ mod tests {
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
         state.checkpoint_resumes = 2;
+        // 31-03: Code is the one stage widened to the `stream-json` transport,
+        // so a launch here passes the D-15 delivery-canary gate. Recording an
+        // already-`Confirmed` outcome is what a real run looks like by its
+        // second Code launch, and it keeps this test about the resume counter
+        // rather than about the guard — `launch_stage_inner_refuses_at_code_
+        // when_the_canary_cannot_confirm` covers the guard's own wiring.
+        state.canary = Some(canary::CanaryOutcome::Confirmed);
         workflow::save_state(&state).unwrap();
 
         let stub_dir = stub_agent_binary("claude");
@@ -1296,6 +1456,354 @@ mod tests {
         );
         let reloaded = workflow::load_state(root, phase).unwrap();
         assert_eq!(reloaded.checkpoint_resumes, 0);
+    }
+
+    // ---- D-15 delivery-canary gate (31-03) ------------------------------
+    //
+    // Every case below except the last drives the gate with an INJECTED
+    // outcome rather than the real `ClaudeCanaryLauncher`, and that bounds
+    // what they establish. They prove the GATE's wiring — once per run,
+    // stream path only, refuse on both failure modes, persist, emit. They
+    // prove nothing at all about whether the real `claude` CLI still
+    // delivers background-task notifications; only plan 31-05's acceptance
+    // run against the real CLI can establish that.
+
+    /// A canary stand-in that records how many times it was asked to run.
+    fn counting_canary(
+        calls: &std::cell::Cell<usize>,
+        outcome: canary::CanaryOutcome,
+    ) -> impl FnOnce() -> canary::CanaryOutcome + '_ {
+        move || {
+            calls.set(calls.get() + 1);
+            outcome
+        }
+    }
+
+    fn canary_state(root: &Path, phase: u32) -> State {
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+        state
+    }
+
+    /// D-15: the guard runs ONCE PER RUN. A canary that re-ran at every stage
+    /// transition would re-spend a real throwaway agent invocation each time —
+    /// the symptom 31-RESEARCH Pitfall 5 names for a guard that landed in the
+    /// per-stage `preflight` hook instead of here.
+    #[test]
+    fn canary_runs_once_per_run() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 120;
+        let mut state = canary_state(root, phase);
+        let calls = std::cell::Cell::new(0usize);
+
+        canary_gate(
+            &mut state,
+            true,
+            counting_canary(&calls, canary::CanaryOutcome::Confirmed),
+        )
+        .unwrap();
+        assert_eq!(
+            calls.get(),
+            1,
+            "the first launch of a run must run the guard"
+        );
+        assert_eq!(state.canary, Some(canary::CanaryOutcome::Confirmed));
+
+        canary_gate(
+            &mut state,
+            true,
+            counting_canary(&calls, canary::CanaryOutcome::Confirmed),
+        )
+        .unwrap();
+        assert_eq!(
+            calls.get(),
+            1,
+            "a second stage launch in the same run must read the recorded outcome, \
+             not re-spend an agent invocation"
+        );
+
+        // Negative control: the counter CAN reach 2. Without this, a
+        // `counting_canary` that was never wired in at all would produce the
+        // same reading as a correctly once-per-run guard.
+        let mut fresh_run = canary_state(root, phase + 1);
+        canary_gate(
+            &mut fresh_run,
+            true,
+            counting_canary(&calls, canary::CanaryOutcome::Confirmed),
+        )
+        .unwrap();
+        assert_eq!(
+            calls.get(),
+            2,
+            "a run with no recorded outcome must run the guard — if this fails, the \
+             assertion above is measuring a closure that is never invoked"
+        );
+    }
+
+    /// The guard protects one premise: that a live `stream-json` session is
+    /// woken back up when a background task finishes. A launch that resolved to
+    /// the legacy single-document path does not rely on that premise.
+    #[test]
+    fn canary_gate_only_applies_to_the_stream_launch_path() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 121;
+        let mut state = canary_state(root, phase);
+        // Plan is not in `STREAM_JSON_STAGES`, so it resolves to
+        // `exec_command_single_document` + `MonitorLaunch::Legacy`.
+        state.stage = Stage::Plan;
+
+        // Driven by the REAL predicate rather than a hardcoded `false`, so this
+        // test tracks the rollout instead of a copy of it.
+        let stream_launch = claude_stream_launch_enabled(state.agent, state.stage);
+        assert!(
+            !stream_launch,
+            "Stage::Plan must still resolve to the legacy path for this test to mean anything"
+        );
+        // Negative control: the same predicate DOES fire for the widened stage,
+        // so the reading above is a real discrimination and not a constant.
+        assert!(
+            claude_stream_launch_enabled(AgentKind::Claude, Stage::Code),
+            "the predicate must still say yes somewhere, or the check above is vacuous"
+        );
+
+        let calls = std::cell::Cell::new(0usize);
+        // `Absent` deliberately: if the gate ran this canary at all, the call
+        // below returns Err and the unwrap fails.
+        canary_gate(
+            &mut state,
+            stream_launch,
+            counting_canary(&calls, canary::CanaryOutcome::Absent),
+        )
+        .unwrap();
+
+        assert_eq!(
+            calls.get(),
+            0,
+            "a legacy launch must not spend an agent invocation on a premise it never relies on"
+        );
+        assert_eq!(
+            state.canary, None,
+            "a launch that never ran the guard must not record an outcome for it"
+        );
+    }
+
+    /// D-15's refusal. Warning-and-proceeding was rejected (the warning scrolls
+    /// past in unattended mode) and so was falling back to sequential dispatch
+    /// (a silent capability downgrade).
+    #[test]
+    fn absent_canary_refuses_to_launch() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 122;
+        let mut state = canary_state(root, phase);
+        // The previous stage's monitor pid, as `transition()` would leave it.
+        state.monitor_pid = Some(4_294_967_000);
+        workflow::save_state(&state).unwrap();
+
+        let calls = std::cell::Cell::new(0usize);
+        let err = canary_gate(
+            &mut state,
+            true,
+            counting_canary(&calls, canary::CanaryOutcome::Absent),
+        )
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(
+            message.contains("ABSENT"),
+            "the refusal must name which of the two failure modes occurred, got: {message}"
+        );
+        assert!(
+            message.contains("multi-plan wave"),
+            "the refusal must say WHICH guarantee is no longer backed by observed behaviour, \
+             got: {message}"
+        );
+
+        assert!(
+            state.monitor_pid.is_none(),
+            "a refused launch must not leave the previous stage's monitor pid standing — \
+             liveness() would report Stuck and point at `devflow resume`, which cannot help"
+        );
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert!(
+            reloaded.monitor_pid.is_none(),
+            "the cleared pid must be persisted, not only cleared in memory"
+        );
+        assert_eq!(
+            reloaded.canary,
+            Some(canary::CanaryOutcome::Absent),
+            "a refusal must still record what the guard found, or the next launch re-runs it"
+        );
+    }
+
+    /// "The CLI could not be run" and "the CLI ran and the behaviour is gone"
+    /// call for different operator action. A merged message would report a
+    /// missing binary as a broken premise (T-31-12: the real risk this guard
+    /// carries is a FALSE refusal).
+    #[test]
+    fn unverified_canary_refuses_to_launch_with_a_distinct_message() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let mut unverified_state = canary_state(root, 123);
+        let calls = std::cell::Cell::new(0usize);
+        let unverified = canary_gate(
+            &mut unverified_state,
+            true,
+            counting_canary(
+                &calls,
+                canary::CanaryOutcome::Unverified(
+                    "could not run `claude`: No such file or directory (os error 2)".to_string(),
+                ),
+            ),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            unverified.contains("No such file or directory"),
+            "the reason the guard could not run must reach the operator, got: {unverified}"
+        );
+        assert!(
+            !unverified.contains("ABSENT"),
+            "an unverified guard must NOT claim the behaviour is gone, got: {unverified}"
+        );
+
+        // The comparison that makes "distinct" a measurement rather than a
+        // claim: the same gate, the other failure mode, a different message.
+        let mut absent_state = canary_state(root, 124);
+        let absent = canary_gate(&mut absent_state, true, || canary::CanaryOutcome::Absent)
+            .unwrap_err()
+            .to_string();
+        assert_ne!(
+            unverified, absent,
+            "the two failure modes must not render the same diagnosis"
+        );
+    }
+
+    /// D-15: every run carries evidence of what was verified when.
+    #[test]
+    fn canary_outcome_is_persisted_and_emitted() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 125;
+        let mut state = canary_state(root, phase);
+        let calls = std::cell::Cell::new(0usize);
+
+        canary_gate(
+            &mut state,
+            true,
+            counting_canary(&calls, canary::CanaryOutcome::Confirmed),
+        )
+        .unwrap();
+
+        let reloaded = workflow::load_state(root, phase).unwrap();
+        assert_eq!(
+            reloaded.canary,
+            Some(canary::CanaryOutcome::Confirmed),
+            "the outcome must survive to the next `devflow` process — each stage launch is one"
+        );
+
+        let log = std::fs::read_to_string(devflow_core::events::events_path(root)).unwrap();
+        let line = log
+            .lines()
+            .find(|line| line.contains("claude_delivery_canary_confirmed"))
+            .expect("the run's provenance must carry the canary outcome");
+        let event: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(event["event"], "claude_delivery_canary_confirmed");
+        assert_eq!(event["phase"], phase);
+
+        // T-31-13: the PREFIX, exactly — never a whole token. An exact
+        // comparison against the constant is what catches a later change that
+        // swaps the field's value for the token itself.
+        assert_eq!(
+            event["token_prefix"],
+            canary::TOKEN_PREFIX,
+            "the payload must carry the token's prefix and nothing more"
+        );
+        assert_eq!(
+            line.matches(canary::TOKEN_PREFIX).count(),
+            1,
+            "the prefix must appear exactly once — a second occurrence means a token leaked in"
+        );
+    }
+
+    /// The linkage the five gate tests above cannot show: that
+    /// `launch_stage_inner` actually calls the gate, at the widened stage, with
+    /// the REAL launcher bound. Runs against the `exit 0` stub `claude`, which
+    /// produces an empty capture and therefore an honest `Absent` — no real
+    /// agent invocation, and no claim about the real CLI's behaviour.
+    #[test]
+    fn launch_stage_inner_refuses_at_code_when_the_canary_cannot_confirm() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 126;
+        let mut state = canary_state(root, phase);
+
+        let stub_dir = stub_agent_binary("claude");
+        let original_path = std::env::var_os("PATH");
+        let stubbed_path = prepend_path(&stub_dir, &original_path);
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", &stubbed_path);
+        }
+
+        let result = launch_stage_inner(&mut state, None, None);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        // The refusal is meant to spawn nothing, but bind the guard anyway —
+        // this test is worthless if it silently starts leaking monitors.
+        let _reap_guard = ReapMonitorOnDrop::after_launch(&state);
+
+        let message = result
+            .expect_err("a launch whose canary cannot confirm must not proceed")
+            .to_string();
+        assert!(
+            message.contains("ABSENT"),
+            "the launch path must surface the guard's own diagnosis, got: {message}"
+        );
+        assert_eq!(state.canary, Some(canary::CanaryOutcome::Absent));
+        assert!(
+            state.monitor_pid.is_none(),
+            "a refused launch must record no monitor pid"
+        );
+        assert_eq!(
+            stage_launched_count(root, phase),
+            0,
+            "a refused launch must emit no stage_launched event — nothing was launched"
+        );
     }
 
     // D-01/D-03/D-05 (28-03, Task 3): the dispatch guard's six named

@@ -140,6 +140,24 @@ pub struct State {
     /// written by a binary predating this field.
     #[serde(default)]
     pub yes_ship: bool,
+    /// What this run's delivery canary established (D-13/D-15, 31-03),
+    /// recorded by the first stage launch that routes through the Claude
+    /// `stream-json` transport. `None` means EITHER "no canary has run for
+    /// this run yet" OR "the state was written by a binary predating this
+    /// field" — both cases behave identically: the canary runs.
+    ///
+    /// Persisted rather than held in memory for the same reason
+    /// [`Self::yes_ship`] is: each stage launch happens in a SEPARATE
+    /// `devflow` process (the monitor's own `advance` tail), so an
+    /// in-process flag would reset to "not yet run" at every stage
+    /// transition and re-spend a real throwaway agent invocation each time —
+    /// which is exactly the symptom 31-RESEARCH Pitfall 5 names for a canary
+    /// that landed in the per-stage `preflight` hook.
+    ///
+    /// A recorded `Absent`/`Unverified` keeps refusing on every later launch
+    /// in the run; it is not consumed by the first refusal.
+    #[serde(default)]
+    pub canary: Option<crate::canary::CanaryOutcome>,
 }
 
 /// Supported coding agents.
@@ -205,6 +223,7 @@ impl State {
             stopped: false,
             stop_reason: None,
             yes_ship: false,
+            canary: None,
         }
     }
 }
