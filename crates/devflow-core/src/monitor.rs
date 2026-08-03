@@ -11,6 +11,7 @@
 //! This is the core automation primitive — no cron, no scheduler,
 //! no agent cooperation needed.
 
+use crate::agent_result::{IdleTimeoutCommit, IdleTimeoutRecord};
 use crate::git::hermetic_command;
 use crate::state::State;
 use std::io::{BufRead, BufReader, Write};
@@ -48,6 +49,149 @@ pub enum MonitorError {
 /// every-line signal this monitor actually uses, the observed max is 7.09s, so
 /// 30s is ~4.2x margin.
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30;
+
+/// The floor an idle timeout can never be configured below (D-02/D-04, 31-02).
+///
+/// Do NOT "correct" this upward on the assumption it is tight — it is tight
+/// only against a signal this phase does not use. The ≥30s floor was derived
+/// from the *milestone* gap distribution (pooled max 13.73s), but D-01 selects
+/// the *every-line* signal, whose observed max is 7.09s. Against the signal
+/// actually in force that is roughly 4.2x margin: comfortable, not marginal.
+///
+/// Do NOT lower it either, and note that no configuration can. Phase 30d
+/// measured a 12-second bound killing a LIVE, HEALTHY run in 2 of 7 trials.
+///
+/// Because the default IS the floor, the value can only ever be raised.
+pub const IDLE_TIMEOUT_FLOOR_SECS: u64 = 30;
+
+/// The environment variable that raises the idle timeout above its floor.
+pub const IDLE_TIMEOUT_ENV: &str = "DEVFLOW_CLAUDE_IDLE_TIMEOUT_SECS";
+
+/// How [`parse_idle_timeout_secs`] arrived at the timeout now in force.
+///
+/// A distinct enum rather than the plain `clamped: bool` the plan sketched:
+/// there are FOUR distinguishable resolutions, not two, and the loud operator
+/// notice needs to name the value that was configured — which a bool cannot
+/// carry. `ValidateOutcome` in `pipeline_outcomes.rs` makes the same argument
+/// for the same reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdleTimeoutResolution {
+    /// Nothing was configured; the default — which is the floor — is in force.
+    Default,
+    /// A configured value at or above the floor is in force verbatim.
+    Configured,
+    /// A configured value BELOW the floor was raised to it (D-04).
+    Clamped {
+        /// What the operator asked for, for the notice to name.
+        configured: u64,
+    },
+    /// A value was set but could not be parsed; the default is in force.
+    ///
+    /// Loud for the same reason the clamp is. An operator who meant `600` and
+    /// typed `60O` silently gets 30s, and a legitimately slow stage then dies
+    /// on a timeout nobody chose. `parse_gate_max_unattended_age` substitutes
+    /// silently in this case and is the anti-pattern here, not the precedent.
+    Unparseable {
+        /// The raw value, echoed back so the typo is visible.
+        raw: String,
+    },
+}
+
+/// A resolved idle timeout together with how it was arrived at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdleTimeoutSetting {
+    /// The window that must elapse with NO line on the child's stdout.
+    pub timeout: Duration,
+    /// How that value was reached — observable to the caller as a VALUE, not
+    /// only as a log line, so a test can assert on it directly.
+    pub resolution: IdleTimeoutResolution,
+}
+
+impl IdleTimeoutSetting {
+    /// Whether the floor clamp engaged.
+    pub fn clamped(&self) -> bool {
+        matches!(self.resolution, IdleTimeoutResolution::Clamped { .. })
+    }
+
+    /// The loud, operator-facing notice this resolution owes, if any.
+    ///
+    /// `None` for the two unremarkable cases. `Some` exactly when a value the
+    /// operator supplied is NOT the value in force — the case that must never
+    /// pass silently.
+    pub fn notice(&self) -> Option<String> {
+        match &self.resolution {
+            IdleTimeoutResolution::Default | IdleTimeoutResolution::Configured => None,
+            IdleTimeoutResolution::Clamped { configured } => Some(format!(
+                "{IDLE_TIMEOUT_ENV}={configured} is below the {IDLE_TIMEOUT_FLOOR_SECS}s floor \
+                 and was CLAMPED; {}s is in force. A shorter window kills healthy runs: a 12s \
+                 bound terminated a live, healthy run in 2 of 7 measured trials.",
+                self.timeout.as_secs()
+            )),
+            IdleTimeoutResolution::Unparseable { raw } => Some(format!(
+                "{IDLE_TIMEOUT_ENV}={raw:?} could not be parsed as a whole number of seconds; \
+                 the {}s default is in force. If you meant to RAISE the timeout, this did not \
+                 do it.",
+                self.timeout.as_secs()
+            )),
+        }
+    }
+}
+
+/// Resolve a raw idle-timeout override into the value actually in force.
+///
+/// Pure — no environment access — so it is unit-testable directly rather than
+/// by mutating process-global env. That shape is copied from
+/// `devflow-cli`'s four `parse_*` timeout readers; their BEHAVIOUR is
+/// deliberately not copied, because none of them clamps against a floor and
+/// none logs when a fallback engages. There is no clamp-and-log precedent
+/// anywhere in this workspace; this is the first (D-04).
+pub fn parse_idle_timeout_secs(raw: Option<String>) -> IdleTimeoutSetting {
+    let floor = Duration::from_secs(IDLE_TIMEOUT_FLOOR_SECS);
+
+    // An unset variable and an EMPTY one are the same intent: nothing chosen.
+    // Only a non-empty value that fails to parse is a typo worth shouting at.
+    let Some(trimmed) = raw.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return IdleTimeoutSetting {
+            timeout: floor,
+            resolution: IdleTimeoutResolution::Default,
+        };
+    };
+
+    let Ok(configured) = trimmed.parse::<u64>() else {
+        return IdleTimeoutSetting {
+            timeout: floor,
+            resolution: IdleTimeoutResolution::Unparseable {
+                raw: trimmed.to_string(),
+            },
+        };
+    };
+
+    if configured < IDLE_TIMEOUT_FLOOR_SECS {
+        IdleTimeoutSetting {
+            timeout: floor,
+            resolution: IdleTimeoutResolution::Clamped { configured },
+        }
+    } else {
+        IdleTimeoutSetting {
+            timeout: Duration::from_secs(configured),
+            resolution: IdleTimeoutResolution::Configured,
+        }
+    }
+}
+
+/// The thin environment wrapper over [`parse_idle_timeout_secs`].
+///
+/// The variable name is spelled out as a STRING LITERAL here rather than
+/// passed as [`IDLE_TIMEOUT_ENV`], and that is deliberate.
+/// `doc_check::source_read_env_vars` recognises a variable only when it is read
+/// through a literal inside `std::env::var("...")`; reading it through the
+/// const compiles and works identically but makes the variable INVISIBLE to
+/// the operator-doc parity gate, which would then pass green while the
+/// variable went undocumented. Verified by removing this variable's row from
+/// `OPERATIONS.md` and confirming `doc_check` reddens.
+pub fn idle_timeout_setting() -> IdleTimeoutSetting {
+    parse_idle_timeout_secs(std::env::var("DEVFLOW_CLAUDE_IDLE_TIMEOUT_SECS").ok())
+}
 
 /// Which supervision shape [`spawn_monitor`] should launch.
 ///
@@ -171,6 +315,22 @@ fn spawn_monitor_inner(
             );
         }
 
+        // D-04: resolve and clamp the idle timeout HERE, in the parent, and
+        // hand the monitor the already-resolved integer.
+        //
+        // The placement is the whole point. `spawn_monitor` runs inside
+        // `devflow start`, attached to the operator's terminal; the monitor is
+        // a detached process whose stdio is all `Stdio::null()`, so a warning
+        // logged there scrolls into nothing. A silent clamp is the exact
+        // failure class this project keeps paying for, so the notice goes to
+        // BOTH `tracing::warn!` and stdout — the log for the record, stdout
+        // for the human who is watching right now.
+        let idle = idle_timeout_setting();
+        if let Some(notice) = idle.notice() {
+            warn!("{notice}");
+            println!("{notice}");
+        }
+
         // The prompt travels as a FILE, not argv: argv has a hard length
         // ceiling and DevFlow stage prompts routinely exceed what is safe to
         // pass positionally.
@@ -199,7 +359,7 @@ fn spawn_monitor_inner(
             .arg("--prompt-file")
             .arg(prompt_file)
             .arg("--idle-timeout-secs")
-            .arg(DEFAULT_IDLE_TIMEOUT_SECS.to_string())
+            .arg(idle.timeout.as_secs().to_string())
             .arg("--")
             .arg(program)
             .args(args)
@@ -529,13 +689,16 @@ pub fn run_pipe_owning_monitor(
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Plan 31-02 owns what this arm must actually do: write the
-                // authoritative IdleTimeout result to its OWN side-channel
-                // file first, then terminate the child's process group via
-                // `crate::agent::terminate_and_verify` (D-05/D-06, and
-                // RESEARCH Pitfall 3 on why the side channel cannot be the
-                // stdout capture). Falling through to reaping here is a
-                // placeholder, not a partial implementation of that.
+                // No outer wall-clock bound exists anywhere in this loop, and
+                // none may be added (D-03). `recv_timeout` measures the gap
+                // since the LAST LINE, so a healthy 47-minute stage that keeps
+                // emitting is never touched — every line the reader thread
+                // forwards resets the window naturally, which is D-01's
+                // every-line signal rather than a milestone-only one. There is
+                // no single wall-clock value that is safe for both a hang and
+                // a legitimately long stage, which is why constraint 5
+                // rejected one.
+                fire_idle_timeout(project_root, phase, workdir, child_pid, idle_timeout);
                 break;
             }
         }
@@ -554,6 +717,262 @@ pub fn run_pipe_owning_monitor(
 
     info!("supervised child {child_pid} exited with code {code}");
     Ok(code)
+}
+
+/// The idle-timeout firing sequence, in the ONE order it may run (D-05).
+///
+/// 1. Enumerate the commits the agent made.
+/// 2. Write the authoritative verdict to its side-channel file, and fsync it.
+/// 3. **Only then** terminate the child.
+/// 4. Append a loud entry to the monitor's own log.
+///
+/// Step 3 must not precede step 2, and reversing them is not a stylistic
+/// choice. Between "the child is dead" and "an authoritative result exists"
+/// there is a window in which the verdict cascade sees a dead process, no
+/// Layer-1 answer, and some commits on the branch — and Layer 2 scores exactly
+/// that as `Success`. That is 999.64 reborn inside its own fix. A bare kill
+/// with no record is the other half of the same failure: exit code 137 reads
+/// as `ResourceKilled`, blaming an OOM that never happened.
+///
+/// **Nothing here rolls back, resets, or reverts a commit** (D-07, T-31-09).
+/// The commit log is READ and never written. A timeout can be a false
+/// positive, and destroying real work on a false positive is unrecoverable —
+/// this repo treats irreversible operations as needing review, not tests.
+///
+/// Scoped to the `PipeOwning` arm alone: `Legacy` keeps today's behaviour, and
+/// Codex/OpenCode keep theirs. The 30-second floor was measured against
+/// Claude's stream cadence, and applying it to an agent whose output cadence
+/// has never been measured would be a behaviour prediction — the thing
+/// constraint 1 forbids.
+///
+/// Every step is best-effort and none can abort the sequence. A failure to
+/// enumerate, write, or log must still leave the child terminated and the
+/// stage machine advancing to a never-silent gate; the operator loses detail,
+/// never the verdict.
+fn fire_idle_timeout(
+    project_root: &Path,
+    phase: u32,
+    workdir: &Path,
+    child_pid: u32,
+    idle: Duration,
+) {
+    let idle_secs = idle.as_secs();
+    warn!("idle timeout: no output from the supervised child for {idle_secs}s");
+
+    // 1. Enumerate. A failure degrades to an empty list plus a note; it never
+    //    aborts, because a missing commit list must not cost the verdict.
+    let (commits, enumeration_note) = enumerate_phase_commits(workdir, phase);
+
+    // 2. Write, flush, fsync. This completing is the ONLY thing that stops
+    //    Layer 2 from later scoring partial commits as Success.
+    let write_error =
+        write_idle_timeout_record(project_root, phase, idle_secs, child_pid, &commits)
+            .err()
+            .map(|err| err.to_string());
+    if let Some(err) = &write_error {
+        warn!("idle timeout: could not persist the verdict: {err}");
+    }
+
+    // 3. Only now is it safe to kill.
+    let terminated = terminate_child_group(child_pid);
+
+    // 4. Loud, durable, and readable after the fact.
+    let named: Vec<String> = commits
+        .iter()
+        .map(|commit| {
+            let short: String = commit.sha.chars().take(7).collect();
+            format!("{short} {}", commit.subject)
+        })
+        .collect();
+    let mut entry = format!(
+        "[idle-timeout] no output for {idle_secs}s; terminated agent pid {child_pid} \
+         (verified dead: {terminated}). {} commit(s) on the phase branch, NONE rolled back{}{}",
+        named.len(),
+        if named.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", named.join("; "))
+        },
+        enumeration_note
+            .map(|note| format!(" [commit enumeration degraded: {note}]"))
+            .unwrap_or_default(),
+    );
+    if let Some(err) = write_error {
+        entry.push_str(&format!(" [verdict file could not be written: {err}]"));
+    }
+    warn!("{entry}");
+    append_monitor_log(project_root, phase, &entry);
+}
+
+/// Enumerate the commits on this phase's feature branch, as
+/// `(commits, degradation note)`.
+///
+/// Same range construction `evaluate_layer2`'s commit COUNT uses
+/// (`{develop}..{feature_prefix}phase-NN`) — the same question asked with
+/// `git log` instead of `rev-list --count`, so the two can never disagree
+/// about which commits are the agent's.
+///
+/// Never returns an error. Every failure path yields an empty list and a note
+/// naming what went wrong: the operator losing the commit NAMES is bad, the
+/// operator losing the VERDICT is the failure this whole plan exists to
+/// prevent.
+fn enumerate_phase_commits(workdir: &Path, phase: u32) -> (Vec<IdleTimeoutCommit>, Option<String>) {
+    let git_flow = crate::config::GitFlowConfig::default();
+    let branch = format!("{}phase-{:02}", git_flow.feature_prefix, phase);
+    let range = format!("{}..{branch}", git_flow.develop);
+
+    let output = match crate::git::git_command(workdir)
+        .args(["log", "--format=%H %s", &range])
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) => return (Vec::new(), Some(format!("git log could not run: {err}"))),
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return (
+            Vec::new(),
+            Some(format!("git log {range} failed: {stderr}")),
+        );
+    }
+
+    let commits = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            // `%H %s` — a sha, one space, then the subject, which may itself
+            // contain spaces. `split_once` is therefore correct and `split`
+            // is not. A subject-less commit still yields an empty subject
+            // rather than being dropped.
+            let (sha, subject) = line.split_once(' ').unwrap_or((line, ""));
+            Some(IdleTimeoutCommit {
+                sha: sha.to_string(),
+                subject: subject.to_string(),
+            })
+        })
+        .collect();
+
+    (commits, None)
+}
+
+/// Write the idle-timeout verdict and get it onto the platter before returning.
+///
+/// `sync_all` is not decoration: D-05's guarantee is that the result exists
+/// before anything can race it, and a buffered write that is still in the page
+/// cache when the process is signalled has not achieved that.
+fn write_idle_timeout_record(
+    project_root: &Path,
+    phase: u32,
+    idle_secs: u64,
+    child_pid: u32,
+    commits: &[IdleTimeoutCommit],
+) -> std::io::Result<()> {
+    let record = IdleTimeoutRecord {
+        status: crate::agent_result::AgentStatus::IdleTimeout
+            .as_wire_str()
+            .to_string(),
+        idle_secs,
+        agent_pid: child_pid,
+        written_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        commits: commits.to_vec(),
+    };
+    let json = serde_json::to_string(&record)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+
+    let path = crate::agent_result::idle_timeout_path(project_root, phase);
+    if let Some(parent) = path.parent() {
+        crate::workflow::ensure_devflow_dir(parent)?;
+    }
+    let mut file = std::fs::File::create(&path)?;
+    file.write_all(json.as_bytes())?;
+    file.flush()?;
+    file.sync_all()
+}
+
+/// Terminate the supervised child's whole process group, returning the
+/// VERIFIED fact of whether the leader is dead.
+///
+/// Acts on `child_pid`, which came from the in-memory `Child` handle — never
+/// on the on-disk pid file (T-31-07). That distinction is what makes the
+/// negative-pid signal below safe at all: while this monitor still holds the
+/// unwaited `Child`, the kernel cannot recycle that pid, so it cannot come to
+/// mean some unrelated process between spawn and now. A pid re-read from disk
+/// carries no such guarantee.
+///
+/// Three steps, and the middle one is borrowed whole rather than reimplemented:
+///
+/// 1. `SIGTERM` to the GROUP. `.process_group(0)` at spawn made the child its
+///    own group leader, so its pid IS its pgid and `-pid` reaches its whole
+///    subtree — the tool subprocesses a coding agent leaves behind, which a
+///    leader-only signal would orphan. It cannot reach this monitor: the
+///    monitor stayed in its own inherited group, which is precisely what
+///    `.process_group(0)` bought (T-31-05).
+/// 2. [`crate::agent::terminate_and_verify`] for the leader — reused, not
+///    rewritten. It owns the `SIGTERM` → poll → `SIGKILL` → re-poll
+///    escalation and returns a verified liveness fact instead of an
+///    assumption. 999.44 measured 15 of 15 orphaned wrappers surviving
+///    `SIGTERM`, so the escalation is not optional.
+/// 3. `SIGKILL` to the group, sweeping any survivor the leader's own
+///    escalation did not cover. Unconditional by design: at this point the run
+///    is over, everything in the group is the agent's subtree, and a `kill` to
+///    an empty group is a no-op `ESRCH`.
+///
+/// The `signed > 1` guard is load-bearing twice over. `kill(-1, sig)` signals
+/// every process the caller may signal, and `kill(0, sig)` signals the
+/// caller's own group — the two catastrophic cases `agent::terminate` already
+/// documents, reachable here through the negation rather than through a
+/// hostile pid file.
+fn terminate_child_group(child_pid: u32) -> bool {
+    let Ok(signed) = libc::pid_t::try_from(child_pid) else {
+        warn!("idle timeout: child pid {child_pid} does not fit pid_t; not signalling");
+        return false;
+    };
+    if signed <= 1 {
+        warn!("idle timeout: refusing to signal group for pid {signed}");
+        return false;
+    }
+
+    // SAFETY: `signed > 1`, so `-signed < -1` and the two catastrophic
+    // targets (`0` = our own group, `-1` = everything) are both excluded.
+    unsafe {
+        libc::kill(-signed, libc::SIGTERM);
+    }
+
+    let dead = crate::agent::terminate_and_verify(
+        child_pid,
+        crate::agent::TERMINATE_VERIFY_WAIT,
+        crate::agent::TERMINATE_VERIFY_POLL,
+    );
+
+    // SAFETY: same guard as above.
+    unsafe {
+        libc::kill(-signed, libc::SIGKILL);
+    }
+
+    dead
+}
+
+/// Append one line to the monitor's own log, creating it if needed.
+///
+/// Best-effort: the monitor's stdio is null, so this file is the only place a
+/// "log loudly" obligation can actually land, but failing to write it must
+/// never abort a termination sequence already in progress.
+fn append_monitor_log(project_root: &Path, phase: u32, entry: &str) {
+    let path = crate::agent_result::monitor_log_path(project_root, phase);
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(file, "{entry}");
+    }
 }
 
 /// Poll for the agent PID that the monitor records, for up to ~1 second.
@@ -1358,5 +1777,374 @@ exit 0
         );
         assert!(captured.contains("ARGV_SAFE"));
         assert!(!dir.path().join("INJECTED").exists());
+    }
+
+    // ---- idle timeout (31-02, D-01..D-08) --------------------------------
+
+    /// D-04: a value below the floor is raised to it, and the fact is
+    /// observable to the CALLER as a value — not only as a log line a test
+    /// would have to capture stdout to see.
+    #[test]
+    fn idle_timeout_secs_clamps_below_floor_and_logs() {
+        let setting = parse_idle_timeout_secs(Some("5".to_string()));
+
+        assert_eq!(setting.timeout, Duration::from_secs(30));
+        assert!(setting.clamped(), "the clamp must be observable as a value");
+        assert_eq!(
+            setting.resolution,
+            IdleTimeoutResolution::Clamped { configured: 5 }
+        );
+
+        // The notice must NAME the configured value, the floor, and the value
+        // actually in force — a clamp that says only "clamped" leaves the
+        // operator guessing which of the three numbers won.
+        let notice = setting.notice().expect("a clamp owes a loud notice");
+        for fragment in ["5", "30", IDLE_TIMEOUT_ENV] {
+            assert!(
+                notice.contains(fragment),
+                "notice must name {fragment:?}; got: {notice}"
+            );
+        }
+    }
+
+    /// The floor raises, it never lowers: a value above it survives verbatim
+    /// and reports no clamp.
+    #[test]
+    fn idle_timeout_secs_accepts_values_above_floor() {
+        let setting = parse_idle_timeout_secs(Some("120".to_string()));
+
+        assert_eq!(setting.timeout, Duration::from_secs(120));
+        assert!(!setting.clamped());
+        assert_eq!(setting.resolution, IdleTimeoutResolution::Configured);
+        assert_eq!(
+            setting.notice(),
+            None,
+            "an honoured value is unremarkable and must not shout"
+        );
+
+        // Boundary: exactly the floor is CONFIGURED, not CLAMPED. An
+        // off-by-one here would report a clamp that never happened and train
+        // operators to ignore the notice.
+        let exact = parse_idle_timeout_secs(Some("30".to_string()));
+        assert_eq!(exact.resolution, IdleTimeoutResolution::Configured);
+        assert!(!exact.clamped());
+    }
+
+    /// Absent, empty, and unparseable all resolve to the floor. The three are
+    /// NOT equivalent in loudness: nothing configured is silent, a typo is not.
+    #[test]
+    fn idle_timeout_secs_defaults_to_the_floor() {
+        let floor = Duration::from_secs(IDLE_TIMEOUT_FLOOR_SECS);
+
+        for raw in [None, Some(String::new()), Some("   ".to_string())] {
+            let setting = parse_idle_timeout_secs(raw.clone());
+            assert_eq!(setting.timeout, floor, "raw {raw:?} must yield the floor");
+            assert_eq!(setting.resolution, IdleTimeoutResolution::Default);
+            assert_eq!(setting.notice(), None, "nothing chosen is not an error");
+        }
+
+        for raw in ["banana", "60O", "-5", "30.5"] {
+            let setting = parse_idle_timeout_secs(Some(raw.to_string()));
+            assert_eq!(setting.timeout, floor, "raw {raw:?} must yield the floor");
+            assert_eq!(
+                setting.resolution,
+                IdleTimeoutResolution::Unparseable {
+                    raw: raw.to_string()
+                }
+            );
+            assert!(
+                setting.notice().is_some(),
+                "a typo that silently halves an intended timeout must be loud: {raw:?}"
+            );
+        }
+    }
+
+    /// D-01/D-03: every line resets the window, and there is no outer
+    /// wall-clock bound. A child that keeps talking for FOUR times the idle
+    /// timeout is never terminated.
+    ///
+    /// The timeout is injected short (400ms) rather than using the 30s
+    /// production default — this measures the RESET MECHANISM, and does so at
+    /// a scale the suite can afford. **What it does not establish:** that 30s
+    /// is the right production value. That rests on Phase 30d's measured gap
+    /// distributions, not on this test.
+    #[test]
+    fn idle_timer_resets_on_every_stream_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 6u32;
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        // 12 lines x 100ms = 1.2s of talking against a 400ms window. Any
+        // implementation that resets on milestones only, or that imposes an
+        // outer bound, kills this child before it finishes.
+        let script = r#"
+set -u
+IFS= read -r turn || exit 91
+i=0
+while [ $i -lt 12 ]; do
+  printf '%s\n' '{"type":"system","subtype":"heartbeat","n":'"$i"'}'
+  sleep 0.1
+  i=$((i+1))
+done
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id":"idle-1","result":"DEVFLOW_RESULT: {\"status\":\"success\"}"}'
+exit 0
+"#;
+
+        let started = std::time::Instant::now();
+        let code = run_pipe_owning_monitor(
+            root,
+            phase,
+            root,
+            "prompt",
+            Duration::from_millis(400),
+            "sh",
+            &["-c".to_string(), script.to_string()],
+            &[],
+        )
+        .expect("a chatty child must be supervised to completion");
+        let elapsed = started.elapsed();
+
+        assert_eq!(code, 0, "the chatty child must exit cleanly, not be killed");
+        assert!(
+            !crate::agent_result::idle_timeout_path(root, phase).exists(),
+            "no timeout may fire while the child is still emitting lines"
+        );
+        assert!(
+            elapsed > Duration::from_millis(400),
+            "the run must outlast the idle window, else it proves nothing \
+             about resetting: {elapsed:?}"
+        );
+
+        let capture =
+            std::fs::read_to_string(crate::agent_result::stdout_path(root, phase)).unwrap();
+        assert_eq!(
+            capture.matches("heartbeat").count(),
+            12,
+            "all twelve resets must have been observed: {capture:?}"
+        );
+    }
+
+    /// D-05, and the assertion the whole ordering exists for.
+    ///
+    /// The observation is made LIVE, by a watcher thread sampling the child's
+    /// liveness at the first instant the verdict file exists — not by
+    /// inspecting order after the fact, which cannot distinguish
+    /// write-then-kill from kill-then-write.
+    ///
+    /// Its own negative control is structural: if the implementation wrote the
+    /// verdict AFTER terminating, the watcher would sample a dead child and
+    /// this test fails with `Some(false)`. The stub ignores `SIGTERM` so the
+    /// window in which "file exists AND child alive" is observable is the full
+    /// `TERMINATE_VERIFY_WAIT`, rather than a microsecond race.
+    ///
+    /// **What the duration of this test measures:** almost entirely
+    /// `agent::TERMINATE_VERIFY_WAIT` (3s), because the stub refuses `SIGTERM`
+    /// and must be escalated to `SIGKILL`. The 250ms idle window is a rounding
+    /// error against it.
+    #[test]
+    fn idle_timeout_writes_side_channel_before_terminating_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let phase = 7u32;
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        // One line, then silence. `trap '' TERM` widens the observation
+        // window to the full SIGTERM->SIGKILL escalation.
+        let script = r#"
+set -u
+IFS= read -r turn || exit 91
+trap '' TERM
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"idle-2"}'
+sleep 120
+"#;
+
+        let verdict = crate::agent_result::idle_timeout_path(&root, phase);
+        let pid_file = crate::agent_result::agent_pid_path(&root, phase);
+        let watcher = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let mut pid: Option<u32> = None;
+            while std::time::Instant::now() < deadline {
+                if pid.is_none() {
+                    pid = std::fs::read_to_string(&pid_file)
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u32>().ok());
+                }
+                if verdict.exists() {
+                    // Sample liveness at the FIRST moment the verdict exists.
+                    return pid.map(crate::agent::agent_running);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            None
+        });
+
+        let code = run_pipe_owning_monitor(
+            &root,
+            phase,
+            &root,
+            "prompt",
+            Duration::from_millis(250),
+            "sh",
+            &["-c".to_string(), script.to_string()],
+            &[],
+        )
+        .expect("a silent child must still produce a supervised outcome");
+
+        let observed = watcher.join().expect("watcher thread panicked");
+        assert_eq!(
+            observed,
+            Some(true),
+            "the verdict must be on disk while the child is STILL ALIVE. \
+             Some(false) = written after termination (the D-05 violation); \
+             None = the verdict never appeared at all"
+        );
+
+        // The verdict must also be readable and correct, not merely present.
+        let raw = std::fs::read_to_string(crate::agent_result::idle_timeout_path(&root, phase))
+            .expect("verdict file must be readable");
+        let record: IdleTimeoutRecord = serde_json::from_str(&raw).expect("verdict must parse");
+        assert_eq!(record.status, "idle_timeout");
+        assert_eq!(record.idle_secs, 0, "250ms truncates to 0 whole seconds");
+        assert!(record.agent_pid > 1);
+
+        // And the whole cascade must agree: Layer 1 reports the timeout.
+        let result = crate::agent_result::evaluate_layer1(&root, phase)
+            .expect("Layer 1 must decide a timed-out run");
+        assert_eq!(
+            result.status,
+            crate::agent_result::AgentStatus::IdleTimeout,
+            "the monitor's verdict must survive all the way to the oracle"
+        );
+
+        // The child was killed, so it has no ordinary exit code — the point is
+        // that the stage machine still reaches a gate rather than hanging.
+        assert!(
+            crate::agent_result::exit_code_path(&root, phase).exists(),
+            "the exit file must still be written so advance() is reachable"
+        );
+        let _ = code;
+
+        // The loud monitor-log entry (D-04/D-07's readable-after-the-fact
+        // obligation) must exist too — the monitor's stdio is null, so this
+        // file is the only place it can land.
+        let log = std::fs::read_to_string(crate::agent_result::monitor_log_path(&root, phase))
+            .expect("the monitor must log its own timeout");
+        assert!(log.contains("idle-timeout"), "log entry missing: {log:?}");
+    }
+
+    /// Minimal git repo: `develop` plus a `feature/phase-NN` branch carrying
+    /// `commits` extra commits.
+    fn init_repo_with_feature_commits(root: &Path, phase: u32, commits: usize) {
+        let git = |args: &[&str]| {
+            let output = crate::git::git_command(root).args(args).output().unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "devflow@example.com"]);
+        git(&["config", "user.name", "DevFlow Tests"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        git(&["config", "core.hooksPath", "/dev/null"]);
+        git(&["checkout", "-b", "develop"]);
+        std::fs::write(root.join("README.md"), "base\n").unwrap();
+        git(&["add", "README.md"]);
+        git(&["commit", "-m", "base"]);
+
+        let branch = format!("feature/phase-{phase:02}");
+        git(&["checkout", "-b", &branch]);
+        for i in 0..commits {
+            let name = format!("work-{i}.txt");
+            std::fs::write(root.join(&name), "work\n").unwrap();
+            git(&["add", &name]);
+            git(&["commit", "-m", &format!("feat: agent work {i}")]);
+        }
+    }
+
+    fn commit_count(root: &Path, phase: u32) -> u32 {
+        let range = format!("develop..feature/phase-{phase:02}");
+        let output = crate::git::git_command(root)
+            .args(["rev-list", "--count", &range])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    /// D-07/T-31-09: a timeout READS the commit log and never writes to it. A
+    /// timeout can be a false positive, and destroying real work on a false
+    /// positive is unrecoverable.
+    ///
+    /// The "commits were enumerated" half is this test's negative control, and
+    /// it is not optional: if enumeration silently returned nothing, "no
+    /// commits were rolled back" would be trivially, vacuously true.
+    #[test]
+    fn idle_timeout_does_not_roll_back_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 8u32;
+        init_repo_with_feature_commits(root, phase, 2);
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        let before = commit_count(root, phase);
+        assert_eq!(before, 2, "fixture precondition");
+
+        // No TERM trap here: the child dies promptly, keeping this test fast.
+        let script = r#"
+set -u
+IFS= read -r turn || exit 91
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"idle-3"}'
+sleep 120
+"#;
+
+        run_pipe_owning_monitor(
+            root,
+            phase,
+            root,
+            "prompt",
+            Duration::from_millis(250),
+            "sh",
+            &["-c".to_string(), script.to_string()],
+            &[],
+        )
+        .expect("a silent child must still produce a supervised outcome");
+
+        assert_eq!(
+            commit_count(root, phase),
+            before,
+            "an idle timeout must never roll back, reset, or revert a commit"
+        );
+
+        // NEGATIVE CONTROL: enumeration must actually have found them, else
+        // the assertion above is vacuous.
+        let raw = std::fs::read_to_string(crate::agent_result::idle_timeout_path(root, phase))
+            .expect("verdict file must exist");
+        let record: IdleTimeoutRecord = serde_json::from_str(&raw).expect("verdict must parse");
+        assert_eq!(
+            record.commits.len(),
+            2,
+            "the verdict must NAME the commits, not merely leave them alone"
+        );
+        for commit in &record.commits {
+            assert_eq!(commit.sha.len(), 40, "full sha expected: {commit:?}");
+            assert!(
+                commit.subject.starts_with("feat: agent work"),
+                "subject must survive enumeration: {commit:?}"
+            );
+        }
+
+        // And the operator-facing reason names them.
+        let result = crate::agent_result::evaluate_layer1(root, phase).unwrap();
+        assert_eq!(result.commits, Some(2));
+        let reason = result.reason.unwrap();
+        assert!(
+            reason.contains("NONE of them were rolled back"),
+            "reason: {reason}"
+        );
     }
 }
