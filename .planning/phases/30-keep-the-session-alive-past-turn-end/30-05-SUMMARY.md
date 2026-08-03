@@ -17,7 +17,12 @@ requires:
     provides: "HUMAN_GATE_VALUE and text_reports_human_gate — the pure matcher, explicitly NOT modified here"
 provides:
   - "claude_stream_reports_human_gate — top-level `result`-events-only gate scan, short-circuiting, returns bool"
-  - "blocking_human_checkpoint_reported stream branch — gated on is_claude_event_stream, never consults raw stdout on the stream path"
+  # DEPRECATED 2026-08-03: "gated on is_claude_event_stream" was superseded by 06675da, which
+  # moved the stream branch onto the separate claude_stream_gate_shape predicate (closing the
+  # gate-scoping fail-open on a torn init). This line was never amended when that landed.
+  # Authoritative: agent_result.rs and 30-CODE-REVIEW.md. Kept, struck through, rather than
+  # rewritten — a SUMMARY records what the plan delivered at the time it was written.
+  - "blocking_human_checkpoint_reported stream branch — [SUPERSEDED: now gated on claude_stream_gate_shape, not is_claude_event_stream] never consults raw stdout on the stream path"
   - "The prompt-echo regression cluster: 7 tests pinning both the false-positive closure and the two opposite-direction harms"
 affects: ["31-adapter-flip", "checkpoint-resume", "checkpoint_auto_decided"]
 
