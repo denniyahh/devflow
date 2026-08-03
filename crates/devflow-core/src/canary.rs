@@ -37,9 +37,17 @@
 //! free to drift away from the first, and the drift would be invisible.
 
 use crate::agent_result;
+use crate::agents::{AgentAdapter, ClaudeAgent};
+use crate::git::hermetic_command;
+use crate::monitor::{self, CloseRule};
 use serde::{Deserialize, Serialize};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+use tracing::warn;
 
 /// The fixed, greppable prefix every declared canary token carries.
 ///
@@ -163,16 +171,273 @@ pub fn canary_prompt(token: &str) -> String {
 /// to [`agent_result::token_reported_in_capture`] — the one function in this
 /// codebase that decides whether a token came back from somewhere trustworthy.
 /// See this module's header for why that decision is not made here.
+/// Every failure mode below is `Unverified`, never `Absent`. `Absent` is a
+/// claim about the CLI's behaviour and may only be made after the CLI actually
+/// ran and produced a capture that could be read.
 pub fn run_delivery_canary<L: CanaryLauncher>(launcher: &L, capture_dir: &Path) -> CanaryOutcome {
     let token = declare_token();
     let capture = canary_capture_path(capture_dir);
 
-    // RED-phase stub: deliberately degenerate. The launcher's verdict is
-    // discarded and the capture is never read, so every outcome reads `Absent`.
-    // Replaced in this task's GREEN commit.
-    let _ = launcher.run(&canary_prompt(&token), &capture);
-    let _ = &agent_result::token_reported_in_capture;
-    CanaryOutcome::Absent
+    // Through `ensure_devflow_dir` rather than a bare `create_dir_all`: it also
+    // self-protects a `.devflow` in the path with a `*` .gitignore, and the
+    // canary capture is agent output that must not be sweepable into a
+    // downstream repo by a routine `git add .` (T-31-13, ROADMAP §999.69).
+    if let Err(err) = crate::workflow::ensure_devflow_dir(capture_dir) {
+        return CanaryOutcome::Unverified(format!(
+            "could not prepare the canary capture directory {}: {err}",
+            capture_dir.display()
+        ));
+    }
+
+    if let Err(reason) = launcher.run(&canary_prompt(&token), &capture) {
+        return CanaryOutcome::Unverified(reason);
+    }
+
+    // Lossy decode, matching the ONE capture-decode policy the rest of this
+    // codebase reads through (`agent_result::read_capture`, CR-01): a single
+    // invalid UTF-8 byte from a raw pipe must not silently disable the guard.
+    // REPLACE rather than drop — dropping joins the tokens on either side.
+    let text = match std::fs::read(&capture) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(err) => {
+            return CanaryOutcome::Unverified(format!(
+                "the canary ran but its capture {} could not be read: {err}",
+                capture.display()
+            ));
+        }
+    };
+
+    if agent_result::token_reported_in_capture(&text, &token) {
+        CanaryOutcome::Confirmed
+    } else {
+        CanaryOutcome::Absent
+    }
+}
+
+/// How long the canary waits with NOTHING arriving on the child's stdout before
+/// concluding nothing more is coming.
+///
+/// Deliberately its OWN constant rather than a reuse of the stage monitor's
+/// idle timeout, despite currently holding the same number: the canary waits
+/// for one trivial background task, the monitor waits for a whole stage, and
+/// coupling them would let a future change to the stage timeout silently change
+/// how patient the guard is. The value is D-02's measured constraint-8 floor
+/// (pooled max 13.73s on the milestone signal; 7.09s on the every-line signal
+/// this path actually sees), so it is roughly 4x margin, not a guess.
+const CANARY_IDLE_SECS: u64 = 30;
+
+/// Absolute wall-clock cap on one canary run.
+///
+/// The guard runs SYNCHRONOUSLY inside the operator's `devflow start`, so a
+/// child that never speaks and never exits would wedge the launch outright.
+/// The idle timeout above already covers a silent child; this covers a chatty
+/// one that never converges.
+const CANARY_DEADLINE_SECS: u64 = 300;
+
+/// How long the child gets to exit on its own after its stdin is released,
+/// before being killed.
+const CANARY_REAP_GRACE_SECS: u64 = 10;
+
+/// Poll interval while reaping.
+const REAP_POLL: Duration = Duration::from_millis(100);
+
+/// The real launcher: runs one throwaway `claude` turn over the same
+/// bidirectional `stream-json` transport a production stage uses.
+///
+/// **Nothing in this plan's test suite executes this type.** Every test injects
+/// a launcher that writes a canned capture, by design — a guard whose own tests
+/// spend real agent invocations is a guard nobody runs. The consequence is that
+/// this implementation is reasoned, not witnessed; plan 31-05's acceptance run
+/// against the real CLI is what witnesses it.
+pub struct ClaudeCanaryLauncher {
+    /// Working directory for the throwaway child.
+    ///
+    /// Carried as a field because [`CanaryLauncher::run`] has nowhere to put a
+    /// cwd and [`hermetic_command`] requires one. Deriving it from the capture
+    /// path instead would silently couple the child's working directory to
+    /// where DevFlow happens to keep its runtime files.
+    pub workdir: PathBuf,
+}
+
+impl CanaryLauncher for ClaudeCanaryLauncher {
+    fn run(&self, prompt: &str, capture: &Path) -> Result<(), String> {
+        // Phase 0 — the codebase's "not attributable to a real phase" sentinel
+        // (see `advance`'s `events::emit(project_root, 0, …)`). `exec_command`
+        // ignores both the phase and the prompt: under `--input-format
+        // stream-json` the prompt travels on stdin, not argv.
+        let (program, args) = ClaudeAgent.exec_command(0, prompt, &[]);
+
+        let mut capture_file = std::fs::File::create(capture).map_err(|err| {
+            format!(
+                "could not create the canary capture {}: {err}",
+                capture.display()
+            )
+        })?;
+
+        // No `.process_group(0)` here, deliberately — the opposite choice from
+        // `run_pipe_owning_monitor`'s detached child. This one runs in the
+        // FOREGROUND of the operator's own CLI, so it should stay in the
+        // terminal's process group and die with a Ctrl-C like any other
+        // foreground child. Group isolation would leave a canary running with
+        // nothing left to reap it.
+        let mut child = hermetic_command(program, &self.workdir)
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            // stderr is discarded rather than teed: the capture must stay
+            // parseable JSONL, and nothing reads a canary's diagnostics.
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|err| format!("could not run `{program}`: {err}"))?;
+
+        let mut child_stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "the canary child exposed no stdin pipe".to_string())?;
+        let child_stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "the canary child exposed no stdout pipe".to_string())?;
+
+        // Same three-participant threading model as the production monitor, and
+        // for the same reason (T-31-04): writing the turn synchronously before
+        // reading stdout is the textbook two-pipe deadlock.
+        let (close_tx, close_rx) = mpsc::channel::<()>();
+        let turn = monitor::user_turn_line(prompt);
+        let writer = std::thread::spawn(move || {
+            let wrote = child_stdin
+                .write_all(turn.as_bytes())
+                .and_then(|()| child_stdin.write_all(b"\n"))
+                .and_then(|()| child_stdin.flush());
+            if let Err(err) = wrote {
+                warn!("could not write the canary's user turn to the child's stdin: {err}");
+                return;
+            }
+            // Held open past the first turn ON PURPOSE. Releasing it here would
+            // end the session before any task-notification turn could be
+            // delivered — which is the very behaviour being measured, so the
+            // guard would report `Absent` against a perfectly healthy CLI.
+            let _ = close_rx.recv();
+            drop(child_stdin);
+        });
+
+        let (line_tx, line_rx) = mpsc::channel::<String>();
+        let reader = std::thread::spawn(move || {
+            for line in BufReader::new(child_stdout).lines() {
+                let Ok(line) = line else {
+                    break;
+                };
+                if let Err(err) = writeln!(capture_file, "{line}") {
+                    warn!("could not append to the canary capture: {err}");
+                }
+                let _ = capture_file.flush();
+                if line_tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+
+        // The SAME close rule the production monitor applies (constraint 4's
+        // AND: a top-level marker plus a drained background-task list), reused
+        // rather than reimplemented. This governs only when stdin is released —
+        // it is a lifecycle decision, not the trust decision. The trust
+        // decision is made once, afterwards, by `run_delivery_canary`.
+        let mut rule = CloseRule::default();
+        let mut close_signalled = false;
+        let idle = Duration::from_secs(CANARY_IDLE_SECS);
+        let deadline = Instant::now() + Duration::from_secs(CANARY_DEADLINE_SECS);
+
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match line_rx.recv_timeout(idle.min(remaining)) {
+                Ok(line) => {
+                    if close_signalled {
+                        continue;
+                    }
+                    rule.observe(&line);
+                    if rule.should_close() {
+                        let _ = close_tx.send(());
+                        close_signalled = true;
+                    }
+                }
+                // Idle expiry, deadline expiry and stdout EOF all mean the same
+                // thing here: stop waiting and go read what was captured. A
+                // timeout is NOT an error — a child that ran and said nothing
+                // useful is a fact about the CLI, and belongs in the
+                // `Absent` decision rather than in `Unverified`.
+                Err(mpsc::RecvTimeoutError::Disconnected | mpsc::RecvTimeoutError::Timeout) => {
+                    break;
+                }
+            }
+        }
+
+        // Release stdin before waiting: a child still holding an open stdin may
+        // never exit on its own.
+        drop(close_tx);
+        reap(&mut child);
+        let _ = writer.join();
+        let _ = reader.join();
+        Ok(())
+    }
+}
+
+/// Wait a bounded time for the canary child to exit, then kill it.
+///
+/// `try_wait`/`kill`/`wait` rather than [`crate::agent::terminate_and_verify`]:
+/// that helper polls `/proc` liveness, and this child is a DIRECT child of the
+/// current process, so it becomes an unreaped zombie whose `/proc` entry
+/// outlives it — the liveness poll would report a dead child as alive for the
+/// full timeout. `wait()` is the correct liveness answer for a direct child.
+///
+/// Known limitation, recorded rather than solved: this signals the child only,
+/// not a process group, so a descendant the canary child itself spawned can
+/// outlive the kill. The canary child is short-lived, capped by
+/// [`CANARY_DEADLINE_SECS`], and dispatches a task that touches nothing.
+fn reap(child: &mut std::process::Child) {
+    let deadline = Instant::now() + Duration::from_secs(CANARY_REAP_GRACE_SECS);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => {}
+            Err(err) => {
+                warn!("could not poll the canary child: {err}");
+                return;
+            }
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(REAP_POLL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// The `claude --version` string, for the run's provenance.
+///
+/// Recorded alongside a canary outcome so a later forensic read can tell WHICH
+/// CLI the behaviour was (or was not) witnessed on — the whole premise is
+/// version-fragile, and an outcome with no version attached cannot be compared
+/// against a later one. Fail-soft: `None` when the binary is missing or says
+/// nothing, because a guard's provenance must never be the reason a launch
+/// fails.
+///
+/// This is NOT the guard. A version string is a proxy for the behaviour, which
+/// is exactly what D-13 rejected; it is recorded as context beside the real
+/// measurement, never in place of it.
+pub fn claude_cli_version() -> Option<String> {
+    let output = std::process::Command::new("claude")
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!version.is_empty()).then_some(version)
 }
 
 #[cfg(test)]
