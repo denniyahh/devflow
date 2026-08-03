@@ -2077,4 +2077,346 @@ mod tests {
         );
         assert!(!events_of_kind(root, "gate_fired").is_empty());
     }
+
+    // ---- D-11: the legacy-launch opt-out (31-04) -------------------------
+
+    /// Set `DEVFLOW_CLAUDE_LEGACY_LAUNCH` for the duration of a test, restoring
+    /// the prior value on drop. Every user holds `ENV_MUTEX`.
+    struct LegacyEnvOverride(Option<std::ffi::OsString>);
+
+    impl LegacyEnvOverride {
+        fn set(value: &str) -> Self {
+            let prior = std::env::var_os("DEVFLOW_CLAUDE_LEGACY_LAUNCH");
+            // SAFETY: serialized by ENV_MUTEX; restored on drop.
+            unsafe { std::env::set_var("DEVFLOW_CLAUDE_LEGACY_LAUNCH", value) };
+            Self(prior)
+        }
+    }
+
+    impl Drop for LegacyEnvOverride {
+        fn drop(&mut self) {
+            // SAFETY: same serialization as `set`.
+            unsafe {
+                match self.0.take() {
+                    Some(prior) => std::env::set_var("DEVFLOW_CLAUDE_LEGACY_LAUNCH", prior),
+                    None => std::env::remove_var("DEVFLOW_CLAUDE_LEGACY_LAUNCH"),
+                }
+            }
+        }
+    }
+
+    fn legacy_state(root: &Path, phase: u32, opt_out: bool) -> State {
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        state.legacy_claude_launch = opt_out;
+        state
+    }
+
+    /// D-11: one flag forces the pre-31 shape back on, even for a stage the
+    /// rollout HAS reached — otherwise the escape hatch is unreachable exactly
+    /// where it is needed.
+    #[test]
+    fn legacy_launch_flag_forces_the_single_document_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = legacy_state(dir.path(), 130, true);
+
+        // Precondition: without the opt-out this stage IS in the rollout, so
+        // the assertion below is a real discrimination and not a stage that
+        // was going to be legacy anyway.
+        assert!(
+            claude_stream_launch_enabled(state.agent, state.stage, false),
+            "Stage::Code must be in STREAM_JSON_STAGES for this test to mean anything"
+        );
+
+        assert!(!claude_stream_launch_enabled(
+            state.agent,
+            state.stage,
+            state.legacy_claude_launch
+        ));
+
+        let adapter = agents::adapter_for(state.agent);
+        let (program, args, launch) = resolve_launch_shape(
+            state.agent,
+            adapter.as_ref(),
+            state.phase,
+            "the stage prompt".to_string(),
+            &[],
+            false,
+        );
+
+        assert!(matches!(launch, monitor::MonitorLaunch::Legacy));
+        assert_eq!(program, "claude");
+        assert_eq!(
+            (program, args),
+            agents::ClaudeAgent::exec_command_single_document("the stage prompt"),
+            "the forced path must be exec_command_single_document byte-for-byte, \
+             not an approximation of it"
+        );
+    }
+
+    /// Off by default: nothing set anywhere leaves the run on the Phase 31
+    /// transport. An escape hatch that engaged on its own would be the silent
+    /// downgrade D-11 rejects.
+    #[test]
+    fn legacy_launch_is_off_by_default() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        // SAFETY: serialized by ENV_MUTEX.
+        unsafe { std::env::remove_var("DEVFLOW_CLAUDE_LEGACY_LAUNCH") };
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = legacy_state(dir.path(), 131, false);
+
+        assert!(
+            !state.legacy_claude_launch,
+            "State::new must default the opt-out to off"
+        );
+        assert!(!devflow_core::config::claude_legacy_launch());
+
+        let stream_launch =
+            claude_stream_launch_enabled(state.agent, state.stage, state.legacy_claude_launch);
+        assert!(stream_launch);
+
+        let adapter = agents::adapter_for(state.agent);
+        let (_program, _args, launch) = resolve_launch_shape(
+            state.agent,
+            adapter.as_ref(),
+            state.phase,
+            "the stage prompt".to_string(),
+            &[],
+            stream_launch,
+        );
+        assert!(matches!(launch, monitor::MonitorLaunch::PipeOwning { .. }));
+    }
+
+    /// D-11's "logged loudly" has to survive an unattended run where nobody is
+    /// watching stdout, so the notice lands on THREE channels. This pins the
+    /// two durable ones — the monitor log (the detached monitor's stdio is
+    /// null) and the run's event ledger. Stdout is not asserted here; see the
+    /// summary's "what this does not establish".
+    #[test]
+    fn legacy_launch_use_is_recorded_in_provenance() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        // SAFETY: serialized by ENV_MUTEX.
+        unsafe { std::env::remove_var("DEVFLOW_CLAUDE_LEGACY_LAUNCH") };
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let state = legacy_state(root, 132, true);
+
+        announce_forced_legacy_launch(&state);
+
+        let events = events_of_kind(root, "claude_legacy_launch_forced");
+        assert_eq!(events.len(), 1, "exactly one provenance record: {events:?}");
+        assert_eq!(events[0]["stage"].as_str(), Some("Code"));
+        assert_eq!(
+            events[0]["source"].as_str(),
+            Some("state:legacy_claude_launch"),
+            "with no env var set in this process, the source is the persisted flag"
+        );
+
+        let log = std::fs::read_to_string(agent_result::monitor_log_path(root, 132))
+            .expect("the monitor log must exist — it is the only channel a detached run has");
+        assert!(log.contains("legacy launch"), "monitor log: {log}");
+
+        // The required message (B3): the opt-out is an explicit acceptance of
+        // 999.64, not an escape from a guard. Asserted on the pure notice so a
+        // reworded log line cannot quietly drop it.
+        let notice = forced_legacy_launch_notice(state.stage, LegacyLaunchSource::PersistedState);
+        assert!(notice.contains("999.64"), "notice: {notice}");
+        assert!(
+            notice.contains("orphan"),
+            "the notice must say delegated work may be ORPHANED, in plain words: {notice}"
+        );
+        assert!(
+            log.contains("999.64"),
+            "the durable channel must carry it too, not just stdout: {log}"
+        );
+    }
+
+    /// Tests SCOPING, not a permitted bypass (adversarial review B3,
+    /// downgraded on evidence).
+    ///
+    /// The D-15 canary asks whether a live `stream-json` session is woken back
+    /// up when a background task finishes. `MonitorLaunch::Legacy` runs the
+    /// child with stdin at `/dev/null`, so a task-notification turn has no
+    /// channel to arrive on — the mechanism the canary tests structurally does
+    /// not exist on that path. Running it there would spend a real agent
+    /// invocation on a 300s deadline answering a question the launch never
+    /// asks. What the operator loses instead is named in the loud notice: the
+    /// legacy path is where a multi-plan wave orphans delegated work (999.64).
+    #[test]
+    fn legacy_launch_skips_the_delivery_canary() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 133;
+        let mut state = canary_state(root, phase);
+        state.legacy_claude_launch = true;
+
+        // Driven by the REAL predicate, so this tracks the wiring rather than
+        // a copy of it.
+        let stream_launch =
+            claude_stream_launch_enabled(state.agent, state.stage, state.legacy_claude_launch);
+        assert!(!stream_launch);
+        // Negative control: the SAME stage and agent, opt-out off, does run the
+        // stream path — so the reading above is the opt-out's doing.
+        assert!(claude_stream_launch_enabled(
+            state.agent,
+            state.stage,
+            false
+        ));
+
+        let calls = std::cell::Cell::new(0usize);
+        // `Absent` deliberately: if the gate ran this canary at all, the call
+        // below returns Err and the unwrap fails.
+        canary_gate(
+            &mut state,
+            stream_launch,
+            counting_canary(&calls, canary::CanaryOutcome::Absent),
+        )
+        .unwrap();
+
+        assert_eq!(calls.get(), 0);
+        assert_eq!(state.canary, None);
+    }
+
+    /// D-11 rejects automatic fallback: a silent downgrade is the same
+    /// invisible-degradation class as the bug this phase fixes.
+    ///
+    /// **Written as a guard against a future well-meaning addition.** The
+    /// obvious "helpful" change — noticing an unparseable stream capture and
+    /// relaunching on the legacy path — is exactly what must not appear. This
+    /// test fails first if it does.
+    ///
+    /// **Scope, stated so this does not read as broader coverage than it is:**
+    /// it covers *parse-failure-driven* fallback only. It does NOT prove that
+    /// nothing anywhere selects legacy automatically — that claim is already
+    /// false on `develop`. `relaunch_checkpoint_session` hardcodes
+    /// `MonitorLaunch::Legacy`, is reached by unconditional checkpoint
+    /// auto-decide, and bypasses both `canary_gate` and
+    /// `claude_stream_launch_enabled` by calling `spawn_agent_and_record`
+    /// directly. That is a pre-existing, deliberate exception recorded in
+    /// 31-04-SUMMARY.md as a known un-migrated route, not something this test
+    /// covers.
+    #[test]
+    fn parse_failure_does_not_trigger_a_fallback() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        // SAFETY: serialized by ENV_MUTEX.
+        unsafe { std::env::remove_var("DEVFLOW_CLAUDE_LEGACY_LAUNCH") };
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 134;
+        let state = legacy_state(root, phase, false);
+        workflow::save_state(&state).unwrap();
+
+        // A capture the stream parser cannot make sense of: JSONL-shaped enough
+        // to be a stream, with nothing any parser can turn into a verdict.
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        std::fs::write(
+            agent_result::stdout_path(root, phase),
+            "{\"type\":\"system\",\"subtype\":\"init\"}\n{\"type\":\"assistant\"\n",
+        )
+        .unwrap();
+
+        // The ordinary indeterminate verdict: Layer 1 abstains rather than
+        // inventing one. (Layer 2/3 then take over as they always have.)
+        assert!(
+            agent_result::evaluate_layer1(root, phase).is_none(),
+            "fixture precondition: the capture must be genuinely indeterminate"
+        );
+
+        // ...and the launch shape for the very same state is UNCHANGED by that
+        // failure. Nothing consulted the capture to pick a transport.
+        let stream_launch =
+            claude_stream_launch_enabled(state.agent, state.stage, state.legacy_claude_launch);
+        assert!(
+            stream_launch,
+            "a parse failure must not select the legacy path — D-11 rejects automatic fallback"
+        );
+        let adapter = agents::adapter_for(state.agent);
+        let (_program, _args, launch) = resolve_launch_shape(
+            state.agent,
+            adapter.as_ref(),
+            state.phase,
+            "the stage prompt".to_string(),
+            &[],
+            stream_launch,
+        );
+        assert!(matches!(launch, monitor::MonitorLaunch::PipeOwning { .. }));
+
+        // And no provenance event claiming a forced legacy launch was written,
+        // which is what a silent fallback would have looked like from outside.
+        assert!(events_of_kind(root, "claude_legacy_launch_forced").is_empty());
+    }
+
+    /// W4: a naive `env::var(..).is_ok()` would make
+    /// `DEVFLOW_CLAUDE_LEGACY_LAUNCH=false` *enable* the legacy path — an
+    /// accidental-reach path D-11 forbids. The value is parsed as a bool.
+    #[test]
+    fn legacy_launch_env_var_is_parsed_as_a_bool() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        {
+            let _env = LegacyEnvOverride::set("true");
+            assert!(devflow_core::config::claude_legacy_launch());
+        }
+        {
+            // The case that motivates the test: PRESENT but false.
+            let _env = LegacyEnvOverride::set("false");
+            assert!(
+                !devflow_core::config::claude_legacy_launch(),
+                "`=false` must not enable the legacy path"
+            );
+        }
+        {
+            // Garbage warns and is ignored — it does not silently enable.
+            let _env = LegacyEnvOverride::set("yes-please");
+            assert!(!devflow_core::config::claude_legacy_launch());
+        }
+        {
+            // Empty is treated as unset, matching `env_value`'s filter.
+            let _env = LegacyEnvOverride::set("");
+            assert!(!devflow_core::config::claude_legacy_launch());
+        }
+    }
+
+    /// W5: `devflow resume` must not silently flip a run back to the stream
+    /// path mid-flight. The persisted opt-out is OR-ed, never cleared — the
+    /// same silent-drop class as `stop_until`'s unconditional clear (999.60),
+    /// which was fixed by gating it.
+    #[test]
+    fn resume_does_not_clear_a_persisted_legacy_launch() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        // SAFETY: serialized by ENV_MUTEX.
+        unsafe { std::env::remove_var("DEVFLOW_CLAUDE_LEGACY_LAUNCH") };
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 135;
+        let mut state = legacy_state(root, phase, true);
+        workflow::save_state(&state).unwrap();
+
+        // The exact combination `resume` applies, with no flag and no env var.
+        apply_legacy_launch_opt_out(&mut state, false);
+
+        assert!(
+            state.legacy_claude_launch,
+            "a plain `devflow resume` must not drop the operator's opt-out"
+        );
+
+        // Negative control: the combination is not a constant `true` — a state
+        // that never had the opt-out stays off.
+        let mut never_opted_out = legacy_state(root, phase + 1, false);
+        apply_legacy_launch_opt_out(&mut never_opted_out, false);
+        assert!(!never_opted_out.legacy_claude_launch);
+    }
 }
