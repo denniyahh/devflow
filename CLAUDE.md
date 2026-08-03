@@ -33,3 +33,21 @@ specifically to the main-checkout case.
   Capture the exit code of the command you care about, not the pipeline.
 - **Old phases use a bare `PLAN.md`**, not `NN-PLAN.md`. A glob for `*-PLAN.md` silently misses
   them, and `.planning/superseded/` holds abandoned plans that should not be counted at all.
+
+## Where the upstream GSD issue ledger lives
+
+`.planning/UPSTREAM-GSD-ISSUES.md` is a **symlink**, not a file. The tracked copy lives in the
+sibling gsd-core checkout:
+
+```
+.planning/UPSTREAM-GSD-ISSUES.md -> ../../gsd-core/scratch/UPSTREAM-GSD-ISSUES.md
+```
+
+File new GSD-core defects there, not in a new file here. If the path reads as missing, the
+symlink was deleted (it is gitignored, so `git clean -fdx` removes it and a fresh clone never
+has it) — recreate it with the `ln -s` target above, or just make any commit: `scripts/hooks/post-commit`
+restores it when the target resolves.
+
+**Do not "fix" this by tracking the symlink.** `tests/build_provenance.rs` copies every path from
+`git ls-files` with `std::fs::copy`, which follows symlinks and panics on failure — on CI, or any
+clone without a `gsd-core` sibling, the link dangles and the test panics.
