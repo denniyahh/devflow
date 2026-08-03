@@ -180,6 +180,26 @@ pub(crate) enum ValidateOutcome {
 /// and wins regardless of which layer decided the result: it is the "two
 /// independent signals agreeing" arm and must not be shadowed by the
 /// external-verify-specific arms below it.
+///
+/// 31-02 audit (non-exhaustive equality site 3 of 3). The `== Success` test
+/// below is CORRECT AS-IS for `AgentStatus::IdleTimeout` and is left unchanged.
+/// An equality test compiles untouched against a new variant, so the
+/// wildcard-free-match mechanism that guards `decide_action` does not reach
+/// here; this was audited by hand.
+///
+/// A monitor-produced idle timeout has `decided_by_layer: Some(1)` and
+/// `verdict: None`, so `external` is `false`, the match falls to `_`, and the
+/// stage classifies as `Failed` — loop back or gate, never advance. That is the
+/// intended routing for "we gave up waiting" at Validate.
+///
+/// ADJACENT, PRE-EXISTING, NOT INTRODUCED HERE: the `(_, Some(Verdict::Pass))`
+/// arm below wins regardless of `status`, so an agent that writes
+/// `DEVFLOW_RESULT: {"status":"...","verdict":"pass"}` classifies as `Passed`
+/// whatever status it names. That is a documented deliberate choice (see the
+/// paragraph above) and it applies identically to `Failed`, `Unknown` and
+/// `ResourceKilled` today — `IdleTimeout` neither creates nor widens it, and
+/// changing it here "for symmetry" would silently re-route those three. Flagged
+/// rather than fixed.
 pub(crate) fn classify_validate_outcome(result: &agent_result::AgentResult) -> ValidateOutcome {
     let external = result.decided_by_layer == Some(0) && result.status == AgentStatus::Success;
     match (external, result.verdict) {

@@ -61,6 +61,23 @@ pub enum AgentStatus {
     /// typically "command not found") (D-07, 17b).
     #[serde(rename = "agent_unavailable")]
     AgentUnavailable,
+    /// The pipe-owning monitor gave up waiting: the child's stream went silent
+    /// for longer than the idle window and DevFlow terminated it (D-06, 31-02).
+    ///
+    /// Deliberately distinct from BOTH neighbours it would otherwise collapse
+    /// into. Against `Failed`: nothing reported a failure — the agent simply
+    /// stopped talking, and a graceful close would fall through to Layer 2,
+    /// which scores partial commits as `Success` (999.64 reborn inside its own
+    /// fix). Against `ResourceKilled`: the box did not run out of memory;
+    /// DevFlow itself did the killing. Only a third variant lets the completion
+    /// oracle tell "we gave up waiting" from either.
+    ///
+    /// The explicit `#[serde(rename)]` is required, not stylistic: the
+    /// enum-level `rename_all = "lowercase"` would collapse the two words into
+    /// `idletimeout`. The two existing two-word variants above carry the same
+    /// rename for the same reason.
+    #[serde(rename = "idle_timeout")]
+    IdleTimeout,
 }
 
 impl AgentStatus {
@@ -79,6 +96,7 @@ impl AgentStatus {
             AgentStatus::Unknown => "unknown",
             AgentStatus::ResourceKilled => "resource_killed",
             AgentStatus::AgentUnavailable => "agent_unavailable",
+            AgentStatus::IdleTimeout => "idle_timeout",
         }
     }
 }
@@ -1479,6 +1497,24 @@ fn parse_claude_event_result(stdout: &str) -> Option<AgentResult> {
     let held_success = match marker {
         // A non-success marker is the agent's own final word and nothing below
         // can improve on it.
+        //
+        // 31-02 audit (non-exhaustive equality site 1 of 3). This `!= Success`
+        // is CORRECT AS-IS for `AgentStatus::IdleTimeout` and is deliberately
+        // left unchanged. The compiler cannot flag this site — an equality test
+        // compiles fine against a new variant — so it is audited by hand here
+        // rather than left to the wildcard-free-match mechanism, which does not
+        // reach it.
+        //
+        // The only way `IdleTimeout` arrives here is an agent writing
+        // `DEVFLOW_RESULT: {"status":"idle_timeout"}` into its own output,
+        // claiming a verdict only DevFlow's monitor is supposed to produce.
+        // The predicate handles that in the fail-safe direction: it is not
+        // `Success`, so it returns immediately as decisive non-success and
+        // `decide_action` gates it for review. A forged idle timeout can
+        // therefore only make a run gate, never advance. The REAL
+        // monitor-produced verdict does not travel this path at all — it is
+        // read from its own side-channel file at the top of `evaluate_layer1`,
+        // before this parser ever runs.
         Some(result) if result.status != AgentStatus::Success => return Some(result),
         other => other,
     };
@@ -1912,6 +1948,16 @@ fn evaluate_layer0(
 /// unchanged from current behavior. A Layer 0 FAILURE is never passed here —
 /// only its affirmative-success arm is, so a failed probe still outranks
 /// every agent-controlled signal.
+///
+/// 31-02 audit (non-exhaustive equality site 2 of 3). The `!= Success` guard
+/// below is CORRECT AS-IS for `AgentStatus::IdleTimeout` and is left unchanged.
+/// The compiler cannot flag an equality test against a new variant, so this is
+/// audited by hand. An idle-timeout result is rejected here by BOTH independent
+/// guards, not just one: its status is not `Success`, and its
+/// `decided_by_layer` is `Some(1)` (the monitor's side-channel verdict is a
+/// Layer-1-class fact), never `Some(0)`. It returns unchanged, which is right —
+/// this function exists only to graft Layer 1's `verdict` onto an affirmative
+/// Layer 0 probe success, and a timeout is neither.
 fn reconcile_layer0_verdict(
     project_root: &Path,
     state: &State,
@@ -5501,8 +5547,14 @@ mod tests {
     }
 
     /// review consensus #1: `as_wire_str()` must never diverge from the serde
-    /// form for ANY variant — pin it for all six via a single round-trip
+    /// form for ANY variant — pin it for all seven via a single round-trip
     /// assertion (quotes stripped).
+    ///
+    /// 31-02: `IdleTimeout` is enumerated here explicitly rather than left to
+    /// the compiler. `as_wire_str`'s wildcard-free match makes a MISSING arm a
+    /// compile error, but it cannot catch a WRONG one — an arm returning
+    /// `"idletimeout"` compiles happily and diverges from the serde form the
+    /// `#[serde(rename)]` produces. Only enumerating the variant here pins that.
     #[test]
     fn as_wire_str_matches_serde_form_for_every_variant() {
         for variant in [
@@ -5512,6 +5564,7 @@ mod tests {
             AgentStatus::Unknown,
             AgentStatus::ResourceKilled,
             AgentStatus::AgentUnavailable,
+            AgentStatus::IdleTimeout,
         ] {
             let serde_form = serde_json::to_string(&variant).unwrap();
             let stripped = serde_form.trim_matches('"');
