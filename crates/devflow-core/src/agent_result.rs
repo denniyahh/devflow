@@ -304,6 +304,20 @@ pub fn claude_stream_session_id(stdout: &str) -> Option<String> {
         return None;
     }
 
+    // A session can rotate mid-capture: each turn opens with its own `init`, and
+    // the LAST one carries the id a resume must target. `claude_stream_events`
+    // discards unparseable lines, so a torn later `init` is invisible here and
+    // the scan below would silently return an EARLIER session's id — resuming
+    // the wrong session with a token that looks perfectly valid.
+    //
+    // Fail closed instead: if any non-empty line failed to parse, we cannot know
+    // whether a newer `init` was among the casualties. `None` costs a resume;
+    // the wrong id corrupts one. (Third adversarial pass, 2026-08-02.)
+    let non_empty_lines = stdout.lines().filter(|l| !l.trim().is_empty()).count();
+    if events.len() != non_empty_lines {
+        return None;
+    }
+
     events
         .iter()
         .rev()
@@ -776,19 +790,32 @@ fn is_claude_event_stream(events: &[serde_json::Value]) -> bool {
 /// of the lines that did NOT parse — in a torn stream they are JSON fragments,
 /// in poisoned plain text they are prose.
 fn claude_stream_gate_shape(stdout: &str, events: &[serde_json::Value]) -> bool {
-    let has_stream_event = events.iter().any(|v| {
-        matches!(
-            v.get("type").and_then(serde_json::Value::as_str),
-            Some("system" | "user" | "assistant")
-        )
-    });
-    if !has_stream_event {
-        return false;
-    }
-    stdout
+    let json_line_count = stdout.lines().filter(|l| !l.trim().is_empty()).count();
+    let all_lines_json_shaped = stdout
         .lines()
         .filter(|l| !l.trim().is_empty())
-        .all(|l| l.trim_start().starts_with('{'))
+        .all(|l| l.trim_start().starts_with('{'));
+    if !all_lines_json_shaped || json_line_count == 0 {
+        return false;
+    }
+
+    let mut saw_claude_type = false;
+    for v in events {
+        match v.get("type").and_then(serde_json::Value::as_str) {
+            // Codex framing (`thread.started`, `item.completed`, `turn.completed`)
+            // — never a Claude stream, and must keep taking the raw-scan path.
+            Some(t) if t.contains('.') => return false,
+            Some("system" | "user" | "assistant") => return true,
+            Some("result") => saw_claude_type = true,
+            _ => {}
+        }
+    }
+    // Only `result` events survived. That is a Claude stream ONLY if the capture
+    // is multi-line JSONL — the shipped single-document envelope is exactly one
+    // `{"type":"result",…}` line and must keep taking the raw-scan path
+    // (T-30-25). A stream whose gate-bearing `user` event tore, leaving just a
+    // later `result`, has more than one line and is still scoped correctly.
+    saw_claude_type && json_line_count > 1
 }
 
 /// The LAST top-level `type: "result"` event in a Claude stream capture.
@@ -1190,6 +1217,45 @@ fn parse_marker_lines(stdout: &str) -> Option<AgentResult> {
 /// stream capture is owned whole by the parser that understands its framing,
 /// rather than letting the generic 4000-character tail scan take a bite of a
 /// mid-line window of JSONL first.
+/// Decode a capture that may contain invalid UTF-8, **dropping** the offending
+/// bytes rather than substituting U+FFFD.
+///
+/// `String::from_utf8_lossy` is the obvious choice and is wrong here. Its
+/// replacement character is a printing, non-whitespace character, so it survives
+/// `trim()` and defeats every downstream guard that asks whether the capture
+/// *starts with* JSON. One stray byte ahead of the envelope was enough to make
+/// Layer 1 abstain on a reported failure and hand the verdict to the exit code.
+///
+/// Dropping is never worse than replacing for these parsers: a byte inside a
+/// JSON string parses either way, and a byte outside one only parses when it is
+/// removed. The cost is that a legitimately-emitted U+FFFD in agent text is
+/// preserved (it is valid UTF-8 and never enters this path) while genuinely
+/// corrupt bytes vanish silently — acceptable, because the alternative is
+/// silently mis-deciding the stage.
+fn decode_capture_dropping_invalid(bytes: &[u8]) -> String {
+    // The loop's first iteration already covers a wholly-valid capture.
+    let mut out = String::with_capacity(bytes.len());
+    let mut rest = bytes;
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(s) => {
+                out.push_str(s);
+                return out;
+            }
+            Err(err) => {
+                let valid_up_to = err.valid_up_to();
+                out.push_str(std::str::from_utf8(&rest[..valid_up_to]).unwrap_or(""));
+                // `error_len() == None` means the tail is a truncated sequence:
+                // nothing after it can be decoded, so stop.
+                let Some(bad_len) = err.error_len() else {
+                    return out;
+                };
+                rest = &rest[valid_up_to + bad_len..];
+            }
+        }
+    }
+}
+
 pub fn evaluate_layer1(project_root: &Path, phase: u32) -> Option<AgentResult> {
     let stdout_path = devflow_dir(project_root).join(format!("phase-{:02}-stdout", phase));
     // Read lossily: in monitor mode the agent's stdout reaches this file via
@@ -1197,8 +1263,18 @@ pub fn evaluate_layer1(project_root: &Path, phase: u32) -> Option<AgentResult> {
     // read_to_string would silently disable ALL Layer-1 detection (marker,
     // envelope, rate limit) — the same failure class CR-01 (13-REVIEW.md)
     // fixed in the blocking-mode capture.
+    //
+    // DROP the invalid bytes rather than replacing them (see
+    // [`decode_capture_dropping_invalid`]). `from_utf8_lossy` substitutes
+    // U+FFFD, which is NOT whitespace — so a single stray byte before the
+    // envelope left `detect_claude_envelope_failure`'s `trimmed.starts_with('{')`
+    // guard false, Layer 1 returned None for an authoritative `is_error: true`,
+    // and the cascade fell through to the Layer-2 exit-code check, turning a
+    // reported FAILURE into a SUCCESS at the Ship gate. Reproduced through
+    // `evaluate_layer1` on the shipped `--output-format json` envelope; this
+    // never depended on stream-json.
     let bytes = std::fs::read(&stdout_path).ok()?;
-    let stdout = String::from_utf8_lossy(&bytes);
+    let stdout = decode_capture_dropping_invalid(&bytes);
     detect_claude_rate_limit(&stdout)
         .map(rate_limited_result)
         .or_else(|| detect_claude_envelope_failure(&stdout))
@@ -2553,6 +2629,108 @@ mod tests {
             blocking_human_checkpoint_reported(&codex),
             "a Codex stream must still be raw-scanned — its top-level types are \
              dotted, so claude_stream_gate_shape excludes it"
+        );
+    }
+
+    /// **Third-pass High.** A stray invalid byte outside the JSON envelope must
+    /// not convert an authoritative failure into a Layer-2 success.
+    ///
+    /// `from_utf8_lossy` substitutes U+FFFD, which survives `trim()`, so
+    /// `detect_claude_envelope_failure`'s `starts_with('{')` guard went false and
+    /// Layer 1 abstained on `is_error: true`. The cascade then fell through to
+    /// the exit-code check — Ship proceeding on a reported failure. Reachable on
+    /// the shipped `--output-format json` envelope; nothing to do with
+    /// stream-json.
+    #[test]
+    fn stray_invalid_byte_does_not_hide_an_envelope_failure() {
+        let envelope = br#"{"type":"result","subtype":"error","is_error":true,"result":"boom","session_id":"s"}"#;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+
+        std::fs::write(stdout_path(dir.path(), 30), envelope).unwrap();
+        assert_eq!(
+            evaluate_layer1(dir.path(), 30).map(|r| r.status),
+            Some(AgentStatus::Failed),
+            "control: the intact envelope is an authoritative Layer-1 failure"
+        );
+
+        let mut poisoned = vec![0xffu8];
+        poisoned.extend_from_slice(envelope);
+        std::fs::write(stdout_path(dir.path(), 31), &poisoned).unwrap();
+        assert_eq!(
+            evaluate_layer1(dir.path(), 31).map(|r| r.status),
+            Some(AgentStatus::Failed),
+            "one invalid byte before the envelope must not make Layer 1 abstain \
+             and hand a FAILURE to the exit-code fallback"
+        );
+    }
+
+    /// **Third-pass Medium.** A torn gate-bearing `user` event must not reopen
+    /// raw-stdout scanning.
+    ///
+    /// `claude_stream_gate_shape` keyed stream recognition on system/user/
+    /// assistant events. If the echoed `user` event tore *after* carrying the
+    /// full gate text and only a later `result` parsed, none of those types
+    /// survived, the capture stopped looking like a stream, and the raw scan
+    /// read the echoed prompt as a declaration. Every line is still `{`-shaped,
+    /// so this is neither the torn-`init` case nor V-01.
+    #[test]
+    fn torn_gate_bearing_user_event_does_not_reopen_raw_scanning() {
+        let echo = v3_message_event(V3_USER_EVENT, &gate_documenting_text());
+        let quiet_result = v3_result_event(V3_RESULT_TURN1, NO_MARKER);
+
+        let closed = format!("{}\n{}\n{}\n", V3_INIT_EVENT, echo, quiet_result);
+        assert!(
+            !blocking_human_checkpoint_reported(&closed),
+            "control: with the echo intact the gate mention is correctly scoped out"
+        );
+
+        let torn = format!("{}\n{}\n", &echo[..echo.len() - 12], quiet_result);
+        assert!(
+            !blocking_human_checkpoint_reported(&torn),
+            "a torn echo leaving only a result must stay scoped, not fall back to \
+             the raw scan that reads the echoed prompt as a declaration"
+        );
+
+        // The shipped single-document envelope is ONE result line and must keep
+        // taking the raw path (T-30-25).
+        let single_doc = v3_result_event(V3_RESULT_TURN1, &gate_declaration_text());
+        assert!(
+            blocking_human_checkpoint_reported(&single_doc),
+            "control: the single-document envelope still uses the raw scan"
+        );
+    }
+
+    /// **Third-pass High.** A torn *later* `init` must not resurrect an earlier
+    /// session's id.
+    ///
+    /// Each turn opens its own `init`; the last carries the id a resume must
+    /// target. Dropped lines are invisible, so the scan returned the last
+    /// PARSEABLE init — a stale token that looks entirely valid. Fails closed
+    /// now: `None` costs a resume, the wrong id corrupts one.
+    #[test]
+    fn torn_later_init_does_not_resurrect_a_stale_session_id() {
+        let init =
+            |id: &str| format!(r#"{{"type":"system","subtype":"init","session_id":"{id}"}}"#);
+
+        let rotated = format!("{}\n{}\n", init("session-a"), init("session-b"));
+        assert_eq!(
+            claude_stream_session_id(&rotated).as_deref(),
+            Some("session-b"),
+            "control: with both init events intact the LAST id wins"
+        );
+
+        let init_c = init("session-c");
+        let torn = format!(
+            "{}\n{}\n{}\n",
+            init("session-a"),
+            init("session-b"),
+            &init_c[..init_c.len() - 10],
+        );
+        assert_ne!(
+            claude_stream_session_id(&torn).as_deref(),
+            Some("session-b"),
+            "a torn newer init must not hand back the previous session's id"
         );
     }
 
