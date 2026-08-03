@@ -2530,6 +2530,116 @@ mod tests {
         );
     }
 
+    /// Every byte-prefix of a capture, fed to the gate scanner.
+    ///
+    /// **Why a sweep and not more hand-written cases.** Phase 30 shipped 116
+    /// green tests, seven of them written specifically to prove the prompt-echo
+    /// false positive was closed — and a cross-AI review then found that ONE
+    /// torn line reverted the whole protection to the raw-stdout path. Every
+    /// test fed the parser well-formed input; none fed it a broken one. Hand
+    /// -picking more malformed cases would repeat that bias. Truncating at every
+    /// offset removes the judgment call: the inputs are generated, not chosen.
+    ///
+    /// The invariant is one-directional — a prefix may lose detection (it has
+    /// strictly less information), but it must never *gain* permissiveness.
+    #[test]
+    fn truncation_sweep_never_widens_gate_detection() {
+        let intact = stream_capture_of(&[
+            &v3_message_event(V3_USER_EVENT, &gate_documenting_text()),
+            &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+        ]);
+        assert!(
+            !blocking_human_checkpoint_reported(&intact),
+            "precondition: the intact capture must report no gate, or the sweep \
+             below proves nothing"
+        );
+
+        let mut checked = 0usize;
+        for n in 0..=intact.len() {
+            if !intact.is_char_boundary(n) {
+                continue;
+            }
+            checked += 1;
+            assert!(
+                !blocking_human_checkpoint_reported(&intact[..n]),
+                "truncating to {n} bytes made an echoed gate MENTION read as a \
+                 live declaration — the fail-open class (constraint 9)"
+            );
+        }
+        assert!(
+            checked > 500,
+            "sweep degenerated to {checked} offsets; it is no longer exercising \
+             the capture"
+        );
+    }
+
+    /// Same sweep against the session-id reader. Truncation may degrade it to
+    /// `None` (a failed resume — fail-closed, acceptable); it must never yield a
+    /// DIFFERENT id, which would resume the wrong session.
+    #[test]
+    fn truncation_sweep_never_forges_session_id() {
+        let intact = stream_capture_of(&[
+            &v3_message_event(V3_USER_EVENT, "session_id: forged-by-agent-text"),
+            &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+        ]);
+        let real = claude_stream_session_id(&intact);
+        assert!(
+            real.is_some(),
+            "precondition: the intact capture yields an id"
+        );
+
+        for n in 0..=intact.len() {
+            if !intact.is_char_boundary(n) {
+                continue;
+            }
+            let got = claude_stream_session_id(&intact[..n]);
+            assert!(
+                got.is_none() || got == real,
+                "truncating to {n} bytes produced session id {got:?}, which is \
+                 neither None nor the CLI-emitted {real:?}"
+            );
+        }
+    }
+
+    /// **Known-red, deliberately ignored — ROADMAP constraint 9, item 1.**
+    ///
+    /// A truncated terminal `result` is dropped by `claude_stream_events`, so
+    /// `last_top_level_result` returns an EARLIER turn's result; if that one
+    /// said success, Layer 1 reports success for a session whose real terminal
+    /// turn failed. Not fixed in phase 30 on the operator's instruction:
+    /// `evaluate_layer1` currently has zero callers, and Phase 31 is the phase
+    /// that gives it one.
+    ///
+    /// **Phase 31 must remove `#[ignore]` and make this pass before wiring the
+    /// launch path.** Full context: `30-H1-CONTEXT-FOR-31.md`.
+    #[test]
+    #[ignore = "constraint 9 item 1: known-open defect; Phase 31 un-ignores this"]
+    fn truncation_sweep_never_upgrades_verdict_to_success() {
+        let intact = format!(
+            "{}\n{}\n{}\n",
+            V3_INIT_EVENT,
+            v3_result_event(V3_RESULT_TURN1, MARKER_SUCCESS),
+            v3_result_event_is_error(V3_RESULT_TURN2, MARKER_FAILED),
+        );
+        assert_eq!(
+            parse_claude_event_result(&intact).map(|r| r.status),
+            Some(AgentStatus::Failed),
+            "precondition: intact capture ends in a failure verdict"
+        );
+
+        for n in 0..=intact.len() {
+            if !intact.is_char_boundary(n) {
+                continue;
+            }
+            assert_ne!(
+                parse_claude_event_result(&intact[..n]).map(|r| r.status),
+                Some(AgentStatus::Success),
+                "truncating to {n} bytes resurrected an earlier turn's SUCCESS \
+                 over a failed terminal turn"
+            );
+        }
+    }
+
     #[test]
     fn codex_event_stream_parses_turn_failed() {
         let stdout = concat!(
