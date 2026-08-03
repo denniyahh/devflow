@@ -527,7 +527,7 @@ const HUMAN_GATE_VALUE: &str = "blocking-human";
 /// keeps the stricter gate.
 pub fn blocking_human_checkpoint_reported(stdout: &str) -> bool {
     let events = claude_stream_events(stdout);
-    if claude_stream_gate_shape(&events) {
+    if claude_stream_gate_shape(stdout, &events) {
         return claude_stream_reports_human_gate(&events);
     }
     if text_reports_human_gate(stdout) {
@@ -756,13 +756,39 @@ fn is_claude_event_stream(events: &[serde_json::Value]) -> bool {
 /// Residual, accepted: a Claude stream carrying ONLY `result` events and a torn
 /// `init` is still unrecognised. Such a capture's raw stdout holds only
 /// agent-authored result text, so the echoed-prompt surface is absent anyway.
-fn claude_stream_gate_shape(events: &[serde_json::Value]) -> bool {
-    events.iter().any(|v| {
+///
+/// **The event shape alone is not sufficient — a majority of non-empty lines
+/// must also have parsed (V-01).** The first version of this predicate asked
+/// only whether *any* event carried a stream type, which let a SINGLE
+/// JSONL-shaped line divert an otherwise plain-text capture onto the stream
+/// branch. Because that branch never consults raw stdout, a genuine
+/// ``**Gate:** `blocking-human` `` sitting in the surrounding plain text was
+/// then silently suppressed — trading the fail-OPEN this function was written to
+/// close for a fail-CLOSED that drops a real human authorization request
+/// (T-30-24's harm direction). Found by phase-30 verification, reproduced
+/// through the public API with controls in both directions.
+///
+/// The second condition is that EVERY non-empty line is JSON-shaped — parsed, or
+/// an unparseable fragment that still opens with `{`. Counting parsed lines does
+/// not work: truncating a real stream drops its surviving-event count below any
+/// ratio threshold, which would send a torn capture back to the raw scan and
+/// reinstate the fail-open. What actually separates the two cases is the shape
+/// of the lines that did NOT parse — in a torn stream they are JSON fragments,
+/// in poisoned plain text they are prose.
+fn claude_stream_gate_shape(stdout: &str, events: &[serde_json::Value]) -> bool {
+    let has_stream_event = events.iter().any(|v| {
         matches!(
             v.get("type").and_then(serde_json::Value::as_str),
             Some("system" | "user" | "assistant")
         )
-    })
+    });
+    if !has_stream_event {
+        return false;
+    }
+    stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .all(|l| l.trim_start().starts_with('{'))
 }
 
 /// The LAST top-level `type: "result"` event in a Claude stream capture.
@@ -2527,6 +2553,47 @@ mod tests {
             blocking_human_checkpoint_reported(&codex),
             "a Codex stream must still be raw-scanned — its top-level types are \
              dotted, so claude_stream_gate_shape excludes it"
+        );
+    }
+
+    /// **V-01 regression.** One stray JSONL-shaped line must not divert a
+    /// plain-text capture onto the stream branch and suppress a real gate.
+    ///
+    /// The first `claude_stream_gate_shape` asked only whether ANY event carried
+    /// a stream type. Since the stream branch never consults raw stdout, a single
+    /// `{"type":"assistant",…}` line was enough to hide a genuine declaration
+    /// sitting in the surrounding plain text — turning the fail-OPEN this
+    /// predicate was written to close into a fail-CLOSED that drops a human
+    /// authorization request. Found by phase-30 verification after the fix
+    /// shipped in `06675da`.
+    #[test]
+    fn one_stray_json_line_does_not_suppress_a_plain_text_gate() {
+        let gate = gate_declaration_text();
+
+        assert!(
+            blocking_human_checkpoint_reported(&gate),
+            "positive control: the gate text alone must be detected"
+        );
+
+        let poisoned =
+            format!("{gate}\n{{\"type\":\"assistant\",\"message\":{{\"content\":[]}}}}\n");
+        assert!(
+            blocking_human_checkpoint_reported(&poisoned),
+            "one stray JSONL line must not suppress a real plain-text gate (V-01)"
+        );
+
+        // The torn-init capture is still recognised as a stream — the majority
+        // rule must not undo the fail-open fix it was added to preserve.
+        let torn_init = &V3_INIT_EVENT[..40];
+        let torn = format!(
+            "{}\n{}\n{}\n",
+            torn_init,
+            v3_message_event(V3_USER_EVENT, &gate_documenting_text()),
+            v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+        );
+        assert!(
+            !blocking_human_checkpoint_reported(&torn),
+            "control: a torn-init stream must still be scoped, not raw-scanned"
         );
     }
 
