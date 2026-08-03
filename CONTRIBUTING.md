@@ -51,8 +51,15 @@ git config --local include.path ../.gitconfig
 ```
 
 (the path is relative to `.git/config`). This turns on SSH-format signing for
-both commits and tags. It deliberately does **not** set `user.signingkey` —
-that is per-contributor and this repository is public.
+both commits and tags, and configures the git-flow branch model. It
+deliberately does **not** set `user.signingkey` — that is per-contributor and
+this repository is public.
+
+Because the model is supplied by that include, **do not run `git flow init -d`**:
+its default production branch is `master` and this repository's is `main`, so
+the defaults would misconfigure git-flow against a branch that does not exist,
+surfacing only later at release or hotfix time. With the include in place,
+`git flow feature start <name>` works directly.
 
 ### Release signing
 
