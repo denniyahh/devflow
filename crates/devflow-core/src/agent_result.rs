@@ -172,7 +172,13 @@ pub fn detect_rate_limit(stdout: &str) -> Option<String> {
 }
 
 fn detect_claude_rate_limit(stdout: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
+    // strip_corruption_padding, not trim(): this detector OUTRANKS the generic
+    // envelope-failure detector, and rate-limit envelopes carry `is_error:
+    // true`. When only the lower-precedence detector stripped edge corruption,
+    // one stray byte inverted the precedence — a RateLimited envelope (routes
+    // to auto-resume) decayed into a generic Failed (routes to review/gating).
+    // Fifth adversarial pass, Medium 1.
+    let value: serde_json::Value = serde_json::from_str(strip_corruption_padding(stdout)).ok()?;
     let rate_limited = json_has_str(&value, "subtype", "error_rate_limit")
         || json_has_i64(&value, "api_error_status", 429)
         || json_has_i64(&value, "status", 429)
@@ -848,11 +854,36 @@ impl ParsedCapture {
                     events.push(v);
                     line_shapes.push(LineShape::Event);
                 }
-                Err(_) => line_shapes.push(if trimmed.starts_with('{') {
-                    LineShape::TornJson
-                } else {
-                    LineShape::Noise
-                }),
+                Err(_) => {
+                    // Apply the SAME edge-corruption policy per line that
+                    // strip_corruption_padding applies per capture. Without
+                    // this, `read_capture`'s U+FFFD replacement in front of an
+                    // otherwise-intact line made it classify as Noise — not
+                    // `{`-prefixed — so the torn-tail guard could not see a
+                    // corrupt superseding event and an earlier success marker
+                    // decided the stage (fifth adversarial pass, High 1).
+                    //
+                    // Retry the parse on the stripped line first: edge
+                    // corruption around an intact event RECOVERS the event and
+                    // its true verdict. Stripping edges cannot join tokens —
+                    // the fabrication hazard was DROPPING bytes inside content
+                    // (fourth pass) — and interior corruption still fails the
+                    // parse. A line that strips to empty was pure corruption:
+                    // torn, fail closed.
+                    let stripped = strip_corruption_padding(trimmed);
+                    if stripped != trimmed
+                        && let Ok(v) = serde_json::from_str::<serde_json::Value>(stripped)
+                    {
+                        events.push(v);
+                        line_shapes.push(LineShape::Event);
+                    } else {
+                        line_shapes.push(if stripped.starts_with('{') || stripped.is_empty() {
+                            LineShape::TornJson
+                        } else {
+                            LineShape::Noise
+                        });
+                    }
+                }
             }
         }
         Self {
@@ -3160,6 +3191,79 @@ mod tests {
             Some(AgentStatus::Success),
             "a torn superseding marker must not let the earlier success marker \
              decide the stage"
+        );
+    }
+
+    /// **Fifth-pass High 1.** A replacement-character-prefixed event line must
+    /// not classify as prose Noise and slip past the torn-tail guard.
+    ///
+    /// `read_capture` turns an invalid byte into U+FFFD; a line reading
+    /// `\u{FFFD}{"type":…}` fails to parse and does not start with `{`, so it
+    /// became Noise — invisible to `torn_json_after_last_matching`. A corrupt
+    /// byte in front of a superseding failed marker let the earlier success
+    /// marker decide the stage, with the contradicting exit code never
+    /// consulted. Live today on the Codex `--json` adapter. The fix recovers
+    /// an edge-corrupt-but-intact event by re-parsing the stripped line, so
+    /// the TRUE verdict decides — better than merely failing indeterminate.
+    #[test]
+    fn corruption_prefixed_event_line_is_not_prose_noise() {
+        let good = concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"t1\"}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",",
+            "\"text\":\"DEVFLOW_RESULT: {\\\"status\\\":\\\"success\\\"}\"}}\n",
+        );
+        let failed_line = concat!(
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",",
+            "\"text\":\"DEVFLOW_RESULT: {\\\"status\\\":\\\"failed\\\"}\"}}\n",
+        );
+
+        let intact = format!("{good}{failed_line}");
+        assert_eq!(
+            parse_codex_event_result(&intact).map(|r| r.status),
+            Some(AgentStatus::Failed),
+            "control: intact capture — the last (failed) marker decides"
+        );
+
+        let poisoned = format!("{good}\u{FFFD}{failed_line}");
+        assert_eq!(
+            parse_codex_event_result(&poisoned).map(|r| r.status),
+            Some(AgentStatus::Failed),
+            "an edge-corrupt superseding marker must be recovered (or at worst \
+             fail indeterminate) — never let the earlier success decide"
+        );
+
+        // Interior corruption stays visible and untrusted: a FFFD INSIDE the
+        // marker's status string must not parse as a valid status (the
+        // fourth-pass fabrication hazard, still guarded).
+        let interior = concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"t1\"}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",",
+            "\"text\":\"DEVFLOW_RESULT: {\\\"status\\\":\\\"suc\u{FFFD}cess\\\"}\"}}\n",
+        );
+        assert_ne!(
+            parse_codex_event_result(interior).map(|r| r.status),
+            Some(AgentStatus::Success),
+            "interior corruption must never be repaired into a success"
+        );
+    }
+
+    /// **Fifth-pass Medium 1.** An edge-corrupt rate-limit envelope must stay
+    /// `RateLimited`, not decay into a generic `Failed`.
+    ///
+    /// The rate-limit detector outranks the generic envelope-failure detector
+    /// precisely because rate-limit envelopes carry `is_error: true`. It was
+    /// the one single-document reader without `strip_corruption_padding`, so a
+    /// stray byte inverted the precedence — auto-resume became review/gating.
+    #[test]
+    fn edge_corrupt_rate_limit_envelope_stays_rate_limited() {
+        let envelope = r#"{"type":"result","subtype":"error_rate_limit","is_error":true,"result":"rate limited","retry_after":"17:00"}"#;
+        assert!(
+            detect_claude_rate_limit(envelope).is_some(),
+            "control: the intact envelope is detected as a rate limit"
+        );
+        assert!(
+            detect_claude_rate_limit(&format!("\u{FFFD}{envelope}")).is_some(),
+            "one stray byte must not demote RateLimited to generic Failed"
         );
     }
 
