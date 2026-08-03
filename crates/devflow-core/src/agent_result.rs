@@ -200,10 +200,16 @@ fn detect_codex_rate_limit(stdout: &str) -> Option<String> {
     // (13-06 dogfood finding: GSD reference tables mentioning "rate limiting"
     // were read by the agent, echoed into an `item.completed` payload, and
     // this scan returned that entire multi-KB line as the "retry time").
+    // The JSON-line exclusion applies the SAME edge-strip policy as
+    // ParsedCapture::parse (sixth-pass Medium 4): an event line whose leading
+    // byte was corrupted to U+FFFD failed the bare parse here and was treated
+    // as prose — re-admitting the exact multi-KB echoed-document false
+    // positive this filter exists to exclude, after ParsedCapture had already
+    // correctly recovered the line as an event.
     let stdout: String = stdout
         .lines()
         .filter(|line| {
-            serde_json::from_str::<serde_json::Value>(line)
+            serde_json::from_str::<serde_json::Value>(strip_corruption_padding(line))
                 .map(|v| !v.is_object())
                 .unwrap_or(true)
         })
@@ -225,12 +231,29 @@ fn detect_codex_rate_limit(stdout: &str) -> Option<String> {
         }
     }
 
-    if lower.contains("usage limit") || lower.contains("rate limit") || lower.contains("429") {
+    // "429" counts as rate-limit evidence only as a STANDALONE token
+    // (sixth-pass Medium 5): a bare substring check fired on "processed issue
+    // #429 successfully" and any number containing 429, routing a healthy run
+    // into auto-resume. A neighbor that is alphanumeric or '#' means the
+    // digits belong to something else.
+    fn standalone_429(line: &str) -> bool {
+        let bytes = line.as_bytes();
+        line.match_indices("429").any(|(i, _)| {
+            let before_ok = i == 0 || {
+                let b = bytes[i - 1];
+                !b.is_ascii_alphanumeric() && b != b'#'
+            };
+            let after_ok = i + 3 >= bytes.len() || !bytes[i + 3].is_ascii_alphanumeric();
+            before_ok && after_ok
+        })
+    }
+
+    if lower.contains("usage limit") || lower.contains("rate limit") || standalone_429(&lower) {
         stdout
             .lines()
             .find(|line| {
                 let line = line.to_ascii_lowercase();
-                line.contains("usage limit") || line.contains("rate limit") || line.contains("429")
+                line.contains("usage limit") || line.contains("rate limit") || standalone_429(&line)
             })
             .map(str::trim)
             .filter(|line| !line.is_empty())
@@ -1423,34 +1446,48 @@ fn normalise_stream_marker_provenance(mut result: AgentResult) -> AgentResult {
     result
 }
 
-/// Scan the last ~4000 characters of `stdout` in reverse line order.
+/// Scan a bounded tail of `stdout` in reverse line order for the last
+/// `DEVFLOW_RESULT` marker.
 ///
 /// `DEVFLOW_RESULT` markers are ASCII. Searching the bounded tail and returning
 /// the last valid marker ensures the agent's final status wins over an earlier
 /// prompt echo without requiring the surrounding output to be ASCII.
+///
+/// Three sixth-pass corrections, each with a paired regression:
+/// - The tail budget counts WHOLE LINES, never bisecting one (High 2): the old
+///   fixed 4000-char window could cut through the final marker line itself
+///   when it carried a long `reason`, silently dropping the authoritative
+///   failure and handing the verdict to the exit code.
+/// - Each line is edge-stripped before prefix matching (High 1): the capture
+///   is read lossily, so one stray byte became U+FFFD glued to the prefix or
+///   the JSON and the marker vanished. Same policy as every other reader:
+///   edges stripped, interior corruption stays visible and untrusted.
+/// - The prefix match is genuinely case-insensitive (High 3), as this
+///   parser's contract has promised all along — the old strip_prefix chain
+///   accepted only ALL-upper or ALL-lower.
 fn parse_marker_lines(stdout: &str) -> Option<AgentResult> {
-    // Only search the tail — agents may echo the marker in their prompt
-    // and we want the LAST occurrence (which is their actual final status).
-    let tail: String = stdout
-        .chars()
-        .rev()
-        .take(4000)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
+    const TAIL_BUDGET_CHARS: usize = 4000;
+    const PREFIX: &str = "DEVFLOW_RESULT:";
 
-    for line in tail.lines().rev() {
-        let Some(json_str) = line
-            .strip_prefix("DEVFLOW_RESULT: ")
-            .or_else(|| line.strip_prefix("devflow_result: "))
-            .or_else(|| line.strip_prefix("DEVFLOW_RESULT:"))
-            .or_else(|| line.strip_prefix("devflow_result:"))
-        else {
+    let mut budget_used = 0usize;
+    for line in stdout.lines().rev() {
+        // The line that crosses the budget is still scanned whole; only the
+        // NEXT one stops the walk. The last line is always scanned, however
+        // long — that is the line the fixed window used to bisect.
+        if budget_used > TAIL_BUDGET_CHARS {
+            break;
+        }
+        budget_used += line.chars().count() + 1;
+
+        let line = strip_corruption_padding(line);
+        let Some(head) = line.get(..PREFIX.len()) else {
             continue;
         };
+        if !head.eq_ignore_ascii_case(PREFIX) {
+            continue;
+        }
 
-        let json_str = json_str.trim();
+        let json_str = line[PREFIX.len()..].trim();
         if let Ok(result) = serde_json::from_str::<AgentResult>(json_str) {
             return Some(result);
         }
@@ -3191,6 +3228,97 @@ mod tests {
             Some(AgentStatus::Success),
             "a torn superseding marker must not let the earlier success marker \
              decide the stage"
+        );
+    }
+
+    /// **Sixth-pass Highs 1–3.** The marker tail scanner — the reader that
+    /// decides most production stages today — must survive edge corruption, a
+    /// marker line longer than the tail budget, and mixed-case prefixes (its
+    /// contract has always said case-insensitive).
+    #[test]
+    fn marker_tail_scan_survives_corruption_length_and_case() {
+        let m = "DEVFLOW_RESULT: {\"status\":\"failed\"}";
+        assert_eq!(
+            parse_devflow_result(m).map(|r| r.status),
+            Some(AgentStatus::Failed),
+            "control: the plain marker parses"
+        );
+
+        // High 1 — edge corruption on either side must not hide the marker.
+        for poisoned in [format!("\u{FFFD}{m}"), format!("{m}\u{FFFD}")] {
+            assert_eq!(
+                parse_devflow_result(&poisoned).map(|r| r.status),
+                Some(AgentStatus::Failed),
+                "one stray byte at a line edge must not hide a failure marker"
+            );
+        }
+        // …while interior corruption stays untrusted (fourth-pass hazard).
+        assert!(
+            parse_devflow_result("DEVFLOW_RESULT: {\"status\":\"fai\u{FFFD}led\"}").is_none(),
+            "interior corruption must not parse as a valid status"
+        );
+
+        // High 2 — a marker line longer than the tail budget is scanned whole.
+        let long_reason = "x".repeat(5000);
+        let long =
+            format!("DEVFLOW_RESULT: {{\"status\":\"failed\",\"reason\":\"{long_reason}\"}}");
+        assert_eq!(
+            parse_devflow_result(&long).map(|r| r.status),
+            Some(AgentStatus::Failed),
+            "the tail budget must never bisect the final marker line"
+        );
+        // …and the budget still bounds the walk: a marker buried beyond the
+        // budget with newer non-marker output after it stays out of reach.
+        let buried = format!("{m}\n{}\n", "y\n".repeat(4100));
+        assert!(
+            parse_devflow_result(&buried).is_none(),
+            "control: the budget still cuts off markers deep in old output"
+        );
+
+        // High 3 — mixed case matches, per the documented contract.
+        assert_eq!(
+            parse_devflow_result("DevFlow_Result: {\"status\":\"failed\"}").map(|r| r.status),
+            Some(AgentStatus::Failed),
+            "mixed-case prefix must match — the contract says case-insensitive"
+        );
+    }
+
+    /// **Sixth-pass Mediums 4–5.** The codex plain-text rate-limit heuristic:
+    /// an edge-corrupt JSON event line must stay excluded from prose scanning,
+    /// and "429" only counts as a standalone token.
+    #[test]
+    fn codex_rate_limit_heuristic_excludes_recovered_json_and_embedded_429() {
+        // M4 — a corrupt-prefixed event line is still a JSON line, not prose.
+        let doc_line = concat!(
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",",
+            "\"text\":\"docs mention rate limiting policies\"}}",
+        );
+        let poisoned =
+            format!("{{\"type\":\"thread.started\",\"thread_id\":\"t\"}}\n\u{FFFD}{doc_line}\n");
+        assert!(
+            detect_codex_rate_limit(&poisoned).is_none(),
+            "an edge-corrupt event line must not be prose-scanned for \
+             rate-limit vocabulary"
+        );
+        // Control: genuine plain-text rate-limit output is still detected.
+        assert!(
+            detect_codex_rate_limit("Rate limit exceeded. Try again at 17:00.").is_some(),
+            "control: real plain-text rate-limit output must still be detected"
+        );
+
+        // M5 — embedded digits are not rate-limit evidence…
+        assert!(
+            detect_codex_rate_limit("processed issue #429 successfully").is_none(),
+            "'#429' is an issue number, not a rate limit"
+        );
+        assert!(
+            detect_codex_rate_limit("transferred 14290 bytes").is_none(),
+            "digits containing 429 are not a rate limit"
+        );
+        // …while a genuine standalone 429 still is.
+        assert!(
+            detect_codex_rate_limit("HTTP 429 Too Many Requests").is_some(),
+            "control: a standalone 429 status is still detected"
         );
     }
 
