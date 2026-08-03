@@ -571,9 +571,31 @@ fn reference_and_cleanup_worktree_cli_flow() {
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
+    // 31-03: the Code stage now runs the D-15 delivery canary before it
+    // launches, and refuses outright unless a token DevFlow planted comes back
+    // inside a TOP-LEVEL `result` event. A fake CLI that cannot do that is,
+    // correctly, a CLI this pipeline will not run on — so the fixture models a
+    // CLI that DOES deliver rather than working around the guard.
+    //
+    // `read -r turn` takes exactly one line and returns: the monitor writes the
+    // user turn followed by a newline, and blocking on full EOF would hang
+    // against a pipe deliberately held open past the first turn. On the legacy
+    // stages stdin is `/dev/null`, so the read yields nothing and the ordinary
+    // marker branch runs, exactly as before this change.
     let fake_bin = fake_bin_dir(&[(
         "claude",
-        "#!/bin/sh\nprintf 'DEVFLOW_RESULT: {\"status\":\"success\"}\n'\n",
+        r#"#!/bin/sh
+read -r turn
+case "$turn" in
+  *DEVFLOW_DELIVERY_CANARY_*)
+    token=$(printf '%s' "$turn" | grep -o 'DEVFLOW_DELIVERY_CANARY_[0-9a-f]*' | head -1)
+    printf '{"type":"result","subtype":"success","is_error":false,"session_id":"s-fake","result":"%s"}\n' "$token"
+    ;;
+  *)
+    printf 'DEVFLOW_RESULT: {"status":"success"}\n'
+    ;;
+esac
+"#,
     )]);
 
     // reference — creates static snapshot
@@ -625,6 +647,17 @@ fn reference_and_cleanup_worktree_cli_flow() {
     // gates.rs::GateAction::from_response) so the monitor clears state,
     // then wait for that to land before invoking cleanup.
     wait_for(&root.join(".devflow/gates/08-validate.json"));
+
+    // 31-03: reaching the Validate gate already implies the Code stage's
+    // delivery canary confirmed — but only implicitly. Asserted explicitly so
+    // that a future change which stops running the guard (e.g. narrowing
+    // `STREAM_JSON_STAGES`) shows up here instead of passing silently.
+    let events = fs::read_to_string(root.join(".devflow/events.jsonl")).unwrap_or_default();
+    assert!(
+        events.contains("claude_delivery_canary_confirmed"),
+        "the Code launch must have run the delivery canary and confirmed it\n{events}"
+    );
+
     run_devflow(
         root,
         &fake_bin.path,
