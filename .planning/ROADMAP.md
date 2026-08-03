@@ -2859,6 +2859,94 @@ rejected in 30-01 and guarded by a regression test.
 
 ---
 
+### Phase 31: Claude Adapter Launch Path — Pipe-Owning Monitor (999.64 arc close)
+
+**Created 2026-08-03.** Scope below is **compiled, not newly authored** — every item traces to
+a source already in this repository: Phase 30's "Next phase (31)" section and its binding
+review constraints (this file, above), `30-H1-CONTEXT-FOR-31.md`, `30-VERIFICATION.md`, and
+`30d-MEASUREMENTS.md`. Nothing here is a new operator decision; discuss-phase owns turning it
+into one.
+
+**Goal (this is also the 999.64 arc goal, which Phase 31 owns):** a DevFlow-driven phase
+containing a multi-plan wave completes that wave without orphaning delegated work. Concretely:
+the detached `sh` script that `spawn_monitor` uses for the Claude adapter is replaced by a
+pipe-owning monitor, and the adapter emits `stream-json` always-on — making 30b's parser
+reachable in production for the first time.
+
+**Acceptance criterion:** the live Phase 29 wave-2 re-run. Per review constraint H4 this is
+**not substitutable by integration tests** — a mocked CLI validates plumbing, not the delivery
+premise.
+
+**Gate status: OPEN — Phase 31 may be planned.** Phase 30's `30c-VERDICT.md` resolved
+`delivery: confirmed`, satisfying the locked precondition ("if it refutes delivery, Phase 31 is
+cancelled before it is planned").
+
+**Scope — the binding constraints assigned here by Phase 30's cross-AI review:**
+
+1. **Always-on adapter switch (constraint 1).** `--input-format stream-json` for the Claude
+   adapter, never selected by predicting which stages will background — that is a D-10-class
+   prediction and is already falsified by the record. Per-stage rollout is permitted as a
+   *sequencing* choice; behavior-prediction is not.
+
+2. **Close rule is an `AND` (constraint 4).** Close stdin only on marker-in-a-**top-level**
+   `result` event **AND** `background_tasks_changed` drained to `[]`. Constraint 7 is why:
+   the CLI **coalesces** completions, so counting `result` events silently undercounts any
+   wave whose completions cluster. Trial 2's shape is superficially indistinguishable from
+   "one child delivered, one lost" — the drain is the only thing separating them.
+   **Do not simplify to a single arm.** Per 30-04 the drain arm is *defensive, not
+   load-bearing* (n=2 Mode B trials delivered everything without it) — that is a documented
+   reason to keep it cheaply, not licence to drop it.
+
+3. **Idle timeout, not wall-clock, floor ≥30s (constraints 5 and 8).** The original ~12s floor
+   was **measured wrong and revised** by 30-04: a 12s timeout would have killed a live healthy
+   run in 2 of 7 trials (13.638s, 13.728s). ≥30s is ~2.2x the pooled observed maximum. On
+   firing, the monitor must write an **authoritative first-class failure** — a graceful close
+   falls through to Layer 2, which scores partial commits as Success (999.64 reborn inside its
+   own fix), and a kill mis-classifies as OOM/`ResourceKilled`. Also: the drain is **not** a
+   stop signal — closing there would have truncated the final turn in all seven trials.
+
+4. **Boundary-truncation residual — constraint 9's surviving obligation.** Constraint 9 items 1
+   and 2 were **CLOSED in Phase 30** by the root-cause refactor (`a557805`); what survives is
+   that a capture cut at an exact line boundary is byte-identical to a healthy shorter run, so
+   **no parser assertion can exist for it**. The defense belongs to this layer: Phase 31's
+   wiring must not let a stream-derived `Success` short-circuit a contradicting exit code (a
+   writer that died between flushing turn N and N+1 also died non-zero).
+
+5. **Near-simultaneous completions (review M3)** and **CLI-version smoke-detection or pinning
+   (review M2)** land here. The task-notification behavior is undocumented CLI behavior
+   observed on `claude_code_version 2.1.220`; a CLI update can invalidate it silently.
+
+6. **Fold in 999.67 (XS).** `parse_devflow_result` lets an agent plant its own Layer-0
+   provenance. A one-line overwrite plus a mirror test, in a file this phase is already
+   editing — closes the defect class rather than the single instance.
+
+**Correct two stale documents before planning.** Phase 31 will read exactly these:
+`30-VERIFICATION.md`'s "Deferred — open items owned by Phase 31" table still lists constraint 9
+items 1 and 2 as open (they are closed — this file's constraint 9 text is authoritative), and
+its W-01/W-02 record that the "stream parser is unreachable in production" claim is overbroad
+(checkpoint detection and `session_id` are wired and live today) and that `30-05-SUMMARY.md`
+names the wrong gate predicate (`claude_stream_gate_shape`, not `is_claude_event_stream`).
+
+**Explicitly out of scope:** 999.65 and 999.66 (each its own phase, sequenced after this one
+because they cannot be observed until 999.64 lands), 999.46 (hygiene, not reliability), 999.70
+(gate-mention-vs-declaration — filed as backlog, explicitly **not** a Phase 31 blocker), 999.71
+(torn-line frequency measurement), and anything release-related.
+
+**Priority:** Highest — closes the 999.64 arc and the v2.3.0 milestone. **Size: M** (operator
+sizing cap; Phase 30 sized this unit as its own M when the split was made).
+**Requirements:** TBD — no REQ-IDs, consistent with this project's convention for
+infrastructure phases; tracked by the constraint numbers above.
+**Depends on:** Phase 30 (parser + confirmed delivery verdict). Structurally gated on
+`30c-VERDICT.md`, which is satisfied.
+
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (run /gsd-plan-phase 31 to break down)
+
+---
+
 ### Phase 30 (original number, SHELVED 2026-08-01 → spike): Withdraw DevFlow From the Release Business
 
 **SHELVED 2026-08-01, before execution.** Operator decision: the project's stated objective for
