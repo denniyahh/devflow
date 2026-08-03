@@ -108,6 +108,12 @@ pub(crate) fn parallel(
         // start`), so every phase it launches keeps the routine gated Ship
         // behavior — `false` here changes nothing about `parallel`'s
         // existing behavior.
+        //
+        // The trailing `false` is D-11's legacy-launch opt-out, off for the
+        // same reason and one stronger: `parallel` is precisely the multi-run
+        // shape whose delegated work the legacy path orphans (999.64). An
+        // operator who genuinely wants it can still set
+        // `DEVFLOW_CLAUDE_LEGACY_LAUNCH`, which `start` reads per phase.
         start(
             project_root,
             phase,
@@ -117,6 +123,7 @@ pub(crate) fn parallel(
             true,
             false,
             None,
+            false,
             false,
         )?;
     }
