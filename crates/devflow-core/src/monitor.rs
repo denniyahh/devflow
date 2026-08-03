@@ -44,25 +44,57 @@ pub enum MonitorError {
 /// Plan 31-02 supplies the configurable-and-clamped reader that can only raise
 /// this. Until then `spawn_monitor` passes this literal to the monitor process.
 ///
-/// Do NOT "correct" this upward on the assumption it is tight. The ≥30s floor
-/// was derived from the *milestone* signal (pooled max 13.73s); against the
-/// every-line signal this monitor actually uses, the observed max is 7.09s, so
-/// 30s is ~4.2x margin.
-pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30;
+/// Raised 30s -> 120s on 2026-08-03 by direct measurement; see
+/// [`IDLE_TIMEOUT_FLOOR_SECS`] for the trials and the reasoning. The previous
+/// value's "~4.2x margin" was computed against a workload that never entered a
+/// long foreground tool call, and did not transfer to one.
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 120;
 
 /// The floor an idle timeout can never be configured below (D-02/D-04, 31-02).
 ///
-/// Do NOT "correct" this upward on the assumption it is tight — it is tight
-/// only against a signal this phase does not use. The ≥30s floor was derived
-/// from the *milestone* gap distribution (pooled max 13.73s), but D-01 selects
-/// the *every-line* signal, whose observed max is 7.09s. Against the signal
-/// actually in force that is roughly 4.2x margin: comfortable, not marginal.
+/// **Raised 30s -> 120s on 2026-08-03, and the reasoning that set 30s was
+/// wrong — read this before touching it again.**
 ///
-/// Do NOT lower it either, and note that no configuration can. Phase 30d
-/// measured a 12-second bound killing a LIVE, HEALTHY run in 2 of 7 trials.
+/// The original ≥30s floor cited "~4.2x margin" against an every-line signal
+/// whose observed max was 7.09s. Both numbers were real; the inference was not.
+/// Phase 30d measured *backgrounded* 10s/22s sleeps, where the agent is never
+/// sitting inside a long foreground tool call. Under one, the CLI emits
+/// `tool_progress` keepalives on a **fixed 30.00s interval**, so a healthy,
+/// hard-working child produces a 30.00s gap between stream lines — dead level
+/// with a 30s timeout, and on the wrong side of it, since the timer starts when
+/// the previous line is *processed* while the keepalive arrives 30s after it
+/// was *sent*, plus pipe latency.
+///
+/// Measured 2026-08-03, CLI 2.1.220, five workload-controlled trials across two
+/// unrelated workload types (each verified to have actually run — elapsed >=
+/// the workload duration, no `tool_use_error`), plus a negative control:
+///
+/// | workload                  | gaps > 5s              |
+/// |---------------------------|------------------------|
+/// | 90s busy loop x3          | ~26.4, **30.00**, ~30.0 |
+/// | `cargo test --workspace` x2 | ~26.4, **30.00**, ~16  |
+/// | control (no long call)    | max 2.2                |
+///
+/// Variance across all five: ±0.02s. `cargo test --workspace` is not a contrived
+/// case — it sits inside DevFlow's own post-merge gate, so the old floor would
+/// have killed healthy Code stages on the common path.
+///
+/// 120s is 4x the measured cadence: it survives **three** consecutive missed
+/// keepalives. That headroom is the point — the hazard is not a slightly larger
+/// gap but a *dropped* keepalive, which doubles the interval outright. 90s
+/// (two missed) is the lowest defensible value; do not go below it.
+///
+/// Do NOT lower it, and note that no configuration can. Phase 30d measured a
+/// 12-second bound killing a LIVE, HEALTHY run in 2 of 7 trials.
+///
+/// **What the five trials do not establish:** one machine, idle, one CLI
+/// version, two workload types. They show the 30.00s cadence is real and
+/// reproducible; they do not prove the interval is fixed across load, hardware,
+/// or CLI versions. That is precisely why this floor sits well above the
+/// observed maximum rather than near it.
 ///
 /// Because the default IS the floor, the value can only ever be raised.
-pub const IDLE_TIMEOUT_FLOOR_SECS: u64 = 30;
+pub const IDLE_TIMEOUT_FLOOR_SECS: u64 = 120;
 
 /// The environment variable that raises the idle timeout above its floor.
 pub const IDLE_TIMEOUT_ENV: &str = "DEVFLOW_CLAUDE_IDLE_TIMEOUT_SECS";
@@ -88,7 +120,7 @@ pub enum IdleTimeoutResolution {
     /// A value was set but could not be parsed; the default is in force.
     ///
     /// Loud for the same reason the clamp is. An operator who meant `600` and
-    /// typed `60O` silently gets 30s, and a legitimately slow stage then dies
+    /// typed `60O` silently gets the 120s default, and a legitimately slow stage then dies
     /// on a timeout nobody chose. `parse_gate_max_unattended_age` substitutes
     /// silently in this case and is the anti-pattern here, not the precedent.
     Unparseable {
@@ -740,10 +772,10 @@ pub fn run_pipe_owning_monitor(
 /// this repo treats irreversible operations as needing review, not tests.
 ///
 /// Scoped to the `PipeOwning` arm alone: `Legacy` keeps today's behaviour, and
-/// Codex/OpenCode keep theirs. The 30-second floor was measured against
-/// Claude's stream cadence, and applying it to an agent whose output cadence
-/// has never been measured would be a behaviour prediction — the thing
-/// constraint 1 forbids.
+/// Codex/OpenCode keep theirs. The 120-second floor was measured against
+/// Claude's stream cadence (a fixed 30.00s `tool_progress` keepalive), and
+/// applying it to an agent whose output cadence has never been measured would
+/// be a behaviour prediction — the thing constraint 1 forbids.
 ///
 /// Every step is best-effort and none can abort the sequence. A failure to
 /// enumerate, write, or log must still leave the child terminated and the
@@ -1788,7 +1820,7 @@ exit 0
     fn idle_timeout_secs_clamps_below_floor_and_logs() {
         let setting = parse_idle_timeout_secs(Some("5".to_string()));
 
-        assert_eq!(setting.timeout, Duration::from_secs(30));
+        assert_eq!(setting.timeout, Duration::from_secs(120));
         assert!(setting.clamped(), "the clamp must be observable as a value");
         assert_eq!(
             setting.resolution,
@@ -1799,7 +1831,7 @@ exit 0
         // actually in force — a clamp that says only "clamped" leaves the
         // operator guessing which of the three numbers won.
         let notice = setting.notice().expect("a clamp owes a loud notice");
-        for fragment in ["5", "30", IDLE_TIMEOUT_ENV] {
+        for fragment in ["5", "120", IDLE_TIMEOUT_ENV] {
             assert!(
                 notice.contains(fragment),
                 "notice must name {fragment:?}; got: {notice}"
@@ -1811,9 +1843,9 @@ exit 0
     /// and reports no clamp.
     #[test]
     fn idle_timeout_secs_accepts_values_above_floor() {
-        let setting = parse_idle_timeout_secs(Some("120".to_string()));
+        let setting = parse_idle_timeout_secs(Some("300".to_string()));
 
-        assert_eq!(setting.timeout, Duration::from_secs(120));
+        assert_eq!(setting.timeout, Duration::from_secs(300));
         assert!(!setting.clamped());
         assert_eq!(setting.resolution, IdleTimeoutResolution::Configured);
         assert_eq!(
@@ -1825,7 +1857,7 @@ exit 0
         // Boundary: exactly the floor is CONFIGURED, not CLAMPED. An
         // off-by-one here would report a clamp that never happened and train
         // operators to ignore the notice.
-        let exact = parse_idle_timeout_secs(Some("30".to_string()));
+        let exact = parse_idle_timeout_secs(Some("120".to_string()));
         assert_eq!(exact.resolution, IdleTimeoutResolution::Configured);
         assert!(!exact.clamped());
     }
@@ -1863,11 +1895,11 @@ exit 0
     /// wall-clock bound. A child that keeps talking for FOUR times the idle
     /// timeout is never terminated.
     ///
-    /// The timeout is injected short (400ms) rather than using the 30s
+    /// The timeout is injected short (400ms) rather than using the 120s
     /// production default — this measures the RESET MECHANISM, and does so at
-    /// a scale the suite can afford. **What it does not establish:** that 30s
-    /// is the right production value. That rests on Phase 30d's measured gap
-    /// distributions, not on this test.
+    /// a scale the suite can afford. **What it does not establish:** that 120s
+    /// is the right production value. That rests on the 2026-08-03 keepalive
+    /// measurement recorded on [`IDLE_TIMEOUT_FLOOR_SECS`], not on this test.
     #[test]
     fn idle_timer_resets_on_every_stream_line() {
         let dir = tempfile::tempdir().unwrap();

@@ -28,11 +28,39 @@ folds in (XS, same file).
   the tighter signal carries more margin under a given timeout. It also rejects the
   "chatty but stuck" blind spot that a both-signals rule would have created.
 
-- **D-02:** Idle timeout is **30s**, the measured constraint-8 floor.
-  **Note for downstream readers:** the ≥30s floor was derived from the *milestone* signal (pooled
-  max 13.73s). Against the every-line signal chosen in D-01 the observed max is 7.09s, so 30s is
-  ~4.2x margin — comfortable, not marginal. Do not "correct" this to a larger value on the
-  assumption that 30s is tight; it is tight only against a signal this phase is not using.
+- **D-02:** ~~Idle timeout is **30s**, the measured constraint-8 floor.~~
+  **AMENDED 2026-08-03 by operator decision, mid-execution: the floor is 120s.**
+
+  **Original text, retained because the amendment is a correction to it:** *"the ≥30s floor was
+  derived from the milestone signal (pooled max 13.73s). Against the every-line signal chosen in
+  D-01 the observed max is 7.09s, so 30s is ~4.2x margin — comfortable, not marginal. Do not
+  'correct' this to a larger value on the assumption that 30s is tight; it is tight only against a
+  signal this phase is not using."*
+
+  **Why it was amended.** Both of those numbers were real; the inference from them was not.
+  `30d-MEASUREMENTS.md` measured **backgrounded 10s/22s sleeps** — a workload where the agent never
+  sits inside a long *foreground* tool call. Direct measurement on 2026-08-03 (CLI 2.1.220, five
+  workload-controlled trials, two unrelated workload types, negative control) found the CLI emits
+  `tool_progress` keepalives on a **fixed 30.00s interval**, variance ±0.02s. So a healthy,
+  hard-working child produces a 30.00s gap between stream lines — level with a 30s timeout and on
+  the wrong side of it, since the timer starts when the previous line is *processed* while the
+  keepalive arrives 30s after it was *sent*, plus pipe latency. The old floor would have killed
+  healthy Code stages running any tool call longer than ~30s, including `cargo test --workspace`,
+  which sits inside DevFlow's own post-merge gate.
+
+  **The new value is 120s** — 4x the measured cadence, surviving three consecutive missed
+  keepalives. The hazard is a *dropped* keepalive doubling the interval, not a marginally larger
+  gap. 90s (two missed) is the lowest defensible value. Full trials, controls, and limits:
+  `31-IDLE-GAP-MEASUREMENTS.md`.
+
+  **The original "do not correct this upward" instruction is withdrawn.** It was written in good
+  faith against the evidence then available and would have prevented this fix. Its replacement, in
+  `IDLE_TIMEOUT_FLOOR_SECS`'s doc comment, states what the value rests on and what would justify
+  changing it — rather than forbidding the change.
+
+  *Found by the adversarial review of plan 31-05, run before wave 3 under the standing rule to
+  review both the phase definition and the plan set. The reviewer correctly flagged it as a risk it
+  could not observe; measuring it is what turned the risk into a decision.*
 
 - **D-03:** **No outer wall-clock bound.** Idle-only. Constraint 5 rejected fixed wall-clock
   because no single value is safe for both hangs and legitimate ~47-minute stages; a healthy long
