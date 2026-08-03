@@ -393,6 +393,48 @@ Unsequenced items — not part of the active phase sequence. Promote with
 `/gsd-review-backlog` when ready; each carries accumulated context in its
 own `phases/999.N-*/CONTEXT.md`.
 
+### Phase 999.74: `classify_validate_outcome` Trusts the Agent's Verdict Over Its Own Status (BACKLOG)
+
+**Linear:** [DEN-95](https://linear.app/denniskim/issue/DEN-95/99974-classify-validate-outcome-trusts-the-agents-verdict-over-its-own)
+**Found:** 2026-08-03, Phase 31 plan 31-02 execution. Re-confirmed independently at HEAD `e9abb0b`
+the same day, and again by the adversarial review of plan 31-04. **Pre-existing** — not introduced
+by Phase 31.
+
+**The defect in one sentence:** `classify_validate_outcome`
+(`crates/devflow-cli/src/pipeline_outcomes.rs:206`) matches
+`(_, Some(Verdict::Pass)) => ValidateOutcome::Passed` **first**, with `_` discarding the status
+entirely — so an agent writing `DEVFLOW_RESULT: {"status":"<anything>","verdict":"pass"}` has its
+Validate stage classified `Passed` whatever the status says.
+
+**Why it matters.** Same trust-inversion family as 999.67, which let an agent plant its own Layer-0
+provenance and is now closed by `a557805`. The layered result model exists so an agent's
+self-report is not what decides the gate; here the self-reported `verdict` outranks the status the
+cascade derived. Applies identically today to `Failed`, `Unknown` and `ResourceKilled`, and to the
+new `AgentStatus::IdleTimeout`. `ValidateOutcome::Passed` flows to `ValidateResult::Passed`
+(`pipeline_outcomes.rs:260`). Neither `parse_devflow_result` nor `parse_claude_event_result`
+normalises `verdict` — both normalise only `decided_by_layer`.
+
+**How it surfaced — twice, both times as code bending around it.** 31-02's `idle_timeout_result`
+sets `verdict: None` with a doc comment naming this exact reason
+(`crates/devflow-core/src/agent_result.rs:1746-1750`). And plan 31-04 was about to walk into it:
+its exit-code arbitration says return `status: Failed` with "every other field carried over",
+which includes `verdict` — making its own success criterion false at Validate. Caught by
+adversarial review before execution.
+
+**Why not fixed inside Phase 31.** Changing the arm silently re-routes three existing statuses
+whose current behaviour nothing has audited — a behavioural change with its own blast radius, not
+a one-line correction. Phase 31 is capped at M with a live acceptance run already gating it, and
+`IdleTimeout` neither creates nor widens the hole.
+
+**Open question the fix must answer, not assume:** whether this can manufacture a *pass* on a run
+that would otherwise have gated. 999.67's analogous entry could only flip `Failed` → `Ambiguous`,
+which still gates. The `_` wildcard here looks stronger — it reaches `Passed` directly — but that
+needs establishing by reading the Validate routing end to end.
+
+**Proposed fix:** gate the `Pass` arm on the status the cascade produced, mirroring what
+`normalise_stream_marker_provenance` did for `decided_by_layer`; audit all three affected statuses
+explicitly; add a mirror test per status so the arm cannot silently regain the wildcard.
+
 ### Phase 999.73: Widen `STREAM_JSON_STAGES` Beyond `Stage::Code` (BACKLOG)
 
 **Linear:** [DEN-94](https://linear.app/denniskim/issue/DEN-94/99973-widen-stream-json-stages-beyond-stagecode-once-the-phase-31)
