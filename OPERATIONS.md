@@ -51,6 +51,13 @@ Define → Plan → Code → Validate → Ship
 
 (`devflow advance` is internal — invoked by monitors with `--phase N`.)
 
+(`devflow monitor` is internal and registered as the hidden `__monitor`
+subcommand — it is the pipe-owning monitor's own process body, re-exec'd
+detached by `spawn_monitor` for a Claude `stream-json` launch. It supervises
+the agent's stdin/stdout, then calls the same `advance` the shell monitor's
+tail invokes. Never run it by hand: it expects to own a child's pipes and
+writes the phase's capture, exit-code and agent-pid files as it goes.)
+
 ## Preflight refusals
 
 Checks `devflow start` performs, in order, before it scaffolds anything (a

@@ -12,7 +12,7 @@ mod staleness;
 mod preflight;
 
 mod pipeline_launch;
-use pipeline_launch::{advance, resume};
+use pipeline_launch::{advance, resume, run_monitor};
 
 mod pipeline_outcomes;
 
@@ -102,6 +102,35 @@ enum Command {
         /// spawn time so advance never depends on a shared state singleton.
         #[arg(long)]
         phase: Option<u32>,
+    },
+    /// Internal: the pipe-owning monitor's own process entry point (Phase 31).
+    ///
+    /// `monitor::spawn_monitor`'s `PipeOwning` arm re-execs this binary as this
+    /// subcommand, detached. Everything after `--` is the supervised child's
+    /// program and argv. Hidden for the same reason `advance` is: it is an
+    /// implementation detail of the monitor chain, never an operator verb.
+    #[command(name = "__monitor", hide = true)]
+    Monitor {
+        /// Project root whose `.devflow/` capture files this monitor writes.
+        #[arg(long)]
+        project: PathBuf,
+        /// Phase whose stage machine to advance once the child is reaped.
+        #[arg(long)]
+        phase: u32,
+        /// Directory the supervised child runs in (the phase worktree when
+        /// worktree mode is active, else the project root).
+        #[arg(long)]
+        workdir: PathBuf,
+        /// File holding the stage prompt. A file, not argv: argv has a hard
+        /// length ceiling and DevFlow stage prompts routinely exceed it.
+        #[arg(long)]
+        prompt_file: PathBuf,
+        /// Seconds of stream silence before the idle timeout fires.
+        #[arg(long)]
+        idle_timeout_secs: u64,
+        /// The supervised child's program and arguments, after `--`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        argv: Vec<String>,
     },
     /// Resume a phase from its saved stage after a rate limit or infrastructure pause.
     ///
@@ -498,6 +527,21 @@ fn run() -> Result<(), CliError> {
             )
         }
         Command::Advance { project, phase } => advance(&project_root(project)?, phase),
+        Command::Monitor {
+            project,
+            phase,
+            workdir,
+            prompt_file,
+            idle_timeout_secs,
+            argv,
+        } => run_monitor(
+            &project_root(project)?,
+            phase,
+            &workdir,
+            &prompt_file,
+            idle_timeout_secs,
+            &argv,
+        ),
         Command::Resume { phase, project } => resume(&project_root(project)?, phase),
         Command::Gate { action } => match action {
             GateCmd::List { all_roots, project } => gate_list(&project_root(project)?, all_roots),

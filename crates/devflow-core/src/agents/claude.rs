@@ -1,7 +1,9 @@
 //! Claude Code agent adapter.
 //!
-//! Launches `claude -p "<prompt>"` in non-interactive mode with structured
-//! JSON output. Claude runs headless — no trust dialogs, no user prompts.
+//! Launches `claude -p` headless with a bidirectional `stream-json` transport:
+//! the initial user turn travels on the child's **stdin**, and its events come
+//! back on stdout one JSON object per line. Claude runs headless — no trust
+//! dialogs, no user prompts.
 
 use super::AgentAdapter;
 
@@ -12,19 +14,50 @@ impl AgentAdapter for ClaudeAgent {
         "Claude Code"
     }
 
+    /// Build the headless `stream-json` launch (Phase 31, constraint 1).
+    ///
+    /// **The prompt is deliberately absent from the returned argv.** Under
+    /// `--input-format stream-json` the CLI takes its initial user turn from
+    /// stdin as a JSON document, not from a positional argument; the monitor
+    /// writes that turn via [`crate::monitor::user_turn_line`]. The `prompt`
+    /// parameter is kept in the signature because [`AgentAdapter`] is shared
+    /// with adapters that DO pass it positionally (Codex, OpenCode) — it is
+    /// unused here on purpose, not by oversight.
+    ///
+    /// Evidence: all three archived Phase 30 harnesses
+    /// (`.planning/phases/30-keep-the-session-alive-past-turn-end/`,
+    /// `30b`/`30c`/`30d`) launch with exactly this flag set and no positional
+    /// prompt, then write
+    /// `{"type":"user","message":{"role":"user","content":<prompt>}}` to the
+    /// child's stdin. `30c-monitor-env-harness.py`'s `DEFAULT_CLI_ARGV` is the
+    /// literal argv reproduced here.
+    ///
+    /// `--verbose` is load-bearing, not decoration: every archived trial that
+    /// produced a usable capture carried it, and dropping it is untested
+    /// territory. Do not "clean it up".
+    ///
+    /// The switch is unconditional and stage-blind — constraint 1 forbids
+    /// predicting at launch time which stages will background work. The
+    /// *sequencing* choice about which stages route here lives at the call
+    /// site (`claude_stream_launch_enabled` in `pipeline_launch.rs`); the
+    /// shape a not-yet-widened stage gets instead is
+    /// [`ClaudeAgent::exec_command_single_document`], which is a live path
+    /// rather than a deprecated one.
     fn exec_command(
         &self,
         _phase: u32,
-        prompt: &str,
+        _prompt: &str,
         _extra_writable_roots: &[std::path::PathBuf],
     ) -> (&'static str, Vec<String>) {
         (
             "claude",
             vec![
                 "-p".into(),
-                prompt.to_string(),
+                "--input-format".into(),
+                "stream-json".into(),
                 "--output-format".into(),
-                "json".into(),
+                "stream-json".into(),
+                "--verbose".into(),
                 "--dangerously-skip-permissions".into(),
             ],
         )
@@ -37,6 +70,39 @@ impl AgentAdapter for ClaudeAgent {
 }
 
 impl ClaudeAgent {
+    /// The pre-31 single-document launch: `-p <prompt>` positionally with
+    /// `--output-format json`.
+    ///
+    /// **This is a live path, not a deprecated leftover.** Two things select
+    /// it, and both are deliberate:
+    ///
+    /// - **D-09/D-10's sequencing gate.** The stream-json launch is rolled out
+    ///   one stage at a time, starting at `Stage::Code`. Every stage not yet
+    ///   widened launches through here. That is a sequencing choice about
+    ///   rollout order, which constraint 1 permits — it is emphatically not a
+    ///   prediction about which stages background work, which constraint 1
+    ///   forbids.
+    /// - **D-11's opt-out.** An explicit flag (off by default) can force this
+    ///   shape back on for recovery without cutting a release. Automatic
+    ///   fallback on parse failure is rejected: a silent downgrade is the same
+    ///   invisible-degradation class as the bug Phase 31 exists to fix.
+    ///
+    /// The argv is the pre-31 [`AgentAdapter::exec_command`] body verbatim, so
+    /// the shipped capture shape (`CaptureKind::SingleDocEnvelope`) and the
+    /// 30b isolation tests that guard it (D-12) keep holding bit-for-bit.
+    pub fn exec_command_single_document(prompt: &str) -> (&'static str, Vec<String>) {
+        (
+            "claude",
+            vec![
+                "-p".into(),
+                prompt.to_string(),
+                "--output-format".into(),
+                "json".into(),
+                "--dangerously-skip-permissions".into(),
+            ],
+        )
+    }
+
     /// Build the resume relaunch command for a confirmed checkpoint
     /// auto-decide (D-03/D-04, 28-03). NOT a trait method — `--resume` is a
     /// Claude-CLI-specific, documented feature with no equivalent on
