@@ -56,13 +56,19 @@ non-substitutable by integration tests.
 | 31-02 T2 | 31-02 | 2 | Constraints 5/8, D-05, D-07 | T-31-06 | The idle-timeout verdict is read before `read_capture`, so a stale stream `result` cannot shadow it | unit (fixture **must** carry a prior real `result` event, plus a negative control) | `cargo test -p devflow-core --lib agent_result::tests::idle_timeout_side_channel_wins_over_stale_stream_result -- --exact` | ❌ W0 | ⬜ pending |
 | 31-02 T3 | 31-02 | 2 | D-01, D-02, D-03, D-04, D-05 | T-31-07, T-31-08, T-31-09 | Timer resets per line; 30s clamped floor logged loudly; verdict written **before** the child is signalled; no commit rolled back | unit (pure parser + injected short timeout) | `cargo test -p devflow-core --lib monitor::tests::idle_timeout_secs_clamps_below_floor_and_logs -- --exact` | ❌ W0 | ⬜ pending |
 | 31-03 T1 | 31-03 | 2 | D-13 | T-31-10, T-31-11 | The declared token counts only inside a top-level `result`; a prompt echo never satisfies it | unit (injected launcher, canned captures) | `cargo test -p devflow-core --lib canary::tests::canary_absent_when_token_appears_only_as_a_prompt_echo -- --exact` | ❌ W0 | ⬜ pending |
-| 31-03 T2 | 31-03 | 2 | D-15 | T-31-12, T-31-13 | Once per run; refuses on absent or unverified with distinguishable messages; outcome in provenance | unit | `cargo test -p devflow --lib pipeline_launch::tests::absent_canary_refuses_to_launch -- --exact` | ❌ W0 | ⬜ pending |
+| 31-03 T2 | 31-03 | 2 | D-15 | T-31-12, T-31-13 | Once per run; refuses on absent or unverified with distinguishable messages; outcome in provenance | unit | `cargo test -p devflow --bin devflow pipeline_launch::tests::absent_canary_refuses_to_launch -- --exact` | ❌ W0 | ⬜ pending |
 | 31-04 T1 | 31-04 | 3 | Constraint 9 (residual), D-12 | T-31-15, T-31-16 | A stream-derived `Success` cannot override a contradicting non-zero exit code; `RateLimited` and `IdleTimeout` are untouched | unit, end-to-end through `evaluate_agent_result` with a zero-exit negative control | `cargo test -p devflow-core --lib agent_result::tests::stream_success_cannot_stand_against_nonzero_exit_code -- --exact` | ❌ W0 | ⬜ pending |
-| 31-04 T2 | 31-04 | 3 | D-11 | T-31-17, T-31-18 | The opt-out is explicit, off by default, loud on three channels; no automatic fallback exists | unit + `--help` output | `cargo test -p devflow --lib pipeline_launch::tests::legacy_launch_is_off_by_default -- --exact` | ❌ W0 | ⬜ pending |
+| 31-04 T2 | 31-04 | 3 | D-11 | T-31-17, T-31-18 | The opt-out is explicit, off by default, loud on three channels; no automatic fallback exists | unit + `--help` output | `cargo test -p devflow --bin devflow pipeline_launch::tests::legacy_launch_is_off_by_default -- --exact` | ❌ W0 | ⬜ pending |
 | 31-05 T1-T3 | 31-05 | 4 | D-16, D-17, D-18, D-19 | T-31-19..T-31-23 | Both plans produce a `SUMMARY.md` and both merge, on the main checkout, with no orchestrator git during the run | **manual-only, by design** | N/A — review constraint H4 makes it non-substitutable by integration tests | N/A | ⬜ pending |
 | — (no task) | — | — | ROADMAP §999.67 | — | Agent cannot forge `decided_by_layer` Layer-0 provenance | unit | `cargo test -p devflow-core --lib agent_result::tests::generic_marker_cannot_forge_layer0_provenance` | ✅ **exists, passes** | ✅ green |
 
 *Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
+
+**Package/target trap, corrected 2026-08-03.** The two `devflow` rows above originally read
+`cargo test -p devflow --lib`, which exits **101** — `devflow` is a binary crate with no lib
+target. `--bin devflow` is correct. 31-03's executor hit this live and recorded it as a
+deviation; `31-03-PLAN.md` still carries the broken form and is deliberately left alone, since it
+is executed and its SUMMARY is the record of what actually ran.
 
 **999.67 row is closed, not pending.** Verified 2026-08-03 at HEAD `0852c03`: `parse_devflow_result`
 (`agent_result.rs:147-162`) applies `normalise_stream_marker_provenance` on both arms; the named
