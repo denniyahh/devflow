@@ -126,3 +126,17 @@ above for whoever formally closes this phase.
 
 *Verified: 2026-08-04*
 *Verifier: Claude (gsd-verifier)*
+
+## Addendum (2026-08-04, same day)
+
+The REQUIREMENTS.md staleness noted above is now closed — `gsd-tools query phase.complete 32`
+ran after this report and flipped HYGIENE-01/02/03 to checked, updated the ROADMAP.md `## Progress`
+row to `Complete`, and set STATE.md `status: completed`.
+
+`32-01-PLAN.md` and `32-01-SUMMARY.md` were added after this report was written (operator-approved
+workaround for `init.manager`'s `implementationComplete = planCount > 0 && summaryCount >=
+planCount` predicate, which otherwise hardcodes `verification_status: "not_required"` and never
+reads this file for a zero-plan phase — filed to the upstream GSD issue ledger). This paragraph
+exists so this file's own commit postdates theirs, clearing the `findStaleVerificationSummary`
+staleness check. No finding above changed as a result of adding them; both documents describe work
+already complete and committed at the time this verification originally ran.
