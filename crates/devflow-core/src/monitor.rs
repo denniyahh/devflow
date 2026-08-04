@@ -520,14 +520,39 @@ fn spawn_monitor_inner(
 /// neither satisfy nor block either arm — but it is still teed verbatim to the
 /// capture file by the reader thread. A torn line therefore cannot silently
 /// decide anything, and cannot be silently lost either.
+/// The three states a `background_tasks_changed` announcement can leave the
+/// close rule in. Kept as a named enum rather than `Option<usize>` (999.75 /
+/// DEN-96, fixed 2026-08-04): a plain `Option` cannot distinguish "no
+/// announcement has ever arrived" from "an announcement arrived but its
+/// `tasks` field was not a readable array", and both used to collapse onto
+/// `None`. `should_close()` treats `None` as permission to close — so an
+/// unparseable *first* announcement closed stdin exactly when a background
+/// task was actually pending, which is the 999.64 orphan shape reachable
+/// through the guard built to prevent it.
+#[derive(Default, PartialEq, Eq, Debug, Clone, Copy)]
+enum BackgroundTaskState {
+    /// No `background_tasks_changed` event has been observed at all. Vacuously
+    /// drained: a stage that never backgrounds anything must still be able to
+    /// close on its marker, or every non-backgrounding stage would hang for
+    /// the full idle timeout.
+    #[default]
+    NeverAnnounced,
+    /// The last announcement carried a readable `tasks` array of this length.
+    /// `Pending(0)` is a real drain; `Pending(n>0)` blocks closing.
+    Pending(usize),
+    /// An announcement arrived — `type: "system"`,
+    /// `subtype: "background_tasks_changed"` — but its `tasks` field was not a
+    /// readable JSON array. Distinct from `NeverAnnounced` specifically so it
+    /// does NOT satisfy `should_close()`: the CLI said tasks might exist and
+    /// this rule could not read the count, so the safe assumption is that
+    /// something is still pending, not that nothing ever was.
+    Unreadable,
+}
+
 #[derive(Default)]
 pub struct CloseRule {
     marker_seen: bool,
-    /// `None` = nothing was ever announced; `Some(n)` = the last announcement
-    /// carried `n` tasks. The two are deliberately distinguishable: `None` is
-    /// vacuously drained, and conflating it with `Some(0)` would erase the
-    /// difference between "no children" and "children, all finished".
-    pending_background_tasks: Option<usize>,
+    background_tasks: BackgroundTaskState,
 }
 
 impl CloseRule {
@@ -542,20 +567,28 @@ impl CloseRule {
         if event.get("type").and_then(serde_json::Value::as_str) == Some("system")
             && event.get("subtype").and_then(serde_json::Value::as_str)
                 == Some("background_tasks_changed")
-            && let Some(tasks) = event.get("tasks").and_then(serde_json::Value::as_array)
         {
-            // Only a readable `tasks` array updates the count. An announcement
-            // whose list cannot be read leaves the previous state standing
-            // rather than being treated as a drain — the conservative
-            // direction, since an early close truncates while a late one
-            // merely costs an idle timeout.
-            self.pending_background_tasks = Some(tasks.len());
+            self.background_tasks = match event.get("tasks").and_then(serde_json::Value::as_array) {
+                Some(tasks) => BackgroundTaskState::Pending(tasks.len()),
+                // The announcement exists but its `tasks` field could not be
+                // read as an array. Distinct from "never announced" — see the
+                // enum doc comment. This is the fix: previously this arm did
+                // nothing, leaving `pending_background_tasks` at its prior
+                // value, which on the FIRST announcement was `None` —
+                // indistinguishable from vacuous drain, and so treated as
+                // permission to close exactly when it should not have been.
+                None => BackgroundTaskState::Unreadable,
+            };
         }
     }
 
     /// Whether both arms hold and the child's stdin may be released.
     pub fn should_close(&self) -> bool {
-        self.marker_seen && matches!(self.pending_background_tasks, None | Some(0))
+        self.marker_seen
+            && matches!(
+                self.background_tasks,
+                BackgroundTaskState::NeverAnnounced | BackgroundTaskState::Pending(0)
+            )
     }
 }
 
@@ -1202,6 +1235,58 @@ mod tests {
             "a marker while a background task is still announced must not \
              close stdin — the pending child's task-notification turn would \
              have nowhere to be delivered"
+        );
+    }
+
+    /// 999.75 / DEN-96, fixed 2026-08-04. The FIRST `background_tasks_changed`
+    /// announcement carries an unparseable `tasks` field (`null`, not an
+    /// array). Before the fix, an unreadable announcement left the field at
+    /// its prior value — which on the first announcement was the same `None`
+    /// used for "nothing was ever announced", so `should_close()` treated it
+    /// as a vacuous drain and closed stdin with a task genuinely pending. This
+    /// is the 999.64 orphan shape, reachable through the guard built to
+    /// prevent it.
+    #[test]
+    fn unreadable_first_announcement_does_not_satisfy_the_drain_arm() {
+        let unreadable_first = observe_all(&[
+            INIT_LINE.to_string(),
+            r#"{"type":"system","subtype":"background_tasks_changed","tasks":null}"#.to_string(),
+            result_line(MARKER),
+        ]);
+        assert!(
+            !unreadable_first.should_close(),
+            "an unreadable FIRST announcement must not be indistinguishable \
+             from never-announced — closing here would release stdin while \
+             the CLI has said a task exists whose count could not be read"
+        );
+
+        // Negative control: the identical sequence, but with NO announcement
+        // at all, must still close — this is the ordinary non-backgrounding
+        // stage, and the fix must not regress it into hanging for the idle
+        // timeout on every run that never backgrounds anything.
+        let never_announced = observe_all(&[INIT_LINE.to_string(), result_line(MARKER)]);
+        assert!(
+            never_announced.should_close(),
+            "a stage that never announces background tasks at all must still \
+             close on its marker alone — conflating NeverAnnounced with \
+             Unreadable would hang every ordinary stage for the full idle \
+             timeout"
+        );
+
+        // A LATER unreadable announcement, after a real pending count was
+        // already known, must also block — the fix must not accidentally
+        // treat Unreadable as forgiving once real state exists.
+        let unreadable_after_pending = observe_all(&[
+            INIT_LINE.to_string(),
+            bg_tasks_line(1),
+            r#"{"type":"system","subtype":"background_tasks_changed","tasks":"not-an-array"}"#
+                .to_string(),
+            result_line(MARKER),
+        ]);
+        assert!(
+            !unreadable_after_pending.should_close(),
+            "an unreadable announcement following a real pending count must \
+             still block closing, not silently forget the pending task"
         );
     }
 
