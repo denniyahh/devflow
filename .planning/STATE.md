@@ -2,19 +2,19 @@
 gsd_state_version: 1.0
 milestone: gsd-hygiene
 milestone_name: milestone (GSD Workflow Hygiene, ACTIVE — declared 2026-08-04)
-current_phase: 32
-current_phase_name: ROADMAP Layout Hygiene
-status: completed
+status: Awaiting next milestone
 stopped_at: Phase 32 context gathered
-last_updated: "2026-08-04T19:09:30.481Z"
+last_updated: "2026-08-04T19:36:53.626Z"
 last_activity: 2026-08-04
-last_activity_desc: Phase 32 complete
+last_activity_desc: Milestone gsd-hygiene completed and archived
 progress:
   total_phases: 1
-  completed_phases: 0
-  total_plans: 0
-  completed_plans: 0
-  percent: 0
+  completed_phases: 1
+  total_plans: 1
+  completed_plans: 1
+  percent: 100
+current_phase: 32
+current_phase_name: ROADMAP Layout Hygiene
 ---
 
 # DevFlow — Project State
@@ -153,16 +153,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 32 of 1 (ROADMAP Layout Hygiene)
-Plan: Not started
-Status: All phases complete
-Last activity: 2026-08-04 — Phase 32 complete
-section now live inside their own heading-to-next-heading window, and a `## Progress` table
-added. Verified live: `roadmap.analyze` phase_count 0->1 (garbage cross-milestone matches ->
-correct Phase 32 only), `milestone complete Hygiene --dry-run` no longer sweeps unrelated
-directories (17-dir sweep confirmed via negative control on pre-fix content), and
-`smart-entry`'s roadmap_total_phases/roadmap_completed_phases flipped null->30/29 (roadmap-derived
-completion path now active instead of the legacy STATE.md fallback).
+Phase: Milestone gsd-hygiene complete
+Plan: —
+Status: Awaiting next milestone
+Last activity: 2026-08-04 — Milestone gsd-hygiene completed and archived
 
 ## Recently Shipped
 
@@ -847,8 +841,4 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 
 ## Operator Next Steps
 
-- ROADMAP.md now has a live Phase 32 (ROADMAP Layout Hygiene) inside the active milestone's own
-  window, plus a `## Progress` table — closes backlog 999.72/999.72a for this repo's active
-  milestone (999.72's OWN closed-milestone windows, v2.3.0/v2.0.0, are unchanged and still
-  reproduce the pass-all degrade if targeted directly; only the active milestone was in scope).
-  Next: `/gsd-discuss-phase 32`.
+- Start the next milestone with /gsd-new-milestone

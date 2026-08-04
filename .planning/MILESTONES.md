@@ -1,5 +1,15 @@
 # Milestones
 
+## gsd-hygiene GSD Workflow Hygiene (Shipped: 2026-08-04)
+
+**Phases completed:** 1 phases, 1 plans, 3 tasks
+
+**Key accomplishments:**
+
+- Confirmed the ROADMAP.md layout fix (HYGIENE-01/02/03) had already landed as a side effect of creating this milestone, then closed the loop: flipped the 999.72/999.72a backlog entries, documented a durability convention, and independently re-verified the phase goal from scratch.
+
+---
+
 ## v2.3.0 the unattended run (Shipped: 2026-08-04)
 
 **Phases completed:** 2 phases (30-31), 10 plans
@@ -32,14 +42,18 @@ and the Phase 29 prose still in `ROADMAP.md`.
   spawning and a monitor daemon, and the CLI surface was rebuilt and then substantially hardened
   across a dozen phases of reliability work (outcome typing, build provenance, preflight gates,
   hermetic git invocation, `main.rs` decomposed from 8,487 to 478 lines with zero behavioral change).
+
 - The `sequentagent` CLI verb was removed as the breaking change the v2.0.0 slot was held open for,
   replaced by `devflow parallel` and a single-agent rate-limit resume path.
+
 - `devflow start --phase N --agent claude --mode auto --yes-ship` reached a completed Ship stage
   unattended for the first time in this project's history (Phase 25), after Phase 23 proved the
   goal unreachable and closed four specific, individually-evidenced blockers.
+
 - A `blocking-human` checkpoint stopped being a dead end for unattended runs — DevFlow can now
   relaunch the exact exited session and resolve the checkpoint itself, with a recorded audit trail
   (Phase 28).
+
 - All 41 production `git` invocations made hermetic against a hostile `GIT_DIR` (Phase 27),
   unblocking both the release executor goal and `devflow sync`.
 
@@ -71,6 +85,7 @@ archive.
 - Core workflow, versioning, and state machine established (phases 1-5, versions 0.1.0-0.6.0).
 - Agent completion protocol, worktree + PR integration, docs/onboarding, and open-source polish
   shipped incrementally (phases 6-9, versions 1.0.0-1.2.0).
+
 - **The GSD-native rewrite (Phase 11)** replaced the original `tmux`-based agent launcher entirely
   with direct process spawning and a monitor daemon — `tmux` stopped being a runtime dependency
   from this point on, and the CLI surface was substantially rebuilt, setting the architecture every
