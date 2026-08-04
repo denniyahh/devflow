@@ -1,20 +1,16 @@
 ---
 gsd_state_version: 1.0
-milestone: gsd-hygiene
-milestone_name: GSD Workflow Hygiene (CLOSED 2026-08-04)
-status: Awaiting next milestone
-stopped_at: Milestone gsd-hygiene completed and archived
-last_updated: "2026-08-04T19:36:53.626Z"
+milestone: v2.4.0
+milestone_name: Resume Unattended Dogfooding
+status: planning
+last_updated: "2026-08-04T21:37:43.367Z"
 last_activity: 2026-08-04
-last_activity_desc: Milestone gsd-hygiene completed and archived
 progress:
-  total_phases: 1
-  completed_phases: 1
-  total_plans: 1
-  completed_plans: 1
-  percent: 100
-current_phase: 32
-current_phase_name: ROADMAP Layout Hygiene
+  total_phases: 0
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
 # DevFlow — Project State
@@ -153,10 +149,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: Milestone gsd-hygiene complete
+Phase: Not started (defining requirements)
 Plan: —
-Status: Awaiting next milestone
-Last activity: 2026-08-04 — Milestone gsd-hygiene completed and archived
+Status: Defining requirements
+Last activity: 2026-08-04 — Milestone v2.4.0 started
 
 ## Recently Shipped
 
