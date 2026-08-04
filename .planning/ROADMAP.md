@@ -2,6 +2,87 @@
 
 > Phase plan source of truth. Each phase drives a `devflow start` agent session.
 
+## 🚧 v2.4.0 milestone (Resume Unattended Dogfooding, ACTIVE — declared 2026-08-04)
+
+**Declared 2026-08-04.** Closes the structural defects blocking unattended, multi-wave `devflow
+start` runs so dogfooding can safely resume. All four items are pre-existing defects found during
+the Phase 29 dogfood run and Phase 31 planning — none are new regressions from the `gsd-hygiene`
+milestone. See `.planning/REQUIREMENTS.md` (DOGFOOD-01..04) and `.planning/PROJECT.md` §
+"Current Milestone."
+
+**Why two phases, not four or one.** Phase 33 bundles **999.65** (the Validate→Code loop-back's
+impossible `--gaps-only` command on a mid-arc phase) and **999.66** (`consecutive_failures` never
+resetting across a loop-back, false-gating any 3+ wave phase at wave 3). 999.66's fix can be
+*written* independently of 999.65, but validating it needs a working loop-back to reach a third
+wave in the first place — 999.65 lands first in dependency order inside the phase, not as a
+separate phase. Phase 34 bundles **999.73** (widen the Phase 30/31 stream-json launch path beyond
+`Stage::Code`) and **999.74** (`classify_validate_outcome` trusting the agent's self-reported
+`verdict` over its own derived status) — split out of Phase 33 because both are open-ended
+investigation, not known mechanical fixes: 999.73's real work is four per-stage production
+captures plus a drain-gate reasoning pass that does NOT transfer from Code's backgrounding
+behavior, and 999.74 carries an explicitly open question ("whether this can manufacture a pass on
+a run that would otherwise have gated") that needs establishing by reading the Validate routing
+end to end, not assumed. Phase 31's own ROADMAP entry for 999.74 already deferred it on exactly
+this basis — it wouldn't fit inside an M-capped phase alongside more mechanical work, direct
+precedent for keeping it out of Phase 33's S–M-sized pair.
+
+| Phase | Name | Status | Version |
+|---|---|---|---|
+| 33 | Loop-Back Correctness for Multi-Wave Validate→Code Cycles | Not started | — |
+| 34 | Stream-JSON Coverage and the Validate Trust Boundary | Not started | — |
+
+### Phase 33: Loop-Back Correctness for Multi-Wave Validate→Code Cycles (999.65 + 999.66)
+**Goal**: A 3+ wave unattended `devflow start` phase can complete its Code↔Validate loop without
+gating on an impossible `--gaps-only` command or a false "3 consecutive failures" ceiling — the
+two defects that have blocked every unattended multi-wave phase since the Phase 29 dogfood run.
+**Depends on**: Nothing (first phase of this milestone). Internally, 999.65 lands before 999.66:
+999.66's false-gate is only observable at wave 3, which requires a working loop-back (999.65) to
+reach a second loop-back at all.
+**Requirements**: DOGFOOD-01, DOGFOOD-02
+**Success Criteria** (what must be TRUE):
+  1. When Validate correctly reports a mid-arc phase incomplete (no `{N}-VERIFICATION.md` because
+     `/gsd-verify-work` never ran), the Validate→Code loop-back issues plain
+     `/gsd-execute-phase {N}` and the phase continues into its next wave, instead of gating on
+     `--gaps-only` matching zero plans.
+  2. When Validate finds genuine defects in already-built work (a `{N}-VERIFICATION.md` exists
+     with real gap findings), the loop-back still issues `--gaps-only` and gap-closure plans are
+     correctly selected — the fix distinguishes the two cases rather than swapping one blind
+     command for another.
+  3. A phase that runs 3 or more Code↔Validate waves in `auto` mode reaches wave 3 and beyond
+     without a false "3 consecutive failures" gate firing on healthy, wave-by-wave forward
+     progress.
+  4. `consecutive_failures` still gates correctly when Validate finds the *same* unresolved
+     problem again across a loop-back — the fix narrows the false positive without disabling the
+     safety gate it protects.
+**Plans**: TBD
+
+### Phase 34: Stream-JSON Coverage and the Validate Trust Boundary (999.73 + 999.74)
+**Goal**: Operators can trust that every pipeline stage launches through the same reliable
+stream-json path already proven for Code — backed by real per-stage evidence, not extended on
+zero evidence — and that a Validate stage's reported outcome reflects its actually-derived status
+rather than the agent's self-reported `verdict` field.
+**Depends on**: Nothing structurally (999.73 blocks only on Phase 31's shipped acceptance run,
+already satisfied; 999.74 has no structural dependency on Phase 33). Sequenced after Phase 33 by
+this milestone's phase numbering, not a technical dependency — see the "why two phases" note above
+for the split rationale.
+**Requirements**: DOGFOOD-03, DOGFOOD-04
+**Success Criteria** (what must be TRUE):
+  1. Define, Plan, Validate, and Ship stages launch through the bidirectional stream-json path —
+     the same pipe-owning-monitor mechanism Phase 31 proved for Code — each backed by a real
+     per-stage production capture rather than a synthetic fixture.
+  2. The close rule's drain-gate reasoning (stdin released only once a `DEVFLOW_RESULT` marker
+     lands AND the background-task list has drained) is re-derived per newly-widened stage rather
+     than assumed to carry over from Code's backgrounding behavior, since a non-backgrounding
+     stage has different drain behavior.
+  3. `classify_validate_outcome`'s `Passed` arm is gated on the status the outcome cascade
+     actually derived, not on the agent's self-reported `verdict` alone — confirmed explicitly
+     for `Failed`, `Unknown`, `ResourceKilled`, and `IdleTimeout`.
+  4. It is established — not assumed — whether the prior trust-inversion could manufacture a pass
+     on a run that would otherwise have gated, with the answer recorded from reading the Validate
+     routing end to end.
+**Plans**: TBD
+
+
 ## Progress
 
 **Scope note:** this table is global (spans every shipped milestone plus the active one), per
@@ -46,6 +127,8 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 30 | 5/5 | Complete | — |
 | 31 | 5/5 | Complete | — |
 | 32 | 0/0 | Complete    | 2026-08-04 |
+| 33 | 0/TBD | Not started | - |
+| 34 | 0/TBD | Not started | - |
 
 ## gsd-hygiene milestone (CLOSED 2026-08-04 — GSD Workflow Hygiene)
 
