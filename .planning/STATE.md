@@ -4,11 +4,11 @@ milestone: gsd-hygiene
 milestone_name: milestone (GSD Workflow Hygiene, ACTIVE — declared 2026-08-04)
 current_phase: 32
 current_phase_name: ROADMAP Layout Hygiene
-status: planning
+status: completed
 stopped_at: Phase 32 context gathered
-last_updated: "2026-08-04T18:35:31.811Z"
+last_updated: "2026-08-04T19:09:30.481Z"
 last_activity: 2026-08-04
-last_activity_desc: "ROADMAP.md restructured: active-milestone heading + Phase 32 detail"
+last_activity_desc: Phase 32 complete
 progress:
   total_phases: 1
   completed_phases: 0
@@ -153,10 +153,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 32 of 1 (ROADMAP Layout Hygiene) — ready to plan
-Plan: —
-Status: Roadmap created; ready for /gsd-discuss-phase 32
-Last activity: 2026-08-04 — ROADMAP.md restructured: active-milestone heading + Phase 32 detail
+Phase: 32 of 1 (ROADMAP Layout Hygiene)
+Plan: Not started
+Status: All phases complete
+Last activity: 2026-08-04 — Phase 32 complete
 section now live inside their own heading-to-next-heading window, and a `## Progress` table
 added. Verified live: `roadmap.analyze` phase_count 0->1 (garbage cross-milestone matches ->
 correct Phase 32 only), `milestone complete Hygiene --dry-run` no longer sweeps unrelated

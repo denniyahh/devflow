@@ -16,11 +16,13 @@ Requirements for this milestone. Each maps to roadmap phases.
 
 ### ROADMAP Layout
 
-- [ ] **HYGIENE-01**: Operator can run `roadmap.analyze` against the active milestone and get a
+- [x] **HYGIENE-01**: Operator can run `roadmap.analyze` against the active milestone and get a
   correct non-zero phase count instead of today's `phase_count: 0` misfire
-- [ ] **HYGIENE-02**: Operator can run `milestone.complete --dry-run` against the active milestone
+
+- [x] **HYGIENE-02**: Operator can run `milestone.complete --dry-run` against the active milestone
   without it triggering the pass-all degrade that sweeps unrelated directories
-- [ ] **HYGIENE-03**: `ROADMAP.md` has a `## Progress` table, closing 999.72a, so
+
+- [x] **HYGIENE-03**: `ROADMAP.md` has a `## Progress` table, closing 999.72a, so
   `state.validate`'s roadmap-derived path works instead of falling back to a legacy STATE.md
   comparison
 
@@ -44,6 +46,6 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| HYGIENE-01 | Phase 32 | Pending |
-| HYGIENE-02 | Phase 32 | Pending |
-| HYGIENE-03 | Phase 32 | Pending |
+| HYGIENE-01 | Phase 32 | Complete |
+| HYGIENE-02 | Phase 32 | Complete |
+| HYGIENE-03 | Phase 32 | Complete |

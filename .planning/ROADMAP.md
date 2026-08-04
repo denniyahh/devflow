@@ -18,6 +18,7 @@ the completion check on its legacy STATE.md-comparison fallback). See
 | 32 | ROADMAP Layout Hygiene | Not started | — |
 
 ### Phase 32: ROADMAP Layout Hygiene
+
 **Goal**: `roadmap.analyze` and `milestone.complete --dry-run`, run against this repo's active
 milestone, report this milestone's own phase instead of misfiring — this phase's own detail
 heading lives inside the active milestone's own heading-to-next-heading window in this file
@@ -26,15 +27,19 @@ roadmap-derived completion check is used instead of its legacy STATE.md-comparis
 **Depends on**: Nothing (first phase of this milestone)
 **Requirements**: HYGIENE-01, HYGIENE-02, HYGIENE-03
 **Success Criteria** (what must be TRUE):
+
   1. `gsd-tools query roadmap.analyze` run against this repo reports a non-zero `phase_count`
      for the active milestone and lists Phase 32 (today: `phase_count: 0`).
+
   2. `gsd-tools query milestone.complete <label> --dry-run` run against the active milestone
      resolves this milestone's own phase set instead of the pass-all degrade that sweeps every
      directory on disk, including unrelated `999.x` backlog directories.
+
   3. `ROADMAP.md` contains a `## Progress` table (columns `Phase`, `Plans Complete`, `Status`,
      `Completed`) whose derived phase counts are non-null, so the roadmap-derived completion
      check is used instead of the legacy STATE.md-comparison fallback it fell back to when no
      such table existed.
+
   4. The three closed-milestone sections (v2.3.0, v2.0.0, v1.0) and the Backlog section are
      unchanged in content — this phase only inserts a new section; it moves nothing.
 **Plans**: TBD
@@ -82,7 +87,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 28 | — | Complete | — |
 | 30 | 5/5 | Complete | — |
 | 31 | 5/5 | Complete | — |
-| 32 | 0/TBD | Not started | - |
+| 32 | 0/0 | Complete    | 2026-08-04 |
 
 ## v2.3.0 milestone (CLOSED 2026-08-04 — the unattended run)
 
@@ -2203,7 +2208,6 @@ as code per the operator's gap-closure decision above. Units 23a–23e and
 **Wave 12** *(blocked on 23-14)*
 
 - [x] 23-15 — Acceptance retry: `devflow start --phase 24 --agent claude --mode auto --yes-ship`, observed read-only, recorded in `23-ACCEPTANCE-RUN-2.md` (the 23-11 record is left byte-identical). Acceptance is claimable **only** on a quoted `workflow_shipped` event plus `devflow evidence --phase 24 --require-shipped` exiting 0 — `workflow_finished` is explicitly not sufficient (23-acceptance)
-
 
 ### Phase 30 (original number, SHELVED 2026-08-01 → spike): Withdraw DevFlow From the Release Business
 
