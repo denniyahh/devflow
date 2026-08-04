@@ -18,11 +18,25 @@ DevFlow must reliably drive the agent through the full pipeline and never
 silently corrupt its own state or lose a human's gate decision, even under a
 mid-run crash or kill.
 
-## Current Milestone
+## Current Milestone: v2.4.0 Resume Unattended Dogfooding
 
-**None declared.** The `gsd-hygiene` milestone (GSD Workflow Hygiene) closed 2026-08-04 — see
-`.planning/milestones/gsd-hygiene-ROADMAP.md` and `-REQUIREMENTS.md` for full detail. Next
-milestone starts with `/gsd-new-milestone`.
+**Goal:** Close the structural defects blocking unattended, multi-wave `devflow start` runs, so
+dogfooding can safely resume. All four items are pre-existing defects found during the Phase 29
+dogfood run and Phase 31 planning — none are new regressions from the `gsd-hygiene` milestone.
+
+**Target features:**
+- Phase 33 — 999.65 (Validate→Code loop-back issues an impossible `--gaps-only` command on a
+  mid-arc phase — confirmed live in the Phase 29 dogfood run, an unresolvable gate) + 999.66
+  (`consecutive_failures` never resets across a loop-back, false-gating any 3+ wave phase at
+  wave 3 regardless of actual outcome)
+- Phase 34 — 999.73 (widen the Phase 30/31 stream-json launch path beyond `Stage::Code` — needs
+  real per-stage captures and a re-derivation of the drain-gate reasoning, not just a flag flip)
+  + 999.74 (`classify_validate_outcome` trusts the agent's self-reported `verdict` over its own
+  derived status, a trust-inversion in the same class as 999.67)
+
+**v2.4.0 is a planning label**, next minor after the last shipped v2.3.0 — the actual crate
+version is still derived automatically from conventional-commit classification at release time
+(`version.rs`), per this project's established versioning policy; it may not land exactly here.
 
 ## Requirements
 
@@ -104,7 +118,11 @@ milestone starts with `/gsd-new-milestone`.
 
 ### Active
 
-*(none currently in flight. **The v2.3.0 milestone was CLOSED 2026-08-04**,
+- 4 requirements for **v2.4.0 Resume Unattended Dogfooding** (declared 2026-08-04) — see
+  `.planning/REQUIREMENTS.md` once written and Phases 33/34 in ROADMAP.md.
+
+*(Historical note on how the project reached this point: **The v2.3.0 milestone was CLOSED
+2026-08-04**,
 bounded from the start (declared 2026-08-02) — it closed when the 999.64 arc
 landed (Phase 30 + Phase 31). This is the first milestone in this project
 actually archived, hand-corrected — see ROADMAP.md and
@@ -257,3 +275,9 @@ phase-by-phase and milestone-by-milestone record.*
 closed the same day it was declared — intentionally unversioned, no crates code. Closed backlog
 999.72/999.72a; `.planning/REQUIREMENTS.md` deleted (fresh for next milestone); no active
 milestone declared yet — see `/gsd-new-milestone`.*
+
+---
+*Last updated: 2026-08-04, same day, starting milestone v2.4.0 Resume Unattended Dogfooding —
+Phase 33 (999.65 + 999.66) and Phase 34 (999.73 + 999.74), scoped through conversation rather
+than fresh domain research (these are pre-existing internal defects with fix directions already
+sketched in ROADMAP.md, not new user-facing capability).*
