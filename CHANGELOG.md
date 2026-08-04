@@ -1,5 +1,49 @@
 # Changelog
 
+## 2.3.0 — 2026-08-04
+
+Phase 30 (the stream-json parser and the feasibility gate) and phase 31 (the
+launch path itself). Together they close the **999.64 arc**: a DevFlow-driven
+phase containing a multi-plan wave now completes that wave without orphaning
+delegated work — the failure that had blocked every attempt at an unattended
+run through this project's history. Phase 29 remains unmerged and is not in
+this release.
+
+The headline is phase 31: the Claude adapter's detached `sh` monitor is
+replaced by a pipe-owning Rust monitor, and the adapter always launches with
+`--input-format stream-json --output-format stream-json`, prompt delivered on
+stdin rather than argv. Holding stdin open past the first turn is what lets a
+background helper agent's completion actually reach the parent session — the
+notification had nowhere to arrive before this. Verified with a live two-plan
+acceptance run, not just integration tests: both plans produced a `SUMMARY.md`
+and both merged, crossing the exact point where a prior attempt (phase 29)
+orphaned both executors of a two-plan wave.
+
+### What's new
+
+- **Idle timeout.** A stage that goes quiet for longer than a configurable,
+  floor-clamped window now fails loudly with a distinct `AgentStatus::IdleTimeout`,
+  naming the agent's commits and rolling nothing back — instead of hanging
+  indefinitely or having a later signal misread as an unrelated failure.
+  `DEVFLOW_CLAUDE_IDLE_TIMEOUT_SECS` raises the window above its floor; it can
+  never be set lower.
+- **Startup delivery canary.** Before a stream-json launch, DevFlow now
+  confirms the background-notification path actually works with one throwaway
+  task, and refuses to run rather than silently degrading if it doesn't.
+- **`--legacy-claude-launch`** (and `DEVFLOW_CLAUDE_LEGACY_LAUNCH`) — an
+  explicit, off-by-default escape hatch back to the pre-31 launch path, loud on
+  every use, with no automatic fallback.
+- Exit-code arbitration: a stream-derived `Success` can no longer stand against
+  a contradicting non-zero process exit code.
+
+### Fixed
+
+Two defects from this release's own peer code review, neither reachable by the
+acceptance run because it only exercised healthy paths: an idle timeout could
+fire and overwrite a stage that had already completed successfully, and a
+single non-UTF-8 byte in agent output could silently truncate the capture.
+Both are covered by mutation-tested regression tests.
+
 ## 2.2.0 — 2026-07-31
 
 Phase 27 (hermetic git invocation) and phase 28 (the checkpoint answer return
