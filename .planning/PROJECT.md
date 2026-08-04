@@ -18,24 +18,24 @@ DevFlow must reliably drive the agent through the full pipeline and never
 silently corrupt its own state or lose a human's gate decision, even under a
 mid-run crash or kill.
 
-## Current Milestone: GSD Workflow Hygiene
+## Current Milestone
 
-**Goal:** Restructure `ROADMAP.md` so backlog item 999.72 — `gsd-tools`' milestone-scoped
-parsers finding zero phases and falling back to a dangerous pass-all default — is no longer
-live in this repo. No crates code changes; this milestone is intentionally unversioned (no
-`vX.Y.Z`, nothing published to crates.io) since it's pure `.planning/` documentation structure.
-
-**Target:**
-- The active milestone's own phase headings live inside its own heading-to-next-heading window
-  in `ROADMAP.md`, verified against a re-run of `roadmap.analyze` and `milestone.complete
-  --dry-run` (both currently misfire — confirmed live 2026-08-04).
-- The missing `## Progress` table (999.72a) exists, most likely as a side effect of this
-  workflow's own `gsd-roadmapper` write.
+**None declared.** The `gsd-hygiene` milestone (GSD Workflow Hygiene) closed 2026-08-04 — see
+`.planning/milestones/gsd-hygiene-ROADMAP.md` and `-REQUIREMENTS.md` for full detail. Next
+milestone starts with `/gsd-new-milestone`.
 
 ## Requirements
 
 ### Validated
 
+- ✓ ROADMAP.md layout restructured so `gsd-tools`' milestone-scoped parsers
+  (`roadmap.analyze`, `milestone.complete --dry-run`) correctly find the active milestone's own
+  phases instead of misfiring (backlog 999.72), and a `## Progress` table exists so the
+  roadmap-derived completion check is used instead of the legacy STATE.md two-scale comparison
+  (999.72a) — gsd-hygiene milestone, Phase 32. The fix landed incidentally via
+  `gsd-roadmapper`'s own milestone-creation write; Phase 32's own work was confirming it,
+  closing the 999.72/999.72a backlog entries, and documenting a durability convention in
+  CLAUDE.md for future milestone boundaries.
 - ✓ 5-stage GSD-native pipeline (Define→Plan→Code→Validate→Ship), `Mode`
   (auto/supervise) with forced-gate-on-repeated-failure — Phase 11
 - ✓ File-based human gate protocol (write/poll/ack, 7-day timeout) — Phase 11
@@ -122,7 +122,11 @@ directory) needed no move. `.planning/phases/` now holds only active backlog
 Hermes Support, previously slotted as "Phase 18," was rescoped out during
 the 2026-07-20 reprioritization to Dogfood Reliability Hardening and now
 sits in the backlog as `999.1` — it is NOT automatically next; backlog
-items require `/gsd-review-backlog` promotion.)*
+items require `/gsd-review-backlog` promotion. **The `gsd-hygiene` milestone
+(GSD Workflow Hygiene, Phase 32) declared and closed the same day, 2026-08-04**
+— intentionally unversioned, `.planning/`-documentation-only, closing backlog
+999.72/999.72a. `milestone.complete` ran cleanly this time (unlike v2.3.0's
+close), confirming the fix. See `.planning/milestones/gsd-hygiene-ROADMAP.md`.)*
 
 ### Out of Scope
 
@@ -192,6 +196,9 @@ items require `/gsd-review-backlog` promotion.)*
 | Acceptance run exercises the Code stage only, not all 5 pipeline stages (Phase 31, D-10) | Code is where 999.64 was observed and the only stage that backgrounds — widening to other stages on zero evidence would extend the adapter to four stages the parser has never actually been exercised against | ✓ Good |
 | Pass criterion is "both plans produce a SUMMARY.md AND both merge," not "the stage reported Success" or "both completions observed in the stream" (Phase 31, D-18) | Both rejected substitutes were identified as signals that could pass while the underlying orphaning defect was still present — the completion oracle had already scored the original 999.64 failure as Success | ✓ Good |
 | `milestone.complete`'s CLI archival step bypassed for v2.3.0's close; milestone archived by hand instead | The CLI's phase-scoping inherited the same ROADMAP-layout defect as 999.72, but on a write path — it tried to archive all 48 project phases instead of the milestone's 2. Caught pre-commit, reverted, filed upstream (GSD-core issue ledger entry 16) | ✓ Good |
+| gsd-hygiene closes unversioned — no `vX.Y.Z` tag, archived under the plain label `gsd-hygiene` instead of `v[X.Y]` (Phase 32 close, 2026-08-04) | The milestone was declared intentionally unversioned (pure `.planning/` docs, no crates code, nothing published); a semver tag would misrepresent it and pollute the tag namespace shared with real crates.io releases | ✓ Good |
+| Backfilled `32-01-PLAN.md`/`32-01-SUMMARY.md` after the fact, explicitly labeled as backfilled, to work around `init.manager`'s `planCount > 0` assumption (Phase 32 close, 2026-08-04) | `buildPhaseCompletionProjection` never reads a phase's real VERIFICATION.md when `plan_count` is 0, so a genuinely complete zero-plan phase reports `phase_complete: false` forever; filed upstream as issue 18. Operator chose this over silently overriding the milestone-close readiness gate | ✓ Good |
+| `milestone.complete` ran cleanly (no `--dry-run` bypass needed) for gsd-hygiene's close, unlike v2.3.0's | 999.72's fix (this same milestone) is what made the CLI's phase-scoping correct — direct confirmation the fix holds, not just the earlier `--dry-run` checks | ✓ Good |
 
 ## Key Files
 
@@ -244,3 +251,9 @@ were excluded from both archives — see their own dispositions in ROADMAP.md
 and `.planning/superseded/`. Individual phase accomplishments are not
 reproduced above; see `.planning/MILESTONES.md` for the authoritative
 phase-by-phase and milestone-by-milestone record.*
+
+---
+*Last updated: 2026-08-04 after the gsd-hygiene milestone (Phase 32, ROADMAP Layout Hygiene)
+closed the same day it was declared — intentionally unversioned, no crates code. Closed backlog
+999.72/999.72a; `.planning/REQUIREMENTS.md` deleted (fresh for next milestone); no active
+milestone declared yet — see `/gsd-new-milestone`.*

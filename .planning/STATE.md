@@ -1,9 +1,9 @@
 ---
 gsd_state_version: 1.0
 milestone: gsd-hygiene
-milestone_name: milestone (GSD Workflow Hygiene, ACTIVE — declared 2026-08-04)
+milestone_name: GSD Workflow Hygiene (CLOSED 2026-08-04)
 status: Awaiting next milestone
-stopped_at: Phase 32 context gathered
+stopped_at: Milestone gsd-hygiene completed and archived
 last_updated: "2026-08-04T19:36:53.626Z"
 last_activity: 2026-08-04
 last_activity_desc: Milestone gsd-hygiene completed and archived
@@ -27,7 +27,7 @@ Items acknowledged and deferred at milestone close on 2026-08-04:
 
 | Category | Item | Status |
 |----------|------|--------|
-| debug | stale-blockers-gate-gsd-next | acknowledged — diagnosed gsd-core tooling defect (smart-entry's blocker scan), unrelated to v2.3.0 milestone content; will address in a future phase |
+| debug | stale-blockers-gate-gsd-next | **resolved 2026-08-04** during gsd-hygiene's close — the STATE.md `## Blockers` fix was already live (`547a401`), and the coupled `complete`-verdict concern is now correctly resolved by Phase 32's own `## Progress` table fix. See `.planning/debug/resolved/stale-blockers-gate-gsd-next.md`. |
 | uat_gap | 24-UAT.md (Phase 24) | acknowledged — audit flagged it but the file's own frontmatter reads status:passed, 1/1 passed, 0 pending/issues/blocked; treated as an audit-tool false positive, skipped, will not revisit |
 
 ## Active Phase
@@ -836,8 +836,8 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 ## Session
 
 **Last session:** 2026-08-04T18:35:31.717Z
-**Stopped at:** Phase 32 context gathered
-**Resume file:** .planning/phases/32-roadmap-layout-hygiene/32-CONTEXT.md
+**Stopped at:** Milestone gsd-hygiene completed and archived
+**Resume file:** .planning/milestones/gsd-hygiene-phases/32-roadmap-layout-hygiene/32-CONTEXT.md
 
 ## Operator Next Steps
 
