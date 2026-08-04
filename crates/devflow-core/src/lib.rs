@@ -54,6 +54,7 @@
 pub mod agent;
 pub mod agent_result;
 pub mod agents;
+pub mod canary;
 pub mod config;
 #[cfg(test)]
 mod doc_check;

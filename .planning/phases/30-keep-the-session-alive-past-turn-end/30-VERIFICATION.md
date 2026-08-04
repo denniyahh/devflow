@@ -209,13 +209,29 @@ Phase 31 plans, because Phase 31 will read exactly those two documents.
 
 ## Deferred — open items owned by Phase 31, correctly gated
 
+> **DEPRECATED IN PART, 2026-08-03 — rows 1 and 2 below are NO LONGER OPEN.** They were closed in
+> Phase 30 itself by the root-cause refactor (`a557805`), which landed *after* this table was
+> written, on the operator's "fix root causes before proceeding" instruction. `ParsedCapture` makes
+> a torn line representable so it can never resurrect an earlier success (row 1), and `is_top_level`
+> became the single provenance predicate shared by gate and verdict selection (row 2). Regressions:
+> `truncation_sweep_never_upgrades_verdict_to_success` (no longer `#[ignore]`d) and
+> `subagent_result_event_never_decides_the_verdict`.
+>
+> **ROADMAP.md's constraint 9 text is authoritative**, not this table. What actually survives for
+> Phase 31 is only the *boundary-truncation residual*: a capture cut at an exact line boundary is
+> content-indistinguishable from a healthy shorter run, so no parser assertion can exist for it and
+> the defense must be that a stream-derived Success never short-circuits a contradicting exit code.
+>
+> Rows 3–5 stand as written. The rows are kept rather than deleted because this is a verification
+> record — removing them would misrepresent what was known at verification time.
+
 These are **not** Phase 30 gaps. Each is a confirmed defect or unclosed evidence gap that
 Phase 30 deliberately did not close, with a binding mechanism preventing it from going live.
 
 | # | Item | Gate | Verified by this verifier |
 |---|---|---|---|
-| 1 | Torn terminal result resurrects an earlier success (constraint 9 item 1) | ROADMAP constraint 9 forbids Phase 31 wiring `evaluate_layer1` until closed; `30-H1-CONTEXT-FOR-31.md` carries the handoff and a drop-in failing test | Reproduced: the ignored test FAILS under `--ignored` at truncation offset 1120. Unreachability re-confirmed with an identical-shape control. |
-| 2 | `last_top_level_result` ignores `parent_tool_use_id` (constraint 9 item 2) | Same constraint | Confirmed by direct read (`:785-790`) — selects solely on `type == "result"`, contradicting its own doc comment at `:782-784`. |
+| 1 | ~~Torn terminal result resurrects an earlier success (constraint 9 item 1)~~ **— CLOSED in Phase 30 by `a557805`; see banner above** | ROADMAP constraint 9 forbids Phase 31 wiring `evaluate_layer1` until closed; `30-H1-CONTEXT-FOR-31.md` carries the handoff and a drop-in failing test | Reproduced: the ignored test FAILS under `--ignored` at truncation offset 1120. Unreachability re-confirmed with an identical-shape control. |
+| 2 | ~~`last_top_level_result` ignores `parent_tool_use_id` (constraint 9 item 2)~~ **— CLOSED in Phase 30 by `a557805`; see banner above** | Same constraint | Confirmed by direct read (`:785-790`) — selects solely on `type == "result"`, contradicting its own doc comment at `:782-784`. |
 | 3 | Gate mention vs gate declaration | Backlog 999.70 / DEN-91 | Entry exists and is substantive |
 | 4 | Is the capture writer actually capable of tearing a terminal line? | Backlog 999.71 / DEN-92 | Entry exists; this is the unmeasured frequency the code review flagged |
 | 5 | Prompt-echo closure is reasoned, not witnessed | Phase 31 produces the first stream captures | Confirmed: every gate fixture is labelled SYNTHETIC in-source (12 explicit sites); no archived capture contains gate text or a prompt echo |

@@ -140,6 +140,46 @@ pub struct State {
     /// written by a binary predating this field.
     #[serde(default)]
     pub yes_ship: bool,
+    /// What this run's delivery canary established (D-13/D-15, 31-03),
+    /// recorded by the first stage launch that routes through the Claude
+    /// `stream-json` transport. `None` means EITHER "no canary has run for
+    /// this run yet" OR "the state was written by a binary predating this
+    /// field" — both cases behave identically: the canary runs.
+    ///
+    /// Persisted rather than held in memory for the same reason
+    /// [`Self::yes_ship`] is: each stage launch happens in a SEPARATE
+    /// `devflow` process (the monitor's own `advance` tail), so an
+    /// in-process flag would reset to "not yet run" at every stage
+    /// transition and re-spend a real throwaway agent invocation each time —
+    /// which is exactly the symptom 31-RESEARCH Pitfall 5 names for a canary
+    /// that landed in the per-stage `preflight` hook.
+    ///
+    /// A recorded `Absent`/`Unverified` keeps refusing on every later launch
+    /// in the run; it is not consumed by the first refusal.
+    #[serde(default)]
+    pub canary: Option<crate::canary::CanaryOutcome>,
+    /// D-11's opt-out: force the pre-31 single-document Claude launch
+    /// (positional prompt, `--output-format json`, the `sh` monitor) for this
+    /// run, off by default.
+    ///
+    /// `false` means EITHER "the operator did not ask for the legacy path" OR
+    /// "the state was written by a binary predating this field" — both cases
+    /// behave identically: the D-09/D-10 rollout decides the transport, which
+    /// is the pre-existing behaviour.
+    ///
+    /// Persisted rather than passed through the call stack for the reason
+    /// [`Self::yes_ship`] gives: each stage launch happens in a SEPARATE
+    /// `devflow` process (the detached monitor's own `advance` tail), so a
+    /// CLI-scoped value would be gone by the time the second stage launches
+    /// and the run would silently revert to the stream transport mid-flight.
+    ///
+    /// Only ever OR-ed, never cleared, once set — see
+    /// `pipeline_launch::apply_legacy_launch_opt_out`. Clearing it on a plain
+    /// `devflow resume` would be the same silent-drop class as `stop_until`'s
+    /// old unconditional clear (999.60). To turn it back off, edit
+    /// `.devflow/state-NN.json` or start a new run.
+    #[serde(default)]
+    pub legacy_claude_launch: bool,
 }
 
 /// Supported coding agents.
@@ -205,6 +245,8 @@ impl State {
             stopped: false,
             stop_reason: None,
             yes_ship: false,
+            canary: None,
+            legacy_claude_launch: false,
         }
     }
 }

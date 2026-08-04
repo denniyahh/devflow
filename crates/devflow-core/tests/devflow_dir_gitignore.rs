@@ -128,9 +128,14 @@ fn all_seven_devflow_constructors_produce_the_gitignore() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let state = State::new(1, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        let pid =
-            monitor::spawn_monitor(&state, "sh", &["-c".to_string(), "exit 0".to_string()], &[])
-                .expect("spawn_monitor");
+        let pid = monitor::spawn_monitor(
+            &state,
+            "sh",
+            &["-c".to_string(), "exit 0".to_string()],
+            &[],
+            monitor::MonitorLaunch::Legacy,
+        )
+        .expect("spawn_monitor");
 
         wait_for_file(
             &agent_result::exit_code_path(root, 1),

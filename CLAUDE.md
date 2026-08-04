@@ -33,3 +33,44 @@ specifically to the main-checkout case.
   Capture the exit code of the command you care about, not the pipeline.
 - **Old phases use a bare `PLAN.md`**, not `NN-PLAN.md`. A glob for `*-PLAN.md` silently misses
   them, and `.planning/superseded/` holds abandoned plans that should not be counted at all.
+
+## Prefer GSD commands over doing it by hand
+
+When a GSD command covers the task, **use it** — `/gsd:phase` to add or edit a phase,
+`/gsd:discuss-phase` / `/gsd:plan-phase` / `/gsd:execute-phase` for the phase lifecycle,
+`/gsd:progress --next` to decide what comes next. Doing the same work by hand is the exception,
+not the default, and it needs a stated reason.
+
+This project *is* a workflow tool; hand-editing `.planning/` behind GSD's back is how STATE.md and
+ROADMAP.md drift from what the tooling believes, and the drift is invisible until something
+downstream reads the stale value.
+
+Legitimate reasons to bypass, all of which should be said out loud rather than assumed:
+
+- The command is known-broken for this case, and the defect is recorded in
+  `.planning/UPSTREAM-GSD-ISSUES.md`.
+- The command produced a wrong result that needs correcting by hand afterwards — record what it
+  got wrong (e.g. `phase.add` files the new entry at the document's last `---`, which lands it in
+  archived prose on this roadmap; the entry then has to be moved).
+- No GSD command covers it.
+
+Bypassing silently is the thing to avoid. Correcting a command's output by hand is fine; skipping
+the command because hand-editing seemed quicker is not.
+
+## Where the upstream GSD issue ledger lives
+
+`.planning/UPSTREAM-GSD-ISSUES.md` is a **symlink**, not a file. The tracked copy lives in the
+sibling gsd-core checkout:
+
+```
+.planning/UPSTREAM-GSD-ISSUES.md -> ../../gsd-core/scratch/UPSTREAM-GSD-ISSUES.md
+```
+
+File new GSD-core defects there, not in a new file here. If the path reads as missing, the
+symlink was deleted (it is gitignored, so `git clean -fdx` removes it and a fresh clone never
+has it) — recreate it with the `ln -s` target above, or just make any commit: `scripts/hooks/post-commit`
+restores it when the target resolves.
+
+**Do not "fix" this by tracking the symlink.** `tests/build_provenance.rs` copies every path from
+`git ls-files` with `std::fs::copy`, which follows symlinks and panics on failure — on CI, or any
+clone without a `gsd-core` sibling, the link dangles and the test panics.

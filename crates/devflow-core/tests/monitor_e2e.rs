@@ -16,7 +16,7 @@ use devflow_core::agent_result::{
 };
 use devflow_core::config::GitFlowConfig;
 use devflow_core::mode::Mode;
-use devflow_core::monitor::{spawn_monitor, wait_for_agent_pid};
+use devflow_core::monitor::{MonitorLaunch, spawn_monitor, wait_for_agent_pid};
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
 use devflow_core::workflow::{WorkflowError, load_state};
@@ -74,7 +74,7 @@ fn monitor_owns_fake_agent_and_records_devflow_result() {
             .to_string(),
     ];
 
-    spawn_monitor(&state, "sh", &args, &[]).expect("spawn monitor");
+    spawn_monitor(&state, "sh", &args, &[], MonitorLaunch::Legacy).expect("spawn monitor");
 
     // The monitor records the agent PID.
     let agent_pid = wait_for_agent_pid(root, phase).expect("agent pid recorded");

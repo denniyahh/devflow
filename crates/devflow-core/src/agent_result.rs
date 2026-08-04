@@ -61,6 +61,23 @@ pub enum AgentStatus {
     /// typically "command not found") (D-07, 17b).
     #[serde(rename = "agent_unavailable")]
     AgentUnavailable,
+    /// The pipe-owning monitor gave up waiting: the child's stream went silent
+    /// for longer than the idle window and DevFlow terminated it (D-06, 31-02).
+    ///
+    /// Deliberately distinct from BOTH neighbours it would otherwise collapse
+    /// into. Against `Failed`: nothing reported a failure — the agent simply
+    /// stopped talking, and a graceful close would fall through to Layer 2,
+    /// which scores partial commits as `Success` (999.64 reborn inside its own
+    /// fix). Against `ResourceKilled`: the box did not run out of memory;
+    /// DevFlow itself did the killing. Only a third variant lets the completion
+    /// oracle tell "we gave up waiting" from either.
+    ///
+    /// The explicit `#[serde(rename)]` is required, not stylistic: the
+    /// enum-level `rename_all = "lowercase"` would collapse the two words into
+    /// `idletimeout`. The two existing two-word variants above carry the same
+    /// rename for the same reason.
+    #[serde(rename = "idle_timeout")]
+    IdleTimeout,
 }
 
 impl AgentStatus {
@@ -79,6 +96,7 @@ impl AgentStatus {
             AgentStatus::Unknown => "unknown",
             AgentStatus::ResourceKilled => "resource_killed",
             AgentStatus::AgentUnavailable => "agent_unavailable",
+            AgentStatus::IdleTimeout => "idle_timeout",
         }
     }
 }
@@ -1046,6 +1064,20 @@ fn classify(capture: &ParsedCapture) -> CaptureKind {
     }
 }
 
+/// Test-only accessor: does [`classify`] call this capture text a Claude
+/// `stream-json` capture?
+///
+/// Exists so `monitor.rs`'s end-to-end tracer test can assert on the REAL
+/// classifier rather than re-deriving "looks like a stream" with its own
+/// heuristic — which is precisely the per-call-site divergence [`classify`]
+/// was introduced to end. `classify`/`CaptureKind`/`ParsedCapture` stay
+/// private; only this yes/no question crosses the module boundary, and only
+/// under `cfg(test)`.
+#[cfg(test)]
+pub(crate) fn capture_is_claude_stream(capture: &str) -> bool {
+    classify(&ParsedCapture::parse(capture)) == CaptureKind::ClaudeStream
+}
+
 /// Whether an event is TOP-LEVEL — authored by the orchestrator session, not
 /// forwarded from a subagent. `parent_tool_use_id` JSON-null or absent.
 ///
@@ -1089,6 +1121,77 @@ fn last_top_level_result(events: &[serde_json::Value]) -> Option<&serde_json::Va
     events.iter().rev().find(|v| {
         v.get("type").and_then(serde_json::Value::as_str) == Some("result") && is_top_level(v)
     })
+}
+
+/// Whether a declared canary `token` came back inside a TOP-LEVEL `result`
+/// event of this capture (D-13).
+///
+/// **Why this takes capture TEXT rather than a project root and phase**, unlike
+/// its siblings [`checkpoint_reported_in_capture`] and
+/// [`session_id_from_capture`]: the delivery canary runs against its own
+/// throwaway capture file, not the phase capture. A canary that read (and
+/// therefore implied writing) `stdout_path(project_root, phase)` would clobber
+/// the stage's own capture — the one artifact the entire Layer 1 cascade
+/// decides on.
+///
+/// **D-13 trap 1 — this may not be a NEW trust path.** The CLI echoes the
+/// operator's prompt back into the same stdout as a `user` event, so the
+/// planted token *will* appear in the stream regardless of whether anything was
+/// delivered. That echo is exactly what produced the checkpoint false positive
+/// 30-05 fixed. Matching is therefore confined to events that are both
+/// `type: "result"` and [`is_top_level`] — the same provenance predicate
+/// [`last_top_level_result`] enforces, reused rather than reinvented.
+///
+/// **D-13 trap 2 — a match proves DELIVERY, never WORK.** The agent can see the
+/// token in its own prompt and emit it without doing anything (999.67's shape).
+/// A hit means "the task-notification path is alive"; it never means the
+/// dispatched work happened. Summaries and merges remain the evidence of work
+/// (D-16/D-18).
+///
+/// Scans EVERY top-level `result`, not just the last one, which is the one
+/// place this deliberately differs from [`last_top_level_result`]. That
+/// function selects the session's final *verdict*, so later turns must
+/// supersede earlier ones. The canary asks a different question — "did the
+/// token ever come back?" — and a token returned on an earlier
+/// task-notification turn is a complete answer to it.
+pub fn token_reported_in_capture(capture: &str, token: &str) -> bool {
+    ParsedCapture::parse(capture)
+        .events
+        .iter()
+        .filter(|v| {
+            v.get("type").and_then(serde_json::Value::as_str) == Some("result") && is_top_level(v)
+        })
+        .any(|v| {
+            v.get("result")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|text| text.contains(token))
+        })
+}
+
+/// Whether ONE parsed stream event is a top-level `result` carrying a
+/// `DEVFLOW_RESULT` marker in its `result` text.
+///
+/// Exposed for the pipe-owning monitor's close rule (Phase 31, constraint 4),
+/// which must decide line-by-line and in real time whether the marker arm is
+/// satisfied — it cannot wait for a whole capture and re-parse it.
+///
+/// This is a COMPOSITION of the two existing predicates, deliberately not a
+/// second implementation of either. T-31-01: the CLI echoes the operator's
+/// prompt back into the same stdout as a `user` event — that echo is what
+/// produced the checkpoint false positive 30-05 fixed — so a marker seen
+/// anywhere but inside an event that is BOTH `type: "result"` AND
+/// [`is_top_level`] must not close the stream. Reusing [`parse_marker_lines`]
+/// keeps the marker grammar (case-insensitive prefix, edge-corruption
+/// stripping, JSON body) in one place rather than letting the monitor grow a
+/// looser `contains("DEVFLOW_RESULT")` of its own.
+pub(crate) fn event_is_top_level_result_marker(event: &serde_json::Value) -> bool {
+    event.get("type").and_then(serde_json::Value::as_str) == Some("result")
+        && is_top_level(event)
+        && event
+            .get("result")
+            .and_then(serde_json::Value::as_str)
+            .and_then(parse_marker_lines)
+            .is_some()
 }
 
 /// Whether any AGENT-AUTHORED text in a Claude stream capture declares a
@@ -1394,6 +1497,24 @@ fn parse_claude_event_result(stdout: &str) -> Option<AgentResult> {
     let held_success = match marker {
         // A non-success marker is the agent's own final word and nothing below
         // can improve on it.
+        //
+        // 31-02 audit (non-exhaustive equality site 1 of 3). This `!= Success`
+        // is CORRECT AS-IS for `AgentStatus::IdleTimeout` and is deliberately
+        // left unchanged. The compiler cannot flag this site — an equality test
+        // compiles fine against a new variant — so it is audited by hand here
+        // rather than left to the wildcard-free-match mechanism, which does not
+        // reach it.
+        //
+        // The only way `IdleTimeout` arrives here is an agent writing
+        // `DEVFLOW_RESULT: {"status":"idle_timeout"}` into its own output,
+        // claiming a verdict only DevFlow's monitor is supposed to produce.
+        // The predicate handles that in the fail-safe direction: it is not
+        // `Success`, so it returns immediately as decisive non-success and
+        // `decide_action` gates it for review. A forged idle timeout can
+        // therefore only make a run gate, never advance. The REAL
+        // monitor-produced verdict does not travel this path at all — it is
+        // read from its own side-channel file at the top of `evaluate_layer1`,
+        // before this parser ever runs.
         Some(result) if result.status != AgentStatus::Success => return Some(result),
         other => other,
     };
@@ -1495,8 +1616,157 @@ fn parse_marker_lines(stdout: &str) -> Option<AgentResult> {
     None
 }
 
+/// One commit the agent made before its stream went silent (D-07, 31-02).
+///
+/// The subject is carried alongside the sha because a bare sha list is not
+/// operator-actionable — D-07's requirement is that the commits be *named*, so
+/// that a silent miscount becomes something a human can act on.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct IdleTimeoutCommit {
+    /// Full commit sha, as `git log --format=%H` emits it.
+    pub sha: String,
+    /// Commit subject line (`%s`).
+    pub subject: String,
+}
+
+/// The pipe-owning monitor's authoritative idle-timeout verdict, as written to
+/// [`idle_timeout_path`] BEFORE the child is terminated (D-05, 31-02).
+///
+/// This is a SIDE CHANNEL, deliberately not the stdout capture. See
+/// [`parse_idle_timeout_side_channel`] for why that distinction is a
+/// correctness requirement rather than a filing preference.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct IdleTimeoutRecord {
+    /// Always [`AgentStatus::IdleTimeout`]'s wire string. Recorded so the file
+    /// is self-describing to a human reading `.devflow/` by hand.
+    pub status: String,
+    /// The idle window that elapsed with no line on the child's stdout.
+    pub idle_secs: u64,
+    /// The supervised child's pid, from the in-memory `Child` handle — never
+    /// re-read from the on-disk pid file, which is exposed to pid reuse
+    /// (T-31-07).
+    pub agent_pid: u32,
+    /// Unix seconds at which the monitor wrote this record.
+    pub written_at: u64,
+    /// Every commit on the phase branch when the timeout fired. NONE of these
+    /// is rolled back — see [`parse_idle_timeout_side_channel`].
+    pub commits: Vec<IdleTimeoutCommit>,
+}
+
+/// Read the monitor's own idle-timeout verdict, if it wrote one.
+///
+/// **This is consulted as the FIRST statement of [`evaluate_layer1`], before
+/// `read_capture` and before every marker parser. That placement is
+/// load-bearing and must not be "tidied" into the `.or_else` chain below it.**
+///
+/// The obvious-looking alternative — appending the verdict to the stdout
+/// capture — is a real correctness bug, not a style choice.
+/// `evaluate_layer1`'s chain reaches `parse_devflow_result`'s tail scan only
+/// when `parse_claude_event_result` returns `None`, and that parser resolves to
+/// the LAST top-level `result` event regardless of what text follows it. On any
+/// stream that already completed one successful turn — the normal shape of a
+/// run long enough to idle out at all — an appended verdict is therefore never
+/// reached, and a stale success stands as the recorded outcome of a run DevFlow
+/// itself killed (T-31-06, 31-RESEARCH Pitfall 3).
+///
+/// Reading before `read_capture` matters for a second reason: that call is an
+/// early `return None` when the capture is missing, so a timeout that fired
+/// before the child emitted anything at all would otherwise be discarded
+/// entirely.
+///
+/// `decided_by_layer` stays `1`. This is a Layer-1-CLASS authoritative verdict
+/// — it just comes from the monitor that supervised the run rather than from
+/// parsing what the agent said about itself. It is emphatically not `0`, which
+/// is reserved for operator-authored external probe provenance that
+/// `classify_validate_outcome` reads as `external`.
+///
+/// **The file's PRESENCE is the signal; its contents are enrichment.** A record
+/// that exists but cannot be read still returns an `IdleTimeout` verdict,
+/// carrying a reason that says the details were lost. Returning `None` there
+/// would drop the verdict back into the cascade and let precisely the stale
+/// success above win — turning a corrupt file into a silent wrong advance,
+/// which is the exact failure this function exists to prevent. The asymmetry is
+/// the one this whole module is built around: a false failure surfaces as a
+/// gate, never as a wrong advance.
+///
+/// **Nothing here rolls anything back** (D-07, T-31-09). The commits are read
+/// and named, never reverted: an idle timeout may be a false positive, and
+/// destroying real work on a false positive is unrecoverable.
+fn parse_idle_timeout_side_channel(project_root: &Path, phase: u32) -> Option<AgentResult> {
+    let path = idle_timeout_path(project_root, phase);
+    let raw = read_capture(&path)?;
+
+    let Ok(record) = serde_json::from_str::<IdleTimeoutRecord>(&raw) else {
+        return Some(idle_timeout_result(
+            format!(
+                "idle timeout: DevFlow's monitor recorded a timeout verdict at {} but the \
+                 record itself is unreadable, so the commit list and idle duration are lost. \
+                 The timeout stands regardless — the file's presence is the authoritative \
+                 signal. Inspect the phase branch by hand; nothing was rolled back.",
+                path.display()
+            ),
+            None,
+        ));
+    };
+
+    let named: Vec<String> = record
+        .commits
+        .iter()
+        .map(|commit| {
+            let short: String = commit.sha.chars().take(7).collect();
+            format!("{short} {}", commit.subject)
+        })
+        .collect();
+
+    let commit_phrase = if named.is_empty() {
+        "No commits were found on the phase branch.".to_string()
+    } else {
+        format!(
+            "The agent made {} commit(s) before going quiet and NONE of them were rolled \
+             back: {}.",
+            named.len(),
+            named.join("; ")
+        )
+    };
+
+    Some(idle_timeout_result(
+        format!(
+            "idle timeout: the agent's output stream was silent for {}s, so DevFlow \
+             terminated it (agent pid {}). {commit_phrase} Review the branch before deciding \
+             what to keep — this run is TERMINAL and is not retried automatically.",
+            record.idle_secs, record.agent_pid
+        ),
+        Some(record.commits.len() as u32),
+    ))
+}
+
+/// Build the `IdleTimeout` verdict Layer 1 reports for a monitor-recorded
+/// timeout.
+///
+/// `verdict` stays `None` deliberately: at `Stage::Validate`,
+/// `classify_validate_outcome` matches `Some(Verdict::Pass)` FIRST and would
+/// classify the stage as passed on the strength of that field alone, whatever
+/// the status says. A timeout has no verdict to offer, and inventing one here
+/// would advance a run that never reported.
+fn idle_timeout_result(reason: String, commits: Option<u32>) -> AgentResult {
+    AgentResult {
+        status: AgentStatus::IdleTimeout,
+        exit_code: None,
+        reason: Some(reason),
+        commits,
+        summary: None,
+        verdict: None,
+        decided_by_layer: Some(1),
+    }
+}
+
 /// Layer 1: Try to detect agent result from the native per-adapter envelope
 /// or the DEVFLOW_RESULT marker in stdout.
+///
+/// The monitor's own idle-timeout side channel is consulted FIRST, ahead of
+/// everything below including `read_capture` itself — see
+/// [`parse_idle_timeout_side_channel`], where that ordering is a correctness
+/// requirement rather than a preference.
 ///
 /// Precedence: Claude rate-limit envelope (a SPECIFIC failure that must
 /// outrank the generic `is_error` check — rate-limit envelopes carry
@@ -1517,6 +1787,15 @@ fn parse_marker_lines(stdout: &str) -> Option<AgentResult> {
 /// rather than letting the generic 4000-character tail scan take a bite of a
 /// mid-line window of JSONL first.
 pub fn evaluate_layer1(project_root: &Path, phase: u32) -> Option<AgentResult> {
+    // FIRST STATEMENT, before `read_capture` and before every parser below.
+    // Do not move this into the `.or_else` chain: `parse_claude_event_result`
+    // resolves the LAST top-level `result` event and would shadow it on any
+    // stream that already had one successful turn. See
+    // `parse_idle_timeout_side_channel`'s doc comment (T-31-06).
+    if let Some(timed_out) = parse_idle_timeout_side_channel(project_root, phase) {
+        return Some(timed_out);
+    }
+
     let stdout = read_capture(&stdout_path(project_root, phase))?;
     detect_claude_rate_limit(&stdout)
         .map(rate_limited_result)
@@ -1827,6 +2106,16 @@ fn evaluate_layer0(
 /// unchanged from current behavior. A Layer 0 FAILURE is never passed here —
 /// only its affirmative-success arm is, so a failed probe still outranks
 /// every agent-controlled signal.
+///
+/// 31-02 audit (non-exhaustive equality site 2 of 3). The `!= Success` guard
+/// below is CORRECT AS-IS for `AgentStatus::IdleTimeout` and is left unchanged.
+/// The compiler cannot flag an equality test against a new variant, so this is
+/// audited by hand. An idle-timeout result is rejected here by BOTH independent
+/// guards, not just one: its status is not `Success`, and its
+/// `decided_by_layer` is `Some(1)` (the monitor's side-channel verdict is a
+/// Layer-1-class fact), never `Some(0)`. It returns unchanged, which is right —
+/// this function exists only to graft Layer 1's `verdict` onto an affirmative
+/// Layer 0 probe success, and a timeout is neither.
 fn reconcile_layer0_verdict(
     project_root: &Path,
     state: &State,
@@ -1840,6 +2129,135 @@ fn reconcile_layer0_verdict(
     }
     let verdict = evaluate_layer1(project_root, state.phase).and_then(|layer1| layer1.verdict);
     AgentResult { verdict, ..result }
+}
+
+/// Refuse to let a stream-derived `Success` outrank a contradicting exit code
+/// (constraint 9's residual, T-31-15, 31-04).
+///
+/// # Why this cannot be a parser assertion
+///
+/// Constraint 9's items 1 and 2 — a torn line at or after the last surviving
+/// top-level `result`, and provenance on verdict selection — were closed at the
+/// root by the `a557805` refactor that made lossiness and capture kind
+/// first-class ([`ParsedCapture`], [`classify`]). What survives is precisely
+/// the case no parser can detect: **a capture cut at an exact line boundary is
+/// byte-identical to a healthy shorter run.** There is nothing in the bytes to
+/// assert on. The writer that died between flushing turn N and turn N+1 also
+/// died non-zero, so the exit code is the only remaining signal — and it lives
+/// one layer up, in the wiring, which is where this defence had to go.
+///
+/// # Why the fix is narrow rather than a cascade reordering
+///
+/// [`evaluate_agent_result_inner`] consults Layer 2 only when Layer 1 abstains,
+/// which is why a Layer 1 `Success` wins over a contradicting exit code today.
+/// That ordering is correct in the ordinary case: Layer 1 is authoritative
+/// precisely so it does not need Layer 2's slower `git rev-list` fallback.
+/// Making Layer 2 run first would trade a rare wrong answer for a slow one on
+/// every stage. So this arbitrates one verdict rather than reordering anything.
+///
+/// # Scope
+///
+/// Fires ONLY on `AgentStatus::Success`. `RateLimited`, `IdleTimeout`,
+/// `ResourceKilled`, `AgentUnavailable`, `Failed` and `Unknown` all return
+/// untouched, each with a named test. Two of those exclusions are load-bearing
+/// rather than tidy: a `RateLimited` downgraded to `Failed` would route the run
+/// to a human gate instead of the auto-resume cron it needs, and an
+/// `IdleTimeout` downgraded to `Failed` would erase the distinction plan 31-02
+/// exists to create — 999.64 reborn inside its own fix.
+///
+/// 31-02 audit convention (non-exhaustive equality site): the `!= Success`
+/// guard below is correct as-is for every current and future variant. Anything
+/// that is not an affirmative claimed success has nothing to arbitrate, so
+/// passing it through unchanged is the right default for a variant added later.
+///
+/// # `verdict: None` is load-bearing — do not carry it over for symmetry
+///
+/// `classify_validate_outcome` (`devflow-cli/src/pipeline_outcomes.rs`) matches
+/// `(_, Some(Verdict::Pass)) => ValidateOutcome::Passed` FIRST, with `_`
+/// discarding the status entirely. A downgraded result that kept
+/// `verdict: Pass` would carry `status: Failed` and still classify Validate as
+/// **Passed** — making this whole function a no-op at the one stage where it
+/// matters most. [`idle_timeout_result`] dodges the same trap the same way, and
+/// says so. A downgraded result has no verdict to offer and must not invent
+/// one. The underlying defect (an agent's self-reported verdict outranking the
+/// status the cascade derived) is filed as **999.74 / DEN-95** and deliberately
+/// not fixed here: changing that match arm silently re-routes `Failed`,
+/// `Unknown` and `ResourceKilled`, whose behaviour nothing has audited.
+///
+/// # Exit-code fidelity
+///
+/// 137 → `ResourceKilled` and 127 → `AgentUnavailable` are preserved rather
+/// than collapsed into `Failed`, mirroring [`evaluate_layer2`] exactly:
+/// `outcome_policy::decide_action` routes those two to `GateInfra` rather than
+/// `GateReview`, and the same exit code must not reach two different operator
+/// gates depending on whether a stale Layer 1 success happened to be present.
+///
+/// Note the `ResourceKilled` arm is currently **unreachable via the
+/// `MonitorLaunch::PipeOwning` path**: `run_pipe_owning_monitor` records
+/// `status.code().unwrap_or(-1)`, so a SIGKILLed child writes `-1`, not `137`.
+/// Recorded rather than silently relabelling a real OOM as `Failed` — the arm
+/// is still reachable from the `Legacy` arm's `sh` monitor, whose `$?` does
+/// carry `128 + signal`.
+///
+/// Unreadable or unparseable exit-file content is tolerated exactly as
+/// [`evaluate_layer2`] tolerates it — a missing file returns the result
+/// unchanged (an absent file is not evidence of failure), and garbage parses to
+/// `-1`. Neither is invented behaviour; both match the sibling reader.
+fn reconcile_stream_success_against_exit_code(
+    project_root: &Path,
+    phase: u32,
+    result: AgentResult,
+) -> AgentResult {
+    if result.status != AgentStatus::Success {
+        return result;
+    }
+
+    let Ok(raw) = std::fs::read_to_string(exit_code_path(project_root, phase)) else {
+        return result;
+    };
+    let exit_code: i32 = raw.trim().parse().unwrap_or(-1);
+    if exit_code == 0 {
+        return result;
+    }
+
+    let (status, lead) = if exit_code == 137 {
+        (
+            AgentStatus::ResourceKilled,
+            format!(
+                "the agent's output stream reported SUCCESS but the process was killed \
+                 (exit code {exit_code}, likely OOM)"
+            ),
+        )
+    } else if exit_code == 127 {
+        (
+            AgentStatus::AgentUnavailable,
+            format!(
+                "the agent's output stream reported SUCCESS but the agent command was \
+                 unavailable (exit code {exit_code}, command not found)"
+            ),
+        )
+    } else {
+        (
+            AgentStatus::Failed,
+            format!(
+                "the agent's output stream reported SUCCESS but the agent exited with \
+                 code {exit_code}"
+            ),
+        )
+    };
+
+    AgentResult {
+        status,
+        exit_code: Some(exit_code),
+        reason: Some(format!(
+            "{lead}. A capture cut at an exact line boundary is byte-identical to a healthy \
+             shorter run, so no parser assertion can tell the two apart — the exit code is the \
+             only remaining signal, and it contradicts the claim. Review the phase branch before \
+             deciding what to keep; nothing was rolled back."
+        )),
+        verdict: None,
+        ..result
+    }
 }
 
 /// Full four-layer evaluation: returns the best available AgentResult.
@@ -1864,8 +2282,18 @@ fn evaluate_agent_result_inner(
     }
 
     // Layer 1: DEVFLOW_RESULT marker (authoritative)
+    //
+    // Authoritative, but not unconditionally: a CLAIMED success is arbitrated
+    // against the recorded exit code before it is returned (31-04, T-31-15).
+    // The cascade below is deliberately NOT reordered — see
+    // `reconcile_stream_success_against_exit_code` for why Layer 2 running
+    // first would be the wrong trade.
     if let Some(result) = evaluate_layer1(project_root, state.phase) {
-        return Ok(result);
+        return Ok(reconcile_stream_success_against_exit_code(
+            project_root,
+            state.phase,
+            result,
+        ));
     }
 
     // Layer 2: Exit code + commit gate
@@ -1901,6 +2329,43 @@ pub fn exit_code_path(project_root: &Path, phase: u32) -> PathBuf {
 /// Path to the file where the monitor records the launched agent's PID.
 pub fn agent_pid_path(project_root: &Path, phase: u32) -> PathBuf {
     devflow_dir(project_root).join(format!("phase-{:02}-agent-pid", phase))
+}
+
+/// Path to the file holding the stage prompt handed to the pipe-owning
+/// monitor (Phase 31).
+///
+/// The prompt travels `spawn_monitor` → detached monitor process as a FILE,
+/// never as argv: DevFlow stage prompts are large and argv has a hard length
+/// ceiling, so a prompt passed positionally would fail on exactly the
+/// context-heavy stages that matter most.
+pub fn prompt_path(project_root: &Path, phase: u32) -> PathBuf {
+    devflow_dir(project_root).join(format!("phase-{:02}-prompt", phase))
+}
+
+/// Path to the pipe-owning monitor's own log for a phase (Phase 31).
+///
+/// The monitor is a detached process whose stdio is not the operator's
+/// terminal — anything it prints to its own stdout goes nowhere. Every "log
+/// loudly" obligation in this phase (the D-04 idle-timeout clamp, the D-11
+/// opt-out notice) writes here instead, so a loud message is actually
+/// readable after the fact.
+pub fn monitor_log_path(project_root: &Path, phase: u32) -> PathBuf {
+    devflow_dir(project_root).join(format!("phase-{:02}-monitor.log", phase))
+}
+
+/// Path to the pipe-owning monitor's idle-timeout verdict for a phase
+/// (D-05/D-06, 31-02).
+///
+/// A SIDE CHANNEL, deliberately separate from the stdout capture: the capture
+/// is the agent's own narration, and a verdict appended to it is shadowed by
+/// any earlier genuine `result` event the stream already contained. See
+/// [`parse_idle_timeout_side_channel`] — that separation is a correctness
+/// requirement (T-31-06), not a filing convention.
+///
+/// Holds a JSON [`IdleTimeoutRecord`]. Written and fsynced by the monitor
+/// BEFORE the child is signalled, so nothing can race the verdict.
+pub fn idle_timeout_path(project_root: &Path, phase: u32) -> PathBuf {
+    devflow_dir(project_root).join(format!("phase-{:02}-idle-timeout", phase))
 }
 
 /// Path to the archived-capture-history directory for a phase (16b).
@@ -3200,6 +3665,62 @@ mod tests {
         );
     }
 
+    /// D-13 trap 1, pinned: the delivery canary's declared token appears in the
+    /// stream as a PROMPT ECHO before it can ever appear as an answer, so a
+    /// naive text scan reports delivery on every run — including runs where the
+    /// notification path is dead. That echo is what produced the checkpoint
+    /// false positive 30-05 fixed.
+    ///
+    /// Three cases, and the first two are the negative controls that give the
+    /// third its meaning: the same token, in the same capture shape, must read
+    /// `false` from an echo and from a subagent-origin result, and `true` only
+    /// from a top-level `result`.
+    #[test]
+    fn token_matches_only_inside_top_level_result() {
+        const TOKEN: &str = "DEVFLOW-CANARY-7f3a";
+
+        // 1. Echo only: the token is in the operator's own turn, forwarded back
+        //    into stdout, and in no result at all.
+        let echoed = format!(
+            "{}\n{}\n{}\n",
+            V3_INIT_EVENT,
+            V3_USER_EVENT.replace("__MARKER__", &format!("please return {TOKEN} when done")),
+            v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+        );
+        assert!(
+            !token_reported_in_capture(&echoed, TOKEN),
+            "a token echoed back in the prompt is not delivery evidence — \
+             the CLI forwards the operator's own turn into the same stdout"
+        );
+
+        // 2. Subagent-origin result: right event type, wrong provenance.
+        let subagent = format!(
+            "{}\n{}\n",
+            V3_INIT_EVENT,
+            v3_result_event(V3_RESULT_TURN2, TOKEN).replacen(
+                "{",
+                "{\"parent_tool_use_id\":\"toolu_child\",",
+                1,
+            ),
+        );
+        assert!(
+            !token_reported_in_capture(&subagent, TOKEN),
+            "a subagent-origin result must not satisfy the canary — it is the \
+             same provenance hole constraint 9 item 2 closed for the verdict"
+        );
+
+        // 3. Authoritative: a top-level `result` carrying the token.
+        let authoritative = format!(
+            "{}\n{}\n",
+            V3_INIT_EVENT,
+            v3_result_event(V3_RESULT_TURN1, TOKEN),
+        );
+        assert!(
+            token_reported_in_capture(&authoritative, TOKEN),
+            "a token inside a top-level result IS the canary's answer"
+        );
+    }
+
     /// The Codex arm of the trailing-torn rule — same R1 root cause, and the
     /// Codex adapter is live in production.
     ///
@@ -4298,6 +4819,206 @@ mod tests {
         );
     }
 
+    // ---- idle-timeout side channel (31-02, D-05/D-06/D-07) ---------------
+
+    /// Write a monitor-shaped idle-timeout record. Field names and types match
+    /// `IdleTimeoutRecord` exactly; the monitor writes it via serde, so a drift
+    /// between the two shows up as a failing deserialize here.
+    fn write_idle_timeout_record(root: &Path, phase: u32, commits: &[(&str, &str)]) {
+        let record = IdleTimeoutRecord {
+            status: AgentStatus::IdleTimeout.as_wire_str().to_string(),
+            idle_secs: 30,
+            agent_pid: 4242,
+            written_at: 1_700_000_000,
+            commits: commits
+                .iter()
+                .map(|(sha, subject)| IdleTimeoutCommit {
+                    sha: (*sha).to_string(),
+                    subject: (*subject).to_string(),
+                })
+                .collect(),
+        };
+        std::fs::write(
+            idle_timeout_path(root, phase),
+            serde_json::to_string(&record).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// T-31-06, and the single most important test in plan 31-02.
+    ///
+    /// The fixture is a REAL archived three-turn capture in which every
+    /// top-level `result` event carries a success marker — the normal shape of
+    /// a run that got far enough to idle out. A fixture without a prior
+    /// `result` event would pass vacuously while the same mechanism silently
+    /// failed in production.
+    ///
+    /// The negative control is encoded INSIDE the test rather than described in
+    /// prose: the same fixture is evaluated first WITHOUT the side channel and
+    /// must return `Success`. If that ever stops holding, the `IdleTimeout`
+    /// assertion below is proving a verdict nothing was competing with.
+    #[test]
+    fn idle_timeout_side_channel_wins_over_stale_stream_result() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 40),
+            v3_stream_capture(MARKER_SUCCESS, MARKER_SUCCESS, MARKER_SUCCESS),
+        )
+        .unwrap();
+
+        // NEGATIVE CONTROL — must produce the OPPOSITE result.
+        assert_eq!(
+            evaluate_layer1(dir.path(), 40).unwrap().status,
+            AgentStatus::Success,
+            "negative control: without the side channel this fixture must decide Success, \
+             otherwise the assertion below is vacuous"
+        );
+
+        write_idle_timeout_record(
+            dir.path(),
+            40,
+            &[("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "feat: partial")],
+        );
+
+        let result = evaluate_layer1(dir.path(), 40).unwrap();
+        assert_eq!(
+            result.status,
+            AgentStatus::IdleTimeout,
+            "a stale success already in the capture must not shadow the monitor's verdict"
+        );
+        assert_eq!(result.decided_by_layer, Some(1));
+    }
+
+    /// The read must precede `read_capture`'s early `return None`, so a
+    /// timeout that fired before the child emitted anything at all is still
+    /// authoritative rather than discarded.
+    #[test]
+    fn idle_timeout_side_channel_is_read_even_when_the_capture_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        assert!(
+            !stdout_path(dir.path(), 41).exists(),
+            "fixture precondition: there must be no capture at all"
+        );
+
+        // NEGATIVE CONTROL: with neither file present Layer 1 abstains, so the
+        // verdict below can only have come from the side channel.
+        assert!(evaluate_layer1(dir.path(), 41).is_none());
+
+        write_idle_timeout_record(dir.path(), 41, &[]);
+
+        let result = evaluate_layer1(dir.path(), 41).unwrap();
+        assert_eq!(result.status, AgentStatus::IdleTimeout);
+        assert_eq!(result.commits, Some(0));
+    }
+
+    /// D-07: the verdict names the commits, and says they were not rolled back.
+    #[test]
+    fn idle_timeout_result_carries_the_commits_it_enumerated() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        write_idle_timeout_record(
+            dir.path(),
+            42,
+            &[
+                ("1111111abcdef0000000000000000000000000000", "feat: first"),
+                ("2222222abcdef0000000000000000000000000000", "fix: second"),
+            ],
+        );
+
+        let result = evaluate_layer1(dir.path(), 42).unwrap();
+
+        assert_eq!(result.commits, Some(2));
+        let reason = result.reason.expect("an idle timeout must explain itself");
+        for fragment in [
+            "1111111",     // short sha, first commit
+            "feat: first", // its subject
+            "2222222",
+            "fix: second",
+            "30s",                           // how long the stream was silent
+            "NONE of them were rolled back", // D-07's non-destruction promise
+        ] {
+            assert!(
+                reason.contains(fragment),
+                "reason must name {fragment:?}; got: {reason}"
+            );
+        }
+        // The full sha must not be what is printed — a 40-char sha in a gate
+        // message is noise, and the short form is what an operator pastes.
+        assert!(!reason.contains("1111111abcdef0000000000000000000000000000"));
+    }
+
+    /// Nothing about the pre-existing cascade changes when no timeout fired.
+    /// Three shapes, each asserted against the verdict it produced before this
+    /// plan existed, with the side channel confirmed absent in every one.
+    #[test]
+    fn absent_side_channel_leaves_the_cascade_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+
+        std::fs::write(
+            stdout_path(dir.path(), 43),
+            v3_stream_capture(NO_MARKER, NO_MARKER, MARKER_SUCCESS),
+        )
+        .unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 44),
+            v3_stream_capture(MARKER_SUCCESS, MARKER_SUCCESS, MARKER_FAILED),
+        )
+        .unwrap();
+
+        for (phase, expected) in [
+            (43, Some(AgentStatus::Success)),
+            (44, Some(AgentStatus::Failed)),
+            (45, None), // no capture, no side channel
+        ] {
+            assert!(
+                !idle_timeout_path(dir.path(), phase).exists(),
+                "fixture precondition: phase {phase} must have no side channel"
+            );
+            assert_eq!(
+                evaluate_layer1(dir.path(), phase).map(|r| r.status),
+                expected,
+                "the cascade changed for phase {phase} with no timeout on disk"
+            );
+        }
+    }
+
+    /// The file's PRESENCE is the signal; its contents are enrichment.
+    ///
+    /// A corrupt record must NOT fall back into the cascade — that would let
+    /// the stale success in the capture win, converting a damaged file into a
+    /// silent wrong advance. This is the same fixture as
+    /// `idle_timeout_side_channel_wins_over_stale_stream_result`, so the
+    /// Success it would otherwise decide is real and not hypothetical.
+    #[test]
+    fn an_unreadable_idle_timeout_record_still_produces_the_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 46),
+            v3_stream_capture(MARKER_SUCCESS, MARKER_SUCCESS, MARKER_SUCCESS),
+        )
+        .unwrap();
+
+        // NEGATIVE CONTROL: this capture decides Success on its own.
+        assert_eq!(
+            evaluate_layer1(dir.path(), 46).unwrap().status,
+            AgentStatus::Success
+        );
+
+        std::fs::write(idle_timeout_path(dir.path(), 46), "{ this is not json").unwrap();
+
+        let result = evaluate_layer1(dir.path(), 46).unwrap();
+        assert_eq!(result.status, AgentStatus::IdleTimeout);
+        assert_eq!(
+            result.commits, None,
+            "an unreadable record must not invent a commit count"
+        );
+        assert!(result.reason.unwrap().contains("unreadable"));
+    }
+
     /// Last-result-wins. A session kept alive across turns emits one `result`
     /// event per turn; only the final one is the session's verdict.
     ///
@@ -5063,6 +5784,263 @@ mod tests {
         assert_eq!(result.summary.as_deref(), Some("ok"));
     }
 
+    // ---- exit-code arbitration on a claimed success (31-04, T-31-15) -----
+    //
+    // Every test below drives the FULL cascade through
+    // `evaluate_agent_result_inner`, never the parser's own return value.
+    // 31-RESEARCH.md § Pitfall 4 records why: a truncation-boundary test that
+    // checks only `parse_claude_event_result` exercises constraint 9's items 1
+    // and 2, which the `a557805` root-cause refactor already closed. The
+    // residual this arbitration exists for lives in the WIRING — Layer 1
+    // returning before Layer 2 is ever consulted — and only the cascade
+    // exercises it.
+
+    /// A success marker that also claims `verdict: pass` — the shape that made
+    /// the naive "carry every other field over" downgrade a no-op at Validate
+    /// (`classify_validate_outcome` matches `Some(Verdict::Pass)` FIRST, with
+    /// `_` discarding the status). Used to prove `verdict` is dropped.
+    const MARKER_SUCCESS_CLAIMING_PASS: &str =
+        r#"Done.\nDEVFLOW_RESULT: {\"status\":\"success\",\"verdict\":\"pass\"}"#;
+
+    /// The residual of constraint 9 that no parser assertion can reach.
+    ///
+    /// A capture cut at an exact line boundary is byte-identical to a healthy
+    /// shorter run, so the stream itself carries no evidence of the tear. The
+    /// writer that died between flushing turn N and turn N+1 also died
+    /// non-zero, and that exit code is the only signal left.
+    #[test]
+    fn stream_success_cannot_stand_against_nonzero_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 31),
+            v3_stream_capture(NO_MARKER, NO_MARKER, MARKER_SUCCESS_CLAIMING_PASS),
+        )
+        .unwrap();
+
+        // NEGATIVE CONTROL, encoded in the test rather than described in prose:
+        // Layer 1 on its own decides Success here AND reports `verdict: Pass`.
+        // Without this the assertions below cannot distinguish "the arbitration
+        // downgraded a success" from "nothing ever claimed success", nor
+        // "`verdict` was dropped" from "`verdict` was never set".
+        let layer1 = evaluate_layer1(dir.path(), 31).unwrap();
+        assert_eq!(layer1.status, AgentStatus::Success);
+        assert_eq!(layer1.verdict, Some(Verdict::Pass));
+
+        std::fs::write(exit_code_path(dir.path(), 31), "1\n").unwrap();
+        let state = state_in(dir.path(), 31);
+
+        let result =
+            evaluate_agent_result_inner(dir.path(), &state, &GitFlowConfig::default(), None)
+                .unwrap();
+
+        assert_eq!(result.status, AgentStatus::Failed);
+        assert_eq!(result.exit_code, Some(1));
+        assert!(
+            result.reason.as_deref().is_some_and(|r| r.contains("1")),
+            "the reason must name the exit code: {:?}",
+            result.reason
+        );
+        // Layer 1 still decided this — the arbitration corrects its verdict, it
+        // does not hand the decision to Layer 2.
+        assert_eq!(result.decided_by_layer, Some(1));
+        // Load-bearing: a downgraded result has no verdict to offer. Carrying
+        // `Some(Verdict::Pass)` over would leave Validate classified Passed and
+        // make this whole test's premise false at the stage that matters most
+        // (999.74 / DEN-95).
+        assert_eq!(result.verdict, None);
+    }
+
+    /// The matched negative control for the test above. Without it, that test
+    /// cannot tell "the arbitration works" from "the arbitration fires on
+    /// everything".
+    #[test]
+    fn stream_success_stands_when_the_exit_code_is_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 32),
+            v3_stream_capture(NO_MARKER, NO_MARKER, MARKER_SUCCESS_CLAIMING_PASS),
+        )
+        .unwrap();
+        std::fs::write(exit_code_path(dir.path(), 32), "0\n").unwrap();
+        let state = state_in(dir.path(), 32);
+
+        let result =
+            evaluate_agent_result_inner(dir.path(), &state, &GitFlowConfig::default(), None)
+                .unwrap();
+
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(result.decided_by_layer, Some(1));
+        // The verdict survives an untouched result — proof that the `None`
+        // asserted in the downgrade test is the arbitration's doing and not a
+        // property of the fixture.
+        assert_eq!(result.verdict, Some(Verdict::Pass));
+    }
+
+    /// A missing exit file is not evidence of failure. This matches
+    /// `evaluate_layer2`'s own tolerance (`Err(_) => return Ok(None)`); a
+    /// stricter reading here would fail every stage whose monitor had not yet
+    /// written the file.
+    #[test]
+    fn stream_success_stands_when_no_exit_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 33),
+            v3_stream_capture(NO_MARKER, NO_MARKER, MARKER_SUCCESS),
+        )
+        .unwrap();
+        assert!(
+            !exit_code_path(dir.path(), 33).exists(),
+            "fixture precondition: there must be no exit file"
+        );
+        let state = state_in(dir.path(), 33);
+
+        let result =
+            evaluate_agent_result_inner(dir.path(), &state, &GitFlowConfig::default(), None)
+                .unwrap();
+
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(result.decided_by_layer, Some(1));
+    }
+
+    /// Only a *claimed success* is arbitrated. Downgrading a rate limit to a
+    /// generic failure would route the run to a human gate instead of the
+    /// auto-resume cron it needs — the exact harm `rate_limited_result`'s
+    /// precedence over `detect_claude_envelope_failure` exists to prevent.
+    #[test]
+    fn rate_limited_verdict_is_not_arbitrated_by_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 34),
+            r#"{"type":"result","subtype":"error_rate_limit","is_error":true,"retry_after":"2026-06-18T15:45:30Z"}"#,
+        )
+        .unwrap();
+        std::fs::write(exit_code_path(dir.path(), 34), "1\n").unwrap();
+        let state = state_in(dir.path(), 34);
+
+        let result =
+            evaluate_agent_result_inner(dir.path(), &state, &GitFlowConfig::default(), None)
+                .unwrap();
+
+        assert_eq!(result.status, AgentStatus::RateLimited);
+        assert_eq!(
+            result.reason.as_deref(),
+            Some("rate limited until 2026-06-18T15:45:30Z"),
+            "the rate-limit reason must survive verbatim — the resume cron reads it"
+        );
+    }
+
+    /// Plan 31-02's side-channel verdict survives arbitration unchanged. An
+    /// `IdleTimeout` collapsed into `Failed` would lose exactly the distinction
+    /// 31-02 exists to create, and the monitor writes a NON-zero exit for a
+    /// child it killed, so this is not a hypothetical pairing.
+    #[test]
+    fn idle_timeout_verdict_is_not_arbitrated_by_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 35),
+            v3_stream_capture(MARKER_SUCCESS, MARKER_SUCCESS, MARKER_SUCCESS),
+        )
+        .unwrap();
+        write_idle_timeout_record(
+            dir.path(),
+            35,
+            &[("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "feat: partial")],
+        );
+        std::fs::write(exit_code_path(dir.path(), 35), "143\n").unwrap();
+        let state = state_in(dir.path(), 35);
+
+        let result =
+            evaluate_agent_result_inner(dir.path(), &state, &GitFlowConfig::default(), None)
+                .unwrap();
+
+        assert_eq!(result.status, AgentStatus::IdleTimeout);
+        assert_eq!(
+            result.exit_code, None,
+            "the arbitration must not graft an exit code onto a timeout verdict"
+        );
+    }
+
+    /// Exit-code fidelity (adversarial review of 31-04, W1). A blanket `Failed`
+    /// would flatten the two codes `evaluate_layer2` classifies specially, and
+    /// `outcome_policy::decide_action` routes those to `GateInfra` rather than
+    /// `GateReview`. The same exit code must not reach two different operator
+    /// gates depending on whether a stale Layer 1 success happened to be there.
+    #[test]
+    fn arbitration_preserves_layer2s_resource_and_unavailable_codes() {
+        for (code, expected) in [
+            (137, AgentStatus::ResourceKilled),
+            (127, AgentStatus::AgentUnavailable),
+            (2, AgentStatus::Failed),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+            std::fs::write(
+                stdout_path(dir.path(), 36),
+                v3_stream_capture(NO_MARKER, NO_MARKER, MARKER_SUCCESS),
+            )
+            .unwrap();
+            std::fs::write(exit_code_path(dir.path(), 36), format!("{code}\n")).unwrap();
+            let state = state_in(dir.path(), 36);
+
+            let arbitrated =
+                evaluate_agent_result_inner(dir.path(), &state, &GitFlowConfig::default(), None)
+                    .unwrap();
+
+            assert_eq!(
+                arbitrated.status, expected,
+                "exit {code} must arbitrate to {expected:?}, matching evaluate_layer2"
+            );
+            assert_eq!(arbitrated.exit_code, Some(code));
+        }
+    }
+
+    /// D-12's inverse assertion, and the mirror of
+    /// [`single_doc_envelope_not_consumed_by_claude_stream_parser`].
+    ///
+    /// That test pins one direction: today's shipped `--output-format json`
+    /// envelope must NOT be consumed by the stream parser. This pins the other:
+    /// a capture produced by plan 31-01's new `stream-json` argv classifies as
+    /// [`CaptureKind::ClaudeStream`] and is NOT consumed by the
+    /// single-document envelope path. Without both directions, widening either
+    /// gate is only half-guarded.
+    ///
+    /// Cites `classify()` / `CaptureKind::ClaudeStream` deliberately: the gate
+    /// predicate `31-CONTEXT.md` and `30-VERIFICATION.md` W-02 still name is no
+    /// longer a live function — the `a557805` refactor replaced it.
+    #[test]
+    fn stream_json_capture_is_not_consumed_by_the_single_document_path() {
+        let capture = v3_stream_capture(NO_MARKER, NO_MARKER, MARKER_SUCCESS);
+
+        // The classifier owns it.
+        assert!(capture_is_claude_stream(&capture));
+
+        // Every single-document reader declines it...
+        assert!(claude_session_id(&capture).is_none());
+        assert!(detect_claude_envelope_failure(&capture).is_none());
+        assert!(detect_claude_rate_limit(&capture).is_none());
+
+        // ...and the stream parser still owns it, so declining costs no verdict.
+        assert_eq!(
+            parse_claude_event_result(&capture).unwrap().status,
+            AgentStatus::Success
+        );
+
+        // Non-vacuity: the single-document readers are not simply broken — the
+        // same three answer a real envelope. Without this, the `is_none()`
+        // assertions above would pass against a reader that returned `None` for
+        // everything.
+        let envelope = r#"{"type":"result","subtype":"error_rate_limit","is_error":true,"retry_after":"2026-06-18T15:45:30Z","session_id":"abc"}"#;
+        assert_eq!(claude_session_id(envelope).as_deref(), Some("abc"));
+        assert!(detect_claude_envelope_failure(envelope).is_some());
+        assert!(detect_claude_rate_limit(envelope).is_some());
+        assert!(!capture_is_claude_stream(envelope));
+    }
+
     #[test]
     fn evaluate_layer1_finds_devflow_result_in_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -5338,8 +6316,14 @@ mod tests {
     }
 
     /// review consensus #1: `as_wire_str()` must never diverge from the serde
-    /// form for ANY variant — pin it for all six via a single round-trip
+    /// form for ANY variant — pin it for all seven via a single round-trip
     /// assertion (quotes stripped).
+    ///
+    /// 31-02: `IdleTimeout` is enumerated here explicitly rather than left to
+    /// the compiler. `as_wire_str`'s wildcard-free match makes a MISSING arm a
+    /// compile error, but it cannot catch a WRONG one — an arm returning
+    /// `"idletimeout"` compiles happily and diverges from the serde form the
+    /// `#[serde(rename)]` produces. Only enumerating the variant here pins that.
     #[test]
     fn as_wire_str_matches_serde_form_for_every_variant() {
         for variant in [
@@ -5349,6 +6333,7 @@ mod tests {
             AgentStatus::Unknown,
             AgentStatus::ResourceKilled,
             AgentStatus::AgentUnavailable,
+            AgentStatus::IdleTimeout,
         ] {
             let serde_form = serde_json::to_string(&variant).unwrap();
             let stripped = serde_form.trim_matches('"');
