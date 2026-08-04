@@ -59,7 +59,7 @@ Not constrained here; the researcher and planner decide:
 ### Backlog source and escalation rationale
 - `.planning/ROADMAP.md` § "Phase 999.39" (now `PROMOTED — Phase 27`) — the full original evidence, the 37-failing-test signal, and the CR-01 escalation rationale in detail. This CONTEXT.md does not restate it.
 - `.planning/ROADMAP.md` § "Phase 27" — the phase entry itself, written when promoting from backlog; goal, depends-on, scope caution.
-- `.planning/phases/26-release-cut-automation/26-REVIEW.md` § "CR-01" — the exact bypass mechanism (`--show-toplevel` vs. `GIT_DIR`-sourced HEAD/refs/objects), reproduced end-to-end against `mutating_project_root` (`main.rs:718-779` on `feature/phase-26`, **not present on `develop`**).
+- `.planning/superseded/26-release-cut-automation/26-REVIEW.md` § "CR-01" — the exact bypass mechanism (`--show-toplevel` vs. `GIT_DIR`-sourced HEAD/refs/objects), reproduced end-to-end against `mutating_project_root` (`main.rs:718-779` on `feature/phase-26`, **not present on `develop`**).
 
 ### Code this phase changes
 - `crates/devflow-core/src/git.rs` — 9 call sites (lines 100, 175, 387, 415, 438, 450, 488, 497, 708).

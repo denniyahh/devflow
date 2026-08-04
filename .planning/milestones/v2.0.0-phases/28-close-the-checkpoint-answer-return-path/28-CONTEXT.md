@@ -226,7 +226,7 @@ Not constrained here; the researcher and planner decide:
   narrowed the phase's actual scope (see `<domain>`); this CONTEXT.md is
   authoritative over the ROADMAP entry's original framing where they
   diverge.
-- `.planning/phases/26-release-cut-automation/26-CONTEXT.md` § D-10 — the
+- `.planning/superseded/26-release-cut-automation/26-CONTEXT.md` § D-10 — the
   tag-signing-viability predictor precedent behind D-02 (why pattern-
   matching failure text was rejected).
 - `.planning/phases/23-end-to-end-dogfood/23-CONTEXT.md` § D-05, D-06 — the

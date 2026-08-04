@@ -114,7 +114,7 @@ Recorded in `.planning/ROADMAP.md`:
   the salvageable pieces, and 5 prerequisites
 - **999.39** (`GIT_DIR` scrubbing, DEN-66) — **escalated Medium → High**; now
   blocks DEN-50 in Linear
-- Full review: `.planning/phases/26-release-cut-automation/26-REVIEW.md`
+- Full review: `.planning/superseded/26-release-cut-automation/26-REVIEW.md`
 
 **Caveat on "CLOSED PARTIAL":** that status is a *documentation* state. It
 records an intent; it did not move, quarantine, or merge any code. The
