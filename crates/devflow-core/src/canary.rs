@@ -218,13 +218,29 @@ pub fn run_delivery_canary<L: CanaryLauncher>(launcher: &L, capture_dir: &Path) 
 /// concluding nothing more is coming.
 ///
 /// Deliberately its OWN constant rather than a reuse of the stage monitor's
-/// idle timeout, despite currently holding the same number: the canary waits
-/// for one trivial background task, the monitor waits for a whole stage, and
-/// coupling them would let a future change to the stage timeout silently change
-/// how patient the guard is. The value is D-02's measured constraint-8 floor
-/// (pooled max 13.73s on the milestone signal; 7.09s on the every-line signal
-/// this path actually sees), so it is roughly 4x margin, not a guess.
-const CANARY_IDLE_SECS: u64 = 30;
+/// idle timeout: the canary waits for one trivial background task, the monitor
+/// waits for a whole stage, and coupling them would let a future change to the
+/// stage timeout silently change how patient the guard is. That separation is
+/// still right — but it is exactly why this constant has to be re-derived when
+/// the evidence moves, rather than tracking the other one for free.
+///
+/// **Raised 30s -> 120s on 2026-08-03. The previous value's stated "~4x margin"
+/// was refuted by measurement.** That figure came from Phase 30d's *backgrounded*
+/// 10s/22s sleeps. Direct measurement (CLI 2.1.220, five workload-controlled
+/// trials, two workload types, negative control) found the CLI emits
+/// `tool_progress` keepalives on a **fixed 30.00s interval**, with the first gap
+/// after `task_started` consistently ~26.4s. So 30s of stream silence is normal
+/// healthy behaviour, and a 30s patience budget had roughly 1.1x margin, not 4x.
+/// See `IDLE_TIMEOUT_FLOOR_SECS` in `monitor.rs` and the phase's
+/// `31-IDLE-GAP-MEASUREMENTS.md`.
+///
+/// **Why a false `Absent` is the expensive direction here.** This guard *refuses
+/// to run* on `Absent`/`Unverified` (D-15). A canary that gives up during a
+/// normal keepalive gap does not degrade the run — it locks the operator out of
+/// every `stream-json` launch until they diagnose it. Being slower to detect a
+/// genuinely dead delivery path costs one wait, bounded anyway by
+/// [`CANARY_DEADLINE_SECS`]; being wrong in the other direction costs the tool.
+const CANARY_IDLE_SECS: u64 = 120;
 
 /// Absolute wall-clock cap on one canary run.
 ///
