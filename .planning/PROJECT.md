@@ -18,6 +18,20 @@ DevFlow must reliably drive the agent through the full pipeline and never
 silently corrupt its own state or lose a human's gate decision, even under a
 mid-run crash or kill.
 
+## Current Milestone: GSD Workflow Hygiene
+
+**Goal:** Restructure `ROADMAP.md` so backlog item 999.72 — `gsd-tools`' milestone-scoped
+parsers finding zero phases and falling back to a dangerous pass-all default — is no longer
+live in this repo. No crates code changes; this milestone is intentionally unversioned (no
+`vX.Y.Z`, nothing published to crates.io) since it's pure `.planning/` documentation structure.
+
+**Target:**
+- The active milestone's own phase headings live inside its own heading-to-next-heading window
+  in `ROADMAP.md`, verified against a re-run of `roadmap.analyze` and `milestone.complete
+  --dry-run` (both currently misfire — confirmed live 2026-08-04).
+- The missing `## Progress` table (999.72a) exists, most likely as a side effect of this
+  workflow's own `gsd-roadmapper` write.
+
 ## Requirements
 
 ### Validated
@@ -186,6 +200,23 @@ items require `/gsd-review-backlog` promotion.)*
 | `.planning/ROADMAP.md` | Phase plan source of truth (current — not the stale pre-GSD `ROADMAP.md` at repo root, which predates the GSD reorg) |
 | `.planning/codebase/` | Codebase map (7 documents, 2026-06-17 — predates Phases 1-12; consider `/gsd-map-codebase` before Phase 13) |
 | `.planning/CONCERNS.md` | Top findings from the original pre-Phase-1 codebase audit |
+
+## Evolution
+
+This document evolves at phase transitions and milestone boundaries.
+
+**After each phase transition** (via `/gsd-transition`):
+1. Requirements invalidated? → Move to Out of Scope with reason
+2. Requirements validated? → Move to Validated with phase reference
+3. New requirements emerged? → Add to Active
+4. Decisions to log? → Add to Key Decisions
+5. "What This Is" still accurate? → Update if drifted
+
+**After each milestone** (via `/gsd-complete-milestone`):
+1. Full review of all sections
+2. Core Value check — still the right priority?
+3. Audit Out of Scope — reasons still valid?
+4. Update Context with current state
 
 ---
 *Last updated: 2026-07-28 after Phase 25 (End-to-End Dogfood Blockers)

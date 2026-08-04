@@ -1,39 +1,16 @@
 ---
 gsd_state_version: 1.0
-milestone: v2.3.0
-milestone_name: "the unattended run (999.64 arc — CLOSED 2026-08-04)"
-current_phase: 31
-status: "v2.3.0 milestone closed — awaiting next milestone"
-stopped_at: "Milestone v2.3.0 CLOSED 2026-08-04. Phase 31 COMPLETE, 5/5 plans. The 999.64 arc closed with it: acceptance run passed attempt 1 (D-18 verified independently from git: two merge commits with independent-forking parents). 31-VERIFICATION.md passed, 879 tests. One adversarial plan review + one peer code review; 3 CRITICAL/HIGH fixed in 522e905 with mutation-proven tests, 1 filed (999.75/DEN-96, itself resolved 2026-08-04 in 2c20ab4/PR #82). Ship/merge decision RESOLVED: the 8 acceptance-run commits (0590537..911bf50, incl. fabricated phase 97) were KEPT by operator decision as D-18 evidence and are in develop's history via PR #78 (1dea423) as of before this close. v2.3.0 released and tagged (signed) on main. D-19 (arc closes) confirmed directly by the operator at milestone close, resolving 31-VERIFICATION.md's flagged human-verification gap. Milestone archived to .planning/milestones/v2.3.0-ROADMAP.md and v2.3.0-phases/; see .planning/MILESTONES.md. Next: /gsd-new-milestone."
-last_updated: "2026-08-04"
+milestone: GSD Workflow Hygiene
+milestone_name: GSD Workflow Hygiene
+status: planning
+last_updated: "2026-08-04T16:44:35.891Z"
 last_activity: 2026-08-04
-last_activity_desc: v2.3.0 milestone closed and archived
 progress:
-  # STALE AND UNVERIFIED — do not trust these five values.
-  # `state.update-progress` is the tool that owns them and it is not usable here:
-  # run 2026-08-02 it regressed current_phase 30 -> 28 from the stale body, rewrote
-  # an unrelated phase-23 historical note, and reported completed:132/total:138 in
-  # its own JSON while writing 131/137 to these fields. Left at their last
-  # hand-trusted values rather than replaced with numbers that cannot be defended.
-  # See .planning/UPSTREAM-GSD-ISSUES.md entries 9 and 11.
-  #
-  # 2026-08-03: this block is deleted by EVERY state verb that calls
-  # syncStateFrontmatter. THREE in one session — `state.planned-phase`
-  # (plan-phase §13b), `state.begin-phase` (execute-phase), and `phase.complete`
-  # — each stripped it and rewrote the counters; none reported the deletion in
-  # its `updated[]`. Restored by hand all three times. `phase.complete` also
-  # regressed `stopped_at` to a value from two stages earlier, which was NOT
-  # caught by its own `warnings[]`.
-  #
-  # STANDING QUESTION FOR THE OPERATOR: this is now a per-verb tax. Either the
-  # preserve-guard gets fixed upstream (ledger entry 9), or these five fields
-  # should be deleted outright rather than defended every time.
-  total_phases: 21
-  completed_phases: 16
-  total_plans: 129
-  completed_plans: 129
-  percent: 88
-current_phase_name: claude-adapter-launch-path-pipe-owning-monitor-999-64-arc-cl
+  total_phases: 0
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
 # DevFlow — Project State
@@ -172,94 +149,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 31
-Plan: Not started
-Status: All phases complete
-
-Phase 30 closed 2026-08-03 via `phase.complete 30`. Note what that did NOT do:
-ROADMAP.md was unchanged (it reported `roadmap_updated: true` while changing
-nothing), so plans 30-03/04/05 still show `[ ]` in the phase entry despite all
-five having summaries, and the entry carries no `**STATUS: COMPLETE**` line of
-the kind Phase 27 has. The milestone table row was already `Complete`.
-real action is `/gsd-review-backlog` to promote a 999.x entry, or `/gsd-ship 27`
-to merge this phase. `phase.complete` auto-advanced this field to "999.1 — Hermes
-Support (BACKLOG)" because its next-phase scan walks into the backlog section;
-corrected here, since that value routes an operator into planning a backlog stub.
-
-(Carried-over Phase 25 remnant, left in place as found: Tasks 1-3 done, both human
-sign-offs recorded in 25-13-SUMMARY.md; 25-14/25-15/25-16 planned 2026-07-28 as
-gap-closure round 3, not yet executed)
-
-**25-10 → 25-13 (2026-07-28):** GAP 1 (25-08) and GAP 2 (25-09) closed and merged. GAP 3
-(truth 7, 25e / 999.47) moved through three states this run: `PRESENT_BEHAVIOR_UNVERIFIED`
-(25-VERIFICATION.md) → `reproduced` by 25-10's Step A push, rejected 2/2 by the `pre-push`
-hook on `commands::tests::gate_sweep_reap_strays_dry_run_discovers_a_real_stray_without_signalling`
-(`commands.rs:3678`, `25-CI-OBSERVATION.md`) → the defect class closed by construction (25-11's
-measured `25-SITE-CENSUS.md` + exec-visibility barrier at all 6 vulnerable/vacuous-negative
-sites; 25-12's `agent::STRAY_MIN_AGE` production age floor) → **`no_reproduction across 11
-observations`** (25-13's `25-CI-TRIALS.md`): 6 local `scripts/check-in-container.sh all`
-push-gate observations (5 standalone + the `pre-push` hook's own 6th) and 5 serialized,
-completed CI `Test`-job trials, all green, all at `tested_head_sha`
-`82328b31eb5cbb8d795bc86f048b2602904dc8f4`.
-
-`origin/feature/phase-25` advanced off `a5a068f` through the real `pre-push` gate to
-`tested_head_sha` (75 previously-local-only commits pushed), and will advance again to
-`evidence_commit_sha` once this STATE.md commit and `25-CI-TRIALS.md`'s artifact commit are
-pushed. `25-10-PLAN.md` is `status: superseded`, `superseded_by: "25-13"` — it will never
-have a `25-10-SUMMARY.md`.
-
-**`no_reproduction` is not a closure claim — and it still isn't, after sign-off.**
-`25-CI-TRIALS.md`'s `status` field remains `no_reproduction`; Task 3's human sign-off is
-recorded as a decision layered on top of that artifact, not an edit to it. Task 3's two
-required responses (Part A: 25e evidence; Part B: 25f's three `25-VALIDATION.md` rows) were
-both recorded verbatim, dated 2026-07-28, in `25-13-SUMMARY.md`.
-
-**Part A resolution:** the human asked whether the observation shape could move from local
-push-gate to GitHub CI; declined (source change, voids the `tested_head_sha` streak, CI is the
-less sensitive instrument per `## Limits of this evidence` point 3), so the human's stated
-pre-authorised approval applied. **Truth 7 (999.47/DEN-72) is recorded as human-verified
-against `25-CI-TRIALS.md`'s evidence, residuals stated — not proven absent.** A backlog
-follow-up was surfaced (a single native-2-vCPU CI job running `scripts/check.sh all`, to
-convert the local observation into a standing per-push guard) but not implemented here.
-**Part B:** approved, with the orchestrator's independent per-row corroboration recorded
-alongside as corroboration only.
-
-Full evidence: `.planning/milestones/v2.0.0-phases/25-end-to-end-dogfood-blockers/25-CI-OBSERVATION.md` (the
-2/2 reproduction), `.planning/milestones/v2.0.0-phases/25-end-to-end-dogfood-blockers/25-CI-TRIALS.md` (the
-11-observation no-reproduction streak), and
-`.planning/milestones/v2.0.0-phases/25-end-to-end-dogfood-blockers/25-13-SUMMARY.md` (both verbatim sign-offs).
-
-**Next action:** plan-level gap-closure work for Phase 25 is complete (25-08, 25-09, 25-11,
-25-12, 25-13; 25-10 superseded). Remaining work is phase-level verification and closure —
-owned by the orchestrator, not this plan.
-
-**23-15 result (second acceptance attempt, 2026-07-26):** `devflow start --phase 24 --agent claude --mode auto --yes-ship` was blocked at launch by the self-dogfood staleness hard block (D-18) — the binary's embedded commit (`0c9dcfe`, built from `feature/phase-23`) and `origin/develop`'s tip (`0dad20d`) are mutually non-ancestors (genuine divergence, confirmed via `git merge-base --is-ancestor` both directions, exit 1 each way), so the block fired before Define ever launched. No `workflow_shipped` event exists for phase 24; `devflow evidence --phase 24 --require-shipped` exits 1 both pre- and post-run — unchanged. See `.planning/milestones/v2.0.0-phases/23-end-to-end-dogfood/23-ACCEPTANCE-RUN-2.md`.
-
-**Operator's two verdicts (recorded verbatim in `23-ACCEPTANCE-RUN-2.md` §15):** `record: valid` (the run-incomplete declaration precisely names its stop cause, source-verified) and `acceptance: failed` (forced by the two-piece evidence contract — no `workflow_shipped`, `--require-shipped` unchanged at exit 1). **Phase 23's own behavioural acceptance criterion — "one phase driven Define→completed Ship, unattended, with Claude" — remains UNMET after two attempts** (attempt 1 failed on target unreachability, now fixed; attempt 2 failed on binary provenance).
-
-**Agreed next action: plan 23-16 — fix the staleness check itself (planned 2026-07-26, `23-16-PLAN.md`, plan-checker VERIFICATION PASSED).**
-
-**This SUPERSEDES the earlier "build `devflow` from a `develop` checkout" workaround**, which the operator rejected: making the topology accidentally line up would permanently prevent dogfooding a change from the branch that contains it, so every future feature-branch fix would be unvalidatable by a real run.
-
-The defect is narrower than the workaround assumed. `embedded_commit_is_stale` (`crates/devflow-cli/src/staleness.rs`) is **not** coupled to `develop` — it compares the embedded commit against `HEAD` (line 50); the apparent coupling comes from `devflow start` forking the phase worktree from `develop`, so HEAD *is* develop's tip (the 18c rule). The function has four ancestry outcomes and the 21d/999.29 content-aware exemption guards only one of them; the divergent arm (`Ok(Some(1)) => Staleness::Stale`, line ~76) is a bare return that never consults it. That arm killed the 23-15 run.
-
-The fix is small because `ancestry_range_affects_build` uses the **two-dot** form `git diff --name-only <embedded> HEAD`, which compares trees rather than history and therefore already works across divergence — the helper needs no change, only its call site is gated behind the wrong condition. Measured proof: `git diff --name-only 0c9dcfe 0dad20d` yields exactly one file (`23-GUARD-SHIP-RECORD.md`) and **zero** build-affecting files, so a content-first check classifies that pair `Fresh`.
-
-Scope boundary: 23-16 is the **fix only** (change + regression tests + PR into `develop` behind a `gate="blocking"` operator merge, per 23-13's precedent and this project's no-autonomous-write-to-`develop` rule). Relaunching `devflow start --phase 24` is a separate follow-on plan, **23-17**, which re-runs 23-14's precondition shape against a binary built from wherever is convenient.
-
-**Recovery-ref disposition:** both `origin` refs (`recovery/pre-23-11-acceptance-e0f87c2`, `recovery/pre-23-15-acceptance-0dad20d`) remain untouched on `origin`; the local copy of the pre-23-11 ref, deleted again by `devflow cleanup`, is deliberately NOT restored (per `23-FINDINGS.md` §B2a); the pre-23-15 ref is now unused (no merge to undo) but retained on `origin` for reuse by the 23-16 retry rather than deleted.
-
-Last activity: 2026-08-03 — Phase 31 complete
-
-**Note on the "Plan: 2 of 15" value this replaces:** `gsd-tools state advance-plan` only increments whatever value is already in this field, which had drifted to "2 of 15" (the parallel-worktree waves 23-01…23-09 deliberately never touch STATE.md, and this field was last corrected against reality at "10 of 11 plans complete" before the plan count grew to 15 with the gap-closure plans 23-12…23-15). Corrected directly to "13 of 15" to match reality (23-12 and 23-13 both now executed) rather than trust the tool's naive +1 increment from a stale base.
-
-Progress: [██████████] 100% (15 of 15 plans executed — plan-count only; the phase's behavioural acceptance goal is UNMET and requires plan 23-16 to close)
-
-*(Machine-readable fields for `gsd-tools state begin-phase` / `advance-plan` —
-this project historically tracked position only in the narrative "Active
-Phase" section above, which `advance-plan` cannot parse (backlog 12,
-`deferred-items.md`). This section restores the standard fields so
-`begin-phase` can seed real Plan/Status values once Phase 20 starts.)*
+Phase: Not started (defining requirements)
+Plan: —
+Status: Defining requirements
+Last activity: 2026-08-04 — Milestone GSD Workflow Hygiene started
 
 ## Recently Shipped
 
