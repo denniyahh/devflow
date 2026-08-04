@@ -93,12 +93,18 @@ mid-run crash or kill.
 *(none currently in flight. **The v2.3.0 milestone was CLOSED 2026-08-04**,
 bounded from the start (declared 2026-08-02) — it closed when the 999.64 arc
 landed (Phase 30 + Phase 31). This is the first milestone in this project
-actually archived via `/gsd-complete-milestone`'s process (hand-corrected —
-see ROADMAP.md and `.planning/milestones/v2.3.0-ROADMAP.md` for why the CLI
-step itself was bypassed). Phases 1-29 and the v1.0/v2.0.0 milestone labels
-remain un-archived in `.planning/phases/` and ROADMAP.md as of this update —
-a known, deliberately deferred cleanup, not an oversight; see ROADMAP.md
-Backlog 999.72.
+actually archived, hand-corrected — see ROADMAP.md and
+`.planning/milestones/v2.3.0-ROADMAP.md` for why `gsd-tools milestone.complete`
+itself was bypassed (filed as upstream GSD-core issue ledger entry 16).
+Immediately after, the full project history was retroactively archived the
+same day: **v2.0.0** (phases 12-25, 27, 28 — the milestone's own existing
+table just hadn't been kept current past Phase 20) and a **retroactively
+declared v1.0** (phases 1-11, which shipped before this project used the
+milestone concept at all). Phase 26 (closed partial, not shipped) moved to
+`.planning/superseded/26-release-cut-automation/`; Phase 29 (aborted, no
+directory) needed no move. `.planning/phases/` now holds only active backlog
+(`999.x`) directories — every numbered phase (1-31) is archived. See
+`.planning/MILESTONES.md` for the full index.
 Hermes Support, previously slotted as "Phase 18," was rescoped out during
 the 2026-07-20 reprioritization to Dogfood Reliability Hardening and now
 sits in the backlog as `999.1` — it is NOT automatically next; backlog
@@ -199,8 +205,11 @@ HEAD (411/0 core, 188/0 cli). This unblocks 999.25 (release executor) and 999.52
 (`devflow sync`), which named it prerequisite #1. Not yet shipped/merged.*
 
 ---
-*Last updated: 2026-08-04 after the v2.3.0 milestone ("the unattended run",
-Phases 30-31) closed. This update covers only what changed for that milestone
-close — Phases 26-29 shipped in the interim and are not individually
-summarized above; see ROADMAP.md and `.planning/MILESTONES.md` for the
-authoritative phase-by-phase and milestone-by-milestone record.*
+*Last updated: 2026-08-04. The v2.3.0 milestone ("the unattended run", Phases
+30-31) closed, then the full prior project history was retroactively archived
+in the same session: v2.0.0 (phases 12-25, 27, 28) and a retroactively
+declared v1.0 (phases 1-11). Phase 26 (not shipped) and Phase 29 (aborted)
+were excluded from both archives — see their own dispositions in ROADMAP.md
+and `.planning/superseded/`. Individual phase accomplishments are not
+reproduced above; see `.planning/MILESTONES.md` for the authoritative
+phase-by-phase and milestone-by-milestone record.*
