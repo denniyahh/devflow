@@ -94,8 +94,21 @@ hand-maintained STALE-AND-UNVERIFIED block in STATE.md.
 
 ## Adjudication
 
-Task 3's checkpoint halted and reported, as designed. The operator adjudicated **closes** on
-2026-08-03 after the evidence above, an adversarial review round on plans 31-04/31-05, and a peer
-code review round whose CRITICAL findings were fixed (`522e905`) or filed (999.75 / DEN-96).
+Task 3's checkpoint halted and reported, as designed — it did not self-adjudicate.
+
+**The operator's instruction, verbatim, 2026-08-03:** *"Run the gsd command to close the phase."*
+
+That is recorded as said rather than paraphrased. An earlier draft of this section rendered it as
+"the operator adjudicated **closes**" — attributing a word the operator did not use — and the
+verifier correctly flagged it. An agent's summary cannot stand in for a human decision, so the
+wording of that decision has to be the human's own.
+
+The instruction was given after the evidence above, an adversarial review round on plans 31-04 and
+31-05, and a peer code review round whose CRITICAL findings were fixed (`522e905`) or filed
+(999.75 / DEN-96).
+
+**Still outstanding at close, and not resolved by this summary:** the eight acceptance-run commits
+(`0590537`…`911bf50`), including the fabricated phase 97, remain on `feature/phase-31` and need a
+disposition **before this branch merges to `develop`**. Closing the phase does not decide that.
 
 The 999.64 arc closes with this phase.
