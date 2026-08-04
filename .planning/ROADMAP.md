@@ -278,12 +278,24 @@ bracket tag directly); then re-verify `roadmap.analyze` for non-zero `phase_coun
 numbers, and non-null `current_phase`.
 
 **Status update (2026-08-04):** the reproduction snapshot above (line numbers, "ACTIVE" milestone,
-30 phase directories on disk) is now historical — the v1.0/v2.0.0/v2.3.0 retroactive milestone
-archival removed all `### Phase N:` detail sections from the live document, so the specific
-trigger (a closed-milestone heading sitting between an active milestone and its phase details) no
-longer exists here today. The underlying `gsd-tools` defect is **not fixed** — it will resurface
-the moment a future milestone's phase detail is added back to `ROADMAP.md` in a layout that
-repeats the same shape. This same root cause also has a worse, write-path sibling: see upstream
+30 phase directories on disk) is historical, but **this defect is still fully live in this repo,
+verified by direct re-run today, after the v1.0/v2.0.0/v2.3.0 retroactive milestone archival**:
+`roadmap.analyze` still returns `phase_count: 0` against current HEAD, and `milestone.complete
+v2.3.0 --dry-run` still triggers the pass-all degrade (now sweeping all 17 backlog directories
+instead of the historical phases it swept before). The archival did not remove Cause 1 — it
+changed its shape. Every milestone heading in the live document (v2.3.0, v2.0.0, v1.0) now
+collapses to a plain markdown *table* with no `### Phase N:` headings inside its own window at
+all (they're archived out), so `extractCurrentMilestone`'s scan finds zero recognizable phase
+entries in the active milestone's section regardless of what heading follows it — the original
+"interrupting closed-milestone heading" framing was only one way to reach `milestonePhaseNums.size
+=== 0`; a milestone whose live content is header-free is another. **This is a repo-structure
+condition, not a backlog-cleanup residue** — closing this item on the theory that archiving old
+phases fixed it would be wrong; it is exactly as reproducible today as when filed. It will keep
+reproducing for any future milestone unless that milestone's own `### Phase N:` (or
+checkbox-bullet) entries land inside its heading-to-next-heading window before archival — not
+guaranteed, and complicated by the separately-documented `phase.add`-inserts-at-the-last-`---`
+bug, whose landing point has moved now that this document is ~1000 lines shorter. This same root
+cause also has a worse, write-path sibling: see upstream
 GSD-core issue ledger entry 16 (`gsd-tools milestone.complete`'s pass-all degrade), found closing
 v2.3.0 the same day.
 
