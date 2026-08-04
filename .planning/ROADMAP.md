@@ -20,7 +20,7 @@ state behind — surfaced 2026-08-02 when a new statusline began rendering it.
 | Phase | Name | Status | Version |
 |---|---|---|---|
 | 30 | Keep the Session Alive Past Turn End | Complete    | — |
-| 31 | The Launch Path Itself | Not yet declared — gated on 30c | — |
+| 31 | The Launch Path Itself | Complete    | — |
 
 ## v2.0.0 milestone (CLOSED 2026-08-02 — spanned releases 2.0.0, 2.1.0, 2.2.0)
 
