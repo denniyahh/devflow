@@ -73,24 +73,32 @@ mid-run crash or kill.
   orphan (25d), the 999.47 cmdline-inheritance CI flake is closed under an
   11-observation streak with human sign-off (25e), and CONTRIBUTING.md's
   release procedure no longer drifts from what 25c implements (25f) — Phase 25,
-  verified 10/10, unreleased
+  shipped v2.1.0
+- ✓ The 999.64 arc (a DevFlow-driven phase containing a multi-plan wave
+  completing without orphaning delegated work): a Claude `stream-json` (JSONL)
+  parser reads Layer-1 verdict, rate-limit classification, `is_error`
+  attribution, and `session_id` without regressing the single-document path
+  (Phase 30), then a pipe-owning Rust monitor puts that parser on the actual
+  production Code-stage launch path — bidirectional `stream-json` argv,
+  stdin released only once a `DEVFLOW_RESULT` marker lands in a top-level
+  `result` AND the background-task list has drained, a nonce-canary guard
+  distinguishing "the behaviour is gone" from "the guard could not run," and
+  stream-vs-exit-code arbitration with a `--legacy-claude-launch` opt-out
+  (Phase 31). Live acceptance run passed on attempt 1, verified independently
+  from git — Phase 31, milestone v2.3.0, shipped v2.3.0. Not yet proven beyond
+  the Code stage (999.73, backlog).
 
 ### Active
 
-*(none currently in flight. Phase 22's **light dogfooding trial** slice is
-complete (22-01, 22-02, resolving 999.30/DEN-55) and integrated for release
-alongside the urgent 999.37 sandbox-escape fix; the broader Concurrency &
-Governance scope (999.4, 999.26, 999.28) remains unplanned. Phase 21
-(Operator Legibility & Observability)
-shipped as v1.8.0, 2026-07-24 (PR #23 → main, signed tag, GitHub Release,
-published to crates.io). Phase 20 shipped as v1.7.0,
-2026-07-23. **The v2.0.0 milestone was CLOSED 2026-08-02** after spanning releases 2.0.0,
-2.1.0 and 2.2.0; the open-ended framing (it did not close at Phase 20 or any fixed phase)
-governed it until then. The active milestone is now **v2.3.0**, declared 2026-08-02 and
-deliberately **bounded** — it closes when the 999.64 arc lands (Phase 30 + Phase 31). See
-ROADMAP.md. `/gsd-complete-milestone` has still not been run: v2.0.0 was closed by
-documentation, because the archive step would have swept Phase 30's unexecuted plans into
-`.planning/milestones/`.
+*(none currently in flight. **The v2.3.0 milestone was CLOSED 2026-08-04**,
+bounded from the start (declared 2026-08-02) — it closed when the 999.64 arc
+landed (Phase 30 + Phase 31). This is the first milestone in this project
+actually archived via `/gsd-complete-milestone`'s process (hand-corrected —
+see ROADMAP.md and `.planning/milestones/v2.3.0-ROADMAP.md` for why the CLI
+step itself was bypassed). Phases 1-29 and the v1.0/v2.0.0 milestone labels
+remain un-archived in `.planning/phases/` and ROADMAP.md as of this update —
+a known, deliberately deferred cleanup, not an oversight; see ROADMAP.md
+Backlog 999.72.
 Hermes Support, previously slotted as "Phase 18," was rescoped out during
 the 2026-07-20 reprioritization to Dogfood Reliability Hardening and now
 sits in the backlog as `999.1` — it is NOT automatically next; backlog
@@ -113,17 +121,19 @@ items require `/gsd-review-backlog` promotion.)*
   through Phase 16. Current operator commands include `start`, `gate`, `logs`,
   `history`, `parallel`, `sequentagent`, `reference`, `cleanup`, `status`,
   `list`, `recover`, `doctor`, and `test`; `advance` remains hidden/internal.
-- Workspace version is `2.2.0` (shipped 2026-07-31). Code/docs historically
-  over-claimed "v2.0.0" as current; Phase 12 corrected this.
-  The `v2.0.0` label named an **open-ended** milestone rather than a bounded
-  arc — decided 2026-07-23 (ROADMAP.md "Milestone stays open") — and on that
-  basis it spanned the 2.0.0, 2.1.0 and 2.2.0 releases, each a minor bump
-  because nothing in them was inherently breaking. **That milestone was closed
-  2026-08-02.** The active milestone is **v2.3.0**, and unlike its predecessor
-  it is bounded: it closes when the 999.64 arc lands. Phase 31 changes
-  DevFlow's internal launch path and agent adapter rather than the CLI surface,
-  so v2.3.0 is expected to remain a minor bump; the `3.0.0` slot stays reserved
-  for a genuinely breaking change, whenever that lands.
+- Workspace version is `2.3.0` (shipped 2026-08-04, tag `v2.3.0`, signed).
+  Code/docs historically over-claimed "v2.0.0" as current; Phase 12 corrected
+  this. The `v2.0.0` label named an **open-ended** milestone rather than a
+  bounded arc — decided 2026-07-23 (ROADMAP.md "Milestone stays open") — and
+  on that basis it spanned the 2.0.0, 2.1.0 and 2.2.0 releases, each a minor
+  bump because nothing in them was inherently breaking. **That milestone was
+  closed 2026-08-02.** The **v2.3.0** milestone, unlike its predecessor, was
+  bounded from declaration: it closed 2026-08-04 when the 999.64 arc landed
+  (Phase 30 + Phase 31). Phase 31 changed DevFlow's internal launch path and
+  agent adapter rather than the CLI surface, so v2.3.0 shipped as a minor
+  bump; the `3.0.0` slot stays reserved for a genuinely breaking change,
+  whenever that lands. No milestone has been declared yet for whatever comes
+  next — see `/gsd-new-milestone`.
 - No `.planning/REQUIREMENTS.md` exists in this project; requirements are
   tracked per-phase in each phase's `CONTEXT.md`, not via formal REQ-IDs.
 
@@ -159,6 +169,9 @@ items require `/gsd-review-backlog` promotion.)*
 | Reuse `finish_workflow` verbatim for the manual `ship --phase` override rather than reimplementing Ship logic (Phase 20e) | The existing fail-closed terminal-Ship contract (retry-gate-reopen, `workflow_finished` emission) already does exactly what a second out-of-process trigger needs; reimplementing risks drift between the monitor-driven and manual paths | ✓ Good |
 | Never honour an operator-set `GIT_DIR` — scrub the repository-local git vars unconditionally at `Command` construction (Phase 27, D-03) | `GIT_DIR` outranks `current_dir()`, so `mutating_project_root` — the guard added expressly to stop `release --execute`/`sync` acting on an unnamed repo — compared two paths, saw a match, and passed while the executor pushed and published against a different repository. Honouring the variable would have preserved that bypass | ✓ Good |
 | Scrub at construction, apply `.envs(...)` after (Phase 27, WR-03 fix) | Ordering is load-bearing: it makes the scrub the default while still letting an adapter that *deliberately* sets one of these vars win — which is what keeps Codex's unsigned-commit override working | ✓ Good |
+| Acceptance run exercises the Code stage only, not all 5 pipeline stages (Phase 31, D-10) | Code is where 999.64 was observed and the only stage that backgrounds — widening to other stages on zero evidence would extend the adapter to four stages the parser has never actually been exercised against | ✓ Good |
+| Pass criterion is "both plans produce a SUMMARY.md AND both merge," not "the stage reported Success" or "both completions observed in the stream" (Phase 31, D-18) | Both rejected substitutes were identified as signals that could pass while the underlying orphaning defect was still present — the completion oracle had already scored the original 999.64 failure as Success | ✓ Good |
+| `milestone.complete`'s CLI archival step bypassed for v2.3.0's close; milestone archived by hand instead | The CLI's phase-scoping inherited the same ROADMAP-layout defect as 999.72, but on a write path — it tried to archive all 48 project phases instead of the milestone's 2. Caught pre-commit, reverted, filed upstream (GSD-core issue ledger entry 16) | ✓ Good |
 
 ## Key Files
 
@@ -184,3 +197,10 @@ verified 2026-07-30 — 6/6 plans, 7/7 must-haves, all 41 production
 git_command}`, Sweep A at 0, both hostile-`GIT_DIR` acceptance commands green at
 HEAD (411/0 core, 188/0 cli). This unblocks 999.25 (release executor) and 999.52
 (`devflow sync`), which named it prerequisite #1. Not yet shipped/merged.*
+
+---
+*Last updated: 2026-08-04 after the v2.3.0 milestone ("the unattended run",
+Phases 30-31) closed. This update covers only what changed for that milestone
+close — Phases 26-29 shipped in the interim and are not individually
+summarized above; see ROADMAP.md and `.planning/MILESTONES.md` for the
+authoritative phase-by-phase and milestone-by-milestone record.*
