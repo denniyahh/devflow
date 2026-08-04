@@ -3046,6 +3046,14 @@ rejected in 30-01 and guarded by a regression test.
 
 ### Phase 31: Claude Adapter Launch Path — Pipe-Owning Monitor (999.64 arc close)
 
+**STATUS: COMPLETE, 2026-08-03** — 5/5 plans, `31-VERIFICATION.md` **passed**, 879 tests, clippy `-D warnings` and `fmt --check` clean. **The 999.64 arc closes with this phase.**
+
+The acceptance run (31-05) passed on **attempt 1**. D-18 was verified independently from git rather than from the run's own report: two merge commits (`1302e93`, `5caaa4c`) whose second parents both fork from the pre-run base `626131b` — a shape inline work cannot produce. The orchestrator's turn ended with **both** executors outstanding (the 999.64 orphan point) and the session survived it and received both completions.
+
+**Two review rounds ran before close, neither of which the automated gates would have replaced.** An adversarial review of the unexecuted plans 31-04/31-05 found 8 blockers (the run could have passed while the mechanism was never engaged; the fallback route did not exist). A peer code review (Gemini 3.1 Pro, DeepSeek v4 Pro) found 4 real defects — 3 fixed in `522e905` with mutation-proven tests, 1 filed as 999.75/DEN-96. A measurement taken mid-phase refuted D-02's stated margin and raised the idle floor 30s→120s (`4d8901a`); the same evidence exposed a regression in the canary, fixed in `1916c4c`.
+
+**Open at close, deliberately:** the 8 acceptance-run commits (`0590537`…`911bf50`), including a fabricated phase 97, are **kept** on `feature/phase-31` by operator decision — they *are* the D-18 evidence and the raw capture was already deleted, so removing them would make the phase's central claim permanently unverifiable. They enter `develop`'s history as-is.
+
 **Created 2026-08-03.** Scope below is **compiled, not newly authored** — every item traces to
 a source already in this repository: Phase 30's "Next phase (31)" section and its binding
 review constraints (this file, above), `30-H1-CONTEXT-FOR-31.md`, `30-VERIFICATION.md`, and
@@ -3129,20 +3137,20 @@ infrastructure phases; tracked by the constraint numbers above.
 Plans:
 **Wave 1**
 
-- [ ] 31-01-PLAN.md — Tracer: a Claude Code stage runs end-to-end through the pipe-owning monitor (wave 1)
+- [x] 31-01-PLAN.md — Tracer: a Claude Code stage runs end-to-end through the pipe-owning monitor (wave 1)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 31-02-PLAN.md — Idle timeout: a stuck stage fails loudly instead of silently (wave 2)
-- [ ] 31-03-PLAN.md — Startup delivery canary: refuse to run when task-notification delivery is gone (wave 2)
+- [x] 31-02-PLAN.md — Idle timeout: a stuck stage fails loudly instead of silently (wave 2)
+- [x] 31-03-PLAN.md — Startup delivery canary: refuse to run when task-notification delivery is gone (wave 2)
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 31-04-PLAN.md — Guards: exit-code arbitration and the loud opt-out (wave 3)
+- [x] 31-04-PLAN.md — Guards: exit-code arbitration and the loud opt-out (wave 3)
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
-- [ ] 31-05-PLAN.md — Acceptance run: the live two-plan wave that gates the 999.64 arc (wave 4)
+- [x] 31-05-PLAN.md — Acceptance run: the live two-plan wave that gates the 999.64 arc (wave 4)
 
 **Scope item 6 (999.67) dropped at planning time — already closed.** `parse_devflow_result`
 (`agent_result.rs:147-162`) applies `normalise_stream_marker_provenance` on both arms as of
