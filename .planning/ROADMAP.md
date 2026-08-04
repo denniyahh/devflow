@@ -393,7 +393,7 @@ Unsequenced items — not part of the active phase sequence. Promote with
 `/gsd-review-backlog` when ready; each carries accumulated context in its
 own `phases/999.N-*/CONTEXT.md`.
 
-### Phase 999.75: `CloseRule` Treats an Unparseable `tasks` List on the FIRST Announcement as Permission to Close (BACKLOG)
+### Phase 999.75: `CloseRule` Treats an Unparseable `tasks` List on the FIRST Announcement as Permission to Close (RESOLVED 2026-08-04)
 
 **Linear:** [DEN-96](https://linear.app/denniskim/issue/DEN-96/99975-closerule-treats-an-unparseable-tasks-list-on-the-first)
 **Found:** 2026-08-03 by peer code review during Phase 31 (DeepSeek v4 Pro, HIGH-1), verified
@@ -421,6 +421,14 @@ explicit enum so the cases cannot collapse.
 **Severity, honestly: contingent on an unobserved CLI behaviour.** Nobody has seen the CLI emit a
 non-array `tasks`, and it serializes that JSON itself. This is a robustness gap in a guard whose
 job is to be conservative, not a demonstrated live failure.
+
+**Resolved 2026-08-04.** `CloseRule` now uses an explicit `BackgroundTaskState` enum
+(`NeverAnnounced` / `Pending(usize)` / `Unreadable`) in place of `Option<usize>`. `should_close()`
+permits only `NeverAnnounced` and `Pending(0)`; `Unreadable` blocks closing and falls through to the
+idle timeout, same as a genuinely pending task. Mutation-tested: reverting to the prior silent-no-op
+behaviour reddens the new regression test and nothing else, with a negative control proving ordinary
+non-backgrounding stages still close on their marker alone. 880 passed, 0 failed; clippy
+`-D warnings` and `fmt --check` clean. Commit `2c20ab4`, merged via PR #82 (`fcae13d`).
 
 ### Phase 999.74: `classify_validate_outcome` Trusts the Agent's Verdict Over Its Own Status (BACKLOG)
 
