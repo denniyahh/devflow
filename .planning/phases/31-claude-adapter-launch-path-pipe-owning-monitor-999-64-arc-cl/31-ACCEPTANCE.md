@@ -202,6 +202,49 @@ happen.
 
 ---
 
+## Provenance: this run validated a build three commits behind HEAD
+
+**Added 2026-08-03, after the run, before phase close.** Read this before citing anything above.
+
+The acceptance run completed at `b157791`. Three commits landed afterwards, two of them touching
+supervised source:
+
+| commit | what it changed | run traversed it? |
+|---|---|---|
+| `1916c4c` | `CANARY_IDLE_SECS` 30s -> 120s | no — the canary confirmed in ~19s |
+| `522e905` | three peer-review fixes in `monitor.rs` (2 CRITICAL) | partly — see below |
+| `b72c6e7` | ROADMAP backlog entry, docs only | n/a |
+
+**What the run therefore does and does not still support.**
+
+Two of `522e905`'s fixes are on paths this run never entered: the post-close idle timeout (the run
+never went silent after its close) and signal-death exit-code capture (its child exited 0). Those
+fixes cannot invalidate the run, because the run never exercised the code they replaced.
+
+The third is different and was checked rather than reasoned about. The reader-thread rewrite
+(`BufRead::lines()` -> `read_until` + `from_utf8_lossy`) sits on the **hot path** — every line of
+output passes through it — so the run's evidence was gathered by code that no longer exists.
+
+**Targeted re-verification, 2026-08-03 after `522e905`:** the real `claude` CLI (2.1.220) was driven
+through the real pipe-owning monitor via `devflow __monitor` against a throwaway project root.
+Result: child exit **0** in **6 seconds** (far under the 120s idle window, so it exited on genuine
+stdin EOF — the close rule fired), **8 of 8 captured lines valid JSON**, **zero U+FFFD replacement
+characters** (the negative control: lossy decode is not mangling well-formed input), terminal
+`result` event present, and no idle-timeout verdict written.
+
+That re-confirms, on the rewritten reader, the premise 31-04 rests on: the real CLI exits 0 after
+`CloseRule` releases stdin. It has now been observed on two different builds.
+
+**What the re-verification does NOT cover.** It is a single short turn with no delegated work. It
+does not re-establish D-18 — that both plans of a two-plan wave produce a `SUMMARY.md` and merge —
+and it does not re-cross the orphan point where the orchestrator's turn ends with executors
+outstanding. Those rest entirely on the original run at `b157791`, against the earlier reader. A
+full re-run was considered and declined: it re-answers a question already answered (does delivery
+work) at the cost of ~22 minutes and eight more commits, while the actual new risk was the hot-path
+rewrite, which the cheap check addresses directly.
+
+---
+
 ## VOID guard — did the wave actually background?
 
 **Yes.** Four top-level `background_tasks_changed` events, non-empty then drained to `[]`:
