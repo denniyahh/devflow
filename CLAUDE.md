@@ -100,3 +100,14 @@ restores it when the target resolves.
 **Do not "fix" this by tracking the symlink.** `tests/build_provenance.rs` copies every path from
 `git ls-files` with `std::fs::copy`, which follows symlinks and panics on failure — on CI, or any
 clone without a `gsd-core` sibling, the link dangles and the test panics.
+
+## Keep DEV-SETUP-CHECKLIST.md in sync
+
+`.planning/DEV-SETUP-CHECKLIST.md` exists so this repo's dev setup — git policy, hooks, CI,
+devcontainer/toolchain pins, GSD config — can be replicated on another project. When a commit
+touches any of those, update the checklist in the **same commit**, not as an afterthought.
+
+`scripts/hooks/post-commit` mechanically warns (never edits) when one of those files changes
+without the checklist moving too — that is the backstop for when this instruction gets missed,
+not a substitute for following it. Proactive beats reactive: a warning after the fact means the
+checklist was stale for however long between commits.
