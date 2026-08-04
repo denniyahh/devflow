@@ -1,13 +1,13 @@
 ---
 gsd_state_version: 1.0
 milestone: v2.3.0
-milestone_name: the unattended run (999.64 arc — closes after Phase 31)
+milestone_name: "the unattended run (999.64 arc — CLOSED 2026-08-04)"
 current_phase: 31
-status: completed
-stopped_at: "Phase 31 COMPLETE, 5/5 plans, closed 2026-08-03 — the 999.64 arc closes with it. Acceptance run passed attempt 1 (D-18 verified independently from git: two merge commits with independent-forking parents). 31-VERIFICATION.md passed, 879 tests. One adversarial plan review + one peer code review; 3 CRITICAL/HIGH fixed in 522e905 with mutation-proven tests, 1 filed (999.75/DEN-96). OPEN: the 8 acceptance-run commits (0590537..911bf50, incl. fabricated phase 97) are KEPT on feature/phase-31 by operator decision — they are the D-18 evidence — and go into develop's history as-is. Next: ship/merge decision."
-last_updated: "2026-08-04T01:51:16.106Z"
-last_activity: 2026-08-03
-last_activity_desc: Phase 31 complete
+status: "v2.3.0 milestone closed — awaiting next milestone"
+stopped_at: "Milestone v2.3.0 CLOSED 2026-08-04. Phase 31 COMPLETE, 5/5 plans. The 999.64 arc closed with it: acceptance run passed attempt 1 (D-18 verified independently from git: two merge commits with independent-forking parents). 31-VERIFICATION.md passed, 879 tests. One adversarial plan review + one peer code review; 3 CRITICAL/HIGH fixed in 522e905 with mutation-proven tests, 1 filed (999.75/DEN-96, itself resolved 2026-08-04 in 2c20ab4/PR #82). Ship/merge decision RESOLVED: the 8 acceptance-run commits (0590537..911bf50, incl. fabricated phase 97) were KEPT by operator decision as D-18 evidence and are in develop's history via PR #78 (1dea423) as of before this close. v2.3.0 released and tagged (signed) on main. D-19 (arc closes) confirmed directly by the operator at milestone close, resolving 31-VERIFICATION.md's flagged human-verification gap. Milestone archived to .planning/milestones/v2.3.0-ROADMAP.md and v2.3.0-phases/; see .planning/MILESTONES.md. Next: /gsd-new-milestone."
+last_updated: "2026-08-04"
+last_activity: 2026-08-04
+last_activity_desc: v2.3.0 milestone closed and archived
 progress:
   # STALE AND UNVERIFIED — do not trust these five values.
   # `state.update-progress` is the tool that owns them and it is not usable here:
@@ -39,6 +39,15 @@ current_phase_name: claude-adapter-launch-path-pipe-owning-monitor-999-64-arc-cl
 # DevFlow — Project State
 
 > Last updated: 2026-08-02
+
+## Deferred Items
+
+Items acknowledged and deferred at milestone close on 2026-08-04:
+
+| Category | Item | Status |
+|----------|------|--------|
+| debug | stale-blockers-gate-gsd-next | acknowledged — diagnosed gsd-core tooling defect (smart-entry's blocker scan), unrelated to v2.3.0 milestone content; will address in a future phase |
+| uat_gap | 24-UAT.md (Phase 24) | acknowledged — audit flagged it but the file's own frontmatter reads status:passed, 1/1 passed, 0 pending/issues/blocked; treated as an audit-tool false positive, skipped, will not revisit |
 
 ## Active Phase
 
@@ -929,5 +938,9 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 ## Session
 
 **Last session:** 2026-08-03T14:05:39Z
-**Stopped at:** Phase 31 context gathered
-**Resume file:** .planning/phases/31-claude-adapter-launch-path-pipe-owning-monitor-999-64-arc-cl/31-CONTEXT.md
+**Stopped at:** Phase 31 context gathered (superseded — Phase 31 completed and the v2.3.0 milestone closed 2026-08-04)
+**Resume file:** .planning/milestones/v2.3.0-phases/31-claude-adapter-launch-path-pipe-owning-monitor-999-64-arc-cl/31-CONTEXT.md (archived location, moved at milestone close)
+
+## Operator Next Steps
+
+- v2.3.0 is closed. Start the next milestone with `/gsd-new-milestone`.
