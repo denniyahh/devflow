@@ -44,6 +44,6 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| HYGIENE-01 | TBD | Pending |
-| HYGIENE-02 | TBD | Pending |
-| HYGIENE-03 | TBD | Pending |
+| HYGIENE-01 | Phase 32 | Pending |
+| HYGIENE-02 | Phase 32 | Pending |
+| HYGIENE-03 | Phase 32 | Pending |

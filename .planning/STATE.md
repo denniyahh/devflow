@@ -1,12 +1,12 @@
 ---
 gsd_state_version: 1.0
-milestone: GSD Workflow Hygiene
+milestone: gsd-hygiene
 milestone_name: GSD Workflow Hygiene
 status: planning
-last_updated: "2026-08-04T16:44:35.891Z"
+last_updated: "2026-08-04T17:12:09.000Z"
 last_activity: 2026-08-04
 progress:
-  total_phases: 0
+  total_phases: 1
   completed_phases: 0
   total_plans: 0
   completed_plans: 0
@@ -149,10 +149,16 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: Not started (defining requirements)
+Phase: 32 of 1 (ROADMAP Layout Hygiene) — ready to plan
 Plan: —
-Status: Defining requirements
-Last activity: 2026-08-04 — Milestone GSD Workflow Hygiene started
+Status: Roadmap created; ready for /gsd-discuss-phase 32
+Last activity: 2026-08-04 — ROADMAP.md restructured: active-milestone heading + Phase 32 detail
+section now live inside their own heading-to-next-heading window, and a `## Progress` table
+added. Verified live: `roadmap.analyze` phase_count 0->1 (garbage cross-milestone matches ->
+correct Phase 32 only), `milestone complete Hygiene --dry-run` no longer sweeps unrelated
+directories (17-dir sweep confirmed via negative control on pre-fix content), and
+`smart-entry`'s roadmap_total_phases/roadmap_completed_phases flipped null->30/29 (roadmap-derived
+completion path now active instead of the legacy STATE.md fallback).
 
 ## Recently Shipped
 
@@ -754,6 +760,7 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 
 ## Roadmap Evolution
 
+- Phase 32 added (2026-08-04): **ROADMAP Layout Hygiene** (dir TBD, not yet planned) — first phase of the new **GSD Workflow Hygiene** milestone (unversioned, `.planning/`-only). Closes backlog **999.72** (`roadmap.analyze` / `milestone.complete --dry-run` misfiring because the active milestone's own window had no `### Phase N:` heading inside it) and **999.72a** (missing `## Progress` table). Fix mechanism: a new `## ð§ GSD Workflow Hygiene milestone (ACTIVE)` heading was inserted as the FIRST heading in `ROADMAP.md` (before the existing `## v2.3.0 milestone (CLOSED...)` heading), with Phase 32's own `### Phase 32:` detail section landing inside that heading's own window, plus a `## Progress` table (30 rows, phases 1-25/27/28/30/31 Complete, 32 Not started; 26/29 excluded as never shipped). The three existing closed-milestone sections and the Backlog section are otherwise byte-for-byte unchanged (`git diff --stat`: insertions only, 0 deletions). Verified live, with negative controls against the pre-fix content (via `git stash`): `roadmap.analyze` phase_count went from 4 (garbage cross-milestone matches: 26, 29 x2, 30 — none belonging to this milestone) to 1 (Phase 32 only); `gsd-tools milestone complete Hygiene --dry-run` sweeps 0 directories (vs. the same command on the unfixed content erroring `no phases found`, and `milestone complete v2.3.0 --dry-run` on either version still sweeping all 17 backlog directories — confirming this fix is scoped to the ACTIVE milestone only, as required; the two already-closed milestones' own windows are unchanged and out of scope per REQUIREMENTS.md's Out of Scope table); a throwaway `32-test-throwaway/` phase directory was correctly picked up as belonging to phase 32 and removed after the check (positive control). `smart-entry --json`'s `signals.roadmap_total_phases`/`roadmap_completed_phases` went from `null`/`null` (legacy STATE.md-comparison fallback) to `30`/`29` (roadmap-derived path). See REQUIREMENTS.md HYGIENE-01/02/03.
 - Phase 31 added (2026-08-03): **Claude Adapter Launch Path — Pipe-Owning Monitor (999.64 arc close)** (dir `31-claude-adapter-launch-path-pipe-owning-monitor-999-64-arc-cl`) — the second half of the 999.64 arc, split off from Phase 30 under the operator's "no phase exceeds M" sizing cap. Created only because `30c-VERDICT.md` resolved `delivery: confirmed`; the locked precondition was that a refuted delivery premise **cancels this phase before it is planned**. Its ROADMAP entry is **compiled from existing sources, not newly authored** — Phase 30's "Next phase (31)" section, binding constraints 1/4/5/7/8/9, `30-H1-CONTEXT-FOR-31.md`, and `30d-MEASUREMENTS.md` — so discuss-phase still owns turning it into decisions. Two known-stale documents are flagged in the entry for correction before planning, because Phase 31 will read exactly those two (`30-VERIFICATION.md`'s deferred-items table lists constraint 9 items 1–2 as open when they were closed in Phase 30 by `a557805`; `30-05-SUMMARY.md` names the wrong gate predicate). **Placement note:** `gsd-tools query phase.add` inserted the stub at `lastIndexOf('\n---')`, which on this 3300-line roadmap landed it mid-prose inside the historical *Phase 29 (original scope)* section; it was moved by hand to sit directly after Phase 30, ahead of the shelved-phase block. Same class of document-order hazard recorded in Phase 27's entry below.
 - Phase 28 added (2026-07-30): **Close the Checkpoint Answer Return Path** (dir `28-close-the-checkpoint-answer-return-path`) — bundles **999.57/DEN-82** (parts A+C; part B deferred), **999.59/DEN-84**, **999.60/DEN-85**, all re-verified open at HEAD `8072ab6`. Chosen over 999.25, which has only 1 of 5 prerequisites met and whose remaining ones are findings inside unmerged `feature/phase-26` code rather than schedulable work. **999.57's entry was corrected during promotion:** it implies `session_id` is available for the session-resume fix, but `session_id` exists only in a test fixture string (`agent_result.rs:1362`) — never parsed or persisted — and the Claude adapter has no `--resume` support, so unit 28a must add all of that plumbing. 999.31 (Modular Agent Driver, High/L) was considered as a fourth unit and excluded: it reworks the same adapter layer, but folding an L into an M+S+S cluster recreates Phase 26's scope-creep shape.
 - Phase 27 added (2026-07-30): **Scrub Redirecting Git Environment From Production Calls** (dir `27-scrub-redirecting-git-environment-from-production-calls`) — promotes backlog **999.39 / DEN-66**, re-verified open at HEAD `b3cab1c`. Promoted immediately after Phase 26 closed PARTIAL: `26-REVIEW.md` CR-01 showed `mutating_project_root` is bypassed by an inherited `GIT_DIR`, making this prerequisite #1 for 999.25's re-attempt and blocking 999.52 (`sync`) from shipping independently. Appended at end-of-milestone rather than after Phase 26's entry, because a stray Phase 23 historical-record block sits between Phase 26 and Phase 24 in document order and would have mis-attributed to 27.
@@ -836,4 +843,8 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 
 ## Operator Next Steps
 
-- v2.3.0 is closed. Start the next milestone with `/gsd-new-milestone`.
+- ROADMAP.md now has a live Phase 32 (ROADMAP Layout Hygiene) inside the active milestone's own
+  window, plus a `## Progress` table — closes backlog 999.72/999.72a for this repo's active
+  milestone (999.72's OWN closed-milestone windows, v2.3.0/v2.0.0, are unchanged and still
+  reproduce the pass-all degrade if targeted directly; only the active milestone was in scope).
+  Next: `/gsd-discuss-phase 32`.
