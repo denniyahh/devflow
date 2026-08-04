@@ -683,11 +683,33 @@ pub fn run_pipe_owning_monitor(
 
     let (line_tx, line_rx) = mpsc::channel::<String>();
     let reader = std::thread::spawn(move || {
-        for line in BufReader::new(child_stdout).lines() {
-            let Ok(line) = line else {
-                // A read error is EOF for supervision purposes.
-                break;
-            };
+        // `read_until` + `from_utf8_lossy`, NOT `BufRead::lines()` (peer review
+        // 2026-08-03, CRITICAL). `lines()` yields `Err(InvalidData)` on a single
+        // non-UTF-8 byte, and the previous code treated any read error as EOF —
+        // so one bad byte silently truncated the capture and dropped every later
+        // line INCLUDING the terminal `DEVFLOW_RESULT` marker. That is precisely
+        // the boundary-truncation class constraint 9 exists for, manufactured by
+        // the supervisor itself rather than by a dying writer.
+        //
+        // Decoding is now lossy and NON-fatal: undecodable bytes become U+FFFD
+        // and the line still reaches the capture and the close rule. A genuine
+        // I/O error still ends the loop, because that one really is EOF.
+        let mut reader_buf = BufReader::new(child_stdout);
+        let mut raw = Vec::new();
+        loop {
+            raw.clear();
+            match reader_buf.read_until(b'\n', &mut raw) {
+                Ok(0) => break, // real EOF
+                Ok(_) => {}
+                Err(err) => {
+                    warn!("stdout read error, treating as EOF: {err}");
+                    break;
+                }
+            }
+            while raw.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
+                raw.pop();
+            }
+            let line = String::from_utf8_lossy(&raw).into_owned();
             // Tee VERBATIM before any interpretation: the whole Layer 1
             // cascade reads this file, and a line the close rule ignores
             // (unparseable noise, interleaved prose) must still reach it.
@@ -721,6 +743,27 @@ pub fn run_pipe_owning_monitor(
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                // AFTER a deliberate close, silence is EXPECTED, not a hang
+                // (peer review 2026-08-03, CRITICAL). The close rule fires only
+                // once the agent has emitted its terminal marker AND background
+                // tasks have drained — at which point it has said everything it
+                // intends to say and is merely winding down. Firing the idle
+                // timeout here wrote an authoritative `IdleTimeout` verdict OVER
+                // a completed, successful stage; and because `evaluate_layer1`
+                // reads that side channel FIRST, by design, so that nothing can
+                // shadow a real timeout, the bogus verdict outranked the real
+                // success and could not be recovered from. The mechanism that
+                // protects a true timeout is what made a false one fatal.
+                //
+                // Break instead: the reap path below already bounds a child that
+                // will not exit, via `terminate_and_verify`.
+                if close_signalled {
+                    info!(
+                        "no output for {idle_timeout:?} after the close rule released stdin; \
+                         the stage already reported — proceeding to reap, NOT recording a timeout"
+                    );
+                    break;
+                }
                 // No outer wall-clock bound exists anywhere in this loop, and
                 // none may be added (D-03). `recv_timeout` measures the gap
                 // since the LAST LINE, so a healthy 47-minute stage that keeps
@@ -741,7 +784,24 @@ pub fn run_pipe_owning_monitor(
     drop(close_tx);
 
     let status = child.wait()?;
-    let code = status.code().unwrap_or(-1);
+    // A signal-killed child has NO exit code — `status.code()` is `None`, and
+    // the previous `unwrap_or(-1)` threw the signal away (peer review
+    // 2026-08-03, found independently by both reviewers and by the 31-04 plan
+    // review as W1). That silently defeated the classification 31-04 took care
+    // to preserve: `evaluate_layer2` and
+    // `reconcile_stream_success_against_exit_code` map **137** to
+    // `ResourceKilled` (routed to `GateInfra` — an infrastructure fault) and
+    // **127** to `AgentUnavailable`. Recording `-1` matched neither, so a real
+    // OOM kill arrived as a generic `Failed` and routed to `GateReview`, asking
+    // an operator to code-review a stage that was killed by the kernel.
+    //
+    // `128 + signal` is the shell convention those constants already encode:
+    // SIGKILL(9) -> 137, SIGTERM(15) -> 143. `-1` is now reachable only when a
+    // status is neither exited nor signalled, which POSIX does not define.
+    let code = status.code().unwrap_or_else(|| {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal().map_or(-1, |signal| 128 + signal)
+    });
     std::fs::write(&exit_file, format!("{code}\n"))?;
 
     let _ = writer.join();
@@ -1394,6 +1454,176 @@ exit 0
         let exit = std::fs::read_to_string(crate::agent_result::exit_code_path(root, phase))
             .expect("the monitor must record the child's exit code");
         assert_eq!(exit.trim(), "0", "exit file contents: {exit:?}");
+    }
+
+    /// Peer review 2026-08-03, CRITICAL: `BufRead::lines()` yields
+    /// `Err(InvalidData)` on one non-UTF-8 byte, and the reader treated any read
+    /// error as EOF — silently truncating the capture and dropping every later
+    /// line, INCLUDING the terminal marker. The supervisor manufactured exactly
+    /// the boundary-truncation failure constraint 9 exists to defend against.
+    ///
+    /// **What this does NOT establish:** that the real `claude` CLI ever emits
+    /// non-UTF-8 on this stream. It emits JSON, which should be valid UTF-8. This
+    /// pins the supervisor's robustness, not a demonstrated CLI behaviour.
+    #[test]
+    fn non_utf8_byte_does_not_truncate_the_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 11u32;
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        // A raw 0xFF is invalid UTF-8 in any position. It sits BETWEEN two good
+        // lines, so a reader that dies on it loses the marker that follows.
+        let script = r#"
+set -u
+IFS= read -r _turn || exit 91
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"utf8-1"}'
+printf 'raw-\377-bytes\n'
+printf '%s\n' '{"type":"system","subtype":"background_tasks_changed","tasks":[]}'
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id":"utf8-1","result":"DEVFLOW_RESULT: {\"status\":\"success\"}"}'
+exit 0
+"#;
+
+        let code = run_pipe_owning_monitor(
+            root,
+            phase,
+            root,
+            "prompt",
+            Duration::from_secs(20),
+            "sh",
+            &["-c".to_string(), script.to_string()],
+            &[],
+        )
+        .expect("the monitor must survive a non-UTF-8 byte on the child's stdout");
+        assert_eq!(code, 0, "stub should exit cleanly");
+
+        let capture =
+            std::fs::read_to_string(crate::agent_result::stdout_path(root, phase)).unwrap();
+        assert!(
+            capture.contains(r#""type":"result""#),
+            "the terminal result event was lost: a non-UTF-8 byte earlier in the \
+             stream truncated the capture. This is the regression:\n{capture}"
+        );
+        assert!(
+            capture.contains("raw-"),
+            "the undecodable line itself must still be teed (lossily), since the \
+             capture is the verbatim record:\n{capture}"
+        );
+        let result = crate::agent_result::evaluate_layer1(root, phase)
+            .expect("Layer 1 must still decide a capture that contained a bad byte");
+        assert_eq!(
+            result.status,
+            crate::agent_result::AgentStatus::Success,
+            "verdict after lossy decode: {result:?}"
+        );
+    }
+
+    /// Peer review 2026-08-03, CRITICAL: after the close rule released stdin the
+    /// supervisor kept timing out on silence and fired `fire_idle_timeout`,
+    /// writing an authoritative `IdleTimeout` verdict OVER a stage that had
+    /// already reported success. `evaluate_layer1` reads that side channel first
+    /// — by design, so nothing can shadow a real timeout — so the bogus verdict
+    /// won and was unrecoverable.
+    ///
+    /// The timeout here (600ms) is injected short deliberately; the child sleeps
+    /// well past it AFTER the marker. **What this does NOT establish:** that the
+    /// 120s production floor is right — that rests on the keepalive measurement
+    /// in `31-IDLE-GAP-MEASUREMENTS.md`, not on this test.
+    #[test]
+    fn no_idle_timeout_is_recorded_when_the_child_is_merely_slow_to_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 12u32;
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        let script = r#"
+set -u
+IFS= read -r _turn || exit 91
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"slow-1"}'
+printf '%s\n' '{"type":"system","subtype":"background_tasks_changed","tasks":[]}'
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id":"slow-1","result":"DEVFLOW_RESULT: {\"status\":\"success\"}"}'
+# Everything has been said; the close rule fires here. Now wind down slowly,
+# well past the injected idle window, emitting nothing.
+sleep 3
+exit 0
+"#;
+
+        let code = run_pipe_owning_monitor(
+            root,
+            phase,
+            root,
+            "prompt",
+            Duration::from_millis(600),
+            "sh",
+            &["-c".to_string(), script.to_string()],
+            &[],
+        )
+        .expect("a slow-exiting child that already reported is not a failure");
+
+        assert!(
+            !crate::agent_result::idle_timeout_path(root, phase).exists(),
+            "an idle-timeout verdict was written for a stage that had ALREADY \
+             emitted its terminal marker and drained its tasks — silence after a \
+             deliberate close is expected, not a hang"
+        );
+        assert_eq!(code, 0, "the child exited cleanly, if slowly");
+
+        let result = crate::agent_result::evaluate_layer1(root, phase)
+            .expect("Layer 1 must decide this capture");
+        assert_eq!(
+            result.status,
+            crate::agent_result::AgentStatus::Success,
+            "a completed stage must not be reported as a timeout: {result:?}"
+        );
+    }
+
+    /// Peer review 2026-08-03 (found independently by BOTH reviewers and by the
+    /// 31-04 plan review as W1): `status.code()` is `None` for a signal-killed
+    /// child, and `unwrap_or(-1)` discarded the signal. `-1` matches neither the
+    /// 137 nor the 127 arm, so a kernel OOM kill arrived as a generic `Failed`
+    /// and routed to `GateReview` — asking a human to code-review a stage the
+    /// kernel killed — instead of `GateInfra`.
+    ///
+    /// This asserts on what the monitor ACTUALLY writes for a real SIGKILL. The
+    /// pre-existing arbitration test hardcoded `"137\n"` into its fixture, so it
+    /// passed green against this defect the entire time — which is why this test
+    /// spawns a child and kills it rather than writing the file itself.
+    #[test]
+    fn a_signal_killed_child_records_128_plus_signal_not_minus_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 13u32;
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        // SIGKILL itself: no exit code exists, only a termination signal.
+        let script = r#"
+set -u
+IFS= read -r _turn || exit 91
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"sig-1"}'
+kill -9 $$
+"#;
+
+        let code = run_pipe_owning_monitor(
+            root,
+            phase,
+            root,
+            "prompt",
+            Duration::from_secs(20),
+            "sh",
+            &["-c".to_string(), script.to_string()],
+            &[],
+        )
+        .expect("the monitor must reap a signal-killed child");
+
+        assert_eq!(
+            code, 137,
+            "SIGKILL(9) must be recorded as 128+9=137, the value \
+             `evaluate_layer2` and `reconcile_stream_success_against_exit_code` \
+             map to ResourceKilled/GateInfra. -1 means the signal was discarded."
+        );
+        let exit = std::fs::read_to_string(crate::agent_result::exit_code_path(root, phase))
+            .expect("the monitor must record the exit code");
+        assert_eq!(exit.trim(), "137", "exit file contents: {exit:?}");
     }
 
     #[test]
