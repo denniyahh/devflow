@@ -1,10 +1,14 @@
 ---
 gsd_state_version: 1.0
 milestone: gsd-hygiene
-milestone_name: GSD Workflow Hygiene
+milestone_name: milestone (GSD Workflow Hygiene, ACTIVE — declared 2026-08-04)
+current_phase: 32
+current_phase_name: ROADMAP Layout Hygiene
 status: planning
-last_updated: "2026-08-04T17:12:09.000Z"
+stopped_at: Phase 32 context gathered
+last_updated: "2026-08-04T18:35:31.811Z"
 last_activity: 2026-08-04
+last_activity_desc: "ROADMAP.md restructured: active-milestone heading + Phase 32 detail"
 progress:
   total_phases: 1
   completed_phases: 0
@@ -837,9 +841,9 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 
 ## Session
 
-**Last session:** 2026-08-03T14:05:39Z
-**Stopped at:** Phase 31 context gathered (superseded — Phase 31 completed and the v2.3.0 milestone closed 2026-08-04)
-**Resume file:** .planning/milestones/v2.3.0-phases/31-claude-adapter-launch-path-pipe-owning-monitor-999-64-arc-cl/31-CONTEXT.md (archived location, moved at milestone close)
+**Last session:** 2026-08-04T18:35:31.717Z
+**Stopped at:** Phase 32 context gathered
+**Resume file:** .planning/phases/32-roadmap-layout-hygiene/32-CONTEXT.md
 
 ## Operator Next Steps
 
