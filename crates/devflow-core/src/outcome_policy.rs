@@ -52,6 +52,17 @@ pub fn decide_action(_stage: Stage, outcome: AgentStatus) -> Action {
         // requires divergent routing.
         AgentStatus::Failed => Action::GateReview,
         AgentStatus::Unknown => Action::GateReview,
+        // 31-02 (D-06/D-08). GateReview, not GateInfra: nothing
+        // infrastructural failed — DevFlow chose to stop waiting, and the
+        // operator has real commits from a partly-done run to look at, which
+        // is a review question, not an infra one.
+        //
+        // Emphatically NOT AutoResume. D-08 makes an idle timeout terminal:
+        // the run's extent is unknown (the agent went quiet rather than
+        // reporting), so a retry would restart on top of a dirty tree nobody
+        // has surveyed. `idle_timeout_is_never_auto_resumed` pins this across
+        // every stage.
+        AgentStatus::IdleTimeout => Action::GateReview,
     }
 }
 
@@ -106,5 +117,69 @@ mod tests {
             decide_action(Stage::Code, AgentStatus::Unknown),
             Action::GateReview
         );
+    }
+
+    /// 31-02 D-06/D-08: an idle timeout is a review-worthy outcome about an
+    /// indeterminate run the operator has real commits to look at — never an
+    /// advance, and never an infra gate (nothing infrastructural failed).
+    #[test]
+    fn idle_timeout_gates_review() {
+        assert_eq!(
+            decide_action(Stage::Code, AgentStatus::IdleTimeout),
+            Action::GateReview
+        );
+    }
+
+    /// Every stage in the chain, walked from `Define` via `Stage::next` rather
+    /// than hardcoded, so a stage inserted into the chain is covered without
+    /// editing this test. (Limit: a stage added OUTSIDE the linear chain would
+    /// still be missed — `Stage` exposes no exhaustive iterator to key off.)
+    fn every_stage() -> Vec<Stage> {
+        let mut stages = vec![Stage::Define];
+        while let Some(next) = stages.last().and_then(|s| s.next()) {
+            stages.push(next);
+        }
+        stages
+    }
+
+    /// 31-02 D-08: an idle timeout is TERMINAL. Auto-resuming would restart
+    /// from a dirty, partly-done state whose extent nobody has established —
+    /// the run went quiet, it did not report. Asserted for every stage, not
+    /// just `Code`, because `decide_action`'s mapping is stage-independent
+    /// today and a future stage-sensitive arm must not quietly reintroduce a
+    /// retry here.
+    #[test]
+    fn idle_timeout_is_never_auto_resumed() {
+        let stages = every_stage();
+        assert_eq!(stages.len(), 5, "stage chain changed; review this test");
+        for stage in stages {
+            let action = decide_action(stage, AgentStatus::IdleTimeout);
+            assert_ne!(
+                action,
+                Action::AutoResume,
+                "IdleTimeout must never auto-resume at {stage:?}"
+            );
+            assert_ne!(
+                action,
+                Action::Advance,
+                "IdleTimeout must never advance at {stage:?}"
+            );
+        }
+    }
+
+    /// Negative control for the test above: the assertion loop has teeth only
+    /// if it can actually fail. `RateLimited` is the one status that DOES
+    /// auto-resume, so running the same loop over it must produce the opposite
+    /// result at every stage. If this ever stops holding, the loop above is
+    /// vacuous and its green is meaningless.
+    #[test]
+    fn the_never_auto_resume_loop_can_actually_fail() {
+        for stage in every_stage() {
+            assert_eq!(
+                decide_action(stage, AgentStatus::RateLimited),
+                Action::AutoResume,
+                "negative control: RateLimited must auto-resume at {stage:?}"
+            );
+        }
     }
 }

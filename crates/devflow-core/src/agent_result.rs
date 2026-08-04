@@ -61,6 +61,23 @@ pub enum AgentStatus {
     /// typically "command not found") (D-07, 17b).
     #[serde(rename = "agent_unavailable")]
     AgentUnavailable,
+    /// The pipe-owning monitor gave up waiting: the child's stream went silent
+    /// for longer than the idle window and DevFlow terminated it (D-06, 31-02).
+    ///
+    /// Deliberately distinct from BOTH neighbours it would otherwise collapse
+    /// into. Against `Failed`: nothing reported a failure — the agent simply
+    /// stopped talking, and a graceful close would fall through to Layer 2,
+    /// which scores partial commits as `Success` (999.64 reborn inside its own
+    /// fix). Against `ResourceKilled`: the box did not run out of memory;
+    /// DevFlow itself did the killing. Only a third variant lets the completion
+    /// oracle tell "we gave up waiting" from either.
+    ///
+    /// The explicit `#[serde(rename)]` is required, not stylistic: the
+    /// enum-level `rename_all = "lowercase"` would collapse the two words into
+    /// `idletimeout`. The two existing two-word variants above carry the same
+    /// rename for the same reason.
+    #[serde(rename = "idle_timeout")]
+    IdleTimeout,
 }
 
 impl AgentStatus {
@@ -79,6 +96,7 @@ impl AgentStatus {
             AgentStatus::Unknown => "unknown",
             AgentStatus::ResourceKilled => "resource_killed",
             AgentStatus::AgentUnavailable => "agent_unavailable",
+            AgentStatus::IdleTimeout => "idle_timeout",
         }
     }
 }
@@ -145,12 +163,20 @@ pub enum ResultError {
 /// marker never appears at the start of a line, so we first unwrap the
 /// envelope and search the inner text.
 pub fn parse_devflow_result(stdout: &str) -> Option<AgentResult> {
+    // normalise_stream_marker_provenance on BOTH arms: parse_marker_lines
+    // deserializes the agent's own JSON, so without the overwrite an agent
+    // writing `"decided_by_layer":0` into its marker forges Layer-0
+    // external-verification provenance, which `classify_validate_outcome`
+    // (pipeline_outcomes.rs) trusts when classifying a Validate stage. The
+    // stream path has normalised since 30-01; this generic path — the one
+    // production hits today — did not (fourth adversarial pass, Medium 1;
+    // the class 999.67 tracks).
     if let Some(inner) = extract_json_result_text(stdout)
         && let Some(result) = parse_marker_lines(&inner)
     {
-        return Some(result);
+        return Some(normalise_stream_marker_provenance(result));
     }
-    parse_marker_lines(stdout)
+    parse_marker_lines(stdout).map(normalise_stream_marker_provenance)
 }
 
 /// Detect agent-specific rate-limit output and return the retry description.
@@ -164,7 +190,13 @@ pub fn detect_rate_limit(stdout: &str) -> Option<String> {
 }
 
 fn detect_claude_rate_limit(stdout: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
+    // strip_corruption_padding, not trim(): this detector OUTRANKS the generic
+    // envelope-failure detector, and rate-limit envelopes carry `is_error:
+    // true`. When only the lower-precedence detector stripped edge corruption,
+    // one stray byte inverted the precedence — a RateLimited envelope (routes
+    // to auto-resume) decayed into a generic Failed (routes to review/gating).
+    // Fifth adversarial pass, Medium 1.
+    let value: serde_json::Value = serde_json::from_str(strip_corruption_padding(stdout)).ok()?;
     let rate_limited = json_has_str(&value, "subtype", "error_rate_limit")
         || json_has_i64(&value, "api_error_status", 429)
         || json_has_i64(&value, "status", 429)
@@ -186,10 +218,16 @@ fn detect_codex_rate_limit(stdout: &str) -> Option<String> {
     // (13-06 dogfood finding: GSD reference tables mentioning "rate limiting"
     // were read by the agent, echoed into an `item.completed` payload, and
     // this scan returned that entire multi-KB line as the "retry time").
+    // The JSON-line exclusion applies the SAME edge-strip policy as
+    // ParsedCapture::parse (sixth-pass Medium 4): an event line whose leading
+    // byte was corrupted to U+FFFD failed the bare parse here and was treated
+    // as prose — re-admitting the exact multi-KB echoed-document false
+    // positive this filter exists to exclude, after ParsedCapture had already
+    // correctly recovered the line as an event.
     let stdout: String = stdout
         .lines()
         .filter(|line| {
-            serde_json::from_str::<serde_json::Value>(line)
+            serde_json::from_str::<serde_json::Value>(strip_corruption_padding(line))
                 .map(|v| !v.is_object())
                 .unwrap_or(true)
         })
@@ -211,12 +249,29 @@ fn detect_codex_rate_limit(stdout: &str) -> Option<String> {
         }
     }
 
-    if lower.contains("usage limit") || lower.contains("rate limit") || lower.contains("429") {
+    // "429" counts as rate-limit evidence only as a STANDALONE token
+    // (sixth-pass Medium 5): a bare substring check fired on "processed issue
+    // #429 successfully" and any number containing 429, routing a healthy run
+    // into auto-resume. A neighbor that is alphanumeric or '#' means the
+    // digits belong to something else.
+    fn standalone_429(line: &str) -> bool {
+        let bytes = line.as_bytes();
+        line.match_indices("429").any(|(i, _)| {
+            let before_ok = i == 0 || {
+                let b = bytes[i - 1];
+                !b.is_ascii_alphanumeric() && b != b'#'
+            };
+            let after_ok = i + 3 >= bytes.len() || !bytes[i + 3].is_ascii_alphanumeric();
+            before_ok && after_ok
+        })
+    }
+
+    if lower.contains("usage limit") || lower.contains("rate limit") || standalone_429(&lower) {
         stdout
             .lines()
             .find(|line| {
                 let line = line.to_ascii_lowercase();
-                line.contains("usage limit") || line.contains("rate limit") || line.contains("429")
+                line.contains("usage limit") || line.contains("rate limit") || standalone_429(&line)
             })
             .map(str::trim)
             .filter(|line| !line.is_empty())
@@ -230,7 +285,10 @@ fn detect_codex_rate_limit(stdout: &str) -> Option<String> {
 /// If `stdout` is a JSON result envelope, return the decoded `result` text
 /// field (with escapes such as `\n` resolved). Returns `None` for plain text.
 fn extract_json_result_text(stdout: &str) -> Option<String> {
-    let trimmed = stdout.trim();
+    // strip_corruption_padding, not trim(): a stray invalid byte decoded to
+    // U+FFFD at either EDGE of the envelope must not defeat the `{` guard
+    // (third-pass High). Interior corruption still fails the parse, by design.
+    let trimmed = strip_corruption_padding(stdout);
     if !trimmed.starts_with('{') {
         return None;
     }
@@ -264,7 +322,10 @@ fn extract_json_result_text(stdout: &str) -> Option<String> {
 /// available to every caller; D-04's persistence target (`State::session_id`)
 /// is unchanged, only the carrier differs.
 pub fn claude_session_id(stdout: &str) -> Option<String> {
-    let trimmed = stdout.trim();
+    // strip_corruption_padding, not trim(): a stray invalid byte decoded to
+    // U+FFFD at either EDGE of the envelope must not defeat the `{` guard
+    // (third-pass High). Interior corruption still fails the parse, by design.
+    let trimmed = strip_corruption_padding(stdout);
     if !trimmed.starts_with('{') {
         return None;
     }
@@ -272,15 +333,117 @@ pub fn claude_session_id(stdout: &str) -> Option<String> {
     value.get("session_id")?.as_str().map(str::to_string)
 }
 
-/// Thin file-reading wrapper over [`claude_session_id`]: reads the phase's
+/// Read the CLI-emitted `session_id` from a Claude `--output-format
+/// stream-json` JSONL capture: the top-level `session_id` of the LAST
+/// `system`/`init` event. `None` for any other capture shape.
+///
+/// The stream sibling of [`claude_session_id`], and it carries that function's
+/// D-04 / T-28-04 discipline **for the same reason** — read its doc comment
+/// before changing anything here. Only the event's TOP-LEVEL `session_id` is
+/// read, via a direct [`serde_json::Value::get`]; the
+/// [`json_find_key`]/[`json_scan`] traversal helpers are NOT to be used. They
+/// descend into nested objects, and a stream carries agent-authored text in
+/// every `result` event — including the `DEVFLOW_RESULT` marker JSON that
+/// [`parse_marker_lines`] deserializes. A traversal would make a `session_id`
+/// the agent planted in its own marker reachable, handing it the ability to
+/// name the session DevFlow later resumes into (T-30-11). Regression test:
+/// `claude_stream_session_id_ignores_agent_planted_value`.
+///
+/// The LAST `init` event wins, consistent with the last-`result`-wins
+/// convention. Verified against the archived capture: its three `init` events
+/// (lines 5, 32 and 47) all carry the same `session_id`, so last-wins and
+/// first-wins agree on today's evidence — but only last-wins stays correct if a
+/// future capture rotates the value mid-stream. Three `init` events do NOT mean
+/// three sessions: session continuity must never be keyed off "have I seen an
+/// `init` event".
+///
+/// No `session_id` field is added to [`AgentResult`] — see
+/// [`claude_session_id`]'s doc comment for why that design stays rejected.
+pub fn claude_stream_session_id(stdout: &str) -> Option<String> {
+    let capture = ParsedCapture::parse(stdout);
+    if classify(&capture) != CaptureKind::ClaudeStream {
+        return None;
+    }
+
+    // A session can rotate mid-capture: each turn opens with its own `init`, and
+    // the LAST one carries the id a resume must target. A torn later `init` is
+    // invisible to the scan below, which would silently return an EARLIER
+    // session's id — resuming the wrong session with a token that looks
+    // perfectly valid. Fail closed on any TORN JSON line: it could have been a
+    // newer `init`. `None` costs a resume; the wrong id corrupts one. (Third
+    // adversarial pass, 2026-08-02.)
+    //
+    // Prose noise lines do NOT block recovery — an `init` is a JSON line, so a
+    // non-`{` line can never be a torn one. The first version of this guard
+    // failed closed on ANY unparsed line and rejected captures with benign
+    // interleaved progress output (fourth adversarial pass, Medium 3).
+    if capture.torn_json_line_present() {
+        return None;
+    }
+
+    capture
+        .events
+        .iter()
+        .rev()
+        .find(|v| {
+            v.get("type").and_then(serde_json::Value::as_str) == Some("system")
+                && v.get("subtype").and_then(serde_json::Value::as_str) == Some("init")
+        })?
+        .get("session_id")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Thin file-reading wrapper over the two session-id readers: reads the phase's
 /// captured stdout file (via [`stdout_path`]) and delegates. `None` for a
 /// missing capture file, never an `Err` — mirrors [`evaluate_layer1`]'s
 /// lossy-read convention (CR-01: one invalid UTF-8 byte from raw `sh`
 /// redirection must not silently disable this reader).
+///
+/// [`claude_stream_session_id`] is tried FIRST, then [`claude_session_id`].
+/// Stream-first is safe and behavior-preserving: the stream gate
+/// ([`is_claude_event_stream`]) declines a single-document envelope, so every
+/// capture shape that ships today still resolves through `claude_session_id`
+/// bit-for-bit. Without this chain the Phase 28 checkpoint-resume path — whose
+/// whole delivery is reconstructing a session via `claude --resume` — returns
+/// `None` for every `stream-json` capture.
 pub fn session_id_from_capture(project_root: &Path, phase: u32) -> Option<String> {
-    let bytes = std::fs::read(stdout_path(project_root, phase)).ok()?;
-    let stdout = String::from_utf8_lossy(&bytes);
-    claude_session_id(&stdout)
+    let stdout = read_capture(&stdout_path(project_root, phase))?;
+    claude_stream_session_id(&stdout).or_else(|| claude_session_id(&stdout))
+}
+
+/// The ONE decode policy for capture files: read the bytes and replace invalid
+/// UTF-8 with U+FFFD. Every capture-file consumer (`evaluate_layer1`,
+/// `checkpoint_reported_in_capture`, `session_id_from_capture`) reads through
+/// here, so the policy cannot silently diverge per call site again.
+///
+/// REPLACE, never drop. A drop-based decode was tried (third adversarial pass
+/// remediation) and refuted by the fourth pass: deleting invalid bytes JOINS
+/// the tokens on either side, and `DEVFLOW_RESULT: {"status":"suc<FF>cess"}`
+/// decoded to a fabricated, VALID success marker that short-circuited a
+/// nonzero exit code. Replacement keeps corruption visible: the marker parser
+/// sees `suc\u{FFFD}cess`, which is not a recognized status, and correctly
+/// refuses to trust it. Consumers that need to tolerate corruption at the
+/// EDGES of a single-document capture strip it explicitly via
+/// [`strip_corruption_padding`] — bounded, and incapable of joining tokens.
+fn read_capture(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Trim whitespace and U+FFFD replacement characters from both ends of a
+/// single-document capture.
+///
+/// U+FFFD is what [`read_capture`] substitutes for invalid bytes, and it is a
+/// printing, non-whitespace character — so a stray byte written before or after
+/// the JSON envelope survives `trim()` and defeats every `starts_with('{')`
+/// guard. That was the third pass's High: Layer 1 abstained on an authoritative
+/// `is_error: true` and the exit-code fallback turned a reported failure into a
+/// Ship-gate success. Stripping only the EDGES is deliberate: corruption inside
+/// the envelope must stay visible and fail the parse, because "repairing" it is
+/// how the fourth pass's marker-fabrication High happened.
+fn strip_corruption_padding(s: &str) -> &str {
+    s.trim_matches(|c: char| c.is_whitespace() || c == '\u{FFFD}')
 }
 
 // WR-12 (13-REVIEW.md), revised: these traversal helpers run on the coding
@@ -366,7 +529,10 @@ fn json_scalar_to_string(value: &serde_json::Value) -> Option<String> {
 /// the documented, stable signal — this does not special-case non-success
 /// subtype values beyond what already exists in `detect_claude_rate_limit`.
 fn detect_claude_envelope_failure(stdout: &str) -> Option<AgentResult> {
-    let trimmed = stdout.trim();
+    // strip_corruption_padding, not trim(): a stray invalid byte decoded to
+    // U+FFFD at either EDGE of the envelope must not defeat the `{` guard
+    // (third-pass High). Interior corruption still fails the parse, by design.
+    let trimmed = strip_corruption_padding(stdout);
     if !trimmed.starts_with('{') {
         return None;
     }
@@ -456,7 +622,30 @@ const HUMAN_GATE_VALUE: &str = "blocking-human";
 /// deliberately does NOT widen into a general "does this look like a
 /// checkpoint" heuristic (D-02 rejected that class of predicate); the scope
 /// is one declared field label with one enumerated value.
+///
+/// **A Claude `stream-json` capture takes a separate branch** and is answered
+/// by [`claude_stream_reports_human_gate`] ALONE — it never consults raw stdout.
+/// That is not an oversight to be "completed" later: under a stream capture the
+/// raw stdout contains the operator's prompt echoed back as a `user` event, so
+/// also scanning it would reinstate the exact false positive the branch exists
+/// to remove (review constraint 3 — the unbounded raw scan is the reader that
+/// "survives by accident" once the single-document invariant is gone). See that
+/// function for which events are eligible and why.
+///
+/// The branch is taken when [`classify`] says [`CaptureKind::ClaudeStream`], so
+/// a single-document envelope, plain text and a Codex stream all fall through to
+/// the two-target logic below, unchanged (T-30-25). Classification is
+/// deliberately weaker than [`is_claude_event_stream`]: requiring a parsed
+/// `system`/`init` here made a single torn line fail OPEN back to the raw scan,
+/// reinstating the echoed-prompt false positive this branch exists to remove.
+/// See [`classify`] for the full rule set and the defects each rule encodes;
+/// see [`is_claude_event_stream`] for why the verdict path keeps its stricter
+/// init-only gate.
 pub fn blocking_human_checkpoint_reported(stdout: &str) -> bool {
+    let capture = ParsedCapture::parse(stdout);
+    if classify(&capture) == CaptureKind::ClaudeStream {
+        return claude_stream_reports_human_gate(&capture.events);
+    }
     if text_reports_human_gate(stdout) {
         return true;
     }
@@ -510,10 +699,9 @@ fn text_reports_human_gate(text: &str) -> bool {
 /// reads the phase's captured stdout file (via [`stdout_path`]) and
 /// delegates. `false` for a missing capture file, never an error.
 pub fn checkpoint_reported_in_capture(project_root: &Path, phase: u32) -> bool {
-    let Ok(bytes) = std::fs::read(stdout_path(project_root, phase)) else {
+    let Some(stdout) = read_capture(&stdout_path(project_root, phase)) else {
         return false;
     };
-    let stdout = String::from_utf8_lossy(&bytes);
     blocking_human_checkpoint_reported(&stdout)
 }
 
@@ -549,14 +737,21 @@ fn is_codex_event_stream(events: &[serde_json::Value]) -> bool {
 /// version — the 13-06 dogfood run captures real output and reconciles any
 /// delta, the same empirical practice 12-12-SUMMARY.md used for Claude.
 fn parse_codex_event_result(stdout: &str) -> Option<AgentResult> {
-    let events: Vec<serde_json::Value> = stdout
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .collect();
+    let capture = ParsedCapture::parse(stdout);
+    let events = &capture.events;
 
-    if !is_codex_event_stream(&events) {
+    if !is_codex_event_stream(events) {
         return None;
+    }
+
+    // Same trailing-torn rule as the Claude stream parser, same R1 root cause:
+    // a torn JSON line after the last parsed event means the capture's tail —
+    // where `turn.failed` would be — may be among the casualties. An earlier
+    // `agent_message` success marker must not decide the stage over a tail we
+    // provably failed to read. The Codex adapter is live in production, so
+    // this is not a Phase-31 deferral.
+    if capture.torn_json_after_last_matching(|_| true) {
+        return Some(indeterminate_capture_failure());
     }
 
     // Codex delivers the agent's DEVFLOW_RESULT self-report inside an
@@ -576,8 +771,13 @@ fn parse_codex_event_result(stdout: &str) -> Option<AgentResult> {
         let text = item.get("text").and_then(serde_json::Value::as_str)?;
         parse_marker_lines(text)
     });
-    if marker.is_some() {
-        return marker;
+    if let Some(result) = marker {
+        // Same provenance overwrite as parse_devflow_result and the Claude
+        // stream path (T-30-26): this AgentResult was deserialized from the
+        // agent's own marker JSON, so a planted `"decided_by_layer":0` would
+        // otherwise forge Layer-0 external-verification provenance. Found by
+        // reading, while closing the identical hole one function over.
+        return Some(normalise_stream_marker_provenance(result));
     }
 
     let terminal = events.iter().rev().find(|v| {
@@ -611,34 +811,804 @@ fn parse_codex_event_result(stdout: &str) -> Option<AgentResult> {
     })
 }
 
-/// Scan the last ~4000 characters of `stdout` in reverse line order.
+/// Parse a captured stdout as JSONL: one `serde_json::Value` per non-blank,
+/// parseable line. Lines that are not valid JSON are dropped, so a stream
+/// interleaved with plain-text progress noise still yields its events.
+///
+/// Shared by [`is_claude_event_stream`] and [`last_top_level_result`], which
+/// both need the same parsed vector. Deliberately NOT retrofitted into
+/// [`parse_codex_event_result`], which open-codes the identical idiom: that
+/// parser is correct and shipping, and rewriting it would put an unrelated
+/// adapter's behavior at risk for a cosmetic dedupe.
+/// Determine whether parsed JSONL lines are a Claude `--output-format
+/// stream-json` event stream, as opposed to a single-document Claude envelope,
+/// a Codex `--json` stream, or plain text.
+///
+/// **Gates on `type: "system"` + `subtype: "init"` and NOTHING ELSE.**
+/// 30-RESEARCH.md offered an alternative — also gate on `type: "result"`
+/// carrying a `session_id` — and that alternative is WRONG; do not "restore"
+/// it. The single-document envelope that ships today is literally
+/// `{"type":"result",...,"session_id":"abc"}`, so a `result`-keyed gate would
+/// swallow every production capture in use and silently displace
+/// [`parse_devflow_result`] in the [`evaluate_layer1`] cascade — a change to
+/// the shipped Layer-1 verdict path, disguised as adding stream support
+/// (T-30-02). The `init` event is both stronger and earlier: it opens the
+/// stream and is present in all three archived captures
+/// (`30a-evidence/raw_output_v3.jsonl` lines 5, 32 and 47).
+///
+/// `single_doc_envelope_not_consumed_by_claude_stream_parser` is the test that
+/// fails if this gate is widened.
+fn is_claude_event_stream(events: &[serde_json::Value]) -> bool {
+    events.iter().any(|v| {
+        v.get("type").and_then(serde_json::Value::as_str) == Some("system")
+            && v.get("subtype").and_then(serde_json::Value::as_str) == Some("init")
+    })
+}
+
+/// The shape of one non-empty capture line after a parse attempt.
+///
+/// `TornJson` vs `Noise` is the load-bearing distinction everywhere below: a
+/// line that failed to parse but still opens with `{` could be a torn event —
+/// a truncated write, or a read of a capture still being appended to — while a
+/// prose line cannot be (every stream event line opens with `{`). Conflating
+/// the two produced both prior misclassification defects: requiring ALL lines
+/// to parse sent torn streams back to the raw scan (second-pass fail-open),
+/// and counting any malformed line as suspicious rejected benign interleaved
+/// progress noise (fourth-pass Medium 3).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LineShape {
+    /// Parsed as JSON; the value lives at the same index in
+    /// [`ParsedCapture::events`]' insertion order.
+    Event,
+    /// Failed to parse but opens with `{` — potentially a torn event.
+    TornJson,
+    /// Failed to parse and does not open with `{` — cannot be a torn event.
+    Noise,
+}
+
+/// A capture parsed ONCE, keeping both the surviving events and the shape of
+/// every non-empty line — including the ones that did not parse.
+///
+/// This is the R1 root-cause fix from the phase-30 adversarial series: the old
+/// `claude_stream_events` returned a bare `Vec<Value>`, so "I dropped
+/// something" was unrepresentable and every consumer silently assumed the
+/// survivors were complete. Four separate defects came from that assumption
+/// (torn-init gate fail-open, stale-success verdict resurrection, stale
+/// session-id resurrection, torn-user gate reopening). Consumers now see the
+/// full line record and must decide explicitly what a torn line means for them.
+struct ParsedCapture {
+    events: Vec<serde_json::Value>,
+    line_shapes: Vec<LineShape>,
+}
+
+impl ParsedCapture {
+    fn parse(stdout: &str) -> Self {
+        let mut events = Vec::new();
+        let mut line_shapes = Vec::new();
+        for line in stdout.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<serde_json::Value>(trimmed) {
+                Ok(v) => {
+                    events.push(v);
+                    line_shapes.push(LineShape::Event);
+                }
+                Err(_) => {
+                    // Apply the SAME edge-corruption policy per line that
+                    // strip_corruption_padding applies per capture. Without
+                    // this, `read_capture`'s U+FFFD replacement in front of an
+                    // otherwise-intact line made it classify as Noise — not
+                    // `{`-prefixed — so the torn-tail guard could not see a
+                    // corrupt superseding event and an earlier success marker
+                    // decided the stage (fifth adversarial pass, High 1).
+                    //
+                    // Retry the parse on the stripped line first: edge
+                    // corruption around an intact event RECOVERS the event and
+                    // its true verdict. Stripping edges cannot join tokens —
+                    // the fabrication hazard was DROPPING bytes inside content
+                    // (fourth pass) — and interior corruption still fails the
+                    // parse. A line that strips to empty was pure corruption:
+                    // torn, fail closed.
+                    let stripped = strip_corruption_padding(trimmed);
+                    if stripped != trimmed
+                        && let Ok(v) = serde_json::from_str::<serde_json::Value>(stripped)
+                    {
+                        events.push(v);
+                        line_shapes.push(LineShape::Event);
+                    } else {
+                        line_shapes.push(if stripped.starts_with('{') || stripped.is_empty() {
+                            LineShape::TornJson
+                        } else {
+                            LineShape::Noise
+                        });
+                    }
+                }
+            }
+        }
+        Self {
+            events,
+            line_shapes,
+        }
+    }
+
+    fn torn_json_line_present(&self) -> bool {
+        self.line_shapes.contains(&LineShape::TornJson)
+    }
+
+    /// Whether a torn JSON line sits AFTER the last parsed event matching
+    /// `pred` — or anywhere at all, when no event matches.
+    ///
+    /// This is the question behind constraint 9 item 1: the capture's REAL
+    /// final verdict may be among the casualties, so nothing that survives
+    /// before the tear is allowed to stand in for it. Prose noise lines are
+    /// not counted — they cannot be a torn event (events open with `{`).
+    fn torn_json_after_last_matching(&self, pred: impl Fn(&serde_json::Value) -> bool) -> bool {
+        let mut last_match_line = None;
+        let mut event_idx = 0usize;
+        for (line_idx, shape) in self.line_shapes.iter().enumerate() {
+            if *shape == LineShape::Event {
+                if pred(&self.events[event_idx]) {
+                    last_match_line = Some(line_idx);
+                }
+                event_idx += 1;
+            }
+        }
+        self.line_shapes
+            .iter()
+            .enumerate()
+            .any(|(line_idx, shape)| {
+                *shape == LineShape::TornJson && last_match_line.is_none_or(|last| line_idx > last)
+            })
+    }
+}
+
+/// What kind of capture this is — decided ONCE, here, instead of re-derived by
+/// per-call-site heuristics.
+///
+/// This is the R2 root-cause fix from the phase-30 adversarial series. Four
+/// generations of ad-hoc shape checks (`starts_with('{')` guards, "any event of
+/// type X", all-lines-JSON, line counts) each got one case wrong: a torn `init`
+/// un-recognised a stream (fail-open), one stray JSON line hijacked plain text
+/// (V-01, fail-closed), a torn gate-bearing `user` event un-recognised a stream
+/// again, and an interleaved prose line was treated as tearing. One classifier
+/// carries all of those lessons in one place.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CaptureKind {
+    /// Not JSONL-shaped in the majority — the raw-scan paths own it.
+    PlainText,
+    /// Exactly one parsed `{"type":"result",…}` line: the envelope the shipped
+    /// `--output-format json` adapter emits (T-30-25). Raw-scan paths own it.
+    SingleDocEnvelope,
+    /// A Claude `stream-json` capture — possibly torn, possibly noisy.
+    ClaudeStream,
+    /// A Codex `--json` capture: dotted top-level types (`thread.started`,
+    /// `item.completed`, `turn.*`). Raw-scan paths own it, as before.
+    CodexStream,
+}
+
+/// Classification rules, in order — each carries the defect that forced it:
+///
+/// 1. **Majority of non-empty lines must be JSON-shaped** (parsed OR torn-`{`),
+///    else `PlainText`. Counting only PARSED lines fails: truncating a real
+///    stream drops its parsed count below any threshold while every surviving
+///    line is still `{`-shaped (the truncation sweep caught exactly that). One
+///    stray JSON line in prose stays under the majority (V-01).
+/// 2. **Any parsed `system`/`user`/`assistant` event → `ClaudeStream`.** Claude
+///    types win over dotted deterministically — the old event loop returned
+///    whichever it happened to iterate first. Real Codex captures never carry
+///    these types, and on a corrupt mixed capture the scoped path is the
+///    fail-closed direction for the gate.
+/// 3. **Any parsed dotted type → `CodexStream`.**
+/// 4. **A single parsed `result` line → `SingleDocEnvelope`** — today's shipped
+///    format, which must keep the raw-scan path (T-30-02 / T-30-25).
+/// 5. **Multi-line with a `result` event or a torn JSON line → `ClaudeStream`.**
+///    A stream whose gate-bearing `user` event tore, leaving only a later
+///    `result`, is still a stream (fourth-pass Low / third-pass Medium shape).
+/// 6. Everything else → `PlainText`.
+///
+/// A LONE torn JSON line is deliberately `PlainText`, not `ClaudeStream`: under
+/// today's format that shape is a torn single-document envelope, and raw-scanning
+/// it preserves detection of a REAL gate declaration inside (dropping one is the
+/// T-30-24 harm — worse than the echo false positive). The residual — a stream
+/// that died with only its echoed-prompt line, torn, and nothing else — requires
+/// the `init` line to have never flushed while the echo line partially did.
+/// Accepted and recorded rather than silently traded away.
+fn classify(capture: &ParsedCapture) -> CaptureKind {
+    let total = capture.line_shapes.len();
+    if total == 0 {
+        return CaptureKind::PlainText;
+    }
+    let noise = capture
+        .line_shapes
+        .iter()
+        .filter(|s| **s == LineShape::Noise)
+        .count();
+    if (total - noise) * 2 <= total {
+        return CaptureKind::PlainText;
+    }
+
+    if capture.events.iter().any(|v| {
+        matches!(
+            v.get("type").and_then(serde_json::Value::as_str),
+            Some("system" | "user" | "assistant")
+        )
+    }) {
+        return CaptureKind::ClaudeStream;
+    }
+    if capture.events.iter().any(|v| {
+        v.get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|t| t.contains('.'))
+    }) {
+        return CaptureKind::CodexStream;
+    }
+
+    let result_events = capture
+        .events
+        .iter()
+        .filter(|v| v.get("type").and_then(serde_json::Value::as_str) == Some("result"))
+        .count();
+    if total == 1 {
+        return if result_events == 1 {
+            CaptureKind::SingleDocEnvelope
+        } else {
+            CaptureKind::PlainText
+        };
+    }
+    if result_events > 0 || capture.torn_json_line_present() {
+        CaptureKind::ClaudeStream
+    } else {
+        CaptureKind::PlainText
+    }
+}
+
+/// Test-only accessor: does [`classify`] call this capture text a Claude
+/// `stream-json` capture?
+///
+/// Exists so `monitor.rs`'s end-to-end tracer test can assert on the REAL
+/// classifier rather than re-deriving "looks like a stream" with its own
+/// heuristic — which is precisely the per-call-site divergence [`classify`]
+/// was introduced to end. `classify`/`CaptureKind`/`ParsedCapture` stay
+/// private; only this yes/no question crosses the module boundary, and only
+/// under `cfg(test)`.
+#[cfg(test)]
+pub(crate) fn capture_is_claude_stream(capture: &str) -> bool {
+    classify(&ParsedCapture::parse(capture)) == CaptureKind::ClaudeStream
+}
+
+/// Whether an event is TOP-LEVEL — authored by the orchestrator session, not
+/// forwarded from a subagent. `parent_tool_use_id` JSON-null or absent.
+///
+/// The ONE provenance predicate, shared by gate scanning and verdict selection
+/// (constraint 9 item 2 / code-review M2: the two paths previously held
+/// different notions — gate scanning enforced provenance while
+/// [`last_top_level_result`] silently did not, despite its name and doc).
+///
+/// The absent case must stay top-level: `result` events carry no such key at
+/// all in any archived capture. Treating absence as positive provenance remains
+/// NECESSARY for today's captures and UNPROVEN safe — no archived capture
+/// contains a subagent-origin `result`, so if one can omit the key it would be
+/// admitted. Recorded, not solved; the type filter is the second, independent
+/// guard on the gate path.
+fn is_top_level(event: &serde_json::Value) -> bool {
+    matches!(
+        event.get("parent_tool_use_id"),
+        None | Some(serde_json::Value::Null)
+    )
+}
+
+/// The LAST top-level `type: "result"` event in a Claude stream capture.
+///
+/// One capture can hold several: a session kept alive across turns emits one
+/// terminal `result` per turn (the archived v3 stream carries three, at lines
+/// 19, 37 and 54, produced across task-notification wake-ups). The last is the
+/// session's final verdict, so an earlier turn must never decide the stage.
+///
+/// T-30-01: selection runs over TOP-LEVEL objects only — each value here is one
+/// whole JSONL line. A `result`-shaped structure the agent writes inside its own
+/// message text is inert string content and structurally unreachable from this
+/// scan. Never route this through [`json_scan`]/[`json_find_key`], which descend
+/// into nested objects; that is the same protection class as D-04/T-28-04's
+/// top-level-only `session_id` read.
+///
+/// Provenance is ENFORCED via [`is_top_level`], not merely documented — the
+/// first version of this function selected on `type == "result"` alone, so a
+/// subagent-origin `result` event would have decided the stage (code-review
+/// M2, constraint 9 item 2).
+fn last_top_level_result(events: &[serde_json::Value]) -> Option<&serde_json::Value> {
+    events.iter().rev().find(|v| {
+        v.get("type").and_then(serde_json::Value::as_str) == Some("result") && is_top_level(v)
+    })
+}
+
+/// Whether a declared canary `token` came back inside a TOP-LEVEL `result`
+/// event of this capture (D-13).
+///
+/// **Why this takes capture TEXT rather than a project root and phase**, unlike
+/// its siblings [`checkpoint_reported_in_capture`] and
+/// [`session_id_from_capture`]: the delivery canary runs against its own
+/// throwaway capture file, not the phase capture. A canary that read (and
+/// therefore implied writing) `stdout_path(project_root, phase)` would clobber
+/// the stage's own capture — the one artifact the entire Layer 1 cascade
+/// decides on.
+///
+/// **D-13 trap 1 — this may not be a NEW trust path.** The CLI echoes the
+/// operator's prompt back into the same stdout as a `user` event, so the
+/// planted token *will* appear in the stream regardless of whether anything was
+/// delivered. That echo is exactly what produced the checkpoint false positive
+/// 30-05 fixed. Matching is therefore confined to events that are both
+/// `type: "result"` and [`is_top_level`] — the same provenance predicate
+/// [`last_top_level_result`] enforces, reused rather than reinvented.
+///
+/// **D-13 trap 2 — a match proves DELIVERY, never WORK.** The agent can see the
+/// token in its own prompt and emit it without doing anything (999.67's shape).
+/// A hit means "the task-notification path is alive"; it never means the
+/// dispatched work happened. Summaries and merges remain the evidence of work
+/// (D-16/D-18).
+///
+/// Scans EVERY top-level `result`, not just the last one, which is the one
+/// place this deliberately differs from [`last_top_level_result`]. That
+/// function selects the session's final *verdict*, so later turns must
+/// supersede earlier ones. The canary asks a different question — "did the
+/// token ever come back?" — and a token returned on an earlier
+/// task-notification turn is a complete answer to it.
+pub fn token_reported_in_capture(capture: &str, token: &str) -> bool {
+    ParsedCapture::parse(capture)
+        .events
+        .iter()
+        .filter(|v| {
+            v.get("type").and_then(serde_json::Value::as_str) == Some("result") && is_top_level(v)
+        })
+        .any(|v| {
+            v.get("result")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|text| text.contains(token))
+        })
+}
+
+/// Whether ONE parsed stream event is a top-level `result` carrying a
+/// `DEVFLOW_RESULT` marker in its `result` text.
+///
+/// Exposed for the pipe-owning monitor's close rule (Phase 31, constraint 4),
+/// which must decide line-by-line and in real time whether the marker arm is
+/// satisfied — it cannot wait for a whole capture and re-parse it.
+///
+/// This is a COMPOSITION of the two existing predicates, deliberately not a
+/// second implementation of either. T-31-01: the CLI echoes the operator's
+/// prompt back into the same stdout as a `user` event — that echo is what
+/// produced the checkpoint false positive 30-05 fixed — so a marker seen
+/// anywhere but inside an event that is BOTH `type: "result"` AND
+/// [`is_top_level`] must not close the stream. Reusing [`parse_marker_lines`]
+/// keeps the marker grammar (case-insensitive prefix, edge-corruption
+/// stripping, JSON body) in one place rather than letting the monitor grow a
+/// looser `contains("DEVFLOW_RESULT")` of its own.
+pub(crate) fn event_is_top_level_result_marker(event: &serde_json::Value) -> bool {
+    event.get("type").and_then(serde_json::Value::as_str) == Some("result")
+        && is_top_level(event)
+        && event
+            .get("result")
+            .and_then(serde_json::Value::as_str)
+            .and_then(parse_marker_lines)
+            .is_some()
+}
+
+/// Whether any AGENT-AUTHORED text in a Claude stream capture declares a
+/// human-blocking gate. The stream-capture half of
+/// [`blocking_human_checkpoint_reported`]; the pure matcher it delegates to,
+/// [`text_reports_human_gate`], is unchanged.
+///
+/// **Why this exists (review constraint 3).** Scanning raw stdout is safe under
+/// the single-document envelope, because the only place gate text can appear
+/// there is the one `result` field the agent authored. A stream capture breaks
+/// that invariant: the operator's prompt is echoed back into the same stdout as
+/// a `user` event, so a prompt that merely DOCUMENTS a checkpoint gate
+/// rendering becomes textually indistinguishable from a live declaration. The
+/// failure is silent — a checkpoint auto-decide fires, or the resume ceiling is
+/// consumed, on a stage whose prompt only discussed checkpoints. DevFlow's own
+/// planning documents are exactly that kind of prompt content.
+///
+/// Two independent filters, both required, neither a substitute for the other:
+///
+/// 1. **Type — keep ONLY `result` events.** `user` events are always either the
+///    echoed prompt or a `task_notification` summary re-injected as user-role
+///    content; neither is the agent declaring anything. `system` events carry
+///    the `init` tool and agent inventory, inert text with no business in a gate
+///    scan. `assistant` events are excluded too, and that exclusion is
+///    deliberate — do NOT "restore" it for completeness. Turn-FINAL assistant
+///    text is duplicated verbatim into the `result` event that follows it
+///    (`30a-evidence/raw_output_v3.jsonl` lines 17→19, 36→37, 53→54), so
+///    admitting the class buys no detection the `result` events do not already
+///    give. What it buys is a new false-positive surface: v3 line 6's top-level
+///    assistant narration ("I'll spawn both subagents in the background now.")
+///    reaches no `result` event at all, so an agent narrating "next I'll handle
+///    the task whose gate the plan declares" would recreate the prompt-echo
+///    false positive one layer inward.
+/// 2. **Provenance — keep only top-level events.** An event is top-level when
+///    `parent_tool_use_id` is JSON null OR the key is absent entirely. The
+///    absent case is load-bearing: `result` events carry no such key at all
+///    (confirmed across all three archived captures), so a naive presence check
+///    would drop exactly the events that matter most. Mistaking
+///    subagent-forwarded narration for orchestrator output is the error that
+///    invalidated the v1 experiment outright. Kept even though filter 1 already
+///    makes it redundant for today's captures — the two guards are meant to
+///    fail independently, so a future widening of the type filter cannot
+///    silently inherit subagent content.
+///
+/// **ALL eligible `result` events are scanned, not only the last.** This
+/// deliberately diverges from [`last_top_level_result`]'s last-result-wins
+/// verdict semantics, and the two conventions must not be "harmonised": a
+/// verdict is a single final answer, whereas this asks whether a gate was
+/// reported ANYWHERE in the stage's output. A gate declared in turn N followed
+/// by task-notification wake-up turns N+1/N+2 — the exact turn shape the v3
+/// capture archives — would be silently dropped by last-result-only, losing a
+/// human authorization request to the generic gate. That is the
+/// opposite-direction harm, and the worse of the two.
+///
+/// Text is read with a direct [`serde_json::Value::get`] chain. Never route
+/// this through [`json_scan`]/[`json_find_key`]: a recursive traversal descends
+/// straight back into the nested message content both filters just excluded,
+/// silently undoing the fix while the tests on the outer shape still pass
+/// (T-30-23).
+///
+/// Returns `bool` and short-circuits on the first match rather than collecting
+/// the eligible text: this runs on every `devflow advance` over a capture that
+/// grows for the whole stage, and there is no reason to allocate a copy of it.
+fn claude_stream_reports_human_gate(events: &[serde_json::Value]) -> bool {
+    events
+        .iter()
+        .filter(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("result"))
+        .filter(|event| is_top_level(event))
+        .filter_map(|event| event.get("result").and_then(serde_json::Value::as_str))
+        .any(text_reports_human_gate)
+}
+
+/// The `rate_limit_info.status` values that mean the CLI DENIED the request.
+///
+/// Provenance, per entry — required reading before adding one:
+///
+/// - `rejected` — drawn from the observed vocabulary of this schema: it is the
+///   value the CLI writes for `overageStatus` in the only archived
+///   `rate_limit_event`
+///   (`.planning/phases/30-keep-the-session-alive-past-turn-end/30a-evidence/raw_output_v3.jsonl`
+///   line 15), so it is the denial token this schema actually speaks. It has
+///   NOT been observed as a `status` value — no archived capture is of a
+///   blocked stream, and every capture DevFlow has taken carries
+///   `status: "allowed"`.
+///
+/// Nothing else is listed, deliberately. Speculatively adding tokens is how the
+/// false positive this list exists to prevent comes back: an unrecognised
+/// status must DEFER (see [`detect_claude_stream_rate_limit`]), never classify.
+/// Correct this list the first time a real blocked capture is archived — that
+/// is the only evidence that settles the vocabulary.
+const CLAUDE_STREAM_RATE_LIMIT_DENIAL_STATUSES: &[&str] = &["rejected"];
+
+/// Detect an explicit quota DENIAL in a Claude `stream-json` capture and return
+/// the retry description, mirroring what [`detect_claude_rate_limit`] returns
+/// for the single-document envelope.
+///
+/// **A `rate_limit_event` is not a rate limit.** The CLI emits these routinely
+/// as quota telemetry on healthy streams: the only archived one
+/// (`raw_output_v3.jsonl` line 15) says `rate_limit_info.status: "allowed"` and
+/// sits in a stream that then completed three turns successfully. Classifying
+/// on the event's PRESENCE would mark every healthy Claude stream stage
+/// `RateLimited`, and `outcome_policy.rs` maps that to `Action::AutoResume` —
+/// so every stage would be auto-resumed against a fabricated retry time
+/// instead of advancing (T-30-26). Note the second trap in the same object:
+/// `overageStatus` is `rejected` one level below `status: "allowed"`, so any
+/// nested search for the token also false-positives. Hence every field here is
+/// read with a direct [`serde_json::Value::get`] on the top-level event and its
+/// `rate_limit_info` child — never [`json_find_key`]/[`json_scan`], which
+/// descend into nested (and, elsewhere in the stream, agent-authored) content
+/// and would let the agent supply the retry hint that drives the resume cron's
+/// scheduling (T-30-12).
+///
+/// Two independent guards, both required, neither a substitute for the other:
+///
+/// 1. **Positional** — only events after the SECOND-TO-LAST `result` event are
+///    eligible, i.e. the final turn. A session kept alive across turns emits one
+///    `result` per turn, and rate-limit chatter from an earlier turn must never
+///    outrank the outcome of a turn that finished later. (In the archived
+///    capture the rate event is at line 15 and the results at 19/37/54, so it is
+///    excluded on position alone.) With fewer than two `result` events the whole
+///    stream IS the final turn.
+/// 2. **Semantic** — only a `status` in
+///    [`CLAUDE_STREAM_RATE_LIMIT_DENIAL_STATUSES`] classifies. A missing
+///    `rate_limit_info`, a missing or non-string `status`, or any unrecognised
+///    value returns `None`.
+///
+/// **Deferring is the deliberately safe direction, not an oversight.**
+/// Under-classifying means an unknown denial status falls through to the
+/// envelope-failure path and is reported `Failed` — a real degradation (the
+/// operator loses automatic resume) but a never-silent one that still gates.
+/// Over-classifying means a healthy stream is auto-resumed against a retry time
+/// the parser invented. The asymmetry is the whole reason this function reads
+/// one field instead of matching a shape.
+fn detect_claude_stream_rate_limit(events: &[serde_json::Value]) -> Option<String> {
+    // Index of the second-to-last `result` event: everything at or before it is
+    // previous-turn history. `None` (fewer than two results) means the whole
+    // stream is the final turn.
+    let boundary = events
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| v.get("type").and_then(serde_json::Value::as_str) == Some("result"))
+        .map(|(idx, _)| idx)
+        .rev()
+        .nth(1);
+    let eligible = match boundary {
+        Some(idx) => &events[idx + 1..],
+        None => events,
+    };
+
+    // Last eligible event wins, matching the last-`result`-wins convention.
+    let event = eligible
+        .iter()
+        .rev()
+        .find(|v| v.get("type").and_then(serde_json::Value::as_str) == Some("rate_limit_event"))?;
+
+    let info = event.get("rate_limit_info")?;
+    let status = info.get("status")?.as_str()?;
+    if !CLAUDE_STREAM_RATE_LIMIT_DENIAL_STATUSES.contains(&status) {
+        return None;
+    }
+
+    // `resetsAt` is epoch seconds, rendered from the JSON number as-is: nothing
+    // parses this string. `outcome_policy.rs` routes on the
+    // `AgentStatus::RateLimited` variant alone and the `reason` text is
+    // operator-facing. Mirrors `detect_claude_rate_limit`'s `retry_after` →
+    // `message` → `error` chain; its final `"usage limit"` default has no
+    // counterpart here because a matched `status` is by construction one of the
+    // non-empty enumerated strings above, so a third rung would be unreachable.
+    Some(
+        info.get("resetsAt")
+            .and_then(json_scalar_to_string)
+            .unwrap_or_else(|| status.to_string()),
+    )
+}
+
+/// The stream-path counterpart of [`detect_claude_envelope_failure`]: treat
+/// `is_error: true` on a stream's last `result` event as an authoritative
+/// Layer-1 failure.
+///
+/// The `reason` shape is reproduced deliberately rather than shared — `result`
+/// text, else `subtype`, else `agent reported is_error`, with a
+/// ` (num_turns: {n})` suffix when present. This phase's scope fence keeps the
+/// four shipped single-document parsers unmodified, so factoring the common
+/// body out of `detect_claude_envelope_failure` is out of bounds here; the two
+/// must be kept in step by hand. `is_error` absent, non-bool, or `false`
+/// returns `None`, deferring exactly as the single-document path does.
+fn claude_stream_envelope_failure(result_event: &serde_json::Value) -> Option<AgentResult> {
+    if !result_event.get("is_error")?.as_bool()? {
+        return None;
+    }
+
+    let num_turns = result_event
+        .get("num_turns")
+        .and_then(serde_json::Value::as_u64);
+    let base_reason = result_event
+        .get("result")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            result_event
+                .get("subtype")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "agent reported is_error".to_string());
+    let reason = match num_turns {
+        Some(n) => format!("{base_reason} (num_turns: {n})"),
+        None => base_reason,
+    };
+
+    Some(AgentResult {
+        status: AgentStatus::Failed,
+        exit_code: None,
+        reason: Some(reason),
+        commits: None,
+        summary: None,
+        verdict: None,
+        decided_by_layer: Some(1),
+    })
+}
+
+/// Parse a Claude `--output-format stream-json` JSONL capture and read the
+/// `DEVFLOW_RESULT` marker out of its LAST `result` event.
+///
+/// The new sibling of [`parse_codex_event_result`], mirroring its shape. Only
+/// decisive when the capture is actually a Claude event stream (per
+/// [`is_claude_event_stream`]); every other shape returns `None` and falls
+/// through to the parser that owns it. Before this existed, a JSONL capture
+/// returned `None` from all four single-document parsers —
+/// `serde_json::from_str` on the whole multi-line document is a hard "trailing
+/// characters" error — so every Claude-driven stage fell through to Layer 2's
+/// coarse exit-code+commit heuristic.
+///
+/// **Precedence, mirroring [`evaluate_layer1`]'s single-document ordering
+/// rather than inventing a new one** — do not reshuffle without reading the
+/// reasons:
+///
+/// 1. Format gate ([`is_claude_event_stream`]); every other shape declines here.
+/// 2. [`detect_claude_stream_rate_limit`] — a final-turn explicit quota denial
+///    wins over EVERYTHING below it, for the same reason `evaluate_layer1`
+///    already puts `detect_claude_rate_limit` ahead of the generic failure
+///    check: a rate-limited run classified as plain `Failed` kills the primary
+///    rate-limit resume cron, the one automated path that exists to recover
+///    from it (T-30-13). The precedence is narrow, not broad — the detector
+///    only fires on an explicit denial inside the final turn, so it cannot
+///    shadow the outcome of a stream that completed.
+/// 3. The `DEVFLOW_RESULT` marker in the last `result` event. A non-success
+///    marker is decisive and returns immediately; a success marker is HELD, not
+///    returned, because step 4 may override it.
+/// 4. [`claude_stream_envelope_failure`] — `is_error: true` on that same event
+///    overrides a held success marker, matching the single-document rule that
+///    the envelope is authoritative for errors and a stale or echoed success
+///    marker must not win (T-30-15).
+/// 5. The held success marker, else `None`.
+///
+/// A last `result` event with no marker and no `is_error` returns `None`
+/// (defer to Layer 2) rather than an unconditional Success, matching the
+/// `turn.completed` convention: a marker-less turn must never silently advance
+/// a stage.
+///
+/// Passing the isolated `result` text to [`parse_marker_lines`] is the correct
+/// scoping, not a workaround. The marker is JSON-escaped inside a
+/// `"result":"..."` string value, so it can never appear as a line starting
+/// with `DEVFLOW_RESULT:` in the raw capture, and that parser's 4000-character
+/// tail window is smaller than a single stream `result` line. Once serde
+/// decodes the field the escaped newlines become real newlines and the existing
+/// tail scan works on it as designed.
+fn parse_claude_event_result(stdout: &str) -> Option<AgentResult> {
+    let capture = ParsedCapture::parse(stdout);
+    if !is_claude_event_stream(&capture.events) {
+        return None;
+    }
+
+    // Constraint 9 item 1 (code-review H1): a torn JSON line at or after the
+    // last surviving top-level result means the session's REAL final verdict
+    // may be among the casualties — a capture read while the CLI was still
+    // appending, or a truncated write. Nothing that survives before the tear
+    // is allowed to stand in for it; in particular an earlier turn's SUCCESS
+    // must never advance the stage. Returning a Failed verdict rather than
+    // None is deliberate: None would fall through to `parse_devflow_result`'s
+    // raw tail scan, which can find the stale marker TEXT inside the surviving
+    // JSON lines and resurrect it through the back door. The cost is a false
+    // failure when the torn trailing line was a quiet task-notification turn;
+    // that reads as loop-back noise, not a silent wrong advance.
+    if capture.torn_json_after_last_matching(|v| {
+        v.get("type").and_then(serde_json::Value::as_str) == Some("result") && is_top_level(v)
+    }) {
+        return Some(indeterminate_capture_failure());
+    }
+
+    if let Some(retry) = detect_claude_stream_rate_limit(&capture.events) {
+        return Some(rate_limited_result(retry));
+    }
+
+    let last_result = last_top_level_result(&capture.events)?;
+
+    let marker = last_result
+        .get("result")
+        .and_then(serde_json::Value::as_str)
+        .and_then(parse_marker_lines)
+        .map(normalise_stream_marker_provenance);
+
+    let held_success = match marker {
+        // A non-success marker is the agent's own final word and nothing below
+        // can improve on it.
+        //
+        // 31-02 audit (non-exhaustive equality site 1 of 3). This `!= Success`
+        // is CORRECT AS-IS for `AgentStatus::IdleTimeout` and is deliberately
+        // left unchanged. The compiler cannot flag this site — an equality test
+        // compiles fine against a new variant — so it is audited by hand here
+        // rather than left to the wildcard-free-match mechanism, which does not
+        // reach it.
+        //
+        // The only way `IdleTimeout` arrives here is an agent writing
+        // `DEVFLOW_RESULT: {"status":"idle_timeout"}` into its own output,
+        // claiming a verdict only DevFlow's monitor is supposed to produce.
+        // The predicate handles that in the fail-safe direction: it is not
+        // `Success`, so it returns immediately as decisive non-success and
+        // `decide_action` gates it for review. A forged idle timeout can
+        // therefore only make a run gate, never advance. The REAL
+        // monitor-produced verdict does not travel this path at all — it is
+        // read from its own side-channel file at the top of `evaluate_layer1`,
+        // before this parser ever runs.
+        Some(result) if result.status != AgentStatus::Success => return Some(result),
+        other => other,
+    };
+
+    if let Some(failure) = claude_stream_envelope_failure(last_result) {
+        return Some(failure);
+    }
+
+    held_success
+}
+
+/// The Layer-1 verdict for a stream capture whose TAIL is provably unreadable:
+/// a torn JSON line after the last surviving result (constraint 9 item 1).
+///
+/// Failed, not `None`, and not the pre-tear result. `None` hands the same
+/// stdout to `parse_devflow_result`'s raw tail scan, which can resurrect the
+/// stale marker text out of the surviving JSON lines; the pre-tear result is
+/// exactly the stale-success defect this exists to close. A false failure on a
+/// torn-but-benign tail surfaces as a retried stage, never as a silent wrong
+/// advance — the asymmetry this whole module is built around.
+fn indeterminate_capture_failure() -> AgentResult {
+    AgentResult {
+        status: AgentStatus::Failed,
+        exit_code: None,
+        reason: Some(
+            "stream capture ends in an unparseable line; the final verdict is indeterminate"
+                .to_string(),
+        ),
+        commits: None,
+        summary: None,
+        verdict: None,
+        decided_by_layer: Some(1),
+    }
+}
+
+/// T-30-26: overwrite the agent-supplied `decided_by_layer` unconditionally.
+///
+/// [`parse_marker_lines`] deserializes the agent's own marker JSON straight
+/// into [`AgentResult`], and the field is `#[serde(default)]`, so an ordinary
+/// `{"status":"success"}` marker leaves it `None` while a hostile
+/// `{"status":"success","decided_by_layer":0}` leaves it `Some(0)`. Neither is
+/// acceptable: every other Layer-1 constructor in this module sets `Some(1)`
+/// explicitly, and `Some(0)` is a Layer-0 external-probe provenance that
+/// `classify_validate_outcome` (devflow-cli's `pipeline_outcomes.rs`) reads as
+/// `external` when classifying a Validate stage. An agent must not be able to
+/// claim a probe verdict it did not earn, so the value is derived here rather
+/// than trusted.
+fn normalise_stream_marker_provenance(mut result: AgentResult) -> AgentResult {
+    result.decided_by_layer = Some(1);
+    result
+}
+
+/// Scan a bounded tail of `stdout` in reverse line order for the last
+/// `DEVFLOW_RESULT` marker.
 ///
 /// `DEVFLOW_RESULT` markers are ASCII. Searching the bounded tail and returning
 /// the last valid marker ensures the agent's final status wins over an earlier
 /// prompt echo without requiring the surrounding output to be ASCII.
+///
+/// Three sixth-pass corrections, each with a paired regression:
+/// - The tail budget counts WHOLE LINES, never bisecting one (High 2): the old
+///   fixed 4000-char window could cut through the final marker line itself
+///   when it carried a long `reason`, silently dropping the authoritative
+///   failure and handing the verdict to the exit code.
+/// - Each line is edge-stripped before prefix matching (High 1): the capture
+///   is read lossily, so one stray byte became U+FFFD glued to the prefix or
+///   the JSON and the marker vanished. Same policy as every other reader:
+///   edges stripped, interior corruption stays visible and untrusted.
+/// - The prefix match is genuinely case-insensitive (High 3), as this
+///   parser's contract has promised all along — the old strip_prefix chain
+///   accepted only ALL-upper or ALL-lower.
 fn parse_marker_lines(stdout: &str) -> Option<AgentResult> {
-    // Only search the tail — agents may echo the marker in their prompt
-    // and we want the LAST occurrence (which is their actual final status).
-    let tail: String = stdout
-        .chars()
-        .rev()
-        .take(4000)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
+    const TAIL_BUDGET_CHARS: usize = 4000;
+    const PREFIX: &str = "DEVFLOW_RESULT:";
 
-    for line in tail.lines().rev() {
-        let Some(json_str) = line
-            .strip_prefix("DEVFLOW_RESULT: ")
-            .or_else(|| line.strip_prefix("devflow_result: "))
-            .or_else(|| line.strip_prefix("DEVFLOW_RESULT:"))
-            .or_else(|| line.strip_prefix("devflow_result:"))
-        else {
+    let mut budget_used = 0usize;
+    for line in stdout.lines().rev() {
+        // The line that crosses the budget is still scanned whole; only the
+        // NEXT one stops the walk. The last line is always scanned, however
+        // long — that is the line the fixed window used to bisect.
+        if budget_used > TAIL_BUDGET_CHARS {
+            break;
+        }
+        budget_used += line.chars().count() + 1;
+
+        let line = strip_corruption_padding(line);
+        let Some(head) = line.get(..PREFIX.len()) else {
             continue;
         };
+        if !head.eq_ignore_ascii_case(PREFIX) {
+            continue;
+        }
 
-        let json_str = json_str.trim();
+        let json_str = line[PREFIX.len()..].trim();
         if let Ok(result) = serde_json::from_str::<AgentResult>(json_str) {
             return Some(result);
         }
@@ -646,29 +1616,191 @@ fn parse_marker_lines(stdout: &str) -> Option<AgentResult> {
     None
 }
 
+/// One commit the agent made before its stream went silent (D-07, 31-02).
+///
+/// The subject is carried alongside the sha because a bare sha list is not
+/// operator-actionable — D-07's requirement is that the commits be *named*, so
+/// that a silent miscount becomes something a human can act on.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct IdleTimeoutCommit {
+    /// Full commit sha, as `git log --format=%H` emits it.
+    pub sha: String,
+    /// Commit subject line (`%s`).
+    pub subject: String,
+}
+
+/// The pipe-owning monitor's authoritative idle-timeout verdict, as written to
+/// [`idle_timeout_path`] BEFORE the child is terminated (D-05, 31-02).
+///
+/// This is a SIDE CHANNEL, deliberately not the stdout capture. See
+/// [`parse_idle_timeout_side_channel`] for why that distinction is a
+/// correctness requirement rather than a filing preference.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct IdleTimeoutRecord {
+    /// Always [`AgentStatus::IdleTimeout`]'s wire string. Recorded so the file
+    /// is self-describing to a human reading `.devflow/` by hand.
+    pub status: String,
+    /// The idle window that elapsed with no line on the child's stdout.
+    pub idle_secs: u64,
+    /// The supervised child's pid, from the in-memory `Child` handle — never
+    /// re-read from the on-disk pid file, which is exposed to pid reuse
+    /// (T-31-07).
+    pub agent_pid: u32,
+    /// Unix seconds at which the monitor wrote this record.
+    pub written_at: u64,
+    /// Every commit on the phase branch when the timeout fired. NONE of these
+    /// is rolled back — see [`parse_idle_timeout_side_channel`].
+    pub commits: Vec<IdleTimeoutCommit>,
+}
+
+/// Read the monitor's own idle-timeout verdict, if it wrote one.
+///
+/// **This is consulted as the FIRST statement of [`evaluate_layer1`], before
+/// `read_capture` and before every marker parser. That placement is
+/// load-bearing and must not be "tidied" into the `.or_else` chain below it.**
+///
+/// The obvious-looking alternative — appending the verdict to the stdout
+/// capture — is a real correctness bug, not a style choice.
+/// `evaluate_layer1`'s chain reaches `parse_devflow_result`'s tail scan only
+/// when `parse_claude_event_result` returns `None`, and that parser resolves to
+/// the LAST top-level `result` event regardless of what text follows it. On any
+/// stream that already completed one successful turn — the normal shape of a
+/// run long enough to idle out at all — an appended verdict is therefore never
+/// reached, and a stale success stands as the recorded outcome of a run DevFlow
+/// itself killed (T-31-06, 31-RESEARCH Pitfall 3).
+///
+/// Reading before `read_capture` matters for a second reason: that call is an
+/// early `return None` when the capture is missing, so a timeout that fired
+/// before the child emitted anything at all would otherwise be discarded
+/// entirely.
+///
+/// `decided_by_layer` stays `1`. This is a Layer-1-CLASS authoritative verdict
+/// — it just comes from the monitor that supervised the run rather than from
+/// parsing what the agent said about itself. It is emphatically not `0`, which
+/// is reserved for operator-authored external probe provenance that
+/// `classify_validate_outcome` reads as `external`.
+///
+/// **The file's PRESENCE is the signal; its contents are enrichment.** A record
+/// that exists but cannot be read still returns an `IdleTimeout` verdict,
+/// carrying a reason that says the details were lost. Returning `None` there
+/// would drop the verdict back into the cascade and let precisely the stale
+/// success above win — turning a corrupt file into a silent wrong advance,
+/// which is the exact failure this function exists to prevent. The asymmetry is
+/// the one this whole module is built around: a false failure surfaces as a
+/// gate, never as a wrong advance.
+///
+/// **Nothing here rolls anything back** (D-07, T-31-09). The commits are read
+/// and named, never reverted: an idle timeout may be a false positive, and
+/// destroying real work on a false positive is unrecoverable.
+fn parse_idle_timeout_side_channel(project_root: &Path, phase: u32) -> Option<AgentResult> {
+    let path = idle_timeout_path(project_root, phase);
+    let raw = read_capture(&path)?;
+
+    let Ok(record) = serde_json::from_str::<IdleTimeoutRecord>(&raw) else {
+        return Some(idle_timeout_result(
+            format!(
+                "idle timeout: DevFlow's monitor recorded a timeout verdict at {} but the \
+                 record itself is unreadable, so the commit list and idle duration are lost. \
+                 The timeout stands regardless — the file's presence is the authoritative \
+                 signal. Inspect the phase branch by hand; nothing was rolled back.",
+                path.display()
+            ),
+            None,
+        ));
+    };
+
+    let named: Vec<String> = record
+        .commits
+        .iter()
+        .map(|commit| {
+            let short: String = commit.sha.chars().take(7).collect();
+            format!("{short} {}", commit.subject)
+        })
+        .collect();
+
+    let commit_phrase = if named.is_empty() {
+        "No commits were found on the phase branch.".to_string()
+    } else {
+        format!(
+            "The agent made {} commit(s) before going quiet and NONE of them were rolled \
+             back: {}.",
+            named.len(),
+            named.join("; ")
+        )
+    };
+
+    Some(idle_timeout_result(
+        format!(
+            "idle timeout: the agent's output stream was silent for {}s, so DevFlow \
+             terminated it (agent pid {}). {commit_phrase} Review the branch before deciding \
+             what to keep — this run is TERMINAL and is not retried automatically.",
+            record.idle_secs, record.agent_pid
+        ),
+        Some(record.commits.len() as u32),
+    ))
+}
+
+/// Build the `IdleTimeout` verdict Layer 1 reports for a monitor-recorded
+/// timeout.
+///
+/// `verdict` stays `None` deliberately: at `Stage::Validate`,
+/// `classify_validate_outcome` matches `Some(Verdict::Pass)` FIRST and would
+/// classify the stage as passed on the strength of that field alone, whatever
+/// the status says. A timeout has no verdict to offer, and inventing one here
+/// would advance a run that never reported.
+fn idle_timeout_result(reason: String, commits: Option<u32>) -> AgentResult {
+    AgentResult {
+        status: AgentStatus::IdleTimeout,
+        exit_code: None,
+        reason: Some(reason),
+        commits,
+        summary: None,
+        verdict: None,
+        decided_by_layer: Some(1),
+    }
+}
+
 /// Layer 1: Try to detect agent result from the native per-adapter envelope
 /// or the DEVFLOW_RESULT marker in stdout.
+///
+/// The monitor's own idle-timeout side channel is consulted FIRST, ahead of
+/// everything below including `read_capture` itself — see
+/// [`parse_idle_timeout_side_channel`], where that ordering is a correctness
+/// requirement rather than a preference.
 ///
 /// Precedence: Claude rate-limit envelope (a SPECIFIC failure that must
 /// outrank the generic `is_error` check — rate-limit envelopes carry
 /// `is_error: true`, and classifying them `Failed` would kill the primary
 /// rate-limit resume cron path) → Claude envelope `is_error: true` (authoritative,
-/// overrides a success marker) → DEVFLOW_RESULT marker (portable; works for
-/// plain text and a Claude envelope's unwrapped `result` text) → Codex JSONL
-/// event stream (`turn.failed` decisive; `turn.completed` defers) → Codex
-/// plain-text rate-limit heuristic (least authoritative, stays last).
+/// overrides a success marker) → Claude `stream-json` JSONL event stream (the
+/// last `result` event's marker decides; a marker-less last turn defers) →
+/// DEVFLOW_RESULT marker (portable; works for plain text and a Claude
+/// envelope's unwrapped `result` text) → Codex JSONL event stream
+/// (`turn.failed` decisive; `turn.completed` defers) → Codex plain-text
+/// rate-limit heuristic (least authoritative, stays last).
+///
+/// The Claude stream parser's position is load-bearing in BOTH directions
+/// (T-30-03). The two single-document detectors stay ahead of it because they
+/// remain authoritative for the `--output-format json` envelope that ships
+/// today. It goes ahead of `parse_devflow_result` so that an adapter-specific
+/// stream capture is owned whole by the parser that understands its framing,
+/// rather than letting the generic 4000-character tail scan take a bite of a
+/// mid-line window of JSONL first.
 pub fn evaluate_layer1(project_root: &Path, phase: u32) -> Option<AgentResult> {
-    let stdout_path = devflow_dir(project_root).join(format!("phase-{:02}-stdout", phase));
-    // Read lossily: in monitor mode the agent's stdout reaches this file via
-    // raw sh redirection, so one invalid UTF-8 byte in a strict
-    // read_to_string would silently disable ALL Layer-1 detection (marker,
-    // envelope, rate limit) — the same failure class CR-01 (13-REVIEW.md)
-    // fixed in the blocking-mode capture.
-    let bytes = std::fs::read(&stdout_path).ok()?;
-    let stdout = String::from_utf8_lossy(&bytes);
+    // FIRST STATEMENT, before `read_capture` and before every parser below.
+    // Do not move this into the `.or_else` chain: `parse_claude_event_result`
+    // resolves the LAST top-level `result` event and would shadow it on any
+    // stream that already had one successful turn. See
+    // `parse_idle_timeout_side_channel`'s doc comment (T-31-06).
+    if let Some(timed_out) = parse_idle_timeout_side_channel(project_root, phase) {
+        return Some(timed_out);
+    }
+
+    let stdout = read_capture(&stdout_path(project_root, phase))?;
     detect_claude_rate_limit(&stdout)
         .map(rate_limited_result)
         .or_else(|| detect_claude_envelope_failure(&stdout))
+        .or_else(|| parse_claude_event_result(&stdout))
         .or_else(|| parse_devflow_result(&stdout))
         .or_else(|| parse_codex_event_result(&stdout))
         .or_else(|| detect_codex_rate_limit(&stdout).map(rate_limited_result))
@@ -974,6 +2106,16 @@ fn evaluate_layer0(
 /// unchanged from current behavior. A Layer 0 FAILURE is never passed here —
 /// only its affirmative-success arm is, so a failed probe still outranks
 /// every agent-controlled signal.
+///
+/// 31-02 audit (non-exhaustive equality site 2 of 3). The `!= Success` guard
+/// below is CORRECT AS-IS for `AgentStatus::IdleTimeout` and is left unchanged.
+/// The compiler cannot flag an equality test against a new variant, so this is
+/// audited by hand. An idle-timeout result is rejected here by BOTH independent
+/// guards, not just one: its status is not `Success`, and its
+/// `decided_by_layer` is `Some(1)` (the monitor's side-channel verdict is a
+/// Layer-1-class fact), never `Some(0)`. It returns unchanged, which is right —
+/// this function exists only to graft Layer 1's `verdict` onto an affirmative
+/// Layer 0 probe success, and a timeout is neither.
 fn reconcile_layer0_verdict(
     project_root: &Path,
     state: &State,
@@ -987,6 +2129,135 @@ fn reconcile_layer0_verdict(
     }
     let verdict = evaluate_layer1(project_root, state.phase).and_then(|layer1| layer1.verdict);
     AgentResult { verdict, ..result }
+}
+
+/// Refuse to let a stream-derived `Success` outrank a contradicting exit code
+/// (constraint 9's residual, T-31-15, 31-04).
+///
+/// # Why this cannot be a parser assertion
+///
+/// Constraint 9's items 1 and 2 — a torn line at or after the last surviving
+/// top-level `result`, and provenance on verdict selection — were closed at the
+/// root by the `a557805` refactor that made lossiness and capture kind
+/// first-class ([`ParsedCapture`], [`classify`]). What survives is precisely
+/// the case no parser can detect: **a capture cut at an exact line boundary is
+/// byte-identical to a healthy shorter run.** There is nothing in the bytes to
+/// assert on. The writer that died between flushing turn N and turn N+1 also
+/// died non-zero, so the exit code is the only remaining signal — and it lives
+/// one layer up, in the wiring, which is where this defence had to go.
+///
+/// # Why the fix is narrow rather than a cascade reordering
+///
+/// [`evaluate_agent_result_inner`] consults Layer 2 only when Layer 1 abstains,
+/// which is why a Layer 1 `Success` wins over a contradicting exit code today.
+/// That ordering is correct in the ordinary case: Layer 1 is authoritative
+/// precisely so it does not need Layer 2's slower `git rev-list` fallback.
+/// Making Layer 2 run first would trade a rare wrong answer for a slow one on
+/// every stage. So this arbitrates one verdict rather than reordering anything.
+///
+/// # Scope
+///
+/// Fires ONLY on `AgentStatus::Success`. `RateLimited`, `IdleTimeout`,
+/// `ResourceKilled`, `AgentUnavailable`, `Failed` and `Unknown` all return
+/// untouched, each with a named test. Two of those exclusions are load-bearing
+/// rather than tidy: a `RateLimited` downgraded to `Failed` would route the run
+/// to a human gate instead of the auto-resume cron it needs, and an
+/// `IdleTimeout` downgraded to `Failed` would erase the distinction plan 31-02
+/// exists to create — 999.64 reborn inside its own fix.
+///
+/// 31-02 audit convention (non-exhaustive equality site): the `!= Success`
+/// guard below is correct as-is for every current and future variant. Anything
+/// that is not an affirmative claimed success has nothing to arbitrate, so
+/// passing it through unchanged is the right default for a variant added later.
+///
+/// # `verdict: None` is load-bearing — do not carry it over for symmetry
+///
+/// `classify_validate_outcome` (`devflow-cli/src/pipeline_outcomes.rs`) matches
+/// `(_, Some(Verdict::Pass)) => ValidateOutcome::Passed` FIRST, with `_`
+/// discarding the status entirely. A downgraded result that kept
+/// `verdict: Pass` would carry `status: Failed` and still classify Validate as
+/// **Passed** — making this whole function a no-op at the one stage where it
+/// matters most. [`idle_timeout_result`] dodges the same trap the same way, and
+/// says so. A downgraded result has no verdict to offer and must not invent
+/// one. The underlying defect (an agent's self-reported verdict outranking the
+/// status the cascade derived) is filed as **999.74 / DEN-95** and deliberately
+/// not fixed here: changing that match arm silently re-routes `Failed`,
+/// `Unknown` and `ResourceKilled`, whose behaviour nothing has audited.
+///
+/// # Exit-code fidelity
+///
+/// 137 → `ResourceKilled` and 127 → `AgentUnavailable` are preserved rather
+/// than collapsed into `Failed`, mirroring [`evaluate_layer2`] exactly:
+/// `outcome_policy::decide_action` routes those two to `GateInfra` rather than
+/// `GateReview`, and the same exit code must not reach two different operator
+/// gates depending on whether a stale Layer 1 success happened to be present.
+///
+/// Note the `ResourceKilled` arm is currently **unreachable via the
+/// `MonitorLaunch::PipeOwning` path**: `run_pipe_owning_monitor` records
+/// `status.code().unwrap_or(-1)`, so a SIGKILLed child writes `-1`, not `137`.
+/// Recorded rather than silently relabelling a real OOM as `Failed` — the arm
+/// is still reachable from the `Legacy` arm's `sh` monitor, whose `$?` does
+/// carry `128 + signal`.
+///
+/// Unreadable or unparseable exit-file content is tolerated exactly as
+/// [`evaluate_layer2`] tolerates it — a missing file returns the result
+/// unchanged (an absent file is not evidence of failure), and garbage parses to
+/// `-1`. Neither is invented behaviour; both match the sibling reader.
+fn reconcile_stream_success_against_exit_code(
+    project_root: &Path,
+    phase: u32,
+    result: AgentResult,
+) -> AgentResult {
+    if result.status != AgentStatus::Success {
+        return result;
+    }
+
+    let Ok(raw) = std::fs::read_to_string(exit_code_path(project_root, phase)) else {
+        return result;
+    };
+    let exit_code: i32 = raw.trim().parse().unwrap_or(-1);
+    if exit_code == 0 {
+        return result;
+    }
+
+    let (status, lead) = if exit_code == 137 {
+        (
+            AgentStatus::ResourceKilled,
+            format!(
+                "the agent's output stream reported SUCCESS but the process was killed \
+                 (exit code {exit_code}, likely OOM)"
+            ),
+        )
+    } else if exit_code == 127 {
+        (
+            AgentStatus::AgentUnavailable,
+            format!(
+                "the agent's output stream reported SUCCESS but the agent command was \
+                 unavailable (exit code {exit_code}, command not found)"
+            ),
+        )
+    } else {
+        (
+            AgentStatus::Failed,
+            format!(
+                "the agent's output stream reported SUCCESS but the agent exited with \
+                 code {exit_code}"
+            ),
+        )
+    };
+
+    AgentResult {
+        status,
+        exit_code: Some(exit_code),
+        reason: Some(format!(
+            "{lead}. A capture cut at an exact line boundary is byte-identical to a healthy \
+             shorter run, so no parser assertion can tell the two apart — the exit code is the \
+             only remaining signal, and it contradicts the claim. Review the phase branch before \
+             deciding what to keep; nothing was rolled back."
+        )),
+        verdict: None,
+        ..result
+    }
 }
 
 /// Full four-layer evaluation: returns the best available AgentResult.
@@ -1011,8 +2282,18 @@ fn evaluate_agent_result_inner(
     }
 
     // Layer 1: DEVFLOW_RESULT marker (authoritative)
+    //
+    // Authoritative, but not unconditionally: a CLAIMED success is arbitrated
+    // against the recorded exit code before it is returned (31-04, T-31-15).
+    // The cascade below is deliberately NOT reordered — see
+    // `reconcile_stream_success_against_exit_code` for why Layer 2 running
+    // first would be the wrong trade.
     if let Some(result) = evaluate_layer1(project_root, state.phase) {
-        return Ok(result);
+        return Ok(reconcile_stream_success_against_exit_code(
+            project_root,
+            state.phase,
+            result,
+        ));
     }
 
     // Layer 2: Exit code + commit gate
@@ -1048,6 +2329,43 @@ pub fn exit_code_path(project_root: &Path, phase: u32) -> PathBuf {
 /// Path to the file where the monitor records the launched agent's PID.
 pub fn agent_pid_path(project_root: &Path, phase: u32) -> PathBuf {
     devflow_dir(project_root).join(format!("phase-{:02}-agent-pid", phase))
+}
+
+/// Path to the file holding the stage prompt handed to the pipe-owning
+/// monitor (Phase 31).
+///
+/// The prompt travels `spawn_monitor` → detached monitor process as a FILE,
+/// never as argv: DevFlow stage prompts are large and argv has a hard length
+/// ceiling, so a prompt passed positionally would fail on exactly the
+/// context-heavy stages that matter most.
+pub fn prompt_path(project_root: &Path, phase: u32) -> PathBuf {
+    devflow_dir(project_root).join(format!("phase-{:02}-prompt", phase))
+}
+
+/// Path to the pipe-owning monitor's own log for a phase (Phase 31).
+///
+/// The monitor is a detached process whose stdio is not the operator's
+/// terminal — anything it prints to its own stdout goes nowhere. Every "log
+/// loudly" obligation in this phase (the D-04 idle-timeout clamp, the D-11
+/// opt-out notice) writes here instead, so a loud message is actually
+/// readable after the fact.
+pub fn monitor_log_path(project_root: &Path, phase: u32) -> PathBuf {
+    devflow_dir(project_root).join(format!("phase-{:02}-monitor.log", phase))
+}
+
+/// Path to the pipe-owning monitor's idle-timeout verdict for a phase
+/// (D-05/D-06, 31-02).
+///
+/// A SIDE CHANNEL, deliberately separate from the stdout capture: the capture
+/// is the agent's own narration, and a verdict appended to it is shadowed by
+/// any earlier genuine `result` event the stream already contained. See
+/// [`parse_idle_timeout_side_channel`] — that separation is a correctness
+/// requirement (T-31-06), not a filing convention.
+///
+/// Holds a JSON [`IdleTimeoutRecord`]. Written and fsynced by the monitor
+/// BEFORE the child is signalled, so nothing can race the verdict.
+pub fn idle_timeout_path(project_root: &Path, phase: u32) -> PathBuf {
+    devflow_dir(project_root).join(format!("phase-{:02}-idle-timeout", phase))
 }
 
 /// Path to the archived-capture-history directory for a phase (16b).
@@ -1727,6 +3045,987 @@ mod tests {
         assert!(checkpoint_reported_in_capture(dir.path(), 11));
     }
 
+    // ---- stream-capture gate scoping (plan 30-05) --------------------------
+    //
+    // Fixtures for this cluster live with the other v3 envelopes further down:
+    // `V3_USER_EVENT`, `V3_ASSISTANT_TOP_LEVEL_EVENT`,
+    // `V3_ASSISTANT_SUBAGENT_EVENT`, `gate_declaration_text` and
+    // `gate_documenting_text`. Read their doc comments before adding a case —
+    // they record which capture line each envelope came from and that every
+    // gate payload is synthetic.
+    //
+    // Each negative asserts a NEGATIVE CONTROL first: `text_reports_human_gate`
+    // must still match the raw capture. Without it a negative would also pass
+    // against a fixture that simply contains no gate text, and would keep
+    // passing if someone deleted the gate line from the fixture.
+
+    /// **REGRESSION — review constraint 3, the prompt-echo false positive.**
+    ///
+    /// Under a single-document envelope the only place gate text can appear is
+    /// the one `result` field the agent authored, so scanning raw stdout is
+    /// safe. A stream capture breaks that invariant: text DevFlow never
+    /// authored is echoed back into the same stdout, and a substring scan
+    /// cannot tell which event it is inside.
+    ///
+    /// A failure here means a checkpoint auto-decide can fire, or the resume
+    /// ceiling be consumed, on a stage whose prompt merely DISCUSSED
+    /// checkpoints — and DevFlow's own planning documents are exactly that kind
+    /// of prompt content.
+    #[test]
+    fn blocking_human_checkpoint_reported_false_for_gate_text_in_user_event() {
+        let capture = stream_capture_of(&[
+            &v3_message_event(V3_USER_EVENT, &gate_documenting_text()),
+            &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+        ]);
+        assert!(
+            text_reports_human_gate(&capture),
+            "negative control: the raw capture must still contain matchable \
+             gate text, or this test asserts nothing"
+        );
+        assert!(
+            !blocking_human_checkpoint_reported(&capture),
+            "gate text inside a `user` event is echoed input, not an agent \
+             declaration (review constraint 3)"
+        );
+    }
+
+    /// **REGRESSION — T-30-22.** Gate text forwarded from a subagent is not the
+    /// orchestrator declaring a gate. Mistaking subagent-forwarded content for
+    /// orchestrator output is the error that invalidated the v1 experiment
+    /// outright and got its whole capture discarded.
+    ///
+    /// Two independent guards reject this event — the type filter (it is an
+    /// `assistant` event) and the provenance filter (its `parent_tool_use_id`
+    /// is non-null). The case is kept even though either alone suffices: they
+    /// are meant to fail independently, so a future widening of the type filter
+    /// cannot silently inherit subagent content.
+    #[test]
+    fn blocking_human_checkpoint_reported_false_for_subagent_forwarded_gate_text() {
+        let capture = stream_capture_of(&[
+            &v3_message_event(V3_ASSISTANT_SUBAGENT_EVENT, &gate_documenting_text()),
+            &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+        ]);
+        assert!(
+            text_reports_human_gate(&capture),
+            "negative control: the raw capture must still contain matchable \
+             gate text, or this test asserts nothing"
+        );
+        assert!(
+            !blocking_human_checkpoint_reported(&capture),
+            "a subagent's forwarded text cannot present as the orchestrator's \
+             own gate declaration"
+        );
+    }
+
+    /// **REGRESSION — T-30-26, the surface cross-AI review found.**
+    ///
+    /// Narration is not declaration. The envelope is v3 line 6, whose captured
+    /// payload is mid-turn narration appearing in NO `result` event of the
+    /// capture — so admitting top-level `assistant` events would add a
+    /// genuinely new trusted surface, not merely duplicate the result text.
+    /// An agent narrating the checkpoint task it is about to work on would then
+    /// trip the gate: the prompt-echo false positive, recreated one layer
+    /// inward.
+    ///
+    /// Nothing observed is lost by excluding the class: turn-FINAL assistant
+    /// text is duplicated verbatim into the `result` event that follows it
+    /// (v3 lines 17→19, 36→37, 53→54).
+    #[test]
+    fn blocking_human_checkpoint_reported_false_for_top_level_assistant_narration() {
+        let capture = stream_capture_of(&[
+            &v3_message_event(V3_ASSISTANT_TOP_LEVEL_EVENT, &gate_documenting_text()),
+            &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+        ]);
+        assert!(
+            text_reports_human_gate(&capture),
+            "negative control: the raw capture must still contain matchable \
+             gate text, or this test asserts nothing"
+        );
+        assert!(
+            !blocking_human_checkpoint_reported(&capture),
+            "intermediate assistant narration discussing a gate is not a live \
+             gate declaration"
+        );
+    }
+
+    /// The positive that stops the scoping from degenerating into always-false
+    /// — which would pass every negative above while silently dropping every
+    /// real human authorization request (T-30-24).
+    #[test]
+    fn blocking_human_checkpoint_reported_true_for_top_level_result_declaration() {
+        let capture = stream_capture_of(&[
+            &v3_message_event(V3_USER_EVENT, "Execute the plan."),
+            &v3_result_event(V3_RESULT_TURN1, &gate_declaration_text()),
+        ]);
+        assert!(
+            blocking_human_checkpoint_reported(&capture),
+            "a gate declared in a top-level `result` event's own result text \
+             must still be detected under a stream capture"
+        );
+    }
+
+    /// **T-30-27.** Detection asks whether a gate fired ANYWHERE in the stage,
+    /// so it deliberately does NOT inherit plan 30-01's last-result-wins
+    /// verdict semantics. A gate declared in turn 1 followed by
+    /// task-notification wake-up turns — the exact turn shape the v3 capture
+    /// archives — must not be dropped in favour of the later, silent results.
+    ///
+    /// Losing a checkpoint report is the opposite-direction harm from the false
+    /// positive this plan closes, and the worse of the two: it silently drops a
+    /// request for human authorization to the generic gate.
+    #[test]
+    fn blocking_human_checkpoint_reported_true_when_only_first_result_declares_gate() {
+        let capture = v3_stream_capture(&gate_declaration_text(), NO_MARKER, NO_MARKER);
+        assert!(
+            blocking_human_checkpoint_reported(&capture),
+            "detection must scan every top-level `result` event, not only the \
+             last one"
+        );
+    }
+
+    /// The overcorrection guard: an echo and a genuine declaration can coexist
+    /// in one capture, and the scoping must resolve per event rather than
+    /// suppressing any capture that contains an echo.
+    #[test]
+    fn blocking_human_checkpoint_reported_true_when_echo_co_occurs_with_declaration() {
+        let capture = stream_capture_of(&[
+            &v3_message_event(V3_USER_EVENT, &gate_documenting_text()),
+            &v3_result_event(V3_RESULT_TURN1, &gate_declaration_text()),
+        ]);
+        assert!(
+            blocking_human_checkpoint_reported(&capture),
+            "an echoed prompt in the same capture must not suppress a genuine \
+             declaration"
+        );
+    }
+
+    /// The same scoping, proven on the path production actually consumes —
+    /// `checkpoint_reported_in_capture` reading `.devflow/phase-NN-stdout` from
+    /// disk. Both directions are asserted in one test on purpose: the negative
+    /// alone cannot distinguish correct scoping from a wrapper that stopped
+    /// reading the file at all.
+    #[test]
+    fn checkpoint_reported_in_capture_scopes_stream_gate_text_to_result_events() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+
+        let echo_only = stream_capture_of(&[
+            &v3_message_event(V3_USER_EVENT, &gate_documenting_text()),
+            &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+        ]);
+        std::fs::write(stdout_path(dir.path(), 30), &echo_only).unwrap();
+        assert!(
+            !checkpoint_reported_in_capture(dir.path(), 30),
+            "an echoed gate mention read from the capture file must not report \
+             a checkpoint"
+        );
+
+        let declared = stream_capture_of(&[
+            &v3_message_event(V3_USER_EVENT, &gate_documenting_text()),
+            &v3_result_event(V3_RESULT_TURN1, &gate_declaration_text()),
+        ]);
+        std::fs::write(stdout_path(dir.path(), 31), &declared).unwrap();
+        assert!(
+            checkpoint_reported_in_capture(dir.path(), 31),
+            "a genuine declaration read from the capture file must still \
+             report a checkpoint"
+        );
+    }
+
+    /// **The fail-open regression.** A torn `system`/`init` line must not send
+    /// gate scanning back to raw stdout.
+    ///
+    /// `claude_stream_events` silently drops any line that fails to parse, and
+    /// recognition used to require a successfully parsed `init`. So one
+    /// truncated first line — a partial write, or a read of a capture still
+    /// being appended to — made the whole capture unrecognised, and
+    /// `blocking_human_checkpoint_reported` fell back to scanning raw stdout,
+    /// which under a stream capture contains the echoed prompt. The constraint-3
+    /// scoping failed OPEN, into the exact false positive it exists to close.
+    /// Found by cross-AI code review (gpt-5.6-sol, 2026-08-02, High finding 2).
+    ///
+    /// Envelopes are real (v3 `user` + `result`); the `init` line is a real one
+    /// truncated mid-token, and the gate text payload is synthetic — no archived
+    /// capture contains gate text or a prompt echo.
+    #[test]
+    fn blocking_human_checkpoint_reported_false_when_init_is_torn() {
+        let torn_init = &V3_INIT_EVENT[..40];
+        assert!(
+            serde_json::from_str::<serde_json::Value>(torn_init).is_err(),
+            "fixture precondition: the truncated init must actually fail to parse"
+        );
+
+        let capture = format!(
+            "{}\n{}\n{}\n",
+            torn_init,
+            v3_message_event(V3_USER_EVENT, &gate_documenting_text()),
+            v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+        );
+        assert!(
+            !blocking_human_checkpoint_reported(&capture),
+            "a torn init must not re-enable the raw-stdout scan and let the \
+             echoed prompt read as a gate declaration"
+        );
+
+        // Same capture, init intact — proves the negative above is the torn-init
+        // path being handled, not the fixture simply lacking gate text.
+        let intact = stream_capture_of(&[
+            &v3_message_event(V3_USER_EVENT, &gate_documenting_text()),
+            &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+        ]);
+        assert!(
+            !blocking_human_checkpoint_reported(&intact),
+            "control: the same capture with a valid init is also false"
+        );
+
+        // And a real declaration is still detected with the init torn, so the
+        // fix did not degenerate into always-false (T-30-24).
+        let declared = format!(
+            "{}\n{}\n{}\n",
+            torn_init,
+            v3_message_event(V3_USER_EVENT, &gate_documenting_text()),
+            v3_result_event(V3_RESULT_TURN1, &gate_declaration_text()),
+        );
+        assert!(
+            blocking_human_checkpoint_reported(&declared),
+            "a genuine declaration must still be detected when init is torn"
+        );
+    }
+
+    /// A stream with NO `init` at all is likewise scoped rather than raw-scanned.
+    /// Same fail-open class as the torn-init case; reported by the same review.
+    #[test]
+    fn blocking_human_checkpoint_reported_false_when_init_is_absent() {
+        let capture = format!(
+            "{}\n{}\n",
+            v3_message_event(V3_USER_EVENT, &gate_documenting_text()),
+            v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+        );
+        assert!(
+            !blocking_human_checkpoint_reported(&capture),
+            "an init-less stream must still scope the gate scan to result events"
+        );
+    }
+
+    /// **The mandatory over-correction controls.** Widening stream recognition
+    /// must not divert the three non-stream inputs off the raw-scan path they
+    /// have always used (T-30-25). Each carries genuine gate text and must
+    /// still report `true`; if any flips to `false`, the widening has started
+    /// suppressing real gates.
+    #[test]
+    fn non_stream_captures_still_use_the_raw_scan_after_widening() {
+        let plain = format!("Some narration.\n{}\n", gate_declaration_text());
+        assert!(
+            blocking_human_checkpoint_reported(&plain),
+            "plain text must still be raw-scanned"
+        );
+
+        let single_doc = v3_result_event(V3_RESULT_TURN1, &gate_declaration_text());
+        assert!(
+            blocking_human_checkpoint_reported(&single_doc),
+            "a single-document envelope must still be raw-scanned — it is \
+             `{{\"type\":\"result\"}}`, which claude_stream_gate_shape excludes"
+        );
+
+        let codex = format!(
+            "{{\"type\":\"thread.started\",\"thread_id\":\"t1\"}}\n\
+             {{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\
+             \"text\":\"{}\"}}}}\n",
+            gate_declaration_text().replace('"', "\\\"")
+        );
+        assert!(
+            blocking_human_checkpoint_reported(&codex),
+            "a Codex stream must still be raw-scanned — its top-level types are \
+             dotted, so claude_stream_gate_shape excludes it"
+        );
+    }
+
+    /// **Fourth-pass High.** Decoding must never JOIN tokens across corrupt
+    /// bytes. The third pass's remediation dropped invalid bytes, and
+    /// `DEVFLOW_RESULT: {"status":"suc<FF>cess"}` with exit 1 decoded to a
+    /// fabricated, VALID success marker — Layer 1 then short-circuited the
+    /// nonzero exit. Replacement (U+FFFD) keeps the corruption visible: the
+    /// status reads `suc\u{FFFD}cess`, no parser trusts it, and the exit code
+    /// decides. Edge corruption stays covered by [`strip_corruption_padding`]
+    /// — see the sibling third-pass test, which must pass alongside this one.
+    #[test]
+    fn corrupt_byte_inside_a_marker_is_never_repaired_into_success() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+
+        let mut poisoned = b"DEVFLOW_RESULT: {\"status\":\"suc".to_vec();
+        poisoned.push(0xff);
+        poisoned.extend_from_slice(b"cess\"}");
+        std::fs::write(stdout_path(dir.path(), 30), &poisoned).unwrap();
+        assert_ne!(
+            evaluate_layer1(dir.path(), 30).map(|r| r.status),
+            Some(AgentStatus::Success),
+            "a corrupt capture with no valid success marker must not be \
+             repaired into an authoritative one"
+        );
+
+        // Control: the same marker with the byte absent IS a real success.
+        std::fs::write(
+            stdout_path(dir.path(), 31),
+            br#"DEVFLOW_RESULT: {"status":"success"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            evaluate_layer1(dir.path(), 31).map(|r| r.status),
+            Some(AgentStatus::Success),
+            "control: the intact marker must still parse as success"
+        );
+    }
+
+    /// **Third-pass High.** A stray invalid byte outside the JSON envelope must
+    /// not convert an authoritative failure into a Layer-2 success.
+    ///
+    /// `from_utf8_lossy` substitutes U+FFFD, which survives `trim()`, so
+    /// `detect_claude_envelope_failure`'s `starts_with('{')` guard went false and
+    /// Layer 1 abstained on `is_error: true`. The cascade then fell through to
+    /// the exit-code check — Ship proceeding on a reported failure. Reachable on
+    /// the shipped `--output-format json` envelope; nothing to do with
+    /// stream-json.
+    #[test]
+    fn stray_invalid_byte_does_not_hide_an_envelope_failure() {
+        let envelope = br#"{"type":"result","subtype":"error","is_error":true,"result":"boom","session_id":"s"}"#;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+
+        std::fs::write(stdout_path(dir.path(), 30), envelope).unwrap();
+        assert_eq!(
+            evaluate_layer1(dir.path(), 30).map(|r| r.status),
+            Some(AgentStatus::Failed),
+            "control: the intact envelope is an authoritative Layer-1 failure"
+        );
+
+        let mut poisoned = vec![0xffu8];
+        poisoned.extend_from_slice(envelope);
+        std::fs::write(stdout_path(dir.path(), 31), &poisoned).unwrap();
+        assert_eq!(
+            evaluate_layer1(dir.path(), 31).map(|r| r.status),
+            Some(AgentStatus::Failed),
+            "one invalid byte before the envelope must not make Layer 1 abstain \
+             and hand a FAILURE to the exit-code fallback"
+        );
+    }
+
+    /// **Third-pass Medium.** A torn gate-bearing `user` event must not reopen
+    /// raw-stdout scanning.
+    ///
+    /// `claude_stream_gate_shape` keyed stream recognition on system/user/
+    /// assistant events. If the echoed `user` event tore *after* carrying the
+    /// full gate text and only a later `result` parsed, none of those types
+    /// survived, the capture stopped looking like a stream, and the raw scan
+    /// read the echoed prompt as a declaration. Every line is still `{`-shaped,
+    /// so this is neither the torn-`init` case nor V-01.
+    #[test]
+    fn torn_gate_bearing_user_event_does_not_reopen_raw_scanning() {
+        let echo = v3_message_event(V3_USER_EVENT, &gate_documenting_text());
+        let quiet_result = v3_result_event(V3_RESULT_TURN1, NO_MARKER);
+
+        let closed = format!("{}\n{}\n{}\n", V3_INIT_EVENT, echo, quiet_result);
+        assert!(
+            !blocking_human_checkpoint_reported(&closed),
+            "control: with the echo intact the gate mention is correctly scoped out"
+        );
+
+        let torn = format!("{}\n{}\n", &echo[..echo.len() - 12], quiet_result);
+        assert!(
+            !blocking_human_checkpoint_reported(&torn),
+            "a torn echo leaving only a result must stay scoped, not fall back to \
+             the raw scan that reads the echoed prompt as a declaration"
+        );
+
+        // The shipped single-document envelope is ONE result line and must keep
+        // taking the raw path (T-30-25).
+        let single_doc = v3_result_event(V3_RESULT_TURN1, &gate_declaration_text());
+        assert!(
+            blocking_human_checkpoint_reported(&single_doc),
+            "control: the single-document envelope still uses the raw scan"
+        );
+    }
+
+    /// **Fourth-pass Medium 3.** Benign prose noise must not block session
+    /// recovery — only a torn JSON line can conceal a newer `init`.
+    ///
+    /// The first fail-closed guard rejected the capture when ANY non-empty line
+    /// failed to parse, so one interleaved progress line disabled checkpoint
+    /// auto-resume while the verdict parser accepted the same capture. An
+    /// `init` is a JSON line; a non-`{` line can never be a torn one.
+    #[test]
+    fn prose_noise_does_not_block_session_recovery() {
+        let stream = format!(
+            "{}\nprogress: still working…\n{}\n",
+            V3_INIT_EVENT,
+            v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+        );
+        assert!(
+            claude_stream_session_id(&stream).is_some(),
+            "a prose progress line must not fail session recovery closed"
+        );
+
+        // Control: the same capture with the noise line made JSON-shaped-but-torn
+        // MUST fail closed — that shape could be a torn newer init.
+        let torn = format!(
+            "{}\n{{\"type\":\"system\",\"subty\n{}\n",
+            V3_INIT_EVENT,
+            v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+        );
+        assert!(
+            claude_stream_session_id(&torn).is_none(),
+            "a torn JSON line could be a newer init and must fail closed"
+        );
+    }
+
+    /// **Third-pass High.** A torn *later* `init` must not resurrect an earlier
+    /// session's id.
+    ///
+    /// Each turn opens its own `init`; the last carries the id a resume must
+    /// target. Dropped lines are invisible, so the scan returned the last
+    /// PARSEABLE init — a stale token that looks entirely valid. Fails closed
+    /// now: `None` costs a resume, the wrong id corrupts one.
+    #[test]
+    fn torn_later_init_does_not_resurrect_a_stale_session_id() {
+        let init =
+            |id: &str| format!(r#"{{"type":"system","subtype":"init","session_id":"{id}"}}"#);
+
+        let rotated = format!("{}\n{}\n", init("session-a"), init("session-b"));
+        assert_eq!(
+            claude_stream_session_id(&rotated).as_deref(),
+            Some("session-b"),
+            "control: with both init events intact the LAST id wins"
+        );
+
+        let init_c = init("session-c");
+        let torn = format!(
+            "{}\n{}\n{}\n",
+            init("session-a"),
+            init("session-b"),
+            &init_c[..init_c.len() - 10],
+        );
+        assert_ne!(
+            claude_stream_session_id(&torn).as_deref(),
+            Some("session-b"),
+            "a torn newer init must not hand back the previous session's id"
+        );
+    }
+
+    /// **V-01 regression.** One stray JSONL-shaped line must not divert a
+    /// plain-text capture onto the stream branch and suppress a real gate.
+    ///
+    /// The first `claude_stream_gate_shape` asked only whether ANY event carried
+    /// a stream type. Since the stream branch never consults raw stdout, a single
+    /// `{"type":"assistant",…}` line was enough to hide a genuine declaration
+    /// sitting in the surrounding plain text — turning the fail-OPEN this
+    /// predicate was written to close into a fail-CLOSED that drops a human
+    /// authorization request. Found by phase-30 verification after the fix
+    /// shipped in `06675da`.
+    #[test]
+    fn one_stray_json_line_does_not_suppress_a_plain_text_gate() {
+        let gate = gate_declaration_text();
+
+        assert!(
+            blocking_human_checkpoint_reported(&gate),
+            "positive control: the gate text alone must be detected"
+        );
+
+        let poisoned =
+            format!("{gate}\n{{\"type\":\"assistant\",\"message\":{{\"content\":[]}}}}\n");
+        assert!(
+            blocking_human_checkpoint_reported(&poisoned),
+            "one stray JSONL line must not suppress a real plain-text gate (V-01)"
+        );
+
+        // The torn-init capture is still recognised as a stream — the majority
+        // rule must not undo the fail-open fix it was added to preserve.
+        let torn_init = &V3_INIT_EVENT[..40];
+        let torn = format!(
+            "{}\n{}\n{}\n",
+            torn_init,
+            v3_message_event(V3_USER_EVENT, &gate_documenting_text()),
+            v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+        );
+        assert!(
+            !blocking_human_checkpoint_reported(&torn),
+            "control: a torn-init stream must still be scoped, not raw-scanned"
+        );
+    }
+
+    /// Every byte-prefix of a capture, fed to the gate scanner.
+    ///
+    /// **Why a sweep and not more hand-written cases.** Phase 30 shipped 116
+    /// green tests, seven of them written specifically to prove the prompt-echo
+    /// false positive was closed — and a cross-AI review then found that ONE
+    /// torn line reverted the whole protection to the raw-stdout path. Every
+    /// test fed the parser well-formed input; none fed it a broken one. Hand
+    /// -picking more malformed cases would repeat that bias. Truncating at every
+    /// offset removes the judgment call: the inputs are generated, not chosen.
+    ///
+    /// The invariant is one-directional — a prefix may lose detection (it has
+    /// strictly less information), but it must never *gain* permissiveness.
+    #[test]
+    fn truncation_sweep_never_widens_gate_detection() {
+        let intact = stream_capture_of(&[
+            &v3_message_event(V3_USER_EVENT, &gate_documenting_text()),
+            &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+        ]);
+        assert!(
+            !blocking_human_checkpoint_reported(&intact),
+            "precondition: the intact capture must report no gate, or the sweep \
+             below proves nothing"
+        );
+
+        let mut checked = 0usize;
+        for n in 0..=intact.len() {
+            if !intact.is_char_boundary(n) {
+                continue;
+            }
+            checked += 1;
+            assert!(
+                !blocking_human_checkpoint_reported(&intact[..n]),
+                "truncating to {n} bytes made an echoed gate MENTION read as a \
+                 live declaration — the fail-open class (constraint 9)"
+            );
+        }
+        assert!(
+            checked > 500,
+            "sweep degenerated to {checked} offsets; it is no longer exercising \
+             the capture"
+        );
+    }
+
+    /// Same sweep against the session-id reader. Truncation may degrade it to
+    /// `None` (a failed resume — fail-closed, acceptable); it must never yield a
+    /// DIFFERENT id, which would resume the wrong session.
+    #[test]
+    fn truncation_sweep_never_forges_session_id() {
+        let intact = stream_capture_of(&[
+            &v3_message_event(V3_USER_EVENT, "session_id: forged-by-agent-text"),
+            &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+        ]);
+        let real = claude_stream_session_id(&intact);
+        assert!(
+            real.is_some(),
+            "precondition: the intact capture yields an id"
+        );
+
+        for n in 0..=intact.len() {
+            if !intact.is_char_boundary(n) {
+                continue;
+            }
+            let got = claude_stream_session_id(&intact[..n]);
+            assert!(
+                got.is_none() || got == real,
+                "truncating to {n} bytes produced session id {got:?}, which is \
+                 neither None nor the CLI-emitted {real:?}"
+            );
+        }
+    }
+
+    /// **Constraint 9 item 2, closed.** A subagent-origin `result` event must
+    /// never decide the stage verdict — `last_top_level_result`'s name and doc
+    /// always claimed top-level selection, but the first implementation
+    /// selected on `type == "result"` alone (code-review M2). Envelope real
+    /// (v3 result turn), planted `parent_tool_use_id` synthetic: no archived
+    /// capture contains a subagent-origin result, so this pins deterministic
+    /// behavior for an unobserved-but-legal shape.
+    #[test]
+    fn subagent_result_event_never_decides_the_verdict() {
+        let subagent_success = v3_result_event(V3_RESULT_TURN2, MARKER_SUCCESS).replacen(
+            "{",
+            "{\"parent_tool_use_id\":\"toolu_child\",",
+            1,
+        );
+        let capture = format!(
+            "{}\n{}\n{}\n",
+            V3_INIT_EVENT,
+            v3_result_event_is_error(V3_RESULT_TURN1, MARKER_FAILED),
+            subagent_success,
+        );
+        assert_eq!(
+            parse_claude_event_result(&capture).map(|r| r.status),
+            Some(AgentStatus::Failed),
+            "a subagent-origin success result must not override the last \
+             top-level failure"
+        );
+
+        // Control: the same final event WITHOUT the planted parent id is
+        // top-level and legitimately wins.
+        let top_level = format!(
+            "{}\n{}\n{}\n",
+            V3_INIT_EVENT,
+            v3_result_event_is_error(V3_RESULT_TURN1, MARKER_FAILED),
+            v3_result_event(V3_RESULT_TURN2, MARKER_SUCCESS),
+        );
+        assert_eq!(
+            parse_claude_event_result(&top_level).map(|r| r.status),
+            Some(AgentStatus::Success),
+            "control: the same event without a parent id is the final verdict"
+        );
+    }
+
+    /// D-13 trap 1, pinned: the delivery canary's declared token appears in the
+    /// stream as a PROMPT ECHO before it can ever appear as an answer, so a
+    /// naive text scan reports delivery on every run — including runs where the
+    /// notification path is dead. That echo is what produced the checkpoint
+    /// false positive 30-05 fixed.
+    ///
+    /// Three cases, and the first two are the negative controls that give the
+    /// third its meaning: the same token, in the same capture shape, must read
+    /// `false` from an echo and from a subagent-origin result, and `true` only
+    /// from a top-level `result`.
+    #[test]
+    fn token_matches_only_inside_top_level_result() {
+        const TOKEN: &str = "DEVFLOW-CANARY-7f3a";
+
+        // 1. Echo only: the token is in the operator's own turn, forwarded back
+        //    into stdout, and in no result at all.
+        let echoed = format!(
+            "{}\n{}\n{}\n",
+            V3_INIT_EVENT,
+            V3_USER_EVENT.replace("__MARKER__", &format!("please return {TOKEN} when done")),
+            v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+        );
+        assert!(
+            !token_reported_in_capture(&echoed, TOKEN),
+            "a token echoed back in the prompt is not delivery evidence — \
+             the CLI forwards the operator's own turn into the same stdout"
+        );
+
+        // 2. Subagent-origin result: right event type, wrong provenance.
+        let subagent = format!(
+            "{}\n{}\n",
+            V3_INIT_EVENT,
+            v3_result_event(V3_RESULT_TURN2, TOKEN).replacen(
+                "{",
+                "{\"parent_tool_use_id\":\"toolu_child\",",
+                1,
+            ),
+        );
+        assert!(
+            !token_reported_in_capture(&subagent, TOKEN),
+            "a subagent-origin result must not satisfy the canary — it is the \
+             same provenance hole constraint 9 item 2 closed for the verdict"
+        );
+
+        // 3. Authoritative: a top-level `result` carrying the token.
+        let authoritative = format!(
+            "{}\n{}\n",
+            V3_INIT_EVENT,
+            v3_result_event(V3_RESULT_TURN1, TOKEN),
+        );
+        assert!(
+            token_reported_in_capture(&authoritative, TOKEN),
+            "a token inside a top-level result IS the canary's answer"
+        );
+    }
+
+    /// The Codex arm of the trailing-torn rule — same R1 root cause, and the
+    /// Codex adapter is live in production.
+    ///
+    /// The resurrection shape here is a torn SUPERSEDING marker: codex verdict
+    /// precedence is marker-over-`turn.failed` by design (13-06 dogfood
+    /// finding), and last-marker-wins — so the tear that matters is one that
+    /// conceals a LATER marker contradicting an earlier success.
+    #[test]
+    fn codex_torn_tail_does_not_resurrect_earlier_success_marker() {
+        let intact = concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"t1\"}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",",
+            "\"text\":\"DEVFLOW_RESULT: {\\\"status\\\":\\\"success\\\"}\"}}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",",
+            "\"text\":\"DEVFLOW_RESULT: {\\\"status\\\":\\\"failed\\\"}\"}}\n",
+        );
+        assert_eq!(
+            parse_codex_event_result(intact).map(|r| r.status),
+            Some(AgentStatus::Failed),
+            "control: intact capture — the LAST marker wins and it is a failure"
+        );
+
+        let torn = &intact[..intact.len() - 20];
+        assert_ne!(
+            parse_codex_event_result(torn).map(|r| r.status),
+            Some(AgentStatus::Success),
+            "a torn superseding marker must not let the earlier success marker \
+             decide the stage"
+        );
+    }
+
+    /// **Sixth-pass Highs 1–3.** The marker tail scanner — the reader that
+    /// decides most production stages today — must survive edge corruption, a
+    /// marker line longer than the tail budget, and mixed-case prefixes (its
+    /// contract has always said case-insensitive).
+    #[test]
+    fn marker_tail_scan_survives_corruption_length_and_case() {
+        let m = "DEVFLOW_RESULT: {\"status\":\"failed\"}";
+        assert_eq!(
+            parse_devflow_result(m).map(|r| r.status),
+            Some(AgentStatus::Failed),
+            "control: the plain marker parses"
+        );
+
+        // High 1 — edge corruption on either side must not hide the marker.
+        for poisoned in [format!("\u{FFFD}{m}"), format!("{m}\u{FFFD}")] {
+            assert_eq!(
+                parse_devflow_result(&poisoned).map(|r| r.status),
+                Some(AgentStatus::Failed),
+                "one stray byte at a line edge must not hide a failure marker"
+            );
+        }
+        // …while interior corruption stays untrusted (fourth-pass hazard).
+        assert!(
+            parse_devflow_result("DEVFLOW_RESULT: {\"status\":\"fai\u{FFFD}led\"}").is_none(),
+            "interior corruption must not parse as a valid status"
+        );
+
+        // High 2 — a marker line longer than the tail budget is scanned whole.
+        let long_reason = "x".repeat(5000);
+        let long =
+            format!("DEVFLOW_RESULT: {{\"status\":\"failed\",\"reason\":\"{long_reason}\"}}");
+        assert_eq!(
+            parse_devflow_result(&long).map(|r| r.status),
+            Some(AgentStatus::Failed),
+            "the tail budget must never bisect the final marker line"
+        );
+        // …and the budget still bounds the walk: a marker buried beyond the
+        // budget with newer non-marker output after it stays out of reach.
+        let buried = format!("{m}\n{}\n", "y\n".repeat(4100));
+        assert!(
+            parse_devflow_result(&buried).is_none(),
+            "control: the budget still cuts off markers deep in old output"
+        );
+
+        // High 3 — mixed case matches, per the documented contract.
+        assert_eq!(
+            parse_devflow_result("DevFlow_Result: {\"status\":\"failed\"}").map(|r| r.status),
+            Some(AgentStatus::Failed),
+            "mixed-case prefix must match — the contract says case-insensitive"
+        );
+    }
+
+    /// **Sixth-pass Mediums 4–5.** The codex plain-text rate-limit heuristic:
+    /// an edge-corrupt JSON event line must stay excluded from prose scanning,
+    /// and "429" only counts as a standalone token.
+    #[test]
+    fn codex_rate_limit_heuristic_excludes_recovered_json_and_embedded_429() {
+        // M4 — a corrupt-prefixed event line is still a JSON line, not prose.
+        let doc_line = concat!(
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",",
+            "\"text\":\"docs mention rate limiting policies\"}}",
+        );
+        let poisoned =
+            format!("{{\"type\":\"thread.started\",\"thread_id\":\"t\"}}\n\u{FFFD}{doc_line}\n");
+        assert!(
+            detect_codex_rate_limit(&poisoned).is_none(),
+            "an edge-corrupt event line must not be prose-scanned for \
+             rate-limit vocabulary"
+        );
+        // Control: genuine plain-text rate-limit output is still detected.
+        assert!(
+            detect_codex_rate_limit("Rate limit exceeded. Try again at 17:00.").is_some(),
+            "control: real plain-text rate-limit output must still be detected"
+        );
+
+        // M5 — embedded digits are not rate-limit evidence…
+        assert!(
+            detect_codex_rate_limit("processed issue #429 successfully").is_none(),
+            "'#429' is an issue number, not a rate limit"
+        );
+        assert!(
+            detect_codex_rate_limit("transferred 14290 bytes").is_none(),
+            "digits containing 429 are not a rate limit"
+        );
+        // …while a genuine standalone 429 still is.
+        assert!(
+            detect_codex_rate_limit("HTTP 429 Too Many Requests").is_some(),
+            "control: a standalone 429 status is still detected"
+        );
+    }
+
+    /// **Fifth-pass High 1.** A replacement-character-prefixed event line must
+    /// not classify as prose Noise and slip past the torn-tail guard.
+    ///
+    /// `read_capture` turns an invalid byte into U+FFFD; a line reading
+    /// `\u{FFFD}{"type":…}` fails to parse and does not start with `{`, so it
+    /// became Noise — invisible to `torn_json_after_last_matching`. A corrupt
+    /// byte in front of a superseding failed marker let the earlier success
+    /// marker decide the stage, with the contradicting exit code never
+    /// consulted. Live today on the Codex `--json` adapter. The fix recovers
+    /// an edge-corrupt-but-intact event by re-parsing the stripped line, so
+    /// the TRUE verdict decides — better than merely failing indeterminate.
+    #[test]
+    fn corruption_prefixed_event_line_is_not_prose_noise() {
+        let good = concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"t1\"}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",",
+            "\"text\":\"DEVFLOW_RESULT: {\\\"status\\\":\\\"success\\\"}\"}}\n",
+        );
+        let failed_line = concat!(
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",",
+            "\"text\":\"DEVFLOW_RESULT: {\\\"status\\\":\\\"failed\\\"}\"}}\n",
+        );
+
+        let intact = format!("{good}{failed_line}");
+        assert_eq!(
+            parse_codex_event_result(&intact).map(|r| r.status),
+            Some(AgentStatus::Failed),
+            "control: intact capture — the last (failed) marker decides"
+        );
+
+        let poisoned = format!("{good}\u{FFFD}{failed_line}");
+        assert_eq!(
+            parse_codex_event_result(&poisoned).map(|r| r.status),
+            Some(AgentStatus::Failed),
+            "an edge-corrupt superseding marker must be recovered (or at worst \
+             fail indeterminate) — never let the earlier success decide"
+        );
+
+        // Interior corruption stays visible and untrusted: a FFFD INSIDE the
+        // marker's status string must not parse as a valid status (the
+        // fourth-pass fabrication hazard, still guarded).
+        let interior = concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"t1\"}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",",
+            "\"text\":\"DEVFLOW_RESULT: {\\\"status\\\":\\\"suc\u{FFFD}cess\\\"}\"}}\n",
+        );
+        assert_ne!(
+            parse_codex_event_result(interior).map(|r| r.status),
+            Some(AgentStatus::Success),
+            "interior corruption must never be repaired into a success"
+        );
+    }
+
+    /// **Fifth-pass Medium 1.** An edge-corrupt rate-limit envelope must stay
+    /// `RateLimited`, not decay into a generic `Failed`.
+    ///
+    /// The rate-limit detector outranks the generic envelope-failure detector
+    /// precisely because rate-limit envelopes carry `is_error: true`. It was
+    /// the one single-document reader without `strip_corruption_padding`, so a
+    /// stray byte inverted the precedence — auto-resume became review/gating.
+    #[test]
+    fn edge_corrupt_rate_limit_envelope_stays_rate_limited() {
+        let envelope = r#"{"type":"result","subtype":"error_rate_limit","is_error":true,"result":"rate limited","retry_after":"17:00"}"#;
+        assert!(
+            detect_claude_rate_limit(envelope).is_some(),
+            "control: the intact envelope is detected as a rate limit"
+        );
+        assert!(
+            detect_claude_rate_limit(&format!("\u{FFFD}{envelope}")).is_some(),
+            "one stray byte must not demote RateLimited to generic Failed"
+        );
+    }
+
+    /// **Fourth-pass Medium 1.** The generic marker path — the one production
+    /// hits today — must overwrite a planted `decided_by_layer`, exactly as the
+    /// stream path has since 30-01. `Some(0)` is Layer-0 external-verification
+    /// provenance, which `classify_validate_outcome` trusts when classifying a
+    /// Validate stage: an agent could force the ambiguous-validation gate with
+    /// a verdict it never earned (999.67's class, live instance).
+    #[test]
+    fn generic_marker_cannot_forge_layer0_provenance() {
+        let stdout = r#"DEVFLOW_RESULT: {"status":"success","decided_by_layer":0}"#;
+        let result = parse_devflow_result(stdout).unwrap();
+        assert_eq!(
+            result.decided_by_layer,
+            Some(1),
+            "a planted decided_by_layer:0 must be overwritten to Layer 1"
+        );
+
+        // Control: an honest marker without the field also normalises to
+        // Some(1) — provenance is DERIVED here, never deserialized.
+        let honest = r#"DEVFLOW_RESULT: {"status":"success"}"#;
+        assert_eq!(
+            parse_devflow_result(honest).unwrap().decided_by_layer,
+            Some(1)
+        );
+    }
+
+    /// Codex arm of the T-30-26 provenance overwrite (fourth-pass Medium 1's
+    /// class): a `decided_by_layer` planted in the codex marker JSON must be
+    /// overwritten, exactly as on the generic and Claude-stream marker paths.
+    #[test]
+    fn codex_marker_cannot_forge_layer0_provenance() {
+        let capture = concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"t1\"}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",",
+            "\"text\":\"DEVFLOW_RESULT: {\\\"status\\\":\\\"success\\\",\\\"decided_by_layer\\\":0}\"}}\n",
+        );
+        let result = parse_codex_event_result(capture).unwrap();
+        assert_eq!(
+            result.decided_by_layer,
+            Some(1),
+            "a planted decided_by_layer:0 must be overwritten to Layer 1"
+        );
+    }
+
+    /// **Constraint 9 item 1, closed for every DETECTABLE truncation**
+    /// (originally committed `#[ignore]`d as a known-red deferral to Phase 31;
+    /// the operator's "fix root causes before proceeding" decision pulled it
+    /// back into phase 30).
+    ///
+    /// A truncated terminal `result` used to vanish from the parsed events, so
+    /// `last_top_level_result` returned an EARLIER turn's result — a stale
+    /// SUCCESS advancing a stage whose real terminal turn failed. Now every
+    /// prefix with a torn trailing line yields an indeterminate FAILURE.
+    ///
+    /// **The named residual — line-boundary truncation is UNDETECTABLE from
+    /// content.** A prefix cut exactly at the newline after the success turn is
+    /// a well-formed capture: two parsed events, no torn line, byte-identical
+    /// to a healthy one-turn-success capture plus nothing. The evidence of loss
+    /// is in the bytes that never arrived, so no parser assertion can exist for
+    /// it. The remaining defense belongs to the layer that HAS the missing
+    /// information: Phase 31's wiring must not let a stream-derived Success
+    /// short-circuit a contradicting exit code (a writer that died between
+    /// flushing turn N and turn N+1 also died with a non-zero exit). Recorded
+    /// in ROADMAP constraint 9.
+    #[test]
+    fn truncation_sweep_never_upgrades_verdict_to_success() {
+        let intact = format!(
+            "{}\n{}\n{}\n",
+            V3_INIT_EVENT,
+            v3_result_event(V3_RESULT_TURN1, MARKER_SUCCESS),
+            v3_result_event_is_error(V3_RESULT_TURN2, MARKER_FAILED),
+        );
+        assert_eq!(
+            parse_claude_event_result(&intact).map(|r| r.status),
+            Some(AgentStatus::Failed),
+            "precondition: intact capture ends in a failure verdict"
+        );
+
+        let mut torn_prefixes = 0usize;
+        let mut clean_prefixes = 0usize;
+        for n in 0..=intact.len() {
+            if !intact.is_char_boundary(n) {
+                continue;
+            }
+            let prefix = &intact[..n];
+            let got = parse_claude_event_result(prefix).map(|r| r.status);
+            if ParsedCapture::parse(prefix).torn_json_line_present() {
+                torn_prefixes += 1;
+                assert_ne!(
+                    got,
+                    Some(AgentStatus::Success),
+                    "truncating to {n} bytes left a torn tail yet resurrected \
+                     an earlier turn's SUCCESS over a failed terminal turn"
+                );
+            } else {
+                clean_prefixes += 1;
+            }
+        }
+        // Negative controls on the sweep itself: both branches must have been
+        // exercised, or the loop is asserting over nothing.
+        assert!(
+            torn_prefixes > 500,
+            "sweep degenerated: only {torn_prefixes} torn prefixes"
+        );
+        assert!(
+            clean_prefixes > 2,
+            "sweep never produced a well-formed prefix; the residual case \
+             documented above is not being exercised"
+        );
+    }
+
     #[test]
     fn codex_event_stream_parses_turn_failed() {
         let stdout = concat!(
@@ -1820,6 +4119,977 @@ mod tests {
     fn claude_envelope_not_consumed_by_codex_parser() {
         let stdout = r#"{"type":"result","subtype":"success","is_error":false,"num_turns":4,"result":"All done.","session_id":"abc"}"#;
         assert!(parse_codex_event_result(stdout).is_none());
+    }
+
+    /// The highest-value isolation test in plan 30-01 (T-30-02).
+    ///
+    /// The single-document `--output-format json` envelope that ships TODAY
+    /// carries `type: "result"` AND a `session_id` — precisely the gate shape
+    /// 30-RESEARCH.md offered as an alternative to `system`/`init`. If anyone
+    /// widens [`is_claude_event_stream`] to accept it, the stream parser starts
+    /// consuming every production capture in use and silently displaces
+    /// `parse_devflow_result` in the Layer-1 cascade. This test fails first.
+    ///
+    /// The first literal is reused verbatim from
+    /// `claude_envelope_not_consumed_by_codex_parser` above so the two read as
+    /// a matched pair.
+    #[test]
+    fn single_doc_envelope_not_consumed_by_claude_stream_parser() {
+        let stdout = r#"{"type":"result","subtype":"success","is_error":false,"num_turns":4,"result":"All done.","session_id":"abc"}"#;
+        assert!(parse_claude_event_result(stdout).is_none());
+
+        // Non-vacuity: the literal above carries no marker, so it would return
+        // None even from a WRONGLY-widened gate — on its own it proves little.
+        // This envelope does carry one, so it can only return None because the
+        // gate declined the document, not because the marker scan came up dry.
+        let with_marker = r#"{"type":"result","subtype":"success","is_error":false,"num_turns":4,"result":"Done.\nDEVFLOW_RESULT: {\"status\":\"success\"}","session_id":"abc"}"#;
+        assert!(parse_claude_event_result(with_marker).is_none());
+
+        // ...and the shipped path still owns it, so declining costs no verdict.
+        assert_eq!(
+            parse_devflow_result(with_marker).unwrap().status,
+            AgentStatus::Success
+        );
+    }
+
+    /// Cross-adapter isolation: a Codex `--json` event stream is not consumed
+    /// by the Claude stream parser. The two gates are mutually exclusive by
+    /// construction — Codex keys on `thread.started`/`turn.*`, Claude on
+    /// `system`/`init` — and this pins that.
+    #[test]
+    fn codex_stream_not_consumed_by_claude_stream_parser() {
+        let stdout = concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"t1\"}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_2\",\"type\":\"agent_message\",\"text\":\"DEVFLOW_RESULT: {\\\"status\\\": \\\"success\\\"}\"}}\n",
+            "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}\n",
+        );
+        assert!(parse_claude_event_result(stdout).is_none());
+
+        // The Codex parser still decides it — isolation costs no verdict.
+        assert_eq!(
+            parse_codex_event_result(stdout).unwrap().status,
+            AgentStatus::Success
+        );
+    }
+
+    /// The same isolation claim in the other direction: a Claude stream capture
+    /// is not consumed by the Codex parser, so the two never collide.
+    #[test]
+    fn claude_stream_not_consumed_by_codex_parser() {
+        let capture = v3_stream_capture(NO_MARKER, NO_MARKER, MARKER_SUCCESS);
+        assert!(parse_codex_event_result(&capture).is_none());
+    }
+
+    /// Plain-text stdout is not consumed by the Claude stream parser.
+    ///
+    /// Non-vacuous by construction: the text carries a real marker, so a gate
+    /// that wrongly fired on non-JSON input would change the verdict rather
+    /// than merely returning None. The second assertion pins that the marker
+    /// path still decides it — the cascade must lose nothing.
+    #[test]
+    fn plain_text_not_consumed_by_claude_stream_parser() {
+        let stdout = "Running the plan...\nDEVFLOW_RESULT: {\"status\":\"success\"}\n";
+        assert!(parse_claude_event_result(stdout).is_none());
+        assert_eq!(
+            parse_devflow_result(stdout).unwrap().status,
+            AgentStatus::Success
+        );
+    }
+
+    // ---- Claude `--output-format stream-json` fixtures (plan 30-01) --------
+    //
+    // Sourced from the archived capture
+    // `.planning/phases/30-keep-the-session-alive-past-turn-end/30a-evidence/raw_output_v3.jsonl`,
+    // a real 54-line stream from a session that survived three orchestrator
+    // turns via task-notification wake-ups. The `init` event is line 5; the
+    // three `result` events are lines 19, 37 and 54.
+    //
+    // TWO documented modifications, both labelled where they occur:
+    //   1. Each envelope's `result` string value is replaced with the sentinel
+    //      `__MARKER__`, which each test fills in. NO archived capture contains
+    //      a real `DEVFLOW_RESULT` marker — the v3 harness produced
+    //      acknowledgment prose, not GSD stage output — so every marker payload
+    //      below is SYNTHETIC. Envelope shape is real; marker text is not.
+    //   2. The `init` event's three inert array payloads are truncated and its
+    //      `cwd` is redacted (see `V3_INIT_EVENT`).
+    // Everything else is byte-for-byte as captured, including field ORDER —
+    // note that `"type":"result"` appears near the END of each result line,
+    // long after `result` itself, which is exactly why the parser must key on
+    // the parsed object rather than on textual position.
+
+    /// v3 line 5 — the `system`/`init` event that opens the stream and is the
+    /// ONLY thing `is_claude_event_stream` gates on.
+    ///
+    /// Modification 2: verbatim except that `tools`, `mcp_servers` and
+    /// `slash_commands` are truncated to a real prefix (verbatim they run to
+    /// 5,523 characters of tool and slash-command names that no code path here
+    /// reads) and `cwd` is redacted to a neutral path — the captured value
+    /// embeds a developer's home directory, and `devflow-core` is published to
+    /// crates.io. Both fields are inert for every function under test.
+    const V3_INIT_EVENT: &str = r#"{"type":"system","subtype":"init","cwd":"/tmp/scratchpad/999.64-experiment","session_id":"559fef4d-2053-459e-b7a7-f3200c3b3790","tools":["Task","Bash","Read","Write"],"mcp_servers":[{"name":"github","status":"pending"}],"model":"claude-opus-5[1m]","permissionMode":"bypassPermissions","slash_commands":["gsd-execute-phase"],"capabilities":["interrupt_receipt_v1","interrupt_cancel_queued_v1","msg_lifecycle_v1"],"uuid":"597e1613-77cb-4cdd-a716-2aa75dc58c0b"}"#;
+
+    /// v3 line 19 — the FIRST turn's terminal `result` event.
+    const V3_RESULT_TURN1: &str = r#"{"is_error":false,"duration_api_ms":8087,"num_turns":3,"stop_reason":"end_turn","session_id":"559fef4d-2053-459e-b7a7-f3200c3b3790","total_cost_usd":0.2401795,"usage":{"input_tokens":4,"cache_creation_input_tokens":20120,"cache_read_input_tokens":49219,"output_tokens":574,"service_tier":"standard","inference_geo":"not_available","speed":"standard"},"permission_denials":[],"terminal_reason":"completed","fast_mode_state":"off","subtype":"success","api_error_status":null,"result":"__MARKER__","ttft_ms":1381,"time_to_request_ms":91,"type":"result","duration_ms":8315,"uuid":"3dce3044-2d33-4c4d-bfcb-80e1756a5522"}"#;
+
+    /// v3 line 37 — the SECOND turn's terminal `result` event, produced after a
+    /// task-notification wake-up. Carries the `origin` key the later turns have
+    /// and the first does not.
+    const V3_RESULT_TURN2: &str = r#"{"is_error":false,"duration_api_ms":27809,"num_turns":1,"stop_reason":"end_turn","session_id":"559fef4d-2053-459e-b7a7-f3200c3b3790","total_cost_usd":0.53654625,"usage":{"input_tokens":2,"cache_creation_input_tokens":3147,"cache_read_input_tokens":35393,"output_tokens":124,"service_tier":"standard","inference_geo":"not_available","speed":"standard"},"permission_denials":[],"terminal_reason":"completed","fast_mode_state":"off","origin":{"kind":"task-notification"},"subtype":"success","api_error_status":null,"result":"__MARKER__","ttft_ms":5476,"time_to_request_ms":18,"type":"result","duration_ms":6195,"uuid":"ca58693c-2599-4eb6-955b-e9d1e7444255"}"#;
+
+    /// v3 line 54 — the THIRD and LAST turn's terminal `result` event. This is
+    /// the one whose marker must decide the stage.
+    const V3_RESULT_TURN3: &str = r#"{"is_error":false,"duration_api_ms":39273,"num_turns":2,"stop_reason":"end_turn","session_id":"559fef4d-2053-459e-b7a7-f3200c3b3790","total_cost_usd":0.6599295,"usage":{"input_tokens":4,"cache_creation_input_tokens":999,"cache_read_input_tokens":77871,"output_tokens":302,"service_tier":"standard","inference_geo":"not_available","speed":"standard"},"permission_denials":[],"terminal_reason":"completed","fast_mode_state":"off","origin":{"kind":"task-notification"},"subtype":"success","api_error_status":null,"result":"__MARKER__","ttft_ms":2099,"time_to_request_ms":14,"type":"result","duration_ms":5276,"uuid":"dc76186e-3e9a-4d52-9152-27aa5012bc41"}"#;
+
+    // ---- prompt-echo regression fixtures (plan 30-05) ----------------------
+    //
+    // Message-event envelopes from the same archived capture. Same sentinel
+    // discipline as the `result` envelopes above — the innermost text payload
+    // is replaced with `__MARKER__` and each test fills it — plus a third
+    // documented modification noted per constant where inert bulk is dropped.
+    // The ENVELOPE is real: every `type`, `parent_tool_use_id`, `session_id`
+    // and `uuid` value, and the nesting shape the extraction path walks, is
+    // exactly as captured.
+    //
+    // NO archived capture contains checkpoint gate text at all — the 30a
+    // harness prompt was about background tasks and never mentioned gates. So
+    // every gate payload below is SYNTHETIC and must not be described as an
+    // observed rendering. What IS observed is the gate VALUE's markdown
+    // code-span rendering, transcribed from the live 2026-07-31 A1 run (see
+    // `HUMAN_GATE_VALUE`), which every fixture here reproduces.
+
+    /// v3 line 10 — a TOP-LEVEL `user` event (`parent_tool_use_id` null).
+    ///
+    /// Modification 3: the trailing `tool_use_result` object is dropped. It is
+    /// inert for every function under test and embeds both a developer home
+    /// directory and the child agent's full prompt; `devflow-core` is published
+    /// to crates.io.
+    ///
+    /// **The archived capture contains no echoed prompt.** Every `user` event
+    /// in it is a `tool_result` relay, because the 30a harness ran a single
+    /// prompt with no re-injection. This fixture's payload therefore STANDS IN
+    /// for an echoed prompt rather than reproducing one. The substitution is
+    /// sound for what is under test: the scan's first filter keys on the
+    /// event's `type`, which is `user` in both cases, and
+    /// `claude_stream_reports_human_gate` excludes that whole class — an echoed
+    /// prompt and a re-injected notification summary are the two members of it.
+    const V3_USER_EVENT: &str = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_01FVk15W8zxiazXutJYn8rsv","type":"tool_result","content":[{"type":"text","text":"__MARKER__"}]}]},"parent_tool_use_id":null,"session_id":"559fef4d-2053-459e-b7a7-f3200c3b3790","uuid":"60c5839e-40b3-492a-83e7-00882189f1d3","timestamp":"2026-08-02T00:22:22.603Z"}"#;
+
+    /// v3 line 6 — a TOP-LEVEL `assistant` event (`parent_tool_use_id` null).
+    ///
+    /// Its captured payload is `I'll spawn both subagents in the background
+    /// now.` — mid-turn narration that appears in NO `result` event of the
+    /// capture, re-confirmed by re-parsing all 54 lines at execution time. That
+    /// property is the entire reason this envelope was chosen: it proves
+    /// top-level assistant text is not merely a preview of the result text, so
+    /// admitting the class would add a genuinely new trusted surface.
+    ///
+    /// Modification 3: the `usage.cache_creation` sub-object is dropped (inert).
+    const V3_ASSISTANT_TOP_LEVEL_EVENT: &str = r#"{"type":"assistant","message":{"model":"claude-opus-5","id":"msg_011Cdcy3oC1a4rcmbp3avDYX","type":"message","role":"assistant","content":[{"type":"text","text":"__MARKER__"}],"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":2,"cache_creation_input_tokens":18673,"cache_read_input_tokens":15273,"output_tokens":1,"service_tier":"standard","inference_geo":"not_available"},"diagnostics":null,"context_management":null},"parent_tool_use_id":null,"session_id":"559fef4d-2053-459e-b7a7-f3200c3b3790","uuid":"85e8747b-e551-47b7-af38-fcd3bb1e06f8","timestamp":"2026-08-02T00:22:18.742Z","request_id":"req_011Cdcy3ngzpMCk3bijt1nkE"}"#;
+
+    /// v3 line 11 — a SUBAGENT-forwarded `assistant` event. Its captured
+    /// `parent_tool_use_id` (`toolu_01FVk15W8zxiazXutJYn8rsv`, the Task call
+    /// that spawned child A) is preserved verbatim: it is the whole point of
+    /// the fixture, and the discrimination whose absence invalidated the v1
+    /// experiment outright.
+    ///
+    /// Modification 3: the `usage.cache_creation` sub-object is dropped (inert).
+    const V3_ASSISTANT_SUBAGENT_EVENT: &str = r#"{"type":"assistant","message":{"model":"claude-opus-5","id":"msg_011Cdcy4BNkfziogNMFM8V7K","type":"message","role":"assistant","content":[{"type":"text","text":"__MARKER__"}],"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":2,"cache_creation_input_tokens":17705,"cache_read_input_tokens":0,"output_tokens":1,"service_tier":"standard","inference_geo":"not_available"},"diagnostics":null,"context_management":null},"parent_tool_use_id":"toolu_01FVk15W8zxiazXutJYn8rsv","session_id":"559fef4d-2053-459e-b7a7-f3200c3b3790","uuid":"3fb37d43-86af-48b1-ace4-55147ed47b15","timestamp":"2026-08-02T00:22:23.850Z","request_id":"req_011Cdcy4ASSvG8gf8fRwiWZW","subagent_type":"general-purpose","task_description":"Signal A after 10s"}"#;
+
+    /// Fill a message envelope's innermost text payload. Mirrors
+    /// [`v3_result_event`] and is kept separate from it so the assertion names
+    /// the right fixture family when a sentinel is lost.
+    fn v3_message_event(envelope: &str, text: &str) -> String {
+        assert!(
+            envelope.contains("__MARKER__"),
+            "fixture envelope lost its message-text sentinel"
+        );
+        envelope.replace("__MARKER__", text)
+    }
+
+    /// A checkpoint DECLARATION, as an agent's final message would render it,
+    /// escaped for a JSON string field (literal `\n`, the way `claude` emits
+    /// an agent's result text).
+    ///
+    /// The gate value carries the markdown CODE SPAN the live 2026-07-31 run
+    /// captured — see [`HUMAN_GATE_VALUE`]. A bare unquoted value would test a
+    /// rendering that has never been observed in production.
+    fn gate_declaration_text() -> String {
+        format!(
+            "## CHECKPOINT REACHED\\n\\n**Type:** decision\\n**Gate:** `{HUMAN_GATE_VALUE}`\\n**Plan:** 30-05\\n"
+        )
+    }
+
+    /// Text that merely DOCUMENTS a gate rendering — the shape a plan file, a
+    /// GSD reference document, or an agent narrating its next task carries.
+    /// Same code-span rendering as a real declaration, which is precisely why a
+    /// substring scan cannot tell the two apart and the EVENT must decide.
+    ///
+    /// Single line, no double quotes, so it drops into a JSON string field
+    /// without further escaping.
+    fn gate_documenting_text() -> String {
+        format!(
+            "The next task is declared **Gate:** `{HUMAN_GATE_VALUE}` in the plan, so the executor must stop rather than auto-select."
+        )
+    }
+
+    // Synthetic `result`-text payloads (modification 1). Written exactly as
+    // they appear INSIDE the envelope's `result` JSON string — escaped quotes
+    // and an escaped newline — because that is how `claude` emits an agent's
+    // final message. Once serde decodes the field the `\n` becomes a real
+    // newline and `parse_marker_lines`' line scan works on it unmodified.
+    const MARKER_SUCCESS: &str = r#"Plan complete.\nDEVFLOW_RESULT: {\"status\":\"success\"}"#;
+    const MARKER_FAILED: &str =
+        r#"Blocked.\nDEVFLOW_RESULT: {\"status\":\"failed\",\"reason\":\"earlier turn aborted\"}"#;
+    const MARKER_PLANTED_LAYER: &str =
+        r#"Done.\nDEVFLOW_RESULT: {\"status\":\"success\",\"decided_by_layer\":0}"#;
+    const NO_MARKER: &str = r#"Acknowledged; nothing to report."#;
+
+    /// Fill one real envelope's `result` field with a synthetic payload.
+    fn v3_result_event(envelope: &str, escaped_result_text: &str) -> String {
+        assert!(
+            envelope.contains("__MARKER__"),
+            "fixture envelope lost its result-text sentinel"
+        );
+        envelope.replace("__MARKER__", escaped_result_text)
+    }
+
+    /// Assemble a three-turn Claude stream capture: the real `init` event
+    /// followed by all three real `result` envelopes, each carrying the given
+    /// payload. Three result events (not two) is load-bearing — a two-event
+    /// fixture cannot tell "last wins" apart from "highest index of two".
+    fn v3_stream_capture(turn1: &str, turn2: &str, turn3: &str) -> String {
+        format!(
+            "{}\n{}\n{}\n{}\n",
+            V3_INIT_EVENT,
+            v3_result_event(V3_RESULT_TURN1, turn1),
+            v3_result_event(V3_RESULT_TURN2, turn2),
+            v3_result_event(V3_RESULT_TURN3, turn3),
+        )
+    }
+
+    // ---- rate-limit / envelope-failure fixtures (plan 30-03) --------------
+
+    /// v3 line 15, **VERBATIM** — the only `rate_limit_event` in any archived
+    /// capture, and the reason this plan exists in its current form.
+    ///
+    /// Read it before touching [`detect_claude_stream_rate_limit`]: its
+    /// `rate_limit_info.status` is **`allowed`**. The CLI emits these events as
+    /// routine quota telemetry on healthy streams — this one sits at line 15 of
+    /// a capture that then completed three turns successfully (results at 19,
+    /// 37 and 54). Presence of the event type carries NO information about
+    /// whether the run was blocked.
+    ///
+    /// Note the second trap one level down: `overageStatus` is `rejected`. Any
+    /// nested search for the token `rejected` (e.g. via [`json_find_key`]) also
+    /// misclassifies this healthy event, which is why the classifier reads
+    /// `rate_limit_info.status` and nothing else, by direct `.get()`.
+    const V3_RATE_LIMIT_EVENT_ALLOWED: &str = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1785645600,"rateLimitType":"five_hour","overageStatus":"rejected","overageDisabledReason":"out_of_credits","isUsingOverage":false},"uuid":"e73e6774-a79d-4cdf-90bd-53a695f44f5a","session_id":"559fef4d-2053-459e-b7a7-f3200c3b3790"}"#;
+
+    /// A `rate_limit_event` with the given `rate_limit_info.status`, built by
+    /// substituting one field of the real archived event above.
+    ///
+    /// **SYNTHETIC for every status except `allowed`.** No archived capture
+    /// contains a blocked stream — the denial fixtures below are constructed,
+    /// not observed, and are labelled as such at each use. Every other field
+    /// (including `resetsAt`, which supplies the retry hint) is exactly as
+    /// captured.
+    fn v3_rate_limit_event(status: &str) -> String {
+        assert!(
+            V3_RATE_LIMIT_EVENT_ALLOWED.contains(r#""status":"allowed""#),
+            "fixture lost its status field"
+        );
+        V3_RATE_LIMIT_EVENT_ALLOWED
+            .replace(r#""status":"allowed""#, &format!(r#""status":"{status}""#))
+    }
+
+    /// One real `result` envelope with its captured `is_error":false` flipped
+    /// to `true`, every other field untouched. The assertion makes the
+    /// substitution non-silent: if the fixture text ever changes, the test
+    /// fails loudly rather than quietly testing an `is_error: false` envelope.
+    fn v3_result_event_is_error(envelope: &str, escaped_result_text: &str) -> String {
+        let filled = v3_result_event(envelope, escaped_result_text);
+        assert!(
+            filled.contains(r#""is_error":false"#),
+            "fixture envelope lost its is_error field"
+        );
+        filled.replace(r#""is_error":false"#, r#""is_error":true"#)
+    }
+
+    /// Assemble a capture from the real `init` event followed by the given
+    /// lines in order. Unlike [`v3_stream_capture`] this lets a test position a
+    /// `rate_limit_event` at an arbitrary index, which is the whole point of
+    /// the final-turn scoping assertions.
+    fn stream_capture_of(lines: &[&str]) -> String {
+        let mut out = String::from(V3_INIT_EVENT);
+        for line in lines {
+            out.push('\n');
+            out.push_str(line);
+        }
+        out.push('\n');
+        out
+    }
+
+    /// **The mandatory negative regression.** The real archived stream — whose
+    /// `rate_limit_event` says `status: "allowed"` and which then completed
+    /// three turns — must NOT classify as `RateLimited`.
+    ///
+    /// This event is routine quota telemetry, not a block. Classifying its mere
+    /// presence as a rate limit would route EVERY healthy Claude stream stage
+    /// into `Action::AutoResume` against a fabricated retry time, instead of
+    /// advancing the pipeline. That mapping is
+    /// `crates/devflow-core/src/outcome_policy.rs:41` — `AgentStatus::RateLimited
+    /// => Action::AutoResume`, re-read in this crate at execution time; 30-03's
+    /// plan and threat register cite it as `outcome_policy.rs:41` without a
+    /// crate, and it is NOT in `devflow-cli`. This is a denial of service on
+    /// the whole product, produced by a one-line "detect the event type"
+    /// shortcut.
+    ///
+    /// Two independent guards must both hold here, and the second assertion
+    /// pins the one the positioning guard alone would hide: the event is placed
+    /// at its real position (before the first `result`, mirroring line 15 vs
+    /// 19), AND its status is not a denial. `detect_claude_stream_rate_limit`
+    /// is asserted directly on a final-turn placement of the same real event so
+    /// the status guard cannot be dropped without this test failing.
+    #[test]
+    fn claude_stream_real_allowed_rate_limit_event_is_not_rate_limited() {
+        let capture = stream_capture_of(&[
+            V3_RATE_LIMIT_EVENT_ALLOWED,
+            &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+            &v3_result_event(V3_RESULT_TURN2, NO_MARKER),
+            &v3_result_event(V3_RESULT_TURN3, MARKER_SUCCESS),
+        ]);
+
+        let result = parse_claude_event_result(&capture)
+            .expect("the final turn's success marker still decides this stream");
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_ne!(result.status, AgentStatus::RateLimited);
+
+        // The status guard on its own: the SAME real event moved into the final
+        // turn (after the second-to-last `result`) is still not a rate limit.
+        // Without this, deleting the status check would leave the test green.
+        let final_turn = stream_capture_of(&[
+            &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+            &v3_result_event(V3_RESULT_TURN2, NO_MARKER),
+            V3_RATE_LIMIT_EVENT_ALLOWED,
+            &v3_result_event(V3_RESULT_TURN3, MARKER_SUCCESS),
+        ]);
+        assert!(
+            detect_claude_stream_rate_limit(&ParsedCapture::parse(&final_turn).events).is_none()
+        );
+    }
+
+    /// The positive: an explicit quota DENIAL inside the final turn classifies
+    /// as `RateLimited`, so the rate-limit resume path stays reachable under
+    /// `stream-json`.
+    ///
+    /// **The denial fixture is SYNTHETIC.** No archived capture contains a
+    /// blocked stream, so the `rejected` status is constructed from the
+    /// observed vocabulary of this schema rather than observed in the wild —
+    /// the same honest-fixture rule this phase applies to marker payloads. The
+    /// retry hint comes from the real `resetsAt` value.
+    #[test]
+    fn claude_stream_final_turn_denial_rate_limit_event_is_rate_limited() {
+        let denial = v3_rate_limit_event("rejected");
+        let capture = stream_capture_of(&[
+            &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+            &v3_result_event(V3_RESULT_TURN2, NO_MARKER),
+            &denial,
+            &v3_result_event(V3_RESULT_TURN3, NO_MARKER),
+        ]);
+
+        let result = parse_claude_event_result(&capture)
+            .expect("a final-turn quota denial must produce a Layer-1 verdict");
+        assert_eq!(result.status, AgentStatus::RateLimited);
+        assert_eq!(
+            result.reason.as_deref(),
+            Some("rate limited until 1785645600")
+        );
+        assert_eq!(result.decided_by_layer, Some(1));
+
+        // Fewer than two `result` events means the whole stream IS the final
+        // turn — a run blocked before it ever completed a turn must still
+        // classify, or the boundary logic silently swallows the common case.
+        let single_turn =
+            stream_capture_of(&[&denial, &v3_result_event(V3_RESULT_TURN1, NO_MARKER)]);
+        assert_eq!(
+            parse_claude_event_result(&single_turn).map(|r| r.status),
+            Some(AgentStatus::RateLimited)
+        );
+    }
+
+    /// Scoping: a denial that predates the final turn cannot outrank the final
+    /// turn's own outcome. Rate-limit chatter from an earlier turn must not
+    /// decide a stream that later completed — in the real capture the rate
+    /// event (line 15) precedes all three results, so an unscoped detector
+    /// would let a first-turn event decide a stream that finished forty seconds
+    /// later.
+    ///
+    /// The denial status here is the SAME one the positive test proves does
+    /// classify, so this test can only pass because of the POSITION guard.
+    #[test]
+    fn claude_stream_denial_before_final_turn_does_not_outrank_final_result() {
+        let capture = stream_capture_of(&[
+            &v3_rate_limit_event("rejected"),
+            &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+            &v3_result_event(V3_RESULT_TURN2, NO_MARKER),
+            &v3_result_event(V3_RESULT_TURN3, MARKER_SUCCESS),
+        ]);
+
+        let result = parse_claude_event_result(&capture)
+            .expect("the final turn's success marker decides this stream");
+        assert_eq!(result.status, AgentStatus::Success);
+    }
+
+    /// An unrecognised `rate_limit_info.status` DEFERS rather than classifying.
+    ///
+    /// Deferring is the deliberately safe direction: an unknown denial status
+    /// falls through to the envelope/marker paths and is reported `Failed` — a
+    /// real degradation (the operator loses automatic resume) but a never-silent
+    /// one that still gates. The opposite error auto-resumes a healthy stream
+    /// against a retry time the parser invented.
+    ///
+    /// Positioned in the FINAL turn, so only the status check can decline it.
+    #[test]
+    fn claude_stream_unrecognised_rate_limit_status_defers() {
+        let capture = stream_capture_of(&[
+            &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+            &v3_result_event(V3_RESULT_TURN2, NO_MARKER),
+            &v3_rate_limit_event("some_future_status"),
+            &v3_result_event(V3_RESULT_TURN3, MARKER_SUCCESS),
+        ]);
+
+        assert!(detect_claude_stream_rate_limit(&ParsedCapture::parse(&capture).events).is_none());
+        let result = parse_claude_event_result(&capture)
+            .expect("the parser must fall through to the marker path");
+        assert_eq!(result.status, AgentStatus::Success);
+    }
+
+    /// Precedence (T-30-13): when the detector fires, rate limit outranks the
+    /// marker path. A rate-limited run classified as generic `Failed` kills the
+    /// primary rate-limit resume cron — the one path that exists to recover
+    /// from it — which is exactly why `evaluate_layer1` already orders
+    /// `detect_claude_rate_limit` ahead of `detect_claude_envelope_failure` for
+    /// the single-document path.
+    ///
+    /// Non-vacuous: the same capture WITHOUT the rate event yields `Failed`, so
+    /// this test fails the moment the ordering is reshuffled.
+    #[test]
+    fn claude_stream_final_turn_denial_outranks_failed_marker() {
+        let with_denial = stream_capture_of(&[
+            &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+            &v3_result_event(V3_RESULT_TURN2, NO_MARKER),
+            &v3_rate_limit_event("rejected"),
+            &v3_result_event(V3_RESULT_TURN3, MARKER_FAILED),
+        ]);
+        assert_eq!(
+            parse_claude_event_result(&with_denial).map(|r| r.status),
+            Some(AgentStatus::RateLimited)
+        );
+
+        let without_denial = v3_stream_capture(NO_MARKER, NO_MARKER, MARKER_FAILED);
+        assert_eq!(
+            parse_claude_event_result(&without_denial).map(|r| r.status),
+            Some(AgentStatus::Failed)
+        );
+    }
+
+    /// A last `result` event with `is_error: true` and NO marker is an
+    /// authoritative Layer-1 failure, not a deferral to Layer 2's coarse
+    /// exit-code heuristic — matching `detect_claude_envelope_failure` for the
+    /// single-document envelope. The reason is drawn from the event's own
+    /// `result` text with the `num_turns` suffix, the same shape that function
+    /// produces.
+    #[test]
+    fn claude_stream_last_result_is_error_without_marker_is_failed() {
+        let capture = stream_capture_of(&[
+            &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+            &v3_result_event(V3_RESULT_TURN2, NO_MARKER),
+            &v3_result_event_is_error(V3_RESULT_TURN3, r#"Execution error: context exhausted"#),
+        ]);
+
+        let result = parse_claude_event_result(&capture)
+            .expect("is_error on the last result must not defer to Layer 2");
+        assert_eq!(result.status, AgentStatus::Failed);
+        assert_eq!(
+            result.reason.as_deref(),
+            Some("Execution error: context exhausted (num_turns: 2)")
+        );
+        assert_eq!(result.decided_by_layer, Some(1));
+    }
+
+    /// Envelope-over-marker (T-30-15): `is_error: true` overrides a SUCCESS
+    /// marker in the same event, matching `detect_claude_envelope_failure`'s
+    /// documented precedence over a stale or echoed success marker.
+    ///
+    /// Non-vacuous: the identical capture with `is_error: false` yields
+    /// `Success`, so the assertion below can only pass because the envelope
+    /// check overrode the marker.
+    #[test]
+    fn claude_stream_is_error_overrides_success_marker() {
+        let capture = stream_capture_of(&[
+            &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+            &v3_result_event(V3_RESULT_TURN2, NO_MARKER),
+            &v3_result_event_is_error(V3_RESULT_TURN3, MARKER_SUCCESS),
+        ]);
+        let result = parse_claude_event_result(&capture)
+            .expect("is_error must produce a verdict even with a success marker");
+        assert_eq!(result.status, AgentStatus::Failed);
+
+        let healthy = v3_stream_capture(NO_MARKER, NO_MARKER, MARKER_SUCCESS);
+        assert_eq!(
+            parse_claude_event_result(&healthy).map(|r| r.status),
+            Some(AgentStatus::Success)
+        );
+    }
+
+    // ---- session id from a stream capture (plan 30-03 Task 2) -------------
+
+    /// The single `session_id` every event in the archived v3 capture carries —
+    /// all three `init` events (lines 5, 32 and 47) and all three `result`
+    /// events agree on it, confirmed by reading the capture.
+    const V3_SESSION_ID: &str = "559fef4d-2053-459e-b7a7-f3200c3b3790";
+
+    /// The real `init` event with its `session_id` substituted. Used only to
+    /// build a SYNTHETIC mid-stream rotation — no archived capture rotates.
+    fn v3_init_event_with_session(session_id: &str) -> String {
+        assert!(
+            V3_INIT_EVENT.contains(V3_SESSION_ID),
+            "fixture lost its session_id"
+        );
+        V3_INIT_EVENT.replace(V3_SESSION_ID, session_id)
+    }
+
+    /// `claude_stream_session_id` reads the CLI-emitted id out of a JSONL
+    /// capture built from the archived `init` events (v3 lines 5, 32 and 47 —
+    /// all three carry this same value).
+    ///
+    /// The second half pins LAST-init-wins with a synthetic rotation: the real
+    /// capture's three `init` events are identical, so first-wins and last-wins
+    /// agree on today's evidence and a fixture built only from it cannot tell
+    /// the two apart. Three `init` events do NOT mean three sessions.
+    #[test]
+    fn claude_stream_session_id_reads_cli_emitted_init_value() {
+        let capture = stream_capture_of(&[
+            &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+            V3_INIT_EVENT,
+            &v3_result_event(V3_RESULT_TURN2, NO_MARKER),
+            V3_INIT_EVENT,
+            &v3_result_event(V3_RESULT_TURN3, MARKER_SUCCESS),
+        ]);
+        assert_eq!(
+            claude_stream_session_id(&capture).as_deref(),
+            Some(V3_SESSION_ID)
+        );
+
+        let rotated = stream_capture_of(&[
+            &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
+            &v3_init_event_with_session("second-session-id"),
+            &v3_result_event(V3_RESULT_TURN2, MARKER_SUCCESS),
+        ]);
+        assert_eq!(
+            claude_stream_session_id(&rotated).as_deref(),
+            Some("second-session-id")
+        );
+    }
+
+    /// D-04 / T-28-04 forgery guard for the stream path — the analog of
+    /// `session_id_in_devflow_result_marker_is_not_returned`, which pins the
+    /// same contract for the single-document envelope.
+    ///
+    /// The fixture defeats BOTH plausible wrong implementations at once: a
+    /// nested traversal (`json_find_key`/`json_scan`) would reach the
+    /// `session_id` the agent planted inside its own `DEVFLOW_RESULT` marker
+    /// text, and a "last event carrying a `session_id`" scan would return the
+    /// final `result` event's own key. Both are wrong; only the `init` event's
+    /// top-level value is CLI-emitted. The divergence between the `result`
+    /// event's id and the `init` event's is synthetic — no archived capture
+    /// diverges — and exists purely so those two implementations cannot pass.
+    #[test]
+    fn claude_stream_session_id_ignores_agent_planted_value() {
+        const PLANTED_MARKER: &str =
+            r#"Done.\nDEVFLOW_RESULT: {\"status\":\"success\",\"session_id\":\"forged-by-agent\"}"#;
+
+        let last_result = v3_result_event(V3_RESULT_TURN3, PLANTED_MARKER)
+            .replace(V3_SESSION_ID, "result-event-session-id");
+        let capture =
+            stream_capture_of(&[&v3_result_event(V3_RESULT_TURN1, NO_MARKER), &last_result]);
+
+        // Non-vacuity: both decoys really are present in the capture text, so a
+        // wrong implementation has something wrong to find.
+        assert!(capture.contains("forged-by-agent"));
+        assert!(capture.contains("result-event-session-id"));
+
+        assert_eq!(
+            claude_stream_session_id(&capture).as_deref(),
+            Some(V3_SESSION_ID)
+        );
+    }
+
+    /// The stream reader does not shadow or duplicate `claude_session_id`: it
+    /// declines the single-document envelope (the exact literal
+    /// `session_id_reads_top_level_string` asserts on) and plain text, so the
+    /// wrapper's stream-first ordering cannot change today's behavior.
+    #[test]
+    fn claude_stream_session_id_declines_non_stream_shapes() {
+        let envelope = r#"{"type":"result","subtype":"success","result":"All done.","session_id":"cf29bfec-69e8-45df-a4f3-3da08ab6f66e"}"#;
+        assert!(claude_stream_session_id(envelope).is_none());
+        // ...and the shipped reader still owns it, so declining costs nothing.
+        assert_eq!(
+            claude_session_id(envelope).as_deref(),
+            Some("cf29bfec-69e8-45df-a4f3-3da08ab6f66e")
+        );
+
+        assert!(claude_stream_session_id("just some plain text output\n").is_none());
+    }
+
+    /// The wiring that matters: `session_id_from_capture` — the Phase 28
+    /// checkpoint-resume reader (`claude --resume` needs an id DevFlow can
+    /// read) — returns an id for a JSONL capture, where before this plan it
+    /// returned `None` for every stream capture.
+    #[test]
+    fn claude_stream_session_id_from_capture_reads_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 30),
+            v3_stream_capture(NO_MARKER, NO_MARKER, MARKER_SUCCESS),
+        )
+        .unwrap();
+
+        assert_eq!(
+            session_id_from_capture(dir.path(), 30).as_deref(),
+            Some(V3_SESSION_ID)
+        );
+    }
+
+    /// The other half of the wiring claim: a single-document envelope capture
+    /// still yields exactly what it did before the stream reader was inserted
+    /// ahead of `claude_session_id` in the fallback chain.
+    #[test]
+    fn claude_stream_wiring_leaves_single_document_capture_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        let envelope = r#"{"type":"result","subtype":"success","result":"All done.","session_id":"cf29bfec-69e8-45df-a4f3-3da08ab6f66e"}"#;
+        std::fs::write(stdout_path(dir.path(), 8), envelope).unwrap();
+
+        assert_eq!(
+            session_id_from_capture(dir.path(), 8).as_deref(),
+            claude_session_id(envelope).as_deref()
+        );
+        assert_eq!(
+            session_id_from_capture(dir.path(), 8).as_deref(),
+            Some("cf29bfec-69e8-45df-a4f3-3da08ab6f66e")
+        );
+    }
+
+    /// The tracer: a real archived `stream-json` capture written to
+    /// `.devflow/phase-NN-stdout` produces a Layer-1 verdict out of
+    /// `evaluate_layer1`. Before plan 30-01 this returned `None` for every
+    /// JSONL capture — `serde_json::from_str` on the whole multi-line document
+    /// is a hard "trailing characters" error, so all four single-document
+    /// parsers declined it and the stage fell through to Layer 2's coarse
+    /// exit-code+commit heuristic.
+    ///
+    /// Fixture provenance and its two modifications are documented on
+    /// `V3_INIT_EVENT` / `V3_RESULT_TURN1..3` above.
+    #[test]
+    fn evaluate_layer1_parses_claude_stream_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 30),
+            v3_stream_capture(NO_MARKER, NO_MARKER, MARKER_SUCCESS),
+        )
+        .unwrap();
+
+        let result = evaluate_layer1(dir.path(), 30).unwrap();
+
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(result.decided_by_layer, Some(1));
+
+        // Non-vacuity guard for the assertion above: this marker omits
+        // `decided_by_layer`, and the field is `#[serde(default)]`, so
+        // `parse_marker_lines` alone yields `None`. `Some(1)` can therefore
+        // only have come from the parser's explicit overwrite.
+        assert_eq!(
+            parse_marker_lines(r#"DEVFLOW_RESULT: {"status":"success"}"#)
+                .unwrap()
+                .decided_by_layer,
+            None
+        );
+    }
+
+    // ---- idle-timeout side channel (31-02, D-05/D-06/D-07) ---------------
+
+    /// Write a monitor-shaped idle-timeout record. Field names and types match
+    /// `IdleTimeoutRecord` exactly; the monitor writes it via serde, so a drift
+    /// between the two shows up as a failing deserialize here.
+    fn write_idle_timeout_record(root: &Path, phase: u32, commits: &[(&str, &str)]) {
+        let record = IdleTimeoutRecord {
+            status: AgentStatus::IdleTimeout.as_wire_str().to_string(),
+            idle_secs: 30,
+            agent_pid: 4242,
+            written_at: 1_700_000_000,
+            commits: commits
+                .iter()
+                .map(|(sha, subject)| IdleTimeoutCommit {
+                    sha: (*sha).to_string(),
+                    subject: (*subject).to_string(),
+                })
+                .collect(),
+        };
+        std::fs::write(
+            idle_timeout_path(root, phase),
+            serde_json::to_string(&record).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// T-31-06, and the single most important test in plan 31-02.
+    ///
+    /// The fixture is a REAL archived three-turn capture in which every
+    /// top-level `result` event carries a success marker — the normal shape of
+    /// a run that got far enough to idle out. A fixture without a prior
+    /// `result` event would pass vacuously while the same mechanism silently
+    /// failed in production.
+    ///
+    /// The negative control is encoded INSIDE the test rather than described in
+    /// prose: the same fixture is evaluated first WITHOUT the side channel and
+    /// must return `Success`. If that ever stops holding, the `IdleTimeout`
+    /// assertion below is proving a verdict nothing was competing with.
+    #[test]
+    fn idle_timeout_side_channel_wins_over_stale_stream_result() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 40),
+            v3_stream_capture(MARKER_SUCCESS, MARKER_SUCCESS, MARKER_SUCCESS),
+        )
+        .unwrap();
+
+        // NEGATIVE CONTROL — must produce the OPPOSITE result.
+        assert_eq!(
+            evaluate_layer1(dir.path(), 40).unwrap().status,
+            AgentStatus::Success,
+            "negative control: without the side channel this fixture must decide Success, \
+             otherwise the assertion below is vacuous"
+        );
+
+        write_idle_timeout_record(
+            dir.path(),
+            40,
+            &[("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "feat: partial")],
+        );
+
+        let result = evaluate_layer1(dir.path(), 40).unwrap();
+        assert_eq!(
+            result.status,
+            AgentStatus::IdleTimeout,
+            "a stale success already in the capture must not shadow the monitor's verdict"
+        );
+        assert_eq!(result.decided_by_layer, Some(1));
+    }
+
+    /// The read must precede `read_capture`'s early `return None`, so a
+    /// timeout that fired before the child emitted anything at all is still
+    /// authoritative rather than discarded.
+    #[test]
+    fn idle_timeout_side_channel_is_read_even_when_the_capture_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        assert!(
+            !stdout_path(dir.path(), 41).exists(),
+            "fixture precondition: there must be no capture at all"
+        );
+
+        // NEGATIVE CONTROL: with neither file present Layer 1 abstains, so the
+        // verdict below can only have come from the side channel.
+        assert!(evaluate_layer1(dir.path(), 41).is_none());
+
+        write_idle_timeout_record(dir.path(), 41, &[]);
+
+        let result = evaluate_layer1(dir.path(), 41).unwrap();
+        assert_eq!(result.status, AgentStatus::IdleTimeout);
+        assert_eq!(result.commits, Some(0));
+    }
+
+    /// D-07: the verdict names the commits, and says they were not rolled back.
+    #[test]
+    fn idle_timeout_result_carries_the_commits_it_enumerated() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        write_idle_timeout_record(
+            dir.path(),
+            42,
+            &[
+                ("1111111abcdef0000000000000000000000000000", "feat: first"),
+                ("2222222abcdef0000000000000000000000000000", "fix: second"),
+            ],
+        );
+
+        let result = evaluate_layer1(dir.path(), 42).unwrap();
+
+        assert_eq!(result.commits, Some(2));
+        let reason = result.reason.expect("an idle timeout must explain itself");
+        for fragment in [
+            "1111111",     // short sha, first commit
+            "feat: first", // its subject
+            "2222222",
+            "fix: second",
+            "30s",                           // how long the stream was silent
+            "NONE of them were rolled back", // D-07's non-destruction promise
+        ] {
+            assert!(
+                reason.contains(fragment),
+                "reason must name {fragment:?}; got: {reason}"
+            );
+        }
+        // The full sha must not be what is printed — a 40-char sha in a gate
+        // message is noise, and the short form is what an operator pastes.
+        assert!(!reason.contains("1111111abcdef0000000000000000000000000000"));
+    }
+
+    /// Nothing about the pre-existing cascade changes when no timeout fired.
+    /// Three shapes, each asserted against the verdict it produced before this
+    /// plan existed, with the side channel confirmed absent in every one.
+    #[test]
+    fn absent_side_channel_leaves_the_cascade_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+
+        std::fs::write(
+            stdout_path(dir.path(), 43),
+            v3_stream_capture(NO_MARKER, NO_MARKER, MARKER_SUCCESS),
+        )
+        .unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 44),
+            v3_stream_capture(MARKER_SUCCESS, MARKER_SUCCESS, MARKER_FAILED),
+        )
+        .unwrap();
+
+        for (phase, expected) in [
+            (43, Some(AgentStatus::Success)),
+            (44, Some(AgentStatus::Failed)),
+            (45, None), // no capture, no side channel
+        ] {
+            assert!(
+                !idle_timeout_path(dir.path(), phase).exists(),
+                "fixture precondition: phase {phase} must have no side channel"
+            );
+            assert_eq!(
+                evaluate_layer1(dir.path(), phase).map(|r| r.status),
+                expected,
+                "the cascade changed for phase {phase} with no timeout on disk"
+            );
+        }
+    }
+
+    /// The file's PRESENCE is the signal; its contents are enrichment.
+    ///
+    /// A corrupt record must NOT fall back into the cascade — that would let
+    /// the stale success in the capture win, converting a damaged file into a
+    /// silent wrong advance. This is the same fixture as
+    /// `idle_timeout_side_channel_wins_over_stale_stream_result`, so the
+    /// Success it would otherwise decide is real and not hypothetical.
+    #[test]
+    fn an_unreadable_idle_timeout_record_still_produces_the_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 46),
+            v3_stream_capture(MARKER_SUCCESS, MARKER_SUCCESS, MARKER_SUCCESS),
+        )
+        .unwrap();
+
+        // NEGATIVE CONTROL: this capture decides Success on its own.
+        assert_eq!(
+            evaluate_layer1(dir.path(), 46).unwrap().status,
+            AgentStatus::Success
+        );
+
+        std::fs::write(idle_timeout_path(dir.path(), 46), "{ this is not json").unwrap();
+
+        let result = evaluate_layer1(dir.path(), 46).unwrap();
+        assert_eq!(result.status, AgentStatus::IdleTimeout);
+        assert_eq!(
+            result.commits, None,
+            "an unreadable record must not invent a commit count"
+        );
+        assert!(result.reason.unwrap().contains("unreadable"));
+    }
+
+    /// Last-result-wins. A session kept alive across turns emits one `result`
+    /// event per turn; only the final one is the session's verdict.
+    ///
+    /// Asserts BOTH directions so the test cannot pass by a parser that merely
+    /// prefers `success`: failed-then-success yields Success, and
+    /// success-then-failed yields Failed. The middle event carries the same
+    /// payload as the first, so a parser that stopped at index 1 would also
+    /// fail.
+    #[test]
+    fn claude_stream_last_result_event_wins_over_earlier_results() {
+        let last_success = v3_stream_capture(MARKER_FAILED, MARKER_FAILED, MARKER_SUCCESS);
+        let result = parse_claude_event_result(&last_success).unwrap();
+        assert_eq!(result.status, AgentStatus::Success);
+
+        let last_failed = v3_stream_capture(MARKER_SUCCESS, MARKER_SUCCESS, MARKER_FAILED);
+        let result = parse_claude_event_result(&last_failed).unwrap();
+        assert_eq!(result.status, AgentStatus::Failed);
+        assert_eq!(result.reason.as_deref(), Some("earlier turn aborted"));
+    }
+
+    /// T-30-26: `decided_by_layer` is provenance, not decoration.
+    /// `crates/devflow-cli/src/pipeline_outcomes.rs` (`classify_validate_outcome`)
+    /// computes `external = decided_by_layer == Some(0) && status == Success`
+    /// and uses it to tell an externally-probe-verified Validate stage apart
+    /// from an ordinary one. An agent that writes `"decided_by_layer": 0` into
+    /// its own marker is claiming a Layer-0 probe provenance it did not earn,
+    /// so the stream parser overwrites the field unconditionally.
+    ///
+    /// This is a runtime assertion on the returned struct, not a source grep —
+    /// it fails the moment the overwrite is dropped.
+    #[test]
+    fn claude_stream_overwrites_agent_planted_decided_by_layer() {
+        // Non-vacuity guard: prove the planted value really would survive
+        // deserialization, so the `Some(1)` below is the overwrite at work and
+        // not an artifact of a marker that failed to parse.
+        assert_eq!(
+            parse_marker_lines(r#"DEVFLOW_RESULT: {"status":"success","decided_by_layer":0}"#)
+                .unwrap()
+                .decided_by_layer,
+            Some(0)
+        );
+
+        let capture = v3_stream_capture(NO_MARKER, NO_MARKER, MARKER_PLANTED_LAYER);
+        let result = parse_claude_event_result(&capture).unwrap();
+
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(result.decided_by_layer, Some(1));
+    }
+
+    /// A marker-less final turn defers to Layer 2 rather than reporting an
+    /// unconditional Success — the same convention `parse_codex_event_result`
+    /// applies to a bare `turn.completed`. A marker-less turn must never
+    /// silently advance a stage.
+    ///
+    /// The FIRST turn carries a success marker, so this also proves the parser
+    /// does not fall back to an earlier turn's marker when the last one has
+    /// none.
+    ///
+    /// Plan 30-03 addendum: the deferral must hold specifically for
+    /// `is_error: false`, which is what the real captured envelope carries —
+    /// asserted below so this reads as a deliberate is_error case rather than
+    /// an incidental one. Only `is_error: true` may promote a marker-less turn
+    /// to `Failed`.
+    #[test]
+    fn claude_stream_last_result_without_marker_defers() {
+        let capture = v3_stream_capture(MARKER_SUCCESS, NO_MARKER, NO_MARKER);
+        assert!(
+            capture.contains(r#""is_error":false"#),
+            "the archived envelopes carry is_error:false; this test is about that case"
+        );
+        assert!(parse_claude_event_result(&capture).is_none());
     }
 
     #[test]
@@ -2514,6 +5784,263 @@ mod tests {
         assert_eq!(result.summary.as_deref(), Some("ok"));
     }
 
+    // ---- exit-code arbitration on a claimed success (31-04, T-31-15) -----
+    //
+    // Every test below drives the FULL cascade through
+    // `evaluate_agent_result_inner`, never the parser's own return value.
+    // 31-RESEARCH.md § Pitfall 4 records why: a truncation-boundary test that
+    // checks only `parse_claude_event_result` exercises constraint 9's items 1
+    // and 2, which the `a557805` root-cause refactor already closed. The
+    // residual this arbitration exists for lives in the WIRING — Layer 1
+    // returning before Layer 2 is ever consulted — and only the cascade
+    // exercises it.
+
+    /// A success marker that also claims `verdict: pass` — the shape that made
+    /// the naive "carry every other field over" downgrade a no-op at Validate
+    /// (`classify_validate_outcome` matches `Some(Verdict::Pass)` FIRST, with
+    /// `_` discarding the status). Used to prove `verdict` is dropped.
+    const MARKER_SUCCESS_CLAIMING_PASS: &str =
+        r#"Done.\nDEVFLOW_RESULT: {\"status\":\"success\",\"verdict\":\"pass\"}"#;
+
+    /// The residual of constraint 9 that no parser assertion can reach.
+    ///
+    /// A capture cut at an exact line boundary is byte-identical to a healthy
+    /// shorter run, so the stream itself carries no evidence of the tear. The
+    /// writer that died between flushing turn N and turn N+1 also died
+    /// non-zero, and that exit code is the only signal left.
+    #[test]
+    fn stream_success_cannot_stand_against_nonzero_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 31),
+            v3_stream_capture(NO_MARKER, NO_MARKER, MARKER_SUCCESS_CLAIMING_PASS),
+        )
+        .unwrap();
+
+        // NEGATIVE CONTROL, encoded in the test rather than described in prose:
+        // Layer 1 on its own decides Success here AND reports `verdict: Pass`.
+        // Without this the assertions below cannot distinguish "the arbitration
+        // downgraded a success" from "nothing ever claimed success", nor
+        // "`verdict` was dropped" from "`verdict` was never set".
+        let layer1 = evaluate_layer1(dir.path(), 31).unwrap();
+        assert_eq!(layer1.status, AgentStatus::Success);
+        assert_eq!(layer1.verdict, Some(Verdict::Pass));
+
+        std::fs::write(exit_code_path(dir.path(), 31), "1\n").unwrap();
+        let state = state_in(dir.path(), 31);
+
+        let result =
+            evaluate_agent_result_inner(dir.path(), &state, &GitFlowConfig::default(), None)
+                .unwrap();
+
+        assert_eq!(result.status, AgentStatus::Failed);
+        assert_eq!(result.exit_code, Some(1));
+        assert!(
+            result.reason.as_deref().is_some_and(|r| r.contains("1")),
+            "the reason must name the exit code: {:?}",
+            result.reason
+        );
+        // Layer 1 still decided this — the arbitration corrects its verdict, it
+        // does not hand the decision to Layer 2.
+        assert_eq!(result.decided_by_layer, Some(1));
+        // Load-bearing: a downgraded result has no verdict to offer. Carrying
+        // `Some(Verdict::Pass)` over would leave Validate classified Passed and
+        // make this whole test's premise false at the stage that matters most
+        // (999.74 / DEN-95).
+        assert_eq!(result.verdict, None);
+    }
+
+    /// The matched negative control for the test above. Without it, that test
+    /// cannot tell "the arbitration works" from "the arbitration fires on
+    /// everything".
+    #[test]
+    fn stream_success_stands_when_the_exit_code_is_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 32),
+            v3_stream_capture(NO_MARKER, NO_MARKER, MARKER_SUCCESS_CLAIMING_PASS),
+        )
+        .unwrap();
+        std::fs::write(exit_code_path(dir.path(), 32), "0\n").unwrap();
+        let state = state_in(dir.path(), 32);
+
+        let result =
+            evaluate_agent_result_inner(dir.path(), &state, &GitFlowConfig::default(), None)
+                .unwrap();
+
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(result.decided_by_layer, Some(1));
+        // The verdict survives an untouched result — proof that the `None`
+        // asserted in the downgrade test is the arbitration's doing and not a
+        // property of the fixture.
+        assert_eq!(result.verdict, Some(Verdict::Pass));
+    }
+
+    /// A missing exit file is not evidence of failure. This matches
+    /// `evaluate_layer2`'s own tolerance (`Err(_) => return Ok(None)`); a
+    /// stricter reading here would fail every stage whose monitor had not yet
+    /// written the file.
+    #[test]
+    fn stream_success_stands_when_no_exit_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 33),
+            v3_stream_capture(NO_MARKER, NO_MARKER, MARKER_SUCCESS),
+        )
+        .unwrap();
+        assert!(
+            !exit_code_path(dir.path(), 33).exists(),
+            "fixture precondition: there must be no exit file"
+        );
+        let state = state_in(dir.path(), 33);
+
+        let result =
+            evaluate_agent_result_inner(dir.path(), &state, &GitFlowConfig::default(), None)
+                .unwrap();
+
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(result.decided_by_layer, Some(1));
+    }
+
+    /// Only a *claimed success* is arbitrated. Downgrading a rate limit to a
+    /// generic failure would route the run to a human gate instead of the
+    /// auto-resume cron it needs — the exact harm `rate_limited_result`'s
+    /// precedence over `detect_claude_envelope_failure` exists to prevent.
+    #[test]
+    fn rate_limited_verdict_is_not_arbitrated_by_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 34),
+            r#"{"type":"result","subtype":"error_rate_limit","is_error":true,"retry_after":"2026-06-18T15:45:30Z"}"#,
+        )
+        .unwrap();
+        std::fs::write(exit_code_path(dir.path(), 34), "1\n").unwrap();
+        let state = state_in(dir.path(), 34);
+
+        let result =
+            evaluate_agent_result_inner(dir.path(), &state, &GitFlowConfig::default(), None)
+                .unwrap();
+
+        assert_eq!(result.status, AgentStatus::RateLimited);
+        assert_eq!(
+            result.reason.as_deref(),
+            Some("rate limited until 2026-06-18T15:45:30Z"),
+            "the rate-limit reason must survive verbatim — the resume cron reads it"
+        );
+    }
+
+    /// Plan 31-02's side-channel verdict survives arbitration unchanged. An
+    /// `IdleTimeout` collapsed into `Failed` would lose exactly the distinction
+    /// 31-02 exists to create, and the monitor writes a NON-zero exit for a
+    /// child it killed, so this is not a hypothetical pairing.
+    #[test]
+    fn idle_timeout_verdict_is_not_arbitrated_by_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 35),
+            v3_stream_capture(MARKER_SUCCESS, MARKER_SUCCESS, MARKER_SUCCESS),
+        )
+        .unwrap();
+        write_idle_timeout_record(
+            dir.path(),
+            35,
+            &[("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "feat: partial")],
+        );
+        std::fs::write(exit_code_path(dir.path(), 35), "143\n").unwrap();
+        let state = state_in(dir.path(), 35);
+
+        let result =
+            evaluate_agent_result_inner(dir.path(), &state, &GitFlowConfig::default(), None)
+                .unwrap();
+
+        assert_eq!(result.status, AgentStatus::IdleTimeout);
+        assert_eq!(
+            result.exit_code, None,
+            "the arbitration must not graft an exit code onto a timeout verdict"
+        );
+    }
+
+    /// Exit-code fidelity (adversarial review of 31-04, W1). A blanket `Failed`
+    /// would flatten the two codes `evaluate_layer2` classifies specially, and
+    /// `outcome_policy::decide_action` routes those to `GateInfra` rather than
+    /// `GateReview`. The same exit code must not reach two different operator
+    /// gates depending on whether a stale Layer 1 success happened to be there.
+    #[test]
+    fn arbitration_preserves_layer2s_resource_and_unavailable_codes() {
+        for (code, expected) in [
+            (137, AgentStatus::ResourceKilled),
+            (127, AgentStatus::AgentUnavailable),
+            (2, AgentStatus::Failed),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+            std::fs::write(
+                stdout_path(dir.path(), 36),
+                v3_stream_capture(NO_MARKER, NO_MARKER, MARKER_SUCCESS),
+            )
+            .unwrap();
+            std::fs::write(exit_code_path(dir.path(), 36), format!("{code}\n")).unwrap();
+            let state = state_in(dir.path(), 36);
+
+            let arbitrated =
+                evaluate_agent_result_inner(dir.path(), &state, &GitFlowConfig::default(), None)
+                    .unwrap();
+
+            assert_eq!(
+                arbitrated.status, expected,
+                "exit {code} must arbitrate to {expected:?}, matching evaluate_layer2"
+            );
+            assert_eq!(arbitrated.exit_code, Some(code));
+        }
+    }
+
+    /// D-12's inverse assertion, and the mirror of
+    /// [`single_doc_envelope_not_consumed_by_claude_stream_parser`].
+    ///
+    /// That test pins one direction: today's shipped `--output-format json`
+    /// envelope must NOT be consumed by the stream parser. This pins the other:
+    /// a capture produced by plan 31-01's new `stream-json` argv classifies as
+    /// [`CaptureKind::ClaudeStream`] and is NOT consumed by the
+    /// single-document envelope path. Without both directions, widening either
+    /// gate is only half-guarded.
+    ///
+    /// Cites `classify()` / `CaptureKind::ClaudeStream` deliberately: the gate
+    /// predicate `31-CONTEXT.md` and `30-VERIFICATION.md` W-02 still name is no
+    /// longer a live function — the `a557805` refactor replaced it.
+    #[test]
+    fn stream_json_capture_is_not_consumed_by_the_single_document_path() {
+        let capture = v3_stream_capture(NO_MARKER, NO_MARKER, MARKER_SUCCESS);
+
+        // The classifier owns it.
+        assert!(capture_is_claude_stream(&capture));
+
+        // Every single-document reader declines it...
+        assert!(claude_session_id(&capture).is_none());
+        assert!(detect_claude_envelope_failure(&capture).is_none());
+        assert!(detect_claude_rate_limit(&capture).is_none());
+
+        // ...and the stream parser still owns it, so declining costs no verdict.
+        assert_eq!(
+            parse_claude_event_result(&capture).unwrap().status,
+            AgentStatus::Success
+        );
+
+        // Non-vacuity: the single-document readers are not simply broken — the
+        // same three answer a real envelope. Without this, the `is_none()`
+        // assertions above would pass against a reader that returned `None` for
+        // everything.
+        let envelope = r#"{"type":"result","subtype":"error_rate_limit","is_error":true,"retry_after":"2026-06-18T15:45:30Z","session_id":"abc"}"#;
+        assert_eq!(claude_session_id(envelope).as_deref(), Some("abc"));
+        assert!(detect_claude_envelope_failure(envelope).is_some());
+        assert!(detect_claude_rate_limit(envelope).is_some());
+        assert!(!capture_is_claude_stream(envelope));
+    }
+
     #[test]
     fn evaluate_layer1_finds_devflow_result_in_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -2789,8 +6316,14 @@ mod tests {
     }
 
     /// review consensus #1: `as_wire_str()` must never diverge from the serde
-    /// form for ANY variant — pin it for all six via a single round-trip
+    /// form for ANY variant — pin it for all seven via a single round-trip
     /// assertion (quotes stripped).
+    ///
+    /// 31-02: `IdleTimeout` is enumerated here explicitly rather than left to
+    /// the compiler. `as_wire_str`'s wildcard-free match makes a MISSING arm a
+    /// compile error, but it cannot catch a WRONG one — an arm returning
+    /// `"idletimeout"` compiles happily and diverges from the serde form the
+    /// `#[serde(rename)]` produces. Only enumerating the variant here pins that.
     #[test]
     fn as_wire_str_matches_serde_form_for_every_variant() {
         for variant in [
@@ -2800,6 +6333,7 @@ mod tests {
             AgentStatus::Unknown,
             AgentStatus::ResourceKilled,
             AgentStatus::AgentUnavailable,
+            AgentStatus::IdleTimeout,
         ] {
             let serde_form = serde_json::to_string(&variant).unwrap();
             let stripped = serde_form.trim_matches('"');

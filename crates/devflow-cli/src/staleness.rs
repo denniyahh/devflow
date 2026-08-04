@@ -786,6 +786,14 @@ mod tests {
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, project_root.clone());
         state.stage = Stage::Code;
         state.worktree_path = Some(worktree_path.clone());
+        // 31-03: Code is the stage widened to the `stream-json` transport, so
+        // the `launch_stage_inner` call in part 2 below passes the D-15
+        // delivery-canary gate. Recording an already-`Confirmed` outcome keeps
+        // this test measuring what it was written to measure — that the
+        // STALENESS check is not re-adjudicated mid-run — instead of failing on
+        // an unrelated guard. The canary's own refusal path is covered by
+        // `pipeline_launch::tests::launch_stage_inner_refuses_at_code_when_the_canary_cannot_confirm`.
+        state.canary = Some(devflow_core::canary::CanaryOutcome::Confirmed);
 
         // 1. The `start`-shaped adjudication: called directly, exactly the
         // way `commands::start` now calls it — once, before any stage is

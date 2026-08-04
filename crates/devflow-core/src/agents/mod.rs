@@ -88,35 +88,88 @@ mod tests {
         assert_eq!(adapter_for(AgentKind::OpenCode).name(), "OpenCode");
     }
 
-    /// Extract the prompt argument carrying the instruction text.
-    fn prompt_arg(kind: AgentKind, prompt: &str) -> String {
+    /// Extract the prompt text as this adapter actually DELIVERS it.
+    ///
+    /// Codex and OpenCode pass it positionally, so it is read back out of
+    /// argv. Claude does not: under `--input-format stream-json` the initial
+    /// user turn travels on the child's stdin, so it is read back out of the
+    /// wire document [`crate::monitor::user_turn_line`] builds. Two lookups,
+    /// one question — "what text did the agent receive?".
+    fn delivered_prompt(kind: AgentKind, prompt: &str) -> String {
+        if kind == AgentKind::Claude {
+            let turn: serde_json::Value =
+                serde_json::from_str(&crate::monitor::user_turn_line(prompt))
+                    .expect("the stdin user turn must be one valid JSON document");
+            return turn
+                .get("message")
+                .and_then(|message| message.get("content"))
+                .and_then(serde_json::Value::as_str)
+                .expect("the user turn must carry the prompt as message.content")
+                .to_string();
+        }
         let (_program, args) = adapter_for(kind).exec_command(7, prompt, &[]);
         args.into_iter()
             .find(|arg| arg.contains("DEVFLOW_RESULT"))
             .expect("agent command should carry the prompt with the DEVFLOW_RESULT contract")
     }
 
+    /// The invariant survived a transport change; it was not deleted with the
+    /// mechanism that used to carry it. Every adapter still receives the
+    /// canonical stage prompt byte-for-byte — Codex and OpenCode in argv,
+    /// Claude in the stdin user turn.
+    ///
+    /// The Claude leg additionally asserts the prompt is ABSENT from argv,
+    /// because "identical text" would otherwise be satisfiable by an adapter
+    /// that sent the prompt through both routes — which would double the
+    /// initial turn.
     #[test]
     fn every_adapter_receives_identical_prompt_text() {
         let prompt = stage_prompt(Stage::Code, 7);
         for kind in [AgentKind::Claude, AgentKind::Codex, AgentKind::OpenCode] {
             assert_eq!(
-                prompt_arg(kind, &prompt),
+                delivered_prompt(kind, &prompt),
                 prompt,
                 "{kind} must receive the canonical stage prompt unchanged"
             );
         }
+
+        let (_program, args) = adapter_for(AgentKind::Claude).exec_command(7, &prompt, &[]);
+        assert!(
+            !args.iter().any(|arg| arg.contains("DEVFLOW_RESULT")),
+            "Claude's prompt must travel on stdin ONLY; a copy left in argv \
+             would deliver the initial turn twice: {args:?}"
+        );
     }
 
+    /// The Phase 31 launch contract, asserted as one thing because getting
+    /// only the flags right is the documented way to half-implement it: the
+    /// transport is `stream-json` in BOTH directions, and the prompt is not a
+    /// positional argument at all.
     #[test]
-    fn claude_wraps_prompt_in_noninteractive_flags() {
+    fn claude_launches_headless_stream_json_without_positional_prompt() {
         let prompt = stage_prompt(Stage::Code, 3);
         let (program, args) = adapter_for(AgentKind::Claude).exec_command(3, &prompt, &[]);
         assert_eq!(program, "claude");
-        let joined = args.join(" ");
-        assert!(joined.contains("-p"));
-        assert!(joined.contains("--output-format json"));
-        assert!(joined.contains("--dangerously-skip-permissions"));
+        assert!(args.iter().any(|a| a == "-p"));
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--input-format" && w[1] == "stream-json"),
+            "the INPUT format is what moves the initial turn onto stdin; \
+             flipping only the output format leaves the CLI with no first \
+             turn and it stalls headless: {args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--output-format" && w[1] == "stream-json"),
+            "the OUTPUT format is what makes the capture a JSONL event stream \
+             the Layer 1 stream parser can read: {args:?}"
+        );
+        assert!(args.iter().any(|a| a == "--dangerously-skip-permissions"));
+        assert!(
+            !args.iter().any(|arg| arg.contains("DEVFLOW_RESULT")),
+            "no positional prompt: the initial user turn travels on stdin, \
+             written by the monitor: {args:?}"
+        );
     }
 
     #[test]

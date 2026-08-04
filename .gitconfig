@@ -47,3 +47,27 @@
 # When unset, the hook does not block — a contributor who never cuts releases
 # needs no configuration. When set, it is enforced with no override flag: the
 # escape hatch is to sign the tag with the right key.
+
+# git-flow branch model.
+#
+# `git flow init -d` must NOT be used here: its default production branch is
+# `master`, and this repository's is `main`. Initialising with the defaults
+# silently configures git-flow against a branch that does not exist, and the
+# error only surfaces later, at release or hotfix time.
+#
+# These names are true for every contributor, so they live in tracked config
+# rather than being re-typed per clone. The feature prefix matches both this
+# repository's existing branches (`feature/phase-30`) and GSD's
+# `git.phase_branch_template` in `.planning/config.json`, so `git flow feature
+# start phase-N` and GSD's own branch creation converge on the same name
+# instead of producing two branches for one phase.
+[gitflow "branch"]
+	master = main
+	develop = develop
+
+[gitflow "prefix"]
+	feature = feature/
+	release = release/
+	hotfix = hotfix/
+	support = support/
+	versiontag = v

@@ -1,30 +1,107 @@
 ---
 gsd_state_version: 1.0
-milestone: v2.0.0
-milestone_name: milestone (open — no fixed closing phase)
-current_phase: 28
-current_phase_name: close-the-checkpoint-answer-return-path
-status: shipped — PR #63 open to develop
-stopped_at: Phase 28 shipped — PR #63 (feature/phase-28 → develop), awaiting CI + merge
-last_updated: "2026-07-31T08:35:00.000Z"
-last_activity: 2026-07-30
-last_activity_desc: "Phase 28 complete: 6/6 plans, 779 tests green, SECURED (threats_open 0), verification passed. A1 closed by a live run that found and fixed a real defect (b22e6cf) — the executor renders the gate value as a markdown code span, which the reader did not match; checkpoints now recognize, auto-decide, audit, resume, and resolve end-to-end"
+milestone: v2.3.0
+milestone_name: the unattended run (999.64 arc — closes after Phase 31)
+current_phase: 31
+status: completed
+stopped_at: "Phase 31 COMPLETE, 5/5 plans, closed 2026-08-03 — the 999.64 arc closes with it. Acceptance run passed attempt 1 (D-18 verified independently from git: two merge commits with independent-forking parents). 31-VERIFICATION.md passed, 879 tests. One adversarial plan review + one peer code review; 3 CRITICAL/HIGH fixed in 522e905 with mutation-proven tests, 1 filed (999.75/DEN-96). OPEN: the 8 acceptance-run commits (0590537..911bf50, incl. fabricated phase 97) are KEPT on feature/phase-31 by operator decision — they are the D-18 evidence — and go into develop's history as-is. Next: ship/merge decision."
+last_updated: "2026-08-04T01:51:16.106Z"
+last_activity: 2026-08-03
+last_activity_desc: Phase 31 complete
 progress:
-  total_phases: 17
-  completed_phases: 15
-  total_plans: 124
-  completed_plans: 124
+  # STALE AND UNVERIFIED — do not trust these five values.
+  # `state.update-progress` is the tool that owns them and it is not usable here:
+  # run 2026-08-02 it regressed current_phase 30 -> 28 from the stale body, rewrote
+  # an unrelated phase-23 historical note, and reported completed:132/total:138 in
+  # its own JSON while writing 131/137 to these fields. Left at their last
+  # hand-trusted values rather than replaced with numbers that cannot be defended.
+  # See .planning/UPSTREAM-GSD-ISSUES.md entries 9 and 11.
+  #
+  # 2026-08-03: this block is deleted by EVERY state verb that calls
+  # syncStateFrontmatter. THREE in one session — `state.planned-phase`
+  # (plan-phase §13b), `state.begin-phase` (execute-phase), and `phase.complete`
+  # — each stripped it and rewrote the counters; none reported the deletion in
+  # its `updated[]`. Restored by hand all three times. `phase.complete` also
+  # regressed `stopped_at` to a value from two stages earlier, which was NOT
+  # caught by its own `warnings[]`.
+  #
+  # STANDING QUESTION FOR THE OPERATOR: this is now a per-verb tax. Either the
+  # preserve-guard gets fixed upstream (ledger entry 9), or these five fields
+  # should be deleted outright rather than defended every time.
+  total_phases: 21
+  completed_phases: 16
+  total_plans: 129
+  completed_plans: 129
   percent: 88
+current_phase_name: claude-adapter-launch-path-pipe-owning-monitor-999-64-arc-cl
 ---
 
 # DevFlow — Project State
 
-> Last updated: 2026-07-25
+> Last updated: 2026-08-02
 
 ## Active Phase
 
+**Phase 30 — Keep the Session Alive Past Turn End (999.64)** — **planned and
+cross-AI reviewed 2026-08-02; ready to execute.** 5 plans across 3 waves on
+`feature/phase-30`: 30b is the Claude stream parser (30-01 tracer, 30-03 rate
+limit / envelope failure / `session_id`, 30-05 checkpoint prompt-echo
+hardening), 30c is the production-environment delivery experiment (30-02), 30d
+is the exit-timing measurement (30-04). A Codex review (`30-REVIEWS.md`) raised
+4 HIGH findings; 15 of 16 were incorporated, 1 rejected with rationale, and the
+phase goal was split from the 999.64 arc goal so Phase 30 can satisfy it —
+Phase 31 owns the launch-path change. 30-03 and 30-05 are gated on 30-02's
+verdict and will not land if delivery is refuted.
+
+**Status 2026-08-02 — all 5 plans executed; ready for verification.** All three
+waves are complete: wave 1 = 30-01 + 30-02, wave 2 = 30-03 + 30-04, wave 3 =
+30-05. The 30-02 delivery gate resolved `delivery: confirmed`, which is what
+allowed 30-03 and 30-05 to land.
+
+`cargo test -p devflow-core --lib agent_result::` reports 132 passed / 0 failed / 0
+ignored — the constraint-9 sweep is live, no longer `#[ignore]`d.
+`scripts/check.sh all` (host) and `scripts/check-in-container.sh all` (pinned CI
+image) both exit 0. Nothing has been pushed.
+
+**Four adversarial passes followed execution, and their findings drove a
+root-cause refactor** (`a557805`; full trail in `30-CODE-REVIEW.md`,
+`30-VERIFICATION.md`, and the pass-3/pass-4 fix commits `f34756c`, `4867207`).
+Eight defects across the passes traced to three root causes, all three now
+structural: `ParsedCapture` makes dropped lines representable (R1), `classify()`
+decides capture kind once instead of per-call-site heuristics (R2), and
+`is_top_level` is the single provenance predicate for gate and verdict paths
+(R3). Constraint 9's two deferred items are **CLOSED in phase 30**; what
+survives for Phase 31 is the boundary-truncation residual — a stream-derived
+Success must not short-circuit a contradicting exit code, because a capture cut
+at an exact line boundary is content-indistinguishable from a healthy shorter
+run. The last code-review Medium is backlog **999.70**; the torn-line frequency
+measurement is **999.71**.
+
+**A correction on reachability, twice wrong before it was right:** the claim
+"`evaluate_layer1` has zero callers" was false — `evaluate_agent_result` runs it
+on every result evaluation from `pipeline_launch.rs:416`. What kept the two
+deferred defects latent was the capture FORMAT (the stream branch requires a
+parsed `init`, which only `stream-json` emits), not a missing caller. Checkpoint
+detection and `claude_stream_session_id` were live the whole time, which is why
+the gate findings were urgent. And **no fixture is a real capture** — no
+archived capture contains checkpoint gate text, and none contains a prompt echo
+at all, so the prompt-echo false positive is closed as reasoned rather than
+witnessed.
+
+30-04 also revised two binding review constraints against measurement: the
+idle-timeout floor moved from ~12s to ≥30s, and the drain gate is now
+characterised as defensive rather than load-bearing (kept as an `AND`
+regardless — see ROADMAP.md constraints 7 and 8).
+
+---
+
+### Historical — superseded phase notes
+
+The entries below describe earlier phases and are retained for context. They are
+**not** the active phase; the frontmatter `current_phase` above is authoritative.
+
 **Phase 23 — End-to-End Dogfood: One Phase, Define→Ship, Unattended, With
-Claude** — **scoped 2026-07-25, not yet discussed or planned.** The goal is the
+Claude** — **scoped 2026-07-25.** The goal was the
 "basic development workflow works end to end" milestone: `devflow start --phase
 N` drives one real phase Define→Ship with Claude, unattended, with no manual
 `ps`, no manual `devflow advance`, and no silent stall.
@@ -86,9 +163,15 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 28 (close-the-checkpoint-answer-return-path) — EXECUTING
-Plan: 1 of 6
-Status: Executing Phase 28
+Phase: 31
+Plan: Not started
+Status: All phases complete
+
+Phase 30 closed 2026-08-03 via `phase.complete 30`. Note what that did NOT do:
+ROADMAP.md was unchanged (it reported `roadmap_updated: true` while changing
+nothing), so plans 30-03/04/05 still show `[ ]` in the phase entry despite all
+five having summaries, and the entry carries no `**STATUS: COMPLETE**` line of
+the kind Phase 27 has. The milestone table row was already `Complete`.
 real action is `/gsd-review-backlog` to promote a 999.x entry, or `/gsd-ship 27`
 to merge this phase. `phase.complete` auto-advanced this field to "999.1 — Hermes
 Support (BACKLOG)" because its next-phase scan walks into the backlog section;
@@ -157,7 +240,7 @@ Scope boundary: 23-16 is the **fix only** (change + regression tests + PR into `
 
 **Recovery-ref disposition:** both `origin` refs (`recovery/pre-23-11-acceptance-e0f87c2`, `recovery/pre-23-15-acceptance-0dad20d`) remain untouched on `origin`; the local copy of the pre-23-11 ref, deleted again by `devflow cleanup`, is deliberately NOT restored (per `23-FINDINGS.md` §B2a); the pre-23-15 ref is now unused (no merge to undo) but retained on `origin` for reuse by the 23-16 retry rather than deleted.
 
-Last activity: 2026-07-30 — Phase 28 execution started
+Last activity: 2026-08-03 — Phase 31 complete
 
 **Note on the "Plan: 2 of 15" value this replaces:** `gsd-tools state advance-plan` only increments whatever value is already in this field, which had drifted to "2 of 15" (the parallel-worktree waves 23-01…23-09 deliberately never touch STATE.md, and this field was last corrected against reality at "10 of 11 plans complete" before the plan count grew to 15 with the gap-closure plans 23-12…23-15). Corrected directly to "13 of 15" to match reality (23-12 and 23-13 both now executed) rather than trust the tool's naive +1 increment from a stale base.
 
@@ -260,8 +343,9 @@ Phase" section above, which `advance-plan` cannot parse (backlog 12,
   **PR #20** (`feat/... → develop`) opened, CI green (8/8 checks), squash-
   merged to `develop` (`e78bc82`) 2026-07-23. **Ships as v1.7.0, not
   v2.0.0** — decided at ship time: nothing across the five units is
-  breaking, and the v2.0.0 milestone stays open rather than closing here
-  (see ROADMAP.md "Milestone stays open," 2026-07-23).
+  breaking, and the v2.0.0 milestone stayed open rather than closing here
+  (see ROADMAP.md "Milestone stays open," 2026-07-23 — superseded 2026-08-02
+  when v2.0.0 closed and the bounded v2.3.0 milestone was declared).
 
   **Fully released 2026-07-23.** `sync-main-to-develop.sh` run first (had
   not been run after v1.6.0 — `origin/main` had diverged from `develop`;
@@ -638,32 +722,37 @@ item, already fixed and committed (`b1dcec7`), not a promotion candidate.
 
 ## Blockers
 
-None currently open for Phase 17.
+None currently open.
 
-- **RESOLVED 2026-07-19 (17-09, `cb9359f`):**
-  `concurrent_ship_advances_finish_both_phases_independently` no longer hangs.
-  Mechanism (confirmed directly via temporary debug instrumentation, not just
-  inferred from timing): the test ships phases 31 and 32 concurrently, and on
-  a genuinely intermittent race (~33-40% of isolated runs, measured across
-  three independent audits plus this fix's own 25-run verification), both
-  `VersionBump` hooks compute the identical next version and race to create
-  the same tag (`cannot lock ref 'refs/tags/...'`); the loser's ship failure
-  reopens its Ship gate, and since the test only ever pre-wrote **one**
-  response per phase, the reopened gate previously polled forever with no
-  timeout. Fix: `DEVFLOW_GATE_TIMEOUT_SECS` is bounded to 2 seconds for this
-  test's poll only (under the file's `ENV_MUTEX` guard, restored
-  immediately after) — the 7-day production default is untouched. The test
-  now asserts either legitimate outcome deterministically (no collision:
-  both phases finish; collision: the loser's bounded timeout + intact,
-  still-gated state). 25 consecutive isolated runs under a 120s external
-  timeout: 0 hangs, 9 of which hit the race and resolved via the bounded
-  path. **The underlying product-level version-tag contention (why the
-  checkout lock occasionally doesn't fully serialize the two threads'
-  terminal hooks) remains open and out of scope** — belongs to future
-  ship/version-bump concurrency work, not Phase 17 or 18. See
-  `17-VALIDATION.md` GAP-2 and `17-09-SUMMARY.md`.
+<!-- This section is a LIVE SET, not a log. GSD's smart-entry scan promotes EVERY hyphen-bullet
+     here to an open blocker and returns situation:"blocked" — including one whose text begins
+     with RESOLVED. It matches on `^-\s+` alone and reads nothing else, so a resolved record
+     retained "for the archive" gates the whole project. Resolved entries must be REMOVED, not
+     annotated or reworded in place (gsd-core templates/state.md: "Clear resolved blockers",
+     "Cleared when addressed"). Do not reintroduce hyphen-bullets here for history.
 
-- Phase 23 behavioral acceptance criterion (one phase Define-to-Ship, unattended) NOT met — 23-11 acceptance run stopped at Define; requires Phase 23 merged to develop before Phase 24 (or any new target) is reachable for a retry
+     A first draft of this very cleanup kept both notes as bullets under a "Resolved" sub-heading
+     and measured identically broken: blockers=2, still "blocked". The scan does not care what a
+     bullet says. Provenance has to leave the section, not be relabelled inside it.
+
+     Two stale entries removed 2026-08-03; provenance below, full investigation in
+     .planning/debug/stale-blockers-gate-gsd-next.md.
+
+     Do not use `gsd-tools state resolve-blocker` on this section: it reported success for a
+     string that appears nowhere in the document, and orphaned the body of a multi-line entry. -->
+
+Provenance for the two entries removed 2026-08-03, neither of which was a live blocker:
+
+(a) 17-09 concurrent-ship hang, RESOLVED 2026-07-19 (`cb9359f`). Full record retained in
+    `17-VALIDATION.md` GAP-2 and `17-09-SUMMARY.md`. Its still-open remainder — product-level
+    version-tag contention on concurrent ship — was tracked as backlog 999.4 and closed
+    `(REMOVED — 2026-07-29)`; it does not block current work.
+
+(b) Phase 23 acceptance item. Stale as written: it required Phase 23 merged before Phase 24 was
+    reachable, and Phases 24-28 and 30 have since completed. Its live concern — one phase
+    Define-to-Ship unattended — is now owned by **Phase 31's acceptance criterion** (the live
+    Phase 29 wave-2 re-run), i.e. tracked as phase scope rather than as a blocker. Removing the
+    entry does not drop the concern.
 
 ## Decisions
 
@@ -763,6 +852,7 @@ None currently open for Phase 17.
 
 ## Roadmap Evolution
 
+- Phase 31 added (2026-08-03): **Claude Adapter Launch Path — Pipe-Owning Monitor (999.64 arc close)** (dir `31-claude-adapter-launch-path-pipe-owning-monitor-999-64-arc-cl`) — the second half of the 999.64 arc, split off from Phase 30 under the operator's "no phase exceeds M" sizing cap. Created only because `30c-VERDICT.md` resolved `delivery: confirmed`; the locked precondition was that a refuted delivery premise **cancels this phase before it is planned**. Its ROADMAP entry is **compiled from existing sources, not newly authored** — Phase 30's "Next phase (31)" section, binding constraints 1/4/5/7/8/9, `30-H1-CONTEXT-FOR-31.md`, and `30d-MEASUREMENTS.md` — so discuss-phase still owns turning it into decisions. Two known-stale documents are flagged in the entry for correction before planning, because Phase 31 will read exactly those two (`30-VERIFICATION.md`'s deferred-items table lists constraint 9 items 1–2 as open when they were closed in Phase 30 by `a557805`; `30-05-SUMMARY.md` names the wrong gate predicate). **Placement note:** `gsd-tools query phase.add` inserted the stub at `lastIndexOf('\n---')`, which on this 3300-line roadmap landed it mid-prose inside the historical *Phase 29 (original scope)* section; it was moved by hand to sit directly after Phase 30, ahead of the shelved-phase block. Same class of document-order hazard recorded in Phase 27's entry below.
 - Phase 28 added (2026-07-30): **Close the Checkpoint Answer Return Path** (dir `28-close-the-checkpoint-answer-return-path`) — bundles **999.57/DEN-82** (parts A+C; part B deferred), **999.59/DEN-84**, **999.60/DEN-85**, all re-verified open at HEAD `8072ab6`. Chosen over 999.25, which has only 1 of 5 prerequisites met and whose remaining ones are findings inside unmerged `feature/phase-26` code rather than schedulable work. **999.57's entry was corrected during promotion:** it implies `session_id` is available for the session-resume fix, but `session_id` exists only in a test fixture string (`agent_result.rs:1362`) — never parsed or persisted — and the Claude adapter has no `--resume` support, so unit 28a must add all of that plumbing. 999.31 (Modular Agent Driver, High/L) was considered as a fourth unit and excluded: it reworks the same adapter layer, but folding an L into an M+S+S cluster recreates Phase 26's scope-creep shape.
 - Phase 27 added (2026-07-30): **Scrub Redirecting Git Environment From Production Calls** (dir `27-scrub-redirecting-git-environment-from-production-calls`) — promotes backlog **999.39 / DEN-66**, re-verified open at HEAD `b3cab1c`. Promoted immediately after Phase 26 closed PARTIAL: `26-REVIEW.md` CR-01 showed `mutating_project_root` is bypassed by an inherited `GIT_DIR`, making this prerequisite #1 for 999.25's re-attempt and blocking 999.52 (`sync`) from shipping independently. Appended at end-of-milestone rather than after Phase 26's entry, because a stray Phase 23 historical-record block sits between Phase 26 and Phase 24 in document order and would have mis-attributed to 27.
 - Phase 18 reprioritized, fixed Phase 19 eliminated (2026-07-20): Dogfood Reliability Hardening (dir `18-dogfood-reliability-hardening`) takes Phase 18's slot from Hermes Support (dir renamed to `999.1-hermes-support`); the fixed "Phase 19: Operator Observability" entry is replaced entirely — its content is absorbed into 18, confirmed already fixed, or moved to backlog dirs `999.2`–`999.5`. See 2026-07-20 decision entry.
@@ -838,6 +928,6 @@ None currently open for Phase 17.
 
 ## Session
 
-**Last session:** 2026-07-31T01:06:18.064Z
-**Stopped at:** Phase 28 context gathered
-**Resume file:** .planning/phases/28-close-the-checkpoint-answer-return-path/28-CONTEXT.md
+**Last session:** 2026-08-03T14:05:39Z
+**Stopped at:** Phase 31 context gathered
+**Resume file:** .planning/phases/31-claude-adapter-launch-path-pipe-owning-monitor-999-64-arc-cl/31-CONTEXT.md

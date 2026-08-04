@@ -1,9 +1,9 @@
 ---
-status: testing
+status: complete
 phase: 25-end-to-end-dogfood-blockers
 source: [25-VERIFICATION.md]
 started: 2026-07-28T18:35:00Z
-updated: 2026-07-28T20:05:00Z
+updated: 2026-08-03T10:45:00Z
 ---
 
 > **Diagnosis note.** The `diagnose_issues` step's parallel debug agents were not spawned. Both
@@ -15,12 +15,7 @@ updated: 2026-07-28T20:05:00Z
 
 ## Current Test
 
-number: 3
-name: Sixth monitor-leak site on the resume() path (WINDOWS item 5)
-expected: |
-  Either resume_clears_stop_marker_and_advances_past_stop_point binds the guard like the
-  other five sites, or the residual is explicitly waived with a reason.
-awaiting: user response
+[testing complete]
 
 ## Tests
 
@@ -38,15 +33,16 @@ severity: major
 
 ### 3. Sixth monitor-leak site on the resume() path (WINDOWS item 5)
 expected: Either `pipeline_launch.rs::tests::resume_clears_stop_marker_and_advances_past_stop_point` binds `ReapMonitorOnDrop::after_launch(&state)` like the other five sites, or the residual is explicitly waived with a stated reason. Found by gsd-verifier after round 4 (observed pid 852403 under --nocapture) and independently confirmed by the orchestrator: `resume()` reaches `launch_stage` at `pipeline_launch.rs:230`. It is a FOURTH wrapping entry point that neither round's enumeration grep could see. Orchestrator's transitive sweep confirms the enumeration is now COMPLETE — this is the only remaining unguarded site.
-result: [pending]
+result: skipped
+reason: "Session left dangling since 2026-07-28; closed out administratively 2026-08-03 during Phase 30 cleanup, not tested. Never verified true or false — if resume()'s monitor-leak site still needs checking, re-open as a new test rather than trusting this skip."
 
 ## Summary
 
 total: 3
 passed: 0
 issues: 2
-pending: 1
-skipped: 0
+pending: 0
+skipped: 1
 blocked: 0
 
 ## Gaps

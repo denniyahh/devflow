@@ -35,6 +35,11 @@ Two things this hook does that are load-bearing:
   hooks directory wholesale, so without that shim the command above would
   silently switch off a global secret scanner. It is a no-op if you have no
   such hook.
+- [`scripts/hooks/post-commit`](scripts/hooks/post-commit) warns when a commit
+  lands a plan `*-SUMMARY.md` while `.planning/STATE.md`'s authored prose still
+  describes an earlier wave. It only warns — it never edits a tracked file, so
+  it cannot break a plan's `git diff --name-only` scope fence. It delegates to a
+  prior `post-commit` the same way. Silent on commits that land no summary.
 
 ### Repository git policy
 
@@ -46,8 +51,15 @@ git config --local include.path ../.gitconfig
 ```
 
 (the path is relative to `.git/config`). This turns on SSH-format signing for
-both commits and tags. It deliberately does **not** set `user.signingkey` —
-that is per-contributor and this repository is public.
+both commits and tags, and configures the git-flow branch model. It
+deliberately does **not** set `user.signingkey` — that is per-contributor and
+this repository is public.
+
+Because the model is supplied by that include, **do not run `git flow init -d`**:
+its default production branch is `master` and this repository's is `main`, so
+the defaults would misconfigure git-flow against a branch that does not exist,
+surfacing only later at release or hotfix time. With the include in place,
+`git flow feature start <name>` works directly.
 
 ### Release signing
 

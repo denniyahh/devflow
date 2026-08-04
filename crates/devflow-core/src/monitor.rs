@@ -11,12 +11,16 @@
 //! This is the core automation primitive — no cron, no scheduler,
 //! no agent cooperation needed.
 
+use crate::agent_result::{IdleTimeoutCommit, IdleTimeoutRecord};
 use crate::git::hermetic_command;
 use crate::state::State;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::mpsc;
 use std::time::Duration;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Errors produced by monitor operations.
 #[derive(Debug, thiserror::Error)]
@@ -30,16 +34,230 @@ pub enum MonitorError {
     /// Could not determine the current executable path.
     #[error("could not determine devflow binary path")]
     NoBinaryPath,
+    /// A child spawned with piped stdio did not expose one of its pipes.
+    #[error("supervised child exposed no {0} pipe")]
+    NoChildPipe(&'static str),
+}
+
+/// Idle-timeout default in seconds (D-02): the measured constraint-8 floor.
+///
+/// Plan 31-02 supplies the configurable-and-clamped reader that can only raise
+/// this. Until then `spawn_monitor` passes this literal to the monitor process.
+///
+/// Raised 30s -> 120s on 2026-08-03 by direct measurement; see
+/// [`IDLE_TIMEOUT_FLOOR_SECS`] for the trials and the reasoning. The previous
+/// value's "~4.2x margin" was computed against a workload that never entered a
+/// long foreground tool call, and did not transfer to one.
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 120;
+
+/// The floor an idle timeout can never be configured below (D-02/D-04, 31-02).
+///
+/// **Raised 30s -> 120s on 2026-08-03, and the reasoning that set 30s was
+/// wrong — read this before touching it again.**
+///
+/// The original ≥30s floor cited "~4.2x margin" against an every-line signal
+/// whose observed max was 7.09s. Both numbers were real; the inference was not.
+/// Phase 30d measured *backgrounded* 10s/22s sleeps, where the agent is never
+/// sitting inside a long foreground tool call. Under one, the CLI emits
+/// `tool_progress` keepalives on a **fixed 30.00s interval**, so a healthy,
+/// hard-working child produces a 30.00s gap between stream lines — dead level
+/// with a 30s timeout, and on the wrong side of it, since the timer starts when
+/// the previous line is *processed* while the keepalive arrives 30s after it
+/// was *sent*, plus pipe latency.
+///
+/// Measured 2026-08-03, CLI 2.1.220, five workload-controlled trials across two
+/// unrelated workload types (each verified to have actually run — elapsed >=
+/// the workload duration, no `tool_use_error`), plus a negative control:
+///
+/// | workload                  | gaps > 5s              |
+/// |---------------------------|------------------------|
+/// | 90s busy loop x3          | ~26.4, **30.00**, ~30.0 |
+/// | `cargo test --workspace` x2 | ~26.4, **30.00**, ~16  |
+/// | control (no long call)    | max 2.2                |
+///
+/// Variance across all five: ±0.02s. `cargo test --workspace` is not a contrived
+/// case — it sits inside DevFlow's own post-merge gate, so the old floor would
+/// have killed healthy Code stages on the common path.
+///
+/// 120s is 4x the measured cadence: it survives **three** consecutive missed
+/// keepalives. That headroom is the point — the hazard is not a slightly larger
+/// gap but a *dropped* keepalive, which doubles the interval outright. 90s
+/// (two missed) is the lowest defensible value; do not go below it.
+///
+/// Do NOT lower it, and note that no configuration can. Phase 30d measured a
+/// 12-second bound killing a LIVE, HEALTHY run in 2 of 7 trials.
+///
+/// **What the five trials do not establish:** one machine, idle, one CLI
+/// version, two workload types. They show the 30.00s cadence is real and
+/// reproducible; they do not prove the interval is fixed across load, hardware,
+/// or CLI versions. That is precisely why this floor sits well above the
+/// observed maximum rather than near it.
+///
+/// Because the default IS the floor, the value can only ever be raised.
+pub const IDLE_TIMEOUT_FLOOR_SECS: u64 = 120;
+
+/// The environment variable that raises the idle timeout above its floor.
+pub const IDLE_TIMEOUT_ENV: &str = "DEVFLOW_CLAUDE_IDLE_TIMEOUT_SECS";
+
+/// How [`parse_idle_timeout_secs`] arrived at the timeout now in force.
+///
+/// A distinct enum rather than the plain `clamped: bool` the plan sketched:
+/// there are FOUR distinguishable resolutions, not two, and the loud operator
+/// notice needs to name the value that was configured — which a bool cannot
+/// carry. `ValidateOutcome` in `pipeline_outcomes.rs` makes the same argument
+/// for the same reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdleTimeoutResolution {
+    /// Nothing was configured; the default — which is the floor — is in force.
+    Default,
+    /// A configured value at or above the floor is in force verbatim.
+    Configured,
+    /// A configured value BELOW the floor was raised to it (D-04).
+    Clamped {
+        /// What the operator asked for, for the notice to name.
+        configured: u64,
+    },
+    /// A value was set but could not be parsed; the default is in force.
+    ///
+    /// Loud for the same reason the clamp is. An operator who meant `600` and
+    /// typed `60O` silently gets the 120s default, and a legitimately slow stage then dies
+    /// on a timeout nobody chose. `parse_gate_max_unattended_age` substitutes
+    /// silently in this case and is the anti-pattern here, not the precedent.
+    Unparseable {
+        /// The raw value, echoed back so the typo is visible.
+        raw: String,
+    },
+}
+
+/// A resolved idle timeout together with how it was arrived at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdleTimeoutSetting {
+    /// The window that must elapse with NO line on the child's stdout.
+    pub timeout: Duration,
+    /// How that value was reached — observable to the caller as a VALUE, not
+    /// only as a log line, so a test can assert on it directly.
+    pub resolution: IdleTimeoutResolution,
+}
+
+impl IdleTimeoutSetting {
+    /// Whether the floor clamp engaged.
+    pub fn clamped(&self) -> bool {
+        matches!(self.resolution, IdleTimeoutResolution::Clamped { .. })
+    }
+
+    /// The loud, operator-facing notice this resolution owes, if any.
+    ///
+    /// `None` for the two unremarkable cases. `Some` exactly when a value the
+    /// operator supplied is NOT the value in force — the case that must never
+    /// pass silently.
+    pub fn notice(&self) -> Option<String> {
+        match &self.resolution {
+            IdleTimeoutResolution::Default | IdleTimeoutResolution::Configured => None,
+            IdleTimeoutResolution::Clamped { configured } => Some(format!(
+                "{IDLE_TIMEOUT_ENV}={configured} is below the {IDLE_TIMEOUT_FLOOR_SECS}s floor \
+                 and was CLAMPED; {}s is in force. A shorter window kills healthy runs: a 12s \
+                 bound terminated a live, healthy run in 2 of 7 measured trials.",
+                self.timeout.as_secs()
+            )),
+            IdleTimeoutResolution::Unparseable { raw } => Some(format!(
+                "{IDLE_TIMEOUT_ENV}={raw:?} could not be parsed as a whole number of seconds; \
+                 the {}s default is in force. If you meant to RAISE the timeout, this did not \
+                 do it.",
+                self.timeout.as_secs()
+            )),
+        }
+    }
+}
+
+/// Resolve a raw idle-timeout override into the value actually in force.
+///
+/// Pure — no environment access — so it is unit-testable directly rather than
+/// by mutating process-global env. That shape is copied from
+/// `devflow-cli`'s four `parse_*` timeout readers; their BEHAVIOUR is
+/// deliberately not copied, because none of them clamps against a floor and
+/// none logs when a fallback engages. There is no clamp-and-log precedent
+/// anywhere in this workspace; this is the first (D-04).
+pub fn parse_idle_timeout_secs(raw: Option<String>) -> IdleTimeoutSetting {
+    let floor = Duration::from_secs(IDLE_TIMEOUT_FLOOR_SECS);
+
+    // An unset variable and an EMPTY one are the same intent: nothing chosen.
+    // Only a non-empty value that fails to parse is a typo worth shouting at.
+    let Some(trimmed) = raw.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return IdleTimeoutSetting {
+            timeout: floor,
+            resolution: IdleTimeoutResolution::Default,
+        };
+    };
+
+    let Ok(configured) = trimmed.parse::<u64>() else {
+        return IdleTimeoutSetting {
+            timeout: floor,
+            resolution: IdleTimeoutResolution::Unparseable {
+                raw: trimmed.to_string(),
+            },
+        };
+    };
+
+    if configured < IDLE_TIMEOUT_FLOOR_SECS {
+        IdleTimeoutSetting {
+            timeout: floor,
+            resolution: IdleTimeoutResolution::Clamped { configured },
+        }
+    } else {
+        IdleTimeoutSetting {
+            timeout: Duration::from_secs(configured),
+            resolution: IdleTimeoutResolution::Configured,
+        }
+    }
+}
+
+/// The thin environment wrapper over [`parse_idle_timeout_secs`].
+///
+/// The variable name is spelled out as a STRING LITERAL here rather than
+/// passed as [`IDLE_TIMEOUT_ENV`], and that is deliberate.
+/// `doc_check::source_read_env_vars` recognises a variable only when it is read
+/// through a literal inside `std::env::var("...")`; reading it through the
+/// const compiles and works identically but makes the variable INVISIBLE to
+/// the operator-doc parity gate, which would then pass green while the
+/// variable went undocumented. Verified by removing this variable's row from
+/// `OPERATIONS.md` and confirming `doc_check` reddens.
+pub fn idle_timeout_setting() -> IdleTimeoutSetting {
+    parse_idle_timeout_secs(std::env::var("DEVFLOW_CLAUDE_IDLE_TIMEOUT_SECS").ok())
+}
+
+/// Which supervision shape [`spawn_monitor`] should launch.
+///
+/// This is a MODE selection on one supervisor, not two monitors: both arms
+/// write the same capture, exit-code and agent-pid files under `.devflow/`,
+/// and both end by advancing the same stage machine. Nothing downstream needs
+/// to know which arm ran.
+pub enum MonitorLaunch {
+    /// Phase 31: a Rust supervisor that owns BOTH of the child's pipes,
+    /// delivers `prompt` as a JSON user turn on the child's stdin, and holds
+    /// that stdin open past the child's first turn so a task-notification turn
+    /// can still be delivered (constraint 4).
+    PipeOwning {
+        /// The stage prompt, delivered on the child's stdin rather than argv.
+        prompt: String,
+    },
+    /// The pre-31 detached `sh` script: stdin is `/dev/null`, stdout is
+    /// redirected to the capture file by the shell, and the script waits on
+    /// the agent then runs `devflow advance`. Every non-Claude adapter, every
+    /// stage not yet widened by D-09/D-10's rollout, and the checkpoint-resume
+    /// relaunch all run through here, unchanged.
+    Legacy,
 }
 
 /// Spawn a background monitor that owns the agent for the given workflow state.
 ///
-/// The monitor is a detached shell process that:
-/// 1. Launches the agent (`program` + `args`) with stdout redirected to the
+/// The monitor is a detached process that:
+/// 1. Launches the agent (`program` + `args`) with stdout captured to the
 ///    phase stdout file, recording the agent PID to the agent-pid file
 /// 2. Waits for the agent to exit and records its exit code to the exit file
 /// 3. Runs `devflow advance --phase N` to advance the workflow through its
 ///    remaining stages
+///
+/// `launch` selects the supervision shape — see [`MonitorLaunch`].
 ///
 /// Returns the PID of the spawned monitor.
 pub fn spawn_monitor(
@@ -47,8 +265,9 @@ pub fn spawn_monitor(
     program: &str,
     args: &[String],
     envs: &[(String, String)],
+    launch: MonitorLaunch,
 ) -> Result<u32, MonitorError> {
-    spawn_monitor_inner(state, program, args, envs, true)
+    spawn_monitor_inner(state, program, args, envs, launch, true)
 }
 
 fn spawn_monitor_inner(
@@ -56,6 +275,7 @@ fn spawn_monitor_inner(
     program: &str,
     args: &[String],
     envs: &[(String, String)],
+    launch: MonitorLaunch,
     run_advance: bool,
 ) -> Result<u32, MonitorError> {
     let project_root = state
@@ -98,6 +318,93 @@ fn spawn_monitor_inner(
         .as_deref()
         .unwrap_or(&state.project_root);
     let workdir = workdir_path.to_str().ok_or(MonitorError::NonUtf8Path)?;
+
+    if let MonitorLaunch::PipeOwning { prompt } = launch {
+        // `run_advance` is not consulted on this arm: the `__monitor`
+        // subcommand always advances after reaping, and `spawn_monitor` is the
+        // only caller of this function — it hardcodes `true`. Adding a
+        // `--no-advance` flag for a case nothing exercises would be an
+        // untested branch; add it when a caller actually needs it.
+        let _ = run_advance;
+
+        // The adapter's extra env rides down by INHERITANCE here (set via
+        // `.envs(...)` on the `__monitor` process below), and that is only
+        // sufficient because the sole adapter routed through this arm —
+        // Claude — declares no extra env at all
+        // (`codex_disables_signing_via_env_others_do_not` asserts this).
+        // Widening this arm to an adapter that DOES set env requires
+        // threading it explicitly to `run_pipe_owning_monitor`: the inner
+        // `hermetic_command` scrubs `GIT_CONFIG_COUNT`, which neutralises any
+        // inherited `GIT_CONFIG_KEY_n` pair (Codex's unsigned-commit
+        // override is exactly that shape). Loud rather than silent, and in
+        // the CLI process where an operator can actually see it.
+        if !envs.is_empty() {
+            warn!(
+                "pipe-owning monitor: {} adapter env var(s) will not survive the \
+                 inner hermetic_command scrub — thread them explicitly before \
+                 routing an env-setting adapter through this arm",
+                envs.len()
+            );
+        }
+
+        // D-04: resolve and clamp the idle timeout HERE, in the parent, and
+        // hand the monitor the already-resolved integer.
+        //
+        // The placement is the whole point. `spawn_monitor` runs inside
+        // `devflow start`, attached to the operator's terminal; the monitor is
+        // a detached process whose stdio is all `Stdio::null()`, so a warning
+        // logged there scrolls into nothing. A silent clamp is the exact
+        // failure class this project keeps paying for, so the notice goes to
+        // BOTH `tracing::warn!` and stdout — the log for the record, stdout
+        // for the human who is watching right now.
+        let idle = idle_timeout_setting();
+        if let Some(notice) = idle.notice() {
+            warn!("{notice}");
+            println!("{notice}");
+        }
+
+        // The prompt travels as a FILE, not argv: argv has a hard length
+        // ceiling and DevFlow stage prompts routinely exceed what is safe to
+        // pass positionally.
+        let prompt_file = crate::agent_result::prompt_path(&state.project_root, state.phase);
+        std::fs::write(&prompt_file, &prompt)?;
+        let prompt_file = prompt_file.to_str().ok_or(MonitorError::NonUtf8Path)?;
+
+        // Re-exec THIS binary as its hidden `__monitor` subcommand. The
+        // monitor must outlive `devflow start`/`advance`, so it has to be a
+        // distinct OS process; re-exec needs no daemonization primitive beyond
+        // `spawn()`-without-`wait()`, which is exactly what the `sh` monitor
+        // below already relies on.
+        //
+        // Ordering is load-bearing for the same reason the Legacy arm's
+        // comment gives: `hermetic_command` does its `env_remove`s at
+        // construction and `.envs(...)` runs after, so deliberate
+        // configuration survives while inherited pollution does not.
+        let child = hermetic_command(&binary, workdir_path)
+            .arg("__monitor")
+            .arg("--project")
+            .arg(project_root)
+            .arg("--phase")
+            .arg(state.phase.to_string())
+            .arg("--workdir")
+            .arg(workdir)
+            .arg("--prompt-file")
+            .arg(prompt_file)
+            .arg("--idle-timeout-secs")
+            .arg(idle.timeout.as_secs().to_string())
+            .arg("--")
+            .arg(program)
+            .args(args)
+            .envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+
+        let pid = child.id();
+        info!("pipe-owning monitor spawned with pid {pid}");
+        return Ok(pid);
+    }
 
     // Shell script that launches the agent in the background, captures its
     // stdout and exit code, then advances the workflow. Because this process
@@ -178,6 +485,588 @@ fn spawn_monitor_inner(
     Ok(pid)
 }
 
+/// Constraint 4's close rule as a pure, line-fed state machine: stdin may be
+/// released only once a `DEVFLOW_RESULT` marker has appeared inside a
+/// TOP-LEVEL `result` event **and** the background-task list has drained.
+///
+/// An `AND` of two arms, neither sufficient alone:
+///
+/// - **Marker arm.** Satisfied only by
+///   [`crate::agent_result::event_is_top_level_result_marker`] — a composition
+///   of the existing `is_top_level` predicate and the existing marker parser,
+///   never a looser text search. The CLI echoes the operator's prompt back
+///   into the same stdout, and DevFlow's own stage prompts discuss
+///   `DEVFLOW_RESULT` markers at length, so marker text alone is not evidence
+///   (T-31-01; the same echo produced the checkpoint false positive 30-05
+///   fixed).
+/// - **Drain arm.** Satisfied when no `background_tasks_changed` event has
+///   ever announced anything (vacuous — the common single-plan case) or when
+///   the most recent one carried an empty list.
+///
+/// **The drain alone is never a stop signal.** 30c/30d measured the
+/// drain-to-final-`result` lag at 4.54–11.51s across 14 trials; closing at the
+/// drain would have truncated the final orchestrator turn in all seven 30d
+/// trials.
+///
+/// **Never count `result` events.** Constraint 7: the CLI coalesces
+/// completions, so a wave whose children finish together produces one `result`
+/// for several of them — a shape superficially indistinguishable from "one
+/// child delivered, one lost". The drained list is the only thing separating
+/// those two. Per 30-04 the drain arm is *defensive rather than load-bearing*
+/// (n=2 Mode B trials delivered everything without it); that is the recorded
+/// reason to keep it cheaply, not a reason to drop it.
+///
+/// **A line that does not parse as JSON is ignored by this rule** — it can
+/// neither satisfy nor block either arm — but it is still teed verbatim to the
+/// capture file by the reader thread. A torn line therefore cannot silently
+/// decide anything, and cannot be silently lost either.
+#[derive(Default)]
+pub struct CloseRule {
+    marker_seen: bool,
+    /// `None` = nothing was ever announced; `Some(n)` = the last announcement
+    /// carried `n` tasks. The two are deliberately distinguishable: `None` is
+    /// vacuously drained, and conflating it with `Some(0)` would erase the
+    /// difference between "no children" and "children, all finished".
+    pending_background_tasks: Option<usize>,
+}
+
+impl CloseRule {
+    /// Fold one raw stdout line into the rule.
+    pub fn observe(&mut self, line: &str) {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+            return;
+        };
+        if crate::agent_result::event_is_top_level_result_marker(&event) {
+            self.marker_seen = true;
+        }
+        if event.get("type").and_then(serde_json::Value::as_str) == Some("system")
+            && event.get("subtype").and_then(serde_json::Value::as_str)
+                == Some("background_tasks_changed")
+            && let Some(tasks) = event.get("tasks").and_then(serde_json::Value::as_array)
+        {
+            // Only a readable `tasks` array updates the count. An announcement
+            // whose list cannot be read leaves the previous state standing
+            // rather than being treated as a drain — the conservative
+            // direction, since an early close truncates while a late one
+            // merely costs an idle timeout.
+            self.pending_background_tasks = Some(tasks.len());
+        }
+    }
+
+    /// Whether both arms hold and the child's stdin may be released.
+    pub fn should_close(&self) -> bool {
+        self.marker_seen && matches!(self.pending_background_tasks, None | Some(0))
+    }
+}
+
+/// The single place the stdin wire shape is constructed: one line of JSON
+/// carrying the initial user turn for a `--input-format stream-json` child.
+///
+/// Shape (`{"type":"user","message":{"role":"user","content":<prompt>}}`) is
+/// reproduced from the three archived Phase 30 harnesses, which all wrote
+/// exactly this and got a working turn back.
+///
+/// Built with `serde_json` rather than `format!` so the prompt is ESCAPED, not
+/// interpolated. A stage prompt is arbitrary text containing quotes, newlines
+/// and backslashes; interpolating it would produce a torn JSON line the CLI
+/// rejects, and a prompt could then alter the surrounding document's structure.
+pub fn user_turn_line(prompt: &str) -> String {
+    serde_json::json!({
+        "type": "user",
+        "message": { "role": "user", "content": prompt },
+    })
+    .to_string()
+}
+
+/// Supervise a `stream-json` child, owning both of its pipes, until the close
+/// rule is satisfied and the child exits. Returns the child's exit code, which
+/// is also written to the phase exit file.
+///
+/// This runs INSIDE the detached `__monitor` process, not in the CLI.
+///
+/// Threading model (constraint 4 / T-31-04). Three participants:
+/// - a **writer thread** owning the child's stdin: it writes the initial user
+///   turn, then BLOCKS on a channel rather than returning. It drops stdin only
+///   when told to, because constraint 4's `AND` can never be honoured if stdin
+///   is already gone — a task-notification turn arriving after the child's
+///   first turn would have nowhere to be delivered.
+/// - a **reader thread** owning the child's stdout: it tees each line verbatim
+///   to the capture file and forwards it to the supervisor. Dropping its
+///   sender at EOF is what surfaces `Disconnected` below.
+/// - the **supervisor** (this function's own thread), which applies the close
+///   rule and reaps.
+///
+/// The write and the read MUST be on independent threads. Writing the prompt
+/// synchronously before reading stdout is the textbook two-pipe deadlock: it
+/// passes every short-prompt smoke test and hangs on exactly the context-heavy
+/// production stages that matter (the Linux pipe buffer is commonly 64KiB and
+/// a DevFlow stage prompt can exceed that in one write).
+#[allow(clippy::too_many_arguments)]
+pub fn run_pipe_owning_monitor(
+    project_root: &Path,
+    phase: u32,
+    workdir: &Path,
+    prompt: &str,
+    idle_timeout: Duration,
+    program: &str,
+    args: &[String],
+    envs: &[(String, String)],
+) -> Result<i32, MonitorError> {
+    let stdout_file = crate::agent_result::stdout_path(project_root, phase);
+    let stderr_file = crate::agent_result::stderr_path(project_root, phase);
+    let exit_file = crate::agent_result::exit_code_path(project_root, phase);
+    let pid_file = crate::agent_result::agent_pid_path(project_root, phase);
+    if let Some(parent) = stdout_file.parent() {
+        crate::workflow::ensure_devflow_dir(parent)?;
+    }
+
+    // stderr goes to its own file so it cannot corrupt the JSONL stdout
+    // capture DevFlow parses — the same separation the Legacy script's
+    // `2>{stderr_file}` provides.
+    let stderr_handle = std::fs::File::create(&stderr_file)?;
+    // One handle, opened once, truncating at open and appending line by line.
+    // Truncate-at-open reproduces the Legacy arm's `>` redirection exactly, so
+    // a capture from a previous attempt can never be mixed into this one's
+    // (the launch path archives the prior capture first, but relying on that
+    // to make an append-mode open safe would be an unstated coupling).
+    let mut capture = std::fs::File::create(&stdout_file)?;
+
+    let mut child = hermetic_command(program, workdir)
+        .args(args)
+        .envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(stderr_handle))
+        // T-31-05: make the child its own process-group leader so a later
+        // group signal cannot reach this monitor's own ancestors. Verified
+        // source shows the pre-31 `spawn_monitor` had NO session or group
+        // configuration at all — detachment came only from the parent not
+        // waiting — so this closes a gap rather than preserving one.
+        // Full `setsid()` session detachment is deliberately NOT done: no
+        // forensics record cites a SIGHUP-related monitor loss, so there is
+        // no evidence it buys anything. `pre_exec` calling `libc::setsid()`
+        // is the one-line follow-on if such a loss ever surfaces.
+        .process_group(0)
+        .spawn()?;
+
+    // Recorded immediately, before any pipe work: `wait_for_agent_pid` polls
+    // for this and the rest of DevFlow's liveness reporting depends on it.
+    let child_pid = child.id();
+    std::fs::write(&pid_file, format!("{child_pid}\n"))?;
+
+    let mut child_stdin = child
+        .stdin
+        .take()
+        .ok_or(MonitorError::NoChildPipe("stdin"))?;
+    let child_stdout = child
+        .stdout
+        .take()
+        .ok_or(MonitorError::NoChildPipe("stdout"))?;
+
+    let (close_tx, close_rx) = mpsc::channel::<()>();
+    let turn = user_turn_line(prompt);
+    let writer = std::thread::spawn(move || {
+        let wrote = child_stdin
+            .write_all(turn.as_bytes())
+            .and_then(|()| child_stdin.write_all(b"\n"))
+            .and_then(|()| child_stdin.flush());
+        if let Err(err) = wrote {
+            warn!("could not write the initial user turn to the child's stdin: {err}");
+            return;
+        }
+        // Deliberately NOT dropping stdin here — see this function's doc.
+        // Either signal (an explicit close, or the supervisor dropping its
+        // sender) means the same thing: stop holding the pipe open.
+        let _ = close_rx.recv();
+        drop(child_stdin);
+    });
+
+    let (line_tx, line_rx) = mpsc::channel::<String>();
+    let reader = std::thread::spawn(move || {
+        // `read_until` + `from_utf8_lossy`, NOT `BufRead::lines()` (peer review
+        // 2026-08-03, CRITICAL). `lines()` yields `Err(InvalidData)` on a single
+        // non-UTF-8 byte, and the previous code treated any read error as EOF —
+        // so one bad byte silently truncated the capture and dropped every later
+        // line INCLUDING the terminal `DEVFLOW_RESULT` marker. That is precisely
+        // the boundary-truncation class constraint 9 exists for, manufactured by
+        // the supervisor itself rather than by a dying writer.
+        //
+        // Decoding is now lossy and NON-fatal: undecodable bytes become U+FFFD
+        // and the line still reaches the capture and the close rule. A genuine
+        // I/O error still ends the loop, because that one really is EOF.
+        let mut reader_buf = BufReader::new(child_stdout);
+        let mut raw = Vec::new();
+        loop {
+            raw.clear();
+            match reader_buf.read_until(b'\n', &mut raw) {
+                Ok(0) => break, // real EOF
+                Ok(_) => {}
+                Err(err) => {
+                    warn!("stdout read error, treating as EOF: {err}");
+                    break;
+                }
+            }
+            while raw.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
+                raw.pop();
+            }
+            let line = String::from_utf8_lossy(&raw).into_owned();
+            // Tee VERBATIM before any interpretation: the whole Layer 1
+            // cascade reads this file, and a line the close rule ignores
+            // (unparseable noise, interleaved prose) must still reach it.
+            if let Err(err) = writeln!(capture, "{line}") {
+                warn!("could not append to the capture file: {err}");
+            }
+            let _ = capture.flush();
+            if line_tx.send(line).is_err() {
+                break;
+            }
+        }
+        // Dropping `line_tx` here is what surfaces `Disconnected` below.
+    });
+
+    // Constraint 4's close rule lives in `CloseRule` so it can be unit-tested
+    // by feeding it lines, with no child process per case.
+    let mut rule = CloseRule::default();
+    let mut close_signalled = false;
+
+    loop {
+        match line_rx.recv_timeout(idle_timeout) {
+            Ok(line) => {
+                if close_signalled {
+                    continue;
+                }
+                rule.observe(&line);
+                if rule.should_close() {
+                    let _ = close_tx.send(());
+                    close_signalled = true;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // AFTER a deliberate close, silence is EXPECTED, not a hang
+                // (peer review 2026-08-03, CRITICAL). The close rule fires only
+                // once the agent has emitted its terminal marker AND background
+                // tasks have drained — at which point it has said everything it
+                // intends to say and is merely winding down. Firing the idle
+                // timeout here wrote an authoritative `IdleTimeout` verdict OVER
+                // a completed, successful stage; and because `evaluate_layer1`
+                // reads that side channel FIRST, by design, so that nothing can
+                // shadow a real timeout, the bogus verdict outranked the real
+                // success and could not be recovered from. The mechanism that
+                // protects a true timeout is what made a false one fatal.
+                //
+                // Break instead: the reap path below already bounds a child that
+                // will not exit, via `terminate_and_verify`.
+                if close_signalled {
+                    info!(
+                        "no output for {idle_timeout:?} after the close rule released stdin; \
+                         the stage already reported — proceeding to reap, NOT recording a timeout"
+                    );
+                    break;
+                }
+                // No outer wall-clock bound exists anywhere in this loop, and
+                // none may be added (D-03). `recv_timeout` measures the gap
+                // since the LAST LINE, so a healthy 47-minute stage that keeps
+                // emitting is never touched — every line the reader thread
+                // forwards resets the window naturally, which is D-01's
+                // every-line signal rather than a milestone-only one. There is
+                // no single wall-clock value that is safe for both a hang and
+                // a legitimately long stage, which is why constraint 5
+                // rejected one.
+                fire_idle_timeout(project_root, phase, workdir, child_pid, idle_timeout);
+                break;
+            }
+        }
+    }
+
+    // Guarantee stdin is released before waiting. A child still holding an
+    // open stdin may never exit, and `child.wait()` would then block forever.
+    drop(close_tx);
+
+    let status = child.wait()?;
+    // A signal-killed child has NO exit code — `status.code()` is `None`, and
+    // the previous `unwrap_or(-1)` threw the signal away (peer review
+    // 2026-08-03, found independently by both reviewers and by the 31-04 plan
+    // review as W1). That silently defeated the classification 31-04 took care
+    // to preserve: `evaluate_layer2` and
+    // `reconcile_stream_success_against_exit_code` map **137** to
+    // `ResourceKilled` (routed to `GateInfra` — an infrastructure fault) and
+    // **127** to `AgentUnavailable`. Recording `-1` matched neither, so a real
+    // OOM kill arrived as a generic `Failed` and routed to `GateReview`, asking
+    // an operator to code-review a stage that was killed by the kernel.
+    //
+    // `128 + signal` is the shell convention those constants already encode:
+    // SIGKILL(9) -> 137, SIGTERM(15) -> 143. `-1` is now reachable only when a
+    // status is neither exited nor signalled, which POSIX does not define.
+    let code = status.code().unwrap_or_else(|| {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal().map_or(-1, |signal| 128 + signal)
+    });
+    std::fs::write(&exit_file, format!("{code}\n"))?;
+
+    let _ = writer.join();
+    let _ = reader.join();
+
+    info!("supervised child {child_pid} exited with code {code}");
+    Ok(code)
+}
+
+/// The idle-timeout firing sequence, in the ONE order it may run (D-05).
+///
+/// 1. Enumerate the commits the agent made.
+/// 2. Write the authoritative verdict to its side-channel file, and fsync it.
+/// 3. **Only then** terminate the child.
+/// 4. Append a loud entry to the monitor's own log.
+///
+/// Step 3 must not precede step 2, and reversing them is not a stylistic
+/// choice. Between "the child is dead" and "an authoritative result exists"
+/// there is a window in which the verdict cascade sees a dead process, no
+/// Layer-1 answer, and some commits on the branch — and Layer 2 scores exactly
+/// that as `Success`. That is 999.64 reborn inside its own fix. A bare kill
+/// with no record is the other half of the same failure: exit code 137 reads
+/// as `ResourceKilled`, blaming an OOM that never happened.
+///
+/// **Nothing here rolls back, resets, or reverts a commit** (D-07, T-31-09).
+/// The commit log is READ and never written. A timeout can be a false
+/// positive, and destroying real work on a false positive is unrecoverable —
+/// this repo treats irreversible operations as needing review, not tests.
+///
+/// Scoped to the `PipeOwning` arm alone: `Legacy` keeps today's behaviour, and
+/// Codex/OpenCode keep theirs. The 120-second floor was measured against
+/// Claude's stream cadence (a fixed 30.00s `tool_progress` keepalive), and
+/// applying it to an agent whose output cadence has never been measured would
+/// be a behaviour prediction — the thing constraint 1 forbids.
+///
+/// Every step is best-effort and none can abort the sequence. A failure to
+/// enumerate, write, or log must still leave the child terminated and the
+/// stage machine advancing to a never-silent gate; the operator loses detail,
+/// never the verdict.
+fn fire_idle_timeout(
+    project_root: &Path,
+    phase: u32,
+    workdir: &Path,
+    child_pid: u32,
+    idle: Duration,
+) {
+    let idle_secs = idle.as_secs();
+    warn!("idle timeout: no output from the supervised child for {idle_secs}s");
+
+    // 1. Enumerate. A failure degrades to an empty list plus a note; it never
+    //    aborts, because a missing commit list must not cost the verdict.
+    let (commits, enumeration_note) = enumerate_phase_commits(workdir, phase);
+
+    // 2. Write, flush, fsync. This completing is the ONLY thing that stops
+    //    Layer 2 from later scoring partial commits as Success.
+    let write_error =
+        write_idle_timeout_record(project_root, phase, idle_secs, child_pid, &commits)
+            .err()
+            .map(|err| err.to_string());
+    if let Some(err) = &write_error {
+        warn!("idle timeout: could not persist the verdict: {err}");
+    }
+
+    // 3. Only now is it safe to kill.
+    let terminated = terminate_child_group(child_pid);
+
+    // 4. Loud, durable, and readable after the fact.
+    let named: Vec<String> = commits
+        .iter()
+        .map(|commit| {
+            let short: String = commit.sha.chars().take(7).collect();
+            format!("{short} {}", commit.subject)
+        })
+        .collect();
+    let mut entry = format!(
+        "[idle-timeout] no output for {idle_secs}s; terminated agent pid {child_pid} \
+         (verified dead: {terminated}). {} commit(s) on the phase branch, NONE rolled back{}{}",
+        named.len(),
+        if named.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", named.join("; "))
+        },
+        enumeration_note
+            .map(|note| format!(" [commit enumeration degraded: {note}]"))
+            .unwrap_or_default(),
+    );
+    if let Some(err) = write_error {
+        entry.push_str(&format!(" [verdict file could not be written: {err}]"));
+    }
+    warn!("{entry}");
+    append_monitor_log(project_root, phase, &entry);
+}
+
+/// Enumerate the commits on this phase's feature branch, as
+/// `(commits, degradation note)`.
+///
+/// Same range construction `evaluate_layer2`'s commit COUNT uses
+/// (`{develop}..{feature_prefix}phase-NN`) — the same question asked with
+/// `git log` instead of `rev-list --count`, so the two can never disagree
+/// about which commits are the agent's.
+///
+/// Never returns an error. Every failure path yields an empty list and a note
+/// naming what went wrong: the operator losing the commit NAMES is bad, the
+/// operator losing the VERDICT is the failure this whole plan exists to
+/// prevent.
+fn enumerate_phase_commits(workdir: &Path, phase: u32) -> (Vec<IdleTimeoutCommit>, Option<String>) {
+    let git_flow = crate::config::GitFlowConfig::default();
+    let branch = format!("{}phase-{:02}", git_flow.feature_prefix, phase);
+    let range = format!("{}..{branch}", git_flow.develop);
+
+    let output = match crate::git::git_command(workdir)
+        .args(["log", "--format=%H %s", &range])
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) => return (Vec::new(), Some(format!("git log could not run: {err}"))),
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return (
+            Vec::new(),
+            Some(format!("git log {range} failed: {stderr}")),
+        );
+    }
+
+    let commits = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            // `%H %s` — a sha, one space, then the subject, which may itself
+            // contain spaces. `split_once` is therefore correct and `split`
+            // is not. A subject-less commit still yields an empty subject
+            // rather than being dropped.
+            let (sha, subject) = line.split_once(' ').unwrap_or((line, ""));
+            Some(IdleTimeoutCommit {
+                sha: sha.to_string(),
+                subject: subject.to_string(),
+            })
+        })
+        .collect();
+
+    (commits, None)
+}
+
+/// Write the idle-timeout verdict and get it onto the platter before returning.
+///
+/// `sync_all` is not decoration: D-05's guarantee is that the result exists
+/// before anything can race it, and a buffered write that is still in the page
+/// cache when the process is signalled has not achieved that.
+fn write_idle_timeout_record(
+    project_root: &Path,
+    phase: u32,
+    idle_secs: u64,
+    child_pid: u32,
+    commits: &[IdleTimeoutCommit],
+) -> std::io::Result<()> {
+    let record = IdleTimeoutRecord {
+        status: crate::agent_result::AgentStatus::IdleTimeout
+            .as_wire_str()
+            .to_string(),
+        idle_secs,
+        agent_pid: child_pid,
+        written_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        commits: commits.to_vec(),
+    };
+    let json = serde_json::to_string(&record)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+
+    let path = crate::agent_result::idle_timeout_path(project_root, phase);
+    if let Some(parent) = path.parent() {
+        crate::workflow::ensure_devflow_dir(parent)?;
+    }
+    let mut file = std::fs::File::create(&path)?;
+    file.write_all(json.as_bytes())?;
+    file.flush()?;
+    file.sync_all()
+}
+
+/// Terminate the supervised child's whole process group, returning the
+/// VERIFIED fact of whether the leader is dead.
+///
+/// Acts on `child_pid`, which came from the in-memory `Child` handle — never
+/// on the on-disk pid file (T-31-07). That distinction is what makes the
+/// negative-pid signal below safe at all: while this monitor still holds the
+/// unwaited `Child`, the kernel cannot recycle that pid, so it cannot come to
+/// mean some unrelated process between spawn and now. A pid re-read from disk
+/// carries no such guarantee.
+///
+/// Three steps, and the middle one is borrowed whole rather than reimplemented:
+///
+/// 1. `SIGTERM` to the GROUP. `.process_group(0)` at spawn made the child its
+///    own group leader, so its pid IS its pgid and `-pid` reaches its whole
+///    subtree — the tool subprocesses a coding agent leaves behind, which a
+///    leader-only signal would orphan. It cannot reach this monitor: the
+///    monitor stayed in its own inherited group, which is precisely what
+///    `.process_group(0)` bought (T-31-05).
+/// 2. [`crate::agent::terminate_and_verify`] for the leader — reused, not
+///    rewritten. It owns the `SIGTERM` → poll → `SIGKILL` → re-poll
+///    escalation and returns a verified liveness fact instead of an
+///    assumption. 999.44 measured 15 of 15 orphaned wrappers surviving
+///    `SIGTERM`, so the escalation is not optional.
+/// 3. `SIGKILL` to the group, sweeping any survivor the leader's own
+///    escalation did not cover. Unconditional by design: at this point the run
+///    is over, everything in the group is the agent's subtree, and a `kill` to
+///    an empty group is a no-op `ESRCH`.
+///
+/// The `signed > 1` guard is load-bearing twice over. `kill(-1, sig)` signals
+/// every process the caller may signal, and `kill(0, sig)` signals the
+/// caller's own group — the two catastrophic cases `agent::terminate` already
+/// documents, reachable here through the negation rather than through a
+/// hostile pid file.
+fn terminate_child_group(child_pid: u32) -> bool {
+    let Ok(signed) = libc::pid_t::try_from(child_pid) else {
+        warn!("idle timeout: child pid {child_pid} does not fit pid_t; not signalling");
+        return false;
+    };
+    if signed <= 1 {
+        warn!("idle timeout: refusing to signal group for pid {signed}");
+        return false;
+    }
+
+    // SAFETY: `signed > 1`, so `-signed < -1` and the two catastrophic
+    // targets (`0` = our own group, `-1` = everything) are both excluded.
+    unsafe {
+        libc::kill(-signed, libc::SIGTERM);
+    }
+
+    let dead = crate::agent::terminate_and_verify(
+        child_pid,
+        crate::agent::TERMINATE_VERIFY_WAIT,
+        crate::agent::TERMINATE_VERIFY_POLL,
+    );
+
+    // SAFETY: same guard as above.
+    unsafe {
+        libc::kill(-signed, libc::SIGKILL);
+    }
+
+    dead
+}
+
+/// Append one line to the monitor's own log, creating it if needed.
+///
+/// Best-effort: the monitor's stdio is null, so this file is the only place a
+/// "log loudly" obligation can actually land, but failing to write it must
+/// never abort a termination sequence already in progress.
+fn append_monitor_log(project_root: &Path, phase: u32, entry: &str) {
+    let path = crate::agent_result::monitor_log_path(project_root, phase);
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(file, "{entry}");
+    }
+}
+
 /// Poll for the agent PID that the monitor records, for up to ~1 second.
 ///
 /// Returns the PID once the monitor has launched the agent, or `None` if it
@@ -215,11 +1104,526 @@ mod tests {
         state
     }
 
+    // ---- close-rule fixtures ------------------------------------------
+    //
+    // Key names, nesting and event types are taken from the real archived
+    // capture at
+    // `.planning/phases/30-keep-the-session-alive-past-turn-end/30a-evidence/raw_output_v3.jsonl`
+    // (lines 5, 8, 19, 44 and 54), not invented: `tasks` is an array of
+    // objects with `task_id`/`task_type`/`description`, the drained event is
+    // the same event with `tasks":[]`, and a coalesced completion carries
+    // `origin.kind == "task-notification"` on an ordinary `result`. Volumes
+    // and identifiers are generalized; shapes are not.
+
+    const INIT_LINE: &str = r#"{"type":"system","subtype":"init","cwd":"/tmp/work","session_id":"s-1","tools":["Task","Bash"],"uuid":"u-init"}"#;
+
+    /// A `system`/`background_tasks_changed` event announcing `count` tasks.
+    /// `count == 0` is the DRAINED shape (v3 line 44).
+    fn bg_tasks_line(count: usize) -> String {
+        let tasks: Vec<String> = (0..count)
+            .map(|i| {
+                format!(
+                    r#"{{"task_id":"t{i}","task_type":"local_agent","description":"child {i}"}}"#
+                )
+            })
+            .collect();
+        format!(
+            r#"{{"type":"system","subtype":"background_tasks_changed","tasks":[{}],"uuid":"u-bg{count}","session_id":"s-1"}}"#,
+            tasks.join(",")
+        )
+    }
+
+    /// A top-level `result` event. `marker` is the `result` field's text —
+    /// the agent's own final message, where a `DEVFLOW_RESULT:` line lives.
+    fn result_line(marker: &str) -> String {
+        format!(
+            r#"{{"type":"result","subtype":"success","is_error":false,"num_turns":3,"stop_reason":"end_turn","session_id":"s-1","uuid":"u-res","result":"{marker}"}}"#
+        )
+    }
+
+    /// The v3 line-54 shape: ONE `result` closing out work that several
+    /// children contributed to, tagged with the task-notification origin.
+    fn coalesced_result_line(marker: &str) -> String {
+        format!(
+            r#"{{"type":"result","subtype":"success","is_error":false,"num_turns":2,"stop_reason":"end_turn","origin":{{"kind":"task-notification"}},"session_id":"s-1","uuid":"u-res-coalesced","result":"{marker}"}}"#
+        )
+    }
+
+    /// Same envelope, forwarded from a subagent rather than authored by the
+    /// orchestrator session.
+    fn subagent_result_line(marker: &str) -> String {
+        result_line(marker).replacen('{', r#"{"parent_tool_use_id":"toolu_child","#, 1)
+    }
+
+    /// A success marker as it appears INSIDE a `result` string field — the
+    /// quotes are escaped because the field is itself JSON.
+    const MARKER: &str = r#"All done.\nDEVFLOW_RESULT: {\"status\":\"success\",\"commits\":3}"#;
+    const NO_MARKER: &str = "Acknowledged; nothing to report.";
+
+    fn observe_all(lines: &[String]) -> CloseRule {
+        let mut rule = CloseRule::default();
+        for line in lines {
+            rule.observe(line);
+        }
+        rule
+    }
+
+    /// Constraint 4 is an `AND`, and neither arm is sufficient alone. Both
+    /// halves are asserted here because a rule that accidentally became an
+    /// `OR` still passes any test that only ever feeds it both.
+    #[test]
+    fn close_rule_requires_both_marker_and_drained_background_tasks() {
+        // Arm A: the drain lands, but no marker ever appears in a top-level
+        // result. Closing here truncates the run before its verdict exists.
+        // The torn line carrying marker TEXT is the negative control: a line
+        // that does not parse as JSON must not be able to satisfy the marker
+        // arm through the back door.
+        let drained_but_unmarked = observe_all(&[
+            INIT_LINE.to_string(),
+            bg_tasks_line(1),
+            bg_tasks_line(0),
+            r#"{"type":"result","result":"DEVFLOW_RESULT: {\"status\":\"succ"#.to_string(),
+            "progress: still working".to_string(),
+            result_line(NO_MARKER),
+        ]);
+        assert!(
+            !drained_but_unmarked.should_close(),
+            "the drain alone must never close stdin: 30c/30d measured the \
+             drain-to-final-result lag at 4.54-11.51s across 14 trials, and \
+             closing at the drain would have truncated the final orchestrator \
+             turn in all seven 30d trials"
+        );
+
+        // Arm B: the marker lands while a child is still pending.
+        let marked_but_pending =
+            observe_all(&[INIT_LINE.to_string(), bg_tasks_line(1), result_line(MARKER)]);
+        assert!(
+            !marked_but_pending.should_close(),
+            "a marker while a background task is still announced must not \
+             close stdin — the pending child's task-notification turn would \
+             have nowhere to be delivered"
+        );
+    }
+
+    /// The common case: a single-plan stage that never dispatches anything.
+    /// The drain arm is satisfied VACUOUSLY, because nothing was ever
+    /// announced — an implementation that waited for a literal empty-list
+    /// event would hang every such stage until the idle timeout.
+    ///
+    /// The interleaved noise lines also pin the other half of the rule's
+    /// tolerance: a torn JSON line and a prose line are ignored for the rule
+    /// (they can neither satisfy nor block it) while still being teed to the
+    /// capture by the reader thread.
+    #[test]
+    fn close_rule_is_vacuously_drained_when_no_background_tasks_event_appears() {
+        let rule = observe_all(&[
+            INIT_LINE.to_string(),
+            "starting up".to_string(),
+            r#"{"type":"assist"#.to_string(),
+            result_line(MARKER),
+        ]);
+        assert!(
+            rule.should_close(),
+            "a stage that never announced a background task is drained by \
+             definition; only the marker arm has anything to satisfy"
+        );
+    }
+
+    /// Constraint 7. The CLI COALESCES completions: two children can finish
+    /// into one `result` event, and two announced tasks can drain to an empty
+    /// list in a single `background_tasks_changed`. Counting `result` events
+    /// therefore silently undercounts any wave whose completions cluster —
+    /// and that shape is superficially indistinguishable from "one child
+    /// delivered, one lost". The drained list is the only thing separating
+    /// them, so the rule asserts on the list state and never on a count.
+    ///
+    /// Per 30-04 the drain arm is DEFENSIVE rather than load-bearing: n=2
+    /// Mode B trials delivered everything without it. That is the documented
+    /// reason to keep it cheaply — "defensive" is not "removable".
+    #[test]
+    fn coalesced_completions_do_not_undercount_children() {
+        let rule = observe_all(&[
+            INIT_LINE.to_string(),
+            bg_tasks_line(2),
+            // BOTH children drain in ONE event...
+            bg_tasks_line(0),
+            // ...and complete into ONE result.
+            coalesced_result_line(MARKER),
+        ]);
+        assert!(
+            rule.should_close(),
+            "two announced children, one drain event and one coalesced result \
+             must still close — a rule that matched result events against \
+             child count would stall here forever"
+        );
+
+        // Negative control: the SAME single coalesced result with the drain
+        // withheld must NOT close. Without this, the assertion above is also
+        // satisfied by a rule that simply closes on any result event, and the
+        // test would be measuring nothing.
+        let undrained = observe_all(&[
+            INIT_LINE.to_string(),
+            bg_tasks_line(2),
+            coalesced_result_line(MARKER),
+        ]);
+        assert!(
+            !undrained.should_close(),
+            "control: it is the drained list that decides, not the arrival of \
+             a result event"
+        );
+    }
+
+    /// T-31-01. The CLI echoes the operator's prompt back into the same
+    /// stdout, and DevFlow's own stage prompts discuss `DEVFLOW_RESULT`
+    /// markers at length — so marker TEXT is not evidence of a verdict. Only
+    /// a marker inside an event that is both `type: "result"` and top-level
+    /// counts, reusing the one provenance predicate rather than inventing a
+    /// second notion of trustworthiness.
+    #[test]
+    fn marker_inside_a_non_top_level_result_does_not_satisfy_the_close_rule() {
+        let subagent = observe_all(&[INIT_LINE.to_string(), subagent_result_line(MARKER)]);
+        assert!(
+            !subagent.should_close(),
+            "a subagent-origin result carrying a marker must not close the \
+             stream — same provenance hole constraint 9 item 2 closed for the \
+             stage verdict"
+        );
+
+        // Control: the identical envelope WITHOUT the planted parent id is
+        // top-level and legitimately closes. Without this the assertion above
+        // would also pass against a rule that never closes at all.
+        let top_level = observe_all(&[INIT_LINE.to_string(), result_line(MARKER)]);
+        assert!(
+            top_level.should_close(),
+            "control: the same event without a parent id is authoritative"
+        );
+    }
+
     #[test]
     fn shell_escape_wraps_basic_strings() {
         assert_eq!(shell_escape("hello"), "'hello'");
         assert_eq!(shell_escape("hello world"), "'hello world'");
         assert_eq!(shell_escape("/tmp/devflow"), "'/tmp/devflow'");
+    }
+
+    /// The Phase 31 tracer: ONE Claude-shaped stage driven end to end through
+    /// the pipe-owning supervisor.
+    ///
+    /// The stub behaves like the real CLI on the two axes under test and no
+    /// others: it takes its initial turn from stdin, and it keeps stdin open
+    /// as a channel it can still be spoken to on. It is a `sh` script because
+    /// the wire behaviour is the subject, not the binary.
+    ///
+    /// **The early-close negative control is the point of the probe files.**
+    /// A stub that merely blocks on stdin EOF before exiting cannot fail:
+    /// whether the monitor closes stdin immediately after the write or only
+    /// after the close rule is satisfied, the stub still eventually sees EOF
+    /// and still exits 0. So the stub instead SAMPLES stdin liveness at a
+    /// moment when a correct monitor provably has not closed it — after the
+    /// drain, before any marker — and records `EARLY` if it is already gone.
+    /// Two files that must disagree: `eof` must exist at the end, `early`
+    /// must never exist.
+    ///
+    /// **The prompt sentinel is a negative control on JSON escaping.** The
+    /// sentinel sits on the SECOND line of a multi-line prompt containing a
+    /// double quote. `user_turn_line` escapes it, so the whole prompt arrives
+    /// as one physical line and the stub's single `read` sees the sentinel. A
+    /// `format!`-interpolated implementation would emit a torn two-line
+    /// document, the stub's `read` would return only the first line, and the
+    /// sentinel check would fail — which is exactly what should happen.
+    #[test]
+    fn pipe_owning_monitor_delivers_prompt_via_stdin_and_captures_stream() {
+        const SENTINEL: &str = "TRACER-PROMPT-SENTINEL";
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 4u32;
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        let eof_file = root.join("stdin-eof");
+        let early_file = root.join("stdin-closed-early");
+
+        // A quote on line one, the sentinel on line two — see the doc above.
+        let prompt = format!("first line with a \" quote\n{SENTINEL}");
+
+        let script = format!(
+            r#"
+set -u
+IFS= read -r turn || {{ echo "NO_INITIAL_TURN_ON_STDIN" >&2; exit 91; }}
+case "$turn" in
+  *{SENTINEL}*) ;;
+  *) echo "INITIAL_TURN_MISSING_PROMPT: $turn" >&2; exit 92 ;;
+esac
+
+# Probe: block on stdin until EOF, then record it. stdout is redirected so
+# this subshell does not hold the capture pipe open after the main shell exits.
+#
+# `exec 3<&0` then `cat <&3` is load-bearing, not a flourish: POSIX assigns
+# /dev/null to a BACKGROUNDED list's stdin before any explicit redirection
+# when job control is off. A bare `( cat > /dev/null ) &` therefore reads EOF
+# instantly and reports an early close that never happened. The explicit
+# `<&3` is applied after that default and overrides it.
+exec 3<&0
+( cat <&3 > /dev/null; printf 'EOF\n' > '{eof}' ) > /dev/null 2>&1 &
+
+printf '%s\n' '{{"type":"system","subtype":"init","session_id":"tracer-1"}}'
+printf '%s\n' '{{"type":"system","subtype":"background_tasks_changed","tasks":[{{"task_id":"t1","task_type":"local_agent"}}]}}'
+printf '%s\n' '{{"type":"system","subtype":"background_tasks_changed","tasks":[]}}'
+
+# The drain has landed but no marker has. A correct monitor is still holding
+# stdin open here; sample it and record the violation if it is not.
+sleep 0.5
+if [ -f '{eof}' ]; then printf 'EARLY\n' > '{early}'; fi
+
+printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"session_id":"tracer-1","result":"DEVFLOW_RESULT: {{\"status\":\"success\",\"commits\":2}}"}}'
+
+# Bounded wait for EOF: a monitor that never closes stdin must fail the
+# assertions below, not hang the suite.
+i=0
+while [ $i -lt 100 ] && [ ! -f '{eof}' ]; do
+  sleep 0.1
+  i=$((i+1))
+done
+exit 0
+"#,
+            eof = eof_file.display(),
+            early = early_file.display(),
+        );
+
+        let code = run_pipe_owning_monitor(
+            root,
+            phase,
+            root,
+            &prompt,
+            Duration::from_secs(20),
+            "sh",
+            &["-c".to_string(), script],
+            &[],
+        )
+        .expect("pipe-owning monitor should supervise the stub to completion");
+
+        let stderr = std::fs::read_to_string(crate::agent_result::stderr_path(root, phase))
+            .unwrap_or_default();
+        assert_eq!(
+            code, 0,
+            "stub exited {code}; 91 = no initial turn arrived on stdin, \
+             92 = the turn arrived but did not carry the prompt (a JSON \
+             escaping regression tears it across lines). stderr: {stderr:?}"
+        );
+
+        assert!(
+            !early_file.exists(),
+            "the monitor closed the child's stdin BEFORE the close rule was \
+             satisfied — the drain had landed but no DEVFLOW_RESULT marker had. \
+             Constraint 4's AND cannot be honoured once stdin is gone: a \
+             task-notification turn would have nowhere to be delivered."
+        );
+        assert!(
+            eof_file.exists(),
+            "the monitor never closed the child's stdin at all; the close rule \
+             should have fired once the marker arrived with the task list drained"
+        );
+
+        let capture =
+            std::fs::read_to_string(crate::agent_result::stdout_path(root, phase)).unwrap();
+        for expected in [
+            r#""subtype":"init""#,
+            r#""task_id":"t1""#,
+            r#""tasks":[]"#,
+            r#""type":"result""#,
+        ] {
+            assert!(
+                capture.contains(expected),
+                "capture is missing {expected}; got:\n{capture}"
+            );
+        }
+        assert!(
+            crate::agent_result::capture_is_claude_stream(&capture),
+            "the capture must classify as a Claude stream-json document — \
+             this is what makes 30b's stream parser reachable at all:\n{capture}"
+        );
+
+        let result = crate::agent_result::evaluate_layer1(root, phase)
+            .expect("Layer 1 must decide this capture");
+        assert_eq!(
+            result.status,
+            crate::agent_result::AgentStatus::Success,
+            "Layer 1 verdict from the stream capture: {result:?}"
+        );
+
+        let exit = std::fs::read_to_string(crate::agent_result::exit_code_path(root, phase))
+            .expect("the monitor must record the child's exit code");
+        assert_eq!(exit.trim(), "0", "exit file contents: {exit:?}");
+    }
+
+    /// Peer review 2026-08-03, CRITICAL: `BufRead::lines()` yields
+    /// `Err(InvalidData)` on one non-UTF-8 byte, and the reader treated any read
+    /// error as EOF — silently truncating the capture and dropping every later
+    /// line, INCLUDING the terminal marker. The supervisor manufactured exactly
+    /// the boundary-truncation failure constraint 9 exists to defend against.
+    ///
+    /// **What this does NOT establish:** that the real `claude` CLI ever emits
+    /// non-UTF-8 on this stream. It emits JSON, which should be valid UTF-8. This
+    /// pins the supervisor's robustness, not a demonstrated CLI behaviour.
+    #[test]
+    fn non_utf8_byte_does_not_truncate_the_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 11u32;
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        // A raw 0xFF is invalid UTF-8 in any position. It sits BETWEEN two good
+        // lines, so a reader that dies on it loses the marker that follows.
+        let script = r#"
+set -u
+IFS= read -r _turn || exit 91
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"utf8-1"}'
+printf 'raw-\377-bytes\n'
+printf '%s\n' '{"type":"system","subtype":"background_tasks_changed","tasks":[]}'
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id":"utf8-1","result":"DEVFLOW_RESULT: {\"status\":\"success\"}"}'
+exit 0
+"#;
+
+        let code = run_pipe_owning_monitor(
+            root,
+            phase,
+            root,
+            "prompt",
+            Duration::from_secs(20),
+            "sh",
+            &["-c".to_string(), script.to_string()],
+            &[],
+        )
+        .expect("the monitor must survive a non-UTF-8 byte on the child's stdout");
+        assert_eq!(code, 0, "stub should exit cleanly");
+
+        let capture =
+            std::fs::read_to_string(crate::agent_result::stdout_path(root, phase)).unwrap();
+        assert!(
+            capture.contains(r#""type":"result""#),
+            "the terminal result event was lost: a non-UTF-8 byte earlier in the \
+             stream truncated the capture. This is the regression:\n{capture}"
+        );
+        assert!(
+            capture.contains("raw-"),
+            "the undecodable line itself must still be teed (lossily), since the \
+             capture is the verbatim record:\n{capture}"
+        );
+        let result = crate::agent_result::evaluate_layer1(root, phase)
+            .expect("Layer 1 must still decide a capture that contained a bad byte");
+        assert_eq!(
+            result.status,
+            crate::agent_result::AgentStatus::Success,
+            "verdict after lossy decode: {result:?}"
+        );
+    }
+
+    /// Peer review 2026-08-03, CRITICAL: after the close rule released stdin the
+    /// supervisor kept timing out on silence and fired `fire_idle_timeout`,
+    /// writing an authoritative `IdleTimeout` verdict OVER a stage that had
+    /// already reported success. `evaluate_layer1` reads that side channel first
+    /// — by design, so nothing can shadow a real timeout — so the bogus verdict
+    /// won and was unrecoverable.
+    ///
+    /// The timeout here (600ms) is injected short deliberately; the child sleeps
+    /// well past it AFTER the marker. **What this does NOT establish:** that the
+    /// 120s production floor is right — that rests on the keepalive measurement
+    /// in `31-IDLE-GAP-MEASUREMENTS.md`, not on this test.
+    #[test]
+    fn no_idle_timeout_is_recorded_when_the_child_is_merely_slow_to_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 12u32;
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        let script = r#"
+set -u
+IFS= read -r _turn || exit 91
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"slow-1"}'
+printf '%s\n' '{"type":"system","subtype":"background_tasks_changed","tasks":[]}'
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id":"slow-1","result":"DEVFLOW_RESULT: {\"status\":\"success\"}"}'
+# Everything has been said; the close rule fires here. Now wind down slowly,
+# well past the injected idle window, emitting nothing.
+sleep 3
+exit 0
+"#;
+
+        let code = run_pipe_owning_monitor(
+            root,
+            phase,
+            root,
+            "prompt",
+            Duration::from_millis(600),
+            "sh",
+            &["-c".to_string(), script.to_string()],
+            &[],
+        )
+        .expect("a slow-exiting child that already reported is not a failure");
+
+        assert!(
+            !crate::agent_result::idle_timeout_path(root, phase).exists(),
+            "an idle-timeout verdict was written for a stage that had ALREADY \
+             emitted its terminal marker and drained its tasks — silence after a \
+             deliberate close is expected, not a hang"
+        );
+        assert_eq!(code, 0, "the child exited cleanly, if slowly");
+
+        let result = crate::agent_result::evaluate_layer1(root, phase)
+            .expect("Layer 1 must decide this capture");
+        assert_eq!(
+            result.status,
+            crate::agent_result::AgentStatus::Success,
+            "a completed stage must not be reported as a timeout: {result:?}"
+        );
+    }
+
+    /// Peer review 2026-08-03 (found independently by BOTH reviewers and by the
+    /// 31-04 plan review as W1): `status.code()` is `None` for a signal-killed
+    /// child, and `unwrap_or(-1)` discarded the signal. `-1` matches neither the
+    /// 137 nor the 127 arm, so a kernel OOM kill arrived as a generic `Failed`
+    /// and routed to `GateReview` — asking a human to code-review a stage the
+    /// kernel killed — instead of `GateInfra`.
+    ///
+    /// This asserts on what the monitor ACTUALLY writes for a real SIGKILL. The
+    /// pre-existing arbitration test hardcoded `"137\n"` into its fixture, so it
+    /// passed green against this defect the entire time — which is why this test
+    /// spawns a child and kills it rather than writing the file itself.
+    #[test]
+    fn a_signal_killed_child_records_128_plus_signal_not_minus_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 13u32;
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        // SIGKILL itself: no exit code exists, only a termination signal.
+        let script = r#"
+set -u
+IFS= read -r _turn || exit 91
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"sig-1"}'
+kill -9 $$
+"#;
+
+        let code = run_pipe_owning_monitor(
+            root,
+            phase,
+            root,
+            "prompt",
+            Duration::from_secs(20),
+            "sh",
+            &["-c".to_string(), script.to_string()],
+            &[],
+        )
+        .expect("the monitor must reap a signal-killed child");
+
+        assert_eq!(
+            code, 137,
+            "SIGKILL(9) must be recorded as 128+9=137, the value \
+             `evaluate_layer2` and `reconcile_stream_success_against_exit_code` \
+             map to ResourceKilled/GateInfra. -1 means the signal was discarded."
+        );
+        let exit = std::fs::read_to_string(crate::agent_result::exit_code_path(root, phase))
+            .expect("the monitor must record the exit code");
+        assert_eq!(exit.trim(), "137", "exit file contents: {exit:?}");
     }
 
     #[test]
@@ -273,7 +1677,7 @@ mod tests {
         // Stub agent: write a known marker to stdout, then exit cleanly.
         let args = vec!["-c".to_string(), "echo MONITOR_READY".to_string()];
 
-        let monitor_pid = spawn_monitor(&state, "sh", &args, &[]).unwrap();
+        let monitor_pid = spawn_monitor(&state, "sh", &args, &[], MonitorLaunch::Legacy).unwrap();
         assert!(monitor_pid > 0);
 
         // Observable side effect #1: the monitor records the agent PID to its
@@ -351,7 +1755,7 @@ mod tests {
         // window this test needs to send SIGTERM and check liveness.
         let args = vec!["-c".to_string(), "sleep 30".to_string()];
 
-        let monitor_pid = spawn_monitor(&state, "sh", &args, &[]).unwrap();
+        let monitor_pid = spawn_monitor(&state, "sh", &args, &[], MonitorLaunch::Legacy).unwrap();
         let agent_pid = wait_for_agent_pid(dir.path(), state.phase)
             .expect("monitor should record the agent pid");
         assert!(
@@ -447,7 +1851,7 @@ mod tests {
         // directories before launching the agent.
         let args = vec!["-c".to_string(), "pwd; echo WORKTREE_READY".to_string()];
 
-        let monitor_pid = spawn_monitor(&state, "sh", &args, &[]).unwrap();
+        let monitor_pid = spawn_monitor(&state, "sh", &args, &[], MonitorLaunch::Legacy).unwrap();
         assert!(monitor_pid > 0);
 
         let agent_pid = wait_for_agent_pid(dir.path(), state.phase)
@@ -533,7 +1937,7 @@ mod tests {
                 "git rev-parse --absolute-git-dir".to_string(),
             ];
 
-            spawn_monitor(&state, "sh", &args, &[]).unwrap();
+            spawn_monitor(&state, "sh", &args, &[], MonitorLaunch::Legacy).unwrap();
             wait_for_agent_pid(&root, state.phase).expect("monitor should record the agent pid");
 
             let stdout_path = crate::agent_result::stdout_path(&root, state.phase);
@@ -614,7 +2018,7 @@ mod tests {
             payload.to_string(),
         ];
 
-        spawn_monitor(&state, "sh", &args, &[]).unwrap();
+        spawn_monitor(&state, "sh", &args, &[], MonitorLaunch::Legacy).unwrap();
         wait_for_agent_pid(dir.path(), state.phase).expect("monitor should record the agent pid");
 
         let stdout_path = crate::agent_result::stdout_path(dir.path(), state.phase);
@@ -635,5 +2039,374 @@ mod tests {
         );
         assert!(captured.contains("ARGV_SAFE"));
         assert!(!dir.path().join("INJECTED").exists());
+    }
+
+    // ---- idle timeout (31-02, D-01..D-08) --------------------------------
+
+    /// D-04: a value below the floor is raised to it, and the fact is
+    /// observable to the CALLER as a value — not only as a log line a test
+    /// would have to capture stdout to see.
+    #[test]
+    fn idle_timeout_secs_clamps_below_floor_and_logs() {
+        let setting = parse_idle_timeout_secs(Some("5".to_string()));
+
+        assert_eq!(setting.timeout, Duration::from_secs(120));
+        assert!(setting.clamped(), "the clamp must be observable as a value");
+        assert_eq!(
+            setting.resolution,
+            IdleTimeoutResolution::Clamped { configured: 5 }
+        );
+
+        // The notice must NAME the configured value, the floor, and the value
+        // actually in force — a clamp that says only "clamped" leaves the
+        // operator guessing which of the three numbers won.
+        let notice = setting.notice().expect("a clamp owes a loud notice");
+        for fragment in ["5", "120", IDLE_TIMEOUT_ENV] {
+            assert!(
+                notice.contains(fragment),
+                "notice must name {fragment:?}; got: {notice}"
+            );
+        }
+    }
+
+    /// The floor raises, it never lowers: a value above it survives verbatim
+    /// and reports no clamp.
+    #[test]
+    fn idle_timeout_secs_accepts_values_above_floor() {
+        let setting = parse_idle_timeout_secs(Some("300".to_string()));
+
+        assert_eq!(setting.timeout, Duration::from_secs(300));
+        assert!(!setting.clamped());
+        assert_eq!(setting.resolution, IdleTimeoutResolution::Configured);
+        assert_eq!(
+            setting.notice(),
+            None,
+            "an honoured value is unremarkable and must not shout"
+        );
+
+        // Boundary: exactly the floor is CONFIGURED, not CLAMPED. An
+        // off-by-one here would report a clamp that never happened and train
+        // operators to ignore the notice.
+        let exact = parse_idle_timeout_secs(Some("120".to_string()));
+        assert_eq!(exact.resolution, IdleTimeoutResolution::Configured);
+        assert!(!exact.clamped());
+    }
+
+    /// Absent, empty, and unparseable all resolve to the floor. The three are
+    /// NOT equivalent in loudness: nothing configured is silent, a typo is not.
+    #[test]
+    fn idle_timeout_secs_defaults_to_the_floor() {
+        let floor = Duration::from_secs(IDLE_TIMEOUT_FLOOR_SECS);
+
+        for raw in [None, Some(String::new()), Some("   ".to_string())] {
+            let setting = parse_idle_timeout_secs(raw.clone());
+            assert_eq!(setting.timeout, floor, "raw {raw:?} must yield the floor");
+            assert_eq!(setting.resolution, IdleTimeoutResolution::Default);
+            assert_eq!(setting.notice(), None, "nothing chosen is not an error");
+        }
+
+        for raw in ["banana", "60O", "-5", "30.5"] {
+            let setting = parse_idle_timeout_secs(Some(raw.to_string()));
+            assert_eq!(setting.timeout, floor, "raw {raw:?} must yield the floor");
+            assert_eq!(
+                setting.resolution,
+                IdleTimeoutResolution::Unparseable {
+                    raw: raw.to_string()
+                }
+            );
+            assert!(
+                setting.notice().is_some(),
+                "a typo that silently halves an intended timeout must be loud: {raw:?}"
+            );
+        }
+    }
+
+    /// D-01/D-03: every line resets the window, and there is no outer
+    /// wall-clock bound. A child that keeps talking for FOUR times the idle
+    /// timeout is never terminated.
+    ///
+    /// The timeout is injected short (400ms) rather than using the 120s
+    /// production default — this measures the RESET MECHANISM, and does so at
+    /// a scale the suite can afford. **What it does not establish:** that 120s
+    /// is the right production value. That rests on the 2026-08-03 keepalive
+    /// measurement recorded on [`IDLE_TIMEOUT_FLOOR_SECS`], not on this test.
+    #[test]
+    fn idle_timer_resets_on_every_stream_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 6u32;
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        // 12 lines x 100ms = 1.2s of talking against a 400ms window. Any
+        // implementation that resets on milestones only, or that imposes an
+        // outer bound, kills this child before it finishes.
+        let script = r#"
+set -u
+IFS= read -r turn || exit 91
+i=0
+while [ $i -lt 12 ]; do
+  printf '%s\n' '{"type":"system","subtype":"heartbeat","n":'"$i"'}'
+  sleep 0.1
+  i=$((i+1))
+done
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id":"idle-1","result":"DEVFLOW_RESULT: {\"status\":\"success\"}"}'
+exit 0
+"#;
+
+        let started = std::time::Instant::now();
+        let code = run_pipe_owning_monitor(
+            root,
+            phase,
+            root,
+            "prompt",
+            Duration::from_millis(400),
+            "sh",
+            &["-c".to_string(), script.to_string()],
+            &[],
+        )
+        .expect("a chatty child must be supervised to completion");
+        let elapsed = started.elapsed();
+
+        assert_eq!(code, 0, "the chatty child must exit cleanly, not be killed");
+        assert!(
+            !crate::agent_result::idle_timeout_path(root, phase).exists(),
+            "no timeout may fire while the child is still emitting lines"
+        );
+        assert!(
+            elapsed > Duration::from_millis(400),
+            "the run must outlast the idle window, else it proves nothing \
+             about resetting: {elapsed:?}"
+        );
+
+        let capture =
+            std::fs::read_to_string(crate::agent_result::stdout_path(root, phase)).unwrap();
+        assert_eq!(
+            capture.matches("heartbeat").count(),
+            12,
+            "all twelve resets must have been observed: {capture:?}"
+        );
+    }
+
+    /// D-05, and the assertion the whole ordering exists for.
+    ///
+    /// The observation is made LIVE, by a watcher thread sampling the child's
+    /// liveness at the first instant the verdict file exists — not by
+    /// inspecting order after the fact, which cannot distinguish
+    /// write-then-kill from kill-then-write.
+    ///
+    /// Its own negative control is structural: if the implementation wrote the
+    /// verdict AFTER terminating, the watcher would sample a dead child and
+    /// this test fails with `Some(false)`. The stub ignores `SIGTERM` so the
+    /// window in which "file exists AND child alive" is observable is the full
+    /// `TERMINATE_VERIFY_WAIT`, rather than a microsecond race.
+    ///
+    /// **What the duration of this test measures:** almost entirely
+    /// `agent::TERMINATE_VERIFY_WAIT` (3s), because the stub refuses `SIGTERM`
+    /// and must be escalated to `SIGKILL`. The 250ms idle window is a rounding
+    /// error against it.
+    #[test]
+    fn idle_timeout_writes_side_channel_before_terminating_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let phase = 7u32;
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        // One line, then silence. `trap '' TERM` widens the observation
+        // window to the full SIGTERM->SIGKILL escalation.
+        let script = r#"
+set -u
+IFS= read -r turn || exit 91
+trap '' TERM
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"idle-2"}'
+sleep 120
+"#;
+
+        let verdict = crate::agent_result::idle_timeout_path(&root, phase);
+        let pid_file = crate::agent_result::agent_pid_path(&root, phase);
+        let watcher = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let mut pid: Option<u32> = None;
+            while std::time::Instant::now() < deadline {
+                if pid.is_none() {
+                    pid = std::fs::read_to_string(&pid_file)
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u32>().ok());
+                }
+                if verdict.exists() {
+                    // Sample liveness at the FIRST moment the verdict exists.
+                    return pid.map(crate::agent::agent_running);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            None
+        });
+
+        let code = run_pipe_owning_monitor(
+            &root,
+            phase,
+            &root,
+            "prompt",
+            Duration::from_millis(250),
+            "sh",
+            &["-c".to_string(), script.to_string()],
+            &[],
+        )
+        .expect("a silent child must still produce a supervised outcome");
+
+        let observed = watcher.join().expect("watcher thread panicked");
+        assert_eq!(
+            observed,
+            Some(true),
+            "the verdict must be on disk while the child is STILL ALIVE. \
+             Some(false) = written after termination (the D-05 violation); \
+             None = the verdict never appeared at all"
+        );
+
+        // The verdict must also be readable and correct, not merely present.
+        let raw = std::fs::read_to_string(crate::agent_result::idle_timeout_path(&root, phase))
+            .expect("verdict file must be readable");
+        let record: IdleTimeoutRecord = serde_json::from_str(&raw).expect("verdict must parse");
+        assert_eq!(record.status, "idle_timeout");
+        assert_eq!(record.idle_secs, 0, "250ms truncates to 0 whole seconds");
+        assert!(record.agent_pid > 1);
+
+        // And the whole cascade must agree: Layer 1 reports the timeout.
+        let result = crate::agent_result::evaluate_layer1(&root, phase)
+            .expect("Layer 1 must decide a timed-out run");
+        assert_eq!(
+            result.status,
+            crate::agent_result::AgentStatus::IdleTimeout,
+            "the monitor's verdict must survive all the way to the oracle"
+        );
+
+        // The child was killed, so it has no ordinary exit code — the point is
+        // that the stage machine still reaches a gate rather than hanging.
+        assert!(
+            crate::agent_result::exit_code_path(&root, phase).exists(),
+            "the exit file must still be written so advance() is reachable"
+        );
+        let _ = code;
+
+        // The loud monitor-log entry (D-04/D-07's readable-after-the-fact
+        // obligation) must exist too — the monitor's stdio is null, so this
+        // file is the only place it can land.
+        let log = std::fs::read_to_string(crate::agent_result::monitor_log_path(&root, phase))
+            .expect("the monitor must log its own timeout");
+        assert!(log.contains("idle-timeout"), "log entry missing: {log:?}");
+    }
+
+    /// Minimal git repo: `develop` plus a `feature/phase-NN` branch carrying
+    /// `commits` extra commits.
+    fn init_repo_with_feature_commits(root: &Path, phase: u32, commits: usize) {
+        let git = |args: &[&str]| {
+            let output = crate::git::git_command(root).args(args).output().unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "devflow@example.com"]);
+        git(&["config", "user.name", "DevFlow Tests"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        git(&["config", "core.hooksPath", "/dev/null"]);
+        git(&["checkout", "-b", "develop"]);
+        std::fs::write(root.join("README.md"), "base\n").unwrap();
+        git(&["add", "README.md"]);
+        git(&["commit", "-m", "base"]);
+
+        let branch = format!("feature/phase-{phase:02}");
+        git(&["checkout", "-b", &branch]);
+        for i in 0..commits {
+            let name = format!("work-{i}.txt");
+            std::fs::write(root.join(&name), "work\n").unwrap();
+            git(&["add", &name]);
+            git(&["commit", "-m", &format!("feat: agent work {i}")]);
+        }
+    }
+
+    fn commit_count(root: &Path, phase: u32) -> u32 {
+        let range = format!("develop..feature/phase-{phase:02}");
+        let output = crate::git::git_command(root)
+            .args(["rev-list", "--count", &range])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    /// D-07/T-31-09: a timeout READS the commit log and never writes to it. A
+    /// timeout can be a false positive, and destroying real work on a false
+    /// positive is unrecoverable.
+    ///
+    /// The "commits were enumerated" half is this test's negative control, and
+    /// it is not optional: if enumeration silently returned nothing, "no
+    /// commits were rolled back" would be trivially, vacuously true.
+    #[test]
+    fn idle_timeout_does_not_roll_back_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 8u32;
+        init_repo_with_feature_commits(root, phase, 2);
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        let before = commit_count(root, phase);
+        assert_eq!(before, 2, "fixture precondition");
+
+        // No TERM trap here: the child dies promptly, keeping this test fast.
+        let script = r#"
+set -u
+IFS= read -r turn || exit 91
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"idle-3"}'
+sleep 120
+"#;
+
+        run_pipe_owning_monitor(
+            root,
+            phase,
+            root,
+            "prompt",
+            Duration::from_millis(250),
+            "sh",
+            &["-c".to_string(), script.to_string()],
+            &[],
+        )
+        .expect("a silent child must still produce a supervised outcome");
+
+        assert_eq!(
+            commit_count(root, phase),
+            before,
+            "an idle timeout must never roll back, reset, or revert a commit"
+        );
+
+        // NEGATIVE CONTROL: enumeration must actually have found them, else
+        // the assertion above is vacuous.
+        let raw = std::fs::read_to_string(crate::agent_result::idle_timeout_path(root, phase))
+            .expect("verdict file must exist");
+        let record: IdleTimeoutRecord = serde_json::from_str(&raw).expect("verdict must parse");
+        assert_eq!(
+            record.commits.len(),
+            2,
+            "the verdict must NAME the commits, not merely leave them alone"
+        );
+        for commit in &record.commits {
+            assert_eq!(commit.sha.len(), 40, "full sha expected: {commit:?}");
+            assert!(
+                commit.subject.starts_with("feat: agent work"),
+                "subject must survive enumeration: {commit:?}"
+            );
+        }
+
+        // And the operator-facing reason names them.
+        let result = crate::agent_result::evaluate_layer1(root, phase).unwrap();
+        assert_eq!(result.commits, Some(2));
+        let reason = result.reason.unwrap();
+        assert!(
+            reason.contains("NONE of them were rolled back"),
+            "reason: {reason}"
+        );
     }
 }

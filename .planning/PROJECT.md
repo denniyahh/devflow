@@ -84,9 +84,13 @@ Governance scope (999.4, 999.26, 999.28) remains unplanned. Phase 21
 (Operator Legibility & Observability)
 shipped as v1.8.0, 2026-07-24 (PR #23 → main, signed tag, GitHub Release,
 published to crates.io). Phase 20 shipped as v1.7.0,
-2026-07-23. The v2.0.0 milestone stays open — it does NOT close at Phase 20 or any other
-fixed phase; numbering continues (21, 22, …) until a genuinely breaking
-change earns the 2.0 slot. `/gsd-complete-milestone` is not run here.
+2026-07-23. **The v2.0.0 milestone was CLOSED 2026-08-02** after spanning releases 2.0.0,
+2.1.0 and 2.2.0; the open-ended framing (it did not close at Phase 20 or any fixed phase)
+governed it until then. The active milestone is now **v2.3.0**, declared 2026-08-02 and
+deliberately **bounded** — it closes when the 999.64 arc lands (Phase 30 + Phase 31). See
+ROADMAP.md. `/gsd-complete-milestone` has still not been run: v2.0.0 was closed by
+documentation, because the archive step would have swept Phase 30's unexecuted plans into
+`.planning/milestones/`.
 Hermes Support, previously slotted as "Phase 18," was rescoped out during
 the 2026-07-20 reprioritization to Dogfood Reliability Hardening and now
 sits in the backlog as `999.1` — it is NOT automatically next; backlog
@@ -109,14 +113,17 @@ items require `/gsd-review-backlog` promotion.)*
   through Phase 16. Current operator commands include `start`, `gate`, `logs`,
   `history`, `parallel`, `sequentagent`, `reference`, `cleanup`, `status`,
   `list`, `recover`, `doctor`, and `test`; `advance` remains hidden/internal.
-- Workspace version is `1.8.0` (Phase 21, shipped 2026-07-24). Code/docs
-  historically over-claimed "v2.0.0" as current; Phase 12 corrected this.
-  The `v2.0.0` label names an open-ended milestone, not a bounded arc with
-  a scheduled closing phase — decided 2026-07-23 (ROADMAP.md "Milestone
-  stays open"): nothing across Phase 20's or Phase 21's units was inherently
-  breaking, so each shipped as a minor bump and the milestone continues past
-  both with no predetermined endpoint. `2.0.0` remains reserved for a
-  future genuinely-breaking change, whenever that happens to land.
+- Workspace version is `2.2.0` (shipped 2026-07-31). Code/docs historically
+  over-claimed "v2.0.0" as current; Phase 12 corrected this.
+  The `v2.0.0` label named an **open-ended** milestone rather than a bounded
+  arc — decided 2026-07-23 (ROADMAP.md "Milestone stays open") — and on that
+  basis it spanned the 2.0.0, 2.1.0 and 2.2.0 releases, each a minor bump
+  because nothing in them was inherently breaking. **That milestone was closed
+  2026-08-02.** The active milestone is **v2.3.0**, and unlike its predecessor
+  it is bounded: it closes when the 999.64 arc lands. Phase 31 changes
+  DevFlow's internal launch path and agent adapter rather than the CLI surface,
+  so v2.3.0 is expected to remain a minor bump; the `3.0.0` slot stays reserved
+  for a genuinely breaking change, whenever that lands.
 - No `.planning/REQUIREMENTS.md` exists in this project; requirements are
   tracked per-phase in each phase's `CONTEXT.md`, not via formal REQ-IDs.
 
@@ -168,8 +175,8 @@ across five gap-closure rounds, 129/129 threats closed, broken-windows ledger at
 0 open / 1 waived / 4 fixed. PR #47 → develop, #50 squash-merged to main,
 signed tag `v2.1.0` (maintainer key, fingerprint verified), main→develop sync
 merge-committed (#51), GitHub Release published, and both crates published to
-crates.io in order (devflow-core → devflow). The v2.0.0 milestone stays open (no
-fixed closing phase)*
+crates.io in order (devflow-core → devflow). The v2.0.0 milestone stayed open at
+this point (no fixed closing phase); it was closed 2026-08-02*
 
 *Phase 27 (Scrub Redirecting Git Environment From Production Calls) completed and
 verified 2026-07-30 — 6/6 plans, 7/7 must-haves, all 41 production
