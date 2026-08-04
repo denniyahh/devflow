@@ -36,34 +36,43 @@ So this is a verify-and-close phase, not a build phase.
 ### Discussion outcome
 The user was offered three gray areas (plan scope given the fix already landed; whether to close
 out the 999.72/999.72a backlog entries' status labels; durability for future milestones) and
-explicitly declined all three, selecting "None of these — I'm ready for context: treat as a
-straightforward verify-and-close with no open decisions." The items below are **Claude's
-defaults resulting from that decline**, not operator-chosen answers to each sub-question — the
-operator did not pick among the options, they opted out of picking. Flagging the provenance
-explicitly per the "no invented constraints" convention: do not treat these as re-litigated or
-re-affirmed operator decisions if a downstream agent needs to revisit them.
+initially declined all three, selecting "None of these — I'm ready for context: treat as a
+straightforward verify-and-close with no open decisions." Immediately after CONTEXT.md was first
+written, the user reopened D-02 directly ("flip the backlog items' status") in the same session —
+recorded below as an operator decision, superseding the earlier Claude's-Discretion default. D-01
+and D-03 remain Claude's defaults from the opt-out, not operator-chosen answers.
+
+### Decisions
+- **D-02 (999.72 / 999.72a backlog entries) — operator decision, reversing the original default:**
+  Flipped. `.planning/ROADMAP.md`'s `### Phase 999.72:` heading now reads
+  `(RESOLVED — 2026-08-04, Phase 32)`, with an inline "Resolution" paragraph documenting that
+  `gsd-roadmapper`'s milestone-creation write (not a Phase-32 plan/execute cycle) is what actually
+  closed it, and that the fix is confirmed for this milestone only — not structural. Sub-item
+  999.72a is marked resolved the same way. No `gsd-tools` handler exists for backlog-heading
+  status edits (checked: `roadmap`'s subcommands are `analyze, get-phase, update-plan-progress,
+  annotate-dependencies, validate, upgrade`; `phase`'s are `uat-passed, next-decimal, add,
+  add-batch, insert, remove, complete, list-plans` — none touch freeform `999.x` backlog prose),
+  so this was a direct edit, consistent with how this file's other resolved backlog entries
+  (999.29, 999.30, etc.) appear to have been closed. — **Reversibility:** reversible — a one-line
+  heading edit to revert.
 
 ### Claude's Discretion
 - **D-01 (plan scope):** The plan should be verification-only — re-run the three checks above
-  live against HEAD, and write SUMMARY.md/VERIFICATION.md documenting that they pass. No edits to
-  `.planning/ROADMAP.md` are planned; the layout is already correct and Success Criterion 4
-  ("this phase only inserts a new section; it moves nothing") is satisfied by construction since
-  nothing needs inserting. — **Reversibility:** reversible — if verification surfaces a real gap
-  (e.g., a check that only passes today because of the specific `--dry-run` label used, or a
-  parser edge case the three checks don't exercise), the plan can still add a targeted ROADMAP.md
-  edit.
-- **D-02 (999.72 / 999.72a backlog entries):** Left untouched — do not change their `(BACKLOG)`
-  status suffix to `(DELIVERED — Phase 32)` or similar, even though other resolved backlog items
-  in ROADMAP.md follow that convention (e.g. 999.29, 999.30). Rationale: REQUIREMENTS.md's Out of
-  Scope table lists "Restructuring the `## Backlog` section itself" with the reason "only the
-  milestone-heading/phase-detail ordering is in scope" — read narrowly as covering this too.
-  — **Reversibility:** reversible — a one-line edit if a future session decides otherwise.
-- **D-03 (durability for future milestones):** Not addressed by this phase. 999.72's own
-  ROADMAP.md text warns the fix "is not guaranteed" to hold at the next milestone boundary
-  (depends on `gsd-roadmapper` doing the right thing again, plus a documented `phase.add`
-  insertion-point bug). REQUIREMENTS.md scopes this milestone as "intentionally narrow" and
-  places gsd-core-side fixes out of scope. If this needs to become durable, that is a future
-  backlog decision, not this phase's.
+  live against HEAD, and write SUMMARY.md/VERIFICATION.md documenting that they pass. No further
+  edits to `.planning/ROADMAP.md` beyond the D-02 backlog-status flip (already made) are planned;
+  the layout itself is already correct and Success Criterion 4 ("this phase only inserts a new
+  section; it moves nothing") is satisfied by construction since nothing needs inserting.
+  — **Reversibility:** reversible — if verification surfaces a real gap, the plan can still add a
+  targeted ROADMAP.md edit.
+- **D-03 (durability for future milestones):** Not addressed by this phase as of the initial
+  opt-out. Options were explained to the user in the same session (see chat transcript / a future
+  `32-DISCUSSION-LOG.md` addendum if the user acts on one): (a) a documented convention that
+  `/gsd-new-milestone` / `/gsd-complete-milestone` must land the active milestone's own
+  `### Phase N:` headings inside its own window before archival, (b) a repo-local check (e.g.
+  wired into `scripts/check.sh`) that asserts `roadmap.analyze`'s `phase_count > 0` and a sane
+  `current_phase`/`next_phase`, catching a regression at CI time instead of at the next
+  `/gsd-new-milestone` run, (c) a gsd-core parser fix — explicitly out of scope per
+  REQUIREMENTS.md. Still open pending explicit operator direction; not implemented.
 
 </decisions>
 
@@ -134,12 +143,10 @@ verified, just close it out" framing established in this session.
 
 - **Durability for future milestones** (D-03 above) — making the ROADMAP.md layout fix
   self-sustaining across milestone boundaries, rather than dependent on `gsd-roadmapper`
-  happening to write phases inside the right window each time. Would need its own backlog item
-  and operator scoping decision; not raised as a new backlog entry here since that itself would
-  be a scope decision the operator didn't make.
-- **Closing 999.72 / 999.72a's status labels** (D-02 above) — deferred by narrow reading of
-  REQUIREMENTS.md's Out of Scope line, not ruled out permanently. A future session could revisit
-  whether "no longer live" (PROJECT.md's Goal) implies the backlog entry should say so.
+  happening to write phases inside the right window each time. Three options were laid out for
+  the operator (documented convention / repo-local CI check / gsd-core parser fix — the last one
+  out of scope per REQUIREMENTS.md); no option has been chosen yet. Would need its own backlog
+  item if pursued.
 
 ### Reviewed Todos (not folded)
 None — `todo.match-phase 32` returned zero matches.

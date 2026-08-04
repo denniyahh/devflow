@@ -322,7 +322,7 @@ is not closed whatever the unit tests say).
 **Related:** CONTEXT.md D-14 (per-child declared tokens) is the adjacent deferral from the same
 planning session — deferred on size, not merit. Strong candidate to pair with this one.
 
-### Phase 999.72: ROADMAP.md Layout Hides Every Phase From `gsd-tools`' Milestone-Scoped Parsers (BACKLOG)
+### Phase 999.72: ROADMAP.md Layout Hides Every Phase From `gsd-tools`' Milestone-Scoped Parsers (RESOLVED — 2026-08-04, Phase 32)
 
 **Linear:** [DEN-93](https://linear.app/denniskim/issue/DEN-93/99972-roadmapmd-layout-hides-every-phase-from-gsd-tools-milestone)
 **Found:** 2026-08-03, creating Phase 31. Not blocking Phase 31.
@@ -381,8 +381,24 @@ cause also has a worse, write-path sibling: see upstream
 GSD-core issue ledger entry 16 (`gsd-tools milestone.complete`'s pass-all degrade), found closing
 v2.3.0 the same day.
 
+**Resolution (2026-08-04, Phase 32):** `gsd-roadmapper`'s write when creating the `gsd-hygiene`
+milestone's own ROADMAP.md section (commit `0b1ad74`) put this milestone's `### Phase 32:`
+heading and its `## Progress` table inside the active milestone's heading-to-next-heading window
+by construction, resolving both Cause 1 and Cause 2 for this milestone as a side effect —
+confirmed by direct re-run in Phase 32's `/gsd-discuss-phase`: `roadmap.analyze` returns
+`phase_count: 1` / `next_phase: "32"`, and `milestone.complete gsd-hygiene --dry-run` correctly
+reports the one unstarted phase instead of the pass-all degrade. **This resolves the condition for
+the current milestone; it is not a structural fix** — the 2026-08-04 status update's warning above
+still holds for whatever milestone comes after `gsd-hygiene`, since nothing changed in
+`gsd-roadmapper` or `phase.add` themselves. See Phase 32's `32-CONTEXT.md` for the verification
+detail and for why durability wasn't tackled in this phase.
+
 **Sub-item 999.72a — add the missing `## Progress` table. Size S, independently landable, do this
 one first.** Added 2026-08-03 after it was traced as the cause of a *second*, separate misverdict.
+**Resolved 2026-08-04** — the table now exists (`## Progress`, this file, added by the same
+`gsd-roadmapper` write). `deriveProgressFromRoadmap`'s roadmap-derived completion path is
+confirmed live (`smart-entry`'s `roadmap_total_phases`/`roadmap_completed_phases` flipped from
+`null` to real counts per STATE.md's 2026-08-04 session note).
 
 `isComplete()` prefers ROADMAP-derived counts and falls back to a legacy STATE.md comparison
 "when the roadmap has no Progress table". We have never had one: the table is absent from **all
