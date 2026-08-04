@@ -1,7 +1,7 @@
 ---
 phase: 31-claude-adapter-launch-path-pipe-owning-monitor-999-64-arc-cl
 verified: 2026-08-04T01:45:35Z
-status: human_needed
+status: passed
 score: 11/13 must-haves verified
 behavior_unverified: 0
 overrides_applied: 0
@@ -25,8 +25,49 @@ Claude adapter, and the adapter emits `stream-json` always-on, making 30b's pars
 production for the first time.
 
 **Verified:** 2026-08-04T01:45Z
-**Status:** human_needed
+**Status:** passed — all three `human_verification` items resolved by the operator 2026-08-03; see "Human verification: resolved" below.
 **Re-verification:** No — initial verification.
+
+## Human verification: resolved (2026-08-03)
+
+The verifier correctly routed three items to a human and did not default on any of them. All three
+are now resolved, so the status is `passed`. Recorded here rather than by re-running the verifier,
+because re-running would only re-ask the same three questions: no `31-UAT.md` exists for this phase,
+and the items were operator decisions and judgment calls, not manual tests.
+
+**Item 1 — disposition of the fabricated phase-97 commits. RESOLVED: keep them.**
+Operator decision, 2026-08-03. The eight commits (`0590537`…`911bf50`) stay on `feature/phase-31`
+and go into `develop`'s history as-is. Rationale: the two worktree merges with independent-forking
+parents **are** the D-18 evidence, and the raw stream capture was already deleted — so the merge
+topology is the only remaining proof that isn't transcription. Rewriting the branch would buy a
+cosmetically cleaner history at the cost of making the phase's central claim permanently
+unverifiable. Squashing was considered and rejected on the same ground: it collapses the two-parent
+topology, which is precisely the shape that distinguishes real delegation from an orchestrator
+working inline. `31-ACCEPTANCE.md` and `31-05-SUMMARY.md` both explain what the commits are, so a
+future reader finds an explanation rather than a mystery.
+
+**Item 2 — was the D-19 checkpoint adjudicated by a human? RESOLVED, and the verifier caught a real
+error.** `31-05-SUMMARY.md` had said *"the operator adjudicated closes"* — attributing a word the
+operator never used. That was an agent's paraphrase standing in for a human decision, which this
+project's rules forbid. Corrected in `fd390d9`: the summary now records the operator's instruction
+verbatim — *"Run the gsd command to close the phase."* The decision is real and the wording is now
+the operator's own.
+
+**Item 3 — how much weight one un-reproducible run should carry. RESOLVED as an accepted limit, not
+a fixed defect.** The raw capture is gone and cannot be recovered; nothing can change that now. The
+phase therefore ships with this bound stated rather than blurred:
+
+> **Established:** the pipe-owning monitor delivered both completions on one real run, crossing the
+> orphan point where the orchestrator's turn ended with both executors outstanding.
+> **NOT established:** that it does so reliably. One run is one run.
+
+The corroboration the verifier found independently — the CLI's background-task IDs
+(`a88358fe70a3a44e7`, `a572f3ed8b7f202e3`) appearing verbatim in the git merge-commit subjects, and
+the merge topology being genuinely independent-forking — supports the transcription without
+substituting for the missing artifact. Anyone relying on this phase for reliability rather than
+feasibility should re-run the acceptance workload, not re-read this document.
+
+---
 
 ## What I checked and how
 
