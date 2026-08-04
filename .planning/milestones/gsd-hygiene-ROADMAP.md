@@ -2,6 +2,48 @@
 
 > Phase plan source of truth. Each phase drives a `devflow start` agent session.
 
+## 🚧 gsd-hygiene milestone (GSD Workflow Hygiene, ACTIVE — declared 2026-08-04)
+
+**Declared 2026-08-04. Intentionally unversioned** — no `vX.Y.Z`, nothing published to
+crates.io. This milestone touches only `.planning/` documentation structure: it restructures
+this file so the active milestone's own phase headings live inside its own
+heading-to-next-heading window, closing backlog **999.72** (`roadmap.analyze` misreporting
+`phase_count: 0`; `milestone.complete --dry-run` triggering its pass-all degrade because
+`milestonePhaseNums.size === 0`) and **999.72a** (the missing `## Progress` table, which left
+the completion check on its legacy STATE.md-comparison fallback). See
+`.planning/REQUIREMENTS.md` (HYGIENE-01/02/03) and `.planning/PROJECT.md` § "Current Milestone."
+
+| Phase | Name | Status | Version |
+|---|---|---|---|
+| 32 | ROADMAP Layout Hygiene | Not started | — |
+
+### Phase 32: ROADMAP Layout Hygiene
+
+**Goal**: `roadmap.analyze` and `milestone.complete --dry-run`, run against this repo's active
+milestone, report this milestone's own phase instead of misfiring — this phase's own detail
+heading lives inside the active milestone's own heading-to-next-heading window in this file
+(before the next `## ` milestone-boundary heading), and a `## Progress` table exists so the
+roadmap-derived completion check is used instead of its legacy STATE.md-comparison fallback.
+**Depends on**: Nothing (first phase of this milestone)
+**Requirements**: HYGIENE-01, HYGIENE-02, HYGIENE-03
+**Success Criteria** (what must be TRUE):
+
+  1. `gsd-tools query roadmap.analyze` run against this repo reports a non-zero `phase_count`
+     for the active milestone and lists Phase 32 (today: `phase_count: 0`).
+
+  2. `gsd-tools query milestone.complete <label> --dry-run` run against the active milestone
+     resolves this milestone's own phase set instead of the pass-all degrade that sweeps every
+     directory on disk, including unrelated `999.x` backlog directories.
+
+  3. `ROADMAP.md` contains a `## Progress` table (columns `Phase`, `Plans Complete`, `Status`,
+     `Completed`) whose derived phase counts are non-null, so the roadmap-derived completion
+     check is used instead of the legacy STATE.md-comparison fallback it fell back to when no
+     such table existed.
+
+  4. The three closed-milestone sections (v2.3.0, v2.0.0, v1.0) and the Backlog section are
+     unchanged in content — this phase only inserts a new section; it moves nothing.
+**Plans**: TBD
+
 ## Progress
 
 **Scope note:** this table is global (spans every shipped milestone plus the active one), per
@@ -46,19 +88,6 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 30 | 5/5 | Complete | — |
 | 31 | 5/5 | Complete | — |
 | 32 | 0/0 | Complete    | 2026-08-04 |
-
-## gsd-hygiene milestone (CLOSED 2026-08-04 — GSD Workflow Hygiene)
-
-**Declared 2026-08-04, closed 2026-08-04. Intentionally unversioned** — no `vX.Y.Z`, nothing
-published to crates.io; pure `.planning/` documentation structure. Restructured this file so the
-active milestone's own phase headings land inside its own heading-to-next-heading window,
-closing backlog `999.72` (`roadmap.analyze` misreporting `phase_count: 0`; `milestone.complete
---dry-run` triggering its pass-all degrade) and `999.72a` (the missing `## Progress` table
-above). Full detail archived to `.planning/milestones/gsd-hygiene-ROADMAP.md`.
-
-| Phase | Name | Status | Version |
-|---|---|---|---|
-| 32 | ROADMAP Layout Hygiene | Complete | — |
 
 ## v2.3.0 milestone (CLOSED 2026-08-04 — the unattended run)
 

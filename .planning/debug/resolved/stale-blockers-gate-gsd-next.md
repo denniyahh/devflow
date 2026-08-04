@@ -1,9 +1,9 @@
 ---
 slug: stale-blockers-gate-gsd-next
-status: diagnosed
+status: resolved
 trigger: "the two blockers reported in STATE.md — the RESOLVED 2026-07-19 (17-09, `cb9359f`) entry, and \"Phase 23 behavioral acceptance criterion (one phase Define-to-Ship, unattended) NOT met\""
 created: 2026-08-03
-updated: 2026-08-03
+updated: 2026-08-04
 ---
 
 # Debug: stale blockers gate /gsd:next
@@ -398,3 +398,30 @@ session_manager_verification: |
   NOT established by the above: only the two cited claims were re-verified. The 7 fixtures, the
   as-is/cleared pair, and the `state resolve-blocker` false-success finding are the
   investigator's measurements, reproduced here on its report alone and not independently re-run.
+
+## Resolution Update (2026-08-04)
+
+**The `fix:` section above is stale.** It says "NOTHING APPLIED, awaiting operator decision" — but
+the proposed `## Blockers` replacement was in fact applied, in commit `547a401` ("docs(state):
+clear two stale blockers; fold the Progress-table gap into 999.72"), bundled into the v2.3.0
+release merge (`dc844b5`). That commit predates this update; the debug session file itself was
+just never updated to reflect it, so `audit-open` kept re-flagging a session whose fix was already
+live. Confirmed by reading `.planning/STATE.md`'s current `## Blockers` section directly — it
+matches the proposed replacement text (minor wording differences, same structure and effect).
+
+**Part (2) of the coupled decision — the `complete`/two-scale-bug fallback — is now also
+resolved**, independently, by Phase 32 (`999.72`/`999.72a`, `gsd-hygiene` milestone, 2026-08-04):
+ROADMAP.md now has a `## Progress` table with real, non-null derived counts, so `isComplete` uses
+the roadmap-derived path instead of the legacy `current_phase` vs. milestone-scoped `total_phases`
+comparison. Re-verified live: `gsd-tools smart-entry --json` now returns `blockers: []`,
+`roadmap_total_phases: 30`, `roadmap_completed_phases: 30`, `situation: "complete"`,
+`recommended: "new-milestone"` — and this verdict is now actually CORRECT (`gsd-hygiene`'s one
+phase, 32, is genuinely done), not the wrong-for-the-wrong-reason verdict this session originally
+measured on a copy.
+
+**Third item, still genuinely open:** the upstream ledger entries (15: blocker lifecycle marker
+awareness; 16: `isComplete` scope mismatch) remain undrafted in
+`.planning/UPSTREAM-GSD-ISSUES.md` — not resolved by the above, just no longer urgent since the
+symptom is gone in this repo. Left for whoever next has reason to file upstream defects.
+
+status: resolved. Moved to `.planning/debug/resolved/`.

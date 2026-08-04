@@ -1,16 +1,20 @@
 ---
 gsd_state_version: 1.0
 milestone: gsd-hygiene
-milestone_name: GSD Workflow Hygiene
-status: planning
-last_updated: "2026-08-04T17:12:09.000Z"
+milestone_name: GSD Workflow Hygiene (CLOSED 2026-08-04)
+status: Awaiting next milestone
+stopped_at: Milestone gsd-hygiene completed and archived
+last_updated: "2026-08-04T19:36:53.626Z"
 last_activity: 2026-08-04
+last_activity_desc: Milestone gsd-hygiene completed and archived
 progress:
   total_phases: 1
-  completed_phases: 0
-  total_plans: 0
-  completed_plans: 0
-  percent: 0
+  completed_phases: 1
+  total_plans: 1
+  completed_plans: 1
+  percent: 100
+current_phase: 32
+current_phase_name: ROADMAP Layout Hygiene
 ---
 
 # DevFlow — Project State
@@ -23,7 +27,7 @@ Items acknowledged and deferred at milestone close on 2026-08-04:
 
 | Category | Item | Status |
 |----------|------|--------|
-| debug | stale-blockers-gate-gsd-next | acknowledged — diagnosed gsd-core tooling defect (smart-entry's blocker scan), unrelated to v2.3.0 milestone content; will address in a future phase |
+| debug | stale-blockers-gate-gsd-next | **resolved 2026-08-04** during gsd-hygiene's close — the STATE.md `## Blockers` fix was already live (`547a401`), and the coupled `complete`-verdict concern is now correctly resolved by Phase 32's own `## Progress` table fix. See `.planning/debug/resolved/stale-blockers-gate-gsd-next.md`. |
 | uat_gap | 24-UAT.md (Phase 24) | acknowledged — audit flagged it but the file's own frontmatter reads status:passed, 1/1 passed, 0 pending/issues/blocked; treated as an audit-tool false positive, skipped, will not revisit |
 
 ## Active Phase
@@ -149,16 +153,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 32 of 1 (ROADMAP Layout Hygiene) — ready to plan
+Phase: Milestone gsd-hygiene complete
 Plan: —
-Status: Roadmap created; ready for /gsd-discuss-phase 32
-Last activity: 2026-08-04 — ROADMAP.md restructured: active-milestone heading + Phase 32 detail
-section now live inside their own heading-to-next-heading window, and a `## Progress` table
-added. Verified live: `roadmap.analyze` phase_count 0->1 (garbage cross-milestone matches ->
-correct Phase 32 only), `milestone complete Hygiene --dry-run` no longer sweeps unrelated
-directories (17-dir sweep confirmed via negative control on pre-fix content), and
-`smart-entry`'s roadmap_total_phases/roadmap_completed_phases flipped null->30/29 (roadmap-derived
-completion path now active instead of the legacy STATE.md fallback).
+Status: Awaiting next milestone
+Last activity: 2026-08-04 — Milestone gsd-hygiene completed and archived
 
 ## Recently Shipped
 
@@ -837,14 +835,10 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 
 ## Session
 
-**Last session:** 2026-08-03T14:05:39Z
-**Stopped at:** Phase 31 context gathered (superseded — Phase 31 completed and the v2.3.0 milestone closed 2026-08-04)
-**Resume file:** .planning/milestones/v2.3.0-phases/31-claude-adapter-launch-path-pipe-owning-monitor-999-64-arc-cl/31-CONTEXT.md (archived location, moved at milestone close)
+**Last session:** 2026-08-04T18:35:31.717Z
+**Stopped at:** Milestone gsd-hygiene completed and archived
+**Resume file:** .planning/milestones/gsd-hygiene-phases/32-roadmap-layout-hygiene/32-CONTEXT.md
 
 ## Operator Next Steps
 
-- ROADMAP.md now has a live Phase 32 (ROADMAP Layout Hygiene) inside the active milestone's own
-  window, plus a `## Progress` table — closes backlog 999.72/999.72a for this repo's active
-  milestone (999.72's OWN closed-milestone windows, v2.3.0/v2.0.0, are unchanged and still
-  reproduce the pass-all degrade if targeted directly; only the active milestone was in scope).
-  Next: `/gsd-discuss-phase 32`.
+- Start the next milestone with /gsd-new-milestone
