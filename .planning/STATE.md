@@ -1,10 +1,14 @@
 ---
 gsd_state_version: 1.0
 milestone: v2.4.0
-milestone_name: Resume Unattended Dogfooding
+milestone_name: milestone (Resume Unattended Dogfooding, ACTIVE — declared 2026-08-04)
+current_phase: 33
+current_phase_name: Loop-Back Correctness for Multi-Wave Validate→Code Cycles
 status: planning
-last_updated: "2026-08-04T21:52:01.000Z"
+stopped_at: Phase 33 context gathered
+last_updated: "2026-08-04T22:42:24.525Z"
 last_activity: 2026-08-04
+last_activity_desc: "ROADMAP.md gained a new `## 🚧 v2.4.0 milestone (ACTIVE)` heading"
 progress:
   total_phases: 2
   completed_phases: 0
@@ -838,9 +842,9 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 
 ## Session
 
-**Last session:** 2026-08-04T18:35:31.717Z
-**Stopped at:** Milestone gsd-hygiene completed and archived
-**Resume file:** .planning/milestones/gsd-hygiene-phases/32-roadmap-layout-hygiene/32-CONTEXT.md
+**Last session:** 2026-08-04T22:42:24.391Z
+**Stopped at:** Phase 33 context gathered
+**Resume file:** .planning/phases/33-loop-back-correctness-for-multi-wave-validate-code-cycles-99/33-CONTEXT.md
 
 ## Operator Next Steps
 
