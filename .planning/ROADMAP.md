@@ -54,7 +54,16 @@ reach a second loop-back at all.
   4. `consecutive_failures` still gates correctly when Validate finds the *same* unresolved
      problem again across a loop-back — the fix narrows the false positive without disabling the
      safety gate it protects.
-**Plans**: TBD
+**Plans**: 3 plans across 2 waves
+
+Plans:
+- [ ] 33-01-PLAN.md — 999.65: route the three in-scope Validate loop-back arms through a
+      `{N}-VERIFICATION.md`-existence check, adding `FixType::FullExecute` for the mid-arc case
+      (wave 1)
+- [ ] 33-02-PLAN.md — 999.66 primitives: the persisted forward-progress baseline on `State` and
+      the pure reset-vs-accumulate predicate in `mode` (wave 1, parallel with 33-01)
+- [ ] 33-03-PLAN.md — 999.66 wiring: one shared git-derived commit-count helper, the rewritten
+      counter branch in `handle_validate_outcome`, and the matched multi-wave test pair (wave 2)
 
 ### Phase 34: Stream-JSON Coverage and the Validate Trust Boundary (999.73 + 999.74)
 **Goal**: Operators can trust that every pipeline stage launches through the same reliable
