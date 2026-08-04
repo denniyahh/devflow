@@ -64,6 +64,34 @@ if [ -n "$summaries" ]; then
   } > "$root/.devflow/state-stale.json" 2>/dev/null
 fi
 
+# Warn when a "how this repo is set up" file changes without the portability
+# checklist moving too.
+#
+# .planning/DEV-SETUP-CHECKLIST.md exists so this repo's dev setup can be
+# replicated elsewhere; it goes stale the same silent way STATE.md does above
+# — nothing else reads it, so drift is invisible until someone tries to
+# actually follow it on a new machine. Unlike the SUMMARY.md signal above,
+# there's no single canonical trigger file, so this matches the same
+# categories the checklist itself documents: git policy, hooks, CI,
+# devcontainer/toolchain pins, GSD config. CLAUDE.md asks the agent to update
+# the checklist in the same commit as a matching change; this is the
+# mechanical backstop for when that doesn't happen — warn only, never edit,
+# same reasoning as the STATE.md check above (a hook silently editing a
+# tracked file mid-commit is worse than the staleness it would fix).
+setup_changed=$(printf '%s\n' "$changed" | grep -E \
+  '^(\.gitconfig|CONTRIBUTING\.md|rust-toolchain\.toml|\.planning/config\.json)$|^scripts/hooks/|^\.github/(workflows/|PULL_REQUEST_TEMPLATE\.md|ISSUE_TEMPLATE/)|^\.devcontainer/|^scripts/(check\.sh|check-in-container\.sh|assert-image-parity\.sh)$' \
+  || true)
+checklist_changed=$(printf '%s\n' "$changed" | grep -Fx '.planning/DEV-SETUP-CHECKLIST.md' || true)
+
+if [ -n "$setup_changed" ] && [ -z "$checklist_changed" ]; then
+  {
+    printf '\n\033[33m── DEV-SETUP-CHECKLIST.md may now be stale ──\033[0m\n'
+    printf 'This commit touched setup file(s) but not the checklist:\n'
+    printf '  %s\n' $setup_changed
+    printf 'Review .planning/DEV-SETUP-CHECKLIST.md and update it if this changes what a fresh replication needs.\n\n'
+  } >&2
+fi
+
 # Restore .planning/UPSTREAM-GSD-ISSUES.md if it has gone missing.
 #
 # That path is a symlink into the sibling gsd-core checkout, where the ledger is

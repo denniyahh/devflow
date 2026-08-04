@@ -38,5 +38,13 @@
     "gsd-doc-classifier": "haiku",
     "gsd-intel-updater": "haiku",
     "gsd-mempalace-curator": "haiku"
+  },
+  "mempalace": {
+    "enabled": true,
+    "capture_artifacts": true,
+    "wing": "devflow",
+    "memory_mode": "augment",
+    "mirror_kg": false,
+    "recall_on_plan": true
   }
 }

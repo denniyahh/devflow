@@ -133,8 +133,14 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
 - [ ] **[GLOBAL, currently empty]** Auto-memory directory convention:
   `~/.claude/projects/<project-path>/memory/` — per-project persistent memory, keyed by encoded
   filesystem path, so it naturally travels with wherever the project lives on disk.
-- [ ] **Not enabled here, optional:** MemPalace (external temporal-KG memory layer) — see prior
-  conversation; requires its own CLI/MCP setup, not just a config flag.
+- [ ] **[PROJECT, enabled 2026-08-04]** MemPalace — `.planning/config.json`'s `mempalace` block:
+  `enabled: true`, `capture_artifacts: true`, `wing: "devflow"`, `memory_mode: "augment"`,
+  `mirror_kg: false`, `recall_on_plan: true`. Requires the `mempalace` CLI on `PATH` (this
+  machine: v3.6.0, installed via `~/.local/bin/mempalace`) — no MCP server registered yet, so
+  transport falls back to CLI-only, which the GSD skills support as a first-class path, not a
+  degraded one. **The palace itself starts empty** (`mempalace status` reported no palace at
+  `~/.mempalace/palace` as of enabling) — capture accrues from new phases going forward; nothing
+  was backfilled from this repo's existing `.planning/` history.
 
 ## 7. GSD planning structure (`.planning/`)
 
