@@ -393,6 +393,35 @@ Unsequenced items — not part of the active phase sequence. Promote with
 `/gsd-review-backlog` when ready; each carries accumulated context in its
 own `phases/999.N-*/CONTEXT.md`.
 
+### Phase 999.75: `CloseRule` Treats an Unparseable `tasks` List on the FIRST Announcement as Permission to Close (BACKLOG)
+
+**Linear:** [DEN-96](https://linear.app/denniskim/issue/DEN-96/99975-closerule-treats-an-unparseable-tasks-list-on-the-first)
+**Found:** 2026-08-03 by peer code review during Phase 31 (DeepSeek v4 Pro, HIGH-1), verified
+against live source the same day. **Deliberately not fixed in Phase 31** — the naive fix breaks the
+common case.
+
+**The defect.** `CloseRule::observe` updates its pending-task count only when a
+`background_tasks_changed` event carries a readable `tasks` array. Its comment calls leaving the
+previous state standing "the conservative direction" — true only when a previous readable
+announcement existed. On the *first* announcement, previous state is `None`, and `should_close()`
+treats `None` as permission to close. In exactly the case the comment defends against, the code
+does the opposite.
+
+**Failure scenario.** First `background_tasks_changed` arrives with `tasks` present but not an
+array. State stays `None`. Marker arrives. stdin is released. A background task completing later
+has no channel for its notification turn — the 999.64 shape, reachable through the guard built to
+prevent it.
+
+**Why the obvious fix is wrong.** Treating `None` as pending would hang every stage that never
+backgrounds anything (the common case) until the 120s idle timeout. The distinction needs three
+states where the code has two: never-announced (close is correct), announced-and-drained (correct),
+announced-but-unreadable (**new** — must not close). Suggested: replace `Option<usize>` with an
+explicit enum so the cases cannot collapse.
+
+**Severity, honestly: contingent on an unobserved CLI behaviour.** Nobody has seen the CLI emit a
+non-array `tasks`, and it serializes that JSON itself. This is a robustness gap in a guard whose
+job is to be conservative, not a demonstrated live failure.
+
 ### Phase 999.74: `classify_validate_outcome` Trusts the Agent's Verdict Over Its Own Status (BACKLOG)
 
 **Linear:** [DEN-95](https://linear.app/denniskim/issue/DEN-95/99974-classify-validate-outcome-trusts-the-agents-verdict-over-its-own)
