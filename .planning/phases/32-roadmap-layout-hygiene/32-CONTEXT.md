@@ -37,10 +37,11 @@ So this is a verify-and-close phase, not a build phase.
 The user was offered three gray areas (plan scope given the fix already landed; whether to close
 out the 999.72/999.72a backlog entries' status labels; durability for future milestones) and
 initially declined all three, selecting "None of these — I'm ready for context: treat as a
-straightforward verify-and-close with no open decisions." Immediately after CONTEXT.md was first
-written, the user reopened D-02 directly ("flip the backlog items' status") in the same session —
-recorded below as an operator decision, superseding the earlier Claude's-Discretion default. D-01
-and D-03 remain Claude's defaults from the opt-out, not operator-chosen answers.
+straightforward verify-and-close with no open decisions." In the same session, the user then
+reopened both D-02 ("flip the backlog items' status") and D-03 ("option 1 would be good enough
+for now") directly — both recorded below as operator decisions, superseding the earlier
+Claude's-Discretion defaults. D-01 remains Claude's default from the opt-out, not an
+operator-chosen answer.
 
 ### Decisions
 - **D-02 (999.72 / 999.72a backlog entries) — operator decision, reversing the original default:**
@@ -55,6 +56,17 @@ and D-03 remain Claude's defaults from the opt-out, not operator-chosen answers.
   so this was a direct edit, consistent with how this file's other resolved backlog entries
   (999.29, 999.30, etc.) appear to have been closed. — **Reversibility:** reversible — a one-line
   heading edit to revert.
+- **D-03 (durability for future milestones) — operator decision:** Option (a), a documented
+  convention, chosen over (b) a repo-local CI check and (c) a gsd-core parser fix (out of scope).
+  Added as a new "Keep the active milestone's phase headings inside its own window" section in
+  `CLAUDE.md` — the project-instructions file already loaded into every session for this repo, so
+  it reaches whoever runs `/gsd-new-milestone` / `/gsd-complete-milestone` or hand-edits
+  `ROADMAP.md` next, without needing a code change. Covers: the two root causes (interrupting
+  closed-milestone heading; reused `### Phase N:` headings), the requirement to keep the
+  `## Progress` table, and a spot-check command (`gsd-tools query roadmap.analyze`). Explicitly
+  "good enough for now" per the operator — not a CI-enforced guarantee; a regression would still
+  only be caught by whoever reads CLAUDE.md at the next milestone boundary, not automatically.
+  — **Reversibility:** reversible — a documentation-only addition.
 
 ### Claude's Discretion
 - **D-01 (plan scope):** The plan should be verification-only — re-run the three checks above
@@ -64,15 +76,6 @@ and D-03 remain Claude's defaults from the opt-out, not operator-chosen answers.
   section; it moves nothing") is satisfied by construction since nothing needs inserting.
   — **Reversibility:** reversible — if verification surfaces a real gap, the plan can still add a
   targeted ROADMAP.md edit.
-- **D-03 (durability for future milestones):** Not addressed by this phase as of the initial
-  opt-out. Options were explained to the user in the same session (see chat transcript / a future
-  `32-DISCUSSION-LOG.md` addendum if the user acts on one): (a) a documented convention that
-  `/gsd-new-milestone` / `/gsd-complete-milestone` must land the active milestone's own
-  `### Phase N:` headings inside its own window before archival, (b) a repo-local check (e.g.
-  wired into `scripts/check.sh`) that asserts `roadmap.analyze`'s `phase_count > 0` and a sane
-  `current_phase`/`next_phase`, catching a regression at CI time instead of at the next
-  `/gsd-new-milestone` run, (c) a gsd-core parser fix — explicitly out of scope per
-  REQUIREMENTS.md. Still open pending explicit operator direction; not implemented.
 
 </decisions>
 
@@ -119,9 +122,9 @@ in the correct shape (see `<domain>` above).
 
 ### Established Patterns
 - Resolved backlog entries elsewhere in ROADMAP.md carry a status suffix on their own heading,
-  e.g. `### Phase 999.29: ... (DELIVERED — Phase 21 / 21d)`. Per D-02, this phase does not apply
-  that pattern to 999.72/999.72a — noted here only so a downstream agent doesn't "helpfully"
-  apply it.
+  e.g. `### Phase 999.29: ... (DELIVERED — Phase 21 / 21d)`. Per D-02, 999.72/999.72a now follow
+  this pattern too (`RESOLVED — 2026-08-04, Phase 32`) — already applied, not something the plan
+  needs to do.
 
 ### Integration Points
 - `phase.complete` will update this phase's own `## Progress` table row (`| 32 | ... | Not
@@ -141,12 +144,11 @@ verified, just close it out" framing established in this session.
 <deferred>
 ## Deferred Ideas
 
-- **Durability for future milestones** (D-03 above) — making the ROADMAP.md layout fix
-  self-sustaining across milestone boundaries, rather than dependent on `gsd-roadmapper`
-  happening to write phases inside the right window each time. Three options were laid out for
-  the operator (documented convention / repo-local CI check / gsd-core parser fix — the last one
-  out of scope per REQUIREMENTS.md); no option has been chosen yet. Would need its own backlog
-  item if pursued.
+- **Options (b) and (c) from D-03** — a repo-local CI check (`scripts/check.sh` assertion on
+  `roadmap.analyze`'s `phase_count`) and a gsd-core parser fix were both raised and not chosen;
+  option (a), a documented convention, was picked as "good enough for now." If the CLAUDE.md
+  convention proves insufficient (a future milestone reproduces 999.72 despite it), option (b) is
+  the natural escalation — would need its own backlog item.
 
 ### Reviewed Todos (not folded)
 None — `todo.match-phase 32` returned zero matches.

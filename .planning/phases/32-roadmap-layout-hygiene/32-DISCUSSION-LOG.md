@@ -36,16 +36,30 @@ as Claude's inference from the opt-out rather than as answers the user gave to e
 
 ---
 
+## Post-write follow-up (same session)
+
+Immediately after CONTEXT.md was first written, the user reopened two of the three declined gray
+areas directly, in plain-text follow-up rather than via AskUserQuestion:
+
+**"flip the backlog items' status"** → D-02 reversed. `.planning/ROADMAP.md`'s `999.72` and
+`999.72a` headings changed from `(BACKLOG)` to `(RESOLVED — 2026-08-04, Phase 32)`, with an inline
+paragraph noting the resolution came from `gsd-roadmapper`'s milestone-creation write, not a
+Phase-32 execute cycle. Committed `09db08e`.
+
+**"what would making the layout fix durable entail?"** → three options presented (documented
+convention / repo-local CI check / gsd-core parser fix, the last out of scope). User replied "i
+think option 1 would be good enough for now" → D-03 resolved. Added a new section to `CLAUDE.md`
+("Keep the active milestone's phase headings inside its own window") documenting the two root
+causes, the `## Progress` table requirement, and a spot-check command. Not yet committed at the
+time this log entry was written — see the phase's git history for the actual commit.
+
 ## Claude's Discretion
 
-- Plan scope: verification-only (D-01 in CONTEXT.md)
-- 999.72 / 999.72a backlog entry status labels: left untouched (D-02)
-- Durability for future milestones: not addressed this phase (D-03)
+- Plan scope: verification-only, no further ROADMAP.md edits beyond the D-02 flip (D-01 in
+  CONTEXT.md) — not reopened by the user.
 
 ## Deferred Ideas
 
-- Durability for future milestones (making the fix self-sustaining across milestone boundaries,
-  not dependent on `gsd-roadmapper` writing phases inside the right window each time) — would
-  need its own backlog item and operator scoping decision.
-- Whether to close out 999.72 / 999.72a's status labels in ROADMAP.md's Backlog section — left
-  open for a future session to revisit against PROJECT.md's "no longer live" framing.
+- Options (b) (repo-local CI check) and (c) (gsd-core parser fix) from the durability discussion
+  — not chosen this round; (b) is the natural escalation if the CLAUDE.md convention alone proves
+  insufficient at a future milestone boundary.
