@@ -59,9 +59,11 @@ reach a second loop-back at all.
   4. `consecutive_failures` still gates correctly when Validate finds the *same* unresolved
      problem again across a loop-back — the fix narrows the false positive without disabling the
      safety gate it protects.
-**Plans**: 5/5 plans executed
+**Plans**: 6/6 plans executed
 
 Plans:
+
+- [x] 33-06-PLAN.md
 
 - [x] 33-01-PLAN.md — 999.65: route the three in-scope Validate loop-back arms through a
       `{N}-VERIFICATION.md`-existence check, adding `FixType::FullExecute` for the mid-arc case
@@ -159,7 +161,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 30 | 5/5 | Complete | — |
 | 31 | 5/5 | Complete | — |
 | 32 | 0/0 | Complete    | 2026-08-04 |
-| 33 | 5/5 | Complete    | 2026-08-05 |
+| 33 | 6/6 | In Progress|  |
 | 34 | 0/TBD | Not started | - |
 
 ## gsd-hygiene milestone (CLOSED 2026-08-04 — GSD Workflow Hygiene)
