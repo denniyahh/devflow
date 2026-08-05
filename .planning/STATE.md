@@ -3,12 +3,12 @@ gsd_state_version: 1.0
 milestone: v2.4.0
 milestone_name: milestone (Resume Unattended Dogfooding, ACTIVE — declared 2026-08-04)
 current_phase: 34
-current_phase_name: Stream-JSON Coverage, the Validate Trust Boundary, and Layer 0 in Worktree Mode (999.73 + 999.74 + 999.76)
-status: "Phase 34 planned — 5 plans across 4 waves, ready to execute"
+current_phase_name: stream-json-coverage-and-the-validate-trust-boundary-999-73-
+status: executing
 stopped_at: Phase 34 planned
-last_updated: "2026-08-05T20:12:36.664Z"
+last_updated: "2026-08-05T21:17:51.866Z"
 last_activity: 2026-08-05
-last_activity_desc: Phase 34 planning complete
+last_activity_desc: Phase 34 execution started
 progress:
   total_phases: 2
   completed_phases: 1
@@ -153,10 +153,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 34 — Stream-JSON Coverage and the Validate Trust Boundary (999.73 + 999.74)
-Plan: Not started
-Status: Phase 34 planned — 5 plans across 4 waves, ready to execute
-Last activity: 2026-08-05 — Phase 34 planning complete
+Phase: 34 (stream-json-coverage-and-the-validate-trust-boundary-999-73-) — EXECUTING
+Plan: 1 of 5
+Status: Executing Phase 34
+Last activity: 2026-08-05 — Phase 34 execution started
 (inserted as the FIRST heading, mirroring the Phase 32 durability fix) with Phase 33 and Phase 34
 detail sections landing inside its own heading-to-next-heading window, plus two new `## Progress`
 rows (33, 34 — Not started). Verified live: `roadmap.analyze` phase_count 0->2 (was returning
