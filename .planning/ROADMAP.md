@@ -59,7 +59,7 @@ reach a second loop-back at all.
   4. `consecutive_failures` still gates correctly when Validate finds the *same* unresolved
      problem again across a loop-back — the fix narrows the false positive without disabling the
      safety gate it protects.
-**Plans**: 3/4 plans executed
+**Plans**: 4/4 plans executed
 
 Plans:
 
@@ -73,7 +73,7 @@ Plans:
 - [x] 33-03-PLAN.md — 999.66 wiring: one shared git-derived commit-count helper, the rewritten
       counter branch in `handle_validate_outcome`, and the matched multi-wave test pair (wave 2)
 
-- [ ] 33-04-PLAN.md — gap closure: two pre-existing tests that seed `consecutive_failures` directly
+- [x] 33-04-PLAN.md — gap closure: two pre-existing tests that seed `consecutive_failures` directly
       without the 999.66 baseline silently left their asserted code paths (one attempting a real
       agent launch during `cargo test`); restore both, make an agent launch structurally impossible,
       and confirm `scripts/check.sh all` is reliably green (wave 3)
@@ -153,7 +153,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 30 | 5/5 | Complete | — |
 | 31 | 5/5 | Complete | — |
 | 32 | 0/0 | Complete    | 2026-08-04 |
-| 33 | 3/4 | In Progress|  |
+| 33 | 4/4 | In Progress|  |
 | 34 | 0/TBD | Not started | - |
 
 ## gsd-hygiene milestone (CLOSED 2026-08-04 — GSD Workflow Hygiene)
