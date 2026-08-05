@@ -270,9 +270,11 @@ pub(crate) fn handle_validate_outcome(
             );
             return match run_gate(project_root, state, Stage::Validate, &context)? {
                 GateAction::Advance => transition(project_root, state, Stage::Ship),
-                GateAction::LoopBack(_) => {
-                    loop_back_to_code(project_root, state, FixType::GapsOnly)
-                }
+                GateAction::LoopBack(_) => loop_back_to_code(
+                    project_root,
+                    state,
+                    select_loop_back_fix(project_root, state.phase),
+                ),
                 GateAction::Abort(reason) => abort(project_root, state, &reason),
             };
         }
@@ -301,7 +303,11 @@ pub(crate) fn handle_validate_outcome(
         };
         return match run_gate(project_root, state, Stage::Validate, &context)? {
             GateAction::Advance => transition(project_root, state, Stage::Ship),
-            GateAction::LoopBack(_) => loop_back_to_code(project_root, state, FixType::GapsOnly),
+            GateAction::LoopBack(_) => loop_back_to_code(
+                project_root,
+                state,
+                select_loop_back_fix(project_root, state.phase),
+            ),
             GateAction::Abort(reason) => abort(project_root, state, &reason),
         };
     }
@@ -1321,6 +1327,176 @@ mod tests {
         assert_eq!(
             last["fix"], "GapsOnly",
             "a phase with an existing {{N}}-VERIFICATION.md must still dispatch GapsOnly"
+        );
+    }
+
+    /// D-01/D-02: the `Ambiguous` gate's loop-back arm must also consult
+    /// `select_loop_back_fix`, not only the plain-Failed tail arm Task 1
+    /// wired. Seeds a rejecting `GateResponse` (note without "abort", so
+    /// `GateAction::from_response` resolves `LoopBack` rather than `Abort`)
+    /// so the gate resolves from an already-written file instead of
+    /// blocking on the multi-day default timeout. PATH is neutralized under
+    /// `ENV_MUTEX` (Task 1's shape) so the resulting `LoopBack` cannot spawn
+    /// a real agent CLI — the `loop_back` event is emitted before that
+    /// launch, so its `Err` is discarded.
+    #[test]
+    fn ambiguous_gate_loop_back_respects_the_mid_arc_check() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 84;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        workflow::save_state(&state).unwrap();
+
+        // No {phase:02}-VERIFICATION.md — mid-arc precondition.
+
+        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"loop back for another pass","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        let _ = handle_validate_outcome(
+            root,
+            &mut state,
+            ValidateOutcome::Ambiguous("test disagreement".to_string()),
+        );
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        let last = devflow_core::events::last_event_of_kind_for_phase(root, phase, "loop_back")
+            .expect("loop_back event must be recorded");
+        assert_eq!(
+            last["fix"], "FullExecute",
+            "the Ambiguous gate's loop-back must respect the mid-arc check, same as the plain tail arm"
+        );
+    }
+
+    /// D-01/D-02: the consecutive-failure-gated loop-back arm must also
+    /// consult `select_loop_back_fix`. Sets `consecutive_failures` to the
+    /// ceiling beforehand so the `should_gate` branch is the one taken
+    /// (rather than the plain-Failed tail arm Task 1 already covers), and
+    /// proves the gated path and the ungated tail agree on the fix — which
+    /// they did not have to. PATH-neutralized under `ENV_MUTEX`, same as
+    /// above.
+    #[test]
+    fn failure_gate_loop_back_respects_the_mid_arc_check() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 85;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        state.consecutive_failures = mode::MAX_CONSECUTIVE_FAILURES;
+        workflow::save_state(&state).unwrap();
+
+        // No {phase:02}-VERIFICATION.md — mid-arc precondition.
+
+        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"loop back for another pass","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        let last = devflow_core::events::last_event_of_kind_for_phase(root, phase, "loop_back")
+            .expect("loop_back event must be recorded");
+        assert_eq!(
+            last["fix"], "FullExecute",
+            "the consecutive-failure-gated loop-back must respect the mid-arc check, same as the ungated tail arm"
+        );
+    }
+
+    /// D-02, the negative control for the whole D-01 change: identical
+    /// precondition (no `{N}-VERIFICATION.md`) as the two tests above, but
+    /// driven through `handle_ship_outcome` instead — must still dispatch
+    /// `GapsOnly`, proving the out-of-scope call site was not swept in as a
+    /// runtime fact, not merely a claim about the diff. PATH-neutralized
+    /// under `ENV_MUTEX`, same as above.
+    #[test]
+    fn ship_loop_back_still_issues_gaps_only_when_verification_absent() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 86;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Ship;
+        assert!(
+            !state.yes_ship,
+            "no pre-authorization must short-circuit the gate"
+        );
+        workflow::save_state(&state).unwrap();
+
+        // No {phase:02}-VERIFICATION.md — same mid-arc precondition that
+        // flips the two Validate arms above.
+
+        let response_path = Gates::response_path(root, phase, Stage::Ship);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"loop back for another pass","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        let _ = handle_ship_outcome(root, &mut state);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        let last = devflow_core::events::last_event_of_kind_for_phase(root, phase, "loop_back")
+            .expect("loop_back event must be recorded");
+        assert_eq!(
+            last["fix"], "GapsOnly",
+            "handle_ship_outcome must remain unaffected by the D-01 mid-arc check (D-02)"
         );
     }
 
