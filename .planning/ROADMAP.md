@@ -295,6 +295,63 @@ Unsequenced items — not part of the active phase sequence. Promote with
 `/gsd-review-backlog` when ready; each carries accumulated context in its
 own `phases/999.N-*/CONTEXT.md`.
 
+### Phase 999.77: A Single Transient `git` Failure Grants a Free `consecutive_failures` Reset, and the Doc Comment Promises the Opposite (BACKLOG)
+
+**Linear:** [DEN-99](https://linear.app/denniskim/issue/DEN-99/99977-a-single-transient-git-failure-grants-a-free-consecutive)
+**Found:** 2026-08-05, Phase 33 code review (WR-03); carried forward as still-open by the DeepSeek
+v4 Pro peer review and confirmed in source. **Pre-existing relative to 33-05**, but the
+accumulate-vs-reset branch it lives in was built by 33-02/33-03, so it is Phase 33-era code.
+
+**Severity: Medium.** It weakens a safety gate rather than producing a wrong result, needs a
+transient fault to trigger, and the gate still fires if `git` failures continue uninterrupted. Not
+Low: it defeats the bound precisely when the bound matters, does so silently, and the source
+currently documents the opposite guarantee — which is how it survived review.
+
+**The defect.** `phase_commit_count` (`crates/devflow-core/src/agent_result.rs:1841`) returns `0`
+indistinguishably for "genuinely no commits", "branch does not exist", and "`git` could not be
+run" — its own doc at `:1838-1840` says so, and adds *"Every consumer treats all three the same
+way."* That last clause is the part that is not true. The baseline write at
+`crates/devflow-cli/src/pipeline_outcomes.rs:357` is **unconditional** ("regardless of which branch
+ran above"), so a `0` produced by a broken `git` is persisted as though it were a real measurement.
+
+**Failure sequence.** (1) `git` momentarily fails; count reads `0`; the streak correctly
+accumulates — this step is fine — but the baseline is overwritten to `Some(0)`. (2) Next cycle
+`git` works and reads the branch's real count, say `40`; the predicate at
+`crates/devflow-core/src/mode.rs:150` is `previous.is_none_or(|p| current > p)` → `40 > 0` →
+**true** → `consecutive_failures = 1`. No new work happened between the two cycles. One flaky `git`
+invocation bought one free reset of the `MAX_CONSECUTIVE_FAILURES` ceiling.
+
+**Impact.** In a genuinely stuck Code↔Validate loop — the exact situation the ceiling exists to
+bound — an intermittent `git` failure pushes the human gate further away every time it occurs. The
+gate is not disabled, but its guarantee degrades from "bounded" to "bounded unless `git` flakes",
+with no limit on how often that can repeat in one run. Silent, environmentally triggered, so it
+reaches an operator as "the unattended run never gated" with nothing in the record explaining why —
+the same class of unattended stall DOGFOOD-01/02 exist to eliminate, reached from the opposite
+direction: failing to gate when it should, rather than gating when it should not.
+
+**The doc comment asserts the opposite, and that is the compounding problem.**
+`pipeline_outcomes.rs:283-286` promises *"The failure direction is toward gating: an unrunnable
+`git` or a missing branch counts zero every cycle, so once a baseline is recorded the counter
+accumulates and the gate stays reachable."* That holds only while `git` stays broken; it is false
+for exactly one transient failure, which is the likelier event. **Correct this comment even if the
+code fix is deferred** — it documents a safety property the code does not have.
+
+**Proposed fix:** distinguish "counted zero" from "could not count" — add a sibling returning
+`Option<u32>`, treat `None` as not-progress *without overwriting the baseline* so the next
+successful measurement compares against the last real observation, and update
+`phase_commit_count`'s "every consumer treats all three the same way" line, which the fix
+deliberately falsifies. Full patch sketch in the Linear issue and in `33-REVIEW.md` WR-03.
+
+**Test coverage the fix must add:** no current test exercises a failing `git`. The regression test
+is the two-cycle sequence itself — force a measurement failure, then a success with an unchanged
+real count, and assert the streak **accumulated** rather than reset. A single-cycle test passes
+against both the buggy and the fixed code, so without that sequence the fix is unverifiable.
+
+**Note for the next reader:** Gemini 3.1 Pro reviewed this logic and rated it clean, analysing
+`current = 0` against `previous = Some(0)` (two *consecutive* `git` failures) and correctly finding
+the streak accumulates. It never examined failure-then-success, which is the actual defect. Do not
+treat that AGREE as clearing this finding.
+
 ### Phase 999.76: Layer 0 External Verification Reads Its Declaration From the Main Checkout, So It Is Inert in Worktree Mode (BACKLOG)
 
 **Linear:** [DEN-98](https://linear.app/denniskim/issue/DEN-98/99976-layer-0-external-verification-reads-its-declaration-from-the)
