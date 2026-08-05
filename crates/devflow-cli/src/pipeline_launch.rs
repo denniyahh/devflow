@@ -976,9 +976,22 @@ pub(crate) fn advance(project_root: &Path, phase: Option<u32>) -> Result<(), Cli
             // resume ceiling has not been exhausted. All five true -> resume
             // and return. Any false -> fall through to the unchanged
             // per-stage dispatch below.
+            //
+            // Steps (2) and (3) deliberately read DIFFERENT roots (999.76,
+            // ROADMAP criterion 6). Step (2) reads the EXECUTION root:
+            // `.planning/` is tracked content, so an in-flight phase's
+            // `{N}-PLAN.md` lives on `feature/phase-{N}` INSIDE the worktree
+            // and is absent from the main checkout for the phase's whole
+            // duration — passing `project_root` here made this entire arm
+            // silently dead in worktree mode, DevFlow's default operating
+            // shape. Step (3) still reads `project_root`, because the stdout
+            // capture lives under `.devflow/` in the project root;
+            // retargeting it would break checkpoint detection in exactly the
+            // mode this change repairs.
             let mut reason = result.reason.clone();
+            let execution_root = state.worktree_path.as_deref().unwrap_or(project_root);
             let checkpoint_confirmed = state.agent == AgentKind::Claude
-                && verify::phase_has_blocking_human_checkpoint(project_root, phase)
+                && verify::phase_has_blocking_human_checkpoint(execution_root, phase)
                 && agent_result::checkpoint_reported_in_capture(project_root, phase);
             if checkpoint_confirmed {
                 let ceiling_ok = state.checkpoint_resumes < mode::MAX_CHECKPOINT_RESUMES;
