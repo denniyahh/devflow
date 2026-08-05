@@ -59,7 +59,7 @@ reach a second loop-back at all.
   4. `consecutive_failures` still gates correctly when Validate finds the *same* unresolved
      problem again across a loop-back — the fix narrows the false positive without disabling the
      safety gate it protects.
-**Plans**: 4/4 plans executed
+**Plans**: 4/5 plans executed
 
 Plans:
 
@@ -77,6 +77,12 @@ Plans:
       without the 999.66 baseline silently left their asserted code paths (one attempting a real
       agent launch during `cargo test`); restore both, make an agent launch structurally impossible,
       and confirm `scripts/check.sh all` is reliably green (wave 3)
+
+- [ ] 33-05-PLAN.md — gap closure (CR-01): D-01's decision signal is read from the main checkout
+      while the Validate agent authors `{N}-VERIFICATION.md` inside the phase's worktree, so
+      `FixType::GapsOnly` is unreachable in worktree mode; thread `evidence_root` through
+      `select_loop_back_fix` and its three call sites, and add the worktree-mode regression test
+      plus its mirrored negative control that no test in the workspace supplies today (wave 4)
 
 ### Phase 34: Stream-JSON Coverage and the Validate Trust Boundary (999.73 + 999.74)
 
