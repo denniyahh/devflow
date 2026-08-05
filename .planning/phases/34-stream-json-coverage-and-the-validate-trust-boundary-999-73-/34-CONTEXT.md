@@ -344,9 +344,9 @@ repair work that a capture happens to reveal (filed, not fixed — D-04).
   a whole-system property.
 
   **Consequences for the other decisions, all binding:**
-  - **D-06's fix does not close this.** Gating the `Passed` arm on the derived status passes
-    cleanly here. Criterion 3 and criterion 4 are separate deliverables.
-  - **D-13 (999.76) must not land without this fix.** Moving Layer 0 discovery to the execution
+  - **Criterion 3 (D-06's fix) does not close this.** Gating the `Passed` arm on the derived status
+    passes cleanly here. Criterion 3 and criterion 4 are separate deliverables.
+  - **999.76 (D-13) must not land without this fix.** Moving Layer 0 discovery to the execution
     root makes `decided_by_layer == Some(0)` common rather than rare, which is exactly the graft's
     precondition.
   - **Do NOT "correct" `idle_timeout_result`'s `verdict: None` doc comment.** An earlier amendment

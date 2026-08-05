@@ -899,9 +899,20 @@ verbatim quotes beside every discrete value cited (enum variants, constants, doc
 `[CITED: 34-REVIEW.md ...]` for the one compiler-checked claim (A2) this session did not re-derive
 by editing source.
 
-## Open Questions
+## Open Questions (both RESOLVED by the Phase 34 plan set, 2026-08-05)
 
-1. **Exact local-binary promotion mechanism for a rebuilt `devflow`.**
+> Annotated after planning, per the plan-checker's warning 1. Neither question is a live ambiguity —
+> each is discharged by a named task or a recorded convention. The original text is kept intact
+> below so the reasoning that produced the question stays legible.
+
+1. **Exact local-binary promotion mechanism for a rebuilt `devflow`.** — **RESOLVED as an explicit
+   investigation task, not as an assumption.** `34-05-PLAN.md` Task 1 is exactly the "short
+   investigation task" this question recommends, with concrete acceptance criteria and a
+   `BINARY-PROMOTION.md` output. Planning also surfaced a **shadowing hazard the task must confront
+   rather than inherit**: `/home/linuxbrew/.linuxbrew/bin/devflow` is a symlink into `target/release/`
+   (tracks every release build) while `~/.local/bin/devflow` is a stale static copy at **v1.8.0** —
+   so which one the shell resolves determines whether a capture run uses the rebuilt binary at all.
+   That is a finding, not an answer; the task still has to establish the convention.
    - What we know: `cargo build -p devflow` produces a binary at `target/debug/devflow` (or
      `target/release/devflow`); the package name is `devflow` (`crates/devflow-cli/Cargo.toml:2`,
      verified).
@@ -913,7 +924,10 @@ by editing source.
      in the repo root) rather than guessing.
 
 2. **Whether the 42-cell D-08 sweep and the 6-case D-15 demonstration should live in one test
-   function or several.**
+   function or several.** — **RESOLVED: many small, descriptively-named `#[test]` functions**, this
+   question's own recommendation. `34-PATTERNS.md` independently confirmed the convention by reading
+   the actual test bodies in both files rather than restating this claim, and `34-01-PLAN.md` /
+   `34-03-PLAN.md` follow it. No table-driven macro is introduced.
    - What we know: both are pure-function tests over `AgentResult`/`ValidateOutcome` values, no I/O
      needed for the classifier sweep (constructed literals), and the graft demonstration needs the
      real cascade (`evaluate_agent_result_inner`, filesystem-backed tempdir fixture).
