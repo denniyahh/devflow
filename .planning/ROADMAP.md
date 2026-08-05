@@ -161,7 +161,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 30 | 5/5 | Complete | — |
 | 31 | 5/5 | Complete | — |
 | 32 | 0/0 | Complete    | 2026-08-04 |
-| 33 | 6/6 | In Progress|  |
+| 33 | 6/6 | Complete    | 2026-08-05 |
 | 34 | 0/TBD | Not started | - |
 
 ## gsd-hygiene milestone (CLOSED 2026-08-04 — GSD Workflow Hygiene)
