@@ -443,6 +443,30 @@ fn emit_canary_outcome(state: &State, outcome: &canary::CanaryOutcome) {
 /// stage that actually backgrounds work, so it is the only one that exercises
 /// task-notification delivery and the drain gate at all. Define would have
 /// been a proxy measurement.
+///
+/// **The launch argv is stage-blind, so a per-stage capture is evidence about
+/// the AGENT and never about the transport** (ROADMAP criterion 1; 34-REVIEW.md
+/// R-02). [`agents::ClaudeAgent::exec_command`]
+/// (`crates/devflow-core/src/agents/claude.rs:46`) ignores all three of its
+/// `_phase`, `_prompt` and `_extra_writable_roots` arguments — verified by
+/// reading the body, which returns a fixed `vec![...]`, not by the underscore
+/// prefixes — and so returns a **byte-identical** argv for every stage.
+/// Membership in this constant therefore selects exactly one thing:
+/// [`resolve_launch_shape`]'s pipe-owning branch. Nothing else about the
+/// transport varies per stage.
+///
+/// The consequence is what makes the capture campaign worth running. A capture
+/// taken at Define and a capture taken at Validate differ only in how the agent
+/// behaved under that stage's prompt — whether it backgrounded work, whether a
+/// `background_tasks_changed` event appears, whether the stream drains. Any
+/// difference between two stages' captures is a fact about agent behaviour. It
+/// is never a fact about the transport, because the transport was the same
+/// bytes both times. Reading a per-stage difference as a transport difference
+/// would be a proxy measurement of exactly the kind D-10 rejected.
+///
+/// Element ORDER here is semantically inert: the constant is consulted with
+/// `slice::contains`, so no launch behaviour depends on it. The list is written
+/// in `Stage`-enum declaration order for readability only.
 const STREAM_JSON_STAGES: &[Stage] = &[Stage::Code];
 
 /// Whether this launch should use the `stream-json` transport and the
