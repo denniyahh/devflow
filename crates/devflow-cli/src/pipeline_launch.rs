@@ -443,6 +443,30 @@ fn emit_canary_outcome(state: &State, outcome: &canary::CanaryOutcome) {
 /// stage that actually backgrounds work, so it is the only one that exercises
 /// task-notification delivery and the drain gate at all. Define would have
 /// been a proxy measurement.
+///
+/// **The launch argv is stage-blind, so a per-stage capture is evidence about
+/// the AGENT and never about the transport** (ROADMAP criterion 1; 34-REVIEW.md
+/// R-02). [`agents::ClaudeAgent::exec_command`]
+/// (`crates/devflow-core/src/agents/claude.rs:46`) ignores all three of its
+/// `_phase`, `_prompt` and `_extra_writable_roots` arguments — verified by
+/// reading the body, which returns a fixed `vec![...]`, not by the underscore
+/// prefixes — and so returns a **byte-identical** argv for every stage.
+/// Membership in this constant therefore selects exactly one thing:
+/// [`resolve_launch_shape`]'s pipe-owning branch. Nothing else about the
+/// transport varies per stage.
+///
+/// The consequence is what makes the capture campaign worth running. A capture
+/// taken at Define and a capture taken at Validate differ only in how the agent
+/// behaved under that stage's prompt — whether it backgrounded work, whether a
+/// `background_tasks_changed` event appears, whether the stream drains. Any
+/// difference between two stages' captures is a fact about agent behaviour. It
+/// is never a fact about the transport, because the transport was the same
+/// bytes both times. Reading a per-stage difference as a transport difference
+/// would be a proxy measurement of exactly the kind D-10 rejected.
+///
+/// Element ORDER here is semantically inert: the constant is consulted with
+/// `slice::contains`, so no launch behaviour depends on it. The list is written
+/// in `Stage`-enum declaration order for readability only.
 const STREAM_JSON_STAGES: &[Stage] = &[Stage::Code];
 
 /// Whether this launch should use the `stream-json` transport and the
@@ -1750,6 +1774,21 @@ mod tests {
     /// The guard protects one premise: that a live `stream-json` session is
     /// woken back up when a background task finishes. A launch that resolved to
     /// the legacy single-document path does not rely on that premise.
+    ///
+    /// **The false-branch discriminator is D-11's legacy opt-out, deliberately —
+    /// NOT stage membership** (ROADMAP criterion 7). This test previously took
+    /// `Stage::Plan`'s absence from [`STREAM_JSON_STAGES`] as its premise. That
+    /// premise is destroyed by the very rollout the constant exists to
+    /// sequence: once all five stages are widened, no Claude stage yields
+    /// `false` and the test becomes unconstructible as written — it would have
+    /// had to be deleted or rewritten under the time pressure of the widening
+    /// commit. `legacy_opt_out` is a separate `&&` term that
+    /// `claude_stream_launch_enabled` respects regardless of the constant's
+    /// contents, so a premise built on it survives full widening.
+    ///
+    /// Verified, not assumed: this pair was run against a temporarily
+    /// fully-widened `STREAM_JSON_STAGES` and stayed green, while the
+    /// pre-rebuild version failed on its `Stage::Plan` premise.
     #[test]
     fn canary_gate_only_applies_to_the_stream_launch_path() {
         let _guard = ENV_MUTEX.lock().unwrap();
@@ -1760,9 +1799,10 @@ mod tests {
 
         let phase = 121;
         let mut state = canary_state(root, phase);
-        // Plan is not in `STREAM_JSON_STAGES`, so it resolves to
-        // `exec_command_single_document` + `MonitorLaunch::Legacy`.
-        state.stage = Stage::Plan;
+        // `Stage::Code` is on the stream path today and stays on it. The
+        // variable under test is the opt-out, not the stage.
+        state.stage = Stage::Code;
+        state.legacy_claude_launch = true;
 
         // Driven by the REAL predicate rather than a hardcoded `false`, so this
         // test tracks the rollout instead of a copy of it.
@@ -1770,13 +1810,17 @@ mod tests {
             claude_stream_launch_enabled(state.agent, state.stage, state.legacy_claude_launch);
         assert!(
             !stream_launch,
-            "Stage::Plan must still resolve to the legacy path for this test to mean anything"
+            "the legacy opt-out must force this launch off the stream path for this test \
+             to mean anything"
         );
-        // Negative control: the same predicate DOES fire for the widened stage,
-        // so the reading above is a real discrimination and not a constant.
+        // Negative control: the SAME agent and the SAME stage, with only the
+        // opt-out cleared, DOES fire. Without this, the reading above would be
+        // a constant rather than a discrimination — and unlike a stage-
+        // membership control, this one cannot be invalidated by widening.
         assert!(
-            claude_stream_launch_enabled(AgentKind::Claude, Stage::Code, false),
-            "the predicate must still say yes somewhere, or the check above is vacuous"
+            claude_stream_launch_enabled(AgentKind::Claude, state.stage, false),
+            "clearing the opt-out must flip the predicate back to true, or the check above \
+             is vacuous"
         );
 
         let calls = std::cell::Cell::new(0usize);
@@ -1797,6 +1841,59 @@ mod tests {
         assert_eq!(
             state.canary, None,
             "a launch that never ran the guard must not record an outcome for it"
+        );
+    }
+
+    /// The other direction of the pair above: with the opt-out cleared, the
+    /// same fixture DOES run the guard and DOES record its outcome.
+    ///
+    /// The refusal half alone cannot distinguish "the gate correctly skipped a
+    /// legacy launch" from "the gate is wired to nothing". This is the case
+    /// that must produce the opposite result, at the level of the gate's own
+    /// effects rather than the predicate's return value.
+    ///
+    /// `Confirmed`, not `Absent`: the sibling test can use `Absent` only
+    /// because its gate never invokes the canary at all. Here it does, and an
+    /// `Absent` outcome would make `canary_gate` return `Err` and the `unwrap`
+    /// below fail for a reason that has nothing to do with what is under test.
+    #[test]
+    fn canary_gate_still_fires_for_a_widened_stage_without_the_opt_out() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 123;
+        let mut state = canary_state(root, phase);
+        state.stage = Stage::Code;
+        state.legacy_claude_launch = false;
+
+        let stream_launch =
+            claude_stream_launch_enabled(state.agent, state.stage, state.legacy_claude_launch);
+        assert!(
+            stream_launch,
+            "without the opt-out this stage must be on the stream path, or this test is \
+             asserting the sibling test's case a second time"
+        );
+
+        let calls = std::cell::Cell::new(0usize);
+        canary_gate(
+            &mut state,
+            stream_launch,
+            counting_canary(&calls, canary::CanaryOutcome::Confirmed),
+        )
+        .unwrap();
+
+        assert_eq!(
+            calls.get(),
+            1,
+            "a stream launch with no recorded outcome must spend the guard exactly once"
+        );
+        assert_eq!(
+            state.canary,
+            Some(canary::CanaryOutcome::Confirmed),
+            "a launch that ran the guard must persist what it found"
         );
     }
 

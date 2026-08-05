@@ -9,7 +9,31 @@
 use std::path::Path;
 
 /// Number of capture generations retained when not otherwise configured.
-pub const DEFAULT_CAPTURE_RETENTION: usize = 5;
+///
+/// **The number is arithmetic, not a round guess** (ROADMAP criterion 7).
+/// `archive_phase_files` runs once per launch and archives the *previous*
+/// stage's files, so a clean five-stage Define→Plan→Code→Validate→Ship run
+/// produces **4** archive events, and each Validate→Code loop-back adds **2**
+/// more.
+///
+/// `12` therefore accommodates a clean run plus four loop-backs **exactly** —
+/// 4 + (4 × 2) = 12, with **zero** headroom at four, because the next archive
+/// event after the twelfth evicts. The bound that carries actual headroom is
+/// **three** loop-backs: 4 + (3 × 2) = 10 ≤ 12. Do not restate this as
+/// "survives four loop-backs with headroom"; it does not.
+///
+/// The prior value of `5` lost Define's capture on the **first** loop-back
+/// (event 6 of 6), silently — `prune_history` deletes without an error or a
+/// log, so the loss surfaces only when someone goes looking for a capture that
+/// is already gone.
+///
+/// This is criterion 7's "changing the constant" branch, chosen over a
+/// run-local `DEVFLOW_CAPTURE_RETENTION` export because the criterion requires
+/// the mitigation leave an **inspectable artifact**: a committed source
+/// constant is greppable and outlives the run, an exported environment
+/// variable is neither. The env and `devflow.toml` overrides are unchanged and
+/// still take precedence — they are simply no longer the mitigation.
+pub const DEFAULT_CAPTURE_RETENTION: usize = 12;
 
 /// Production/release branch name.
 pub const MAIN: &str = "main";

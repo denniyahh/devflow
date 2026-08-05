@@ -6127,6 +6127,106 @@ mod tests {
         assert_eq!(exit_count, 3, "expected at most 3 retained generations");
     }
 
+    /// The set of stamp groups currently surviving in a history directory,
+    /// derived the same way `prune_history` derives them (`rsplit_once('-')`,
+    /// keep the left part) so the assertion measures grouping rather than a
+    /// listing length.
+    fn surviving_stamps(history: &Path) -> std::collections::BTreeSet<String> {
+        std::fs::read_dir(history)
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_str()?.to_string();
+                name.rsplit_once('-')
+                    .map(|(stamp, _suffix)| stamp.to_string())
+            })
+            .collect()
+    }
+
+    /// ROADMAP criterion 7's retention half. `DEFAULT_CAPTURE_RETENTION` was
+    /// `5`, and `archive_phase_files` runs once per launch: a clean five-stage
+    /// Define→Plan→Code→Validate→Ship run produces 4 archive events and each
+    /// Validate→Code loop-back adds 2. At `5`, the first loop-back's sixth
+    /// event evicted Define's capture — silently, with no error and no log.
+    ///
+    /// What a regression here costs: a stage capture destroyed before the
+    /// phase that requested it has read it, which is unrecoverable after the
+    /// fact because `.devflow/` is the only copy until it is deliberately
+    /// copied out.
+    #[test]
+    fn prune_history_retains_a_full_five_stage_run_with_loop_backs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let history = history_dir(root, 1);
+        std::fs::create_dir_all(&history).unwrap();
+
+        let retain = crate::config::DEFAULT_CAPTURE_RETENTION;
+
+        // Twelve generations, strictly increasing. The suffix is load-bearing:
+        // `prune_history` derives a stamp with `rsplit_once('-')` and keeps the
+        // LEFT part, so a bare `{nanos}-{seq}` name would yield the stamp
+        // `{nanos}` and then delete `{nanos}-stdout`, which never exists — the
+        // retain half would false-pass via the `stamps.len() <= retain` early
+        // return while the evict half could never pass at all.
+        let stamps: Vec<String> = (0..12)
+            .map(|i| format!("{}-0", 1_700_000_000_000_000_000u128 + i))
+            .collect();
+        for stamp in &stamps {
+            std::fs::write(history.join(format!("{stamp}-stdout")), "capture").unwrap();
+        }
+        // The oldest generation gets a second suffix so eviction-by-stamp-group
+        // is actually exercised rather than assumed: one evicted stamp must
+        // take BOTH its files.
+        std::fs::write(history.join(format!("{}-exit", stamps[0])), "0").unwrap();
+
+        prune_history(&history, retain);
+
+        let survivors = surviving_stamps(&history);
+        assert_eq!(
+            survivors.len(),
+            12,
+            "a five-stage run with loop-backs must not lose a capture at the default \
+             retention; found {survivors:?}"
+        );
+        for stamp in &stamps {
+            assert!(
+                survivors.contains(stamp),
+                "generation {stamp} was evicted at exactly the retention boundary"
+            );
+        }
+
+        // Opposite-result control. Without this half the test would be
+        // measuring a directory listing, not pruning: `prune_history` returns
+        // early whenever `stamps.len() <= retain`, so a fixture that never
+        // crosses the boundary passes identically against a `prune_history`
+        // that does nothing at all.
+        let thirteenth = format!("{}-0", 1_700_000_000_000_000_000u128 + 12);
+        std::fs::write(history.join(format!("{thirteenth}-stdout")), "capture").unwrap();
+
+        prune_history(&history, retain);
+
+        let after = surviving_stamps(&history);
+        assert_eq!(
+            after.len(),
+            12,
+            "crossing the boundary by one must evict exactly one stamp group, not zero \
+             and not several; found {after:?}"
+        );
+        assert!(
+            !after.contains(&stamps[0]),
+            "the evicted generation must be the OLDEST by stamp order"
+        );
+        assert!(
+            !history.join(format!("{}-exit", stamps[0])).exists(),
+            "eviction operates on the stamp GROUP: the oldest generation's -exit file must \
+             go with its -stdout, or pruning is leaking partial generations"
+        );
+        assert!(
+            after.contains(&thirteenth),
+            "the newest generation must survive its own arrival"
+        );
+    }
+
     #[test]
     fn evaluate_agent_result_reads_files_end_to_end() {
         let dir = tempfile::tempdir().unwrap();
