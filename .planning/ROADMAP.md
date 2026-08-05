@@ -59,7 +59,7 @@ reach a second loop-back at all.
   4. `consecutive_failures` still gates correctly when Validate finds the *same* unresolved
      problem again across a loop-back — the fix narrows the false positive without disabling the
      safety gate it protects.
-**Plans**: 4/5 plans executed
+**Plans**: 5/5 plans executed
 
 Plans:
 
@@ -78,7 +78,7 @@ Plans:
       agent launch during `cargo test`); restore both, make an agent launch structurally impossible,
       and confirm `scripts/check.sh all` is reliably green (wave 3)
 
-- [ ] 33-05-PLAN.md — gap closure (CR-01): D-01's decision signal is read from the main checkout
+- [x] 33-05-PLAN.md — gap closure (CR-01): D-01's decision signal is read from the main checkout
       while the Validate agent authors `{N}-VERIFICATION.md` inside the phase's worktree, so
       `FixType::GapsOnly` is unreachable in worktree mode; thread `evidence_root` through
       `select_loop_back_fix` and its three call sites, and add the worktree-mode regression test
@@ -159,7 +159,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 30 | 5/5 | Complete | — |
 | 31 | 5/5 | Complete | — |
 | 32 | 0/0 | Complete    | 2026-08-04 |
-| 33 | 4/4 | In Progress|  |
+| 33 | 5/5 | In Progress|  |
 | 34 | 0/TBD | Not started | - |
 
 ## gsd-hygiene milestone (CLOSED 2026-08-04 — GSD Workflow Hygiene)
