@@ -306,3 +306,13 @@ as its register row prescribed.
 `.planning/REQUIREMENTS.md`'s DOGFOOD-01/02 checkboxes still read unchecked/"Pending" despite Phase 33
 shipping both. 33-VERIFICATION.md classes this Info-level doc hygiene, not a `gaps:` entry, and the
 plan deliberately does not claim it. Left for the operator / phase-completion tooling.
+
+## Self-Check: PASSED
+
+- `crates/devflow-cli/src/pipeline_gate.rs` — FOUND
+- `crates/devflow-cli/src/pipeline_outcomes.rs` — FOUND
+- `.planning/phases/33-.../33-04-SUMMARY.md` — FOUND
+- commit `add79bd` (Task 1) — FOUND in `git log`
+- commit `c210978` (Task 2) — FOUND in `git log`
+- commit `9f4a47e` (SUMMARY) — FOUND in `git log`
+- working tree clean after the final commit
