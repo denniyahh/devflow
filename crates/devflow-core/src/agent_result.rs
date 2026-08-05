@@ -5385,6 +5385,78 @@ mod tests {
         assert_eq!(passing.decided_by_layer, Some(0));
     }
 
+    /// 999.76 (ROADMAP criterion 6): the INVERSE of the fixture above. The
+    /// PLAN lives only under the worktree and `project_root`'s own
+    /// `.planning/phases/` is absent entirely — which is what an in-flight
+    /// phase actually looks like. `.planning/` is tracked content, so a phase's
+    /// `{N}-PLAN.md` sits on `feature/phase-{N}` INSIDE the worktree and is
+    /// absent from the main checkout for the phase's whole duration.
+    ///
+    /// The live provenance measurement for that layout claim is **NC-7**,
+    /// recorded in this phase's `34-04-SUMMARY.md`: `git ls-tree -r develop`
+    /// vs `git ls-tree -r HEAD` over `.planning/phases`, reported with both
+    /// refs' counts. NC-7 is evidence that the layout manufactured here is the
+    /// real one — it says nothing about whether this code is correct. That
+    /// claim is carried by this fixture and by its main-checkout mirror
+    /// `external_probe_discovers_from_project_root_across_every_stage_without_a_worktree`,
+    /// which must be read together with it.
+    #[test]
+    fn external_probe_discovers_from_the_worktree_when_the_main_checkout_lacks_the_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join("phase-worktree");
+        // The PLAN exists ONLY under the worktree — `dir.path()`'s own
+        // `.planning/phases/` is deliberately never created.
+        let phase_dir = worktree.join(".planning/phases/16-reliability");
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        std::fs::write(
+            phase_dir.join("16-01-PLAN.md"),
+            "---\nexternal_verify: \"test -f implemented\"\n---\n",
+        )
+        .unwrap();
+        // Captures live in the project root, not the worktree.
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 16),
+            "DEVFLOW_RESULT: {\"status\":\"success\"}\n",
+        )
+        .unwrap();
+        let mut state = state_in(dir.path(), 16);
+        state.worktree_path = Some(worktree.clone());
+
+        let approval = vec!["test -f implemented".to_string()];
+
+        // The probe file does not exist yet, so this must fail ON THE PROBE.
+        let failing = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approval),
+        )
+        .unwrap();
+        assert_eq!(failing.status, AgentStatus::Failed);
+        assert!(
+            failing
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("external verification failed")),
+            "expected a failing-probe reason; a PLAN-removed reason means discovery \
+             silently returned zero commands — i.e. discovery still reads project_root \
+             and 999.76's fix did not land: {:?}",
+            failing.reason
+        );
+
+        std::fs::write(worktree.join("implemented"), "done").unwrap();
+        let passing = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approval),
+        )
+        .unwrap();
+        assert_eq!(passing.status, AgentStatus::Success);
+        assert_eq!(passing.decided_by_layer, Some(0));
+    }
+
     #[test]
     fn changed_external_probe_never_inherits_prior_approval() {
         let dir = tempfile::tempdir().unwrap();
