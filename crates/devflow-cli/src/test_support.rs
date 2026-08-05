@@ -249,6 +249,67 @@ pub(crate) fn agent_free_git_only_path_dir() -> tempfile::TempDir {
     dir
 }
 
+/// RAII guard that REPLACES `PATH` with an [`agent_free_git_only_path_dir`]
+/// for the scope it is bound in, and restores the previous `PATH` on EVERY
+/// exit path of that scope — including a path on which a later assertion
+/// panics (WR-05).
+///
+/// Same reasoning as [`ReapMonitorOnDrop`], applied to a different resource:
+/// a plain trailing `set_var("PATH", original)` only runs on the success path,
+/// since Rust abandons the rest of a function's statements the instant a panic
+/// begins unwinding, so it is the language's own `Drop` guarantee — not a call
+/// ordering convention — that makes the restore unconditional.
+///
+/// What the trailing-statement shape costs when a region does panic is
+/// specific and compounding: `PATH` stays pointed at the neutral tempdir,
+/// whose `TempDir` the same unwind then drops and DELETES, so every other
+/// parallel test thread inherits a `PATH` naming a directory that no longer
+/// exists; and the panic poisons [`ENV_MUTEX`], turning every subsequent
+/// `ENV_MUTEX.lock().unwrap()` into a `PoisonError` panic. One legible
+/// failing assertion becomes a cascade across the whole binary.
+///
+/// The guard owns the `TempDir`, so the neutral directory outlives every use
+/// of the `PATH` that names it. `Drop` restores the captured value first and
+/// only then drops the `TempDir` (a type's own `Drop::drop` runs before its
+/// fields are dropped), so `PATH` never transiently names a deleted directory.
+///
+/// **The caller must already hold [`ENV_MUTEX`].** `set_var` is process-wide
+/// and `cargo test` runs in parallel; this guard makes the restore
+/// unconditional, it does not make the mutation safe on its own.
+pub(crate) struct NeutralPath {
+    _dir: tempfile::TempDir,
+    original: Option<std::ffi::OsString>,
+}
+
+impl NeutralPath {
+    /// Named `install`, not `new`: binding it is not bookkeeping, it mutates
+    /// process-global state at the moment of the call.
+    pub(crate) fn install() -> Self {
+        let dir = agent_free_git_only_path_dir();
+        let original = std::env::var_os("PATH");
+        // SAFETY: the caller holds ENV_MUTEX (documented precondition), so
+        // no other test thread is reading or writing PATH concurrently.
+        unsafe { std::env::set_var("PATH", dir.path()) };
+        Self {
+            _dir: dir,
+            original,
+        }
+    }
+}
+
+impl Drop for NeutralPath {
+    fn drop(&mut self) {
+        // SAFETY: still serialized under the ENV_MUTEX guard the caller holds
+        // for at least as long as this guard's own scope.
+        unsafe {
+            match &self.original {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+    }
+}
+
 /// [`agent_free_git_only_path_dir`], extended with a real `sh` symlink
 /// (needed by `monitor::spawn_monitor`'s backgrounding script) and a
 /// harmless no-op stub for `program` (needed by `ensure_agent_binary`),
