@@ -297,6 +297,113 @@ Unsequenced items — not part of the active phase sequence. Promote with
 `/gsd-review-backlog` when ready; each carries accumulated context in its
 own `phases/999.N-*/CONTEXT.md`.
 
+### Phase 999.81: Phase 33 Advisory Cleanup — the Loop-Back Prompt Calls a Normal Continuation a Defect, Plus Three Hygiene Items (BACKLOG)
+
+**Linear:** [DEN-103](https://linear.app/denniskim/issue/DEN-103/99981-phase-33-advisory-cleanup-the-loop-back-prompt-calls-a-normal)
+**Found:** 2026-08-05, Phase 33 code review (IN-05, IN-01, IN-03, IN-04), each verified in source
+before filing. Grouped as one entry per the 21-REVIEW advisory-cleanup precedent.
+
+**Priority:** Low | **Size:** S
+
+**IN-05 is the one worth doing, and it is a single match arm.** `fix_prompt`
+(`crates/devflow-core/src/prompt.rs:297-307`) gives all three `FixType` variants the same preamble:
+*"Validation reported issues. Run the fix command for this loop:"*. For `FixType::FullExecute` that
+contradicts the enum's own doc comment (`:55-60`) — *"the phase is mid-arc rather than defective"*.
+Phase 33 fixed the **routing** so a mid-arc phase gets `/gsd-execute-phase {N}`; the agent receiving
+it is still told validation reported issues, so it is primed to hunt defects in work that was simply
+never judged. The phase's own semantic, undone one layer down.
+
+**The other three:** IN-01 — `select_loop_back_fix` (`pipeline_outcomes.rs:261-267`) is reachable
+only through six full `handle_validate_outcome` drives; a table test over
+`(worktree_path, artifact_location) → FixType` would make future cases cheap. IN-03 — the
+branch-name derivation is duplicated at four sites (`agent_result.rs:1904`, `ship_evidence.rs:160`,
+`test_support.rs:122`) despite `phase_commit_count`'s doc saying the extraction exists *because*
+copies diverged; expose `phase_branch_name`. IN-04 — `commit_on_feature_branch`
+(`test_support.rs:112-137`) never restores the prior checkout, benign for its two callers but a
+landmine for any future Validate→Ship pairing.
+
+### Phase 999.80: Three Tests Can Spawn a Real Agent During `cargo test` — 33-04's Hardening Reached Two of Five Sites (BACKLOG)
+
+**Linear:** [DEN-102](https://linear.app/denniskim/issue/DEN-102/99980-three-tests-can-spawn-a-real-agent-during-cargo-test-33-04s)
+**Found:** 2026-08-05, Phase 33 code review (WR-06). Re-verified at HEAD after 33-06: still open.
+
+**Priority:** Medium | **Size:** S — ~6 lines per site
+
+**Severity: Medium.** An unhardened test can launch an autonomous agent with the developer's
+inherited credentials during `cargo test`, burning real quota. Not High: each site has a post-hoc
+assertion that would *notice* the drift — but the spawn happens **before** that assertion runs, and
+preventing the spawn is the entire point of 33-04.
+
+Tests seeding `state.consecutive_failures` directly carry a `None` baseline, take the reset arm,
+drop off the gated path, and fall through `handle_validate_outcome` → `loop_back_to_code` →
+`launch_stage` → a real `claude` spawn. Hardened: `pipeline_gate.rs:1111-1170`,
+`pipeline_outcomes.rs:1823-1881`. **Not hardened** (baseline seed only, no PATH neutralization):
+`pipeline_outcomes.rs:819-861`, `:873-930` (backs three tests), `:2057-2081`. 33-06 added the
+`NeutralPath` RAII guard (`test_support.rs:279`) but applied it only to the two regions 33-05 added.
+
+**Decide the order against 999.38 deliberately — they touch the same lines with opposite intent.**
+999.38 wants to *remove* process-global `PATH` mutation in favour of per-`Command` `env`, which
+would let `ENV_MUTEX` shrink or disappear; it explicitly names `pipeline_outcomes.rs:879`, inside
+one of the three sites above. Either do 999.38 first and harden these with the new mechanism, or do
+this first as the cheap safety fix and let 999.38 sweep them later. Do not work them independently.
+
+### Phase 999.79: `{N}-VERIFICATION.md` Never Goes Stale, So a `--force` Re-Run Inherits the Previous Run's Verdict and Gates Unresolvably (BACKLOG)
+
+**Linear:** [DEN-101](https://linear.app/denniskim/issue/DEN-101/99979-n-verificationmd-never-goes-stale-so-a-force-re-run-inherits-the)
+**Found:** 2026-08-05, Phase 33 code review (WR-02, carried from the first pass and given a new
+concrete instance by 33-05).
+
+**Priority:** Medium | **Size:** S–M
+
+**Severity: Medium** — a correctness regression path Phase 33's own fix opened, reaching the exact
+unresolvable-gate outcome DOGFOOD-01 exists to prevent, from a new direction.
+
+`phase_verification_exists` (`crates/devflow-core/src/agent_result.rs:2588`) is a pure existence
+check; nothing deletes, dates or invalidates `{N}-VERIFICATION.md`. 33-05 correctly made the probe
+follow `state.worktree_path` — but *unfiltered*. A `--force` re-run of the same phase number
+(`ensure_phase_worktree`, `commands.rs:239`) checks out `feature/phase-NN`, which still carries the
+**previous** run's committed artifact. That re-run is mid-arc by construction, so its first Validate
+failure finds the stale artifact, returns `true`, and dispatches `--gaps-only` — matching zero plans
+and gating unresolvably.
+
+**Fix:** minimum, record the limitation in the doc comment. Real fix, invalidate on staleness —
+compare a recorded plan count (more robust than mtime, which survives `git checkout` in ways that do
+not reflect judgement freshness) against the phase's current plan set. **Prohibition:** do NOT
+"fix" this by reverting the probe to `project_root` — that reintroduces the CR-01 defect 33-05
+closed and two external peer reviews independently confirmed.
+
+### Phase 999.78: The Code↔Validate Loop Has No Progress-Independent Bound, and the Gate Message Understates How Long It Has Run (BACKLOG)
+
+**Linear:** [DEN-100](https://linear.app/denniskim/issue/DEN-100/99978-the-codevalidate-loop-has-no-progress-independent-bound-and-the)
+**Found:** 2026-08-05, Phase 33 code review (WR-01, WR-04, IN-02). Grouped because WR-04's fix
+supplies WR-01's ceiling for free.
+
+**Priority:** Medium | **Size:** M
+
+**WR-01 — the only unconditional bound is gone.** `consecutive_failures_made_progress`
+(`crates/devflow-core/src/mode.rs:149-151`) resets the streak whenever the commit *count* rises, and
+no other counter bounds this loop. `mode.rs:136-148` defers the remedy to "a follow-up if the
+assumption proves wrong" but **no numbered entry existed for it** — this is that number; cite it
+from the doc comment. It matters more here than in the abstract: the Code stage's fix command is a
+GSD command, and GSD commands routinely commit `.planning/` artifacts even when they change no
+source, so "commits something trivial every cycle" is the *ordinary* behaviour of the thing in that
+slot, not an adversarial hypothetical.
+
+**WR-04 — the gate message understates duration in Supervise mode.**
+`pipeline_outcomes.rs:367-370` interpolates `state.consecutive_failures` into *"Validation failed
+{} time(s) — human review needed."* After 33-03 that is a *streak length*, not a total. Supervise
+gates on every failure (`mode.rs:173-175`), so a phase committing anything each cycle shows
+*"Validation failed 1 time(s)"* at the 2nd, 5th and 9th gate alike — in the one mode where a human
+sees every occurrence.
+
+**IN-02 — a resumed pre-999.66 state reads as a fresh streak.** `state.rs:71-100`: `None` means
+both "genuine first failure" and "state predates this field", and nothing in `events.jsonl` tells
+them apart, so an operator upgrading a binary mid-phase gets no signal the failure budget widened.
+
+**Fix:** a separate never-reset per-phase Validate-failure total closes WR-01 and WR-04 together;
+add a distinct `loop_back` reason string for the absent-baseline case. Related but deliberately
+separate: 999.77 attacks the same counter by corrupting its baseline rather than removing the bound.
+
 ### Phase 999.77: A Single Transient `git` Failure Grants a Free `consecutive_failures` Reset, and the Doc Comment Promises the Opposite (BACKLOG)
 
 **Linear:** [DEN-99](https://linear.app/denniskim/issue/DEN-99/99977-a-single-transient-git-failure-grants-a-free-consecutive)
@@ -1111,6 +1218,8 @@ Plans:
 **Goal:** `run_git_stdout` (`crates/devflow-cli/src/staleness.rs:106`) resolves `git` through `PATH`, while several tests replace `PATH` **entirely** with a stub directory containing no `git` — `pipeline_launch.rs:590`, `pipeline_outcomes.rs:879/1132/1246`, `preflight.rs:627/701`. `ENV_MUTEX` serializes those mutators against *each other* but not against the ~155 other tests in the same binary that shell out to git concurrently, so `Command::new("git")` intermittently fails to spawn and `run_git_stdout` returns `None`.
 
 **Evidence:** reproduced once in four full-suite runs — `staleness::tests::ahead_build_from_descendant_commit_warns_instead_of_blocking` panicking at `staleness.rs:891` (`rev-parse HEAD`). This is a genuine flake source, distinct from 999.37, and was found while investigating it.
+
+**Second mechanism, observed 2026-08-05 (Phase 33 review WR-05 + the 33-06 execution run).** The same `ENV_MUTEX`+`PATH` regions have a *second* failure mode this entry did not originally name: the restore is a trailing statement, and Rust abandons remaining statements the instant a panic begins unwinding. So a panic inside a region (a) leaves `PATH` pointed at a `neutral_path_dir` the unwind then drops and **deletes**, handing every concurrent test a `PATH` naming a nonexistent directory, and (b) poisons `ENV_MUTEX`, so every later `ENV_MUTEX.lock().unwrap()` panics with `PoisonError` — one legible failure becomes a cascade. Observed live during 33-06: a single `index.lock` failure in `concurrent_ship_advances_finish_both_phases_independently` cascaded into ~15 unrelated `PoisonError` failures. Phase 33-06 added a `NeutralPath` RAII guard (`crates/devflow-cli/src/test_support.rs:279`, `impl Drop` at `:300`) and applied it to **two** regions only; ten pre-existing regions still use the trailing-statement form (`pipeline_outcomes.rs:1280-1304`, `:1355-1383`, `:1434-1458`, `:1489-1508`, `:1545-1560`, `:1779-1798`, `:1850-1865`, `:1915-1930`; `pipeline_gate.rs:1140-1159`, `:1231-1246`). Two cheap partial mitigations short of this entry's full per-`Command` fix: retrofit `NeutralPath` to the remaining ten, and replace `ENV_MUTEX.lock().unwrap()` with `.unwrap_or_else(PoisonError::into_inner)` — the mutex guards a `()`, so no invariant can be protected by refusing a poisoned lock. See also 999.80, which needs three *more* such regions and must be sequenced against this entry deliberately.
 
 **Note:** Rust 2024 makes `std::env::set_var`/`remove_var` `unsafe` precisely because this pattern is unsound in a threaded test binary — the fix direction is per-`Command` `env`/`env_remove` (as 999.37's `test_support` now does for git) rather than process-global mutation. Fixing this would let `ENV_MUTEX` shrink or disappear, which is worth more than the flake itself. Related: 999.15 (hermetic tests for shell entry points).
 
