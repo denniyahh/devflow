@@ -2022,13 +2022,28 @@ pub fn evaluate_layer3(
 /// stage, not only Code (D-05 gap 1 / D-06). With no declarations (or when
 /// disabled), behavior is byte-for-byte the pre-Phase-16 cascade.
 ///
-/// Two roots are intentionally kept distinct (review Plan 03 MEDIUM,
-/// OpenCode): `project_root` is used to DISCOVER the PLAN's declared
-/// commands (`.planning/phases/` lives there, not in a worktree checkout),
-/// while `execution_root` — the worktree, when one is set — is where probes
-/// actually RUN. Conflating the two previously meant a worktree-based phase
-/// could not find its own declaration and silently mis-hit the
-/// "PLAN removed" veto below.
+/// Both DISCOVERY and probe EXECUTION read `execution_root` — the worktree
+/// when one is set, `project_root` otherwise (999.76, ROADMAP criterion 6).
+///
+/// This knowingly OVERTURNS a recorded prior peer-review decision
+/// (review Plan 03 MEDIUM, OpenCode). That decision held the two roots must
+/// stay distinct, discovery reading `project_root` because
+/// `.planning/phases/` "lives there, not in a worktree checkout". **The
+/// premise has the direction backwards.** `.planning/` is TRACKED content,
+/// so an in-flight phase's `{N}-PLAN.md` is committed on `feature/phase-{N}`
+/// and therefore exists INSIDE the worktree while absent from the main checkout for
+/// the phase's whole duration. Discovering from `project_root` meant a
+/// correctly-declared probe set silently never ran in worktree mode —
+/// DevFlow's default operating shape — with no error and no log, and the
+/// "PLAN removed" veto below fired in its place. Recorded as an overturn
+/// rather than patched quietly, so a later reader can see the direction was
+/// reconsidered on evidence rather than overlooked.
+///
+/// Three sibling reads deliberately KEEP `project_root` and must not be
+/// "corrected" to match: [`phase_commit_count`] (git worktrees share refs and
+/// the object database, so counting from the main checkout is right), and
+/// [`checkpoint_reported_in_capture`] and [`evaluate_layer1`] (both read the
+/// stdout capture under `.devflow/`, which lives in the project root).
 fn evaluate_layer0(
     project_root: &Path,
     state: &State,
@@ -2039,7 +2054,7 @@ fn evaluate_layer0(
     }
 
     let execution_root = state.worktree_path.as_deref().unwrap_or(project_root);
-    let commands = crate::verify::external_verify_commands(project_root, state.phase);
+    let commands = crate::verify::external_verify_commands(execution_root, state.phase);
     if commands.is_empty() {
         return approved_commands.map(|_| AgentResult {
             status: AgentStatus::Failed,
@@ -5310,17 +5325,27 @@ mod tests {
     }
 
     /// D-05 gap 1 / D-06 (17-03): Layer 0 now evaluates on every stage, not
-    /// only Code. Also covers the review-flagged worktree bug (Plan 03
-    /// MEDIUM, OpenCode): PLAN discovery must read `project_root` (where
-    /// `.planning/phases/` actually lives), while probe execution still
-    /// reads `execution_root` (the worktree) — using the worktree for
-    /// discovery would find zero commands and mis-fire the "PLAN removed"
-    /// veto.
+    /// only Code.
+    ///
+    /// This is the MAIN-CHECKOUT MIRROR of
+    /// `external_probe_discovers_from_the_worktree_when_the_main_checkout_lacks_the_plan`,
+    /// and the two must be read together: with no worktree set, discovery and
+    /// probe execution resolve to the SAME root, so 999.76's relocation of
+    /// discovery to `execution_root` provably leaves this path untouched.
+    /// Without this mirror the worktree fixture alone could not distinguish
+    /// "discovery reads the execution root" from "discovery reads any root
+    /// that happens to hold the PLAN".
+    ///
+    /// It previously set `state.worktree_path` and asserted the opposite
+    /// direction — that discovery must read `project_root` while probes run in
+    /// the worktree (review Plan 03 MEDIUM, OpenCode). 999.76 overturned that
+    /// premise (see [`evaluate_layer0`]'s doc comment), so the fixture was
+    /// converted rather than deleted: every assertion below is the original
+    /// one, including the `"external verification failed"` reason text and the
+    /// final `Success` assertion. Only the two roots' coincidence changed.
     #[test]
-    fn external_probe_discovers_from_project_root_across_every_stage_and_executes_in_worktree() {
+    fn external_probe_discovers_from_project_root_across_every_stage_without_a_worktree() {
         let dir = tempfile::tempdir().unwrap();
-        let worktree = dir.path().join("phase-worktree");
-        std::fs::create_dir_all(&worktree).unwrap();
         let phase_dir = dir.path().join(".planning/phases/16-reliability");
         std::fs::create_dir_all(&phase_dir).unwrap();
         std::fs::write(
@@ -5335,15 +5360,16 @@ mod tests {
         )
         .unwrap();
         let mut state = state_in(dir.path(), 16);
-        state.worktree_path = Some(worktree.clone());
+        // No worktree: `execution_root` falls back to `project_root`, so
+        // discovery and probe execution read the same directory.
+        state.worktree_path = None;
         state.stage = Stage::Plan;
 
         let approval = vec!["test -f implemented".to_string()];
 
-        // Layer 0 now fires on Plan too — the probe file does not yet exist
-        // in the worktree, so this must fail on the probe itself (NOT a
-        // false PLAN-removed veto, which would mean discovery silently
-        // returned zero commands).
+        // Layer 0 now fires on Plan too — the probe file does not yet exist,
+        // so this must fail on the probe itself (NOT a false PLAN-removed
+        // veto, which would mean discovery silently returned zero commands).
         let plan_result = evaluate_agent_result_inner(
             dir.path(),
             &state,
@@ -5371,9 +5397,9 @@ mod tests {
         .unwrap();
         assert_eq!(code_result.status, AgentStatus::Failed);
 
-        // The probe still executes against execution_root (the worktree) —
-        // only PLAN discovery moved to project_root.
-        std::fs::write(worktree.join("implemented"), "done").unwrap();
+        // The probe executes against execution_root, which without a worktree
+        // IS project_root — the coincidence this mirror exists to pin.
+        std::fs::write(dir.path().join("implemented"), "done").unwrap();
         let passing = evaluate_agent_result_inner(
             dir.path(),
             &state,
