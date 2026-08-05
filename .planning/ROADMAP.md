@@ -322,24 +322,37 @@ copies diverged; expose `phase_branch_name`. IN-04 — `commit_on_feature_branch
 (`test_support.rs:112-137`) never restores the prior checkout, benign for its two callers but a
 landmine for any future Validate→Ship pairing.
 
-### Phase 999.80: Three Tests Can Spawn a Real Agent During `cargo test` — 33-04's Hardening Reached Two of Five Sites (BACKLOG)
+### Phase 999.80: Three Test Sites Are Protected From Spawning a Real Agent Only by a Content-Dependent Gate Response, Not Structurally (BACKLOG)
 
-**Linear:** [DEN-102](https://linear.app/denniskim/issue/DEN-102/99980-three-tests-can-spawn-a-real-agent-during-cargo-test-33-04s)
-**Found:** 2026-08-05, Phase 33 code review (WR-06). Re-verified at HEAD after 33-06: still open.
+**Linear:** [DEN-102](https://linear.app/denniskim/issue/DEN-102/99980-three-test-sites-are-protected-from-spawning-a-real-agent-only)
+**Found:** 2026-08-05, Phase 33 code review (WR-06); **corrected the same day** by the Phase 33
+security audit, which mapped it to the registered trust boundary "cargo test process → spawned
+agent CLI" (T-33-09 / T-33-17).
 
-**Priority:** Medium | **Size:** S — ~6 lines per site
+**Priority:** Low | **Size:** S — ~6 lines per site
 
-**Severity: Medium.** An unhardened test can launch an autonomous agent with the developer's
-inherited credentials during `cargo test`, burning real quota. Not High: each site has a post-hoc
-assertion that would *notice* the drift — but the spawn happens **before** that assertion runs, and
-preventing the spawn is the entire point of 33-04.
+**Severity: Low-Medium.** *This entry's original filing said these tests "can spawn a real agent"
+and rated it Medium. That was wrong and is retracted here rather than silently edited away.*
 
-Tests seeding `state.consecutive_failures` directly carry a `None` baseline, take the reset arm,
-drop off the gated path, and fall through `handle_validate_outcome` → `loop_back_to_code` →
-`launch_stage` → a real `claude` spawn. Hardened: `pipeline_gate.rs:1111-1170`,
-`pipeline_outcomes.rs:1823-1881`. **Not hardened** (baseline seed only, no PATH neutralization):
-`pipeline_outcomes.rs:819-861`, `:873-930` (backs three tests), `:2057-2081`. 33-06 added the
-`NeutralPath` RAII guard (`test_support.rs:279`) but applied it only to the two regions 33-05 added.
+**No agent spawn happens today.** All three sites pre-write a rejected gate response whose note
+contains `abort` — e.g. `{"approved":false,"note":"abort: test cleanup","responded_by":"test"}` —
+so `GateAction::from_response` resolves to `Abort`, not `LoopBack`, and control never reaches
+`loop_back_to_code` → `launch_stage`. Verified in source at all three sites. The original filing
+inherited 33-REVIEW.md's WR-06 framing without checking the gate-response path.
+
+**What survives, and is still worth fixing:** that protection is **content-dependent, not
+structural** — a magic substring in a JSON note in a test fixture, with no assertion protecting it.
+Any future edit rewording the note, changing `from_response`'s parsing, or routing one of these down
+the `LoopBack` arm silently reintroduces a real `claude` spawn with the developer's inherited
+credentials. 33-04 closed exactly this class for two *other* sites **structurally**, with PATH
+neutralization, not by relying on response content.
+
+Sites protected only by response content: `pipeline_outcomes.rs:825-864`, `:878-930` (backs three
+tests), `:2073-2097`. Hardened structurally: `pipeline_gate.rs:1111-1170`,
+`pipeline_outcomes.rs:1823-1881`. 33-06 added the `NeutralPath` RAII guard (`test_support.rs:279`)
+but applied it only to the two regions 33-05 added. Cheaper alternative if the full fix is deferred:
+assert at each site that the gate resolved to `Abort`, making the content-dependence a checked
+invariant rather than an accident.
 
 **Decide the order against 999.38 deliberately — they touch the same lines with opposite intent.**
 999.38 wants to *remove* process-global `PATH` mutation in favour of per-`Command` `env`, which
