@@ -288,3 +288,11 @@ change is one expression in a pure function plus tests and comments.
 (999.76) makes `decided_by_layer == Some(0)` common in worktree mode — this graft's precondition.
 If this fix must be withdrawn, revert 34-04 in the same operation or gate Validate manually until
 it is restored, and say so in the revert message.
+
+## Self-Check: PASSED
+
+- `34-01-SUMMARY.md` — FOUND on disk.
+- `a90cb90`, `38aaaf2`, `e60ad2c`, `128a4e4` — all FOUND in `git log`.
+- `crates/devflow-core/src/agent_result.rs` — modified, committed, working tree clean.
+- STATE.md and ROADMAP.md deliberately NOT modified (worktree mode; the orchestrator owns those
+  writes after the wave completes). The post-commit hook's staleness notice is expected.
