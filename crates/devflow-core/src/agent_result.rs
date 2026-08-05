@@ -5618,6 +5618,12 @@ mod tests {
     /// self-contradictory marker, `decide_action` would advance it, and
     /// `classify_validate_outcome` would classify Validate as `Passed`.
     ///
+    /// Also carries NC-5's two discrimination cases, which share this fixture.
+    /// The exploit needs BOTH marker fields; removing either must not reach an
+    /// affirmative pair. The mandatory opposite-result control lives in
+    /// `layer0_verdict_graft_still_transplants_a_passing_layer1_verdict` — if
+    /// that test also produced `None` the fix would be indiscriminate and this
+    /// one would prove nothing.
     #[test]
     fn layer0_verdict_graft_declines_when_layer1_status_is_not_success() {
         let dir = tempfile::tempdir().unwrap();
@@ -5653,6 +5659,168 @@ mod tests {
         );
         assert_eq!(result.status, AgentStatus::Success);
         assert_eq!(result.decided_by_layer, Some(0));
+
+        // NC-5a: removes the `verdict` FIELD, keeps the failed status. `None`
+        // both pre- and post-fix, so this case cannot discriminate the fix —
+        // that is the point. The failed status alone is not the exploit.
+        std::fs::write(
+            stdout_path(dir.path(), 16),
+            "DEVFLOW_RESULT: {\"status\":\"failed\"}\n",
+        )
+        .unwrap();
+        let result = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approval),
+        )
+        .unwrap();
+        assert_eq!(
+            result.verdict, None,
+            "NC-5a removes the `verdict` field: there is no verdict to graft, \
+             so the result must be None whether or not the fix is present"
+        );
+
+        // NC-5b: removes `verdict: pass` SPECIFICALLY by downgrading it to
+        // `gaps`, keeping both fields present. Pre-fix this grafted
+        // `Some(Gaps)`; post-fix it declines like any other non-Success
+        // Layer 1. Neither state is an affirmative pair — the exploit needs
+        // `pass`, not merely any verdict.
+        std::fs::write(
+            stdout_path(dir.path(), 16),
+            "DEVFLOW_RESULT: {\"status\":\"failed\",\"verdict\":\"gaps\"}\n",
+        )
+        .unwrap();
+        let result = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approval),
+        )
+        .unwrap();
+        assert_ne!(
+            result.verdict,
+            Some(Verdict::Pass),
+            "NC-5b removes `verdict: pass` by downgrading it to `gaps`: this \
+             case must never reach an affirmative pair"
+        );
+        assert_eq!(result.verdict, None);
+    }
+
+    /// NC-5's positive half: the fix declines ONLY when Layer 1's own status is
+    /// not `Success`, never indiscriminately.
+    ///
+    /// This is the case that must produce the OPPOSITE result from
+    /// `layer0_verdict_graft_declines_when_layer1_status_is_not_success`. If
+    /// both produced `None` the fix would have disabled 18e's legitimate
+    /// reconciliation wholesale — re-introducing the 17-03 regression that
+    /// `reconcile_layer0_verdict` exists to fix — and the pair would prove
+    /// nothing about D-15, because a measurement whose two arms agree is
+    /// broken rather than informative.
+    #[test]
+    fn layer0_verdict_graft_still_transplants_a_passing_layer1_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase_dir = dir.path().join(".planning/phases/16-reliability");
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        std::fs::write(
+            phase_dir.join("16-01-PLAN.md"),
+            "---\nexternal_verify: \"test -f shipped\"\n---\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("shipped"), "done").unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        let mut state = state_in(dir.path(), 16);
+        state.stage = Stage::Validate;
+        let approval = vec!["test -f shipped".to_string()];
+
+        std::fs::write(
+            stdout_path(dir.path(), 16),
+            "DEVFLOW_RESULT: {\"status\":\"success\",\"verdict\":\"pass\"}\n",
+        )
+        .unwrap();
+        let result = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approval),
+        )
+        .unwrap();
+        assert_eq!(
+            result.verdict,
+            Some(Verdict::Pass),
+            "a passing verdict from a Layer 1 that reported its OWN success \
+             must still be transplanted (18e); a None here would mean the \
+             D-15 fix is indiscriminate"
+        );
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(result.decided_by_layer, Some(0));
+    }
+
+    /// NC-6: with Layer 0 disabled, the same self-contradictory marker never
+    /// gets laundered at all — Layer 1 reports `Failed` verbatim and
+    /// `decide_action` routes it to `GateReview`.
+    ///
+    /// What the control proves: the GRAFT is the mechanism, not the classifier
+    /// and not `decide_action`. Removing Layer 0 removes the laundering
+    /// entirely, so the exploit's precondition is an affirmative Layer-0 probe
+    /// success — which is exactly why plan 34-04 (999.76), by making
+    /// `decided_by_layer == Some(0)` common in worktree mode, must not land
+    /// without the fix this test pins.
+    ///
+    /// The routing consequence is asserted here rather than assumed, so a
+    /// future change to `decide_action`'s `Failed` arm breaks this test rather
+    /// than silently invalidating the control.
+    #[test]
+    fn layer0_disabled_routes_a_self_reported_failure_to_gate_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase_dir = dir.path().join(".planning/phases/16-reliability");
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        // The difference from the fixtures above: Layer 0 is switched off, so
+        // the cascade falls through to Layer 1 instead of short-circuiting on
+        // an affirmative probe success.
+        std::fs::write(
+            dir.path().join("devflow.toml"),
+            "external_verify_enabled = false\n",
+        )
+        .unwrap();
+        // Belt AND braces, deliberately. `config::external_verify_enabled`
+        // consults `DEVFLOW_EXTERNAL_VERIFY_ENABLED` BEFORE `devflow.toml`, and
+        // `config::tests::env_overrides_file_external_verification` sets that
+        // variable to "true" process-globally under a mutex private to its own
+        // module — which cannot serialize against this one. A PLAN declaring
+        // `external_verify` would therefore let a parallel run of that test
+        // re-enable Layer 0 here and flake this control into a green.
+        // Declaring no probe closes that window: with no declared commands and
+        // no approval vector, `evaluate_layer0` abstains whatever the env says,
+        // so this test is deterministic under every value of the variable.
+        std::fs::write(phase_dir.join("16-01-PLAN.md"), "---\nplan: 01\n---\n").unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        let mut state = state_in(dir.path(), 16);
+        state.stage = Stage::Validate;
+
+        std::fs::write(
+            stdout_path(dir.path(), 16),
+            "DEVFLOW_RESULT: {\"status\":\"failed\",\"verdict\":\"pass\"}\n",
+        )
+        .unwrap();
+        // No approval vector — Layer 0 is disabled, so there is nothing to
+        // approve, and supplying one would re-arm the very arm being removed.
+        let result =
+            evaluate_agent_result_inner(dir.path(), &state, &GitFlowConfig::default(), None)
+                .unwrap();
+
+        assert_eq!(
+            result.status,
+            AgentStatus::Failed,
+            "with Layer 0 disabled, Layer 1's self-reported failure stands \
+             verbatim — there is no affirmative probe success to graft onto"
+        );
+        assert_eq!(result.decided_by_layer, Some(1));
+        assert_eq!(
+            crate::outcome_policy::decide_action(Stage::Validate, result.status),
+            crate::outcome_policy::Action::GateReview,
+            "a self-reported failure must gate for review, never advance"
+        );
     }
 
     /// 18e's reconciliation is scoped to `Stage::Validate` only (flagged
