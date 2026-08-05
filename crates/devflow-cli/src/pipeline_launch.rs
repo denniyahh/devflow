@@ -1060,6 +1060,17 @@ mod tests {
     /// for that phase carries the monitor's pid — `transition()` saves state
     /// BEFORE calling `launch_stage`, so the pid must be saved again inside
     /// `launch_stage` or it is lost.
+    ///
+    /// **Premise moved off `STREAM_JSON_STAGES` membership deliberately
+    /// (34-06); do not "simplify" the opt-out away.** This test's subject is
+    /// pid persistence, not which launch path runs, so it previously relied on
+    /// its stage being ABSENT from `STREAM_JSON_STAGES` — an incidental
+    /// premise that 34-05's widening destroys, at which point `canary_gate`
+    /// invokes the real `ClaudeCanaryLauncher` and the launch fails on a
+    /// delivery refusal that has nothing to do with pid persistence. Pinning
+    /// the legacy path via the opt-out makes the premise explicit and stable
+    /// under any contents of the constant, exactly as
+    /// `canary_gate_only_applies_to_the_stream_launch_path` does.
     #[test]
     fn launch_stage_persists_monitor_pid_for_reload() {
         let _guard = env_lock();
@@ -1070,6 +1081,9 @@ mod tests {
 
         let phase = 65;
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        // Not because this test wants legacy behaviour, but because its
+        // subject is orthogonal to the launch path (34-06).
+        state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
         let stub_dir = stub_agent_binary("claude");
@@ -1122,6 +1136,13 @@ mod tests {
     /// stay marked `stopped` forever despite the operator's explicit
     /// resume. Asserts on the persisted state (not just `resume`'s exit
     /// code), since `transition()` saves state before `launch_stage` runs.
+    ///
+    /// **Premise moved off `STREAM_JSON_STAGES` membership deliberately
+    /// (34-06); do not "simplify" the opt-out away.** The subject is resume's
+    /// stop-marker semantics, not which launch path the relaunch takes. The
+    /// opt-out is persisted here rather than set on a local binding because
+    /// `resume()` loads its own `State` from disk; `apply_legacy_launch_opt_out`
+    /// ORs the persisted value, so it survives the reload.
     #[test]
     fn resume_clears_stop_marker_and_advances_past_stop_point() {
         let _guard = env_lock();
@@ -1136,6 +1157,9 @@ mod tests {
         state.stop_until = Some(Stage::Plan);
         state.stopped = true;
         state.stop_reason = Some("stopped after plan completed (--until plan)".to_string());
+        // Not because this test wants legacy behaviour, but because its
+        // subject is orthogonal to the launch path (34-06).
+        state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
         let stub_dir = stub_agent_binary("claude");
@@ -1205,6 +1229,12 @@ mod tests {
     /// `resume_clears_stop_marker_and_advances_past_stop_point` above, since
     /// `transition()`'s `stop_until == Some(from)` interception only sees
     /// what was actually written to disk.
+    ///
+    /// **Premise moved off `STREAM_JSON_STAGES` membership deliberately
+    /// (34-06); do not "simplify" the opt-out away.** The subject is the
+    /// unfired `--until` cap's survival, not which launch path the relaunch
+    /// takes. Persisted rather than set locally, for the same reason as the
+    /// sibling test above: `resume()` reloads its own `State`.
     #[test]
     fn resume_preserves_unfired_until_cap() {
         let _guard = env_lock();
@@ -1221,6 +1251,9 @@ mod tests {
         state.stop_until = Some(Stage::Plan);
         state.stopped = false;
         state.stop_reason = None;
+        // Not because this test wants legacy behaviour, but because its
+        // subject is orthogonal to the launch path (34-06).
+        state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
         let stub_dir = stub_agent_binary("claude");
@@ -1273,6 +1306,11 @@ mod tests {
     /// `--until` cap at all (`stop_until: None`) must remain unaffected by
     /// gating the clear on `state.stopped` — nothing to preserve, nothing to
     /// clear, and the relaunch must still happen.
+    ///
+    /// **Premise moved off `STREAM_JSON_STAGES` membership deliberately
+    /// (34-06); do not "simplify" the opt-out away.** The subject is that the
+    /// no-cap resume path is undisturbed, not which launch path the relaunch
+    /// takes. Persisted rather than set locally, as in the two siblings above.
     #[test]
     fn resume_without_a_cap_is_unchanged() {
         let _guard = env_lock();
@@ -1286,6 +1324,9 @@ mod tests {
         state.stop_until = None;
         state.stopped = false;
         state.stop_reason = None;
+        // Not because this test wants legacy behaviour, but because its
+        // subject is orthogonal to the launch path (34-06).
+        state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
         let stub_dir = stub_agent_binary("claude");

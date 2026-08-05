@@ -1578,6 +1578,16 @@ mod tests {
         // (D-14) — only the injected adapter's `preflight` fails; the real
         // Claude adapter's default (Ok) preflight passes every other check.
         state.stage = Stage::Plan;
+        // Premise moved off `STREAM_JSON_STAGES` membership deliberately
+        // (34-06); do not "simplify" this away. The subject is the launch
+        // COUNT through the Advance arm (CR-01's double-launch defect), not
+        // which launch path is taken. Stage::Plan was incidentally absent
+        // from the constant; 34-05's widening puts it on the stream path,
+        // where `canary_gate` invokes the real `ClaudeCanaryLauncher` and the
+        // launch fails on a delivery refusal unrelated to launch counting.
+        // The `launches == 1` and `monitor_pid.is_some()` assertions below
+        // are untouched, so a launch must still genuinely happen.
+        state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
         let response_path = Gates::response_path(root, phase, Stage::Plan);
@@ -1662,6 +1672,12 @@ mod tests {
         let phase = 64;
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Plan;
+        // Premise moved off `STREAM_JSON_STAGES` membership deliberately
+        // (34-06); do not "simplify" this away. Same reasoning as the Advance
+        // arm's sibling above: the subject is the launch COUNT through the
+        // LoopBack arm, not which launch path is taken, and the `launches == 1`
+        // and `monitor_pid.is_some()` assertions below are untouched.
+        state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
         let response_path = Gates::response_path(root, phase, Stage::Plan);
