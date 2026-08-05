@@ -70,6 +70,34 @@ pub struct State {
     /// counter is NOT touched by `transition()`.
     #[serde(default)]
     pub preflight_retries: u32,
+    /// The commit count observed on the phase's feature branch at the most
+    /// recent Validate failure (999.66, D-03) — the forward-progress
+    /// baseline [`crate::mode::consecutive_failures_made_progress`] compares
+    /// against to decide whether a new failure begins a fresh streak or
+    /// continues the existing one.
+    ///
+    /// `None` means no prior failure has been recorded — either the first
+    /// failure of a phase, or the first failure observed after resuming
+    /// state written by a binary predating this field — and is deliberately
+    /// distinct from `Some(0)`, which means a failure WAS recorded and the
+    /// branch genuinely carried zero commits at that moment; a later failure
+    /// that again counts zero commits must accumulate against that `Some(0)`
+    /// baseline rather than being treated as a fresh streak.
+    ///
+    /// A serde-absent value (state written by a binary predating this field)
+    /// deserializes to `None`, which is exactly the "no prior record"
+    /// meaning above — the same backward-compat pattern as every other
+    /// `#[serde(default)]` field added since 17-01.
+    ///
+    /// Unlike [`Self::consecutive_failures`] and [`Self::infra_failures`],
+    /// this field is NOT touched by `transition()` — it is a baseline
+    /// observation rather than a counter, matching how
+    /// [`Self::preflight_retries`] and [`Self::checkpoint_resumes`] are
+    /// handled. It is replaced wholesale at each failure rather than
+    /// incremented, so it needs no `saturating_add` treatment, unlike every
+    /// other numeric field on this struct.
+    #[serde(default)]
+    pub last_validate_failure_commit_count: Option<u32>,
     /// When the phase started (Unix seconds).
     pub started_at: String,
     /// Path to the project root.
@@ -235,6 +263,7 @@ impl State {
             consecutive_failures: 0,
             infra_failures: 0,
             preflight_retries: 0,
+            last_validate_failure_commit_count: None,
             started_at: timestamp_now(),
             project_root,
             worktree_path: None,
@@ -374,6 +403,47 @@ mod tests {
         }"#;
         let loaded: State = serde_json::from_str(json).unwrap();
         assert_eq!(loaded.infra_failures, 0);
+    }
+
+    /// `last_validate_failure_commit_count` round-trips through serde as an
+    /// exact `Option<u32>` (999.66, D-03) — its own key appears in the
+    /// persisted JSON before the value round-trip is asserted, so a field
+    /// accidentally attributed `skip_serializing_if` (which would still pass
+    /// a naive in-memory round-trip while never persisting anything) is
+    /// caught.
+    #[test]
+    fn last_validate_failure_commit_count_round_trips_through_serde() {
+        let mut state = State::new(1, AgentKind::Claude, Mode::Auto, PathBuf::from("/repo"));
+        state.last_validate_failure_commit_count = Some(3);
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(
+            json.contains("last_validate_failure_commit_count"),
+            "last_validate_failure_commit_count must appear in persisted JSON"
+        );
+        let loaded: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            loaded.last_validate_failure_commit_count,
+            Some(3),
+            "last_validate_failure_commit_count must round-trip through serde"
+        );
+    }
+
+    /// A serde-absent `last_validate_failure_commit_count` (state written by
+    /// a binary predating this field) must deserialize to `None` — the
+    /// "no prior failure recorded" meaning — not to `Some(0)`, which would
+    /// misrepresent a never-observed baseline as an observed zero.
+    #[test]
+    fn last_validate_failure_commit_count_absent_from_json_defaults_to_none() {
+        let json = r#"{
+            "stage": "code",
+            "phase": 1,
+            "agent": "claude",
+            "mode": "auto",
+            "started_at": "0",
+            "project_root": "/repo"
+        }"#;
+        let loaded: State = serde_json::from_str(json).unwrap();
+        assert_eq!(loaded.last_validate_failure_commit_count, None);
     }
 
     /// D-18f: `preflight_retries` round-trips through serde (its own key
