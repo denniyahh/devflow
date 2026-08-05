@@ -2546,8 +2546,8 @@ fn archive_phase_files_with_stamp(
     Ok(Some(stamp.to_string()))
 }
 
-fn phase_review_path(project_root: &Path, phase: u32) -> Option<PathBuf> {
-    let phases = std::fs::read_dir(project_root.join(".planning/phases")).ok()?;
+fn phase_review_path(evidence_root: &Path, phase: u32) -> Option<PathBuf> {
+    let phases = std::fs::read_dir(evidence_root.join(".planning/phases")).ok()?;
     let prefix = format!("{phase:02}-");
     for entry in phases.flatten() {
         if entry
@@ -2575,8 +2575,18 @@ fn phase_review_path(project_root: &Path, phase: u32) -> Option<PathBuf> {
 /// [`phase_review_path`]'s directory-prefix-scan idiom exactly, but returns a
 /// `bool` — no caller needs the artifact's path, only whether it exists. A
 /// missing `.planning/phases` directory returns `false` rather than panicking.
-pub fn phase_verification_exists(project_root: &Path, phase: u32) -> bool {
-    let Ok(phases) = std::fs::read_dir(project_root.join(".planning/phases")) else {
+///
+/// `evidence_root` is the root the Validate agent actually wrote to — the
+/// phase's worktree when `state.worktree_path` is set, else the project root.
+/// `.planning/` is tracked, so in worktree mode the artifact lands on
+/// `feature/phase-N` and is invisible from the main checkout for the phase's
+/// entire in-flight duration. Passing the project root in worktree mode is
+/// exactly the defect this parameter name exists to prevent (33-CONTEXT.md
+/// CR-01); it is NOT interchangeable with the root used for git reads such as
+/// [`phase_commit_count`], whose refs and object database are shared across
+/// worktrees and which therefore correctly takes the project root.
+pub fn phase_verification_exists(evidence_root: &Path, phase: u32) -> bool {
+    let Ok(phases) = std::fs::read_dir(evidence_root.join(".planning/phases")) else {
         return false;
     };
     let prefix = format!("{phase:02}-");
