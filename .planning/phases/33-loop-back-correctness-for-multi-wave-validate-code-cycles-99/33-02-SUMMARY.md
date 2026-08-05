@@ -125,6 +125,14 @@ None - no external service configuration required.
 - 33-03 can now wire `last_validate_failure_commit_count` and `consecutive_failures_made_progress` together with the commit-count I/O helper it is responsible for adding.
 - No blockers.
 
+## Self-Check: PASSED
+- `crates/devflow-core/src/state.rs` — FOUND
+- `crates/devflow-core/src/mode.rs` — FOUND
+- `.planning/phases/33-loop-back-correctness-for-multi-wave-validate-code-cycles-99/33-02-SUMMARY.md` — FOUND
+- Commit `8ce5bf1` (Task 1) — FOUND in git log
+- Commit `558bf18` (Task 2) — FOUND in git log
+- Commit `c178889` (SUMMARY) — FOUND in git log
+
 ---
 *Phase: 33-loop-back-correctness-for-multi-wave-validate-code-cycles-99*
 *Completed: 2026-08-04*
