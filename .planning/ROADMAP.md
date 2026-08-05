@@ -129,6 +129,7 @@ below; it carries no v1 requirement of its own.
 - **First pass** rewrote this entry after establishing that both original halves rested on premises
   the code refutes — the stream-json launch argv is identical across all five stages, so per-stage
   *transport* verification is vacuous.
+
 - **Second pass reversed the first pass's headline conclusion.** The first pass concluded the
   999.74 inversion was unreachable in production and wrote that answer into criterion 4. It is
   reachable — via `reconcile_layer0_verdict`, not via the `(_, Some(Pass))` wildcard. The first
@@ -201,24 +202,29 @@ below; it carries no v1 requirement of its own.
      recorded as a deliberate behaviour change, and capture retention cannot evict an earlier
      stage's capture before the phase has read it — by changing the constant or copying captures at
      landing, so the mitigation leaves an inspectable artifact rather than a run-local env var.
-**Plans**: 5 plans across 4 waves. The binding sequencing constraint (999.76 must not land without
+**Plans**: 1/5 plans executed
 criterion 4's graft fix) is expressed as a real `depends_on` edge from 34-04 to 34-01, and every
 `wave` matches its `depends_on` DAG's topological level.
 
 Plans:
-- [ ] 34-01-PLAN.md — wave 1 (tracer). The `reconcile_layer0_verdict` graft fix: consult Layer 1's
+
+- [x] 34-01-PLAN.md — wave 1 (tracer). The `reconcile_layer0_verdict` graft fix: consult Layer 1's
   status before transplanting Layer 1's verdict, demonstrated through the real cascade with NC-5/NC-6.
   Criteria 4 (core half) and 5. `DOGFOOD-04`.
+
 - [ ] 34-02-PLAN.md — wave 2. Criterion-7 collateral and capture infrastructure: the canary test
   rebuilt on the legacy-opt-out discriminator, `DEFAULT_CAPTURE_RETENTION` raised with its arithmetic
   in source, the stage-blind-argv record, and the evidence directory layout. Criteria 1 (in-source
   record) and 7. `DOGFOOD-03`.
+
 - [ ] 34-03-PLAN.md — wave 2. `classify_validate_outcome` rewritten as an exhaustive
   `(layer0, status, verdict)` match, the 42-cell D-08 sweep, NC-1…NC-4, and criterion 4's downstream
   routing half. Criterion 3. `DOGFOOD-04`.
+
 - [ ] 34-04-PLAN.md — wave 3. 999.76: Layer 0 discovers from the execution root, both call sites
   fixed together, worktree-vs-main-checkout fixtures, NC-7. Criterion 6. `DOGFOOD-04`.
   **Depends on 34-01 — the binding constraint.**
+
 - [ ] 34-05-PLAN.md — wave 4, `autonomous: false`. The live capture campaign: resolve local binary
   promotion, widen, capture on `--no-worktree`, let the evidence decide the constant, record every
   stage's reason, drain analysis, delivery-floor escalation, D-12/D-04 backlog filings. Criteria 1, 2
@@ -269,7 +275,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 31 | 5/5 | Complete | — |
 | 32 | 0/0 | Complete    | 2026-08-04 |
 | 33 | 6/6 | Complete    | 2026-08-05 |
-| 34 | 0/TBD | Not started | - |
+| 34 | 1/5 | In Progress|  |
 
 ## gsd-hygiene milestone (CLOSED 2026-08-04 — GSD Workflow Hygiene)
 
