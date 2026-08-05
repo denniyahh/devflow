@@ -1141,6 +1141,47 @@ mod tests {
         );
     }
 
+    /// T-34-03-01, D-06: the ONE cell whose classification the exhaustive-match
+    /// rewrite actually changes. The superseded `(_, Some(Verdict::Pass))` arm
+    /// was matched first and discarded the derived status entirely, so an
+    /// agent-written `verdict: pass` outranked a `status` DevFlow derived
+    /// itself. The rewritten match enumerates the status position, so a
+    /// non-`Success` status can no longer be discarded by a verdict.
+    ///
+    /// **This cell is unreachable in production** — `decide_action` routes
+    /// every non-`Success` status to a gate before `classify_validate_outcome`
+    /// is called (`34-CONTEXT.md` D-05's amendment). It is defence in depth,
+    /// pinned here because it is the only assertion in this plan that was RED
+    /// before the rewrite and GREEN after it; every other cell's destination is
+    /// byte-identical across the change.
+    #[test]
+    fn non_success_status_never_classifies_as_passed_even_with_verdict_pass() {
+        for status in [
+            AgentStatus::Failed,
+            AgentStatus::Unknown,
+            AgentStatus::RateLimited,
+            AgentStatus::ResourceKilled,
+            AgentStatus::AgentUnavailable,
+            AgentStatus::IdleTimeout,
+        ] {
+            let result = agent_result::AgentResult {
+                status,
+                exit_code: None,
+                reason: None,
+                commits: None,
+                summary: None,
+                verdict: Some(Verdict::Pass),
+                decided_by_layer: Some(0),
+            };
+            assert_eq!(
+                classify_validate_outcome(&result),
+                ValidateOutcome::Failed,
+                "an agent-written verdict:pass must not outrank the derived status {status:?}"
+            );
+        }
+    }
+
+    /// D-08/consensus #4: a `ResourceKilled` outcome on a non-Validate stage
     /// D-08/consensus #4: a `ResourceKilled` outcome on a non-Validate stage
     /// bumps `infra_failures` and leaves `consecutive_failures` untouched —
     /// `handle_infra_outcome` (the `GateInfra` arm) never routes through
