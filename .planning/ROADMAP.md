@@ -202,7 +202,7 @@ below; it carries no v1 requirement of its own.
      recorded as a deliberate behaviour change, and capture retention cannot evict an earlier
      stage's capture before the phase has read it — by changing the constant or copying captures at
      landing, so the mitigation leaves an inspectable artifact rather than a run-local env var.
-**Plans**: 3/5 plans executed
+**Plans**: 4/5 plans executed
 criterion 4's graft fix) is expressed as a real `depends_on` edge from 34-04 to 34-01, and every
 `wave` matches its `depends_on` DAG's topological level.
 
@@ -221,7 +221,7 @@ Plans:
   `(layer0, status, verdict)` match, the 42-cell D-08 sweep, NC-1…NC-4, and criterion 4's downstream
   routing half. Criterion 3. `DOGFOOD-04`.
 
-- [ ] 34-04-PLAN.md — wave 3. 999.76: Layer 0 discovers from the execution root, both call sites
+- [x] 34-04-PLAN.md — wave 3. 999.76: Layer 0 discovers from the execution root, both call sites
   fixed together, worktree-vs-main-checkout fixtures, NC-7. Criterion 6. `DOGFOOD-04`.
   **Depends on 34-01 — the binding constraint.**
 
@@ -275,7 +275,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 31 | 5/5 | Complete | — |
 | 32 | 0/0 | Complete    | 2026-08-04 |
 | 33 | 6/6 | Complete    | 2026-08-05 |
-| 34 | 3/5 | In Progress|  |
+| 34 | 4/5 | In Progress|  |
 
 ## gsd-hygiene milestone (CLOSED 2026-08-04 — GSD Workflow Hygiene)
 
