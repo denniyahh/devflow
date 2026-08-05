@@ -1274,6 +1274,156 @@ mod tests {
         );
     }
 
+    /// 999.66, ROADMAP criterion 3: a phase running three or more
+    /// Code<->Validate waves in Auto mode, with a new commit landing on its
+    /// feature branch before every failure, must not trip the ceiling —
+    /// `handle_validate_outcome`'s reset-vs-accumulate branch must read each
+    /// cycle's new commit as forward progress and restart the streak at 1.
+    ///
+    /// Runs `mode::MAX_CONSECUTIVE_FAILURES + 1` cycles deliberately, one
+    /// more than the ceiling: a passing assertion at exactly the ceiling is
+    /// also consistent with an off-by-one in the reset condition, and the
+    /// extra cycle removes that reading.
+    ///
+    /// **What this test does NOT establish.** It proves the counter does not
+    /// accumulate when new commits land between failures — it cannot
+    /// distinguish a commit that fixed what Validate reported from a commit
+    /// that did not. An agent that commits anything at all on every cycle
+    /// resets the streak every cycle. That is the accepted, documented
+    /// weakness of the commit-count signal (33-RESEARCH.md's D-03
+    /// Recommendation and Assumptions Log A1; see also
+    /// `handle_validate_outcome`'s own doc comment), not a gap this test
+    /// closes.
+    #[test]
+    fn healthy_multi_wave_progress_does_not_reach_the_ceiling() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 87;
+        init_repo(root);
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        for i in 0..(mode::MAX_CONSECUTIVE_FAILURES + 1) {
+            // A real new commit BEFORE the failure is recorded, on every
+            // cycle — the count observed at each failure strictly exceeds
+            // the previously recorded baseline.
+            commit_on_feature_branch(root, phase, &format!("wave-{i}"));
+            std::fs::write(
+                &response_path,
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap();
+            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+            state.stage = Stage::Code;
+            let _ = transition(root, &mut state, Stage::Validate);
+        }
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        assert_eq!(
+            state.consecutive_failures, 1,
+            "a new commit before every failure must restart the streak at 1, not accumulate it"
+        );
+        assert!(
+            !state
+                .mode
+                .should_gate(Stage::Validate, state.consecutive_failures),
+            "genuine forward progress must never force the Auto-mode Validate gate"
+        );
+    }
+
+    /// 999.66, ROADMAP criterion 4, and the negative control for
+    /// `healthy_multi_wave_progress_does_not_reach_the_ceiling` above:
+    /// removing exactly one variable (the repeated commit) from an otherwise
+    /// identical setup must restore the pre-fix ceiling-reaching behavior.
+    ///
+    /// Unlike `consecutive_failures_reaches_ceiling_across_cycles` — which
+    /// runs against a root with NO git repository, so its count is zero
+    /// because the branch is missing — this repository has a real
+    /// `feature/phase-NN` branch carrying one commit before the loop starts,
+    /// and that commit count never changes. This is a different route to "no
+    /// progress" (an existing branch returning a stable non-zero count,
+    /// rather than the branch-missing fallback), and only this one proves
+    /// the count comparison itself works rather than the branch-missing
+    /// fallback.
+    ///
+    /// Confirmed to pass against the pre-fix code as well as after (see
+    /// 33-03-SUMMARY.md) — a negative control that only passes after the
+    /// change would not be controlling for anything.
+    #[test]
+    fn repeated_failure_without_new_commits_still_reaches_the_ceiling() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 88;
+        init_repo(root);
+        // Establish the branch with a stable, non-zero commit count. No
+        // further commits land during the loop below.
+        commit_on_feature_branch(root, phase, "seed");
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        for _ in 0..mode::MAX_CONSECUTIVE_FAILURES {
+            std::fs::write(
+                &response_path,
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap();
+            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+            state.stage = Stage::Code;
+            let _ = transition(root, &mut state, Stage::Validate);
+        }
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        assert_eq!(state.consecutive_failures, mode::MAX_CONSECUTIVE_FAILURES);
+        assert!(
+            state
+                .mode
+                .should_gate(Stage::Validate, state.consecutive_failures),
+            "a genuinely stuck loop with no new commits must still reach the reachable ceiling"
+        );
+    }
+
     /// D-01 (33-CONTEXT.md), ROADMAP criterion 1: a Validate failure on a
     /// phase with no `{N}-VERIFICATION.md` must loop back to Code with the
     /// plain `/gsd-execute-phase {N}` command, not `--gaps-only` (which

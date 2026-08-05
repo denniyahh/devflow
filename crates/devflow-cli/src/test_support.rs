@@ -101,6 +101,41 @@ pub(crate) fn init_repo_no_version_file(root: &Path) {
     git(&["checkout", "-q", "-b", "develop"]);
 }
 
+/// Land one real commit on `feature/phase-{phase:02}`, creating the branch
+/// from the current `HEAD` if it does not already exist. Designed to be
+/// called repeatedly within one test, so each call adds exactly one commit
+/// to the `develop..branch` range — assumes [`init_repo`] has already run.
+///
+/// Uses plain `checkout`, never `checkout -B`, when the branch already
+/// exists: `-B` resets an existing branch to `HEAD`, which would silently
+/// discard the commits an earlier call in the same test already made.
+pub(crate) fn commit_on_feature_branch(root: &Path, phase: u32, label: &str) {
+    let git = |args: &[&str]| {
+        let ok = devflow_core::test_support::git_command(root)
+            .args(args)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    let branch = format!("feature/phase-{phase:02}");
+    let branch_exists = devflow_core::test_support::git_command(root)
+        .args(["rev-parse", "--verify", &branch])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if branch_exists {
+        git(&["checkout", &branch]);
+    } else {
+        git(&["checkout", "-b", &branch]);
+    }
+    let file_name = format!("{label}.txt");
+    std::fs::write(root.join(&file_name), label).unwrap();
+    git(&["add", &file_name]);
+    git(&["commit", "-m", label]);
+}
+
 /// TEST-ONLY adapter (module-scope so any test can reach it — hoisted
 /// from a test-function-local `AlwaysRejectAdapter`, 18f Task 1) whose
 /// `preflight` fails unconditionally, with no interior mutability. Two
