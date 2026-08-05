@@ -301,6 +301,21 @@ pub(crate) fn handle_validate_outcome(
     state: &mut State,
     outcome: ValidateOutcome,
 ) -> Result<(), CliError> {
+    // WR-08: the evidence root, resolved ONCE for every loop-back arm in this
+    // function. `.planning/` is tracked and the Validate agent runs in the
+    // worktree, so the `{N}-VERIFICATION.md` it authors lands on
+    // `feature/phase-{N}` inside the worktree and is invisible from the main
+    // checkout; the probe must therefore follow the agent's cwd. Resolving it
+    // per-arm made a fourth arm's correctness depend on its author noticing
+    // the pattern — the original CR-01 was exactly one call site passing the
+    // wrong root. Owned (`PathBuf`, not `&Path`) so it holds no borrow of
+    // `state` across the `&mut state` calls in each arm. This is NOT the root
+    // the `phase_commit_count` read below uses: see the CR-01 note above.
+    let evidence_root: PathBuf = state
+        .worktree_path
+        .clone()
+        .unwrap_or_else(|| project_root.to_path_buf());
+
     // 18e / T-18-19: an ambiguous outcome must gate IMMEDIATELY — it is
     // being adjudicated right now, not retried, so it must never fall
     // through to the counter-based `should_gate` check below and must never
@@ -316,12 +331,8 @@ pub(crate) fn handle_validate_outcome(
             return match run_gate(project_root, state, Stage::Validate, &context)? {
                 GateAction::Advance => transition(project_root, state, Stage::Ship),
                 GateAction::LoopBack(_) => {
-                    // CR-01: bound to a local so the shared borrow of `state`
-                    // ends before `loop_back_to_code` takes it mutably.
-                    let fix = select_loop_back_fix(
-                        state.worktree_path.as_deref().unwrap_or(project_root),
-                        state.phase,
-                    );
+                    // Evidence root: see the single binding at the top.
+                    let fix = select_loop_back_fix(&evidence_root, state.phase);
                     loop_back_to_code(project_root, state, fix)
                 }
                 GateAction::Abort(reason) => abort(project_root, state, &reason),
@@ -372,12 +383,8 @@ pub(crate) fn handle_validate_outcome(
         return match run_gate(project_root, state, Stage::Validate, &context)? {
             GateAction::Advance => transition(project_root, state, Stage::Ship),
             GateAction::LoopBack(_) => {
-                // CR-01: see the Ambiguous arm above — same evidence root,
-                // same borrow-ordering reason for the local binding.
-                let fix = select_loop_back_fix(
-                    state.worktree_path.as_deref().unwrap_or(project_root),
-                    state.phase,
-                );
+                // Evidence root: see the single binding at the top.
+                let fix = select_loop_back_fix(&evidence_root, state.phase);
                 loop_back_to_code(project_root, state, fix)
             }
             GateAction::Abort(reason) => abort(project_root, state, &reason),
@@ -387,12 +394,10 @@ pub(crate) fn handle_validate_outcome(
     match result {
         ValidateResult::Passed => transition(project_root, state, Stage::Ship),
         ValidateResult::Failed => {
-            // CR-01: the plain-Failed tail arm — the common auto-loop path,
-            // and the one the Phase 29 dogfood actually hit.
-            let fix = select_loop_back_fix(
-                state.worktree_path.as_deref().unwrap_or(project_root),
-                state.phase,
-            );
+            // The plain-Failed tail arm — the common auto-loop path, and the
+            // one the Phase 29 dogfood actually hit. Evidence root: see the
+            // single binding at the top.
+            let fix = select_loop_back_fix(&evidence_root, state.phase);
             loop_back_to_code(project_root, state, fix)
         }
     }
