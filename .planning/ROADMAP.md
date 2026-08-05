@@ -28,7 +28,7 @@ precedent for keeping it out of Phase 33's S–M-sized pair.
 
 | Phase | Name | Status | Version |
 |---|---|---|---|
-| 33 | Loop-Back Correctness for Multi-Wave Validate→Code Cycles | Not started | — |
+| 33 | Loop-Back Correctness for Multi-Wave Validate→Code Cycles | Complete (2026-08-05, PR #90) | — |
 | 34 | Stream-JSON Coverage and the Validate Trust Boundary | Not started | — |
 
 ### Phase 33: Loop-Back Correctness for Multi-Wave Validate→Code Cycles (999.65 + 999.66)
@@ -580,7 +580,13 @@ behaviour reddens the new regression test and nothing else, with a negative cont
 non-backgrounding stages still close on their marker alone. 880 passed, 0 failed; clippy
 `-D warnings` and `fmt --check` clean. Commit `2c20ab4`, merged via PR #82 (`fcae13d`).
 
-### Phase 999.74: `classify_validate_outcome` Trusts the Agent's Verdict Over Its Own Status (BACKLOG)
+### Phase 999.74: `classify_validate_outcome` Trusts the Agent's Verdict Over Its Own Status (PROMOTED — Phase 34)
+
+**Scheduled as Phase 34** (with 999.73), requirement **DOGFOOD-04**. Phase 34's success criterion 3
+is this entry's fix — gate the `Passed` arm on the status the cascade derived, confirmed explicitly
+for `Failed`, `Unknown`, `ResourceKilled` and `IdleTimeout` — and criterion 4 is this entry's own
+open question, carried forward unrelaxed: establish, by reading the Validate routing end to end,
+whether the inversion can manufacture a *pass* on a run that would otherwise have gated.
 
 **Linear:** [DEN-95](https://linear.app/denniskim/issue/DEN-95/99974-classify-validate-outcome-trusts-the-agents-verdict-over-its-own)
 **Found:** 2026-08-03, Phase 31 plan 31-02 execution. Re-confirmed independently at HEAD `e9abb0b`
@@ -622,7 +628,13 @@ needs establishing by reading the Validate routing end to end.
 `normalise_stream_marker_provenance` did for `decided_by_layer`; audit all three affected statuses
 explicitly; add a mirror test per status so the arm cannot silently regain the wildcard.
 
-### Phase 999.73: Widen `STREAM_JSON_STAGES` Beyond `Stage::Code` (BACKLOG)
+### Phase 999.73: Widen `STREAM_JSON_STAGES` Beyond `Stage::Code` (PROMOTED — Phase 34)
+
+**Scheduled as Phase 34** (with 999.74), requirement **DOGFOOD-03**. Phase 34's success criteria 1
+and 2 carry this entry's two halves: widen the bidirectional stream-json path to Define/Plan/
+Validate/Ship backed by *real per-stage production captures* rather than synthetic fixtures, and
+re-derive the drain-gate reasoning per newly-widened stage rather than assuming it carries over
+from Code's backgrounding behavior.
 
 **Linear:** [DEN-94](https://linear.app/denniskim/issue/DEN-94/99973-widen-stream-json-stages-beyond-stagecode-once-the-phase-31)
 **Deferred:** 2026-08-03 by operator decision, during Phase 31 planning. Explicitly **not** in
