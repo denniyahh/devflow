@@ -229,6 +229,25 @@ pub(crate) enum ValidateResult {
     Failed,
 }
 
+/// The single D-01 decision point every in-scope loop-back arm consults:
+/// whether a Validate→Code loop-back should dispatch the plain
+/// `/gsd-execute-phase {N}` command (the phase is mid-arc — no
+/// `{N}-VERIFICATION.md` has been produced yet, so `--gaps-only` would match
+/// zero plans and gate unresolvably) or the narrower `--gaps-only` command
+/// (a `{N}-VERIFICATION.md` already exists, so this is a genuine gaps loop).
+///
+/// D-02 places `handle_ship_outcome`'s loop-back deliberately out of scope:
+/// by the time Ship runs, the phase has already been judged complete, so it
+/// is by definition not mid-arc and `FixType::GapsOnly` is already correct
+/// there — that call site does not call this helper.
+fn select_loop_back_fix(project_root: &Path, phase: u32) -> FixType {
+    if agent_result::phase_verification_exists(project_root, phase) {
+        FixType::GapsOnly
+    } else {
+        FixType::FullExecute
+    }
+}
+
 /// Decide what happens after a Validate stage, honoring the active mode's
 /// gate policy, the consecutive-failure threshold, and (18e) the immediate
 /// gate an ambiguous `external_verify` outcome forces regardless of either.
@@ -289,7 +308,11 @@ pub(crate) fn handle_validate_outcome(
 
     match result {
         ValidateResult::Passed => transition(project_root, state, Stage::Ship),
-        ValidateResult::Failed => loop_back_to_code(project_root, state, FixType::GapsOnly),
+        ValidateResult::Failed => loop_back_to_code(
+            project_root,
+            state,
+            select_loop_back_fix(project_root, state.phase),
+        ),
     }
 }
 
@@ -1197,6 +1220,107 @@ mod tests {
         assert_eq!(
             state.infra_failures, 0,
             "infra_failures must still reset unconditionally on the same hop the consecutive reset now skips"
+        );
+    }
+
+    /// D-01 (33-CONTEXT.md), ROADMAP criterion 1: a Validate failure on a
+    /// phase with no `{N}-VERIFICATION.md` must loop back to Code with the
+    /// plain `/gsd-execute-phase {N}` command, not `--gaps-only` (which
+    /// matches zero plans and gates unresolvably on a mid-arc phase). Drives
+    /// the plain-Failed tail arm directly — the common auto-loop path, and
+    /// the one the Phase 29 dogfood actually hit.
+    #[test]
+    fn mid_arc_loop_back_issues_plain_execute_command() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 82;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+
+        // Deliberately no `.planning/phases/{phase:02}-*/{phase:02}-VERIFICATION.md`
+        // — this is the mid-arc precondition.
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        // The launch fails by design under a neutralized PATH (no real agent
+        // CLI can spawn) — the `loop_back` event is emitted before that, so
+        // the resulting `Err` is discarded, matching the established shape
+        // in `consecutive_failures_reaches_ceiling_across_cycles`.
+        let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        let last = devflow_core::events::last_event_of_kind_for_phase(root, phase, "loop_back")
+            .expect("loop_back event must be recorded");
+        assert_eq!(
+            last["fix"], "FullExecute",
+            "a mid-arc phase (no {{N}}-VERIFICATION.md) must dispatch FullExecute, not GapsOnly"
+        );
+    }
+
+    /// D-01 (33-CONTEXT.md), ROADMAP criterion 2: a Validate failure on a
+    /// phase whose `{N}-VERIFICATION.md` already exists must still loop back
+    /// with `--gaps-only` — unchanged from the pre-fix behavior. This is the
+    /// negative control for `mid_arc_loop_back_issues_plain_execute_command`:
+    /// identical drive, opposite precondition, opposite outcome — neither
+    /// test is meaningful without the other.
+    #[test]
+    fn genuine_gaps_loop_back_still_issues_gaps_only() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 83;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+
+        let phase_dir = root
+            .join(".planning/phases")
+            .join(format!("{phase:02}-test"));
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        std::fs::write(
+            phase_dir.join(format!("{phase:02}-VERIFICATION.md")),
+            "verified\n",
+        )
+        .unwrap();
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        let last = devflow_core::events::last_event_of_kind_for_phase(root, phase, "loop_back")
+            .expect("loop_back event must be recorded");
+        assert_eq!(
+            last["fix"], "GapsOnly",
+            "a phase with an existing {{N}}-VERIFICATION.md must still dispatch GapsOnly"
         );
     }
 

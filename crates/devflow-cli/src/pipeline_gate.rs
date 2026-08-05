@@ -148,6 +148,7 @@ pub(crate) fn prepare_loop_back_to_code(
         serde_json::json!({
             "from": gate_stage.to_string(),
             "consecutive_failures": state.consecutive_failures,
+            "fix": format!("{fix:?}"),
         }),
     );
     println!(
