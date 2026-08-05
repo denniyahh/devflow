@@ -2540,6 +2540,37 @@ fn phase_review_path(project_root: &Path, phase: u32) -> Option<PathBuf> {
     None
 }
 
+/// Whether `/gsd-verify-work` has produced a `{phase:02}-VERIFICATION.md`
+/// artifact for `phase` yet.
+///
+/// Per D-01 (33-CONTEXT.md), this is the sole mid-arc-vs-genuine-gaps signal
+/// a Validate→Code loop-back consults: a phase with no verification artifact
+/// is still mid-arc (its remaining plans have not been judged at all), so a
+/// loop-back must re-run the phase in full rather than dispatch `--gaps-only`,
+/// which matches zero plans and gates unresolvably. Mirrors
+/// [`phase_review_path`]'s directory-prefix-scan idiom exactly, but returns a
+/// `bool` — no caller needs the artifact's path, only whether it exists. A
+/// missing `.planning/phases` directory returns `false` rather than panicking.
+pub fn phase_verification_exists(project_root: &Path, phase: u32) -> bool {
+    let Ok(phases) = std::fs::read_dir(project_root.join(".planning/phases")) else {
+        return false;
+    };
+    let prefix = format!("{phase:02}-");
+    for entry in phases.flatten() {
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(&prefix))
+        {
+            let verification = entry.path().join(format!("{phase:02}-VERIFICATION.md"));
+            if verification.exists() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Keep only the newest `retain` capture generations under `history_dir`,
 /// deleting older ones. Generations are grouped by their stamp (the shared
 /// prefix of a `{stamp}-stdout`/`{stamp}-exit` pair, split off the trailing
@@ -6493,6 +6524,36 @@ mod tests {
              foreign repository) must still resolve project_root's own \
              branch and commits; child exit status {:?}\nstdout:\n{stdout}",
             out.status
+        );
+    }
+
+    /// D-01 (33-CONTEXT.md): `phase_verification_exists` is the sole signal
+    /// a Validate→Code loop-back consults to tell a mid-arc phase apart from
+    /// a genuinely gap-flagged one. Covers all three states: no
+    /// `.planning/phases` directory at all, a phase directory with no
+    /// verification artifact, and a phase directory that has one — mirroring
+    /// `phase_review_path`'s directory-prefix-scan idiom.
+    #[test]
+    fn phase_verification_exists_finds_the_artifact_by_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        assert!(
+            !phase_verification_exists(root, 82),
+            "no .planning/phases directory at all must return false, not panic"
+        );
+
+        let phase_dir = root.join(".planning/phases/82-loop-back-fix");
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        assert!(
+            !phase_verification_exists(root, 82),
+            "a phase directory with no {{N}}-VERIFICATION.md must return false"
+        );
+
+        std::fs::write(phase_dir.join("82-VERIFICATION.md"), "verified\n").unwrap();
+        assert!(
+            phase_verification_exists(root, 82),
+            "a phase directory holding {{N}}-VERIFICATION.md must return true"
         );
     }
 }
