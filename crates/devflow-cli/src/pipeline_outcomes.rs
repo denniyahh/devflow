@@ -1591,6 +1591,14 @@ mod tests {
     /// proves the gated path and the ungated tail agree on the fix — which
     /// they did not have to. PATH-neutralized under `ENV_MUTEX`, same as
     /// above.
+    ///
+    /// 33-04: both the seeded 999.66 baseline and the counter assertion on the
+    /// `loop_back` event are required, and they do different jobs — the seed
+    /// puts this test back on the gated arm (without it the counter resets to
+    /// 1 and `should_gate` is false), and the assertion is what notices if a
+    /// later change moves it off again. The pre-existing `fix` assertion
+    /// cannot: both arms route through `select_loop_back_fix` and both emit
+    /// `FullExecute`, so this test passed vacuously on the wrong arm.
     #[test]
     fn failure_gate_loop_back_respects_the_mid_arc_check() {
         let _guard = ENV_MUTEX.lock().unwrap();
@@ -1601,6 +1609,11 @@ mod tests {
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         state.consecutive_failures = mode::MAX_CONSECUTIVE_FAILURES;
+        // 999.66 (33-03): seed the forward-progress baseline alongside the
+        // streak, or the `None` baseline resets the counter to 1 and this
+        // test silently exercises the ungated tail arm instead of the
+        // consecutive-failure-gated arm its name and doc comment claim.
+        state.last_validate_failure_commit_count = Some(0);
         workflow::save_state(&state).unwrap();
 
         // No {phase:02}-VERIFICATION.md — mid-arc precondition.
@@ -1632,6 +1645,14 @@ mod tests {
 
         let last = devflow_core::events::last_event_of_kind_for_phase(root, phase, "loop_back")
             .expect("loop_back event must be recorded");
+        assert!(
+            last["consecutive_failures"]
+                .as_u64()
+                .expect("loop_back event must carry consecutive_failures")
+                >= u64::from(mode::MAX_CONSECUTIVE_FAILURES),
+            "must be the consecutive-failure-GATED loop-back arm (counter {}) — a value below the threshold means this ran the ungated tail arm instead",
+            last["consecutive_failures"]
+        );
         assert_eq!(
             last["fix"], "FullExecute",
             "the consecutive-failure-gated loop-back must respect the mid-arc check, same as the ungated tail arm"
