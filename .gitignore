@@ -51,3 +51,10 @@ Thumbs.db
 
 # Bytecode cache from importing the Phase 30 experiment harnesses under .planning/
 __pycache__/
+
+# MemPalace capture staging. Artifacts are copied here so `mempalace mine`'s
+# detect_room() can assign a room from the folder path. The directory must PERSIST
+# rather than be cleaned up: mine's idempotency keys on absolute source_file + mtime,
+# so deleting it makes every re-run re-file duplicate drawers. Ignored so it cannot be
+# swept into an unrelated commit by a blanket `git add -A`.
+.planning/.mempalace-stage/
