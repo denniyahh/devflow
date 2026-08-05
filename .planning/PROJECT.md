@@ -116,6 +116,21 @@ version is still derived automatically from conventional-commit classification a
   from git — Phase 31, milestone v2.3.0, shipped v2.3.0. Not yet proven beyond
   the Code stage (999.73, backlog).
 
+- ✓ Loop-back correctness for multi-wave Validate→Code cycles (DOGFOOD-01 +
+  DOGFOOD-02, validated in Phase 33): the Validate→Code loop-back distinguishes
+  a mid-arc phase (no `{N}-VERIFICATION.md` — issues plain `/gsd-execute-phase
+  {N}`) from one with genuine recorded gaps (issues `--gaps-only`), reading that
+  signal from the phase's *worktree* rather than the main checkout, since
+  `.planning/` is tracked and an in-flight phase's artifacts exist only on its
+  own branch; and `consecutive_failures` resets on wave-by-wave forward progress
+  measured from a persisted commit-count baseline, so a healthy 3+ wave phase no
+  longer false-gates at wave 3 while a genuinely repeated failure still gates.
+  Evidence is unit-level (4/4 ROADMAP criteria, 20/20 plan truths). Every test
+  drives a tempdir with `PATH` neutralized and builds its "worktree" with
+  `create_dir_all` rather than a linked `git worktree` — the end-to-end claim
+  ("a 3+ wave unattended `devflow start` phase completes") awaits a real
+  dogfood run against this binary.
+
 ### Active
 
 - 4 requirements for **v2.4.0 Resume Unattended Dogfooding** (declared 2026-08-04) — see
@@ -281,3 +296,14 @@ milestone declared yet — see `/gsd-new-milestone`.*
 Phase 33 (999.65 + 999.66) and Phase 34 (999.73 + 999.74), scoped through conversation rather
 than fresh domain research (these are pre-existing internal defects with fix directions already
 sketched in ROADMAP.md, not new user-facing capability).*
+
+---
+*Last updated: 2026-08-05 after Phase 33 (Loop-Back Correctness for Multi-Wave Validate→Code
+Cycles) completed — 5/5 plans, verification passed 4/4 ROADMAP criteria, DOGFOOD-01 and
+DOGFOOD-02 marked Complete. It took two gap-closure plans past the original three: 33-04 repaired
+two pre-existing tests that had silently stopped exercising their asserted code paths (one was
+attempting a real agent launch during `cargo test`), and 33-05 closed the review-found defect that
+the decision signal was read from the main checkout while the Validate agent authors it inside the
+phase's worktree — the same wrong-root class the code review then traced one file over into
+`evaluate_layer0`, which remains open as a backlog candidate. Milestone v2.4.0 continues with
+Phase 34.*
