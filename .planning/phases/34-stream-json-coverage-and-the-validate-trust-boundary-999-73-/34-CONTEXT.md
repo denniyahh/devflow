@@ -76,14 +76,22 @@ repair work that a capture happens to reveal (filed, not fixed — D-04).
   does not exercise `resolve_launch_shape` and the pipe-owning monitor is **not**, because it would
   be a proxy capture proving nothing about the production path. See `34-REVIEW.md` R-04.
 
-  **Amendment 2 — the PARTIAL-close route is UNRESOLVED and must not be assumed.** The original
-  text said the remainder "returns as a numbered `999.x` backlog entry." That has nowhere to land:
-  DOGFOOD-03 is a v1 requirement of the active v2.4.0 milestone, Phase 34 is its last phase,
-  `REQUIREMENTS.md` models requirements as checkboxes with no partial state, and `999.x` backlog is
-  explicitly listed Out of Scope for this milestone. Phase 26 is precedent for a PARTIAL close but
-  a materially different one — it was never shipped and its goal was re-opened wholesale. **A
-  planner must not treat PARTIAL as a settled exit; escalate to the operator if a stage proves
-  unobtainable.**
+  **Amendment 2 — RESOLVED 2026-08-05 by rewording DOGFOOD-03, not by a PARTIAL close.** The
+  original text said the remainder "returns as a numbered `999.x` backlog entry." That had nowhere
+  to land: Phase 34 is the active milestone's last phase, `REQUIREMENTS.md` models requirements as
+  checkboxes with no partial state, and `999.x` backlog is explicitly Out of Scope for this
+  milestone. Phase 26 is precedent for a PARTIAL close, but a materially different one — it was
+  never shipped and its goal was re-opened wholesale.
+
+  **The fix was upstream of the phase.** DOGFOOD-03 named four specific stages, making it an
+  implementation plan rather than an operator-facing guarantee — the only one of the four
+  requirements phrased that way. It now states the evidence discipline itself, so a stage left
+  narrow is a *satisfied* requirement (visibly, deliberately on the legacy path) rather than an
+  unsatisfiable checkbox. Operator decision, 2026-08-05. See `REQUIREMENTS.md`'s inline note.
+
+  **What this does NOT license.** Leaving a stage narrow still requires the recorded reason in the
+  const's doc comment, and D-04's filing obligation is unchanged. "Not evidenced" must be visible
+  and deliberate — the requirement now turns on exactly that, so a silent omission fails it.
 
 - **D-03:** **No new runtime per-stage dial.** `31/D-11`'s `legacy_opt_out` remains the single
   predicate governing launch shape, the `31/D-15` canary gate, and the loud notice together —
@@ -239,23 +247,25 @@ repair work that a capture happens to reveal (filed, not fixed — D-04).
   (capture-writer torn lines), which is adjacent but would re-inflate a scope that shrank for good
   reasons.
 
-### Open — needs an operator decision before planning
+### Unreadable — the D-04/D-11 tie-break
 
-- **D-14 [OPEN — do not let a planner resolve this]:** **Which rule governs
-  `BackgroundTaskState::Unreadable`?** D-04 (capture-revealed parser defect → file it, stage stays
-  narrow) and D-11 (a list that never drains → widen, the rule is working) give opposite answers,
-  and `Unreadable` satisfies both descriptions — it is by construction a parser gap, the 999.75 /
-  DEN-96 failure class.
+- **D-14:** **`BackgroundTaskState::Unreadable` is governed by D-04, not D-11 — file it, and the
+  stage stays narrow.** Operator decision, 2026-08-05, taken after review surfaced the conflict:
+  D-04 (capture-revealed parser defect → file, stage stays narrow) and D-11 (a list that never
+  drains → widen, the rule is working) both describe `Unreadable`, and the disambiguating option
+  had been declined during discussion in favour of D-11's unconditional form.
 
-  The operator was offered the disambiguating option during discussion ("`Unreadable` or
-  still-pending at run end → file") and declined it in favour of D-11's unconditional form. **That
-  answer was given without the information R-03 later established:** `Unreadable` blocks
-  `should_close()` permanently, so widening a stage on an `Unreadable` capture *guarantees* the
-  forced-idle-timeout shape rather than risking it. This is materially different from the
-  `Pending(n>0)`-that-resolves case D-11 was actually about.
+  **The governing reason is the parser gap, not the timeout.** An `Unreadable` in a capture means
+  DevFlow could not read a `background_tasks_changed` shape the CLI actually emitted — the
+  999.75 / DEN-96 class — and that is a defect worth filing whether or not the run recovered.
 
-  Recorded as open rather than decided, per this project's rule that a recommendation of mine is
-  never written down as an operator decision. Escalate; do not infer.
+  **Precision correction, recorded because an earlier draft of this document and of `34-REVIEW.md`
+  R-03 overstated it:** `Unreadable` does **not** block `should_close()` permanently.
+  `CloseRule::observe` (`crates/devflow-core/src/monitor.rs:571-581`) reassigns
+  `background_tasks` on *every* `background_tasks_changed` event, so a subsequent readable
+  announcement clears `Unreadable` to `Pending(n)`. It blocks until a later readable announcement
+  arrives, and only blocks through to the idle timeout when it is the run's last announcement. The
+  decision does not rest on the overstated version.
 
 ### Claude's Discretion
 

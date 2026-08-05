@@ -115,6 +115,15 @@ discussion log shows the operator was offered the disambiguating option ("still-
 → file") and declined it; the question as put to them understated this cost as "the capture must
 show the timeout behaved."
 
+> **Correction (2026-08-05), after this finding was first written.** An earlier version of R-03 and
+> of the amended D-11 said `Unreadable` blocks `should_close()` **permanently**. That is wrong.
+> `CloseRule::observe` (`monitor.rs:571-581`) reassigns `background_tasks` on *every*
+> `background_tasks_changed` event, so a later readable announcement clears `Unreadable` to
+> `Pending(n)`. It blocks until a subsequent readable announcement, and blocks through to the idle
+> timeout only when it is the run's last announcement. The `Pending(n>0)`-never-drains case in the
+> body above is unaffected — that one does hold to timeout. D-14 resolves `Unreadable` under D-04
+> on the parser-gap ground, which does not depend on the overstated claim.
+
 ### R-04 — D-02's evidence rule is circular, and two escapes exist (HIGH)
 
 Confirmed by every external lane and directly. `resolve_launch_shape`
@@ -225,10 +234,21 @@ assumption in either direction — but it does not refute `31/D-10`.
 - **`canary_gate_only_applies_to_the_stream_launch_path`** (`pipeline_launch.rs:1754`) becomes
   unconstructible as written: with all five stages widened, no Claude stage yields
   `stream_launch == false`, so the test must be rebuilt on the legacy opt-out or a non-Claude agent.
-- **Milestone accounting.** DOGFOOD-03 is a v1 requirement of the active v2.4.0 milestone, Phase 34
-  is its last phase, `REQUIREMENTS.md` models requirements as checkboxes with no partial state, and
-  `999.x` backlog is explicitly out of scope for this milestone. D-02's "close PARTIAL, backlog the
-  rest" has nowhere to land at milestone close. **Unresolved — flagged for the operator.**
+- **Milestone accounting — RESOLVED 2026-08-05.** DOGFOOD-03 is a v1 requirement of the active
+  v2.4.0 milestone, Phase 34 is its last phase, `REQUIREMENTS.md` models requirements as checkboxes
+  with no partial state, and `999.x` backlog is explicitly out of scope for this milestone, so
+  D-02's "close PARTIAL, backlog the rest" had nowhere to land.
+
+  Fixed upstream of the phase rather than inside it: DOGFOOD-03 named four specific stages, making
+  it the only one of the four requirements phrased as an implementation plan instead of an
+  operator-facing guarantee. It was reworded to state the evidence discipline itself, so a stage
+  left visibly and deliberately narrow *satisfies* the requirement rather than blocking it. The
+  rewrite is **stricter** than the original — the original could be met by widening four stages on
+  four thin captures; the rewrite cannot be met by any unevidenced widening. Operator decision;
+  alternatives considered were splitting DOGFOOD-03 into 03a/03b (changes coverage accounting and
+  relocates the same problem), adding a Phase 35 (largest lift, and premature while no stage is
+  *known* unobtainable), and deferring to close (rejected — by then the only options are an untrue
+  checkbox or an open milestone).
 
 ---
 

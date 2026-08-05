@@ -23,9 +23,26 @@ Requirements for this milestone. Each maps to roadmap phases.
 - [x] **DOGFOOD-02**: Operator can run a 3+ wave unattended phase in `auto` mode without a false
   "3 consecutive failures" gate firing on healthy wave-by-wave progress (999.66)
 
-- [ ] **DOGFOOD-03**: Operator can trust that Define/Plan/Validate/Ship stages launch through the
-  same reliable stream-json path already proven for Code, backed by real per-stage captures, not
-  synthetic fixtures (999.73)
+- [ ] **DOGFOOD-03**: Operator can trust that every stage DevFlow launches through the stream-json
+  path was put there on real per-stage behavioural evidence — and that any stage not yet evidenced
+  is visibly and deliberately still on the legacy path, never silently assumed to work (999.73)
+
+  > **Reworded 2026-08-05 — a modelling correction, and it tightens rather than relaxes the
+  > guarantee.** The original text read "Define/Plan/Validate/Ship stages launch through the same
+  > reliable stream-json path already proven for Code, backed by real per-stage captures, not
+  > synthetic fixtures." That named four specific stages, which made it an *implementation plan*
+  > rather than an operator-facing guarantee — the only requirement here phrased that way; its
+  > three siblings all state what the operator can rely on. The practical consequence was that a
+  > partial delivery had nowhere to land: this file models requirements as checkboxes with no
+  > partial state, `999.x` backlog is Out of Scope for this milestone, and Phase 34 is its last
+  > phase, so widening three of four stages would have forced a choice between ticking a box that
+  > was not true and holding the milestone open indefinitely.
+  >
+  > **The rewrite is stricter, not looser.** The original could be satisfied by widening all four
+  > stages on four thin captures. This one cannot be satisfied by *any* unevidenced widening — the
+  > evidence discipline is the deliverable, which is what 999.73 was always about ("widening now
+  > would extend the adapter to four stages on zero evidence"). Phase 34's rewritten success
+  > criterion 1 is the matching statement. Full reasoning: `34-REVIEW.md`.
 
 - [ ] **DOGFOOD-04**: Operator can trust that a Validate stage's reported outcome reflects its
   actually-derived status, not just the agent's self-reported verdict field (999.74)
