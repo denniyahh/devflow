@@ -295,6 +295,75 @@ Unsequenced items — not part of the active phase sequence. Promote with
 `/gsd-review-backlog` when ready; each carries accumulated context in its
 own `phases/999.N-*/CONTEXT.md`.
 
+### Phase 999.76: Layer 0 External Verification Reads Its Declaration From the Main Checkout, So It Is Inert in Worktree Mode (BACKLOG)
+
+**Linear:** [DEN-98](https://linear.app/denniskim/issue/DEN-98/99976-layer-0-external-verification-reads-its-declaration-from-the)
+**Found:** 2026-08-05, Phase 33 code review; confirmed independently by two peer reviews (Claude
+code-reviewer, DeepSeek v4 Pro via hermes). **Pre-existing** — `git blame` puts both lines at
+2026-07-18 (`c620fb37`, `305e2675`), weeks before Phase 33's merge-base `7b55fce` (2026-08-04).
+Not introduced by Phase 33; *surfaced* by it, because 33-05 fixed the same defect class one file
+over and its new doc comments now make this one's justification provably false.
+
+**Severity: High.** Worktree mode is DevFlow's default operating shape, and in that shape the
+pipeline's highest-trust verification layer never runs. Not Urgent: it fails toward the existing
+Layer 1/2 cascade rather than toward a false pass, there is no data loss or security exposure, and
+it has been latent since 2026-07-18 with no observed production incident.
+
+**The defect in one sentence:** `evaluate_layer0`
+(`crates/devflow-core/src/agent_result.rs:2041-2042`) resolves the correct worktree-aware root and
+then does not use it for discovery — `let execution_root = state.worktree_path.as_deref()
+.unwrap_or(project_root);` on one line, `external_verify_commands(project_root, state.phase)` on
+the next. `execution_root` is used only later, to *run* the probes.
+
+**Why that root is wrong.** `.planning/` is tracked content, so an in-flight phase's `{N}-PLAN.md`
+is committed on `feature/phase-{N}` and lives inside that phase's worktree; the main checkout sits
+on `develop` and does not have it for the phase's whole duration. No merge-back happens during the
+phase, so this is the steady state, not a race. Measured with a discriminating negative control:
+`git ls-tree -r develop --name-only -- .planning/phases | grep -c '/33-'` returns **0** while the
+same command against `HEAD` returns **17**. (The non-recursive form returns 0 for *every* ref and
+proves nothing — use `-r`.) The doc comment at `:2025-2031` asserts the opposite and is false.
+
+**Impact — the silent branch is the dangerous one.** With `DEVFLOW_TRUST_EXTERNAL_VERIFY` unset
+(the default), `commands` is empty, `approved_commands` is `None`, and `evaluate_layer0` returns
+`None`; the cascade falls through to Layer 1/2 and the stage evaluates normally. Declared external
+post-condition probes **never execute, and nothing reports that they were skipped**. Layer 0 exists
+precisely so a failed probe outranks every agent-controlled signal, and an all-passing probe set is
+affirmative completion evidence on its own — in worktree mode that guarantee is currently vacuous.
+With the env var set, the opposite: `commands` empty against `Some(approved)` fires the veto and
+every stage hard-fails with `"external verification approval mismatch; PLAN declaration was
+removed"` — loud, but wrong, and the message names a cause it cannot know.
+
+**Same root cause, second call site.** `crates/devflow-cli/src/pipeline_launch.rs:957` calls
+`verify::phase_has_blocking_human_checkpoint(project_root, phase)`, also routed through
+`phase_plan_files`, so the whole plan-28-03 checkpoint auto-decide path is silently dead in
+worktree mode. Fix both together or the class recurs a third time.
+
+**Why the suite cannot catch it — and why this is a plan, not a patch.**
+`external_probe_discovers_from_project_root_across_every_stage_and_executes_in_worktree`
+(`agent_result.rs:5259`) writes the PLAN under the tempdir standing in for `project_root` while
+pointing `state.worktree_path` at an empty sibling directory. It manufactures exactly the layout
+the defect assumes, so it is structurally incapable of failing on it, and its doc comment
+(`:5255-5257`) codifies the false premise as deliberate intent. A naive one-line root swap breaks
+this green test. Found by the DeepSeek peer review; both Claude reviews missed it.
+
+**Proposed fix:** (1) pass `execution_root` at `:2042` using the `worktree_path.as_deref()
+.unwrap_or(project_root)` idiom Phase 33 standardised; (2) rewrite the `:5259` test so the PLAN
+lives under the worktree, keeping a non-worktree companion for the `None` fallback arm; (3) correct
+both false doc comments; (4) fix `pipeline_launch.rs:957` with matching coverage; (5) reword the
+"PLAN declaration was removed" message.
+
+**Prohibition the fix must respect:** do NOT retarget `phase_commit_count`. It reads `project_root`
+deliberately and correctly — git refs and the object database are shared across a repository's
+worktrees, so a worktree commit is already visible from the main checkout. Declaration discovery on
+the worktree, commit counting on the main checkout, is the correct end state; Phase 33 established
+exactly that asymmetry for the loop-back path.
+
+**Open question the fix should answer rather than assume:** no test in the workspace exercises a
+real linked `git worktree` — the worktree-mode tests use plain `create_dir_all` directories with no
+git repository at all. Adequate for a filesystem stat, but the shared-refs property
+`phase_commit_count` depends on is asserted in comments and exercised by nothing. Decide whether
+this fix carries the first linked-worktree integration test.
+
 ### Phase 999.75: `CloseRule` Treats an Unparseable `tasks` List on the FIRST Announcement as Permission to Close (RESOLVED 2026-08-04)
 
 **Linear:** [DEN-96](https://linear.app/denniskim/issue/DEN-96/99975-closerule-treats-an-unparseable-tasks-list-on-the-first)
