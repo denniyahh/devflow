@@ -1311,9 +1311,8 @@ mod tests {
                         _ => ValidateOutcome::Failed,
                     };
 
-                    let actual = classify_validate_outcome(&classifier_fixture(
-                        layer0, status, verdict,
-                    ));
+                    let actual =
+                        classify_validate_outcome(&classifier_fixture(layer0, status, verdict));
                     assert_eq!(
                         actual, expected,
                         "cell (layer0={layer0}, status={status:?}, verdict={verdict:?}) \
@@ -1402,11 +1401,7 @@ mod tests {
     fn external_verify_absent_verdict_is_ambiguous_only_when_layer0_decided() {
         assert!(
             matches!(
-                classify_validate_outcome(&classifier_fixture(
-                    true,
-                    AgentStatus::Success,
-                    None
-                )),
+                classify_validate_outcome(&classifier_fixture(true, AgentStatus::Success, None)),
                 ValidateOutcome::Ambiguous(_)
             ),
             "a Layer-0 probe pass with no agent verdict at all must gate immediately"
@@ -1417,6 +1412,99 @@ mod tests {
             "with no Layer-0 probe, a missing verdict is the ordinary fail-safe and \
              must stay on the auto-loop. If this half matched the layer0=true half, \
              the layer0 dimension would be decorative rather than load-bearing"
+        );
+    }
+
+    /// The DOWNSTREAM half of ROADMAP criterion 4's demonstration: the Validate
+    /// shape produced AFTER plan 34-01's graft fix routes to an immediate gate,
+    /// while the pre-fix laundered shape routes to Ship.
+    ///
+    /// **This test covers only half the route, deliberately.** The upstream half
+    /// — that `reconcile_layer0_verdict` no longer manufactures the second shape
+    /// out of a `{"status":"failed","verdict":"pass"}` marker — is pinned in
+    /// `devflow-core` by `layer0_verdict_graft_declines_when_layer1_status_is_not_success`
+    /// (plan 34-01). The two crates' tests together cover the route.
+    ///
+    /// **Do not "consolidate" the pair into one crate.**
+    /// `classify_validate_outcome` is `pub(crate)` to `devflow-cli` and cannot be
+    /// called from `devflow-core`'s test module, and `devflow-core` cannot depend
+    /// on `devflow-cli`. The split is forced by visibility, not by oversight.
+    ///
+    /// **What the two shapes are.** Post-fix, the graft declines to transplant a
+    /// failing Layer 1's verdict, so Validate presents
+    /// `(decided_by_layer: Some(0), status: Success, verdict: None)` — a Layer-0
+    /// probe pass with no agent verdict, which is `Ambiguous`. Pre-fix, the same
+    /// marker produced `(Some(0), Success, Some(Pass))`, which is `Passed` and
+    /// advances. That second classification is NOT a defect in this classifier —
+    /// by the time it runs the status genuinely IS `Success` — which is exactly
+    /// why criterion 3's structural fix does not and could not close criterion 4.
+    ///
+    /// **The routing half** is asserted here only for the gating direction (the
+    /// one criterion 4 claims). The `Passed` → `Stage::Ship` direction is pinned
+    /// by `external_verify_agreement_advances_to_ship`, which needs `ENV_MUTEX`
+    /// and a neutralized `PATH` to keep `transition`'s `launch_stage` from
+    /// spawning a real agent CLI; reproducing that here would add env mutation to
+    /// an otherwise pure test for no additional coverage.
+    #[test]
+    fn grafted_failure_shape_gates_instead_of_shipping() {
+        // The POST-graft-fix shape.
+        let post_fix =
+            classify_validate_outcome(&classifier_fixture(true, AgentStatus::Success, None));
+        match &post_fix {
+            ValidateOutcome::Ambiguous(detail) => assert!(
+                detail.contains("no agent verdict"),
+                "the ambiguous payload must name the missing verdict so the \
+                 [never-silent] gate context says which signal was absent: {detail}"
+            ),
+            other => panic!("the post-fix Validate shape must gate, not ship — got {other:?}"),
+        }
+
+        // The PRE-fix laundered shape — the downstream half of the exploit,
+        // asserted as such. Opposite result from the same fixture shape, which
+        // is what makes the pair a demonstration rather than a restatement.
+        assert_eq!(
+            classify_validate_outcome(&classifier_fixture(
+                true,
+                AgentStatus::Success,
+                Some(Verdict::Pass),
+            )),
+            ValidateOutcome::Passed,
+            "the laundered shape classifies as Passed — this is the downstream \
+             half of 999.74's exploit, closed upstream by 34-01's graft fix, not here"
+        );
+
+        // The routing half, gating direction: drive the real
+        // `handle_validate_outcome` and confirm the post-fix shape does NOT
+        // reach Ship. An abort response is pre-seeded so the gate resolves
+        // without spawning anything (same pattern as
+        // `external_verify_disagreement_gates_immediately`).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 93;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        handle_validate_outcome(root, &mut state, post_fix).unwrap();
+
+        assert_ne!(
+            state.stage,
+            Stage::Ship,
+            "the post-fix shape must never advance to Ship — that advance is the \
+             whole of 999.74"
+        );
+        assert_eq!(
+            state.consecutive_failures, 0,
+            "an ambiguous outcome gates on cycle one without touching the counter, \
+             so the operator sees an immediate gate rather than a delayed retry"
         );
     }
 
