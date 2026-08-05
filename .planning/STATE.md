@@ -6,7 +6,7 @@ current_phase: 34
 current_phase_name: Stream-JSON Coverage and the Validate Trust Boundary (999.73 + 999.74)
 status: "Phase 33 shipped — PR #90"
 stopped_at: Phase 34 context gathered
-last_updated: "2026-08-05T16:50:08.524Z"
+last_updated: "2026-08-05T18:06:41.301Z"
 last_activity: 2026-08-05
 progress:
   total_phases: 2
@@ -851,3 +851,9 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 - ROADMAP.md now has a live Phase 33 + Phase 34 (Resume Unattended Dogfooding, v2.4.0) inside the
   active milestone's own window, plus updated `## Progress` rows — the milestone is declared and
   roadmapped but not yet planned. Next: `/gsd-discuss-phase 33`.
+
+## Accumulated Context
+
+### Roadmap Evolution
+
+- Phase 34 edited: edited fields: title, goal, depends_on, requirements, success_criteria — rewritten after adversarial review (34-REVIEW.md); 999.76 folded in

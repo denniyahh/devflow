@@ -26,10 +26,20 @@ end to end, not assumed. Phase 31's own ROADMAP entry for 999.74 already deferre
 this basis — it wouldn't fit inside an M-capped phase alongside more mechanical work, direct
 precedent for keeping it out of Phase 33's S–M-sized pair.
 
+**Amended 2026-08-05 — Phase 34 also carries 999.76.** An adversarial review of `34-CONTEXT.md`
+(six independent lanes; see `34-REVIEW.md`) established that both of Phase 34's original halves
+were smaller than this section assumed: the 999.74 inversion is unreachable in production because
+`decide_action` intercepts every non-`Success` status upstream, and 999.73's per-stage transport
+verification is vacuous because the stream-json launch argv is byte-identical across all five
+stages. 999.76 (Layer 0 external verification inert in worktree mode) was folded into the freed
+scope — not as unrelated work, but because it sits *inside* the match 999.74 rewrites: `external`
+requires `decided_by_layer == Some(0)`, which worktree-mode runs never produce, so rewriting the
+match without it would design around branches that never fire.
+
 | Phase | Name | Status | Version |
 |---|---|---|---|
 | 33 | Loop-Back Correctness for Multi-Wave Validate→Code Cycles | Complete (2026-08-05, PR #90) | — |
-| 34 | Stream-JSON Coverage and the Validate Trust Boundary | Not started | — |
+| 34 | Stream-JSON Coverage, the Validate Trust Boundary, and Layer 0 in Worktree Mode | Not started | — |
 
 ### Phase 33: Loop-Back Correctness for Multi-Wave Validate→Code Cycles (999.65 + 999.66)
 
@@ -86,35 +96,63 @@ Plans:
       `select_loop_back_fix` and its three call sites, and add the worktree-mode regression test
       plus its mirrored negative control that no test in the workspace supplies today (wave 4)
 
-### Phase 34: Stream-JSON Coverage and the Validate Trust Boundary (999.73 + 999.74)
+### Phase 34: Stream-JSON Coverage, the Validate Trust Boundary, and Layer 0 in Worktree Mode (999.73 + 999.74 + 999.76)
 
-**Goal**: Operators can trust that every pipeline stage launches through the same reliable
-stream-json path already proven for Code — backed by real per-stage evidence, not extended on
-zero evidence — and that a Validate stage's reported outcome reflects its actually-derived status
-rather than the agent's self-reported `verdict` field.
-**Depends on**: Nothing structurally (999.73 blocks only on Phase 31's shipped acceptance run,
-already satisfied; 999.74 has no structural dependency on Phase 33). Sequenced after Phase 33 by
-this milestone's phase numbering, not a technical dependency — see the "why two phases" note above
-for the split rationale.
-**Requirements**: DOGFOOD-03, DOGFOOD-04
+**Goal**: Stages join the stream-json launch path on per-stage *behavioural* evidence — what each
+stage's drain-and-close interaction actually does — rather than on per-stage transport
+verification, which the stage-blind argv makes vacuous. The Validate classifier carries its own
+status guard instead of depending on an upstream routing decision in another crate, with the
+in-source record corrected where it asserts a live defect that is not reachable. And Layer 0
+external verification actually runs in worktree mode, so the arms that classifier is built around
+are not inert in DevFlow's default operating shape.
+**Depends on**: Nothing structurally. 999.73's original blocker (Phase 31's shipped acceptance run)
+is satisfied; 999.74 and 999.76 have no structural dependency on Phase 33. Internally, **999.76
+lands before 999.74's match rewrite** — `classify_validate_outcome`'s `external` arms are
+unreachable while Layer 0 is inert in worktree mode, so rewriting the match first would design
+around dead branches.
+**Requirements**: DOGFOOD-03, DOGFOOD-04. 999.76 is folded in on scope freed by criteria 1 and 4
+below; it carries no v1 requirement of its own.
+**Scope correction (2026-08-05)**: this entry was rewritten after an adversarial review of
+`34-CONTEXT.md` established that both original halves rested on premises the code refutes — the
+999.74 inversion is unreachable in production, and the stream-json launch argv is identical across
+all five stages. Superseded wording and the evidence for each change are recorded in
+`.planning/phases/34-stream-json-coverage-and-the-validate-trust-boundary-999-73-/34-REVIEW.md`.
 **Success Criteria** (what must be TRUE):
 
-  1. Define, Plan, Validate, and Ship stages launch through the bidirectional stream-json path —
-     the same pipe-owning-monitor mechanism Phase 31 proved for Code — each backed by a real
-     per-stage production capture rather than a synthetic fixture.
+  1. Every stage added to `STREAM_JSON_STAGES` is added on the strength of a real production
+     capture of *that stage* — and the phase records, in source, that `ClaudeAgent::exec_command`
+     ignores its `_phase` and `_prompt` arguments, so the launch argv is byte-identical across all
+     five stages. A per-stage capture is therefore evidence about agent behaviour under that
+     stage's prompt, never about the transport.
 
-  2. The close rule's drain-gate reasoning (stdin released only once a `DEVFLOW_RESULT` marker
-     lands AND the background-task list has drained) is re-derived per newly-widened stage rather
-     than assumed to carry over from Code's backgrounding behavior, since a non-backgrounding
-     stage has different drain behavior.
+  2. No stage is widened without its capture answering what happens when the close rule does *not*
+     fire. A stage that backgrounds work still pending when the marker lands never satisfies
+     `CloseRule::should_close()`, so the supervise loop reaches its idle window, terminates the
+     child and gates the stage — widening can make a stage unusable unattended. For each widened
+     stage the phase names which `BackgroundTaskState` its capture produced, and what a recurrence
+     costs on the next run.
 
-  3. `classify_validate_outcome`'s `Passed` arm is gated on the status the outcome cascade
-     actually derived, not on the agent's self-reported `verdict` alone — confirmed explicitly
-     for `Failed`, `Unknown`, `ResourceKilled`, and `IdleTimeout`.
+  3. `classify_validate_outcome`'s `Passed` arm is gated on the derived status **structurally** — a
+     new `AgentStatus` variant is a compile error, not a silent join — with a decided and defended
+     destination for all **seven** variants, including `RateLimited` and `AgentUnavailable`, which
+     the superseded criterion omitted.
 
-  4. It is established — not assumed — whether the prior trust-inversion could manufacture a pass
-     on a run that would otherwise have gated, with the answer recorded from reading the Validate
-     routing end to end.
+  4. It is recorded, with evidence, that the trust inversion is **not reachable in production** at
+     HEAD: the classifier's sole production call site sits inside `Action::Advance`, and
+     `decide_action` maps only `Success` there. The two in-source comments that assert otherwise
+     (`idle_timeout_result`, and `reconcile_stream_success_against_exit_code`'s "`verdict: None` is
+     load-bearing" note) are corrected, and the arm states that its own safety depends on a routing
+     decision in another crate which `decide_action`'s comment explicitly marks revisitable.
+
+  5. Layer 0 external verification discovers its declaration from the **execution root**, so a
+     declared probe set actually runs in worktree mode — DevFlow's default shape. The same root
+     defect at `phase_has_blocking_human_checkpoint` is fixed in the same change, and a test
+     distinguishes worktree discovery from main-checkout discovery.
+
+  6. The collateral that widening forces is closed, not deferred:
+     `canary_gate_only_applies_to_the_stream_launch_path` is rebuilt on a discriminator that still
+     exists once every Claude stage is on the stream path, and capture retention cannot evict an
+     earlier stage's capture before the phase has read it.
 **Plans**: TBD
 
 ## Progress
@@ -474,7 +512,16 @@ against both the buggy and the fixed code, so without that sequence the fix is u
 the streak accumulates. It never examined failure-then-success, which is the actual defect. Do not
 treat that AGREE as clearing this finding.
 
-### Phase 999.76: Layer 0 External Verification Reads Its Declaration From the Main Checkout, So It Is Inert in Worktree Mode (BACKLOG)
+### Phase 999.76: Layer 0 External Verification Reads Its Declaration From the Main Checkout, So It Is Inert in Worktree Mode (PROMOTED — Phase 34)
+
+**Scheduled as Phase 34** (with 999.73 and 999.74), promoted 2026-08-05. Phase 34's success
+criterion 5 is this entry's fix, including the second call site at
+`phase_has_blocking_human_checkpoint`. **Why it landed here rather than in its own phase:** it is
+inside the code 999.74 rewrites. `classify_validate_outcome`'s `external` predicate requires
+`decided_by_layer == Some(0)`, which only `evaluate_layer0` produces — and this defect makes that
+unreachable in worktree mode, DevFlow's default shape. Rewriting the match around the two
+`external`-gated `Ambiguous` arms without fixing this first would be designing around branches that
+never fire. It also sequences *before* the match rewrite inside the phase, for the same reason.
 
 **Linear:** [DEN-98](https://linear.app/denniskim/issue/DEN-98/99976-layer-0-external-verification-reads-its-declaration-from-the)
 **Found:** 2026-08-05, Phase 33 code review; confirmed independently by two peer reviews (Claude
@@ -582,11 +629,44 @@ non-backgrounding stages still close on their marker alone. 880 passed, 0 failed
 
 ### Phase 999.74: `classify_validate_outcome` Trusts the Agent's Verdict Over Its Own Status (PROMOTED — Phase 34)
 
-**Scheduled as Phase 34** (with 999.73), requirement **DOGFOOD-04**. Phase 34's success criterion 3
-is this entry's fix — gate the `Passed` arm on the status the cascade derived, confirmed explicitly
-for `Failed`, `Unknown`, `ResourceKilled` and `IdleTimeout` — and criterion 4 is this entry's own
-open question, carried forward unrelaxed: establish, by reading the Validate routing end to end,
-whether the inversion can manufacture a *pass* on a run that would otherwise have gated.
+**Scheduled as Phase 34** (with 999.73 and 999.76), requirement **DOGFOOD-04**. Phase 34's success
+criterion 3 is this entry's fix and criterion 4 is its open question — but **both were rewritten on
+2026-08-05 after the open question was answered.** Read the correction below before this entry's
+original analysis.
+
+> **CORRECTION (2026-08-05) — the inversion is NOT reachable in production.** Six independent
+> adversarial lanes plus direct source verification established that `classify_validate_outcome`
+> has exactly one production call site (`crates/devflow-cli/src/pipeline_launch.rs:937`), inside
+> the `Action::Advance` arm of `outcome_policy::decide_action`. That match is wildcard-free and
+> maps **only `AgentStatus::Success`** to `Advance`: `Failed`/`Unknown`/`IdleTimeout` →
+> `GateReview`, `ResourceKilled`/`AgentUnavailable` → `GateInfra`, `RateLimited` → `AutoResume`. At
+> Validate the `GateReview` arm calls `handle_validate_outcome(.., ValidateOutcome::Failed)`
+> verdict-blind at `:990`. The other apparent call site, `pipeline_gate.rs:584`, is inside
+> `#[cfg(test)]`. Negative control: `cargo test -p devflow-core --lib outcome_policy::` reports
+> 9 passed / 538 filtered out, with a named test pinning every non-`Success` variant away from
+> `Advance`.
+>
+> **So the four `(non-Success, Some(Pass))` pairs this entry names are unreachable, and the answer
+> to the open question is "no".** What remains is real but different:
+>
+> 1. **A latent structural weakness.** The arm's safety depends entirely on a guard in *another
+>    crate* that its own doc comment never mentions — and `decide_action`'s comment marks the
+>    `Failed`/`Unknown` collapse "DEFERRED… Revisit if 18d requires divergent routing." A future
+>    split makes the wildcard live with nothing local to notice.
+> 2. **A documentation defect with measured cost.** At least two in-source comments assert the
+>    inversion is live and consequential, and code was bent around it twice — `idle_timeout_result`
+>    sets `verdict: None` citing this exact reason, and plan 31-04 nearly shipped a change caught
+>    only by adversarial review. Both defensive choices were right; both rationales are wrong about
+>    reachability.
+>
+> **Not established:** whether a real agent ever emits a self-contradictory marker. The parsers
+> deserialize `status` and `verdict` independently with no cross-check and neither normalises
+> `verdict`, but no archived capture in this repo contains such a line — absence here is weak
+> evidence, not a bound.
+>
+> The fix is still worth doing, as defence-in-depth plus a corrected record — **not** as closing an
+> exploitable hole. Criterion 3 additionally now covers all seven `AgentStatus` variants; the
+> original four omitted `RateLimited` and `AgentUnavailable`.
 
 **Linear:** [DEN-95](https://linear.app/denniskim/issue/DEN-95/99974-classify-validate-outcome-trusts-the-agents-verdict-over-its-own)
 **Found:** 2026-08-03, Phase 31 plan 31-02 execution. Re-confirmed independently at HEAD `e9abb0b`
@@ -630,11 +710,40 @@ explicitly; add a mirror test per status so the arm cannot silently regain the w
 
 ### Phase 999.73: Widen `STREAM_JSON_STAGES` Beyond `Stage::Code` (PROMOTED — Phase 34)
 
-**Scheduled as Phase 34** (with 999.74), requirement **DOGFOOD-03**. Phase 34's success criteria 1
-and 2 carry this entry's two halves: widen the bidirectional stream-json path to Define/Plan/
-Validate/Ship backed by *real per-stage production captures* rather than synthetic fixtures, and
-re-derive the drain-gate reasoning per newly-widened stage rather than assuming it carries over
-from Code's backgrounding behavior.
+**Scheduled as Phase 34** (with 999.74 and 999.76), requirement **DOGFOOD-03**. Phase 34's success
+criteria 1 and 2 carry this entry's two halves — **both rewritten on 2026-08-05.** Read the
+correction below before this entry's original analysis.
+
+> **CORRECTION (2026-08-05) — the per-stage transport verification is vacuous; the behavioural risk
+> is larger than stated.** `ClaudeAgent::exec_command`
+> (`crates/devflow-core/src/agents/claude.rs:46`) ignores its `_phase`, `_prompt` and
+> `_extra_writable_roots` arguments and returns a fixed argv. **The stream-json launch shape is
+> byte-identical for all five stages.** Nothing about the transport, monitor wiring or parser varies
+> per stage, so "confirm each added stage against a real capture" is evidence about *agent
+> behaviour under that stage's prompt* — criterion 2's question — not about the launch mechanism.
+> Criterion 1 as originally worded is close to mechanically vacuous.
+>
+> **What grew instead.** Widening can make a stage *unusable*. `CloseRule::should_close()` requires
+> `marker_seen` AND a drained list; if a stage backgrounds work still pending when its marker lands,
+> the rule never fires, the supervise loop reaches `RecvTimeoutError::Timeout`, and
+> `fire_idle_timeout` terminates the child and records a terminal `IdleTimeout` → `GateReview`.
+> Those stages take the legacy path today and cannot hit this at all. That risk is *created by* the
+> widening and is the real content of criteria 1 and 2.
+>
+> **Ordering trap this entry did not anticipate.** A stage produces a stream-json capture only via
+> the pipe-owning path, and `claude_stream_launch_enabled` offers an opt-*out* only — no force-on
+> exists. So evidence cannot precede widening through the normal pipeline. Two escapes exist:
+> widen in the working tree and let the evidence decide what gets *committed* (making the gate
+> commit-time, not build-time), or drive the hidden `devflow __monitor` subcommand
+> (`crates/devflow-cli/src/main.rs:133`), which never consults `STREAM_JSON_STAGES` — pointed at a
+> scratch phase, since it advances the stage machine on reap.
+>
+> **Two further traps found in the same review.** `31-ACCEPTANCE.md`'s pass bar is *"VOID unless the
+> capture shows a `background_tasks_changed` event with a NON-EMPTY `tasks` array followed by a
+> drain to `[]`"* — a non-backgrounding stage cannot satisfy that by construction, so it must not be
+> reused verbatim as the per-stage bar. And `DEFAULT_CAPTURE_RETENTION = 5`
+> (`crates/devflow-core/src/config.rs:12`) will evict an earlier stage's capture if the phase takes
+> any Validate→Code loop-back.
 
 **Linear:** [DEN-94](https://linear.app/denniskim/issue/DEN-94/99973-widen-stream-json-stages-beyond-stagecode-once-the-phase-31)
 **Deferred:** 2026-08-03 by operator decision, during Phase 31 planning. Explicitly **not** in
