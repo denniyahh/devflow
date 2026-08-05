@@ -1268,7 +1268,7 @@ mod tests {
     /// incorrectly.
     #[test]
     fn preflight_major_bump_check_fires_against_the_worktree_head() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let (outer, worktree_path) = major_bump_worktree_fixture();
         let project_root = outer.path().join("project");
@@ -1308,7 +1308,7 @@ mod tests {
     /// instead of this one.
     #[test]
     fn run_preflight_major_bump_gates_and_never_ships_unattended() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         let git_only_dir = agent_free_git_only_path_dir();
         let original_path = std::env::var_os("PATH");
         // SAFETY: serialized under ENV_MUTEX.
@@ -1372,7 +1372,7 @@ mod tests {
     /// `run_preflight_advance_skips_recheck_on_idempotently_failing_check`).
     #[test]
     fn run_preflight_major_bump_gate_not_auto_approved_by_yes_ship() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         let original_gate_timeout = std::env::var_os("DEVFLOW_GATE_TIMEOUT_SECS");
         let git_only_dir = agent_free_git_only_path_dir();
         let original_path = std::env::var_os("PATH");
@@ -1440,7 +1440,7 @@ mod tests {
     /// compose in production.
     #[test]
     fn generic_preflight_checks_reports_major_bump_even_when_gh_auth_fails_first() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         let git_only_dir = git_only_path_dir_with_failing_gh();
         let original_path = std::env::var_os("PATH");
         // SAFETY: serialized under ENV_MUTEX.
@@ -1566,7 +1566,7 @@ mod tests {
     /// `run_preflight` says to.
     #[test]
     fn run_preflight_advance_gate_launches_agent_exactly_once() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1653,7 +1653,7 @@ mod tests {
     /// path as Advance.
     #[test]
     fn run_preflight_loopback_gate_launches_agent_exactly_once() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1770,7 +1770,7 @@ mod tests {
     /// of hanging the suite for 7 days.
     #[test]
     fn run_preflight_advance_skips_recheck_on_idempotently_failing_check() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         let original_gate_timeout = std::env::var_os("DEVFLOW_GATE_TIMEOUT_SECS");
         // SAFETY: serialized under ENV_MUTEX.
         unsafe {
@@ -1864,7 +1864,7 @@ mod tests {
     /// background writer.
     #[test]
     fn run_preflight_loopback_bounds_recursion() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         let original_gate_timeout = std::env::var_os("DEVFLOW_GATE_TIMEOUT_SECS");
         // SAFETY: serialized under ENV_MUTEX.
         unsafe {

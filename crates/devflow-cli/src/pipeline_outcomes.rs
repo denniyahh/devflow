@@ -740,7 +740,7 @@ mod tests {
     /// (no other test holds the project lock).
     #[test]
     fn checkout_hooks_skip_instead_of_running_unserialized_on_lock_timeout() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         // A live holder (this process) keeps the lock contended; the stale-
@@ -1062,7 +1062,7 @@ mod tests {
     /// mutation survives regardless of the launch outcome.
     #[test]
     fn external_verify_agreement_advances_to_ship() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1637,7 +1637,7 @@ mod tests {
     /// approach.
     #[test]
     fn consecutive_failures_reaches_ceiling_across_cycles() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1710,7 +1710,7 @@ mod tests {
     /// closes.
     #[test]
     fn healthy_multi_wave_progress_does_not_reach_the_ceiling() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1786,7 +1786,7 @@ mod tests {
     /// change would not be controlling for anything.
     #[test]
     fn repeated_failure_without_new_commits_still_reaches_the_ceiling() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1846,7 +1846,7 @@ mod tests {
     /// the one the Phase 29 dogfood actually hit.
     #[test]
     fn mid_arc_loop_back_issues_plain_execute_command() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1895,7 +1895,7 @@ mod tests {
     /// test is meaningful without the other.
     #[test]
     fn genuine_gaps_loop_back_still_issues_gaps_only() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1961,7 +1961,7 @@ mod tests {
     /// above (the `--no-worktree` case), never a replacement for it.
     #[test]
     fn worktree_mode_genuine_gaps_loop_back_issues_gaps_only() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -2031,7 +2031,7 @@ mod tests {
     /// function hid.
     #[test]
     fn worktree_mode_mid_arc_loop_back_issues_plain_execute() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir_a = tempfile::tempdir().unwrap();
         let root_a = dir_a.path();
@@ -2087,7 +2087,7 @@ mod tests {
     /// two roots.
     #[test]
     fn worktree_mode_main_checkout_only_artifact_is_the_or_both_roots_discriminator() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir_b = tempfile::tempdir().unwrap();
         let root_b = dir_b.path();
@@ -2140,7 +2140,7 @@ mod tests {
     /// launch, so its `Err` is discarded.
     #[test]
     fn ambiguous_gate_loop_back_respects_the_mid_arc_check() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -2205,7 +2205,7 @@ mod tests {
     /// `FullExecute`, so this test passed vacuously on the wrong arm.
     #[test]
     fn failure_gate_loop_back_respects_the_mid_arc_check() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -2271,7 +2271,7 @@ mod tests {
     /// under `ENV_MUTEX`, same as above.
     #[test]
     fn ship_loop_back_still_issues_gaps_only_when_verification_absent() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -2386,7 +2386,7 @@ mod tests {
     /// so neither `handle_validate_outcome`'s loop-back nor `transition`'s
     /// own `launch_stage` risk spawning a real agent CLI.
     fn arm_b_genuine_failures_reach_the_ceiling(root: &Path, phase: u32) {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
@@ -2925,7 +2925,7 @@ mod tests {
     /// `DEVFLOW_GATE_NOTIFY_CMD`, so it's serialized under `ENV_MUTEX`.
     #[test]
     fn non_validate_failure_fires_gate_and_hook() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
