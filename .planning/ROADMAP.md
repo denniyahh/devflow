@@ -32,6 +32,7 @@ precedent for keeping it out of Phase 33's S–M-sized pair.
 | 34 | Stream-JSON Coverage and the Validate Trust Boundary | Not started | — |
 
 ### Phase 33: Loop-Back Correctness for Multi-Wave Validate→Code Cycles (999.65 + 999.66)
+
 **Goal**: A 3+ wave unattended `devflow start` phase can complete its Code↔Validate loop without
 gating on an impossible `--gaps-only` command or a false "3 consecutive failures" ceiling — the
 two defects that have blocked every unattended multi-wave phase since the Phase 29 dogfood run.
@@ -40,23 +41,53 @@ two defects that have blocked every unattended multi-wave phase since the Phase 
 reach a second loop-back at all.
 **Requirements**: DOGFOOD-01, DOGFOOD-02
 **Success Criteria** (what must be TRUE):
+
   1. When Validate correctly reports a mid-arc phase incomplete (no `{N}-VERIFICATION.md` because
      `/gsd-verify-work` never ran), the Validate→Code loop-back issues plain
      `/gsd-execute-phase {N}` and the phase continues into its next wave, instead of gating on
      `--gaps-only` matching zero plans.
+
   2. When Validate finds genuine defects in already-built work (a `{N}-VERIFICATION.md` exists
      with real gap findings), the loop-back still issues `--gaps-only` and gap-closure plans are
      correctly selected — the fix distinguishes the two cases rather than swapping one blind
      command for another.
+
   3. A phase that runs 3 or more Code↔Validate waves in `auto` mode reaches wave 3 and beyond
      without a false "3 consecutive failures" gate firing on healthy, wave-by-wave forward
      progress.
+
   4. `consecutive_failures` still gates correctly when Validate finds the *same* unresolved
      problem again across a loop-back — the fix narrows the false positive without disabling the
      safety gate it protects.
-**Plans**: TBD
+**Plans**: 6/6 plans executed
+
+Plans:
+
+- [x] 33-06-PLAN.md
+
+- [x] 33-01-PLAN.md — 999.65: route the three in-scope Validate loop-back arms through a
+      `{N}-VERIFICATION.md`-existence check, adding `FixType::FullExecute` for the mid-arc case
+      (wave 1)
+
+- [x] 33-02-PLAN.md — 999.66 primitives: the persisted forward-progress baseline on `State` and
+      the pure reset-vs-accumulate predicate in `mode` (wave 1, parallel with 33-01)
+
+- [x] 33-03-PLAN.md — 999.66 wiring: one shared git-derived commit-count helper, the rewritten
+      counter branch in `handle_validate_outcome`, and the matched multi-wave test pair (wave 2)
+
+- [x] 33-04-PLAN.md — gap closure: two pre-existing tests that seed `consecutive_failures` directly
+      without the 999.66 baseline silently left their asserted code paths (one attempting a real
+      agent launch during `cargo test`); restore both, make an agent launch structurally impossible,
+      and confirm `scripts/check.sh all` is reliably green (wave 3)
+
+- [x] 33-05-PLAN.md — gap closure (CR-01): D-01's decision signal is read from the main checkout
+      while the Validate agent authors `{N}-VERIFICATION.md` inside the phase's worktree, so
+      `FixType::GapsOnly` is unreachable in worktree mode; thread `evidence_root` through
+      `select_loop_back_fix` and its three call sites, and add the worktree-mode regression test
+      plus its mirrored negative control that no test in the workspace supplies today (wave 4)
 
 ### Phase 34: Stream-JSON Coverage and the Validate Trust Boundary (999.73 + 999.74)
+
 **Goal**: Operators can trust that every pipeline stage launches through the same reliable
 stream-json path already proven for Code — backed by real per-stage evidence, not extended on
 zero evidence — and that a Validate stage's reported outcome reflects its actually-derived status
@@ -67,21 +98,24 @@ this milestone's phase numbering, not a technical dependency — see the "why tw
 for the split rationale.
 **Requirements**: DOGFOOD-03, DOGFOOD-04
 **Success Criteria** (what must be TRUE):
+
   1. Define, Plan, Validate, and Ship stages launch through the bidirectional stream-json path —
      the same pipe-owning-monitor mechanism Phase 31 proved for Code — each backed by a real
      per-stage production capture rather than a synthetic fixture.
+
   2. The close rule's drain-gate reasoning (stdin released only once a `DEVFLOW_RESULT` marker
      lands AND the background-task list has drained) is re-derived per newly-widened stage rather
      than assumed to carry over from Code's backgrounding behavior, since a non-backgrounding
      stage has different drain behavior.
+
   3. `classify_validate_outcome`'s `Passed` arm is gated on the status the outcome cascade
      actually derived, not on the agent's self-reported `verdict` alone — confirmed explicitly
      for `Failed`, `Unknown`, `ResourceKilled`, and `IdleTimeout`.
+
   4. It is established — not assumed — whether the prior trust-inversion could manufacture a pass
      on a run that would otherwise have gated, with the answer recorded from reading the Validate
      routing end to end.
 **Plans**: TBD
-
 
 ## Progress
 
@@ -127,7 +161,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 30 | 5/5 | Complete | — |
 | 31 | 5/5 | Complete | — |
 | 32 | 0/0 | Complete    | 2026-08-04 |
-| 33 | 0/TBD | Not started | - |
+| 33 | 6/6 | Complete    | 2026-08-05 |
 | 34 | 0/TBD | Not started | - |
 
 ## gsd-hygiene milestone (CLOSED 2026-08-04 — GSD Workflow Hygiene)
@@ -262,6 +296,252 @@ why this differs from the pre-existing `v1.0-ASSESSMENT.md`, an unrelated older 
 Unsequenced items — not part of the active phase sequence. Promote with
 `/gsd-review-backlog` when ready; each carries accumulated context in its
 own `phases/999.N-*/CONTEXT.md`.
+
+### Phase 999.81: Phase 33 Advisory Cleanup — the Loop-Back Prompt Calls a Normal Continuation a Defect, Plus Three Hygiene Items (BACKLOG)
+
+**Linear:** [DEN-103](https://linear.app/denniskim/issue/DEN-103/99981-phase-33-advisory-cleanup-the-loop-back-prompt-calls-a-normal)
+**Found:** 2026-08-05, Phase 33 code review (IN-05, IN-01, IN-03, IN-04), each verified in source
+before filing. Grouped as one entry per the 21-REVIEW advisory-cleanup precedent.
+
+**Priority:** Low | **Size:** S
+
+**IN-05 is the one worth doing, and it is a single match arm.** `fix_prompt`
+(`crates/devflow-core/src/prompt.rs:297-307`) gives all three `FixType` variants the same preamble:
+*"Validation reported issues. Run the fix command for this loop:"*. For `FixType::FullExecute` that
+contradicts the enum's own doc comment (`:55-60`) — *"the phase is mid-arc rather than defective"*.
+Phase 33 fixed the **routing** so a mid-arc phase gets `/gsd-execute-phase {N}`; the agent receiving
+it is still told validation reported issues, so it is primed to hunt defects in work that was simply
+never judged. The phase's own semantic, undone one layer down.
+
+**The other three:** IN-01 — `select_loop_back_fix` (`pipeline_outcomes.rs:261-267`) is reachable
+only through six full `handle_validate_outcome` drives; a table test over
+`(worktree_path, artifact_location) → FixType` would make future cases cheap. IN-03 — the
+branch-name derivation is duplicated at four sites (`agent_result.rs:1904`, `ship_evidence.rs:160`,
+`test_support.rs:122`) despite `phase_commit_count`'s doc saying the extraction exists *because*
+copies diverged; expose `phase_branch_name`. IN-04 — `commit_on_feature_branch`
+(`test_support.rs:112-137`) never restores the prior checkout, benign for its two callers but a
+landmine for any future Validate→Ship pairing.
+
+### Phase 999.80: Three Test Sites Are Protected From Spawning a Real Agent Only by a Content-Dependent Gate Response, Not Structurally (BACKLOG)
+
+**Linear:** [DEN-102](https://linear.app/denniskim/issue/DEN-102/99980-three-test-sites-are-protected-from-spawning-a-real-agent-only)
+**Found:** 2026-08-05, Phase 33 code review (WR-06); **corrected the same day** by the Phase 33
+security audit, which mapped it to the registered trust boundary "cargo test process → spawned
+agent CLI" (T-33-09 / T-33-17).
+
+**Priority:** Low | **Size:** S — ~6 lines per site
+
+**Severity: Low-Medium.** *This entry's original filing said these tests "can spawn a real agent"
+and rated it Medium. That was wrong and is retracted here rather than silently edited away.*
+
+**No agent spawn happens today.** All three sites pre-write a rejected gate response whose note
+contains `abort` — e.g. `{"approved":false,"note":"abort: test cleanup","responded_by":"test"}` —
+so `GateAction::from_response` resolves to `Abort`, not `LoopBack`, and control never reaches
+`loop_back_to_code` → `launch_stage`. Verified in source at all three sites. The original filing
+inherited 33-REVIEW.md's WR-06 framing without checking the gate-response path.
+
+**What survives, and is still worth fixing:** that protection is **content-dependent, not
+structural** — a magic substring in a JSON note in a test fixture, with no assertion protecting it.
+Any future edit rewording the note, changing `from_response`'s parsing, or routing one of these down
+the `LoopBack` arm silently reintroduces a real `claude` spawn with the developer's inherited
+credentials. 33-04 closed exactly this class for two *other* sites **structurally**, with PATH
+neutralization, not by relying on response content.
+
+Sites protected only by response content: `pipeline_outcomes.rs:825-864`, `:878-930` (backs three
+tests), `:2073-2097`. Hardened structurally: `pipeline_gate.rs:1111-1170`,
+`pipeline_outcomes.rs:1823-1881`. 33-06 added the `NeutralPath` RAII guard (`test_support.rs:279`)
+but applied it only to the two regions 33-05 added. Cheaper alternative if the full fix is deferred:
+assert at each site that the gate resolved to `Abort`, making the content-dependence a checked
+invariant rather than an accident.
+
+**Decide the order against 999.38 deliberately — they touch the same lines with opposite intent.**
+999.38 wants to *remove* process-global `PATH` mutation in favour of per-`Command` `env`, which
+would let `ENV_MUTEX` shrink or disappear; it explicitly names `pipeline_outcomes.rs:879`, inside
+one of the three sites above. Either do 999.38 first and harden these with the new mechanism, or do
+this first as the cheap safety fix and let 999.38 sweep them later. Do not work them independently.
+
+### Phase 999.79: `{N}-VERIFICATION.md` Never Goes Stale, So a `--force` Re-Run Inherits the Previous Run's Verdict and Gates Unresolvably (BACKLOG)
+
+**Linear:** [DEN-101](https://linear.app/denniskim/issue/DEN-101/99979-n-verificationmd-never-goes-stale-so-a-force-re-run-inherits-the)
+**Found:** 2026-08-05, Phase 33 code review (WR-02, carried from the first pass and given a new
+concrete instance by 33-05).
+
+**Priority:** Medium | **Size:** S–M
+
+**Severity: Medium** — a correctness regression path Phase 33's own fix opened, reaching the exact
+unresolvable-gate outcome DOGFOOD-01 exists to prevent, from a new direction.
+
+`phase_verification_exists` (`crates/devflow-core/src/agent_result.rs:2588`) is a pure existence
+check; nothing deletes, dates or invalidates `{N}-VERIFICATION.md`. 33-05 correctly made the probe
+follow `state.worktree_path` — but *unfiltered*. A `--force` re-run of the same phase number
+(`ensure_phase_worktree`, `commands.rs:239`) checks out `feature/phase-NN`, which still carries the
+**previous** run's committed artifact. That re-run is mid-arc by construction, so its first Validate
+failure finds the stale artifact, returns `true`, and dispatches `--gaps-only` — matching zero plans
+and gating unresolvably.
+
+**Fix:** minimum, record the limitation in the doc comment. Real fix, invalidate on staleness —
+compare a recorded plan count (more robust than mtime, which survives `git checkout` in ways that do
+not reflect judgement freshness) against the phase's current plan set. **Prohibition:** do NOT
+"fix" this by reverting the probe to `project_root` — that reintroduces the CR-01 defect 33-05
+closed and two external peer reviews independently confirmed.
+
+### Phase 999.78: The Code↔Validate Loop Has No Progress-Independent Bound, and the Gate Message Understates How Long It Has Run (BACKLOG)
+
+**Linear:** [DEN-100](https://linear.app/denniskim/issue/DEN-100/99978-the-codevalidate-loop-has-no-progress-independent-bound-and-the)
+**Found:** 2026-08-05, Phase 33 code review (WR-01, WR-04, IN-02). Grouped because WR-04's fix
+supplies WR-01's ceiling for free.
+
+**Priority:** Medium | **Size:** M
+
+**WR-01 — the only unconditional bound is gone.** `consecutive_failures_made_progress`
+(`crates/devflow-core/src/mode.rs:149-151`) resets the streak whenever the commit *count* rises, and
+no other counter bounds this loop. `mode.rs:136-148` defers the remedy to "a follow-up if the
+assumption proves wrong" but **no numbered entry existed for it** — this is that number; cite it
+from the doc comment. It matters more here than in the abstract: the Code stage's fix command is a
+GSD command, and GSD commands routinely commit `.planning/` artifacts even when they change no
+source, so "commits something trivial every cycle" is the *ordinary* behaviour of the thing in that
+slot, not an adversarial hypothetical.
+
+**WR-04 — the gate message understates duration in Supervise mode.**
+`pipeline_outcomes.rs:367-370` interpolates `state.consecutive_failures` into *"Validation failed
+{} time(s) — human review needed."* After 33-03 that is a *streak length*, not a total. Supervise
+gates on every failure (`mode.rs:173-175`), so a phase committing anything each cycle shows
+*"Validation failed 1 time(s)"* at the 2nd, 5th and 9th gate alike — in the one mode where a human
+sees every occurrence.
+
+**IN-02 — a resumed pre-999.66 state reads as a fresh streak.** `state.rs:71-100`: `None` means
+both "genuine first failure" and "state predates this field", and nothing in `events.jsonl` tells
+them apart, so an operator upgrading a binary mid-phase gets no signal the failure budget widened.
+
+**Fix:** a separate never-reset per-phase Validate-failure total closes WR-01 and WR-04 together;
+add a distinct `loop_back` reason string for the absent-baseline case. Related but deliberately
+separate: 999.77 attacks the same counter by corrupting its baseline rather than removing the bound.
+
+### Phase 999.77: A Single Transient `git` Failure Grants a Free `consecutive_failures` Reset, and the Doc Comment Promises the Opposite (BACKLOG)
+
+**Linear:** [DEN-99](https://linear.app/denniskim/issue/DEN-99/99977-a-single-transient-git-failure-grants-a-free-consecutive)
+**Found:** 2026-08-05, Phase 33 code review (WR-03); carried forward as still-open by the DeepSeek
+v4 Pro peer review and confirmed in source. **Pre-existing relative to 33-05**, but the
+accumulate-vs-reset branch it lives in was built by 33-02/33-03, so it is Phase 33-era code.
+
+**Severity: Medium.** It weakens a safety gate rather than producing a wrong result, needs a
+transient fault to trigger, and the gate still fires if `git` failures continue uninterrupted. Not
+Low: it defeats the bound precisely when the bound matters, does so silently, and the source
+currently documents the opposite guarantee — which is how it survived review.
+
+**The defect.** `phase_commit_count` (`crates/devflow-core/src/agent_result.rs:1841`) returns `0`
+indistinguishably for "genuinely no commits", "branch does not exist", and "`git` could not be
+run" — its own doc at `:1838-1840` says so, and adds *"Every consumer treats all three the same
+way."* That last clause is the part that is not true. The baseline write at
+`crates/devflow-cli/src/pipeline_outcomes.rs:357` is **unconditional** ("regardless of which branch
+ran above"), so a `0` produced by a broken `git` is persisted as though it were a real measurement.
+
+**Failure sequence.** (1) `git` momentarily fails; count reads `0`; the streak correctly
+accumulates — this step is fine — but the baseline is overwritten to `Some(0)`. (2) Next cycle
+`git` works and reads the branch's real count, say `40`; the predicate at
+`crates/devflow-core/src/mode.rs:150` is `previous.is_none_or(|p| current > p)` → `40 > 0` →
+**true** → `consecutive_failures = 1`. No new work happened between the two cycles. One flaky `git`
+invocation bought one free reset of the `MAX_CONSECUTIVE_FAILURES` ceiling.
+
+**Impact.** In a genuinely stuck Code↔Validate loop — the exact situation the ceiling exists to
+bound — an intermittent `git` failure pushes the human gate further away every time it occurs. The
+gate is not disabled, but its guarantee degrades from "bounded" to "bounded unless `git` flakes",
+with no limit on how often that can repeat in one run. Silent, environmentally triggered, so it
+reaches an operator as "the unattended run never gated" with nothing in the record explaining why —
+the same class of unattended stall DOGFOOD-01/02 exist to eliminate, reached from the opposite
+direction: failing to gate when it should, rather than gating when it should not.
+
+**The doc comment asserts the opposite, and that is the compounding problem.**
+`pipeline_outcomes.rs:283-286` promises *"The failure direction is toward gating: an unrunnable
+`git` or a missing branch counts zero every cycle, so once a baseline is recorded the counter
+accumulates and the gate stays reachable."* That holds only while `git` stays broken; it is false
+for exactly one transient failure, which is the likelier event. **Correct this comment even if the
+code fix is deferred** — it documents a safety property the code does not have.
+
+**Proposed fix:** distinguish "counted zero" from "could not count" — add a sibling returning
+`Option<u32>`, treat `None` as not-progress *without overwriting the baseline* so the next
+successful measurement compares against the last real observation, and update
+`phase_commit_count`'s "every consumer treats all three the same way" line, which the fix
+deliberately falsifies. Full patch sketch in the Linear issue and in `33-REVIEW.md` WR-03.
+
+**Test coverage the fix must add:** no current test exercises a failing `git`. The regression test
+is the two-cycle sequence itself — force a measurement failure, then a success with an unchanged
+real count, and assert the streak **accumulated** rather than reset. A single-cycle test passes
+against both the buggy and the fixed code, so without that sequence the fix is unverifiable.
+
+**Note for the next reader:** Gemini 3.1 Pro reviewed this logic and rated it clean, analysing
+`current = 0` against `previous = Some(0)` (two *consecutive* `git` failures) and correctly finding
+the streak accumulates. It never examined failure-then-success, which is the actual defect. Do not
+treat that AGREE as clearing this finding.
+
+### Phase 999.76: Layer 0 External Verification Reads Its Declaration From the Main Checkout, So It Is Inert in Worktree Mode (BACKLOG)
+
+**Linear:** [DEN-98](https://linear.app/denniskim/issue/DEN-98/99976-layer-0-external-verification-reads-its-declaration-from-the)
+**Found:** 2026-08-05, Phase 33 code review; confirmed independently by two peer reviews (Claude
+code-reviewer, DeepSeek v4 Pro via hermes). **Pre-existing** — `git blame` puts both lines at
+2026-07-18 (`c620fb37`, `305e2675`), weeks before Phase 33's merge-base `7b55fce` (2026-08-04).
+Not introduced by Phase 33; *surfaced* by it, because 33-05 fixed the same defect class one file
+over and its new doc comments now make this one's justification provably false.
+
+**Severity: High.** Worktree mode is DevFlow's default operating shape, and in that shape the
+pipeline's highest-trust verification layer never runs. Not Urgent: it fails toward the existing
+Layer 1/2 cascade rather than toward a false pass, there is no data loss or security exposure, and
+it has been latent since 2026-07-18 with no observed production incident.
+
+**The defect in one sentence:** `evaluate_layer0`
+(`crates/devflow-core/src/agent_result.rs:2041-2042`) resolves the correct worktree-aware root and
+then does not use it for discovery — `let execution_root = state.worktree_path.as_deref()
+.unwrap_or(project_root);` on one line, `external_verify_commands(project_root, state.phase)` on
+the next. `execution_root` is used only later, to *run* the probes.
+
+**Why that root is wrong.** `.planning/` is tracked content, so an in-flight phase's `{N}-PLAN.md`
+is committed on `feature/phase-{N}` and lives inside that phase's worktree; the main checkout sits
+on `develop` and does not have it for the phase's whole duration. No merge-back happens during the
+phase, so this is the steady state, not a race. Measured with a discriminating negative control:
+`git ls-tree -r develop --name-only -- .planning/phases | grep -c '/33-'` returns **0** while the
+same command against `HEAD` returns **17**. (The non-recursive form returns 0 for *every* ref and
+proves nothing — use `-r`.) The doc comment at `:2025-2031` asserts the opposite and is false.
+
+**Impact — the silent branch is the dangerous one.** With `DEVFLOW_TRUST_EXTERNAL_VERIFY` unset
+(the default), `commands` is empty, `approved_commands` is `None`, and `evaluate_layer0` returns
+`None`; the cascade falls through to Layer 1/2 and the stage evaluates normally. Declared external
+post-condition probes **never execute, and nothing reports that they were skipped**. Layer 0 exists
+precisely so a failed probe outranks every agent-controlled signal, and an all-passing probe set is
+affirmative completion evidence on its own — in worktree mode that guarantee is currently vacuous.
+With the env var set, the opposite: `commands` empty against `Some(approved)` fires the veto and
+every stage hard-fails with `"external verification approval mismatch; PLAN declaration was
+removed"` — loud, but wrong, and the message names a cause it cannot know.
+
+**Same root cause, second call site.** `crates/devflow-cli/src/pipeline_launch.rs:957` calls
+`verify::phase_has_blocking_human_checkpoint(project_root, phase)`, also routed through
+`phase_plan_files`, so the whole plan-28-03 checkpoint auto-decide path is silently dead in
+worktree mode. Fix both together or the class recurs a third time.
+
+**Why the suite cannot catch it — and why this is a plan, not a patch.**
+`external_probe_discovers_from_project_root_across_every_stage_and_executes_in_worktree`
+(`agent_result.rs:5259`) writes the PLAN under the tempdir standing in for `project_root` while
+pointing `state.worktree_path` at an empty sibling directory. It manufactures exactly the layout
+the defect assumes, so it is structurally incapable of failing on it, and its doc comment
+(`:5255-5257`) codifies the false premise as deliberate intent. A naive one-line root swap breaks
+this green test. Found by the DeepSeek peer review; both Claude reviews missed it.
+
+**Proposed fix:** (1) pass `execution_root` at `:2042` using the `worktree_path.as_deref()
+.unwrap_or(project_root)` idiom Phase 33 standardised; (2) rewrite the `:5259` test so the PLAN
+lives under the worktree, keeping a non-worktree companion for the `None` fallback arm; (3) correct
+both false doc comments; (4) fix `pipeline_launch.rs:957` with matching coverage; (5) reword the
+"PLAN declaration was removed" message.
+
+**Prohibition the fix must respect:** do NOT retarget `phase_commit_count`. It reads `project_root`
+deliberately and correctly — git refs and the object database are shared across a repository's
+worktrees, so a worktree commit is already visible from the main checkout. Declaration discovery on
+the worktree, commit counting on the main checkout, is the correct end state; Phase 33 established
+exactly that asymmetry for the loop-back path.
+
+**Open question the fix should answer rather than assume:** no test in the workspace exercises a
+real linked `git worktree` — the worktree-mode tests use plain `create_dir_all` directories with no
+git repository at all. Adequate for a filesystem stat, but the shared-refs property
+`phase_commit_count` depends on is asserted in comments and exercised by nothing. Decide whether
+this fix carries the first linked-worktree integration test.
 
 ### Phase 999.75: `CloseRule` Treats an Unparseable `tasks` List on the FIRST Announcement as Permission to Close (RESOLVED 2026-08-04)
 
@@ -951,6 +1231,8 @@ Plans:
 **Goal:** `run_git_stdout` (`crates/devflow-cli/src/staleness.rs:106`) resolves `git` through `PATH`, while several tests replace `PATH` **entirely** with a stub directory containing no `git` — `pipeline_launch.rs:590`, `pipeline_outcomes.rs:879/1132/1246`, `preflight.rs:627/701`. `ENV_MUTEX` serializes those mutators against *each other* but not against the ~155 other tests in the same binary that shell out to git concurrently, so `Command::new("git")` intermittently fails to spawn and `run_git_stdout` returns `None`.
 
 **Evidence:** reproduced once in four full-suite runs — `staleness::tests::ahead_build_from_descendant_commit_warns_instead_of_blocking` panicking at `staleness.rs:891` (`rev-parse HEAD`). This is a genuine flake source, distinct from 999.37, and was found while investigating it.
+
+**Second mechanism, observed 2026-08-05 (Phase 33 review WR-05 + the 33-06 execution run).** The same `ENV_MUTEX`+`PATH` regions have a *second* failure mode this entry did not originally name: the restore is a trailing statement, and Rust abandons remaining statements the instant a panic begins unwinding. So a panic inside a region (a) leaves `PATH` pointed at a `neutral_path_dir` the unwind then drops and **deletes**, handing every concurrent test a `PATH` naming a nonexistent directory, and (b) poisons `ENV_MUTEX`, so every later `ENV_MUTEX.lock().unwrap()` panics with `PoisonError` — one legible failure becomes a cascade. Observed live during 33-06: a single `index.lock` failure in `concurrent_ship_advances_finish_both_phases_independently` cascaded into ~15 unrelated `PoisonError` failures. Phase 33-06 added a `NeutralPath` RAII guard (`crates/devflow-cli/src/test_support.rs:279`, `impl Drop` at `:300`) and applied it to **two** regions only; ten pre-existing regions still use the trailing-statement form (`pipeline_outcomes.rs:1280-1304`, `:1355-1383`, `:1434-1458`, `:1489-1508`, `:1545-1560`, `:1779-1798`, `:1850-1865`, `:1915-1930`; `pipeline_gate.rs:1140-1159`, `:1231-1246`). Two cheap partial mitigations short of this entry's full per-`Command` fix: retrofit `NeutralPath` to the remaining ten, and replace `ENV_MUTEX.lock().unwrap()` with `.unwrap_or_else(PoisonError::into_inner)` — the mutex guards a `()`, so no invariant can be protected by refusing a poisoned lock. See also 999.80, which needs three *more* such regions and must be sequenced against this entry deliberately.
 
 **Note:** Rust 2024 makes `std::env::set_var`/`remove_var` `unsafe` precisely because this pattern is unsound in a threaded test binary — the fix direction is per-`Command` `env`/`env_remove` (as 999.37's `test_support` now does for git) rather than process-global mutation. Fixing this would let `ENV_MUTEX` shrink or disappear, which is worth more than the flake itself. Related: 999.15 (hermetic tests for shell entry points).
 

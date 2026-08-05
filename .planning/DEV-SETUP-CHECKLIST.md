@@ -141,6 +141,18 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
   degraded one. **The palace itself starts empty** (`mempalace status` reported no palace at
   `~/.mempalace/palace` as of enabling) — capture accrues from new phases going forward; nothing
   was backfilled from this repo's existing `.planning/` history.
+- [ ] **[PROJECT, enabled 2026-08-05]** TDD capability — `.planning/config.json`'s
+  `workflow.tdd_mode: true`. The `tdd` capability ships installed/enabled/active by default, but
+  **both** its hooks gate on this key, so it is inert until the key is set: a `plan:pre`
+  *contribution* (injects test-first guidance into plan authoring) and an `execute:post` *gate*
+  (the end-of-phase TDD review). Enabled from Phase 34 onward; Phases ≤33 predate it and carry no
+  `gate_status:` commit trailers, which is why `/gsd-ship`'s TDD Audit section self-suppressed on
+  PR #90. **Advisory, not blocking, on its own** — the `execute:post` gate is declared
+  `blocking: false`, so a violation prints a table and execution continues. It escalates to
+  genuinely blocking only under **MVP+TDD** (`workflow.mvp_mode: true` as well), which additionally
+  arms a per-task RED-commit gate: every behavior-adding task must be preceded by a
+  `test(NN-PP):` commit touching a test path, or execution halts. `mvp_mode` is **not** set on
+  this project, so today's posture is guidance + advisory review.
 
 ## 7. GSD planning structure (`.planning/`)
 

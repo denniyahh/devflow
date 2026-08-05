@@ -229,14 +229,93 @@ pub(crate) enum ValidateResult {
     Failed,
 }
 
+/// The single D-01 decision point every in-scope loop-back arm consults:
+/// whether a Validate→Code loop-back should dispatch the plain
+/// `/gsd-execute-phase {N}` command (the phase is mid-arc — no
+/// `{N}-VERIFICATION.md` has been produced yet, so `--gaps-only` would match
+/// zero plans and gate unresolvably) or the narrower `--gaps-only` command
+/// (a `{N}-VERIFICATION.md` already exists, so this is a genuine gaps loop).
+///
+/// D-02 places `handle_ship_outcome`'s loop-back deliberately out of scope:
+/// by the time Ship runs, the phase has already been judged complete, so it
+/// is by definition not mid-arc and `FixType::GapsOnly` is already correct
+/// there — that call site does not call this helper.
+///
+/// CR-01: the root passed in is the **evidence root**, not the main checkout.
+/// In worktree mode that is the phase's worktree, because `.planning/` is a
+/// tracked directory and the Validate agent runs in the worktree — so the
+/// `{N}-VERIFICATION.md` it authors lands on `feature/phase-{N}` inside the
+/// worktree tree and is absent from the main checkout for the phase's entire
+/// in-flight duration (there is no merge-back, so this is the steady state,
+/// not a race). Callers resolve it from `state.worktree_path`, falling back
+/// to the project root — the same plain fallback idiom used at
+/// `staleness.rs:330`, `preflight.rs:733` and `agent_result.rs:2041`, and
+/// deliberately NOT `hook_context_root`'s `.exists()`-filtered variant below,
+/// which answers a different question (where to WRITE, so a vanished worktree
+/// must degrade to somewhere writable; here a vanished worktree means the
+/// evidence is gone with it, and falling back would resurrect a stale or
+/// other-branch artifact as this phase's). `--no-worktree` runs fall back to
+/// the project root and are unaffected. Passing the bare `project_root` here in worktree mode
+/// makes the predicate read `false` unconditionally, which is exactly the
+/// defect this parameter's name now guards against.
+fn select_loop_back_fix(evidence_root: &Path, phase: u32) -> FixType {
+    if agent_result::phase_verification_exists(evidence_root, phase) {
+        FixType::GapsOnly
+    } else {
+        FixType::FullExecute
+    }
+}
+
 /// Decide what happens after a Validate stage, honoring the active mode's
 /// gate policy, the consecutive-failure threshold, and (18e) the immediate
 /// gate an ambiguous `external_verify` outcome forces regardless of either.
+///
+/// 999.66: on a recorded failure, the counter now decides between beginning a
+/// fresh streak and continuing the existing one, instead of always
+/// continuing. It asks [`mode::consecutive_failures_made_progress`], fed by
+/// [`agent_result::phase_commit_count`] read fresh against `project_root` and
+/// the baseline persisted in `state.last_validate_failure_commit_count`. A
+/// `true` (progress) result means new commits exist on the feature branch
+/// since the last recorded failure — **not** that those commits addressed
+/// what Validate reported. This narrows the ceiling's guarantee to loops that
+/// produce no commits at all; it does not disable the ceiling. That is the
+/// accepted weakness of the commit-count signal recorded in
+/// `33-RESEARCH.md`'s D-03 Recommendation and Assumptions Log A1. The failure
+/// direction is toward gating: an unrunnable `git` or a missing branch counts
+/// zero every cycle, so once a baseline is recorded the counter accumulates
+/// and the gate stays reachable.
+///
+/// CR-01: the two root-consuming reads in this function are on deliberately
+/// **different** roots, and must stay that way. The `{N}-VERIFICATION.md`
+/// existence probe (via [`select_loop_back_fix`]) follows the agent's cwd —
+/// the phase's worktree when one is configured — because that is where the
+/// Validate agent authors the artifact and `.planning/` is tracked, so it is
+/// invisible from the main checkout until merge. The
+/// [`agent_result::phase_commit_count`] read one branch below keeps reading
+/// `project_root`, the main checkout, because git refs and the object
+/// database are shared across a repository's worktrees, so a commit made in
+/// the worktree is already visible from there. Retargeting the commit count
+/// at the worktree would fix nothing and would break the 999.66 wiring.
 pub(crate) fn handle_validate_outcome(
     project_root: &Path,
     state: &mut State,
     outcome: ValidateOutcome,
 ) -> Result<(), CliError> {
+    // WR-08: the evidence root, resolved ONCE for every loop-back arm in this
+    // function. `.planning/` is tracked and the Validate agent runs in the
+    // worktree, so the `{N}-VERIFICATION.md` it authors lands on
+    // `feature/phase-{N}` inside the worktree and is invisible from the main
+    // checkout; the probe must therefore follow the agent's cwd. Resolving it
+    // per-arm made a fourth arm's correctness depend on its author noticing
+    // the pattern — the original CR-01 was exactly one call site passing the
+    // wrong root. Owned (`PathBuf`, not `&Path`) so it holds no borrow of
+    // `state` across the `&mut state` calls in each arm. This is NOT the root
+    // the `phase_commit_count` read below uses: see the CR-01 note above.
+    let evidence_root: PathBuf = state
+        .worktree_path
+        .clone()
+        .unwrap_or_else(|| project_root.to_path_buf());
+
     // 18e / T-18-19: an ambiguous outcome must gate IMMEDIATELY — it is
     // being adjudicated right now, not retried, so it must never fall
     // through to the counter-based `should_gate` check below and must never
@@ -252,7 +331,9 @@ pub(crate) fn handle_validate_outcome(
             return match run_gate(project_root, state, Stage::Validate, &context)? {
                 GateAction::Advance => transition(project_root, state, Stage::Ship),
                 GateAction::LoopBack(_) => {
-                    loop_back_to_code(project_root, state, FixType::GapsOnly)
+                    // Evidence root: see the single binding at the top.
+                    let fix = select_loop_back_fix(&evidence_root, state.phase);
+                    loop_back_to_code(project_root, state, fix)
                 }
                 GateAction::Abort(reason) => abort(project_root, state, &reason),
             };
@@ -262,10 +343,29 @@ pub(crate) fn handle_validate_outcome(
     };
 
     if result == ValidateResult::Failed {
-        // Now that the counter genuinely accumulates (18d), an unbounded
-        // loop could otherwise overflow it and wrap to 0, silently
-        // restoring the unreachable-ceiling bug in a slower form.
-        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        let current =
+            agent_result::phase_commit_count(project_root, &GitFlowConfig::default(), state.phase);
+        if mode::consecutive_failures_made_progress(
+            state.last_validate_failure_commit_count,
+            current,
+        ) {
+            // New commits landed since the last recorded failure — this
+            // failure is the first of a new streak, not a continuation. Set
+            // to 1, not 0: the gate context rendered below interpolates the
+            // counter into a message naming how many times validation has
+            // failed, and zeroing it would make that message read zero on a
+            // real failure.
+            state.consecutive_failures = 1;
+        } else {
+            // Now that the counter genuinely accumulates (18d), an unbounded
+            // loop could otherwise overflow it and wrap to 0, silently
+            // restoring the unreachable-ceiling bug in a slower form.
+            state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        }
+        // The baseline advances on every recorded failure regardless of
+        // which branch ran above — updating it only on the progress branch
+        // would let a stale low baseline report progress forever.
+        state.last_validate_failure_commit_count = Some(current);
         workflow::save_state(state)?;
     }
 
@@ -282,14 +382,24 @@ pub(crate) fn handle_validate_outcome(
         };
         return match run_gate(project_root, state, Stage::Validate, &context)? {
             GateAction::Advance => transition(project_root, state, Stage::Ship),
-            GateAction::LoopBack(_) => loop_back_to_code(project_root, state, FixType::GapsOnly),
+            GateAction::LoopBack(_) => {
+                // Evidence root: see the single binding at the top.
+                let fix = select_loop_back_fix(&evidence_root, state.phase);
+                loop_back_to_code(project_root, state, fix)
+            }
             GateAction::Abort(reason) => abort(project_root, state, &reason),
         };
     }
 
     match result {
         ValidateResult::Passed => transition(project_root, state, Stage::Ship),
-        ValidateResult::Failed => loop_back_to_code(project_root, state, FixType::GapsOnly),
+        ValidateResult::Failed => {
+            // The plain-Failed tail arm — the common auto-loop path, and the
+            // one the Phase 29 dogfood actually hit. Evidence root: see the
+            // single binding at the top.
+            let fix = select_loop_back_fix(&evidence_root, state.phase);
+            loop_back_to_code(project_root, state, fix)
+        }
     }
 }
 
@@ -720,6 +830,13 @@ mod tests {
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         state.consecutive_failures = mode::MAX_CONSECUTIVE_FAILURES - 1;
+        // Simulate that a baseline was already recorded at the (no-repo)
+        // commit count of 0 — this test pre-seeds the streak directly rather
+        // than driving it through repeated handle_validate_outcome calls, so
+        // it must also pre-seed the forward-progress baseline 999.66 added,
+        // or the fresh None-baseline would be read as "first-ever failure"
+        // and reset the streak instead of continuing it.
+        state.last_validate_failure_commit_count = Some(0);
         workflow::save_state(&state).unwrap();
 
         // Pre-write a rejected response whose note says "abort" so
@@ -767,6 +884,10 @@ mod tests {
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         state.consecutive_failures = consecutive_failures;
+        // See validate_failure_threshold_forces_gate_then_aborts: pre-seed
+        // the 999.66 baseline to match the (no-repo) commit count of 0 so a
+        // directly-seeded streak isn't misread as a first-ever failure.
+        state.last_validate_failure_commit_count = Some(0);
         workflow::save_state(&state).unwrap();
 
         std::fs::create_dir_all(root.join(".devflow")).unwrap();
@@ -1200,6 +1321,638 @@ mod tests {
         );
     }
 
+    /// 999.66, ROADMAP criterion 3: a phase running three or more
+    /// Code<->Validate waves in Auto mode, with a new commit landing on its
+    /// feature branch before every failure, must not trip the ceiling —
+    /// `handle_validate_outcome`'s reset-vs-accumulate branch must read each
+    /// cycle's new commit as forward progress and restart the streak at 1.
+    ///
+    /// Runs `mode::MAX_CONSECUTIVE_FAILURES + 1` cycles deliberately, one
+    /// more than the ceiling: a passing assertion at exactly the ceiling is
+    /// also consistent with an off-by-one in the reset condition, and the
+    /// extra cycle removes that reading.
+    ///
+    /// **What this test does NOT establish.** It proves the counter does not
+    /// accumulate when new commits land between failures — it cannot
+    /// distinguish a commit that fixed what Validate reported from a commit
+    /// that did not. An agent that commits anything at all on every cycle
+    /// resets the streak every cycle. That is the accepted, documented
+    /// weakness of the commit-count signal (33-RESEARCH.md's D-03
+    /// Recommendation and Assumptions Log A1; see also
+    /// `handle_validate_outcome`'s own doc comment), not a gap this test
+    /// closes.
+    #[test]
+    fn healthy_multi_wave_progress_does_not_reach_the_ceiling() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 87;
+        init_repo(root);
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        for i in 0..(mode::MAX_CONSECUTIVE_FAILURES + 1) {
+            // A real new commit BEFORE the failure is recorded, on every
+            // cycle — the count observed at each failure strictly exceeds
+            // the previously recorded baseline.
+            commit_on_feature_branch(root, phase, &format!("wave-{i}"));
+            std::fs::write(
+                &response_path,
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap();
+            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+            state.stage = Stage::Code;
+            let _ = transition(root, &mut state, Stage::Validate);
+        }
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        assert_eq!(
+            state.consecutive_failures, 1,
+            "a new commit before every failure must restart the streak at 1, not accumulate it"
+        );
+        assert!(
+            !state
+                .mode
+                .should_gate(Stage::Validate, state.consecutive_failures),
+            "genuine forward progress must never force the Auto-mode Validate gate"
+        );
+    }
+
+    /// 999.66, ROADMAP criterion 4, and the negative control for
+    /// `healthy_multi_wave_progress_does_not_reach_the_ceiling` above:
+    /// removing exactly one variable (the repeated commit) from an otherwise
+    /// identical setup must restore the pre-fix ceiling-reaching behavior.
+    ///
+    /// Unlike `consecutive_failures_reaches_ceiling_across_cycles` — which
+    /// runs against a root with NO git repository, so its count is zero
+    /// because the branch is missing — this repository has a real
+    /// `feature/phase-NN` branch carrying one commit before the loop starts,
+    /// and that commit count never changes. This is a different route to "no
+    /// progress" (an existing branch returning a stable non-zero count,
+    /// rather than the branch-missing fallback), and only this one proves
+    /// the count comparison itself works rather than the branch-missing
+    /// fallback.
+    ///
+    /// Confirmed to pass against the pre-fix code as well as after (see
+    /// 33-03-SUMMARY.md) — a negative control that only passes after the
+    /// change would not be controlling for anything.
+    #[test]
+    fn repeated_failure_without_new_commits_still_reaches_the_ceiling() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 88;
+        init_repo(root);
+        // Establish the branch with a stable, non-zero commit count. No
+        // further commits land during the loop below.
+        commit_on_feature_branch(root, phase, "seed");
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        for _ in 0..mode::MAX_CONSECUTIVE_FAILURES {
+            std::fs::write(
+                &response_path,
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap();
+            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+            state.stage = Stage::Code;
+            let _ = transition(root, &mut state, Stage::Validate);
+        }
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        assert_eq!(state.consecutive_failures, mode::MAX_CONSECUTIVE_FAILURES);
+        assert!(
+            state
+                .mode
+                .should_gate(Stage::Validate, state.consecutive_failures),
+            "a genuinely stuck loop with no new commits must still reach the reachable ceiling"
+        );
+    }
+
+    /// D-01 (33-CONTEXT.md), ROADMAP criterion 1: a Validate failure on a
+    /// phase with no `{N}-VERIFICATION.md` must loop back to Code with the
+    /// plain `/gsd-execute-phase {N}` command, not `--gaps-only` (which
+    /// matches zero plans and gates unresolvably on a mid-arc phase). Drives
+    /// the plain-Failed tail arm directly — the common auto-loop path, and
+    /// the one the Phase 29 dogfood actually hit.
+    #[test]
+    fn mid_arc_loop_back_issues_plain_execute_command() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 82;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+
+        // Deliberately no `.planning/phases/{phase:02}-*/{phase:02}-VERIFICATION.md`
+        // — this is the mid-arc precondition.
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        // The launch fails by design under a neutralized PATH (no real agent
+        // CLI can spawn) — the `loop_back` event is emitted before that, so
+        // the resulting `Err` is discarded, matching the established shape
+        // in `consecutive_failures_reaches_ceiling_across_cycles`.
+        let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        let last = devflow_core::events::last_event_of_kind_for_phase(root, phase, "loop_back")
+            .expect("loop_back event must be recorded");
+        assert_eq!(
+            last["fix"], "FullExecute",
+            "a mid-arc phase (no {{N}}-VERIFICATION.md) must dispatch FullExecute, not GapsOnly"
+        );
+    }
+
+    /// D-01 (33-CONTEXT.md), ROADMAP criterion 2: a Validate failure on a
+    /// phase whose `{N}-VERIFICATION.md` already exists must still loop back
+    /// with `--gaps-only` — unchanged from the pre-fix behavior. This is the
+    /// negative control for `mid_arc_loop_back_issues_plain_execute_command`:
+    /// identical drive, opposite precondition, opposite outcome — neither
+    /// test is meaningful without the other.
+    #[test]
+    fn genuine_gaps_loop_back_still_issues_gaps_only() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 83;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+
+        let phase_dir = root
+            .join(".planning/phases")
+            .join(format!("{phase:02}-test"));
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        std::fs::write(
+            phase_dir.join(format!("{phase:02}-VERIFICATION.md")),
+            "verified\n",
+        )
+        .unwrap();
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        let last = devflow_core::events::last_event_of_kind_for_phase(root, phase, "loop_back")
+            .expect("loop_back event must be recorded");
+        assert_eq!(
+            last["fix"], "GapsOnly",
+            "a phase with an existing {{N}}-VERIFICATION.md must still dispatch GapsOnly"
+        );
+    }
+
+    /// CR-01 (33-REVIEW.md / 33-VERIFICATION.md), ROADMAP criterion 2 in
+    /// DevFlow's *normal* operating mode: a Validate failure on a phase whose
+    /// `{N}-VERIFICATION.md` exists only inside that phase's worktree must
+    /// still dispatch `--gaps-only`. `.planning/` is a tracked directory and
+    /// the Validate agent runs in the worktree, so the artifact it authors
+    /// lands on `feature/phase-{N}` inside the worktree tree and is simply
+    /// absent from the main checkout for the phase's entire in-flight
+    /// duration. There is no merge-back, so this is the steady state, not a
+    /// race.
+    ///
+    /// This is the first test in the workspace to configure
+    /// `state.worktree_path` on a `handle_validate_outcome` drive — which is
+    /// precisely why CR-01 survived a green suite. Every one of Phase 33's
+    /// eight pre-existing loop-back tests leaves `worktree_path` at
+    /// `State::new()`'s default of `None`, making `project_root` and "the root
+    /// the agent actually wrote to" identical by construction: the one
+    /// condition under which this defect is invisible.
+    ///
+    /// Companion to `genuine_gaps_loop_back_still_issues_gaps_only` directly
+    /// above (the `--no-worktree` case), never a replacement for it.
+    #[test]
+    fn worktree_mode_genuine_gaps_loop_back_issues_gaps_only() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 93;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        // IN-07: `handle_validate_outcome` is only reached from `advance` with
+        // `stage == Validate`, so that is the only stage this fixture may
+        // honestly claim — otherwise `prepare_loop_back_to_code` cleans up the
+        // Code gate and emits `"from": "Code"` on a Validate loop-back.
+        state.stage = Stage::Validate;
+        let worktree = root.join(format!(".worktrees/phase-{phase}"));
+        std::fs::create_dir_all(&worktree).unwrap();
+        state.worktree_path = Some(worktree.clone());
+        workflow::save_state(&state).unwrap();
+
+        // The artifact is written under the WORKTREE only. The bare tempdir
+        // root deliberately has no `.planning` directory at all, so it is
+        // structurally impossible to satisfy the probe from the main
+        // checkout — that is the entire point of this test.
+        let phase_dir = worktree
+            .join(".planning/phases")
+            .join(format!("{phase:02}-test"));
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        std::fs::write(
+            phase_dir.join(format!("{phase:02}-VERIFICATION.md")),
+            "verified\n",
+        )
+        .unwrap();
+
+        // WR-05: RAII, so a panic inside the region restores PATH by `Drop`
+        // rather than by a trailing statement the unwind would skip. Scoped so
+        // the restore still happens before the assertions below, exactly as
+        // the trailing-statement form did.
+        {
+            let _path_guard = NeutralPath::install();
+            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+        }
+
+        // Read the event from `root`, not the worktree: `events::emit` is
+        // called with `project_root`, and `state.rs`'s own doc comment says
+        // state and capture files always live under the main project root.
+        let last = devflow_core::events::last_event_of_kind_for_phase(root, phase, "loop_back")
+            .expect("loop_back event must be recorded");
+        assert_eq!(
+            last["fix"], "GapsOnly",
+            "a {{N}}-VERIFICATION.md existing only in the phase's worktree must still dispatch GapsOnly"
+        );
+    }
+
+    /// Scenario A of the mirrored negative control for
+    /// `worktree_mode_genuine_gaps_loop_back_issues_gaps_only` directly above:
+    /// identical worktree setup, opposite artifact precondition, opposite
+    /// required outcome. Without it, that test cannot be told apart from an
+    /// implementation that returns `GapsOnly` whenever a worktree happens to
+    /// be configured at all — a control that cannot fail is not a control.
+    ///
+    /// Phase 94: no `{N}-VERIFICATION.md` anywhere — neither under the
+    /// worktree nor under the main checkout. The mid-arc precondition, in
+    /// worktree mode. ROADMAP criterion 1.
+    ///
+    /// IN-06: scenario B lives in its own `#[test]`
+    /// (`worktree_mode_main_checkout_only_artifact_is_the_or_both_roots_discriminator`)
+    /// rather than below this test's assertion. Packed into one function, a
+    /// failure HERE aborted before B ran, and B is the suite's only
+    /// discriminator against a probe-both-roots implementation — the single
+    /// test whose loss would be least visible is exactly the one a shared
+    /// function hid.
+    #[test]
+    fn worktree_mode_mid_arc_loop_back_issues_plain_execute() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir_a = tempfile::tempdir().unwrap();
+        let root_a = dir_a.path();
+        let phase_a = 94;
+        let mut state_a = State::new(phase_a, AgentKind::Claude, Mode::Auto, root_a.to_path_buf());
+        // IN-07: Validate is the only stage production reaches this call from.
+        state_a.stage = Stage::Validate;
+        let worktree_a = root_a.join(format!(".worktrees/phase-{phase_a}"));
+        std::fs::create_dir_all(&worktree_a).unwrap();
+        state_a.worktree_path = Some(worktree_a.clone());
+        workflow::save_state(&state_a).unwrap();
+
+        // Deliberately no `{phase:02}-VERIFICATION.md` under the worktree AND
+        // deliberately none under the bare root either — this is the mid-arc
+        // precondition expressed in worktree mode, not an oversight.
+
+        // WR-05: RAII PATH neutralization. This drive reaches
+        // `loop_back_to_code` -> `launch_stage`, so it must never be able to
+        // resolve a real agent CLI.
+        {
+            let _path_guard = NeutralPath::install();
+            let _ = handle_validate_outcome(root_a, &mut state_a, ValidateOutcome::Failed);
+        }
+
+        let last_a =
+            devflow_core::events::last_event_of_kind_for_phase(root_a, phase_a, "loop_back")
+                .expect("scenario A loop_back event must be recorded");
+        assert_eq!(
+            last_a["fix"], "FullExecute",
+            "no {{N}}-VERIFICATION.md in the worktree (nor anywhere else) must dispatch FullExecute"
+        );
+    }
+
+    /// **The only test in the workspace that fails a probe-both-roots-and-OR-them
+    /// implementation.** Scenario B of the mirrored negative control, split out
+    /// of `worktree_mode_mid_arc_loop_back_issues_plain_execute` per IN-06 so
+    /// that a scenario-A failure can never abort the run before it is asserted.
+    ///
+    /// Phase 95: `{N}-VERIFICATION.md` present under the **main checkout
+    /// only**, never under the worktree. This scenario is a deliberate
+    /// addition beyond the verification's prescribed pair, because an
+    /// implementation that probes *both* roots — a plausible and superficially
+    /// safer misreading of the fix — passes the positive test, passes scenario
+    /// A, and passes both `--no-worktree` tests. This case is the only one that
+    /// fails it. Semantically: an artifact visible from the main checkout while
+    /// this phase is in flight inside a worktree belongs to a *different* run,
+    /// and treating it as this phase's evidence is CR-01 with the sign
+    /// reversed.
+    ///
+    /// Do not merge this back into a shared `#[test]` with scenario A, and do
+    /// not weaken its assertion: deleting it costs the suite nothing visible
+    /// today and everything the day someone "hardens" the probe by OR-ing the
+    /// two roots.
+    #[test]
+    fn worktree_mode_main_checkout_only_artifact_is_the_or_both_roots_discriminator() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir_b = tempfile::tempdir().unwrap();
+        let root_b = dir_b.path();
+        let phase_b = 95;
+        let mut state_b = State::new(phase_b, AgentKind::Claude, Mode::Auto, root_b.to_path_buf());
+        // IN-07: Validate is the only stage production reaches this call from.
+        state_b.stage = Stage::Validate;
+        let worktree_b = root_b.join(format!(".worktrees/phase-{phase_b}"));
+        std::fs::create_dir_all(&worktree_b).unwrap();
+        state_b.worktree_path = Some(worktree_b.clone());
+        workflow::save_state(&state_b).unwrap();
+
+        // Built from the tempdir ROOT, never from the worktree path: writing
+        // this under the worktree by mistake would silently turn scenario B
+        // into a duplicate of the positive test with an inverted assertion.
+        let stale_dir = root_b
+            .join(".planning/phases")
+            .join(format!("{phase_b:02}-test"));
+        std::fs::create_dir_all(&stale_dir).unwrap();
+        std::fs::write(
+            stale_dir.join(format!("{phase_b:02}-VERIFICATION.md")),
+            "stale artifact belonging to a different run\n",
+        )
+        .unwrap();
+
+        // WR-05: RAII PATH neutralization — same reason as scenario A, this
+        // drive also reaches `loop_back_to_code` -> `launch_stage`.
+        {
+            let _path_guard = NeutralPath::install();
+            let _ = handle_validate_outcome(root_b, &mut state_b, ValidateOutcome::Failed);
+        }
+
+        let last_b =
+            devflow_core::events::last_event_of_kind_for_phase(root_b, phase_b, "loop_back")
+                .expect("scenario B loop_back event must be recorded");
+        assert_eq!(
+            last_b["fix"], "FullExecute",
+            "a {{N}}-VERIFICATION.md visible only from the main checkout belongs to a different run and must NOT resurrect GapsOnly"
+        );
+    }
+
+    /// D-01/D-02: the `Ambiguous` gate's loop-back arm must also consult
+    /// `select_loop_back_fix`, not only the plain-Failed tail arm Task 1
+    /// wired. Seeds a rejecting `GateResponse` (note without "abort", so
+    /// `GateAction::from_response` resolves `LoopBack` rather than `Abort`)
+    /// so the gate resolves from an already-written file instead of
+    /// blocking on the multi-day default timeout. PATH is neutralized under
+    /// `ENV_MUTEX` (Task 1's shape) so the resulting `LoopBack` cannot spawn
+    /// a real agent CLI — the `loop_back` event is emitted before that
+    /// launch, so its `Err` is discarded.
+    #[test]
+    fn ambiguous_gate_loop_back_respects_the_mid_arc_check() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 84;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        workflow::save_state(&state).unwrap();
+
+        // No {phase:02}-VERIFICATION.md — mid-arc precondition.
+
+        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"loop back for another pass","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        let _ = handle_validate_outcome(
+            root,
+            &mut state,
+            ValidateOutcome::Ambiguous("test disagreement".to_string()),
+        );
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        let last = devflow_core::events::last_event_of_kind_for_phase(root, phase, "loop_back")
+            .expect("loop_back event must be recorded");
+        assert_eq!(
+            last["fix"], "FullExecute",
+            "the Ambiguous gate's loop-back must respect the mid-arc check, same as the plain tail arm"
+        );
+    }
+
+    /// D-01/D-02: the consecutive-failure-gated loop-back arm must also
+    /// consult `select_loop_back_fix`. Sets `consecutive_failures` to the
+    /// ceiling beforehand so the `should_gate` branch is the one taken
+    /// (rather than the plain-Failed tail arm Task 1 already covers), and
+    /// proves the gated path and the ungated tail agree on the fix — which
+    /// they did not have to. PATH-neutralized under `ENV_MUTEX`, same as
+    /// above.
+    ///
+    /// 33-04: both the seeded 999.66 baseline and the counter assertion on the
+    /// `loop_back` event are required, and they do different jobs — the seed
+    /// puts this test back on the gated arm (without it the counter resets to
+    /// 1 and `should_gate` is false), and the assertion is what notices if a
+    /// later change moves it off again. The pre-existing `fix` assertion
+    /// cannot: both arms route through `select_loop_back_fix` and both emit
+    /// `FullExecute`, so this test passed vacuously on the wrong arm.
+    #[test]
+    fn failure_gate_loop_back_respects_the_mid_arc_check() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 85;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        state.consecutive_failures = mode::MAX_CONSECUTIVE_FAILURES;
+        // 999.66 (33-03): seed the forward-progress baseline alongside the
+        // streak, or the `None` baseline resets the counter to 1 and this
+        // test silently exercises the ungated tail arm instead of the
+        // consecutive-failure-gated arm its name and doc comment claim.
+        state.last_validate_failure_commit_count = Some(0);
+        workflow::save_state(&state).unwrap();
+
+        // No {phase:02}-VERIFICATION.md — mid-arc precondition.
+
+        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"loop back for another pass","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        let last = devflow_core::events::last_event_of_kind_for_phase(root, phase, "loop_back")
+            .expect("loop_back event must be recorded");
+        assert!(
+            last["consecutive_failures"]
+                .as_u64()
+                .expect("loop_back event must carry consecutive_failures")
+                >= u64::from(mode::MAX_CONSECUTIVE_FAILURES),
+            "must be the consecutive-failure-GATED loop-back arm (counter {}) — a value below the threshold means this ran the ungated tail arm instead",
+            last["consecutive_failures"]
+        );
+        assert_eq!(
+            last["fix"], "FullExecute",
+            "the consecutive-failure-gated loop-back must respect the mid-arc check, same as the ungated tail arm"
+        );
+    }
+
+    /// D-02, the negative control for the whole D-01 change: identical
+    /// precondition (no `{N}-VERIFICATION.md`) as the two tests above, but
+    /// driven through `handle_ship_outcome` instead — must still dispatch
+    /// `GapsOnly`, proving the out-of-scope call site was not swept in as a
+    /// runtime fact, not merely a claim about the diff. PATH-neutralized
+    /// under `ENV_MUTEX`, same as above.
+    #[test]
+    fn ship_loop_back_still_issues_gaps_only_when_verification_absent() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 86;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Ship;
+        assert!(
+            !state.yes_ship,
+            "no pre-authorization must short-circuit the gate"
+        );
+        workflow::save_state(&state).unwrap();
+
+        // No {phase:02}-VERIFICATION.md — same mid-arc precondition that
+        // flips the two Validate arms above.
+
+        let response_path = Gates::response_path(root, phase, Stage::Ship);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"loop back for another pass","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        let _ = handle_ship_outcome(root, &mut state);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        let last = devflow_core::events::last_event_of_kind_for_phase(root, phase, "loop_back")
+            .expect("loop_back event must be recorded");
+        assert_eq!(
+            last["fix"], "GapsOnly",
+            "handle_ship_outcome must remain unaffected by the D-01 mid-arc check (D-02)"
+        );
+    }
+
     /// Combined 18d+18e scenario (18-RESEARCH.md Pitfall 1) — the only test
     /// that proves both fixes hold TOGETHER, not each in isolation: 18e's
     /// Layer-0 discard is what makes an `external_verify` Validate fail for
@@ -1324,6 +2077,10 @@ mod tests {
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         state.consecutive_failures = u32::MAX;
+        // See validate_failure_threshold_forces_gate_then_aborts: pre-seed
+        // the 999.66 baseline to match the (no-repo) commit count of 0 so a
+        // directly-seeded streak isn't misread as a first-ever failure.
+        state.last_validate_failure_commit_count = Some(0);
         workflow::save_state(&state).unwrap();
 
         let response_path = Gates::response_path(root, phase, Stage::Validate);

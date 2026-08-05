@@ -1,16 +1,20 @@
 ---
 gsd_state_version: 1.0
 milestone: v2.4.0
-milestone_name: Resume Unattended Dogfooding
-status: planning
-last_updated: "2026-08-04T21:52:01.000Z"
-last_activity: 2026-08-04
+milestone_name: milestone (Resume Unattended Dogfooding, ACTIVE — declared 2026-08-04)
+current_phase: 34
+current_phase_name: Stream-JSON Coverage and the Validate Trust Boundary (999.73 + 999.74)
+status: "Phase 33 shipped — PR #90"
+stopped_at: Phase 33 context gathered
+last_updated: "2026-08-05T13:26:23.652Z"
+last_activity: 2026-08-05
 progress:
   total_phases: 2
-  completed_phases: 0
-  total_plans: 0
-  completed_plans: 0
-  percent: 0
+  completed_phases: 1
+  total_plans: 6
+  completed_plans: 6
+  percent: 50
+last_activity_desc: Phase 33 complete, transitioned to Phase 34
 ---
 
 # DevFlow — Project State
@@ -149,10 +153,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 33 of 2 (Loop-Back Correctness for Multi-Wave Validate→Code Cycles) — ready to plan
-Plan: —
-Status: Roadmap created; ready for /gsd-discuss-phase 33
-Last activity: 2026-08-04 — ROADMAP.md gained a new `## 🚧 v2.4.0 milestone (ACTIVE)` heading
+Phase: 34 — Stream-JSON Coverage and the Validate Trust Boundary (999.73 + 999.74)
+Plan: Not started
+Status: Phase 33 shipped — PR #90
+Last activity: 2026-08-05
 (inserted as the FIRST heading, mirroring the Phase 32 durability fix) with Phase 33 and Phase 34
 detail sections landing inside its own heading-to-next-heading window, plus two new `## Progress`
 rows (33, 34 — Not started). Verified live: `roadmap.analyze` phase_count 0->2 (was returning
@@ -838,9 +842,9 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 
 ## Session
 
-**Last session:** 2026-08-04T18:35:31.717Z
-**Stopped at:** Milestone gsd-hygiene completed and archived
-**Resume file:** .planning/milestones/gsd-hygiene-phases/32-roadmap-layout-hygiene/32-CONTEXT.md
+**Last session:** 2026-08-04T22:42:24.391Z
+**Stopped at:** Phase 33 context gathered
+**Resume file:** .planning/phases/33-loop-back-correctness-for-multi-wave-validate-code-cycles-99/33-CONTEXT.md
 
 ## Operator Next Steps
 

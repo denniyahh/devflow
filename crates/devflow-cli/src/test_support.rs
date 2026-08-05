@@ -101,6 +101,41 @@ pub(crate) fn init_repo_no_version_file(root: &Path) {
     git(&["checkout", "-q", "-b", "develop"]);
 }
 
+/// Land one real commit on `feature/phase-{phase:02}`, creating the branch
+/// from the current `HEAD` if it does not already exist. Designed to be
+/// called repeatedly within one test, so each call adds exactly one commit
+/// to the `develop..branch` range — assumes [`init_repo`] has already run.
+///
+/// Uses plain `checkout`, never `checkout -B`, when the branch already
+/// exists: `-B` resets an existing branch to `HEAD`, which would silently
+/// discard the commits an earlier call in the same test already made.
+pub(crate) fn commit_on_feature_branch(root: &Path, phase: u32, label: &str) {
+    let git = |args: &[&str]| {
+        let ok = devflow_core::test_support::git_command(root)
+            .args(args)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    let branch = format!("feature/phase-{phase:02}");
+    let branch_exists = devflow_core::test_support::git_command(root)
+        .args(["rev-parse", "--verify", &branch])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if branch_exists {
+        git(&["checkout", &branch]);
+    } else {
+        git(&["checkout", "-b", &branch]);
+    }
+    let file_name = format!("{label}.txt");
+    std::fs::write(root.join(&file_name), label).unwrap();
+    git(&["add", &file_name]);
+    git(&["commit", "-m", label]);
+}
+
 /// TEST-ONLY adapter (module-scope so any test can reach it — hoisted
 /// from a test-function-local `AlwaysRejectAdapter`, 18f Task 1) whose
 /// `preflight` fails unconditionally, with no interior mutability. Two
@@ -212,6 +247,67 @@ pub(crate) fn agent_free_git_only_path_dir() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     std::os::unix::fs::symlink(&real_git, dir.path().join("git")).unwrap();
     dir
+}
+
+/// RAII guard that REPLACES `PATH` with an [`agent_free_git_only_path_dir`]
+/// for the scope it is bound in, and restores the previous `PATH` on EVERY
+/// exit path of that scope — including a path on which a later assertion
+/// panics (WR-05).
+///
+/// Same reasoning as [`ReapMonitorOnDrop`], applied to a different resource:
+/// a plain trailing `set_var("PATH", original)` only runs on the success path,
+/// since Rust abandons the rest of a function's statements the instant a panic
+/// begins unwinding, so it is the language's own `Drop` guarantee — not a call
+/// ordering convention — that makes the restore unconditional.
+///
+/// What the trailing-statement shape costs when a region does panic is
+/// specific and compounding: `PATH` stays pointed at the neutral tempdir,
+/// whose `TempDir` the same unwind then drops and DELETES, so every other
+/// parallel test thread inherits a `PATH` naming a directory that no longer
+/// exists; and the panic poisons [`ENV_MUTEX`], turning every subsequent
+/// `ENV_MUTEX.lock().unwrap()` into a `PoisonError` panic. One legible
+/// failing assertion becomes a cascade across the whole binary.
+///
+/// The guard owns the `TempDir`, so the neutral directory outlives every use
+/// of the `PATH` that names it. `Drop` restores the captured value first and
+/// only then drops the `TempDir` (a type's own `Drop::drop` runs before its
+/// fields are dropped), so `PATH` never transiently names a deleted directory.
+///
+/// **The caller must already hold [`ENV_MUTEX`].** `set_var` is process-wide
+/// and `cargo test` runs in parallel; this guard makes the restore
+/// unconditional, it does not make the mutation safe on its own.
+pub(crate) struct NeutralPath {
+    _dir: tempfile::TempDir,
+    original: Option<std::ffi::OsString>,
+}
+
+impl NeutralPath {
+    /// Named `install`, not `new`: binding it is not bookkeeping, it mutates
+    /// process-global state at the moment of the call.
+    pub(crate) fn install() -> Self {
+        let dir = agent_free_git_only_path_dir();
+        let original = std::env::var_os("PATH");
+        // SAFETY: the caller holds ENV_MUTEX (documented precondition), so
+        // no other test thread is reading or writing PATH concurrently.
+        unsafe { std::env::set_var("PATH", dir.path()) };
+        Self {
+            _dir: dir,
+            original,
+        }
+    }
+}
+
+impl Drop for NeutralPath {
+    fn drop(&mut self) {
+        // SAFETY: still serialized under the ENV_MUTEX guard the caller holds
+        // for at least as long as this guard's own scope.
+        unsafe {
+            match &self.original {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+    }
 }
 
 /// [`agent_free_git_only_path_dir`], extended with a real `sh` symlink

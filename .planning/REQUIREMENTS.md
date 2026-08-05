@@ -16,14 +16,17 @@ Requirements for this milestone. Each maps to roadmap phases.
 
 ### Dogfood Reliability
 
-- [ ] **DOGFOOD-01**: Operator can run a 3+ wave unattended phase where Validate correctly
+- [x] **DOGFOOD-01**: Operator can run a 3+ wave unattended phase where Validate correctly
   reports the phase mid-arc/incomplete, without the loop-back issuing an unresolvable
   `--gaps-only` command (999.65)
-- [ ] **DOGFOOD-02**: Operator can run a 3+ wave unattended phase in `auto` mode without a false
+
+- [x] **DOGFOOD-02**: Operator can run a 3+ wave unattended phase in `auto` mode without a false
   "3 consecutive failures" gate firing on healthy wave-by-wave progress (999.66)
+
 - [ ] **DOGFOOD-03**: Operator can trust that Define/Plan/Validate/Ship stages launch through the
   same reliable stream-json path already proven for Code, backed by real per-stage captures, not
   synthetic fixtures (999.73)
+
 - [ ] **DOGFOOD-04**: Operator can trust that a Validate stage's reported outcome reflects its
   actually-derived status, not just the agent's self-reported verdict field (999.74)
 
@@ -45,12 +48,13 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| DOGFOOD-01 | Phase 33 | Pending |
-| DOGFOOD-02 | Phase 33 | Pending |
+| DOGFOOD-01 | Phase 33 | Complete |
+| DOGFOOD-02 | Phase 33 | Complete |
 | DOGFOOD-03 | Phase 34 | Pending |
 | DOGFOOD-04 | Phase 34 | Pending |
 
 **Coverage:**
+
 - v1 requirements: 4 total
 - Mapped to phases: 4
 - Unmapped: 0 ✓

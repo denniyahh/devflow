@@ -1819,10 +1819,52 @@ fn rate_limited_result(retry: String) -> AgentResult {
     }
 }
 
+/// Commits on the phase's feature branch that are not on `develop`.
+///
+/// Derives the branch name from `git_flow.feature_prefix` and the zero-padded
+/// `phase`, verifies the branch exists with `rev-parse --verify`, and on
+/// success counts `{git_flow.develop}..{branch}` with `rev-list --count`.
+/// This is the single implementation of that count — [`evaluate_layer2`] and
+/// `pipeline_outcomes::handle_validate_outcome`'s forward-progress check both
+/// call it rather than each re-deriving the branch name and re-running the
+/// same two git commands, which is what made the two counts able to silently
+/// diverge before this extraction.
+///
+/// Must be called with the main `project_root`, never a worktree path — git
+/// worktrees share refs and the object database, so a commit made inside a
+/// linked worktree is immediately visible to a count run from the main
+/// checkout, which is the property every caller already relies on.
+///
+/// A `0` return is deliberately indistinguishable across three causes:
+/// genuinely no commits, the branch does not exist, or `git` could not be
+/// run. Every consumer treats all three the same way.
+pub fn phase_commit_count(project_root: &Path, git_flow: &GitFlowConfig, phase: u32) -> u32 {
+    let branch = format!("{}phase-{:02}", git_flow.feature_prefix, phase);
+
+    let branch_exists = git_command(project_root)
+        .args(["rev-parse", "--verify", &branch])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if !branch_exists {
+        return 0;
+    }
+
+    let range = format!("{}..{branch}", git_flow.develop);
+    git_command(project_root)
+        .args(["rev-list", "--count", &range])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
+        .unwrap_or(0)
+}
+
 /// Layer 2: Use exit code + commit count to determine result.
 ///
 /// Reads exit code from `.devflow/phase-NN-exit` file.
-/// Counts commits in `feature/phase-NN` branch (if it exists).
+/// Counts commits in `feature/phase-NN` branch (if it exists), via
+/// [`phase_commit_count`].
 ///
 /// The commit-count gate ("no commits → failed") is scoped to `stage` — it
 /// only applies to `Stage::Plan`/`Stage::Code` (checked via an explicit
@@ -1860,25 +1902,7 @@ pub fn evaluate_layer2(
     };
 
     let branch = format!("{}phase-{:02}", git_flow.feature_prefix, phase);
-
-    // Verify branch exists before counting commits.
-    let branch_exists = git_command(project_root)
-        .args(["rev-parse", "--verify", &branch])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
-    let commits: u32 = if branch_exists {
-        let range = format!("{}..{branch}", git_flow.develop);
-        git_command(project_root)
-            .args(["rev-list", "--count", &range])
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
-            .unwrap_or(0)
-    } else {
-        0
-    };
+    let commits: u32 = phase_commit_count(project_root, git_flow, phase);
 
     let commit_gated = matches!(stage, Stage::Plan | Stage::Code);
     let no_work_done = commit_gated && commits == 0;
@@ -2522,8 +2546,8 @@ fn archive_phase_files_with_stamp(
     Ok(Some(stamp.to_string()))
 }
 
-fn phase_review_path(project_root: &Path, phase: u32) -> Option<PathBuf> {
-    let phases = std::fs::read_dir(project_root.join(".planning/phases")).ok()?;
+fn phase_review_path(evidence_root: &Path, phase: u32) -> Option<PathBuf> {
+    let phases = std::fs::read_dir(evidence_root.join(".planning/phases")).ok()?;
     let prefix = format!("{phase:02}-");
     for entry in phases.flatten() {
         if entry
@@ -2538,6 +2562,47 @@ fn phase_review_path(project_root: &Path, phase: u32) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Whether `/gsd-verify-work` has produced a `{phase:02}-VERIFICATION.md`
+/// artifact for `phase` yet.
+///
+/// Per D-01 (33-CONTEXT.md), this is the sole mid-arc-vs-genuine-gaps signal
+/// a Validate→Code loop-back consults: a phase with no verification artifact
+/// is still mid-arc (its remaining plans have not been judged at all), so a
+/// loop-back must re-run the phase in full rather than dispatch `--gaps-only`,
+/// which matches zero plans and gates unresolvably. Mirrors
+/// [`phase_review_path`]'s directory-prefix-scan idiom exactly, but returns a
+/// `bool` — no caller needs the artifact's path, only whether it exists. A
+/// missing `.planning/phases` directory returns `false` rather than panicking.
+///
+/// `evidence_root` is the root the Validate agent actually wrote to — the
+/// phase's worktree when `state.worktree_path` is set, else the project root.
+/// `.planning/` is tracked, so in worktree mode the artifact lands on
+/// `feature/phase-N` and is invisible from the main checkout for the phase's
+/// entire in-flight duration. Passing the project root in worktree mode is
+/// exactly the defect this parameter name exists to prevent (33-CONTEXT.md
+/// CR-01); it is NOT interchangeable with the root used for git reads such as
+/// [`phase_commit_count`], whose refs and object database are shared across
+/// worktrees and which therefore correctly takes the project root.
+pub fn phase_verification_exists(evidence_root: &Path, phase: u32) -> bool {
+    let Ok(phases) = std::fs::read_dir(evidence_root.join(".planning/phases")) else {
+        return false;
+    };
+    let prefix = format!("{phase:02}-");
+    for entry in phases.flatten() {
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(&prefix))
+        {
+            let verification = entry.path().join(format!("{phase:02}-VERIFICATION.md"));
+            if verification.exists() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Keep only the newest `retain` capture generations under `history_dir`,
@@ -6057,6 +6122,28 @@ mod tests {
         assert_eq!(result.reason.as_deref(), Some("bad output"));
     }
 
+    /// The case `consecutive_failures_reaches_ceiling_across_cycles`
+    /// (`pipeline_outcomes.rs`) silently depends on: a repository with no
+    /// `feature/phase-NN` branch at all must report 0, not error or panic.
+    #[test]
+    fn phase_commit_count_reports_zero_without_a_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init"]);
+        git(dir.path(), &["config", "user.email", "devflow@example.com"]);
+        git(dir.path(), &["config", "user.name", "DevFlow Tests"]);
+        git(dir.path(), &["config", "commit.gpgsign", "false"]);
+        git(dir.path(), &["config", "tag.gpgsign", "false"]);
+        git(dir.path(), &["config", "core.hooksPath", "/dev/null"]);
+        git(dir.path(), &["checkout", "-b", "develop"]);
+        std::fs::write(dir.path().join("README.md"), "base\n").unwrap();
+        git(dir.path(), &["add", "README.md"]);
+        git(dir.path(), &["commit", "-m", "base"]);
+
+        let count = phase_commit_count(dir.path(), &GitFlowConfig::default(), 999);
+
+        assert_eq!(count, 0, "no feature/phase-99 branch exists in this repo");
+    }
+
     #[test]
     fn evaluate_layer2_falls_back_to_exit_code_and_commit_count() {
         let dir = tempfile::tempdir().unwrap();
@@ -6493,6 +6580,36 @@ mod tests {
              foreign repository) must still resolve project_root's own \
              branch and commits; child exit status {:?}\nstdout:\n{stdout}",
             out.status
+        );
+    }
+
+    /// D-01 (33-CONTEXT.md): `phase_verification_exists` is the sole signal
+    /// a Validate→Code loop-back consults to tell a mid-arc phase apart from
+    /// a genuinely gap-flagged one. Covers all three states: no
+    /// `.planning/phases` directory at all, a phase directory with no
+    /// verification artifact, and a phase directory that has one — mirroring
+    /// `phase_review_path`'s directory-prefix-scan idiom.
+    #[test]
+    fn phase_verification_exists_finds_the_artifact_by_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        assert!(
+            !phase_verification_exists(root, 82),
+            "no .planning/phases directory at all must return false, not panic"
+        );
+
+        let phase_dir = root.join(".planning/phases/82-loop-back-fix");
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        assert!(
+            !phase_verification_exists(root, 82),
+            "a phase directory with no {{N}}-VERIFICATION.md must return false"
+        );
+
+        std::fs::write(phase_dir.join("82-VERIFICATION.md"), "verified\n").unwrap();
+        assert!(
+            phase_verification_exists(root, 82),
+            "a phase directory holding {{N}}-VERIFICATION.md must return true"
         );
     }
 }
