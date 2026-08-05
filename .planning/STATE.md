@@ -5,8 +5,8 @@ milestone_name: milestone (Resume Unattended Dogfooding, ACTIVE — declared 202
 current_phase: 34
 current_phase_name: Stream-JSON Coverage and the Validate Trust Boundary (999.73 + 999.74)
 status: "Phase 33 shipped — PR #90"
-stopped_at: Phase 33 context gathered
-last_updated: "2026-08-05T13:26:23.652Z"
+stopped_at: Phase 34 context gathered
+last_updated: "2026-08-05T16:50:08.524Z"
 last_activity: 2026-08-05
 progress:
   total_phases: 2
@@ -842,9 +842,9 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 
 ## Session
 
-**Last session:** 2026-08-04T22:42:24.391Z
-**Stopped at:** Phase 33 context gathered
-**Resume file:** .planning/phases/33-loop-back-correctness-for-multi-wave-validate-code-cycles-99/33-CONTEXT.md
+**Last session:** 2026-08-05T16:50:08.212Z
+**Stopped at:** Phase 34 context gathered
+**Resume file:** .planning/phases/34-stream-json-coverage-and-the-validate-trust-boundary-999-73-/34-CONTEXT.md
 
 ## Operator Next Steps
 
