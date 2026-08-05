@@ -32,6 +32,7 @@ precedent for keeping it out of Phase 33's S–M-sized pair.
 | 34 | Stream-JSON Coverage and the Validate Trust Boundary | Not started | — |
 
 ### Phase 33: Loop-Back Correctness for Multi-Wave Validate→Code Cycles (999.65 + 999.66)
+
 **Goal**: A 3+ wave unattended `devflow start` phase can complete its Code↔Validate loop without
 gating on an impossible `--gaps-only` command or a false "3 consecutive failures" ceiling — the
 two defects that have blocked every unattended multi-wave phase since the Phase 29 dogfood run.
@@ -40,32 +41,40 @@ two defects that have blocked every unattended multi-wave phase since the Phase 
 reach a second loop-back at all.
 **Requirements**: DOGFOOD-01, DOGFOOD-02
 **Success Criteria** (what must be TRUE):
+
   1. When Validate correctly reports a mid-arc phase incomplete (no `{N}-VERIFICATION.md` because
      `/gsd-verify-work` never ran), the Validate→Code loop-back issues plain
      `/gsd-execute-phase {N}` and the phase continues into its next wave, instead of gating on
      `--gaps-only` matching zero plans.
+
   2. When Validate finds genuine defects in already-built work (a `{N}-VERIFICATION.md` exists
      with real gap findings), the loop-back still issues `--gaps-only` and gap-closure plans are
      correctly selected — the fix distinguishes the two cases rather than swapping one blind
      command for another.
+
   3. A phase that runs 3 or more Code↔Validate waves in `auto` mode reaches wave 3 and beyond
      without a false "3 consecutive failures" gate firing on healthy, wave-by-wave forward
      progress.
+
   4. `consecutive_failures` still gates correctly when Validate finds the *same* unresolved
      problem again across a loop-back — the fix narrows the false positive without disabling the
      safety gate it protects.
-**Plans**: 3 plans across 2 waves
+**Plans**: 2/3 plans executed
 
 Plans:
-- [ ] 33-01-PLAN.md — 999.65: route the three in-scope Validate loop-back arms through a
+
+- [x] 33-01-PLAN.md — 999.65: route the three in-scope Validate loop-back arms through a
       `{N}-VERIFICATION.md`-existence check, adding `FixType::FullExecute` for the mid-arc case
       (wave 1)
-- [ ] 33-02-PLAN.md — 999.66 primitives: the persisted forward-progress baseline on `State` and
+
+- [x] 33-02-PLAN.md — 999.66 primitives: the persisted forward-progress baseline on `State` and
       the pure reset-vs-accumulate predicate in `mode` (wave 1, parallel with 33-01)
+
 - [ ] 33-03-PLAN.md — 999.66 wiring: one shared git-derived commit-count helper, the rewritten
       counter branch in `handle_validate_outcome`, and the matched multi-wave test pair (wave 2)
 
 ### Phase 34: Stream-JSON Coverage and the Validate Trust Boundary (999.73 + 999.74)
+
 **Goal**: Operators can trust that every pipeline stage launches through the same reliable
 stream-json path already proven for Code — backed by real per-stage evidence, not extended on
 zero evidence — and that a Validate stage's reported outcome reflects its actually-derived status
@@ -76,21 +85,24 @@ this milestone's phase numbering, not a technical dependency — see the "why tw
 for the split rationale.
 **Requirements**: DOGFOOD-03, DOGFOOD-04
 **Success Criteria** (what must be TRUE):
+
   1. Define, Plan, Validate, and Ship stages launch through the bidirectional stream-json path —
      the same pipe-owning-monitor mechanism Phase 31 proved for Code — each backed by a real
      per-stage production capture rather than a synthetic fixture.
+
   2. The close rule's drain-gate reasoning (stdin released only once a `DEVFLOW_RESULT` marker
      lands AND the background-task list has drained) is re-derived per newly-widened stage rather
      than assumed to carry over from Code's backgrounding behavior, since a non-backgrounding
      stage has different drain behavior.
+
   3. `classify_validate_outcome`'s `Passed` arm is gated on the status the outcome cascade
      actually derived, not on the agent's self-reported `verdict` alone — confirmed explicitly
      for `Failed`, `Unknown`, `ResourceKilled`, and `IdleTimeout`.
+
   4. It is established — not assumed — whether the prior trust-inversion could manufacture a pass
      on a run that would otherwise have gated, with the answer recorded from reading the Validate
      routing end to end.
 **Plans**: TBD
-
 
 ## Progress
 
@@ -136,7 +148,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 30 | 5/5 | Complete | — |
 | 31 | 5/5 | Complete | — |
 | 32 | 0/0 | Complete    | 2026-08-04 |
-| 33 | 0/TBD | Not started | - |
+| 33 | 2/3 | In Progress|  |
 | 34 | 0/TBD | Not started | - |
 
 ## gsd-hygiene milestone (CLOSED 2026-08-04 — GSD Workflow Hygiene)
