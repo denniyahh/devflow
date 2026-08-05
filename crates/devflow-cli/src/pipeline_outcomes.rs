@@ -251,6 +251,21 @@ fn select_loop_back_fix(project_root: &Path, phase: u32) -> FixType {
 /// Decide what happens after a Validate stage, honoring the active mode's
 /// gate policy, the consecutive-failure threshold, and (18e) the immediate
 /// gate an ambiguous `external_verify` outcome forces regardless of either.
+///
+/// 999.66: on a recorded failure, the counter now decides between beginning a
+/// fresh streak and continuing the existing one, instead of always
+/// continuing. It asks [`mode::consecutive_failures_made_progress`], fed by
+/// [`agent_result::phase_commit_count`] read fresh against `project_root` and
+/// the baseline persisted in `state.last_validate_failure_commit_count`. A
+/// `true` (progress) result means new commits exist on the feature branch
+/// since the last recorded failure — **not** that those commits addressed
+/// what Validate reported. This narrows the ceiling's guarantee to loops that
+/// produce no commits at all; it does not disable the ceiling. That is the
+/// accepted weakness of the commit-count signal recorded in
+/// `33-RESEARCH.md`'s D-03 Recommendation and Assumptions Log A1. The failure
+/// direction is toward gating: an unrunnable `git` or a missing branch counts
+/// zero every cycle, so once a baseline is recorded the counter accumulates
+/// and the gate stays reachable.
 pub(crate) fn handle_validate_outcome(
     project_root: &Path,
     state: &mut State,
@@ -283,10 +298,29 @@ pub(crate) fn handle_validate_outcome(
     };
 
     if result == ValidateResult::Failed {
-        // Now that the counter genuinely accumulates (18d), an unbounded
-        // loop could otherwise overflow it and wrap to 0, silently
-        // restoring the unreachable-ceiling bug in a slower form.
-        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        let current =
+            agent_result::phase_commit_count(project_root, &GitFlowConfig::default(), state.phase);
+        if mode::consecutive_failures_made_progress(
+            state.last_validate_failure_commit_count,
+            current,
+        ) {
+            // New commits landed since the last recorded failure — this
+            // failure is the first of a new streak, not a continuation. Set
+            // to 1, not 0: the gate context rendered below interpolates the
+            // counter into a message naming how many times validation has
+            // failed, and zeroing it would make that message read zero on a
+            // real failure.
+            state.consecutive_failures = 1;
+        } else {
+            // Now that the counter genuinely accumulates (18d), an unbounded
+            // loop could otherwise overflow it and wrap to 0, silently
+            // restoring the unreachable-ceiling bug in a slower form.
+            state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        }
+        // The baseline advances on every recorded failure regardless of
+        // which branch ran above — updating it only on the progress branch
+        // would let a stale low baseline report progress forever.
+        state.last_validate_failure_commit_count = Some(current);
         workflow::save_state(state)?;
     }
 
@@ -749,6 +783,13 @@ mod tests {
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         state.consecutive_failures = mode::MAX_CONSECUTIVE_FAILURES - 1;
+        // Simulate that a baseline was already recorded at the (no-repo)
+        // commit count of 0 — this test pre-seeds the streak directly rather
+        // than driving it through repeated handle_validate_outcome calls, so
+        // it must also pre-seed the forward-progress baseline 999.66 added,
+        // or the fresh None-baseline would be read as "first-ever failure"
+        // and reset the streak instead of continuing it.
+        state.last_validate_failure_commit_count = Some(0);
         workflow::save_state(&state).unwrap();
 
         // Pre-write a rejected response whose note says "abort" so
@@ -796,6 +837,10 @@ mod tests {
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         state.consecutive_failures = consecutive_failures;
+        // See validate_failure_threshold_forces_gate_then_aborts: pre-seed
+        // the 999.66 baseline to match the (no-repo) commit count of 0 so a
+        // directly-seeded streak isn't misread as a first-ever failure.
+        state.last_validate_failure_commit_count = Some(0);
         workflow::save_state(&state).unwrap();
 
         std::fs::create_dir_all(root.join(".devflow")).unwrap();
@@ -1229,6 +1274,156 @@ mod tests {
         );
     }
 
+    /// 999.66, ROADMAP criterion 3: a phase running three or more
+    /// Code<->Validate waves in Auto mode, with a new commit landing on its
+    /// feature branch before every failure, must not trip the ceiling —
+    /// `handle_validate_outcome`'s reset-vs-accumulate branch must read each
+    /// cycle's new commit as forward progress and restart the streak at 1.
+    ///
+    /// Runs `mode::MAX_CONSECUTIVE_FAILURES + 1` cycles deliberately, one
+    /// more than the ceiling: a passing assertion at exactly the ceiling is
+    /// also consistent with an off-by-one in the reset condition, and the
+    /// extra cycle removes that reading.
+    ///
+    /// **What this test does NOT establish.** It proves the counter does not
+    /// accumulate when new commits land between failures — it cannot
+    /// distinguish a commit that fixed what Validate reported from a commit
+    /// that did not. An agent that commits anything at all on every cycle
+    /// resets the streak every cycle. That is the accepted, documented
+    /// weakness of the commit-count signal (33-RESEARCH.md's D-03
+    /// Recommendation and Assumptions Log A1; see also
+    /// `handle_validate_outcome`'s own doc comment), not a gap this test
+    /// closes.
+    #[test]
+    fn healthy_multi_wave_progress_does_not_reach_the_ceiling() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 87;
+        init_repo(root);
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        for i in 0..(mode::MAX_CONSECUTIVE_FAILURES + 1) {
+            // A real new commit BEFORE the failure is recorded, on every
+            // cycle — the count observed at each failure strictly exceeds
+            // the previously recorded baseline.
+            commit_on_feature_branch(root, phase, &format!("wave-{i}"));
+            std::fs::write(
+                &response_path,
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap();
+            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+            state.stage = Stage::Code;
+            let _ = transition(root, &mut state, Stage::Validate);
+        }
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        assert_eq!(
+            state.consecutive_failures, 1,
+            "a new commit before every failure must restart the streak at 1, not accumulate it"
+        );
+        assert!(
+            !state
+                .mode
+                .should_gate(Stage::Validate, state.consecutive_failures),
+            "genuine forward progress must never force the Auto-mode Validate gate"
+        );
+    }
+
+    /// 999.66, ROADMAP criterion 4, and the negative control for
+    /// `healthy_multi_wave_progress_does_not_reach_the_ceiling` above:
+    /// removing exactly one variable (the repeated commit) from an otherwise
+    /// identical setup must restore the pre-fix ceiling-reaching behavior.
+    ///
+    /// Unlike `consecutive_failures_reaches_ceiling_across_cycles` — which
+    /// runs against a root with NO git repository, so its count is zero
+    /// because the branch is missing — this repository has a real
+    /// `feature/phase-NN` branch carrying one commit before the loop starts,
+    /// and that commit count never changes. This is a different route to "no
+    /// progress" (an existing branch returning a stable non-zero count,
+    /// rather than the branch-missing fallback), and only this one proves
+    /// the count comparison itself works rather than the branch-missing
+    /// fallback.
+    ///
+    /// Confirmed to pass against the pre-fix code as well as after (see
+    /// 33-03-SUMMARY.md) — a negative control that only passes after the
+    /// change would not be controlling for anything.
+    #[test]
+    fn repeated_failure_without_new_commits_still_reaches_the_ceiling() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 88;
+        init_repo(root);
+        // Establish the branch with a stable, non-zero commit count. No
+        // further commits land during the loop below.
+        commit_on_feature_branch(root, phase, "seed");
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        for _ in 0..mode::MAX_CONSECUTIVE_FAILURES {
+            std::fs::write(
+                &response_path,
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap();
+            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+            state.stage = Stage::Code;
+            let _ = transition(root, &mut state, Stage::Validate);
+        }
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        assert_eq!(state.consecutive_failures, mode::MAX_CONSECUTIVE_FAILURES);
+        assert!(
+            state
+                .mode
+                .should_gate(Stage::Validate, state.consecutive_failures),
+            "a genuinely stuck loop with no new commits must still reach the reachable ceiling"
+        );
+    }
+
     /// D-01 (33-CONTEXT.md), ROADMAP criterion 1: a Validate failure on a
     /// phase with no `{N}-VERIFICATION.md` must loop back to Code with the
     /// plain `/gsd-execute-phase {N}` command, not `--gaps-only` (which
@@ -1624,6 +1819,10 @@ mod tests {
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         state.consecutive_failures = u32::MAX;
+        // See validate_failure_threshold_forces_gate_then_aborts: pre-seed
+        // the 999.66 baseline to match the (no-repo) commit count of 0 so a
+        // directly-seeded streak isn't misread as a first-ever failure.
+        state.last_validate_failure_commit_count = Some(0);
         workflow::save_state(&state).unwrap();
 
         let response_path = Gates::response_path(root, phase, Stage::Validate);

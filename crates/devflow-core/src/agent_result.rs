@@ -1819,10 +1819,52 @@ fn rate_limited_result(retry: String) -> AgentResult {
     }
 }
 
+/// Commits on the phase's feature branch that are not on `develop`.
+///
+/// Derives the branch name from `git_flow.feature_prefix` and the zero-padded
+/// `phase`, verifies the branch exists with `rev-parse --verify`, and on
+/// success counts `{git_flow.develop}..{branch}` with `rev-list --count`.
+/// This is the single implementation of that count — [`evaluate_layer2`] and
+/// `pipeline_outcomes::handle_validate_outcome`'s forward-progress check both
+/// call it rather than each re-deriving the branch name and re-running the
+/// same two git commands, which is what made the two counts able to silently
+/// diverge before this extraction.
+///
+/// Must be called with the main `project_root`, never a worktree path — git
+/// worktrees share refs and the object database, so a commit made inside a
+/// linked worktree is immediately visible to a count run from the main
+/// checkout, which is the property every caller already relies on.
+///
+/// A `0` return is deliberately indistinguishable across three causes:
+/// genuinely no commits, the branch does not exist, or `git` could not be
+/// run. Every consumer treats all three the same way.
+pub fn phase_commit_count(project_root: &Path, git_flow: &GitFlowConfig, phase: u32) -> u32 {
+    let branch = format!("{}phase-{:02}", git_flow.feature_prefix, phase);
+
+    let branch_exists = git_command(project_root)
+        .args(["rev-parse", "--verify", &branch])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if !branch_exists {
+        return 0;
+    }
+
+    let range = format!("{}..{branch}", git_flow.develop);
+    git_command(project_root)
+        .args(["rev-list", "--count", &range])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
+        .unwrap_or(0)
+}
+
 /// Layer 2: Use exit code + commit count to determine result.
 ///
 /// Reads exit code from `.devflow/phase-NN-exit` file.
-/// Counts commits in `feature/phase-NN` branch (if it exists).
+/// Counts commits in `feature/phase-NN` branch (if it exists), via
+/// [`phase_commit_count`].
 ///
 /// The commit-count gate ("no commits → failed") is scoped to `stage` — it
 /// only applies to `Stage::Plan`/`Stage::Code` (checked via an explicit
@@ -1860,25 +1902,7 @@ pub fn evaluate_layer2(
     };
 
     let branch = format!("{}phase-{:02}", git_flow.feature_prefix, phase);
-
-    // Verify branch exists before counting commits.
-    let branch_exists = git_command(project_root)
-        .args(["rev-parse", "--verify", &branch])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
-    let commits: u32 = if branch_exists {
-        let range = format!("{}..{branch}", git_flow.develop);
-        git_command(project_root)
-            .args(["rev-list", "--count", &range])
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
-            .unwrap_or(0)
-    } else {
-        0
-    };
+    let commits: u32 = phase_commit_count(project_root, git_flow, phase);
 
     let commit_gated = matches!(stage, Stage::Plan | Stage::Code);
     let no_work_done = commit_gated && commits == 0;
@@ -6086,6 +6110,28 @@ mod tests {
 
         assert_eq!(result.status, AgentStatus::Failed);
         assert_eq!(result.reason.as_deref(), Some("bad output"));
+    }
+
+    /// The case `consecutive_failures_reaches_ceiling_across_cycles`
+    /// (`pipeline_outcomes.rs`) silently depends on: a repository with no
+    /// `feature/phase-NN` branch at all must report 0, not error or panic.
+    #[test]
+    fn phase_commit_count_reports_zero_without_a_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init"]);
+        git(dir.path(), &["config", "user.email", "devflow@example.com"]);
+        git(dir.path(), &["config", "user.name", "DevFlow Tests"]);
+        git(dir.path(), &["config", "commit.gpgsign", "false"]);
+        git(dir.path(), &["config", "tag.gpgsign", "false"]);
+        git(dir.path(), &["config", "core.hooksPath", "/dev/null"]);
+        git(dir.path(), &["checkout", "-b", "develop"]);
+        std::fs::write(dir.path().join("README.md"), "base\n").unwrap();
+        git(dir.path(), &["add", "README.md"]);
+        git(dir.path(), &["commit", "-m", "base"]);
+
+        let count = phase_commit_count(dir.path(), &GitFlowConfig::default(), 999);
+
+        assert_eq!(count, 0, "no feature/phase-99 branch exists in this repo");
     }
 
     #[test]
