@@ -2233,15 +2233,31 @@ fn reconcile_layer0_verdict(
 ///
 /// `classify_validate_outcome` (`devflow-cli/src/pipeline_outcomes.rs`) matches
 /// `(_, Some(Verdict::Pass)) => ValidateOutcome::Passed` FIRST, with `_`
-/// discarding the status entirely. A downgraded result that kept
-/// `verdict: Pass` would carry `status: Failed` and still classify Validate as
-/// **Passed** — making this whole function a no-op at the one stage where it
-/// matters most. [`idle_timeout_result`] dodges the same trap the same way, and
-/// says so. A downgraded result has no verdict to offer and must not invent
-/// one. The underlying defect (an agent's self-reported verdict outranking the
-/// status the cascade derived) is filed as **999.74 / DEN-95** and deliberately
-/// not fixed here: changing that match arm silently re-routes `Failed`,
-/// `Unknown` and `ResourceKilled`, whose behaviour nothing has audited.
+/// discarding the status entirely. A downgraded result has no verdict to offer
+/// and must not invent one. [`idle_timeout_result`] dodges the same trap the
+/// same way, and says so. That instruction is unchanged and still binding.
+///
+/// **Correction (34-01, D-15).** An earlier version of this note went further
+/// and claimed a kept `verdict: Pass` on a `status: Failed` "would still
+/// classify Validate as **Passed**", making this function a no-op at Validate.
+/// That overstated the reachability. `outcome_policy::decide_action` intercepts
+/// every non-`Success` status and routes it to a gate BEFORE
+/// `classify_validate_outcome` is ever reached, so THIS path is protected and
+/// this function is not a no-op. The `verdict: None` above is defence in depth,
+/// which is why it stays.
+///
+/// The route into the inversion that IS reachable is
+/// [`reconcile_layer0_verdict`]'s graft — it produced `status: Success` with a
+/// self-reported failure's verdict attached, so `decide_action` had nothing to
+/// intercept. See that function's own doc comment for the full record. It is
+/// closed in plan 34-01; the classifier's own structural fix (gating the
+/// `Passed` arm on the derived status) lands in plan 34-03.
+///
+/// **999.74 / DEN-95** is therefore being CLOSED in Phase 34 rather than
+/// deliberately deferred. The caution that motivated the earlier deferral still
+/// applies to the classifier half and is discharged there, not here: changing
+/// that match arm re-routes `Failed`, `Unknown` and `ResourceKilled`, so 34-03
+/// audits all of them explicitly.
 ///
 /// # Exit-code fidelity
 ///
@@ -6141,10 +6157,17 @@ mod tests {
     // returning before Layer 2 is ever consulted — and only the cascade
     // exercises it.
 
-    /// A success marker that also claims `verdict: pass` — the shape that made
-    /// the naive "carry every other field over" downgrade a no-op at Validate
-    /// (`classify_validate_outcome` matches `Some(Verdict::Pass)` FIRST, with
-    /// `_` discarding the status). Used to prove `verdict` is dropped.
+    /// A success marker that also claims `verdict: pass` — the shape a naive
+    /// "carry every other field over" downgrade would have preserved. Used to
+    /// prove `verdict` is dropped.
+    ///
+    /// Correction (34-01, D-15): an earlier version of this comment asserted
+    /// that keeping the field would classify Validate as Passed because
+    /// `classify_validate_outcome` matches `Some(Verdict::Pass)` first with the
+    /// status discarded. That overstated the reachability — `decide_action`
+    /// intercepts a non-`Success` status before the classifier runs. The
+    /// corrected record of how the inversion is actually reached lives on
+    /// [`super::reconcile_layer0_verdict`].
     const MARKER_SUCCESS_CLAIMING_PASS: &str =
         r#"Done.\nDEVFLOW_RESULT: {\"status\":\"success\",\"verdict\":\"pass\"}"#;
 
