@@ -276,6 +276,17 @@ Additional structural acceptance checks confirmed live:
 - No blockers. `consecutive_failures_reaches_ceiling_across_cycles` — the safety gate 33-03 will
   narrow — was confirmed passing unmodified, so 33-03 starts from a known-good baseline.
 
+## Self-Check: PASSED
+
+- FOUND: `crates/devflow-core/src/agent_result.rs`
+- FOUND: `crates/devflow-core/src/prompt.rs`
+- FOUND: `crates/devflow-cli/src/pipeline_gate.rs`
+- FOUND: `crates/devflow-cli/src/pipeline_outcomes.rs`
+- FOUND: `.planning/phases/33-loop-back-correctness-for-multi-wave-validate-code-cycles-99/33-01-SUMMARY.md`
+- FOUND commit `57f1d62` (Task 1)
+- FOUND commit `ff28032` (Task 2)
+- FOUND commit `1c57dce` (this SUMMARY)
+
 ---
 *Phase: 33-loop-back-correctness-for-multi-wave-validate-code-cycles-99*
 *Completed: 2026-08-04*
