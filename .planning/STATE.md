@@ -4,17 +4,17 @@ milestone: v2.4.0
 milestone_name: milestone (Resume Unattended Dogfooding, ACTIVE — declared 2026-08-04)
 current_phase: 34
 current_phase_name: Stream-JSON Coverage and the Validate Trust Boundary (999.73 + 999.74)
-status: planning
+status: "Phase 33 shipped — PR #90"
 stopped_at: Phase 33 context gathered
-last_updated: "2026-08-05T12:20:39.666Z"
+last_updated: "2026-08-05T13:26:23.652Z"
 last_activity: 2026-08-05
-last_activity_desc: Phase 33 complete, transitioned to Phase 34
 progress:
   total_phases: 2
   completed_phases: 1
   total_plans: 6
   completed_plans: 6
   percent: 50
+last_activity_desc: Phase 33 complete, transitioned to Phase 34
 ---
 
 # DevFlow — Project State
@@ -155,8 +155,8 @@ change earns 2.0.
 
 Phase: 34 — Stream-JSON Coverage and the Validate Trust Boundary (999.73 + 999.74)
 Plan: Not started
-Status: Ready to plan
-Last activity: 2026-08-05 — Phase 33 complete, transitioned to Phase 34
+Status: Phase 33 shipped — PR #90
+Last activity: 2026-08-05
 (inserted as the FIRST heading, mirroring the Phase 32 durability fix) with Phase 33 and Phase 34
 detail sections landing inside its own heading-to-next-heading window, plus two new `## Progress`
 rows (33, 34 — Not started). Verified live: `roadmap.analyze` phase_count 0->2 (was returning
