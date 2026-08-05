@@ -240,8 +240,26 @@ pub(crate) enum ValidateResult {
 /// by the time Ship runs, the phase has already been judged complete, so it
 /// is by definition not mid-arc and `FixType::GapsOnly` is already correct
 /// there — that call site does not call this helper.
-fn select_loop_back_fix(project_root: &Path, phase: u32) -> FixType {
-    if agent_result::phase_verification_exists(project_root, phase) {
+///
+/// CR-01: the root passed in is the **evidence root**, not the main checkout.
+/// In worktree mode that is the phase's worktree, because `.planning/` is a
+/// tracked directory and the Validate agent runs in the worktree — so the
+/// `{N}-VERIFICATION.md` it authors lands on `feature/phase-{N}` inside the
+/// worktree tree and is absent from the main checkout for the phase's entire
+/// in-flight duration (there is no merge-back, so this is the steady state,
+/// not a race). Callers resolve it from `state.worktree_path`, falling back
+/// to the project root — the same plain fallback idiom used at
+/// `staleness.rs:330`, `preflight.rs:733` and `agent_result.rs:2041`, and
+/// deliberately NOT `hook_context_root`'s `.exists()`-filtered variant below,
+/// which answers a different question (where to WRITE, so a vanished worktree
+/// must degrade to somewhere writable; here a vanished worktree means the
+/// evidence is gone with it, and falling back would resurrect a stale or
+/// other-branch artifact as this phase's). `--no-worktree` runs fall back to
+/// the project root and are unaffected. Passing the bare `project_root` here in worktree mode
+/// makes the predicate read `false` unconditionally, which is exactly the
+/// defect this parameter's name now guards against.
+fn select_loop_back_fix(evidence_root: &Path, phase: u32) -> FixType {
+    if agent_result::phase_verification_exists(evidence_root, phase) {
         FixType::GapsOnly
     } else {
         FixType::FullExecute
@@ -266,6 +284,18 @@ fn select_loop_back_fix(project_root: &Path, phase: u32) -> FixType {
 /// direction is toward gating: an unrunnable `git` or a missing branch counts
 /// zero every cycle, so once a baseline is recorded the counter accumulates
 /// and the gate stays reachable.
+///
+/// CR-01: the two root-consuming reads in this function are on deliberately
+/// **different** roots, and must stay that way. The `{N}-VERIFICATION.md`
+/// existence probe (via [`select_loop_back_fix`]) follows the agent's cwd —
+/// the phase's worktree when one is configured — because that is where the
+/// Validate agent authors the artifact and `.planning/` is tracked, so it is
+/// invisible from the main checkout until merge. The
+/// [`agent_result::phase_commit_count`] read one branch below keeps reading
+/// `project_root`, the main checkout, because git refs and the object
+/// database are shared across a repository's worktrees, so a commit made in
+/// the worktree is already visible from there. Retargeting the commit count
+/// at the worktree would fix nothing and would break the 999.66 wiring.
 pub(crate) fn handle_validate_outcome(
     project_root: &Path,
     state: &mut State,
@@ -285,11 +315,15 @@ pub(crate) fn handle_validate_outcome(
             );
             return match run_gate(project_root, state, Stage::Validate, &context)? {
                 GateAction::Advance => transition(project_root, state, Stage::Ship),
-                GateAction::LoopBack(_) => loop_back_to_code(
-                    project_root,
-                    state,
-                    select_loop_back_fix(project_root, state.phase),
-                ),
+                GateAction::LoopBack(_) => {
+                    // CR-01: bound to a local so the shared borrow of `state`
+                    // ends before `loop_back_to_code` takes it mutably.
+                    let fix = select_loop_back_fix(
+                        state.worktree_path.as_deref().unwrap_or(project_root),
+                        state.phase,
+                    );
+                    loop_back_to_code(project_root, state, fix)
+                }
                 GateAction::Abort(reason) => abort(project_root, state, &reason),
             };
         }
@@ -337,22 +371,30 @@ pub(crate) fn handle_validate_outcome(
         };
         return match run_gate(project_root, state, Stage::Validate, &context)? {
             GateAction::Advance => transition(project_root, state, Stage::Ship),
-            GateAction::LoopBack(_) => loop_back_to_code(
-                project_root,
-                state,
-                select_loop_back_fix(project_root, state.phase),
-            ),
+            GateAction::LoopBack(_) => {
+                // CR-01: see the Ambiguous arm above — same evidence root,
+                // same borrow-ordering reason for the local binding.
+                let fix = select_loop_back_fix(
+                    state.worktree_path.as_deref().unwrap_or(project_root),
+                    state.phase,
+                );
+                loop_back_to_code(project_root, state, fix)
+            }
             GateAction::Abort(reason) => abort(project_root, state, &reason),
         };
     }
 
     match result {
         ValidateResult::Passed => transition(project_root, state, Stage::Ship),
-        ValidateResult::Failed => loop_back_to_code(
-            project_root,
-            state,
-            select_loop_back_fix(project_root, state.phase),
-        ),
+        ValidateResult::Failed => {
+            // CR-01: the plain-Failed tail arm — the common auto-loop path,
+            // and the one the Phase 29 dogfood actually hit.
+            let fix = select_loop_back_fix(
+                state.worktree_path.as_deref().unwrap_or(project_root),
+                state.phase,
+            );
+            loop_back_to_code(project_root, state, fix)
+        }
     }
 }
 
@@ -1522,6 +1564,82 @@ mod tests {
         assert_eq!(
             last["fix"], "GapsOnly",
             "a phase with an existing {{N}}-VERIFICATION.md must still dispatch GapsOnly"
+        );
+    }
+
+    /// CR-01 (33-REVIEW.md / 33-VERIFICATION.md), ROADMAP criterion 2 in
+    /// DevFlow's *normal* operating mode: a Validate failure on a phase whose
+    /// `{N}-VERIFICATION.md` exists only inside that phase's worktree must
+    /// still dispatch `--gaps-only`. `.planning/` is a tracked directory and
+    /// the Validate agent runs in the worktree, so the artifact it authors
+    /// lands on `feature/phase-{N}` inside the worktree tree and is simply
+    /// absent from the main checkout for the phase's entire in-flight
+    /// duration. There is no merge-back, so this is the steady state, not a
+    /// race.
+    ///
+    /// This is the first test in the workspace to configure
+    /// `state.worktree_path` on a `handle_validate_outcome` drive — which is
+    /// precisely why CR-01 survived a green suite. Every one of Phase 33's
+    /// eight pre-existing loop-back tests leaves `worktree_path` at
+    /// `State::new()`'s default of `None`, making `project_root` and "the root
+    /// the agent actually wrote to" identical by construction: the one
+    /// condition under which this defect is invisible.
+    ///
+    /// Companion to `genuine_gaps_loop_back_still_issues_gaps_only` directly
+    /// above (the `--no-worktree` case), never a replacement for it.
+    #[test]
+    fn worktree_mode_genuine_gaps_loop_back_issues_gaps_only() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 93;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        let worktree = root.join(format!(".worktrees/phase-{phase}"));
+        std::fs::create_dir_all(&worktree).unwrap();
+        state.worktree_path = Some(worktree.clone());
+        workflow::save_state(&state).unwrap();
+
+        // The artifact is written under the WORKTREE only. The bare tempdir
+        // root deliberately has no `.planning` directory at all, so it is
+        // structurally impossible to satisfy the probe from the main
+        // checkout — that is the entire point of this test.
+        let phase_dir = worktree
+            .join(".planning/phases")
+            .join(format!("{phase:02}-test"));
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        std::fs::write(
+            phase_dir.join(format!("{phase:02}-VERIFICATION.md")),
+            "verified\n",
+        )
+        .unwrap();
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        // Read the event from `root`, not the worktree: `events::emit` is
+        // called with `project_root`, and `state.rs`'s own doc comment says
+        // state and capture files always live under the main project root.
+        let last = devflow_core::events::last_event_of_kind_for_phase(root, phase, "loop_back")
+            .expect("loop_back event must be recorded");
+        assert_eq!(
+            last["fix"], "GapsOnly",
+            "a {{N}}-VERIFICATION.md existing only in the phase's worktree must still dispatch GapsOnly"
         );
     }
 
