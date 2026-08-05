@@ -39,7 +39,15 @@ containing it).
 
 ## Findings that changed the phase
 
-### R-01 — The 999.74 trust inversion is not reachable in production (CRITICAL)
+> ## ⚠ R-01 IS WRONG — see the SECOND PASS section at the end of this document
+>
+> R-01's *narrow* claim (the classifier's own inputs are always `Success`) is true and was verified
+> many times over. The conclusion drawn from it — that the trust inversion is unreachable — is
+> **false**. The status is laundered upstream by `reconcile_layer0_verdict`. R-01 is left intact
+> below because the reasoning error is the point: checking a function's inputs does not establish a
+> whole-system property, and that error propagated into ROADMAP.md before it was caught.
+
+### R-01 — The 999.74 trust inversion is not reachable in production (CRITICAL) — **SUPERSEDED**
 
 Reached independently by internal agents B and C, `hermes`, and direct verification.
 
@@ -161,9 +169,20 @@ external-verify is enabled, then discovers commands from `project_root` while th
 `decided_by_layer == Some(0)` — and therefore `external == true` — is unreachable in worktree mode,
 DevFlow's default shape.
 
-Rewriting the match to preserve the `external` arms without fixing this is designing around
-branches that never fire. **This is why 999.76 was folded into Phase 34 and sequenced before the
-match rewrite.**
+**Corrected 2026-08-05 (second pass), twice over.** (1) `Some(0)` *is* produced in worktree mode —
+`evaluate_layer0` returns it with `status: Failed` in four arms, including the mis-discovery veto.
+What is unreachable there is `external == true`, i.e. affirmative Layer-0 success. (2) The
+sequencing claim built on this ("999.76 before the match rewrite") does not hold: the match's input
+type is unchanged by 999.76 and its `external` arms are live in main-checkout runs, so the rewritten
+match is byte-identical whichever lands first. The real constraint is the reverse — **999.76 must
+not land without the graft fix** (second-pass finding S-01), because it makes `Some(0)` common,
+which is the graft's precondition.
+
+**Also omitted here, and material:** the source records this behaviour as deliberate.
+`agent_result.rs:2022-2031` reads "Two roots are intentionally kept distinct (review Plan 03 MEDIUM,
+OpenCode)". The 999.76 backlog entry addresses that ("the doc comment … asserts the opposite and is
+false"); this section presented it as a plain oversight, so a reader of R-06 alone would not know
+the fix must overturn a prior peer-review decision.
 
 ### R-07 — `BackgroundTaskState::Unreadable` is ungoverned (HIGH)
 
@@ -171,8 +190,10 @@ Found by all three external lanes and internal agent B. D-11 ("a list that never
 and D-04 ("a capture-revealed parser defect → file it, stage stays narrow") give opposite answers
 for `Unreadable`, which is by construction a parser gap — the 999.75 / DEN-96 failure class. The
 disambiguating option was offered in discussion and declined. The stakes are R-03's: `Unreadable`
-blocks `should_close()` permanently, so widening on it *guarantees* the forced-timeout shape rather
-than risking it.
+blocks `should_close()` until a later readable announcement arrives — and through to the idle
+timeout if it is the run's last — so widening on it risks the forced-timeout shape. (Corrected
+2026-08-05: an earlier version of this sentence said "permanently", repeating the overstatement
+already corrected under R-03.)
 
 ### R-08 — Criterion 3's enumeration was incomplete (MEDIUM)
 
@@ -254,3 +275,122 @@ assumption in either direction — but it does not refute `31/D-10`.
 
 *Phase: 34-stream-json-coverage-and-the-validate-trust-boundary-999-73-999-74*
 *Review conducted: 2026-08-05*
+
+
+---
+
+# SECOND PASS — reviewing the fixes (2026-08-05)
+
+The amendments above were written by the same person who ran the first pass, so a second
+six-lane pass reviewed **the fixes**, not the original problems. Same structure: three external
+CLIs (`codex`, `hermes`, `opencode`) and three internal agents — attack the amendments, refute
+criterion 4's new answer, audit this document's own accuracy.
+
+**Headline: the first pass's findings held; its remediation did not.** Every first-pass finding
+was independently re-verified as factually exact (R-01's narrow claim, R-02, R-03's mechanism,
+R-05, R-06's mechanism, R-08, the citation-defect table, and the test evidence — `cargo test -p
+devflow-core --lib outcome_policy::` → 9 passed, 0 failed, 538 filtered out, run independently
+twice and matching this document's citation exactly). Nine defects were introduced by the fixes.
+
+## S-01 — R-01's conclusion is false; the inversion IS reachable (CRITICAL)
+
+`reconcile_layer0_verdict` (`crates/devflow-core/src/agent_result.rs:2143-2156`), reached from
+`evaluate_agent_result_inner:2305` on the Layer 0 arm:
+
+```rust
+if state.stage != Stage::Validate
+    || result.status != AgentStatus::Success        // Layer 0's status
+    || result.decided_by_layer != Some(0) { return result; }
+let verdict = evaluate_layer1(project_root, state.phase)
+    .and_then(|layer1| layer1.verdict);             // Layer 1's verdict, status unread
+AgentResult { verdict, ..result }
+```
+
+It grafts Layer 1's `verdict` onto an affirmative Layer-0 probe success while checking only Layer
+0's status. A marker `{"status":"failed","verdict":"pass"}` parses to `(Failed, Some(Pass))`; the
+graft yields `(Success, Some(Pass), Some(0))`; `decide_action` advances it; the classifier computes
+`external == true` and returns `Passed`; `Mode::Auto` transitions to Ship.
+
+**Demonstrated, not reasoned** — six cases against a HEAD-built `advance` binary in out-of-repo
+temp projects. Negative controls: verdict removed → gates; verdict `gaps` → gates; Layer 0 disabled
+→ `decide_action` intercepts exactly as R-01 describes, which is the control proving the harness is
+not manufacturing the result. Both the single-envelope and stream-json capture paths reproduce it.
+
+**Criterion 3's fix does not close it** — the derived status genuinely is `Success`. Preconditions
+are production-reachable: `external_verify_enabled` defaults to `true` (`config.rs:81`), plus a
+matching `DEVFLOW_TRUST_EXTERNAL_VERIFY`, a PLAN declaring `external_verify:`, and passing probes.
+**Still unestablished:** whether a real agent emits a self-contradictory marker in practice; no
+parser cross-checks `status` against `verdict`.
+
+**Corollary — do NOT "correct" `idle_timeout_result`'s comment.** Criterion 4 originally instructed
+that. `reconcile_layer0_verdict` sources its verdict from `evaluate_layer1`, whose first statement
+is the idle-timeout side channel; a timeout carrying a verdict would graft and ship. That comment
+documents a live guard. Only `reconcile_stream_success_against_exit_code`'s sibling note is
+overstated, and only because `decide_action` does protect that path.
+
+## S-02 — The DOGFOOD-03 reword was a coverage relaxation described as a tightening (HIGH)
+
+Found by all three external lanes and one internal. The weakest conforming delivery under the first
+reword: widen **zero** stages, record four "not evidenced" reasons — satisfying criteria 1, 2 and 7
+vacuously, since nothing widened means nothing to evidence and no collateral to fix. "Stricter, not
+looser" was true on the evidence axis and false on the coverage axis; only the first was stated, in
+three separate documents.
+
+Two further problems in the same reword: the clause carrying the strictness ("visibly and
+deliberately still on the legacy path") lived only in `34-CONTEXT.md`, which disclaims its own
+bindingness; and the reword quantifies over *every* stage on the path, which includes `Stage::Code`
+— whose raw capture was deleted during Phase 31's cleanup, making the requirement false at HEAD with
+no criterion requiring it be fixed.
+
+Repaired by operator decision: a delivery floor in DOGFOOD-03, the visibility clause moved into
+binding criterion 1, and Code brought into criterion 1's scope.
+
+## S-03 — Defects introduced by the first pass's own amendments (HIGH)
+
+| # | Defect | Status |
+|---|---|---|
+| 1 | D-02 sanctioned `devflow __monitor` two sentences after forbidding harnesses that skip `resolve_launch_shape` — which is exactly what it skips | fixed |
+| 2 | D-02's working-tree route unspecified: `devflow start` worktrees from `develop` before the staleness check, so an uncommitted constant yields a legacy capture | fixed |
+| 3 | Deferred Ideas still carried the PARTIAL-close rule D-02 Amendment 2 retired, un-struck | fixed |
+| 4 | D-08's sweep left at 21 cells after D-06's tuple widened to 42 — and `decided_by_layer` is `#[serde(default)]`, so the natural fixture leaves both `Ambiguous` arms unexercised and a regression deleting them green | fixed |
+| 5 | D-06's replacement tuple under-specified; the trap is reusing the composite `external` as the normaliser, which folds an `AgentStatus` equality test back in | fixed |
+| 6 | D-13's sequencing premise false, and the ordering blocked the cheap classifier work behind the riskiest change in the phase | fixed |
+| 7 | D-14 label collision reintroduced — two stale `D-14 per-child` references, one in Phase Boundary, inverting the operator's decision | fixed |
+| 8 | D-07's original "Rejected:" rationale deleted outright, no strike-through — the one lapse in this document's own discipline, and the deleted text argued against the amendment that replaced it | restored |
+| 9 | D-07's replacement test is a no-op — all six non-`Success` variants already have named tests | fixed |
+
+**On D-06's tuple, the lanes disagreed and the disagreement was resolved by compiling.** `opencode`
+judged it unwritable; `hermes` and an internal agent each compiled a wildcard-free match over
+`(Option<u8>, AgentStatus, Option<Verdict>)` in 10 arms, with two negative controls (deleting a
+status arm, and adding an 8th `AgentStatus` variant) both producing E0004. It is writable; it was
+under-specified.
+
+## S-04 — Citation defects in this document (LOW, all fixed)
+
+`monitor.rs:765-812` was cited for `should_close()`, which is at `:586-593` (the range is right for
+the supervise loop). `main.rs:133` was cited for `run_pipe_owning_monitor`, which appears nowhere in
+`main.rs` — the call is `pipeline_launch.rs:513` inside `run_monitor`. `pipeline_gate.rs:584` was
+called "the apparent second call site" when it is a `use` import and the function appears zero times
+in that file. R-04's "everything else to `exec_command_single_document`" over-generalises — only the
+Claude branch does that. Criterion 1 named two ignored `exec_command` arguments where R-02 names
+three. The substantive claims each of these supports all survived independent re-verification.
+
+## Still open after the second pass
+
+- **`Pending(n>0)`-still-pending-at-run-end has no owner** when the phase cannot establish that the
+  shape was pathological rather than routine. D-11 governs the widen case, D-04 excludes itself
+  (D-11 calls a non-draining list "the rule working, not a defect"), D-02 excludes itself (the
+  capture *was* obtained), D-14 covers only `Unreadable`. The safe default is obvious; no rule
+  attaches the recorded-reason obligation, which is what DOGFOOD-03 now turns on.
+- **D-11's "pathological rather than routine" bar is unenforceable under D-10's n=1**, by the
+  amendment's own admission.
+- **Criterion 2's framing sentence is unanswerable for a `NeverAnnounced` stage** — the close rule
+  always fires vacuously there, so no capture can answer "what happens when it does not fire". The
+  operative clause that follows is what should be graded.
+- **Criterion 4 named two in-source comments asserting the inversion; at least four do.** The
+  durable one is `agent_result.rs:5863-5866` (`MARKER_SUCCESS_CLAIMING_PASS`'s doc comment), which
+  no fix touches.
+- **999.74's entry cites `pipeline_outcomes.rs:260` for `ValidateResult`**, which is at `:226-229`;
+  line 260 is inside `select_loop_back_fix`'s doc comment. Pre-existing, missed by the rewrite.
+- **ROADMAP.md's 999.73 entry still carries the "only stage" strengthening** that the rewrite
+  corrected in `34-CONTEXT.md` — and is probably where that phrasing originated.

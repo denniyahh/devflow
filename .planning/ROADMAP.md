@@ -33,8 +33,11 @@ were smaller than this section assumed: the 999.74 inversion is unreachable in p
 verification is vacuous because the stream-json launch argv is byte-identical across all five
 stages. 999.76 (Layer 0 external verification inert in worktree mode) was folded into the freed
 scope — not as unrelated work, but because it sits *inside* the match 999.74 rewrites: `external`
-requires `decided_by_layer == Some(0)`, which worktree-mode runs never produce, so rewriting the
-match without it would design around branches that never fire.
+requires `decided_by_layer == Some(0)` **and** `status == Success` together, and worktree-mode runs
+never produce that *combination* — `evaluate_layer0` does return `Some(0)` there, but with
+`status: Failed` (the mis-discovery veto). What is inert in worktree mode is affirmative Layer-0
+success, not every `Some(0)`. Corrected 2026-08-05; an earlier version of this line said worktree
+runs "never produce" `Some(0)`, which is false.
 
 | Phase | Name | Status | Version |
 |---|---|---|---|
@@ -106,24 +109,46 @@ in-source record corrected where it asserts a live defect that is not reachable.
 external verification actually runs in worktree mode, so the arms that classifier is built around
 are not inert in DevFlow's default operating shape.
 **Depends on**: Nothing structurally. 999.73's original blocker (Phase 31's shipped acceptance run)
-is satisfied; 999.74 and 999.76 have no structural dependency on Phase 33. Internally, **999.76
-lands before 999.74's match rewrite** — `classify_validate_outcome`'s `external` arms are
-unreachable while Layer 0 is inert in worktree mode, so rewriting the match first would design
-around dead branches.
+is satisfied; 999.74 and 999.76 have no structural dependency on Phase 33. Internally, the only
+binding order is that **999.76 (criterion 6) must not land without criterion 4's graft fix** — it
+makes `decided_by_layer == Some(0)` common, which is the graft's precondition.
+
+**Corrected 2026-08-05 (second review pass):** an earlier version of this line made 999.76 land
+*before* the match rewrite, on the premise that `decided_by_layer == Some(0)` never occurs in
+worktree mode. That premise is false — `evaluate_layer0` returns `Some(0)` with `status: Failed` in
+four arms, including exactly the veto 999.76's mis-discovery produces; what is unreachable there is
+`external == true`. The match's input type is unchanged by 999.76 and its `external` arms are live
+in main-checkout runs, so the rewritten match is byte-identical whichever lands first. That
+ordering also blocked the cheap, zero-runtime-delta classifier work behind the riskiest change in
+the phase. Downgraded to the one real constraint above.
 **Requirements**: DOGFOOD-03, DOGFOOD-04. 999.76 is folded in on scope freed by criteria 1 and 4
 below; it carries no v1 requirement of its own.
-**Scope correction (2026-08-05)**: this entry was rewritten after an adversarial review of
-`34-CONTEXT.md` established that both original halves rested on premises the code refutes — the
-999.74 inversion is unreachable in production, and the stream-json launch argv is identical across
-all five stages. Superseded wording and the evidence for each change are recorded in
+**Scope corrections (2026-08-05)**: two review passes, both recorded in
 `.planning/phases/34-stream-json-coverage-and-the-validate-trust-boundary-999-73-/34-REVIEW.md`.
+
+- **First pass** rewrote this entry after establishing that both original halves rested on premises
+  the code refutes — the stream-json launch argv is identical across all five stages, so per-stage
+  *transport* verification is vacuous.
+- **Second pass reversed the first pass's headline conclusion.** The first pass concluded the
+  999.74 inversion was unreachable in production and wrote that answer into criterion 4. It is
+  reachable — via `reconcile_layer0_verdict`, not via the `(_, Some(Pass))` wildcard. The first
+  pass checked the classifier's inputs and correctly found they are always `Success`; it did not
+  check that the status is **laundered upstream** by a graft that reads Layer 1's verdict without
+  reading Layer 1's status. Criteria 4 and 5 now carry the corrected answer, and the phase gained
+  the graft fix.
 **Success Criteria** (what must be TRUE):
 
   1. Every stage added to `STREAM_JSON_STAGES` is added on the strength of a real production
-     capture of *that stage* — and the phase records, in source, that `ClaudeAgent::exec_command`
-     ignores its `_phase` and `_prompt` arguments, so the launch argv is byte-identical across all
-     five stages. A per-stage capture is therefore evidence about agent behaviour under that
-     stage's prompt, never about the transport.
+     capture of *that stage*; **every stage NOT added carries a recorded reason in the constant's
+     doc comment** — visibly and deliberately on the legacy path, never silently omitted; and **at
+     least one stage is newly widened on a newly captured run, or the operator is explicitly told
+     why none could be** (DOGFOOD-03's delivery floor — a zero-widening close is an escalation, not
+     a silent pass). The phase also records, in source, that `ClaudeAgent::exec_command` ignores its
+     `_phase`, `_prompt` and `_extra_writable_roots` arguments, so the launch argv is byte-identical
+     across all five stages: a per-stage capture is evidence about agent behaviour under that
+     stage's prompt, never about the transport. **`Stage::Code` is in scope for this criterion** —
+     it is on the path today and its raw capture was deleted during Phase 31's cleanup, so it is
+     either re-captured or its transcription-only evidence is recorded as such.
 
   2. No stage is widened without its capture answering what happens when the close rule does *not*
      fire. A stage that backgrounds work still pending when the marker lands never satisfies
@@ -137,22 +162,45 @@ all five stages. Superseded wording and the evidence for each change are recorde
      destination for all **seven** variants, including `RateLimited` and `AgentUnavailable`, which
      the superseded criterion omitted.
 
-  4. It is recorded, with evidence, that the trust inversion is **not reachable in production** at
-     HEAD: the classifier's sole production call site sits inside `Action::Advance`, and
-     `decide_action` maps only `Success` there. The two in-source comments that assert otherwise
-     (`idle_timeout_result`, and `reconcile_stream_success_against_exit_code`'s "`verdict: None` is
-     load-bearing" note) are corrected, and the arm states that its own safety depends on a routing
-     decision in another crate which `decide_action`'s comment explicitly marks revisitable.
+  4. **`reconcile_layer0_verdict` consults Layer 1's status before transplanting Layer 1's
+     verdict.** Today it grafts the agent's `verdict` onto an affirmative Layer-0 probe success
+     while checking only *Layer 0's* status (`agent_result.rs:2143-2156`), so a marker of
+     `{"status":"failed","verdict":"pass"}` yields `(Success, Some(Pass), layer 0)` — which
+     `decide_action` advances and the classifier reads as `Passed`. **This is the live route by
+     which the agent's self-report converts a Validate that would otherwise have gated into a
+     transition to Ship, and criterion 3 does not close it**, because the derived status genuinely
+     is `Success`. Demonstrated end-to-end against a HEAD-built `advance` binary, with negative
+     controls: removing or changing the verdict gates; disabling Layer 0 makes `decide_action`
+     intercept.
 
-  5. Layer 0 external verification discovers its declaration from the **execution root**, so a
+  5. It is recorded that the trust inversion **is** reachable, by the route in criterion 4 rather
+     than by the `(_, Some(Pass))` wildcard — the classifier's own inputs are indeed always
+     `Success` (its sole production call site is inside `Action::Advance`, and `decide_action` maps
+     only `Success` there), because the status is laundered upstream by the graft. The arm states
+     that its safety depends on a routing decision in another crate which `decide_action`'s comment
+     marks revisitable. **`idle_timeout_result`'s `verdict: None` comment is NOT to be "corrected"
+     — it is a live guard:** `reconcile_layer0_verdict` sources its verdict from `evaluate_layer1`,
+     whose first statement is the idle-timeout side channel, so a timeout carrying a verdict would
+     graft and ship. Only `reconcile_stream_success_against_exit_code`'s note is overstated, and
+     only in that `decide_action` does protect that particular path.
+
+  6. Layer 0 external verification discovers its declaration from the **execution root**, so a
      declared probe set actually runs in worktree mode — DevFlow's default shape. The same root
      defect at `phase_has_blocking_human_checkpoint` is fixed in the same change, and a test
-     distinguishes worktree discovery from main-checkout discovery.
+     distinguishes worktree discovery from main-checkout discovery. **This must not land without
+     criterion 4's fix**: moving discovery to the execution root makes `decided_by_layer == Some(0)`
+     common rather than rare, which is precisely the precondition the graft needs — shipping it
+     alone widens a live hole. Note the fix overturns a recorded prior decision: the source at
+     `agent_result.rs:2022-2031` says the two roots are "intentionally kept distinct (review Plan 03
+     MEDIUM, OpenCode)".
 
-  6. The collateral that widening forces is closed, not deferred:
+  7. The collateral that widening forces is closed, not deferred:
      `canary_gate_only_applies_to_the_stream_launch_path` is rebuilt on a discriminator that still
-     exists once every Claude stage is on the stream path, and capture retention cannot evict an
-     earlier stage's capture before the phase has read it.
+     exists once every Claude stage is on the stream path (`pipeline_launch.rs:1771` and its
+     negative control at `:1777`), the D-15 canary refusal's relocation from Code to Define is
+     recorded as a deliberate behaviour change, and capture retention cannot evict an earlier
+     stage's capture before the phase has read it — by changing the constant or copying captures at
+     landing, so the mitigation leaves an inspectable artifact rather than a run-local env var.
 **Plans**: TBD
 
 ## Progress
@@ -634,7 +682,46 @@ criterion 3 is this entry's fix and criterion 4 is its open question — but **b
 2026-08-05 after the open question was answered.** Read the correction below before this entry's
 original analysis.
 
-> **CORRECTION (2026-08-05) — the inversion is NOT reachable in production.** Six independent
+> **SUPERSEDED — read the SECOND CORRECTION below first.** The block immediately following was
+> written after the first review pass and its headline conclusion is **wrong**. It is kept because
+> its narrow structural claim (the classifier's own inputs are always `Success`) is true and load-
+> bearing, and because the reasoning error it embodies — checking a function's inputs and inferring
+> a whole-system property — is worth being able to retrace.
+>
+> **SECOND CORRECTION (2026-08-05) — the inversion IS reachable, by a different route.**
+> `reconcile_layer0_verdict` (`crates/devflow-core/src/agent_result.rs:2143-2156`) grafts Layer 1's
+> `verdict` onto an affirmative Layer-0 probe success while checking only *Layer 0's* status:
+>
+> ```rust
+> if state.stage != Stage::Validate
+>     || result.status != AgentStatus::Success        // Layer 0's status
+>     || result.decided_by_layer != Some(0) { return result; }
+> let verdict = evaluate_layer1(project_root, state.phase)
+>     .and_then(|layer1| layer1.verdict);             // Layer 1's verdict, status unread
+> AgentResult { verdict, ..result }
+> ```
+>
+> An agent marker `{"status":"failed","verdict":"pass"}` parses to `(Failed, Some(Pass))`; the graft
+> transplants `Pass` onto `Success`, producing `(Success, Some(Pass), Some(0))`. `decide_action`
+> advances it; the classifier computes `external == true` and returns `Passed`; `Mode::Auto`
+> transitions to Ship. Reached via `evaluate_agent_result_inner:2305`, on the production path.
+>
+> **So the answer to this entry's open question is YES** — the agent's self-reported verdict,
+> attached to its own self-reported failure, converts a Validate that would otherwise have gated
+> into a Ship transition. Demonstrated end-to-end against a HEAD-built `advance` binary in
+> out-of-repo temp projects, with negative controls: verdict removed or set to `gaps` → gates;
+> Layer 0 disabled → `decide_action` intercepts as the block below describes.
+>
+> **Criterion 3's fix does not close this** — the derived status genuinely is `Success`. The graft
+> fix is criterion 4. Preconditions are production-reachable: `external_verify_enabled` defaults to
+> `true` (`config.rs:81`), plus a matching `DEVFLOW_TRUST_EXTERNAL_VERIFY`, a PLAN declaring
+> `external_verify:`, and passing probes. **Still unestablished:** whether a real agent emits a
+> self-contradictory marker in practice. No parser cross-checks `status` against `verdict`.
+>
+> ---
+>
+> **FIRST CORRECTION (2026-08-05, superseded above) — the inversion is NOT reachable in
+> production.** Six independent
 > adversarial lanes plus direct source verification established that `classify_validate_outcome`
 > has exactly one production call site (`crates/devflow-cli/src/pipeline_launch.rs:937`), inside
 > the `Action::Advance` arm of `outcome_policy::decide_action`. That match is wildcard-free and
@@ -646,8 +733,10 @@ original analysis.
 > 9 passed / 538 filtered out, with a named test pinning every non-`Success` variant away from
 > `Advance`.
 >
-> **So the four `(non-Success, Some(Pass))` pairs this entry names are unreachable, and the answer
-> to the open question is "no".** What remains is real but different:
+> **So the four `(non-Success, Some(Pass))` pairs this entry names are unreachable *at the
+> classifier*** — true, and the second correction above does not disturb it. The inference drawn
+> from it ("and therefore the answer to the open question is no") was wrong. What the first pass
+> identified remains real:
 >
 > 1. **A latent structural weakness.** The arm's safety depends entirely on a guard in *another
 >    crate* that its own doc comment never mentions — and `decide_action`'s comment marks the

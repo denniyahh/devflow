@@ -8,9 +8,16 @@
 > document (six independent lanes, `34-REVIEW.md`) found that several decisions rested on premises
 > the code refutes. Amended decisions are marked **[AMENDED]** with the superseded text kept
 > visible, because the superseded reasoning is what a reader would otherwise reconstruct. The two
-> findings F-01 and F-02 are both **downgraded** — F-01 is refuted outright. 999.76 has been folded
-> into this phase and is decided in D-13 below. `ROADMAP.md`'s Phase 34 entry was rewritten to
-> match; its criteria, not this document's original framing, are binding.
+> findings F-01 and F-02 are both **downgraded**. 999.76 has been folded into this phase (D-13).
+> `ROADMAP.md`'s Phase 34 entry was rewritten to match; its criteria, not this document's original
+> framing, are binding.
+>
+> **SECOND PASS (same day) reversed the first pass's headline conclusion.** The first pass judged
+> the 999.74 inversion unreachable and F-01 refuted. It IS reachable — through
+> `reconcile_layer0_verdict`, not the `(_, Some(Pass))` wildcard. See **D-15**, which is the
+> phase's real 999.74 defect. The second pass also found nine defects introduced *by* the first
+> pass's own amendments; those are corrected in place and marked. Where an amendment is itself
+> amended, both prior states are kept.
 
 <domain>
 ## Phase Boundary
@@ -29,10 +36,12 @@ assuming it carries over from Code's backgrounding behaviour.
 (`crates/devflow-cli/src/pipeline_outcomes.rs:203`) matches `(_, Some(Verdict::Pass))` **first**,
 with `_` discarding the derived status entirely. Gate the `Passed` arm on the status the outcome
 cascade actually derived, confirmed explicitly for `Failed`, `Unknown`, `ResourceKilled` and
-`IdleTimeout` — and establish, rather than assume, whether the inversion can manufacture a pass on
-a run that would otherwise have gated.
+`IdleTimeout`. **The open question is now answered: yes, it can** — but by
+`reconcile_layer0_verdict` grafting the agent's verdict onto a Layer-0 success without reading
+Layer 1's status, not by the wildcard. That graft is in scope (D-15) and the wildcard fix alone
+does not close it.
 
-**Not in this phase:** D-14 per-child declared tokens (see Deferred Ideas); parser or monitor
+**Not in this phase:** `31/D-14` per-child declared tokens (see Deferred Ideas); parser or monitor
 repair work that a capture happens to reveal (filed, not fixed — D-04).
 
 </domain>
@@ -71,10 +80,21 @@ repair work that a capture happens to reveal (filed, not fixed — D-04).
   circular: a stage produces a stream-json capture only via the pipe-owning path, which requires
   membership in `STREAM_JSON_STAGES`, and the predicate offers an opt-*out* only. Evidence
   therefore cannot precede widening. The rule is: widen in the working tree, capture, and let the
-  evidence decide what gets **committed** — or drive `devflow __monitor` against a scratch phase,
-  which bypasses the constant entirely. Either is sanctioned; inventing a standalone harness that
-  does not exercise `resolve_launch_shape` and the pipe-owning monitor is **not**, because it would
-  be a proxy capture proving nothing about the production path. See `34-REVIEW.md` R-04.
+  evidence decide what gets **committed**.
+
+  **Corrected: `devflow __monitor` is NOT an equivalent route.** An earlier version of this
+  amendment sanctioned it two sentences after forbidding harnesses that skip `resolve_launch_shape`
+  — and `__monitor` skips exactly that (`run_monitor`, `pipeline_launch.rs:493`, calls
+  `run_pipe_owning_monitor` directly). Use it to smoke-test the monitor if useful, never to produce
+  a capture offered as criterion 1 evidence.
+
+  **The working-tree route needs its lifecycle stated, or it silently produces legacy captures.**
+  `devflow start` creates its worktree from `develop` *before* the staleness check, so an
+  uncommitted widened constant is absent from the worktree and the run captures the legacy path.
+  A real capture therefore requires `--no-worktree` (which puts the executor on the main checkout,
+  where `CLAUDE.md` forbids all git activity until it exits) plus a rebuild, so the running binary
+  actually contains the widened constant. The planner must specify that sequence explicitly.
+  See `34-REVIEW.md` R-04.
 
   **Amendment 2 — RESOLVED 2026-08-05 by rewording DOGFOOD-03, not by a PARTIAL close.** The
   original text said the remainder "returns as a numbered `999.x` backlog entry." That had nowhere
@@ -88,6 +108,17 @@ repair work that a capture happens to reveal (filed, not fixed — D-04).
   requirements phrased that way. It now states the evidence discipline itself, so a stage left
   narrow is a *satisfied* requirement (visibly, deliberately on the legacy path) rather than an
   unsatisfiable checkbox. Operator decision, 2026-08-05. See `REQUIREMENTS.md`'s inline note.
+
+  **Amendment 3 — the first reword was a coverage relaxation described as a tightening; repaired
+  2026-08-05.** Calling it "stricter, not looser" was true on the evidence axis and false on the
+  coverage axis, and only the first was stated. Under it the weakest conforming delivery was: widen
+  *zero* stages and record four reasons, satisfying criteria 1, 2 and 7 vacuously. Two repairs,
+  both operator-decided: DOGFOOD-03 gained a **delivery floor** (at least one stage newly widened on
+  a newly captured run, or an explicit escalation saying why none could be), and the "visibly and
+  deliberately" clause moved into binding criterion 1 — it previously lived only here, in a document
+  whose own notice disclaims its bindingness. Also newly owned: **`Stage::Code` is in scope**, since
+  the requirement quantifies over every stage on the path and Code's raw capture was deleted during
+  Phase 31's cleanup.
 
   **What this does NOT license.** Leaving a stage narrow still requires the recorded reason in the
   const's doc comment, and D-04's filing obligation is unchanged. "Not evidenced" must be visible
@@ -130,7 +161,7 @@ repair work that a capture happens to reveal (filed, not fixed — D-04).
   behaviour change to unwind.
 
   **What D-05 does NOT cover, and a planner must not extend it to:** the only *reachable* rows are
-  `(Success, Gaps)` and `(Success, None)`, which differ solely by `decided_by_layer`. Those are
+  `(Success, Gaps)` and `(Success, None)` — plus `(Success, Pass)`, the positive control. Those are
   **not** status/verdict disagreements and D-05 says nothing about them. Collapsing them to
   `Ambiguous` would turn the ordinary "validation found gaps" auto-loop into an immediate gate on
   cycle one — the loop 999.65/999.66 and Phase 33 just repaired. See D-06's amendment.
@@ -148,10 +179,28 @@ repair work that a capture happens to reveal (filed, not fixed — D-04).
   `Passed`, new variant is a compile error — is sound and unchanged; only the tuple was wrong. This
   was the orchestrator's error in the option recommended to the operator. See `34-REVIEW.md` R-05.
 
-  **Sequencing:** D-13 (999.76) lands **before** this rewrite. While Layer 0 is inert in worktree
-  mode, `decided_by_layer == Some(0)` never occurs there, so the `external` arms this match is
-  built around are dead in DevFlow's default shape — designing around them first would lock in
-  dead branches. See `34-REVIEW.md` R-06.
+  **Shape, specified — the amendment above was under-specified and had a trap.** Normalise
+  `decided_by_layer` to a two-state value FIRST — `let layer0 = result.decided_by_layer == Some(0);`
+  or a two-variant provenance enum — then `match (layer0, status, verdict)`, 2 × 7 × 3 = 42 cells.
+  **The normaliser must be layer-only.** Reusing the existing composite `external`
+  (`layer == Some(0) && status == Success`) is the trap: it folds an `AgentStatus` equality test
+  back in — the exact hand-audited construct D-06 exists to eliminate — and `external == false`
+  then conflates "Layer 1, Success" with "Layer 0, Failed", so the arms can no longer tell
+  provenance from status. The wildcard ban is **positional**: `_` in the layer or verdict position
+  is fine; only the status position must be enumerated.
+
+  Verified writable, not assumed: a wildcard-free match compiles in 10 arms, and two negative
+  controls hold — deleting a status arm and adding an 8th `AgentStatus` variant both produce E0004.
+  The two `external`-gated `Ambiguous` arms survive verbatim as `(true, Success, Some(Gaps))` and
+  `(true, Success, None)`; `(false, Success, Some(Gaps) | None)` stays `Failed`, preserving the
+  ordinary auto-loop D-05's "what this does NOT cover" paragraph demands.
+
+  **Sequencing [CORRECTED]:** ~~D-13 (999.76) lands before this rewrite.~~ There is no such
+  dependency. The match's input type is unchanged by 999.76 and its `external` arms are live in
+  main-checkout runs, so the rewritten match is byte-identical whichever lands first. The premise
+  was also false — `evaluate_layer0` does return `Some(0)` in worktree mode, with `status: Failed`;
+  what is unreachable there is `external == true`. The real constraint runs the other way and is
+  recorded in D-15: **999.76 must not land without the graft fix.**
 
   **A wildcard to `Failed` is also forbidden.** The original wording banned only a wildcard
   *reaching `Passed`*, which permits `_ => Failed` and preserves the same
@@ -173,21 +222,44 @@ repair work that a capture happens to reveal (filed, not fixed — D-04).
   production cannot produce. That is precisely the proxy-measurement shape criterion 4 exists to
   avoid, encoded in a locked decision.
 
-  **The amended deliverable:** (a) the **written finding** — already established, recorded in
-  `34-REVIEW.md` R-01, and now carried in the rewritten criterion 4 — that the inversion is not
-  reachable, with its evidence and its stated limits; and (b) an executable test that pins the
-  **reachability guarantee itself** rather than a fake exploit: a test asserting `decide_action`
-  routes every non-`Success` variant away from `Advance`, so the day that changes, the guard
-  `classify_validate_outcome` silently depends on fails loudly. The written half was always the
-  part that answers criterion 4; the executable half now protects the answer instead of
-  dramatising a defect that isn't reachable.
+  **Superseded rationale, restored — it was deleted outright in the first amendment, which was the
+  one place this document's strike-through discipline lapsed, and it argues against that
+  amendment:** *"Rejected: a written audit alone — that is an assertion about code, verified once
+  by reading, with nothing preventing drift, and this project has shipped green tests over a broken
+  feature more than once (`31/D-19`'s stated reason for a live gate). Rejected: the test alone — the
+  reasoning about why auto mode skips the gate would live nowhere a future reader finds it."* That
+  objection turned out to be right: the written-audit-alone half is exactly what got the answer
+  wrong, and a live demonstration is what corrected it.
 
-- **D-08:** **Criterion 3 is verified by a full matrix sweep** over every
-  `(AgentStatus × Option<Verdict>)` pair asserting the whole classification matrix, plus a **named
-  positive control** (`Success` + `Pass` → `Passed`, which must still pass) and a negative control.
-  Phase 30's constraint-9 sweep is direct precedent. Rejected: four named per-status mirror tests as
-  the roadmap entry proposes — they cover only the four pairs someone thought to write, leaving
-  `verdict: gaps` and `verdict: none` against each status unasserted.
+  **The amended deliverable [AMENDED AGAIN 2026-08-05]:** (a) the **written finding**, now carrying
+  the *corrected* answer per D-15 — the inversion IS reachable, via the graft; and (b) an
+  **executable demonstration of the graft**, which is writable end-to-end and was in fact already
+  run: seed a Validate stage with a passing Layer-0 probe and a `{"status":"failed","verdict":
+  "pass"}` marker, assert the stage transitions to Ship pre-fix and gates post-fix, with the
+  verdict-removed and Layer-0-disabled negative controls beside it.
+
+  ~~An executable test asserting `decide_action` routes every non-`Success` variant away from
+  `Advance`.~~ **Dropped: it is a no-op.** All six non-`Success` variants already have named tests
+  doing exactly that (`cargo test -p devflow-core --lib outcome_policy::` → 9 passed, 0 failed, 538
+  filtered out). The proposed test was strictly weaker than what exists.
+
+- **D-08 [AMENDED — the sweep was under-dimensioned]:** **Criterion 3 is verified by a full matrix
+  sweep**, plus named controls. Phase 30's constraint-9 sweep is direct precedent. Rejected: four
+  named per-status mirror tests as the roadmap entry proposes — they cover only the four pairs
+  someone thought to write.
+
+  **Amendment — the sweep is `(layer0 ∈ {true,false}) × 7 statuses × 3 verdicts` = 42 cells, not
+  21.** D-06's tuple widened and D-08 was not updated with it. The failure this would have caused
+  is concrete, not theoretical: `decided_by_layer` is `#[serde(default)]` and its own doc reserves
+  `None` for test fixtures, so the natural sweep fixture leaves `external` false in all 21 cells —
+  **both `Ambiguous` arms go unexercised, and a regression deleting them both is green.** D-08's
+  positive control does not catch it either, because `(Success, Pass) → Passed` is
+  layer-independent.
+
+  **Required named controls:** the positive control `(_, Success, Some(Pass)) → Passed`; and the
+  two `Ambiguous` cells `(true, Success, Some(Gaps))` and `(true, Success, None)` as their own
+  named positive controls, each paired with its `layer0 = false` mirror asserting `Failed` — the
+  pairing is what makes the layer dimension load-bearing rather than decorative.
 
 ### Drain-gate re-derivation (success criterion 2)
 
@@ -237,15 +309,56 @@ repair work that a capture happens to reveal (filed, not fixed — D-04).
 
 - **D-13:** **999.76 is folded into this phase**, on scope freed by the criterion 1 and 4
   corrections. Operator decision, 2026-08-05. It is not unrelated work: `classify_validate_outcome`'s
-  `external` predicate requires `decided_by_layer == Some(0)`, which only `evaluate_layer0`
-  produces, and 999.76 makes that unreachable in worktree mode — DevFlow's default shape. Rewriting
-  the match without it designs around dead branches.
+  `external` predicate requires `decided_by_layer == Some(0)` **and** `status == Success`
+  together, and 999.76 makes that *combination* unreachable in worktree mode — DevFlow's default
+  shape. (Corrected: `Some(0)` alone IS produced there, with `status: Failed`, by the mis-discovery
+  veto. An earlier version said worktree runs never produce `Some(0)`, which is false.)
+
+  **The dependency runs the opposite way from what this decision first recorded.** 999.76 does not
+  need to land first — see D-06's corrected sequencing note. It must not land **without** D-15's
+  graft fix, because making Layer 0 discovery work in worktree mode makes `Some(0)` common, which is
+  the graft's precondition.
 
   Within my remit and decided: **999.76 sequences before D-06's match rewrite**, and its second
   call site (`phase_has_blocking_human_checkpoint`, `pipeline_launch.rs:957`) is fixed in the same
   change — the 999.76 entry states the class recurs otherwise. Rejected: also folding in 999.71
   (capture-writer torn lines), which is adjacent but would re-inflate a scope that shrank for good
   reasons.
+
+### The Layer 0 verdict graft — added after the second review pass
+
+- **D-15:** **`reconcile_layer0_verdict` is in scope, and it is where 999.74's real defect lives.**
+  Operator decision, 2026-08-05. The function (`agent_result.rs:2143-2156`) grafts Layer 1's
+  `verdict` onto an affirmative Layer-0 probe success while checking only **Layer 0's** status. A
+  marker of `{"status":"failed","verdict":"pass"}` therefore yields `(Success, Some(Pass),
+  Some(0))`, which `decide_action` advances and `classify_validate_outcome` reads as `Passed` —
+  Ship, in `Mode::Auto`, on a run whose agent reported failure.
+
+  **The fix is to consult Layer 1's status before transplanting its verdict.** A verdict attached
+  to a self-reported failure is not a pass.
+
+  **Why this was missed the first time, recorded because the error is repeatable.** The first pass
+  proved the classifier's inputs are always `Success` and inferred the inversion was unreachable.
+  The proof was right; the inference was wrong. The status is **laundered upstream** — it genuinely
+  *is* `Success` by the time the classifier sees it. Checking a function's inputs does not establish
+  a whole-system property.
+
+  **Consequences for the other decisions, all binding:**
+  - **D-06's fix does not close this.** Gating the `Passed` arm on the derived status passes
+    cleanly here. Criterion 3 and criterion 4 are separate deliverables.
+  - **D-13 (999.76) must not land without this fix.** Moving Layer 0 discovery to the execution
+    root makes `decided_by_layer == Some(0)` common rather than rare, which is exactly the graft's
+    precondition.
+  - **Do NOT "correct" `idle_timeout_result`'s `verdict: None` doc comment.** An earlier amendment
+    instructed that; it is wrong. `reconcile_layer0_verdict` sources its verdict from
+    `evaluate_layer1`, whose first statement is the idle-timeout side channel — a timeout carrying
+    a verdict would graft and ship. That comment documents a live guard. Only
+    `reconcile_stream_success_against_exit_code`'s sibling note is overstated.
+
+  **Established by demonstration, not reading:** six cases against a HEAD-built `advance` binary in
+  out-of-repo temp projects. Negative controls: verdict removed or set to `gaps` → gates; Layer 0
+  disabled → `decide_action` intercepts. **Not established:** whether a real agent emits a
+  self-contradictory marker in practice — no parser cross-checks `status` against `verdict`.
 
 ### Unreadable — the D-04/D-11 tie-break
 
@@ -291,7 +404,7 @@ questions to re-surface:
 
 ### Binding scope and requirements
 - `.planning/ROADMAP.md` § "Phase 34: Stream-JSON Coverage and the Validate Trust Boundary" — the
-  authoritative goal and its four success criteria.
+  authoritative goal and its seven success criteria (four originally; rewritten 2026-08-05).
 - `.planning/ROADMAP.md` § "Phase 999.73: Widen `STREAM_JSON_STAGES` Beyond `Stage::Code`" — state
   at Phase 31 close, why it was deferred rather than widened, and the proposed work.
 - `.planning/ROADMAP.md` § "Phase 999.74: `classify_validate_outcome` Trusts the Agent's Verdict
@@ -495,7 +608,7 @@ questions to re-surface:
 <deferred>
 ## Deferred Ideas
 
-- **D-14 per-child declared tokens** (per D-12) — one declared token per dispatched child rather
+- **`31/D-14` per-child declared tokens** (per D-12) — one declared token per dispatched child rather
   than `31/D-13`'s startup-canary-only scope. Would defeat constraint 7's coalescing undercount
   directly instead of leaning on the drain gate. Deferred on size, not merit, for the second time
   (`31/D-14` was the first). **Action item: file it as its own numbered `999.x` ROADMAP entry plus
@@ -504,8 +617,13 @@ questions to re-surface:
 - **Any parser or monitor defect a per-stage capture reveals** (per D-04) — filed as a numbered
   `999.x` entry with its capture as evidence, not fixed here.
 
-- **Un-widened stages** (per D-02) — if a stage's capture cannot be obtained, the remaining
-  widening returns as a numbered `999.x` entry and the phase closes PARTIAL on criterion 1.
+- ~~**Un-widened stages** (per D-02) — if a stage's capture cannot be obtained, the remaining
+  widening returns as a numbered `999.x` entry and the phase closes PARTIAL on criterion 1.~~
+  **RETIRED 2026-08-05** — this is the rule D-02 Amendment 2 replaced, and it survived here
+  un-struck through the first rewrite. A reviewer reading it would reintroduce the milestone
+  contradiction the amendment resolved. Current rule: an un-widened stage carries a recorded reason
+  and *satisfies* the reworded DOGFOOD-03; the phase does not close PARTIAL on that account, and a
+  zero-widening outcome is an explicit escalation to the operator.
 
 </deferred>
 

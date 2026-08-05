@@ -24,25 +24,41 @@ Requirements for this milestone. Each maps to roadmap phases.
   "3 consecutive failures" gate firing on healthy wave-by-wave progress (999.66)
 
 - [ ] **DOGFOOD-03**: Operator can trust that every stage DevFlow launches through the stream-json
-  path was put there on real per-stage behavioural evidence — and that any stage not yet evidenced
-  is visibly and deliberately still on the legacy path, never silently assumed to work (999.73)
+  path was put there on real per-stage behavioural evidence; that any stage not yet evidenced is
+  visibly and deliberately still on the legacy path, never silently assumed to work; and that the
+  phase moved this forward — **at least one stage is newly widened on a newly captured run, or the
+  operator is explicitly told why none could be** (999.73)
 
-  > **Reworded 2026-08-05 — a modelling correction, and it tightens rather than relaxes the
-  > guarantee.** The original text read "Define/Plan/Validate/Ship stages launch through the same
-  > reliable stream-json path already proven for Code, backed by real per-stage captures, not
-  > synthetic fixtures." That named four specific stages, which made it an *implementation plan*
-  > rather than an operator-facing guarantee — the only requirement here phrased that way; its
-  > three siblings all state what the operator can rely on. The practical consequence was that a
-  > partial delivery had nowhere to land: this file models requirements as checkboxes with no
-  > partial state, `999.x` backlog is Out of Scope for this milestone, and Phase 34 is its last
-  > phase, so widening three of four stages would have forced a choice between ticking a box that
-  > was not true and holding the milestone open indefinitely.
+  > **Reworded 2026-08-05 — a modelling correction. Amended the same day after a second review
+  > pass found the first reword was a coverage relaxation described as a tightening.**
   >
-  > **The rewrite is stricter, not looser.** The original could be satisfied by widening all four
-  > stages on four thin captures. This one cannot be satisfied by *any* unevidenced widening — the
-  > evidence discipline is the deliverable, which is what 999.73 was always about ("widening now
-  > would extend the adapter to four stages on zero evidence"). Phase 34's rewritten success
-  > criterion 1 is the matching statement. Full reasoning: `34-REVIEW.md`.
+  > The original text read "Define/Plan/Validate/Ship stages launch through the same reliable
+  > stream-json path already proven for Code, backed by real per-stage captures, not synthetic
+  > fixtures." That named four specific stages, making it an *implementation plan* rather than an
+  > operator-facing guarantee — the only requirement here phrased that way. The practical
+  > consequence was that a partial delivery had nowhere to land: this file models requirements as
+  > checkboxes with no partial state, and Phase 34 is this milestone's last phase.
+  >
+  > **What the first reword got wrong, stated plainly.** It was described as "stricter, not
+  > looser." That is true on the evidence axis and **false on the coverage axis**, and the second
+  > characterisation was omitted. The weakest conforming delivery under the first reword was: widen
+  > *zero* stages, record four "not evidenced" reasons — satisfying criteria 1, 2 and 7 vacuously,
+  > since nothing widened means nothing to evidence and no collateral to fix. The requirement's
+  > subject had an extension the delivery itself determined, so shrinking the set satisfied it.
+  > That is not what an operator who approved the original was agreeing to.
+  >
+  > **Two repairs, both operator-decided 2026-08-05.** (1) The delivery floor above — the phase
+  > must actually move the rollout forward or say why it cannot, so a zero-widening close is an
+  > escalation rather than a silent pass. (2) The "visibly and deliberately" clause is now carried
+  > in Phase 34's binding success criterion 1, not only in `34-CONTEXT.md` — which disclaims its
+  > own bindingness, so the whole strictness argument previously rested on a non-binding document.
+  >
+  > **Known gap this requirement now owns, and Phase 34 must answer.** This clause quantifies over
+  > *every* stage on the stream path, which today means `Stage::Code` — whose raw capture was
+  > deleted during Phase 31's cleanup and never committed (`31-VERIFICATION.md`). No real
+  > production stream capture exists in-repo. Code must therefore be re-captured, or its
+  > transcription-only evidence recorded as such, before this box is ticked. Full reasoning:
+  > `34-REVIEW.md`.
 
 - [ ] **DOGFOOD-04**: Operator can trust that a Validate stage's reported outcome reflects its
   actually-derived status, not just the agent's self-reported verdict field (999.74)
