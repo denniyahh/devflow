@@ -1235,6 +1235,191 @@ mod tests {
         }
     }
 
+    /// Every `AgentStatus` variant, in the order the production match names
+    /// them. Kept as an explicit literal rather than derived: if a future
+    /// variant is added, the production match is already an E0004 (NC-4), and
+    /// this array going stale is caught by the sweep's cell counter.
+    const ALL_STATUSES: [AgentStatus; 7] = [
+        AgentStatus::Success,
+        AgentStatus::Failed,
+        AgentStatus::Unknown,
+        AgentStatus::RateLimited,
+        AgentStatus::ResourceKilled,
+        AgentStatus::AgentUnavailable,
+        AgentStatus::IdleTimeout,
+    ];
+
+    /// The three observable states of `AgentResult::verdict`.
+    const ALL_VERDICTS: [Option<Verdict>; 3] = [Some(Verdict::Pass), Some(Verdict::Gaps), None];
+
+    /// Builds a classifier fixture from the three matrix coordinates.
+    ///
+    /// `decided_by_layer` is set EXPLICITLY in both directions — `Some(0)` when
+    /// `layer0`, `Some(1)` otherwise — and NEVER `None`. That is load-bearing,
+    /// not stylistic (T-34-03-03): the field is `#[serde(default)]` and its own
+    /// doc comment reserves `None` for fixtures that do not route through the
+    /// real cascade, so omitting it (or passing `None` for the false case)
+    /// would make the `layer0 = false` half indistinguishable from an omission
+    /// bug — `layer0` would be false in all 42 cells, both `Ambiguous` arms
+    /// would go unexercised, and a regression deleting them both would pass
+    /// green. `Some(1)` says "a layer other than 0 decided this", which is the
+    /// real production shape for a Layer-1 result.
+    fn classifier_fixture(
+        layer0: bool,
+        status: AgentStatus,
+        verdict: Option<Verdict>,
+    ) -> agent_result::AgentResult {
+        agent_result::AgentResult {
+            status,
+            exit_code: None,
+            reason: None,
+            commits: None,
+            summary: None,
+            verdict,
+            decided_by_layer: if layer0 { Some(0) } else { Some(1) },
+        }
+    }
+
+    /// D-08's full matrix sweep: 2 `layer0` states × 7 statuses × 3 verdict
+    /// states = 42 cells, each asserted against the decision table.
+    ///
+    /// The 21-cell version this replaces was under-dimensioned: without the
+    /// `layer0` dimension both `Ambiguous` arms go unexercised and a regression
+    /// deleting them both is green. The expected-outcome table below is written
+    /// independently of the production match (and is permitted its wildcard —
+    /// D-06's ban is scoped to the production match's status position); the
+    /// mutation controls recorded in this plan's SUMMARY are what establish
+    /// that the pair actually discriminates rather than agreeing vacuously.
+    #[test]
+    fn classify_validate_outcome_sweeps_all_forty_two_cells() {
+        let mut visited = 0_usize;
+
+        for layer0 in [true, false] {
+            for status in ALL_STATUSES {
+                for verdict in ALL_VERDICTS {
+                    let expected = match (layer0, status, verdict) {
+                        (_, AgentStatus::Success, Some(Verdict::Pass)) => ValidateOutcome::Passed,
+                        (true, AgentStatus::Success, Some(Verdict::Gaps)) => {
+                            ValidateOutcome::Ambiguous(
+                                "external verification passed but the agent reported gaps"
+                                    .to_string(),
+                            )
+                        }
+                        (true, AgentStatus::Success, None) => ValidateOutcome::Ambiguous(
+                            "external verification passed but no agent verdict arrived".to_string(),
+                        ),
+                        _ => ValidateOutcome::Failed,
+                    };
+
+                    let actual = classify_validate_outcome(&classifier_fixture(
+                        layer0, status, verdict,
+                    ));
+                    assert_eq!(
+                        actual, expected,
+                        "cell (layer0={layer0}, status={status:?}, verdict={verdict:?}) \
+                         classified as {actual:?}, expected {expected:?}"
+                    );
+                    visited += 1;
+                }
+            }
+        }
+
+        assert_eq!(
+            visited, 42,
+            "the sweep must visit every cell of the 2 x 7 x 3 matrix; a truncated \
+             iterator or a stale ALL_STATUSES/ALL_VERDICTS array shows up here"
+        );
+    }
+
+    /// NC-1, the positive control: `(_, Success, Some(Pass))` classifies as
+    /// `Passed` for BOTH `layer0` values. The layer-independence is the point —
+    /// this is D-18e's "two independent signals agreeing" arm, and it is also
+    /// why NC-1 alone cannot catch a fixture that collapses `layer0` to one
+    /// value. NC-2 and NC-3 below are what catch that.
+    #[test]
+    fn verdict_pass_classifies_as_passed_regardless_of_layer() {
+        for layer0 in [true, false] {
+            assert_eq!(
+                classify_validate_outcome(&classifier_fixture(
+                    layer0,
+                    AgentStatus::Success,
+                    Some(Verdict::Pass),
+                )),
+                ValidateOutcome::Passed,
+                "a passing verdict on a successful stage advances regardless of which \
+                 layer decided it (layer0={layer0}); this arm is deliberately \
+                 layer-independent"
+            );
+        }
+    }
+
+    /// NC-2 and its paired mirror, deliberately in ONE test so the pair cannot
+    /// be split and half-deleted.
+    ///
+    /// `(true, Success, Some(Gaps))` is `Ambiguous` — an external probe passed
+    /// while the agent reported gaps, which is two signals disagreeing and gates
+    /// immediately. `(false, Success, Some(Gaps))` is `Failed` — no probe
+    /// decided it, so there is no second signal, and it must stay on the
+    /// ordinary counter-based auto-loop (D-05's "what this does NOT cover";
+    /// T-34-03-02).
+    ///
+    /// If both halves returned the same outcome the `layer0` dimension would be
+    /// decorative rather than load-bearing, and a fixture that silently
+    /// collapsed it would pass.
+    #[test]
+    fn external_verify_gaps_is_ambiguous_only_when_layer0_decided() {
+        assert!(
+            matches!(
+                classify_validate_outcome(&classifier_fixture(
+                    true,
+                    AgentStatus::Success,
+                    Some(Verdict::Gaps),
+                )),
+                ValidateOutcome::Ambiguous(_)
+            ),
+            "a Layer-0 probe pass against a gaps verdict is two signals disagreeing \
+             and must gate immediately"
+        );
+        assert_eq!(
+            classify_validate_outcome(&classifier_fixture(
+                false,
+                AgentStatus::Success,
+                Some(Verdict::Gaps),
+            )),
+            ValidateOutcome::Failed,
+            "with no Layer-0 probe there is no second signal to disagree with; this \
+             must stay the ordinary auto-loop, not become an immediate gate. If this \
+             half matched the layer0=true half, the layer0 dimension would be \
+             decorative rather than load-bearing"
+        );
+    }
+
+    /// NC-3 and its paired mirror, same shape and same reason as NC-2 above:
+    /// `(true, Success, None)` is `Ambiguous` (the probe passed but no agent
+    /// verdict arrived at all), while `(false, Success, None)` is `Failed` (the
+    /// verdict-less Validate fail-safe, unchanged).
+    #[test]
+    fn external_verify_absent_verdict_is_ambiguous_only_when_layer0_decided() {
+        assert!(
+            matches!(
+                classify_validate_outcome(&classifier_fixture(
+                    true,
+                    AgentStatus::Success,
+                    None
+                )),
+                ValidateOutcome::Ambiguous(_)
+            ),
+            "a Layer-0 probe pass with no agent verdict at all must gate immediately"
+        );
+        assert_eq!(
+            classify_validate_outcome(&classifier_fixture(false, AgentStatus::Success, None)),
+            ValidateOutcome::Failed,
+            "with no Layer-0 probe, a missing verdict is the ordinary fail-safe and \
+             must stay on the auto-loop. If this half matched the layer0=true half, \
+             the layer0 dimension would be decorative rather than load-bearing"
+        );
+    }
+
     /// D-08/consensus #4: a `ResourceKilled` outcome on a non-Validate stage
     /// bumps `infra_failures` and leaves `consecutive_failures` untouched —
     /// `handle_infra_outcome` (the `GateInfra` arm) never routes through
