@@ -1600,7 +1600,11 @@ mod tests {
         let root = dir.path();
         let phase = 93;
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
-        state.stage = Stage::Code;
+        // IN-07: `handle_validate_outcome` is only reached from `advance` with
+        // `stage == Validate`, so that is the only stage this fixture may
+        // honestly claim — otherwise `prepare_loop_back_to_code` cleans up the
+        // Code gate and emits `"from": "Code"` on a Validate loop-back.
+        state.stage = Stage::Validate;
         let worktree = root.join(format!(".worktrees/phase-{phase}"));
         std::fs::create_dir_all(&worktree).unwrap();
         state.worktree_path = Some(worktree.clone());
@@ -1620,21 +1624,13 @@ mod tests {
         )
         .unwrap();
 
-        let neutral_path_dir = agent_free_git_only_path_dir();
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", neutral_path_dir.path());
-        }
-
-        let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
+        // WR-05: RAII, so a panic inside the region restores PATH by `Drop`
+        // rather than by a trailing statement the unwind would skip. Scoped so
+        // the restore still happens before the assertions below, exactly as
+        // the trailing-statement form did.
+        {
+            let _path_guard = NeutralPath::install();
+            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
         }
 
         // Read the event from `root`, not the worktree: `events::emit` is
@@ -1648,38 +1644,34 @@ mod tests {
         );
     }
 
-    /// The mirrored negative control for
+    /// Scenario A of the mirrored negative control for
     /// `worktree_mode_genuine_gaps_loop_back_issues_gaps_only` directly above:
     /// identical worktree setup, opposite artifact precondition, opposite
     /// required outcome. Without it, that test cannot be told apart from an
     /// implementation that returns `GapsOnly` whenever a worktree happens to
     /// be configured at all — a control that cannot fail is not a control.
     ///
-    /// Two independent scenarios, each with its own tempdir and `State`:
+    /// Phase 94: no `{N}-VERIFICATION.md` anywhere — neither under the
+    /// worktree nor under the main checkout. The mid-arc precondition, in
+    /// worktree mode. ROADMAP criterion 1.
     ///
-    /// - **A** (phase 94): no `{N}-VERIFICATION.md` anywhere — neither under
-    ///   the worktree nor under the main checkout. The mid-arc precondition,
-    ///   in worktree mode. ROADMAP criterion 1.
-    /// - **B** (phase 95): `{N}-VERIFICATION.md` present under the **main
-    ///   checkout only**, never under the worktree. This scenario is a
-    ///   deliberate addition beyond the verification's prescribed pair,
-    ///   because an implementation that probes *both* roots — a plausible and
-    ///   superficially safer misreading of the fix — passes the positive
-    ///   test, passes scenario A, and passes both `--no-worktree` tests.
-    ///   Scenario B is the only case that fails it. Semantically: an artifact
-    ///   visible from the main checkout while this phase is in flight inside a
-    ///   worktree belongs to a *different* run, and treating it as this
-    ///   phase's evidence is CR-01 with the sign reversed.
+    /// IN-06: scenario B lives in its own `#[test]`
+    /// (`worktree_mode_main_checkout_only_artifact_is_the_or_both_roots_discriminator`)
+    /// rather than below this test's assertion. Packed into one function, a
+    /// failure HERE aborted before B ran, and B is the suite's only
+    /// discriminator against a probe-both-roots implementation — the single
+    /// test whose loss would be least visible is exactly the one a shared
+    /// function hid.
     #[test]
     fn worktree_mode_mid_arc_loop_back_issues_plain_execute() {
         let _guard = ENV_MUTEX.lock().unwrap();
 
-        // --- Scenario A: worktree configured, no artifact anywhere ---
         let dir_a = tempfile::tempdir().unwrap();
         let root_a = dir_a.path();
         let phase_a = 94;
         let mut state_a = State::new(phase_a, AgentKind::Claude, Mode::Auto, root_a.to_path_buf());
-        state_a.stage = Stage::Code;
+        // IN-07: Validate is the only stage production reaches this call from.
+        state_a.stage = Stage::Validate;
         let worktree_a = root_a.join(format!(".worktrees/phase-{phase_a}"));
         std::fs::create_dir_all(&worktree_a).unwrap();
         state_a.worktree_path = Some(worktree_a.clone());
@@ -1689,13 +1681,53 @@ mod tests {
         // deliberately none under the bare root either — this is the mid-arc
         // precondition expressed in worktree mode, not an oversight.
 
-        // --- Scenario B: worktree configured, artifact under the MAIN
-        // CHECKOUT only ---
+        // WR-05: RAII PATH neutralization. This drive reaches
+        // `loop_back_to_code` -> `launch_stage`, so it must never be able to
+        // resolve a real agent CLI.
+        {
+            let _path_guard = NeutralPath::install();
+            let _ = handle_validate_outcome(root_a, &mut state_a, ValidateOutcome::Failed);
+        }
+
+        let last_a =
+            devflow_core::events::last_event_of_kind_for_phase(root_a, phase_a, "loop_back")
+                .expect("scenario A loop_back event must be recorded");
+        assert_eq!(
+            last_a["fix"], "FullExecute",
+            "no {{N}}-VERIFICATION.md in the worktree (nor anywhere else) must dispatch FullExecute"
+        );
+    }
+
+    /// **The only test in the workspace that fails a probe-both-roots-and-OR-them
+    /// implementation.** Scenario B of the mirrored negative control, split out
+    /// of `worktree_mode_mid_arc_loop_back_issues_plain_execute` per IN-06 so
+    /// that a scenario-A failure can never abort the run before it is asserted.
+    ///
+    /// Phase 95: `{N}-VERIFICATION.md` present under the **main checkout
+    /// only**, never under the worktree. This scenario is a deliberate
+    /// addition beyond the verification's prescribed pair, because an
+    /// implementation that probes *both* roots — a plausible and superficially
+    /// safer misreading of the fix — passes the positive test, passes scenario
+    /// A, and passes both `--no-worktree` tests. This case is the only one that
+    /// fails it. Semantically: an artifact visible from the main checkout while
+    /// this phase is in flight inside a worktree belongs to a *different* run,
+    /// and treating it as this phase's evidence is CR-01 with the sign
+    /// reversed.
+    ///
+    /// Do not merge this back into a shared `#[test]` with scenario A, and do
+    /// not weaken its assertion: deleting it costs the suite nothing visible
+    /// today and everything the day someone "hardens" the probe by OR-ing the
+    /// two roots.
+    #[test]
+    fn worktree_mode_main_checkout_only_artifact_is_the_or_both_roots_discriminator() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
         let dir_b = tempfile::tempdir().unwrap();
         let root_b = dir_b.path();
         let phase_b = 95;
         let mut state_b = State::new(phase_b, AgentKind::Claude, Mode::Auto, root_b.to_path_buf());
-        state_b.stage = Stage::Code;
+        // IN-07: Validate is the only stage production reaches this call from.
+        state_b.stage = Stage::Validate;
         let worktree_b = root_b.join(format!(".worktrees/phase-{phase_b}"));
         std::fs::create_dir_all(&worktree_b).unwrap();
         state_b.worktree_path = Some(worktree_b.clone());
@@ -1714,33 +1746,12 @@ mod tests {
         )
         .unwrap();
 
-        // One guard, one PATH neutralization, one restore — covering both
-        // drives, since both reach `loop_back_to_code` -> `launch_stage`.
-        let neutral_path_dir = agent_free_git_only_path_dir();
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: serialized under ENV_MUTEX.
-        unsafe {
-            std::env::set_var("PATH", neutral_path_dir.path());
+        // WR-05: RAII PATH neutralization — same reason as scenario A, this
+        // drive also reaches `loop_back_to_code` -> `launch_stage`.
+        {
+            let _path_guard = NeutralPath::install();
+            let _ = handle_validate_outcome(root_b, &mut state_b, ValidateOutcome::Failed);
         }
-
-        let _ = handle_validate_outcome(root_a, &mut state_a, ValidateOutcome::Failed);
-        let _ = handle_validate_outcome(root_b, &mut state_b, ValidateOutcome::Failed);
-
-        // SAFETY: still serialized under ENV_MUTEX from above.
-        unsafe {
-            match &original_path {
-                Some(path) => std::env::set_var("PATH", path),
-                None => std::env::remove_var("PATH"),
-            }
-        }
-
-        let last_a =
-            devflow_core::events::last_event_of_kind_for_phase(root_a, phase_a, "loop_back")
-                .expect("scenario A loop_back event must be recorded");
-        assert_eq!(
-            last_a["fix"], "FullExecute",
-            "no {{N}}-VERIFICATION.md in the worktree (nor anywhere else) must dispatch FullExecute"
-        );
 
         let last_b =
             devflow_core::events::last_event_of_kind_for_phase(root_b, phase_b, "loop_back")
