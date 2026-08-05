@@ -1643,6 +1643,109 @@ mod tests {
         );
     }
 
+    /// The mirrored negative control for
+    /// `worktree_mode_genuine_gaps_loop_back_issues_gaps_only` directly above:
+    /// identical worktree setup, opposite artifact precondition, opposite
+    /// required outcome. Without it, that test cannot be told apart from an
+    /// implementation that returns `GapsOnly` whenever a worktree happens to
+    /// be configured at all — a control that cannot fail is not a control.
+    ///
+    /// Two independent scenarios, each with its own tempdir and `State`:
+    ///
+    /// - **A** (phase 94): no `{N}-VERIFICATION.md` anywhere — neither under
+    ///   the worktree nor under the main checkout. The mid-arc precondition,
+    ///   in worktree mode. ROADMAP criterion 1.
+    /// - **B** (phase 95): `{N}-VERIFICATION.md` present under the **main
+    ///   checkout only**, never under the worktree. This scenario is a
+    ///   deliberate addition beyond the verification's prescribed pair,
+    ///   because an implementation that probes *both* roots — a plausible and
+    ///   superficially safer misreading of the fix — passes the positive
+    ///   test, passes scenario A, and passes both `--no-worktree` tests.
+    ///   Scenario B is the only case that fails it. Semantically: an artifact
+    ///   visible from the main checkout while this phase is in flight inside a
+    ///   worktree belongs to a *different* run, and treating it as this
+    ///   phase's evidence is CR-01 with the sign reversed.
+    #[test]
+    fn worktree_mode_mid_arc_loop_back_issues_plain_execute() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        // --- Scenario A: worktree configured, no artifact anywhere ---
+        let dir_a = tempfile::tempdir().unwrap();
+        let root_a = dir_a.path();
+        let phase_a = 94;
+        let mut state_a = State::new(phase_a, AgentKind::Claude, Mode::Auto, root_a.to_path_buf());
+        state_a.stage = Stage::Code;
+        let worktree_a = root_a.join(format!(".worktrees/phase-{phase_a}"));
+        std::fs::create_dir_all(&worktree_a).unwrap();
+        state_a.worktree_path = Some(worktree_a.clone());
+        workflow::save_state(&state_a).unwrap();
+
+        // Deliberately no `{phase:02}-VERIFICATION.md` under the worktree AND
+        // deliberately none under the bare root either — this is the mid-arc
+        // precondition expressed in worktree mode, not an oversight.
+
+        // --- Scenario B: worktree configured, artifact under the MAIN
+        // CHECKOUT only ---
+        let dir_b = tempfile::tempdir().unwrap();
+        let root_b = dir_b.path();
+        let phase_b = 95;
+        let mut state_b = State::new(phase_b, AgentKind::Claude, Mode::Auto, root_b.to_path_buf());
+        state_b.stage = Stage::Code;
+        let worktree_b = root_b.join(format!(".worktrees/phase-{phase_b}"));
+        std::fs::create_dir_all(&worktree_b).unwrap();
+        state_b.worktree_path = Some(worktree_b.clone());
+        workflow::save_state(&state_b).unwrap();
+
+        // Built from the tempdir ROOT, never from the worktree path: writing
+        // this under the worktree by mistake would silently turn scenario B
+        // into a duplicate of the positive test with an inverted assertion.
+        let stale_dir = root_b
+            .join(".planning/phases")
+            .join(format!("{phase_b:02}-test"));
+        std::fs::create_dir_all(&stale_dir).unwrap();
+        std::fs::write(
+            stale_dir.join(format!("{phase_b:02}-VERIFICATION.md")),
+            "stale artifact belonging to a different run\n",
+        )
+        .unwrap();
+
+        // One guard, one PATH neutralization, one restore — covering both
+        // drives, since both reach `loop_back_to_code` -> `launch_stage`.
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        let _ = handle_validate_outcome(root_a, &mut state_a, ValidateOutcome::Failed);
+        let _ = handle_validate_outcome(root_b, &mut state_b, ValidateOutcome::Failed);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        let last_a =
+            devflow_core::events::last_event_of_kind_for_phase(root_a, phase_a, "loop_back")
+                .expect("scenario A loop_back event must be recorded");
+        assert_eq!(
+            last_a["fix"], "FullExecute",
+            "no {{N}}-VERIFICATION.md in the worktree (nor anywhere else) must dispatch FullExecute"
+        );
+
+        let last_b =
+            devflow_core::events::last_event_of_kind_for_phase(root_b, phase_b, "loop_back")
+                .expect("scenario B loop_back event must be recorded");
+        assert_eq!(
+            last_b["fix"], "FullExecute",
+            "a {{N}}-VERIFICATION.md visible only from the main checkout belongs to a different run and must NOT resurrect GapsOnly"
+        );
+    }
+
     /// D-01/D-02: the `Ambiguous` gate's loop-back arm must also consult
     /// `select_loop_back_fix`, not only the plain-Failed tail arm Task 1
     /// wired. Seeds a rejecting `GateResponse` (note without "abort", so
