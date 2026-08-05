@@ -175,42 +175,96 @@ pub(crate) enum ValidateOutcome {
 /// Classify a Validate-stage `AgentResult` into its three-way outcome
 /// (D-18e, the binding operator decision reproduced in 18-05-PLAN.md).
 ///
-/// Pure function over `&AgentResult` — no I/O — so the whole decision
-/// matrix is directly unit-testable. `Some(Verdict::Pass)` is matched FIRST
-/// and wins regardless of which layer decided the result: it is the "two
-/// independent signals agreeing" arm and must not be shadowed by the
-/// external-verify-specific arms below it.
+/// Pure function over `&AgentResult` — no I/O — so the whole decision matrix is
+/// directly unit-testable.
 ///
-/// 31-02 audit (non-exhaustive equality site 3 of 3). The `== Success` test
-/// below is CORRECT AS-IS for `AgentStatus::IdleTimeout` and is left unchanged.
-/// An equality test compiles untouched against a new variant, so the
-/// wildcard-free-match mechanism that guards `decide_action` does not reach
-/// here; this was audited by hand.
+/// **The match is exhaustive over the `AgentStatus` position with no wildcard
+/// arm** (D-06, ROADMAP criterion 3). Every one of the seven variants appears by
+/// name, so an eighth is a compile error (E0004) rather than a silent join in
+/// either direction. The ban is POSITIONAL: `_` in the `layer0` or `verdict`
+/// position is fine — only the status position must be enumerated. It is a ban
+/// in BOTH directions: a catch-all routed to `Failed` carries the same
+/// compiles-untouched-against-a-new-variant weakness as one routed to `Passed`.
+///
+/// `layer0` is deliberately the LAYER-ONLY normalisation. The superseded
+/// composite (`decided_by_layer == Some(0) && status == Success`) folded an
+/// `AgentStatus` equality test back into the normaliser — the exact
+/// hand-audited construct this rewrite exists to eliminate — and its `false`
+/// value conflated "Layer 1, Success" with "Layer 0, Failed", so the arms could
+/// not tell provenance from status (D-06's named trap).
 ///
 /// A monitor-produced idle timeout has `decided_by_layer: Some(1)` and
-/// `verdict: None`, so `external` is `false`, the match falls to `_`, and the
-/// stage classifies as `Failed` — loop back or gate, never advance. That is the
-/// intended routing for "we gave up waiting" at Validate.
+/// `verdict: None`, so `layer0` is `false` and the status lands on the
+/// six-variant `Failed` arm below — loop back or gate, never advance. That is
+/// the intended routing for "we gave up waiting" at Validate, and it is
+/// unchanged by this rewrite.
 ///
-/// ADJACENT, PRE-EXISTING, NOT INTRODUCED HERE: the `(_, Some(Verdict::Pass))`
-/// arm below wins regardless of `status`, so an agent that writes
-/// `DEVFLOW_RESULT: {"status":"...","verdict":"pass"}` classifies as `Passed`
-/// whatever status it names. That is a documented deliberate choice (see the
-/// paragraph above) and it applies identically to `Failed`, `Unknown` and
-/// `ResourceKilled` today — `IdleTimeout` neither creates nor widens it, and
-/// changing it here "for symmetry" would silently re-route those three. Flagged
-/// rather than fixed.
+/// # How the Validate trust inversion is actually reached (D-15, ROADMAP criterion 5)
+///
+/// A superseded note here claimed the `(_, Some(Verdict::Pass))` wildcard let an
+/// agent's self-reported `verdict` outrank any `status`, and flagged it as
+/// pre-existing rather than fixing it. **The route named was wrong.** The
+/// inversion IS reachable, but by `reconcile_layer0_verdict`'s graft in
+/// `devflow-core`, not by this match:
+///
+/// - This function's own inputs genuinely ARE always `Success`. `decide_action`
+///   routes every non-`Success` status to a gate before
+///   `classify_validate_outcome` is called, and the sole production call site is
+///   inside its `Action::Advance` arm. The status was **laundered upstream**:
+///   the graft attached Layer 1's `verdict` to Layer 0's `Success` without
+///   reading Layer 1's own status.
+/// - **That graft is fixed in plan 34-01, and criterion 3's fix here does not
+///   close it.** This rewrite passes cleanly over the exploit precisely because
+///   the status it sees is already affirmative. Criterion 3 and criterion 4 are
+///   separate deliverables; neither alone closes the pair.
+/// - **The `Ambiguous` arms' safety depends on a routing decision in another
+///   crate** — `outcome_policy.rs`'s deferred `Failed`/`Unknown` collapse, which
+///   `decide_action`'s own comment marks revisitable.
+///
+/// The `(false, Success, Gaps | None)` cells stay `Failed` on purpose (D-05's
+/// "what this does NOT cover"): collapsing them to `Ambiguous` would convert the
+/// ordinary "validation found gaps" auto-loop into an immediate gate on cycle
+/// one — the loop 999.65/999.66 and Phase 33 just repaired.
 pub(crate) fn classify_validate_outcome(result: &agent_result::AgentResult) -> ValidateOutcome {
-    let external = result.decided_by_layer == Some(0) && result.status == AgentStatus::Success;
-    match (external, result.verdict) {
-        (_, Some(Verdict::Pass)) => ValidateOutcome::Passed,
-        (true, Some(Verdict::Gaps)) => ValidateOutcome::Ambiguous(
+    let layer0 = result.decided_by_layer == Some(0);
+    match (layer0, result.status, result.verdict) {
+        // The "two independent signals agreeing" arm — layer-independent, which
+        // is why `layer0` is `_` here and not `true`.
+        (_, AgentStatus::Success, Some(Verdict::Pass)) => ValidateOutcome::Passed,
+        (true, AgentStatus::Success, Some(Verdict::Gaps)) => ValidateOutcome::Ambiguous(
             "external verification passed but the agent reported gaps".to_string(),
         ),
-        (true, None) => ValidateOutcome::Ambiguous(
+        (true, AgentStatus::Success, None) => ValidateOutcome::Ambiguous(
             "external verification passed but no agent verdict arrived".to_string(),
         ),
-        _ => ValidateOutcome::Failed,
+        // No external probe decided this result, so there is no second signal to
+        // disagree with — an ordinary Validate failure, routed to the
+        // counter-based auto-loop (D-05).
+        (false, AgentStatus::Success, Some(Verdict::Gaps) | None) => ValidateOutcome::Failed,
+        // All six non-`Success` statuses share the `Failed` destination, named
+        // individually so an eighth variant cannot join them silently.
+        //
+        // `RateLimited` and `AgentUnavailable` are the two the superseded
+        // criterion 3 omitted. All six are unreachable at this call site:
+        // `classify_validate_outcome` is called only inside `decide_action`'s
+        // `Action::Advance` arm, and `decide_action` maps only `Success` there.
+        //
+        // `Failed` is chosen because it is exactly what the superseded `_` arm
+        // already gave them, so this rewrite has ZERO runtime delta for these
+        // cells. A divergent destination for `RateLimited` specifically would
+        // contradict `outcome_policy.rs`'s live, defended
+        // `AgentStatus::RateLimited => Action::AutoResume` routing if the cell
+        // ever became reachable — confront that tension before changing this.
+        (
+            _,
+            AgentStatus::Failed
+            | AgentStatus::Unknown
+            | AgentStatus::RateLimited
+            | AgentStatus::ResourceKilled
+            | AgentStatus::AgentUnavailable
+            | AgentStatus::IdleTimeout,
+            _,
+        ) => ValidateOutcome::Failed,
     }
 }
 
@@ -1181,7 +1235,6 @@ mod tests {
         }
     }
 
-    /// D-08/consensus #4: a `ResourceKilled` outcome on a non-Validate stage
     /// D-08/consensus #4: a `ResourceKilled` outcome on a non-Validate stage
     /// bumps `infra_failures` and leaves `consecutive_failures` untouched —
     /// `handle_infra_outcome` (the `GateInfra` arm) never routes through
