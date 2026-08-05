@@ -2140,6 +2140,39 @@ fn evaluate_layer0(
 /// Layer-1-class fact), never `Some(0)`. It returns unchanged, which is right —
 /// this function exists only to graft Layer 1's `verdict` onto an affirmative
 /// Layer 0 probe success, and a timeout is neither.
+///
+/// # This function is 999.74's real defect site (D-15, ROADMAP criterion 4)
+///
+/// Until 34-01 the graft read Layer 1's `verdict` and nothing else. A marker of
+/// `{"status":"failed","verdict":"pass"}` therefore produced `(Success,
+/// Some(Pass), Some(0))`: an agent's self-reported FAILURE laundered into an
+/// affirmative pair, which `outcome_policy::decide_action` advances and
+/// `classify_validate_outcome` reads as `Passed` — Ship, in `Mode::Auto`, on a
+/// run whose agent said it had failed. The status was never inspected, so
+/// nothing downstream could see the contradiction; by the time the classifier
+/// ran, the status genuinely WAS `Success`.
+///
+/// The fix consults Layer 1's own `AgentStatus` before transplanting its
+/// verdict, because **a verdict attached to a self-reported failure is not a
+/// pass**. Only `AgentStatus::Success` from Layer 1 may contribute a verdict;
+/// everything else leaves `verdict: None` and the stage classifies `Ambiguous`,
+/// which gates.
+///
+/// The classifier fix (plan 34-03, ROADMAP criterion 3) does **not** close this
+/// and never could: gating `classify_validate_outcome`'s `Passed` arm on the
+/// derived status passes cleanly here, because the derived status is `Success`.
+/// Criterion 3 and criterion 4 are separate deliverables. Regression-pinned by
+/// `layer0_verdict_graft_declines_when_layer1_status_is_not_success`, with
+/// `layer0_verdict_graft_still_transplants_a_passing_layer1_verdict` as its
+/// mandatory opposite-result control.
+///
+/// `evaluate_layer1` is called on `project_root`, NOT on the execution root,
+/// and that asymmetry is deliberate rather than an oversight: Layer 1 reads the
+/// stdout capture under `.devflow/`, which lives in the project root, while
+/// Layer 0 above DISCOVERS declarations in `.planning/phases/` (project root)
+/// and RUNS probes in the worktree. Plan 34-04 moves Layer 0's *discovery* to
+/// the execution root; this call stays on `project_root` and is still correct
+/// afterwards. Recorded here so a later reader does not "fix" the asymmetry.
 fn reconcile_layer0_verdict(
     project_root: &Path,
     state: &State,
@@ -2151,7 +2184,9 @@ fn reconcile_layer0_verdict(
     {
         return result;
     }
-    let verdict = evaluate_layer1(project_root, state.phase).and_then(|layer1| layer1.verdict);
+    let verdict = evaluate_layer1(project_root, state.phase)
+        .filter(|layer1| layer1.status == AgentStatus::Success)
+        .and_then(|layer1| layer1.verdict);
     AgentResult { verdict, ..result }
 }
 
@@ -5485,6 +5520,14 @@ mod tests {
     /// consult Layer 1's verdict rather than discard it — the two-signal
     /// reconciliation `reconcile_layer0_verdict` adds. Covers all three
     /// verdict states Layer 1 can produce: pass, gaps, and no marker at all.
+    ///
+    /// D-15 (34-01) adds a FOURTH case: the self-contradictory marker
+    /// `{"status":"failed","verdict":"pass"}`. "Consult Layer 1's verdict" was
+    /// implemented as "read Layer 1's verdict and nothing else", so an agent
+    /// that reported its own failure while claiming a passing verdict had that
+    /// verdict grafted onto Layer 0's `Success` — 999.74's real route. The
+    /// fourth case pins `verdict: None` for it; before the fix it observed
+    /// `Some(Pass)`.
     #[test]
     fn layer0_affirmative_success_consults_layer1_verdict_at_validate() {
         let dir = tempfile::tempdir().unwrap();
@@ -5540,6 +5583,76 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.verdict, None);
+
+        // D-15: the self-contradictory marker. Layer 1 reports its own run
+        // FAILED and simultaneously claims a passing verdict. Pre-fix the graft
+        // read only `.verdict` and produced `Some(Pass)`, i.e. an affirmative
+        // pair `decide_action` advances and `classify_validate_outcome` reads
+        // as Passed — Ship, unattended, on a run whose agent reported failure.
+        std::fs::write(
+            stdout_path(dir.path(), 16),
+            "DEVFLOW_RESULT: {\"status\":\"failed\",\"verdict\":\"pass\"}\n",
+        )
+        .unwrap();
+        let result = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approval),
+        )
+        .unwrap();
+        assert_eq!(
+            result.verdict, None,
+            "a verdict attached to a self-reported failure must not be grafted (D-15)"
+        );
+        // The fix touches `.verdict` only — Layer 0 still decided the status.
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(result.decided_by_layer, Some(0));
+    }
+
+    /// D-15 / ROADMAP criterion 4: `reconcile_layer0_verdict` must consult
+    /// Layer 1's own `AgentStatus` before transplanting its `verdict`.
+    ///
+    /// A regression here costs an unattended Ship on a run whose agent reported
+    /// failure: the graft would rebuild `(Success, Some(Pass), Some(0))` from a
+    /// self-contradictory marker, `decide_action` would advance it, and
+    /// `classify_validate_outcome` would classify Validate as `Passed`.
+    ///
+    #[test]
+    fn layer0_verdict_graft_declines_when_layer1_status_is_not_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase_dir = dir.path().join(".planning/phases/16-reliability");
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        std::fs::write(
+            phase_dir.join("16-01-PLAN.md"),
+            "---\nexternal_verify: \"test -f shipped\"\n---\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("shipped"), "done").unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        let mut state = state_in(dir.path(), 16);
+        state.stage = Stage::Validate;
+        let approval = vec!["test -f shipped".to_string()];
+
+        // The exploit itself: both fields present and mutually contradictory.
+        std::fs::write(
+            stdout_path(dir.path(), 16),
+            "DEVFLOW_RESULT: {\"status\":\"failed\",\"verdict\":\"pass\"}\n",
+        )
+        .unwrap();
+        let result = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approval),
+        )
+        .unwrap();
+        assert_eq!(
+            result.verdict, None,
+            "self-contradictory marker: the verdict must be declined (D-15)"
+        );
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(result.decided_by_layer, Some(0));
     }
 
     /// 18e's reconciliation is scoped to `Stage::Validate` only (flagged
