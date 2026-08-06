@@ -208,6 +208,51 @@ Unsequenced items — not part of the active phase sequence. Promote with
 `/gsd-review-backlog` when ready; each carries accumulated context in its
 own `phases/999.N-*/CONTEXT.md`.
 
+### Phase 999.86: Replace `release --check`'s Tag-Signing Predictor With a Direct Probe (BACKLOG, revises D-10 for `release --check` only)
+
+**Linear:** [DEN-75](https://linear.app/denniskim/issue/DEN-75/release-check-tag-signing-gate-false-negatives-when-the-key-is-not-in)
+(re-promoted; priority raised Medium → High). DEN-79, a duplicate describing the same predictor's
+other failure face, closed Canceled the same day rather than left open alongside this entry.
+**Found (again):** 2026-08-06, live, blocking `release --check` preflight during the v2.4.0 cut.
+
+**This entry does not reopen 999.50/999.54 as filed.** Those entries (below, both marked REMOVED)
+recorded a real operator decision — D-10, `superseded/26-release-cut-automation/26-CONTEXT.md` —
+and stay as the historical record of it, unedited. This is a new decision, made after the old one's
+premise stopped holding, filed fresh rather than as a silent rewrite of settled history.
+
+**Why D-10's premise stopped holding.** D-10 rejected fixing `check_ssh_signing_viability` on the
+reasoning that the whole predictor should be replaced by an executor that runs the real `git tag -s`
+and reads git's own result — no viability guess needed, ever. That executor is `devflow release`
+with real execution (DEN-50, **still Backlog**, never built). `release --check`'s predictor was
+never actually removed or replaced — it is the only thing that exists today, still reading
+`ssh-add -l` and comparing fingerprints, unchanged since D-10. It just produced the exact false
+negative D-10 was filed about, live, on a machine with the correct key loaded — verified directly:
+`ssh-keygen -Y sign` against the configured key succeeded and `git tag -v` confirmed the right
+fingerprint, while `release --check` reported `NotViable`.
+
+**The fix is not a second predictor.** DEN-75 already named the right shape, unimplemented until
+now: stop inferring viability from `ssh-add -l` and compare a probe *is* the operation the tag step
+will perform — sign a throwaway payload with `ssh-keygen -Y sign` and report viability from its own
+exit code. This cannot disagree with what `git tag -s` does, because it is not a second
+implementation of "will signing work" — it does the actual cryptographic operation on disposable
+input. D-10's objection to prediction is honored, not violated: the objection was that a predictor
+must independently stay in sync with git's real behavior, and a probe has no independent behavior to
+drift out of sync with.
+
+**Scope discipline, explicit:** this fixes `check_ssh_signing_viability` in `release --check` only.
+It does not build `devflow release`'s real executor (DEN-50, unaffected, still a separate item), and
+it does not reopen the "should DevFlow predict signing viability" question D-10 already closed for
+that executor — the executor still must run the real signed `git tag`, not call this probe as a
+substitute.
+
+**Priority:** High — this is the second time this predictor has produced a false negative during an
+actual release cut with the correct key present (first: DEN-75, v2.0.0; now: v2.4.0), and the false
+negative was in the caution direction only by luck of which check fired first — the underlying
+mechanism (comparing fingerprints against `ssh-add -l`, which knows nothing about on-disk private
+key material a probe would find) is unreliable by construction, not by circumstance.
+| **Size:** S — one function rewrite plus a regression test asserting `SigningViability::Viable`
+against a probe that actually signs, not a fingerprint match.
+
 ### Phase 999.85: Two Protected Comments Now Justify Themselves by a Mechanism Phase 34 Deleted (BACKLOG)
 
 **Linear:** [DEN-107](https://linear.app/denniskim/issue/DEN-107/99985-two-protected-comments-now-justify-themselves-by-a-mechanism)
