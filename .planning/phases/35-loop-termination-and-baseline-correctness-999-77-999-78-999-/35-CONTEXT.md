@@ -13,7 +13,7 @@
 > **One discretion item departs from its backlog entry's stated fix direction** (999.79's freshness
 > signal). It is marked as such rather than presented as settled.
 >
-> **This phase's decisions are `D-01`…`D-08`.** D-08 was added 2026-08-06 after adversarial review,
+> **This phase's decisions are `D-01`…`D-09`.** D-08 was added 2026-08-06 after adversarial review,
 > when an item wrongly filed under discretion was escalated and the operator decided it.
 
 ---
@@ -186,7 +186,7 @@ linked-worktree-harness question.
 <decisions>
 ## Implementation Decisions
 
-> **Label scope.** This phase's decisions are `D-01`…`D-08`. Phase 34's decisions are cited with a
+> **Label scope.** This phase's decisions are `D-01`…`D-09`. Phase 34's decisions are cited with a
 > `34/` prefix and Phase 31's with `31/`. They are different decisions with overlapping numbers.
 
 ### Signing probe surface (999.86)
@@ -388,13 +388,51 @@ linked-worktree-harness question.
   and routes it to `AgentStatus::Failed`. A transient `git` failure returns `0`, so an agent that
   **exited 0 and committed real work** is classified `Failed — no work done` and fed back into the
   Code↔Validate loop. That is the same root cause as 999.77 but a worse consequence — a
-  misclassification rather than a weakened bound. Under D-08 the compiler will force this call site
-  to be confronted; **the phase still maps it to today's zero-treatment explicitly**, rather than
-  silently widening scope. **Filed 2026-08-06 as `999.87` / DEN-108** after a duplicate check against
-  the ROADMAP backlog and Linear (nearest neighbours: 999.77/DEN-99, same root cause but scoped to
-  the baseline write; 999.81 IN-03, adjacent line but a different concern).
+  misclassification rather than a weakened bound. **Filed 2026-08-06 as `999.87` / DEN-108** after a
+  duplicate check (nearest neighbours: 999.77/DEN-99, same root cause but scoped to the baseline
+  write; 999.81 IN-03, adjacent line, different concern) — **and then folded into this phase the
+  same day; see D-09.**
   *Not established:* how often Layer 2 is the deciding layer in production — the code path was read,
   the frequency was not measured.
+
+### `evaluate_layer2`'s unmeasurable count (999.87) — folded in, operator carve-out
+
+- **D-09:** **999.87 is folded into this phase, and `evaluate_layer2` returns `Ok(None)` — falling
+  through to Layer 3 — when the commit count cannot be measured.** Operator decision, 2026-08-06,
+  after the operator challenged the original "file it, fix it later" disposition. **They were right
+  and the original reasoning was wrong**, recorded because the error is repeatable:
+
+  34/D-04 ("a defect a fix reveals is filed, not fixed in-phase") was invoked mechanically. That rule
+  governs defects in *adjacent* code a fix merely **surfaces** — Phase 34's parser case. This is not
+  adjacent. **D-08 makes `let commits: u32 = phase_commit_count(..)` (`agent_result.rs:1905`) a type
+  error**, so the phase must edit that exact line regardless; the deferral amounted to writing
+  `.unwrap_or(0)` to *deliberately preserve a known misclassification* inside the phase whose whole
+  subject is transient-`git`-failure handling. There was never a "leave it alone" option to defend.
+
+  **The marginal cost is small because the expensive part is already required.** Criterion 1's
+  two-cycle regression test needs a forced-`git`-failure harness (A-13; `NeutralPath` + the
+  `PATH`-guarding mutex in `crates/devflow-cli/src/test_support.rs`). Once that exists, exercising
+  this call site under the same forced failure is nearly free. Deferring meant building the harness,
+  shipping, and reloading all of this context later for a one-branch change.
+
+  **Why `Ok(None)` rather than the alternatives.** It matches the idiom already in this function
+  three lines up — `Err(_) => return Ok(None), // fall to Layer 3` for an unreadable exit file. "I
+  could not read my input" already has an established answer here, so this is the least-invention
+  option. Rejected: returning `Unknown` to gate (fail-closed, and it would make the doc comment
+  999.77 corrects actually *true* — but it introduces a new stall mode on a git blip, in a milestone
+  whose point is eliminating stalls). Rejected: classifying on exit code alone (fail-open, and it
+  contradicts `31/D-18` — "pass is a landed artifact, never a reported status" — since the commit
+  gate exists precisely because exit 0 alone does not prove work happened).
+
+  **Accepted cost, stated explicitly:** Layer 3 is the last-resort layer, so on a `git` blip the
+  decision moves to a layer that may itself be degraded, and the run continues rather than gating.
+  That is the deliberate trade against introducing a new gate on a transient fault.
+  — **Reversibility:** reversible — one match arm in a pure-ish classifier, no persisted state, no
+  published signature change beyond D-08's own.
+
+  **Scope consequences the planner must carry:** ROADMAP Phase 35 gains **criterion 6**;
+  `REQUIREMENTS.md` gains **HARDEN-07**; the phase is now six items, not five. The `999.87` backlog
+  entry is marked `PROMOTED — Phase 35` with its superseded "follow-up" reasoning kept visible.
 
 ### Claude's Discretion
 

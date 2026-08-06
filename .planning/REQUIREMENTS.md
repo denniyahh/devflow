@@ -34,6 +34,12 @@ Requirements for this milestone. Each maps to a roadmap phase.
   (999.76) is covered by a regression test that would catch a future regression at the call site,
   not just correct by construction with no test driving it (999.84)
 
+- [ ] **HARDEN-07**: Operator can trust that a transient `git` failure does not make a *successful*
+  agent run read as failed — "could not count" is distinguished from "counted zero" at **both**
+  consumers of the commit count, not only at the `consecutive_failures` baseline (999.87). Added
+  2026-08-06 by operator decision, after the 999.77 fix was found to force `evaluate_layer2`'s call
+  site open at compile time; see ROADMAP Phase 35 criterion 6.
+
 ### Release Hardening
 
 - [ ] **HARDEN-05**: Operator can trust `release --check`'s tag-signing preflight reflects whether
@@ -71,13 +77,14 @@ Which phases cover which requirements. Updated during roadmap creation.
 | HARDEN-03 | Phase 35 | Pending |
 | HARDEN-04 | Phase 35 | Pending |
 | HARDEN-05 | Phase 35 | Pending |
+| HARDEN-07 | Phase 35 | Pending |
 | HARDEN-06 | Phase 36 | Pending |
 
 **Coverage:**
 
-- v1 requirements: 5 total (HARDEN-01..05)
+- v1 requirements: 6 total (HARDEN-01..05, HARDEN-07)
 - v2 requirements: 1 total (HARDEN-06)
-- Mapped to phases: 6
+- Mapped to phases: 7
 - Unmapped: 0 ✓
 
 ---

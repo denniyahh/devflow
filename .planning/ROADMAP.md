@@ -30,7 +30,7 @@ those five confirmed fixes down waiting on a harness.
 | 35 | Loop-Termination and Baseline Correctness | Not started | — |
 | 36 | Drain Gate Concurrency Measurement | Not started | — |
 
-### Phase 35: Loop-Termination and Baseline Correctness (999.77 + 999.78 + 999.79 + 999.84 + 999.86)
+### Phase 35: Loop-Termination and Baseline Correctness (999.77 + 999.78 + 999.79 + 999.84 + 999.86 + 999.87)
 
 **Goal**: Operator can trust the Code↔Validate loop's failure-gating mechanics and the release
 signing preflight behave as documented and are enforced by regression tests, not by
@@ -38,9 +38,11 @@ correctness-by-construction alone — a transient `git` failure can no longer fo
 baseline, the loop has a bound independent of trivial per-cycle commits, a `--force` re-run
 doesn't inherit a stale verdict, the worktree-mode checkpoint call site is regression-tested, and
 `release --check`'s signing result reflects a real probe rather than a predictor that has already
-false-negatived live twice.
+false-negatived live twice. **Scope widened 2026-08-06 (operator):** 999.87 folded in — the same
+`Option<u32>` change forces `evaluate_layer2`'s call site open, so both consumers of the lossy count
+are fixed together rather than one being repaired while the other keeps collapsing the distinction.
 **Depends on**: Nothing (first phase of this milestone).
-**Requirements**: HARDEN-01, HARDEN-02, HARDEN-03, HARDEN-04, HARDEN-05
+**Requirements**: HARDEN-01, HARDEN-02, HARDEN-03, HARDEN-04, HARDEN-05, HARDEN-07
 **Success Criteria** (what must be TRUE):
 
   1. A transient `git` failure while measuring `phase_commit_count` no longer overwrites the
@@ -71,6 +73,14 @@ false-negatived live twice.
      `ssh-keygen -Y sign` probe against a throwaway payload, not from an `ssh-add -l`
      fingerprint comparison — closing the predictor that has produced a live false negative with
      the correct key present on two separate release cuts (999.86).
+
+  6. A transient `git` failure no longer causes `evaluate_layer2` to classify a successful agent as
+     `Failed` — an unmeasurable commit count is distinguished from a measured zero at **both**
+     consumers, not only at the `consecutive_failures` baseline, and Layer 2 returns `Ok(None)` to
+     fall through to Layer 3 (the idiom it already uses for an unreadable exit file) rather than
+     treating "could not count" as evidence of no work. Verified by the same forced-`git`-failure
+     harness criterion 1 requires, with the discriminating case being `exit_code = 0` +
+     `Stage::Code` + unrunnable `git` (999.87).
 **Plans**: TBD
 
 ### Phase 36: Drain Gate Concurrency Measurement (999.83)
@@ -315,7 +325,7 @@ Unsequenced items — not part of the active phase sequence. Promote with
 `/gsd-review-backlog` when ready; each carries accumulated context in its
 own `phases/999.N-*/CONTEXT.md`.
 
-### Phase 999.87: `evaluate_layer2` Reads an Unrunnable `git` as "No Work Done", Misclassifying a Successful Agent as `Failed` (BACKLOG)
+### Phase 999.87: `evaluate_layer2` Reads an Unrunnable `git` as "No Work Done", Misclassifying a Successful Agent as `Failed` (PROMOTED — Phase 35)
 
 **Linear:** [DEN-108](https://linear.app/denniskim/issue/DEN-108/99987-evaluate-layer2-reads-an-unrunnable-git-as-no-work-done)
 **Found:** 2026-08-06, while reasoning through Phase 35's D-08 decision (change
@@ -347,7 +357,16 @@ commit count that was never measured.
 from git, so the two signals fail independently — a broken `git` does not prevent `exit_code == 0`
 from being true.
 
-**Relationship to Phase 35 — this is a follow-up, not independent work.** D-08 changes
+**FOLDED INTO PHASE 35 (operator decision, 2026-08-06), reversing the disposition below.** The
+original filing deferred this as a follow-up. The operator challenged that and was right: D-08 makes
+`let commits: u32 = phase_commit_count(..)` a **type error**, so Phase 35 must edit this exact line
+regardless — and the deferral amounted to writing `.unwrap_or(0)` to deliberately preserve a known
+misclassification inside the phase whose subject is that very failure mode. The expensive part (the
+forced-`git`-failure harness) is already required by criterion 1, making the marginal cost small.
+Phase 35 criterion 6 now owns it, and `evaluate_layer2` returns `Ok(None)` → Layer 3. The
+superseded reasoning is kept below because it is what a reader would otherwise reconstruct.
+
+~~**Relationship to Phase 35 — this is a follow-up, not independent work.**~~ D-08 changes
 `phase_commit_count` to return `Option<u32>`, which forces this call site to be confronted by the
 compiler. Phase 35 deliberately maps `None` to today's zero-treatment **explicitly, with a
 comment**, rather than widening its own scope (34/D-04). This entry is exactly "revisit that
