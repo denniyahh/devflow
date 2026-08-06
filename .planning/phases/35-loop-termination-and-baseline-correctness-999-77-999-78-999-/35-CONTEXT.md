@@ -13,6 +13,107 @@
 > **One discretion item departs from its backlog entry's stated fix direction** (999.79's freshness
 > signal). It is marked as such rather than presented as settled.
 
+---
+
+## AMENDMENT NOTICE — adversarial review, 2026-08-06
+
+Four adversarial lanes were run against this document the day it was written (two internal, two
+external). **Every finding below was re-verified against source by the orchestrator before being
+accepted** — one was found overstated and is recorded in its corrected form (A-07). Corrections are
+marked `[CORRECTED]` inline where the original text would otherwise be reconstructed by a reader.
+
+**A-08 is an OPEN QUESTION for the operator, not a resolution.** Everything else is settled.
+
+- **A-01 — the `transition()` reset claim in `<code_context>` was FALSE.** The original said
+  `consecutive_failures` and `infra_failures` are both reset by `transition()`. Only `infra_failures`
+  is unconditional. `consecutive_failures` is gated on
+  `mode::transition_resets_consecutive_failures` (`mode.rs:111-113`), which is
+  `!matches!((from, to), (Stage::Code, Stage::Validate))` — it deliberately does **not** reset on
+  the Code→Validate hop, i.e. the only transition the loop under repair makes. This mattered because
+  a planner would have used the false version to justify the new 999.78 field ("the existing counter
+  resets, so we need a new one") and the justification would not survive review. The correct reason
+  is the *progress-based* reset at `pipeline_outcomes.rs:405-412`. Corrected inline.
+
+- **A-02 — the 999.84 base fixture named was the wrong one.** The document sent the planner to
+  `code_unknown_does_not_transition_to_validate` (a scoped-thread, gate-polling test for a different
+  path) and to `relaunch_checkpoint_session_emits_exactly_one_audit_event` (a helper-level test that
+  never calls `advance()`). **`advance_with_declared_checkpoint_and_reported_gate_relaunches_and_records`
+  (`pipeline_launch.rs:2302`) already drives `advance()` through `Action::GateReview` with all five
+  preconditions**, synchronously, with a negative sibling at `:2361`. 999.84's test is a small delta
+  on it. This violated the document's own "extend, do not rebuild" instruction on the phase's only
+  test deliverable. Corrected inline.
+
+- **A-03 — D-02's "no second spawn" contradicted D-04's retained fingerprint.**
+  `public_key_fingerprint` (`git.rs:786`) is a `Command::new("ssh-keygen")` spawn, so D-04 mandated
+  exactly what D-02's wording forbade. **Resolution: D-02's "no second spawn" is scoped to the
+  verdict-and-reason path** — nothing may spawn a second process to *decide* viability or to author
+  a `NotViable` reason. The fingerprint is a cosmetic field on the already-decided success path.
+  D-02's rejection rationale should be read as "doubles the spawn surface *on the failure path*".
+  If literal minimality is preferred, dropping it is a one-line change to `Viable { fingerprint:
+  None }`, which the type already permits.
+
+- **A-04 — criterion 1's actual fix site had no decision.** The discretion item specified the
+  `Option<u32>` return type and `evaluate_layer2`'s mapping, but said nothing about
+  `handle_validate_outcome`, which is where the defect lives: the **unconditional baseline write at
+  `pipeline_outcomes.rs:419`** ("The baseline advances on every recorded failure regardless of which
+  branch ran above"). **Decision: when the measurement returns `None`, treat it as not-progress AND
+  skip the baseline write entirely**, so the next successful measurement compares against the last
+  *real* observation. That is the half of the backlog's fix the document had dropped, and it is what
+  criterion 1 actually names.
+
+- **A-05 — the 999.79 `State::new` evidence was a proxy measurement.** "`start()` calls `State::new`
+  unconditionally at `commands.rs:124`" is true, but it does not establish what it was used to
+  establish. The artifact to be fingerprinted lives at the **evidence root**, which in worktree mode
+  is created by `ensure_phase_worktree` at `commands.rs:239` — *after* `:124`. At `:124` the file
+  does not yet exist on any reachable path. The fresh-`State` fact supports "a run-scoped baseline
+  slot exists"; it does **not** support "the stale artifact's fingerprint can be captured at start".
+  The planner must site the capture after the evidence root is resolved, and the both-directions test
+  requirement is unchanged and now load-bearing.
+
+- **A-06 — `Option<u32>` is two-valued; the doc comment names three causes.** `phase_commit_count`
+  returns `0` early when `rev-parse --verify` fails, covering both "branch does not exist yet"
+  (normal on a phase's first Validate) and "git is broken". **Decision: split on whether the command
+  RAN.** `.output()` returning `Err` (could not execute git) → `None`. `.output()` returning `Ok`
+  with a non-zero status (branch genuinely absent) → `Some(0)`, because that is a real observation,
+  not a measurement failure. Collapsing the branch-absent case to `None` would change progress
+  semantics on the first failure of every phase.
+
+- **A-07 — D-01's reversibility rating measured the constant, not the mechanism [agent claim
+  corrected].** A review lane asserted the timeout needs a new dependency. **That is overstated.**
+  `devflow-core` has no timeout crate and `Command::output()` cannot time out — but `canary.rs:364-426`
+  already carries a spawn + deadline + `try_wait` + kill + reap pattern in this same crate, and
+  `agent.rs:135` a related one. So it is a copy of an in-crate precedent, not a new dependency.
+  D-01's "one env assignment and one duration constant" still understates it: the mechanism is the
+  bulk of D-01's work. Rating stands as `reversible`; the effort estimate does not.
+
+- **A-09 — citations were stale and one pointed at out-of-scope material.** Every `ROADMAP.md` line
+  range was shifted ~110-135 lines by the roadmap edits committed after this document was written,
+  and the 999.84 range had come to cover the **999.85** entry this phase declares out of scope.
+  Source citations for `git.rs`, `mode.rs`, `state.rs`, `verify.rs` and `pipeline_outcomes.rs` were
+  also off. All corrected; ROADMAP refs now locate by heading, which does not drift.
+
+- **A-10 — criterion 5 is satisfied for the path form only.** Under D-03, inline `key::` keys return
+  `Unknown`, so they get neither `Viable` nor `NotViable`. This is a deliberate, recorded gap, not
+  an oversight — but it should be stated at verification time rather than discovered there.
+
+### A-08 — OPEN: the 999.77 return-type change is a one-way public-API break filed under discretion
+
+`pub fn phase_commit_count(...) -> u32` (`agent_result.rs:1841`) is public API of the published
+`devflow-core` crate. Changing its return type is the **same class of irreversible act as D-04** —
+same crate, same publish, undo-by-republication — but D-04 was put to the operator and this was not;
+it sits under "Claude's Discretion" with an instruction to act on it.
+
+The document's own precedent (D-04 rated `one-way`, D-07 escalated as behavioural) says anything
+one-way goes to the operator. **This item should be confirmed before planning proceeds.** The
+alternative it displaced — the backlog's sibling function — avoids the API break at the cost of
+reinstating the two-implementations hazard `phase_commit_count`'s doc comment warns about.
+
+Related and also uncounted: the 999.79 freshness check likely needs a signature change to
+`pub fn phase_verification_exists` (`agent_result.rs:2654`), which would be a **third** public-API
+change in the same cut. D-04's version-bump reasoning is scoped to two.
+
+---
+
 <domain>
 ## Phase Boundary
 
@@ -151,7 +252,7 @@ linked-worktree-harness question.
   watching the new test fail, restoring — is binding and must happen. But it is a one-time act that
   nothing re-runs. So the test *also* asserts directly that
   `phase_has_blocking_human_checkpoint(project_root, phase)` is `false`, the same
-  "opposite-result case" shape `verify.rs:351` and `:377` already carry, which re-runs on every
+  "opposite-result case" shape `verify.rs:351` and `:376` already carry, which re-runs on every
   `cargo test`.
 
   **What the mechanical half does and does not establish**, stated because the distinction is the
@@ -169,9 +270,17 @@ linked-worktree-harness question.
     `crates/devflow-cli/tests/`. `advance()` is `pub(crate)` (`pipeline_launch.rs:936`), so an
     integration test in `tests/` cannot call it. The backlog entry's phrase "one integration test"
     is loose on this point.
-  - **The harness already exists.** `code_unknown_does_not_transition_to_validate`
-    (`pipeline_launch.rs:~1452`) drives a real `advance()` on a scoped thread over a real git repo
-    via `init_repo`, polling for gate files. Extend that pattern; do not build a new one.
+  - **[CORRECTED — see Amendment A-02. The base fixture named here was the wrong one.]**
+    **The test to extend is `advance_with_declared_checkpoint_and_reported_gate_relaunches_and_records`
+    (`pipeline_launch.rs:2302`).** It already drives a real `advance()` **through the
+    `Action::GateReview` arm** with all five preconditions satisfied — `env_lock()`,
+    `stub_agent_binary("claude")`, `init_repo`, a declared-checkpoint PLAN, a confirmed capture, a
+    session id — and asserts exactly one `checkpoint_auto_decided` event. It is a synchronous
+    `advance()` call: no scoped thread, no gate-file polling. Its negative sibling is at `:2361`.
+    **999.84's test is a small delta on it** — set `state.worktree_path = Some(worktree)`, move the
+    `blocking-human` PLAN so it exists only under the worktree, and add the decoy PLAN under
+    `project_root` per D-05. (`code_unknown_does_not_transition_to_validate` at `:~1452`, named in
+    the original bullet, drives a *different* code path and is not the right base.)
   - **Nothing real is launched.** Satisfying all five preconditions makes the code call
     `relaunch_checkpoint_session`, which spawns an agent —
     `relaunch_checkpoint_session_emits_exactly_one_audit_event` (`pipeline_launch.rs:1626`) already
@@ -213,7 +322,7 @@ The operator declined to discuss the 999.77 / 999.78 / 999.79 area (except D-07 
 
 - **999.77 — the two doc comments are part of the deliverable, not cleanup.**
   `phase_commit_count`'s "Every consumer treats all three the same way" line
-  (`agent_result.rs:~1838-1840`) is deliberately falsified by the fix. `pipeline_outcomes.rs:283-286`
+  (`agent_result.rs:~1838-1840`) is deliberately falsified by the fix. `pipeline_outcomes.rs:337-340`
   promises a guarantee the code does not have; the backlog says correct it *even if the code fix is
   deferred*. ROADMAP criterion 1 names the doc comment explicitly.
 
@@ -284,14 +393,14 @@ The operator declined to discuss the 999.77 / 999.78 / 999.79 area (except D-07 
 - `.planning/ROADMAP.md` § "Phase 35: Loop-Termination and Baseline Correctness" — the
   authoritative goal and its five success criteria. Binding over this document's framing.
 - `.planning/REQUIREMENTS.md` — HARDEN-01…HARDEN-05, and the Out of Scope table.
-- `.planning/ROADMAP.md` § "Phase 999.77" (lines ~592-647) — the failure sequence, the false doc
+- `.planning/ROADMAP.md` § "Phase 999.77" (locate by heading — line numbers drift) — the failure sequence, the false doc
   comment, the required two-cycle test, and the Gemini-AGREE caveat.
-- `.planning/ROADMAP.md` § "Phase 999.78" (lines ~560-590) — WR-01, WR-04, IN-02.
-- `.planning/ROADMAP.md` § "Phase 999.79" (lines ~535-558) — including the `project_root`
+- `.planning/ROADMAP.md` § "Phase 999.78" (locate by heading) — WR-01, WR-04, IN-02.
+- `.planning/ROADMAP.md` § "Phase 999.79" (locate by heading) — including the `project_root`
   prohibition.
-- `.planning/ROADMAP.md` § "Phase 999.84" (lines ~415-470) — the five preconditions, why the Phase
+- `.planning/ROADMAP.md` § "Phase 999.84" (locate by heading) — the five preconditions, why the Phase
   34 capture campaign does not cover it, and the negative-control requirement.
-- `.planning/ROADMAP.md` § "Phase 999.86" (lines ~318-361) — why D-10's premise stopped holding,
+- `.planning/ROADMAP.md` § "Phase 999.86" (locate by heading) — why D-10's premise stopped holding,
   and the explicit scope discipline.
 
 ### Prior decisions this phase inherits
@@ -304,7 +413,7 @@ The operator declined to discuss the 999.77 / 999.78 / 999.79 area (except D-07 
   stopped holding, not a rewrite of it; D-10 stays as the historical record, unedited.
 
 ### Source under change
-- `crates/devflow-core/src/git.rs:758-955` — `SigningViability`, `SigningStatus`,
+- `crates/devflow-core/src/git.rs:728-1010` — `SigningViability`, `SigningStatus`,
   `classify_ssh_add_status`, `inline_signing_key_blob`, `inline_key_fingerprint`,
   `public_key_fingerprint`, `check_ssh_signing_viability`, `check_gpg_signing_viability`. Read the
   doc comments in full — they record 20d's D-01/D-02/D-03/D-06/D-08/D-12 and why each branch spawns
@@ -316,9 +425,10 @@ The operator declined to discuss the 999.77 / 999.78 / 999.79 area (except D-07 
 - `crates/devflow-core/src/mode.rs:120-151` — `consecutive_failures_made_progress` and the doc
   comment deferring the remedy to "a follow-up if the assumption proves wrong". 999.78 is that
   follow-up; cite it from the doc comment.
-- `crates/devflow-core/src/mode.rs:163-186` — `Mode::should_gate` / `should_auto_loop` and
-  `MAX_CONSECUTIVE_FAILURES`.
-- `crates/devflow-core/src/state.rs:55-110` — `consecutive_failures`, `infra_failures`,
+- `crates/devflow-core/src/mode.rs:163-186` — `Mode::should_gate` / `should_auto_loop`.
+  **`MAX_CONSECUTIVE_FAILURES` is at `mode.rs:18`**, not in that window, and
+  `transition_resets_consecutive_failures` is at `mode.rs:111`.
+- `crates/devflow-core/src/state.rs:45-110` — `consecutive_failures`, `infra_failures`,
   `preflight_retries`, `last_validate_failure_commit_count`, `worktree_path`. The `#[serde(default)]`
   backward-compat pattern and the "NOT touched by `transition()`" convention both live here.
 - `crates/devflow-cli/src/pipeline_outcomes.rs:283-470` — `select_loop_back_fix`,
@@ -376,15 +486,22 @@ The operator declined to discuss the 999.77 / 999.78 / 999.79 area (except D-07 
 
 ### Established Patterns
 
-- **Opposite-result assertions in the same test** (`verify.rs:351`/`:377`, and 34/D-08) — a pair
+- **Opposite-result assertions in the same test** (`verify.rs:351`/`:376`, and 34/D-08) — a pair
   that returns the same answer for both inputs is measuring the wrong thing. D-06 continues it.
 - **`#[serde(default)]` for every numeric/optional `State` field added since 17-01**, with the
   absent case given an explicit documented meaning (`last_validate_failure_commit_count`'s
   `None`-vs-`Some(0)` note is the model to follow for 999.78's and 999.79's new fields).
-- **Counters that bound a *stuck loop* are reset by `transition()`; observations and per-phase
-  totals are not** — `consecutive_failures`/`infra_failures` versus
-  `preflight_retries`/`checkpoint_resumes`/`last_validate_failure_commit_count`. 999.78's new total
-  belongs in the second group.
+- **[CORRECTED — the original form of this bullet was false; see Amendment A-01.]** The reset rule
+  is *conditional*, not a clean two-group split. `infra_failures` is reset unconditionally
+  (`pipeline_gate.rs:97`), but `consecutive_failures` is reset only when
+  `mode::transition_resets_consecutive_failures(from, to)` returns true — and that function
+  (`mode.rs:111-113`) is `!matches!((from, to), (Stage::Code, Stage::Validate))`, i.e. it
+  **deliberately does NOT reset on the Code→Validate hop**, the only transition the loop under
+  repair executes. `preflight_retries`/`checkpoint_resumes`/`last_validate_failure_commit_count` are
+  untouched by `transition()`, as stated. 999.78's new total belongs with that third group.
+  **Do not justify the new field with "the existing counter is reset by `transition()`"** — inside
+  the loop it is not. The real reason `consecutive_failures` cannot serve as the bound is the
+  progress-based reset at `pipeline_outcomes.rs:405-412`.
 - **Structural guards over hand audits** (34/D-06) — an equality test compiles untouched against a
   new variant; a type change does not. This is the basis for the 999.77 `Option<u32>` resolution.
 - **Fail-soft preflight** (20d D-06) — an absent tool yields `Unknown`, never a hard-fail
