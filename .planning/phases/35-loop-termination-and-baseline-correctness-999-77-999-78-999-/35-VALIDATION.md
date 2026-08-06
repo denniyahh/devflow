@@ -156,11 +156,25 @@ tested or explicitly recorded as accepted-not-tested. Silence here is a validati
 
 ## Wave 0 Requirements
 
-- [ ] `crates/devflow-cli/src/test_support.rs` — new `NoGitPath` RAII guard (empty-directory `PATH`,
-      mirroring `NeutralPath` at `:327`, holding `env_lock()` at `:94`). Prerequisite for **both**
-      criterion 1's and criterion 6's tests.
-- [ ] NC-1's harness-sanity control — `Command::new("git")` returns `Err` with the guard installed
-      and `Ok` without it. Write **before** the regression tests; retain if cheap.
+- [ ] **One `NoGitPath` RAII guard per crate** (empty-directory `PATH`, mirroring `NeutralPath` at
+      `crates/devflow-cli/src/test_support.rs:327`, each holding its own crate's single `PATH`
+      mutex). Prerequisite for **both** criterion 1's and criterion 6's tests.
+      - `crates/devflow-cli/src/test_support.rs` — beside `NeutralPath`, under `env_lock()` (`:94`)
+      - `crates/devflow-core/src/test_support.rs` — plus that crate's **first** `PATH` mutex,
+        `#[cfg(test)]`-only
+      **Why not one shared guard:** `crates/devflow-core/src/lib.rs:79` gates the module with
+      `#[cfg(any(test, feature = "test-support"))]` and `tempfile` is a dev-dependency, so a guard
+      shared across the crate boundary would not compile for devflow-cli. The `#[cfg(test)]` gate on
+      devflow-core's copy makes it unreachable from devflow-cli, so no test binary can ever hold two
+      guards under two different mutexes — the `PATH` race is prevented structurally, not by
+      discipline.
+- [ ] NC-1's harness-sanity control, **in each crate** — `Command::new("git")` returns `Err` with
+      the guard installed and `Ok` without it, and `PATH` is byte-identical to its pre-guard value
+      after the guard drops. Write **before** the regression tests; retain if cheap.
+- [ ] **Flake risk to watch:** `NoGitPath` is the first guard in this workspace that makes `git`
+      unresolvable process-wide, and devflow-core has had zero `PATH` mutations until now. Sibling
+      `git`-shelling tests can fail spuriously inside a guarded window. Mitigation is scope
+      minimisation, enforced as an acceptance criterion.
 - [ ] `crates/devflow-core/src/agent_result.rs` — the 999.87 `evaluate_layer2`-unrunnable-`git`
       test; and the `Option<u32>` change to `phase_commit_count` (`:1841`) that forces both
       consumers open.
@@ -185,7 +199,7 @@ tested or explicitly recorded as accepted-not-tested. Silence here is a validati
 
 | Behavior | Requirement | Why Manual | Test Instructions |
 |----------|-------------|------------|-------------------|
-| `execution_root` reaches `phase_has_blocking_human_checkpoint`, proven by a performed revert | HARDEN-04 c4 | "This test fails when the fix is reverted" is a property of a mutation, not of the committed tree; no committed test can assert it about itself | The binding is `pipeline_launch.rs:1070` (`let execution_root = state.worktree_path.as_deref().unwrap_or(project_root);`); the call is `:1071`. Revert **either** — bind `execution_root = project_root`, or pass `project_root` at the call — run the new test, record the failure output, revert the revert, re-run and record the pass. Both halves go in the SUMMARY. |
+| `execution_root` reaches `phase_has_blocking_human_checkpoint`, proven by a performed revert | HARDEN-04 c4 | "This test fails when the fix is reverted" is a property of a mutation, not of the committed tree; no committed test can assert it about itself | The binding is `pipeline_launch.rs:1068` (`let execution_root = state.worktree_path.as_deref().unwrap_or(project_root);`); the call the ROADMAP criterion cites is `:1070` (`&& verify::phase_has_blocking_human_checkpoint(execution_root, phase)`). Revert **either** — bind `execution_root = project_root`, or pass `project_root` at the call — run the new test, record the failure output, revert the revert, re-run and record the pass. Both halves go in the SUMMARY. |
 | Doc comment no longer over-promises | HARDEN-01 c1 | Prose accuracy; no assertion can judge whether a comment matches behaviour | Read the identified `pipeline_outcomes.rs` doc comment against the post-change code and confirm the guarantee claimed is the guarantee delivered |
 | Public-API removal recorded for release | HARDEN-05 c5 / D-04 | `CHANGELOG.md` + crate-doc accuracy is editorial | Confirm the removal of `classify_ssh_add_status` and `SigningStatus` is recorded; version stays `v2.5.0` per D-08; version set in two places; `devflow-core` publishes before `devflow-cli` |
 
