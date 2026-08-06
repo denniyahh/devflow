@@ -1060,9 +1060,20 @@ mod tests {
     /// for that phase carries the monitor's pid — `transition()` saves state
     /// BEFORE calling `launch_stage`, so the pid must be saved again inside
     /// `launch_stage` or it is lost.
+    ///
+    /// **Premise moved off `STREAM_JSON_STAGES` membership deliberately
+    /// (34-06); do not "simplify" the opt-out away.** This test's subject is
+    /// pid persistence, not which launch path runs, so it previously relied on
+    /// its stage being ABSENT from `STREAM_JSON_STAGES` — an incidental
+    /// premise that 34-05's widening destroys, at which point `canary_gate`
+    /// invokes the real `ClaudeCanaryLauncher` and the launch fails on a
+    /// delivery refusal that has nothing to do with pid persistence. Pinning
+    /// the legacy path via the opt-out makes the premise explicit and stable
+    /// under any contents of the constant, exactly as
+    /// `canary_gate_only_applies_to_the_stream_launch_path` does.
     #[test]
     fn launch_stage_persists_monitor_pid_for_reload() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1070,6 +1081,9 @@ mod tests {
 
         let phase = 65;
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        // Not because this test wants legacy behaviour, but because its
+        // subject is orthogonal to the launch path (34-06).
+        state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
         let stub_dir = stub_agent_binary("claude");
@@ -1122,9 +1136,16 @@ mod tests {
     /// stay marked `stopped` forever despite the operator's explicit
     /// resume. Asserts on the persisted state (not just `resume`'s exit
     /// code), since `transition()` saves state before `launch_stage` runs.
+    ///
+    /// **Premise moved off `STREAM_JSON_STAGES` membership deliberately
+    /// (34-06); do not "simplify" the opt-out away.** The subject is resume's
+    /// stop-marker semantics, not which launch path the relaunch takes. The
+    /// opt-out is persisted here rather than set on a local binding because
+    /// `resume()` loads its own `State` from disk; `apply_legacy_launch_opt_out`
+    /// ORs the persisted value, so it survives the reload.
     #[test]
     fn resume_clears_stop_marker_and_advances_past_stop_point() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1136,6 +1157,9 @@ mod tests {
         state.stop_until = Some(Stage::Plan);
         state.stopped = true;
         state.stop_reason = Some("stopped after plan completed (--until plan)".to_string());
+        // Not because this test wants legacy behaviour, but because its
+        // subject is orthogonal to the launch path (34-06).
+        state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
         let stub_dir = stub_agent_binary("claude");
@@ -1205,9 +1229,15 @@ mod tests {
     /// `resume_clears_stop_marker_and_advances_past_stop_point` above, since
     /// `transition()`'s `stop_until == Some(from)` interception only sees
     /// what was actually written to disk.
+    ///
+    /// **Premise moved off `STREAM_JSON_STAGES` membership deliberately
+    /// (34-06); do not "simplify" the opt-out away.** The subject is the
+    /// unfired `--until` cap's survival, not which launch path the relaunch
+    /// takes. Persisted rather than set locally, for the same reason as the
+    /// sibling test above: `resume()` reloads its own `State`.
     #[test]
     fn resume_preserves_unfired_until_cap() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1221,6 +1251,9 @@ mod tests {
         state.stop_until = Some(Stage::Plan);
         state.stopped = false;
         state.stop_reason = None;
+        // Not because this test wants legacy behaviour, but because its
+        // subject is orthogonal to the launch path (34-06).
+        state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
         let stub_dir = stub_agent_binary("claude");
@@ -1273,9 +1306,14 @@ mod tests {
     /// `--until` cap at all (`stop_until: None`) must remain unaffected by
     /// gating the clear on `state.stopped` — nothing to preserve, nothing to
     /// clear, and the relaunch must still happen.
+    ///
+    /// **Premise moved off `STREAM_JSON_STAGES` membership deliberately
+    /// (34-06); do not "simplify" the opt-out away.** The subject is that the
+    /// no-cap resume path is undisturbed, not which launch path the relaunch
+    /// takes. Persisted rather than set locally, as in the two siblings above.
     #[test]
     fn resume_without_a_cap_is_unchanged() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1286,6 +1324,9 @@ mod tests {
         state.stop_until = None;
         state.stopped = false;
         state.stop_reason = None;
+        // Not because this test wants legacy behaviour, but because its
+        // subject is orthogonal to the launch path (34-06).
+        state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
         let stub_dir = stub_agent_binary("claude");
@@ -1406,7 +1447,7 @@ mod tests {
     /// real agent CLI and without racing other PATH-mutating tests.
     #[test]
     fn launch_stage_inner_clears_monitor_pid_on_early_failure() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1507,7 +1548,7 @@ mod tests {
     /// checkpoint decision.
     #[test]
     fn relaunch_checkpoint_session_emits_exactly_one_audit_event() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1556,7 +1597,7 @@ mod tests {
     /// invocations.
     #[test]
     fn relaunch_checkpoint_session_increments_and_persists_counter() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1602,7 +1643,7 @@ mod tests {
     /// the current stage's agent run, not a new stage entry.
     #[test]
     fn relaunch_checkpoint_session_does_not_change_stage() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1648,7 +1689,7 @@ mod tests {
     /// lifetime.
     #[test]
     fn launch_stage_inner_resets_checkpoint_resumes_counter() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1730,7 +1771,7 @@ mod tests {
     /// per-stage `preflight` hook instead of here.
     #[test]
     fn canary_runs_once_per_run() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1804,7 +1845,7 @@ mod tests {
     /// pre-rebuild version failed on its `Stage::Plan` premise.
     #[test]
     fn canary_gate_only_applies_to_the_stream_launch_path() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1871,7 +1912,7 @@ mod tests {
     /// below fail for a reason that has nothing to do with what is under test.
     #[test]
     fn canary_gate_still_fires_for_a_widened_stage_without_the_opt_out() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1915,7 +1956,7 @@ mod tests {
     /// (a silent capability downgrade).
     #[test]
     fn absent_canary_refuses_to_launch() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1969,7 +2010,7 @@ mod tests {
     /// carries is a FALSE refusal).
     #[test]
     fn unverified_canary_refuses_to_launch_with_a_distinct_message() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -2014,7 +2055,7 @@ mod tests {
     /// D-15: every run carries evidence of what was verified when.
     #[test]
     fn canary_outcome_is_persisted_and_emitted() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -2069,7 +2110,7 @@ mod tests {
     /// agent invocation, and no claim about the real CLI's behaviour.
     #[test]
     fn launch_stage_inner_refuses_at_code_when_the_canary_cannot_confirm() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -2183,7 +2224,7 @@ mod tests {
     /// `gate_fired` for this stage.
     #[test]
     fn advance_with_declared_checkpoint_and_reported_gate_relaunches_and_records() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -2471,7 +2512,7 @@ mod tests {
     /// downgrade D-11 rejects.
     #[test]
     fn legacy_launch_is_off_by_default() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         // SAFETY: serialized by ENV_MUTEX.
         unsafe { std::env::remove_var("DEVFLOW_CLAUDE_LEGACY_LAUNCH") };
 
@@ -2507,7 +2548,7 @@ mod tests {
     /// summary's "what this does not establish".
     #[test]
     fn legacy_launch_use_is_recorded_in_provenance() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         // SAFETY: serialized by ENV_MUTEX.
         unsafe { std::env::remove_var("DEVFLOW_CLAUDE_LEGACY_LAUNCH") };
 
@@ -2562,7 +2603,7 @@ mod tests {
     /// legacy path is where a multi-plan wave orphans delegated work (999.64).
     #[test]
     fn legacy_launch_skips_the_delivery_canary() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -2619,7 +2660,7 @@ mod tests {
     /// covers.
     #[test]
     fn parse_failure_does_not_trigger_a_fallback() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         // SAFETY: serialized by ENV_MUTEX.
         unsafe { std::env::remove_var("DEVFLOW_CLAUDE_LEGACY_LAUNCH") };
 
@@ -2682,7 +2723,7 @@ mod tests {
     /// accidental-reach path D-11 forbids. The value is parsed as a bool.
     #[test]
     fn legacy_launch_env_var_is_parsed_as_a_bool() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         {
             let _env = LegacyEnvOverride::set("true");
@@ -2714,7 +2755,7 @@ mod tests {
     /// which was fixed by gating it.
     #[test]
     fn resume_does_not_clear_a_persisted_legacy_launch() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         // SAFETY: serialized by ENV_MUTEX.
         unsafe { std::env::remove_var("DEVFLOW_CLAUDE_LEGACY_LAUNCH") };
 
