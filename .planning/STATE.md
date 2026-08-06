@@ -2,18 +2,18 @@
 gsd_state_version: 1.0
 milestone: v2.4.0
 milestone_name: milestone (Resume Unattended Dogfooding, ACTIVE — declared 2026-08-04)
-current_phase: 34
-status: completed
-stopped_at: Completed 34-05-PLAN.md
-last_updated: "2026-08-06T11:17:31.166Z"
+status: Awaiting next milestone
+stopped_at: Phase 34 complete — UAT passed, security verified, milestone v2.4.0 at 100%
+last_updated: "2026-08-06T11:32:47.141Z"
 last_activity: 2026-08-06
-last_activity_desc: Phase 34 complete
+last_activity_desc: Milestone v2.4.0 completed and archived
 progress:
   total_phases: 2
   completed_phases: 2
   total_plans: 12
   completed_plans: 12
   percent: 100
+current_phase: 34
 current_phase_name: stream-json-coverage-and-the-validate-trust-boundary-999-73-
 ---
 
@@ -153,16 +153,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 34
-Plan: Not started
-Status: All phases complete
-Last activity: 2026-08-06 — Phase 34 complete
-(inserted as the FIRST heading, mirroring the Phase 32 durability fix) with Phase 33 and Phase 34
-detail sections landing inside its own heading-to-next-heading window, plus two new `## Progress`
-rows (33, 34 — Not started). Verified live: `roadmap.analyze` phase_count 0->2 (was returning
-garbage cross-milestone matches with no active milestone declared), next_phase "33",
-`milestone.complete v2.4.0 --dry-run` correctly reports "2 unstarted phase(s)" instead of a
-pass-all sweep, and `smart-entry`'s roadmap_total_phases/roadmap_completed_phases read 32/30.
+Phase: Milestone v2.4.0 complete
+Plan: —
+Status: Awaiting next milestone
+Last activity: 2026-08-06 — Milestone v2.4.0 completed and archived
 
 ## Recently Shipped
 
@@ -849,14 +843,7 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 
 ## Operator Next Steps
 
-- **Milestone v2.4.0 is 100% complete** (phases 33 and 34, 12/12 plans). Next:
-  `/gsd-complete-milestone v2.4.0` to archive it and prepare the next.
-- Phase 34's UAT test 1 passed by **operator attestation, not demonstration** — the
-  `Action::GateReview` worktree call site still has no regression guard. Tracked as ROADMAP 999.84 /
-  Linear DEN-106, and recorded as T-34-04-04 in `34-SECURITY.md` as mitigated-by-construction.
-- `34-SECURITY.md` raised one new low-severity finding (F-34-01): `idle_timeout_result`'s doc
-  comment was protected from edits by criterion 5, but this phase's own 34-01 and 34-03 fixes made
-  its stated rationale stale. Accepted, below the `high` block threshold, not yet filed.
+- Start the next milestone with /gsd-new-milestone
 
 ## Accumulated Context
 

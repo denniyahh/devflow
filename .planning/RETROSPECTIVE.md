@@ -78,6 +78,79 @@ published to crates.io)
 
 ---
 
+## Milestone: v2.4.0 — Resume Unattended Dogfooding
+
+**Shipped:** 2026-08-06 (planning close; not released)
+**Phases:** 2 (33, 34) | **Plans:** 12 | **Tasks:** 25
+
+### What Was Built
+
+The structural defects blocking unattended multi-wave `devflow start` runs. Phase 33 fixed the
+Code↔Validate loop's two failures: `consecutive_failures` never resetting on real progress
+(999.66), and loop-back fix selection reading the main checkout instead of the worktree (999.65).
+Phase 34 closed the Validate trust boundary — the status-gated verdict graft plus an exhaustive
+classifier naming all seven `AgentStatus` variants (999.74) — widened all five stages onto the
+stream-json launch path on real production captures (999.73), and made Layer 0's declaration
+discovery worktree-aware (999.76).
+
+### What Worked
+
+**Negative controls, applied as a standing habit rather than on request.** Nearly every claim in
+this milestone shipped with a case that had to produce the opposite result: the graft fix's
+positive half (`layer0_verdict_graft_still_transplants_a_passing_layer1_verdict`) proving the
+filter is not indiscriminate; the PII scan's `linuxbrew` control proving the scanner functions
+before its zero was believed; the root-sensitivity test pair each asserting the opposite root. The
+milestone's most valuable finding came from exactly this discipline.
+
+**Self-disclosed gaps beat discovered ones.** Plan 34-04 reverted its own fix and re-ran the full
+suite to prove its coverage gap was real, then said so in its SUMMARY. The verifier reproduced it
+independently rather than accepting the claim. Nothing about criterion 6b had to be caught later.
+
+**The capture campaign was allowed to refute its own premise.** Zero `background_tasks_changed`
+events across 1063 events despite 8 sub-agent dispatches — the opposite of what the widening
+decision assumed. It was filed as 999.83 and reported near the top of the verification, not buried.
+
+### What Was Inefficient
+
+**A prohibition protected text while the claim underneath it rotted.** Criterion 5 forbade editing
+`idle_timeout_result`'s doc comment. The phase honoured that exactly — and its own 34-01 and 34-03
+fixes invalidated both mechanisms the comment cites. Nobody noticed until the security audit at
+close. A "do not edit" constraint on a comment needs a paired check that the comment is still true
+after the phase's other changes land.
+
+**"Correct by construction" accumulated without a guard.** 999.76's second call site is right, and
+nothing would catch it going wrong. The phase knew this, recorded it honestly, and shipped anyway —
+which was the correct call — but the item then rode all the way to milestone close as the sole
+blocker on a requirement's traceability row.
+
+### Patterns Established
+
+- **Mitigated-by-construction vs. mitigated-by-demonstration** is now an explicit distinction in
+  threat registers (`34-SECURITY.md`, T-34-04-04), not an implicit one.
+- **Audit Limitations sections.** `34-SECURITY.md` states what its ASVS L1 depth does *not*
+  establish, including a measurement the auditor got wrong and corrected mid-run. A security
+  document that hides its own corrected measurement is worth less than one that shows it.
+- **Per-stage evidence needs a discriminating observation, not a completion.** Each capture's
+  `run.log` records what distinguishes it from a legacy single-document run, and explicitly states
+  that "the stage completed" is not that observation.
+
+### Key Lessons
+
+1. **A passing test suite is not coverage of the thing you changed.** Reverting the criterion-6b
+   argument left 279 tests green. The suite's size was never evidence about that line.
+2. **A live run only counts if its configuration can discriminate.** The Phase 34 capture campaign
+   ran `--no-worktree`, which collapses `execution_root` to `project_root` — structurally unable to
+   test the worktree fix, no matter how real the run was.
+3. **Fixing a defect leaves stale descriptions of it behind.** 999.85 exists because two comments
+   still explain a mechanism this milestone deleted. Worth a sweep at the end of any phase that
+   changes a documented invariant's route.
+
+### Cost Observations
+
+- Sessions: milestone spanned 2026-08-04 → 2026-08-06.
+- Notable: Phase 34's live capture campaign declared ~8.2 USD across five stage captures (the CLI's
+  own `total_cost_usd`, recorded as reported), dominated by Code at 6.10 USD / 49 turns / 695s.
+
 ## Cross-Milestone Trends
 
 ### Process Evolution

@@ -18,7 +18,27 @@ DevFlow must reliably drive the agent through the full pipeline and never
 silently corrupt its own state or lose a human's gate decision, even under a
 mid-run crash or kill.
 
-## Current Milestone: v2.4.0 Resume Unattended Dogfooding
+## Current State: v2.4.0 Resume Unattended Dogfooding — CLOSED 2026-08-06
+
+**Shipped as a planning milestone; not released.** At close the workspace version was still
+`2.3.0`, `CHANGELOG.md` had no 2.4.0 section, the work sat unmerged on `feature/phase-34`, and no
+`v2.4.0` tag existed. Closing the milestone archived the planning artifacts; cutting the release is
+a separate operation on the project's real release path.
+
+**Delivered.** The Code↔Validate loop no longer false-gates on healthy work (999.66), loop-back fix
+selection reads the worktree (999.65), Validate's reported outcome reflects derived status rather
+than the agent's self-report (999.74), all five stages joined the stream-json launch path on real
+captures (999.73), and Layer 0 verification works in worktree mode (999.76).
+
+**Closed as `override_closeout`.** Both phases verified and the pre-close artifact audit was clear,
+but DOGFOOD-04's traceability row remains `Pending` and no `/gsd-audit-milestone` was run. See
+`.planning/MILESTONES.md` § Known Gaps — chiefly 999.84 / DEN-106, an unguarded call site whose
+correctness rests on construction rather than a regression test.
+
+**Next:** `/gsd-new-milestone`.
+
+<details>
+<summary>Original v2.4.0 milestone definition (declared 2026-08-04)</summary>
 
 **Goal:** Close the structural defects blocking unattended, multi-wave `devflow start` runs, so
 dogfooding can safely resume. All four items are pre-existing defects found during the Phase 29
@@ -37,6 +57,8 @@ dogfood run and Phase 31 planning — none are new regressions from the `gsd-hyg
 **v2.4.0 is a planning label**, next minor after the last shipped v2.3.0 — the actual crate
 version is still derived automatically from conventional-commit classification at release time
 (`version.rs`), per this project's established versioning policy; it may not land exactly here.
+
+</details>
 
 ## Requirements
 
@@ -131,10 +153,24 @@ version is still derived automatically from conventional-commit classification a
   ("a 3+ wave unattended `devflow start` phase completes") awaits a real
   dogfood run against this binary.
 
+- ✓ **DOGFOOD-03** — every stream-json stage joined the launch path on real per-stage behavioural
+  evidence, with committed PII-scrubbed production captures and per-stage drain analysis, rather
+  than on a flag flip — v2.4.0 (Phase 34). The campaign refuted its own premise (zero
+  `background_tasks_changed` events across 1063, despite 8 sub-agent dispatches) and that was filed
+  as 999.83 rather than absorbed.
+- ✓ **DOGFOOD-04 (core claim)** — Validate's reported outcome reflects derived status, not the
+  agent's self-reported `verdict` — v2.4.0 (Phase 34), via the status-gated graft and the
+  exhaustive classifier, both with live tests and negative controls. **Not fully ticked:** its
+  traceability row stayed `Pending` at close because 999.76's second call site has no regression
+  guard (999.84 / DEN-106).
+
 ### Active
 
-- 4 requirements for **v2.4.0 Resume Unattended Dogfooding** (declared 2026-08-04) — see
-  `.planning/REQUIREMENTS.md` once written and Phases 33/34 in ROADMAP.md.
+- **No active milestone.** v2.4.0 closed 2026-08-06; run `/gsd-new-milestone` to declare the next
+  and write a fresh `REQUIREMENTS.md`.
+- Carried into the next milestone from v2.4.0's Known Gaps: **999.84 / DEN-106** (unguarded
+  `GateReview` root argument), **999.85 / DEN-107** (two comments justifying themselves by deleted
+  mechanisms), **999.83** (the drain gate has never observed sub-agent concurrency).
 
 *(Historical note on how the project reached this point: **The v2.3.0 milestone was CLOSED
 2026-08-04**,
@@ -298,12 +334,10 @@ than fresh domain research (these are pre-existing internal defects with fix dir
 sketched in ROADMAP.md, not new user-facing capability).*
 
 ---
-*Last updated: 2026-08-05 after Phase 33 (Loop-Back Correctness for Multi-Wave Validate→Code
-Cycles) completed — 5/5 plans, verification passed 4/4 ROADMAP criteria, DOGFOOD-01 and
-DOGFOOD-02 marked Complete. It took two gap-closure plans past the original three: 33-04 repaired
-two pre-existing tests that had silently stopped exercising their asserted code paths (one was
-attempting a real agent launch during `cargo test`), and 33-05 closed the review-found defect that
-the decision signal was read from the main checkout while the Validate agent authors it inside the
-phase's worktree — the same wrong-root class the code review then traced one file over into
-`evaluate_layer0`, which remains open as a backlog candidate. Milestone v2.4.0 continues with
-Phase 34.*
+*Last updated: 2026-08-06 after milestone **v2.4.0 Resume Unattended Dogfooding** closed —
+2 phases (33, 34), 12 plans, 25 tasks. Closed as `override_closeout`: both phases verified and the
+pre-close artifact audit clear, but DOGFOOD-04's traceability row remained `Pending` and no
+`/gsd-audit-milestone` was run. The milestone is a planning close, not a release — workspace version
+still 2.3.0, no 2.4.0 changelog section, work unmerged on `feature/phase-34`, no `v2.4.0` tag.
+Phase 34's UAT closed on operator attestation rather than demonstration, leaving 999.84 / DEN-106 as
+the standing gap. Next: `/gsd-new-milestone`.*

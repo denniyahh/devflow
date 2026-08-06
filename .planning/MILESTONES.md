@@ -1,5 +1,72 @@
 # Milestones
 
+## v2.4.0 Resume Unattended Dogfooding (Shipped: 2026-08-06)
+
+**Phases completed:** 2 phases (33, 34), 12 plans, 25 tasks
+**Closeout type:** override_closeout — see Known Gaps below. All phases verified
+(`phase_complete: true`, `verification_status: passed`) and the pre-close artifact audit was clear,
+but DOGFOOD-04's traceability row remains `Pending`.
+
+**Delivered:** the structural defects blocking unattended, multi-wave `devflow start` runs are
+closed — the loop can now survive a healthy 3+ wave phase, the Validate stage's reported outcome
+reflects derived status rather than the agent's self-report, and Layer 0 verification is no longer
+inert in worktree mode.
+
+**Key accomplishments:**
+
+- **999.66 / DOGFOOD-02 — the loop no longer false-gates on healthy work.**
+  `handle_validate_outcome`'s consecutive-failures counter resets on a real new commit and only
+  accumulates when a Validate→Code loop produces nothing, so a healthy 3+ wave phase reaches the
+  end while a genuinely stuck loop still hits `MAX_CONSECUTIVE_FAILURES`.
+- **999.65 / DOGFOOD-01 — loop-back fix selection reads the right root.** `select_loop_back_fix`
+  reads `{N}-VERIFICATION.md` from the phase's worktree rather than the main checkout, making
+  `FixType::GapsOnly` reachable on the Validate path in worktree mode for the first time. Proven by
+  a test that failed with the inverted value against unchanged code.
+- **999.74 / DOGFOOD-04 — the Validate trust boundary.** `reconcile_layer0_verdict` now consults
+  Layer 1's own status before transplanting its verdict, and `classify_validate_outcome` was
+  rewritten as an exhaustive match naming all seven `AgentStatus` variants with no wildcard in the
+  status position. An agent-written `verdict: pass` attached to its own `status: failed` no longer
+  advances to Ship unattended — the exploit was reproduced against the real cascade before the fix,
+  and pinned by a regression test with a matched positive control.
+- **999.73 / DOGFOOD-03 — every stream-json stage joined on real evidence.** All five `Stage`
+  variants widened onto the stream-json launch path against committed, PII-scrubbed production
+  captures with per-stage drain analysis, rather than on assumption. **The campaign refuted its own
+  premise** — zero `background_tasks_changed` events across 1063 events despite 8 concurrent
+  sub-agent dispatches — and that was filed as backlog 999.83 rather than quietly absorbed.
+- **999.76 — Layer 0 works in DevFlow's default operating shape.** External-verification discovery
+  reads the execution root, so a correctly-declared probe set no longer silently never executes in
+  worktree mode.
+
+### Known Gaps
+
+Recorded rather than waved through — this is an `override_closeout`.
+
+- **DOGFOOD-04 traceability row is `Pending`, not `Complete`.** Criteria 3 and 4 close the core
+  self-report-vs-derived-status guarantee directly, with live tests and negative controls. What
+  remains is 999.76's second call site — `phase_has_blocking_human_checkpoint` under
+  `Action::GateReview` — which is correct by construction but has **no regression guard**:
+  reverting its root argument leaves the full 279-test binary suite green. Phase 34's UAT closed
+  this by operator attestation rather than demonstration. Tracked as **999.84 / DEN-106**.
+- **999.85 / DEN-107** — two in-source comments (`idle_timeout_result`'s doc comment and a residual
+  instance inside `stream_success_cannot_stand_against_nonzero_exit_code`) still justify themselves
+  by mechanisms this milestone's own fixes deleted. Conclusions correct, reasons stale. Surfaced by
+  the Phase 34 security audit.
+- **999.83** — the drain gate, the safety mechanism the widened stages' unattended behaviour
+  depends on, is currently proven *not* to see sub-agent concurrency on Claude CLI 2.1.222.
+- **No `/gsd-audit-milestone` was run** before this close. Requirements coverage was checked against
+  REQUIREMENTS.md's traceability table and all phases were independently verified, but the
+  cross-phase integration and E2E-flow audit that `/gsd-audit-milestone` performs did not happen.
+
+### Release status
+
+**This milestone close is a planning-state operation only — v2.4.0 is not released.** At close:
+the workspace version is still `2.3.0`, `CHANGELOG.md` has no 2.4.0 section, the work sits on
+`feature/phase-34` (66 commits ahead of `develop`, unmerged), and no `v2.4.0` tag exists. Cutting
+the release requires the project's real release path — PRs through both protected-branch hops, the
+version bump, the changelog entry, a signed tag, and publishing core before cli.
+
+---
+
 ## gsd-hygiene GSD Workflow Hygiene (Shipped: 2026-08-04)
 
 **Phases completed:** 1 phases, 1 plans, 3 tasks
