@@ -740,7 +740,7 @@ currently documents the opposite guarantee — which is how it survived review.
 indistinguishably for "genuinely no commits", "branch does not exist", and "`git` could not be
 run" — its own doc at `:1838-1840` says so, and adds *"Every consumer treats all three the same
 way."* That last clause is the part that is not true. The baseline write at
-`crates/devflow-cli/src/pipeline_outcomes.rs:357` is **unconditional** ("regardless of which branch
+`crates/devflow-cli/src/pipeline_outcomes.rs:422` is **unconditional** ("regardless of which branch
 ran above"), so a `0` produced by a broken `git` is persisted as though it were a real measurement.
 
 **Failure sequence.** (1) `git` momentarily fails; count reads `0`; the streak correctly

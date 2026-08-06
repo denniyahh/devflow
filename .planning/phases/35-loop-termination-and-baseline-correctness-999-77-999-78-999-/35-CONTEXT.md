@@ -96,6 +96,45 @@ marked `[CORRECTED]` inline where the original text would otherwise be reconstru
   `Unknown`, so they get neither `Viable` nor `NotViable`. This is a deliberate, recorded gap, not
   an oversight — but it should be stated at verification time rather than discovered there.
 
+### Added by the external lane (opencode), verified independently
+
+- **A-11 — the new 999.78 counter is defeated by restarting the phase, and nothing said so.** The
+  counter is specified as a "never-reset per-phase total" living in `State`. But `State::new`
+  (`state.rs:263-272`) zeroes **every** counter — `consecutive_failures: 0`, `preflight_retries: 0`,
+  `checkpoint_resumes: 0`, `last_validate_failure_commit_count: None` — and `start()` calls it
+  unconditionally on every run, `--force` included. So a phase that hits the ceiling and is
+  restarted gets a fresh budget: **`State` is per-RUN, while the bound is specified as per-PHASE.**
+  Those are not the same lifetime, and the whole point of the counter is to bound a phase that keeps
+  failing.
+  **Decision: the planner must state the counter's persistence explicitly**, and the reset event must
+  be a real event (phase completion / operator approval at the ceiling gate), not "whenever a new
+  process starts". If it cannot outlive `State`, that is a finding to escalate, not to paper over —
+  a bound that resets on restart does not bound the unattended case D-07 exists for.
+
+- **A-12 — the 999.79 fingerprint has a first-encounter fork the document never resolved, and one
+  branch permanently regresses `--gaps-only`.** Sharpens A-05. On a `--force` re-run the stale
+  artifact is already on disk when the run starts, so the implementer must choose:
+  **(a)** record the stale artifact's hash *before* the Validate agent runs, so the agent's rewrite
+  registers as a change; or **(b)** record only when Validate finishes, in which case the first check
+  sees `None` → `FullExecute`, and every later check compares the unchanged stale hash → `FullExecute`
+  **forever**. Branch (b) is the silent permanent regression this document warns about but does not
+  structurally prevent. **Take (a).** The both-directions test in the 999.79 discretion item is what
+  discriminates them, which is why it is mandatory rather than nice-to-have.
+
+- **A-13 — the 999.77 two-cycle test needs a way to force a `git` failure, and none was specified
+  [agent claim refined].** `phase_commit_count` shells out to real `git`, so "force a measurement
+  failure" needs a mechanism. The lane reported this as an unsolved gap. **It is a gap in this
+  document, but the tooling already exists:** `crates/devflow-cli/src/test_support.rs` carries
+  `NeutralPath` plus the `PATH`-guarding mutex (`PATH` is mutated 36 times across 12 lock regions),
+  which is exactly the shape `stub_agent_binary` uses. A failing-`git` shim placed first on `PATH`
+  under that guard is the intended route. The planner must still specify it — without a mechanism
+  the two-cycle sequence cannot be written at all, and the fix becomes unverifiable.
+
+- **A-14 — the ROADMAP's own 999.77 entry cited the baseline write at `pipeline_outcomes.rs:357`;
+  it is at `:422`.** Line 357 is the tail of `handle_validate_outcome`'s signature. Corrected in
+  `ROADMAP.md`. This is the second stale citation in that entry (see A-09 for the doc-comment one) —
+  treat every `file:line` in the 999.x entries as needing re-checking before use, not as canonical.
+
 ### A-08 — OPEN: the 999.77 return-type change is a one-way public-API break filed under discretion
 
 `pub fn phase_commit_count(...) -> u32` (`agent_result.rs:1841`) is public API of the published
