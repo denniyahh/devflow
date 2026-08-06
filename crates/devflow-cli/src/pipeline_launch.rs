@@ -467,7 +467,21 @@ fn emit_canary_outcome(state: &State, outcome: &canary::CanaryOutcome) {
 /// Element ORDER here is semantically inert: the constant is consulted with
 /// `slice::contains`, so no launch behaviour depends on it. The list is written
 /// in `Stage`-enum declaration order for readability only.
-const STREAM_JSON_STAGES: &[Stage] = &[Stage::Code];
+///
+/// **PROVISIONAL — widened in the working tree pending the capture campaign
+/// (plan 34-05 task 2, D-02 Amendment 1).** The evidence gate for this constant
+/// is commit-time, not build-time: all five variants are listed here so the
+/// capture run can reach each stage's pipe-owning launch, and task 5 removes
+/// any stage whose capture did not materialise or did not support it. This
+/// paragraph is replaced by per-stage evidence entries once the evidence has
+/// decided; if you are reading it at HEAD, the campaign did not finish.
+const STREAM_JSON_STAGES: &[Stage] = &[
+    Stage::Define,
+    Stage::Plan,
+    Stage::Code,
+    Stage::Validate,
+    Stage::Ship,
+];
 
 /// Whether this launch should use the `stream-json` transport and the
 /// pipe-owning monitor.
