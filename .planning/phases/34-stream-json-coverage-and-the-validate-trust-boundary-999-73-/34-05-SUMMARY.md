@@ -282,6 +282,22 @@ None. No stub, placeholder, or TODO was introduced.
 None beyond the plan's register. T-34-05-01 (information disclosure via committed captures)
 **fired for real** and is documented in deviations 2 and 3 rather than as a new flag.
 
+## Self-Check: PASSED
+
+All 13 claimed artifacts exist and are non-empty (3 documents + 5 × `raw_output.jsonl` + 5 ×
+`run.log`). All 6 claimed commits resolve: `da0bf8f`, `9d198ee`, `69ff870`, `d454c16`, `7deb8ef`,
+`a33a498`. A negative control (`deadbee1`) correctly reported MISSING, so the existence probe can
+fail. Working tree clean, on `feature/phase-34`, 6 commits unpushed.
+
+**Hand-corrections to tooling output, recorded per CLAUDE.md rather than made silently:**
+`state.advance-plan` incremented a stale counter to `Plan: 2 of 5` / `Status: Ready to execute`,
+which was wrong twice over — 34-05 is the phase's *last* plan and all six now have summaries. Set to
+`Plan: 6 of 6 — all plans executed` / `Status: All plans executed — phase not yet closed`.
+`state.update-progress` also reported `Progress field not found in STATE.md` while a `progress:`
+block is present in the frontmatter; left alone, as it is pre-existing drift outside this plan's
+scope. ROADMAP's phase-34 row reads `6/6 | In Progress`, which is correct — closing the phase is
+`phase.complete`'s job, not this plan's.
+
 ## Note on `actuals.tokens`
 
 `497000` is chars/4 over the realized diff, as the estimate's scale requires. It is **dominated by
