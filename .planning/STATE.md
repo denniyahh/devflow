@@ -6,7 +6,7 @@ status: planning
 last_updated: "2026-08-06T14:14:11.571Z"
 last_activity: 2026-08-06
 progress:
-  total_phases: 0
+  total_phases: 2
   completed_phases: 0
   total_plans: 0
   completed_plans: 0
@@ -150,10 +150,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: Not started (defining requirements)
-Plan: —
-Status: Defining requirements
-Last activity: 2026-08-06 — Milestone v2.5.0 started
+Phase: 35 of 36 (Loop-Termination and Baseline Correctness) — ready to plan
+Plan: — (not yet planned)
+Status: Roadmap created, ready for planning
+Last activity: 2026-08-06 — ROADMAP.md created for v2.5.0: Phase 35 (HARDEN-01..05 / 999.77+999.78+999.79+999.84+999.86), Phase 36 (HARDEN-06 / 999.83). Next: `/gsd-plan-phase 35`.
 
 ## Recently Shipped
 

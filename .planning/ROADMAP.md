@@ -2,6 +2,111 @@
 
 > Phase plan source of truth. Each phase drives a `devflow start` agent session.
 
+## 🚧 v2.5.0 milestone (Loop-Termination and Release Hardening, ACTIVE — declared 2026-08-06)
+
+**Declared 2026-08-06, the same day v2.4.0 released.** Closes five confirmed defects/gaps that
+surfaced from v2.4.0's own release, plus one investigation into a concurrency blind spot the
+safety net v2.4.0 just widened. All six are pre-existing issues found via code review, live
+release cuts, and Phase 34's own capture campaign — none are new regressions from v2.4.0. See
+`.planning/REQUIREMENTS.md` (HARDEN-01..06) and `.planning/PROJECT.md` § "Current Milestone."
+
+**Why two phases, not one or six.** Phase 35 bundles five items that are confirmed live defects
+or already-decided fixes, small-to-medium in size, safe to land together in one phase: **999.77**
+(a transient `git` failure grants a free `consecutive_failures` reset, contradicting the doc
+comment), **999.78** (the Code↔Validate loop has no progress-independent bound, and the
+Supervise-mode gate message reports a resettable streak instead of a cumulative total),
+**999.79** (`{N}-VERIFICATION.md` never goes stale, so `--force` inherits a prior run's verdict
+and gates unresolvably), **999.84** (the `GateReview` checkpoint call site's root argument is
+correct by construction but has no regression test), and **999.86** (`release --check`'s
+tag-signing predictor has now false-negatived live twice with the correct key present; replace it
+with a real `ssh-keygen -Y sign` probe). Phase 36 carries **999.83** alone — the drain gate has
+never observed real sub-agent concurrency, and its fixture's shape doesn't match what production
+actually emits. That item is investigation-shaped (design the right experiment first, same family
+as backlog 999.71's precedent) rather than a quick patch, and bundling it with Phase 35 would slow
+those five confirmed fixes down waiting on a harness.
+
+| Phase | Name | Status | Version |
+|---|---|---|---|
+| 35 | Loop-Termination and Baseline Correctness | Not started | — |
+| 36 | Drain Gate Concurrency Measurement | Not started | — |
+
+### Phase 35: Loop-Termination and Baseline Correctness (999.77 + 999.78 + 999.79 + 999.84 + 999.86)
+
+**Goal**: Operator can trust the Code↔Validate loop's failure-gating mechanics and the release
+signing preflight behave as documented and are enforced by regression tests, not by
+correctness-by-construction alone — a transient `git` failure can no longer forge a fresh
+baseline, the loop has a bound independent of trivial per-cycle commits, a `--force` re-run
+doesn't inherit a stale verdict, the worktree-mode checkpoint call site is regression-tested, and
+`release --check`'s signing result reflects a real probe rather than a predictor that has already
+false-negatived live twice.
+**Depends on**: Nothing (first phase of this milestone).
+**Requirements**: HARDEN-01, HARDEN-02, HARDEN-03, HARDEN-04, HARDEN-05
+**Success Criteria** (what must be TRUE):
+
+  1. A transient `git` failure while measuring `phase_commit_count` no longer overwrites the
+     persisted `consecutive_failures` baseline with a false zero — the next successful
+     measurement compares against the last real observed count, "could not count" is
+     distinguished from "counted zero," and `pipeline_outcomes.rs`'s doc comment no longer
+     promises a guarantee the code doesn't have (999.77).
+
+  2. An unattended Code↔Validate loop that commits trivial `.planning/` artifacts every cycle
+     without making real progress still reaches a bound distinguishable from ordinary streak
+     resets — a never-reset per-phase Validate-failure total exists — and in Supervise mode the
+     gate message reports that cumulative total rather than a streak length that can read
+     misleadingly low at the 2nd, 5th, and 9th gate alike (999.78).
+
+  3. Running `devflow start --phase N --force` against a phase with a stale `{N}-VERIFICATION.md`
+     from a previous run no longer inherits that verdict — staleness is detected (via a recorded
+     plan-count comparison or equivalent) so the loop-back treats the phase as mid-arc rather than
+     dispatching `--gaps-only` against zero matching plans and gating unresolvably (999.79).
+
+  4. The worktree-mode `GateReview` checkpoint auto-decide call site
+     (`pipeline_launch.rs:1070`, passing `execution_root` into
+     `phase_has_blocking_human_checkpoint`) is covered by an integration test that fails when the
+     argument is reverted to `project_root` — demonstrated by actually performing that revert and
+     watching the new test fail, with its negative control recorded alongside it, not asserted
+     from reading the fix (999.84).
+
+  5. `release --check`'s tag-signing preflight reports `Viable`/`NotViable` from a real
+     `ssh-keygen -Y sign` probe against a throwaway payload, not from an `ssh-add -l`
+     fingerprint comparison — closing the predictor that has produced a live false negative with
+     the correct key present on two separate release cuts (999.86).
+**Plans**: TBD
+
+### Phase 36: Drain Gate Concurrency Measurement (999.83)
+
+**Goal**: Operator has a real, evidence-based answer to whether the drain gate — the safety net
+the v2.4.0 stream-json widening depends on — actually observes real sub-agent concurrency, in
+place of the untested assumption its synthetic fixture currently encodes. This is
+investigation-shaped work: design and run the right experiment, in the same family as backlog
+999.71's precedent, rather than apply a predetermined fix.
+**Depends on**: Nothing structurally — sequenced after Phase 35 only by phase numbering.
+Deliberately isolated so this investigation does not block Phase 35's five confirmed fixes; it may
+be planned and executed independently of Phase 35's completion.
+**Requirements**: HARDEN-06
+**Success Criteria** (what must be TRUE):
+
+  1. The event family (or families) Claude CLI actually emits for each kind of concurrent child
+     work — sub-agent dispatch, backgrounded shell, or other — is established from live
+     production evidence beyond the single n=1 capture already on record (`34-evidence/`), not
+     inferred a second time from source reading alone.
+
+  2. The question "does the drain gate see real sub-agent concurrency" is answered honestly per
+     observed condition (CLI version, workload shape) — including recording a negative or
+     inconclusive result exactly as measured, rather than assuming the answer resolves in the
+     direction of "the gate already works."
+
+  3. One of two outcomes is delivered, not deferred: either `CloseRule::observe` is widened to
+     the event families production actually emits, or an in-source explanation records why
+     `background_tasks_changed` remains the right and sufficient key — and the SYNTHETIC fixture
+     label is corrected to match whatever the measurement found.
+
+  4. The measurement's own scope and strength are stated explicitly in its record — sample size,
+     CLI version(s), workload shape(s) covered, and what conclusion that evidence can and cannot
+     support — so a future reader cannot mistake a narrow result for a general guarantee about the
+     drain gate.
+**Plans**: TBD
+
 ## Progress
 
 **Scope note:** this table is global (spans every shipped milestone plus the active one), per
@@ -48,6 +153,8 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 32 | 0/0 | Complete    | 2026-08-04 |
 | 33 | 6/6 | Complete    | 2026-08-05 |
 | 34 | 6/6 | Complete    | 2026-08-06 |
+| 35 | — | Not started | — |
+| 36 | — | Not started | — |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
 
