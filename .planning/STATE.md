@@ -2,9 +2,13 @@
 gsd_state_version: 1.0
 milestone: v2.5.0
 milestone_name: Loop-Termination and Release Hardening
+current_phase: 35
+current_phase_name: Loop-Termination and Baseline Correctness
 status: planning
-last_updated: "2026-08-06T14:14:11.571Z"
+stopped_at: Phase 35 context gathered
+last_updated: "2026-08-06T15:41:26.779Z"
 last_activity: 2026-08-06
+last_activity_desc: "ROADMAP.md created for v2.5.0: Phase 35 (HARDEN-01..05 / 999.77+999.78+999.79+999.84+999.86), Phase 36 (HARDEN-06 / 999.83). Next: `/gsd-plan-phase 35`."
 progress:
   total_phases: 2
   completed_phases: 0
@@ -834,9 +838,9 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 
 ## Session
 
-**Last session:** 2026-08-06T11:17:31.166Z
-**Stopped at:** Phase 34 complete — UAT passed, security verified, milestone v2.4.0 at 100%
-**Resume file:** None
+**Last session:** 2026-08-06T15:41:26.736Z
+**Stopped at:** Phase 35 context gathered
+**Resume file:** .planning/phases/35-loop-termination-and-baseline-correctness-999-77-999-78-999-/35-CONTEXT.md
 
 ## Operator Next Steps
 
