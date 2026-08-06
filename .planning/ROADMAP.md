@@ -81,7 +81,15 @@ are fixed together rather than one being repaired while the other keeps collapsi
      treating "could not count" as evidence of no work. Verified by the same forced-`git`-failure
      harness criterion 1 requires, with the discriminating case being `exit_code = 0` +
      `Stage::Code` + unrunnable `git` (999.87).
-**Plans**: TBD
+**Plans**: 6 plans across 4 waves
+
+Plans:
+- [ ] 35-01-PLAN.md — tracer: the unmeasurable-`git` spine end to end — `NoGitPath` harness in both crates, `phase_commit_count` becomes `Option<u32>`, both consumers honour it, two-cycle regression test, corrected doc comments (criteria 1 + 6)
+- [ ] 35-02-PLAN.md — worktree-mode `GateReview` checkpoint regression test with D-05's decoy PLAN, D-06's re-running control, and the performed revert demonstration (criterion 4)
+- [ ] 35-03-PLAN.md — replace `release --check`'s signing predictor with a bounded, non-interactive `ssh-keygen -Y sign` probe; delete the predictor, its enum and the orphaned helper (criterion 5)
+- [ ] 35-04-PLAN.md — never-reset per-phase Validate-failure total that survives `--force`, a ceiling that gates without aborting, and a gate message led by the cumulative number (criterion 2)
+- [ ] 35-05-PLAN.md — run-scoped content fingerprint makes `{N}-VERIFICATION.md` go stale, so a `--force` re-run stops inheriting the previous run's verdict; both directions tested (criterion 3)
+- [ ] 35-06-PLAN.md — enumerate and document the public-API break: verified `CHANGELOG.md` entry plus removal notes at each site; release stays `v2.5.0`, milestone unrenamed (D-04 / D-08)
 
 ### Phase 36: Drain Gate Concurrency Measurement (999.83)
 
