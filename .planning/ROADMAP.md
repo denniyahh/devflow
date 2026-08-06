@@ -315,7 +315,7 @@ Unsequenced items — not part of the active phase sequence. Promote with
 `/gsd-review-backlog` when ready; each carries accumulated context in its
 own `phases/999.N-*/CONTEXT.md`.
 
-### Phase 999.86: Replace `release --check`'s Tag-Signing Predictor With a Direct Probe (BACKLOG, revises D-10 for `release --check` only)
+### Phase 999.86: Replace `release --check`'s Tag-Signing Predictor With a Direct Probe (PROMOTED — Phase 35, revises D-10 for `release --check` only)
 
 **Linear:** [DEN-75](https://linear.app/denniskim/issue/DEN-75/release-check-tag-signing-gate-false-negatives-when-the-key-is-not-in)
 (re-promoted; priority raised Medium → High). DEN-79, a duplicate describing the same predictor's
@@ -333,9 +333,25 @@ and reads git's own result — no viability guess needed, ever. That executor is
 with real execution (DEN-50, **still Backlog**, never built). `release --check`'s predictor was
 never actually removed or replaced — it is the only thing that exists today, still reading
 `ssh-add -l` and comparing fingerprints, unchanged since D-10. It just produced the exact false
-negative D-10 was filed about, live, on a machine with the correct key loaded — verified directly:
-`ssh-keygen -Y sign` against the configured key succeeded and `git tag -v` confirmed the right
-fingerprint, while `release --check` reported `NotViable`.
+negative D-10 was filed about, live, ~~on a machine with the correct key loaded~~ — verified
+directly: `ssh-keygen -Y sign` against the configured key succeeded and `git tag -v` confirmed the
+right fingerprint, while `release --check` reported `NotViable`.
+
+**Correction to "the correct key loaded" (2026-08-06, Phase 35 discussion).** The key was **not
+loaded in the agent**, and that is the actual mechanism rather than an incidental detail. Measured
+on the operator's host: `ssh-add -l` exits **0** (the agent holds *other* identities), the
+configured signing key's fingerprint is **absent** from that output, and `ssh-keygen -Y sign` with
+that key still exits **0** — because the unencrypted private-key sibling is on disk. So the
+predictor reaches `SigningStatus::KeysListed`, fails its `stdout.contains(&fingerprint)` test, and
+returns `NotViable { "ssh-agent has keys loaded, but not the configured signing key" }` while
+signing genuinely works.
+
+This matters beyond wording: it names the class. `ssh-add -l` cannot see on-disk private key
+material, so **agent membership is not a necessary condition for `git tag -s` to succeed** — the
+predictor is testing a condition the real operation does not require. The original phrasing
+suggested a lookup that merely missed a present key; the real defect is that the predictor asks the
+wrong question. Any regression test asserting `Viable` must therefore **not** depend on agent
+membership.
 
 **The fix is not a second predictor.** DEN-75 already named the right shape, unimplemented until
 now: stop inferring viability from `ssh-add -l` and compare a probe *is* the operation the tag step
@@ -358,7 +374,42 @@ negative was in the caution direction only by luck of which check fired first �
 mechanism (comparing fingerprints against `ssh-add -l`, which knows nothing about on-disk private
 key material a probe would find) is unreliable by construction, not by circumstance.
 | **Size:** S — one function rewrite plus a regression test asserting `SigningViability::Viable`
-against a probe that actually signs, not a fingerprint match.
+against a probe that actually signs, not a fingerprint match. **Revised 2026-08-06: still S, but it
+carries a public-API removal** (see finding 3 below), so the cut shipping it needs its version bump
+to reflect that.
+
+**Findings from the Phase 35 discussion (2026-08-06).** All measured on the operator's host with
+positive and negative controls; n=1, one OpenSSH build, one ed25519 key — they fix the *shape* of
+the fix, and are not coverage.
+
+1. **A naive probe can BLOCK, and the entry does not mention it.** With an encrypted key, no agent,
+   and a *working* askpass, `ssh-keygen -Y sign` waits on a passphrase prompt — measured, it timed
+   out at 6s against a 30s askpass. `release --check` hanging on a dialog is the unattended-stall
+   class DOGFOOD-01 exists to eliminate, reached from a new direction. `SSH_ASKPASS_REQUIRE=never`
+   turns that into exit 255 in **0s**, and the positive control confirms the working signing path
+   still exits 0 under the same variable. Phase 35 decided both that variable **and** a wall-clock
+   timeout (35 D-01), since the variable only closes the askpass route — a wedged agent or a stalled
+   PKCS11 provider still blocks.
+
+2. **`ssh-keygen -Y sign -f` takes a path, so the inline `key::` form is not directly probeable.**
+   It resolves the private key by stripping `.pub` from *that path*, or via the agent. A blob
+   materialized to a temp file has neither unless the agent holds it — measured working when the
+   agent holds it (exit 0) and failing when it does not (255). Phase 35 declined to probe inline
+   values at all (35 D-03), returning `Unknown` fail-soft; that was a surface-cost choice, **not** a
+   feasibility finding, so reopening it needs only a temp file and a cleanup path.
+
+3. **The fix orphans public API.** `classify_ssh_add_status` and `SigningStatus` are `pub` in
+   `devflow_core::git`, their only production caller is the `ssh-add -l` branch being deleted, and
+   `devflow-cli` consumes only `SigningViability`. Phase 35 decided to remove both and treat it as
+   the real break it is (35 D-04). `inline_key_fingerprint` (private) is orphaned too, by finding 2.
+
+4. **`-n` namespace: verify, do not assume.** The probe's value is being the operation rather than
+   an approximation of it, so the namespace must be checked against a real git-produced signature.
+   Left to the planner deliberately, flagged here so it is not quietly guessed.
+
+**Not established:** whether `release --check` itself reports `NotViable` on this host was *traced*
+through `git.rs` against the measured inputs, not observed by running the command. The inputs are
+measured; the verdict is inferred from them.
 
 ### Phase 999.85: Two Protected Comments Now Justify Themselves by a Mechanism Phase 34 Deleted (BACKLOG)
 
@@ -412,7 +463,7 @@ as licence to relax the instruction — the instruction is still load-bearing, j
 open in Linear despite Phase 34 closing it via criterion 3. Same for DEN-98 (999.76) via criterion
 6. Both want a status sweep.
 
-### Phase 999.84: Nothing Guards the Root Argument at the `GateReview` Checkpoint Call Site, So 999.76's Fix Can Regress Silently (BACKLOG)
+### Phase 999.84: Nothing Guards the Root Argument at the `GateReview` Checkpoint Call Site, So 999.76's Fix Can Regress Silently (PROMOTED — Phase 35)
 
 **Linear:** [DEN-106](https://linear.app/denniskim/issue/DEN-106/99984-nothing-guards-the-root-argument-at-the-gatereview-checkpoint)
 **Found:** 2026-08-06, Phase 34 UAT test 1 — the phase's sole human-verification item, self-disclosed
@@ -462,12 +513,56 @@ which is the failure mode it exists to close.
 
 **Relationship to 999.76's open question — decide together, but they are not the same item.** 999.76
 (this entry's parent, promoted into Phase 34) left an unanswered question: whether that fix should
-carry the workspace's first *real linked* `git worktree` integration test, since today's
-worktree-mode tests use plain `create_dir_all` directories with no git repository at all. That
-question is motivated by `phase_commit_count`'s shared-refs property, not by this call site, and it
-remains open. **This entry does not depend on it** — the `:1070` guard needs only a directory
-standing in for the worktree, exactly as `verify.rs:351` already does, so it can land cheaply and
-independently. If the linked-worktree harness is built first, this test should use it.
+carry ~~the workspace's first *real linked* `git worktree` integration test, since today's
+worktree-mode tests use plain `create_dir_all` directories with no git repository at all~~ a real
+linked `git worktree` test. That question is motivated by `phase_commit_count`'s shared-refs
+property, not by this call site, and it remains open. **This entry does not depend on it** — the
+`:1070` guard needs only a directory standing in for the worktree, exactly as `verify.rs:351`
+already does, so it can land cheaply and independently. If the linked-worktree harness is built
+first, this test should use it.
+
+**Correction: "the workspace's first" is FALSE (2026-08-06, Phase 35 discussion).** Real
+`git worktree add` fixtures already exist in at least three places:
+
+- `crates/devflow-cli/src/staleness.rs` — `worktree_staleness_fixture()`, the fullest one: a
+  `develop` branch with a recorded commit, a **sibling** feature-branch worktree via
+  `git worktree add -b <branch> <path> <start_point>`, and two further commits made inside it.
+- `crates/devflow-cli/src/preflight.rs:1198` — a second real fixture (CR-02, `25-REVIEW.md`).
+- `crates/devflow-core/src/worktree.rs` — the worktree module's own fixtures.
+
+The claim is true only of the `verify.rs` tests specifically. **Two consequences.** (a) 999.76's
+open question is materially cheaper than this entry implies — it is "should the 999.76-touched tests
+use a real worktree", not "should the workspace build its first", and a fixture can be adapted
+rather than invented. (b) No entry or plan should cite "the workspace has no such harness" as a
+reason for anything; it is not true.
+
+**Correction: "one integration test" is loose.** `advance()` is `pub(crate)`
+(`pipeline_launch.rs:936`), so **no test under `crates/devflow-cli/tests/` can call it**. The test
+must live in `pipeline_launch.rs`'s own `#[cfg(test)]` module.
+
+**Two pieces of the harness already exist**, checked during the Phase 35 discussion — the test
+should extend them, not rebuild:
+
+- `code_unknown_does_not_transition_to_validate` (`pipeline_launch.rs:~1452`) drives a real
+  `advance()` on a scoped thread over a real git repo via `init_repo`, polling for gate files.
+- `relaunch_checkpoint_session_emits_exactly_one_audit_event` (`pipeline_launch.rs:1626`) shows how
+  to satisfy the resume path **without launching an agent**, via a `stub_agent_binary("claude")`
+  helper and an `env_lock()` guard. The observable is the `checkpoint_auto_decided` event, which
+  `relaunch_checkpoint_session` emits *before* the spawn by design (28-03 D-07).
+
+**Phase 35 strengthened the proposed fixture (35 D-05).** The bare form above leaves `project_root`
+with no `.planning/phases/` at all, so it discriminates partly by a condition production never
+satisfies — the main checkout always carries `.planning/phases/`, often including a previous run's
+copy of this phase. The phase writes a **decoy** PLAN under `project_root` for the same phase
+declaring no `blocking-human` gate, so the revert fails because the *wrong root was read* rather
+than because the main checkout happened to be empty. Same cost, stronger control.
+
+**Phase 35 also added a re-running control (35 D-06).** The performed revert stays mandatory, but it
+is a one-time act nothing repeats; the test additionally asserts
+`phase_has_blocking_human_checkpoint(project_root, phase)` is `false`, the same opposite-result shape
+`verify.rs:351`/`:377` already carry. Stated precisely: the mechanical half proves the two roots
+*disagree*; only the performed revert proves `:1070` passes `execution_root`. Neither substitutes
+for the other.
 
 ### Phase 999.81: Phase 33 Advisory Cleanup — the Loop-Back Prompt Calls a Normal Continuation a Defect, Plus Three Hygiene Items (BACKLOG)
 
@@ -532,7 +627,7 @@ would let `ENV_MUTEX` shrink or disappear; it explicitly names `pipeline_outcome
 one of the three sites above. Either do 999.38 first and harden these with the new mechanism, or do
 this first as the cheap safety fix and let 999.38 sweep them later. Do not work them independently.
 
-### Phase 999.79: `{N}-VERIFICATION.md` Never Goes Stale, So a `--force` Re-Run Inherits the Previous Run's Verdict and Gates Unresolvably (BACKLOG)
+### Phase 999.79: `{N}-VERIFICATION.md` Never Goes Stale, So a `--force` Re-Run Inherits the Previous Run's Verdict and Gates Unresolvably (PROMOTED — Phase 35)
 
 **Linear:** [DEN-101](https://linear.app/denniskim/issue/DEN-101/99979-n-verificationmd-never-goes-stale-so-a-force-re-run-inherits-the)
 **Found:** 2026-08-05, Phase 33 code review (WR-02, carried from the first pass and given a new
@@ -557,7 +652,28 @@ not reflect judgement freshness) against the phase's current plan set. **Prohibi
 "fix" this by reverting the probe to `project_root` — that reintroduces the CR-01 defect 33-05
 closed and two external peer reviews independently confirmed.
 
-### Phase 999.78: The Code↔Validate Loop Has No Progress-Independent Bound, and the Gate Message Understates How Long It Has Run (BACKLOG)
+**A cheaper "or equivalent" surfaced 2026-08-06 (Phase 35 discussion).** Established, not assumed:
+`start()` calls `State::new(...)` **unconditionally** at `commands.rs:124`, *before* any `--force`
+handling — so every `devflow start`, forced or not, begins with fresh `State`. That makes a
+**run-scoped** freshness signal available without any plan-count bookkeeping: record a content
+fingerprint of `{N}-VERIFICATION.md` in `State` and treat the artifact as fresh only once it has
+changed within this run. The entry's rejection of mtime is about mtime as an *age* signal (it
+survives `git checkout`); as change-detection against a run-start baseline that objection does not
+apply, and a content hash removes it entirely. Phase 35 leans this way — recorded explicitly as a
+**departure from this entry's stated fix direction**, so it is overrulable on sight rather than
+discovered later.
+
+**Why the plan-count route is weaker, stated so the choice is arguable:** it detects "the plan set
+changed", so it false-negatives whenever a replan happens to produce the same count.
+
+**The risk in either mechanism, and the test it demands.** A freshness rule that is too strict never
+lets `--gaps-only` fire again, silently regressing what Phase 33 built — trading an unresolvable gate
+for a loop that always re-runs every plan. Both directions must be tested: (a) a stale artifact
+inherited from a prior run must yield `FullExecute`, and (b) an artifact the Validate agent authored
+*this run* must yield `GapsOnly`. A test covering only (a) passes against a rule that marks
+everything stale forever.
+
+### Phase 999.78: The Code↔Validate Loop Has No Progress-Independent Bound, and the Gate Message Understates How Long It Has Run (PROMOTED — Phase 35)
 
 **Linear:** [DEN-100](https://linear.app/denniskim/issue/DEN-100/99978-the-codevalidate-loop-has-no-progress-independent-bound-and-the)
 **Found:** 2026-08-05, Phase 33 code review (WR-01, WR-04, IN-02). Grouped because WR-04's fix
@@ -589,7 +705,26 @@ them apart, so an operator upgrading a binary mid-phase gets no signal the failu
 add a distinct `loop_back` reason string for the absent-baseline case. Related but deliberately
 separate: 999.77 attacks the same counter by corrupting its baseline rather than removing the bound.
 
-### Phase 999.77: A Single Transient `git` Failure Grants a Free `consecutive_failures` Reset, and the Doc Comment Promises the Opposite (BACKLOG)
+**Decided 2026-08-06 (operator, Phase 35 discussion) — what happens at the ceiling.** The entry
+specified the counter but never said what exhausting it *does*, which is a behavioural question, not
+an implementation detail: **it fires a human gate and the run stays alive**, the same shape as
+`MAX_CONSECUTIVE_FAILURES` today. Rejected: aborting the phase (destructive and irreversible
+relative to gating — a phase one cycle from converging gets killed); gating in Supervise but
+aborting in Auto (contradicts Auto's existing ceiling, which gates). **Accepted cost, stated:** an
+unattended overnight run now parks on a gate instead of looping to completion. That is the intent,
+and it is still a behaviour change from today's "looped forever unnoticed."
+
+**Shape settled alongside it (Phase 35, orchestrator's remit).** A new `State` field with
+`#[serde(default)]`, following `last_validate_failure_commit_count`'s backward-compat pattern, and
+**not** touched by `transition()` — it belongs with `preflight_retries`/`checkpoint_resumes` (per-phase
+observations) rather than `consecutive_failures`/`infra_failures` (per-streak counters reset on every
+successful transition). The ceiling is a named constant meaningfully above `MAX_CONSECUTIVE_FAILURES
+= 3` so it acts as a backstop rather than a competing primary bound. The gate message must lead with
+the cumulative total and name it as a per-phase total; a streak may appear as a secondary clause only
+if it cannot be mistaken for the headline number, since WR-04's whole complaint is that the current
+text reads identically at the 2nd, 5th and 9th gate.
+
+### Phase 999.77: A Single Transient `git` Failure Grants a Free `consecutive_failures` Reset, and the Doc Comment Promises the Opposite (PROMOTED — Phase 35)
 
 **Linear:** [DEN-99](https://linear.app/denniskim/issue/DEN-99/99977-a-single-transient-git-failure-grants-a-free-consecutive)
 **Found:** 2026-08-05, Phase 33 code review (WR-03); carried forward as still-open by the DeepSeek
@@ -630,11 +765,22 @@ accumulates and the gate stays reachable."* That holds only while `git` stays br
 for exactly one transient failure, which is the likelier event. **Correct this comment even if the
 code fix is deferred** — it documents a safety property the code does not have.
 
-**Proposed fix:** distinguish "counted zero" from "could not count" — add a sibling returning
-`Option<u32>`, treat `None` as not-progress *without overwriting the baseline* so the next
+**Proposed fix:** distinguish "counted zero" from "could not count" — ~~add a sibling returning
+`Option<u32>`~~, treat `None` as not-progress *without overwriting the baseline* so the next
 successful measurement compares against the last real observation, and update
 `phase_commit_count`'s "every consumer treats all three the same way" line, which the fix
 deliberately falsifies. Full patch sketch in the Linear issue and in `33-REVIEW.md` WR-03.
+
+**Revision to the sibling proposal (2026-08-06, Phase 35 discussion).** A *sibling* contradicts
+`phase_commit_count`'s own doc comment, which states the single implementation exists because
+"[re-deriving] the same two git commands … is what made the two counts able to silently diverge
+before this extraction." A sibling reinstates exactly that hazard, and nothing stops a future caller
+reaching for the lossy one. Phase 35 resolved instead to **change the single implementation's return
+type to `Option<u32>`**, so one implementation survives *and* the compiler enumerates every consumer
+once — continuing 34/D-06's structural-over-hand-audited line. `evaluate_layer2` maps `None` to its
+existing zero-treatment explicitly at the call site, with a comment, so the behaviour it retains is a
+visible choice rather than an inherited accident. **Note this makes it a public-API change** in a
+published crate, stacking with 999.86's own removal; both land in the same cut.
 
 **Test coverage the fix must add:** no current test exercises a failing `git`. The regression test
 is the two-cycle sequence itself — force a measurement failure, then a success with an unchanged
@@ -718,11 +864,27 @@ worktrees, so a worktree commit is already visible from the main checkout. Decla
 the worktree, commit counting on the main checkout, is the correct end state; Phase 33 established
 exactly that asymmetry for the loop-back path.
 
-**Open question the fix should answer rather than assume:** no test in the workspace exercises a
+**Open question the fix should answer rather than assume:** ~~no test in the workspace exercises a
 real linked `git worktree` — the worktree-mode tests use plain `create_dir_all` directories with no
-git repository at all. Adequate for a filesystem stat, but the shared-refs property
-`phase_commit_count` depends on is asserted in comments and exercised by nothing. Decide whether
-this fix carries the first linked-worktree integration test.
+git repository at all.~~ The **worktree-mode tests for this defect class** use plain
+`create_dir_all` directories with no git repository. Adequate for a filesystem stat, but the
+shared-refs property `phase_commit_count` depends on is asserted in comments and exercised by
+nothing. Decide whether this fix carries ~~the first~~ a linked-worktree integration test.
+
+**Correction to the struck premise (2026-08-06, Phase 35 discussion).** "No test in the workspace
+exercises a real linked `git worktree`" is **false**. At least three real `git worktree add`
+fixtures exist: `crates/devflow-cli/src/staleness.rs`'s `worktree_staleness_fixture()` (a `develop`
+branch, a sibling feature-branch worktree, and commits made inside it),
+`crates/devflow-cli/src/preflight.rs:1198` (CR-02), and `crates/devflow-core/src/worktree.rs`'s own
+fixtures. The true statement is narrower: *the tests covering this defect class* use plain
+directories.
+
+**The open question survives, at lower cost.** It is genuinely unanswered — `phase_commit_count`'s
+shared-refs property is still asserted only in comments — but answering it means **adapting an
+existing fixture**, not building the workspace's first. Phase 35 declined to do it there (35 D-05):
+999.84's call-site guard resolves a path, and a linked worktree's files are ordinary files, so the
+machinery buys nothing for *that* test. This question is motivated by the commit-count property
+instead, and stays open on its own merits.
 
 ### Phase 999.75: `CloseRule` Treats an Unparseable `tasks` List on the FIRST Announcement as Permission to Close (RESOLVED 2026-08-04)
 
