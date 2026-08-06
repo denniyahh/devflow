@@ -21,8 +21,11 @@
 ## AMENDMENT NOTICE — adversarial review, 2026-08-06
 
 Four adversarial lanes were run against this document the day it was written (two internal, two
-external). **Every finding below was re-verified against source by the orchestrator before being
-accepted** — one was found overstated and is recorded in its corrected form (A-07). Corrections are
+external); a third external lane was hard-blocked on usage limits and contributed nothing.
+**Every finding below was re-verified against source by the orchestrator before being accepted** —
+one was found overstated and is recorded in its corrected form (A-07), and one was **refuted
+outright** (see the hermes section). One lane was also mis-reported as having failed when it had
+not; see the note above A-15. Corrections are
 marked `[CORRECTED]` inline where the original text would otherwise be reconstructed by a reader.
 
 **A-08 was escalated and is now ANSWERED (operator, 2026-08-06) — see D-08.** Everything is settled.
@@ -98,6 +101,43 @@ marked `[CORRECTED]` inline where the original text would otherwise be reconstru
 - **A-10 — criterion 5 is satisfied for the path form only.** Under D-03, inline `key::` keys return
   `Unknown`, so they get neither `Viable` nor `NotViable`. This is a deliberate, recorded gap, not
   an oversight — but it should be stated at verification time rather than discovered there.
+
+### Added by the second external lane (hermes), verified independently
+
+Recorded late: this lane was initially reported as having produced nothing. That was an
+orchestrator error — a process-liveness check matched the wrong pattern, and the miss was reported
+as a result. The lane ran to completion and its findings are below, with one refuted.
+
+- **A-15 — D-04's deletion breaks a live unit test, and "only production caller" obscured it.**
+  D-04 justifies removing `classify_ssh_add_status` / `SigningStatus` on the grounds that their
+  "only **production** caller is the `ssh-add -l` branch this phase removes". True, and incomplete:
+  `classify_ssh_add_status_maps_all_three_documented_exit_codes` (`git.rs:1829-1833`) asserts on all
+  four mappings and will fail to compile once the items are gone. **Delete that test with the same
+  change**, exactly as D-04 already instructs for `inline_key_fingerprint`. The lane rated this HIGH;
+  it is closer to LOW in consequence (the compiler catches it immediately) but the wording genuinely
+  invited the oversight, which is why it is recorded rather than waved off.
+
+- **A-16 — D-01's timeout rationale states unmeasured cases as though measured.** D-01 says "the
+  timeout covers what the env var does not — a wedged `ssh-agent`, a stalled PKCS11 provider."
+  **Neither was measured.** What was measured is the askpass-block case and its `REQUIRE=never`
+  mitigation. The wedged-agent and PKCS11 cases are *reasoned* extrapolations of why a timeout is
+  prudent — good reasons, but they are inference sitting in a sentence that reads as evidence.
+  D-01's decision is unchanged; its justification should be read as "a timeout is defence against
+  blocking modes we have not enumerated", not as a claim about tested scenarios.
+
+- **A-17 — the `Unknown` reason string for inline keys is unspecified.** D-03 says inline `key::`
+  and raw `ssh-` values return `SigningViability::Unknown` but never says what `reason` accompanies
+  it, leaving diagnostics to the implementer. Under D-02 reasons are a **fixed set keyed by failure
+  class**, so this is a fourth class needing a fixed string, not a free choice. The planner should
+  name it alongside the other three.
+
+- **REFUTED — "no error handling for a missing `ssh-keygen` causes potential crashes" (rated
+  CRITICAL by the lane).** Two independent reasons it is wrong. (a) D-02 already names this case
+  explicitly: "`ssh-keygen` absent (→ `Unknown`, fail-soft, matching D-06 of phase 20d)". (b) The
+  premise is wrong about Rust: `Command::new(..).output()` returns `Result` and does not panic on a
+  missing binary — the existing `ssh-add` site at `git.rs:901-907` handles exactly this with
+  `Err(_) => Unknown`, which is the pattern the probe follows. Recorded rather than dropped because
+  a future reader re-reading this lane's output would otherwise reconstruct the concern.
 
 ### Added by the external lane (opencode), verified independently
 
