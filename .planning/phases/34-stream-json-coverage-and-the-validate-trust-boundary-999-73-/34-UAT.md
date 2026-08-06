@@ -60,3 +60,13 @@ blocked: 0
 - test: 1
   idea: "Add an integration test that drives `advance()` through `Action::GateReview` in worktree mode with a worktree-only blocking-human PLAN, and validate it with a negative control (revert the call site to `project_root` and confirm the new test fails). Converts the criterion-6b inference into a regression guard."
   deferred_at: 2026-08-06
+  tracked_as: "ROADMAP 999.84 / Linear DEN-106"
+  note: |
+    Checked for an existing item before filing rather than assuming one was
+    absent: searched ROADMAP.md and three Linear queries. The nearest match is
+    999.76's own unanswered open question (ROADMAP:663-668) about building the
+    workspace's first REAL linked `git worktree` integration test — adjacent
+    infrastructure, different motivation (`phase_commit_count`'s shared-refs
+    property), and it does not guard `pipeline_launch.rs:1070`. Recorded in
+    999.84 as related-but-independent. Linear search is fuzzy and paged, so
+    this is a bounded search, not proof of absence.

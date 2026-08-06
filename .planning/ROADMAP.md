@@ -412,6 +412,62 @@ Unsequenced items — not part of the active phase sequence. Promote with
 `/gsd-review-backlog` when ready; each carries accumulated context in its
 own `phases/999.N-*/CONTEXT.md`.
 
+### Phase 999.84: Nothing Guards the Root Argument at the `GateReview` Checkpoint Call Site, So 999.76's Fix Can Regress Silently (BACKLOG)
+
+**Linear:** [DEN-106](https://linear.app/denniskim/issue/DEN-106/99984-nothing-guards-the-root-argument-at-the-gatereview-checkpoint)
+**Found:** 2026-08-06, Phase 34 UAT test 1 — the phase's sole human-verification item, self-disclosed
+by 34-04's own SUMMARY and independently reproduced by the phase verifier rather than accepted on
+the claim.
+
+**Priority:** Medium | **Size:** S — one integration test plus its negative control. No production
+change; the production code is already correct.
+
+**The gap.** `pipeline_launch.rs:1070` passes `execution_root` to
+`verify::phase_has_blocking_human_checkpoint`, which is 999.76 criterion 6's second call site and
+the reason the plan-28-03 checkpoint auto-decide path is not dead in worktree mode. **No test
+asserts that argument.** Revert it to `project_root` — reintroducing the exact defect 999.76 was
+filed for — and `cargo test -p devflow --bin devflow` still reports **279 passed; 0 failed**. That
+is the measurement, run twice independently: once by plan 34-04, once by the verifier.
+
+**What already exists, and why it is not enough.** `verify.rs:351`
+(`…reads_the_execution_root_in_worktree_mode`) and `verify.rs:377`
+(`…still_reads_the_project_root_without_a_worktree`) pin the *function's* root-sensitivity in both
+directions, and each carries an explicit opposite-result assertion so the pair cannot degrade into
+measuring "a PLAN exists somewhere." They are well built. They simply never drive the call site, so
+the argument at `:1070` is unguarded by construction.
+
+**Why the Phase 34 capture campaign does not cover it either** (checked, not assumed — the campaign
+is the obvious place to look):
+
+1. Every capture ran `devflow start --phase 1 --no-worktree …`. `main.rs:533` → `commands.rs:238`'s
+   `else` branch never assigns `worktree_path`, so it keeps its `None` default (`state.rs:269`), and
+   `state.worktree_path.as_deref().unwrap_or(project_root)` evaluates to `project_root`. The changed
+   expression returns the identical value the pre-fix code passed — structurally incapable of
+   discriminating.
+2. `blocking-human` appears **0 times** in `scripts/scratch-dogfood-repo.sh`. Negative control: the
+   string matches in 20 files elsewhere in the repo, so the zero is a real zero and not a broken
+   search. Condition (2) of the arm's five-condition guard was false regardless of root.
+
+**Proposed fix.** One integration test driving `advance()` through `Action::GateReview` with all
+five preconditions satisfied — `worktree_path = Some(worktree)`, a PLAN declaring
+`gate="blocking-human"` written **only** under the worktree, `agent = AgentKind::Claude`, a session
+id on record, the checkpoint present in the capture, `checkpoint_resumes` below
+`MAX_CHECKPOINT_RESUMES` — asserting the resume path fires rather than falling through to the
+per-stage dispatch.
+
+**The test only counts if it ships with its negative control:** revert `:1070` to `project_root` and
+the new test must FAIL. Without that step this entry produces a 280th test that passes both ways,
+which is the failure mode it exists to close.
+
+**Relationship to 999.76's open question — decide together, but they are not the same item.** 999.76
+(this entry's parent, promoted into Phase 34) left an unanswered question: whether that fix should
+carry the workspace's first *real linked* `git worktree` integration test, since today's
+worktree-mode tests use plain `create_dir_all` directories with no git repository at all. That
+question is motivated by `phase_commit_count`'s shared-refs property, not by this call site, and it
+remains open. **This entry does not depend on it** — the `:1070` guard needs only a directory
+standing in for the worktree, exactly as `verify.rs:351` already does, so it can land cheaply and
+independently. If the linked-worktree harness is built first, this test should use it.
+
 ### Phase 999.81: Phase 33 Advisory Cleanup — the Loop-Back Prompt Calls a Normal Continuation a Defect, Plus Three Hygiene Items (BACKLOG)
 
 **Linear:** [DEN-103](https://linear.app/denniskim/issue/DEN-103/99981-phase-33-advisory-cleanup-the-loop-back-prompt-calls-a-normal)
