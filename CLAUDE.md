@@ -33,6 +33,17 @@ specifically to the main-checkout case.
   Capture the exit code of the command you care about, not the pipeline.
 - **Old phases use a bare `PLAN.md`**, not `NN-PLAN.md`. A glob for `*-PLAN.md` silently misses
   them, and `.planning/superseded/` holds abandoned plans that should not be counted at all.
+- **`git commit` runs against whatever branch is currently checked out, not the branch you last
+  reasoned about.** An unrelated `git checkout` earlier in a long tool sequence (2026-08-06:
+  switching to `main` to delete a merged feature branch) silently changed what a much-later commit
+  landed on — `develop`/`main` are both protected, so this is normally caught, but only if the push
+  actually targets the branch that moved. `git push origin <branch>` pushes the *named local
+  branch*, not the checked-out one; if they've diverged, a stale-but-unpushed named branch can
+  report "Everything up-to-date" while the real mistake sits uncommunicated on whatever's checked
+  out. Before any `git commit` not immediately preceded by a `git checkout` in the same call, run
+  `git rev-parse --abbrev-ref HEAD` and confirm it matches the intended target — protected-branch
+  rejection is the backstop, not a substitute for checking, and it only fires if the push actually
+  reaches the branch that's wrong.
 
 ## Prefer GSD commands over doing it by hand
 
