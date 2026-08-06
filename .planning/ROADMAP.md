@@ -84,11 +84,22 @@ are fixed together rather than one being repaired while the other keeps collapsi
 **Plans**: 6 plans across 4 waves
 
 Plans:
+**Wave 1**
+
 - [ ] 35-01-PLAN.md — tracer: the unmeasurable-`git` spine end to end — `NoGitPath` harness in both crates, `phase_commit_count` becomes `Option<u32>`, both consumers honour it, two-cycle regression test, corrected doc comments (criteria 1 + 6)
 - [ ] 35-02-PLAN.md — worktree-mode `GateReview` checkpoint regression test with D-05's decoy PLAN, D-06's re-running control, and the performed revert demonstration (criterion 4)
 - [ ] 35-03-PLAN.md — replace `release --check`'s signing predictor with a bounded, non-interactive `ssh-keygen -Y sign` probe; delete the predictor, its enum and the orphaned helper (criterion 5)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
 - [ ] 35-04-PLAN.md — never-reset per-phase Validate-failure total that survives `--force`, a ceiling that gates without aborting, and a gate message led by the cumulative number (criterion 2)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
 - [ ] 35-05-PLAN.md — run-scoped content fingerprint makes `{N}-VERIFICATION.md` go stale, so a `--force` re-run stops inheriting the previous run's verdict; both directions tested (criterion 3)
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
 - [ ] 35-06-PLAN.md — enumerate and document the public-API break: verified `CHANGELOG.md` entry plus removal notes at each site; release stays `v2.5.0`, milestone unrenamed (D-04 / D-08)
 
 ### Phase 36: Drain Gate Concurrency Measurement (999.83)
@@ -519,6 +530,7 @@ are now dead:
 
 1. After 34-03, `pipeline_outcomes.rs:233` reads `(_, AgentStatus::Success, Some(Verdict::Pass))`.
    The status position is no longer a wildcard, so a non-`Success` status cannot reach `Passed`.
+
 2. The remaining route — a timeout's verdict grafted through `reconcile_layer0_verdict`, reachable
    because `evaluate_layer1` returns the idle-timeout side channel as its **first statement**
    (`agent_result.rs:1795`) — is closed by 34-01's own
@@ -547,6 +559,7 @@ as licence to relax the instruction — the instruction is still load-bearing, j
 
 **Note for whoever picks this up:** DEN-95 (999.74), the defect these comments describe, is still
 open in Linear despite Phase 34 closing it via criterion 3. Same for DEN-98 (999.76) via criterion
+
 6. Both want a status sweep.
 
 ### Phase 999.84: Nothing Guards the Root Argument at the `GateReview` Checkpoint Call Site, So 999.76's Fix Can Regress Silently (PROMOTED — Phase 35)
@@ -613,6 +626,7 @@ first, this test should use it.
 - `crates/devflow-cli/src/staleness.rs` — `worktree_staleness_fixture()`, the fullest one: a
   `develop` branch with a recorded commit, a **sibling** feature-branch worktree via
   `git worktree add -b <branch> <path> <start_point>`, and two further commits made inside it.
+
 - `crates/devflow-cli/src/preflight.rs:1198` — a second real fixture (CR-02, `25-REVIEW.md`).
 - `crates/devflow-core/src/worktree.rs` — the worktree module's own fixtures.
 
@@ -631,6 +645,7 @@ should extend them, not rebuild:
 
 - `code_unknown_does_not_transition_to_validate` (`pipeline_launch.rs:~1452`) drives a real
   `advance()` on a scoped thread over a real git repo via `init_repo`, polling for gate files.
+
 - `relaunch_checkpoint_session_emits_exactly_one_audit_event` (`pipeline_launch.rs:1626`) shows how
   to satisfy the resume path **without launching an agent**, via a `stub_agent_binary("claude")`
   helper and an `env_lock()` guard. The observable is the `checkpoint_auto_decided` event, which
