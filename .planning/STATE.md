@@ -1,18 +1,16 @@
 ---
 gsd_state_version: 1.0
-milestone: v2.4.0
-milestone_name: Resume Unattended Dogfooding (CLOSED 2026-08-06)
-status: Awaiting next milestone
-stopped_at: v2.4.0 released — CHANGELOG, GitHub Release, signed tag, devflow-core and devflow published to crates.io
-last_updated: "2026-08-06T12:35:00.000Z"
+milestone: v2.5.0
+milestone_name: Loop-Termination and Release Hardening
+status: planning
+last_updated: "2026-08-06T14:14:11.571Z"
 last_activity: 2026-08-06
-last_activity_desc: v2.4.0 released end-to-end (tag, GitHub Release, crates.io)
 progress:
   total_phases: 2
-  completed_phases: 2
-  total_plans: 12
-  completed_plans: 12
-  percent: 100
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
 # DevFlow — Project State
@@ -152,10 +150,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: Milestone v2.4.0 complete
-Plan: —
-Status: Awaiting next milestone
-Last activity: 2026-08-06 — Milestone v2.4.0 completed and archived
+Phase: 35 of 36 (Loop-Termination and Baseline Correctness) — ready to plan
+Plan: — (not yet planned)
+Status: Roadmap created, ready for planning
+Last activity: 2026-08-06 — ROADMAP.md created for v2.5.0: Phase 35 (HARDEN-01..05 / 999.77+999.78+999.79+999.84+999.86), Phase 36 (HARDEN-06 / 999.83). Next: `/gsd-plan-phase 35`.
 
 ## Recently Shipped
 

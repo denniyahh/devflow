@@ -18,12 +18,36 @@ DevFlow must reliably drive the agent through the full pipeline and never
 silently corrupt its own state or lose a human's gate decision, even under a
 mid-run crash or kill.
 
-## Current State: v2.4.0 Resume Unattended Dogfooding — CLOSED 2026-08-06
+## Current Milestone: v2.5.0 Loop-Termination and Release Hardening
+
+**Goal:** Close five confirmed defects/gaps that surfaced from v2.4.0's own release, plus one
+investigation into a concurrency blind spot in the safety net v2.4.0 just widened. All six are
+pre-existing issues found via code review, live release cuts, and Phase 34's own capture campaign —
+none are new regressions from v2.4.0.
+
+**Target features:**
+- Phase 35 — 999.77 (a single transient `git` failure grants a free `consecutive_failures` reset,
+  and the doc comment asserts the opposite) + 999.78 (the Code↔Validate loop has no
+  progress-independent bound) + 999.79 (`{N}-VERIFICATION.md` never goes stale, so a `--force`
+  re-run gates unresolvably) + 999.84 (nothing guards the `GateReview` checkpoint call site's root
+  argument) + 999.86 (`release --check`'s tag-signing predictor false-negatived live, twice across
+  two releases — replace with a real `ssh-keygen -Y sign` probe)
+- Phase 36 — 999.83 (the drain gate has never observed real sub-agent concurrency; its fixture's
+  shape doesn't match production). Standalone: investigation-shaped, not a quick patch, so it does
+  not bundle with the confirmed fixes above.
+
+**v2.5.0 is a planning label**, next minor after the last shipped v2.4.0 — the actual crate version
+is still derived automatically from conventional-commit classification at release time
+(`version.rs`), per this project's established versioning policy; it may not land exactly here.
+
+<details>
+<summary>Previous milestone: v2.4.0 Resume Unattended Dogfooding — CLOSED 2026-08-06</summary>
 
 **Shipped as a planning milestone; not released.** At close the workspace version was still
 `2.3.0`, `CHANGELOG.md` had no 2.4.0 section, the work sat unmerged on `feature/phase-34`, and no
 `v2.4.0` tag existed. Closing the milestone archived the planning artifacts; cutting the release is
-a separate operation on the project's real release path.
+a separate operation on the project's real release path. Released separately the same day: tagged,
+GitHub Release published, `devflow-core` and `devflow` published to crates.io.
 
 **Delivered.** The Code↔Validate loop no longer false-gates on healthy work (999.66), loop-back fix
 selection reads the worktree (999.65), Validate's reported outcome reflects derived status rather
@@ -33,9 +57,7 @@ captures (999.73), and Layer 0 verification works in worktree mode (999.76).
 **Closed as `override_closeout`.** Both phases verified and the pre-close artifact audit was clear,
 but DOGFOOD-04's traceability row remains `Pending` and no `/gsd-audit-milestone` was run. See
 `.planning/MILESTONES.md` § Known Gaps — chiefly 999.84 / DEN-106, an unguarded call site whose
-correctness rests on construction rather than a regression test.
-
-**Next:** `/gsd-new-milestone`.
+correctness rests on construction rather than a regression test, now carried into v2.5.0 Phase 35.
 
 <details>
 <summary>Original v2.4.0 milestone definition (declared 2026-08-04)</summary>
@@ -57,6 +79,8 @@ dogfood run and Phase 31 planning — none are new regressions from the `gsd-hyg
 **v2.4.0 is a planning label**, next minor after the last shipped v2.3.0 — the actual crate
 version is still derived automatically from conventional-commit classification at release time
 (`version.rs`), per this project's established versioning policy; it may not land exactly here.
+
+</details>
 
 </details>
 
@@ -166,11 +190,10 @@ version is still derived automatically from conventional-commit classification a
 
 ### Active
 
-- **No active milestone.** v2.4.0 closed 2026-08-06; run `/gsd-new-milestone` to declare the next
-  and write a fresh `REQUIREMENTS.md`.
-- Carried into the next milestone from v2.4.0's Known Gaps: **999.84 / DEN-106** (unguarded
-  `GateReview` root argument), **999.85 / DEN-107** (two comments justifying themselves by deleted
-  mechanisms), **999.83** (the drain gate has never observed sub-agent concurrency).
+- 6 requirements for **v2.5.0 Loop-Termination and Release Hardening** (declared 2026-08-06) — see
+  `.planning/REQUIREMENTS.md` and Phases 35/36 in ROADMAP.md.
+- **999.85 / DEN-107** (two comments justifying themselves by mechanisms v2.4.0 deleted) — low
+  severity, not folded into v2.5.0's scope; remains backlog for a future pass.
 
 *(Historical note on how the project reached this point: **The v2.3.0 milestone was CLOSED
 2026-08-04**,
@@ -340,4 +363,13 @@ pre-close artifact audit clear, but DOGFOOD-04's traceability row remained `Pend
 `/gsd-audit-milestone` was run. The milestone is a planning close, not a release — workspace version
 still 2.3.0, no 2.4.0 changelog section, work unmerged on `feature/phase-34`, no `v2.4.0` tag.
 Phase 34's UAT closed on operator attestation rather than demonstration, leaving 999.84 / DEN-106 as
-the standing gap. Next: `/gsd-new-milestone`.*
+the standing gap.
+
+---
+*Last updated: 2026-08-06, same day, v2.4.0 released (signed tag, GitHub Release, `devflow-core`
+and `devflow` published to crates.io — separate operation from the planning close above) and
+milestone **v2.5.0 Loop-Termination and Release Hardening** started — Phase 35 (999.77 + 999.78 +
+999.79 + 999.84 + 999.86) and Phase 36 (999.83), scoped through conversation rather than fresh
+domain research (five confirmed pre-existing defects with fix directions already decided, plus one
+investigation-shaped item, none new user-facing capability). Scope agreed with the operator before
+this workflow ran; confirmed rather than re-derived at the milestone-summary checkpoint.*
