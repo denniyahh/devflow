@@ -1,22 +1,14 @@
 ---
-status: testing
+status: complete
 phase: 34-stream-json-coverage-and-the-validate-trust-boundary-999-73-
 source: [34-VERIFICATION.md]
 started: 2026-08-06T10:30:00Z
-updated: 2026-08-06T10:30:00Z
+updated: 2026-08-06T10:52:38Z
 ---
 
 ## Current Test
 
-number: 1
-name: Layer 0's second call site — `phase_has_blocking_human_checkpoint` under `Action::GateReview` in worktree mode
-expected: |
-  Drive `advance()` through `Action::GateReview` in worktree mode with a
-  blocking-human-checkpoint PLAN placed ONLY inside the worktree (absent from the
-  main checkout), a session id set, and the checkpoint reported in the capture.
-  The run auto-decides the checkpoint — the plan-28-03 path fires — rather than
-  falling through as it did before 34-04.
-awaiting: user response
+[testing complete]
 
 ## Tests
 
@@ -40,15 +32,31 @@ Closing this needs either a live worktree-mode run through `GateReview`, or a ne
 integration test that drives it end-to-end. The integration test is the more
 durable answer, since it converts a standing inference into a guard.
 
-result: [pending]
+result: pass
+source: human
+verified_at: 2026-08-06T10:52:38Z
+note: |
+  Passed by operator attestation, not by demonstration. No live worktree-mode
+  `GateReview` run was performed in this session and no integration test was
+  added, so the standing inference (root-sensitivity proven in `verify.rs` +
+  correct call-site wiring proven by source read) remains an inference. The
+  regression guard is still absent: reverting the call site's argument to
+  `project_root` leaves the full 279-test binary suite green, as both plan 34-04
+  and the verifier independently measured. Filed as follow-up below.
 
 ## Summary
 
 total: 1
-passed: 0
+passed: 1
 issues: 0
-pending: 1
+pending: 0
 skipped: 0
 blocked: 0
 
 ## Gaps
+
+## Deferred Follow-Ups
+
+- test: 1
+  idea: "Add an integration test that drives `advance()` through `Action::GateReview` in worktree mode with a worktree-only blocking-human PLAN, and validate it with a negative control (revert the call site to `project_root` and confirm the new test fails). Converts the criterion-6b inference into a regression guard."
+  deferred_at: 2026-08-06
