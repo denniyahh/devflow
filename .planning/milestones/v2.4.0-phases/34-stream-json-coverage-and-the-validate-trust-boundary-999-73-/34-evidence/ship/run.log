@@ -1,0 +1,36 @@
+# Phase 34 — `stream-json` capture provenance: `Stage::Ship`
+
+command invoked : devflow start --phase 1 --no-worktree --agent claude --mode auto
+                  (run from a throwaway repo scaffolded by scripts/scratch-dogfood-repo.sh,
+                  which refuses any destination inside this checkout)
+child argv      : claude -p --input-format stream-json --output-format stream-json --verbose
+                  --dangerously-skip-permissions
+stage           : ship
+claude_cli_version : 2.1.222 (Claude Code)
+devflow build commit : 9d198ee
+STREAM_JSON_STAGES at capture time : 9d198ee — the five-variant widening
+                  (Define, Plan, Code, Validate, Ship), committed before the run
+devflow binary sha256 : c81d82698fda4171a43bf8f6116cab7d99b6ddef5b22dab2e027fdd75e85aa17
+                  (byte-identical to `readlink -f "$(command -v devflow)"`; moved off the
+                  pre-widening 022629778d715f935550f50adfc6d53a80f37f0ddf65ff415874ba9956227932)
+capture source  : live phase-01-stdout (copied before stop)
+size            : 890551 bytes, 463 top-level events, 0 unparseable
+
+outcome         : Completed in 31 turns (516 s) and reported `Ship blocked at preflight ... this repo has no git remote`. Expected for a scratch target with no remote; the stage launched, ran, and emitted a top-level `result` marker, which is what this capture is evidence of.
+
+result event    : subtype=success is_error=False num_turns=31 duration_ms=516474
+declared cost   : 4.676446899999999 USD (the CLI's own `total_cost_usd`, recorded as reported)
+
+stream-path discriminating observation
+                : 463 top-level NDJSON events including 102 `task_progress` frames.
+                  This is what distinguishes the capture from a legacy single-document run.
+                  "The stage completed" is NOT that observation and is not offered as one.
+
+BackgroundTaskState : NeverAnnounced — zero `system`/`background_tasks_changed` events in this
+                  capture. Counted by parsing every line and by a raw `rg` over the file; a
+                  positive control on the same file (`task_notification`) matched, so the zero
+                  is a real zero and not a broken probe. See DRAIN-ANALYSIS.md.
+
+PII scrub       : home path -> <home>, OS username -> <user>, `session_id` -> <session-01>.
+                  Verified by a zero-match `rg` over the whole evidence tree, with the
+                  unscrubbed source matching 44x as the negative control.

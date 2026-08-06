@@ -2,121 +2,6 @@
 
 > Phase plan source of truth. Each phase drives a `devflow start` agent session.
 
-## 🚧 v2.4.0 milestone (Resume Unattended Dogfooding, ACTIVE — declared 2026-08-04)
-
-**Declared 2026-08-04.** Closes the structural defects blocking unattended, multi-wave `devflow
-start` runs so dogfooding can safely resume. All four items are pre-existing defects found during
-the Phase 29 dogfood run and Phase 31 planning — none are new regressions from the `gsd-hygiene`
-milestone. See `.planning/REQUIREMENTS.md` (DOGFOOD-01..04) and `.planning/PROJECT.md` §
-"Current Milestone."
-
-**Why two phases, not four or one.** Phase 33 bundles **999.65** (the Validate→Code loop-back's
-impossible `--gaps-only` command on a mid-arc phase) and **999.66** (`consecutive_failures` never
-resetting across a loop-back, false-gating any 3+ wave phase at wave 3). 999.66's fix can be
-*written* independently of 999.65, but validating it needs a working loop-back to reach a third
-wave in the first place — 999.65 lands first in dependency order inside the phase, not as a
-separate phase. Phase 34 bundles **999.73** (widen the Phase 30/31 stream-json launch path beyond
-`Stage::Code`) and **999.74** (`classify_validate_outcome` trusting the agent's self-reported
-`verdict` over its own derived status) — split out of Phase 33 because both are open-ended
-investigation, not known mechanical fixes: 999.73's real work is four per-stage production
-captures plus a drain-gate reasoning pass that does NOT transfer from Code's backgrounding
-behavior, and 999.74 carries an explicitly open question ("whether this can manufacture a pass on
-a run that would otherwise have gated") that needs establishing by reading the Validate routing
-end to end, not assumed. Phase 31's own ROADMAP entry for 999.74 already deferred it on exactly
-this basis — it wouldn't fit inside an M-capped phase alongside more mechanical work, direct
-precedent for keeping it out of Phase 33's S–M-sized pair.
-
-| Phase | Name | Status | Version |
-|---|---|---|---|
-| 33 | Loop-Back Correctness for Multi-Wave Validate→Code Cycles | Complete (2026-08-05, PR #90) | — |
-| 34 | Stream-JSON Coverage and the Validate Trust Boundary | Not started | — |
-
-### Phase 33: Loop-Back Correctness for Multi-Wave Validate→Code Cycles (999.65 + 999.66)
-
-**Goal**: A 3+ wave unattended `devflow start` phase can complete its Code↔Validate loop without
-gating on an impossible `--gaps-only` command or a false "3 consecutive failures" ceiling — the
-two defects that have blocked every unattended multi-wave phase since the Phase 29 dogfood run.
-**Depends on**: Nothing (first phase of this milestone). Internally, 999.65 lands before 999.66:
-999.66's false-gate is only observable at wave 3, which requires a working loop-back (999.65) to
-reach a second loop-back at all.
-**Requirements**: DOGFOOD-01, DOGFOOD-02
-**Success Criteria** (what must be TRUE):
-
-  1. When Validate correctly reports a mid-arc phase incomplete (no `{N}-VERIFICATION.md` because
-     `/gsd-verify-work` never ran), the Validate→Code loop-back issues plain
-     `/gsd-execute-phase {N}` and the phase continues into its next wave, instead of gating on
-     `--gaps-only` matching zero plans.
-
-  2. When Validate finds genuine defects in already-built work (a `{N}-VERIFICATION.md` exists
-     with real gap findings), the loop-back still issues `--gaps-only` and gap-closure plans are
-     correctly selected — the fix distinguishes the two cases rather than swapping one blind
-     command for another.
-
-  3. A phase that runs 3 or more Code↔Validate waves in `auto` mode reaches wave 3 and beyond
-     without a false "3 consecutive failures" gate firing on healthy, wave-by-wave forward
-     progress.
-
-  4. `consecutive_failures` still gates correctly when Validate finds the *same* unresolved
-     problem again across a loop-back — the fix narrows the false positive without disabling the
-     safety gate it protects.
-**Plans**: 6/6 plans executed
-
-Plans:
-
-- [x] 33-06-PLAN.md
-
-- [x] 33-01-PLAN.md — 999.65: route the three in-scope Validate loop-back arms through a
-      `{N}-VERIFICATION.md`-existence check, adding `FixType::FullExecute` for the mid-arc case
-      (wave 1)
-
-- [x] 33-02-PLAN.md — 999.66 primitives: the persisted forward-progress baseline on `State` and
-      the pure reset-vs-accumulate predicate in `mode` (wave 1, parallel with 33-01)
-
-- [x] 33-03-PLAN.md — 999.66 wiring: one shared git-derived commit-count helper, the rewritten
-      counter branch in `handle_validate_outcome`, and the matched multi-wave test pair (wave 2)
-
-- [x] 33-04-PLAN.md — gap closure: two pre-existing tests that seed `consecutive_failures` directly
-      without the 999.66 baseline silently left their asserted code paths (one attempting a real
-      agent launch during `cargo test`); restore both, make an agent launch structurally impossible,
-      and confirm `scripts/check.sh all` is reliably green (wave 3)
-
-- [x] 33-05-PLAN.md — gap closure (CR-01): D-01's decision signal is read from the main checkout
-      while the Validate agent authors `{N}-VERIFICATION.md` inside the phase's worktree, so
-      `FixType::GapsOnly` is unreachable in worktree mode; thread `evidence_root` through
-      `select_loop_back_fix` and its three call sites, and add the worktree-mode regression test
-      plus its mirrored negative control that no test in the workspace supplies today (wave 4)
-
-### Phase 34: Stream-JSON Coverage and the Validate Trust Boundary (999.73 + 999.74)
-
-**Goal**: Operators can trust that every pipeline stage launches through the same reliable
-stream-json path already proven for Code — backed by real per-stage evidence, not extended on
-zero evidence — and that a Validate stage's reported outcome reflects its actually-derived status
-rather than the agent's self-reported `verdict` field.
-**Depends on**: Nothing structurally (999.73 blocks only on Phase 31's shipped acceptance run,
-already satisfied; 999.74 has no structural dependency on Phase 33). Sequenced after Phase 33 by
-this milestone's phase numbering, not a technical dependency — see the "why two phases" note above
-for the split rationale.
-**Requirements**: DOGFOOD-03, DOGFOOD-04
-**Success Criteria** (what must be TRUE):
-
-  1. Define, Plan, Validate, and Ship stages launch through the bidirectional stream-json path —
-     the same pipe-owning-monitor mechanism Phase 31 proved for Code — each backed by a real
-     per-stage production capture rather than a synthetic fixture.
-
-  2. The close rule's drain-gate reasoning (stdin released only once a `DEVFLOW_RESULT` marker
-     lands AND the background-task list has drained) is re-derived per newly-widened stage rather
-     than assumed to carry over from Code's backgrounding behavior, since a non-backgrounding
-     stage has different drain behavior.
-
-  3. `classify_validate_outcome`'s `Passed` arm is gated on the status the outcome cascade
-     actually derived, not on the agent's self-reported `verdict` alone — confirmed explicitly
-     for `Failed`, `Unknown`, `ResourceKilled`, and `IdleTimeout`.
-
-  4. It is established — not assumed — whether the prior trust-inversion could manufacture a pass
-     on a run that would otherwise have gated, with the answer recorded from reading the Validate
-     routing end to end.
-**Plans**: TBD
-
 ## Progress
 
 **Scope note:** this table is global (spans every shipped milestone plus the active one), per
@@ -162,7 +47,33 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 31 | 5/5 | Complete | — |
 | 32 | 0/0 | Complete    | 2026-08-04 |
 | 33 | 6/6 | Complete    | 2026-08-05 |
-| 34 | 0/TBD | Not started | - |
+| 34 | 6/6 | Complete    | 2026-08-06 |
+
+## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
+
+**Declared 2026-08-04, closed 2026-08-06.** Closed the structural defects blocking unattended,
+multi-wave `devflow start` runs: the Code↔Validate loop no longer false-gates on healthy work,
+Validate's reported outcome reflects derived status rather than the agent's self-report, and Layer 0
+verification is no longer inert in worktree mode. All four items were pre-existing defects found
+during the Phase 29 dogfood run and Phase 31 planning. Full detail archived to
+`.planning/milestones/v2.4.0-ROADMAP.md`; requirements to
+`.planning/milestones/v2.4.0-REQUIREMENTS.md`; phase directories to
+`.planning/milestones/v2.4.0-phases/`.
+
+**Closed as `override_closeout`, not `verified_closeout`.** Both phases verified and the pre-close
+artifact audit was clear, but DOGFOOD-04's traceability row remains `Pending` — its core guarantee
+is closed by Phase 34 criteria 3 and 4, while 999.76's second call site is correct by construction
+with no regression guard (999.84 / DEN-106). No `/gsd-audit-milestone` was run. See
+`.planning/MILESTONES.md` § Known Gaps.
+
+**Not released.** This close is a planning-state operation. At close the workspace version was still
+`2.3.0`, `CHANGELOG.md` had no 2.4.0 section, the work sat unmerged on `feature/phase-34`, and no
+`v2.4.0` tag existed.
+
+| Phase | Name | Status | Version |
+|---|---|---|---|
+| 33 | Loop-Back Correctness for Multi-Wave Validate→Code Cycles (999.65 + 999.66) | Complete | — |
+| 34 | Stream-JSON Coverage, the Validate Trust Boundary, and Layer 0 in Worktree Mode (999.73 + 999.74 + 999.76) | Complete | — |
 
 ## gsd-hygiene milestone (CLOSED 2026-08-04 — GSD Workflow Hygiene)
 
@@ -296,6 +207,115 @@ why this differs from the pre-existing `v1.0-ASSESSMENT.md`, an unrelated older 
 Unsequenced items — not part of the active phase sequence. Promote with
 `/gsd-review-backlog` when ready; each carries accumulated context in its
 own `phases/999.N-*/CONTEXT.md`.
+
+### Phase 999.85: Two Protected Comments Now Justify Themselves by a Mechanism Phase 34 Deleted (BACKLOG)
+
+**Linear:** [DEN-107](https://linear.app/denniskim/issue/DEN-107/99985-two-protected-comments-now-justify-themselves-by-a-mechanism)
+**Found:** 2026-08-06, Phase 34 security audit (`34-SECURITY.md` findings F-34-01 and F-34-02).
+Grouped as one entry per the 999.81 advisory-cleanup precedent — same file, same root cause, same
+one-paragraph fix.
+
+**Priority:** Low | **Size:** S — two comment rewrites, no production change.
+
+**The shape of it.** Phase 34's success criterion 5 and threat T-34-01-04 explicitly **forbade**
+editing `idle_timeout_result`'s doc comment, and the phase honoured that prohibition exactly. The
+prohibition protected the comment's *text*. It could not protect the comment's *claim*, which
+34-01 and 34-03 invalidated in the same phase. Both comments' conclusions remain correct; the
+reasons they give for those conclusions are now false.
+
+**F-34-01 — `agent_result.rs:1746-1750`, `idle_timeout_result`.** The comment says `verdict` stays
+`None` because `classify_validate_outcome` "matches `Some(Verdict::Pass)` FIRST and would classify
+the stage as passed on the strength of that field alone, **whatever the status says**." Both halves
+are now dead:
+
+1. After 34-03, `pipeline_outcomes.rs:233` reads `(_, AgentStatus::Success, Some(Verdict::Pass))`.
+   The status position is no longer a wildcard, so a non-`Success` status cannot reach `Passed`.
+2. The remaining route — a timeout's verdict grafted through `reconcile_layer0_verdict`, reachable
+   because `evaluate_layer1` returns the idle-timeout side channel as its **first statement**
+   (`agent_result.rs:1795`) — is closed by 34-01's own
+   `.filter(|layer1| layer1.status == AgentStatus::Success)` at `:2203`. `idle_timeout_result` sets
+   `status: AgentStatus::IdleTimeout` (`:1753`), so it is filtered.
+
+`verdict: None` is now defended structurally in two places rather than by this convention.
+
+**F-34-02 — `agent_result.rs:6412-6417`, inside
+`stream_success_cannot_stand_against_nonzero_exit_code`.** The same superseded claim: "Carrying
+`Some(Verdict::Pass)` over would leave Validate classified Passed." Disclosed as out of scope by
+34-01-SUMMARY deviation 3 ("[Observation, no action taken] A residual instance of the superseded
+claim") and recorded again by the Phase 34 verifier under criterion 5. It is inside a test rather
+than production doc, which is why 34-01 correctly left it.
+
+**Why this is worth a ticket rather than a shrug.** This is the Repudiation class T-34-01-03 and
+T-34-03-04 were filed about, one level up. A reader who checks either comment's stated mechanism
+against the current classifier finds it false, may conclude the guard is vestigial, and may
+"helpfully" populate a verdict there — reopening a route Phase 34 closed. The hazard is indirect
+and the severity is low; the fix is a paragraph.
+
+**Proposed fix.** Rewrite both comments to cite the two structural defences that now carry the
+invariant (the classifier's enumerated status position; the graft's status filter), keeping the
+`verdict: None` instruction itself intact and unweakened. Do **not** treat "the mechanism changed"
+as licence to relax the instruction — the instruction is still load-bearing, just doubly defended.
+
+**Note for whoever picks this up:** DEN-95 (999.74), the defect these comments describe, is still
+open in Linear despite Phase 34 closing it via criterion 3. Same for DEN-98 (999.76) via criterion
+6. Both want a status sweep.
+
+### Phase 999.84: Nothing Guards the Root Argument at the `GateReview` Checkpoint Call Site, So 999.76's Fix Can Regress Silently (BACKLOG)
+
+**Linear:** [DEN-106](https://linear.app/denniskim/issue/DEN-106/99984-nothing-guards-the-root-argument-at-the-gatereview-checkpoint)
+**Found:** 2026-08-06, Phase 34 UAT test 1 — the phase's sole human-verification item, self-disclosed
+by 34-04's own SUMMARY and independently reproduced by the phase verifier rather than accepted on
+the claim.
+
+**Priority:** Medium | **Size:** S — one integration test plus its negative control. No production
+change; the production code is already correct.
+
+**The gap.** `pipeline_launch.rs:1070` passes `execution_root` to
+`verify::phase_has_blocking_human_checkpoint`, which is 999.76 criterion 6's second call site and
+the reason the plan-28-03 checkpoint auto-decide path is not dead in worktree mode. **No test
+asserts that argument.** Revert it to `project_root` — reintroducing the exact defect 999.76 was
+filed for — and `cargo test -p devflow --bin devflow` still reports **279 passed; 0 failed**. That
+is the measurement, run twice independently: once by plan 34-04, once by the verifier.
+
+**What already exists, and why it is not enough.** `verify.rs:351`
+(`…reads_the_execution_root_in_worktree_mode`) and `verify.rs:377`
+(`…still_reads_the_project_root_without_a_worktree`) pin the *function's* root-sensitivity in both
+directions, and each carries an explicit opposite-result assertion so the pair cannot degrade into
+measuring "a PLAN exists somewhere." They are well built. They simply never drive the call site, so
+the argument at `:1070` is unguarded by construction.
+
+**Why the Phase 34 capture campaign does not cover it either** (checked, not assumed — the campaign
+is the obvious place to look):
+
+1. Every capture ran `devflow start --phase 1 --no-worktree …`. `main.rs:533` → `commands.rs:238`'s
+   `else` branch never assigns `worktree_path`, so it keeps its `None` default (`state.rs:269`), and
+   `state.worktree_path.as_deref().unwrap_or(project_root)` evaluates to `project_root`. The changed
+   expression returns the identical value the pre-fix code passed — structurally incapable of
+   discriminating.
+
+2. `blocking-human` appears **0 times** in `scripts/scratch-dogfood-repo.sh`. Negative control: the
+   string matches in 20 files elsewhere in the repo, so the zero is a real zero and not a broken
+   search. Condition (2) of the arm's five-condition guard was false regardless of root.
+
+**Proposed fix.** One integration test driving `advance()` through `Action::GateReview` with all
+five preconditions satisfied — `worktree_path = Some(worktree)`, a PLAN declaring
+`gate="blocking-human"` written **only** under the worktree, `agent = AgentKind::Claude`, a session
+id on record, the checkpoint present in the capture, `checkpoint_resumes` below
+`MAX_CHECKPOINT_RESUMES` — asserting the resume path fires rather than falling through to the
+per-stage dispatch.
+
+**The test only counts if it ships with its negative control:** revert `:1070` to `project_root` and
+the new test must FAIL. Without that step this entry produces a 280th test that passes both ways,
+which is the failure mode it exists to close.
+
+**Relationship to 999.76's open question — decide together, but they are not the same item.** 999.76
+(this entry's parent, promoted into Phase 34) left an unanswered question: whether that fix should
+carry the workspace's first *real linked* `git worktree` integration test, since today's
+worktree-mode tests use plain `create_dir_all` directories with no git repository at all. That
+question is motivated by `phase_commit_count`'s shared-refs property, not by this call site, and it
+remains open. **This entry does not depend on it** — the `:1070` guard needs only a directory
+standing in for the worktree, exactly as `verify.rs:351` already does, so it can land cheaply and
+independently. If the linked-worktree harness is built first, this test should use it.
 
 ### Phase 999.81: Phase 33 Advisory Cleanup — the Loop-Back Prompt Calls a Normal Continuation a Defect, Plus Three Hygiene Items (BACKLOG)
 
@@ -474,7 +494,16 @@ against both the buggy and the fixed code, so without that sequence the fix is u
 the streak accumulates. It never examined failure-then-success, which is the actual defect. Do not
 treat that AGREE as clearing this finding.
 
-### Phase 999.76: Layer 0 External Verification Reads Its Declaration From the Main Checkout, So It Is Inert in Worktree Mode (BACKLOG)
+### Phase 999.76: Layer 0 External Verification Reads Its Declaration From the Main Checkout, So It Is Inert in Worktree Mode (PROMOTED — Phase 34)
+
+**Scheduled as Phase 34** (with 999.73 and 999.74), promoted 2026-08-05. Phase 34's success
+criterion 5 is this entry's fix, including the second call site at
+`phase_has_blocking_human_checkpoint`. **Why it landed here rather than in its own phase:** it is
+inside the code 999.74 rewrites. `classify_validate_outcome`'s `external` predicate requires
+`decided_by_layer == Some(0)`, which only `evaluate_layer0` produces — and this defect makes that
+unreachable in worktree mode, DevFlow's default shape. Rewriting the match around the two
+`external`-gated `Ambiguous` arms without fixing this first would be designing around branches that
+never fire. It also sequences *before* the match rewrite inside the phase, for the same reason.
 
 **Linear:** [DEN-98](https://linear.app/denniskim/issue/DEN-98/99976-layer-0-external-verification-reads-its-declaration-from-the)
 **Found:** 2026-08-05, Phase 33 code review; confirmed independently by two peer reviews (Claude
@@ -582,11 +611,85 @@ non-backgrounding stages still close on their marker alone. 880 passed, 0 failed
 
 ### Phase 999.74: `classify_validate_outcome` Trusts the Agent's Verdict Over Its Own Status (PROMOTED — Phase 34)
 
-**Scheduled as Phase 34** (with 999.73), requirement **DOGFOOD-04**. Phase 34's success criterion 3
-is this entry's fix — gate the `Passed` arm on the status the cascade derived, confirmed explicitly
-for `Failed`, `Unknown`, `ResourceKilled` and `IdleTimeout` — and criterion 4 is this entry's own
-open question, carried forward unrelaxed: establish, by reading the Validate routing end to end,
-whether the inversion can manufacture a *pass* on a run that would otherwise have gated.
+**Scheduled as Phase 34** (with 999.73 and 999.76), requirement **DOGFOOD-04**. Phase 34's success
+criterion 3 is this entry's fix and criterion 4 is its open question — but **both were rewritten on
+2026-08-05 after the open question was answered.** Read the correction below before this entry's
+original analysis.
+
+> **SUPERSEDED — read the SECOND CORRECTION below first.** The block immediately following was
+> written after the first review pass and its headline conclusion is **wrong**. It is kept because
+> its narrow structural claim (the classifier's own inputs are always `Success`) is true and load-
+> bearing, and because the reasoning error it embodies — checking a function's inputs and inferring
+> a whole-system property — is worth being able to retrace.
+>
+> **SECOND CORRECTION (2026-08-05) — the inversion IS reachable, by a different route.**
+> `reconcile_layer0_verdict` (`crates/devflow-core/src/agent_result.rs:2143-2156`) grafts Layer 1's
+> `verdict` onto an affirmative Layer-0 probe success while checking only *Layer 0's* status:
+>
+> ```rust
+> if state.stage != Stage::Validate
+>     || result.status != AgentStatus::Success        // Layer 0's status
+>     || result.decided_by_layer != Some(0) { return result; }
+> let verdict = evaluate_layer1(project_root, state.phase)
+>     .and_then(|layer1| layer1.verdict);             // Layer 1's verdict, status unread
+> AgentResult { verdict, ..result }
+> ```
+>
+> An agent marker `{"status":"failed","verdict":"pass"}` parses to `(Failed, Some(Pass))`; the graft
+> transplants `Pass` onto `Success`, producing `(Success, Some(Pass), Some(0))`. `decide_action`
+> advances it; the classifier computes `external == true` and returns `Passed`; `Mode::Auto`
+> transitions to Ship. Reached via `evaluate_agent_result_inner:2305`, on the production path.
+>
+> **So the answer to this entry's open question is YES** — the agent's self-reported verdict,
+> attached to its own self-reported failure, converts a Validate that would otherwise have gated
+> into a Ship transition. Demonstrated end-to-end against a HEAD-built `advance` binary in
+> out-of-repo temp projects, with negative controls: verdict removed or set to `gaps` → gates;
+> Layer 0 disabled → `decide_action` intercepts as the block below describes.
+>
+> **Criterion 3's fix does not close this** — the derived status genuinely is `Success`. The graft
+> fix is criterion 4. Preconditions are production-reachable: `external_verify_enabled` defaults to
+> `true` (`config.rs:81`), plus a matching `DEVFLOW_TRUST_EXTERNAL_VERIFY`, a PLAN declaring
+> `external_verify:`, and passing probes. **Still unestablished:** whether a real agent emits a
+> self-contradictory marker in practice. No parser cross-checks `status` against `verdict`.
+>
+> ---
+>
+> **FIRST CORRECTION (2026-08-05, superseded above) — the inversion is NOT reachable in
+> production.** Six independent
+> adversarial lanes plus direct source verification established that `classify_validate_outcome`
+> has exactly one production call site (`crates/devflow-cli/src/pipeline_launch.rs:937`), inside
+> the `Action::Advance` arm of `outcome_policy::decide_action`. That match is wildcard-free and
+> maps **only `AgentStatus::Success`** to `Advance`: `Failed`/`Unknown`/`IdleTimeout` →
+> `GateReview`, `ResourceKilled`/`AgentUnavailable` → `GateInfra`, `RateLimited` → `AutoResume`. At
+> Validate the `GateReview` arm calls `handle_validate_outcome(.., ValidateOutcome::Failed)`
+> verdict-blind at `:990`. The other apparent call site, `pipeline_gate.rs:584`, is inside
+> `#[cfg(test)]`. Negative control: `cargo test -p devflow-core --lib outcome_policy::` reports
+> 9 passed / 538 filtered out, with a named test pinning every non-`Success` variant away from
+> `Advance`.
+>
+> **So the four `(non-Success, Some(Pass))` pairs this entry names are unreachable *at the
+> classifier*** — true, and the second correction above does not disturb it. The inference drawn
+> from it ("and therefore the answer to the open question is no") was wrong. What the first pass
+> identified remains real:
+>
+> 1. **A latent structural weakness.** The arm's safety depends entirely on a guard in *another
+>    crate* that its own doc comment never mentions — and `decide_action`'s comment marks the
+>    `Failed`/`Unknown` collapse "DEFERRED… Revisit if 18d requires divergent routing." A future
+>    split makes the wildcard live with nothing local to notice.
+> 2. **A documentation defect with measured cost.** At least two in-source comments assert the
+>    inversion is live and consequential, and code was bent around it twice — `idle_timeout_result`
+>    sets `verdict: None` citing this exact reason, and plan 31-04 nearly shipped a change caught
+>    only by adversarial review. Both defensive choices were right; both rationales are wrong about
+>    reachability.
+>
+> **Not established:** whether a real agent ever emits a self-contradictory marker. The parsers
+> deserialize `status` and `verdict` independently with no cross-check and neither normalises
+> `verdict`, but no archived capture in this repo contains such a line — absence here is weak
+> evidence, not a bound.
+>
+> The fix is still worth doing, as defence-in-depth plus a corrected record — **not** as closing an
+> exploitable hole. Criterion 3 additionally now covers all seven `AgentStatus` variants; the
+> original four omitted `RateLimited` and `AgentUnavailable`.
 
 **Linear:** [DEN-95](https://linear.app/denniskim/issue/DEN-95/99974-classify-validate-outcome-trusts-the-agents-verdict-over-its-own)
 **Found:** 2026-08-03, Phase 31 plan 31-02 execution. Re-confirmed independently at HEAD `e9abb0b`
@@ -630,11 +733,40 @@ explicitly; add a mirror test per status so the arm cannot silently regain the w
 
 ### Phase 999.73: Widen `STREAM_JSON_STAGES` Beyond `Stage::Code` (PROMOTED — Phase 34)
 
-**Scheduled as Phase 34** (with 999.74), requirement **DOGFOOD-03**. Phase 34's success criteria 1
-and 2 carry this entry's two halves: widen the bidirectional stream-json path to Define/Plan/
-Validate/Ship backed by *real per-stage production captures* rather than synthetic fixtures, and
-re-derive the drain-gate reasoning per newly-widened stage rather than assuming it carries over
-from Code's backgrounding behavior.
+**Scheduled as Phase 34** (with 999.74 and 999.76), requirement **DOGFOOD-03**. Phase 34's success
+criteria 1 and 2 carry this entry's two halves — **both rewritten on 2026-08-05.** Read the
+correction below before this entry's original analysis.
+
+> **CORRECTION (2026-08-05) — the per-stage transport verification is vacuous; the behavioural risk
+> is larger than stated.** `ClaudeAgent::exec_command`
+> (`crates/devflow-core/src/agents/claude.rs:46`) ignores its `_phase`, `_prompt` and
+> `_extra_writable_roots` arguments and returns a fixed argv. **The stream-json launch shape is
+> byte-identical for all five stages.** Nothing about the transport, monitor wiring or parser varies
+> per stage, so "confirm each added stage against a real capture" is evidence about *agent
+> behaviour under that stage's prompt* — criterion 2's question — not about the launch mechanism.
+> Criterion 1 as originally worded is close to mechanically vacuous.
+>
+> **What grew instead.** Widening can make a stage *unusable*. `CloseRule::should_close()` requires
+> `marker_seen` AND a drained list; if a stage backgrounds work still pending when its marker lands,
+> the rule never fires, the supervise loop reaches `RecvTimeoutError::Timeout`, and
+> `fire_idle_timeout` terminates the child and records a terminal `IdleTimeout` → `GateReview`.
+> Those stages take the legacy path today and cannot hit this at all. That risk is *created by* the
+> widening and is the real content of criteria 1 and 2.
+>
+> **Ordering trap this entry did not anticipate.** A stage produces a stream-json capture only via
+> the pipe-owning path, and `claude_stream_launch_enabled` offers an opt-*out* only — no force-on
+> exists. So evidence cannot precede widening through the normal pipeline. Two escapes exist:
+> widen in the working tree and let the evidence decide what gets *committed* (making the gate
+> commit-time, not build-time), or drive the hidden `devflow __monitor` subcommand
+> (`crates/devflow-cli/src/main.rs:133`), which never consults `STREAM_JSON_STAGES` — pointed at a
+> scratch phase, since it advances the stage machine on reap.
+>
+> **Two further traps found in the same review.** `31-ACCEPTANCE.md`'s pass bar is *"VOID unless the
+> capture shows a `background_tasks_changed` event with a NON-EMPTY `tasks` array followed by a
+> drain to `[]`"* — a non-backgrounding stage cannot satisfy that by construction, so it must not be
+> reused verbatim as the per-stage bar. And `DEFAULT_CAPTURE_RETENTION = 5`
+> (`crates/devflow-core/src/config.rs:12`) will evict an earlier stage's capture if the phase takes
+> any Validate→Code loop-back.
 
 **Linear:** [DEN-94](https://linear.app/denniskim/issue/DEN-94/99973-widen-stream-json-stages-beyond-stagecode-once-the-phase-31)
 **Deferred:** 2026-08-03 by operator decision, during Phase 31 planning. Explicitly **not** in
@@ -1305,6 +1437,19 @@ number. Next free backlog number is 999.47.
 
 **Fix direction, revised:** a registry-independent path — scan for running `devflow advance` children and reconcile against the registry, surfacing "running but unregistered" as its own reportable class rather than silence. Likely belongs in `doctor` as a finding plus a `gate sweep` flag. It **must** escalate `TERM` → `KILL` with a bounded wait and verify death rather than assuming it, and must reap the wrapper/child pair together. Add a regression test asserting a `TERM`-ignoring child is still cleared.
 
+**RECURRENCE CONFIRMED 2026-08-06 (Phase 34 execution).** Census during Phase 34 — five worktree-isolated executors plus one main-checkout executor over ~14h — found **10 real `devflow` processes** (filtering on `comm == devflow`), **3 of 10** reparented to `systemd --user`, oldest three at 22h27m / 12h23m / 11h35m, **87 MB** resident, **every root a `/tmp/.tmp*` scratch dir and none in a real repository**. The wrapper/child pair structure reproduced: 9 `sh -c apid=…` wrappers alongside the binaries. This entry's characterisation is unchanged; no new entry was filed. Full census on DEN-68.
+
+**Two measurement traps for whoever builds the reaper**, both hit while taking that census:
+
+- **`pgrep -f` over-reports.** `pgrep -f 'devflow (advance|__monitor)'` returned **12** where `comm == devflow` returned **10** — the wrapper shells carry the devflow command in their own argv and match the pattern. A census built on it over-reports, and a reaper built on it signals the *wrapper*, which this entry already notes manufactures a fresh orphan.
+- **`etime` must be sorted numerically.** String-sorting `ps -o etime=` ranks `27:14` above `22:25:31`. Use `etimes`. The "oldest orphan" figure is the one most likely to be quoted, and the string sort silently understates it.
+
+**`SIGTERM` immunity did NOT reproduce on 2026-08-06.** Sweeping the population above — 10 `devflow` plus 7 wrappers, reaped child-then-wrapper — **all 17 died on `TERM`; zero needed `KILL`.** That contradicts the 2026-07-27 escalation (15/15 survived `TERM`), which is the observation that raised this entry to High. It does not refute it: with 2026-07-26 ("cleared in 1s"), 2026-07-27 (15/15 survived) and today (17/17 died), the behaviour is **variable**, not immune. That *strengthens* the fix direction rather than weakening it — a reaper assuming immunity is as wrong as one assuming compliance, so the existing "escalate `TERM` → `KILL` with a bounded wait and verify death rather than assume it" requirement is exactly right. Priority stays High on the enumeration gap regardless. Untested hypothesis worth checking when this is picked up: whether immunity tracks the child's blocked wait state rather than its age.
+
+**Sweeper self-kill — a trap for the proposed `gate sweep` flag.** The first sweep attempt terminated itself (exit 144): an inline `bash -c` script's own command line contains the search patterns, so `pgrep -f devflow` and `pgrep -f apid=` both matched the sweeper. Any reaper implemented as a shell helper must exclude `$$` explicitly, or run from a file so its argv does not contain its own patterns.
+
+**Agent worktrees — a non-complication, recorded so it is not re-investigated.** Six of the ten processes execute binaries under `.claude/worktrees/agent-*/target/debug/devflow` whose worktrees were since removed, so `/proc/PID/exe` reports `(deleted)`. This does **not** affect the identity model: `agent.rs` identifies processes by recorded `(pid, starttime)` precisely because `/proc` lies ("identity must be recorded, never inferred"). The only implication is narrow — the registry-independent *scan* in the fix direction above must tolerate exe paths carrying `(deleted)` and pointing inside removed worktrees, rather than reading an unresolvable path as "not a devflow process."
+
 **Priority:** High — raised from Medium. `SIGTERM` immunity means the documented recovery path silently fails, and the fix direction as originally written (enumeration only) would not have cleared a single one of today's 30 processes. | **Size:** M — needs a PID-discovery mechanism that is safe on shared machines and does not misidentify unrelated processes. Linear: DEN-68.
 
 Plans:
@@ -1783,6 +1928,75 @@ Plans:
 Plans:
 
 - [x] Delivered as an out-of-band patch, 2026-07-31 (no phase — emergency unblock for the Phase 29 dogfood)
+
+### Phase 999.83: The Drain Gate Never Saw 8 Concurrent Sub-Agents — Its Fixture's Shape Is Not What Production Emits (BACKLOG)
+
+**Linear:** [DEN-104](https://linear.app/denniskim/issue/DEN-104/99983-the-drain-gate-never-saw-8-concurrent-sub-agents-its-fixtures)
+**Found:** 2026-08-06, phase 34 plan 34-05's capture campaign (D-04: file capture-revealed defects,
+do not fix them in the capture plan).
+
+**Evidence:** `.planning/phases/34-…/34-evidence/` — all five per-stage captures, and
+`34-evidence/DRAIN-ANALYSIS.md` for the full working.
+
+**The defect, in one line:** `CloseRule` keys its drain arm on
+`type:"system", subtype:"background_tasks_changed"`, and across 1063 top-level events spanning a
+complete five-stage production run that subtype appeared **zero times** — including in the two
+stages that dispatched **8 concurrent sub-agents** between them.
+
+**Why it is not simply "the run had no concurrency."** The 8 dispatches were announced as
+`subtype:"task_started"` carrying `"task_type":"local_agent"` — *the exact `task_type` value the
+drain gate's own synthetic fixture manufactures* (`monitor.rs:1164`). The fixture models a
+`local_agent` task as arriving inside a `background_tasks_changed` `tasks` array; production, on
+`claude` 2.1.222, announced it through the `task_started` / `task_progress` / `task_notification`
+family instead. D-09 recorded that every gate fixture is labelled SYNTHETIC and the parser's
+production correctness was *reasoned, not witnessed*. It is now witnessed, and for this path the
+reasoning did not survive.
+
+**What it costs.** `should_close()`'s drain arm is satisfied vacuously (`NeverAnnounced`) while
+sub-agents are live, so stdin closes on the marker alone. That is the precondition of the 999.64
+orphan shape — at `Stage::Code`, the exact stage 999.64 was observed at.
+
+**What this does NOT establish, and why the entry is scoped narrowly.** Every `Bash` call in the run
+carried `"run_in_background": false` (8 occurrences, **zero** `true`), so the **backgrounded-shell**
+path was never exercised and may work exactly as designed. No child work was actually orphaned in
+this run. n=1, one CLI version, one workload shape.
+
+**The work.** Establish which event family the CLI uses for each kind of concurrent child, at more
+than n=1; then either widen `CloseRule::observe` to the families production actually emits, or
+record in-source why `background_tasks_changed` is the right and sufficient key. Re-label the
+fixture to match whatever is found.
+
+**Priority:** High — it weakens the specific guard built for 999.64. **Size:** M.
+
+---
+
+### Phase 999.82: Re-File 31/D-14 — Per-Child Declared Tokens, Deferred on Size for the Second Time (BACKLOG)
+
+**Linear:** [DEN-105](https://linear.app/denniskim/issue/DEN-105/99982-re-file-31d-14-per-child-declared-tokens-deferred-on-size-for)
+**Found:** re-filed 2026-08-06 by phase 34 plan 34-05 under D-12. Originally CONTEXT.md D-14 in
+phase 31, deferred there; carried into phase 34's discussion and deferred again.
+
+**Why this entry exists separately from the existing note.** `ROADMAP.md`'s 999.73-adjacent deferral
+note already mentions per-child declared tokens in passing. D-12 requires the item to be a
+**numbered backlog entry in its own right**, not a clause inside another phase's note — an item that
+lives only as a cross-reference is one nobody schedules.
+
+**The item:** attribute declared token usage **per child** rather than per run. Each sub-agent's
+`result` event carries its own usage and `total_cost_usd`; DevFlow currently reads only the
+top-level figure.
+
+**Why it keeps getting deferred, stated plainly:** size, not merit. Both times it was cut to protect
+a phase's scope, and both times the reason recorded was that the drain gate would cover the same
+ground. Phase 34's captures weaken that argument — see 999.83, where the drain gate observed none of
+the 8 sub-agents it would have needed to see.
+
+**What it would defeat.** Constraint 7's coalescing undercount, **directly** — by counting each
+child's declared tokens instead of inferring concurrency from a gate that this phase has now shown
+can miss it entirely.
+
+**Priority:** Medium. **Size:** M.
+
+---
 
 ### Phase 999.71: Measure Whether the Capture Writer Actually Leaves Torn Terminal Lines (BACKLOG)
 

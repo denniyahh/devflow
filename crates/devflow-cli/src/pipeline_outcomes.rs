@@ -175,42 +175,96 @@ pub(crate) enum ValidateOutcome {
 /// Classify a Validate-stage `AgentResult` into its three-way outcome
 /// (D-18e, the binding operator decision reproduced in 18-05-PLAN.md).
 ///
-/// Pure function over `&AgentResult` — no I/O — so the whole decision
-/// matrix is directly unit-testable. `Some(Verdict::Pass)` is matched FIRST
-/// and wins regardless of which layer decided the result: it is the "two
-/// independent signals agreeing" arm and must not be shadowed by the
-/// external-verify-specific arms below it.
+/// Pure function over `&AgentResult` — no I/O — so the whole decision matrix is
+/// directly unit-testable.
 ///
-/// 31-02 audit (non-exhaustive equality site 3 of 3). The `== Success` test
-/// below is CORRECT AS-IS for `AgentStatus::IdleTimeout` and is left unchanged.
-/// An equality test compiles untouched against a new variant, so the
-/// wildcard-free-match mechanism that guards `decide_action` does not reach
-/// here; this was audited by hand.
+/// **The match is exhaustive over the `AgentStatus` position with no wildcard
+/// arm** (D-06, ROADMAP criterion 3). Every one of the seven variants appears by
+/// name, so an eighth is a compile error (E0004) rather than a silent join in
+/// either direction. The ban is POSITIONAL: `_` in the `layer0` or `verdict`
+/// position is fine — only the status position must be enumerated. It is a ban
+/// in BOTH directions: a catch-all routed to `Failed` carries the same
+/// compiles-untouched-against-a-new-variant weakness as one routed to `Passed`.
+///
+/// `layer0` is deliberately the LAYER-ONLY normalisation. The superseded
+/// composite (`decided_by_layer == Some(0) && status == Success`) folded an
+/// `AgentStatus` equality test back into the normaliser — the exact
+/// hand-audited construct this rewrite exists to eliminate — and its `false`
+/// value conflated "Layer 1, Success" with "Layer 0, Failed", so the arms could
+/// not tell provenance from status (D-06's named trap).
 ///
 /// A monitor-produced idle timeout has `decided_by_layer: Some(1)` and
-/// `verdict: None`, so `external` is `false`, the match falls to `_`, and the
-/// stage classifies as `Failed` — loop back or gate, never advance. That is the
-/// intended routing for "we gave up waiting" at Validate.
+/// `verdict: None`, so `layer0` is `false` and the status lands on the
+/// six-variant `Failed` arm below — loop back or gate, never advance. That is
+/// the intended routing for "we gave up waiting" at Validate, and it is
+/// unchanged by this rewrite.
 ///
-/// ADJACENT, PRE-EXISTING, NOT INTRODUCED HERE: the `(_, Some(Verdict::Pass))`
-/// arm below wins regardless of `status`, so an agent that writes
-/// `DEVFLOW_RESULT: {"status":"...","verdict":"pass"}` classifies as `Passed`
-/// whatever status it names. That is a documented deliberate choice (see the
-/// paragraph above) and it applies identically to `Failed`, `Unknown` and
-/// `ResourceKilled` today — `IdleTimeout` neither creates nor widens it, and
-/// changing it here "for symmetry" would silently re-route those three. Flagged
-/// rather than fixed.
+/// # How the Validate trust inversion is actually reached (D-15, ROADMAP criterion 5)
+///
+/// A superseded note here claimed the `(_, Some(Verdict::Pass))` wildcard let an
+/// agent's self-reported `verdict` outrank any `status`, and flagged it as
+/// pre-existing rather than fixing it. **The route named was wrong.** The
+/// inversion IS reachable, but by `reconcile_layer0_verdict`'s graft in
+/// `devflow-core`, not by this match:
+///
+/// - This function's own inputs genuinely ARE always `Success`. `decide_action`
+///   routes every non-`Success` status to a gate before
+///   `classify_validate_outcome` is called, and the sole production call site is
+///   inside its `Action::Advance` arm. The status was **laundered upstream**:
+///   the graft attached Layer 1's `verdict` to Layer 0's `Success` without
+///   reading Layer 1's own status.
+/// - **That graft is fixed in plan 34-01, and criterion 3's fix here does not
+///   close it.** This rewrite passes cleanly over the exploit precisely because
+///   the status it sees is already affirmative. Criterion 3 and criterion 4 are
+///   separate deliverables; neither alone closes the pair.
+/// - **The `Ambiguous` arms' safety depends on a routing decision in another
+///   crate** — `outcome_policy.rs`'s deferred `Failed`/`Unknown` collapse, which
+///   `decide_action`'s own comment marks revisitable.
+///
+/// The `(false, Success, Gaps | None)` cells stay `Failed` on purpose (D-05's
+/// "what this does NOT cover"): collapsing them to `Ambiguous` would convert the
+/// ordinary "validation found gaps" auto-loop into an immediate gate on cycle
+/// one — the loop 999.65/999.66 and Phase 33 just repaired.
 pub(crate) fn classify_validate_outcome(result: &agent_result::AgentResult) -> ValidateOutcome {
-    let external = result.decided_by_layer == Some(0) && result.status == AgentStatus::Success;
-    match (external, result.verdict) {
-        (_, Some(Verdict::Pass)) => ValidateOutcome::Passed,
-        (true, Some(Verdict::Gaps)) => ValidateOutcome::Ambiguous(
+    let layer0 = result.decided_by_layer == Some(0);
+    match (layer0, result.status, result.verdict) {
+        // The "two independent signals agreeing" arm — layer-independent, which
+        // is why `layer0` is `_` here and not `true`.
+        (_, AgentStatus::Success, Some(Verdict::Pass)) => ValidateOutcome::Passed,
+        (true, AgentStatus::Success, Some(Verdict::Gaps)) => ValidateOutcome::Ambiguous(
             "external verification passed but the agent reported gaps".to_string(),
         ),
-        (true, None) => ValidateOutcome::Ambiguous(
+        (true, AgentStatus::Success, None) => ValidateOutcome::Ambiguous(
             "external verification passed but no agent verdict arrived".to_string(),
         ),
-        _ => ValidateOutcome::Failed,
+        // No external probe decided this result, so there is no second signal to
+        // disagree with — an ordinary Validate failure, routed to the
+        // counter-based auto-loop (D-05).
+        (false, AgentStatus::Success, Some(Verdict::Gaps) | None) => ValidateOutcome::Failed,
+        // All six non-`Success` statuses share the `Failed` destination, named
+        // individually so an eighth variant cannot join them silently.
+        //
+        // `RateLimited` and `AgentUnavailable` are the two the superseded
+        // criterion 3 omitted. All six are unreachable at this call site:
+        // `classify_validate_outcome` is called only inside `decide_action`'s
+        // `Action::Advance` arm, and `decide_action` maps only `Success` there.
+        //
+        // `Failed` is chosen because it is exactly what the superseded `_` arm
+        // already gave them, so this rewrite has ZERO runtime delta for these
+        // cells. A divergent destination for `RateLimited` specifically would
+        // contradict `outcome_policy.rs`'s live, defended
+        // `AgentStatus::RateLimited => Action::AutoResume` routing if the cell
+        // ever became reachable — confront that tension before changing this.
+        (
+            _,
+            AgentStatus::Failed
+            | AgentStatus::Unknown
+            | AgentStatus::RateLimited
+            | AgentStatus::ResourceKilled
+            | AgentStatus::AgentUnavailable
+            | AgentStatus::IdleTimeout,
+            _,
+        ) => ValidateOutcome::Failed,
     }
 }
 
@@ -686,7 +740,7 @@ mod tests {
     /// (no other test holds the project lock).
     #[test]
     fn checkout_hooks_skip_instead_of_running_unserialized_on_lock_timeout() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         // A live holder (this process) keeps the lock contended; the stale-
@@ -1008,7 +1062,7 @@ mod tests {
     /// mutation survives regardless of the launch outcome.
     #[test]
     fn external_verify_agreement_advances_to_ship() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1141,6 +1195,319 @@ mod tests {
         );
     }
 
+    /// T-34-03-01, D-06: the ONE cell whose classification the exhaustive-match
+    /// rewrite actually changes. The superseded `(_, Some(Verdict::Pass))` arm
+    /// was matched first and discarded the derived status entirely, so an
+    /// agent-written `verdict: pass` outranked a `status` DevFlow derived
+    /// itself. The rewritten match enumerates the status position, so a
+    /// non-`Success` status can no longer be discarded by a verdict.
+    ///
+    /// **This cell is unreachable in production** — `decide_action` routes
+    /// every non-`Success` status to a gate before `classify_validate_outcome`
+    /// is called (`34-CONTEXT.md` D-05's amendment). It is defence in depth,
+    /// pinned here because it is the only assertion in this plan that was RED
+    /// before the rewrite and GREEN after it; every other cell's destination is
+    /// byte-identical across the change.
+    #[test]
+    fn non_success_status_never_classifies_as_passed_even_with_verdict_pass() {
+        for status in [
+            AgentStatus::Failed,
+            AgentStatus::Unknown,
+            AgentStatus::RateLimited,
+            AgentStatus::ResourceKilled,
+            AgentStatus::AgentUnavailable,
+            AgentStatus::IdleTimeout,
+        ] {
+            let result = agent_result::AgentResult {
+                status,
+                exit_code: None,
+                reason: None,
+                commits: None,
+                summary: None,
+                verdict: Some(Verdict::Pass),
+                decided_by_layer: Some(0),
+            };
+            assert_eq!(
+                classify_validate_outcome(&result),
+                ValidateOutcome::Failed,
+                "an agent-written verdict:pass must not outrank the derived status {status:?}"
+            );
+        }
+    }
+
+    /// Every `AgentStatus` variant, in the order the production match names
+    /// them. Kept as an explicit literal rather than derived: if a future
+    /// variant is added, the production match is already an E0004 (NC-4), and
+    /// this array going stale is caught by the sweep's cell counter.
+    const ALL_STATUSES: [AgentStatus; 7] = [
+        AgentStatus::Success,
+        AgentStatus::Failed,
+        AgentStatus::Unknown,
+        AgentStatus::RateLimited,
+        AgentStatus::ResourceKilled,
+        AgentStatus::AgentUnavailable,
+        AgentStatus::IdleTimeout,
+    ];
+
+    /// The three observable states of `AgentResult::verdict`.
+    const ALL_VERDICTS: [Option<Verdict>; 3] = [Some(Verdict::Pass), Some(Verdict::Gaps), None];
+
+    /// Builds a classifier fixture from the three matrix coordinates.
+    ///
+    /// `decided_by_layer` is set EXPLICITLY in both directions — `Some(0)` when
+    /// `layer0`, `Some(1)` otherwise — and NEVER `None`. That is load-bearing,
+    /// not stylistic (T-34-03-03): the field is `#[serde(default)]` and its own
+    /// doc comment reserves `None` for fixtures that do not route through the
+    /// real cascade, so omitting it (or passing `None` for the false case)
+    /// would make the `layer0 = false` half indistinguishable from an omission
+    /// bug — `layer0` would be false in all 42 cells, both `Ambiguous` arms
+    /// would go unexercised, and a regression deleting them both would pass
+    /// green. `Some(1)` says "a layer other than 0 decided this", which is the
+    /// real production shape for a Layer-1 result.
+    fn classifier_fixture(
+        layer0: bool,
+        status: AgentStatus,
+        verdict: Option<Verdict>,
+    ) -> agent_result::AgentResult {
+        agent_result::AgentResult {
+            status,
+            exit_code: None,
+            reason: None,
+            commits: None,
+            summary: None,
+            verdict,
+            decided_by_layer: if layer0 { Some(0) } else { Some(1) },
+        }
+    }
+
+    /// D-08's full matrix sweep: 2 `layer0` states × 7 statuses × 3 verdict
+    /// states = 42 cells, each asserted against the decision table.
+    ///
+    /// The 21-cell version this replaces was under-dimensioned: without the
+    /// `layer0` dimension both `Ambiguous` arms go unexercised and a regression
+    /// deleting them both is green. The expected-outcome table below is written
+    /// independently of the production match (and is permitted its wildcard —
+    /// D-06's ban is scoped to the production match's status position); the
+    /// mutation controls recorded in this plan's SUMMARY are what establish
+    /// that the pair actually discriminates rather than agreeing vacuously.
+    #[test]
+    fn classify_validate_outcome_sweeps_all_forty_two_cells() {
+        let mut visited = 0_usize;
+
+        for layer0 in [true, false] {
+            for status in ALL_STATUSES {
+                for verdict in ALL_VERDICTS {
+                    let expected = match (layer0, status, verdict) {
+                        (_, AgentStatus::Success, Some(Verdict::Pass)) => ValidateOutcome::Passed,
+                        (true, AgentStatus::Success, Some(Verdict::Gaps)) => {
+                            ValidateOutcome::Ambiguous(
+                                "external verification passed but the agent reported gaps"
+                                    .to_string(),
+                            )
+                        }
+                        (true, AgentStatus::Success, None) => ValidateOutcome::Ambiguous(
+                            "external verification passed but no agent verdict arrived".to_string(),
+                        ),
+                        _ => ValidateOutcome::Failed,
+                    };
+
+                    let actual =
+                        classify_validate_outcome(&classifier_fixture(layer0, status, verdict));
+                    assert_eq!(
+                        actual, expected,
+                        "cell (layer0={layer0}, status={status:?}, verdict={verdict:?}) \
+                         classified as {actual:?}, expected {expected:?}"
+                    );
+                    visited += 1;
+                }
+            }
+        }
+
+        assert_eq!(
+            visited, 42,
+            "the sweep must visit every cell of the 2 x 7 x 3 matrix; a truncated \
+             iterator or a stale ALL_STATUSES/ALL_VERDICTS array shows up here"
+        );
+    }
+
+    /// NC-1, the positive control: `(_, Success, Some(Pass))` classifies as
+    /// `Passed` for BOTH `layer0` values. The layer-independence is the point —
+    /// this is D-18e's "two independent signals agreeing" arm, and it is also
+    /// why NC-1 alone cannot catch a fixture that collapses `layer0` to one
+    /// value. NC-2 and NC-3 below are what catch that.
+    #[test]
+    fn verdict_pass_classifies_as_passed_regardless_of_layer() {
+        for layer0 in [true, false] {
+            assert_eq!(
+                classify_validate_outcome(&classifier_fixture(
+                    layer0,
+                    AgentStatus::Success,
+                    Some(Verdict::Pass),
+                )),
+                ValidateOutcome::Passed,
+                "a passing verdict on a successful stage advances regardless of which \
+                 layer decided it (layer0={layer0}); this arm is deliberately \
+                 layer-independent"
+            );
+        }
+    }
+
+    /// NC-2 and its paired mirror, deliberately in ONE test so the pair cannot
+    /// be split and half-deleted.
+    ///
+    /// `(true, Success, Some(Gaps))` is `Ambiguous` — an external probe passed
+    /// while the agent reported gaps, which is two signals disagreeing and gates
+    /// immediately. `(false, Success, Some(Gaps))` is `Failed` — no probe
+    /// decided it, so there is no second signal, and it must stay on the
+    /// ordinary counter-based auto-loop (D-05's "what this does NOT cover";
+    /// T-34-03-02).
+    ///
+    /// If both halves returned the same outcome the `layer0` dimension would be
+    /// decorative rather than load-bearing, and a fixture that silently
+    /// collapsed it would pass.
+    #[test]
+    fn external_verify_gaps_is_ambiguous_only_when_layer0_decided() {
+        assert!(
+            matches!(
+                classify_validate_outcome(&classifier_fixture(
+                    true,
+                    AgentStatus::Success,
+                    Some(Verdict::Gaps),
+                )),
+                ValidateOutcome::Ambiguous(_)
+            ),
+            "a Layer-0 probe pass against a gaps verdict is two signals disagreeing \
+             and must gate immediately"
+        );
+        assert_eq!(
+            classify_validate_outcome(&classifier_fixture(
+                false,
+                AgentStatus::Success,
+                Some(Verdict::Gaps),
+            )),
+            ValidateOutcome::Failed,
+            "with no Layer-0 probe there is no second signal to disagree with; this \
+             must stay the ordinary auto-loop, not become an immediate gate. If this \
+             half matched the layer0=true half, the layer0 dimension would be \
+             decorative rather than load-bearing"
+        );
+    }
+
+    /// NC-3 and its paired mirror, same shape and same reason as NC-2 above:
+    /// `(true, Success, None)` is `Ambiguous` (the probe passed but no agent
+    /// verdict arrived at all), while `(false, Success, None)` is `Failed` (the
+    /// verdict-less Validate fail-safe, unchanged).
+    #[test]
+    fn external_verify_absent_verdict_is_ambiguous_only_when_layer0_decided() {
+        assert!(
+            matches!(
+                classify_validate_outcome(&classifier_fixture(true, AgentStatus::Success, None)),
+                ValidateOutcome::Ambiguous(_)
+            ),
+            "a Layer-0 probe pass with no agent verdict at all must gate immediately"
+        );
+        assert_eq!(
+            classify_validate_outcome(&classifier_fixture(false, AgentStatus::Success, None)),
+            ValidateOutcome::Failed,
+            "with no Layer-0 probe, a missing verdict is the ordinary fail-safe and \
+             must stay on the auto-loop. If this half matched the layer0=true half, \
+             the layer0 dimension would be decorative rather than load-bearing"
+        );
+    }
+
+    /// The DOWNSTREAM half of ROADMAP criterion 4's demonstration: the Validate
+    /// shape produced AFTER plan 34-01's graft fix routes to an immediate gate,
+    /// while the pre-fix laundered shape routes to Ship.
+    ///
+    /// **This test covers only half the route, deliberately.** The upstream half
+    /// — that `reconcile_layer0_verdict` no longer manufactures the second shape
+    /// out of a `{"status":"failed","verdict":"pass"}` marker — is pinned in
+    /// `devflow-core` by `layer0_verdict_graft_declines_when_layer1_status_is_not_success`
+    /// (plan 34-01). The two crates' tests together cover the route.
+    ///
+    /// **Do not "consolidate" the pair into one crate.**
+    /// `classify_validate_outcome` is `pub(crate)` to `devflow-cli` and cannot be
+    /// called from `devflow-core`'s test module, and `devflow-core` cannot depend
+    /// on `devflow-cli`. The split is forced by visibility, not by oversight.
+    ///
+    /// **What the two shapes are.** Post-fix, the graft declines to transplant a
+    /// failing Layer 1's verdict, so Validate presents
+    /// `(decided_by_layer: Some(0), status: Success, verdict: None)` — a Layer-0
+    /// probe pass with no agent verdict, which is `Ambiguous`. Pre-fix, the same
+    /// marker produced `(Some(0), Success, Some(Pass))`, which is `Passed` and
+    /// advances. That second classification is NOT a defect in this classifier —
+    /// by the time it runs the status genuinely IS `Success` — which is exactly
+    /// why criterion 3's structural fix does not and could not close criterion 4.
+    ///
+    /// **The routing half** is asserted here only for the gating direction (the
+    /// one criterion 4 claims). The `Passed` → `Stage::Ship` direction is pinned
+    /// by `external_verify_agreement_advances_to_ship`, which needs `ENV_MUTEX`
+    /// and a neutralized `PATH` to keep `transition`'s `launch_stage` from
+    /// spawning a real agent CLI; reproducing that here would add env mutation to
+    /// an otherwise pure test for no additional coverage.
+    #[test]
+    fn grafted_failure_shape_gates_instead_of_shipping() {
+        // The POST-graft-fix shape.
+        let post_fix =
+            classify_validate_outcome(&classifier_fixture(true, AgentStatus::Success, None));
+        match &post_fix {
+            ValidateOutcome::Ambiguous(detail) => assert!(
+                detail.contains("no agent verdict"),
+                "the ambiguous payload must name the missing verdict so the \
+                 [never-silent] gate context says which signal was absent: {detail}"
+            ),
+            other => panic!("the post-fix Validate shape must gate, not ship — got {other:?}"),
+        }
+
+        // The PRE-fix laundered shape — the downstream half of the exploit,
+        // asserted as such. Opposite result from the same fixture shape, which
+        // is what makes the pair a demonstration rather than a restatement.
+        assert_eq!(
+            classify_validate_outcome(&classifier_fixture(
+                true,
+                AgentStatus::Success,
+                Some(Verdict::Pass),
+            )),
+            ValidateOutcome::Passed,
+            "the laundered shape classifies as Passed — this is the downstream \
+             half of 999.74's exploit, closed upstream by 34-01's graft fix, not here"
+        );
+
+        // The routing half, gating direction: drive the real
+        // `handle_validate_outcome` and confirm the post-fix shape does NOT
+        // reach Ship. An abort response is pre-seeded so the gate resolves
+        // without spawning anything (same pattern as
+        // `external_verify_disagreement_gates_immediately`).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 93;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &response_path,
+            r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+        )
+        .unwrap();
+
+        handle_validate_outcome(root, &mut state, post_fix).unwrap();
+
+        assert_ne!(
+            state.stage,
+            Stage::Ship,
+            "the post-fix shape must never advance to Ship — that advance is the \
+             whole of 999.74"
+        );
+        assert_eq!(
+            state.consecutive_failures, 0,
+            "an ambiguous outcome gates on cycle one without touching the counter, \
+             so the operator sees an immediate gate rather than a delayed retry"
+        );
+    }
+
     /// D-08/consensus #4: a `ResourceKilled` outcome on a non-Validate stage
     /// bumps `infra_failures` and leaves `consecutive_failures` untouched —
     /// `handle_infra_outcome` (the `GateInfra` arm) never routes through
@@ -1270,7 +1637,7 @@ mod tests {
     /// approach.
     #[test]
     fn consecutive_failures_reaches_ceiling_across_cycles() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1343,7 +1710,7 @@ mod tests {
     /// closes.
     #[test]
     fn healthy_multi_wave_progress_does_not_reach_the_ceiling() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1419,7 +1786,7 @@ mod tests {
     /// change would not be controlling for anything.
     #[test]
     fn repeated_failure_without_new_commits_still_reaches_the_ceiling() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1479,7 +1846,7 @@ mod tests {
     /// the one the Phase 29 dogfood actually hit.
     #[test]
     fn mid_arc_loop_back_issues_plain_execute_command() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1528,7 +1895,7 @@ mod tests {
     /// test is meaningful without the other.
     #[test]
     fn genuine_gaps_loop_back_still_issues_gaps_only() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1594,7 +1961,7 @@ mod tests {
     /// above (the `--no-worktree` case), never a replacement for it.
     #[test]
     fn worktree_mode_genuine_gaps_loop_back_issues_gaps_only() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1664,7 +2031,7 @@ mod tests {
     /// function hid.
     #[test]
     fn worktree_mode_mid_arc_loop_back_issues_plain_execute() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir_a = tempfile::tempdir().unwrap();
         let root_a = dir_a.path();
@@ -1720,7 +2087,7 @@ mod tests {
     /// two roots.
     #[test]
     fn worktree_mode_main_checkout_only_artifact_is_the_or_both_roots_discriminator() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir_b = tempfile::tempdir().unwrap();
         let root_b = dir_b.path();
@@ -1773,7 +2140,7 @@ mod tests {
     /// launch, so its `Err` is discarded.
     #[test]
     fn ambiguous_gate_loop_back_respects_the_mid_arc_check() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1838,7 +2205,7 @@ mod tests {
     /// `FullExecute`, so this test passed vacuously on the wrong arm.
     #[test]
     fn failure_gate_loop_back_respects_the_mid_arc_check() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1904,7 +2271,7 @@ mod tests {
     /// under `ENV_MUTEX`, same as above.
     #[test]
     fn ship_loop_back_still_issues_gaps_only_when_verification_absent() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -2019,7 +2386,7 @@ mod tests {
     /// so neither `handle_validate_outcome`'s loop-back nor `transition`'s
     /// own `launch_stage` risk spawning a real agent CLI.
     fn arm_b_genuine_failures_reach_the_ceiling(root: &Path, phase: u32) {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
@@ -2558,7 +2925,7 @@ mod tests {
     /// `DEVFLOW_GATE_NOTIFY_CMD`, so it's serialized under `ENV_MUTEX`.
     #[test]
     fn non_validate_failure_fires_gate_and_hook() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();

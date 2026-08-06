@@ -49,6 +49,54 @@ use std::sync::Mutex;
 /// is preserved by construction, not by convention.
 pub(crate) static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
+/// Acquire [`ENV_MUTEX`], recovering the guard if a previous holder panicked.
+///
+/// **This is the intended entry point; do not call `ENV_MUTEX.lock().unwrap()`
+/// directly.** [`NeutralPath`]'s doc comment already describes the cascade this
+/// exists to stop, in the paragraph beginning "What the trailing-statement
+/// shape costs" — one legible failing assertion becomes a `PoisonError` panic
+/// in every subsequent env-mutating test in the binary. That paragraph
+/// documents the amplification; this function is what prevents it. Measured on
+/// this suite: a single induced `assert!(false)` under the lock reported **25
+/// failures (24 of them `PoisonError`)** through `.lock().unwrap()`, and
+/// **exactly 1** through this accessor.
+///
+/// **Why recovering a poisoned guard is CORRECT here, not merely convenient.**
+/// Poison exists to warn that a panic may have left data behind the lock in a
+/// half-mutated state. The data this mutex guards is not the `()` payload — it
+/// is the process environment, and every mutation of it in this crate's tests
+/// is restored on the unwinding path by an RAII guard rather than by a trailing
+/// statement:
+///
+/// - [`NeutralPath`] restores (or removes) `PATH` in its `Drop`, and holds the
+///   neutral `TempDir` so `PATH` never transiently names a deleted directory.
+/// - [`ReapMonitorOnDrop`] reaps the detached monitor wrapper in its `Drop`,
+///   with a `std::thread::panicking()` interlock so it cannot double-panic into
+///   an `abort()` during the very unwind it is cleaning up after.
+///
+/// `Drop` runs during unwinding, so by the time the poisoned guard is handed to
+/// the next test, the state that poisoning would warn about has already been
+/// restored. That is the whole argument, and it is conditional:
+///
+/// **Without those guards this accessor WOULD be unsound.** It is stated
+/// plainly because the failure is silent — a future author who replaces a
+/// `NeutralPath` binding with a trailing `set_var("PATH", original)`, or drops a
+/// `ReapMonitorOnDrop` in favour of a trailing `reap_spawned_monitor` call, will
+/// see no compiler error and no failing test. They will instead have converted
+/// this function from "tolerates poison because cleanup already happened" into
+/// "silently hands the next test a `PATH` naming a deleted directory". If you
+/// are removing an unwind-safe guard, you are changing this function's premise;
+/// re-read [`NeutralPath`] before you do.
+///
+/// Directly mutated env vars inside a lock region are still the caller's
+/// responsibility to restore — this accessor does not make an unguarded
+/// `set_var` safe, any more than [`NeutralPath`] makes one safe on its own.
+pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    ENV_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Build a real git repo (main + develop, with a Cargo.toml committed) so
 /// the terminal-path hooks (`VersionBump`, `BranchCleanup`) exercised below
 /// have real git plumbing to operate on rather than an empty directory.

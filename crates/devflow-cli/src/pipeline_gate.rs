@@ -984,7 +984,7 @@ mod tests {
     /// both phases finish independently, exactly as before.
     #[test]
     fn concurrent_ship_advances_finish_both_phases_independently() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         let original_gate_timeout = std::env::var_os("DEVFLOW_GATE_TIMEOUT_SECS");
         // SAFETY: serialized under ENV_MUTEX. Bounds a reopened Ship gate's
         // poll to a few seconds instead of the 7-day production default.
@@ -1138,7 +1138,7 @@ mod tests {
         .unwrap();
 
         {
-            let _guard = ENV_MUTEX.lock().unwrap();
+            let _guard = env_lock();
 
             let neutral_path_dir = agent_free_git_only_path_dir();
             let original_path = std::env::var_os("PATH");
@@ -1218,7 +1218,7 @@ mod tests {
     /// thread while still hiding agent CLIs from this one.
     #[test]
     fn transition_resets_infra_failures() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1277,7 +1277,7 @@ mod tests {
     /// hop under test.
     #[test]
     fn repeated_code_to_validate_transition_is_idempotent_on_the_counter() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1369,7 +1369,7 @@ mod tests {
     /// independent knobs.
     #[test]
     fn ship_override_bounds_foreground_wait_on_terminal_hook_failure() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         let original_foreground_timeout = std::env::var_os("DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS");
         // SAFETY: serialized under ENV_MUTEX. Bounds ONLY the foreground
         // knob — DEVFLOW_GATE_TIMEOUT_SECS (the background default) is
@@ -1628,7 +1628,7 @@ mod tests {
     /// reset a sibling phase's counter.
     #[test]
     fn consecutive_failures_are_independent_across_phases() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();

@@ -2,19 +2,19 @@
 gsd_state_version: 1.0
 milestone: v2.4.0
 milestone_name: milestone (Resume Unattended Dogfooding, ACTIVE — declared 2026-08-04)
-current_phase: 34
-current_phase_name: Stream-JSON Coverage and the Validate Trust Boundary (999.73 + 999.74)
-status: "Phase 33 shipped — PR #90"
-stopped_at: Phase 33 context gathered
-last_updated: "2026-08-05T13:26:23.652Z"
-last_activity: 2026-08-05
+status: Awaiting next milestone
+stopped_at: Phase 34 complete — UAT passed, security verified, milestone v2.4.0 at 100%
+last_updated: "2026-08-06T11:32:47.141Z"
+last_activity: 2026-08-06
+last_activity_desc: Milestone v2.4.0 completed and archived
 progress:
   total_phases: 2
-  completed_phases: 1
-  total_plans: 6
-  completed_plans: 6
-  percent: 50
-last_activity_desc: Phase 33 complete, transitioned to Phase 34
+  completed_phases: 2
+  total_plans: 12
+  completed_plans: 12
+  percent: 100
+current_phase: 34
+current_phase_name: stream-json-coverage-and-the-validate-trust-boundary-999-73-
 ---
 
 # DevFlow — Project State
@@ -153,16 +153,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 34 — Stream-JSON Coverage and the Validate Trust Boundary (999.73 + 999.74)
-Plan: Not started
-Status: Phase 33 shipped — PR #90
-Last activity: 2026-08-05
-(inserted as the FIRST heading, mirroring the Phase 32 durability fix) with Phase 33 and Phase 34
-detail sections landing inside its own heading-to-next-heading window, plus two new `## Progress`
-rows (33, 34 — Not started). Verified live: `roadmap.analyze` phase_count 0->2 (was returning
-garbage cross-milestone matches with no active milestone declared), next_phase "33",
-`milestone.complete v2.4.0 --dry-run` correctly reports "2 unstarted phase(s)" instead of a
-pass-all sweep, and `smart-entry`'s roadmap_total_phases/roadmap_completed_phases read 32/30.
+Phase: Milestone v2.4.0 complete
+Plan: —
+Status: Awaiting next milestone
+Last activity: 2026-08-06 — Milestone v2.4.0 completed and archived
 
 ## Recently Shipped
 
@@ -839,15 +833,20 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 | Phase 24 P01 | 7min | 2 tasks | 1 files |
 | Phase 24 P02 | 8min | 2 tasks | 1 files |
 | Phase 25 P13 | ~30min automated + human review turnaround | 3 tasks | 6 files |
+| Phase 34 P05 | 110m | 6 tasks | 19 files |
 
 ## Session
 
-**Last session:** 2026-08-04T22:42:24.391Z
-**Stopped at:** Phase 33 context gathered
-**Resume file:** .planning/phases/33-loop-back-correctness-for-multi-wave-validate-code-cycles-99/33-CONTEXT.md
+**Last session:** 2026-08-06T11:17:31.166Z
+**Stopped at:** Phase 34 complete — UAT passed, security verified, milestone v2.4.0 at 100%
+**Resume file:** None
 
 ## Operator Next Steps
 
-- ROADMAP.md now has a live Phase 33 + Phase 34 (Resume Unattended Dogfooding, v2.4.0) inside the
-  active milestone's own window, plus updated `## Progress` rows — the milestone is declared and
-  roadmapped but not yet planned. Next: `/gsd-discuss-phase 33`.
+- Start the next milestone with /gsd-new-milestone
+
+## Accumulated Context
+
+### Roadmap Evolution
+
+- Phase 34 edited: edited fields: title, goal, depends_on, requirements, success_criteria — rewritten after adversarial review (34-REVIEW.md); 999.76 folded in

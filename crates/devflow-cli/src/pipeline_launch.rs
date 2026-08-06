@@ -443,7 +443,107 @@ fn emit_canary_outcome(state: &State, outcome: &canary::CanaryOutcome) {
 /// stage that actually backgrounds work, so it is the only one that exercises
 /// task-notification delivery and the drain gate at all. Define would have
 /// been a proxy measurement.
-const STREAM_JSON_STAGES: &[Stage] = &[Stage::Code];
+///
+/// **The launch argv is stage-blind, so a per-stage capture is evidence about
+/// the AGENT and never about the transport** (ROADMAP criterion 1; 34-REVIEW.md
+/// R-02). [`agents::ClaudeAgent::exec_command`]
+/// (`crates/devflow-core/src/agents/claude.rs:46`) ignores all three of its
+/// `_phase`, `_prompt` and `_extra_writable_roots` arguments — verified by
+/// reading the body, which returns a fixed `vec![...]`, not by the underscore
+/// prefixes — and so returns a **byte-identical** argv for every stage.
+/// Membership in this constant therefore selects exactly one thing:
+/// [`resolve_launch_shape`]'s pipe-owning branch. Nothing else about the
+/// transport varies per stage.
+///
+/// The consequence is what makes the capture campaign worth running. A capture
+/// taken at Define and a capture taken at Validate differ only in how the agent
+/// behaved under that stage's prompt — whether it backgrounded work, whether a
+/// `background_tasks_changed` event appears, whether the stream drains. Any
+/// difference between two stages' captures is a fact about agent behaviour. It
+/// is never a fact about the transport, because the transport was the same
+/// bytes both times. Reading a per-stage difference as a transport difference
+/// would be a proxy measurement of exactly the kind D-10 rejected.
+///
+/// Element ORDER here is semantically inert: the constant is consulted with
+/// `slice::contains`, so no launch behaviour depends on it. The list is written
+/// in `Stage`-enum declaration order for readability only.
+///
+/// # Per-stage evidence (ROADMAP criterion 1, phase 34)
+///
+/// Every one of the five `Stage` variants is accounted for by name below —
+/// each entry names the capture that authorised it, or, for a stage left off
+/// the list, what was attempted and what specifically prevented the evidence.
+/// All five are currently ON the list, so no "recorded reason for staying
+/// narrow" entry is live; the format is retained so that removing a stage
+/// requires writing one rather than deleting a line.
+///
+/// All five captures come from a SINGLE run — `devflow start --phase 1
+/// --no-worktree --agent claude --mode auto` against a throwaway repo
+/// scaffolded by `scripts/scratch-dogfood-repo.sh`, on `claude` 2.1.222, driven
+/// by a binary whose digest was verified byte-identical to the build made from
+/// this tree after the widening. Evidence directories are under
+/// `.planning/phases/34-…/34-evidence/{stage}/`.
+///
+/// - **`Stage::Define`** — WIDENED on `34-evidence/define/`. 8 top-level
+///   NDJSON events; `BackgroundTaskState::NeverAnnounced`, which
+///   [`monitor::CloseRule::should_close`] treats as vacuously drained by
+///   design. **Thin by construction:** the stage ran 1 turn in 2.3 s with no
+///   tool use, because the scratch scaffold pre-writes the plan and
+///   `/gsd-discuss-phase` had nothing to gather. It is evidence that Define
+///   takes the stream path and does not announce background tasks *on a
+///   workload with no work in it* — not that Define never backgrounds work.
+/// - **`Stage::Plan`** — WIDENED on `34-evidence/plan/`. 11 events, 2 turns,
+///   11.8 s, `NeverAnnounced`. Same thinness and the same cause: the agent
+///   reported "The deliverable already exists … No work performed".
+/// - **`Stage::Code`** — WIDENED on `34-evidence/code/`. The substantive
+///   capture of the run: 455 events, 49 turns, 695 s, 67 Bash / 22 Read /
+///   5 Write / 3 Edit and **3 `Agent` sub-agent dispatches**. `NeverAnnounced`
+///   throughout — see the refutation recorded in `34-evidence/DRAIN-ANALYSIS.md`.
+///   **This capture is NEW and does not supersede Phase 31's transcription.**
+///   Phase 31's raw capture was deleted during cleanup and never committed, so
+///   that stage survives only as transcription; this capture is a *fresh
+///   capture*, taken against a scaffolded single-file probe phase. The two
+///   differ in workload shape, tool-use volume and backgrounding pressure —
+///   exactly the variables the drain question turns on — so Phase 31's
+///   transcription remains the only production-phase evidence for Code.
+/// - **`Stage::Validate`** — WIDENED on `34-evidence/validate/`. 126 events,
+///   28 turns, 199 s, `NeverAnnounced`. Recorded observation, not diagnosed
+///   here: the agent self-reported `PHASE 1 IS NYQUIST-COMPLIANT` and DevFlow
+///   still classified the stage as a `loop_back` to Code. That is the
+///   validate trust boundary this phase exists to tighten, and the capture is
+///   filed as an observation of it rather than as a defect.
+/// - **`Stage::Ship`** — WIDENED on `34-evidence/ship/`. 463 events, 31 turns,
+///   516 s, `NeverAnnounced`, with 5 further `Agent` dispatches. The stage
+///   launched and ran to a top-level `result` marker; its *work* stopped at
+///   preflight because the scratch repo has no git remote. The capture is
+///   evidence about the launch path, which is what membership here selects —
+///   it is NOT evidence that a real Ship completes.
+///
+/// **What none of these establish (D-10, n=1).** Each capture shows the shape
+/// occurred ONCE. None of them shows it is the stage's steady behaviour across
+/// prompts, phase shapes or CLI versions — Phase 30 needed n=2–3 trials before
+/// its drain measurements meant anything. A `NeverAnnounced` reading from a
+/// 2.3-second no-op is the weakest form this evidence takes, and Define and
+/// Plan are both that form.
+///
+/// **Criterion 7 — the D-15 canary refusal has MOVED, deliberately.** With
+/// `Stage::Define` on the stream path, [`canary_gate`] now runs at Define
+/// instead of Code. A run whose canary returns `Absent`/`Unverified` therefore
+/// refuses at the FIRST stage, instead of completing Define and Plan on the
+/// legacy path and only then refusing. This is a real change to unattended
+/// behaviour, accepted rather than mitigated: D-15 rejected both alternatives
+/// (warn-and-proceed fails unattended; falling back to the legacy path is a
+/// silent capability downgrade). On the capture run the canary returned
+/// `Confirmed` at Define, so the relocated refusal did not fire — the
+/// relocation is recorded here on the strength of the code path, not on the
+/// strength of having watched it refuse.
+const STREAM_JSON_STAGES: &[Stage] = &[
+    Stage::Define,
+    Stage::Plan,
+    Stage::Code,
+    Stage::Validate,
+    Stage::Ship,
+];
 
 /// Whether this launch should use the `stream-json` transport and the
 /// pipe-owning monitor.
@@ -952,9 +1052,22 @@ pub(crate) fn advance(project_root: &Path, phase: Option<u32>) -> Result<(), Cli
             // resume ceiling has not been exhausted. All five true -> resume
             // and return. Any false -> fall through to the unchanged
             // per-stage dispatch below.
+            //
+            // Steps (2) and (3) deliberately read DIFFERENT roots (999.76,
+            // ROADMAP criterion 6). Step (2) reads the EXECUTION root:
+            // `.planning/` is tracked content, so an in-flight phase's
+            // `{N}-PLAN.md` lives on `feature/phase-{N}` INSIDE the worktree
+            // and is absent from the main checkout for the phase's whole
+            // duration — passing `project_root` here made this entire arm
+            // silently dead in worktree mode, DevFlow's default operating
+            // shape. Step (3) still reads `project_root`, because the stdout
+            // capture lives under `.devflow/` in the project root;
+            // retargeting it would break checkpoint detection in exactly the
+            // mode this change repairs.
             let mut reason = result.reason.clone();
+            let execution_root = state.worktree_path.as_deref().unwrap_or(project_root);
             let checkpoint_confirmed = state.agent == AgentKind::Claude
-                && verify::phase_has_blocking_human_checkpoint(project_root, phase)
+                && verify::phase_has_blocking_human_checkpoint(execution_root, phase)
                 && agent_result::checkpoint_reported_in_capture(project_root, phase);
             if checkpoint_confirmed {
                 let ceiling_ok = state.checkpoint_resumes < mode::MAX_CHECKPOINT_RESUMES;
@@ -1023,9 +1136,20 @@ mod tests {
     /// for that phase carries the monitor's pid — `transition()` saves state
     /// BEFORE calling `launch_stage`, so the pid must be saved again inside
     /// `launch_stage` or it is lost.
+    ///
+    /// **Premise moved off `STREAM_JSON_STAGES` membership deliberately
+    /// (34-06); do not "simplify" the opt-out away.** This test's subject is
+    /// pid persistence, not which launch path runs, so it previously relied on
+    /// its stage being ABSENT from `STREAM_JSON_STAGES` — an incidental
+    /// premise that 34-05's widening destroys, at which point `canary_gate`
+    /// invokes the real `ClaudeCanaryLauncher` and the launch fails on a
+    /// delivery refusal that has nothing to do with pid persistence. Pinning
+    /// the legacy path via the opt-out makes the premise explicit and stable
+    /// under any contents of the constant, exactly as
+    /// `canary_gate_only_applies_to_the_stream_launch_path` does.
     #[test]
     fn launch_stage_persists_monitor_pid_for_reload() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1033,6 +1157,9 @@ mod tests {
 
         let phase = 65;
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        // Not because this test wants legacy behaviour, but because its
+        // subject is orthogonal to the launch path (34-06).
+        state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
         let stub_dir = stub_agent_binary("claude");
@@ -1085,9 +1212,16 @@ mod tests {
     /// stay marked `stopped` forever despite the operator's explicit
     /// resume. Asserts on the persisted state (not just `resume`'s exit
     /// code), since `transition()` saves state before `launch_stage` runs.
+    ///
+    /// **Premise moved off `STREAM_JSON_STAGES` membership deliberately
+    /// (34-06); do not "simplify" the opt-out away.** The subject is resume's
+    /// stop-marker semantics, not which launch path the relaunch takes. The
+    /// opt-out is persisted here rather than set on a local binding because
+    /// `resume()` loads its own `State` from disk; `apply_legacy_launch_opt_out`
+    /// ORs the persisted value, so it survives the reload.
     #[test]
     fn resume_clears_stop_marker_and_advances_past_stop_point() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1099,6 +1233,9 @@ mod tests {
         state.stop_until = Some(Stage::Plan);
         state.stopped = true;
         state.stop_reason = Some("stopped after plan completed (--until plan)".to_string());
+        // Not because this test wants legacy behaviour, but because its
+        // subject is orthogonal to the launch path (34-06).
+        state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
         let stub_dir = stub_agent_binary("claude");
@@ -1168,9 +1305,15 @@ mod tests {
     /// `resume_clears_stop_marker_and_advances_past_stop_point` above, since
     /// `transition()`'s `stop_until == Some(from)` interception only sees
     /// what was actually written to disk.
+    ///
+    /// **Premise moved off `STREAM_JSON_STAGES` membership deliberately
+    /// (34-06); do not "simplify" the opt-out away.** The subject is the
+    /// unfired `--until` cap's survival, not which launch path the relaunch
+    /// takes. Persisted rather than set locally, for the same reason as the
+    /// sibling test above: `resume()` reloads its own `State`.
     #[test]
     fn resume_preserves_unfired_until_cap() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1184,6 +1327,9 @@ mod tests {
         state.stop_until = Some(Stage::Plan);
         state.stopped = false;
         state.stop_reason = None;
+        // Not because this test wants legacy behaviour, but because its
+        // subject is orthogonal to the launch path (34-06).
+        state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
         let stub_dir = stub_agent_binary("claude");
@@ -1236,9 +1382,14 @@ mod tests {
     /// `--until` cap at all (`stop_until: None`) must remain unaffected by
     /// gating the clear on `state.stopped` — nothing to preserve, nothing to
     /// clear, and the relaunch must still happen.
+    ///
+    /// **Premise moved off `STREAM_JSON_STAGES` membership deliberately
+    /// (34-06); do not "simplify" the opt-out away.** The subject is that the
+    /// no-cap resume path is undisturbed, not which launch path the relaunch
+    /// takes. Persisted rather than set locally, as in the two siblings above.
     #[test]
     fn resume_without_a_cap_is_unchanged() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1249,6 +1400,9 @@ mod tests {
         state.stop_until = None;
         state.stopped = false;
         state.stop_reason = None;
+        // Not because this test wants legacy behaviour, but because its
+        // subject is orthogonal to the launch path (34-06).
+        state.legacy_claude_launch = true;
         workflow::save_state(&state).unwrap();
 
         let stub_dir = stub_agent_binary("claude");
@@ -1369,7 +1523,7 @@ mod tests {
     /// real agent CLI and without racing other PATH-mutating tests.
     #[test]
     fn launch_stage_inner_clears_monitor_pid_on_early_failure() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1470,7 +1624,7 @@ mod tests {
     /// checkpoint decision.
     #[test]
     fn relaunch_checkpoint_session_emits_exactly_one_audit_event() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1519,7 +1673,7 @@ mod tests {
     /// invocations.
     #[test]
     fn relaunch_checkpoint_session_increments_and_persists_counter() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1565,7 +1719,7 @@ mod tests {
     /// the current stage's agent run, not a new stage entry.
     #[test]
     fn relaunch_checkpoint_session_does_not_change_stage() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1611,7 +1765,7 @@ mod tests {
     /// lifetime.
     #[test]
     fn launch_stage_inner_resets_checkpoint_resumes_counter() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1693,7 +1847,7 @@ mod tests {
     /// per-stage `preflight` hook instead of here.
     #[test]
     fn canary_runs_once_per_run() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1750,9 +1904,24 @@ mod tests {
     /// The guard protects one premise: that a live `stream-json` session is
     /// woken back up when a background task finishes. A launch that resolved to
     /// the legacy single-document path does not rely on that premise.
+    ///
+    /// **The false-branch discriminator is D-11's legacy opt-out, deliberately —
+    /// NOT stage membership** (ROADMAP criterion 7). This test previously took
+    /// `Stage::Plan`'s absence from [`STREAM_JSON_STAGES`] as its premise. That
+    /// premise is destroyed by the very rollout the constant exists to
+    /// sequence: once all five stages are widened, no Claude stage yields
+    /// `false` and the test becomes unconstructible as written — it would have
+    /// had to be deleted or rewritten under the time pressure of the widening
+    /// commit. `legacy_opt_out` is a separate `&&` term that
+    /// `claude_stream_launch_enabled` respects regardless of the constant's
+    /// contents, so a premise built on it survives full widening.
+    ///
+    /// Verified, not assumed: this pair was run against a temporarily
+    /// fully-widened `STREAM_JSON_STAGES` and stayed green, while the
+    /// pre-rebuild version failed on its `Stage::Plan` premise.
     #[test]
     fn canary_gate_only_applies_to_the_stream_launch_path() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1760,9 +1929,10 @@ mod tests {
 
         let phase = 121;
         let mut state = canary_state(root, phase);
-        // Plan is not in `STREAM_JSON_STAGES`, so it resolves to
-        // `exec_command_single_document` + `MonitorLaunch::Legacy`.
-        state.stage = Stage::Plan;
+        // `Stage::Code` is on the stream path today and stays on it. The
+        // variable under test is the opt-out, not the stage.
+        state.stage = Stage::Code;
+        state.legacy_claude_launch = true;
 
         // Driven by the REAL predicate rather than a hardcoded `false`, so this
         // test tracks the rollout instead of a copy of it.
@@ -1770,13 +1940,17 @@ mod tests {
             claude_stream_launch_enabled(state.agent, state.stage, state.legacy_claude_launch);
         assert!(
             !stream_launch,
-            "Stage::Plan must still resolve to the legacy path for this test to mean anything"
+            "the legacy opt-out must force this launch off the stream path for this test \
+             to mean anything"
         );
-        // Negative control: the same predicate DOES fire for the widened stage,
-        // so the reading above is a real discrimination and not a constant.
+        // Negative control: the SAME agent and the SAME stage, with only the
+        // opt-out cleared, DOES fire. Without this, the reading above would be
+        // a constant rather than a discrimination — and unlike a stage-
+        // membership control, this one cannot be invalidated by widening.
         assert!(
-            claude_stream_launch_enabled(AgentKind::Claude, Stage::Code, false),
-            "the predicate must still say yes somewhere, or the check above is vacuous"
+            claude_stream_launch_enabled(AgentKind::Claude, state.stage, false),
+            "clearing the opt-out must flip the predicate back to true, or the check above \
+             is vacuous"
         );
 
         let calls = std::cell::Cell::new(0usize);
@@ -1800,12 +1974,65 @@ mod tests {
         );
     }
 
+    /// The other direction of the pair above: with the opt-out cleared, the
+    /// same fixture DOES run the guard and DOES record its outcome.
+    ///
+    /// The refusal half alone cannot distinguish "the gate correctly skipped a
+    /// legacy launch" from "the gate is wired to nothing". This is the case
+    /// that must produce the opposite result, at the level of the gate's own
+    /// effects rather than the predicate's return value.
+    ///
+    /// `Confirmed`, not `Absent`: the sibling test can use `Absent` only
+    /// because its gate never invokes the canary at all. Here it does, and an
+    /// `Absent` outcome would make `canary_gate` return `Err` and the `unwrap`
+    /// below fail for a reason that has nothing to do with what is under test.
+    #[test]
+    fn canary_gate_still_fires_for_a_widened_stage_without_the_opt_out() {
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 123;
+        let mut state = canary_state(root, phase);
+        state.stage = Stage::Code;
+        state.legacy_claude_launch = false;
+
+        let stream_launch =
+            claude_stream_launch_enabled(state.agent, state.stage, state.legacy_claude_launch);
+        assert!(
+            stream_launch,
+            "without the opt-out this stage must be on the stream path, or this test is \
+             asserting the sibling test's case a second time"
+        );
+
+        let calls = std::cell::Cell::new(0usize);
+        canary_gate(
+            &mut state,
+            stream_launch,
+            counting_canary(&calls, canary::CanaryOutcome::Confirmed),
+        )
+        .unwrap();
+
+        assert_eq!(
+            calls.get(),
+            1,
+            "a stream launch with no recorded outcome must spend the guard exactly once"
+        );
+        assert_eq!(
+            state.canary,
+            Some(canary::CanaryOutcome::Confirmed),
+            "a launch that ran the guard must persist what it found"
+        );
+    }
+
     /// D-15's refusal. Warning-and-proceeding was rejected (the warning scrolls
     /// past in unattended mode) and so was falling back to sequential dispatch
     /// (a silent capability downgrade).
     #[test]
     fn absent_canary_refuses_to_launch() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1859,7 +2086,7 @@ mod tests {
     /// carries is a FALSE refusal).
     #[test]
     fn unverified_canary_refuses_to_launch_with_a_distinct_message() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1904,7 +2131,7 @@ mod tests {
     /// D-15: every run carries evidence of what was verified when.
     #[test]
     fn canary_outcome_is_persisted_and_emitted() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1959,7 +2186,7 @@ mod tests {
     /// agent invocation, and no claim about the real CLI's behaviour.
     #[test]
     fn launch_stage_inner_refuses_at_code_when_the_canary_cannot_confirm() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -2073,7 +2300,7 @@ mod tests {
     /// `gate_fired` for this stage.
     #[test]
     fn advance_with_declared_checkpoint_and_reported_gate_relaunches_and_records() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -2361,7 +2588,7 @@ mod tests {
     /// downgrade D-11 rejects.
     #[test]
     fn legacy_launch_is_off_by_default() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         // SAFETY: serialized by ENV_MUTEX.
         unsafe { std::env::remove_var("DEVFLOW_CLAUDE_LEGACY_LAUNCH") };
 
@@ -2397,7 +2624,7 @@ mod tests {
     /// summary's "what this does not establish".
     #[test]
     fn legacy_launch_use_is_recorded_in_provenance() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         // SAFETY: serialized by ENV_MUTEX.
         unsafe { std::env::remove_var("DEVFLOW_CLAUDE_LEGACY_LAUNCH") };
 
@@ -2452,7 +2679,7 @@ mod tests {
     /// legacy path is where a multi-plan wave orphans delegated work (999.64).
     #[test]
     fn legacy_launch_skips_the_delivery_canary() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -2509,7 +2736,7 @@ mod tests {
     /// covers.
     #[test]
     fn parse_failure_does_not_trigger_a_fallback() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         // SAFETY: serialized by ENV_MUTEX.
         unsafe { std::env::remove_var("DEVFLOW_CLAUDE_LEGACY_LAUNCH") };
 
@@ -2572,7 +2799,7 @@ mod tests {
     /// accidental-reach path D-11 forbids. The value is parsed as a bool.
     #[test]
     fn legacy_launch_env_var_is_parsed_as_a_bool() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         {
             let _env = LegacyEnvOverride::set("true");
@@ -2604,7 +2831,7 @@ mod tests {
     /// which was fixed by gating it.
     #[test]
     fn resume_does_not_clear_a_persisted_legacy_launch() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         // SAFETY: serialized by ENV_MUTEX.
         unsafe { std::env::remove_var("DEVFLOW_CLAUDE_LEGACY_LAUNCH") };
 

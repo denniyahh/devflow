@@ -1,5 +1,57 @@
 # Changelog
 
+## 2.4.0 — 2026-08-06
+
+Phase 33 (loop-back correctness for multi-wave Validate↔Code cycles) and phase 34 (stream-json
+coverage, the Validate trust boundary, and Layer 0 in worktree mode). Together they close the
+**structural defects blocking unattended, multi-wave `devflow start` runs** found during the phase
+29 dogfood run and phase 31 planning, so unattended dogfooding can safely resume.
+
+The headline is the Validate trust boundary (999.74): an agent that self-reports `status: failed`
+alongside `verdict: pass` used to have that verdict grafted onto an otherwise-derived `Success`
+result and advance to Ship unattended. `reconcile_layer0_verdict` now consults Layer 1's own status
+before transplanting its verdict, and `classify_validate_outcome` was rewritten as an exhaustive
+match naming all seven `AgentStatus` variants — an eighth is now a compile error, not a silent join.
+The exploit was reproduced against the real cascade before the fix, with a matched positive control
+proving the fix isn't indiscriminate.
+
+### What's new
+
+- **The Code↔Validate loop no longer false-gates on healthy work (999.66).**
+  `consecutive_failures` is measured from a persisted commit-count baseline instead of an unreset
+  counter, so a healthy 3+ wave phase no longer false-gates at wave 3 while a genuinely stuck loop
+  still reaches `MAX_CONSECUTIVE_FAILURES`.
+- **Loop-back fix selection reads the worktree (999.65).** `select_loop_back_fix` reads
+  `{N}-VERIFICATION.md` from the phase's worktree instead of the main checkout, making
+  `FixType::GapsOnly` reachable on the Validate path in worktree mode for the first time.
+- **All five stream-json stages joined the launch path on real evidence (999.73).** Widened beyond
+  `Stage::Code` against committed, PII-scrubbed production captures with per-stage drain analysis,
+  not a flag flip. The capture campaign refuted its own premise — zero `background_tasks_changed`
+  events across 1063 events despite 8 concurrent sub-agent dispatches — filed as a known gap rather
+  than absorbed; see Known Issues.
+- **Layer 0 external verification works in worktree mode (999.76).** Declaration discovery now
+  reads the execution root, so a correctly-declared `external_verify` probe set no longer silently
+  never executes — the plan-28-03 checkpoint auto-decide path is fixed at the same call site.
+
+### Fixed
+
+- Self-reported `status: failed` paired with `verdict: pass` could reach Ship unattended via the
+  Layer 0 verdict graft (999.74). Closed by gating the graft on Layer 1's own status.
+- The Validate classifier's status-position wildcard could discard a non-`Success` status silently;
+  now every `AgentStatus` variant is named explicitly.
+
+### Known Issues
+
+- **The drain gate has not been observed to see sub-agent concurrency** on Claude CLI 2.1.222 — the
+  safety mechanism the widened stream-json stages' unattended behavior depends on. Tracked as 999.83.
+- **One call site in the worktree-mode checkpoint fix has no regression test.** The fix is correct
+  by direct source read and by two root-sensitivity tests on the function it calls, but no test
+  drives the call site itself: reverting its argument leaves the full test suite green. Tracked as
+  999.84.
+- **Two in-source comments (`idle_timeout_result` and a test-module comment) describe a mechanism
+  this release's own fixes replaced.** Their conclusions are still correct; their stated reasoning
+  is not. Tracked as 999.85.
+
 ## 2.3.0 — 2026-08-04
 
 Phase 30 (the stream-json parser and the feasibility gate) and phase 31 (the

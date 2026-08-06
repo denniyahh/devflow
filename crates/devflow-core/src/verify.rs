@@ -118,6 +118,15 @@ fn command_from_frontmatter(contents: &str) -> Option<String> {
 /// first and is read from `.planning/phases/`. Those files are agent-writable
 /// during Code, but that is the SAME trust boundary [`external_verify_commands`]
 /// already documents and accepts — reused, not newly introduced.
+///
+/// **The CALLER is responsible for passing the root the phase's plans actually
+/// live under** — the execution root (the worktree) in worktree mode, the
+/// project root otherwise. `.planning/` is tracked content, so an in-flight
+/// phase's `{N}-PLAN.md` sits on `feature/phase-{N}` inside the worktree and
+/// is absent from the main checkout; a caller passing the main checkout gets a
+/// silent `false` rather than an error (999.76, ROADMAP criterion 6). The
+/// caller that does this correctly is `pipeline_launch.rs`'s
+/// `Action::GateReview` arm, which resolves `state.worktree_path` first.
 pub fn phase_has_blocking_human_checkpoint(project_root: &Path, phase: u32) -> bool {
     const HUMAN_BLOCKING_GATE: &str = r#"gate="blocking-human""#;
     phase_plan_files(project_root, phase)
@@ -321,6 +330,67 @@ mod tests {
         assert!(
             !phase_has_blocking_human_checkpoint(dir.path(), 91),
             "only *-PLAN.md files are scanned, not SUMMARY/RESEARCH files"
+        );
+    }
+
+    /// 999.76 (ROADMAP criterion 6), the second call site.
+    ///
+    /// This function reads whatever root it is handed, so the CALLER decides
+    /// whether it can see the phase's plans at all. `pipeline_launch.rs`'s
+    /// `Action::GateReview` arm passed `project_root` unconditionally; in
+    /// worktree mode the phase's `{N}-PLAN.md` lives on `feature/phase-{N}`
+    /// inside the worktree and is absent from the main checkout, so this
+    /// returned `false` and the plan-28-03 checkpoint auto-decide path was
+    /// silently dead for the phase's whole duration.
+    ///
+    /// This test and its mirror below pin the property that makes the caller's
+    /// choice matter: the answer DEPENDS on the root. Each carries the
+    /// opposite-root assertion, because a pair that returned `true` for both
+    /// roots would only be measuring that a PLAN exists somewhere.
+    #[test]
+    fn phase_has_blocking_human_checkpoint_reads_the_execution_root_in_worktree_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join("phase-worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let body = format!(
+            "---\nphase: 91\n---\n\n<task type=\"checkpoint:human-verify\" gate=\"{HUMAN_GATE_VALUE}\">\n</task>\n"
+        );
+        // The PLAN exists ONLY inside the worktree — the project root's own
+        // `.planning/phases/` is deliberately never created.
+        write_phase_file(&worktree, "91-probe", "91-01-PLAN.md", &body);
+
+        assert!(
+            phase_has_blocking_human_checkpoint(&worktree, 91),
+            "the execution root holds the PLAN, so the declaration must be found"
+        );
+        assert!(
+            !phase_has_blocking_human_checkpoint(dir.path(), 91),
+            "opposite-result case: the project root has no PLAN and must return false — \
+             if both roots returned true, this pair would be measuring the presence of a \
+             file somewhere rather than which root is read"
+        );
+    }
+
+    /// The main-checkout mirror of the test above: with no worktree the two
+    /// roots coincide, so 999.76's call-site change leaves this path untouched.
+    #[test]
+    fn phase_has_blocking_human_checkpoint_still_reads_the_project_root_without_a_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty_sibling = dir.path().join("phase-worktree");
+        std::fs::create_dir_all(&empty_sibling).unwrap();
+        let body = format!(
+            "---\nphase: 91\n---\n\n<task type=\"checkpoint:human-verify\" gate=\"{HUMAN_GATE_VALUE}\">\n</task>\n"
+        );
+        write_phase_file(dir.path(), "91-probe", "91-01-PLAN.md", &body);
+
+        assert!(
+            phase_has_blocking_human_checkpoint(dir.path(), 91),
+            "without a worktree the execution root IS the project root"
+        );
+        assert!(
+            !phase_has_blocking_human_checkpoint(&empty_sibling, 91),
+            "opposite-result case: a root without the PLAN must return false, so the \
+             assertion above is about which root is read and not about the file existing"
         );
     }
 }

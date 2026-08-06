@@ -656,7 +656,7 @@ mod tests {
     /// inventing a new one.
     #[test]
     fn embedded_commit_is_stale_uses_worktree_head() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let (outer, worktree_path, embedded_commit) = worktree_staleness_fixture();
         let project_root = outer.path().join("project");
@@ -687,7 +687,7 @@ mod tests {
     /// `worktree_staleness_fixture`'s unguarded real `git` subprocesses.
     #[test]
     fn enforce_build_staleness_blocks_self_dogfood_behind_worktree_head() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let (outer, worktree_path, embedded_commit) = worktree_staleness_fixture();
         let project_root = outer.path().join("project");
@@ -754,7 +754,7 @@ mod tests {
     /// mutates `PATH` for the stubbed `claude` binary.
     #[test]
     fn mid_run_stage_transition_does_not_readjudicate_staleness() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let (outer, worktree_path, embedded_commit) = worktree_staleness_fixture();
         let project_root = outer.path().join("project");
@@ -890,7 +890,7 @@ mod tests {
     /// `worktree_staleness_fixture`'s unguarded real `git` subprocesses.
     #[test]
     fn staleness_without_worktree_is_unchanged() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let (outer, _worktree_path, embedded_commit) = worktree_staleness_fixture();
         let project_root = outer.path().join("project");
@@ -1210,7 +1210,7 @@ mod tests {
     /// `25-03-SUMMARY.md` for re-filing.
     #[test]
     fn ahead_build_from_descendant_commit_warns_instead_of_blocking() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
