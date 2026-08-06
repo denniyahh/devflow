@@ -1532,6 +1532,15 @@ number. Next free backlog number is 999.47.
 
 **Fix direction, revised:** a registry-independent path — scan for running `devflow advance` children and reconcile against the registry, surfacing "running but unregistered" as its own reportable class rather than silence. Likely belongs in `doctor` as a finding plus a `gate sweep` flag. It **must** escalate `TERM` → `KILL` with a bounded wait and verify death rather than assuming it, and must reap the wrapper/child pair together. Add a regression test asserting a `TERM`-ignoring child is still cleared.
 
+**RECURRENCE CONFIRMED 2026-08-06 (Phase 34 execution).** Census during Phase 34 — five worktree-isolated executors plus one main-checkout executor over ~14h — found **10 real `devflow` processes** (filtering on `comm == devflow`), **3 of 10** reparented to `systemd --user`, oldest three at 22h27m / 12h23m / 11h35m, **87 MB** resident, **every root a `/tmp/.tmp*` scratch dir and none in a real repository**. The wrapper/child pair structure reproduced: 9 `sh -c apid=…` wrappers alongside the binaries. This entry's characterisation is unchanged; no new entry was filed. Full census on DEN-68.
+
+**Two measurement traps for whoever builds the reaper**, both hit while taking that census:
+
+- **`pgrep -f` over-reports.** `pgrep -f 'devflow (advance|__monitor)'` returned **12** where `comm == devflow` returned **10** — the wrapper shells carry the devflow command in their own argv and match the pattern. A census built on it over-reports, and a reaper built on it signals the *wrapper*, which this entry already notes manufactures a fresh orphan.
+- **`etime` must be sorted numerically.** String-sorting `ps -o etime=` ranks `27:14` above `22:25:31`. Use `etimes`. The "oldest orphan" figure is the one most likely to be quoted, and the string sort silently understates it.
+
+**Agent worktrees — a non-complication, recorded so it is not re-investigated.** Six of the ten processes execute binaries under `.claude/worktrees/agent-*/target/debug/devflow` whose worktrees were since removed, so `/proc/PID/exe` reports `(deleted)`. This does **not** affect the identity model: `agent.rs` identifies processes by recorded `(pid, starttime)` precisely because `/proc` lies ("identity must be recorded, never inferred"). The only implication is narrow — the registry-independent *scan* in the fix direction above must tolerate exe paths carrying `(deleted)` and pointing inside removed worktrees, rather than reading an unresolvable path as "not a devflow process."
+
 **Priority:** High — raised from Medium. `SIGTERM` immunity means the documented recovery path silently fails, and the fix direction as originally written (enumeration only) would not have cleared a single one of today's 30 processes. | **Size:** M — needs a PID-discovery mechanism that is safe on shared machines and does not misidentify unrelated processes. Linear: DEN-68.
 
 Plans:
