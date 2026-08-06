@@ -375,8 +375,9 @@ mechanism (comparing fingerprints against `ssh-add -l`, which knows nothing abou
 key material a probe would find) is unreliable by construction, not by circumstance.
 | **Size:** S — one function rewrite plus a regression test asserting `SigningViability::Viable`
 against a probe that actually signs, not a fingerprint match. **Revised 2026-08-06: still S, but it
-carries a public-API removal** (see finding 3 below), so the cut shipping it needs its version bump
-to reflect that.
+carries a public-API removal** (see finding 3 below). Version handling decided the same day: the
+release stays `v2.5.0` (no external consumers), and the removal is recorded in `CHANGELOG.md` and
+the crate docs instead of forcing a major bump.
 
 **Findings from the Phase 35 discussion (2026-08-06).** All measured on the operator's host with
 positive and negative controls; n=1, one OpenSSH build, one ed25519 key — they fix the *shape* of
@@ -776,8 +777,10 @@ found this had been resolved without asking, despite being the same one-way clas
 public-API removal. `phase_commit_count`'s return type becomes `Option<u32>`. Rejected: a
 `#[deprecated]` delegating wrapper that would have kept it non-breaking — declined because the break
 is already bought by 999.86's deletions, and a major bump is a fixed cost rather than a per-item
-one. **Consequence: the workspace moves to `3.0.0`, not `2.5.0`** (both crates share
-`version.workspace = true`), which makes the currently-declared `v2.5.0` milestone name wrong.
+one. **Version, decided separately the same day: the release stays `v2.5.0`.** Strict semver would
+say `3.0.0`, declined because `devflow-core` has no external consumers — so the break is
+**documented** (a `CHANGELOG.md` entry naming every changed/removed `pub` item, plus a crate-doc
+deprecation note) rather than versioned. The milestone is **not** renamed.
 
 **Defect surfaced during that reasoning, filed not fixed (34/D-04).** `evaluate_layer2`
 (`agent_result.rs:1905`) sets `no_work_done = commit_gated && commits == 0` and routes it to

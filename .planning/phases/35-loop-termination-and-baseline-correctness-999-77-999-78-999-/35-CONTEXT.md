@@ -151,9 +151,9 @@ recorded as **D-08** in `<decisions>`.
 
 Related and also uncounted: the 999.79 freshness check likely needs a signature change to
 `pub fn phase_verification_exists` (`agent_result.rs:2654`), which would be a **third** public-API
-change in the same cut. Under D-08 that is no longer a reason to hesitate — the major bump is a
-fixed cost already paid — but the planner should still enumerate every `pub` item it changes so the
-release notes are complete.
+change in the same cut. Under D-08 that is no longer a reason to hesitate — the release stays
+`v2.5.0` and the breaks are documented rather than versioned — but the planner must still enumerate
+every `pub` item it changes, because that list *is* the deliverable now.
 
 ---
 
@@ -250,9 +250,11 @@ linked-worktree-harness question.
   Rejected: keeping the enum while deleting the fn — a public enum no public function produces is
   worse than either whole option.
   — **Reversibility:** one-way — removes two `pub` items from a crate published to crates.io. Undo
-  is not a code revert but a re-publication; the version bump for the cut carrying this phase must
-  reflect the removal, and per `project-devflow-release-mechanics` the version is set in two places
-  and `devflow-core` publishes before `devflow-cli`.
+  is not a code revert but a re-publication. **Version handling settled by D-08: the release stays
+  `v2.5.0`** (no external consumers; strict semver's `3.0.0` was explicitly declined), and the
+  removal is recorded in `CHANGELOG.md` and the crate docs instead. Per
+  `project-devflow-release-mechanics` the version is set in two places and `devflow-core` publishes
+  before `devflow-cli`.
 
   **Orphan created by this phase's own change:** `inline_key_fingerprint` (private,
   `git.rs:841`) loses its only production caller under D-03, since inline values no longer reach
@@ -364,12 +366,21 @@ linked-worktree-harness question.
   version terms. `phase_commit_count` is also public by accident of module layout rather than design
   — it takes a `GitFlowConfig` and a phase number, and no external consumer would plausibly call it.
 
-  **Consequence the planner must carry: the workspace goes to `3.0.0`, not `2.5.0`.** Both crates
-  use `version.workspace = true` (currently `2.4.0`), so `devflow-core` and `devflow-cli` move
-  together. Per `project-devflow-release-mechanics` the version is set in two places and
-  `devflow-core` publishes before `devflow-cli`. **The active milestone is currently declared
-  `v2.5.0`** in `STATE.md`, `ROADMAP.md`, `REQUIREMENTS.md` and `PROJECT.md` — that name is now
-  wrong and is flagged to the operator separately; do not rename it from inside a plan.
+  **Version: the release stays `v2.5.0`. Operator decision, 2026-08-06.** Strict semver would say
+  `3.0.0`, and that was put to the operator explicitly. It was declined on the grounds that
+  **`devflow-core` has no external consumers**, so the compatibility risk is theoretical, while
+  renaming the active milestone would mean editing `STATE.md`, `ROADMAP.md`, `REQUIREMENTS.md` and
+  `PROJECT.md` and disturbing the milestone-heading window `CLAUDE.md` flags as parser-fragile
+  (999.72/999.72a broke exactly that way). **Do not rename the milestone.** Both crates still share
+  `version.workspace = true`, and per `project-devflow-release-mechanics` the version is set in two
+  places with `devflow-core` publishing before `devflow-cli`.
+
+  **The break is documented instead — this is a phase deliverable, not release-time paperwork.**
+  A `CHANGELOG.md` entry under the new version must name every changed or removed `pub` item
+  (`phase_commit_count`'s signature, plus D-04's `classify_ssh_add_status` and `SigningStatus`), and
+  the crate docs must carry a deprecation note saying the old forms are gone and why. The planner
+  should enumerate every `pub` item the phase touches so that list is complete — 999.79 may add a
+  third via `phase_verification_exists`.
   — **Reversibility:** one-way — same class as D-04, and now pooled with it in a single 3.0.0 cut.
 
   **Defect surfaced while reasoning about this decision, NOT fixed here (34/D-04).**
