@@ -843,6 +843,10 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 ## Operator Next Steps
 
 - Start the next milestone with /gsd-new-milestone
+- **999.86 / DEN-75 (High) must land in the next milestone's phase set** — `release --check`'s
+  tag-signing predictor produced a live false negative during v2.4.0's own release, for the second
+  time across two releases. Fix direction already decided: replace with a real `ssh-keygen -Y sign`
+  probe. Operator confirmed in-scope 2026-08-06.
 
 ## Accumulated Context
 
