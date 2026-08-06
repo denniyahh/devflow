@@ -1,25 +1,23 @@
 ---
 gsd_state_version: 1.0
 milestone: v2.4.0
-milestone_name: milestone (Resume Unattended Dogfooding, ACTIVE — declared 2026-08-04)
+milestone_name: Resume Unattended Dogfooding (CLOSED 2026-08-06)
 status: Awaiting next milestone
-stopped_at: Phase 34 complete — UAT passed, security verified, milestone v2.4.0 at 100%
-last_updated: "2026-08-06T11:32:47.141Z"
+stopped_at: v2.4.0 released — CHANGELOG, GitHub Release, signed tag, devflow-core and devflow published to crates.io
+last_updated: "2026-08-06T12:35:00.000Z"
 last_activity: 2026-08-06
-last_activity_desc: Milestone v2.4.0 completed and archived
+last_activity_desc: v2.4.0 released end-to-end (tag, GitHub Release, crates.io)
 progress:
   total_phases: 2
   completed_phases: 2
   total_plans: 12
   completed_plans: 12
   percent: 100
-current_phase: 34
-current_phase_name: stream-json-coverage-and-the-validate-trust-boundary-999-73-
 ---
 
 # DevFlow — Project State
 
-> Last updated: 2026-08-02
+> Last updated: 2026-08-06
 
 ## Deferred Items
 
@@ -88,7 +86,8 @@ regardless — see ROADMAP.md constraints 7 and 8).
 ### Historical — superseded phase notes
 
 The entries below describe earlier phases and are retained for context. They are
-**not** the active phase; the frontmatter `current_phase` above is authoritative.
+**not** the active phase; the frontmatter `status` above (no `current_phase` —
+milestone v2.4.0 is closed, awaiting the next milestone) is authoritative.
 
 **Phase 23 — End-to-End Dogfood: One Phase, Define→Ship, Unattended, With
 Claude** — **scoped 2026-07-25.** The goal was the
