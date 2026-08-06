@@ -315,6 +315,64 @@ Unsequenced items — not part of the active phase sequence. Promote with
 `/gsd-review-backlog` when ready; each carries accumulated context in its
 own `phases/999.N-*/CONTEXT.md`.
 
+### Phase 999.87: `evaluate_layer2` Reads an Unrunnable `git` as "No Work Done", Misclassifying a Successful Agent as `Failed` (BACKLOG)
+
+**Linear:** [DEN-108](https://linear.app/denniskim/issue/DEN-108/99987-evaluate-layer2-reads-an-unrunnable-git-as-no-work-done)
+**Found:** 2026-08-06, while reasoning through Phase 35's D-08 decision (change
+`phase_commit_count`'s return type, or add a sibling). **Not** found by any of the four adversarial
+review lanes run against Phase 35's CONTEXT.md that day — it surfaced from asking what the *other*
+consumer does with the same lossy return value, which no lane thought to ask.
+
+**Priority:** Medium | **Size:** S — one branch plus its test, on top of Phase 35's `Option<u32>`
+plumbing.
+
+**Severity: Medium.** Same root cause as 999.77, **worse consequence.** 999.77 weakens a *bound*;
+this produces a **wrong classification** — a successful agent run reported as failed and looped
+back. Needs a transient fault to trigger, which is why it is not High.
+
+**Not a duplicate — checked before filing.** 999.77/DEN-99 shares the root cause but is scoped to
+the `consecutive_failures` baseline write in `handle_validate_outcome`, never mentions
+`evaluate_layer2`'s classification, and its proposed fix leaves this call site untouched. 999.81's
+IN-03 cites `agent_result.rs:1904`, one line above, but concerns duplicated branch-name derivation.
+
+**The defect.** `phase_commit_count` (`crates/devflow-core/src/agent_result.rs:1841`) returns `0`
+indistinguishably for three causes — genuinely no commits, branch absent, or `git` could not run.
+`evaluate_layer2` (`agent_result.rs:1905`) then computes
+`no_work_done = commit_gated && commits == 0` for `Plan`/`Code` stages and routes
+`exit_code != 0 || no_work_done` to `AgentStatus::Failed`. So a momentary `git` failure makes an
+agent that **exited 0 having committed real work** read as `Failed`, with a reason string naming a
+commit count that was never measured.
+
+**Why the bad combination is reachable:** the exit code is read from `.devflow/phase-NN-exit`, not
+from git, so the two signals fail independently — a broken `git` does not prevent `exit_code == 0`
+from being true.
+
+**Relationship to Phase 35 — this is a follow-up, not independent work.** D-08 changes
+`phase_commit_count` to return `Option<u32>`, which forces this call site to be confronted by the
+compiler. Phase 35 deliberately maps `None` to today's zero-treatment **explicitly, with a
+comment**, rather than widening its own scope (34/D-04). This entry is exactly "revisit that
+mapping", and **should not be attempted before Phase 35 lands** — the `Option` plumbing is the
+prerequisite.
+
+**Proposed fix.** Decide what Layer 2 does when the count is `None` (could not measure) as distinct
+from `Some(0)` (genuinely no commits); "could not measure" is not evidence of no work and must not
+feed `no_work_done`. **The open question the fix should answer rather than assume:** what Layer 2
+returns instead. Falling through to Layer 3 is the natural precedent — the same function already
+does exactly that for an unreadable exit file (`Err(_) => return Ok(None)`). Phase 35's A-06 fixes
+the adjacent split: `.output()` returning `Err` → `None`; `Ok` with non-zero status (branch
+genuinely absent) → `Some(0)`, because branch-absent is a real observation.
+
+**Test coverage the fix must add.** No current test exercises a failing `git` in this path. The
+discriminating case is `exit_code = 0` + `Stage::Code` + unrunnable `git`, asserting the result is
+**not** `Failed`-for-no-work; a test of the ordinary `commits == 0` case passes against both the
+buggy and the fixed code. `crates/devflow-cli/src/test_support.rs` already carries `NeutralPath`
+plus a `PATH`-guarding mutex — the same mechanism `stub_agent_binary` uses — which is the intended
+route for a failing-`git` shim.
+
+**Not established:** how often Layer 2 is the deciding layer in production. The code path was read
+and verified; the frequency was not. If Layers 0/1 almost always decide first, real exposure is
+smaller than the code suggests — worth measuring before prioritising this above other Medium items.
+
 ### Phase 999.86: Replace `release --check`'s Tag-Signing Predictor With a Direct Probe (PROMOTED — Phase 35, revises D-10 for `release --check` only)
 
 **Linear:** [DEN-75](https://linear.app/denniskim/issue/DEN-75/release-check-tag-signing-gate-false-negatives-when-the-key-is-not-in)
@@ -782,7 +840,7 @@ say `3.0.0`, declined because `devflow-core` has no external consumers — so th
 **documented** (a `CHANGELOG.md` entry naming every changed/removed `pub` item, plus a crate-doc
 deprecation note) rather than versioned. The milestone is **not** renamed.
 
-**Defect surfaced during that reasoning, filed not fixed (34/D-04).** `evaluate_layer2`
+**Defect surfaced during that reasoning — now filed as 999.87 / DEN-108 (34/D-04).** `evaluate_layer2`
 (`agent_result.rs:1905`) sets `no_work_done = commit_gated && commits == 0` and routes it to
 `AgentStatus::Failed`. A transient `git` failure returns `0`, so an agent that exited 0 having
 committed real work reads as `Failed — no work done`. Same root cause as this entry, worse

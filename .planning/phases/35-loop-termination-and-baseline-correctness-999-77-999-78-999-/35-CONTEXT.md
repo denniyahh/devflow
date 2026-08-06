@@ -389,8 +389,10 @@ linked-worktree-harness question.
   **exited 0 and committed real work** is classified `Failed — no work done` and fed back into the
   Code↔Validate loop. That is the same root cause as 999.77 but a worse consequence — a
   misclassification rather than a weakened bound. Under D-08 the compiler will force this call site
-  to be confronted; **the phase still maps it to today's zero-treatment explicitly and files the
-  defect**, rather than silently widening scope. Filing is pending the operator's go-ahead.
+  to be confronted; **the phase still maps it to today's zero-treatment explicitly**, rather than
+  silently widening scope. **Filed 2026-08-06 as `999.87` / DEN-108** after a duplicate check against
+  the ROADMAP backlog and Linear (nearest neighbours: 999.77/DEN-99, same root cause but scoped to
+  the baseline write; 999.81 IN-03, adjacent line but a different concern).
   *Not established:* how often Layer 2 is the deciding layer in production — the code path was read,
   the frequency was not measured.
 
