@@ -76,8 +76,8 @@ that does and does not establish.
 | T-34-05-05 | Denial of Service | widening on a non-draining capture | high | mitigate | Decision table requires a stated basis for calling a shape pathological; defaults to leaving a stage narrow when n=1 cannot supply it. | closed |
 | T-34-05-06 | Repudiation | an un-widened stage's recorded reason | medium | mitigate | All five `Stage` variants named by name in `STREAM_JSON_STAGES`'s doc comment; blocking human read before commit. | closed |
 | T-34-05-SC | Tampering | package installs | low | accept | No dependency; scratch repo scaffolded in-repo, `claude` CLI already present. | closed |
-| F-34-01 | Repudiation | `idle_timeout_result` doc comment | low | accept | **New finding, this audit.** Below the `high` block threshold — non-blocking. See below. | closed — below high threshold (non-blocking) |
-| F-34-02 | Repudiation | `agent_result.rs:6415` test comment | low | accept | Residual overstated comment inside a test, disclosed by 34-01's own SUMMARY as out of scope. | closed — below high threshold (non-blocking) |
+| F-34-01 | Repudiation | `idle_timeout_result` doc comment | low | accept | **New finding, this audit.** Below the `high` block threshold — non-blocking. Filed as 999.85 / DEN-107. See below. | closed — below high threshold (non-blocking) |
+| F-34-02 | Repudiation | `agent_result.rs:6412-6417` test comment | low | accept | Residual overstated comment inside `stream_success_cannot_stand_against_nonzero_exit_code`, disclosed by 34-01's SUMMARY deviation 3 as out of scope. Filed with F-34-01 as 999.85 / DEN-107. | closed — below high threshold (non-blocking) |
 
 *Status: open · closed · open — below high threshold (non-blocking)*
 *Severity: critical > high > medium > low — only open threats at or above `workflow.security_block_on` count toward `threats_open`*
@@ -115,9 +115,10 @@ severity is low, but it is exactly the Repudiation class T-34-01-03 and T-34-03-
 prohibition was correct for the phase as scoped. The correction belongs to a follow-up that can
 weigh it against the guard's history.
 
-**Disposition:** accept for Phase 34, below the `high` block threshold. Recommended follow-up:
-rewrite the comment's rationale to cite the two structural defences that now carry it, keeping the
-`verdict: None` instruction intact.
+**Disposition:** accept for Phase 34, below the `high` block threshold. **Filed 2026-08-06 as
+ROADMAP 999.85 / Linear DEN-107**, grouped with F-34-02 — same file, same root cause, same fix.
+The follow-up rewrites both comments' rationale to cite the two structural defences that now carry
+the invariant, keeping the `verdict: None` instruction intact and unweakened.
 
 ---
 
@@ -129,8 +130,8 @@ rewrite the comment's rationale to cite the two structural defences that now car
 | R-34-02 | T-34-03-05 | `RateLimited`'s classifier destination is unreachable today and the delta from the superseded `_` arm is zero; tension recorded inline. | plan 34-03 | 2026-08-06 |
 | R-34-03 | T-34-05-04 | Canary refusal relocating Code→Define is a deliberate behaviour change; both alternatives rejected in D-15. | plan 34-05 | 2026-08-06 |
 | R-34-04 | T-34-01-SC, T-34-02-SC, T-34-03-SC, T-34-04-SC, T-34-05-SC | The phase adds no `Cargo.toml` dependency, so no Package Legitimacy Gate run is required. | all plans | 2026-08-06 |
-| R-34-05 | F-34-01 | Comment rationale stale but conclusion correct; the guard is now carried structurally in two places. Editing was prohibited by criterion 5. Low severity, below the `high` block threshold. | this audit | 2026-08-06 |
-| R-34-06 | F-34-02 | Residual overstated comment inside a test, not production doc; disclosed as out of scope by 34-01's SUMMARY. | 34-01 | 2026-08-06 |
+| R-34-05 | F-34-01 | Comment rationale stale but conclusion correct; the guard is now carried structurally in two places. Editing was prohibited by criterion 5. Low severity, below the `high` block threshold. Follow-up filed as 999.85 / DEN-107. | this audit | 2026-08-06 |
+| R-34-06 | F-34-02 | Residual overstated comment inside a test, not production doc; disclosed as out of scope by 34-01's SUMMARY. Follow-up filed as 999.85 / DEN-107. | 34-01 | 2026-08-06 |
 
 *Accepted risks do not resurface in future audit runs.*
 

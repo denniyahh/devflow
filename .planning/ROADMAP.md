@@ -412,6 +412,58 @@ Unsequenced items — not part of the active phase sequence. Promote with
 `/gsd-review-backlog` when ready; each carries accumulated context in its
 own `phases/999.N-*/CONTEXT.md`.
 
+### Phase 999.85: Two Protected Comments Now Justify Themselves by a Mechanism Phase 34 Deleted (BACKLOG)
+
+**Linear:** [DEN-107](https://linear.app/denniskim/issue/DEN-107/99985-two-protected-comments-now-justify-themselves-by-a-mechanism)
+**Found:** 2026-08-06, Phase 34 security audit (`34-SECURITY.md` findings F-34-01 and F-34-02).
+Grouped as one entry per the 999.81 advisory-cleanup precedent — same file, same root cause, same
+one-paragraph fix.
+
+**Priority:** Low | **Size:** S — two comment rewrites, no production change.
+
+**The shape of it.** Phase 34's success criterion 5 and threat T-34-01-04 explicitly **forbade**
+editing `idle_timeout_result`'s doc comment, and the phase honoured that prohibition exactly. The
+prohibition protected the comment's *text*. It could not protect the comment's *claim*, which
+34-01 and 34-03 invalidated in the same phase. Both comments' conclusions remain correct; the
+reasons they give for those conclusions are now false.
+
+**F-34-01 — `agent_result.rs:1746-1750`, `idle_timeout_result`.** The comment says `verdict` stays
+`None` because `classify_validate_outcome` "matches `Some(Verdict::Pass)` FIRST and would classify
+the stage as passed on the strength of that field alone, **whatever the status says**." Both halves
+are now dead:
+
+1. After 34-03, `pipeline_outcomes.rs:233` reads `(_, AgentStatus::Success, Some(Verdict::Pass))`.
+   The status position is no longer a wildcard, so a non-`Success` status cannot reach `Passed`.
+2. The remaining route — a timeout's verdict grafted through `reconcile_layer0_verdict`, reachable
+   because `evaluate_layer1` returns the idle-timeout side channel as its **first statement**
+   (`agent_result.rs:1795`) — is closed by 34-01's own
+   `.filter(|layer1| layer1.status == AgentStatus::Success)` at `:2203`. `idle_timeout_result` sets
+   `status: AgentStatus::IdleTimeout` (`:1753`), so it is filtered.
+
+`verdict: None` is now defended structurally in two places rather than by this convention.
+
+**F-34-02 — `agent_result.rs:6412-6417`, inside
+`stream_success_cannot_stand_against_nonzero_exit_code`.** The same superseded claim: "Carrying
+`Some(Verdict::Pass)` over would leave Validate classified Passed." Disclosed as out of scope by
+34-01-SUMMARY deviation 3 ("[Observation, no action taken] A residual instance of the superseded
+claim") and recorded again by the Phase 34 verifier under criterion 5. It is inside a test rather
+than production doc, which is why 34-01 correctly left it.
+
+**Why this is worth a ticket rather than a shrug.** This is the Repudiation class T-34-01-03 and
+T-34-03-04 were filed about, one level up. A reader who checks either comment's stated mechanism
+against the current classifier finds it false, may conclude the guard is vestigial, and may
+"helpfully" populate a verdict there — reopening a route Phase 34 closed. The hazard is indirect
+and the severity is low; the fix is a paragraph.
+
+**Proposed fix.** Rewrite both comments to cite the two structural defences that now carry the
+invariant (the classifier's enumerated status position; the graft's status filter), keeping the
+`verdict: None` instruction itself intact and unweakened. Do **not** treat "the mechanism changed"
+as licence to relax the instruction — the instruction is still load-bearing, just doubly defended.
+
+**Note for whoever picks this up:** DEN-95 (999.74), the defect these comments describe, is still
+open in Linear despite Phase 34 closing it via criterion 3. Same for DEN-98 (999.76) via criterion
+6. Both want a status sweep.
+
 ### Phase 999.84: Nothing Guards the Root Argument at the `GateReview` Checkpoint Call Site, So 999.76's Fix Can Regress Silently (BACKLOG)
 
 **Linear:** [DEN-106](https://linear.app/denniskim/issue/DEN-106/99984-nothing-guards-the-root-argument-at-the-gatereview-checkpoint)
