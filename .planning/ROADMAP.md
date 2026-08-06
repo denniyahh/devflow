@@ -277,7 +277,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 31 | 5/5 | Complete | — |
 | 32 | 0/0 | Complete    | 2026-08-04 |
 | 33 | 6/6 | Complete    | 2026-08-05 |
-| 34 | 6/6 | In Progress|  |
+| 34 | 6/6 | Complete    | 2026-08-06 |
 
 ## gsd-hygiene milestone (CLOSED 2026-08-04 — GSD Workflow Hygiene)
 
@@ -444,6 +444,7 @@ is the obvious place to look):
    `state.worktree_path.as_deref().unwrap_or(project_root)` evaluates to `project_root`. The changed
    expression returns the identical value the pre-fix code passed — structurally incapable of
    discriminating.
+
 2. `blocking-human` appears **0 times** in `scripts/scratch-dogfood-repo.sh`. Negative control: the
    string matches in 20 files elsewhere in the repo, so the zero is a real zero and not a broken
    search. Condition (2) of the arm's five-condition guard was false regardless of root.

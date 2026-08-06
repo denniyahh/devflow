@@ -23,7 +23,7 @@ Requirements for this milestone. Each maps to roadmap phases.
 - [x] **DOGFOOD-02**: Operator can run a 3+ wave unattended phase in `auto` mode without a false
   "3 consecutive failures" gate firing on healthy wave-by-wave progress (999.66)
 
-- [ ] **DOGFOOD-03**: Operator can trust that every stage DevFlow launches through the stream-json
+- [x] **DOGFOOD-03**: Operator can trust that every stage DevFlow launches through the stream-json
   path was put there on real per-stage behavioural evidence; that any stage not yet evidenced is
   visibly and deliberately still on the legacy path, never silently assumed to work; and that the
   phase moved this forward — **at least one stage is newly widened on a newly captured run, or the
@@ -83,7 +83,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 |-------------|-------|--------|
 | DOGFOOD-01 | Phase 33 | Complete |
 | DOGFOOD-02 | Phase 33 | Complete |
-| DOGFOOD-03 | Phase 34 | Pending |
+| DOGFOOD-03 | Phase 34 | Complete |
 | DOGFOOD-04 | Phase 34 | Pending |
 
 **Coverage:**
