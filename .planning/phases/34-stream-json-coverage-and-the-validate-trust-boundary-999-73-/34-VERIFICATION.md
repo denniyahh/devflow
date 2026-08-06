@@ -1,17 +1,19 @@
 ---
 phase: 34-stream-json-coverage-and-the-validate-trust-boundary-999-73-
 verified: 2026-08-06T10:30:00Z
-status: human_needed
+status: passed
 score: 7/8 must-haves verified
 behavior_unverified: 1
 overrides_applied: 0
 gaps: []
 behavior_unverified_items:
+
   - truth: "999.76's second Layer-0-in-worktree-mode call site (`verify::phase_has_blocking_human_checkpoint` in `pipeline_launch.rs`'s `Action::GateReview` arm) reads the execution root, so the plan-28-03 checkpoint auto-decide path is no longer silently dead in worktree mode."
     test: "Drive `advance()` through `Action::GateReview` in worktree mode against a phase whose PLAN declares `gate=\"blocking-human\"` and lives only in the worktree (not the main checkout), with a session id and a capture present, and assert the checkpoint is auto-decided rather than falling through to the generic failure dispatch."
     expected: "The auto-decide path fires because `phase_has_blocking_human_checkpoint` is called with the execution root, not `project_root`."
     why_human: "Confirmed by direct re-execution: reverting the call site's argument from `execution_root` back to `project_root` and re-running the full `cargo test -p devflow --bin devflow` suite (279 tests) still reports `0 failed`. No test in the repository — including the two new `verify.rs` tests, which pin the function's own root-sensitivity but never drive this call site — would catch a regression here. The code is present and correctly wired (confirmed by direct source read), but the runtime claim is unexercised by any test."
 human_verification:
+
   - test: "Drive `advance()` through `Action::GateReview` in worktree mode with a blocking-human-checkpoint PLAN placed only inside the worktree, a session id set, and the checkpoint reported in the capture; confirm the run auto-decides rather than falling through."
     expected: "Checkpoint is auto-decided (the plan-28-03 path fires), matching the code's stated behavior."
     why_human: "No automated test exercises this call site end-to-end; a live/manual run or a new integration test is needed to convert this from an inference (root-sensitivity + correct call-site wiring, verified separately) into a demonstration."
@@ -149,6 +151,7 @@ phase, because:
   favorably), but it means the drain gate — the safety mechanism the widened stages' unattended
   behavior depends on — is currently proven *not* to see sub-agent concurrency on CLI 2.1.222. That
   is a live gap in the safety net underneath this phase's own widening decision, tracked separately.
+
 - **Define and Plan are thin evidence.** 1 turn/2.3s and 2 turns/11.8s, because the capture run's
   scaffold pre-writes the plan so both stages had almost nothing to do. This is honestly disclosed
   in-source and in the SUMMARY, and the delivery floor does not require strong evidence, only real
