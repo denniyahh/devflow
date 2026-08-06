@@ -202,11 +202,13 @@ below; it carries no v1 requirement of its own.
      recorded as a deliberate behaviour change, and capture retention cannot evict an earlier
      stage's capture before the phase has read it — by changing the constant or copying captures at
      landing, so the mitigation leaves an inspectable artifact rather than a run-local env var.
-**Plans**: 4/5 plans executed
+**Plans**: 5/6 plans executed
 criterion 4's graft fix) is expressed as a real `depends_on` edge from 34-04 to 34-01, and every
 `wave` matches its `depends_on` DAG's topological level.
 
 Plans:
+
+- [x] 34-06-PLAN.md
 
 - [x] 34-01-PLAN.md — wave 1 (tracer). The `reconcile_layer0_verdict` graft fix: consult Layer 1's
   status before transplanting Layer 1's verdict, demonstrated through the real cascade with NC-5/NC-6.
@@ -275,7 +277,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 31 | 5/5 | Complete | — |
 | 32 | 0/0 | Complete    | 2026-08-04 |
 | 33 | 6/6 | Complete    | 2026-08-05 |
-| 34 | 4/5 | In Progress|  |
+| 34 | 5/6 | In Progress|  |
 
 ## gsd-hygiene milestone (CLOSED 2026-08-04 — GSD Workflow Hygiene)
 
