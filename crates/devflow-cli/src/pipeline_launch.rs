@@ -468,13 +468,75 @@ fn emit_canary_outcome(state: &State, outcome: &canary::CanaryOutcome) {
 /// `slice::contains`, so no launch behaviour depends on it. The list is written
 /// in `Stage`-enum declaration order for readability only.
 ///
-/// **PROVISIONAL — widened in the working tree pending the capture campaign
-/// (plan 34-05 task 2, D-02 Amendment 1).** The evidence gate for this constant
-/// is commit-time, not build-time: all five variants are listed here so the
-/// capture run can reach each stage's pipe-owning launch, and task 5 removes
-/// any stage whose capture did not materialise or did not support it. This
-/// paragraph is replaced by per-stage evidence entries once the evidence has
-/// decided; if you are reading it at HEAD, the campaign did not finish.
+/// # Per-stage evidence (ROADMAP criterion 1, phase 34)
+///
+/// Every one of the five `Stage` variants is accounted for by name below —
+/// each entry names the capture that authorised it, or, for a stage left off
+/// the list, what was attempted and what specifically prevented the evidence.
+/// All five are currently ON the list, so no "recorded reason for staying
+/// narrow" entry is live; the format is retained so that removing a stage
+/// requires writing one rather than deleting a line.
+///
+/// All five captures come from a SINGLE run — `devflow start --phase 1
+/// --no-worktree --agent claude --mode auto` against a throwaway repo
+/// scaffolded by `scripts/scratch-dogfood-repo.sh`, on `claude` 2.1.222, driven
+/// by a binary whose digest was verified byte-identical to the build made from
+/// this tree after the widening. Evidence directories are under
+/// `.planning/phases/34-…/34-evidence/{stage}/`.
+///
+/// - **`Stage::Define`** — WIDENED on `34-evidence/define/`. 8 top-level
+///   NDJSON events; `BackgroundTaskState::NeverAnnounced`, which
+///   [`monitor::CloseRule::should_close`] treats as vacuously drained by
+///   design. **Thin by construction:** the stage ran 1 turn in 2.3 s with no
+///   tool use, because the scratch scaffold pre-writes the plan and
+///   `/gsd-discuss-phase` had nothing to gather. It is evidence that Define
+///   takes the stream path and does not announce background tasks *on a
+///   workload with no work in it* — not that Define never backgrounds work.
+/// - **`Stage::Plan`** — WIDENED on `34-evidence/plan/`. 11 events, 2 turns,
+///   11.8 s, `NeverAnnounced`. Same thinness and the same cause: the agent
+///   reported "The deliverable already exists … No work performed".
+/// - **`Stage::Code`** — WIDENED on `34-evidence/code/`. The substantive
+///   capture of the run: 455 events, 49 turns, 695 s, 67 Bash / 22 Read /
+///   5 Write / 3 Edit and **3 `Agent` sub-agent dispatches**. `NeverAnnounced`
+///   throughout — see the refutation recorded in `34-evidence/DRAIN-ANALYSIS.md`.
+///   **This capture is NEW and does not supersede Phase 31's transcription.**
+///   Phase 31's raw capture was deleted during cleanup and never committed, so
+///   that stage survives only as transcription; this capture is a *fresh
+///   capture*, taken against a scaffolded single-file probe phase. The two
+///   differ in workload shape, tool-use volume and backgrounding pressure —
+///   exactly the variables the drain question turns on — so Phase 31's
+///   transcription remains the only production-phase evidence for Code.
+/// - **`Stage::Validate`** — WIDENED on `34-evidence/validate/`. 126 events,
+///   28 turns, 199 s, `NeverAnnounced`. Recorded observation, not diagnosed
+///   here: the agent self-reported `PHASE 1 IS NYQUIST-COMPLIANT` and DevFlow
+///   still classified the stage as a `loop_back` to Code. That is the
+///   validate trust boundary this phase exists to tighten, and the capture is
+///   filed as an observation of it rather than as a defect.
+/// - **`Stage::Ship`** — WIDENED on `34-evidence/ship/`. 463 events, 31 turns,
+///   516 s, `NeverAnnounced`, with 5 further `Agent` dispatches. The stage
+///   launched and ran to a top-level `result` marker; its *work* stopped at
+///   preflight because the scratch repo has no git remote. The capture is
+///   evidence about the launch path, which is what membership here selects —
+///   it is NOT evidence that a real Ship completes.
+///
+/// **What none of these establish (D-10, n=1).** Each capture shows the shape
+/// occurred ONCE. None of them shows it is the stage's steady behaviour across
+/// prompts, phase shapes or CLI versions — Phase 30 needed n=2–3 trials before
+/// its drain measurements meant anything. A `NeverAnnounced` reading from a
+/// 2.3-second no-op is the weakest form this evidence takes, and Define and
+/// Plan are both that form.
+///
+/// **Criterion 7 — the D-15 canary refusal has MOVED, deliberately.** With
+/// `Stage::Define` on the stream path, [`canary_gate`] now runs at Define
+/// instead of Code. A run whose canary returns `Absent`/`Unverified` therefore
+/// refuses at the FIRST stage, instead of completing Define and Plan on the
+/// legacy path and only then refusing. This is a real change to unattended
+/// behaviour, accepted rather than mitigated: D-15 rejected both alternatives
+/// (warn-and-proceed fails unattended; falling back to the legacy path is a
+/// silent capability downgrade). On the capture run the canary returned
+/// `Confirmed` at Define, so the relocated refusal did not fire — the
+/// relocation is recorded here on the strength of the code path, not on the
+/// strength of having watched it refuse.
 const STREAM_JSON_STAGES: &[Stage] = &[
     Stage::Define,
     Stage::Plan,

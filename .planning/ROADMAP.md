@@ -2011,6 +2011,75 @@ Plans:
 
 - [x] Delivered as an out-of-band patch, 2026-07-31 (no phase — emergency unblock for the Phase 29 dogfood)
 
+### Phase 999.83: The Drain Gate Never Saw 8 Concurrent Sub-Agents — Its Fixture's Shape Is Not What Production Emits (BACKLOG)
+
+**Linear:** not yet created — needs an issue under team Denniskim, project DevFlow.
+**Found:** 2026-08-06, phase 34 plan 34-05's capture campaign (D-04: file capture-revealed defects,
+do not fix them in the capture plan).
+
+**Evidence:** `.planning/phases/34-…/34-evidence/` — all five per-stage captures, and
+`34-evidence/DRAIN-ANALYSIS.md` for the full working.
+
+**The defect, in one line:** `CloseRule` keys its drain arm on
+`type:"system", subtype:"background_tasks_changed"`, and across 1063 top-level events spanning a
+complete five-stage production run that subtype appeared **zero times** — including in the two
+stages that dispatched **8 concurrent sub-agents** between them.
+
+**Why it is not simply "the run had no concurrency."** The 8 dispatches were announced as
+`subtype:"task_started"` carrying `"task_type":"local_agent"` — *the exact `task_type` value the
+drain gate's own synthetic fixture manufactures* (`monitor.rs:1164`). The fixture models a
+`local_agent` task as arriving inside a `background_tasks_changed` `tasks` array; production, on
+`claude` 2.1.222, announced it through the `task_started` / `task_progress` / `task_notification`
+family instead. D-09 recorded that every gate fixture is labelled SYNTHETIC and the parser's
+production correctness was *reasoned, not witnessed*. It is now witnessed, and for this path the
+reasoning did not survive.
+
+**What it costs.** `should_close()`'s drain arm is satisfied vacuously (`NeverAnnounced`) while
+sub-agents are live, so stdin closes on the marker alone. That is the precondition of the 999.64
+orphan shape — at `Stage::Code`, the exact stage 999.64 was observed at.
+
+**What this does NOT establish, and why the entry is scoped narrowly.** Every `Bash` call in the run
+carried `"run_in_background": false` (8 occurrences, **zero** `true`), so the **backgrounded-shell**
+path was never exercised and may work exactly as designed. No child work was actually orphaned in
+this run. n=1, one CLI version, one workload shape.
+
+**The work.** Establish which event family the CLI uses for each kind of concurrent child, at more
+than n=1; then either widen `CloseRule::observe` to the families production actually emits, or
+record in-source why `background_tasks_changed` is the right and sufficient key. Re-label the
+fixture to match whatever is found.
+
+**Priority:** High — it weakens the specific guard built for 999.64. **Size:** M.
+
+---
+
+### Phase 999.82: Re-File 31/D-14 — Per-Child Declared Tokens, Deferred on Size for the Second Time (BACKLOG)
+
+**Linear:** not yet created — needs an issue under team Denniskim, project DevFlow.
+**Found:** re-filed 2026-08-06 by phase 34 plan 34-05 under D-12. Originally CONTEXT.md D-14 in
+phase 31, deferred there; carried into phase 34's discussion and deferred again.
+
+**Why this entry exists separately from the existing note.** `ROADMAP.md`'s 999.73-adjacent deferral
+note already mentions per-child declared tokens in passing. D-12 requires the item to be a
+**numbered backlog entry in its own right**, not a clause inside another phase's note — an item that
+lives only as a cross-reference is one nobody schedules.
+
+**The item:** attribute declared token usage **per child** rather than per run. Each sub-agent's
+`result` event carries its own usage and `total_cost_usd`; DevFlow currently reads only the
+top-level figure.
+
+**Why it keeps getting deferred, stated plainly:** size, not merit. Both times it was cut to protect
+a phase's scope, and both times the reason recorded was that the drain gate would cover the same
+ground. Phase 34's captures weaken that argument — see 999.83, where the drain gate observed none of
+the 8 sub-agents it would have needed to see.
+
+**What it would defeat.** Constraint 7's coalescing undercount, **directly** — by counting each
+child's declared tokens instead of inferring concurrency from a gate that this phase has now shown
+can miss it entirely.
+
+**Priority:** Medium. **Size:** M.
+
+---
+
 ### Phase 999.71: Measure Whether the Capture Writer Actually Leaves Torn Terminal Lines (BACKLOG)
 
 **Linear:** [DEN-92](https://linear.app/denniskim/issue/DEN-92/99971-measure-whether-the-capture-writer-actually-leaves-torn-terminal)
