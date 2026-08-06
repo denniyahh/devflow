@@ -1,0 +1,3 @@
+# `.devflow/phase-01-stderr.log` was 0 bytes for the whole run — a single stderr file
+# is kept per phase, not per stage, so this is the run-level stderr reproduced into each
+# stage directory. An empty stderr is itself a finding (Phase 30 kept it at 0 bytes too).
