@@ -2022,7 +2022,7 @@ Plans:
 
 ### Phase 999.83: The Drain Gate Never Saw 8 Concurrent Sub-Agents — Its Fixture's Shape Is Not What Production Emits (BACKLOG)
 
-**Linear:** not yet created — needs an issue under team Denniskim, project DevFlow.
+**Linear:** [DEN-104](https://linear.app/denniskim/issue/DEN-104/99983-the-drain-gate-never-saw-8-concurrent-sub-agents-its-fixtures)
 **Found:** 2026-08-06, phase 34 plan 34-05's capture campaign (D-04: file capture-revealed defects,
 do not fix them in the capture plan).
 
@@ -2063,7 +2063,7 @@ fixture to match whatever is found.
 
 ### Phase 999.82: Re-File 31/D-14 — Per-Child Declared Tokens, Deferred on Size for the Second Time (BACKLOG)
 
-**Linear:** not yet created — needs an issue under team Denniskim, project DevFlow.
+**Linear:** [DEN-105](https://linear.app/denniskim/issue/DEN-105/99982-re-file-31d-14-per-child-declared-tokens-deferred-on-size-for)
 **Found:** re-filed 2026-08-06 by phase 34 plan 34-05 under D-12. Originally CONTEXT.md D-14 in
 phase 31, deferred there; carried into phase 34's discussion and deferred again.
 
