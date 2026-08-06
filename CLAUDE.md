@@ -57,6 +57,32 @@ Legitimate reasons to bypass, all of which should be said out loud rather than a
 Bypassing silently is the thing to avoid. Correcting a command's output by hand is fine; skipping
 the command because hand-editing seemed quicker is not.
 
+## Keep the active milestone's phase headings inside its own window
+
+`gsd-tools`' milestone-scoped parsers (`roadmap.analyze`'s `extractCurrentMilestone`,
+`deriveProgressFromRoadmap`) scope to the *active* milestone's heading-to-next-heading window in
+`ROADMAP.md` — from its `## ` milestone heading up to the next `## ` heading. If that window ends
+up prose-only (no `### Phase N:` headings, no `## Progress` table), the parsers misfire silently:
+`roadmap.analyze` reports `phase_count: 0`, `milestone.complete --dry-run` falls back to a
+pass-all degrade that sweeps every directory on disk, and `state.validate` falls back to a
+two-scale STATE.md comparison instead of roadmap-derived counts. This happened for real (999.72,
+999.72a) and was resolved for the `gsd-hygiene` milestone incidentally, by `gsd-roadmapper`'s own
+write when creating it — nothing guarantees the next milestone lands the same way.
+
+When declaring or archiving a milestone by hand (bypassing `/gsd-new-milestone` /
+`/gsd-complete-milestone`, or double-checking their output):
+
+- The active milestone's own `### Phase N:` headings must land inside its own
+  heading-to-next-heading window — not below a later closed-milestone heading.
+- `ROADMAP.md` must keep its `## Progress` table (columns `Phase`, `Plans Complete`, `Status`,
+  `Completed`). There is no repair verb if it goes missing — `phase.complete` only maintains an
+  existing table, it does not create one.
+- After any milestone declare/archive edit, spot-check with `gsd-tools query roadmap.analyze` —
+  a non-zero `phase_count` and a real `next_phase` confirm the window is intact.
+
+See ROADMAP.md's `999.72` / `999.72a` backlog entries (resolved by Phase 32) for the full
+root-cause history.
+
 ## Where the upstream GSD issue ledger lives
 
 `.planning/UPSTREAM-GSD-ISSUES.md` is a **symlink**, not a file. The tracked copy lives in the
@@ -74,3 +100,14 @@ restores it when the target resolves.
 **Do not "fix" this by tracking the symlink.** `tests/build_provenance.rs` copies every path from
 `git ls-files` with `std::fs::copy`, which follows symlinks and panics on failure — on CI, or any
 clone without a `gsd-core` sibling, the link dangles and the test panics.
+
+## Keep DEV-SETUP-CHECKLIST.md in sync
+
+`.planning/DEV-SETUP-CHECKLIST.md` exists so this repo's dev setup — git policy, hooks, CI,
+devcontainer/toolchain pins, GSD config — can be replicated on another project. When a commit
+touches any of those, update the checklist in the **same commit**, not as an afterthought.
+
+`scripts/hooks/post-commit` mechanically warns (never edits) when one of those files changes
+without the checklist moving too — that is the backstop for when this instruction gets missed,
+not a substitute for following it. Proactive beats reactive: a warning after the fact means the
+checklist was stale for however long between commits.

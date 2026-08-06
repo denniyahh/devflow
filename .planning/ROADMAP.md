@@ -2,33 +2,110 @@
 
 > Phase plan source of truth. Each phase drives a `devflow start` agent session.
 
-## v2.3.0 milestone (ACTIVE — bounded, closes when the 999.64 arc lands)
+## Progress
 
-**Declared 2026-08-02.** Deliberately **bounded**: this milestone closes when 999.64 is
-delivered — Phase 30 (the parser and the feasibility gate) plus Phase 31 (the launch path
-itself, planned only if `30c-VERDICT.md` confirms delivery). 999.65 and 999.66 become
-observable only once 999.64 is fixed, and may be folded in before close.
+**Scope note:** this table is global (spans every shipped milestone plus the active one), per
+`deriveProgressFromRoadmap`'s own design (it reads the whole file, not a milestone-scoped
+slice). Phases 26 (closed partial, never shipped) and 29 (aborted, never merged) are excluded —
+neither belongs to any shipped milestone (see `PROJECT.md` § "Active" and
+`.planning/superseded/26-release-cut-automation/`). `999.x` backlog entries are excluded per
+`deriveProgressFromRoadmap`'s own `/^999(?:\.|$)/` filter. `Plans Complete` reads "—" where this
+table's author did not have a directly-verified per-phase count on hand at authoring time
+(2026-08-04); those cells don't affect the derived phase-completion counts this Progress table
+exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 
-**Milestone goal** — the operator's stated objective for this stretch: a DevFlow-driven
-phase containing a multi-plan wave completes that wave without orphaning delegated work.
-This is the 999.64 arc goal, owned by Phase 31.
+| Phase | Plans Complete | Status | Completed |
+|---|---|---|---|
+| 1 | 1/1 | Complete | — |
+| 2 | 1/1 | Complete | — |
+| 3 | 1/1 | Complete | — |
+| 4 | 1/1 | Complete | — |
+| 5 | 1/1 | Complete | — |
+| 6 | 1/1 | Complete | — |
+| 7 | 1/1 | Complete | — |
+| 8 | 1/1 | Complete | — |
+| 9 | 1/1 | Complete | — |
+| 10 | 1/1 | Complete | — |
+| 11 | 2/2 | Complete | — |
+| 12 | — | Complete | — |
+| 13 | — | Complete | — |
+| 14 | — | Complete | — |
+| 15 | — | Complete | — |
+| 16 | — | Complete | — |
+| 17 | — | Complete | — |
+| 18 | 7/7 | Complete | — |
+| 19 | 11/11 | Complete | — |
+| 20 | 5/5 | Complete | — |
+| 21 | 4/4 | Complete | — |
+| 22 | 2/2 | Complete | — |
+| 23 | — | Complete | — |
+| 24 | — | Complete | — |
+| 25 | 18/19 | Complete | — |
+| 27 | 6/6 | Complete | — |
+| 28 | — | Complete | — |
+| 30 | 5/5 | Complete | — |
+| 31 | 5/5 | Complete | — |
+| 32 | 0/0 | Complete    | 2026-08-04 |
+| 33 | 6/6 | Complete    | 2026-08-05 |
+| 34 | 6/6 | Complete    | 2026-08-06 |
 
-The open-ended framing used for v2.0.0 is deliberately **not** repeated here. That decision
-(2026-07-23, below) let the milestone drift across three releases and leave stale milestone
-state behind — surfaced 2026-08-02 when a new statusline began rendering it.
+## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
+
+**Declared 2026-08-04, closed 2026-08-06.** Closed the structural defects blocking unattended,
+multi-wave `devflow start` runs: the Code↔Validate loop no longer false-gates on healthy work,
+Validate's reported outcome reflects derived status rather than the agent's self-report, and Layer 0
+verification is no longer inert in worktree mode. All four items were pre-existing defects found
+during the Phase 29 dogfood run and Phase 31 planning. Full detail archived to
+`.planning/milestones/v2.4.0-ROADMAP.md`; requirements to
+`.planning/milestones/v2.4.0-REQUIREMENTS.md`; phase directories to
+`.planning/milestones/v2.4.0-phases/`.
+
+**Closed as `override_closeout`, not `verified_closeout`.** Both phases verified and the pre-close
+artifact audit was clear, but DOGFOOD-04's traceability row remains `Pending` — its core guarantee
+is closed by Phase 34 criteria 3 and 4, while 999.76's second call site is correct by construction
+with no regression guard (999.84 / DEN-106). No `/gsd-audit-milestone` was run. See
+`.planning/MILESTONES.md` § Known Gaps.
+
+**Not released.** This close is a planning-state operation. At close the workspace version was still
+`2.3.0`, `CHANGELOG.md` had no 2.4.0 section, the work sat unmerged on `feature/phase-34`, and no
+`v2.4.0` tag existed.
+
+| Phase | Name | Status | Version |
+|---|---|---|---|
+| 33 | Loop-Back Correctness for Multi-Wave Validate→Code Cycles (999.65 + 999.66) | Complete | — |
+| 34 | Stream-JSON Coverage, the Validate Trust Boundary, and Layer 0 in Worktree Mode (999.73 + 999.74 + 999.76) | Complete | — |
+
+## gsd-hygiene milestone (CLOSED 2026-08-04 — GSD Workflow Hygiene)
+
+**Declared 2026-08-04, closed 2026-08-04. Intentionally unversioned** — no `vX.Y.Z`, nothing
+published to crates.io; pure `.planning/` documentation structure. Restructured this file so the
+active milestone's own phase headings land inside its own heading-to-next-heading window,
+closing backlog `999.72` (`roadmap.analyze` misreporting `phase_count: 0`; `milestone.complete
+--dry-run` triggering its pass-all degrade) and `999.72a` (the missing `## Progress` table
+above). Full detail archived to `.planning/milestones/gsd-hygiene-ROADMAP.md`.
+
+| Phase | Name | Status | Version |
+|---|---|---|---|
+| 32 | ROADMAP Layout Hygiene | Complete | — |
+
+## v2.3.0 milestone (CLOSED 2026-08-04 — the unattended run)
+
+**Declared 2026-08-02, closed 2026-08-04.** Deliberately **bounded**: this milestone closed when
+999.64 was delivered — Phase 30 (the parser and the feasibility gate) plus Phase 31 (the launch
+path itself). Full detail archived to `.planning/milestones/v2.3.0-ROADMAP.md`.
 
 | Phase | Name | Status | Version |
 |---|---|---|---|
 | 30 | Keep the Session Alive Past Turn End | Complete    | — |
-| 31 | The Launch Path Itself | Complete    | — |
+| 31 | The Launch Path Itself | Complete    | 2.3.0 |
 
 ## v2.0.0 milestone (CLOSED 2026-08-02 — spanned releases 2.0.0, 2.1.0, 2.2.0)
 
 **Closed 2026-08-02.** The label named an open-ended milestone rather than a bounded arc
 (see "Milestone stays open" below), so it never had a scheduled endpoint and continued past
 the 2.0.0 release through 2.1.0 and 2.2.0. Closed by operator decision once Phase 29 aborted
-and Phase 30 was rescoped to the 999.64 arc, which is a distinct unit of work. Phase table
-below is historical — what shipped under this label.
+and Phase 30 was rescoped to the 999.64 arc, which is a distinct unit of work. Full detail
+archived to `.planning/milestones/v2.0.0-ROADMAP.md`.
 
 | Phase | Name | Status | Version |
 |---|---|---|---|
@@ -41,21 +118,36 @@ below is historical — what shipped under this label.
 | 18 | Dogfood Reliability Hardening | Complete    | 1.5.0 |
 | 19 | Release Integrity + `main.rs` Decomposition | Complete    | 1.6.0 |
 | 20 | Release Correctness + Operator Control | Complete    | 1.7.0 |
+| 21 | Operator Legibility & Observability | Complete    | 1.8.0 |
+| 22 | Concurrency & Governance Correctness | Complete    | 1.8.1 |
+| 23 | End-to-End Dogfood — One Phase, Define→Ship, Unattended, With Claude | Complete    | 2.0.0 |
+| 24 | `release --check` Signing-Key Inline Classification | Complete    | 2.0.0 |
+| 25 | End-to-End Dogfood Blockers — Start, Progress, Finish, Recover | Complete    | 2.1.0 |
+| 27 | Scrub Redirecting Git Environment From Production Calls | Complete    | 2.2.0 |
+| 28 | Close the Checkpoint Answer Return Path | Complete    | 2.2.0 |
 
-## Shipped
+**Not in this milestone** — Phase 26 (CLOSED PARTIAL, not shipped) moved to
+`.planning/superseded/26-release-cut-automation/`; Phase 29 (ABORTED, never merged,
+no directory) stays as prose-only history below.
+
+## v1.0 milestone (CLOSED, retroactively labeled 2026-08-04 — never declared at the time)
+
+**No milestone concept existed for this era.** Phases 1-11 shipped individually as versions
+0.1.0 through ~1.2.0 before this project adopted "milestone" as a grouping concept at all
+(v2.0.0 was the first, declared 2026-07-23). This label was applied retroactively by operator
+decision on 2026-08-04, alongside the v2.0.0 archival, rather than leaving this era permanently
+un-archived. Full detail archived to `.planning/milestones/v1.0-ROADMAP.md` (see that file for
+why this differs from the pre-existing `v1.0-ASSESSMENT.md`, an unrelated older artifact).
 
 | Phase | Name | Version |
 |---|---|---|
-| 21 | Operator Legibility & Observability | 1.8.0 |
-| 20 | Release Correctness + Operator Control | 1.7.0 |
-| 18 | Dogfood Reliability Hardening | 1.5.0 |
-| 11 | GSD-Native Architecture + Remediation | 1.2.0 |
-| 10 | Logging + Planning Step | — |
-| 9 | Open-Source Polish | 1.2.0 |
-| 8 | Docs & Onboarding | 1.0.1 |
-| 7 | Worktrees & PR Integration | 1.0.0 |
-| 6 | Agent Completion Protocol | 1.0.0 |
 | 1–5 | Core workflow, versioning, state machine | 0.1.0–0.6.0 |
+| 6 | Agent Completion Protocol | 1.0.0 |
+| 7 | Worktrees & PR Integration | 1.0.0 |
+| 8 | Docs & Onboarding | 1.0.1 |
+| 9 | Open-Source Polish | 1.2.0 |
+| 10 | Logging + Planning Step | — |
+| 11 | GSD-Native Architecture + Remediation | 1.2.0 |
 
 ## Reorganized (June 2026)
 
@@ -110,290 +202,377 @@ below is historical — what shipped under this label.
 - **Phase 14 rescoped to Parallel Safety + Observability** — the 2026-07-14 move of Hermes into Phase 14 was a workload-balance call made before the CR-03 parallel-safety flaw was deferred there (2026-07-15), which made 14 the heaviest phase instead of the slimmest. Phase 14 now leads with CR-03 (per-phase state files, phase-threaded monitor advance, coarse lock for main-checkout mutations), keeps the `capture_agent_output()` sync-path decision, and builds observability (`logs`/`events.jsonl`/`status`) on the final per-phase state model — in that order, since the state-file shape dictates what `status`/`logs`/`events.jsonl` enumerate.
 - **Phase 16 (new): Hermes Support** — HermesAgent adapter, skill-file rewrite, and Hermes plugin moved out of 14. Depends on Phase 14 (the plugin's gate watcher consumes `events.jsonl` and the Phase 13 notify hook); sits after Phase 15 so public-facing OSS readiness isn't gated on personal-infrastructure work.
 
-### Phase 12: Bootstrap + Housekeeping
-
-**Goal:** Pay down the Phase 11 code-review debt (WR-01…WR-10, IN-02…IN-05), close the untested orchestration-core paths and never-run manual verifications, harden versioning (WR-04 + version-consistency to 1.2.0), and get the crates publish-ready (metadata + dry-run, NO publish). Bootstrap (12a new-project/map-codebase) is DEFERRED to its own future phase — see CONTEXT.md "Planning-Time Decisions".
-**Requirements**: WR-01, WR-02, WR-03, WR-04, WR-05, WR-06, WR-07, WR-08, WR-09, WR-10, IN-02, IN-03, IN-04, IN-05, 12b, 12c, 12f, 12g (see CONTEXT.md — no formal REQ-IDs)
-**Depends on:** Phase 11
-**Plans:** 12/12 plans complete
-
-Plans:
-**Wave 1**
-
-- [x] 12-01-PLAN.md — WR-07: atomic `save_state` (temp+rename) so a kill mid-write can't corrupt state.json
-- [x] 12-02-PLAN.md — WR-06 runaway-cron guard + IN-04 `cargo fmt --check`
-- [x] 12-03-PLAN.md — WR-01: monitor spawns the agent as argv (no shell interpolation)
-- [x] 12-04-PLAN.md — WR-02/WR-03 + 12f Validate→Ship hook-firing test
-- [x] 12-05-PLAN.md — WR-04 TOML parser robustness + 12f workspace write_version + IN-05 version→1.2.0
-- [x] 12-06-PLAN.md — 12c publish-prep: crates.io metadata + dry-run/package (NO publish)
-- [x] 12-07-PLAN.md — WR-10 config-decoy test cleanup + WR-09 marker-scan doc/guard
-- [x] 12-08-PLAN.md — 12f: gate-timeout fast path + branch ahead/behind + monitor advance-failure
-
-**Wave 2** *(blocked on Wave 1 completion)*
-
-- [x] 12-09-PLAN.md — 12f: advance()/finish + consecutive-failures→gate→abort (main.rs)
-- [x] 12-10-PLAN.md — WR-05/WR-08 + 12f parse_rfc3339ish negative-offset (ship.rs)
-- [x] 12-12-PLAN.md — 12g manual verifications (Hermes gate, real agent, DocsUpdate; Full-Ship blocked)
-
-**Wave 3** *(blocked on Wave 2 completion)*
-
-- [x] 12-11-PLAN.md — IN-02 dead-field removal + IN-03 Agent→AgentKind / trait→AgentAdapter rename
-
-### Phase 13: MVP Core Loop
-
-**Goal:** Get the basic AI development loop (Define→Plan→Code→Validate→Ship) working end-to-end so DevFlow is usable on real projects again — `ship.rs` GSD-native rewrite (13a), completion-protocol correctness: verdict-vs-ran + native Claude/Codex envelope parsing (13b), never-silent failures: WR-11 + gate notify hook + configurable timeout (13c), worktree-by-default (13d), and a real dogfood run as the acceptance test (13e).
-**Requirements**: 13a–13e, WR-11 (see CONTEXT.md)
-**Depends on:** Phase 12
-**Plans:** 6/6 plans complete
-
-Plans:
-
-**Wave 1** *(front-loaded: riskiest failure-handling + parsing)*
-
-- [x] 13-01-PLAN.md — 13a/13c/WR-11: never-silent failure handling — Ship failure branch, handle_stage_failure, notify hook, env gate timeout (main.rs, gates.rs)
-- [x] 13-02-PLAN.md — 13a: delete dead v1 ship.rs bookkeeping + headless-safe Ship prompt (code-review before ship) (ship.rs, prompt.rs)
-- [x] 13-03-PLAN.md — 13b: native envelope parsing — Claude is_error/num_turns, Codex JSONL, stage-scoped Layer 2 (agent_result.rs)
-
-**Wave 2** *(blocked on Wave 1: shares main.rs)*
-
-- [x] 13-04-PLAN.md — 13d: worktree-by-default with `--no-worktree` opt-out (main.rs, phase7_cli.rs)
-
-**Wave 3** *(blocked on Waves 1–2: shares agent_result.rs/prompt.rs/main.rs)*
-
-- [x] 13-05-PLAN.md — 13b: verdict-vs-ran split — Verdict enum, Validate prompt verdict, advance() verdict gating (agent_result.rs, prompt.rs, main.rs)
-
-**Wave 4** *(final: manual acceptance, blocked on all)*
-
-- [x] 13-06-PLAN.md — 13e: MVP acceptance dogfood run — Claude full-loop + Full-Ship re-verification + Codex leg (manual checkpoints)
-
-### Phase 14: Parallel Safety + Observability
-
-**Goal:** Make concurrent phases safe by construction, then surface loop progress instead of a black box. Leads with the deferred CR-03 design flaw from Phase 13's post-fix review: per-phase locks sit on a project-global `state.json` and unguarded main-checkout git ops, so `devflow parallel` is unsafe by construction — fix shape and acceptance criteria in `phases/13-mvp-core-loop/13-DEFERRED-CR-03.md` (per-phase state files, phase-threaded monitor advance, short coarse lock for main-checkout mutations) (14a). Then the `capture_agent_output()` sync-path decision, taken alongside CR-03's sequentagent re-check (14b), and observability — `devflow logs [--follow]`, append-only phase-aware `events.jsonl`, richer `devflow status` — built on the per-phase state model (14c). Hermes work moved out to Phase 16 (2026-07-16).
-**Requirements**: 13-DEFERRED-CR-03 (parallel-safety), 14a–14c (see CONTEXT.md)
-**Depends on:** Phase 13
-**Plans:** 4/4 plans complete
-
-Plans:
-
-- [x] 14-01-PLAN.md — 14a core: per-phase state files + phase-threaded `advance --phase N` (workflow.rs, monitor.rs, main.rs)
-- [x] 14-02-PLAN.md — 14a/14b: coarse checkout lock + sequentagent behind the monitor, sync capture path deleted (lock.rs, monitor.rs, agent.rs, main.rs)
-- [x] 14-03-PLAN.md — 14a closeout: multi-phase status/recover + concurrent-advance acceptance test
-- [x] 14-04-PLAN.md — 14c: events.jsonl (schema v1) + `devflow logs [--follow]` + richer per-phase status
-
-See `14-SUMMARY.md` for validation + live two-phase e2e acceptance evidence.
-
-### Phase 15: Dogfood Enablement + OSS Readiness
-
-**Goal:** Rescoped 2026-07-16 (dogfood-first — operator priority is a fully functional MVP for dogfooding). **15a Dogfood Enablement:** `devflow gate` subcommand (list/approve/reject — removes the last hand-edited-JSON step in the loop), an accurate `OPERATIONS.md` operator reference, and the doc-accuracy quick hits (`.devflow.yaml` decoy removal, IN-01 lib.rs rustdoc, `--help` snapshot test); exit criterion: a real phase runs end-to-end with gates answered only via `devflow gate` + the notify hook. **15b OSS Packaging** (run *through* DevFlow as the first post-MVP dogfood): README/ARCHITECTURE rewrite against v2 reality, CONTRIBUTING, dev container, crates.io publish. Antigravity adapter (old 15c) deferred out of the phase to unscheduled backlog.
-**Requirements**: 15a, 15b (see CONTEXT.md)
-**Depends on:** Phase 14
-**Plans:** 5/5 plans executed
-
-Plans:
-**Wave 1**
-
-- [x] 15a — dogfood enablement (gate subcommand, OPERATIONS.md, accuracy fixes) — complete 2026-07-16; exit criterion verified live (full phase with the gate answered only via `devflow gate approve`)
-- [x] 15-01-PLAN.md (wave 1) — README/SECURITY/DEPENDENCIES accuracy pass against the real v2 CLI surface
-- [x] 15-02-PLAN.md (wave 1) — ARCHITECTURE.md full rewrite against source + docs/guides accuracy
-- [x] 15-03-PLAN.md (wave 1) — CONTRIBUTING refresh (required-checks note) + greenfield .devcontainer + container-parity CI job
-- [x] 15-04-PLAN.md (wave 1) — dual-license fix (add LICENSE-APACHE) + publish dry-run verification
-
-**Wave 2** *(blocked on Wave 1 completion)*
-
-- [x] 15-05-PLAN.md (wave 2, non-autonomous) — publish devflow-core then devflow to crates.io (operator-held token gate) — complete 2026-07-17; both crates confirmed live on crates.io
-
-### Phase 16: Pipeline Reliability Hardening
-
-**Goal:** Inserted 2026-07-17, pushing the prior Phase 16 (Hermes Support) to 17. Surfaced entirely by dogfooding Phase 15 through DevFlow itself: two Code-stage false positives on the crates.io publish plan (no repo-diff success signal, once via Layer-2 commit-count heuristic and once via an incorrect agent self-report), and four consecutive Ship-time code-review failures on legitimate but distinct findings (leaked runtime telemetry, an incomplete follow-up fix, a CI job that couldn't fail loud, a doc/behavior mismatch) that a single-pass standard-depth reviewer surfaced one at a time instead of together. Scope: (a) external post-condition verification for plans with no repo-diff success signal, (b) retained per-stage capture history instead of clobbering `.devflow/phase-NN-stdout` on every stage launch, (c) a deterministic doc-claim-vs-source checker, (d) deep-mode + multi-angle parallel review for Ship's gating pass instead of one single-pass standard-depth reviewer, (e) incremental per-plan/per-wave review instead of only at phase end, (f) worktree-aware `devflow status` (currently reports `idle` when run from inside the worktree it created), (g) legacy-state WARN cleanup/hint, (h) cross-attempt Ship/Code history view.
-**Requirements**: 16a, 16b, 16c, 16d, 16e, 16f, 16g, 16h, 16i, 16j, 16k (scope items — no formal REQ-IDs; binding decisions D-01…D-09 in 16-CONTEXT.md)
-**UI hint**: no
-**Depends on:** Phase 15 (surfaced entirely by dogfooding it)
-**Plans:** 7/7 plans complete
-
-Plans:
-
-**Wave 1** *(16k first per D-09; config foundation in parallel)*
-
-- [x] 16-01-PLAN.md — 16k: wire the missing Merge hook first into the terminal Ship path (idempotent), fix wrong-checkout VersionBump ordering, truthful merge_result event, clean bogus CHANGELOG entries
-- [x] 16-02-PLAN.md — D-03: minimal devflow.toml config foundation (toml dep behind a blocking legitimacy checkpoint) + DevflowConfig with all Phase 16 knobs + env>file>default loader
-
-**Wave 2** *(blocked on Wave 1)*
-
-- [x] 16-03-PLAN.md — 16a/16b: Layer-0 external post-condition verification (verify.rs) + retained per-stage capture history (archive instead of wipe)
-- [x] 16-04-PLAN.md — 16d/16e: deep multi-angle capability-conditional Ship review + advisory incremental self-review (prompt.rs)
-- [x] 16-05-PLAN.md — 16c/16i: deterministic doc-claim checker (existence + pinned claims + allowlist) and source-derived .gitignore invariant (doc_check.rs, all #[test])
-
-**Wave 3** *(blocked on Wave 2: shares main.rs)*
-
-- [x] 16-06-PLAN.md — 16f/16g: shared project-root walk-up resolver + gate positional-arg footgun fix + legacy-state WARN recover hint
-
-**Wave 4** *(blocked on Wave 3: shares main.rs; correlates 16b history)*
-
-- [x] 16-07-PLAN.md — 16j/16h: persistent escalating pending-gate status banner + cross-attempt Ship/Code history view (history.rs)
-
-### Phase 17: Pipeline Dogfood Follow-Up
-
-**Goal:** Close the pipeline-reliability holes the Phase 16 dogfood exposed —
-`Unknown` completion must never auto-advance a stage (17a), typed agent
-outcomes with a deterministic retry policy (17b), a preflight readiness gate
-that fails before agent time is consumed (17c), and build provenance in
-`workflow_started` so a stale self-dogfood binary is detectable (17d). The
-terminal-Ship alarm was traced to a stale executable, not a live regression;
-state/event reconciliation and the WR-03 test fix were deferred to Phase 18 on
-2026-07-18.
-**Requirements:** P1–P4 in `17-DOGFOOD-RETROSPECTIVE.md`; acceptance criteria
-2, 3, 4 (criterion 1 is already covered by Phase 16's regression test — verify
-against final HEAD rather than re-plan). AC-4 is narrowed to the
-plan-interactivity and Ship-scoped `gh auth` checks only — the
-security-artifact and reviewer-set sub-checks are deferred to Phase 18's
-Hermes adapter, an accepted override recorded in
-`17-VERIFICATION.md`'s frontmatter (`overrides:`).
-**Depends on:** Phase 16
-**Blocks:** Phase 18 Hermes Support
-**Plans:** 13/13 plans executed
-
-Plans:
-
-- [x] 17-13-PLAN.md
-
-- [x] 17-12-PLAN.md
-
-- [x] 17-10-PLAN.md
-- [x] 17-11-PLAN.md
-
-- [x] 17-09-PLAN.md
-
-- [x] 17-07-PLAN.md
-- [x] 17-08-PLAN.md
-
-- [x] 17-06-PLAN.md
-
-**Wave 1** *(devflow-core foundations + build script, no shared files)*
-
-- [x] 17-01-PLAN.md — 17b: typed outcome taxonomy (ResourceKilled/AgentUnavailable), Layer 2 exit-code classification, pure exhaustive outcome→action policy module, separate infra-failure counter
-- [x] 17-02-PLAN.md — 17d: first workspace build.rs embedding git provenance (commit/dirty) with graceful no-git degradation *(the build timestamp originally planned here was removed by 17-11 closing CR-02: a per-second value forced a devflow-cli recompile on every build once build.rs always re-runs)*
-
-**Wave 2** *(blocked on 17-01: shares agent_result.rs)*
-
-- [x] 17-03-PLAN.md — 17a: Layer 0 runs every stage + vouches for a passing approved probe (D-05); Layer 3 zero-commit/no-declaration → fail-closed (D-02/D-03)
-
-**Wave 3** *(blocked on 17-01/17-03: rewrites advance() dispatch)*
-
-- [x] 17-04-PLAN.md — 17a/17b: exhaustive decide_action dispatch (Unknown never advances), primary-loop rate-limit auto-resume, infra-counter gating, structured advance_evaluated evidence
-
-**Wave 4** *(blocked on 17-02/17-04: shares main.rs)*
-
-- [x] 17-05-PLAN.md — 17c/17d: scoped preflight readiness gate (adapter hook + generic checks) and workflow_started build provenance + self-dogfood staleness block
-
-### Phase 18: Dogfood Reliability Hardening
-
-**Goal:** Make DevFlow's own supervision layer trustworthy and usable from a plain terminal. Reprioritized 2026-07-20 (operator decision) — dogfooding has repeatedly found legitimate functional bugs that tax every subsequent dogfood run, so this pipeline-reliability work takes Phase 18's slot ahead of Hermes (personal-infrastructure, moved to `## Backlog`). Replaces the fixed "Phase 19" roadmap entry entirely: every item it carried is either absorbed here (18a–18g), confirmed already fixed (19e/19f, 19i), or moved to `## Backlog` (19b, 19c, 19h, 19j). Full detail, evidence, and both recorded operator decisions live in `phases/18-dogfood-reliability-hardening/CONTEXT.md`; reproduction evidence in `.planning/OPERATOR-OBSERVABILITY-FINDINGS.md` and `17-REVIEW.md`.
-
-- **18a** — `devflow doctor` project-aware reconciliation *(was 18d)*
-- **18b** — monitor liveness observability *(was 19a; extends 18a — sequence after it)*
-- **18c** — staleness evaluated against the wrong tree; enforces the standing rebuild-before-revalidate dogfood rule *(was 19d; root cause of Round 4 CR-01)*
-- **18d** — Code↔Validate `consecutive_failures` reset makes `MAX_CONSECUTIVE_FAILURES` unreachable *(was 19g)*
-- **18e** — Layer 0 short-circuit makes Validate unpassable when `external_verify` is declared *(was 19k; operator decision recorded 2026-07-20)*
-- **18f** — approving a preflight gate re-runs the identical check and wedges for 7 days *(was 19l; operator decision recorded 2026-07-20)*
-- **18g** — WR-03 test stabilization, `parallel_creates_two_worktrees_and_spawns_two_monitors` *(was 18e)*
-
-**Requirements**: 18a–18g (see CONTEXT.md)
-**Depends on:** Phase 17 (typed outcomes, build provenance)
-**Plans:** 7/7 plans executed
-
-Plans:
-
-- [x] 18-01-PLAN.md — 18a: `devflow doctor` project-aware reconciliation (wave 1)
-- [x] 18-02-PLAN.md — 18g: WR-03 test stabilization, assertion placement (wave 1)
-- [x] 18-03-PLAN.md — 18b: persist and probe `monitor_pid`, representable "stuck" state (wave 2)
-- [x] 18-04-PLAN.md — 18d: make `MAX_CONSECUTIVE_FAILURES` reachable for the Code↔Validate loop (wave 3)
-- [x] 18-05-PLAN.md — 18e: Layer 0/Validate verdict reconciliation + three-way outcome (wave 4)
-- [x] 18-06-PLAN.md — 18c: evaluate build staleness against the worktree HEAD (wave 5)
-- [x] 18-07-PLAN.md — 18f: preflight gate approval skips the adjudicated check, bounded (wave 6)
-
-**Verified** 2026-07-21 (`18-VERIFICATION.md`, 7/7 must-haves, each traced to source + an independently-executed passing test; both binding operator decisions confirmed). **Code-reviewed** (`18-REVIEW.md`, 0 critical / 4 warning) and **review-fixed** in a `18-fix` batch (6 commits): `doctor --json` single-object output (WR-01), stale-`monitor_pid` false-"Stuck" (WR-04), path-free staleness event (WR-02, third instance — see `999.10`), the `unreachable!()` eliminated by construction (WR-03), and the new 18c worktree test hardened against the 19i PATH-race flake. Final: 426 tests, clippy `--workspace --all-targets` clean, fmt clean. **Merged to main and released as v1.5.0** (2026-07-21, PR #12, signed tag `v1.5.0`, published to crates.io).
-
-### Phase 19: Release Integrity + `main.rs` Decomposition
-
-**Goal:** Close the two release-integrity defects whose blast radius reaches outside this repository (999.10's `.devflow/` PII leak into *users'* git history, 999.11's empty commit under a release tag), then decompose the 8,467-line `crates/devflow-cli/src/main.rs` as a pure-move refactor so later phases stop paying the near-serial wave tax. Adds the AI change acceptance contract (999.16) on a parallel, source-conflict-free track.
-**Targets:** v1.6.0 — nothing here is breaking and, apart from the PII fix, almost nothing is user-visible. Phase 20 carries the operator-facing set this split makes plannable as one phase.
-**Promoted from backlog** 2026-07-21: 999.10 (DEN-35), 999.11 (DEN-36), 999.8 (DEN-33), 999.16 (DEN-41).
-**Requirements:** 19a, 19b, 19c–19f, 19g (see CONTEXT.md — no formal REQ-IDs)
-**Depends on:** Phase 18 — 999.8 was deliberately blocked on it; 18a/18b are the instrumentation that makes an `ENV_MUTEX` regression observable, and 18e/18f reshaped the functions that determine the module seams.
-**Plans:** 11/11 plans executed
-
-**Sequencing is load-bearing:** 19a and 19b land *before* the split, so they are small diffs against the file everyone knows rather than against seven new modules. 19g has no source overlap and can run in any wave.
-
-**Principal risk — `ENV_MUTEX`:** 18 `.lock()` sites / 63 references in `main.rs`, and a repeat root cause across three expensive-to-diagnose failures (19i, GAP-2, 999.4). If its serialization guarantees cannot survive distribution across module boundaries, that is a finding to surface, not to patch around. Verification must be CI-on-branch; local-green is explicitly insufficient.
-
-Plans:
-
-**Wave 1** *(19a/19b/19g — all pre-split, zero file overlap)*
-
-- [x] 19-01-PLAN.md — 19a-WR01: new `workflow::ensure_devflow_dir` writing a self-ignoring `.devflow/.gitignore`, all 7 constructors converted, coverage + scratch-repo tests
-- [x] 19-02-PLAN.md — 19a-WR02: redact `exe_path` in `events.jsonl` to the binary filename only
-- [x] 19-03-PLAN.md — 19b: `commit_path` no longer forces an empty commit (RED-first); D-17 `commit_all` finding recorded
-- [x] 19-04-PLAN.md — 19g: `.claude/skills/ai-change-acceptance/` + `CONTRIBUTING.md` prose
-
-**Wave 2** *(blocked on wave 1)*
-
-- [x] 19-05-PLAN.md — 19g dogfood checkpoint: run `/gsd-code-review` against a non-compliant diff and a compliant control
-- [x] 19-06-PLAN.md — split foundation: committed pre-split baseline, `pub(crate)` pass on cross-cluster types, `ENV_MUTEX` hoist into `test_support.rs`
-
-**Wave 3** *(blocked on 19-06)*
-
-- [x] 19-07-PLAN.md — extract `staleness.rs` + `preflight.rs` (procedure shakedown; preflight↔pipeline coupling documented)
-
-**Wave 4** *(blocked on 19-07)*
-
-- [x] 19-08-PLAN.md — pipeline sub-split at the D-06 seams: `pipeline_launch.rs`, `pipeline_outcomes.rs`, `pipeline_gate.rs`
-
-**Wave 5** *(blocked on 19-08)*
-
-- [x] 19-09-PLAN.md — extract `parallel.rs`, `commands.rs`, `config_parse.rs`; reduce `main.rs` to a thin crate root
-
-**Wave 6** *(blocked on 19-09)*
-
-- [x] 19-10-PLAN.md — regenerate `.planning/codebase/STRUCTURE.md` + `TESTING.md`, reconcile this ROADMAP entry
-- [x] 19-11-PLAN.md — phase gate: three-part equivalence proof on CI-on-branch (D-11), `ENV_MUTEX` disposition (D-12), scratch-repo 19a reproduction, requirement roll-call
-
-### Phase 20: Release Correctness + Operator Control
-
-**Goal:** Close the two defects that make DevFlow's own release cut unreliable (999.24's `VersionBump` self-pin, which has shipped broken two for two and hits any user with a published Cargo workspace; 999.23's unreliable `phase7_cli.rs` git fixtures, which have produced two distinct coin-flip failures on release-path PRs in a single day), then add the two operator controls the pipeline has never had — a clean stop point short of Ship (999.6) and a way to drive a phase through Ship when the monitor is dead (999.7) — plus a release-cut preflight (999.13) so the manual checklist stops being the only thing between a green suite and a broken publish.
-**Targets:** v1.7.0 — decided 2026-07-23 (see "Milestone stays open" below). Nothing in these five units is inherently breaking.
-**Promoted from backlog** 2026-07-22: 999.24 (DEN-49), 999.23 (DEN-48), 999.6 (DEN-31), 999.13 (DEN-38), 999.7 (DEN-32).
-**Requirements:** 20a, 20b, 20c, 20d, 20e (see CONTEXT.md — no formal REQ-IDs)
-**Depends on:** Phase 19 — the `main.rs` split is what makes 999.6, 999.7 and 999.13 plannable as one phase in ~3 waves; all three previously conflicted in a single 8,467-line file. 999.7 also depends on 18a/18b (shipped v1.5.0), which are what tell an operator *why* the pipeline is stuck.
-**Plans:** 5/5 plans executed
-
-**Sequencing is load-bearing:** 20a and 20b land first so this phase's own CI and release cut are trustworthy while the rest is in flight. 20d blocks on 20a — its primary check asserts 20a's invariant and must not encode today's manual patch as the expected state. 20e sequences last: it needs a design pass and it touches the Ship/outcome path 20d reasons about.
-
-Plans:
-
-**Wave 1** *(20a/20b — no file overlap; both gate this phase's own release cut)*
-
-- [x] 20-01-PLAN.md — 20a: `version::write_version` also rewrites `[workspace.dependencies]` local-path self-pins (additive inline-table pass; PR #17 guard becomes no-op-by-construction)
-- [x] 20-02-PLAN.md — 20b: `cleanup --force` liveness guard + bounded-backoff retry (product fix for the worktree race) and `phase7_cli.rs` fixture durability (instance 2, fixture-side per D-08)
-
-**Wave 2** *(20c — depends on 20b; first of the serialized 20c→20d→20e CLI-dispatch chain)*
-
-- [x] 20-03-PLAN.md — 20c: `devflow start --until <stage>` halts cleanly (new `State` stop marker, `transition` interception, `check_dead_agent` stop-awareness), `--until ship` rejected
-
-**Wave 3** *(20d — depends on 20a + 20c; serialized after 20c to avoid a shared `main.rs`/`commands.rs` clap-enum merge conflict)*
-
-- [x] 20-04-PLAN.md — 20d: `devflow release --check` read-only preflight — self-pin (asserts 20a), `develop`/`main` divergence, publish order, `gpg.format`-aware signing viability
-
-**Wave 4** *(20e — sequenced last; depends on 20a + 20d; inherits 20a's self-pin fix via VersionBump)*
-
-- [x] 20-05-PLAN.md — 20e: `devflow ship --phase N [--force]` manual override — second consumer of the on-disk Ship response, reuses `finish_workflow` (D-01), `--force` scoped to Ship (D-02)
-
 ## Backlog
 
 Unsequenced items — not part of the active phase sequence. Promote with
 `/gsd-review-backlog` when ready; each carries accumulated context in its
 own `phases/999.N-*/CONTEXT.md`.
 
-### Phase 999.75: `CloseRule` Treats an Unparseable `tasks` List on the FIRST Announcement as Permission to Close (BACKLOG)
+### Phase 999.85: Two Protected Comments Now Justify Themselves by a Mechanism Phase 34 Deleted (BACKLOG)
+
+**Linear:** [DEN-107](https://linear.app/denniskim/issue/DEN-107/99985-two-protected-comments-now-justify-themselves-by-a-mechanism)
+**Found:** 2026-08-06, Phase 34 security audit (`34-SECURITY.md` findings F-34-01 and F-34-02).
+Grouped as one entry per the 999.81 advisory-cleanup precedent — same file, same root cause, same
+one-paragraph fix.
+
+**Priority:** Low | **Size:** S — two comment rewrites, no production change.
+
+**The shape of it.** Phase 34's success criterion 5 and threat T-34-01-04 explicitly **forbade**
+editing `idle_timeout_result`'s doc comment, and the phase honoured that prohibition exactly. The
+prohibition protected the comment's *text*. It could not protect the comment's *claim*, which
+34-01 and 34-03 invalidated in the same phase. Both comments' conclusions remain correct; the
+reasons they give for those conclusions are now false.
+
+**F-34-01 — `agent_result.rs:1746-1750`, `idle_timeout_result`.** The comment says `verdict` stays
+`None` because `classify_validate_outcome` "matches `Some(Verdict::Pass)` FIRST and would classify
+the stage as passed on the strength of that field alone, **whatever the status says**." Both halves
+are now dead:
+
+1. After 34-03, `pipeline_outcomes.rs:233` reads `(_, AgentStatus::Success, Some(Verdict::Pass))`.
+   The status position is no longer a wildcard, so a non-`Success` status cannot reach `Passed`.
+2. The remaining route — a timeout's verdict grafted through `reconcile_layer0_verdict`, reachable
+   because `evaluate_layer1` returns the idle-timeout side channel as its **first statement**
+   (`agent_result.rs:1795`) — is closed by 34-01's own
+   `.filter(|layer1| layer1.status == AgentStatus::Success)` at `:2203`. `idle_timeout_result` sets
+   `status: AgentStatus::IdleTimeout` (`:1753`), so it is filtered.
+
+`verdict: None` is now defended structurally in two places rather than by this convention.
+
+**F-34-02 — `agent_result.rs:6412-6417`, inside
+`stream_success_cannot_stand_against_nonzero_exit_code`.** The same superseded claim: "Carrying
+`Some(Verdict::Pass)` over would leave Validate classified Passed." Disclosed as out of scope by
+34-01-SUMMARY deviation 3 ("[Observation, no action taken] A residual instance of the superseded
+claim") and recorded again by the Phase 34 verifier under criterion 5. It is inside a test rather
+than production doc, which is why 34-01 correctly left it.
+
+**Why this is worth a ticket rather than a shrug.** This is the Repudiation class T-34-01-03 and
+T-34-03-04 were filed about, one level up. A reader who checks either comment's stated mechanism
+against the current classifier finds it false, may conclude the guard is vestigial, and may
+"helpfully" populate a verdict there — reopening a route Phase 34 closed. The hazard is indirect
+and the severity is low; the fix is a paragraph.
+
+**Proposed fix.** Rewrite both comments to cite the two structural defences that now carry the
+invariant (the classifier's enumerated status position; the graft's status filter), keeping the
+`verdict: None` instruction itself intact and unweakened. Do **not** treat "the mechanism changed"
+as licence to relax the instruction — the instruction is still load-bearing, just doubly defended.
+
+**Note for whoever picks this up:** DEN-95 (999.74), the defect these comments describe, is still
+open in Linear despite Phase 34 closing it via criterion 3. Same for DEN-98 (999.76) via criterion
+6. Both want a status sweep.
+
+### Phase 999.84: Nothing Guards the Root Argument at the `GateReview` Checkpoint Call Site, So 999.76's Fix Can Regress Silently (BACKLOG)
+
+**Linear:** [DEN-106](https://linear.app/denniskim/issue/DEN-106/99984-nothing-guards-the-root-argument-at-the-gatereview-checkpoint)
+**Found:** 2026-08-06, Phase 34 UAT test 1 — the phase's sole human-verification item, self-disclosed
+by 34-04's own SUMMARY and independently reproduced by the phase verifier rather than accepted on
+the claim.
+
+**Priority:** Medium | **Size:** S — one integration test plus its negative control. No production
+change; the production code is already correct.
+
+**The gap.** `pipeline_launch.rs:1070` passes `execution_root` to
+`verify::phase_has_blocking_human_checkpoint`, which is 999.76 criterion 6's second call site and
+the reason the plan-28-03 checkpoint auto-decide path is not dead in worktree mode. **No test
+asserts that argument.** Revert it to `project_root` — reintroducing the exact defect 999.76 was
+filed for — and `cargo test -p devflow --bin devflow` still reports **279 passed; 0 failed**. That
+is the measurement, run twice independently: once by plan 34-04, once by the verifier.
+
+**What already exists, and why it is not enough.** `verify.rs:351`
+(`…reads_the_execution_root_in_worktree_mode`) and `verify.rs:377`
+(`…still_reads_the_project_root_without_a_worktree`) pin the *function's* root-sensitivity in both
+directions, and each carries an explicit opposite-result assertion so the pair cannot degrade into
+measuring "a PLAN exists somewhere." They are well built. They simply never drive the call site, so
+the argument at `:1070` is unguarded by construction.
+
+**Why the Phase 34 capture campaign does not cover it either** (checked, not assumed — the campaign
+is the obvious place to look):
+
+1. Every capture ran `devflow start --phase 1 --no-worktree …`. `main.rs:533` → `commands.rs:238`'s
+   `else` branch never assigns `worktree_path`, so it keeps its `None` default (`state.rs:269`), and
+   `state.worktree_path.as_deref().unwrap_or(project_root)` evaluates to `project_root`. The changed
+   expression returns the identical value the pre-fix code passed — structurally incapable of
+   discriminating.
+
+2. `blocking-human` appears **0 times** in `scripts/scratch-dogfood-repo.sh`. Negative control: the
+   string matches in 20 files elsewhere in the repo, so the zero is a real zero and not a broken
+   search. Condition (2) of the arm's five-condition guard was false regardless of root.
+
+**Proposed fix.** One integration test driving `advance()` through `Action::GateReview` with all
+five preconditions satisfied — `worktree_path = Some(worktree)`, a PLAN declaring
+`gate="blocking-human"` written **only** under the worktree, `agent = AgentKind::Claude`, a session
+id on record, the checkpoint present in the capture, `checkpoint_resumes` below
+`MAX_CHECKPOINT_RESUMES` — asserting the resume path fires rather than falling through to the
+per-stage dispatch.
+
+**The test only counts if it ships with its negative control:** revert `:1070` to `project_root` and
+the new test must FAIL. Without that step this entry produces a 280th test that passes both ways,
+which is the failure mode it exists to close.
+
+**Relationship to 999.76's open question — decide together, but they are not the same item.** 999.76
+(this entry's parent, promoted into Phase 34) left an unanswered question: whether that fix should
+carry the workspace's first *real linked* `git worktree` integration test, since today's
+worktree-mode tests use plain `create_dir_all` directories with no git repository at all. That
+question is motivated by `phase_commit_count`'s shared-refs property, not by this call site, and it
+remains open. **This entry does not depend on it** — the `:1070` guard needs only a directory
+standing in for the worktree, exactly as `verify.rs:351` already does, so it can land cheaply and
+independently. If the linked-worktree harness is built first, this test should use it.
+
+### Phase 999.81: Phase 33 Advisory Cleanup — the Loop-Back Prompt Calls a Normal Continuation a Defect, Plus Three Hygiene Items (BACKLOG)
+
+**Linear:** [DEN-103](https://linear.app/denniskim/issue/DEN-103/99981-phase-33-advisory-cleanup-the-loop-back-prompt-calls-a-normal)
+**Found:** 2026-08-05, Phase 33 code review (IN-05, IN-01, IN-03, IN-04), each verified in source
+before filing. Grouped as one entry per the 21-REVIEW advisory-cleanup precedent.
+
+**Priority:** Low | **Size:** S
+
+**IN-05 is the one worth doing, and it is a single match arm.** `fix_prompt`
+(`crates/devflow-core/src/prompt.rs:297-307`) gives all three `FixType` variants the same preamble:
+*"Validation reported issues. Run the fix command for this loop:"*. For `FixType::FullExecute` that
+contradicts the enum's own doc comment (`:55-60`) — *"the phase is mid-arc rather than defective"*.
+Phase 33 fixed the **routing** so a mid-arc phase gets `/gsd-execute-phase {N}`; the agent receiving
+it is still told validation reported issues, so it is primed to hunt defects in work that was simply
+never judged. The phase's own semantic, undone one layer down.
+
+**The other three:** IN-01 — `select_loop_back_fix` (`pipeline_outcomes.rs:261-267`) is reachable
+only through six full `handle_validate_outcome` drives; a table test over
+`(worktree_path, artifact_location) → FixType` would make future cases cheap. IN-03 — the
+branch-name derivation is duplicated at four sites (`agent_result.rs:1904`, `ship_evidence.rs:160`,
+`test_support.rs:122`) despite `phase_commit_count`'s doc saying the extraction exists *because*
+copies diverged; expose `phase_branch_name`. IN-04 — `commit_on_feature_branch`
+(`test_support.rs:112-137`) never restores the prior checkout, benign for its two callers but a
+landmine for any future Validate→Ship pairing.
+
+### Phase 999.80: Three Test Sites Are Protected From Spawning a Real Agent Only by a Content-Dependent Gate Response, Not Structurally (BACKLOG)
+
+**Linear:** [DEN-102](https://linear.app/denniskim/issue/DEN-102/99980-three-test-sites-are-protected-from-spawning-a-real-agent-only)
+**Found:** 2026-08-05, Phase 33 code review (WR-06); **corrected the same day** by the Phase 33
+security audit, which mapped it to the registered trust boundary "cargo test process → spawned
+agent CLI" (T-33-09 / T-33-17).
+
+**Priority:** Low | **Size:** S — ~6 lines per site
+
+**Severity: Low-Medium.** *This entry's original filing said these tests "can spawn a real agent"
+and rated it Medium. That was wrong and is retracted here rather than silently edited away.*
+
+**No agent spawn happens today.** All three sites pre-write a rejected gate response whose note
+contains `abort` — e.g. `{"approved":false,"note":"abort: test cleanup","responded_by":"test"}` —
+so `GateAction::from_response` resolves to `Abort`, not `LoopBack`, and control never reaches
+`loop_back_to_code` → `launch_stage`. Verified in source at all three sites. The original filing
+inherited 33-REVIEW.md's WR-06 framing without checking the gate-response path.
+
+**What survives, and is still worth fixing:** that protection is **content-dependent, not
+structural** — a magic substring in a JSON note in a test fixture, with no assertion protecting it.
+Any future edit rewording the note, changing `from_response`'s parsing, or routing one of these down
+the `LoopBack` arm silently reintroduces a real `claude` spawn with the developer's inherited
+credentials. 33-04 closed exactly this class for two *other* sites **structurally**, with PATH
+neutralization, not by relying on response content.
+
+Sites protected only by response content: `pipeline_outcomes.rs:825-864`, `:878-930` (backs three
+tests), `:2073-2097`. Hardened structurally: `pipeline_gate.rs:1111-1170`,
+`pipeline_outcomes.rs:1823-1881`. 33-06 added the `NeutralPath` RAII guard (`test_support.rs:279`)
+but applied it only to the two regions 33-05 added. Cheaper alternative if the full fix is deferred:
+assert at each site that the gate resolved to `Abort`, making the content-dependence a checked
+invariant rather than an accident.
+
+**Decide the order against 999.38 deliberately — they touch the same lines with opposite intent.**
+999.38 wants to *remove* process-global `PATH` mutation in favour of per-`Command` `env`, which
+would let `ENV_MUTEX` shrink or disappear; it explicitly names `pipeline_outcomes.rs:879`, inside
+one of the three sites above. Either do 999.38 first and harden these with the new mechanism, or do
+this first as the cheap safety fix and let 999.38 sweep them later. Do not work them independently.
+
+### Phase 999.79: `{N}-VERIFICATION.md` Never Goes Stale, So a `--force` Re-Run Inherits the Previous Run's Verdict and Gates Unresolvably (BACKLOG)
+
+**Linear:** [DEN-101](https://linear.app/denniskim/issue/DEN-101/99979-n-verificationmd-never-goes-stale-so-a-force-re-run-inherits-the)
+**Found:** 2026-08-05, Phase 33 code review (WR-02, carried from the first pass and given a new
+concrete instance by 33-05).
+
+**Priority:** Medium | **Size:** S–M
+
+**Severity: Medium** — a correctness regression path Phase 33's own fix opened, reaching the exact
+unresolvable-gate outcome DOGFOOD-01 exists to prevent, from a new direction.
+
+`phase_verification_exists` (`crates/devflow-core/src/agent_result.rs:2588`) is a pure existence
+check; nothing deletes, dates or invalidates `{N}-VERIFICATION.md`. 33-05 correctly made the probe
+follow `state.worktree_path` — but *unfiltered*. A `--force` re-run of the same phase number
+(`ensure_phase_worktree`, `commands.rs:239`) checks out `feature/phase-NN`, which still carries the
+**previous** run's committed artifact. That re-run is mid-arc by construction, so its first Validate
+failure finds the stale artifact, returns `true`, and dispatches `--gaps-only` — matching zero plans
+and gating unresolvably.
+
+**Fix:** minimum, record the limitation in the doc comment. Real fix, invalidate on staleness —
+compare a recorded plan count (more robust than mtime, which survives `git checkout` in ways that do
+not reflect judgement freshness) against the phase's current plan set. **Prohibition:** do NOT
+"fix" this by reverting the probe to `project_root` — that reintroduces the CR-01 defect 33-05
+closed and two external peer reviews independently confirmed.
+
+### Phase 999.78: The Code↔Validate Loop Has No Progress-Independent Bound, and the Gate Message Understates How Long It Has Run (BACKLOG)
+
+**Linear:** [DEN-100](https://linear.app/denniskim/issue/DEN-100/99978-the-codevalidate-loop-has-no-progress-independent-bound-and-the)
+**Found:** 2026-08-05, Phase 33 code review (WR-01, WR-04, IN-02). Grouped because WR-04's fix
+supplies WR-01's ceiling for free.
+
+**Priority:** Medium | **Size:** M
+
+**WR-01 — the only unconditional bound is gone.** `consecutive_failures_made_progress`
+(`crates/devflow-core/src/mode.rs:149-151`) resets the streak whenever the commit *count* rises, and
+no other counter bounds this loop. `mode.rs:136-148` defers the remedy to "a follow-up if the
+assumption proves wrong" but **no numbered entry existed for it** — this is that number; cite it
+from the doc comment. It matters more here than in the abstract: the Code stage's fix command is a
+GSD command, and GSD commands routinely commit `.planning/` artifacts even when they change no
+source, so "commits something trivial every cycle" is the *ordinary* behaviour of the thing in that
+slot, not an adversarial hypothetical.
+
+**WR-04 — the gate message understates duration in Supervise mode.**
+`pipeline_outcomes.rs:367-370` interpolates `state.consecutive_failures` into *"Validation failed
+{} time(s) — human review needed."* After 33-03 that is a *streak length*, not a total. Supervise
+gates on every failure (`mode.rs:173-175`), so a phase committing anything each cycle shows
+*"Validation failed 1 time(s)"* at the 2nd, 5th and 9th gate alike — in the one mode where a human
+sees every occurrence.
+
+**IN-02 — a resumed pre-999.66 state reads as a fresh streak.** `state.rs:71-100`: `None` means
+both "genuine first failure" and "state predates this field", and nothing in `events.jsonl` tells
+them apart, so an operator upgrading a binary mid-phase gets no signal the failure budget widened.
+
+**Fix:** a separate never-reset per-phase Validate-failure total closes WR-01 and WR-04 together;
+add a distinct `loop_back` reason string for the absent-baseline case. Related but deliberately
+separate: 999.77 attacks the same counter by corrupting its baseline rather than removing the bound.
+
+### Phase 999.77: A Single Transient `git` Failure Grants a Free `consecutive_failures` Reset, and the Doc Comment Promises the Opposite (BACKLOG)
+
+**Linear:** [DEN-99](https://linear.app/denniskim/issue/DEN-99/99977-a-single-transient-git-failure-grants-a-free-consecutive)
+**Found:** 2026-08-05, Phase 33 code review (WR-03); carried forward as still-open by the DeepSeek
+v4 Pro peer review and confirmed in source. **Pre-existing relative to 33-05**, but the
+accumulate-vs-reset branch it lives in was built by 33-02/33-03, so it is Phase 33-era code.
+
+**Severity: Medium.** It weakens a safety gate rather than producing a wrong result, needs a
+transient fault to trigger, and the gate still fires if `git` failures continue uninterrupted. Not
+Low: it defeats the bound precisely when the bound matters, does so silently, and the source
+currently documents the opposite guarantee — which is how it survived review.
+
+**The defect.** `phase_commit_count` (`crates/devflow-core/src/agent_result.rs:1841`) returns `0`
+indistinguishably for "genuinely no commits", "branch does not exist", and "`git` could not be
+run" — its own doc at `:1838-1840` says so, and adds *"Every consumer treats all three the same
+way."* That last clause is the part that is not true. The baseline write at
+`crates/devflow-cli/src/pipeline_outcomes.rs:357` is **unconditional** ("regardless of which branch
+ran above"), so a `0` produced by a broken `git` is persisted as though it were a real measurement.
+
+**Failure sequence.** (1) `git` momentarily fails; count reads `0`; the streak correctly
+accumulates — this step is fine — but the baseline is overwritten to `Some(0)`. (2) Next cycle
+`git` works and reads the branch's real count, say `40`; the predicate at
+`crates/devflow-core/src/mode.rs:150` is `previous.is_none_or(|p| current > p)` → `40 > 0` →
+**true** → `consecutive_failures = 1`. No new work happened between the two cycles. One flaky `git`
+invocation bought one free reset of the `MAX_CONSECUTIVE_FAILURES` ceiling.
+
+**Impact.** In a genuinely stuck Code↔Validate loop — the exact situation the ceiling exists to
+bound — an intermittent `git` failure pushes the human gate further away every time it occurs. The
+gate is not disabled, but its guarantee degrades from "bounded" to "bounded unless `git` flakes",
+with no limit on how often that can repeat in one run. Silent, environmentally triggered, so it
+reaches an operator as "the unattended run never gated" with nothing in the record explaining why —
+the same class of unattended stall DOGFOOD-01/02 exist to eliminate, reached from the opposite
+direction: failing to gate when it should, rather than gating when it should not.
+
+**The doc comment asserts the opposite, and that is the compounding problem.**
+`pipeline_outcomes.rs:283-286` promises *"The failure direction is toward gating: an unrunnable
+`git` or a missing branch counts zero every cycle, so once a baseline is recorded the counter
+accumulates and the gate stays reachable."* That holds only while `git` stays broken; it is false
+for exactly one transient failure, which is the likelier event. **Correct this comment even if the
+code fix is deferred** — it documents a safety property the code does not have.
+
+**Proposed fix:** distinguish "counted zero" from "could not count" — add a sibling returning
+`Option<u32>`, treat `None` as not-progress *without overwriting the baseline* so the next
+successful measurement compares against the last real observation, and update
+`phase_commit_count`'s "every consumer treats all three the same way" line, which the fix
+deliberately falsifies. Full patch sketch in the Linear issue and in `33-REVIEW.md` WR-03.
+
+**Test coverage the fix must add:** no current test exercises a failing `git`. The regression test
+is the two-cycle sequence itself — force a measurement failure, then a success with an unchanged
+real count, and assert the streak **accumulated** rather than reset. A single-cycle test passes
+against both the buggy and the fixed code, so without that sequence the fix is unverifiable.
+
+**Note for the next reader:** Gemini 3.1 Pro reviewed this logic and rated it clean, analysing
+`current = 0` against `previous = Some(0)` (two *consecutive* `git` failures) and correctly finding
+the streak accumulates. It never examined failure-then-success, which is the actual defect. Do not
+treat that AGREE as clearing this finding.
+
+### Phase 999.76: Layer 0 External Verification Reads Its Declaration From the Main Checkout, So It Is Inert in Worktree Mode (PROMOTED — Phase 34)
+
+**Scheduled as Phase 34** (with 999.73 and 999.74), promoted 2026-08-05. Phase 34's success
+criterion 5 is this entry's fix, including the second call site at
+`phase_has_blocking_human_checkpoint`. **Why it landed here rather than in its own phase:** it is
+inside the code 999.74 rewrites. `classify_validate_outcome`'s `external` predicate requires
+`decided_by_layer == Some(0)`, which only `evaluate_layer0` produces — and this defect makes that
+unreachable in worktree mode, DevFlow's default shape. Rewriting the match around the two
+`external`-gated `Ambiguous` arms without fixing this first would be designing around branches that
+never fire. It also sequences *before* the match rewrite inside the phase, for the same reason.
+
+**Linear:** [DEN-98](https://linear.app/denniskim/issue/DEN-98/99976-layer-0-external-verification-reads-its-declaration-from-the)
+**Found:** 2026-08-05, Phase 33 code review; confirmed independently by two peer reviews (Claude
+code-reviewer, DeepSeek v4 Pro via hermes). **Pre-existing** — `git blame` puts both lines at
+2026-07-18 (`c620fb37`, `305e2675`), weeks before Phase 33's merge-base `7b55fce` (2026-08-04).
+Not introduced by Phase 33; *surfaced* by it, because 33-05 fixed the same defect class one file
+over and its new doc comments now make this one's justification provably false.
+
+**Severity: High.** Worktree mode is DevFlow's default operating shape, and in that shape the
+pipeline's highest-trust verification layer never runs. Not Urgent: it fails toward the existing
+Layer 1/2 cascade rather than toward a false pass, there is no data loss or security exposure, and
+it has been latent since 2026-07-18 with no observed production incident.
+
+**The defect in one sentence:** `evaluate_layer0`
+(`crates/devflow-core/src/agent_result.rs:2041-2042`) resolves the correct worktree-aware root and
+then does not use it for discovery — `let execution_root = state.worktree_path.as_deref()
+.unwrap_or(project_root);` on one line, `external_verify_commands(project_root, state.phase)` on
+the next. `execution_root` is used only later, to *run* the probes.
+
+**Why that root is wrong.** `.planning/` is tracked content, so an in-flight phase's `{N}-PLAN.md`
+is committed on `feature/phase-{N}` and lives inside that phase's worktree; the main checkout sits
+on `develop` and does not have it for the phase's whole duration. No merge-back happens during the
+phase, so this is the steady state, not a race. Measured with a discriminating negative control:
+`git ls-tree -r develop --name-only -- .planning/phases | grep -c '/33-'` returns **0** while the
+same command against `HEAD` returns **17**. (The non-recursive form returns 0 for *every* ref and
+proves nothing — use `-r`.) The doc comment at `:2025-2031` asserts the opposite and is false.
+
+**Impact — the silent branch is the dangerous one.** With `DEVFLOW_TRUST_EXTERNAL_VERIFY` unset
+(the default), `commands` is empty, `approved_commands` is `None`, and `evaluate_layer0` returns
+`None`; the cascade falls through to Layer 1/2 and the stage evaluates normally. Declared external
+post-condition probes **never execute, and nothing reports that they were skipped**. Layer 0 exists
+precisely so a failed probe outranks every agent-controlled signal, and an all-passing probe set is
+affirmative completion evidence on its own — in worktree mode that guarantee is currently vacuous.
+With the env var set, the opposite: `commands` empty against `Some(approved)` fires the veto and
+every stage hard-fails with `"external verification approval mismatch; PLAN declaration was
+removed"` — loud, but wrong, and the message names a cause it cannot know.
+
+**Same root cause, second call site.** `crates/devflow-cli/src/pipeline_launch.rs:957` calls
+`verify::phase_has_blocking_human_checkpoint(project_root, phase)`, also routed through
+`phase_plan_files`, so the whole plan-28-03 checkpoint auto-decide path is silently dead in
+worktree mode. Fix both together or the class recurs a third time.
+
+**Why the suite cannot catch it — and why this is a plan, not a patch.**
+`external_probe_discovers_from_project_root_across_every_stage_and_executes_in_worktree`
+(`agent_result.rs:5259`) writes the PLAN under the tempdir standing in for `project_root` while
+pointing `state.worktree_path` at an empty sibling directory. It manufactures exactly the layout
+the defect assumes, so it is structurally incapable of failing on it, and its doc comment
+(`:5255-5257`) codifies the false premise as deliberate intent. A naive one-line root swap breaks
+this green test. Found by the DeepSeek peer review; both Claude reviews missed it.
+
+**Proposed fix:** (1) pass `execution_root` at `:2042` using the `worktree_path.as_deref()
+.unwrap_or(project_root)` idiom Phase 33 standardised; (2) rewrite the `:5259` test so the PLAN
+lives under the worktree, keeping a non-worktree companion for the `None` fallback arm; (3) correct
+both false doc comments; (4) fix `pipeline_launch.rs:957` with matching coverage; (5) reword the
+"PLAN declaration was removed" message.
+
+**Prohibition the fix must respect:** do NOT retarget `phase_commit_count`. It reads `project_root`
+deliberately and correctly — git refs and the object database are shared across a repository's
+worktrees, so a worktree commit is already visible from the main checkout. Declaration discovery on
+the worktree, commit counting on the main checkout, is the correct end state; Phase 33 established
+exactly that asymmetry for the loop-back path.
+
+**Open question the fix should answer rather than assume:** no test in the workspace exercises a
+real linked `git worktree` — the worktree-mode tests use plain `create_dir_all` directories with no
+git repository at all. Adequate for a filesystem stat, but the shared-refs property
+`phase_commit_count` depends on is asserted in comments and exercised by nothing. Decide whether
+this fix carries the first linked-worktree integration test.
+
+### Phase 999.75: `CloseRule` Treats an Unparseable `tasks` List on the FIRST Announcement as Permission to Close (RESOLVED 2026-08-04)
 
 **Linear:** [DEN-96](https://linear.app/denniskim/issue/DEN-96/99975-closerule-treats-an-unparseable-tasks-list-on-the-first)
 **Found:** 2026-08-03 by peer code review during Phase 31 (DeepSeek v4 Pro, HIGH-1), verified
@@ -422,7 +601,95 @@ explicit enum so the cases cannot collapse.
 non-array `tasks`, and it serializes that JSON itself. This is a robustness gap in a guard whose
 job is to be conservative, not a demonstrated live failure.
 
-### Phase 999.74: `classify_validate_outcome` Trusts the Agent's Verdict Over Its Own Status (BACKLOG)
+**Resolved 2026-08-04.** `CloseRule` now uses an explicit `BackgroundTaskState` enum
+(`NeverAnnounced` / `Pending(usize)` / `Unreadable`) in place of `Option<usize>`. `should_close()`
+permits only `NeverAnnounced` and `Pending(0)`; `Unreadable` blocks closing and falls through to the
+idle timeout, same as a genuinely pending task. Mutation-tested: reverting to the prior silent-no-op
+behaviour reddens the new regression test and nothing else, with a negative control proving ordinary
+non-backgrounding stages still close on their marker alone. 880 passed, 0 failed; clippy
+`-D warnings` and `fmt --check` clean. Commit `2c20ab4`, merged via PR #82 (`fcae13d`).
+
+### Phase 999.74: `classify_validate_outcome` Trusts the Agent's Verdict Over Its Own Status (PROMOTED — Phase 34)
+
+**Scheduled as Phase 34** (with 999.73 and 999.76), requirement **DOGFOOD-04**. Phase 34's success
+criterion 3 is this entry's fix and criterion 4 is its open question — but **both were rewritten on
+2026-08-05 after the open question was answered.** Read the correction below before this entry's
+original analysis.
+
+> **SUPERSEDED — read the SECOND CORRECTION below first.** The block immediately following was
+> written after the first review pass and its headline conclusion is **wrong**. It is kept because
+> its narrow structural claim (the classifier's own inputs are always `Success`) is true and load-
+> bearing, and because the reasoning error it embodies — checking a function's inputs and inferring
+> a whole-system property — is worth being able to retrace.
+>
+> **SECOND CORRECTION (2026-08-05) — the inversion IS reachable, by a different route.**
+> `reconcile_layer0_verdict` (`crates/devflow-core/src/agent_result.rs:2143-2156`) grafts Layer 1's
+> `verdict` onto an affirmative Layer-0 probe success while checking only *Layer 0's* status:
+>
+> ```rust
+> if state.stage != Stage::Validate
+>     || result.status != AgentStatus::Success        // Layer 0's status
+>     || result.decided_by_layer != Some(0) { return result; }
+> let verdict = evaluate_layer1(project_root, state.phase)
+>     .and_then(|layer1| layer1.verdict);             // Layer 1's verdict, status unread
+> AgentResult { verdict, ..result }
+> ```
+>
+> An agent marker `{"status":"failed","verdict":"pass"}` parses to `(Failed, Some(Pass))`; the graft
+> transplants `Pass` onto `Success`, producing `(Success, Some(Pass), Some(0))`. `decide_action`
+> advances it; the classifier computes `external == true` and returns `Passed`; `Mode::Auto`
+> transitions to Ship. Reached via `evaluate_agent_result_inner:2305`, on the production path.
+>
+> **So the answer to this entry's open question is YES** — the agent's self-reported verdict,
+> attached to its own self-reported failure, converts a Validate that would otherwise have gated
+> into a Ship transition. Demonstrated end-to-end against a HEAD-built `advance` binary in
+> out-of-repo temp projects, with negative controls: verdict removed or set to `gaps` → gates;
+> Layer 0 disabled → `decide_action` intercepts as the block below describes.
+>
+> **Criterion 3's fix does not close this** — the derived status genuinely is `Success`. The graft
+> fix is criterion 4. Preconditions are production-reachable: `external_verify_enabled` defaults to
+> `true` (`config.rs:81`), plus a matching `DEVFLOW_TRUST_EXTERNAL_VERIFY`, a PLAN declaring
+> `external_verify:`, and passing probes. **Still unestablished:** whether a real agent emits a
+> self-contradictory marker in practice. No parser cross-checks `status` against `verdict`.
+>
+> ---
+>
+> **FIRST CORRECTION (2026-08-05, superseded above) — the inversion is NOT reachable in
+> production.** Six independent
+> adversarial lanes plus direct source verification established that `classify_validate_outcome`
+> has exactly one production call site (`crates/devflow-cli/src/pipeline_launch.rs:937`), inside
+> the `Action::Advance` arm of `outcome_policy::decide_action`. That match is wildcard-free and
+> maps **only `AgentStatus::Success`** to `Advance`: `Failed`/`Unknown`/`IdleTimeout` →
+> `GateReview`, `ResourceKilled`/`AgentUnavailable` → `GateInfra`, `RateLimited` → `AutoResume`. At
+> Validate the `GateReview` arm calls `handle_validate_outcome(.., ValidateOutcome::Failed)`
+> verdict-blind at `:990`. The other apparent call site, `pipeline_gate.rs:584`, is inside
+> `#[cfg(test)]`. Negative control: `cargo test -p devflow-core --lib outcome_policy::` reports
+> 9 passed / 538 filtered out, with a named test pinning every non-`Success` variant away from
+> `Advance`.
+>
+> **So the four `(non-Success, Some(Pass))` pairs this entry names are unreachable *at the
+> classifier*** — true, and the second correction above does not disturb it. The inference drawn
+> from it ("and therefore the answer to the open question is no") was wrong. What the first pass
+> identified remains real:
+>
+> 1. **A latent structural weakness.** The arm's safety depends entirely on a guard in *another
+>    crate* that its own doc comment never mentions — and `decide_action`'s comment marks the
+>    `Failed`/`Unknown` collapse "DEFERRED… Revisit if 18d requires divergent routing." A future
+>    split makes the wildcard live with nothing local to notice.
+> 2. **A documentation defect with measured cost.** At least two in-source comments assert the
+>    inversion is live and consequential, and code was bent around it twice — `idle_timeout_result`
+>    sets `verdict: None` citing this exact reason, and plan 31-04 nearly shipped a change caught
+>    only by adversarial review. Both defensive choices were right; both rationales are wrong about
+>    reachability.
+>
+> **Not established:** whether a real agent ever emits a self-contradictory marker. The parsers
+> deserialize `status` and `verdict` independently with no cross-check and neither normalises
+> `verdict`, but no archived capture in this repo contains such a line — absence here is weak
+> evidence, not a bound.
+>
+> The fix is still worth doing, as defence-in-depth plus a corrected record — **not** as closing an
+> exploitable hole. Criterion 3 additionally now covers all seven `AgentStatus` variants; the
+> original four omitted `RateLimited` and `AgentUnavailable`.
 
 **Linear:** [DEN-95](https://linear.app/denniskim/issue/DEN-95/99974-classify-validate-outcome-trusts-the-agents-verdict-over-its-own)
 **Found:** 2026-08-03, Phase 31 plan 31-02 execution. Re-confirmed independently at HEAD `e9abb0b`
@@ -464,7 +731,42 @@ needs establishing by reading the Validate routing end to end.
 `normalise_stream_marker_provenance` did for `decided_by_layer`; audit all three affected statuses
 explicitly; add a mirror test per status so the arm cannot silently regain the wildcard.
 
-### Phase 999.73: Widen `STREAM_JSON_STAGES` Beyond `Stage::Code` (BACKLOG)
+### Phase 999.73: Widen `STREAM_JSON_STAGES` Beyond `Stage::Code` (PROMOTED — Phase 34)
+
+**Scheduled as Phase 34** (with 999.74 and 999.76), requirement **DOGFOOD-03**. Phase 34's success
+criteria 1 and 2 carry this entry's two halves — **both rewritten on 2026-08-05.** Read the
+correction below before this entry's original analysis.
+
+> **CORRECTION (2026-08-05) — the per-stage transport verification is vacuous; the behavioural risk
+> is larger than stated.** `ClaudeAgent::exec_command`
+> (`crates/devflow-core/src/agents/claude.rs:46`) ignores its `_phase`, `_prompt` and
+> `_extra_writable_roots` arguments and returns a fixed argv. **The stream-json launch shape is
+> byte-identical for all five stages.** Nothing about the transport, monitor wiring or parser varies
+> per stage, so "confirm each added stage against a real capture" is evidence about *agent
+> behaviour under that stage's prompt* — criterion 2's question — not about the launch mechanism.
+> Criterion 1 as originally worded is close to mechanically vacuous.
+>
+> **What grew instead.** Widening can make a stage *unusable*. `CloseRule::should_close()` requires
+> `marker_seen` AND a drained list; if a stage backgrounds work still pending when its marker lands,
+> the rule never fires, the supervise loop reaches `RecvTimeoutError::Timeout`, and
+> `fire_idle_timeout` terminates the child and records a terminal `IdleTimeout` → `GateReview`.
+> Those stages take the legacy path today and cannot hit this at all. That risk is *created by* the
+> widening and is the real content of criteria 1 and 2.
+>
+> **Ordering trap this entry did not anticipate.** A stage produces a stream-json capture only via
+> the pipe-owning path, and `claude_stream_launch_enabled` offers an opt-*out* only — no force-on
+> exists. So evidence cannot precede widening through the normal pipeline. Two escapes exist:
+> widen in the working tree and let the evidence decide what gets *committed* (making the gate
+> commit-time, not build-time), or drive the hidden `devflow __monitor` subcommand
+> (`crates/devflow-cli/src/main.rs:133`), which never consults `STREAM_JSON_STAGES` — pointed at a
+> scratch phase, since it advances the stage machine on reap.
+>
+> **Two further traps found in the same review.** `31-ACCEPTANCE.md`'s pass bar is *"VOID unless the
+> capture shows a `background_tasks_changed` event with a NON-EMPTY `tasks` array followed by a
+> drain to `[]`"* — a non-backgrounding stage cannot satisfy that by construction, so it must not be
+> reused verbatim as the per-stage bar. And `DEFAULT_CAPTURE_RETENTION = 5`
+> (`crates/devflow-core/src/config.rs:12`) will evict an earlier stage's capture if the phase takes
+> any Validate→Code loop-back.
 
 **Linear:** [DEN-94](https://linear.app/denniskim/issue/DEN-94/99973-widen-stream-json-stages-beyond-stagecode-once-the-phase-31)
 **Deferred:** 2026-08-03 by operator decision, during Phase 31 planning. Explicitly **not** in
@@ -503,7 +805,7 @@ is not closed whatever the unit tests say).
 **Related:** CONTEXT.md D-14 (per-child declared tokens) is the adjacent deferral from the same
 planning session — deferred on size, not merit. Strong candidate to pair with this one.
 
-### Phase 999.72: ROADMAP.md Layout Hides Every Phase From `gsd-tools`' Milestone-Scoped Parsers (BACKLOG)
+### Phase 999.72: ROADMAP.md Layout Hides Every Phase From `gsd-tools`' Milestone-Scoped Parsers (RESOLVED — 2026-08-04, Phase 32)
 
 **Linear:** [DEN-93](https://linear.app/denniskim/issue/DEN-93/99972-roadmapmd-layout-hides-every-phase-from-gsd-tools-milestone)
 **Found:** 2026-08-03, creating Phase 31. Not blocking Phase 31.
@@ -540,8 +842,46 @@ match the regex (`### Archived — Phase 30 …` suffices, since `Phase` must fo
 bracket tag directly); then re-verify `roadmap.analyze` for non-zero `phase_count`, no duplicate
 numbers, and non-null `current_phase`.
 
+**Status update (2026-08-04):** the reproduction snapshot above (line numbers, "ACTIVE" milestone,
+30 phase directories on disk) is historical, but **this defect is still fully live in this repo,
+verified by direct re-run today, after the v1.0/v2.0.0/v2.3.0 retroactive milestone archival**:
+`roadmap.analyze` still returns `phase_count: 0` against current HEAD, and `milestone.complete
+v2.3.0 --dry-run` still triggers the pass-all degrade (now sweeping all 17 backlog directories
+instead of the historical phases it swept before). The archival did not remove Cause 1 — it
+changed its shape. Every milestone heading in the live document (v2.3.0, v2.0.0, v1.0) now
+collapses to a plain markdown *table* with no `### Phase N:` headings inside its own window at
+all (they're archived out), so `extractCurrentMilestone`'s scan finds zero recognizable phase
+entries in the active milestone's section regardless of what heading follows it — the original
+"interrupting closed-milestone heading" framing was only one way to reach `milestonePhaseNums.size
+=== 0`; a milestone whose live content is header-free is another. **This is a repo-structure
+condition, not a backlog-cleanup residue** — closing this item on the theory that archiving old
+phases fixed it would be wrong; it is exactly as reproducible today as when filed. It will keep
+reproducing for any future milestone unless that milestone's own `### Phase N:` (or
+checkbox-bullet) entries land inside its heading-to-next-heading window before archival — not
+guaranteed, and complicated by the separately-documented `phase.add`-inserts-at-the-last-`---`
+bug, whose landing point has moved now that this document is ~1000 lines shorter. This same root
+cause also has a worse, write-path sibling: see upstream
+GSD-core issue ledger entry 16 (`gsd-tools milestone.complete`'s pass-all degrade), found closing
+v2.3.0 the same day.
+
+**Resolution (2026-08-04, Phase 32):** `gsd-roadmapper`'s write when creating the `gsd-hygiene`
+milestone's own ROADMAP.md section (commit `0b1ad74`) put this milestone's `### Phase 32:`
+heading and its `## Progress` table inside the active milestone's heading-to-next-heading window
+by construction, resolving both Cause 1 and Cause 2 for this milestone as a side effect —
+confirmed by direct re-run in Phase 32's `/gsd-discuss-phase`: `roadmap.analyze` returns
+`phase_count: 1` / `next_phase: "32"`, and `milestone.complete gsd-hygiene --dry-run` correctly
+reports the one unstarted phase instead of the pass-all degrade. **This resolves the condition for
+the current milestone; it is not a structural fix** — the 2026-08-04 status update's warning above
+still holds for whatever milestone comes after `gsd-hygiene`, since nothing changed in
+`gsd-roadmapper` or `phase.add` themselves. See Phase 32's `32-CONTEXT.md` for the verification
+detail and for why durability wasn't tackled in this phase.
+
 **Sub-item 999.72a — add the missing `## Progress` table. Size S, independently landable, do this
 one first.** Added 2026-08-03 after it was traced as the cause of a *second*, separate misverdict.
+**Resolved 2026-08-04** — the table now exists (`## Progress`, this file, added by the same
+`gsd-roadmapper` write). `deriveProgressFromRoadmap`'s roadmap-derived completion path is
+confirmed live (`smart-entry`'s `roadmap_total_phases`/`roadmap_completed_phases` flipped from
+`null` to real counts per STATE.md's 2026-08-04 session note).
 
 `isComplete()` prefers ROADMAP-derived counts and falls back to a legacy STATE.md comparison
 "when the roadmap has no Progress table". We have never had one: the table is absent from **all
@@ -647,14 +987,14 @@ Plans:
 ### Phase 999.4: Version-Tag Contention on Concurrent Ship (REMOVED — 2026-07-29)
 
 **Was:** Two phases computing the same next version race to create one tag under `devflow parallel` (multiple whole phases concurrently). *(was 19h)*
-**Removed during Phase 26 discuss-phase:** the race is specific to `devflow parallel`'s whole-phase concurrency; the operator confirmed they never use, and would never want, a single DevFlow user running multiple phases at once ("that's just asking for trouble"). Since the scenario cannot occur in actual usage, this entry is removed rather than left filed. See `phases/26-release-cut-automation/26-CONTEXT.md` D-11. Linear: DEN-29 (close as won't-do).
+**Removed during Phase 26 discuss-phase:** the race is specific to `devflow parallel`'s whole-phase concurrency; the operator confirmed they never use, and would never want, a single DevFlow user running multiple phases at once ("that's just asking for trouble"). Since the scenario cannot occur in actual usage, this entry is removed rather than left filed. See `superseded/26-release-cut-automation/26-CONTEXT.md` D-11. Linear: DEN-29 (close as won't-do).
 `devflow parallel`'s own future (deprecate whole-phase concurrency vs. repurpose for intra-phase workstreams vs. leave alone) is captured as a deferred idea in that same CONTEXT.md, for its own future phase — not lost, just not a defect record.
 
 ### Phase 999.5: ChangelogAppend Placeholder Content (PROMOTED — Phase 26)
 
 **Goal:** Every generated changelog entry reads "Released phase via DevFlow" — deferred twice already (17-10, 17-12). *(was 19j)*
 **Priority:** Low | **Size:** M — reviewed 2026-07-21: confirmed still generic (`ship.rs:431`). Cosmetic by its own admission, but sized M not S — needs a real content source designed (plan diffs? SUMMARY.md extraction?) before implementation, which is why it's been deferred 3 times already. Linear: DEN-30.
-**Requirements:** TBD — see `phases/26-release-cut-automation/999.5-BACKLOG-DOSSIER.md`
+**Requirements:** TBD — see `superseded/26-release-cut-automation/999.5-BACKLOG-DOSSIER.md`
 **Promoted:** Phase 26, 2026-07-29 — added using capacity freed by dropping 999.54/999.50/999.4; content source resolved by reusing Phase 25's conventional-commit classifier (see `26-CONTEXT.md` D-12).
 **Plans:** 0 plans
 
@@ -929,7 +1269,7 @@ Phase 26's direct-push design was fighting a rule it could simply have followed.
 
 **Goal:** A `devflow release` that *executes* the full release cut — version-bump PR → merge to `main` → signed tag → sync `develop` → publish `devflow-core` then `devflow` to crates.io — not just the read-only preflight. Phase 20's 20d (DEN-38) delivers `--check` only; Phase 20 CONTEXT.md D-03 locked that scope and recorded this executor as the follow-up.
 **Priority:** High | **Size:** L — drives irreversible operations (squash-merge to `main`, signed tag, a crates.io publish that can never be un-published or reused), so it needs its own discuss-phase design pass on failure/rollback semantics (tag lands but publish fails; core publishes but cli does not). Blocks on Phase 20's 20a (self-pin) and 20d (`--check`): the executor's preflight step *is* 20d's check and its `VersionBump` step inherits 20a's correctness. Source: Phase 20 D-03 (2026-07-22). Linear: DEN-50 (blocked by DEN-49, DEN-38).
-**Requirements:** TBD — see `phases/26-release-cut-automation/999.25-BACKLOG-DOSSIER.md`
+**Requirements:** TBD — see `superseded/26-release-cut-automation/999.25-BACKLOG-DOSSIER.md`
 **Promoted:** Phase 26, 2026-07-29 — re-verified open at HEAD `76e49f1` before promotion; bundled with 999.54, 999.50, 999.52 (same release-mechanics area).
 **Re-opened:** 2026-07-30 — Phase 26 delivered it PARTIAL and not shippable; see the RE-OPENED block above for the five open Criticals and the 999.39 prerequisite.
 **Plans:** 7 plans executed in Phase 26 (26-03..26-09), code unmerged on `feature/phase-26`
@@ -951,7 +1291,7 @@ Plans:
 
 ### Phase 999.27: `release --check` Signing-Key Inline Classification (PROMOTED — Phase 24)
 
-**Goal:** `check_ssh_signing_viability` (20d, `crates/devflow-core/src/git.rs`) misclassifies an inline (non-path) `user.signingkey` value — a literal key blob configured directly rather than as a file path is treated as a path and reported as not-found. Deterministic edge case; every path-based and no-key branch is already correct and tested. Full detail in `.planning/phases/20-release-correctness-operator-control/20-REVIEW.md` (INF-01).
+**Goal:** `check_ssh_signing_viability` (20d, `crates/devflow-core/src/git.rs`) misclassifies an inline (non-path) `user.signingkey` value — a literal key blob configured directly rather than as a file path is treated as a path and reported as not-found. Deterministic edge case; every path-based and no-key branch is already correct and tested. Full detail in `.planning/milestones/v2.0.0-phases/20-release-correctness-operator-control/20-REVIEW.md` (INF-01).
 **Priority:** Low | **Size:** S — single classification branch + one test; found by Phase 20 code review (2026-07-23), deferred as Info-severity while CR-01/CR-02 + WR-01/02/03 were fixed inline on the phase-20 branch. Linear: DEN-52.
 **Requirements:** TBD — see CONTEXT.md
 **Promoted:** Phase 24, 2026-07-26 — selected as the acceptance target for Phase 23 plan 23-11 (D-02)
@@ -1036,6 +1376,8 @@ Plans:
 
 **Evidence:** reproduced once in four full-suite runs — `staleness::tests::ahead_build_from_descendant_commit_warns_instead_of_blocking` panicking at `staleness.rs:891` (`rev-parse HEAD`). This is a genuine flake source, distinct from 999.37, and was found while investigating it.
 
+**Second mechanism, observed 2026-08-05 (Phase 33 review WR-05 + the 33-06 execution run).** The same `ENV_MUTEX`+`PATH` regions have a *second* failure mode this entry did not originally name: the restore is a trailing statement, and Rust abandons remaining statements the instant a panic begins unwinding. So a panic inside a region (a) leaves `PATH` pointed at a `neutral_path_dir` the unwind then drops and **deletes**, handing every concurrent test a `PATH` naming a nonexistent directory, and (b) poisons `ENV_MUTEX`, so every later `ENV_MUTEX.lock().unwrap()` panics with `PoisonError` — one legible failure becomes a cascade. Observed live during 33-06: a single `index.lock` failure in `concurrent_ship_advances_finish_both_phases_independently` cascaded into ~15 unrelated `PoisonError` failures. Phase 33-06 added a `NeutralPath` RAII guard (`crates/devflow-cli/src/test_support.rs:279`, `impl Drop` at `:300`) and applied it to **two** regions only; ten pre-existing regions still use the trailing-statement form (`pipeline_outcomes.rs:1280-1304`, `:1355-1383`, `:1434-1458`, `:1489-1508`, `:1545-1560`, `:1779-1798`, `:1850-1865`, `:1915-1930`; `pipeline_gate.rs:1140-1159`, `:1231-1246`). Two cheap partial mitigations short of this entry's full per-`Command` fix: retrofit `NeutralPath` to the remaining ten, and replace `ENV_MUTEX.lock().unwrap()` with `.unwrap_or_else(PoisonError::into_inner)` — the mutex guards a `()`, so no invariant can be protected by refusing a poisoned lock. See also 999.80, which needs three *more* such regions and must be sequenced against this entry deliberately.
+
 **Note:** Rust 2024 makes `std::env::set_var`/`remove_var` `unsafe` precisely because this pattern is unsound in a threaded test binary — the fix direction is per-`Command` `env`/`env_remove` (as 999.37's `test_support` now does for git) rather than process-global mutation. Fixing this would let `ENV_MUTEX` shrink or disappear, which is worth more than the flake itself. Related: 999.15 (hermetic tests for shell entry points).
 
 **Priority:** Medium | **Size:** M
@@ -1085,7 +1427,7 @@ number. Next free backlog number is 999.47.
 
 **Goal:** A `devflow advance` process can outlive its own lock **and** its persisted state. When it does, both of Phase 23's new primitives return success while the orphan keeps running: `gate sweep` never lists it (its root is absent from the registry, so cross-root enumeration cannot see it), and `devflow stop --phase N --root PATH` reports `no lock held … nothing is running advance()` and exits 0.
 
-**Evidence:** observed live 2026-07-26 while clearing the machine's orphan population with Phase 23's own tooling. 22 of 23 orphans were reaped by `devflow gate sweep`; PID 3744133 (`--phase 7`, root `/tmp/.tmpMVmZBl`, ~8.6h old) was unreachable. `stop` was tried against both phase 7 and phase 8 (the root's state file is `state-08.json`) — both returned the same no-lock/no-state message and exit 0. `kill -TERM` cleared it in 1s. Full detail: `.planning/phases/23-end-to-end-dogfood/23-FINDINGS.md` §A1.
+**Evidence:** observed live 2026-07-26 while clearing the machine's orphan population with Phase 23's own tooling. 22 of 23 orphans were reaped by `devflow gate sweep`; PID 3744133 (`--phase 7`, root `/tmp/.tmpMVmZBl`, ~8.6h old) was unreachable. `stop` was tried against both phase 7 and phase 8 (the root's state file is `state-08.json`) — both returned the same no-lock/no-state message and exit 0. `kill -TERM` cleared it in 1s. Full detail: `.planning/milestones/v2.0.0-phases/23-end-to-end-dogfood/23-FINDINGS.md` §A1.
 
 **Why it matters:** the messages are *true* against recorded state, so this is not a false attestation — but an operator reading exit codes concludes the machine is clean when it is not. This is the residue of the orphan class Phase 23 was written to close, and the one case still requiring `kill(1)`.
 
@@ -1094,6 +1436,19 @@ number. Next free backlog number is 999.47.
 **Why that matters more than the enumeration gap.** Each wrapper installs `trap cleanup TERM INT` where `cleanup` kills `$apid` and exits. That handler is evidently not firing — the most likely mechanism is the shell being blocked in `wait $apid` on a child it can never reap. **Any reaping path built on `SIGTERM` will therefore report success and leave the process running**, which is a strictly worse failure than the silence this entry already describes. The two-layer structure (wrapper + child, each independently reparented) also means a reaper must handle *both* layers; killing only the wrapper manufactures a fresh orphan.
 
 **Fix direction, revised:** a registry-independent path — scan for running `devflow advance` children and reconcile against the registry, surfacing "running but unregistered" as its own reportable class rather than silence. Likely belongs in `doctor` as a finding plus a `gate sweep` flag. It **must** escalate `TERM` → `KILL` with a bounded wait and verify death rather than assuming it, and must reap the wrapper/child pair together. Add a regression test asserting a `TERM`-ignoring child is still cleared.
+
+**RECURRENCE CONFIRMED 2026-08-06 (Phase 34 execution).** Census during Phase 34 — five worktree-isolated executors plus one main-checkout executor over ~14h — found **10 real `devflow` processes** (filtering on `comm == devflow`), **3 of 10** reparented to `systemd --user`, oldest three at 22h27m / 12h23m / 11h35m, **87 MB** resident, **every root a `/tmp/.tmp*` scratch dir and none in a real repository**. The wrapper/child pair structure reproduced: 9 `sh -c apid=…` wrappers alongside the binaries. This entry's characterisation is unchanged; no new entry was filed. Full census on DEN-68.
+
+**Two measurement traps for whoever builds the reaper**, both hit while taking that census:
+
+- **`pgrep -f` over-reports.** `pgrep -f 'devflow (advance|__monitor)'` returned **12** where `comm == devflow` returned **10** — the wrapper shells carry the devflow command in their own argv and match the pattern. A census built on it over-reports, and a reaper built on it signals the *wrapper*, which this entry already notes manufactures a fresh orphan.
+- **`etime` must be sorted numerically.** String-sorting `ps -o etime=` ranks `27:14` above `22:25:31`. Use `etimes`. The "oldest orphan" figure is the one most likely to be quoted, and the string sort silently understates it.
+
+**`SIGTERM` immunity did NOT reproduce on 2026-08-06.** Sweeping the population above — 10 `devflow` plus 7 wrappers, reaped child-then-wrapper — **all 17 died on `TERM`; zero needed `KILL`.** That contradicts the 2026-07-27 escalation (15/15 survived `TERM`), which is the observation that raised this entry to High. It does not refute it: with 2026-07-26 ("cleared in 1s"), 2026-07-27 (15/15 survived) and today (17/17 died), the behaviour is **variable**, not immune. That *strengthens* the fix direction rather than weakening it — a reaper assuming immunity is as wrong as one assuming compliance, so the existing "escalate `TERM` → `KILL` with a bounded wait and verify death rather than assume it" requirement is exactly right. Priority stays High on the enumeration gap regardless. Untested hypothesis worth checking when this is picked up: whether immunity tracks the child's blocked wait state rather than its age.
+
+**Sweeper self-kill — a trap for the proposed `gate sweep` flag.** The first sweep attempt terminated itself (exit 144): an inline `bash -c` script's own command line contains the search patterns, so `pgrep -f devflow` and `pgrep -f apid=` both matched the sweeper. Any reaper implemented as a shell helper must exclude `$$` explicitly, or run from a file so its argv does not contain its own patterns.
+
+**Agent worktrees — a non-complication, recorded so it is not re-investigated.** Six of the ten processes execute binaries under `.claude/worktrees/agent-*/target/debug/devflow` whose worktrees were since removed, so `/proc/PID/exe` reports `(deleted)`. This does **not** affect the identity model: `agent.rs` identifies processes by recorded `(pid, starttime)` precisely because `/proc` lies ("identity must be recorded, never inferred"). The only implication is narrow — the registry-independent *scan* in the fix direction above must tolerate exe paths carrying `(deleted)` and pointing inside removed worktrees, rather than reading an unresolvable path as "not a devflow process."
 
 **Priority:** High — raised from Medium. `SIGTERM` immunity means the documented recovery path silently fails, and the fix direction as originally written (enumeration only) would not have cleared a single one of today's 30 processes. | **Size:** M — needs a PID-discovery mechanism that is safe on shared machines and does not misidentify unrelated processes. Linear: DEN-68.
 
@@ -1288,7 +1643,7 @@ Plans:
 ### Phase 999.50: `release --check` Tag-Signing Gate False-Negatives When the Key Is Not in `ssh-agent` (REMOVED — 2026-07-29)
 
 **Was:** `check_ssh_signing_viability` (`crates/devflow-core/src/git.rs`) false-negatives release preflight when the agent holds other keys but not the configured one, even though the private key file on disk would let `git tag -s` succeed anyway (measured live during the v2.0.0 cut).
-**Removed during Phase 26 discuss-phase, after briefly being promoted there:** the operator determined DevFlow should never predict tag-signing viability at all — a predictor is a second implementation of "will signing work?" that must stay in sync with git's real behavior, which is exactly the bug class this item and 999.54 are about. The executor built in Phase 26 instead runs the real signed `git tag` command directly and reads git's own result — no viability guess needed. Full reasoning: `phases/26-release-cut-automation/26-CONTEXT.md` D-10. Linear: DEN-75 (close as won't-do).
+**Removed during Phase 26 discuss-phase, after briefly being promoted there:** the operator determined DevFlow should never predict tag-signing viability at all — a predictor is a second implementation of "will signing work?" that must stay in sync with git's real behavior, which is exactly the bug class this item and 999.54 are about. The executor built in Phase 26 instead runs the real signed `git tag` command directly and reads git's own result — no viability guess needed. Full reasoning: `superseded/26-release-cut-automation/26-CONTEXT.md` D-10. Linear: DEN-75 (close as won't-do).
 
 ### Phase 999.51: `devflow start` Resolves Its Base From a Possibly-Stale Local `develop`, and Never Fetches (PROMOTED — Phase 25)
 
@@ -1348,7 +1703,7 @@ Plans:
 ### Phase 999.54: `release --check` Tag-Signing Viability Reads the Wrong Config Key (REMOVED — 2026-07-29)
 
 **Was:** `check_signing_viability` reads `user.signingkey` (the agent's ordinary key) instead of `devflow.releaseSigningKey` (the maintainer's release key), so it false-negatives release preflight on a correctly-configured maintainer machine — measured live during the v2.1.0 cut.
-**Removed during Phase 26 discuss-phase, after briefly being promoted there:** same disposition as 999.50 — the operator does not want DevFlow predicting tag-signing viability at all, ever. Full reasoning: `phases/26-release-cut-automation/26-CONTEXT.md` D-10. Linear: DEN-79 (close as won't-do).
+**Removed during Phase 26 discuss-phase, after briefly being promoted there:** same disposition as 999.50 — the operator does not want DevFlow predicting tag-signing viability at all, ever. Full reasoning: `superseded/26-release-cut-automation/26-CONTEXT.md` D-10. Linear: DEN-79 (close as won't-do).
 
 ### Phase 999.55: `phase7_cli::wait_for` Fixed 5s Budget Times Out Under Load (BACKLOG)
 
@@ -1408,7 +1763,7 @@ Plans:
 
 **Do not fix this by auto-approving.** `checkpoints.md` is explicit that `gate="blocking-human"` is never bypassed in any mode, and Phase 26's own run proved why: the executor found and fixed a plan that had mistakenly tagged these two irreversible authorizations `gate="blocking"` (auto-bypassable, auto-selects the *first* option) — that bug would have silently authorized `cargo publish` with no human input. The gate is correct; only the return path is missing.
 
-**Priority:** High — it is the one defect that makes a *correctly written* plan unable to finish unattended, and the workaround requires an operator who knows an undocumented manual-SUMMARY trick. | **Size:** M — (A) is bounded but touches launch/prompt/gate plumbing and needs a new gate classification; (C) is S; (B) is M and may not be needed. Source: Phase 26 dogfood run (2026-07-29), full write-up in `phases/26-release-cut-automation/26-01-SUMMARY.md` § "Issues Encountered". Linear: DEN-82.
+**Priority:** High — it is the one defect that makes a *correctly written* plan unable to finish unattended, and the workaround requires an operator who knows an undocumented manual-SUMMARY trick. | **Size:** M — (A) is bounded but touches launch/prompt/gate plumbing and needs a new gate classification; (C) is S; (B) is M and may not be needed. Source: Phase 26 dogfood run (2026-07-29), full write-up in `superseded/26-release-cut-automation/26-01-SUMMARY.md` § "Issues Encountered". Linear: DEN-82.
 
 Plans:
 
@@ -1573,6 +1928,75 @@ Plans:
 Plans:
 
 - [x] Delivered as an out-of-band patch, 2026-07-31 (no phase — emergency unblock for the Phase 29 dogfood)
+
+### Phase 999.83: The Drain Gate Never Saw 8 Concurrent Sub-Agents — Its Fixture's Shape Is Not What Production Emits (BACKLOG)
+
+**Linear:** [DEN-104](https://linear.app/denniskim/issue/DEN-104/99983-the-drain-gate-never-saw-8-concurrent-sub-agents-its-fixtures)
+**Found:** 2026-08-06, phase 34 plan 34-05's capture campaign (D-04: file capture-revealed defects,
+do not fix them in the capture plan).
+
+**Evidence:** `.planning/phases/34-…/34-evidence/` — all five per-stage captures, and
+`34-evidence/DRAIN-ANALYSIS.md` for the full working.
+
+**The defect, in one line:** `CloseRule` keys its drain arm on
+`type:"system", subtype:"background_tasks_changed"`, and across 1063 top-level events spanning a
+complete five-stage production run that subtype appeared **zero times** — including in the two
+stages that dispatched **8 concurrent sub-agents** between them.
+
+**Why it is not simply "the run had no concurrency."** The 8 dispatches were announced as
+`subtype:"task_started"` carrying `"task_type":"local_agent"` — *the exact `task_type` value the
+drain gate's own synthetic fixture manufactures* (`monitor.rs:1164`). The fixture models a
+`local_agent` task as arriving inside a `background_tasks_changed` `tasks` array; production, on
+`claude` 2.1.222, announced it through the `task_started` / `task_progress` / `task_notification`
+family instead. D-09 recorded that every gate fixture is labelled SYNTHETIC and the parser's
+production correctness was *reasoned, not witnessed*. It is now witnessed, and for this path the
+reasoning did not survive.
+
+**What it costs.** `should_close()`'s drain arm is satisfied vacuously (`NeverAnnounced`) while
+sub-agents are live, so stdin closes on the marker alone. That is the precondition of the 999.64
+orphan shape — at `Stage::Code`, the exact stage 999.64 was observed at.
+
+**What this does NOT establish, and why the entry is scoped narrowly.** Every `Bash` call in the run
+carried `"run_in_background": false` (8 occurrences, **zero** `true`), so the **backgrounded-shell**
+path was never exercised and may work exactly as designed. No child work was actually orphaned in
+this run. n=1, one CLI version, one workload shape.
+
+**The work.** Establish which event family the CLI uses for each kind of concurrent child, at more
+than n=1; then either widen `CloseRule::observe` to the families production actually emits, or
+record in-source why `background_tasks_changed` is the right and sufficient key. Re-label the
+fixture to match whatever is found.
+
+**Priority:** High — it weakens the specific guard built for 999.64. **Size:** M.
+
+---
+
+### Phase 999.82: Re-File 31/D-14 — Per-Child Declared Tokens, Deferred on Size for the Second Time (BACKLOG)
+
+**Linear:** [DEN-105](https://linear.app/denniskim/issue/DEN-105/99982-re-file-31d-14-per-child-declared-tokens-deferred-on-size-for)
+**Found:** re-filed 2026-08-06 by phase 34 plan 34-05 under D-12. Originally CONTEXT.md D-14 in
+phase 31, deferred there; carried into phase 34's discussion and deferred again.
+
+**Why this entry exists separately from the existing note.** `ROADMAP.md`'s 999.73-adjacent deferral
+note already mentions per-child declared tokens in passing. D-12 requires the item to be a
+**numbered backlog entry in its own right**, not a clause inside another phase's note — an item that
+lives only as a cross-reference is one nobody schedules.
+
+**The item:** attribute declared token usage **per child** rather than per run. Each sub-agent's
+`result` event carries its own usage and `total_cost_usd`; DevFlow currently reads only the
+top-level figure.
+
+**Why it keeps getting deferred, stated plainly:** size, not merit. Both times it was cut to protect
+a phase's scope, and both times the reason recorded was that the drain gate would cover the same
+ground. Phase 34's captures weaken that argument — see 999.83, where the drain gate observed none of
+the 8 sub-agents it would have needed to see.
+
+**What it would defeat.** Constraint 7's coalescing undercount, **directly** — by counting each
+child's declared tokens instead of inferring concurrency from a gate that this phase has now shown
+can miss it entirely.
+
+**Priority:** Medium. **Size:** M.
+
+---
 
 ### Phase 999.71: Measure Whether the Capture Writer Actually Leaves Torn Terminal Lines (BACKLOG)
 
@@ -1904,118 +2328,6 @@ Plans:
 
 - [ ] TBD (promote with /gsd-review-backlog when ready)
 
-### Phase 21: Operator Legibility & Observability
-
-**Shipped as v1.8.0** (2026-07-24) — PR #23 (`develop → main`, squash `cfa9167`), signed tag `v1.8.0`, [GitHub Release](https://github.com/denniyahh/devflow/releases/tag/v1.8.0). `sync-main-to-develop.sh` run via PR #24 (merge `01ad9e4`). Published to crates.io (`devflow-core` then `devflow`, both confirmed live at 1.8.0).
-
-**Goal:** Make DevFlow's operator surface **legible** and its self-reported state **trustworthy** — every unit single-writer, operator-facing, reversible or detection-only, and testable without any irreversible side effect. Scope recut from the original "Operator Usability & Release Execution" (operator decision, 2026-07-23): the release-cut executor (999.25) and `--base` (999.28) were removed (→ own phase / Phase 22 respectively) and the phase backfilled with legibility/observability units. Not `/gsd-review-backlog`-promoted; scope is operator-decided — see `phases/21-*/21-CONTEXT.md`.
-**Requirements**: TBD (no REQ-IDs — units 21a–21d map to CONTEXT decisions D-03..D-07)
-**Depends on:** Phase 20
-**Plans:** 4/4 plans complete
-
-**Sequencing is load-bearing:** 21d (staleness content-awareness) leads in Wave 1
-per D-07 — the dogfood staleness guard hard-blocks this phase's own stages after
-every `.planning/` commit, so it lands first. 21a/21b/21c then serialize
-(Waves 2/3/4) because all three edit `crates/devflow-cli/src/commands.rs` and the
-same-wave zero-file-overlap rule forbids parallelizing them (the familiar
-`commands.rs`/`main.rs` contention from Phases 18/19). 21e (changelog content)
-stays excluded stretch (D-08, blocked on a content-source design decision).
-
-Units (operator-decided; committed unless marked optional):
-
-- **21a** — Operator discoverability (999.3 / DEN-28): `gate show`, rate-limit reset surfacing, in-stage `status` progress, recovery-verb hints. Sequence early.
-- **21b** — Doctor planning-doc staleness reconciliation (999.14 / DEN-39): flag stale ROADMAP/STATE narrative vs git tags; detection-only.
-- **21c** — sequentagent second-process tracking (999.2 / DEN-27): narrowed — monitor half shipped v1.5.0.
-- **21d** — Dogfood staleness guard content-awareness (999.29 / DEN-54): stop docs-only false-blocks. **Sequence first** (unblocks this phase's own stages).
-- **21e** *(optional/stretch)* — ChangelogAppend real content (999.5 / DEN-30): blocked on choosing a content source.
-
-Plans:
-
-**Wave 1** *(21d first per D-07 — unblocks this phase's own dogfood stages)*
-
-- [x] 21-01-PLAN.md — 21d: content-aware `embedded_commit_is_stale` strict-ancestor arm (docs-only ranges → Fresh; docs+source → Stale) + fix two now-broken fixtures + block-message wording (staleness.rs)
-
-**Wave 2** *(blocked on 21-01; shares commands.rs with 21b/21c)*
-
-- [x] 21-02-PLAN.md — 21a: additive discoverability — `devflow gate show <phase>` (untruncated), rate-limit reset time in `status`, in-stage progress line, recovery-verb hints from a stuck state (commands.rs, main.rs)
-
-**Wave 3** *(blocked on 21-02; shares commands.rs)*
-
-- [x] 21-03-PLAN.md — 21b: detection-only `doctor` planning-doc staleness check vs git tags — third `--json` key, v1.5.0 legacy-noise cutoff, no prose auto-edit (commands.rs)
-
-**Wave 4** *(blocked on 21-03; shares commands.rs)*
-
-- [x] 21-04-PLAN.md — 21c: sequentagent second-process record (path-free slot A/B + AgentKind, not routed through State) surfaced in `status` (agent_result.rs, parallel.rs, commands.rs)
-
-### Phase 22: Concurrency & Governance Correctness
-
-**Goal:** A light dogfooding trial, not the full concurrency/governance phase: resolve the four advisory findings from Phase 21's code review (`21-REVIEW.md`), promoted as backlog **999.30 / DEN-55**. Share the omitted-stage gate resolution `gate_show` and `gate_respond` currently copy-paste (WR-01); replace `collect_planning_doc_findings`'s hardcoded `"main"` with `devflow_core::config::MAIN` (WR-02); make `gate_show` read open gates once, closing a narrow TOCTOU (WR-03); fold `status`'s per-phase `events.jsonl` rescan into the existing single-pass event summary (IN-01). Runs through Validate and stops before Ship. The broader "Concurrency & Governance Correctness" scope (999.4 version-tag contention, 999.26 object-store races, 999.28 `--base`) remains unplanned and is explicitly out of this trial's boundary — see `phases/22-concurrency-governance-correctness/22-CONTEXT.md`.
-**Requirements**: TBD (no REQ-IDs — narrow trial scoped directly from 999.30 / DEN-55, see CONTEXT.md)
-**Depends on:** Phase 21
-**Plans:** 2/2 plans complete
-
-**Trial history:** First attempted with Codex (2026-07-24) — Define succeeded, Plan failed immediately (`/gsd-plan-phase` reached Codex as a literal, non-existent shell command, the confirmed defect behind `.planning/audits/2026-07-24-codex-compatibility-review.md` and backlog 999.31/DEN-56). Two ad-hoc point-fixes were committed directly against `crates/devflow-core/src/agents/codex.rs` as a stopgap; Codex still couldn't route the skill and the run stalled on `apply_patch` errors mid-ROADMAP-promotion, leaving the workflow state lost (`devflow doctor` showed no active phase) though the worktree/branch survived. Retried 2026-07-24 with Claude directly (operator decision, given 999.31 isn't implemented yet): the two ad-hoc Codex commits were reset out (`git reset --hard` to `4af0991`), the existing `22-RESEARCH.md`/plans were kept and executed as-is.
-
-**Executed 2026-07-24** on `feature/phase-22` — 22-01 (`c442e00`) then 22-02 (`2bbfabd`), plus a docs commit (`c30f617`) promoting this ROADMAP section from `[To be planned]`, closing the plan-checker BLOCKER the stalled Codex run never resolved. **Validated**: `cargo fmt --check` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean, `cargo test --workspace` green.
-
-**Re-verified and shipped 2026-07-24.** The original "tests green" claim was recorded the same day this repository was corrupted by 999.37, so it was re-run independently from a clean checkout rather than trusted: 537 tests across 13 binaries, 0 failed. Also audited for coupling to the process-management model currently being revamped (999.33/999.34) — **zero**: no changed line touches monitor, `monitor_pid`, pgid, spawn, teardown, `Liveness`, `process_group` or supervisor, and only two source files change (`commands.rs`, `events.rs`). Both changes are read-side; the event `emit` path is untouched, so the socket-supervisor redesign leaves this work intact. `commands.rs` nets **−6 lines** by removing the `gate_show`/`gate_respond` copy-paste.
-
-The branch was then reused as the **staging branch for this release**, integrating the 999.37 containment fix and the naming reframe, tested as a unit, and merged to `develop` from there. Its name understates its final contents.
-
-*Note:* the Codex compatibility audit (`.planning/audits/2026-07-24-codex-compatibility-review.md`) and the 999.31 agent-driver-modularization backlog entry (`.planning/phases/999.31-agent-driver-modularization/CONTEXT.md`) referenced above were **not in the v1.8.1 release** — they sat on the unmerged `archive/planning-docs-2026-07-24` branch. **Recovered onto the mainline 2026-07-25**, along with the three process-lifecycle/teardown/supervisor audits and the scope-creep review, so those references now resolve. DEN-56 tracks the same defect in Linear.
-
-Plans:
-
-- [x] 22-01 — Shared gate resolution + `gate_show` one-read + `MAIN` constant (WR-01, WR-02, WR-03)
-- [x] 22-02 — Single-pass `stage_launched` timestamp summary + full Validate (IN-01)
-
-### Phase 23: End-to-End Dogfood — One Phase, Define→Ship, Unattended, With Claude
-
-**Goal:** Make `devflow start --phase N` drive one real phase from Define
-through Ship **unattended with Claude**, with no manual `ps`, no manual
-`devflow advance`, and no silent stall. This is the "basic development
-workflow works end to end" milestone, scoped deliberately narrow: one agent
-(Claude), one phase, no release cut.
-
-**Scope recut 2026-07-25 (operator decision).** This phase previously read
-"Test Suite & CI Hardening" with a `[To be planned]` placeholder goal. That
-theme — 999.15, 999.17, 999.18, 999.19, 999.20, 999.22 — was reviewed against
-the end-to-end goal and advances it by approximately zero, so it returns to the
-backlog undisturbed and this phase is repurposed. Nothing was lost: the prior
-entry had no content beyond its title.
-
-**Requirements**: TBD (no REQ-IDs — units 23a–23e, sourced from 999.33/DEN-58
-and 999.34/DEN-59 plus the dogfood-probe finding this phase generated first).
-Plans carry the unit identifiers `23a`, `23b`, `23c`, `23d`, `23e` and
-`yes-ship` as requirement tokens. **`23b` and `23c` were redefined, and `23e`
-added, by the 2026-07-25 replan** — see "Re-aimed 2026-07-25" below.
-**Depends on:** Phase 22
-**Plans:** 16/16 plans complete
-gap-closure set** (planned 2026-07-26 from `23-VERIFICATION.md`'s single
-recorded gap), unstarted
-2026-07-25; the original 23-03…23-12 are archived under
-`phases/23-end-to-end-dogfood/superseded/`)
-
-**FINAL STATUS 2026-07-27 — CLOSED, 16/16 plans, by recorded operator decision.**
-Attempt 3 (`23-ACCEPTANCE-RUN-3.md`) drove Define → Plan → Code **fully
-unattended**, all three stages succeeding with verified on-disk deliverables — the
-furthest any DevFlow-driven run has reached in this project's history — then halted
-at the Validate boundary on a **correct** D-18 staleness firing, because the target
-phase modifies DevFlow's own compiled source. Resuming would have required
-rebuilding the driver from unvalidated code, which the operator rejected on
-soundness grounds.
-
-The behavioural criterion is therefore **accepted-unmet, not satisfied**, and is now
-permanently unmeetable for phase 24: that phase was completed manually and merged
-via PR #34, so a re-run would no-op through every stage and `workflow_shipped` can
-never be emitted for it. The structural cause is filed as **999.48 / DEN-73**; the
-oracle was deliberately NOT re-pointed at a substitute target. Full disposition in
-`23-VERIFICATION.md`'s `accepted_exception` frontmatter block.
-
-Positively: the halt was **not a silent stall** — the failure mode this phase exists
-to eliminate. The guard emitted a typed event and both monitor and agent exited
-cleanly, against Phase 17's two silent monitor deaths at ~4h each.
-
 ### Phase 26: Release-Cut Automation
 
 **STATUS: CLOSED PARTIAL, 2026-07-30 — operator decision.** 9 plans executed,
@@ -2146,7 +2458,7 @@ this much design attention before planning starts.
 
 **Requirements**: TBD — no REQ-IDs; tracked by backlog identifier (`999.25`,
 `999.54`, `999.50`, `999.52`), not invented REQ-IDs. See
-`phases/26-release-cut-automation/999.25-BACKLOG-DOSSIER.md` for the original backlog
+`superseded/26-release-cut-automation/999.25-BACKLOG-DOSSIER.md` for the original backlog
 context (possible shapes, publish-ordering constraint, prior deferral
 reasoning from Phase 20 D-03).
 **Depends on:** Phase 25
@@ -2458,707 +2770,6 @@ as code per the operator's gap-closure decision above. Units 23a–23e and
 **Wave 12** *(blocked on 23-14)*
 
 - [x] 23-15 — Acceptance retry: `devflow start --phase 24 --agent claude --mode auto --yes-ship`, observed read-only, recorded in `23-ACCEPTANCE-RUN-2.md` (the 23-11 record is left byte-identical). Acceptance is claimable **only** on a quoted `workflow_shipped` event plus `devflow evidence --phase 24 --require-shipped` exiting 0 — `workflow_finished` is explicitly not sufficient (23-acceptance)
-
-### Phase 24: `release --check` Signing-Key Inline Classification
-
-**Goal:** `check_ssh_signing_viability` (20d, `crates/devflow-core/src/git.rs`) misclassifies an inline (non-path) `user.signingkey` value — a literal key blob configured directly rather than as a file path is treated as a path and reported as not-found. Deterministic edge case; every path-based and no-key branch is already correct and tested. Full detail in `.planning/phases/20-release-correctness-operator-control/20-REVIEW.md` (INF-01).
-**Priority:** Low | **Size:** S — single classification branch + one test; found by Phase 20 code review (2026-07-23). Linear: DEN-52.
-**Requirements**: TBD — promoted from backlog 999.27
-**Depends on:** Phase 23
-**Plans:** 2/2 plans complete
-
-*Promoted from backlog Phase 999.27 on 2026-07-26 as the acceptance target for Phase 23 plan 23-11 (D-02). Selected as low-stakes by consequence: a release-preflight advisory check that touches no merge, version, or ship control flow.*
-
-Plans:
-
-**Wave 1**
-
-- [x] 24-01-PLAN.md — Classify `key::`/raw-`ssh-` `user.signingkey` values as inline keys per git's own prefix precedence, fingerprint them via `ssh-keygen -lf -` over stdin, and prove it with five agent-independent tests in `devflow-core::git`
-
-**Wave 2** *(blocked on 24-01)*
-
-- [x] 24-02-PLAN.md — Operator-boundary proof: `devflow release --check` neither leaks the inline blob nor reports it missing, and degrades to a non-blocking `warn` when the ssh tooling is absent
-
-### Phase 25: End-to-End Dogfood Blockers — Start, Progress, Finish, Recover
-
-**Goal:** Make an unattended `devflow start --phase N --agent claude --mode auto --yes-ship` run reach a completed Ship stage **without a human touching it**, by closing the four things that currently prevent it. Phase 23 proved the goal is not reachable today: its third acceptance attempt drove Define→Plan→Code unattended — the furthest any run has gone — then halted, and two of its three attempts additionally required a human to repair the base ref before `devflow start` would even launch. This phase closes the specific, individually-evidenced blockers rather than re-attempting the run and rediscovering them.
-**Priority:** High | **Size:** L (re-sized at plan time, 2026-07-27 — was M) — six units plus 999.38 folded in. 25b, 25e, 25f and 999.38 are genuinely S as filed; 25a is S–M, option chosen at plan review 2026-07-27 (fetch + fast-forward-when-safe, else refuse — see `25-05-PLAN.md` §`<resolved_decision>`, and CONTEXT.md D-17 as amended); **25c is M, not the S this entry states** — it is a full replacement of `compute_version`'s three inputs plus a new preflight gate plus a previously-unflagged consumer at `pipeline_gate.rs:809-840`. No phase split recommended; see `25-01-PLAN.md` § Phase-level notes for the assessment and the seam if one is ever wanted.
-**Requirements**: TBD — promoted from backlog 999.51, 999.48, 999.49, 999.44, 999.47; plus 25f (CONTRIBUTING release-procedure drift, no backlog entry — found 2026-07-27). Tracked by unit identifier (`25a`–`25f`, `999.38`), not by REQ-ID — this project has no `.planning/REQUIREMENTS.md`.
-**Depends on:** Phase 24
-**Plans:** 18/19 plans executed
-
-Gap-closure plans (wave numbering restarts at 1 for this run):
-
-- [x] 25-08-PLAN.md — 25c/999.49: the D-09 major-bump gate fires in the default worktree path (CR-01 aggregation + CR-02 execution-root scope + real-worktree regression test) (wave 1)
-- [x] 25-09-PLAN.md — 25c/999.49: `release_range_start` anchors correctly across realistic release topologies (CR-03 + two topology fixtures) (wave 1)
-- [~] 25-10-PLAN.md — HALTED at Task 1 Step E; SUPERSEDED by 25-13
-- [x] 25-11-PLAN.md — 25e/999.47: fresh site census + bounded exec-visibility barrier at every vulnerable spawn-then-cmdline-census site in `crates/` (wave 1)
-- [x] 25-12-PLAN.md — 25e/999.47: production reaper age floor (`agent::STRAY_MIN_AGE`) refusing to `SIGKILL` inside the exec-visibility window (wave 2)
-- [x] 25-13-PLAN.md — 25e/999.47 + 25f: push through the real `pre-push` gate, an 11-observation CI-on-branch streak, and dual human sign-off (wave 3)
-
-**25-10 disposition:** 25-10 halted at Task 1 Step E when its push was rejected 2/2 by the `pre-push` container gate on the very defect its trials were meant to observe, and is superseded by 25-13 — a corrected protocol with a falsified-premise fix, a corrected test list, and a second (local push-gate) verification shape — rather than re-run, because re-running it unchanged would produce evidence about tests that are no longer the risk.
-
-Gap-closure plans, round 3 — planned 2026-07-28 against `25-VERIFICATION.md`'s two remaining gaps (wave numbering restarts at 1 for this run):
-
-- [x] 25-14-PLAN.md — 25a/999.51: CR-02 — the base-ref fast-forward becomes a compare-and-swap (`git update-ref` with `<oldvalue>`) behind a repository-wide checked-out predicate (`git worktree list --porcelain`), plus a second-worktree regression test (`preflight.rs`) (wave 1)
-- [x] 25-15-PLAN.md — 25d/999.44: CR-01 — a registry-reachability filter interposed between the structural `/proc` census and BOTH operator surfaces, an explicit `--root` ruling, corrected `doctor`/`--reap-strays`/census wording, and a three-fixture same-pass regression test (`commands.rs`, `main.rs`, `agent.rs`) (wave 1)
-- [x] 25-16-PLAN.md — WR-03 (folded in, not deferred): the two tests that drive a real `launch_stage_inner` now reap the detached monitor wrapper they spawn, with verified death, via one shared `#[cfg(test)]` helper (`test_support.rs`, `staleness.rs`, `pipeline_launch.rs`) (wave 1)
-
-**Round-3 wave rationale:** all three run in parallel in wave 1. Their file sets were checked against live source at plan time and are disjoint — `preflight.rs` / (`commands.rs`, `main.rs`, `agent.rs`) / (`test_support.rs`, `staleness.rs`, `pipeline_launch.rs`) — so the same-wave zero-file-overlap rule that forced near-serial waves in Phases 18, 19, 21 and in this phase's own rounds 1–2 does not bind here. 25-14 does not touch `commands.rs` because `ensure_base_ref_current`'s signature and its `commands.rs:154` call site are unchanged by construction. **The `scripts/check-in-container.sh all` push-gate run is a phase-level, post-merge step run ONCE after all three merge — not once per worktree**, because several simultaneous `taskset -c 0,1` container runs manufacture the same load-induced flake 25-11/25-12/25-13 closed.
-
-Gap-closure plans, round 4 — planned 2026-07-28 against `25-UAT.md`'s two gaps, both test-only defects in the `devflow` CLI crate (wave numbering restarts at 1 for this run):
-
-- [x] 25-17-PLAN.md — G-25-2/WR-06: the monitor reap becomes an RAII `Drop` guard (`test_support::ReapMonitorOnDrop`) bound before the panicking assertions at both sites 25-16 fixed, with a double-panic interlock and a discriminating test plus control (`test_support.rs`, `pipeline_launch.rs`, `staleness.rs`) (wave 1)
-- [x] 25-18-PLAN.md — G-25-1/WR-05: the two `preflight.rs` tests that reach `monitor::spawn_monitor` through `run_preflight`'s `Advance`/`LoopBack` recursion bind the same guard and assert they really spawned; closes `WINDOWS.md` items 1 and 3 (`preflight.rs`, `.planning/WINDOWS.md`) (wave 2)
-
-**Round-4 wave rationale:** the two gaps' file sets are disjoint (`preflight.rs` alone vs `test_support.rs`/`pipeline_launch.rs`/`staleness.rs`), but they are NOT independent. G-25-1's fix must use the guard G-25-2 introduces — wiring a plain trailing `reap_spawned_monitor(&state)` into `preflight.rs` would knowingly reproduce WR-06 in two new places on the same day it was closed in two others. So 25-18 depends on 25-17's API rather than on its files, and runs in wave 2. The guard's exact signature is pinned verbatim in 25-18's `<interfaces>` so its executor needs no cross-plan SUMMARY read, and 25-18 carries a precondition asserting the guard exists before it edits.
-
-**WR-03 disposition (explicit, per the verifier's request):** folded into round 3 as 25-16 rather than deferred. The justification is not tidiness — 25-15's regression test asserts against a live `/proc` census, and the leak replenishes that census's noise on every `cargo test --workspace` run. The verifier's own words: it *"actively degrades confidence in any future CR-01 fix's own test suite until closed."* WR-01 (`version.rs:338-349`) and WR-04 (`commands.rs:3727-3762`) remain Info-severity and are NOT pulled in: `version.rs` is in no round-3 file set, and while 25-15 does edit `commands.rs`, it does not touch WR-04's lines — the reachability filter is interposed before `reap_stray_candidates`, leaving that function and its test untouched.
-
-*Scoped 2026-07-27 against one criterion — "what does an unattended run need in order to finish?" — after validating every open High in the backlog against the codebase. The four requirements below are the decomposition; each unit maps to exactly one.*
-
-**The four requirements, and the unit that closes each:**
-
-| # | Requirement | Unit | Evidence it is unmet today |
-|---|---|---|---|
-| 1 | A run **starts** on a current base | **25a** — 999.51 / DEN-76 | Blocked 2 of 3 acceptance attempts; a human ran `git fetch` by hand each time |
-| 2 | A run **progresses** through all five stages | **25b** — 999.48 / DEN-73 | Attempt 3 halted at the Validate boundary on a correct D-18 firing |
-
-**25b re-sized S (was S–M), 2026-07-27 — the fix is one guard, not a design pass.** `launch_stage`'s third parameter, `archived_stage: Option<Stage>`, *already* distinguishes the two cases at every call site: `None` is a fresh start (`commands.rs:236`, i.e. `devflow start`), `Some(stage)` is a transition (`pipeline_gate.rs:110/122`, `pipeline_outcomes.rs:362/370`). Pinning the verdict is therefore `if archived_stage.is_none() { enforce_build_staleness(…)?; }` — no new state field, no threading, no design pass. `pipeline_launch.rs:165` already documents this exact shape for the `Advance` arm ("skipping a check it just adjudicated for this one relaunch, not granting a standing bypass"). The earlier S–M estimate was made before checking whether the distinguishing information already existed; it did.
-
-**Why 25b is kept rather than deleted, though it is the only dogfood-only unit.** `staleness.rs` is 1,794 lines and 21 tests, all gated on `is_self_dogfood_workspace` — it fires in this repository and nowhere else, so it is genuine dogfooding overhead and a fair candidate for removal. It is retained because the outstanding work is a single line: deleting a tested, working module to avoid one guard is a worse trade than paying it. The default stays **on for a self-dogfood workspace, evaluated once at `start`**, which preserves the Phase 16 false-evidence protection (a stale binary cannot *begin* driving its own repo) while removing the mid-run halt, which has no safety value — the source it reports staleness against is the phase's own in-progress work. A bypass *flag* is deliberately not the mechanism: since the guard fires only here, "skip in dogfood" is deletion with extra steps.
-| 3 | A run **finishes** with correct artifacts | **25c** — 999.49 / DEN-74 | `compute_version` yields `~1.11.359` against a real `1.8.1` |
-| 4 | A stalled run **recovers** without `kill(1)` | **25d** — 999.44 / DEN-68 | 15/15 orphans survived `SIGTERM`; only `SIGKILL` cleared them |
-
-**Plus one unit that is not a requirement but a stall generator:**
-
-**25e** — 999.47 / DEN-72. `MAX_CONSECUTIVE_FAILURES = 3` (`mode.rs:18`) forces a gate after three consecutive Validate failures. A test that fails roughly half the time under CI load is therefore not merely CI noise inside an unattended loop — it is a mechanism for halting a healthy run. Cheapest unit in the phase; its production risk is already closed, so this is test-only work.
-
-**25f** — CONTRIBUTING.md's release procedure is stale in two ways after the signing work merged in PR #38, and both mislead at the highest-stakes step. **(a)** Step 5 says `git tag -s vX.Y.Z <commit>`. On a machine where the agent works, `user.signingkey` is the *agent's* key, so that command produces an **agent-signed release tag** — exactly what the maintainer-key policy exists to prevent. The `pre-push` hook now refuses to push such a tag, so the outcome is a blocked release rather than a mis-signed one, but the operator discovers it *after* the squash-merge to `main` has already happened. Step 5 must direct the reader to `git -c user.signingkey="$(git config --get devflow.releaseSigningKey)" tag -s …`. **(b)** The same step warns that "a repo-local `tag.gpgsign=false` means `-a` alone will not sign" — no longer true, since the tracked `.gitconfig` added in #38 sets `tag.gpgsign=true`. A reader following a stale warning reasons about the wrong failure mode. Size S, docs-only. Found 2026-07-27 while walking the v2.0.0 release; the drift was introduced by #38 itself, so it is this project's own regression to close.
-
-**Sequencing.** 25a → 25b → 25c is the spine and is ordered: a run must start correctly before "does it progress" is even observable, and must progress before "does it finish correctly" can be tested. 25d and 25e are independent of the spine and of each other, so they can run in parallel with it.
-
-**25b and 25c compose and must ship together.** 25b makes an unattended run reachable; 25c fires on the first run that succeeds. Shipping 25b alone converts a phase that cannot finish into one that finishes by writing a garbage version and tagging it on `develop` — strictly worse than the current halt, because `hooks_after_ship` has no rollback after its `Merge` step.
-
-**Optional sixth unit — 999.38 (Medium), operator's call at plan time.** A test-suite `PATH` race, distinct from 999.47 but the same failure shape: a genuine flake ("reproduced once in four full-suite runs") feeding the same 3-strike Validate gate. Folding it in with 25e does the flake work in one pass; leaving it out does not block the goal. Not counted in this phase's size.
-
-**Deliberately excluded, with reasons — do not re-add without revisiting these:**
-
-- **999.31 / DEN-56** (modular agent driver) — a *Codex* blocker. This goal is scoped "with Claude"; Phase 23 deferred it for precisely this reason. Including it roughly doubles the phase and moves the stated goal by zero.
-- **999.25 / DEN-50** (release-cut executor) — Phase 23's own scoping states *"'end to end' stops when the Ship stage completes, the crates.io publish stays manual."* Including it re-expands a deliberately narrowed scope.
-- **999.15 / DEN-40** (hermetic shell-entry-point tests) and **999.21 / DEN-46** (AI-acceptance wiring) — neither sits on the dogfood execution path; DEN-46's wiring surface is partly outside this repository.
-- **999.4 / DEN-29** (concurrent-ship version race) — requires two simultaneous ships; this goal is one phase.
-- **999.5 / DEN-30** (changelog placeholder content) — on the Ship path but cosmetic, M-sized, and deferred three times for want of a content source.
-- **999.39** (production git calls inherit `GIT_DIR`) — a real exposure of the 999.37 class, but `devflow` is not invoked from a git hook on the pipeline's critical path. Considered and excluded, not overlooked.
-
-**Acceptance (revised 2026-07-27 per CONTEXT.md D-15/D-16 — standing policy change, operator-confirmed).** The end-to-end acceptance run this paragraph previously required is now **unofficial and continuous**: it runs when the operator chooses and **gates no phase's completion, until further notice** — not this phase, not later ones. Phase 25 is therefore **complete when 25a–25f are each implemented and verified on their own unit-level merits** — each unit needs its own verifiable acceptance (a test, a closed reproduction) rather than relying on the end-to-end run to backstop it. Anything a future unofficial run surfaces is filed to the backlog the usual way, exactly as Phase 23's runs were. This suspension is deliberately reversible — the single-run closure criterion can be reinstated later if the operator chooses.
-
-**Planned 2026-07-27 — 7 plans across 3 waves.** Ordered by file ownership rather than by the
-spine above: `commands.rs` is touched by four of the six units and `preflight.rs` by two, so the
-same-wave zero-file-overlap rule forces the sequencing (the same constraint Phases 18, 19 and 21
-each hit). D-15's decoupling of the acceptance run dissolves the spine's observational rationale,
-so the code dependency graph is what orders the work. **25b (plan 25-03) and 25c (plans 25-01 and
-25-06) all land in this phase**, honouring the ship-together constraint below.
-
-Plans:
-
-- [x] 25-19-PLAN.md
-
-- [ ] 25-10-PLAN.md
-
-- [~] 25-10-PLAN.md — SUPERSEDED by 25-13 (see the gap-closure list above; this line previously read `[ ]`, contradicting that disposition)
-
-- [x] 25-11-PLAN.md
-- [x] 25-12-PLAN.md
-- [x] 25-13-PLAN.md
-- [x] 25-14-PLAN.md — 25a/CR-02: compare-and-swap fast-forward + repository-wide checked-out predicate (`preflight.rs`) (round-3 wave 1)
-- [x] 25-15-PLAN.md — 25d/CR-01: registry-reachability filter before both stray surfaces, `--root` ruling, corrected wording (`commands.rs`, `main.rs`, `agent.rs`) (round-3 wave 1)
-- [x] 25-16-PLAN.md — WR-03: launch-driving tests reap the monitor they spawn (`test_support.rs`, `staleness.rs`, `pipeline_launch.rs`) (round-3 wave 1)
-- [x] 25-17-PLAN.md — G-25-2/WR-06: RAII `ReapMonitorOnDrop` guard bound before the panicking assertions, with a double-panic interlock and a discriminating test plus control (`test_support.rs`, `pipeline_launch.rs`, `staleness.rs`) (round-4 wave 1)
-- [x] 25-18-PLAN.md — G-25-1/WR-05: the two `preflight.rs` recursion tests bind the same guard and assert they really spawned; closes `WINDOWS.md` items 1 and 3 (`preflight.rs`, `.planning/WINDOWS.md`) (round-4 wave 2)
-
-**Wave 1** *(four plans in parallel — disjoint file sets)*
-
-- [x] 25-01-PLAN.md — 25c derivation: reachable-tag baseline, anchored commit range, conventional-commit classification, rewritten `compute_version` (`version.rs`, `+semver`, `+git-conventional`)
-- [x] 25-02-PLAN.md — 25d/25e core primitives: `terminate_and_verify`, registry-independent stray discovery, `#[deprecated]` on the unsound predicate (`agent.rs`)
-- [x] 25-03-PLAN.md — 25b + 999.38: hoist the staleness adjudication into `start`, prove it is not re-adjudicated mid-run, de-race the descendant-commit test (`pipeline_launch.rs`, `commands.rs`, `staleness.rs`)
-- [x] 25-04-PLAN.md — 25f + D-06 + D-16: CONTRIBUTING release step 5, the versioning constraint in two places, the Acceptance paragraph below (`CONTRIBUTING.md`, `ROADMAP.md`, `PROJECT.md`)
-
-**Wave 2** *(blocked on 25-03 — shares `commands.rs`)*
-
-- [x] 25-05-PLAN.md — 25a: base-ref currency probe wired ahead of the reachability guard; fetch, then fast-forward the local base when safe and refuse loudly otherwise (`preflight.rs`, `commands.rs`)
-
-**Wave 3** *(two plans in parallel — blocked on 25-01/25-02 and on 25-05's file ownership)*
-
-- [x] 25-06-PLAN.md — 25c gate: `preflight_major_bump_check` (D-09) plus the `pipeline_gate.rs` fixture that re-derives the replaced algorithm (`preflight.rs`, `pipeline_gate.rs`)
-- [x] 25-07-PLAN.md — 25d/25e surface: `doctor` stray finding, opt-in `gate sweep` reaping, deleted-root e2e test, retargeted `stop` identity test (`commands.rs`, `main.rs`, new `tests/reap_strays_e2e.rs`)
-
-### Phase 27: Scrub Redirecting Git Environment From Production Calls
-
-**STATUS: COMPLETE, 2026-07-30** — merged to `develop` via PR #60 (merge commit `c6192a1`), 47 commits. **Not released**; no tag or version bump was cut, and Ship's terminal hooks never ran (see "How this phase closed" below).
-
-**Delivered:** all **41** production `Command::new("git")` sites across 7 files routed through `devflow_core::git::{git_command, hermetic_command}`, plus two indirect `sh → cargo → git` spawn edges — including **`monitor.rs:148`, the spawn that launches the coding agent itself**, which was the single highest-consequence site in the codebase and was *not* in the original literal-grep scope. Verified on `develop` after merge: **zero** bare `Command::new("git")` remain in production code (every surviving textual match is a comment). `test_support` now re-exports `git.rs`'s constants rather than keeping a second copy, so the two lists cannot drift.
-
-**Acceptance signal met** — the whole point of the phase. 999.37 deliberately left 37 unit tests failing under a dirty environment so the exposure would stay visible. Under a hostile `GIT_DIR` the suite is now `411 passed / 0 failed` (devflow-core) and `188 passed / 0 failed` (devflow-cli); ordinary `cargo test --workspace` is **719 passed / 0 failed**, clippy `-D warnings` and `cargo fmt --check` clean. `27-VERIFICATION.md`: **status `passed`, 7/7 truths**, with the verifier independently re-running the falsification (revert a call site → test fails → restore → passes) rather than trusting the claim.
-
-**Review:** `27-REVIEW.md` — 0 critical, 3 warnings, 3 info. All three warnings closed in `936b371`. WR-01 is worth remembering: two "hostile `GIT_DIR`" tests set no hostile environment at all and passed identically with or without the scrub, and **the first attempt to fix them was itself vacuous** (passed `--exact` against a bare test name, so zero tests ran and the binary still exited 0). Both now assert the child reported `1 passed`, not merely that it exited 0.
-
-**Residual, by design:** four lower-consequence indirect spawn edges remain open — `hooks.rs:222`, `gates.rs:323`, `verify.rs:106`, `commands.rs::cmd_check`. None launches an agent. Found by this phase's own census (`27-SPAWN-CENSUS.md`, RESEARCH Assumption A2 held **OPEN, not silently closed**) and filed as **999.61**. D-02 also held throughout: `crates/devflow-cli/build.rs` is byte-identical to its base state, and the indirect chain behind it was closed at DevFlow's own spawn edge instead.
-
-**How this phase closed — Ship was deliberately not run.** Dogfooded through DevFlow itself (`devflow start --phase 27 --mode auto --until validate`) Define→Plan→Code→Validate. Ship was excluded because its terminal hooks (`Merge → VersionBump → ChangelogAppend → BranchCleanup`) are fail-fast with no rollback and would have merged and tagged directly, and because `develop` is PR-gated (W-17 bypass deliberately unconfigured). The branch was pushed and merged by human review instead. **The run surfaced 999.60/DEN-85 live:** `devflow resume` discarded the never-fired `--until validate` cap and advanced into Ship unguarded; Ship was killed ~10s in with no side effects, held only by `yes_ship: false`.
-
-**Unblocks:** **999.25** (release executor, DEN-50) — this was its prerequisite #1, since `26-REVIEW.md` CR-01 showed `mutating_project_root` is bypassed by an inherited `GIT_DIR` — and **999.52** (`devflow sync`), which shares that guard.
-
-**Promoted:** 2026-07-30 — backlog **999.39 / DEN-66**, re-verified open at HEAD `b3cab1c` before promotion. Promoted to its own phase exactly as Phase 26 anticipated ("Deferred to its own phase (27+), not because it's low-value").
-
-**Goal:** Route every production git invocation through a single scrubbing constructor — mirroring what `test_support::git_command` already does for tests — so that `GIT_DIR`, `GIT_WORK_TREE` and the other repository-local variables cannot silently redirect DevFlow onto a repository the operator never named. At promotion time all production `Command::new("git")` sites pinned `current_dir()` and nothing else (estimated ~86; the grep-confirmed count was **41**, plus indirect spawn edges the literal grep could not see); `GIT_DIR` outranks the working directory, so any `devflow` process launched with one set operates on *that* repository instead.
-
-**Why this is High, not hygiene.** Phase 26's re-review (`26-REVIEW.md`, finding **CR-01**) found that `mutating_project_root` — the guard written expressly to stop `release --execute`/`sync` acting on an unnamed repository (D-13, closing C-06) — **is bypassed by an inherited `GIT_DIR`**. `git rev-parse --show-toplevel` reports the *cwd's* work tree while HEAD, refs and objects come from `GIT_DIR`, so the guard compares two paths, sees a match, and passes while the executor pushes, tags, and publishes against a different repository. The effect is no longer wrong answers but **irreversible operations against the wrong repository**. Git sets these variables for hooks, `rebase --exec`, `bisect run` and `submodule foreach` — and DevFlow runs git hooks as part of its own workflow.
-
-**Sequencing consequence — this is why the phase exists now.** No mutating-command root guard can be trusted until this lands. It is prerequisite #1 for **999.25** (release executor, DEN-50) and blocks **999.52** (`devflow sync`) from shipping independently, since sync shares the same bypassed guard. Both are held on `feature/phase-26` awaiting it.
-
-**Design decision this phase must settle:** whether an operator-set `GIT_DIR` should ever be honoured. The safer default is **no** — decide deliberately in discuss-phase rather than by omission, and record it.
-
-**Acceptance signal already exists.** With `GIT_DIR` set, 37 unit tests currently fail because production functions under test (e.g. `tag_exists_and_reachable`) resolve to the wrong repository. 999.37 deliberately left these failing rather than papering over them, so they are a ready-made red-to-green target — see the 999.39 backlog entry's "Residual, by design" note. Add a regression test asserting the guard itself holds under a hostile `GIT_DIR`; `crates/devflow-cli/tests/project_root_guard.rs:18-21` names the risk for its own helpers today but never tests it against the guard.
-
-**Requirements**: TBD — no REQ-IDs; tracked by backlog identifier (`999.39`), consistent with Phases 21/22/26. Full evidence, escalation rationale and prior-deferral reasoning remain in the **999.39** backlog entry above; this entry does not restate them.
-**Depends on:** Phase 26 (CLOSED PARTIAL — no code dependency, but 999.25's re-attempt depends on this)
-**Plans:** 6/6 plans complete
-
-**Scope caution carried from Phase 26's exclusion note:** ~86 call sites spanning most of `crates/` including `git.rs`. Mechanical, but it is production behavior and touches the same files as the unmerged 999.25 cluster — expect file-overlap serialization and plan waves accordingly.
-
-**Planning corrections (2026-07-30, measured — supersede the two figures above).** The `~86` call sites is a double count (an `rg` glob matched each file twice); the grep-confirmed figure is **41** production sites across 7 files, verified independently three times at HEAD. The `37 unit tests` acceptance signal was measured during 999.37 and predates several phases; re-measured live under a hostile `GIT_DIR` it is **54** (devflow-core) **+ 44** (devflow-cli, `pipeline_gate`/`pipeline_outcomes` excluded) **= 98**. A bare `cargo test --workspace` does **not** terminate under a hostile `GIT_DIR`, so the acceptance commands are the two scoped ones. Full detail: `27-RESEARCH.md` § Summary and `27-01-PLAN.md` § "Phase-level recorded decisions and corrections".
-
-Plans:
-**Wave 1**
-
-- [x] 27-01-PLAN.md — Tracer: the scrubbing constructor in `devflow-core::git`, proven end-to-end through one core caller and one cli caller under a hostile `GIT_DIR` (wave 1)
-
-**Wave 2** *(blocked on Wave 1 completion)*
-
-- [x] 27-02-PLAN.md — Migrate `git.rs`'s remaining 7 sites (4 of them wrapper chokepoints) and both `worktree.rs` sites (wave 2)
-- [x] 27-03-PLAN.md — Migrate `version.rs` (10 sites) and `agent_result.rs` (3 sites) (wave 2)
-- [x] 27-04-PLAN.md — Migrate `staleness.rs` (2 sites) and `commands.rs` (3 git sites + the indirect `sh -c` spawn, RESEARCH Open Question #1 decided in scope) (wave 2)
-- [x] 27-05-PLAN.md — Migrate `preflight.rs` (11 sites, 2 inside closures, 1 write operation) (wave 2)
-
-**Wave 3** *(blocked on Wave 2 completion)*
-
-- [x] 27-06-PLAN.md — Workspace spawn-edge census and the phase acceptance run under a hostile `GIT_DIR` (wave 3)
-
-### Phase 28: Close the Checkpoint Answer Return Path
-
-**Promoted:** 2026-07-30 — bundles **999.57 / DEN-82** (primary), **999.59 / DEN-84**, and **999.60 / DEN-85**. All three re-verified open at HEAD `8072ab6` before promotion (see "Verified at promotion" below). Chosen over 999.25 (release executor), whose own entry lists five prerequisites of which only one — 999.39, delivered by Phase 27 — is now met.
-
-**Goal:** Make an operator's answer reach the agent. A `gate="blocking-human"` checkpoint is currently a **dead end for any DevFlow-driven run**: the agent stops and asks a question, there is no path by which the answer reaches it, and every retry spawns a fresh process that asks the identical question again. This is the single largest gap between DevFlow's stated goal (unattended `--yes-ship` / `--yes-release` runs) and what it can actually finish, because a plan that *correctly* gates an irreversible decision becomes a plan that can never complete unattended. Two adjacent defects in the same gate → prompt → relaunch path are folded in.
-
-**Why this and not 999.25.** 999.25's re-attempt needs prerequisites 2–4 closed (ledger terminal state, the `v{version}` namespace collision, the `cargo info` predicate), and those are findings *inside* code that exists only on the unmerged `feature/phase-26` branch — not schedulable work items. Prerequisite 5 (W-17) is explicitly "do this last, immediately before UAT, never before". And Phase 26's own recorded lesson asks whether each irreversible step can be made independently re-runnable *before* composing them — design work nobody has done. Meanwhile 999.57 blocks 999.25 in practice regardless: plan 26-01 was two `blocking-human` checkpoints authorizing exactly the irreversible operations the executor performs, so any re-attempt hits this immediately.
-
-**Units:**
-
-- **28a — 999.57 (A): session resume, the primary fix.** On approving a *checkpoint* gate (a class that must be distinguished from a generic transient-error gate), relaunch as `claude -p --resume <session_id> "<answer>"` against the exact exited session, instead of spawning a fresh stage run. Gives the checkpoint protocol the live back-and-forth it was written for, and is dramatically cheaper — no CONTEXT/RESEARCH re-read, no re-running completed tasks.
-- **28b — 999.57 (C): make checkpoint gates legible.** `truncate_reason` (`pipeline_outcomes.rs:318`, → `render_gate_context(reason, 300)`) caps gate context, so the operator sees `"…must select direct-push or pr-based-develop… [truncated]"` and must read `.devflow/phase-NN-stdout` by hand to find the options. A checkpoint gate is semantically different from an error gate and should render as a real menu — numbered options, verbatim, untruncated — in `devflow status` / `devflow gate show`. Independent of how the answer is transmitted; **do regardless of 28a's outcome.**
-- **28c — 999.59 / DEN-84: the interview flag.** A missing `CONTEXT.md` is ambiguous — it means either "run the interview" (impossible headlessly) or "no interview wanted" (inexpressible), and Define guesses the arm that cannot succeed. Lands in `prompt.rs`'s `idempotent_stage_prompt`, the sibling of the `stage_prompt*` family 28a must give a new parameter.
-- **28d — 999.60 / DEN-85: preserve an unfired `--until` cap.** `resume` clears `stopped`/`stop_reason`/`stop_until` unconditionally (`pipeline_launch.rs:226-228`), so a cap that never fired is silently discarded. Gate the clear on `state.stopped`. Same resume/relaunch plumbing 28a rewrites.
-
-**Verified at promotion (2026-07-30, HEAD `8072ab6`) — and one entry corrected:**
-
-| Claim | Status |
-|---|---|
-| `gates.rs` reads the note only for `"abort"` | ✅ confirmed, `gates.rs:74` |
-| `stage_prompt*` has no answer channel | ✅ confirmed — all three signatures are `(stage, phase, project_root)` |
-| `truncate_reason` caps gate context | ✅ confirmed, 300 chars |
-| **`session_id` is available for 28a** | ⚠️ **999.57's entry overstates this.** It says the id was "observed live", implying availability. In the codebase `session_id` appears **only inside a test fixture string** (`agent_result.rs:1362`) — never parsed, never stored, never persisted. The Claude adapter has **no `--resume` support**. |
-
-**Scope consequence of that correction:** 28a is not "thread an existing value through". It needs (i) capture `session_id` from the Claude result envelope, (ii) persist it on per-phase state, (iii) add `--resume` to the Claude adapter, (iv) add the checkpoint-vs-error gate classification. Size **M**, and the planner should not inherit the entry's more optimistic framing.
-
-**999.57 part (B) is deliberately NOT in scope.** The structured `{plan}-CHECKPOINT-ANSWERS.json` fallback exists so the design does not *depend* on every agent having a resume primitive — but whether Codex/OpenCode need it is unknown until (A) proves the shape, and part of its wiring lives in the GSD skill layer outside this repository. Build only if (A) demonstrates the need.
-
-**Do not fix 28a by auto-approving.** `checkpoints.md` is explicit that `gate="blocking-human"` is never bypassed in any mode, and Phase 26's run proved why: a plan had mistakenly tagged two irreversible authorizations `gate="blocking"` (auto-bypassable, auto-selects the *first* option), which would have silently authorized `cargo publish` with no human input. The gate is correct; only the return path is missing.
-
-**Explicitly excluded, with reasons — do not re-add without revisiting:**
-
-- **999.31 / Modular Agent Driver (High, Size L).** Genuinely adjacent — it reworks the adapter layer, exactly where 28a adds `--resume`. Excluded because folding an **L** into an M+S+S cluster recreates the multi-domain scope creep Phase 26 was built to avoid, and Phase 26's lesson was that oversized phases hide defects. Better sequenced *after*, inheriting a working `--resume` as a known-good case.
-- **999.28 / `--base` override (Medium, M).** Touches `start` but not the gate/prompt/relaunch path. Adjacent by file, unrelated by concern.
-- **999.61 / DEN-86** (four residual spawn edges) — unrelated mechanism; its own small phase.
-
-**Scope narrowed during discussion (2026-07-30) — `28-CONTEXT.md` is authoritative over this entry's original framing.** The goal that survived is *"recognize a checkpoint correctly, and let DevFlow resolve it unattended"*, not *"get an operator's answer back to the agent"*: no usable notification/response channel exists to build a human-answer path on (D-08/D-09), and building one is explicitly deferred (D-11). Consequently **28b was repurposed** from "render checkpoint gates as a legible menu" to "keep a durable audit record of what was auto-decided" (D-07), and **28c's framing changed** from "add an interview flag" to "delete the branch that runs the interview headlessly" (D-14). A fifth item, a persistent `yes_ship` config option (D-12/D-13, a deliberate reversal of Phase 23's D-05), was added during the discussion.
-
-**Requirements**: TBD — no REQ-IDs; tracked by backlog identifier (`999.57`, `999.59`, `999.60`) plus `28-CONTEXT.md` decision IDs (`D-01`…`D-15`), consistent with Phases 21/22/26/27.
-**Depends on:** Phase 27 (no code dependency; sequencing only)
-**Plans:** 6/6 plans executed
-
-**Capacity note, recorded rather than assumed.** Three items in one phase is what Phase 26 attempted, and Phase 26 did not ship. The mitigating difference: all four units share one narrow mechanism (gate → prompt → relaunch), none drives an irreversible operation, and 28b/28c/28d are each **S**. If scope pressure appears during planning, drop **28c** first (it is the most independent), then **28d**; 28a+28b are the phase's reason to exist.
-
-Plans:
-**Wave 1**
-
-- [x] 28-01-PLAN.md — wave 1 · tracer: probe the checkpoint-recognition seam against a live headless run, then encode D-01's static PLAN.md scan
-
-**Wave 2** *(blocked on Wave 1 completion)*
-
-- [x] 28-02-PLAN.md — wave 2 · capture the Claude session id and confirm a reported checkpoint from stdout; persist both new `State` fields (D-01/D-04)
-- [x] 28-04-PLAN.md — wave 2 · Define must never invoke the interview headlessly; delete the branch, keep Plan's intact (999.59 / D-14)
-- [x] 28-05-PLAN.md — wave 2 · `resume` must not clear an unfired `--until` cap (999.60 / D-15)
-- [x] 28-06-PLAN.md — wave 2 · persistent `yes_ship` config option with a never-silent notice; CLI flag still wins (D-12/D-13)
-
-**Wave 3** *(blocked on Wave 2 completion)*
-
-- [x] 28-03-PLAN.md — wave 3 · the resume primitive, the bounded relaunch path, the `checkpoint_auto_decided` audit record, and the dispatch guard (D-03/D-04/D-05/D-07)
-
-### Phase 30: Keep the Session Alive Past Turn End (999.64)
-
-**Scoped 2026-08-01.** Operator's stated objective for the next stretch, verbatim: *"a fully
-functional DevFlow — whatever we define its functionality to be — that I can start using and
-that ends successfully. If we have to reduce scope to achieve that, I'm fine with that."*
-Release-cut automation (the original Phase 30) is **shelved as a spike**, not executed — see
-below. This phase is scoped to **999.64 alone**, deliberately not bundled with 999.65 or 999.66
-even though all three surfaced from the same 2026-07-31 dogfood run: 999.64 is the precondition
-for the other two ever being *observable* in an autonomous run (999.65 needs a second loop-back
-to fire; 999.66 needs a third), so fixing it first is not a preference, it's a dependency order.
-
-**Arc goal (999.64 — spans Phase 30 AND Phase 31, owned by Phase 31):** a DevFlow-driven phase
-containing a multi-plan wave completes that wave without orphaning delegated work — the specific
-failure that has blocked every attempt at an unattended run through this project's history.
-
-**Goal:** the parser and the feasibility gate — Layer 1 can read a Claude `stream-json` (JSONL)
-capture (verdict, rate limit, envelope failure, `session_id`, checkpoint detection) without
-regressing the shipped single-document path by a single test, and the two premises Phase 31
-would rest on each have archived evidence and a recorded verdict: (a) whether
-`task-notification` delivery survives DevFlow's real launch environment (`30c-VERDICT.md`), and
-(b) what the CLI does on stdin close, both drained and with pending background tasks
-(`30d-MEASUREMENTS.md`).
-
-**Goal reconciliation (2026-08-02, cross-AI review finding 4).** The arc goal above was
-previously stated as this phase's own goal line while this same entry forbids any launch-path
-change — so Phase 30 could not satisfy its own stated goal and phase verification would have
-failed it by construction. The two goals are now stated separately: Phase 30 is verified against
-the phase goal directly above; the arc goal is Phase 31's acceptance criterion (the live Phase 29
-wave-2 re-run). Nothing about the scope of either phase changed — only which goal each is
-measured against.
-
-**The defect, unchanged from its backlog filing:** DevFlow launches every stage as `claude -p
-"<prompt>"`. The agent's turn ending terminates the process. GSD's `execute-phase` workflow
-backgrounds `Agent()` dispatch for any wave with 2+ plans (to avoid a `.git/config.lock` race on
-simultaneous worktree creation) and expects the orchestrator's turn to end and later resume when
-the completion notification arrives — a model that holds interactively and is fatal under
-one-shot launch. Live evidence, Phase 29 wave 2: two executors dispatched, orchestrator said
-*"I'll pick up when they return"* and exited with `stop_reason: end_turn, subtype: success`; the
-executors produced 5 real commits on orphaned branches, neither wrote a `SUMMARY.md`, nothing
-merged, and DevFlow's own completion oracle scored the stage Success because it has no marker for
-"the agent delegated to a process it can no longer see."
-
-#### 30a — the feasibility experiment: RUN and CONFIRMED (2026-08-01), then adversarially reviewed
-
-Three experiment iterations (artifacts in the session scratchpad, `999.64-experiment/`;
-raw JSONL logs are the evidence of record, not the harness's own printed verdicts):
-
-- **v1 — invalid, kept as a recorded pitfall.** Its turn-detection heuristic mistook
-  *subagent-forwarded narration* (`parent_tool_use_id` set) for orchestrator resumption. Any
-  future consumer of these streams must discriminate on `parent_tool_use_id == null`.
-
-- **v2 — single background child.** After the CLI's `result` event fired (the point where a
-  plain `claude -p` exits), the process stayed alive on open stdin; the child completed real
-  work ~19s later; a **new top-level orchestrator turn followed, and its `result` event carried
-  `origin: {kind: "task-notification"}`** — the CLI itself attributing the turn to the child's
-  completion, not an inference from timing. (Harness hung afterward on a blocking `readline` —
-  harness bug, post-evidence, fixed in v3 with `select()`.)
-
-- **v3 — TWO CONCURRENT children (10s / 22s), the actual Phase 29 wave-2 shape.** Both
-  completions delivered independently as separate `task-notification`-origin results, each
-  triggering a real orchestrator turn that acted on the completion; both signal files verified
-  on disk. Process exited **0.38s** after stdin close.
-
-**Adversarial review of the assessment built on these results (Claude Fable 5, 2026-08-01):
-"the evidence survives; the plan is destroyed in its two central claims."** The review
-re-parsed both raw logs independently (confirming E-claims, including defeating its own
-multiple-`init` counter-reading: same `session_id` throughout, resumed turns retain prior
-knowledge, so "runtime-injected new turn in the same live session" and "orchestrator resumed"
-are the same fact) and then destroyed the proposed implementation shape. Its findings are
-**binding constraints on 30b's plans**:
-
-1. **No launch-time prediction (C1).** Scoping stream-json to "stages that will background" is
-   a D-10-class prediction of GSD's dispatch behavior — and already falsified by the record
-   (subagents background *by default*; a Plan-stage background loss is on record). The mode is
-   **always-on for the Claude adapter**, or rolled out per-stage as a sequencing choice; never
-   selected by predicting agent behavior.
-
-2. **This is a monitor rewrite, not a flag change, and it splits into three plans (C2).**
-   `spawn_monitor` is a detached `sh` script with `stdin(Stdio::null())` and the prompt as
-   argv — it cannot hold a pipe open. The real shape: (i) a Claude stream-event parsing layer
-   in `agent_result.rs` (mirroring the existing Codex event-stream pattern), (ii) a
-   pipe-owning monitor path replacing the `sh` script for this adapter, (iii) the adapter
-   flag/argv switch. Each independently landable and testable.
-
-3. **The parse layer mostly dies under JSONL capture (H1).** Verified against source:
-   `parse_devflow_result`'s whole-doc path, `claude_session_id` (breaks 28-03 checkpoint
-   resume), `detect_claude_rate_limit`, and envelope-failure detection all fail on JSONL;
-   `blocking_human_checkpoint_reported` survives *by accident* and gains a false-positive
-   surface (stream echoes the full prompt back, so prompt text documenting a gate reads as a
-   live gate); the marker scan's 4000-char tail window is smaller than a single stream `result`
-   event line. The parser plan owns all of these, plus the newly observed `rate_limit_event`
-   stream type. **Multiple `result` events per process is the new normal — last-result
-   semantics, never first-result.**
-
-4. **Stdin-close must gate on marker AND drained task set (H2).** Closing on first
-   `DEVFLOW_RESULT` alone re-creates the orphaning by DevFlow's own hand (orchestrator declares
-   while children still run). The stream provides `background_tasks_changed` events that drain
-   to `[]` — close only on *marker observed in a top-level `result` event AND background task
-   set empty*. What close-with-pending-tasks does is untested and must be treated as undefined.
-
-5. **Idle timeout, not wall-clock; and the timeout writes its own authoritative result (H3).**
-   No fixed wall-clock is safe for both hangs and legitimate ~47-minute stages. The stream is a
-   per-event heartbeat: time out on stream *idleness* inside a generous outer bound. On firing,
-   the monitor must record an authoritative first-class failure — a graceful close falls
-   through to Layer 2, which would score partial commits as Success (999.64 reborn inside its
-   own fix), and a kill mis-classifies as OOM/`ResourceKilled`.
-
-6. **Evidence gaps to close in-phase (M1–M4):** the 0.38s exit timing is unarchived (harness
-   stdout only — re-measure and archive, including close-with-pending-tasks); the
-   task-notification resume behavior is unpinned, undocumented CLI behavior observed on
-   `claude_code_version 2.1.220` (smoke-detect it in a canary or pin the CLI); near-simultaneous
-   completions are untested (real executors finish at correlated times); and the deciding
-   environment test — **run the v3 harness once through `spawn_monitor` itself** — is cheap and
-   closes the interactive-vs-production question completely.
-
-#### Remaining units — SPLIT ACROSS TWO PHASES (operator sizing cap, 2026-08-01)
-
-**Operator ruling: no phase exceeds M.** The review's honest re-size of the full launch-path
-work was M–L, which violates the cap — so the work splits along the seam the review's own
-constraint 2 identified, instead of relabeling the same scope. The split is not arbitrary: it
-puts the *premise-refuting* experiments before the *expensive* rewrite, so if the production
-environment refutes what the interactive experiments showed, the monitor rewrite is never paid
-for.
-
-**This phase (30) — the parser and the de-risking experiments. Size M, no launch-path change,
-no deployment risk:**
-
-- **30b — the Claude stream-event parsing layer.** Pure functions in `agent_result.rs`
-  (public API in `devflow-core`, so no dead-code conflict with `-D warnings`), mirroring the
-  existing Codex event-stream pattern: marker extraction from top-level `result` events with
-  **last-result semantics**, `session_id`, `rate_limit_event` handling, failure envelopes,
-  checkpoint detection hardened against the stream's prompt-echo false-positive surface
-  (review constraint 3). **Test fixtures are the archived v2/v3 raw logs in
-  `30a-evidence/`** — real captures, not synthetic.
-
-- **30c — the production-environment experiment (review M4).** Run the v3 harness once
-  *through `spawn_monitor` itself* — scrubbed env, separated stderr, detached launch. This is
-  the deciding test for whether task-notification delivery exists in DevFlow's real launch
-  context. **If it refutes delivery, Phase 31 is cancelled before it is planned** and 999.64
-  re-scopes around the rejected-options table.
-
-- **30d — re-measure and archive the exit-timing evidence (review M1),** including the
-  untested close-with-pending-tasks case, whose behavior is currently undefined.
-
-**Next phase (31) — the launch path itself. Size M. Planned only after 30c confirms:**
-the pipe-owning monitor replacing the `sh` script for the Claude adapter (close rule: marker
-in a top-level `result` event AND `background_tasks_changed` drained to empty — constraint 4;
-idle timeout writing an authoritative first-class result — constraint 5), the always-on
-adapter switch (constraint 1: no launch-time prediction), and the live Phase 29 wave-2 re-run
-as the acceptance criterion (constraint on H4: not substitutable by integration tests — a
-mocked CLI validates plumbing, not the delivery premise). Near-simultaneous-completion
-behavior (review M3) and CLI-version smoke-detection (review M2) land here.
-
-**Shortlisted, added 2026-08-02:** **999.67** — `parse_devflow_result` lets an agent plant its own
-Layer-0 provenance. Found by 30-01 while closing the identical hole on the new stream path, and left
-open only because 30-01's scope fence forbids touching the shipped path. XS: a one-line overwrite
-plus a mirror test, in a file Phase 31 is already editing. Folding it in here closes the defect class
-rather than the single instance.
-
-**BINDING CONSTRAINT (constraint 7), added 2026-08-02 from 30c trial 2 — the monitor MUST NOT treat
-the count of `result` events as the count of children that returned.** The CLI **coalesces**
-completions: when two children finish close together while the orchestrator is still working, both
-notifications are absorbed into a *single* resumed turn producing *one* `result` event. Measured in
-`30c-VERDICT-scrubbed.md` — two children delivered, one notification-origin result, notifications
-4.75s apart (t+30.62, t+35.37); trial 1's completions arrived 5.5s apart *after* the first resume had
-finished, so that run produced two. The resumed turn states it unprompted: *"Both subagents completed
-and both notifications were delivered to this orchestrator turn."*
-
-A monitor counting result events to decide how many children came back would therefore **silently
-undercount any wave whose completions cluster** — the exact silent-miscount class this whole phase
-exists to eliminate.
-
-**This is why constraint 4's close rule is an `AND`, not a redundancy.** `background_tasks_changed`
-draining to `[]` is the authoritative "all children returned" signal; the `result` marker only
-indicates the orchestrator declared. Trial 2's shape is *superficially indistinguishable* from "one
-child delivered, one lost" — one result event either way — and the drain is the only thing that
-separates them. **Do not simplify the close rule to a single arm.** A future reader is likely to
-read the second arm as belt-and-braces — and per 30-04 below, **it is** belt-and-braces (defensive,
-not load-bearing), which is a deliberate reason to keep it, not license to drop it.
-
-**REVISED 2026-08-02 by 30-04** (`30-04-SUMMARY.md`, `30d-MEASUREMENTS.md`): re-run across 7 fresh
-trials (5 Mode A + 2 Mode B) plus a recomputation of 30c's own published logs found the drain gate
-is **defensive, not load-bearing** — n=2 Mode B trials both delivered every completion even though
-the monitor closed on the marker alone, children still running. **Keep the `AND`, but rewrite its
-justification**: the gate is nearly free (the CLI outlived the close by ~40s anyway), n=2 only
-proves the benign path exists rather than that it's the only one, and it removes a class of
-question about an undocumented code path. Also: a monitor must not read process exit as a
-completion signal after an early close, and 999.64's failure mode is not reproduced by this
-mechanism — if Phase 31 loses child work, early stdin close is not the cause.
-
-**BINDING CONSTRAINT (constraint 8), added 2026-08-02 from the 30c reliability set — the idle
-timeout must not be set below ~12s, and the drain is NOT a stop signal.** Measured across all seven
-trials: the longest quiet gap inside a *healthy* run was 10.52–11.51s. **An idle timeout under ~12s
-would have killed every one of the seven.** Separately, the interval from `background_tasks_changed`
-draining to `[]` until the final `result` arrived ranged 4.54s to 11.51s — a 2.5x spread, and the
-least stable interval measured anywhere in 30c. A monitor that treats the drain as "nothing more is
-coming" and closes there would have truncated the final orchestrator turn in **all seven** trials.
-
-Constraint 4's close rule already requires the marker *and* the drain, which is what protects
-against this — but constraint 5's idle timeout is the mechanism that could still fire early, so the
-floor is a hard input, not a tuning preference. Treat ~12s as a measured lower bound from a
-two-child wave and size the real timeout above it with margin; a wave with more children or slower
-work will have longer quiet gaps.
-
-**REVISED 2026-08-02 by 30-04 — the ~12s floor is too low; raise it to ≥30s.** A second, independent
-7-trial set (30d) reproduced the milestone-event quiet-gap measure (7.70–13.73s, pooled max 13.73s
-across 30c+30d) and added a stricter every-stream-line measure an idle timer would actually see
-(6.02–7.09s). **A 12-second idle timeout would have killed a live, healthy run in 2 of the 7 30d
-trials** (13.638s and 13.728s) — worse than 30c's own band suggested. Mode-A trial 1 shows the
-mechanism: a coalesced run (2 `result` events merged into one delivered turn, per constraint 7)
-lengthens the quiet interval, and coalescing occurred in 1 of 7 trials here, matching 30c's rate
-exactly. **New floor: ≥30s** — ~2.2x the pooled observed maximum on the milestone definition and
-~4x on the every-line one. Direction (set a floor, don't let it tune below the observed maximum)
-was right in the original constraint; the number was not.
-
-**BINDING CONSTRAINT (constraint 9), added 2026-08-02 from the phase-30 cross-AI CODE review
-(codex/gpt-5.6-sol, high effort — `30-CODE-REVIEW.md`); REVISED same day, twice.**
-
-*Correction to the original justification.* Items 1 and 2 were first deferred as "latent because
-`evaluate_layer1` has zero callers." **That claim was false**: `evaluate_agent_result` — the live
-Layer-1 entry called from `pipeline_launch.rs:416` on every result evaluation — runs
-`evaluate_layer1` inside its layer cascade, in the same file. The verification grep excluded
-`agent_result.rs` itself, so its negative control validated only "no references outside the file"
-while the conclusion claimed "no callers." What actually kept these two defects latent is the
-CAPTURE FORMAT: `parse_claude_event_result` requires a parsed `system`/`init` line, which only
-`--output-format stream-json` emits, and production ships single-document `json`. The deferral
-survived on the format argument; the caller argument was wrong. (The file's own WR-12 comment
-says "every `devflow advance` invocation runs through evaluate_layer1" — pass 3's UTF-8 High was
-reachable precisely because of it.)
-
-*Status after the root-cause refactor (`a557805`), pulled back into phase 30 on the operator's
-"fix root causes before proceeding" instruction:*
-
-1. **CLOSED — a torn terminal line can no longer resurrect an earlier turn's success.**
-   `ParsedCapture` records every non-empty line (parsed / torn-JSON / noise); a torn JSON line
-   after the last surviving top-level result yields an indeterminate **Failed** — never the
-   pre-tear result, and never `None` (which would fall through to the raw tail scan and resurrect
-   the stale marker text through the back door). Live truncation sweep:
-   `truncation_sweep_never_upgrades_verdict_to_success`, no longer `#[ignore]`d. The same rule
-   guards the **Codex** parser, whose adapter is live today (a torn superseding marker cannot
-   resurrect an earlier success marker).
-
-2. **CLOSED — provenance is one predicate.** `is_top_level` (parent JSON-null or absent) is shared
-   by gate scanning and `last_top_level_result`; a subagent-origin `result` cannot decide the
-   stage. Regression: `subagent_result_event_never_decides_the_verdict`.
-
-**What REMAINS binding on Phase 31 — the boundary-truncation residual.** A capture truncated at an
-exact line boundary is a well-formed capture: no torn line survives, and a stream ending in an
-earlier turn's success is byte-identical to a healthy shorter run. The evidence of loss is in the
-bytes that never arrived, so NO parser assertion can exist for it — the sweep's doc comment records
-this with the exercised counter-case. The defense belongs to the layer holding the missing
-information: **Phase 31's wiring must not let a stream-derived Success short-circuit a
-contradicting exit code** (a writer that died between flushing turn N and turn N+1 also died with a
-non-zero exit). Treat that as constraint 9's surviving obligation.
-
-The review also corrected plan 30-05's own wording: "absent `parent_tool_use_id` confirmed across
-all three archived captures" is **partly vacuous** — independently re-counted, the three captures
-hold 12/25/54 events and **0**/2/3 `result` events, so the first capture evidences nothing. Absent
-being treated as top-level remains *necessary* for today's results and *unproven safe*.
-
-The review's third finding (a documentary gate mention reading as a declaration) is **not** a
-Phase 31 blocker and is filed as backlog **999.70**. Its High finding 2 — gate scoping failing open
-to the raw scan on a torn `init` — was fixed in phase 30 itself (`06675da`).
-
-**Explicitly out of scope, on the operator's instruction — do not fold in even though they are
-adjacent and were found the same day:**
-
-- **999.65** (loop-back issues `--gaps-only` on a mid-arc phase) and **999.66**
-  (`consecutive_failures` accumulates on healthy progress) — each is its own phase, sequenced
-  after this one specifically because they cannot be observed or tested until 999.64 lands.
-
-- **999.46** (leaked fixture processes) — real but not blocking an autonomous run; hygiene, not
-  reliability.
-
-- Anything release-related — see the shelved entry below.
-
-**Priority:** Highest — the standing blocker on the operator's stated objective. **Size: M**
-(30a complete; 30b is the only substantial unit, and it is pure functions against archived
-fixtures; 30c/30d are S experiments). Phase 31 carries the monitor rewrite as its own M.
-
-**Requirements:** TBD — tracked by unit (`30a`–`30d`) plus the six binding review constraints
-above (constraints 1, 4, 5 bind Phase 31; constraints 2, 3, 6 bind this phase); no REQ-IDs,
-consistent with this project's convention for infrastructure phases.
-**Depends on:** nothing structurally; 30a is closed; 30c is the gate on Phase 31 ever being
-planned.
-
-**Plans:** 5 plans across 3 waves (planned 2026-08-02). Waves 1 and 2 each run one Rust plan
-and one experiment plan in parallel — disjoint file sets, no overlap. Wave 3 is single-plan by
-construction, since all three 30b plans edit `agent_result.rs`.
-
-Plans:
-
-- [x] 30-01-PLAN.md — 30b tracer: the end-to-end Claude stream slice. `claude_stream_events`,
-  `is_claude_event_stream`, `last_top_level_result`, `parse_claude_event_result`, wired into
-  `evaluate_layer1`, plus the isolation tests proving neither shipped capture shape is hijacked.
-  (wave 1)
-
-- [x] 30-02-PLAN.md — 30c: the production-environment experiment. A standalone harness
-  replicating `spawn_monitor`'s process shape (read-only w.r.t. DevFlow source), its archived
-  evidence, and `30c-VERDICT.md`'s binary `delivery:` field — the gate on Phase 31. Ends in a
-  blocking operator sign-off. (wave 1, `autonomous: false`)
-
-- [ ] 30-03-PLAN.md — 30b expansion: `rate_limit_event`, stream envelope-failure, and
-  `claude_stream_session_id` wired into `session_id_from_capture`, preserving D-04's
-  top-level-only read discipline. (wave 2)
-
-- [ ] 30-04-PLAN.md — 30d: re-measure and archive exit timing as a multi-trial distribution,
-  plus the first observation of the undefined close-with-pending-tasks case. (wave 2)
-
-- [ ] 30-05-PLAN.md — 30b expansion: scope the checkpoint gate scan to the `result` text of
-  top-level `result` events ONLY, closing review constraint 3's prompt-echo false positive
-  without admitting intermediate assistant narration as trusted gate text. (wave 3)
-
-**Cross-cutting constraints (all five plans):**
-
-- The archived evidence contains no absolute home paths, OS usernames, session identifiers, or
-  credentials. Raw CLI output is staged outside `.planning/` and published only after
-  validation, structural redaction, and a secret scan.
-
-- No file under `crates/devflow-core/src/monitor.rs`, `crates/devflow-core/src/agents/`, or
-  `crates/devflow-cli/src/` is modified by any plan in this phase.
-
-- `30c-VERDICT.md`'s `delivery:` field gates Phase 31, and — per cross-AI review finding 5 —
-  also gates whether the 30b expansion plans (30-03, 30-05) land at all, since the shipped
-  Claude adapter still emits single-document JSON (`agents/claude.rs`, `--output-format json`)
-  and a refuted delivery premise leaves the stream parser with no operational producer. That
-  branch is an operator decision recorded at 30-02's Task 3 checkpoint, not an automatic one.
-
-Planner notes: the review constraints were treated as locked design inputs. Constraints 2, 3
-and 6 are implemented here; constraints 1, 4 and 5 are represented but NOT implemented — every
-plan carries a `<scope_fence>` forbidding any change to `monitor.rs`, `agents/claude.rs` or
-`pipeline_launch.rs`. Three citation errors in the phase's own source documents were found and
-corrected at plan time (see 30-01's `<corrections_to_source_documents>`), the most consequential
-being 30-RESEARCH.md's suggestion that the stream gate could key on `type: "result"` — which
-would have swallowed every shipped single-document envelope. That alternative is explicitly
-rejected in 30-01 and guarded by a regression test.
-
----
-
-### Phase 31: Claude Adapter Launch Path — Pipe-Owning Monitor (999.64 arc close)
-
-**STATUS: COMPLETE, 2026-08-03** — 5/5 plans, `31-VERIFICATION.md` **passed**, 879 tests, clippy `-D warnings` and `fmt --check` clean. **The 999.64 arc closes with this phase.**
-
-The acceptance run (31-05) passed on **attempt 1**. D-18 was verified independently from git rather than from the run's own report: two merge commits (`1302e93`, `5caaa4c`) whose second parents both fork from the pre-run base `626131b` — a shape inline work cannot produce. The orchestrator's turn ended with **both** executors outstanding (the 999.64 orphan point) and the session survived it and received both completions.
-
-**Two review rounds ran before close, neither of which the automated gates would have replaced.** An adversarial review of the unexecuted plans 31-04/31-05 found 8 blockers (the run could have passed while the mechanism was never engaged; the fallback route did not exist). A peer code review (Gemini 3.1 Pro, DeepSeek v4 Pro) found 4 real defects — 3 fixed in `522e905` with mutation-proven tests, 1 filed as 999.75/DEN-96. A measurement taken mid-phase refuted D-02's stated margin and raised the idle floor 30s→120s (`4d8901a`); the same evidence exposed a regression in the canary, fixed in `1916c4c`.
-
-**Open at close, deliberately:** the 8 acceptance-run commits (`0590537`…`911bf50`), including a fabricated phase 97, are **kept** on `feature/phase-31` by operator decision — they *are* the D-18 evidence and the raw capture was already deleted, so removing them would make the phase's central claim permanently unverifiable. They enter `develop`'s history as-is.
-
-**Created 2026-08-03.** Scope below is **compiled, not newly authored** — every item traces to
-a source already in this repository: Phase 30's "Next phase (31)" section and its binding
-review constraints (this file, above), `30-H1-CONTEXT-FOR-31.md`, `30-VERIFICATION.md`, and
-`30d-MEASUREMENTS.md`. Nothing here is a new operator decision; discuss-phase owns turning it
-into one.
-
-**Goal (this is also the 999.64 arc goal, which Phase 31 owns):** a DevFlow-driven phase
-containing a multi-plan wave completes that wave without orphaning delegated work. Concretely:
-the detached `sh` script that `spawn_monitor` uses for the Claude adapter is replaced by a
-pipe-owning monitor, and the adapter emits `stream-json` always-on — making 30b's parser
-reachable in production for the first time.
-
-**Acceptance criterion:** the live Phase 29 wave-2 re-run. Per review constraint H4 this is
-**not substitutable by integration tests** — a mocked CLI validates plumbing, not the delivery
-premise.
-
-**Gate status: OPEN — Phase 31 may be planned.** Phase 30's `30c-VERDICT.md` resolved
-`delivery: confirmed`, satisfying the locked precondition ("if it refutes delivery, Phase 31 is
-cancelled before it is planned").
-
-**Scope — the binding constraints assigned here by Phase 30's cross-AI review:**
-
-1. **Always-on adapter switch (constraint 1).** `--input-format stream-json` for the Claude
-   adapter, never selected by predicting which stages will background — that is a D-10-class
-   prediction and is already falsified by the record. Per-stage rollout is permitted as a
-   *sequencing* choice; behavior-prediction is not.
-
-2. **Close rule is an `AND` (constraint 4).** Close stdin only on marker-in-a-**top-level**
-   `result` event **AND** `background_tasks_changed` drained to `[]`. Constraint 7 is why:
-   the CLI **coalesces** completions, so counting `result` events silently undercounts any
-   wave whose completions cluster. Trial 2's shape is superficially indistinguishable from
-   "one child delivered, one lost" — the drain is the only thing separating them.
-   **Do not simplify to a single arm.** Per 30-04 the drain arm is *defensive, not
-   load-bearing* (n=2 Mode B trials delivered everything without it) — that is a documented
-   reason to keep it cheaply, not licence to drop it.
-
-3. **Idle timeout, not wall-clock, floor ≥30s (constraints 5 and 8).** The original ~12s floor
-   was **measured wrong and revised** by 30-04: a 12s timeout would have killed a live healthy
-   run in 2 of 7 trials (13.638s, 13.728s). ≥30s is ~2.2x the pooled observed maximum. On
-   firing, the monitor must write an **authoritative first-class failure** — a graceful close
-   falls through to Layer 2, which scores partial commits as Success (999.64 reborn inside its
-   own fix), and a kill mis-classifies as OOM/`ResourceKilled`. Also: the drain is **not** a
-   stop signal — closing there would have truncated the final turn in all seven trials.
-
-4. **Boundary-truncation residual — constraint 9's surviving obligation.** Constraint 9 items 1
-   and 2 were **CLOSED in Phase 30** by the root-cause refactor (`a557805`); what survives is
-   that a capture cut at an exact line boundary is byte-identical to a healthy shorter run, so
-   **no parser assertion can exist for it**. The defense belongs to this layer: Phase 31's
-   wiring must not let a stream-derived `Success` short-circuit a contradicting exit code (a
-   writer that died between flushing turn N and N+1 also died non-zero).
-
-5. **Near-simultaneous completions (review M3)** and **CLI-version smoke-detection or pinning
-   (review M2)** land here. The task-notification behavior is undocumented CLI behavior
-   observed on `claude_code_version 2.1.220`; a CLI update can invalidate it silently.
-
-6. **Fold in 999.67 (XS).** `parse_devflow_result` lets an agent plant its own Layer-0
-   provenance. A one-line overwrite plus a mirror test, in a file this phase is already
-   editing — closes the defect class rather than the single instance.
-
-**Correct two stale documents before planning.** Phase 31 will read exactly these:
-`30-VERIFICATION.md`'s "Deferred — open items owned by Phase 31" table still lists constraint 9
-items 1 and 2 as open (they are closed — this file's constraint 9 text is authoritative), and
-its W-01/W-02 record that the "stream parser is unreachable in production" claim is overbroad
-(checkpoint detection and `session_id` are wired and live today) and that `30-05-SUMMARY.md`
-names the wrong gate predicate (`claude_stream_gate_shape`, not `is_claude_event_stream`).
-
-**Explicitly out of scope:** 999.65 and 999.66 (each its own phase, sequenced after this one
-because they cannot be observed until 999.64 lands), 999.46 (hygiene, not reliability), 999.70
-(gate-mention-vs-declaration — filed as backlog, explicitly **not** a Phase 31 blocker), 999.71
-(torn-line frequency measurement), and anything release-related.
-
-**Priority:** Highest — closes the 999.64 arc and the v2.3.0 milestone. **Size: M** (operator
-sizing cap; Phase 30 sized this unit as its own M when the split was made).
-**Requirements:** TBD — no REQ-IDs, consistent with this project's convention for
-infrastructure phases; tracked by the constraint numbers above.
-**Depends on:** Phase 30 (parser + confirmed delivery verdict). Structurally gated on
-`30c-VERDICT.md`, which is satisfied.
-
-**Plans:** 5 plans in 4 waves
-
-Plans:
-**Wave 1**
-
-- [x] 31-01-PLAN.md — Tracer: a Claude Code stage runs end-to-end through the pipe-owning monitor (wave 1)
-
-**Wave 2** *(blocked on Wave 1 completion)*
-
-- [x] 31-02-PLAN.md — Idle timeout: a stuck stage fails loudly instead of silently (wave 2)
-- [x] 31-03-PLAN.md — Startup delivery canary: refuse to run when task-notification delivery is gone (wave 2)
-
-**Wave 3** *(blocked on Wave 2 completion)*
-
-- [x] 31-04-PLAN.md — Guards: exit-code arbitration and the loud opt-out (wave 3)
-
-**Wave 4** *(blocked on Wave 3 completion)*
-
-- [x] 31-05-PLAN.md — Acceptance run: the live two-plan wave that gates the 999.64 arc (wave 4)
-
-**Scope item 6 (999.67) dropped at planning time — already closed.** `parse_devflow_result`
-(`agent_result.rs:147-162`) applies `normalise_stream_marker_provenance` on both arms as of
-commit `a557805` (2026-08-02), one day before this entry was written; the named regression test
-returns `1 passed; 501 filtered out` against a bogus-name control of `0 passed; 502 filtered
-out`. Recorded in `31-01-PLAN.md` § planning_provenance rather than silently omitted.
-
----
 
 ### Phase 30 (original number, SHELVED 2026-08-01 → spike): Withdraw DevFlow From the Release Business
 

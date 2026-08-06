@@ -196,7 +196,7 @@ Not constrained here; the researcher and planner decide:
 **Downstream agents MUST read these before planning or implementing.**
 
 ### Backlog sources this phase was promoted from
-- `.planning/phases/26-release-cut-automation/999.25-BACKLOG-DOSSIER.md` —
+- `.planning/superseded/26-release-cut-automation/999.25-BACKLOG-DOSSIER.md` —
   the original 999.25 backlog context: possible shapes, publish-ordering
   constraint, prior deferral reasoning from Phase 20 D-03. Predates this
   discussion; D-01 through D-06 above supersede its "possible shapes" list

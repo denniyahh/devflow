@@ -1819,10 +1819,52 @@ fn rate_limited_result(retry: String) -> AgentResult {
     }
 }
 
+/// Commits on the phase's feature branch that are not on `develop`.
+///
+/// Derives the branch name from `git_flow.feature_prefix` and the zero-padded
+/// `phase`, verifies the branch exists with `rev-parse --verify`, and on
+/// success counts `{git_flow.develop}..{branch}` with `rev-list --count`.
+/// This is the single implementation of that count — [`evaluate_layer2`] and
+/// `pipeline_outcomes::handle_validate_outcome`'s forward-progress check both
+/// call it rather than each re-deriving the branch name and re-running the
+/// same two git commands, which is what made the two counts able to silently
+/// diverge before this extraction.
+///
+/// Must be called with the main `project_root`, never a worktree path — git
+/// worktrees share refs and the object database, so a commit made inside a
+/// linked worktree is immediately visible to a count run from the main
+/// checkout, which is the property every caller already relies on.
+///
+/// A `0` return is deliberately indistinguishable across three causes:
+/// genuinely no commits, the branch does not exist, or `git` could not be
+/// run. Every consumer treats all three the same way.
+pub fn phase_commit_count(project_root: &Path, git_flow: &GitFlowConfig, phase: u32) -> u32 {
+    let branch = format!("{}phase-{:02}", git_flow.feature_prefix, phase);
+
+    let branch_exists = git_command(project_root)
+        .args(["rev-parse", "--verify", &branch])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if !branch_exists {
+        return 0;
+    }
+
+    let range = format!("{}..{branch}", git_flow.develop);
+    git_command(project_root)
+        .args(["rev-list", "--count", &range])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
+        .unwrap_or(0)
+}
+
 /// Layer 2: Use exit code + commit count to determine result.
 ///
 /// Reads exit code from `.devflow/phase-NN-exit` file.
-/// Counts commits in `feature/phase-NN` branch (if it exists).
+/// Counts commits in `feature/phase-NN` branch (if it exists), via
+/// [`phase_commit_count`].
 ///
 /// The commit-count gate ("no commits → failed") is scoped to `stage` — it
 /// only applies to `Stage::Plan`/`Stage::Code` (checked via an explicit
@@ -1860,25 +1902,7 @@ pub fn evaluate_layer2(
     };
 
     let branch = format!("{}phase-{:02}", git_flow.feature_prefix, phase);
-
-    // Verify branch exists before counting commits.
-    let branch_exists = git_command(project_root)
-        .args(["rev-parse", "--verify", &branch])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
-    let commits: u32 = if branch_exists {
-        let range = format!("{}..{branch}", git_flow.develop);
-        git_command(project_root)
-            .args(["rev-list", "--count", &range])
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
-            .unwrap_or(0)
-    } else {
-        0
-    };
+    let commits: u32 = phase_commit_count(project_root, git_flow, phase);
 
     let commit_gated = matches!(stage, Stage::Plan | Stage::Code);
     let no_work_done = commit_gated && commits == 0;
@@ -1998,13 +2022,28 @@ pub fn evaluate_layer3(
 /// stage, not only Code (D-05 gap 1 / D-06). With no declarations (or when
 /// disabled), behavior is byte-for-byte the pre-Phase-16 cascade.
 ///
-/// Two roots are intentionally kept distinct (review Plan 03 MEDIUM,
-/// OpenCode): `project_root` is used to DISCOVER the PLAN's declared
-/// commands (`.planning/phases/` lives there, not in a worktree checkout),
-/// while `execution_root` — the worktree, when one is set — is where probes
-/// actually RUN. Conflating the two previously meant a worktree-based phase
-/// could not find its own declaration and silently mis-hit the
-/// "PLAN removed" veto below.
+/// Both DISCOVERY and probe EXECUTION read `execution_root` — the worktree
+/// when one is set, `project_root` otherwise (999.76, ROADMAP criterion 6).
+///
+/// This knowingly OVERTURNS a recorded prior peer-review decision
+/// (review Plan 03 MEDIUM, OpenCode). That decision held the two roots must
+/// stay distinct, discovery reading `project_root` because
+/// `.planning/phases/` "lives there, not in a worktree checkout". **The
+/// premise has the direction backwards.** `.planning/` is TRACKED content,
+/// so an in-flight phase's `{N}-PLAN.md` is committed on `feature/phase-{N}`
+/// and therefore exists INSIDE the worktree while absent from the main checkout for
+/// the phase's whole duration. Discovering from `project_root` meant a
+/// correctly-declared probe set silently never ran in worktree mode —
+/// DevFlow's default operating shape — with no error and no log, and the
+/// "PLAN removed" veto below fired in its place. Recorded as an overturn
+/// rather than patched quietly, so a later reader can see the direction was
+/// reconsidered on evidence rather than overlooked.
+///
+/// Three sibling reads deliberately KEEP `project_root` and must not be
+/// "corrected" to match: [`phase_commit_count`] (git worktrees share refs and
+/// the object database, so counting from the main checkout is right), and
+/// [`checkpoint_reported_in_capture`] and [`evaluate_layer1`] (both read the
+/// stdout capture under `.devflow/`, which lives in the project root).
 fn evaluate_layer0(
     project_root: &Path,
     state: &State,
@@ -2015,7 +2054,7 @@ fn evaluate_layer0(
     }
 
     let execution_root = state.worktree_path.as_deref().unwrap_or(project_root);
-    let commands = crate::verify::external_verify_commands(project_root, state.phase);
+    let commands = crate::verify::external_verify_commands(execution_root, state.phase);
     if commands.is_empty() {
         return approved_commands.map(|_| AgentResult {
             status: AgentStatus::Failed,
@@ -2116,6 +2155,39 @@ fn evaluate_layer0(
 /// Layer-1-class fact), never `Some(0)`. It returns unchanged, which is right —
 /// this function exists only to graft Layer 1's `verdict` onto an affirmative
 /// Layer 0 probe success, and a timeout is neither.
+///
+/// # This function is 999.74's real defect site (D-15, ROADMAP criterion 4)
+///
+/// Until 34-01 the graft read Layer 1's `verdict` and nothing else. A marker of
+/// `{"status":"failed","verdict":"pass"}` therefore produced `(Success,
+/// Some(Pass), Some(0))`: an agent's self-reported FAILURE laundered into an
+/// affirmative pair, which `outcome_policy::decide_action` advances and
+/// `classify_validate_outcome` reads as `Passed` — Ship, in `Mode::Auto`, on a
+/// run whose agent said it had failed. The status was never inspected, so
+/// nothing downstream could see the contradiction; by the time the classifier
+/// ran, the status genuinely WAS `Success`.
+///
+/// The fix consults Layer 1's own `AgentStatus` before transplanting its
+/// verdict, because **a verdict attached to a self-reported failure is not a
+/// pass**. Only `AgentStatus::Success` from Layer 1 may contribute a verdict;
+/// everything else leaves `verdict: None` and the stage classifies `Ambiguous`,
+/// which gates.
+///
+/// The classifier fix (plan 34-03, ROADMAP criterion 3) does **not** close this
+/// and never could: gating `classify_validate_outcome`'s `Passed` arm on the
+/// derived status passes cleanly here, because the derived status is `Success`.
+/// Criterion 3 and criterion 4 are separate deliverables. Regression-pinned by
+/// `layer0_verdict_graft_declines_when_layer1_status_is_not_success`, with
+/// `layer0_verdict_graft_still_transplants_a_passing_layer1_verdict` as its
+/// mandatory opposite-result control.
+///
+/// `evaluate_layer1` is called on `project_root`, NOT on the execution root,
+/// and that asymmetry is deliberate rather than an oversight: Layer 1 reads the
+/// stdout capture under `.devflow/`, which lives in the project root, while
+/// Layer 0 above DISCOVERS declarations in `.planning/phases/` (project root)
+/// and RUNS probes in the worktree. Plan 34-04 moves Layer 0's *discovery* to
+/// the execution root; this call stays on `project_root` and is still correct
+/// afterwards. Recorded here so a later reader does not "fix" the asymmetry.
 fn reconcile_layer0_verdict(
     project_root: &Path,
     state: &State,
@@ -2127,7 +2199,9 @@ fn reconcile_layer0_verdict(
     {
         return result;
     }
-    let verdict = evaluate_layer1(project_root, state.phase).and_then(|layer1| layer1.verdict);
+    let verdict = evaluate_layer1(project_root, state.phase)
+        .filter(|layer1| layer1.status == AgentStatus::Success)
+        .and_then(|layer1| layer1.verdict);
     AgentResult { verdict, ..result }
 }
 
@@ -2174,15 +2248,31 @@ fn reconcile_layer0_verdict(
 ///
 /// `classify_validate_outcome` (`devflow-cli/src/pipeline_outcomes.rs`) matches
 /// `(_, Some(Verdict::Pass)) => ValidateOutcome::Passed` FIRST, with `_`
-/// discarding the status entirely. A downgraded result that kept
-/// `verdict: Pass` would carry `status: Failed` and still classify Validate as
-/// **Passed** — making this whole function a no-op at the one stage where it
-/// matters most. [`idle_timeout_result`] dodges the same trap the same way, and
-/// says so. A downgraded result has no verdict to offer and must not invent
-/// one. The underlying defect (an agent's self-reported verdict outranking the
-/// status the cascade derived) is filed as **999.74 / DEN-95** and deliberately
-/// not fixed here: changing that match arm silently re-routes `Failed`,
-/// `Unknown` and `ResourceKilled`, whose behaviour nothing has audited.
+/// discarding the status entirely. A downgraded result has no verdict to offer
+/// and must not invent one. [`idle_timeout_result`] dodges the same trap the
+/// same way, and says so. That instruction is unchanged and still binding.
+///
+/// **Correction (34-01, D-15).** An earlier version of this note went further
+/// and claimed a kept `verdict: Pass` on a `status: Failed` "would still
+/// classify Validate as **Passed**", making this function a no-op at Validate.
+/// That overstated the reachability. `outcome_policy::decide_action` intercepts
+/// every non-`Success` status and routes it to a gate BEFORE
+/// `classify_validate_outcome` is ever reached, so THIS path is protected and
+/// this function is not a no-op. The `verdict: None` above is defence in depth,
+/// which is why it stays.
+///
+/// The route into the inversion that IS reachable is
+/// [`reconcile_layer0_verdict`]'s graft — it produced `status: Success` with a
+/// self-reported failure's verdict attached, so `decide_action` had nothing to
+/// intercept. See that function's own doc comment for the full record. It is
+/// closed in plan 34-01; the classifier's own structural fix (gating the
+/// `Passed` arm on the derived status) lands in plan 34-03.
+///
+/// **999.74 / DEN-95** is therefore being CLOSED in Phase 34 rather than
+/// deliberately deferred. The caution that motivated the earlier deferral still
+/// applies to the classifier half and is discharged there, not here: changing
+/// that match arm re-routes `Failed`, `Unknown` and `ResourceKilled`, so 34-03
+/// audits all of them explicitly.
 ///
 /// # Exit-code fidelity
 ///
@@ -2522,8 +2612,8 @@ fn archive_phase_files_with_stamp(
     Ok(Some(stamp.to_string()))
 }
 
-fn phase_review_path(project_root: &Path, phase: u32) -> Option<PathBuf> {
-    let phases = std::fs::read_dir(project_root.join(".planning/phases")).ok()?;
+fn phase_review_path(evidence_root: &Path, phase: u32) -> Option<PathBuf> {
+    let phases = std::fs::read_dir(evidence_root.join(".planning/phases")).ok()?;
     let prefix = format!("{phase:02}-");
     for entry in phases.flatten() {
         if entry
@@ -2538,6 +2628,47 @@ fn phase_review_path(project_root: &Path, phase: u32) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Whether `/gsd-verify-work` has produced a `{phase:02}-VERIFICATION.md`
+/// artifact for `phase` yet.
+///
+/// Per D-01 (33-CONTEXT.md), this is the sole mid-arc-vs-genuine-gaps signal
+/// a Validate→Code loop-back consults: a phase with no verification artifact
+/// is still mid-arc (its remaining plans have not been judged at all), so a
+/// loop-back must re-run the phase in full rather than dispatch `--gaps-only`,
+/// which matches zero plans and gates unresolvably. Mirrors
+/// [`phase_review_path`]'s directory-prefix-scan idiom exactly, but returns a
+/// `bool` — no caller needs the artifact's path, only whether it exists. A
+/// missing `.planning/phases` directory returns `false` rather than panicking.
+///
+/// `evidence_root` is the root the Validate agent actually wrote to — the
+/// phase's worktree when `state.worktree_path` is set, else the project root.
+/// `.planning/` is tracked, so in worktree mode the artifact lands on
+/// `feature/phase-N` and is invisible from the main checkout for the phase's
+/// entire in-flight duration. Passing the project root in worktree mode is
+/// exactly the defect this parameter name exists to prevent (33-CONTEXT.md
+/// CR-01); it is NOT interchangeable with the root used for git reads such as
+/// [`phase_commit_count`], whose refs and object database are shared across
+/// worktrees and which therefore correctly takes the project root.
+pub fn phase_verification_exists(evidence_root: &Path, phase: u32) -> bool {
+    let Ok(phases) = std::fs::read_dir(evidence_root.join(".planning/phases")) else {
+        return false;
+    };
+    let prefix = format!("{phase:02}-");
+    for entry in phases.flatten() {
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(&prefix))
+        {
+            let verification = entry.path().join(format!("{phase:02}-VERIFICATION.md"));
+            if verification.exists() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Keep only the newest `retain` capture generations under `history_dir`,
@@ -5194,17 +5325,27 @@ mod tests {
     }
 
     /// D-05 gap 1 / D-06 (17-03): Layer 0 now evaluates on every stage, not
-    /// only Code. Also covers the review-flagged worktree bug (Plan 03
-    /// MEDIUM, OpenCode): PLAN discovery must read `project_root` (where
-    /// `.planning/phases/` actually lives), while probe execution still
-    /// reads `execution_root` (the worktree) — using the worktree for
-    /// discovery would find zero commands and mis-fire the "PLAN removed"
-    /// veto.
+    /// only Code.
+    ///
+    /// This is the MAIN-CHECKOUT MIRROR of
+    /// `external_probe_discovers_from_the_worktree_when_the_main_checkout_lacks_the_plan`,
+    /// and the two must be read together: with no worktree set, discovery and
+    /// probe execution resolve to the SAME root, so 999.76's relocation of
+    /// discovery to `execution_root` provably leaves this path untouched.
+    /// Without this mirror the worktree fixture alone could not distinguish
+    /// "discovery reads the execution root" from "discovery reads any root
+    /// that happens to hold the PLAN".
+    ///
+    /// It previously set `state.worktree_path` and asserted the opposite
+    /// direction — that discovery must read `project_root` while probes run in
+    /// the worktree (review Plan 03 MEDIUM, OpenCode). 999.76 overturned that
+    /// premise (see [`evaluate_layer0`]'s doc comment), so the fixture was
+    /// converted rather than deleted: every assertion below is the original
+    /// one, including the `"external verification failed"` reason text and the
+    /// final `Success` assertion. Only the two roots' coincidence changed.
     #[test]
-    fn external_probe_discovers_from_project_root_across_every_stage_and_executes_in_worktree() {
+    fn external_probe_discovers_from_project_root_across_every_stage_without_a_worktree() {
         let dir = tempfile::tempdir().unwrap();
-        let worktree = dir.path().join("phase-worktree");
-        std::fs::create_dir_all(&worktree).unwrap();
         let phase_dir = dir.path().join(".planning/phases/16-reliability");
         std::fs::create_dir_all(&phase_dir).unwrap();
         std::fs::write(
@@ -5219,15 +5360,16 @@ mod tests {
         )
         .unwrap();
         let mut state = state_in(dir.path(), 16);
-        state.worktree_path = Some(worktree.clone());
+        // No worktree: `execution_root` falls back to `project_root`, so
+        // discovery and probe execution read the same directory.
+        state.worktree_path = None;
         state.stage = Stage::Plan;
 
         let approval = vec!["test -f implemented".to_string()];
 
-        // Layer 0 now fires on Plan too — the probe file does not yet exist
-        // in the worktree, so this must fail on the probe itself (NOT a
-        // false PLAN-removed veto, which would mean discovery silently
-        // returned zero commands).
+        // Layer 0 now fires on Plan too — the probe file does not yet exist,
+        // so this must fail on the probe itself (NOT a false PLAN-removed
+        // veto, which would mean discovery silently returned zero commands).
         let plan_result = evaluate_agent_result_inner(
             dir.path(),
             &state,
@@ -5255,8 +5397,80 @@ mod tests {
         .unwrap();
         assert_eq!(code_result.status, AgentStatus::Failed);
 
-        // The probe still executes against execution_root (the worktree) —
-        // only PLAN discovery moved to project_root.
+        // The probe executes against execution_root, which without a worktree
+        // IS project_root — the coincidence this mirror exists to pin.
+        std::fs::write(dir.path().join("implemented"), "done").unwrap();
+        let passing = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approval),
+        )
+        .unwrap();
+        assert_eq!(passing.status, AgentStatus::Success);
+        assert_eq!(passing.decided_by_layer, Some(0));
+    }
+
+    /// 999.76 (ROADMAP criterion 6): the INVERSE of the fixture above. The
+    /// PLAN lives only under the worktree and `project_root`'s own
+    /// `.planning/phases/` is absent entirely — which is what an in-flight
+    /// phase actually looks like. `.planning/` is tracked content, so a phase's
+    /// `{N}-PLAN.md` sits on `feature/phase-{N}` INSIDE the worktree and is
+    /// absent from the main checkout for the phase's whole duration.
+    ///
+    /// The live provenance measurement for that layout claim is **NC-7**,
+    /// recorded in this phase's `34-04-SUMMARY.md`: `git ls-tree -r develop`
+    /// vs `git ls-tree -r HEAD` over `.planning/phases`, reported with both
+    /// refs' counts. NC-7 is evidence that the layout manufactured here is the
+    /// real one — it says nothing about whether this code is correct. That
+    /// claim is carried by this fixture and by its main-checkout mirror
+    /// `external_probe_discovers_from_project_root_across_every_stage_without_a_worktree`,
+    /// which must be read together with it.
+    #[test]
+    fn external_probe_discovers_from_the_worktree_when_the_main_checkout_lacks_the_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join("phase-worktree");
+        // The PLAN exists ONLY under the worktree — `dir.path()`'s own
+        // `.planning/phases/` is deliberately never created.
+        let phase_dir = worktree.join(".planning/phases/16-reliability");
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        std::fs::write(
+            phase_dir.join("16-01-PLAN.md"),
+            "---\nexternal_verify: \"test -f implemented\"\n---\n",
+        )
+        .unwrap();
+        // Captures live in the project root, not the worktree.
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        std::fs::write(
+            stdout_path(dir.path(), 16),
+            "DEVFLOW_RESULT: {\"status\":\"success\"}\n",
+        )
+        .unwrap();
+        let mut state = state_in(dir.path(), 16);
+        state.worktree_path = Some(worktree.clone());
+
+        let approval = vec!["test -f implemented".to_string()];
+
+        // The probe file does not exist yet, so this must fail ON THE PROBE.
+        let failing = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approval),
+        )
+        .unwrap();
+        assert_eq!(failing.status, AgentStatus::Failed);
+        assert!(
+            failing
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("external verification failed")),
+            "expected a failing-probe reason; a PLAN-removed reason means discovery \
+             silently returned zero commands — i.e. discovery still reads project_root \
+             and 999.76's fix did not land: {:?}",
+            failing.reason
+        );
+
         std::fs::write(worktree.join("implemented"), "done").unwrap();
         let passing = evaluate_agent_result_inner(
             dir.path(),
@@ -5420,6 +5634,14 @@ mod tests {
     /// consult Layer 1's verdict rather than discard it — the two-signal
     /// reconciliation `reconcile_layer0_verdict` adds. Covers all three
     /// verdict states Layer 1 can produce: pass, gaps, and no marker at all.
+    ///
+    /// D-15 (34-01) adds a FOURTH case: the self-contradictory marker
+    /// `{"status":"failed","verdict":"pass"}`. "Consult Layer 1's verdict" was
+    /// implemented as "read Layer 1's verdict and nothing else", so an agent
+    /// that reported its own failure while claiming a passing verdict had that
+    /// verdict grafted onto Layer 0's `Success` — 999.74's real route. The
+    /// fourth case pins `verdict: None` for it; before the fix it observed
+    /// `Some(Pass)`.
     #[test]
     fn layer0_affirmative_success_consults_layer1_verdict_at_validate() {
         let dir = tempfile::tempdir().unwrap();
@@ -5475,6 +5697,244 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.verdict, None);
+
+        // D-15: the self-contradictory marker. Layer 1 reports its own run
+        // FAILED and simultaneously claims a passing verdict. Pre-fix the graft
+        // read only `.verdict` and produced `Some(Pass)`, i.e. an affirmative
+        // pair `decide_action` advances and `classify_validate_outcome` reads
+        // as Passed — Ship, unattended, on a run whose agent reported failure.
+        std::fs::write(
+            stdout_path(dir.path(), 16),
+            "DEVFLOW_RESULT: {\"status\":\"failed\",\"verdict\":\"pass\"}\n",
+        )
+        .unwrap();
+        let result = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approval),
+        )
+        .unwrap();
+        assert_eq!(
+            result.verdict, None,
+            "a verdict attached to a self-reported failure must not be grafted (D-15)"
+        );
+        // The fix touches `.verdict` only — Layer 0 still decided the status.
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(result.decided_by_layer, Some(0));
+    }
+
+    /// D-15 / ROADMAP criterion 4: `reconcile_layer0_verdict` must consult
+    /// Layer 1's own `AgentStatus` before transplanting its `verdict`.
+    ///
+    /// A regression here costs an unattended Ship on a run whose agent reported
+    /// failure: the graft would rebuild `(Success, Some(Pass), Some(0))` from a
+    /// self-contradictory marker, `decide_action` would advance it, and
+    /// `classify_validate_outcome` would classify Validate as `Passed`.
+    ///
+    /// Also carries NC-5's two discrimination cases, which share this fixture.
+    /// The exploit needs BOTH marker fields; removing either must not reach an
+    /// affirmative pair. The mandatory opposite-result control lives in
+    /// `layer0_verdict_graft_still_transplants_a_passing_layer1_verdict` — if
+    /// that test also produced `None` the fix would be indiscriminate and this
+    /// one would prove nothing.
+    #[test]
+    fn layer0_verdict_graft_declines_when_layer1_status_is_not_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase_dir = dir.path().join(".planning/phases/16-reliability");
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        std::fs::write(
+            phase_dir.join("16-01-PLAN.md"),
+            "---\nexternal_verify: \"test -f shipped\"\n---\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("shipped"), "done").unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        let mut state = state_in(dir.path(), 16);
+        state.stage = Stage::Validate;
+        let approval = vec!["test -f shipped".to_string()];
+
+        // The exploit itself: both fields present and mutually contradictory.
+        std::fs::write(
+            stdout_path(dir.path(), 16),
+            "DEVFLOW_RESULT: {\"status\":\"failed\",\"verdict\":\"pass\"}\n",
+        )
+        .unwrap();
+        let result = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approval),
+        )
+        .unwrap();
+        assert_eq!(
+            result.verdict, None,
+            "self-contradictory marker: the verdict must be declined (D-15)"
+        );
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(result.decided_by_layer, Some(0));
+
+        // NC-5a: removes the `verdict` FIELD, keeps the failed status. `None`
+        // both pre- and post-fix, so this case cannot discriminate the fix —
+        // that is the point. The failed status alone is not the exploit.
+        std::fs::write(
+            stdout_path(dir.path(), 16),
+            "DEVFLOW_RESULT: {\"status\":\"failed\"}\n",
+        )
+        .unwrap();
+        let result = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approval),
+        )
+        .unwrap();
+        assert_eq!(
+            result.verdict, None,
+            "NC-5a removes the `verdict` field: there is no verdict to graft, \
+             so the result must be None whether or not the fix is present"
+        );
+
+        // NC-5b: removes `verdict: pass` SPECIFICALLY by downgrading it to
+        // `gaps`, keeping both fields present. Pre-fix this grafted
+        // `Some(Gaps)`; post-fix it declines like any other non-Success
+        // Layer 1. Neither state is an affirmative pair — the exploit needs
+        // `pass`, not merely any verdict.
+        std::fs::write(
+            stdout_path(dir.path(), 16),
+            "DEVFLOW_RESULT: {\"status\":\"failed\",\"verdict\":\"gaps\"}\n",
+        )
+        .unwrap();
+        let result = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approval),
+        )
+        .unwrap();
+        assert_ne!(
+            result.verdict,
+            Some(Verdict::Pass),
+            "NC-5b removes `verdict: pass` by downgrading it to `gaps`: this \
+             case must never reach an affirmative pair"
+        );
+        assert_eq!(result.verdict, None);
+    }
+
+    /// NC-5's positive half: the fix declines ONLY when Layer 1's own status is
+    /// not `Success`, never indiscriminately.
+    ///
+    /// This is the case that must produce the OPPOSITE result from
+    /// `layer0_verdict_graft_declines_when_layer1_status_is_not_success`. If
+    /// both produced `None` the fix would have disabled 18e's legitimate
+    /// reconciliation wholesale — re-introducing the 17-03 regression that
+    /// `reconcile_layer0_verdict` exists to fix — and the pair would prove
+    /// nothing about D-15, because a measurement whose two arms agree is
+    /// broken rather than informative.
+    #[test]
+    fn layer0_verdict_graft_still_transplants_a_passing_layer1_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase_dir = dir.path().join(".planning/phases/16-reliability");
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        std::fs::write(
+            phase_dir.join("16-01-PLAN.md"),
+            "---\nexternal_verify: \"test -f shipped\"\n---\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("shipped"), "done").unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        let mut state = state_in(dir.path(), 16);
+        state.stage = Stage::Validate;
+        let approval = vec!["test -f shipped".to_string()];
+
+        std::fs::write(
+            stdout_path(dir.path(), 16),
+            "DEVFLOW_RESULT: {\"status\":\"success\",\"verdict\":\"pass\"}\n",
+        )
+        .unwrap();
+        let result = evaluate_agent_result_inner(
+            dir.path(),
+            &state,
+            &GitFlowConfig::default(),
+            Some(&approval),
+        )
+        .unwrap();
+        assert_eq!(
+            result.verdict,
+            Some(Verdict::Pass),
+            "a passing verdict from a Layer 1 that reported its OWN success \
+             must still be transplanted (18e); a None here would mean the \
+             D-15 fix is indiscriminate"
+        );
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(result.decided_by_layer, Some(0));
+    }
+
+    /// NC-6: with Layer 0 disabled, the same self-contradictory marker never
+    /// gets laundered at all — Layer 1 reports `Failed` verbatim and
+    /// `decide_action` routes it to `GateReview`.
+    ///
+    /// What the control proves: the GRAFT is the mechanism, not the classifier
+    /// and not `decide_action`. Removing Layer 0 removes the laundering
+    /// entirely, so the exploit's precondition is an affirmative Layer-0 probe
+    /// success — which is exactly why plan 34-04 (999.76), by making
+    /// `decided_by_layer == Some(0)` common in worktree mode, must not land
+    /// without the fix this test pins.
+    ///
+    /// The routing consequence is asserted here rather than assumed, so a
+    /// future change to `decide_action`'s `Failed` arm breaks this test rather
+    /// than silently invalidating the control.
+    #[test]
+    fn layer0_disabled_routes_a_self_reported_failure_to_gate_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let phase_dir = dir.path().join(".planning/phases/16-reliability");
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        // The difference from the fixtures above: Layer 0 is switched off, so
+        // the cascade falls through to Layer 1 instead of short-circuiting on
+        // an affirmative probe success.
+        std::fs::write(
+            dir.path().join("devflow.toml"),
+            "external_verify_enabled = false\n",
+        )
+        .unwrap();
+        // Belt AND braces, deliberately. `config::external_verify_enabled`
+        // consults `DEVFLOW_EXTERNAL_VERIFY_ENABLED` BEFORE `devflow.toml`, and
+        // `config::tests::env_overrides_file_external_verification` sets that
+        // variable to "true" process-globally under a mutex private to its own
+        // module — which cannot serialize against this one. A PLAN declaring
+        // `external_verify` would therefore let a parallel run of that test
+        // re-enable Layer 0 here and flake this control into a green.
+        // Declaring no probe closes that window: with no declared commands and
+        // no approval vector, `evaluate_layer0` abstains whatever the env says,
+        // so this test is deterministic under every value of the variable.
+        std::fs::write(phase_dir.join("16-01-PLAN.md"), "---\nplan: 01\n---\n").unwrap();
+        std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
+        let mut state = state_in(dir.path(), 16);
+        state.stage = Stage::Validate;
+
+        std::fs::write(
+            stdout_path(dir.path(), 16),
+            "DEVFLOW_RESULT: {\"status\":\"failed\",\"verdict\":\"pass\"}\n",
+        )
+        .unwrap();
+        // No approval vector — Layer 0 is disabled, so there is nothing to
+        // approve, and supplying one would re-arm the very arm being removed.
+        let result =
+            evaluate_agent_result_inner(dir.path(), &state, &GitFlowConfig::default(), None)
+                .unwrap();
+
+        assert_eq!(
+            result.status,
+            AgentStatus::Failed,
+            "with Layer 0 disabled, Layer 1's self-reported failure stands \
+             verbatim — there is no affirmative probe success to graft onto"
+        );
+        assert_eq!(result.decided_by_layer, Some(1));
+        assert_eq!(
+            crate::outcome_policy::decide_action(Stage::Validate, result.status),
+            crate::outcome_policy::Action::GateReview,
+            "a self-reported failure must gate for review, never advance"
+        );
     }
 
     /// 18e's reconciliation is scoped to `Stage::Validate` only (flagged
@@ -5765,6 +6225,106 @@ mod tests {
         assert_eq!(exit_count, 3, "expected at most 3 retained generations");
     }
 
+    /// The set of stamp groups currently surviving in a history directory,
+    /// derived the same way `prune_history` derives them (`rsplit_once('-')`,
+    /// keep the left part) so the assertion measures grouping rather than a
+    /// listing length.
+    fn surviving_stamps(history: &Path) -> std::collections::BTreeSet<String> {
+        std::fs::read_dir(history)
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_str()?.to_string();
+                name.rsplit_once('-')
+                    .map(|(stamp, _suffix)| stamp.to_string())
+            })
+            .collect()
+    }
+
+    /// ROADMAP criterion 7's retention half. `DEFAULT_CAPTURE_RETENTION` was
+    /// `5`, and `archive_phase_files` runs once per launch: a clean five-stage
+    /// Define→Plan→Code→Validate→Ship run produces 4 archive events and each
+    /// Validate→Code loop-back adds 2. At `5`, the first loop-back's sixth
+    /// event evicted Define's capture — silently, with no error and no log.
+    ///
+    /// What a regression here costs: a stage capture destroyed before the
+    /// phase that requested it has read it, which is unrecoverable after the
+    /// fact because `.devflow/` is the only copy until it is deliberately
+    /// copied out.
+    #[test]
+    fn prune_history_retains_a_full_five_stage_run_with_loop_backs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let history = history_dir(root, 1);
+        std::fs::create_dir_all(&history).unwrap();
+
+        let retain = crate::config::DEFAULT_CAPTURE_RETENTION;
+
+        // Twelve generations, strictly increasing. The suffix is load-bearing:
+        // `prune_history` derives a stamp with `rsplit_once('-')` and keeps the
+        // LEFT part, so a bare `{nanos}-{seq}` name would yield the stamp
+        // `{nanos}` and then delete `{nanos}-stdout`, which never exists — the
+        // retain half would false-pass via the `stamps.len() <= retain` early
+        // return while the evict half could never pass at all.
+        let stamps: Vec<String> = (0..12)
+            .map(|i| format!("{}-0", 1_700_000_000_000_000_000u128 + i))
+            .collect();
+        for stamp in &stamps {
+            std::fs::write(history.join(format!("{stamp}-stdout")), "capture").unwrap();
+        }
+        // The oldest generation gets a second suffix so eviction-by-stamp-group
+        // is actually exercised rather than assumed: one evicted stamp must
+        // take BOTH its files.
+        std::fs::write(history.join(format!("{}-exit", stamps[0])), "0").unwrap();
+
+        prune_history(&history, retain);
+
+        let survivors = surviving_stamps(&history);
+        assert_eq!(
+            survivors.len(),
+            12,
+            "a five-stage run with loop-backs must not lose a capture at the default \
+             retention; found {survivors:?}"
+        );
+        for stamp in &stamps {
+            assert!(
+                survivors.contains(stamp),
+                "generation {stamp} was evicted at exactly the retention boundary"
+            );
+        }
+
+        // Opposite-result control. Without this half the test would be
+        // measuring a directory listing, not pruning: `prune_history` returns
+        // early whenever `stamps.len() <= retain`, so a fixture that never
+        // crosses the boundary passes identically against a `prune_history`
+        // that does nothing at all.
+        let thirteenth = format!("{}-0", 1_700_000_000_000_000_000u128 + 12);
+        std::fs::write(history.join(format!("{thirteenth}-stdout")), "capture").unwrap();
+
+        prune_history(&history, retain);
+
+        let after = surviving_stamps(&history);
+        assert_eq!(
+            after.len(),
+            12,
+            "crossing the boundary by one must evict exactly one stamp group, not zero \
+             and not several; found {after:?}"
+        );
+        assert!(
+            !after.contains(&stamps[0]),
+            "the evicted generation must be the OLDEST by stamp order"
+        );
+        assert!(
+            !history.join(format!("{}-exit", stamps[0])).exists(),
+            "eviction operates on the stamp GROUP: the oldest generation's -exit file must \
+             go with its -stdout, or pruning is leaking partial generations"
+        );
+        assert!(
+            after.contains(&thirteenth),
+            "the newest generation must survive its own arrival"
+        );
+    }
+
     #[test]
     fn evaluate_agent_result_reads_files_end_to_end() {
         let dir = tempfile::tempdir().unwrap();
@@ -5795,10 +6355,17 @@ mod tests {
     // returning before Layer 2 is ever consulted — and only the cascade
     // exercises it.
 
-    /// A success marker that also claims `verdict: pass` — the shape that made
-    /// the naive "carry every other field over" downgrade a no-op at Validate
-    /// (`classify_validate_outcome` matches `Some(Verdict::Pass)` FIRST, with
-    /// `_` discarding the status). Used to prove `verdict` is dropped.
+    /// A success marker that also claims `verdict: pass` — the shape a naive
+    /// "carry every other field over" downgrade would have preserved. Used to
+    /// prove `verdict` is dropped.
+    ///
+    /// Correction (34-01, D-15): an earlier version of this comment asserted
+    /// that keeping the field would classify Validate as Passed because
+    /// `classify_validate_outcome` matches `Some(Verdict::Pass)` first with the
+    /// status discarded. That overstated the reachability — `decide_action`
+    /// intercepts a non-`Success` status before the classifier runs. The
+    /// corrected record of how the inversion is actually reached lives on
+    /// [`super::reconcile_layer0_verdict`].
     const MARKER_SUCCESS_CLAIMING_PASS: &str =
         r#"Done.\nDEVFLOW_RESULT: {\"status\":\"success\",\"verdict\":\"pass\"}"#;
 
@@ -6055,6 +6622,28 @@ mod tests {
 
         assert_eq!(result.status, AgentStatus::Failed);
         assert_eq!(result.reason.as_deref(), Some("bad output"));
+    }
+
+    /// The case `consecutive_failures_reaches_ceiling_across_cycles`
+    /// (`pipeline_outcomes.rs`) silently depends on: a repository with no
+    /// `feature/phase-NN` branch at all must report 0, not error or panic.
+    #[test]
+    fn phase_commit_count_reports_zero_without_a_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init"]);
+        git(dir.path(), &["config", "user.email", "devflow@example.com"]);
+        git(dir.path(), &["config", "user.name", "DevFlow Tests"]);
+        git(dir.path(), &["config", "commit.gpgsign", "false"]);
+        git(dir.path(), &["config", "tag.gpgsign", "false"]);
+        git(dir.path(), &["config", "core.hooksPath", "/dev/null"]);
+        git(dir.path(), &["checkout", "-b", "develop"]);
+        std::fs::write(dir.path().join("README.md"), "base\n").unwrap();
+        git(dir.path(), &["add", "README.md"]);
+        git(dir.path(), &["commit", "-m", "base"]);
+
+        let count = phase_commit_count(dir.path(), &GitFlowConfig::default(), 999);
+
+        assert_eq!(count, 0, "no feature/phase-99 branch exists in this repo");
     }
 
     #[test]
@@ -6493,6 +7082,36 @@ mod tests {
              foreign repository) must still resolve project_root's own \
              branch and commits; child exit status {:?}\nstdout:\n{stdout}",
             out.status
+        );
+    }
+
+    /// D-01 (33-CONTEXT.md): `phase_verification_exists` is the sole signal
+    /// a Validate→Code loop-back consults to tell a mid-arc phase apart from
+    /// a genuinely gap-flagged one. Covers all three states: no
+    /// `.planning/phases` directory at all, a phase directory with no
+    /// verification artifact, and a phase directory that has one — mirroring
+    /// `phase_review_path`'s directory-prefix-scan idiom.
+    #[test]
+    fn phase_verification_exists_finds_the_artifact_by_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        assert!(
+            !phase_verification_exists(root, 82),
+            "no .planning/phases directory at all must return false, not panic"
+        );
+
+        let phase_dir = root.join(".planning/phases/82-loop-back-fix");
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        assert!(
+            !phase_verification_exists(root, 82),
+            "a phase directory with no {{N}}-VERIFICATION.md must return false"
+        );
+
+        std::fs::write(phase_dir.join("82-VERIFICATION.md"), "verified\n").unwrap();
+        assert!(
+            phase_verification_exists(root, 82),
+            "a phase directory holding {{N}}-VERIFICATION.md must return true"
         );
     }
 }

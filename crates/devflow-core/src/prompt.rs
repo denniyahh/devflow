@@ -32,12 +32,32 @@ DevFlow reads this line to decide whether the stage succeeded. \
 Output nothing after it.";
 
 /// A fix variant used when looping Code ↔ Validate.
+///
+/// `#[non_exhaustive]`: operator decision, 2026-08-04. This enum is public in
+/// the published `devflow-core` crate, so adding a variant is already a
+/// breaking change for any external crate matching on it exhaustively — this
+/// release (`FullExecute`, added for D-01) already pays that cost. Paying for
+/// `#[non_exhaustive]` at the same time makes every later variant addition
+/// additive instead of breaking again, the same reasoning `State` records for
+/// its own `#[non_exhaustive]` (`state.rs:30-31`). Verified empirically before
+/// applying: the only `match` over a `FixType` value anywhere in the
+/// workspace is `fix_prompt` below, which lives in this crate and is
+/// therefore unaffected by the attribute — no wildcard arm is needed, here or
+/// anywhere else in the workspace, and none should be added to `fix_prompt`
+/// itself (see its doc comment).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FixType {
     /// Run the GSD audit-fix pipeline over review findings.
     AuditFix,
     /// Re-run execution targeting only the gaps left by validation.
     GapsOnly,
+    /// Re-run the phase's remaining plans with the plain, unflagged
+    /// `/gsd-execute-phase {N}` command, because the phase is mid-arc rather
+    /// than defective — D-01 (33-CONTEXT.md): a phase with no
+    /// `{N}-VERIFICATION.md` yet has not been judged, so `--gaps-only` would
+    /// match zero plans and gate unresolvably.
+    FullExecute,
 }
 
 /// Substitute the `{N}` phase placeholder in a GSD command string.
@@ -279,6 +299,7 @@ pub fn fix_prompt(fix_type: FixType, phase: u32) -> String {
     let command = match fix_type {
         FixType::AuditFix => format!("/gsd-audit-fix {phase}"),
         FixType::GapsOnly => format!("/gsd-execute-phase {phase} --gaps-only"),
+        FixType::FullExecute => format!("/gsd-execute-phase {phase}"),
     };
     format!(
         "Validation reported issues. Run the fix command for this loop:\n\n    {command}\n\n{COMPLETION_PROTOCOL}"
@@ -494,6 +515,15 @@ mod tests {
         assert!(fix_prompt(FixType::AuditFix, 11).contains("/gsd-audit-fix 11"));
         assert!(fix_prompt(FixType::GapsOnly, 11).contains("--gaps-only"));
         assert!(fix_prompt(FixType::AuditFix, 11).contains("DEVFLOW_RESULT"));
+
+        // D-01: FullExecute renders the plain, unflagged execute command.
+        let full_execute_prompt = fix_prompt(FixType::FullExecute, 11);
+        assert!(full_execute_prompt.contains("/gsd-execute-phase 11"));
+        // Negative control: without this, FullExecute's command string would
+        // just be a substring of GapsOnly's — this proves the two are
+        // actually distinguishable, not that FullExecute merely contains
+        // GapsOnly's prefix.
+        assert!(!full_execute_prompt.contains("--gaps-only"));
     }
 
     /// D-03/D-07 (28-03): the audit event quotes this instruction verbatim,

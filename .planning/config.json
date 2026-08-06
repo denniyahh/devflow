@@ -7,7 +7,8 @@
     "subagent_timeout": 300000,
     "_auto_chain_active": false,
     "nyquist_validation": true,
-    "ai_integration_phase": true
+    "ai_integration_phase": true,
+    "tdd_mode": true
   },
   "git": {
     "main": "main",
@@ -38,5 +39,13 @@
     "gsd-doc-classifier": "haiku",
     "gsd-intel-updater": "haiku",
     "gsd-mempalace-curator": "haiku"
+  },
+  "mempalace": {
+    "enabled": true,
+    "capture_artifacts": true,
+    "wing": "devflow",
+    "memory_mode": "augment",
+    "mirror_kg": false,
+    "recall_on_plan": true
   }
 }

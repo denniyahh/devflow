@@ -148,6 +148,7 @@ pub(crate) fn prepare_loop_back_to_code(
         serde_json::json!({
             "from": gate_stage.to_string(),
             "consecutive_failures": state.consecutive_failures,
+            "fix": format!("{fix:?}"),
         }),
     );
     println!(
@@ -983,7 +984,7 @@ mod tests {
     /// both phases finish independently, exactly as before.
     #[test]
     fn concurrent_ship_advances_finish_both_phases_independently() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         let original_gate_timeout = std::env::var_os("DEVFLOW_GATE_TIMEOUT_SECS");
         // SAFETY: serialized under ENV_MUTEX. Bounds a reopened Ship gate's
         // poll to a few seconds instead of the 7-day production default.
@@ -1099,6 +1100,14 @@ mod tests {
     /// old, already-consumed response still on disk and `poll_response`
     /// would resolve from it instantly instead of waiting for a fresh human
     /// decision.
+    ///
+    /// 33-04: the seeded 999.66 forward-progress baseline, the
+    /// neutralized PATH and the two branch-pinning assertions below exist
+    /// because this test once silently left its intended path — 999.66's
+    /// reset-vs-accumulate change reset the directly-seeded streak to 1, so no
+    /// gate fired and the test fell through to a real agent launch while every
+    /// gate-file assertion it owned still passed (`prepare_loop_back_to_code`
+    /// calls the same `Gates::cleanup` that `abort()` does).
     #[test]
     fn abort_cleans_up_gate_files_so_a_later_gate_does_not_reuse_stale_response() {
         let dir = tempfile::tempdir().unwrap();
@@ -1108,6 +1117,14 @@ mod tests {
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         state.consecutive_failures = mode::MAX_CONSECUTIVE_FAILURES - 1;
+        // 999.66 (33-03) made the counter reset-vs-accumulate against a
+        // persisted baseline. This test seeds the streak directly rather than
+        // driving it through repeated `handle_validate_outcome` calls, so it
+        // must also seed the baseline — a `None` baseline reads as
+        // "first-ever failure" and resets the streak to 1, which drops this
+        // test out of the gated path it asserts against and into
+        // `loop_back_to_code` -> `launch_stage` (a real agent spawn).
+        state.last_validate_failure_commit_count = Some(0);
         workflow::save_state(&state).unwrap();
 
         // Pre-write a rejected response whose note says "abort" so
@@ -1120,7 +1137,37 @@ mod tests {
         )
         .unwrap();
 
-        handle_validate_outcome(root, &mut state, ValidateOutcome::Failed).unwrap();
+        {
+            let _guard = env_lock();
+
+            let neutral_path_dir = agent_free_git_only_path_dir();
+            let original_path = std::env::var_os("PATH");
+            // SAFETY: serialized under ENV_MUTEX.
+            unsafe {
+                std::env::set_var("PATH", neutral_path_dir.path());
+            }
+
+            handle_validate_outcome(root, &mut state, ValidateOutcome::Failed).unwrap();
+
+            // SAFETY: still serialized under ENV_MUTEX from above.
+            unsafe {
+                match &original_path {
+                    Some(path) => std::env::set_var("PATH", path),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+        }
+
+        assert!(
+            state.consecutive_failures >= mode::MAX_CONSECUTIVE_FAILURES,
+            "gate threshold must have been reached (got {}) — a reset means the gate never fired",
+            state.consecutive_failures
+        );
+        assert_eq!(
+            state.stage,
+            Stage::Validate,
+            "gate must have fired and aborted — Stage::Code means it silently looped back and tried to launch an agent"
+        );
 
         // The gate, response, and ack files for the stage the gate fired on
         // (Validate) must all be gone after the Abort path runs.
@@ -1171,7 +1218,7 @@ mod tests {
     /// thread while still hiding agent CLIs from this one.
     #[test]
     fn transition_resets_infra_failures() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1230,7 +1277,7 @@ mod tests {
     /// hop under test.
     #[test]
     fn repeated_code_to_validate_transition_is_idempotent_on_the_counter() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1322,7 +1369,7 @@ mod tests {
     /// independent knobs.
     #[test]
     fn ship_override_bounds_foreground_wait_on_terminal_hook_failure() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         let original_foreground_timeout = std::env::var_os("DEVFLOW_FOREGROUND_GATE_TIMEOUT_SECS");
         // SAFETY: serialized under ENV_MUTEX. Bounds ONLY the foreground
         // knob — DEVFLOW_GATE_TIMEOUT_SECS (the background default) is
@@ -1581,7 +1628,7 @@ mod tests {
     /// reset a sibling phase's counter.
     #[test]
     fn consecutive_failures_are_independent_across_phases() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();

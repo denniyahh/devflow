@@ -112,6 +112,44 @@ pub fn transition_resets_consecutive_failures(from: Stage, to: Stage) -> bool {
     !matches!((from, to), (Stage::Code, Stage::Validate))
 }
 
+/// Whether a Validate failure represents forward progress since the last
+/// recorded failure (999.66, D-03) — i.e. whether Code produced new commits
+/// on the phase's feature branch since
+/// [`crate::state::State::last_validate_failure_commit_count`] was last
+/// observed.
+///
+/// `previous` is the baseline recorded at the prior failure;
+/// `current` is the commit count observed at THIS failure.
+///
+/// `None` for `previous` reports progress: it means no prior failure has
+/// been recorded, so there is no streak to continue — the first failure of
+/// a phase, and the first failure observed after resuming state written
+/// before this baseline field existed, must both begin a fresh streak
+/// rather than extend a nonexistent one.
+///
+/// The comparison is strictly greater, not merely not-equal: a count that
+/// went DOWN means the branch was rewound or rebuilt, which is not evidence
+/// that the problem Validate reported was addressed. Treating a decrease as
+/// progress would hand a free counter reset to exactly the situation least
+/// likely to deserve one.
+///
+/// **What this predicate does not establish.** A `true` result means new
+/// commits exist, not that those commits addressed anything. An agent that
+/// commits something trivial on every cycle resets the streak every cycle
+/// and never reaches [`MAX_CONSECUTIVE_FAILURES`]. This is the accepted,
+/// documented weakness of the commit-count signal recorded in
+/// `33-RESEARCH.md`'s D-03 Recommendation and Assumptions Log A1 — the same
+/// weakness `evaluate_layer2`'s own "no work done" gate already carries,
+/// which a single trivial commit also already defeats today. It is a real
+/// narrowing of the guarantee that `MAX_CONSECUTIVE_FAILURES` bounds a
+/// genuinely stuck loop, and it is deliberately NOT strengthened here with a
+/// lines-changed or files-touched threshold — that is a follow-up if the
+/// assumption proves wrong, not a speculative heuristic to add to the
+/// safety gate's path now.
+pub fn consecutive_failures_made_progress(previous: Option<u32>, current: u32) -> bool {
+    previous.is_none_or(|p| current > p)
+}
+
 /// How DevFlow drives the pipeline for a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -259,5 +297,33 @@ mod tests {
             Stage::Validate,
             Stage::Ship
         ));
+    }
+
+    #[test]
+    fn made_progress_treats_no_prior_record_as_progress() {
+        // No prior record with a zero current count: the state of a
+        // brand-new phase whose feature branch does not exist yet. This is
+        // the case that matters most — it must report progress so the very
+        // first failure of a phase never mis-accumulates.
+        assert!(consecutive_failures_made_progress(None, 0));
+        // No prior record with a non-zero current count.
+        assert!(consecutive_failures_made_progress(None, 5));
+    }
+
+    #[test]
+    fn made_progress_requires_a_strictly_higher_count() {
+        // Strictly greater: progress.
+        assert!(consecutive_failures_made_progress(Some(2), 3));
+        // Equal, both non-zero: no progress.
+        assert!(!consecutive_failures_made_progress(Some(2), 2));
+        // Equal, both zero: no progress. This is the case
+        // `consecutive_failures_reaches_ceiling_across_cycles` (devflow-cli)
+        // actually exercises — a repo with no feature branch, counting zero
+        // commits every cycle — and it is the single case
+        // MAX_CONSECUTIVE_FAILURES most depends on remaining reachable.
+        assert!(!consecutive_failures_made_progress(Some(0), 0));
+        // Lower: no progress. A count that went down means the branch was
+        // rewound or rebuilt, not that the reported problem was addressed.
+        assert!(!consecutive_failures_made_progress(Some(3), 2));
     }
 }

@@ -9,7 +9,7 @@ source: .planning/audits/2026-07-24-codex-compatibility-review.md, refined
 > Filed from the Codex compatibility audit (`.planning/audits/2026-07-24-codex-compatibility-review.md`),
 > written after a confirmed dogfood failure: generic `/gsd-*` labels reached
 > Codex as literal shell commands during an attempted Phase 22 light
-> dogfooding trial (see `phases/22-concurrency-governance-correctness/22-CONTEXT.md`).
+> dogfooding trial (see `milestones/v2.0.0-phases/22-concurrency-governance-correctness/22-CONTEXT.md`).
 > The audit's root-cause finding: `Stage::gsd_command()` bakes a raw
 > slash-command string into core (`crates/devflow-core/src/stage.rs`), and
 > `prompt.rs` renders it identically for every adapter — an assumption that
@@ -151,5 +151,5 @@ and whatever comes after:
   evidence, severity-ranked findings, validation matrix.
 - `crates/devflow-core/src/stage.rs`, `prompt.rs`, `agents/mod.rs`,
   `agents/codex.rs`, `agent_result.rs`, `crates/devflow-cli/src/preflight.rs`.
-- `.planning/phases/22-concurrency-governance-correctness/22-CONTEXT.md` —
+- `.planning/milestones/v2.0.0-phases/22-concurrency-governance-correctness/22-CONTEXT.md` —
   the light dogfooding trial whose Codex run surfaced this.

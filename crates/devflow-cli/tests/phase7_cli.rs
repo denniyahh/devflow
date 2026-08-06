@@ -80,14 +80,51 @@ fn path_with_fake_bin(fake_bin: &Path) -> String {
 }
 
 fn run_devflow(root: &Path, fake_bin: &Path, args: &[&str]) -> Output {
-    let output = Command::new(devflow_bin())
+    run_devflow_inner(root, fake_bin, args, false)
+}
+
+/// [`run_devflow`] with D-11's legacy-launch opt-out forced on for the spawned
+/// process.
+///
+/// **This is the integration-suite counterpart of 34-06's in-process
+/// `state.legacy_claude_launch = true`, and it exists for the same reason: to
+/// state a test's launch-path premise explicitly instead of inheriting it from
+/// `STREAM_JSON_STAGES` membership.** A test whose subject is `start`'s own
+/// behaviour — which branch it forks from, whether it creates a worktree, where
+/// a `--until` cap halts it — is orthogonal to the transport the stage's agent
+/// is launched over. Left implicit, that premise silently depends on the
+/// stage's ABSENCE from `STREAM_JSON_STAGES`, and 34-05's widening destroys it:
+/// `canary_gate` then invokes the real `ClaudeCanaryLauncher` at `Stage::Define`
+/// and the launch dies on a delivery refusal that has nothing to do with the
+/// subject under test.
+///
+/// The variable is read by `devflow_core::config::claude_legacy_launch()` inside
+/// the child, folded into the persisted `state.legacy_claude_launch` by
+/// `commands::start`'s `apply_legacy_launch_opt_out`, and therefore survives to
+/// every later stage the DETACHED monitor launches — which is what these tests
+/// need, since the monitor chain, not this process, runs Plan and beyond.
+///
+/// **Do NOT reach for this to silence a canary refusal in a test whose subject
+/// IS the stream path.** Pinning such a test to the legacy transport deletes the
+/// coverage rather than stabilising it; see
+/// `parallel_creates_two_worktrees_and_spawns_two_monitors`, which deliberately
+/// does not use this helper.
+fn run_devflow_legacy_launch(root: &Path, fake_bin: &Path, args: &[&str]) -> Output {
+    run_devflow_inner(root, fake_bin, args, true)
+}
+
+fn run_devflow_inner(root: &Path, fake_bin: &Path, args: &[&str], legacy_launch: bool) -> Output {
+    let mut command = Command::new(devflow_bin());
+    command
         .args(args)
         .arg(root)
         .env("PATH", path_with_fake_bin(fake_bin))
         .env("DEVFLOW_TEST_ROOT", root)
-        .current_dir(root)
-        .output()
-        .expect("run devflow");
+        .current_dir(root);
+    if legacy_launch {
+        command.env("DEVFLOW_CLAUDE_LEGACY_LAUNCH", "true");
+    }
+    let output = command.output().expect("run devflow");
     assert!(
         output.status.success(),
         "devflow {args:?} failed\nstdout:\n{}\nstderr:\n{}",
@@ -169,10 +206,47 @@ fn parallel_creates_two_worktrees_and_spawns_two_monitors() {
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     init_repo(root);
+    // 34-06b: this test does NOT take D-11's legacy opt-out, and that is the
+    // whole point of it. It is the multi-plan wave test, and the D-15 delivery
+    // canary exists precisely to guarantee that a concurrent wave does not
+    // silently orphan its dispatched work (999.64). Pinning it to the legacy
+    // single-document transport would make the wave it covers the one shape the
+    // canary is not protecting — deleting the coverage instead of stabilising
+    // it, which is the "repaired by the wrong mechanism" failure 34-06 declined
+    // to commit on this test's behalf.
+    //
+    // So the canary outcome is STUBBED rather than bypassed, through the seam
+    // this suite already has across the process boundary: the fake `claude` on
+    // PATH. The script below is the one
+    // `reference_and_cleanup_worktree_cli_flow` already uses — it models a CLI
+    // that DOES deliver the planted token back inside a top-level `result`
+    // event, so `run_delivery_canary` reaches a deterministic `Confirmed`
+    // without any real agent invocation, and every step of the guard it is
+    // meant to exercise (declare, plant, capture, trust-decide) actually runs.
+    // No production code has a test-only escape hatch added for this.
+    //
+    // `read -r turn` takes exactly one line and returns: the monitor writes the
+    // user turn followed by a newline, and blocking on full EOF would hang
+    // against a pipe deliberately held open past the first turn. On the legacy
+    // stages stdin is `/dev/null`, so the read yields nothing and the ordinary
+    // marker branch runs, exactly as before this change — which is why phase 7
+    // behaves identically under the committed `&[Stage::Code]` constant and
+    // under 34-05's widening.
     let fake_bin = fake_bin_dir(&[
         (
             "claude",
-            "#!/bin/sh\nprintf 'fake claude\\nDEVFLOW_RESULT: {\"status\":\"success\"}\\n'\n",
+            r#"#!/bin/sh
+read -r turn
+case "$turn" in
+  *DEVFLOW_DELIVERY_CANARY_*)
+    token=$(printf '%s' "$turn" | grep -o 'DEVFLOW_DELIVERY_CANARY_[0-9a-f]*' | head -1)
+    printf '{"type":"result","subtype":"success","is_error":false,"session_id":"s-fake","result":"%s"}\n' "$token"
+    ;;
+  *)
+    printf 'fake claude\nDEVFLOW_RESULT: {"status":"success"}\n'
+    ;;
+esac
+"#,
         ),
         (
             "codex",
@@ -237,7 +311,11 @@ fn start_defaults_to_worktree() {
 
     // No worktree flag at all — worktree-by-default (13d) means this must
     // create the isolated worktree without an explicit opt-in.
-    run_devflow(
+    //
+    // Legacy launch pinned deliberately (34-06b): the subject is where `start`
+    // puts the phase, not which transport its agent is launched over. See
+    // `run_devflow_legacy_launch`.
+    run_devflow_legacy_launch(
         root,
         &fake_bin.path,
         &[
@@ -293,9 +371,13 @@ fn start_worktree_mode_ignores_main_checkout_divergence() {
     )]);
 
     // Worktree mode is the default — no --no-worktree flag. This must
-    // succeed (run_devflow asserts a zero exit status) despite the main
+    // succeed (the helper asserts a zero exit status) despite the main
     // checkout being 51 commits behind develop.
-    run_devflow(
+    //
+    // Legacy launch pinned deliberately (34-06b): the subject is the
+    // divergence check's scope, not the launch transport. See
+    // `run_devflow_legacy_launch`.
+    run_devflow_legacy_launch(
         root,
         &fake_bin.path,
         &[
@@ -317,7 +399,10 @@ fn start_no_worktree_uses_feature_branch() {
         "#!/bin/sh\nprintf 'DEVFLOW_RESULT: {\"status\":\"success\"}\\n'\n",
     )]);
 
-    run_devflow(
+    // Legacy launch pinned deliberately (34-06b): the subject is that
+    // `--no-worktree` keeps the phase on its feature branch, not which
+    // transport its agent is launched over. See `run_devflow_legacy_launch`.
+    run_devflow_legacy_launch(
         root,
         &fake_bin.path,
         &[
@@ -362,7 +447,12 @@ fn start_until_plan_halts_cleanly() {
         "#!/bin/sh\nprintf 'DEVFLOW_RESULT: {\"status\":\"success\"}\\n'\n",
     )]);
 
-    run_devflow(
+    // Legacy launch pinned deliberately (34-06b): the subject is WHERE the
+    // `--until` cap halts the stage machine, not which transport each stage's
+    // agent is launched over. The opt-out reaches Plan too — it is persisted
+    // into `state.legacy_claude_launch` by `start`, so the detached monitor
+    // that launches Plan reads it back. See `run_devflow_legacy_launch`.
+    run_devflow_legacy_launch(
         root,
         &fake_bin.path,
         &[
