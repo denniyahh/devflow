@@ -12,6 +12,9 @@
 >
 > **One discretion item departs from its backlog entry's stated fix direction** (999.79's freshness
 > signal). It is marked as such rather than presented as settled.
+>
+> **This phase's decisions are `D-01`…`D-08`.** D-08 was added 2026-08-06 after adversarial review,
+> when an item wrongly filed under discretion was escalated and the operator decided it.
 
 ---
 
@@ -22,7 +25,7 @@ external). **Every finding below was re-verified against source by the orchestra
 accepted** — one was found overstated and is recorded in its corrected form (A-07). Corrections are
 marked `[CORRECTED]` inline where the original text would otherwise be reconstructed by a reader.
 
-**A-08 is an OPEN QUESTION for the operator, not a resolution.** Everything else is settled.
+**A-08 was escalated and is now ANSWERED (operator, 2026-08-06) — see D-08.** Everything is settled.
 
 - **A-01 — the `transition()` reset claim in `<code_context>` was FALSE.** The original said
   `consecutive_failures` and `infra_failures` are both reset by `transition()`. Only `infra_failures`
@@ -135,7 +138,7 @@ marked `[CORRECTED]` inline where the original text would otherwise be reconstru
   `ROADMAP.md`. This is the second stale citation in that entry (see A-09 for the doc-comment one) —
   treat every `file:line` in the 999.x entries as needing re-checking before use, not as canonical.
 
-### A-08 — OPEN: the 999.77 return-type change is a one-way public-API break filed under discretion
+### A-08 — RESOLVED: escalated to the operator, who chose the breaking change (now D-08)
 
 `pub fn phase_commit_count(...) -> u32` (`agent_result.rs:1841`) is public API of the published
 `devflow-core` crate. Changing its return type is the **same class of irreversible act as D-04** —
@@ -143,13 +146,14 @@ same crate, same publish, undo-by-republication — but D-04 was put to the oper
 it sits under "Claude's Discretion" with an instruction to act on it.
 
 The document's own precedent (D-04 rated `one-way`, D-07 escalated as behavioural) says anything
-one-way goes to the operator. **This item should be confirmed before planning proceeds.** The
-alternative it displaced — the backlog's sibling function — avoids the API break at the cost of
-reinstating the two-implementations hazard `phase_commit_count`'s doc comment warns about.
+one-way goes to the operator. It was escalated, and **the operator chose the breaking change** —
+recorded as **D-08** in `<decisions>`.
 
 Related and also uncounted: the 999.79 freshness check likely needs a signature change to
 `pub fn phase_verification_exists` (`agent_result.rs:2654`), which would be a **third** public-API
-change in the same cut. D-04's version-bump reasoning is scoped to two.
+change in the same cut. Under D-08 that is no longer a reason to hesitate — the major bump is a
+fixed cost already paid — but the planner should still enumerate every `pub` item it changes so the
+release notes are complete.
 
 ---
 
@@ -182,7 +186,7 @@ linked-worktree-harness question.
 <decisions>
 ## Implementation Decisions
 
-> **Label scope.** This phase's decisions are `D-01`…`D-07`. Phase 34's decisions are cited with a
+> **Label scope.** This phase's decisions are `D-01`…`D-08`. Phase 34's decisions are cited with a
 > `34/` prefix and Phase 31's with `31/`. They are different decisions with overlapping numbers.
 
 ### Signing probe surface (999.86)
@@ -342,6 +346,42 @@ linked-worktree-harness question.
   **Accepted cost, stated explicitly:** an unattended overnight run now parks on a gate instead of
   looping to completion. That is the intent, and it is still a behaviour change from today's
   "looped forever unnoticed."
+
+### Breaking change to `devflow-core` (999.77) — operator carve-out
+
+- **D-08:** **`phase_commit_count`'s return type changes to `Option<u32>`; Phase 35 ships a breaking
+  `devflow-core` change.** Operator decision, 2026-08-06, escalated from Claude's Discretion after
+  adversarial review flagged that a one-way public-API break had been resolved without asking (A-08).
+
+  Rejected: the backlog's **sibling function** — it leaves the lossy call site compiling unchanged,
+  and there is now a *named instance* of that harm (see the `evaluate_layer2` finding below).
+  Rejected: a **`#[deprecated]` delegating wrapper** (`phase_commit_count` = `…_checked(..).unwrap_or(0)`),
+  which would have been non-breaking while keeping one implementation — a genuine option, declined
+  because the break is already bought.
+
+  **Why the marginal cost is zero.** D-04 already removes two `pub` items, which is itself breaking.
+  A major bump is a **fixed cost, not per-item**, so adding this change costs nothing further in
+  version terms. `phase_commit_count` is also public by accident of module layout rather than design
+  — it takes a `GitFlowConfig` and a phase number, and no external consumer would plausibly call it.
+
+  **Consequence the planner must carry: the workspace goes to `3.0.0`, not `2.5.0`.** Both crates
+  use `version.workspace = true` (currently `2.4.0`), so `devflow-core` and `devflow-cli` move
+  together. Per `project-devflow-release-mechanics` the version is set in two places and
+  `devflow-core` publishes before `devflow-cli`. **The active milestone is currently declared
+  `v2.5.0`** in `STATE.md`, `ROADMAP.md`, `REQUIREMENTS.md` and `PROJECT.md` — that name is now
+  wrong and is flagged to the operator separately; do not rename it from inside a plan.
+  — **Reversibility:** one-way — same class as D-04, and now pooled with it in a single 3.0.0 cut.
+
+  **Defect surfaced while reasoning about this decision, NOT fixed here (34/D-04).**
+  `evaluate_layer2` (`agent_result.rs:1905`) computes `no_work_done = commit_gated && commits == 0`
+  and routes it to `AgentStatus::Failed`. A transient `git` failure returns `0`, so an agent that
+  **exited 0 and committed real work** is classified `Failed — no work done` and fed back into the
+  Code↔Validate loop. That is the same root cause as 999.77 but a worse consequence — a
+  misclassification rather than a weakened bound. Under D-08 the compiler will force this call site
+  to be confronted; **the phase still maps it to today's zero-treatment explicitly and files the
+  defect**, rather than silently widening scope. Filing is pending the operator's go-ahead.
+  *Not established:* how often Layer 2 is the deciding layer in production — the code path was read,
+  the frequency was not measured.
 
 ### Claude's Discretion
 

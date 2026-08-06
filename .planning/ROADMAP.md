@@ -771,6 +771,21 @@ successful measurement compares against the last real observation, and update
 `phase_commit_count`'s "every consumer treats all three the same way" line, which the fix
 deliberately falsifies. Full patch sketch in the Linear issue and in `33-REVIEW.md` WR-03.
 
+**DECIDED 2026-08-06 (operator): take the breaking change.** Escalated after adversarial review
+found this had been resolved without asking, despite being the same one-way class as 999.86's own
+public-API removal. `phase_commit_count`'s return type becomes `Option<u32>`. Rejected: a
+`#[deprecated]` delegating wrapper that would have kept it non-breaking — declined because the break
+is already bought by 999.86's deletions, and a major bump is a fixed cost rather than a per-item
+one. **Consequence: the workspace moves to `3.0.0`, not `2.5.0`** (both crates share
+`version.workspace = true`), which makes the currently-declared `v2.5.0` milestone name wrong.
+
+**Defect surfaced during that reasoning, filed not fixed (34/D-04).** `evaluate_layer2`
+(`agent_result.rs:1905`) sets `no_work_done = commit_gated && commits == 0` and routes it to
+`AgentStatus::Failed`. A transient `git` failure returns `0`, so an agent that exited 0 having
+committed real work reads as `Failed — no work done`. Same root cause as this entry, worse
+consequence: a misclassification rather than a weakened bound. The sibling proposal below would have
+left it silently intact, which is the concrete harm that decided the option above.
+
 **Revision to the sibling proposal (2026-08-06, Phase 35 discussion).** A *sibling* contradicts
 `phase_commit_count`'s own doc comment, which states the single implementation exists because
 "[re-deriving] the same two git commands … is what made the two counts able to silently diverge
