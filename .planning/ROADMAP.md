@@ -29,6 +29,7 @@ those five confirmed fixes down waiting on a harness.
 |---|---|---|---|
 | 35 | Loop-Termination and Baseline Correctness | Not started | — |
 | 35.1 | Unattended-Launch Prerequisites | Not started | — |
+| 35.2 | Verification Provenance | Not started | — |
 | 36 | Drain Gate Concurrency Measurement | Not started | — |
 
 ### Phase 35: Loop-Termination and Baseline Correctness (999.77 + 999.78 + 999.79 + 999.84 + 999.86 + 999.87)
@@ -152,6 +153,54 @@ correctness question about *how* an unattended agent decides, separable from *wh
 proceed at all.
 **Plans**: TBD
 
+### Phase 35.2: Verification Provenance (999.89 / HARDEN-03)
+
+**Goal**: A loop-back decision knows whether *this run's* Validate agent authored
+`{N}-VERIFICATION.md`, rather than inferring it from whether the bytes changed — and the cross-repo
+branch-naming coincidence that currently keeps the byte-inference safe is pinned by a test instead of
+being relied on silently.
+**Depends on**: Phase 35.1 — reuses its simulated unattended run as the harness for criterion 4
+rather than standing up a second one.
+**Requirements**: HARDEN-03
+**Success Criteria** (what must be TRUE):
+
+  1. `verification_authored_this_run` decides on a **run-owned marker DevFlow itself writes**, not on
+     a content fingerprint. DevFlow does not author `{N}-VERIFICATION.md` — the only `fs::write` of
+     it in this codebase is two test fixtures (`agent_result.rs:7532`, `:7602`); GSD's verifier agent
+     is the writer. So the marker must be something DevFlow owns and stamps around the Validate
+     stage, **not** a field the agent is asked to embed: an instruction to an agent is a request, not
+     a guarantee, and provenance that can be silently skipped is not provenance.
+
+  2. A byte change the Validate agent did not cause no longer reads as authored-this-run. The
+     scenario to drive is 999.89's: the artifact is replaced under the evidence root (as a branch
+     checkout would replace it) with no Validate agent having run, and the dispatch must be a full
+     execute — not `--gaps-only` against zero matching plans.
+
+  3. **The cheap half, which defends the route that would make the defect common.** A test pins that
+     DevFlow's phase-branch name matches the string GSD's `execute-phase` independently computes,
+     **including the single-digit padding case** (DevFlow zero-pads to `feature/phase-07`; GSD takes
+     a bare number and — verified 2026-08-07 — emits the same). Today GSD's branching step finds the
+     branch already present and degenerates to a no-op `git switch`; that is the only reason a
+     checkout does not routinely replace the artifact. Two conventions maintained in two
+     repositories, nothing enforcing agreement. This test is what makes a drift loud instead of
+     turning a rare failure routine, silently, from a change in a repo that has no reason to know the
+     invariant exists.
+
+  4. Both directions are demonstrated in the same run: an artifact the Validate agent genuinely wrote
+     still dispatches `--gaps-only`, and an artifact changed by anything else dispatches a full
+     execute. 35-05's own lesson applies directly — its two-stub demonstration showed an
+     always-stale rule silently reverts Phase 33, and a rule tested in only one direction cannot
+     catch that.
+
+  5. `mtime` is stated as rejected, with its reason, so a later reader does not retry it:
+     `phase_verification_mtime_nanos` already exists, but a checkout or merge-back updates mtime
+     exactly as it updates content, so it fails on the identical scenario.
+
+**Not in scope**: changing the artifact's format or asking GSD to write anything. Both would make
+this depend on an upstream change (see `.planning/UPSTREAM-GSD-ISSUES.md`); the whole point of the
+run-owned marker is that DevFlow can close this alone.
+**Plans**: TBD
+
 ### Phase 36: Drain Gate Concurrency Measurement (999.83)
 
 **Goal**: Operator has a real, evidence-based answer to whether the drain gate — the safety net
@@ -240,6 +289,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 34 | 6/6 | Complete    | 2026-08-06 |
 | 35 | 6/6 | In Progress|  |
 | 35.1 | — | Not started | — |
+| 35.2 | — | Not started | — |
 | 36 | — | Not started | — |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
