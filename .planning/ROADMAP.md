@@ -81,7 +81,7 @@ are fixed together rather than one being repaired while the other keeps collapsi
      treating "could not count" as evidence of no work. Verified by the same forced-`git`-failure
      harness criterion 1 requires, with the discriminating case being `exit_code = 0` +
      `Stage::Code` + unrunnable `git` (999.87).
-**Plans**: 5/6 plans executed
+**Plans**: 6/6 plans executed
 
 Plans:
 **Wave 1**
@@ -100,7 +100,7 @@ Plans:
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
-- [ ] 35-06-PLAN.md — enumerate and document the public-API break: verified `CHANGELOG.md` entry plus removal notes at each site; release stays `v2.5.0`, milestone unrenamed (D-04 / D-08)
+- [x] 35-06-PLAN.md — enumerate and document the public-API break: verified `CHANGELOG.md` entry plus removal notes at each site; release stays `v2.5.0`, milestone unrenamed (D-04 / D-08)
 
 ### Phase 36: Drain Gate Concurrency Measurement (999.83)
 
@@ -182,7 +182,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 32 | 0/0 | Complete    | 2026-08-04 |
 | 33 | 6/6 | Complete    | 2026-08-05 |
 | 34 | 6/6 | Complete    | 2026-08-06 |
-| 35 | 5/6 | In Progress|  |
+| 35 | 6/6 | In Progress|  |
 | 36 | — | Not started | — |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
@@ -376,9 +376,11 @@ only because of a coincidence:
 - DevFlow creates its phase worktree on `feature/phase-{phase:02}` (`worktree.rs:42`,
   `commands.rs:2740`, `pipeline_gate.rs:695`) **before** the baseline is captured
   (`commands.rs:344`, placed after the worktree fork by A-05 — that placement is deliberate).
+
 - GSD's `execute-phase` independently computes `branch_name` and produces the identical string.
   Verified 2026-08-07 including the single-digit case, where DevFlow zero-pads and GSD takes a bare
   number: `init.execute-phase 7` returns `feature/phase-07`.
+
 - So GSD's branching step finds the branch already present and degenerates to a no-op `git switch`.
 
 **Nothing enforces that agreement.** Two conventions maintained in two different repositories happen
@@ -392,6 +394,7 @@ a *different repo* that has no reason to know this invariant exists.
 1. Embed a run identifier in `{N}-VERIFICATION.md` (or alongside it) so provenance is *checked*
    rather than inferred from bytes. The predicate then asks "was this authored by this run",
    which is the question it is actually trying to answer.
+
 2. Add a test pinning that DevFlow's phase-branch name matches the convention GSD computes,
    including the single-digit padding case. This is small and defends the route that would make
    the defect common.
