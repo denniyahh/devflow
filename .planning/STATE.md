@@ -4,11 +4,11 @@ milestone: v2.5.0
 milestone_name: Loop-Termination and Release Hardening
 current_phase: 35
 current_phase_name: Loop-Termination and Baseline Correctness
-status: Ready to execute
+status: executing
 stopped_at: Phase 35 planned — 6 plans across 4 waves
-last_updated: "2026-08-06T19:21:52.299Z"
-last_activity: 2026-08-06
-last_activity_desc: "Phase 35 planned: 6 plans across 4 waves, covering HARDEN-01..05 + HARDEN-07 (999.77+999.78+999.79+999.84+999.86+999.87). Research, validation strategy and pattern map committed. Next: `/gsd-execute-phase 35`."
+last_updated: "2026-08-07T10:57:35.527Z"
+last_activity: 2026-08-07
+last_activity_desc: Phase 35 execution started
 progress:
   total_phases: 2
   completed_phases: 0
@@ -154,10 +154,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 35 of 36 (Loop-Termination and Baseline Correctness) — ready to plan
-Plan: — (not yet planned)
-Status: Roadmap created, ready for planning
-Last activity: 2026-08-06 — ROADMAP.md created for v2.5.0: Phase 35 (HARDEN-01..05 / 999.77+999.78+999.79+999.84+999.86), Phase 36 (HARDEN-06 / 999.83). Next: `/gsd-plan-phase 35`.
+Phase: 35 of 36 (Loop-Termination and Baseline Correctness) — EXECUTING
+Plan: 1 of 6
+Status: Executing Phase 35
+Last activity: 2026-08-07 — Phase 35 execution started
 
 ## Recently Shipped
 
