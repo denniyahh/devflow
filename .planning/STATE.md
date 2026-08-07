@@ -1,20 +1,20 @@
 ---
 gsd_state_version: 1.0
 milestone: v2.5.0
-milestone_name: Loop-Termination and Release Hardening
-current_phase: 35
-current_phase_name: Loop-Termination and Baseline Correctness
-status: executing
-stopped_at: Phase 35 planned — 6 plans across 4 waves
-last_updated: "2026-08-07T10:57:35.527Z"
+milestone_name: milestone (Loop-Termination and Release Hardening, ACTIVE — declared 2026-08-06)
+current_phase: 35.1
+current_phase_name: Unattended-Launch Prerequisites (999.93)
+status: planning
+stopped_at: Phase 35 context gathered
+last_updated: "2026-08-07T22:39:32.623Z"
 last_activity: 2026-08-07
-last_activity_desc: Phase 35 execution started
+last_activity_desc: Phase 35 complete, transitioned to Phase 35.1
 progress:
-  total_phases: 2
-  completed_phases: 0
+  total_phases: 4
+  completed_phases: 1
   total_plans: 6
-  completed_plans: 0
-  percent: 0
+  completed_plans: 6
+  percent: 25
 ---
 
 # DevFlow — Project State
@@ -154,10 +154,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 35 of 36 (Loop-Termination and Baseline Correctness) — EXECUTING
-Plan: 1 of 6
-Status: Executing Phase 35
-Last activity: 2026-08-07 — Phase 35 execution started
+Phase: 35.1 of 36 (Unattended-Launch Prerequisites (999.93))
+Plan: Not started
+Status: Ready to plan
+Last activity: 2026-08-07 — Phase 35 complete, transitioned to Phase 35.1
 
 ## Recently Shipped
 

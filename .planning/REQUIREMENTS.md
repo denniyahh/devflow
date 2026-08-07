@@ -17,24 +17,24 @@ Requirements for this milestone. Each maps to a roadmap phase.
 
 ### Loop-Termination Hardening
 
-- [ ] **HARDEN-01**: Operator can trust `consecutive_failures` reflects real repeated failure, not
+- [x] **HARDEN-01**: Operator can trust `consecutive_failures` reflects real repeated failure, not
   a single transient `git` hiccup — the counter's baseline is not silently overwritten by a
   measurement failure (999.77)
 
-- [ ] **HARDEN-02**: Operator can trust an unattended Code↔Validate loop has a bound independent
+- [x] **HARDEN-02**: Operator can trust an unattended Code↔Validate loop has a bound independent
   of trivial per-cycle commits (GSD commands routinely commit `.planning/` artifacts even when
   nothing source-level changed), and the Supervise-mode gate message reports a real cumulative
   total rather than a streak length that resets misleadingly low (999.78)
 
-- [ ] **HARDEN-03**: Operator can `--force` re-run a phase without inheriting the previous run's
+- [x] **HARDEN-03**: Operator can `--force` re-run a phase without inheriting the previous run's
   stale `VERIFICATION.md`, which today causes the loop-back to dispatch `--gaps-only` against a
   mid-arc phase and gate unresolvably (999.79)
 
-- [ ] **HARDEN-04**: Operator can trust the worktree-mode `GateReview` checkpoint auto-decide path
+- [x] **HARDEN-04**: Operator can trust the worktree-mode `GateReview` checkpoint auto-decide path
   (999.76) is covered by a regression test that would catch a future regression at the call site,
   not just correct by construction with no test driving it (999.84)
 
-- [ ] **HARDEN-07**: Operator can trust that a transient `git` failure does not make a *successful*
+- [x] **HARDEN-07**: Operator can trust that a transient `git` failure does not make a *successful*
   agent run read as failed — "could not count" is distinguished from "counted zero" at **both**
   consumers of the commit count, not only at the `consecutive_failures` baseline (999.87). Added
   2026-08-06 by operator decision, after the 999.77 fix was found to force `evaluate_layer2`'s call
@@ -72,12 +72,12 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| HARDEN-01 | Phase 35 | Pending |
-| HARDEN-02 | Phase 35 | Pending |
-| HARDEN-03 | Phase 35 | Pending |
-| HARDEN-04 | Phase 35 | Pending |
+| HARDEN-01 | Phase 35 | Complete |
+| HARDEN-02 | Phase 35 | Complete |
+| HARDEN-03 | Phase 35 | Complete |
+| HARDEN-04 | Phase 35 | Complete |
 | HARDEN-05 | Phase 35 | Complete |
-| HARDEN-07 | Phase 35 | Pending |
+| HARDEN-07 | Phase 35 | Complete |
 | HARDEN-06 | Phase 36 | Pending |
 
 **Coverage:**

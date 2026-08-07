@@ -287,7 +287,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 32 | 0/0 | Complete    | 2026-08-04 |
 | 33 | 6/6 | Complete    | 2026-08-05 |
 | 34 | 6/6 | Complete    | 2026-08-06 |
-| 35 | 6/6 | In Progress|  |
+| 35 | 6/6 | Complete    | 2026-08-07 |
 | 35.1 | — | Not started | — |
 | 35.2 | — | Not started | — |
 | 36 | — | Not started | — |
