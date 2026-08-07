@@ -83,6 +83,8 @@ offender.
 | HARDEN-05 · c5 | `release --check` reports `Viable`/`NotViable` from a real `ssh-keygen -Y sign` probe | unit | new probe tests in `git.rs` / `release_check.rs` — positive, negative, block-then-recover | ❌ W0 |
 | HARDEN-05 · c5 deletion | `classify_ssh_add_status` / `SigningStatus` / `inline_key_fingerprint` removed with their tests | compile + diff review | workspace builds; `rg` finds no surviving reference | ❌ W0 |
 | HARDEN-07 · c6 | `evaluate_layer2` returns `Ok(None)` for `exit_code = 0` + `Stage::Code` + unrunnable `git` | unit | new test in `agent_result.rs` with `NoGitPath` installed | ❌ W0 |
+| HARDEN-07 · c6 cascade | `evaluate_agent_result` driven with the same input returns a **non-`Failed`** result — the outcome the criterion states, which the per-layer test above does not establish because `evaluate_layer3` carries its own copy of the same lossy count | unit (cascade level) | new test in `agent_result.rs`, `NoGitPath` around the `evaluate_agent_result` call only; NC-12 is its control | ❌ W0 |
+| HARDEN-07 · c6 layer 3 | An unmeasurable count at Layer 3 classifies `Unknown` with no commit figure, not `Failed` with a forged zero; the two existing Layer 3 tests pass byte-unchanged as its opposite-result controls | unit | new test in `agent_result.rs` beside `evaluate_layer3_falls_back_to_commit_count` (`:6760`) and `evaluate_layer3_zero_commits_is_failed_and_flags_human_review` (`:6780`) | ❌ W0 |
 
 ---
 
@@ -100,11 +102,12 @@ and each is individually named, because an unnamed control is one nobody notices
 | NC-4 | Unrunnable ≠ measured-zero | A `git` shim that **runs and exits non-zero** yields `Some(0)` (real observation), **not** `None`. A test built on a failing shim rather than an absent `git` exercises the wrong path entirely | A-06 + RESEARCH §A |
 | NC-5 | The 999.78 ceiling actually bounds | Remove the ceiling check (or the increment) — the trivial-commit loop must no longer gate | RESEARCH §C |
 | NC-6 | The gate message reports the total | Revert the format string to interpolate only `consecutive_failures` — the "total ≠ streak at the 2nd vs 5th gate" assertion must fail | RESEARCH §C |
-| NC-7 | Staleness detection is two-directional | A rule marking everything stale forever passes the stale case but **must fail** the fresh case. A one-direction test cannot catch this silent permanent regression | A-12 + RESEARCH §D |
+| NC-7 | Staleness detection is two-directional | A rule marking everything stale forever passes the stale case but **must fail** the fresh case. A one-direction test cannot catch this silent permanent regression. **Two halves, both required (review pass 2, H-1):** an *automated* half — the four-row freshness truth table in `35-05` Task 3, which re-runs on every `cargo test` and fails under both an always-stale and an always-fresh stub — and the *performed mutation* below, which is one-time and now has an owner in the Manual-Only table. Before this revision NC-7 had neither: it was named here, absent from the Manual-Only table, and not a test, so an always-stale regression could ship with nothing to catch it | A-12 + RESEARCH §D + review pass 2 |
 | NC-8 | `:1070` passes `execution_root` | **Perform** the revert to `project_root`, run the test, confirm it fails, revert the revert. The mechanical D-06 assertion is a re-running control and does **not** substitute for the performed revert; neither substitutes for the other | D-05/D-06 + criterion 4 |
 | NC-9 | The signing probe is not vacuously true | Remove the private key file (leave only the `.pub`) — `Viable` must flip to `NotViable` | RESEARCH §F |
-| NC-10 | `SSH_ASKPASS_REQUIRE=never` is what prevents the hang | Omit the env var against the **same** encrypted-key fixture — the run must visibly exceed the test's timeout budget, proving the env var and not the timeout alone (nor the fixture) is load-bearing | D-01 + RESEARCH §F |
+| NC-10 | `SSH_ASKPASS_REQUIRE=never` is what prevents the hang | Omit the env var against the **same** encrypted-key fixture — the run must visibly exceed the test's timeout budget, proving the env var and not the timeout alone (nor the fixture) is load-bearing. **The observation window must be calibrated, not assumed (review pass 2, H-3):** measure the non-blocking arm's wall-clock exit duration first and derive the window from it, at a stated multiple, with the test failing "control uncalibrated" if the relationship does not hold. An uncalibrated window shorter than the tool's own give-up time reports "blocked" for the wrong reason and passes. Record both numbers | D-01 + RESEARCH §F + review pass 2 |
 | NC-11 | The 999.87 case is the unrunnable one | The existing `evaluate_layer2_exit_zero_no_commits_is_failed` (`agent_result.rs:6668`) covers ordinary `commits == 0` and correctly asserts `Failed`. Extending **it** would be a proxy — c6's discriminating case is `exit_code = 0` + `Stage::Code` + unrunnable `git` | ROADMAP 999.87 |
+| NC-12 | Criterion 6's fix removed the defect rather than moving it one layer down | Leave `evaluate_layer2`'s `Ok(None)` fix in place and revert **only** `evaluate_layer3`'s could-not-measure arm to a zero treatment — the cascade test `evaluate_agent_result_with_unrunnable_git_does_not_report_failed` must then fail. A unit test on `evaluate_layer2` alone passes under that revert, which is exactly how the Layer 3 defect survived planning: `evaluate_layer3` runs its own inline count with the same lossy collapse (`agent_result.rs:1977-1986`) and classifies zero as `Failed` at `:1988`, and every path reaching Layer 2 also reaches Layer 3 | Review pass 2, A-H1 (agycli) |
 
 **Why NC-1 is load-bearing and not ceremony.** Criteria 1 and 6 both assert on behaviour that only
 occurs when `git` cannot be executed. If the guard silently fails to take effect — wrong `PATH`
@@ -130,6 +133,23 @@ Carried as a standing obligation on the phase summary:
 - **Nothing here establishes how often Layer 2 is the deciding layer in production.** The code path
   was read and verified; frequency was never measured. The 999.87 and 999.77 backlog entries both
   record this as "Not established."
+- **Criterion 6 green does not mean the run behaves differently.** `AgentStatus::Failed` and
+  `AgentStatus::Unknown` map to the same `Action::GateReview` today
+  (`crates/devflow-core/src/outcome_policy.rs:53-54`, a deliberate identical mapping). So the
+  criterion-6 work changes the recorded classification, the commit figure and the operator-facing
+  reason string — all of which are real and all of which an operator reads — and does **not** change
+  what happens next in the pipeline. No test may assert a dispatch-level difference; such a test
+  passes against the buggy code too.
+- **`NoGitPath` is a `PATH`-based guard.** Every `git` child in this workspace is constructed
+  PATH-resolved (`git.rs:72` → `:87`, `Command::new("git")`), which is what makes the guard work. A
+  future refactor to an absolute `git` path would disarm it silently while every dependent test kept
+  passing. Recorded as a known property of the harness, not a live defect.
+- **NC-10 is a single observation of each arm** even when calibrated — a weak bound on the
+  environment variable's effect, not a reliability claim about it.
+- **Nothing establishes the freshness baseline's behaviour under a process kill** between the
+  selector's in-memory write and its persistence in `prepare_loop_back_to_code`. The window is small
+  and contains no blocking wait; its failure direction is fail-open (a later same-run check reads an
+  unchanged artifact as fresh), not fail-safe. Accepted and stated in `35-05`, not covered.
 - **A green suite does not establish that the 999.78 bound survives a `--force` restart** unless the
   option chosen for the Open Risk below is itself tested. `State::new` zeroes every counter
   unconditionally.
@@ -178,6 +198,12 @@ tested or explicitly recorded as accepted-not-tested. Silence here is a validati
 - [ ] `crates/devflow-core/src/agent_result.rs` — the 999.87 `evaluate_layer2`-unrunnable-`git`
       test; and the `Option<u32>` change to `phase_commit_count` (`:1841`) that forces both
       consumers open.
+- [ ] `crates/devflow-core/src/agent_result.rs` — **the third consumer the compiler does not
+      surface.** `evaluate_layer3` (`:1971`) runs its own inline count (`:1977`-`:1986`) with the
+      identical lossy collapse and classifies zero as `Failed` (`:1988`); the cascade reaches it
+      whenever Layer 2 returns `None` (`:2390`/`:2395`). Re-point it at `phase_commit_count` and add
+      the unmeasurable-count arm, plus the cascade-level test and NC-12. Without this, criterion 6's
+      per-layer test passes while the end-to-end outcome is unchanged.
 - [ ] The 999.77 multi-cycle test — module owner to be decided by the plan (`pipeline_outcomes.rs`
       if it drives `handle_validate_outcome`; `agent_result.rs` if it drives the lower-level
       `phase_commit_count` / progress-check pair).
@@ -202,6 +228,8 @@ tested or explicitly recorded as accepted-not-tested. Silence here is a validati
 | `execution_root` reaches `phase_has_blocking_human_checkpoint`, proven by a performed revert | HARDEN-04 c4 | "This test fails when the fix is reverted" is a property of a mutation, not of the committed tree; no committed test can assert it about itself | The binding is `pipeline_launch.rs:1068` (`let execution_root = state.worktree_path.as_deref().unwrap_or(project_root);`); the call the ROADMAP criterion cites is `:1070` (`&& verify::phase_has_blocking_human_checkpoint(execution_root, phase)`). Revert **either** — bind `execution_root = project_root`, or pass `project_root` at the call — run the new test, record the failure output, revert the revert, re-run and record the pass. Both halves go in the SUMMARY. |
 | Doc comment no longer over-promises | HARDEN-01 c1 | Prose accuracy; no assertion can judge whether a comment matches behaviour | Read the identified `pipeline_outcomes.rs` doc comment against the post-change code and confirm the guarantee claimed is the guarantee delivered |
 | Public-API removal recorded for release | HARDEN-05 c5 / D-04 | `CHANGELOG.md` + crate-doc accuracy is editorial | Confirm the removal of `classify_ssh_add_status` and `SigningStatus` is recorded; version stays `v2.5.0` per D-08; version set in two places; `devflow-core` publishes before `devflow-cli` |
+| NC-7's performed mutation — the always-stale rule | HARDEN-03 c3 | "This test fails when the rule is inverted" is a property of a mutation, not of the committed tree. The committed four-row truth table covers the same class automatically; this half covers the *wiring* the table cannot see | **Owner: `35-05` Task 3's executor.** In `select_loop_back_fix`, replace the freshness comparison with one that always reports stale. Re-run both direction tests. `stale_verification_artifact_dispatches_full_execute` must still pass and `verification_written_this_run_dispatches_gaps_only` must print a `test result: FAILED` line — the asymmetry is the evidence. Restore, re-run, record both outputs in the SUMMARY. If both tests pass under the mutation, the pair is measuring nothing and criterion 3 has no coverage |
+| NC-12's performed mutation — the Layer-3-only revert | HARDEN-07 c6 | Same reason as above: it is a property of a mutation, and the point of *this* one is that it must isolate Layer 3 while leaving Layer 2 fixed, which no committed test can arrange for itself | **Owner: `35-01` Task 3's executor.** Revert only `evaluate_layer3`'s could-not-measure arm to a zero treatment, leaving `evaluate_layer2`'s `Ok(None)` in place. Re-run `evaluate_agent_result_with_unrunnable_git_does_not_report_failed` and confirm a `test result: FAILED` line. Restore, re-run, record both outputs. A demonstration that mutates Layer 2 instead does **not** establish this — it re-proves the thing that was never in doubt |
 
 ---
 
@@ -216,6 +244,13 @@ tested or explicitly recorded as accepted-not-tested. Silence here is a validati
 - [ ] NC-1 passed before any criterion-1 or criterion-6 result was believed
 - [ ] The 999.78 `--force` persistence choice is stated in a PLAN.md and either tested or recorded
       as accepted-not-tested
+- [ ] NC-12 performed: the Layer-3-only revert run and its failure recorded, so criterion 6 is
+      established as an outcome and not as a property of one function
+- [ ] NC-7's automated half (the four-row truth table) is committed and was demonstrated to fail
+      under both an always-stale and an always-fresh stub; NC-7's performed mutation has an owner in
+      the Manual-Only table and was run
+- [ ] NC-10's measured non-blocking exit duration is recorded beside the observation window it
+      calibrated — a window with no measured baseline beside it does not satisfy this control
 - [ ] Full-suite runtime measured and recorded (not assumed)
 - [ ] `nyquist_compliant: true` set in frontmatter
 
