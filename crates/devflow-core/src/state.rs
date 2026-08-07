@@ -154,13 +154,27 @@ pub struct State {
     /// evidence root for the run is known.
     ///
     /// `None` means no artifact was observed at the start of this run — the
-    /// ordinary case for a phase being executed for the first time, and also
-    /// what state written by a binary predating this field deserializes to,
-    /// which is the same reading. It is deliberately distinct from `Some(h)`:
-    /// an artifact that EXISTS now where the baseline recorded none was
-    /// authored during this run, whereas an artifact whose fingerprint still
-    /// equals the baseline was inherited from a previous run and its verdict
-    /// must not be reused.
+    /// ordinary case for a phase being executed for the first time. It is
+    /// deliberately distinct from `Some(h)`: an artifact that EXISTS now where
+    /// the baseline recorded none was authored during this run, whereas an
+    /// artifact whose fingerprint still equals the baseline was inherited from
+    /// a previous run and its verdict must not be reused.
+    ///
+    /// **State written by a binary predating this field also deserializes to
+    /// `None`, and that is NOT the same reading** (WR-05, 35-REVIEW). This doc
+    /// comment used to claim it was. For a phase started under an older binary
+    /// and continued by this one, the previous run's committed
+    /// `{N}-VERIFICATION.md` is already on disk while the baseline reads
+    /// `None` — so the `(Some, None)` row would classify an inherited artifact
+    /// as authored-this-run and dispatch `--gaps-only` against zero matching
+    /// plans, gating unresolvably. That is verbatim the DOGFOOD-01-class stall
+    /// 999.79 exists to close, reproduced for every in-flight phase across the
+    /// upgrade.
+    ///
+    /// [`Self::verification_baseline_captured`] is the discriminator: only a
+    /// run that actually performed the observation sets it, so a `None` from an
+    /// old state file is distinguishable from a `None` that means "looked, and
+    /// there was nothing there".
     ///
     /// Why this exists at all: nothing deletes or dates `{N}-VERIFICATION.md`,
     /// so a `devflow start --force` re-run checks out a branch still carrying
@@ -181,6 +195,26 @@ pub struct State {
     /// started with.
     #[serde(default)]
     pub last_verification_fingerprint: Option<u64>,
+    /// Whether [`Self::last_verification_fingerprint`] was actually observed by
+    /// this run, as opposed to merely absent (WR-05, 35-REVIEW).
+    ///
+    /// `Option<u64>` cannot carry this on its own: `None` means both "the run
+    /// looked and found no artifact" and "this state file predates the field,
+    /// so nobody ever looked", and those two demand OPPOSITE dispatches. The
+    /// first is the ordinary first-verification case and `--gaps-only` is
+    /// right; the second may be sitting on an inherited artifact, where
+    /// `--gaps-only` matches zero plans and stalls.
+    ///
+    /// `false` is therefore the correct serde default in both directions: a
+    /// state file written before this field existed genuinely did not capture a
+    /// baseline, and the conservative reading of an artifact whose provenance
+    /// is unknown is "inherited" — a full execute is wasteful, an unresolvable
+    /// gate is not recoverable.
+    ///
+    /// Set exactly once per run, at the same site that captures the baseline,
+    /// after `state.worktree_path` holds its final value.
+    #[serde(default)]
+    pub verification_baseline_captured: bool,
     /// When the phase started (Unix seconds).
     pub started_at: String,
     /// Path to the project root.
@@ -349,6 +383,7 @@ impl State {
             last_validate_failure_commit_count: None,
             phase_validate_failures: 0,
             last_verification_fingerprint: None,
+            verification_baseline_captured: false,
             started_at: timestamp_now(),
             project_root,
             worktree_path: None,
@@ -610,6 +645,34 @@ mod tests {
         }"#;
         let loaded: State = serde_json::from_str(json).unwrap();
         assert_eq!(loaded.last_verification_fingerprint, None);
+        // WR-05 (35-REVIEW): the SAME absent JSON must also report that nobody
+        // captured a baseline. `None` alone cannot carry that — it means both
+        // "looked, found nothing" and "never looked" — and the two demand
+        // opposite dispatches downstream.
+        assert!(
+            !loaded.verification_baseline_captured,
+            "state predating the baseline field never captured one, and must not claim to"
+        );
+    }
+
+    /// The other half of the pair above: a state file written by THIS binary
+    /// carries the flag, so the two cases really are distinguishable after a
+    /// round trip. Without this, `verification_baseline_captured` could be
+    /// hardcoded `false` and the absent-JSON assertion above would still pass.
+    #[test]
+    fn verification_baseline_captured_round_trips_through_serde() {
+        let mut state = State::new(1, AgentKind::Claude, Mode::Auto, PathBuf::from("/repo"));
+        state.verification_baseline_captured = true;
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(
+            json.contains("verification_baseline_captured"),
+            "verification_baseline_captured must appear in persisted JSON"
+        );
+        let loaded: State = serde_json::from_str(&json).unwrap();
+        assert!(
+            loaded.verification_baseline_captured,
+            "a captured baseline must survive the save/load the real pipeline performs"
+        );
     }
 
     /// D-18f: `preflight_retries` round-trips through serde (its own key

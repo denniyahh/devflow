@@ -388,6 +388,10 @@ pub(crate) fn start(
         .unwrap_or_else(|| project_root.to_path_buf());
     state.last_verification_fingerprint =
         agent_result::phase_verification_fingerprint(&evidence_root, phase);
+    // WR-05: the observation happened. Without this flag a `None` fingerprint
+    // from an old state file is indistinguishable from a `None` that means
+    // "looked, found nothing", and the two demand opposite dispatches.
+    state.verification_baseline_captured = true;
 
     // 25b (D-03): the self-dogfood build-staleness gate, hoisted here from
     // `pipeline_launch::launch_stage_inner` (17d originally placed it there,

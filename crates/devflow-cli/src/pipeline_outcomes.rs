@@ -333,7 +333,28 @@ fn select_loop_back_fix(evidence_root: &Path, phase: u32, state: &mut State) -> 
     //   gate for a loop that re-runs every plan in the phase, forever. It
     //   would pass every test asserting only the stale direction.
     let current = agent_result::phase_verification_fingerprint(evidence_root, phase);
-    if verification_authored_this_run(current, state.last_verification_fingerprint) {
+    // WR-05: an artifact with no captured baseline is dispatched conservatively
+    // (below), but silently doing so would leave an operator who upgraded a
+    // binary mid-phase wondering why a gaps-only pass became a full execute.
+    // Same signalling posture as IN-02's `ValidateFailureNoBaseline`, on the
+    // channel that survives the run.
+    if current.is_some() && !state.verification_baseline_captured {
+        events::emit(
+            &state.project_root.clone(),
+            phase,
+            "verification_baseline_absent",
+            serde_json::json!({
+                "dispatch": "full_execute",
+                "why": "no run-start baseline was captured for this phase's \
+                        {N}-VERIFICATION.md, so its provenance is unknown",
+            }),
+        );
+    }
+    if verification_authored_this_run(
+        current,
+        state.last_verification_fingerprint,
+        state.verification_baseline_captured,
+    ) {
         // Record the new observation as the baseline, so a SUBSEQUENT
         // loop-back that finds the artifact unchanged is in turn correctly
         // treated as stale. Without this, one rewrite would mark the artifact
@@ -376,9 +397,15 @@ fn select_loop_back_fix(evidence_root: &Path, phase: u32, state: &mut State) -> 
 /// * `current` is `None` — no artifact exists, so nothing was authored. The
 ///   phase is mid-arc and D-01's original `FullExecute` answer stands
 ///   unchanged. Catches an always-fresh rule.
-/// * `current` is `Some`, baseline is `None` — an artifact exists where the run
-///   start saw none, so this run's Validate agent created it. The ordinary
-///   first-verification case. Catches an always-stale rule.
+/// * `current` is `Some`, baseline is `None`, and the baseline WAS captured —
+///   an artifact exists where the run start saw none, so this run's Validate
+///   agent created it. The ordinary first-verification case. Catches an
+///   always-stale rule.
+/// * `current` is `Some`, baseline is `None`, and the baseline was NOT captured
+///   — this state file predates the field, so nobody looked (WR-05). The
+///   artifact may well be the previous run's, and reading it as this run's is
+///   the 999.79 stall. Answered "inherited", the conservative direction: a full
+///   execute is wasteful, an unresolvable gate is not recoverable.
 /// * fingerprints are EQUAL — the artifact is byte-identical to what this run
 ///   started with, so it was inherited from a previous run and its verdict must
 ///   not be reused (999.79). Catches an always-fresh rule.
@@ -393,10 +420,17 @@ fn select_loop_back_fix(evidence_root: &Path, phase: u32, state: &mut State) -> 
 /// direction HARDEN-03 exists to prevent. Establishing real provenance would
 /// need the artifact to carry a run identifier, which is a larger change than
 /// 999.79 asks for.
-fn verification_authored_this_run(current: Option<u64>, run_start_baseline: Option<u64>) -> bool {
+fn verification_authored_this_run(
+    current: Option<u64>,
+    run_start_baseline: Option<u64>,
+    baseline_captured: bool,
+) -> bool {
     match (current, run_start_baseline) {
         (None, _) => false,
-        (Some(_), None) => true,
+        // WR-05: `baseline_captured` is what separates "the run looked and
+        // found nothing" from "this state predates the field, so nobody
+        // looked". Only the first licenses reading the artifact as this run's.
+        (Some(_), None) => baseline_captured,
         (Some(now), Some(baseline)) => now != baseline,
     }
 }
@@ -3346,6 +3380,12 @@ mod tests {
         let phase = 83;
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
+        // WR-05 (35-REVIEW): stands in for `start()`'s run-start capture,
+        // which this fixture does not go through. A hand-built `State` leaves
+        // `verification_baseline_captured` false — the shape of state written
+        // by a binary predating the field — and that is a DIFFERENT scenario
+        // (an artifact of unknown provenance) from the one under test here.
+        state.verification_baseline_captured = true;
         workflow::save_state(&state).unwrap();
 
         let phase_dir = root
@@ -3419,6 +3459,12 @@ mod tests {
         let worktree = root.join(format!(".worktrees/phase-{phase}"));
         std::fs::create_dir_all(&worktree).unwrap();
         state.worktree_path = Some(worktree.clone());
+        // WR-05 (35-REVIEW): stands in for `start()`'s run-start capture,
+        // which this fixture does not go through. A hand-built `State` leaves
+        // `verification_baseline_captured` false — the shape of state written
+        // by a binary predating the field — and that is a DIFFERENT scenario
+        // (an artifact of unknown provenance) from the one under test here.
+        state.verification_baseline_captured = true;
         workflow::save_state(&state).unwrap();
 
         // The artifact is written under the WORKTREE only. The bare tempdir
@@ -3750,11 +3796,15 @@ mod tests {
         let worktree_b = root_b.join(format!(".worktrees/phase-{phase_b}"));
         std::fs::create_dir_all(&worktree_b).unwrap();
         state_b.worktree_path = Some(worktree_b.clone());
-        // No artifact existed when this run started.
+        // No artifact existed when this run started — and the run DID look.
+        // WR-05 (35-REVIEW): both halves are premises. `None` alone is
+        // ambiguous, and the unlooked variant is a different scenario with the
+        // opposite required dispatch (row 2b of the truth table).
         assert_eq!(
             state_b.last_verification_fingerprint, None,
             "premise: sub-case 2 requires an absent run-start baseline"
         );
+        state_b.verification_baseline_captured = true;
         workflow::save_state(&state_b).unwrap();
 
         let phase_dir_b = worktree_b
@@ -3795,23 +3845,28 @@ mod tests {
     ///
     /// The row set is chosen so BOTH over-corrections are caught, not one:
     ///
-    /// | current      | baseline     | fresh? | fails under |
-    /// |--------------|--------------|--------|-------------|
-    /// | `None`       | `None`       | no     | always-fresh|
-    /// | `Some(h)`    | `None`       | yes    | always-stale|
-    /// | `Some(h)`    | `Some(h)`    | no     | always-fresh|
-    /// | `Some(h)`    | `Some(g≠h)`  | yes    | always-stale|
+    /// | current      | baseline     | captured | fresh? | fails under |
+    /// |--------------|--------------|----------|--------|-------------|
+    /// | `None`       | `None`       | true     | no     | always-fresh|
+    /// | `Some(h)`    | `None`       | true     | yes    | always-stale|
+    /// | `Some(h)`    | `None`       | **false**| **no** | always-fresh|
+    /// | `Some(h)`    | `Some(h)`    | true     | no     | always-fresh|
+    /// | `Some(h)`    | `Some(g≠h)`  | true     | yes    | always-stale|
     ///
-    /// Two rows fail an always-stale stub and the other two fail an
-    /// always-fresh stub. A table that only fails one of the two would not be
-    /// exhaustive and the row set would be wrong.
+    /// Two rows fail an always-stale stub and the others fail an always-fresh
+    /// stub. A table that only fails one of the two would not be exhaustive and
+    /// the row set would be wrong.
+    ///
+    /// Row 2b is WR-05's (35-REVIEW): it and row 2 differ in exactly one input,
+    /// and a predicate ignoring `baseline_captured` collapses them — which is
+    /// how an upgraded in-flight phase reproduced the 999.79 stall.
     #[test]
     fn verification_freshness_truth_table_is_exhaustive() {
         // Row 1 — no artifact at all. Not "authored this run": there is
         // nothing to have authored. The phase is mid-arc and D-01's original
         // FullExecute answer stands, unchanged by 999.79.
         assert!(
-            !verification_authored_this_run(None, None),
+            !verification_authored_this_run(None, None, true),
             "row 1: an absent artifact is never 'authored this run'"
         );
 
@@ -3819,31 +3874,133 @@ mod tests {
         // a verdict from; grouped with row 1 rather than given its own row
         // because the predicate cannot distinguish them and must not try.
         assert!(
-            !verification_authored_this_run(None, Some(7)),
+            !verification_authored_this_run(None, Some(7), true),
             "row 1b: an artifact that is absent NOW is never 'authored this run', whatever the \
              baseline recorded"
         );
 
-        // Row 2 — exists now, nothing recorded at run start. The ordinary
-        // first-verification case: Validate authored it during this run.
+        // Row 2 — exists now, nothing recorded at run start, and the run DID
+        // look. The ordinary first-verification case: Validate authored it
+        // during this run.
         assert!(
-            verification_authored_this_run(Some(7), None),
+            verification_authored_this_run(Some(7), None, true),
             "row 2: an artifact existing where the baseline recorded none was authored this run"
+        );
+
+        // Row 2b (WR-05) — identical to row 2 except that nobody ever looked:
+        // state written by a binary predating the baseline field. The artifact
+        // may be the PREVIOUS run's, so its verdict must not be reused.
+        assert!(
+            !verification_authored_this_run(Some(7), None, false),
+            "row 2b: with no captured baseline the artifact's provenance is unknown, and \
+             reading it as this run's is the 999.79 stall reproduced across an upgrade"
         );
 
         // Row 3 — unchanged since run start. The 999.79 case: inherited from a
         // previous run, its verdict must not be reused.
         assert!(
-            !verification_authored_this_run(Some(7), Some(7)),
+            !verification_authored_this_run(Some(7), Some(7), true),
             "row 3: an artifact whose fingerprint equals the run-start baseline is INHERITED, \
              not authored this run"
         );
 
         // Row 4 — content changed since run start. Validate rewrote it.
         assert!(
-            verification_authored_this_run(Some(7), Some(8)),
+            verification_authored_this_run(Some(7), Some(8), true),
             "row 4: an artifact whose fingerprint differs from the run-start baseline was \
              rewritten during this run"
+        );
+    }
+
+    /// WR-05 (35-REVIEW) end to end: a phase started under a binary predating
+    /// `last_verification_fingerprint` and continued by this one must NOT read
+    /// the inherited `{N}-VERIFICATION.md` as this run's work.
+    ///
+    /// The old state file deserializes the baseline to `None` while the
+    /// previous run's committed artifact is already on disk, so the
+    /// `(Some, None)` row fired and dispatched `--gaps-only` against zero
+    /// matching plans — the DOGFOOD-01-class unresolvable stall 999.79 exists
+    /// to close, reproduced for every in-flight phase across an upgrade.
+    ///
+    /// **Both halves under one artifact**, differing in exactly one field. The
+    /// upgraded state must dispatch `FullExecute`; a state that genuinely
+    /// captured the baseline and found nothing must still dispatch `GapsOnly`.
+    /// Asserting only the first would be satisfied by an always-stale rule,
+    /// which the selector's own comment names as the worse over-correction —
+    /// it silently reverts what Phase 33 built.
+    #[test]
+    fn an_uncaptured_baseline_does_not_claim_an_inherited_artifact() {
+        let _guard = env_lock();
+
+        /// Drive one Validate failure against a phase whose artifact already
+        /// exists, and report the dispatched fix.
+        fn dispatch_with(root: &Path, phase: u32, baseline_captured: bool) -> String {
+            let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+            state.stage = Stage::Validate;
+            state.verification_baseline_captured = baseline_captured;
+            workflow::save_state(&state).unwrap();
+
+            let phase_dir = root
+                .join(".planning/phases")
+                .join(format!("{phase:02}-test"));
+            std::fs::create_dir_all(&phase_dir).unwrap();
+            std::fs::write(
+                phase_dir.join(format!("{phase:02}-VERIFICATION.md")),
+                "verdict: pass -- committed by a PREVIOUS run\n",
+            )
+            .unwrap();
+
+            {
+                let _path_guard = NeutralPath::install();
+                let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+            }
+
+            devflow_core::events::last_event_of_kind_for_phase(root, phase, "loop_back")
+                .expect("loop_back event must be recorded")["fix"]
+                .as_str()
+                .expect("the fix must be recorded as a string")
+                .to_string()
+        }
+
+        // The upgrade case: nobody ever looked, and the artifact predates this
+        // run.
+        let upgraded_dir = tempfile::tempdir().unwrap();
+        let upgraded_root = upgraded_dir.path();
+        assert_eq!(
+            dispatch_with(upgraded_root, 78, false),
+            "FullExecute",
+            "with no captured baseline the artifact's provenance is unknown; --gaps-only \
+             would match zero plans and gate unresolvably"
+        );
+        assert!(
+            devflow_core::events::last_event_of_kind_for_phase(
+                upgraded_root,
+                78,
+                "verification_baseline_absent",
+            )
+            .is_some(),
+            "the operator must be able to see WHY a gaps-only pass became a full execute"
+        );
+
+        // NEGATIVE CONTROL: identical in every respect except that this run
+        // performed the observation.
+        let captured_dir = tempfile::tempdir().unwrap();
+        let captured_root = captured_dir.path();
+        assert_eq!(
+            dispatch_with(captured_root, 79, true),
+            "GapsOnly",
+            "the ordinary first-verification case must be untouched — an always-stale rule \
+             re-runs every plan in the phase forever, which the selector's own comment calls \
+             the worse over-correction"
+        );
+        assert!(
+            devflow_core::events::last_event_of_kind_for_phase(
+                captured_root,
+                79,
+                "verification_baseline_absent",
+            )
+            .is_none(),
+            "a signal emitted on the ordinary case too would carry no information"
         );
     }
 
