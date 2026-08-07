@@ -396,6 +396,29 @@ T-35-SC are accepted as planned (this plan installs no packages).
    checkpoint answer. I ran the gate's substantive check — re-running the verification end-to-end —
    rather than emitting a checkpoint nobody could answer. Re-surfaced here because it is still open.
 
+
+   **RESOLVED 2026-08-07 (35-verify-work investigation).** The question as posed — *should
+   `workflow.auto_mode` satisfy the spec's `auto_advance` check?* — has no answer, because
+   **`workflow.auto_mode` is read by nothing.** It is absent from gsd-core's config schema, its
+   defaults manifest, and `references/planning-config.md`; the only `auto_mode` occurrences in that
+   repo are the unrelated XML tags `<auto_mode>` and `<auto_mode_detection>`. It was written into
+   `.planning/config.json` by the project's `GSD init` commit and appears to be a rename that
+   shipped without a migration. Filed upstream as **G-04** in `.planning/UPSTREAM-GSD-ISSUES.md`.
+
+   **What the executors did was therefore correct, for a reason neither could see.** Running the
+   gate's substantive check was the right call — but not because `auto_mode` implied autonomy.
+   Auto-mode was genuinely inactive: `check auto-mode` reports
+   `{"active": false, "source": "none", "auto_chain_active": false, "auto_advance": false}` on this
+   project. There was no channel and no flag, and the improvisation was the only thing available.
+
+   **Why simply setting `auto_advance: true` is NOT the fix**, and this is the part that took the
+   investigation: that flag conflates checkpoint-bypass with stage-chaining
+   (`plan-phase.md:1563` launches execute-phase itself when it is set), so enabling it would make
+   DevFlow's Plan stage run the Code stage and corrupt the very commit-attribution this phase's
+   accounting depends on. Upstream causes filed as **G-01**, **G-02**, **G-03**; DevFlow's own fix
+   is scoped as **Phase 35.1** (999.93), which also adds the preflight that would have made this
+   condition loud instead of leaving it to two executors to rediscover.
+
 ## Self-Check: PASSED
 
 Files verified present on disk: `crates/devflow-core/src/agent_result.rs`,
