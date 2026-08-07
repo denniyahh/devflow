@@ -148,10 +148,38 @@ pub struct State {
     /// back to zero and silently restore itself.
     #[serde(default)]
     pub phase_validate_failures: u32,
-    /// RED stub (999.79, 35-05 Task 1): deliberately `#[serde(skip)]` so the
-    /// round-trip test fails until the real `#[serde(default)]` treatment
-    /// lands. Replaced in the GREEN step.
-    #[serde(skip)]
+    /// The content fingerprint of this phase's `{N}-VERIFICATION.md` as it
+    /// stood at the START of this run (999.79), read via
+    /// [`crate::agent_result::phase_verification_fingerprint`] once the
+    /// evidence root for the run is known.
+    ///
+    /// `None` means no artifact was observed at the start of this run — the
+    /// ordinary case for a phase being executed for the first time, and also
+    /// what state written by a binary predating this field deserializes to,
+    /// which is the same reading. It is deliberately distinct from `Some(h)`:
+    /// an artifact that EXISTS now where the baseline recorded none was
+    /// authored during this run, whereas an artifact whose fingerprint still
+    /// equals the baseline was inherited from a previous run and its verdict
+    /// must not be reused.
+    ///
+    /// Why this exists at all: nothing deletes or dates `{N}-VERIFICATION.md`,
+    /// so a `devflow start --force` re-run checks out a branch still carrying
+    /// the previous run's committed copy. Without this baseline the first
+    /// Validate failure of that re-run reads the inherited artifact as a
+    /// verdict and dispatches a `--gaps-only` pass against zero matching plans,
+    /// which gates unresolvably — the same unattended-stall class as
+    /// DOGFOOD-01, reached from a different direction.
+    ///
+    /// **Lifetime.** Like [`Self::last_validate_failure_commit_count`], and
+    /// unlike [`Self::consecutive_failures`] and [`Self::infra_failures`], this
+    /// field is NOT touched by `transition()` — it is a run-scoped observation
+    /// rather than a counter, so it is replaced wholesale rather than
+    /// incremented and needs no `saturating_add` treatment. It is also NOT
+    /// carried across a forced restart the way
+    /// [`Self::phase_validate_failures`] is: a new run must re-observe the
+    /// artifact, because the whole point is to compare against what THIS run
+    /// started with.
+    #[serde(default)]
     pub last_verification_fingerprint: Option<u64>,
     /// When the phase started (Unix seconds).
     pub started_at: String,
