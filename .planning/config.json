@@ -8,7 +8,8 @@
     "_auto_chain_active": false,
     "nyquist_validation": true,
     "ai_integration_phase": true,
-    "tdd_mode": true
+    "tdd_mode": true,
+    "windows_enforce": true
   },
   "git": {
     "main": "main",
@@ -45,7 +46,9 @@
     "capture_artifacts": true,
     "wing": "devflow",
     "memory_mode": "augment",
-    "mirror_kg": false,
-    "recall_on_plan": true
+    "mirror_kg": true,
+    "recall_on_plan": true,
+    "diary_journal": true,
+    "cross_project_tunnels": true
   }
 }
