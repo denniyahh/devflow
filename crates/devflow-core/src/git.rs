@@ -1968,9 +1968,14 @@ mod tests {
     /// `key::`-prefixed form or the raw deprecated `ssh-` compat form — must
     /// never be classified as a missing filesystem path. Git never stats an
     /// inline value, so this must never return the missing-key-file
-    /// `NotViable`. This test intentionally does NOT assert which of
-    /// `Viable`/agent-`NotViable`/`Unknown` is returned, since that depends
-    /// on the host's ssh-agent state (D-10).
+    /// `NotViable`.
+    ///
+    /// This test deliberately keeps its narrow assertion — only that the
+    /// missing-file reason is absent. It used to be narrow because the
+    /// outcome depended on the host's ssh-agent state (D-10); it is narrow
+    /// now because that is the single property it exists to guard, and
+    /// `inline_signing_key_returns_unknown_without_probing` pins the exact
+    /// arm. Leaving the assertion here narrow keeps one falsifier per test.
     #[test]
     fn check_signing_viability_never_reports_key_file_missing_for_inline_key() {
         const MISSING_FILE_REASON: &str = "user.signingkey is set but the key file does not exist";
@@ -2046,9 +2051,12 @@ mod tests {
 
     /// D-03/D-12: values that neither start with `key::` nor `ssh-` still
     /// take the path branch and keep today's byte-for-byte behavior — the
-    /// early `.exists()` return, before `ssh-add` is ever spawned. This is
-    /// the D-03 falsifier: bare `ecdsa-`/`sk-` forms must NOT be treated as
-    /// inline.
+    /// early `.exists()` return, which still fires before anything is
+    /// spawned. What follows that early return is now the signing probe
+    /// rather than the deleted `ssh-add` predictor; the guarantee under
+    /// test is that a missing file is answered without reaching it at all.
+    /// This is the D-03 falsifier: bare `ecdsa-`/`sk-` forms must NOT be
+    /// treated as inline.
     #[test]
     fn check_signing_viability_still_reports_missing_file_for_a_path_value() {
         const MISSING_FILE_REASON: &str = "user.signingkey is set but the key file does not exist";
@@ -2075,16 +2083,25 @@ mod tests {
         }
     }
 
-    /// D-06: every inline-branch failure mode must degrade to `Unknown`
-    /// (or, at the `pub` boundary, one of the two shared agent-state
-    /// `NotViable` reasons that both branches can legitimately reach) —
-    /// never a NEW hard fail introduced by this phase. Agent-independent:
-    /// these values are unparseable/empty regardless of host ssh-agent
-    /// state.
+    /// D-06: every inline-branch failure mode must degrade to `Unknown`,
+    /// never a NEW hard fail introduced by this phase. That guarantee is
+    /// what this test preserves; only the reasons it accepts changed.
+    ///
+    /// It used to pin a two-reason set built from the predictor's no-agent
+    /// and agent-empty strings, neither of which the code can produce any
+    /// more — a test that referenced the deleted mechanism through its
+    /// output rather than its symbols, so nothing but a run would have
+    /// caught it. Under D-03 an unparseable inline value classifies as
+    /// inline and returns the single fixed inline reason without being
+    /// probed at all.
+    ///
+    /// Its agent-independence note survives, now true by construction
+    /// rather than by argument: these values never reach a probe, so no
+    /// host's agent state can reach this result.
     #[test]
     fn check_signing_viability_never_hard_fails_on_an_unparseable_inline_key() {
-        const NO_AGENT_REASON: &str = "no ssh-agent reachable (SSH_AUTH_SOCK unset or dead)";
-        const AGENT_EMPTY_REASON: &str = "ssh-agent reachable but has no identities loaded";
+        const INLINE_REASON: &str =
+            "cannot verify signing viability — an inline user.signingkey is not probed";
         let unparseable_values = ["key::", "key::this is not a key at all"];
         for value in unparseable_values {
             let repo = init_repo();
@@ -2094,12 +2111,13 @@ mod tests {
 
             let result = check_signing_viability(root);
 
-            if let SigningViability::NotViable { reason } = &result {
-                assert!(
-                    reason == NO_AGENT_REASON || reason == AGENT_EMPTY_REASON,
-                    "value {value:?} produced an unexpected hard fail: {result:?}"
-                );
-            }
+            assert_eq!(
+                result,
+                SigningViability::Unknown {
+                    reason: INLINE_REASON.into(),
+                },
+                "value {value:?} produced an unexpected hard fail: {result:?}"
+            );
         }
     }
 
