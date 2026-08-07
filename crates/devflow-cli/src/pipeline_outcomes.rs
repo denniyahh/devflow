@@ -586,7 +586,32 @@ pub(crate) fn handle_validate_outcome(
         state.phase_validate_failures,
     ) {
         let context = match result {
-            ValidateResult::Passed => "Validation passed — approve to ship?".to_string(),
+            // WR-04 (35-REVIEW): the ceiling clause belongs in BOTH arms.
+            // `ceiling_gate` and `should_gate` are evaluated regardless of
+            // `result`, and `Mode::should_gate` puts the ceiling predicate
+            // ahead of its per-mode match — so once the budget is exhausted a
+            // *passing* Validate gates too, including in Auto. Without the
+            // clause the whole context read "Validation passed — approve to
+            // ship?", and an operator running unattended-Auto saw a gate this
+            // mode is not supposed to fire on a pass, with nothing explaining
+            // why; answering it then spent the accumulated budget.
+            //
+            // Explaining the gate rather than suppressing it (D-07's "gate,
+            // do not abort" posture): a phase that burned the whole budget
+            // before passing is exactly the one worth a human look before it
+            // ships, and removing an operator checkpoint is the riskier of the
+            // two directions the review offered.
+            ValidateResult::Passed => {
+                let mut message = "Validation passed — approve to ship?".to_string();
+                if ceiling_gate {
+                    message.push_str(&format!(
+                        " (This phase recorded {} Validate failure(s), at the per-phase ceiling of {} — that is why this gate fired. Answering it restarts the count.)",
+                        state.phase_validate_failures,
+                        mode::MAX_PHASE_VALIDATE_FAILURES
+                    ));
+                }
+                message
+            }
             // WR-04: the CUMULATIVE per-phase total leads, and is named as a
             // per-phase quantity. The streak follows as a clearly subordinate
             // parenthetical. The complaint being fixed is that the old text
@@ -2686,6 +2711,99 @@ mod tests {
                 .phase_validate_failures,
             0,
             "the reset must be persisted, not merely in memory — the next process reads the file"
+        );
+    }
+
+    /// WR-04 (35-REVIEW): a *passing* Validate at the ceiling gates too, and
+    /// the gate must say why.
+    ///
+    /// `ceiling_gate` and `should_gate` are both evaluated regardless of the
+    /// result, and `Mode::should_gate` puts the ceiling predicate ahead of its
+    /// per-mode match — so an exhausted budget gates a pass as well as a
+    /// failure. The ceiling clause was appended only inside the `Failed` arm,
+    /// so an operator running unattended-Auto got a gate whose entire context
+    /// was "Validation passed — approve to ship?" from a mode that is not
+    /// supposed to gate on a pass, and answering it spent the budget.
+    ///
+    /// **The control is the Supervise half, not a below-ceiling Auto pass.**
+    /// Auto below the ceiling does not gate on a pass at all, so that half
+    /// would assert only that a gate which never fired printed no clause — it
+    /// could not tell "clause at the ceiling" from "clause always". Supervise
+    /// gates on EVERY Validate, so the below-ceiling half there produces a real
+    /// gate with a real message that must NOT carry the clause.
+    #[test]
+    fn a_passing_validate_at_the_ceiling_explains_why_it_gated() {
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        // AUTO, at the ceiling, and the Validate PASSED. Nothing here is a
+        // failure: the budget is spent from earlier cycles and no increment
+        // happens on this call.
+        let auto_phase = 88;
+        let mut auto = State::new(
+            auto_phase,
+            AgentKind::Claude,
+            Mode::Auto,
+            root.to_path_buf(),
+        );
+        auto.stage = Stage::Validate;
+        auto.phase_validate_failures = mode::MAX_PHASE_VALIDATE_FAILURES;
+        workflow::save_state(&auto).unwrap();
+        let auto_response = Gates::response_path(root, auto_phase, Stage::Validate);
+        std::fs::create_dir_all(auto_response.parent().unwrap()).unwrap();
+        std::fs::write(&auto_response, LOOP_BACK_RESPONSE).unwrap();
+        let _ = handle_validate_outcome(root, &mut auto, ValidateOutcome::Passed);
+
+        // CONTROL — SUPERVISE, below the ceiling, also a pass. Gates (Supervise
+        // always does), so there IS a message, and it must not blame a ceiling
+        // that was never reached.
+        let supervise_phase = 89;
+        let mut supervise = State::new(
+            supervise_phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        supervise.stage = Stage::Validate;
+        supervise.phase_validate_failures = 2;
+        workflow::save_state(&supervise).unwrap();
+        let supervise_response = Gates::response_path(root, supervise_phase, Stage::Validate);
+        std::fs::create_dir_all(supervise_response.parent().unwrap()).unwrap();
+        std::fs::write(&supervise_response, LOOP_BACK_RESPONSE).unwrap();
+        let _ = handle_validate_outcome(root, &mut supervise, ValidateOutcome::Passed);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        let auto_context = last_gate_context(root, auto_phase)
+            .expect("premise: an exhausted budget gates even in Auto, even on a pass");
+        assert!(
+            auto_context.contains("per-phase ceiling"),
+            "an Auto-mode gate on a PASS is unexplained without the ceiling clause — the \
+             operator has no way to know why the run stopped: {auto_context:?}"
+        );
+
+        let supervise_context = last_gate_context(root, supervise_phase)
+            .expect("premise for the control: Supervise gates on every Validate");
+        assert!(
+            !supervise_context.contains("per-phase ceiling"),
+            "NEGATIVE CONTROL: a clause appended to every passing gate would carry no \
+             information at all: {supervise_context:?}"
         );
     }
 
