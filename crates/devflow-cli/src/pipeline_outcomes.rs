@@ -487,6 +487,19 @@ pub(crate) fn handle_validate_outcome(
         workflow::save_state(state)?;
     }
 
+    // F-6: read ONCE, and used for both the message's ceiling clause and the
+    // reset below, so the two can never disagree about whether this gate was a
+    // ceiling gate. Read AFTER the increment above, so it reflects the failure
+    // being handled right now.
+    //
+    // Deliberately NOT "did a gate fire": `Stage::Validate` + `Mode::Supervise`
+    // gates unconditionally, so in Supervise the two conditions overlap
+    // completely. A reset keyed on gating would clear the total at every
+    // Supervise failure, the accumulation would never be observable, and the
+    // bound would be defeated in exactly the mode where an operator watches
+    // every occurrence.
+    let ceiling_gate = mode::phase_failure_ceiling_reached(state.phase_validate_failures);
+
     if state.mode.should_gate(
         Stage::Validate,
         state.consecutive_failures,
@@ -512,8 +525,9 @@ pub(crate) fn handle_validate_outcome(
                 // every Validate gates, so a gate-keyed clause would appear on
                 // every message and carry no information at all. The
                 // comparison is not re-derived here; there is exactly one
-                // implementation of it, in `mode`.
-                if mode::phase_failure_ceiling_reached(state.phase_validate_failures) {
+                // implementation of it, in `mode`, read once into
+                // `ceiling_gate` above.
+                if ceiling_gate {
                     message.push_str(&format!(
                         " The per-phase ceiling of {} is reached: this run is paused for a human, not aborted — approve to ship, reject to loop back for another pass, or abort.",
                         mode::MAX_PHASE_VALIDATE_FAILURES
@@ -528,12 +542,18 @@ pub(crate) fn handle_validate_outcome(
             // offers — reaching the ceiling adds no abort path, because
             // aborting is destructive and irreversible relative to gating and
             // would kill a phase that may be one cycle from converging.
-            GateAction::Advance => transition(project_root, state, Stage::Ship),
+            GateAction::Advance => {
+                reset_phase_failures_at_ceiling(state, ceiling_gate);
+                transition(project_root, state, Stage::Ship)
+            }
             GateAction::LoopBack(_) => {
                 // Evidence root: see the single binding at the top.
                 let fix = select_loop_back_fix(&evidence_root, state.phase);
+                reset_phase_failures_at_ceiling(state, ceiling_gate);
                 loop_back_to_code(project_root, state, fix, loop_back_reason(baseline_absent))
             }
+            // No reset on abort: the phase is ending and `abort` clears its
+            // state outright, so there is no budget left to restore.
             GateAction::Abort(reason) => abort(project_root, state, &reason),
         };
     }
@@ -547,6 +567,25 @@ pub(crate) fn handle_validate_outcome(
             let fix = select_loop_back_fix(&evidence_root, state.phase);
             loop_back_to_code(project_root, state, fix, loop_back_reason(baseline_absent))
         }
+    }
+}
+
+/// A-11 reset event two: a human answered the CEILING gate by advancing or
+/// looping back, so the per-phase budget starts again (999.78, D-07).
+///
+/// `ceiling_gate` is the caller's single read of
+/// `mode::phase_failure_ceiling_reached`, passed in rather than recomputed so
+/// this reset and the message's ceiling clause cannot disagree about whether
+/// the gate just answered was a ceiling gate.
+///
+/// The caller must never pass "a gate fired" here. Supervise gates on every
+/// Validate, so that would clear the total at every failure and the bound
+/// would never accumulate at all — an unbounded loop wearing a gate on every
+/// cycle. The persisting write is the caller's: both arms that call this go on
+/// to `transition` or `loop_back_to_code`, each of which saves state.
+fn reset_phase_failures_at_ceiling(state: &mut State, ceiling_gate: bool) {
+    if ceiling_gate {
+        state.phase_validate_failures = 0;
     }
 }
 
@@ -2439,6 +2478,101 @@ mod tests {
         );
         assert_eq!(without_baseline, "validate_failure_no_commit_baseline");
         assert_eq!(with_baseline, "validate_failure");
+    }
+
+    /// A-11 reset event TWO: operator approval at the CEILING gate clears the
+    /// per-phase budget — and an ordinary below-ceiling gate does not.
+    ///
+    /// **Both halves run in Supervise, and that is load-bearing.** In Auto a
+    /// below-ceiling Validate failure does not gate at all, so the second half
+    /// would pass without ever exercising the discrimination — it would prove
+    /// only that a gate that never fired did not reset anything. Supervise
+    /// gates on EVERY Validate, so both halves reach a real gate answered by a
+    /// real response, and the only thing that differs between them is whether
+    /// the ceiling predicate is true.
+    ///
+    /// Without the second half, an implementation that reset on every gate
+    /// would pass — and that implementation is the T-35-20b defect: the total
+    /// would never accumulate in the one mode where an operator sees every
+    /// occurrence.
+    #[test]
+    fn phase_validate_failures_reset_on_operator_approval_at_the_ceiling_gate() {
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        // HALF ONE — at the ceiling. One more recorded failure takes the total
+        // to exactly MAX, the gate fires, and the operator loops back.
+        let at_ceiling_phase = 95;
+        let mut at_ceiling = State::new(
+            at_ceiling_phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        at_ceiling.stage = Stage::Validate;
+        at_ceiling.phase_validate_failures = mode::MAX_PHASE_VALIDATE_FAILURES - 1;
+        workflow::save_state(&at_ceiling).unwrap();
+        let at_ceiling_response = Gates::response_path(root, at_ceiling_phase, Stage::Validate);
+        std::fs::create_dir_all(at_ceiling_response.parent().unwrap()).unwrap();
+        std::fs::write(&at_ceiling_response, LOOP_BACK_RESPONSE).unwrap();
+        let _ = handle_validate_outcome(root, &mut at_ceiling, ValidateOutcome::Failed);
+
+        // HALF TWO — below the ceiling, everything else identical. Supervise
+        // gates here too, and the operator answers with the same loop-back.
+        let below_phase = 96;
+        let mut below = State::new(
+            below_phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        below.stage = Stage::Validate;
+        below.phase_validate_failures = 2;
+        workflow::save_state(&below).unwrap();
+        let below_response = Gates::response_path(root, below_phase, Stage::Validate);
+        std::fs::create_dir_all(below_response.parent().unwrap()).unwrap();
+        std::fs::write(&below_response, LOOP_BACK_RESPONSE).unwrap();
+        let _ = handle_validate_outcome(root, &mut below, ValidateOutcome::Failed);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        assert!(
+            last_gate_context(root, below_phase).is_some(),
+            "premise for the second half: Supervise gates on a below-ceiling failure too. If \
+             no gate fired, the half proves nothing about the discrimination"
+        );
+        assert_eq!(
+            at_ceiling.phase_validate_failures, 0,
+            "a human answered the CEILING gate, so the per-phase budget starts again"
+        );
+        assert_eq!(
+            below.phase_validate_failures, 3,
+            "an ordinary below-ceiling Supervise gate must leave the total untouched — a reset \
+             on every gate would clear it at every failure and the bound would never accumulate"
+        );
+        assert_eq!(
+            workflow::load_state(root, at_ceiling_phase)
+                .expect("the ceiling gate must leave the run alive, not abort it")
+                .phase_validate_failures,
+            0,
+            "the reset must be persisted, not merely in memory — the next process reads the file"
+        );
     }
 
     /// `HARDEN-02 precision`: the per-phase total accumulates with a saturating
