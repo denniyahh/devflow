@@ -2739,6 +2739,46 @@ can miss it entirely.
 
 ---
 
+### Phase 999.95: `cargo doc` Is Not in This Repo's Definition of Green, and Carries a 33-Warning Baseline (BACKLOG)
+
+**Found:** 2026-08-07, phase 35-06 verification, when the plan's acceptance criterion required
+`cargo doc` to complete without warnings and it did not. Disposition set during 35-verify-work.
+
+**The gap, in one line:** `scripts/check.sh all` runs fmt + clippy + test and never invokes
+`cargo doc`, which is how a rustdoc warning baseline accumulated unnoticed since before 2.4.0.
+
+**Measured 2026-08-07, not transcribed.** `cargo doc --workspace --no-deps` reports **33 warnings,
+all in `devflow-core`'s lib doc**; `devflow-cli` contributes none. Every one is the same class —
+*"public documentation for `X` links to private item `Y`"*. Negative control run: filtering the
+warning lines for anything *other* than that class returns only the summary line, so the
+single-class claim is measured rather than assumed.
+
+> 35-06 reported 35; the count today is 33. The discrepancy is not investigated — it may be a
+> different counting basis (warning locations vs. emitted lines) or genuine drift. Whoever takes
+> this should re-measure rather than trust either figure.
+
+**Established as pre-existing, by 35-06, with evidence.** None of the 33 warning locations falls
+inside the ranges that plan edited, and seven sit in four files phase 35 never opened
+(`git diff --stat 749a151..HEAD` over those files is empty). This is old debt surfacing, not a
+regression.
+
+**Scope of the fix.** One mechanical class. Each site either re-points the doc link at a public
+item, drops the link while keeping the prose, or makes the linked item public where that is the
+honest answer. Low risk — documentation only, no behaviour change — but it touches many files, so
+it wants its own diff rather than riding along with unrelated work.
+
+**The gating question is deliberately NOT bundled, and stays open.** Adding a `cargo doc` step to
+`check.sh` changes what *every* future commit must satisfy, including commits in files unrelated to
+whatever a future author is changing. That is a policy decision, and it is much easier to make
+against a zero-warning baseline than against a 33-warning one — which is the whole argument for
+fixing first and gating second. Also worth deciding then: whether `check.sh` or the pre-push
+container gate is the right home, given doc builds are slow and `check.sh` runs far more often.
+
+**Priority:** Low — it is documentation quality, and nothing is silently wrong today. **Size:** S
+for the fix; the gating decision is separate and smaller.
+
+---
+
 ### Phase 999.93: Unattended Runs Have No Preflight for the Conditions They Require (BACKLOG — HIGH)
 
 **Found:** 2026-08-07, phase 35 verify-work, tracing why 35-01 and 35-05 both hit a GSD checkpoint

@@ -345,11 +345,24 @@ T-35-SC accepted — no packages installed, and this plan does not perform the r
 
 ## Still open — needs the operator's word, not my assumption
 
-1. **`cargo doc` is not in this repo's definition of green, and carries a 35-warning baseline.**
+1. **RESOLVED 2026-08-07 (operator, during 35-verify-work) — filed as backlog 999.95.**
+   **`cargo doc` is not in this repo's definition of green, and carries a 35-warning baseline.**
    `scripts/check.sh all` runs fmt + clippy + test only. Every warning is the same class (public
    documentation linking to a private item), so it is likely a small mechanical fix, but adding a
    doc step to `check.sh` changes what every future commit must satisfy and is a policy decision,
    not mine. Out of scope here; worth a backlog entry.
+
+   **Disposition: fix the warning class, do NOT add the gate yet — the two are separate decisions.**
+   Gating is far easier to decide against a zero-warning baseline than against the current one, and
+   bundling them would force a policy call as a side effect of a documentation cleanup. Both are
+   scoped in 999.95, with the gating question (and whether `check.sh` or the pre-push container gate
+   is the right home, given doc builds are slow) left explicitly open.
+
+   **Re-measured during verify-work rather than trusting this figure:** `cargo doc --workspace
+   --no-deps` reports **33** warnings today, all in `devflow-core`; `devflow-cli` contributes none.
+   The single-class claim was re-checked with a negative control (filtering for any other warning
+   kind returns only the summary line). The 35-vs-33 discrepancy is unexplained and recorded in
+   999.95 as something to re-measure rather than inherit.
 2. **The version step is deliberately NOT done.** `Cargo.toml` remains at `2.4.0` while
    `CHANGELOG.md` now has a `2.5.0` heading. That is what the plan requires — the version is set in
    two places at release time, with `devflow-core` publishing before `devflow-cli` — but it does
