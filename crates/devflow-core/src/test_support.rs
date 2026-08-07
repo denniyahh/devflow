@@ -139,6 +139,53 @@ pub use crate::git::{
     ALSO_REDIRECTING_GIT_VARS, REPO_LOCAL_GIT_VARS, git_command, hermetic_command,
 };
 
+// ## Why there is no absent-`git` (`NoGitPath`) harness in THIS crate
+//
+// 35-01 planned one `NoGitPath` guard per crate, so that criterion 6's tests
+// could force `git` to be unresolvable and drive `phase_commit_count`'s
+// could-not-measure branch from inside `devflow-core`. **That guard was built
+// here, measured, and removed.** It is recorded rather than silently omitted,
+// because the next author to need a failing `git` will otherwise rebuild it.
+//
+// A `PATH`-replacing guard mutates process-global state, and `cargo test` runs
+// this crate's whole suite as threads in ONE process. `devflow-core` shells out
+// to `git` from eight modules (`git`, `version`, `worktree`, `agent_result`,
+// `monitor`, `ship_evidence`, `hooks`, and this one), and — decisively — its
+// tests reach `git` by calling PRODUCTION code that spawns it, not only through
+// fixture helpers. So no fixture-level lock can cover them: serializing this
+// module's own `git()` helper still left
+// `agent_result::tests::evaluate_layer2_exit_zero_no_commits_is_failed` failing,
+// because its `git` call happens inside `evaluate_layer2` itself.
+//
+// Measured, with a control:
+//
+//   - guard used by three regression tests ....... 1-5 unrelated failures/run
+//   - guard used by its own sanity test only ..... 1 failure in 8 runs
+//   - sanity test `#[ignore]`d (control) ......... 0 failures in 10 runs
+//
+// The asymmetry between the last two lines is what identifies the guard itself
+// as the cause rather than a pre-existing flake. Ten clean runs is a weak bound
+// on the control arm, not a proof of zero flake rate; it is enough to establish
+// the direction, which is all that is being claimed.
+//
+// **What to use instead.** `hermetic_command` sets `cmd.current_dir(dir)`, so
+// passing a path that does not exist makes the spawn itself fail and
+// `.output()` return `Err` — the identical arm a missing binary produces,
+// reached with no environment mutation and therefore no effect on any other
+// test. `agent_result`'s `phase_commit_count_reports_none_when_git_cannot_run`
+// and `evaluate_layer3_unmeasurable_count_is_unknown_not_failed` both take that
+// route. It is also immune to the latent fragility of a `PATH` guard, which a
+// future refactor to an absolute `git` path would disarm silently.
+//
+// **When that is not enough**, because the code under test must also READ a
+// file from `project_root` (`evaluate_layer2` reads its exit file there, so a
+// non-existent root would fail for the wrong reason), the test belongs in
+// `devflow-cli`'s binary, where every `PATH` mutation goes through one
+// `ENV_MUTEX` that its `git`-touching tests already hold. Criterion 6's
+// layer-level and cascade-level tests live in
+// `devflow-cli/src/pipeline_outcomes.rs` for exactly this reason; they call the
+// same `pub` functions, so only the binary differs.
+
 #[cfg(test)]
 mod tests {
     use super::*;

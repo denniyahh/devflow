@@ -1,5 +1,154 @@
 # Changelog
 
+## 2.5.0 — 2026-08-07
+
+Phase 35 (loop termination and baseline correctness). Four defects that let an unattended
+`devflow start` run **either loop without a bound or stop for the wrong reason**, plus the
+release preflight that has now false-negatived on two separate release cuts.
+
+The unifying fault is a lossy collapse: three different places treated "could not measure" as
+"measured zero". A single transient `git` failure was enough to forge a fresh
+`consecutive_failures` baseline (999.77), and the same forged zero made the result cascade
+classify a *successful* agent as `Failed` (999.87). Both are closed by making the count's
+absence representable rather than by patching each consumer.
+
+**This release contains breaking changes to `devflow-core` and does not take a major version
+bump. That is deliberate, not an oversight** — see *Public API* below for the reasoning and the
+full enumeration.
+
+### What's new
+
+- **The Code↔Validate loop now has a bound that trivial commits cannot defeat (999.78).** A
+  never-reset per-phase Validate-failure total accumulates independently of the commit count and
+  gates at `MAX_PHASE_VALIDATE_FAILURES` (10). Previously the Code stage's fix command committed
+  `.planning/` artifacts on cycles that changed no source, which reset the streak every cycle and
+  made `MAX_CONSECUTIVE_FAILURES` unreachable in the ordinary case. The ceiling **gates, it never
+  aborts**: approve, loop back, or abort are the same three choices an ordinary Validate gate
+  offers, and the phase's state survives.
+- **The Supervise gate message reports how long the phase has actually run (999.78).** It leads
+  with the cumulative per-phase total and relegates the streak to a parenthetical, so the 2nd, 5th
+  and 9th gate no longer read identically.
+- **`{N}-VERIFICATION.md` goes stale (999.79).** `devflow start --phase N --force` no longer
+  inherits the previous run's committed verdict. A content fingerprint of the artifact is recorded
+  at run start and compared on loop-back; an artifact unchanged since then dispatches a full
+  execute instead of a `--gaps-only` pass against zero matching plans.
+- **`release --check`'s tag-signing preflight performs the operation instead of predicting it
+  (999.86).** It now signs throwaway bytes with `ssh-keygen -Y sign` in a private per-call
+  workspace and reports the exit code. The probe runs under `setsid`, so a controlling terminal's
+  `/dev/tty` passphrase prompt cannot capture it, and it is bounded by a wall-clock ceiling.
+
+### Fixed
+
+- **A transient `git` failure granted a free `consecutive_failures` reset (999.77).**
+  `phase_commit_count` collapsed an unrunnable or unparseable `git` to `0`, the baseline was
+  written unconditionally, the next real count exceeded that forged zero, it read as forward
+  progress, and the streak reset to 1 — one free extension of the failure ceiling per transient
+  fault. The baseline write now happens only on a real measurement.
+- **The same forged zero misclassified a successful agent as `Failed` (999.87).** `evaluate_layer2`
+  now returns `Ok(None)` on an unmeasurable count and falls through to Layer 3, and
+  `evaluate_layer3` — which carried its own independent copy of the same collapse — was re-pointed
+  at the shared counter. An unmeasurable count is now `Unknown` with no commit figure. Note this
+  corrects the recorded classification and the operator-facing reason string, **not** the dispatch:
+  `Failed` and `Unknown` both route to `Action::GateReview`.
+- **The signing predictor inferred viability from `ssh-add -l` (999.86).** Agent identity listings
+  cannot see on-disk private key material, so a correct key that no agent happened to hold reported
+  as not viable. It tested a condition the real signing operation does not require.
+- **The worktree-mode `GateReview` checkpoint call site is now regression-tested (999.84).** The
+  fix shipped in 2.4.0 was correct by construction but reverting its argument left the suite green.
+  A test now drives the call site and was watched failing under the performed revert, with a
+  localisation control that stayed green.
+
+### Public API (`devflow-core`)
+
+**This release breaks `devflow-core`'s public API under a minor version bump.** Strict semver
+would say `3.0.0`. That was put to the operator and declined on the grounds that `devflow-core`
+has no external consumers, so the compatibility risk is theoretical, while renaming the active
+milestone would disturb a roadmap-parsing window this project has already broken twice. **The
+break is documented here instead of being versioned** — this enumeration is what stands in for the
+version number that was declined. A reader who finds a breaking change under a minor bump should
+not have to guess whether it was an oversight.
+
+Every row below was verified against the source tree, not transcribed from the plans.
+
+#### Changed — breaking
+
+- **`devflow_core::agent_result::phase_commit_count`** — return type `u32` → `Option<u32>`.
+  `None` means the count could not be established (the `git` child could not be executed, or its
+  stdout did not parse); `Some(0)` means git ran and the branch genuinely has no commits. Closes
+  999.77 and 999.87, which are both instances of those two cases being indistinguishable.
+- **`devflow_core::mode::Mode::should_gate`** — signature widened from
+  `(self, stage, consecutive_failures)` to
+  `(self, stage, consecutive_failures, phase_validate_failures)`. Widened rather than disjuncted at
+  the call site deliberately: five tests re-derived the old two-argument expression to mirror the
+  production decision, and a call-site disjunct would have left all five compiling and silently no
+  longer mirroring anything. Required by 999.78.
+
+#### Removed — breaking
+
+- **`devflow_core::git::classify_ssh_add_status`** and **`devflow_core::git::SigningStatus`** —
+  the `ssh-add -l` exit-code predictor and its status enum, removed together with the private
+  `inline_key_fingerprint` orphaned alongside them. They inferred tag-signing viability from agent
+  identity membership, which is not a condition signing requires; the result was a live false
+  negative on two release cuts with the correct key present (999.86). Replaced by
+  `check_signing_viability`'s direct `ssh-keygen -Y sign` probe. A note at their former location in
+  `git.rs` records this, so a reader who reaches for them finds the reason rather than a gap.
+
+#### Changed — behaviour only, no signature change
+
+- **`devflow_core::agent_result::evaluate_layer3`** — signature, visibility and argument list are
+  **unchanged**; a caller needs no edit. Its observable classification does change: its inline
+  `rev-list --count` was deleted and re-pointed at `phase_commit_count`, so a count that cannot be
+  measured now classifies as `AgentStatus::Unknown` with no commit figure, where it previously
+  reported `Failed` with a forged zero. Listed separately rather than under *breaking* because
+  filing a behaviour change as a compatibility break would dilute the two entries a consumer must
+  actually act on — but listed at all, because someone tracing a changed verdict needs to find it.
+
+#### Added — non-breaking
+
+- **`devflow_core::agent_result::phase_verification_fingerprint`** — new `pub fn` returning
+  `Option<u64>`, a stable FNV-1a/64 content hash of `{N}-VERIFICATION.md` (999.79). Written out
+  rather than using `std`'s `DefaultHasher`, whose output is not guaranteed stable across toolchain
+  versions; this value is persisted by one process and compared by another, so an unstable hash
+  would read as "changed" after a Rust upgrade — the fail-open direction.
+- **`devflow_core::mode::MAX_PHASE_VALIDATE_FAILURES`** — new `pub const`, value `10` (999.78),
+  with a compile-time assertion that it stays strictly above `MAX_CONSECUTIVE_FAILURES`.
+- **`devflow_core::mode::phase_failure_ceiling_reached`** — new `pub fn`, the single implementation
+  of the ceiling comparison, shared by the gate message's ceiling clause and the reset so the two
+  cannot disagree (999.78).
+- **`devflow_core::state::State::phase_validate_failures`** (`u32`, 999.78) and
+  **`devflow_core::state::State::last_verification_fingerprint`** (`Option<u64>`, 999.79) — two new
+  `pub` fields. **Additive rather than breaking**: `State` carries `#[non_exhaustive]`, so no
+  external crate can construct it with a struct literal in the first place, and both fields are
+  `#[serde(default)]`, so existing `.devflow/state-NN.json` files deserialize unchanged. The
+  persisted JSON shape gains two optional keys.
+
+#### Unchanged, and stated because it was anticipated otherwise
+
+- **`devflow_core::agent_result::phase_verification_exists`** — planning anticipated that the
+  freshness work might force a third public-API break here. **It did not.** Its signature,
+  visibility and behaviour are unchanged; the freshness rule was built on an additive function and
+  a private path resolver that both it and the new fingerprint now share. Recorded so the absence
+  reads as a checked non-event rather than an omission. It currently has no in-workspace caller.
+
+### Known Issues
+
+- **The verification-freshness rule infers provenance from bytes, not from run identity.** An
+  artifact whose content changes for any reason other than this run's Validate agent — a worktree
+  merge-back, an operator edit — reads as authored-this-run and dispatches `--gaps-only`, which is
+  the failure direction 999.79 exists to prevent, reached by a different route. Tracked as 999.89.
+- **The `setsid` guard on the signing probe's regression test is n=1 per arm, one host, one
+  container.** `git::tests::the_signing_probe_is_not_captured_by_a_controlling_terminal` was added
+  and confirmed to fail (`REGRESSION:` panic) when the `pre_exec` is removed — 999.88 is resolved,
+  not open — but the test is timing-based (a pathologically loaded box could false-red it) against
+  one OpenSSH build and one encrypted key.
+- **`MAX_PHASE_VALIDATE_FAILURES = 10` is a judgement, not a measurement.** Nothing establishes how
+  many Validate failures a genuinely-converging phase takes.
+- **Two in-source comments (`idle_timeout_result` and a test-module comment) still describe a
+  mechanism a previous release replaced.** Carried over from 2.4.0, explicitly out of scope here.
+  Tracked as 999.85.
+- **The drain gate still has not been observed to see sub-agent concurrency.** Carried over from
+  2.4.0. Tracked as 999.83.
+
 ## 2.4.0 — 2026-08-06
 
 Phase 33 (loop-back correctness for multi-wave Validate↔Code cycles) and phase 34 (stream-json

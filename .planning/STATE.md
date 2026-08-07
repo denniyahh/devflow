@@ -1,16 +1,20 @@
 ---
 gsd_state_version: 1.0
 milestone: v2.5.0
-milestone_name: Loop-Termination and Release Hardening
-status: planning
-last_updated: "2026-08-06T14:14:11.571Z"
-last_activity: 2026-08-06
+milestone_name: milestone (Loop-Termination and Release Hardening, ACTIVE — declared 2026-08-06)
+current_phase: 35.1
+current_phase_name: Unattended-Launch Prerequisites (999.93)
+status: "Phase 35 shipped — PR #99"
+stopped_at: Phase 35 context gathered
+last_updated: "2026-08-07T23:19:47.782Z"
+last_activity: 2026-08-07
 progress:
-  total_phases: 2
-  completed_phases: 0
-  total_plans: 0
-  completed_plans: 0
-  percent: 0
+  total_phases: 4
+  completed_phases: 1
+  total_plans: 6
+  completed_plans: 6
+  percent: 25
+last_activity_desc: Phase 35 complete, transitioned to Phase 35.1
 ---
 
 # DevFlow — Project State
@@ -150,10 +154,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 35 of 36 (Loop-Termination and Baseline Correctness) — ready to plan
-Plan: — (not yet planned)
-Status: Roadmap created, ready for planning
-Last activity: 2026-08-06 — ROADMAP.md created for v2.5.0: Phase 35 (HARDEN-01..05 / 999.77+999.78+999.79+999.84+999.86), Phase 36 (HARDEN-06 / 999.83). Next: `/gsd-plan-phase 35`.
+Phase: 35.1 of 36 (Unattended-Launch Prerequisites (999.93))
+Plan: Not started
+Status: Phase 35 shipped — PR #99
+Last activity: 2026-08-07
 
 ## Recently Shipped
 
@@ -834,9 +838,9 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 
 ## Session
 
-**Last session:** 2026-08-06T11:17:31.166Z
-**Stopped at:** Phase 34 complete — UAT passed, security verified, milestone v2.4.0 at 100%
-**Resume file:** None
+**Last session:** 2026-08-06T15:41:26.736Z
+**Stopped at:** Phase 35 context gathered
+**Resume file:** .planning/phases/35-loop-termination-and-baseline-correctness-999-77-999-78-999-/35-CONTEXT.md
 
 ## Operator Next Steps
 

@@ -1824,40 +1824,104 @@ fn rate_limited_result(retry: String) -> AgentResult {
 /// Derives the branch name from `git_flow.feature_prefix` and the zero-padded
 /// `phase`, verifies the branch exists with `rev-parse --verify`, and on
 /// success counts `{git_flow.develop}..{branch}` with `rev-list --count`.
-/// This is the single implementation of that count — [`evaluate_layer2`] and
-/// `pipeline_outcomes::handle_validate_outcome`'s forward-progress check both
-/// call it rather than each re-deriving the branch name and re-running the
-/// same two git commands, which is what made the two counts able to silently
-/// diverge before this extraction.
+/// This is the single implementation of that count — [`evaluate_layer2`],
+/// [`evaluate_layer3`] and `pipeline_outcomes::handle_validate_outcome`'s
+/// forward-progress check all call it rather than each re-deriving the branch
+/// name and re-running the same two git commands, which is what made the
+/// counts able to silently diverge before this extraction. That claim was
+/// aspirational until 35-01: [`evaluate_layer3`] carried its own inline
+/// `rev-list --count` with an independent copy of the lossy zero collapse, and
+/// deleting it is what makes "single implementation" true.
 ///
 /// Must be called with the main `project_root`, never a worktree path — git
 /// worktrees share refs and the object database, so a commit made inside a
 /// linked worktree is immediately visible to a count run from the main
 /// checkout, which is the property every caller already relies on.
 ///
-/// A `0` return is deliberately indistinguishable across three causes:
-/// genuinely no commits, the branch does not exist, or `git` could not be
-/// run. Every consumer treats all three the same way.
-pub fn phase_commit_count(project_root: &Path, git_flow: &GitFlowConfig, phase: u32) -> u32 {
+/// The return distinguishes a MEASUREMENT from a measurement FAILURE, which
+/// is the whole point of the `Option` (999.77 / D-08, A-06):
+///
+/// - `Some(n)` — git ran and reported a real number. This includes
+///   `Some(0)` for a branch that genuinely does not exist yet, which is
+///   normal on a phase's first Validate and is a real observation, not a
+///   failure to observe.
+/// - `None` — the count could not be established: either the `git` child
+///   could not be executed at all (`.output()` returned `Err`), or it ran but
+///   produced stdout that does not parse as a `u32`. A-06 splits only the
+///   ran/did-not-run axis; the unparseable case is mapped to `None` here
+///   because the child produced no usable count, and reporting a forged zero
+///   for it would recreate exactly the hazard this signature removes.
+///
+/// **The two consumers now handle `None` distinctly, and neither collapses it
+/// to zero.** `pipeline_outcomes::handle_validate_outcome` treats an
+/// unmeasurable cycle as not-progress and leaves its persisted baseline
+/// untouched, so the next real measurement still compares against the last
+/// real observation. [`evaluate_layer2`] returns `Ok(None)` and falls through
+/// to [`evaluate_layer3`], which classifies an unmeasurable count as
+/// [`AgentStatus::Unknown`] rather than asserting the negative that no work
+/// was done.
+///
+/// # Changed in v2.5.0 — breaking
+///
+/// The return type was `u32` before this release; it is now `Option<u32>`
+/// (999.77 / 999.87). A call site updating from the old form must decide which
+/// of the two states it means, because the old type conflated them:
+///
+/// - `Some(0)` — git RAN and the branch genuinely has no commits. This is the
+///   old `0` in its legitimate sense, and is normal on a phase's first Validate.
+/// - `None` — no count was established at all. This is the case the old
+///   signature could not express, and `.unwrap_or(0)` is precisely the wrong
+///   way to restore it: collapsing it back to zero is the defect this change
+///   exists to remove. A transient `git` failure then reads as "no work done",
+///   which forged a `consecutive_failures` baseline reset (999.77) and made the
+///   result cascade classify a successful agent as `Failed` (999.87).
+///
+/// The enumeration of this and every other public-surface change in the release
+/// is in `CHANGELOG.md` under 2.5.0.
+pub fn phase_commit_count(
+    project_root: &Path,
+    git_flow: &GitFlowConfig,
+    phase: u32,
+) -> Option<u32> {
     let branch = format!("{}phase-{:02}", git_flow.feature_prefix, phase);
 
-    let branch_exists = git_command(project_root)
+    // A-06: split on whether the command RAN, not on what it answered. An
+    // `Err` means the child could not be executed — a measurement failure. An
+    // `Ok` with an unsuccessful status means git ran and reported the branch
+    // absent, which is a real observation of zero commits.
+    match git_command(project_root)
         .args(["rev-parse", "--verify", &branch])
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
-    if !branch_exists {
-        return 0;
+    {
+        Err(_) => return None,
+        Ok(output) if !output.status.success() => return Some(0),
+        Ok(_) => {}
     }
 
     let range = format!("{}..{branch}", git_flow.develop);
-    git_command(project_root)
+    // A-06 again, applied to the second step (CR-01, 35-REVIEW). This arm used
+    // to be `.output().ok()?` followed by `.parse().ok()`, which split on
+    // whether the output PARSED rather than on whether the command RAN — the
+    // opposite of the rule the `rev-parse` step above states and follows. A
+    // `rev-list` that runs and exits non-zero writes an empty stdout, so any
+    // condition making the range invalid (the configured `develop` absent from
+    // the checkout, a shallow clone) parsed to nothing and returned `None`
+    // *permanently*, not transiently. That is a measurement the command DID
+    // make; it belongs with the branch-absent case above as a real zero.
+    let output = match git_command(project_root)
         .args(["rev-list", "--count", &range])
         .output()
-        .ok()
-        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
-        .unwrap_or(0)
+    {
+        Err(_) => return None,
+        Ok(output) => output,
+    };
+    if !output.status.success() {
+        return Some(0);
+    }
+    // A success whose stdout does not parse is a different animal: git ran,
+    // succeeded, and said something this function cannot read. Nothing was
+    // established, so it stays `None` rather than being asserted as zero.
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
 /// Layer 2: Use exit code + commit count to determine result.
@@ -1883,6 +1947,10 @@ pub fn phase_commit_count(project_root: &Path, git_flow: &GitFlowConfig, phase: 
 ///           (not commit-gated; Validate's real pass signal is its verdict,
 ///           not a bare zero-commit — see Task 2's turn.completed deferral)
 ///   exit unknown                                         → fall to Layer 3 (return None)
+///   exit=0, stage in {Plan, Code}, commits UNMEASURABLE  → fall to Layer 3 (return None)
+///           (CR-01: the ONLY row an unmeasurable count changes. Every other
+///           row above is decided by the exit code alone and keeps its verdict
+///           with the count rendered as "unknown" in the reason string.)
 ///
 /// WR-06 (13-REVIEW.md): takes only the explicit `project_root` parameter
 /// for both the `.devflow/` file paths and the git subprocess `current_dir`
@@ -1902,10 +1970,38 @@ pub fn evaluate_layer2(
     };
 
     let branch = format!("{}phase-{:02}", git_flow.feature_prefix, phase);
-    let commits: u32 = phase_commit_count(project_root, git_flow, phase);
-
+    let commits = phase_commit_count(project_root, git_flow, phase);
     let commit_gated = matches!(stage, Stage::Plan | Stage::Code);
-    let no_work_done = commit_gated && commits == 0;
+
+    // D-09 (999.87): an unmeasurable commit count is NOT evidence that no work
+    // was done, and the commit gate below would classify it as
+    // `Failed — no work done` if it were collapsed to zero.
+    //
+    // CR-01 (35-REVIEW): the guard belongs HERE, not above the exit-code
+    // classification. `commits` is load-bearing for exactly one term —
+    // `no_work_done`, which only exists when `commit_gated` holds. Returning
+    // early on any `None` also discarded the 137 / 127 / `exit != 0` verdicts
+    // and the non-commit-gated `Success`, none of which read the count at all.
+    // That mattered because Layer 2 is the SOLE classifier for 137 and 127
+    // (Layer 1 sees no marker from a SIGKILLed or never-launched agent, and
+    // Layer 3 has no ResourceKilled/AgentUnavailable arm), and the same host
+    // fault that OOM-kills an agent also makes the `fork` for `git` fail — so
+    // the two observations arrive together, and an infra fault was routed into
+    // the Validate loop it is explicitly forbidden from entering
+    // (`pipeline_launch.rs`, review consensus #4 / D-08).
+    //
+    // Fall through ONLY when the missing count is what would have decided.
+    if commit_gated && exit_code == 0 && commits.is_none() {
+        return Ok(None); // fall to Layer 3
+    }
+
+    let no_work_done = commit_gated && commits == Some(0);
+    // Reason strings must not invent a number they do not have. Every
+    // surviving arm below interpolates the count for context only.
+    let commits_desc = match commits {
+        Some(n) => format!("{n} commits"),
+        None => "an unmeasurable number of commits".to_string(),
+    };
 
     // 137 (SIGKILL, typically OOM) and 127 (command not found) are classified
     // BEFORE the generic `exit_code != 0 -> Failed` catch-all, using the same
@@ -1926,31 +2022,27 @@ pub fn evaluate_layer2(
         exit_code: Some(exit_code),
         reason: if exit_code == 137 {
             Some(format!(
-                "agent process was killed (exit code 137, likely OOM) ({} commits on {})",
-                commits, branch
+                "agent process was killed (exit code 137, likely OOM) ({commits_desc} on {branch})"
             ))
         } else if exit_code == 127 {
             Some(format!(
-                "agent command was unavailable (exit code 127, command not found) ({} commits on {})",
-                commits, branch
+                "agent command was unavailable (exit code 127, command not found) \
+                 ({commits_desc} on {branch})"
             ))
         } else if exit_code != 0 {
             Some(format!(
-                "agent exited with code {} ({} commits on {})",
-                exit_code, commits, branch
+                "agent exited with code {exit_code} ({commits_desc} on {branch})"
             ))
         } else if no_work_done {
             Some(format!(
-                "no commits found on {} (agent exit code was {})",
-                branch, exit_code
+                "no commits found on {branch} (agent exit code was {exit_code})"
             ))
         } else {
             Some(format!(
-                "{} commits on {} (agent exit code was {})",
-                commits, branch, exit_code
+                "{commits_desc} on {branch} (agent exit code was {exit_code})"
             ))
         },
-        commits: Some(commits),
+        commits,
         summary: None,
         verdict: None,
         decided_by_layer: Some(2),
@@ -1968,45 +2060,75 @@ pub fn evaluate_layer2(
 /// masquerade as ambiguous-but-fine; the reason flags that human review is
 /// needed. This only fires when neither Layer 1 nor Layer 2 produced a
 /// definitive result.
+///
+/// **The split is three-way, not two-way (35-01/F-4).** The two cases above
+/// both assume the commit count was actually established. A third case —
+/// the count could not be MEASURED at all — is classified `Unknown` with
+/// `commits` left absent and a reason naming the measurement failure. It is
+/// not `Failed`: that asserts a negative the evidence does not support, and
+/// on a transient `git` fault it is the exact misclassification this layer
+/// used to produce. An unmeasurable count is strictly less certain than the
+/// `commits > 0` case already called `Unknown`, so `Unknown` is the
+/// consistent answer.
+///
+/// The count now comes from [`phase_commit_count`] rather than a second
+/// inline derivation. This layer previously ran its own `rev-list --count`
+/// that fell soft to a zero default, an independent copy of the same lossy
+/// collapse — so fixing only [`evaluate_layer2`] relocated the
+/// misclassification here instead of removing it. The two measurable arms'
+/// behaviour and reason strings are unchanged.
 pub fn evaluate_layer3(
     project_root: &Path,
     phase: u32,
     git_flow: &GitFlowConfig,
 ) -> Result<AgentResult, ResultError> {
     let branch = format!("{}phase-{:02}", git_flow.feature_prefix, phase);
-    let commits = git_command(project_root)
-        .args([
-            "rev-list",
-            "--count",
-            &format!("{}..{branch}", git_flow.develop),
-        ])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
-        .unwrap_or(0);
+    // F-4 (35-01): this layer used to run its OWN inline `rev-list --count`
+    // that fell soft to a zero default, an independent copy of the same lossy
+    // collapse `phase_commit_count` carried. Because every path that reaches
+    // Layer 2 also reaches Layer 3, fixing only Layer 2 relocated the
+    // misclassification here instead of removing it. Routed through the shared
+    // counter so the cascade's last layer measures the same way every other
+    // consumer does.
+    let commits = phase_commit_count(project_root, git_flow, phase);
 
-    let (status, reason) = if commits > 0 {
-        (
+    let (status, reason) = match commits {
+        Some(n) if n > 0 => (
             AgentStatus::Unknown,
             format!(
                 "unverified — agent process is gone but {} commits exist on {}",
-                commits, branch
+                n, branch
             ),
-        )
-    } else {
-        (
+        ),
+        Some(_) => (
             AgentStatus::Failed,
             "no work accounted for — agent process is gone with no commits and no declared \
              external post-condition; human review needed"
                 .to_string(),
-        )
+        ),
+        // F-4: an unmeasurable count is not evidence of absent work here
+        // either. `Failed` asserts a negative the evidence does not support,
+        // and it is the classification this phase exists to stop producing on
+        // a transient fault. Layer 3 already reserves `Unknown` for "there is
+        // something here I cannot verify"; a count that could not be taken at
+        // all is strictly less certain than that, so `Unknown` is the
+        // consistent answer. `commits` is left absent rather than forged to
+        // zero — "no work" and "could not tell" are different facts.
+        None => (
+            AgentStatus::Unknown,
+            format!(
+                "unverified — agent process is gone and the work could not be accounted for: \
+                 the commit count on {} could not be measured; human review needed",
+                branch
+            ),
+        ),
     };
 
     Ok(AgentResult {
         status,
         exit_code: None,
         reason: Some(reason),
-        commits: Some(commits),
+        commits,
         summary: None,
         verdict: None,
         decided_by_layer: Some(3),
@@ -2652,9 +2774,24 @@ fn phase_review_path(evidence_root: &Path, phase: u32) -> Option<PathBuf> {
 /// [`phase_commit_count`], whose refs and object database are shared across
 /// worktrees and which therefore correctly takes the project root.
 pub fn phase_verification_exists(evidence_root: &Path, phase: u32) -> bool {
-    let Ok(phases) = std::fs::read_dir(evidence_root.join(".planning/phases")) else {
-        return false;
-    };
+    phase_verification_path(evidence_root, phase).is_some()
+}
+
+/// The `{phase:02}-VERIFICATION.md` artifact's path under `evidence_root`, or
+/// `None` when no phase directory carries one.
+///
+/// Extracted from [`phase_verification_exists`] (999.79, 35-05) so the
+/// existence probe and the content fingerprint below scan for the artifact in
+/// exactly ONE place. Duplicating the prefix scan would let the two answer
+/// about different files after any future change to the directory layout — and
+/// the freshness rule is only sound while "does it exist" and "what are its
+/// bytes" are questions about the same path.
+///
+/// `evidence_root` carries the same meaning and the same prohibition as it does
+/// for [`phase_verification_exists`]: it is the root the Validate agent
+/// actually wrote to, never the main checkout in worktree mode.
+fn phase_verification_path(evidence_root: &Path, phase: u32) -> Option<PathBuf> {
+    let phases = std::fs::read_dir(evidence_root.join(".planning/phases")).ok()?;
     let prefix = format!("{phase:02}-");
     for entry in phases.flatten() {
         if entry
@@ -2664,11 +2801,92 @@ pub fn phase_verification_exists(evidence_root: &Path, phase: u32) -> bool {
         {
             let verification = entry.path().join(format!("{phase:02}-VERIFICATION.md"));
             if verification.exists() {
-                return true;
+                return Some(verification);
             }
         }
     }
-    false
+    None
+}
+
+/// A content fingerprint of the phase's `{phase:02}-VERIFICATION.md`, or `None`
+/// when no such artifact exists under `evidence_root` (999.79, 35-05).
+///
+/// **What it is for.** Nothing deletes, dates or invalidates the artifact, and
+/// `devflow start --phase N --force` checks out a branch that still carries the
+/// PREVIOUS run's committed copy. That re-run is mid-arc by construction, so its
+/// first Validate failure would find the stale artifact, read it as a verdict,
+/// and dispatch a `--gaps-only` pass against zero matching plans — gating
+/// unresolvably. Comparing this value against the one recorded at the start of
+/// the run distinguishes "the Validate agent authored this during this run"
+/// from "this was inherited".
+///
+/// **Why the algorithm is written out rather than borrowed from `std`.** This
+/// value is persisted by one process (`devflow start`) and compared by a later
+/// one (`devflow advance`), so it must mean the same thing in both.
+/// `std::collections::hash_map::DefaultHasher` explicitly does NOT guarantee a
+/// stable output across toolchain versions, so an operator who upgraded Rust
+/// mid-phase would see every artifact read as "changed" — which is the
+/// fail-OPEN direction, dispatching gaps-only exactly where a full execute was
+/// correct. This is FNV-1a/64, fixed by these two constants and nothing else.
+///
+/// **No security property is claimed.** This is change detection over a
+/// planning document that is already committed to the repository. It is not
+/// collision-resistant and must never be used to authenticate anything; an
+/// adversary who can write the artifact can already write whatever verdict they
+/// like into it.
+///
+/// # Companion: [`phase_verification_mtime_nanos`]
+///
+/// Content alone cannot see an IDEMPOTENT rewrite (WR-06, 35-REVIEW): a
+/// Validate agent that re-authors byte-identical content on a later cycle
+/// produces the same fingerprint as an artifact nobody touched, and the
+/// consumer then classifies its own agent's work as inherited. The mtime is
+/// the second input that separates "unchanged because inherited" from
+/// "unchanged because idempotent"; it is read from the same resolved path and
+/// returns `None` on exactly the same "no artifact" condition, so the two are
+/// always consistent about whether an artifact exists.
+pub fn phase_verification_fingerprint(evidence_root: &Path, phase: u32) -> Option<u64> {
+    let path = phase_verification_path(evidence_root, phase)?;
+    let bytes = std::fs::read(path).ok()?;
+    // FNV-1a, 64-bit: offset basis and prime are the published constants.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    Some(hash)
+}
+
+/// The mtime of the same `{phase:02}-VERIFICATION.md`
+/// [`phase_verification_fingerprint`] hashes, in nanoseconds since the Unix
+/// epoch, or `None` when no such artifact exists under `evidence_root`.
+///
+/// WR-06 (35-REVIEW): the second input the freshness rule needs. A content
+/// fingerprint cannot see an IDEMPOTENT rewrite — a Validate agent that
+/// re-authors byte-identical content on a later cycle produces the same hash as
+/// an artifact nobody touched — so a hash-only rule classifies its own agent's
+/// work as inherited and re-runs every plan in the phase from then on. An
+/// inherited file's mtime does not advance during a run; a rewritten one's
+/// does, whatever the bytes say.
+///
+/// Resolved through the same [`phase_verification_path`] and returning `None`
+/// on the same "no artifact" condition, so the two readings can never disagree
+/// about whether the artifact exists.
+///
+/// **This is not provenance either.** Any writer advances an mtime, so the
+/// limitation the fingerprint's doc comment records — a mid-run branch switch
+/// or an operator edit reading as authored-this-run — is not closed by this and
+/// is marginally widened by it: a checkout restoring byte-identical content
+/// used to read as inherited and now reads as authored. That is accepted
+/// deliberately, because the case it fixes (a deterministic verification writer
+/// on cycle 2 of an unresolved gap) is ordinary rather than exotic.
+pub fn phase_verification_mtime_nanos(evidence_root: &Path, phase: u32) -> Option<u64> {
+    let path = phase_verification_path(evidence_root, phase)?;
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let since_epoch = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    // `as` would silently wrap past year 2554; a `None` here degrades to the
+    // content-only comparison, which is the pre-WR-06 behaviour.
+    u64::try_from(since_epoch.as_nanos()).ok()
 }
 
 /// Keep only the newest `retain` capture generations under `history_dir`,
@@ -6643,7 +6861,119 @@ mod tests {
 
         let count = phase_commit_count(dir.path(), &GitFlowConfig::default(), 999);
 
-        assert_eq!(count, 0, "no feature/phase-99 branch exists in this repo");
+        assert_eq!(
+            count,
+            Some(0),
+            "git RAN and reported the branch absent — a real observation of zero, \
+             not a failure to measure"
+        );
+    }
+
+    /// The paired opposite-result case for
+    /// `phase_commit_count_reports_zero_without_a_branch` directly above, and
+    /// the pair is what makes either one mean anything (NC-4).
+    ///
+    /// The two differ in exactly one respect: whether the `git` child could be
+    /// executed at all. The repository is identical in both — no
+    /// `feature/phase-NN` branch — so a `Some(0)` here would prove the split
+    /// was made on "was the answer zero" rather than on "did the command run",
+    /// which is the distinction the whole `Option` exists to carry.
+    ///
+    /// Deliberately NOT built on a `git` shim that runs and exits non-zero:
+    /// that path returns `Ok(status)` from `.output()` and is a real
+    /// observation, so it would exercise the case above while appearing to
+    /// cover this one (F-1).
+    ///
+    /// **Why an unspawnable working directory rather than `NoGitPath` here —
+    /// F-1b's recorded fallback, taken on measured evidence.** `NoGitPath`
+    /// makes `git` unresolvable *process-wide*, and `devflow-core`'s tests
+    /// shell out to `git` from eight modules that all compile into ONE
+    /// parallel test binary. Installing it here failed 1-5 unrelated sibling
+    /// tests per run, nondeterministically, depending on which of them
+    /// happened to invoke `git` inside the guarded window. Serializing them
+    /// would mean every present and future `git`-touching test in the crate
+    /// opting into the same mutex — discipline, not structure, and silently
+    /// reopened by the next test that forgets.
+    ///
+    /// `hermetic_command` sets `cmd.current_dir(dir)`, so a directory that
+    /// does not exist makes the spawn itself fail and `.output()` return
+    /// `Err` — the identical arm, reached with no environment mutation at all
+    /// and therefore no effect on any other test. `phase_commit_count` cannot
+    /// tell the two causes apart: it sees only `Err`.
+    ///
+    /// This route is also independent of the PATH-resolution property C5
+    /// flags as a latent fragility of `NoGitPath` (a future refactor to an
+    /// absolute `git` path would disarm that guard silently; it would not
+    /// disarm this).
+    #[test]
+    fn phase_commit_count_reports_none_when_git_cannot_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let unspawnable_root = dir.path().join("this-directory-does-not-exist");
+        assert!(
+            !unspawnable_root.exists(),
+            "the fixture depends on this path being absent"
+        );
+
+        let count = phase_commit_count(&unspawnable_root, &GitFlowConfig::default(), 999);
+
+        assert_eq!(
+            count, None,
+            "a git child that could not be executed is a measurement FAILURE and must \
+             never be reported as a measured zero"
+        );
+    }
+
+    /// CR-01 (35-REVIEW), the `rev-list` half. The branch EXISTS, so the
+    /// `rev-parse` step succeeds and the function reaches its second git call
+    /// — but `develop` is absent from the checkout, so `A..B` is an invalid
+    /// range and `rev-list` runs, exits non-zero, and writes nothing to
+    /// stdout. That used to fall out of `.parse().ok()` as `None`, splitting
+    /// on whether the output PARSED rather than on whether the command RAN,
+    /// which contradicts this function's own A-06 rule and the `rev-parse`
+    /// step directly above it.
+    ///
+    /// It is the *permanence* that makes this worth a test: unlike a fork
+    /// failure, a misconfigured or absent `develop` does not clear on retry,
+    /// so before the fix every stage of every phase in such a checkout
+    /// measured as unmeasurable, forever.
+    ///
+    /// `phase_commit_count_reports_none_when_git_cannot_run` is the NC-4
+    /// control — the one case that must still be `None`.
+    #[test]
+    fn phase_commit_count_reports_zero_when_the_range_is_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init"]);
+        git(dir.path(), &["config", "user.email", "devflow@example.com"]);
+        git(dir.path(), &["config", "user.name", "DevFlow Tests"]);
+        git(dir.path(), &["config", "commit.gpgsign", "false"]);
+        git(dir.path(), &["config", "tag.gpgsign", "false"]);
+        git(dir.path(), &["config", "core.hooksPath", "/dev/null"]);
+        // The feature branch exists; `develop` deliberately does not.
+        git(dir.path(), &["checkout", "-b", "feature/phase-999"]);
+        std::fs::write(dir.path().join("README.md"), "base\n").unwrap();
+        git(dir.path(), &["add", "README.md"]);
+        git(dir.path(), &["commit", "-m", "base"]);
+
+        // The fixture is only meaningful if the second git call really is the
+        // one that fails, so assert the first one would have succeeded.
+        assert!(
+            git_command(dir.path())
+                .args(["rev-parse", "--verify", "feature/phase-999"])
+                .output()
+                .expect("git must be runnable for this fixture")
+                .status
+                .success(),
+            "the branch must verify, or this test exercises the rev-parse arm instead"
+        );
+
+        let count = phase_commit_count(dir.path(), &GitFlowConfig::default(), 999);
+
+        assert_eq!(
+            count,
+            Some(0),
+            "git RAN and reported the range unusable — a measurement, not a failure to \
+             measure; `None` here is permanent for the whole checkout"
+        );
     }
 
     #[test]
@@ -6683,6 +7013,30 @@ mod tests {
         assert_eq!(result.commits, Some(0));
         assert!(result.reason.unwrap().contains("no commits"));
     }
+
+    // HARDEN-07 / criterion 6's two discriminating tests — the layer-level one
+    // on `evaluate_layer2` and the cascade-level one on
+    // `evaluate_agent_result` — do NOT live here. They need `git` to be
+    // unresolvable while `project_root` still EXISTS (Layer 2 reads its exit
+    // file from that root, so an unspawnable working directory would make the
+    // exit read fail and return `Ok(None)` for the wrong reason), and only a
+    // `PATH` guard delivers that combination.
+    //
+    // A process-global `PATH` guard is not viable in THIS test binary:
+    // `devflow-core` shells out to `git` from eight modules that run in
+    // parallel, and tests call production code that spawns `git` directly, so
+    // no fixture-helper lock can cover them. Measured twice — 1-5 unrelated
+    // failures per run before any serialization, and still 1 failure in 8 runs
+    // after this module's own `git()` helper took the lock
+    // (`evaluate_layer2_exit_zero_no_commits_is_failed`, whose `git` call
+    // happens inside `evaluate_layer2` itself).
+    //
+    // Both tests therefore live in `devflow-cli`'s `pipeline_outcomes.rs`,
+    // whose test binary routes every `PATH` mutation through one `ENV_MUTEX`
+    // its `git`-touching tests already hold. They call these same `pub`
+    // functions directly, so the assertion is unchanged — only the binary it
+    // runs in differs. `evaluate_layer2_exit_zero_no_commits_is_failed` below
+    // remains their NC-11 opposite-result control and is unedited.
 
     #[test]
     fn evaluate_layer2_nonzero_exit_is_failed() {
@@ -6792,6 +7146,73 @@ mod tests {
         assert!(
             reason.to_ascii_lowercase().contains("human review"),
             "reason was: {reason}"
+        );
+    }
+
+    /// F-4 (35-01) / HARDEN-07: Layer 3 used to carry its OWN inline commit
+    /// count with the same lossy `.unwrap_or(0)` collapse `phase_commit_count`
+    /// had, and classified the resulting zero as `Failed`. Since every path
+    /// that reaches Layer 2 also reaches Layer 3, fixing only Layer 2 would
+    /// have relocated the misclassification one layer down rather than
+    /// removing it.
+    ///
+    /// A count that could not be measured is not evidence of absent work. It
+    /// is strictly less certain than the `commits > 0` case Layer 3 already
+    /// calls `Unknown`, so `Unknown` is the consistent classification and
+    /// `Failed` — which asserts a negative — is not.
+    ///
+    /// The two tests directly above are this one's required opposite-result
+    /// controls, and they run in the same suite with their bodies unedited: a
+    /// branch with one commit still gives `Unknown`/`Some(1)`, and a branch
+    /// with no commits still gives `Failed`/`Some(0)`. Without them, an
+    /// implementation that returned `Unknown` unconditionally would pass this
+    /// test.
+    ///
+    /// **No assertion here touches `Action` or anything downstream of
+    /// `outcome_policy::decide_action` (F-5).** `Failed` and `Unknown` map
+    /// identically to `Action::GateReview` today, so a dispatch-level
+    /// assertion would pass against the buggy code too. The observable
+    /// difference is entirely in the `AgentResult`.
+    ///
+    /// Uses the same unspawnable-working-directory route as
+    /// `phase_commit_count_reports_none_when_git_cannot_run`, for the reason
+    /// recorded there (F-1b): a process-wide `PATH` guard broke unrelated
+    /// sibling tests in this crate nondeterministically, and this route
+    /// reaches the identical `Err` arm with no environment mutation.
+    #[test]
+    fn evaluate_layer3_unmeasurable_count_is_unknown_not_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let unspawnable_root = dir.path().join("this-directory-does-not-exist");
+        assert!(
+            !unspawnable_root.exists(),
+            "the fixture depends on this path being absent"
+        );
+
+        let result = evaluate_layer3(&unspawnable_root, 5, &GitFlowConfig::default()).unwrap();
+
+        assert_ne!(
+            result.status,
+            AgentStatus::Failed,
+            "an unmeasurable commit count must never be classified as absent work — \
+             this is the outcome criterion 6 exists to remove"
+        );
+        assert_eq!(
+            result.status,
+            AgentStatus::Unknown,
+            "asserted positively as well as negatively, so a future change to some \
+             other non-Failed value still has to confront this test"
+        );
+        assert_eq!(
+            result.commits, None,
+            "the commit figure must be absent, not a forged Some(0) — the difference \
+             between 'no work' and 'could not tell' is the whole point"
+        );
+        assert_eq!(result.decided_by_layer, Some(3));
+        let reason = result.reason.unwrap();
+        assert!(
+            reason.contains("could not be measured"),
+            "the reason must name the measurement failure rather than absent work, \
+             reason was: {reason}"
         );
     }
 
@@ -7112,6 +7533,78 @@ mod tests {
         assert!(
             phase_verification_exists(root, 82),
             "a phase directory holding {{N}}-VERIFICATION.md must return true"
+        );
+    }
+
+    /// 999.79 (35-05): the fingerprint must be a function of the artifact's
+    /// BYTES, not of its existence.
+    ///
+    /// Both halves are required and neither is redundant. The first half
+    /// (different bytes → different values) is satisfied by any hash. The
+    /// second half (identical bytes → identical values) is what rules out a
+    /// value derived from something incidental — a timestamp, an inode, a
+    /// counter — which would make every check read "changed" and permanently
+    /// disable the gaps-only path. A constant-returning implementation fails
+    /// the first half; a nondeterministic one fails the second.
+    #[test]
+    fn phase_verification_fingerprint_differs_when_content_differs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase_dir = root.join(".planning/phases/84-fingerprint");
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        let artifact = phase_dir.join("84-VERIFICATION.md");
+
+        std::fs::write(&artifact, "verdict: gaps\n").unwrap();
+        let first = phase_verification_fingerprint(root, 84)
+            .expect("an artifact that exists must produce a fingerprint");
+
+        let first_again = phase_verification_fingerprint(root, 84)
+            .expect("an artifact that exists must produce a fingerprint");
+        assert_eq!(
+            first, first_again,
+            "identical bytes must produce identical fingerprints — a value that changes on \
+             its own would mark every artifact fresh forever and disable the stale check"
+        );
+
+        std::fs::write(&artifact, "verdict: pass\n").unwrap();
+        let second = phase_verification_fingerprint(root, 84)
+            .expect("an artifact that exists must produce a fingerprint");
+        assert_ne!(
+            first, second,
+            "different bytes must produce different fingerprints — a constant implementation \
+             would report every re-authored artifact as unchanged"
+        );
+    }
+
+    /// 999.79 (35-05): an absent artifact yields no fingerprint, which is
+    /// distinguishable from an artifact whose content happens to hash to zero.
+    /// Both are asserted here so "absent" can never be conflated with "hashed
+    /// to the zero value".
+    #[test]
+    fn phase_verification_fingerprint_is_none_when_the_artifact_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        assert_eq!(
+            phase_verification_fingerprint(root, 85),
+            None,
+            "no .planning/phases directory at all must yield None, not panic"
+        );
+
+        let phase_dir = root.join(".planning/phases/85-fingerprint");
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        assert_eq!(
+            phase_verification_fingerprint(root, 85),
+            None,
+            "a phase directory with no {{N}}-VERIFICATION.md must yield None"
+        );
+
+        std::fs::write(phase_dir.join("85-VERIFICATION.md"), "").unwrap();
+        let empty = phase_verification_fingerprint(root, 85);
+        assert!(
+            empty.is_some(),
+            "an EMPTY artifact still exists and must yield Some — the control against an \
+             implementation that conflates 'absent' with 'no bytes'"
         );
     }
 }

@@ -17,26 +17,32 @@ Requirements for this milestone. Each maps to a roadmap phase.
 
 ### Loop-Termination Hardening
 
-- [ ] **HARDEN-01**: Operator can trust `consecutive_failures` reflects real repeated failure, not
+- [x] **HARDEN-01**: Operator can trust `consecutive_failures` reflects real repeated failure, not
   a single transient `git` hiccup — the counter's baseline is not silently overwritten by a
   measurement failure (999.77)
 
-- [ ] **HARDEN-02**: Operator can trust an unattended Code↔Validate loop has a bound independent
+- [x] **HARDEN-02**: Operator can trust an unattended Code↔Validate loop has a bound independent
   of trivial per-cycle commits (GSD commands routinely commit `.planning/` artifacts even when
   nothing source-level changed), and the Supervise-mode gate message reports a real cumulative
   total rather than a streak length that resets misleadingly low (999.78)
 
-- [ ] **HARDEN-03**: Operator can `--force` re-run a phase without inheriting the previous run's
+- [x] **HARDEN-03**: Operator can `--force` re-run a phase without inheriting the previous run's
   stale `VERIFICATION.md`, which today causes the loop-back to dispatch `--gaps-only` against a
   mid-arc phase and gate unresolvably (999.79)
 
-- [ ] **HARDEN-04**: Operator can trust the worktree-mode `GateReview` checkpoint auto-decide path
+- [x] **HARDEN-04**: Operator can trust the worktree-mode `GateReview` checkpoint auto-decide path
   (999.76) is covered by a regression test that would catch a future regression at the call site,
   not just correct by construction with no test driving it (999.84)
 
+- [x] **HARDEN-07**: Operator can trust that a transient `git` failure does not make a *successful*
+  agent run read as failed — "could not count" is distinguished from "counted zero" at **both**
+  consumers of the commit count, not only at the `consecutive_failures` baseline (999.87). Added
+  2026-08-06 by operator decision, after the 999.77 fix was found to force `evaluate_layer2`'s call
+  site open at compile time; see ROADMAP Phase 35 criterion 6.
+
 ### Release Hardening
 
-- [ ] **HARDEN-05**: Operator can trust `release --check`'s tag-signing preflight reflects whether
+- [x] **HARDEN-05**: Operator can trust `release --check`'s tag-signing preflight reflects whether
   signing will actually work — via a real `ssh-keygen -Y sign` probe on a throwaway payload,
   rather than a fingerprint-matching predictor that has now false-negatived live during two
   separate release cuts with the correct key present (999.86)
@@ -66,18 +72,19 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| HARDEN-01 | Phase 35 | Pending |
-| HARDEN-02 | Phase 35 | Pending |
-| HARDEN-03 | Phase 35 | Pending |
-| HARDEN-04 | Phase 35 | Pending |
-| HARDEN-05 | Phase 35 | Pending |
+| HARDEN-01 | Phase 35 | Complete |
+| HARDEN-02 | Phase 35 | Complete |
+| HARDEN-03 | Phase 35 | Complete |
+| HARDEN-04 | Phase 35 | Complete |
+| HARDEN-05 | Phase 35 | Complete |
+| HARDEN-07 | Phase 35 | Complete |
 | HARDEN-06 | Phase 36 | Pending |
 
 **Coverage:**
 
-- v1 requirements: 5 total (HARDEN-01..05)
+- v1 requirements: 6 total (HARDEN-01..05, HARDEN-07)
 - v2 requirements: 1 total (HARDEN-06)
-- Mapped to phases: 6
+- Mapped to phases: 7
 - Unmapped: 0 ✓
 
 ---

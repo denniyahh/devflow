@@ -44,6 +44,23 @@ specifically to the main-checkout case.
   `git rev-parse --abbrev-ref HEAD` and confirm it matches the intended target — protected-branch
   rejection is the backstop, not a substitute for checking, and it only fires if the push actually
   reaches the branch that's wrong.
+- **`cargo test -p devflow --lib` verifies nothing.** `devflow` is binary-only (`devflow[bin]`, no
+  `src/lib.rs`), so cargo exits non-zero with `error: no library targets found in package 'devflow'`
+  before running a single test. Use `-p devflow --bin devflow`. `-p devflow-core --lib` *is* valid —
+  that crate has a lib target. Phase 35 shipped this formulation into 21 `<automated>` acceptance
+  blocks across four plans; three separate executors each rediscovered it on the clock.
+- **A revert that hangs is not a revert that fails.** When proving a regression test catches a
+  reverted change, a wedged harness and a failed assertion are different observations and only one
+  is evidence. 35-02's first attempt polled a never-answered gate for 600s and died to SIGTERM; the
+  fixture needed a pre-written abort response before the revert could produce a real
+  `test result: FAILED`. Require the failing direction to print a failure, not merely to not-pass.
+- **A symbol search does not find tests that reference a deleted item through its strings.** Those
+  break at run time, not compile time, so the workspace still builds and only the suite catches
+  them. 35-03's plan warned about this for one file and still missed two such tests in a second.
+  After deleting a `pub` item, grep its *reason strings* and message literals as well as its name.
+- **A grep over source counts comment prose.** 35-01's region check reported a surviving
+  `unwrap_or(0)` that existed only inside a comment. Strip comments before counting, or the measure
+  reports on documentation rather than on code.
 
 ## Prefer GSD commands over doing it by hand
 

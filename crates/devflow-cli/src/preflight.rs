@@ -351,8 +351,8 @@ pub(crate) enum BaseRefCurrency {
 /// `git fetch` so the comparison is made against a freshly-updated
 /// remote-tracking ref rather than merely "nobody has fetched recently."
 ///
-/// The fetch updates ONLY the remote-tracking ref (`git fetch <remote>
-/// <base>`) — it never touches the local branch or the working tree, so it
+/// The fetch updates ONLY the remote-tracking ref (`git fetch <remote> <base>`)
+/// — it never touches the local branch or the working tree, so it
 /// cannot fail with a "branch is checked out" error the way a refspec fetch
 /// into the local branch would. On spawn error or non-zero exit the fetch
 /// fails SOFT: a warning is printed and the comparison proceeds against

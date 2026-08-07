@@ -98,6 +98,141 @@ pub struct State {
     /// other numeric field on this struct.
     #[serde(default)]
     pub last_validate_failure_commit_count: Option<u32>,
+    /// Every Validate failure recorded for this PHASE, accumulated without
+    /// regard to forward progress (999.78/WR-01, D-07) — the backstop bound
+    /// [`crate::mode::MAX_PHASE_VALIDATE_FAILURES`] compares against, and the
+    /// leading number in the Supervise gate message (WR-04).
+    ///
+    /// A serde-absent value (state written by a binary predating this field)
+    /// deserializes to 0, which is exactly its "no failures recorded for this
+    /// phase" meaning — the same backward-compat pattern as every other
+    /// `#[serde(default)]` field added since 17-01. Unlike
+    /// [`Self::last_validate_failure_commit_count`], zero is not ambiguous
+    /// here: an upgraded binary and a genuine first failure both start the
+    /// budget at its full width, and that widening is what IN-02's distinct
+    /// loop-back reason exists to announce.
+    ///
+    /// Why it exists next to [`Self::consecutive_failures`] rather than
+    /// replacing it: `consecutive_failures` is reset whenever
+    /// [`crate::mode::consecutive_failures_made_progress`] reports that new
+    /// commits landed, and the Code stage's fix command is a GSD command
+    /// which routinely commits `.planning/` artifacts even when no source
+    /// changed. A loop that commits something trivial every cycle therefore
+    /// resets the streak every cycle and never reaches
+    /// [`crate::mode::MAX_CONSECUTIVE_FAILURES`]. This total cannot be reset
+    /// by a commit count.
+    ///
+    /// **Lifetime — deliberately unlike every other counter on this struct.**
+    /// It is NOT touched by the stage transition (`transition_resets_*` has no
+    /// say over it), matching how [`Self::preflight_retries`] and
+    /// [`Self::checkpoint_resumes`] are handled, because it is a per-phase
+    /// total rather than a per-streak counter. It is also carried across a
+    /// forced restart: `commands::start()` reads any persisted state for the
+    /// same phase and copies this one field into the fresh `State`, because a
+    /// bound a `devflow start --force` resets does not bound the unattended
+    /// case D-07 exists for. Exactly two events reset it to zero:
+    ///
+    /// 1. **Phase completion** — `finish_workflow_with_gate_timeout` calls
+    ///    `workflow::clear_state`, deleting `.devflow/state-{NN}.json`, so the
+    ///    next start for that phase finds nothing to carry.
+    /// 2. **Operator approval at the ceiling gate** — the Validate gate
+    ///    handling zeroes it when a human advances or loops back AND
+    ///    [`crate::mode::phase_failure_ceiling_reached`] is true. Keyed on that
+    ///    predicate and never on "a gate fired": Supervise gates on every
+    ///    Validate, so a gate-keyed reset would clear the total at every
+    ///    failure and it would never accumulate in the one mode where an
+    ///    operator watches every occurrence.
+    ///
+    /// Any increment must use `saturating_add`, like [`Self::infra_failures`]
+    /// and [`Self::checkpoint_resumes`], so an exhausted budget can never wrap
+    /// back to zero and silently restore itself.
+    #[serde(default)]
+    pub phase_validate_failures: u32,
+    /// The content fingerprint of this phase's `{N}-VERIFICATION.md` as it
+    /// stood at the START of this run (999.79), read via
+    /// [`crate::agent_result::phase_verification_fingerprint`] once the
+    /// evidence root for the run is known.
+    ///
+    /// `None` means no artifact was observed at the start of this run — the
+    /// ordinary case for a phase being executed for the first time. It is
+    /// deliberately distinct from `Some(h)`: an artifact that EXISTS now where
+    /// the baseline recorded none was authored during this run, whereas an
+    /// artifact whose fingerprint still equals the baseline was inherited from
+    /// a previous run and its verdict must not be reused.
+    ///
+    /// **State written by a binary predating this field also deserializes to
+    /// `None`, and that is NOT the same reading** (WR-05, 35-REVIEW). This doc
+    /// comment used to claim it was. For a phase started under an older binary
+    /// and continued by this one, the previous run's committed
+    /// `{N}-VERIFICATION.md` is already on disk while the baseline reads
+    /// `None` — so the `(Some, None)` row would classify an inherited artifact
+    /// as authored-this-run and dispatch `--gaps-only` against zero matching
+    /// plans, gating unresolvably. That is verbatim the DOGFOOD-01-class stall
+    /// 999.79 exists to close, reproduced for every in-flight phase across the
+    /// upgrade.
+    ///
+    /// [`Self::verification_baseline_captured`] is the discriminator: only a
+    /// run that actually performed the observation sets it, so a `None` from an
+    /// old state file is distinguishable from a `None` that means "looked, and
+    /// there was nothing there".
+    ///
+    /// Why this exists at all: nothing deletes or dates `{N}-VERIFICATION.md`,
+    /// so a `devflow start --force` re-run checks out a branch still carrying
+    /// the previous run's committed copy. Without this baseline the first
+    /// Validate failure of that re-run reads the inherited artifact as a
+    /// verdict and dispatches a `--gaps-only` pass against zero matching plans,
+    /// which gates unresolvably — the same unattended-stall class as
+    /// DOGFOOD-01, reached from a different direction.
+    ///
+    /// **Lifetime.** Like [`Self::last_validate_failure_commit_count`], and
+    /// unlike [`Self::consecutive_failures`] and [`Self::infra_failures`], this
+    /// field is NOT touched by `transition()` — it is a run-scoped observation
+    /// rather than a counter, so it is replaced wholesale rather than
+    /// incremented and needs no `saturating_add` treatment. It is also NOT
+    /// carried across a forced restart the way
+    /// [`Self::phase_validate_failures`] is: a new run must re-observe the
+    /// artifact, because the whole point is to compare against what THIS run
+    /// started with.
+    #[serde(default)]
+    pub last_verification_fingerprint: Option<u64>,
+    /// Whether [`Self::last_verification_fingerprint`] was actually observed by
+    /// this run, as opposed to merely absent (WR-05, 35-REVIEW).
+    ///
+    /// `Option<u64>` cannot carry this on its own: `None` means both "the run
+    /// looked and found no artifact" and "this state file predates the field,
+    /// so nobody ever looked", and those two demand OPPOSITE dispatches. The
+    /// first is the ordinary first-verification case and `--gaps-only` is
+    /// right; the second may be sitting on an inherited artifact, where
+    /// `--gaps-only` matches zero plans and stalls.
+    ///
+    /// `false` is therefore the correct serde default in both directions: a
+    /// state file written before this field existed genuinely did not capture a
+    /// baseline, and the conservative reading of an artifact whose provenance
+    /// is unknown is "inherited" — a full execute is wasteful, an unresolvable
+    /// gate is not recoverable.
+    ///
+    /// Set exactly once per run, at the same site that captures the baseline,
+    /// after `state.worktree_path` holds its final value.
+    #[serde(default)]
+    pub verification_baseline_captured: bool,
+    /// The mtime of the same artifact [`Self::last_verification_fingerprint`]
+    /// hashes, in nanoseconds since the Unix epoch, as of the same observation.
+    ///
+    /// WR-06 (35-REVIEW): a content fingerprint cannot see an IDEMPOTENT
+    /// rewrite. A Validate agent that re-authors byte-identical content on a
+    /// later failing cycle produces the same hash as an artifact nobody
+    /// touched, so a hash-only rule reads its own agent's work as inherited and
+    /// dispatches a full execute — re-running every plan in the phase on every
+    /// subsequent cycle instead of the gaps-only pass Phase 33 built. That is
+    /// the "too strict" direction the freshness rule's own comment claims to
+    /// guard against and did not.
+    ///
+    /// Moves in lockstep with the fingerprint: written at the same capture
+    /// site, replaced at the same update site, and never read on its own — the
+    /// pair is the observation, and either one differing means the artifact was
+    /// written during this run.
+    #[serde(default)]
+    pub last_verification_mtime_nanos: Option<u64>,
     /// When the phase started (Unix seconds).
     pub started_at: String,
     /// Path to the project root.
@@ -264,6 +399,10 @@ impl State {
             infra_failures: 0,
             preflight_retries: 0,
             last_validate_failure_commit_count: None,
+            phase_validate_failures: 0,
+            last_verification_fingerprint: None,
+            verification_baseline_captured: false,
+            last_verification_mtime_nanos: None,
             started_at: timestamp_now(),
             project_root,
             worktree_path: None,
@@ -336,6 +475,7 @@ mod tests {
         assert_eq!(state.consecutive_failures, 0);
         assert_eq!(state.infra_failures, 0);
         assert_eq!(state.preflight_retries, 0);
+        assert_eq!(state.phase_validate_failures, 0);
         assert!(!state.started_at.is_empty());
         assert_eq!(state.monitor_pid, None);
         assert_eq!(state.stop_until, None);
@@ -444,6 +584,114 @@ mod tests {
         }"#;
         let loaded: State = serde_json::from_str(json).unwrap();
         assert_eq!(loaded.last_validate_failure_commit_count, None);
+    }
+
+    /// 999.78/D-07: `phase_validate_failures` round-trips through serde. The
+    /// key-presence assertion comes BEFORE the value round-trip deliberately —
+    /// a field that never actually persists still passes a naive in-memory
+    /// round trip, and a bound that lives only in memory does not bound a
+    /// phase whose whole failure mode spans separate `devflow` processes.
+    #[test]
+    fn phase_validate_failures_round_trips_through_serde() {
+        let mut state = State::new(1, AgentKind::Claude, Mode::Auto, PathBuf::from("/repo"));
+        state.phase_validate_failures = 7;
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(
+            json.contains("phase_validate_failures"),
+            "phase_validate_failures must appear in persisted JSON"
+        );
+        let loaded: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            loaded.phase_validate_failures, 7,
+            "phase_validate_failures must round-trip through serde"
+        );
+    }
+
+    /// A serde-absent `phase_validate_failures` (state written by a binary
+    /// predating this field) deserializes to 0 — "no failures recorded for
+    /// this phase" — rather than failing the load outright, which would make
+    /// an upgrade mid-phase unrecoverable.
+    #[test]
+    fn phase_validate_failures_absent_from_json_defaults_to_zero() {
+        let json = r#"{
+            "stage": "code",
+            "phase": 1,
+            "agent": "claude",
+            "mode": "auto",
+            "started_at": "0",
+            "project_root": "/repo"
+        }"#;
+        let loaded: State = serde_json::from_str(json).unwrap();
+        assert_eq!(loaded.phase_validate_failures, 0);
+    }
+
+    /// 999.79 (35-05): `last_verification_fingerprint` round-trips through
+    /// serde. The key-presence assertion comes BEFORE the value round-trip for
+    /// the same reason the two fields above give — this baseline is written by
+    /// `devflow start` and compared by a later `devflow advance`, which is a
+    /// different process, so a field that never reaches disk would leave every
+    /// comparison reading `None` and defeat the whole rule.
+    #[test]
+    fn last_verification_fingerprint_round_trips_through_serde() {
+        let mut state = State::new(1, AgentKind::Claude, Mode::Auto, PathBuf::from("/repo"));
+        state.last_verification_fingerprint = Some(0x0123_4567_89ab_cdef);
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(
+            json.contains("last_verification_fingerprint"),
+            "last_verification_fingerprint must appear in persisted JSON"
+        );
+        let loaded: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            loaded.last_verification_fingerprint,
+            Some(0x0123_4567_89ab_cdef),
+            "last_verification_fingerprint must round-trip through serde"
+        );
+    }
+
+    /// A serde-absent `last_verification_fingerprint` (state written by a
+    /// binary predating this field) deserializes to `None` — "no artifact was
+    /// observed at the start of this run" — rather than failing the load, which
+    /// would make an upgrade mid-phase unrecoverable.
+    #[test]
+    fn last_verification_fingerprint_absent_from_json_defaults_to_none() {
+        let json = r#"{
+            "stage": "code",
+            "phase": 1,
+            "agent": "claude",
+            "mode": "auto",
+            "started_at": "0",
+            "project_root": "/repo"
+        }"#;
+        let loaded: State = serde_json::from_str(json).unwrap();
+        assert_eq!(loaded.last_verification_fingerprint, None);
+        // WR-05 (35-REVIEW): the SAME absent JSON must also report that nobody
+        // captured a baseline. `None` alone cannot carry that — it means both
+        // "looked, found nothing" and "never looked" — and the two demand
+        // opposite dispatches downstream.
+        assert!(
+            !loaded.verification_baseline_captured,
+            "state predating the baseline field never captured one, and must not claim to"
+        );
+    }
+
+    /// The other half of the pair above: a state file written by THIS binary
+    /// carries the flag, so the two cases really are distinguishable after a
+    /// round trip. Without this, `verification_baseline_captured` could be
+    /// hardcoded `false` and the absent-JSON assertion above would still pass.
+    #[test]
+    fn verification_baseline_captured_round_trips_through_serde() {
+        let mut state = State::new(1, AgentKind::Claude, Mode::Auto, PathBuf::from("/repo"));
+        state.verification_baseline_captured = true;
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(
+            json.contains("verification_baseline_captured"),
+            "verification_baseline_captured must appear in persisted JSON"
+        );
+        let loaded: State = serde_json::from_str(&json).unwrap();
+        assert!(
+            loaded.verification_baseline_captured,
+            "a captured baseline must survive the save/load the real pipeline performs"
+        );
     }
 
     /// D-18f: `preflight_retries` round-trips through serde (its own key

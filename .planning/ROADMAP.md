@@ -27,10 +27,12 @@ those five confirmed fixes down waiting on a harness.
 
 | Phase | Name | Status | Version |
 |---|---|---|---|
-| 35 | Loop-Termination and Baseline Correctness | Not started | — |
+| 35 | Loop-Termination and Baseline Correctness | Complete (2026-08-07) | — |
+| 35.1 | Unattended-Launch Prerequisites | Not started | — |
+| 35.2 | Verification Provenance | Not started | — |
 | 36 | Drain Gate Concurrency Measurement | Not started | — |
 
-### Phase 35: Loop-Termination and Baseline Correctness (999.77 + 999.78 + 999.79 + 999.84 + 999.86)
+### Phase 35: Loop-Termination and Baseline Correctness (999.77 + 999.78 + 999.79 + 999.84 + 999.86 + 999.87)
 
 **Goal**: Operator can trust the Code↔Validate loop's failure-gating mechanics and the release
 signing preflight behave as documented and are enforced by regression tests, not by
@@ -38,9 +40,11 @@ correctness-by-construction alone — a transient `git` failure can no longer fo
 baseline, the loop has a bound independent of trivial per-cycle commits, a `--force` re-run
 doesn't inherit a stale verdict, the worktree-mode checkpoint call site is regression-tested, and
 `release --check`'s signing result reflects a real probe rather than a predictor that has already
-false-negatived live twice.
+false-negatived live twice. **Scope widened 2026-08-06 (operator):** 999.87 folded in — the same
+`Option<u32>` change forces `evaluate_layer2`'s call site open, so both consumers of the lossy count
+are fixed together rather than one being repaired while the other keeps collapsing the distinction.
 **Depends on**: Nothing (first phase of this milestone).
-**Requirements**: HARDEN-01, HARDEN-02, HARDEN-03, HARDEN-04, HARDEN-05
+**Requirements**: HARDEN-01, HARDEN-02, HARDEN-03, HARDEN-04, HARDEN-05, HARDEN-07
 **Success Criteria** (what must be TRUE):
 
   1. A transient `git` failure while measuring `phase_commit_count` no longer overwrites the
@@ -71,6 +75,130 @@ false-negatived live twice.
      `ssh-keygen -Y sign` probe against a throwaway payload, not from an `ssh-add -l`
      fingerprint comparison — closing the predictor that has produced a live false negative with
      the correct key present on two separate release cuts (999.86).
+
+  6. A transient `git` failure no longer causes `evaluate_layer2` to classify a successful agent as
+     `Failed` — an unmeasurable commit count is distinguished from a measured zero at **both**
+     consumers, not only at the `consecutive_failures` baseline, and Layer 2 returns `Ok(None)` to
+     fall through to Layer 3 (the idiom it already uses for an unreadable exit file) rather than
+     treating "could not count" as evidence of no work. Verified by the same forced-`git`-failure
+     harness criterion 1 requires, with the discriminating case being `exit_code = 0` +
+     `Stage::Code` + unrunnable `git` (999.87).
+**Plans**: 6/6 plans executed
+
+Plans:
+**Wave 1**
+
+- [x] 35-01-PLAN.md — tracer: the unmeasurable-`git` spine end to end — `NoGitPath` harness in both crates, `phase_commit_count` becomes `Option<u32>`, **all three** consumers honour it, two-cycle regression test, corrected doc comments (criteria 1 + 6). **Scope grew 2026-08-07 (cross-AI review, A-H1):** `evaluate_layer3` carried its own inline copy of the same lossy count, so criterion 6's `Ok(None)` fall-through only relocated the misclassification into Layer 3. Layer 3 is now fixed in the same plan and verified at the **cascade** level (`evaluate_agent_result`), since a per-layer test on `evaluate_layer2` alone is the proxy that hid it. Note `Failed` and `Unknown` both route to `Action::GateReview` (`outcome_policy.rs:53-54`), so this corrects the recorded classification and reason string, not the dispatch — no dispatch-level assertion is admissible as evidence here.
+- [x] 35-02-PLAN.md — worktree-mode `GateReview` checkpoint regression test with D-05's decoy PLAN, D-06's re-running control, and the performed revert demonstration (criterion 4)
+- [x] 35-03-PLAN.md — replace `release --check`'s signing predictor with a bounded, non-interactive `ssh-keygen -Y sign` probe; delete the predictor, its enum and the orphaned helper (criterion 5)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
+- [x] 35-04-PLAN.md — never-reset per-phase Validate-failure total that survives `--force`, a ceiling that gates without aborting, and a gate message led by the cumulative number (criterion 2)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
+- [x] 35-05-PLAN.md — run-scoped content fingerprint makes `{N}-VERIFICATION.md` go stale, so a `--force` re-run stops inheriting the previous run's verdict; both directions tested (criterion 3)
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
+- [x] 35-06-PLAN.md — enumerate and document the public-API break: verified `CHANGELOG.md` entry plus removal notes at each site; release stays `v2.5.0`, milestone unrenamed (D-04 / D-08)
+
+### Phase 35.1: Unattended-Launch Prerequisites (999.93)
+
+**Goal**: `devflow start --mode auto` can actually complete a phase with no human present — ordinary
+GSD `blocking` checkpoints resolve instead of stalling the run — and a preflight refuses the launch,
+loudly, when the conditions that make that true do not hold.
+**Depends on**: Phase 35 (whose `phase_validate_failures` accounting is what a stalled unattended run
+currently burns through). Sequenced **before** Phase 36, which needs a working unattended run to
+gather the live concurrency evidence its criterion 1 demands.
+**Requirements**: HARDEN-07
+**Success Criteria** (what must be TRUE):
+
+  1. During the Code stage and the `--gaps-only` fix loop, `check auto-mode` reports active, so GSD
+     auto-approves ordinary `gate="blocking"` checkpoints instead of the run stalling into a gate.
+     Established by driving a real checkpoint, not by asserting the flag's value.
+
+  2. The chain flag DevFlow sets is cleared again on **every** exit path from those stages, including
+     error and kill paths. `.planning/config.json` is tracked and `commit_docs` is on, so a leaked
+     `_auto_chain_active: true` is committed and then fires GSD's plan-phase chaining on the *next*
+     phase (upstream G-03: the clear at `plan-phase.md:1547` does not affect the decision at `:1563`,
+     which reads the pre-clear value). A test must demonstrate the leak is closed on a failure path,
+     not only on the happy path.
+
+  3. DevFlow's Plan stage does not chain into execute-phase. `workflow.auto_advance` is NOT set
+     persistently — that flag conflates checkpoint-bypass with stage-chaining (upstream G-01), and
+     setting it makes plan-phase launch execute-phase itself, double-executing the Code stage and
+     misattributing its commits to the Plan stage.
+
+  4. A preflight reports, per condition, whether an unattended run's prerequisites hold, and
+     **refuses** the launch when they do not — a warning is read by nobody in an unattended run. It
+     carries a negative control: a fixture where the check reports NOT viable. A preflight that
+     cannot fail is the defect it exists to prevent (the 999.86 lesson, one phase earlier).
+
+  5. The work is demonstrated by a simulated unattended run that crosses the seams under test —
+     Plan → Code with a real checkpoint — rather than by unit tests alone. Phase 35 shipped with no
+     end-to-end run anywhere in it; this criterion exists so the same gap is not repeated on the
+     change whose entire purpose is making unattended runs work.
+
+  6. **Observation to collect while running, not a criterion to satisfy:** record the per-phase
+     Validate-failure count this run actually reaches. `MAX_PHASE_VALIDATE_FAILURES = 10` (35-04) is
+     an unmeasured judgement — the const assertion pins only its relation to
+     `MAX_CONSECUTIVE_FAILURES`, never the absolute value — and no history exists to mine because the
+     counter did not exist before Phase 35. This run is the first opportunity to observe the real
+     number. Record it even if the run never approaches the ceiling; "converged in 2" is data.
+
+**Not in scope**: the first-option `decision` checkpoint behaviour (filed as 999.94) — it is a
+correctness question about *how* an unattended agent decides, separable from *whether* it can
+proceed at all.
+**Plans**: TBD
+
+### Phase 35.2: Verification Provenance (999.89 / HARDEN-03)
+
+**Goal**: A loop-back decision knows whether *this run's* Validate agent authored
+`{N}-VERIFICATION.md`, rather than inferring it from whether the bytes changed — and the cross-repo
+branch-naming coincidence that currently keeps the byte-inference safe is pinned by a test instead of
+being relied on silently.
+**Depends on**: Phase 35.1 — reuses its simulated unattended run as the harness for criterion 4
+rather than standing up a second one.
+**Requirements**: HARDEN-03
+**Success Criteria** (what must be TRUE):
+
+  1. `verification_authored_this_run` decides on a **run-owned marker DevFlow itself writes**, not on
+     a content fingerprint. DevFlow does not author `{N}-VERIFICATION.md` — the only `fs::write` of
+     it in this codebase is two test fixtures (`agent_result.rs:7532`, `:7602`); GSD's verifier agent
+     is the writer. So the marker must be something DevFlow owns and stamps around the Validate
+     stage, **not** a field the agent is asked to embed: an instruction to an agent is a request, not
+     a guarantee, and provenance that can be silently skipped is not provenance.
+
+  2. A byte change the Validate agent did not cause no longer reads as authored-this-run. The
+     scenario to drive is 999.89's: the artifact is replaced under the evidence root (as a branch
+     checkout would replace it) with no Validate agent having run, and the dispatch must be a full
+     execute — not `--gaps-only` against zero matching plans.
+
+  3. **The cheap half, which defends the route that would make the defect common.** A test pins that
+     DevFlow's phase-branch name matches the string GSD's `execute-phase` independently computes,
+     **including the single-digit padding case** (DevFlow zero-pads to `feature/phase-07`; GSD takes
+     a bare number and — verified 2026-08-07 — emits the same). Today GSD's branching step finds the
+     branch already present and degenerates to a no-op `git switch`; that is the only reason a
+     checkout does not routinely replace the artifact. Two conventions maintained in two
+     repositories, nothing enforcing agreement. This test is what makes a drift loud instead of
+     turning a rare failure routine, silently, from a change in a repo that has no reason to know the
+     invariant exists.
+
+  4. Both directions are demonstrated in the same run: an artifact the Validate agent genuinely wrote
+     still dispatches `--gaps-only`, and an artifact changed by anything else dispatches a full
+     execute. 35-05's own lesson applies directly — its two-stub demonstration showed an
+     always-stale rule silently reverts Phase 33, and a rule tested in only one direction cannot
+     catch that.
+
+  5. `mtime` is stated as rejected, with its reason, so a later reader does not retry it:
+     `phase_verification_mtime_nanos` already exists, but a checkout or merge-back updates mtime
+     exactly as it updates content, so it fails on the identical scenario.
+
+**Not in scope**: changing the artifact's format or asking GSD to write anything. Both would make
+this depend on an upstream change (see `.planning/UPSTREAM-GSD-ISSUES.md`); the whole point of the
+run-owned marker is that DevFlow can close this alone.
 **Plans**: TBD
 
 ### Phase 36: Drain Gate Concurrency Measurement (999.83)
@@ -105,6 +233,12 @@ be planned and executed independently of Phase 35's completion.
      CLI version(s), workload shape(s) covered, and what conclusion that evidence can and cannot
      support — so a future reader cannot mistake a narrow result for a general guarantee about the
      drain gate.
+
+  5. **Observation to collect while running, not a criterion to satisfy:** record the per-phase
+     Validate-failure count this run reaches (same ask as Phase 35.1's criterion 6, repeated here so
+     whichever run happens first captures it). `MAX_PHASE_VALIDATE_FAILURES = 10` is an unmeasured
+     judgement carried provisionally from 35-04; these are the first runs able to say what the real
+     number looks like.
 **Plans**: TBD
 
 ## Progress
@@ -153,7 +287,9 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 32 | 0/0 | Complete    | 2026-08-04 |
 | 33 | 6/6 | Complete    | 2026-08-05 |
 | 34 | 6/6 | Complete    | 2026-08-06 |
-| 35 | — | Not started | — |
+| 35 | 6/6 | Complete    | 2026-08-07 |
+| 35.1 | — | Not started | — |
+| 35.2 | — | Not started | — |
 | 36 | — | Not started | — |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
@@ -315,7 +451,326 @@ Unsequenced items — not part of the active phase sequence. Promote with
 `/gsd-review-backlog` when ready; each carries accumulated context in its
 own `phases/999.N-*/CONTEXT.md`.
 
-### Phase 999.86: Replace `release --check`'s Tag-Signing Predictor With a Direct Probe (BACKLOG, revises D-10 for `release --check` only)
+### Phase 999.92: The 999.47 Regression Test Loses Its Own Fixture Shape Before It Asserts — Flaky, and Weak When Green (BACKLOG)
+
+**Linear:** [DEN-113](https://linear.app/denniskim/issue/DEN-113/99992-the-99947-regression-test-loses-its-own-fixture-shape-before-it)
+**Found:** 2026-08-07 by `/gsd-validate-phase 35`. Surfaced as a one-off flake during the phase
+audit; the weak-coverage half was found while diagnosing the flake, and is the more serious of the two.
+
+**Priority:** Medium | **Size:** S — one fixture, but the obvious one-line fix is the *wrong* fix
+(see below).
+
+**Not a recurrence of 999.47, and deliberately not filed there.** 999.47/DEN-72 is closed and
+`PROMOTED — Phase 25`: its production defect (`looks_like_devflow_process` returning `true` for a
+non-devflow process) was fixed, the barrier landed 2026-07-28, and CI failures went to zero. This is
+a defect in the *test fixture* that guards it — a different thing, and reopening a delivered entry
+would misfile it.
+
+**Two defects in one test**, `agent::tests::discover_stray_devflow_processes_rejects_the_999_47_false_positive_shape`
+(`crates/devflow-core/src/agent.rs:774`).
+
+**(1) The flake.** The fixture is `sh -c 'sleep 30' /tmp/devflow-scratch/looks-like-devflow`, and
+the test crosses `test_support::wait_for_exec_visibility(pid, "sh", …)` (`test_support.rs:92`)
+before asserting. But `/bin/sh` is bash, and bash `exec`s a lone simple command rather than forking
+for it — so `argv[0]` becomes `sleep` almost immediately, while the barrier polls for `sh` every
+2 ms. Measured directly on 2026-08-07: `argv[0]` is `sh` at t≈2 ms and `sleep` from t≈4 ms onward,
+so roughly one poll iteration ever sees the expected value. Miss it and the barrier burns its full
+`EXEC_VISIBILITY_WAIT` ceiling and fails the assertion.
+
+**(2) The serious half — the test is weak even when it passes.** After bash's second `exec` the
+process cmdline is plain `sleep 30`: **the devflow-looking path is gone from argv entirely.**
+Confirmed twice, by reading `/proc/PID/cmdline` after settle — the `looks-like-devflow` fragment is
+absent. So whenever this test goes green it is asserting that a plain `sleep 30` is not discovered,
+which is trivially true and is *not* the "999.47 false-positive shape" the test is named for: a
+process that merely mentions a devflow-looking path as an argument. The shape it exists to reject
+evaporates ~2 ms after spawn, before the census ever runs.
+
+**Why the obvious fix is wrong.** Changing the barrier to wait for `sleep` instead of `sh` removes
+the flake and makes the *wrong* test pass reliably — the fixture still holds no devflow-looking
+argv. The fixture itself has to keep that shape for the census's duration (e.g. a helper whose real
+argv contains the path, or a command bash will not optimise into an `exec`), and the fix should
+carry an assertion that the fragment is actually present in `/proc/PID/cmdline` at assert time — a
+premise check, so the test voids itself rather than passing vacuously if the shape is lost again.
+
+**This is the proxy-measurement class Phase 35 exists to close**, sitting inside the regression test
+for 999.47. A measurement adjacent to the question, reported as the answer.
+
+**Evidence status — read before acting.** The flake was observed **once**, by the phase-35 nyquist
+auditor. The validate-phase audit did **not** reproduce it: 10/10 targeted runs and 3/3 full-suite
+runs green, including two under the pinned container gate. Targeted runs lack the parallel
+contention the race needs, so that is weak counter-evidence rather than a refutation — but the
+frequency is unestablished and should not be assumed high. **Defect (2) is not probabilistic and
+does not depend on reproducing the flake**; it was verified directly and holds on every run.
+
+**Related:** 999.47/DEN-72 (the closed original), Phase 25's 25-11 (which added the barrier),
+999.88/DEN-109 (the sibling "assumed the ambient environment" mistake found the same day).
+
+### Phase 999.91: Add a Doc Gate to `check.sh` That Denies Only the Rustdoc Lints Which Catch Real Errors (BACKLOG)
+
+**Linear:** [DEN-112](https://linear.app/denniskim/issue/DEN-112/99991-add-a-doc-gate-to-checksh-that-denies-only-the-rustdoc-lints)
+**Found:** 2026-08-07, Phase 35. The five concrete falsehoods this surfaced were fixed in-phase
+(commit `8350340`); this entry is the **gate** that would have caught them when they were written.
+
+**Priority:** Low-Medium | **Size:** S — one line in `scripts/check.sh`, plus the CI equivalent.
+
+**The shape of it.** `cargo doc` runs nowhere in this repository — not in `scripts/check.sh`
+(`fmt` + `clippy` + `test` only), not in CI. Nothing has ever checked documentation correctness.
+Measured 2026-08-07 at `0c111d0`: **38 warnings**, in three classes (cross-checked two ways — a
+per-class tally of 33 + 4 + 1 against rustdoc's own per-crate totals of 36 + 2).
+
+| Class | Count | Assessment |
+|---|---|---|
+| `rustdoc::private_intra_doc_links` — public doc links to a private item | 33 | Stylistic. This codebase writes unusually detailed doc comments that name internal helpers; the link merely does not resolve in *public* docs. |
+| `rustdoc::broken_intra_doc_links` — link to an item that does not exist | 4 | **Real.** Documentation asserting something false about the code. |
+| `rustdoc::invalid_html_tags` | 1 | **Real.** Swallows following text in rendered output. |
+
+The five real ones were: `[`feature_start_force`]` missing its `Self::` qualifier (`git.rs:129`);
+two links treating the constant `MAX_CHECKPOINT_RESUMES` as if it had associated items
+(`mode.rs:98`); `ClaudeAgent::exec_command` linked through the struct when it is a **trait** method
+(`pipeline_launch.rs:449`); and an unclosed `<remote>` tag (`preflight.rs:354`). None was introduced
+by Phase 35 — all five predate it, verified against `749a151..HEAD`.
+
+**Why this repo in particular.** `CLAUDE.md` requires maintaining comments and docstrings, and
+Phase 35's 35-06 rested on the premise that *documentation is the deliverable*, standing in for the
+version bump D-08 declined. A repository that treats doc accuracy as a shippable artifact while
+four doc links point at nonexistent symbols has no mechanism matching its stated standard.
+
+**The proposal, and why it is cheap.** The choice is not "clean all 38" versus "no gate". Deny only
+the lints that catch real errors and the 33 stylistic ones are ignored by design:
+
+```bash
+RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links -D rustdoc::invalid_html_tags" \
+  cargo doc --workspace --no-deps
+```
+
+At `8350340` this passes with zero findings, so the gate can be added **without a cleanup phase
+first** — that is the whole argument for doing it. Adding it changes what every future commit must
+satisfy, which is why it is a policy call for the operator rather than a drive-by.
+
+**Open sub-question, not decided here.** Whether the 33 private-link warnings should eventually be
+resolved (by unlinking, or by `--document-private-items`) or accepted permanently as house style.
+The gate above is deliberately neutral on it.
+
+### Phase 999.90: `handle_validate_outcome` Counts Commits Against `GitFlowConfig::default()`, Not the Project's Configured Git-Flow (BACKLOG)
+
+**Linear:** [DEN-111](https://linear.app/denniskim/issue/DEN-111/99990-handle-validate-outcome-counts-commits-against)
+**Found:** 2026-08-07, Phase 35 code review (35-REVIEW.md, IN-02). **Pre-existing** — the line was
+moved by 35-04, not introduced by it. Filed rather than fixed in-phase per the 34/D-04 precedent
+(a defect a fix *reveals* is filed, not fixed in the same phase).
+
+**Priority:** Low-Medium | **Size:** S — thread the configured value through one call site.
+
+**The shape of it.** `pipeline_outcomes.rs:523` calls `phase_commit_count` with
+`GitFlowConfig::default()` rather than the project's configured git-flow. A project that configures
+a non-default `develop` or `feature_prefix` therefore counts commits against branch names that do
+not exist in its checkout.
+
+**Why Phase 35 makes this worse, not better.** Before this phase, the resulting `rev-list` failure
+produced an unparseable empty stdout and a `None` count, which fell through to Layer 3 and gated for
+review — wrong, but visible and safe. CR-01's fix (commit `cf462ec`) correctly made a `rev-list`
+that *ran and failed* return `Some(0)`, matching the `rev-parse` step and the function's own A-06
+rule. For a correctly-configured project that is right. For a project hitting this defect it means
+the count is now a confident **zero** rather than an absent measurement — so a commit-gated stage
+reads `Failed — no work done` and loops back, instead of gating.
+
+That is a strictly worse failure mode for the misconfigured case, and it is the direct interaction
+the review flagged: the two defects are individually defensible and jointly produce a silent wrong
+answer.
+
+**Fix.** Thread the project's `GitFlowConfig` to the call site instead of constructing a default.
+Add a test with a non-default `develop` asserting the count is taken against the configured branch.
+
+**Related:** CR-01 in 35-REVIEW.md (fixed in-phase, `cf462ec`), 999.77, 999.87.
+
+### Phase 999.89: The Verification-Freshness Rule Infers Provenance From Bytes, and Is Only Safe Because Two Branch-Naming Conventions Happen to Agree (BACKLOG)
+
+**Linear:** [DEN-110](https://linear.app/denniskim/issue/DEN-110/99989-verification-freshness-infers-provenance-from-bytes-and-is-only)
+**Found:** 2026-08-07, Phase 35 execution, reviewing what 35-05 shipped.
+
+**Priority:** Medium | **Size:** M — a run identifier in the artifact, plus one convention-pinning
+test.
+
+**The shape of it.** 35-05 closed 999.79 by fingerprinting `{N}-VERIFICATION.md` at run start and
+treating an unchanged artifact as inherited. The predicate
+(`verification_authored_this_run`, `pipeline_outcomes.rs:396`) keys on **content change alone**:
+
+```rust
+(None, _)              => false,
+(Some(_), None)        => true,   // absent at run start, present now
+(Some(now), Some(base)) => now != base,
+```
+
+It therefore cannot distinguish "this run's Validate agent wrote a verdict" from "these bytes
+changed for some other reason". Anything that alters the artifact under the evidence root reads as
+authored-this-run and dispatches `--gaps-only` — mid-arc that matches zero plans and gates
+unresolvably, which is the exact 999.79 failure reached by a different route. The plan ships this
+knowingly (`must_haves`, `verification: backstop`).
+
+**Why it is not currently common — and why that is the worrying part.** The obvious trigger would
+be the Code stage, which runs `/gsd-execute-phase {N}`: that workflow performs branch checkouts and
+worktree merges, and a checkout replaces working-tree contents wholesale. It does not fire today
+only because of a coincidence:
+
+- DevFlow creates its phase worktree on `feature/phase-{phase:02}` (`worktree.rs:42`,
+  `commands.rs:2740`, `pipeline_gate.rs:695`) **before** the baseline is captured
+  (`commands.rs:344`, placed after the worktree fork by A-05 — that placement is deliberate).
+
+- GSD's `execute-phase` independently computes `branch_name` and produces the identical string.
+  Verified 2026-08-07 including the single-digit case, where DevFlow zero-pads and GSD takes a bare
+  number: `init.execute-phase 7` returns `feature/phase-07`.
+
+- So GSD's branching step finds the branch already present and degenerates to a no-op `git switch`.
+
+**Nothing enforces that agreement.** Two conventions maintained in two different repositories happen
+to emit the same string. If either drifts, GSD's branching step forks off `origin/<default>`
+instead, replacing the worktree contents — including the artifact — and lands directly on the
+`(Some(_), None) => true` row. The failure would go from rare to routine, silently, from a change in
+a *different repo* that has no reason to know this invariant exists.
+
+**Two-part fix, and the second part is the cheap one.**
+
+1. Embed a run identifier in `{N}-VERIFICATION.md` (or alongside it) so provenance is *checked*
+   rather than inferred from bytes. The predicate then asks "was this authored by this run",
+   which is the question it is actually trying to answer.
+
+2. Add a test pinning that DevFlow's phase-branch name matches the convention GSD computes,
+   including the single-digit padding case. This is small and defends the route that would make
+   the defect common.
+
+**Live routes today** (with the branch route closed): an operator editing the artifact mid-run, or
+external tooling touching the repo while a phase is in flight. Both real, both uncommon.
+
+**Related:** 999.79 (closed by 35-05, this is its residual), 999.84, DOGFOOD-01 (same unattended
+stall class).
+
+### Phase 999.88: The `setsid` Guard on the Tag-Signing Probe Has No Regression Test (RESOLVED 2026-08-07)
+
+> **RESOLVED 2026-08-07 by `/gsd-validate-phase 35`**, which found this same gap independently as
+> Phase 35's only outstanding Nyquist gap (35-03's D8, `human_judgment: true`) and closed it rather
+> than record it Manual-Only a second time.
+>
+> **Delivered:** `git::tests::the_signing_probe_is_not_captured_by_a_controlling_terminal`
+> (commit `8917dcd`, +339 test-only lines; arm-0 correction in `d33a837`). It builds exactly what
+> "What the test needs" below specifies — a pty acquired via `TIOCSCTTY`, and an `open("/dev/tty")`
+> premise check in the child that voids the run instead of passing it if the terminal did not take.
+> Three arms, of which the first two must disagree or the test fails as `PREMISE FAILED` rather than
+> reporting a regression.
+>
+> **The guard is no longer held in place by nothing** — verified by performing the mutation, not by
+> reading the fix: commenting out the `pre_exec` block yields `test result: FAILED. 0 passed;
+> 1 failed` with a `REGRESSION:` panic, against a no-terminal control that still exits in ~5 ms.
+> Re-performed after the arm-0 correction. Green on host and under the pinned container gate
+> (`scripts/check-in-container.sh all`, exit 0, 956 passed across 22 binaries).
+>
+> **What it still does not establish:** n=1 per arm, one host and one container, OpenSSH 10.4p1 /
+> 9.2p1, one ed25519 encrypted key. It is timing-based, so a pathologically loaded box could false-red
+> it; it cannot silently pass, because both failure directions are loud.
+>
+> **Cost of the lesson:** the first version passed on a terminal-less host and hard-failed the
+> container gate, because `check-in-container.sh` runs `docker run --rm -t` and the test inherited
+> that pty as its controlling terminal. See 999.92 — the same "assumed the ambient environment"
+> mistake, in a different fixture.
+
+**Linear:** [DEN-109](https://linear.app/denniskim/issue/DEN-109/99988-the-setsid-guard-on-the-tag-signing-probe-has-no-regression-test)
+**Found:** 2026-08-07, Phase 35 execution, while folding 35-03's deferred `setsid` fix in on
+operator instruction.
+
+**Priority:** Medium | **Size:** S–M — one test, but it needs a pty fixture this workspace does not
+yet have.
+
+**The shape of it.** 35-03 replaced `release --check`'s signing predictor with a real probe, then
+`34aab4f` detached that probe from any controlling terminal via `libc::setsid()` in a `pre_exec`
+hook. The fix is correct and was measured with a proper control — under a real `pty.fork()` session
+leader the un-detached arm was still alive when the window closed while the detached arm exited in
+8.1 ms, and the paired no-terminal control had both arms agree at 7.7 ms vs 8.3 ms, which is what
+proves the variable is doing the work. But **deleting the `pre_exec` block would not fail the
+suite.** The guard is held in place by nothing.
+
+**Why this is the same class Phase 35 exists to close.** 35-02 was a whole plan written because the
+worktree-mode `GateReview` call site was "correct by construction" with no test behind it (999.84).
+Landing a second unguarded correctness-by-construction fix three plans later, in the same phase,
+would be incoherent. The coverage entry is already marked `human_judgment: true` in `35-03-SUMMARY.md`
+for exactly this reason.
+
+**What the test needs.** A Rust fixture that allocates a pty and calls `TIOCSCTTY` so the child has
+a genuine controlling terminal, then asserts the probe terminates promptly with `setsid` and does
+not without it. The measurement harness must assert `open("/dev/tty")` succeeds before measuring,
+so a silent degradation into the no-terminal case voids the run instead of passing it — that guard
+is what made 35-03's own measurement trustworthy and it belongs in the committed test too.
+
+**Deliberately not in scope.** Widening 35-03 to build this was excluded at execution time on
+scope-discipline grounds, and that call was right; it is a real piece of work, not a one-liner.
+
+**Related:** 999.86 (the probe itself, PROMOTED — Phase 35).
+
+### Phase 999.87: `evaluate_layer2` Reads an Unrunnable `git` as "No Work Done", Misclassifying a Successful Agent as `Failed` (PROMOTED — Phase 35)
+
+**Linear:** [DEN-108](https://linear.app/denniskim/issue/DEN-108/99987-evaluate-layer2-reads-an-unrunnable-git-as-no-work-done)
+**Found:** 2026-08-06, while reasoning through Phase 35's D-08 decision (change
+`phase_commit_count`'s return type, or add a sibling). **Not** found by any of the four adversarial
+review lanes run against Phase 35's CONTEXT.md that day — it surfaced from asking what the *other*
+consumer does with the same lossy return value, which no lane thought to ask.
+
+**Priority:** Medium | **Size:** S — one branch plus its test, on top of Phase 35's `Option<u32>`
+plumbing.
+
+**Severity: Medium.** Same root cause as 999.77, **worse consequence.** 999.77 weakens a *bound*;
+this produces a **wrong classification** — a successful agent run reported as failed and looped
+back. Needs a transient fault to trigger, which is why it is not High.
+
+**Not a duplicate — checked before filing.** 999.77/DEN-99 shares the root cause but is scoped to
+the `consecutive_failures` baseline write in `handle_validate_outcome`, never mentions
+`evaluate_layer2`'s classification, and its proposed fix leaves this call site untouched. 999.81's
+IN-03 cites `agent_result.rs:1904`, one line above, but concerns duplicated branch-name derivation.
+
+**The defect.** `phase_commit_count` (`crates/devflow-core/src/agent_result.rs:1841`) returns `0`
+indistinguishably for three causes — genuinely no commits, branch absent, or `git` could not run.
+`evaluate_layer2` (`agent_result.rs:1905`) then computes
+`no_work_done = commit_gated && commits == 0` for `Plan`/`Code` stages and routes
+`exit_code != 0 || no_work_done` to `AgentStatus::Failed`. So a momentary `git` failure makes an
+agent that **exited 0 having committed real work** read as `Failed`, with a reason string naming a
+commit count that was never measured.
+
+**Why the bad combination is reachable:** the exit code is read from `.devflow/phase-NN-exit`, not
+from git, so the two signals fail independently — a broken `git` does not prevent `exit_code == 0`
+from being true.
+
+**FOLDED INTO PHASE 35 (operator decision, 2026-08-06), reversing the disposition below.** The
+original filing deferred this as a follow-up. The operator challenged that and was right: D-08 makes
+`let commits: u32 = phase_commit_count(..)` a **type error**, so Phase 35 must edit this exact line
+regardless — and the deferral amounted to writing `.unwrap_or(0)` to deliberately preserve a known
+misclassification inside the phase whose subject is that very failure mode. The expensive part (the
+forced-`git`-failure harness) is already required by criterion 1, making the marginal cost small.
+Phase 35 criterion 6 now owns it, and `evaluate_layer2` returns `Ok(None)` → Layer 3. The
+superseded reasoning is kept below because it is what a reader would otherwise reconstruct.
+
+~~**Relationship to Phase 35 — this is a follow-up, not independent work.**~~ D-08 changes
+`phase_commit_count` to return `Option<u32>`, which forces this call site to be confronted by the
+compiler. Phase 35 deliberately maps `None` to today's zero-treatment **explicitly, with a
+comment**, rather than widening its own scope (34/D-04). This entry is exactly "revisit that
+mapping", and **should not be attempted before Phase 35 lands** — the `Option` plumbing is the
+prerequisite.
+
+**Proposed fix.** Decide what Layer 2 does when the count is `None` (could not measure) as distinct
+from `Some(0)` (genuinely no commits); "could not measure" is not evidence of no work and must not
+feed `no_work_done`. **The open question the fix should answer rather than assume:** what Layer 2
+returns instead. Falling through to Layer 3 is the natural precedent — the same function already
+does exactly that for an unreadable exit file (`Err(_) => return Ok(None)`). Phase 35's A-06 fixes
+the adjacent split: `.output()` returning `Err` → `None`; `Ok` with non-zero status (branch
+genuinely absent) → `Some(0)`, because branch-absent is a real observation.
+
+**Test coverage the fix must add.** No current test exercises a failing `git` in this path. The
+discriminating case is `exit_code = 0` + `Stage::Code` + unrunnable `git`, asserting the result is
+**not** `Failed`-for-no-work; a test of the ordinary `commits == 0` case passes against both the
+buggy and the fixed code. `crates/devflow-cli/src/test_support.rs` already carries `NeutralPath`
+plus a `PATH`-guarding mutex — the same mechanism `stub_agent_binary` uses — which is the intended
+route for a failing-`git` shim.
+
+**Not established:** how often Layer 2 is the deciding layer in production. The code path was read
+and verified; the frequency was not. If Layers 0/1 almost always decide first, real exposure is
+smaller than the code suggests — worth measuring before prioritising this above other Medium items.
+
+### Phase 999.86: Replace `release --check`'s Tag-Signing Predictor With a Direct Probe (PROMOTED — Phase 35, revises D-10 for `release --check` only)
 
 **Linear:** [DEN-75](https://linear.app/denniskim/issue/DEN-75/release-check-tag-signing-gate-false-negatives-when-the-key-is-not-in)
 (re-promoted; priority raised Medium → High). DEN-79, a duplicate describing the same predictor's
@@ -333,9 +788,25 @@ and reads git's own result — no viability guess needed, ever. That executor is
 with real execution (DEN-50, **still Backlog**, never built). `release --check`'s predictor was
 never actually removed or replaced — it is the only thing that exists today, still reading
 `ssh-add -l` and comparing fingerprints, unchanged since D-10. It just produced the exact false
-negative D-10 was filed about, live, on a machine with the correct key loaded — verified directly:
-`ssh-keygen -Y sign` against the configured key succeeded and `git tag -v` confirmed the right
-fingerprint, while `release --check` reported `NotViable`.
+negative D-10 was filed about, live, ~~on a machine with the correct key loaded~~ — verified
+directly: `ssh-keygen -Y sign` against the configured key succeeded and `git tag -v` confirmed the
+right fingerprint, while `release --check` reported `NotViable`.
+
+**Correction to "the correct key loaded" (2026-08-06, Phase 35 discussion).** The key was **not
+loaded in the agent**, and that is the actual mechanism rather than an incidental detail. Measured
+on the operator's host: `ssh-add -l` exits **0** (the agent holds *other* identities), the
+configured signing key's fingerprint is **absent** from that output, and `ssh-keygen -Y sign` with
+that key still exits **0** — because the unencrypted private-key sibling is on disk. So the
+predictor reaches `SigningStatus::KeysListed`, fails its `stdout.contains(&fingerprint)` test, and
+returns `NotViable { "ssh-agent has keys loaded, but not the configured signing key" }` while
+signing genuinely works.
+
+This matters beyond wording: it names the class. `ssh-add -l` cannot see on-disk private key
+material, so **agent membership is not a necessary condition for `git tag -s` to succeed** — the
+predictor is testing a condition the real operation does not require. The original phrasing
+suggested a lookup that merely missed a present key; the real defect is that the predictor asks the
+wrong question. Any regression test asserting `Viable` must therefore **not** depend on agent
+membership.
 
 **The fix is not a second predictor.** DEN-75 already named the right shape, unimplemented until
 now: stop inferring viability from `ssh-add -l` and compare a probe *is* the operation the tag step
@@ -358,7 +829,43 @@ negative was in the caution direction only by luck of which check fired first �
 mechanism (comparing fingerprints against `ssh-add -l`, which knows nothing about on-disk private
 key material a probe would find) is unreliable by construction, not by circumstance.
 | **Size:** S — one function rewrite plus a regression test asserting `SigningViability::Viable`
-against a probe that actually signs, not a fingerprint match.
+against a probe that actually signs, not a fingerprint match. **Revised 2026-08-06: still S, but it
+carries a public-API removal** (see finding 3 below). Version handling decided the same day: the
+release stays `v2.5.0` (no external consumers), and the removal is recorded in `CHANGELOG.md` and
+the crate docs instead of forcing a major bump.
+
+**Findings from the Phase 35 discussion (2026-08-06).** All measured on the operator's host with
+positive and negative controls; n=1, one OpenSSH build, one ed25519 key — they fix the *shape* of
+the fix, and are not coverage.
+
+1. **A naive probe can BLOCK, and the entry does not mention it.** With an encrypted key, no agent,
+   and a *working* askpass, `ssh-keygen -Y sign` waits on a passphrase prompt — measured, it timed
+   out at 6s against a 30s askpass. `release --check` hanging on a dialog is the unattended-stall
+   class DOGFOOD-01 exists to eliminate, reached from a new direction. `SSH_ASKPASS_REQUIRE=never`
+   turns that into exit 255 in **0s**, and the positive control confirms the working signing path
+   still exits 0 under the same variable. Phase 35 decided both that variable **and** a wall-clock
+   timeout (35 D-01), since the variable only closes the askpass route — a wedged agent or a stalled
+   PKCS11 provider still blocks.
+
+2. **`ssh-keygen -Y sign -f` takes a path, so the inline `key::` form is not directly probeable.**
+   It resolves the private key by stripping `.pub` from *that path*, or via the agent. A blob
+   materialized to a temp file has neither unless the agent holds it — measured working when the
+   agent holds it (exit 0) and failing when it does not (255). Phase 35 declined to probe inline
+   values at all (35 D-03), returning `Unknown` fail-soft; that was a surface-cost choice, **not** a
+   feasibility finding, so reopening it needs only a temp file and a cleanup path.
+
+3. **The fix orphans public API.** `classify_ssh_add_status` and `SigningStatus` are `pub` in
+   `devflow_core::git`, their only production caller is the `ssh-add -l` branch being deleted, and
+   `devflow-cli` consumes only `SigningViability`. Phase 35 decided to remove both and treat it as
+   the real break it is (35 D-04). `inline_key_fingerprint` (private) is orphaned too, by finding 2.
+
+4. **`-n` namespace: verify, do not assume.** The probe's value is being the operation rather than
+   an approximation of it, so the namespace must be checked against a real git-produced signature.
+   Left to the planner deliberately, flagged here so it is not quietly guessed.
+
+**Not established:** whether `release --check` itself reports `NotViable` on this host was *traced*
+through `git.rs` against the measured inputs, not observed by running the command. The inputs are
+measured; the verdict is inferred from them.
 
 ### Phase 999.85: Two Protected Comments Now Justify Themselves by a Mechanism Phase 34 Deleted (BACKLOG)
 
@@ -382,6 +889,7 @@ are now dead:
 
 1. After 34-03, `pipeline_outcomes.rs:233` reads `(_, AgentStatus::Success, Some(Verdict::Pass))`.
    The status position is no longer a wildcard, so a non-`Success` status cannot reach `Passed`.
+
 2. The remaining route — a timeout's verdict grafted through `reconcile_layer0_verdict`, reachable
    because `evaluate_layer1` returns the idle-timeout side channel as its **first statement**
    (`agent_result.rs:1795`) — is closed by 34-01's own
@@ -410,9 +918,10 @@ as licence to relax the instruction — the instruction is still load-bearing, j
 
 **Note for whoever picks this up:** DEN-95 (999.74), the defect these comments describe, is still
 open in Linear despite Phase 34 closing it via criterion 3. Same for DEN-98 (999.76) via criterion
+
 6. Both want a status sweep.
 
-### Phase 999.84: Nothing Guards the Root Argument at the `GateReview` Checkpoint Call Site, So 999.76's Fix Can Regress Silently (BACKLOG)
+### Phase 999.84: Nothing Guards the Root Argument at the `GateReview` Checkpoint Call Site, So 999.76's Fix Can Regress Silently (PROMOTED — Phase 35)
 
 **Linear:** [DEN-106](https://linear.app/denniskim/issue/DEN-106/99984-nothing-guards-the-root-argument-at-the-gatereview-checkpoint)
 **Found:** 2026-08-06, Phase 34 UAT test 1 — the phase's sole human-verification item, self-disclosed
@@ -462,12 +971,58 @@ which is the failure mode it exists to close.
 
 **Relationship to 999.76's open question — decide together, but they are not the same item.** 999.76
 (this entry's parent, promoted into Phase 34) left an unanswered question: whether that fix should
-carry the workspace's first *real linked* `git worktree` integration test, since today's
-worktree-mode tests use plain `create_dir_all` directories with no git repository at all. That
-question is motivated by `phase_commit_count`'s shared-refs property, not by this call site, and it
-remains open. **This entry does not depend on it** — the `:1070` guard needs only a directory
-standing in for the worktree, exactly as `verify.rs:351` already does, so it can land cheaply and
-independently. If the linked-worktree harness is built first, this test should use it.
+carry ~~the workspace's first *real linked* `git worktree` integration test, since today's
+worktree-mode tests use plain `create_dir_all` directories with no git repository at all~~ a real
+linked `git worktree` test. That question is motivated by `phase_commit_count`'s shared-refs
+property, not by this call site, and it remains open. **This entry does not depend on it** — the
+`:1070` guard needs only a directory standing in for the worktree, exactly as `verify.rs:351`
+already does, so it can land cheaply and independently. If the linked-worktree harness is built
+first, this test should use it.
+
+**Correction: "the workspace's first" is FALSE (2026-08-06, Phase 35 discussion).** Real
+`git worktree add` fixtures already exist in at least three places:
+
+- `crates/devflow-cli/src/staleness.rs` — `worktree_staleness_fixture()`, the fullest one: a
+  `develop` branch with a recorded commit, a **sibling** feature-branch worktree via
+  `git worktree add -b <branch> <path> <start_point>`, and two further commits made inside it.
+
+- `crates/devflow-cli/src/preflight.rs:1198` — a second real fixture (CR-02, `25-REVIEW.md`).
+- `crates/devflow-core/src/worktree.rs` — the worktree module's own fixtures.
+
+The claim is true only of the `verify.rs` tests specifically. **Two consequences.** (a) 999.76's
+open question is materially cheaper than this entry implies — it is "should the 999.76-touched tests
+use a real worktree", not "should the workspace build its first", and a fixture can be adapted
+rather than invented. (b) No entry or plan should cite "the workspace has no such harness" as a
+reason for anything; it is not true.
+
+**Correction: "one integration test" is loose.** `advance()` is `pub(crate)`
+(`pipeline_launch.rs:936`), so **no test under `crates/devflow-cli/tests/` can call it**. The test
+must live in `pipeline_launch.rs`'s own `#[cfg(test)]` module.
+
+**Two pieces of the harness already exist**, checked during the Phase 35 discussion — the test
+should extend them, not rebuild:
+
+- `code_unknown_does_not_transition_to_validate` (`pipeline_launch.rs:~1452`) drives a real
+  `advance()` on a scoped thread over a real git repo via `init_repo`, polling for gate files.
+
+- `relaunch_checkpoint_session_emits_exactly_one_audit_event` (`pipeline_launch.rs:1626`) shows how
+  to satisfy the resume path **without launching an agent**, via a `stub_agent_binary("claude")`
+  helper and an `env_lock()` guard. The observable is the `checkpoint_auto_decided` event, which
+  `relaunch_checkpoint_session` emits *before* the spawn by design (28-03 D-07).
+
+**Phase 35 strengthened the proposed fixture (35 D-05).** The bare form above leaves `project_root`
+with no `.planning/phases/` at all, so it discriminates partly by a condition production never
+satisfies — the main checkout always carries `.planning/phases/`, often including a previous run's
+copy of this phase. The phase writes a **decoy** PLAN under `project_root` for the same phase
+declaring no `blocking-human` gate, so the revert fails because the *wrong root was read* rather
+than because the main checkout happened to be empty. Same cost, stronger control.
+
+**Phase 35 also added a re-running control (35 D-06).** The performed revert stays mandatory, but it
+is a one-time act nothing repeats; the test additionally asserts
+`phase_has_blocking_human_checkpoint(project_root, phase)` is `false`, the same opposite-result shape
+`verify.rs:351`/`:377` already carry. Stated precisely: the mechanical half proves the two roots
+*disagree*; only the performed revert proves `:1070` passes `execution_root`. Neither substitutes
+for the other.
 
 ### Phase 999.81: Phase 33 Advisory Cleanup — the Loop-Back Prompt Calls a Normal Continuation a Defect, Plus Three Hygiene Items (BACKLOG)
 
@@ -532,7 +1087,7 @@ would let `ENV_MUTEX` shrink or disappear; it explicitly names `pipeline_outcome
 one of the three sites above. Either do 999.38 first and harden these with the new mechanism, or do
 this first as the cheap safety fix and let 999.38 sweep them later. Do not work them independently.
 
-### Phase 999.79: `{N}-VERIFICATION.md` Never Goes Stale, So a `--force` Re-Run Inherits the Previous Run's Verdict and Gates Unresolvably (BACKLOG)
+### Phase 999.79: `{N}-VERIFICATION.md` Never Goes Stale, So a `--force` Re-Run Inherits the Previous Run's Verdict and Gates Unresolvably (PROMOTED — Phase 35)
 
 **Linear:** [DEN-101](https://linear.app/denniskim/issue/DEN-101/99979-n-verificationmd-never-goes-stale-so-a-force-re-run-inherits-the)
 **Found:** 2026-08-05, Phase 33 code review (WR-02, carried from the first pass and given a new
@@ -557,7 +1112,28 @@ not reflect judgement freshness) against the phase's current plan set. **Prohibi
 "fix" this by reverting the probe to `project_root` — that reintroduces the CR-01 defect 33-05
 closed and two external peer reviews independently confirmed.
 
-### Phase 999.78: The Code↔Validate Loop Has No Progress-Independent Bound, and the Gate Message Understates How Long It Has Run (BACKLOG)
+**A cheaper "or equivalent" surfaced 2026-08-06 (Phase 35 discussion).** Established, not assumed:
+`start()` calls `State::new(...)` **unconditionally** at `commands.rs:124`, *before* any `--force`
+handling — so every `devflow start`, forced or not, begins with fresh `State`. That makes a
+**run-scoped** freshness signal available without any plan-count bookkeeping: record a content
+fingerprint of `{N}-VERIFICATION.md` in `State` and treat the artifact as fresh only once it has
+changed within this run. The entry's rejection of mtime is about mtime as an *age* signal (it
+survives `git checkout`); as change-detection against a run-start baseline that objection does not
+apply, and a content hash removes it entirely. Phase 35 leans this way — recorded explicitly as a
+**departure from this entry's stated fix direction**, so it is overrulable on sight rather than
+discovered later.
+
+**Why the plan-count route is weaker, stated so the choice is arguable:** it detects "the plan set
+changed", so it false-negatives whenever a replan happens to produce the same count.
+
+**The risk in either mechanism, and the test it demands.** A freshness rule that is too strict never
+lets `--gaps-only` fire again, silently regressing what Phase 33 built — trading an unresolvable gate
+for a loop that always re-runs every plan. Both directions must be tested: (a) a stale artifact
+inherited from a prior run must yield `FullExecute`, and (b) an artifact the Validate agent authored
+*this run* must yield `GapsOnly`. A test covering only (a) passes against a rule that marks
+everything stale forever.
+
+### Phase 999.78: The Code↔Validate Loop Has No Progress-Independent Bound, and the Gate Message Understates How Long It Has Run (PROMOTED — Phase 35)
 
 **Linear:** [DEN-100](https://linear.app/denniskim/issue/DEN-100/99978-the-codevalidate-loop-has-no-progress-independent-bound-and-the)
 **Found:** 2026-08-05, Phase 33 code review (WR-01, WR-04, IN-02). Grouped because WR-04's fix
@@ -589,7 +1165,26 @@ them apart, so an operator upgrading a binary mid-phase gets no signal the failu
 add a distinct `loop_back` reason string for the absent-baseline case. Related but deliberately
 separate: 999.77 attacks the same counter by corrupting its baseline rather than removing the bound.
 
-### Phase 999.77: A Single Transient `git` Failure Grants a Free `consecutive_failures` Reset, and the Doc Comment Promises the Opposite (BACKLOG)
+**Decided 2026-08-06 (operator, Phase 35 discussion) — what happens at the ceiling.** The entry
+specified the counter but never said what exhausting it *does*, which is a behavioural question, not
+an implementation detail: **it fires a human gate and the run stays alive**, the same shape as
+`MAX_CONSECUTIVE_FAILURES` today. Rejected: aborting the phase (destructive and irreversible
+relative to gating — a phase one cycle from converging gets killed); gating in Supervise but
+aborting in Auto (contradicts Auto's existing ceiling, which gates). **Accepted cost, stated:** an
+unattended overnight run now parks on a gate instead of looping to completion. That is the intent,
+and it is still a behaviour change from today's "looped forever unnoticed."
+
+**Shape settled alongside it (Phase 35, orchestrator's remit).** A new `State` field with
+`#[serde(default)]`, following `last_validate_failure_commit_count`'s backward-compat pattern, and
+**not** touched by `transition()` — it belongs with `preflight_retries`/`checkpoint_resumes` (per-phase
+observations) rather than `consecutive_failures`/`infra_failures` (per-streak counters reset on every
+successful transition). The ceiling is a named constant meaningfully above `MAX_CONSECUTIVE_FAILURES
+= 3` so it acts as a backstop rather than a competing primary bound. The gate message must lead with
+the cumulative total and name it as a per-phase total; a streak may appear as a secondary clause only
+if it cannot be mistaken for the headline number, since WR-04's whole complaint is that the current
+text reads identically at the 2nd, 5th and 9th gate.
+
+### Phase 999.77: A Single Transient `git` Failure Grants a Free `consecutive_failures` Reset, and the Doc Comment Promises the Opposite (PROMOTED — Phase 35)
 
 **Linear:** [DEN-99](https://linear.app/denniskim/issue/DEN-99/99977-a-single-transient-git-failure-grants-a-free-consecutive)
 **Found:** 2026-08-05, Phase 33 code review (WR-03); carried forward as still-open by the DeepSeek
@@ -605,7 +1200,7 @@ currently documents the opposite guarantee — which is how it survived review.
 indistinguishably for "genuinely no commits", "branch does not exist", and "`git` could not be
 run" — its own doc at `:1838-1840` says so, and adds *"Every consumer treats all three the same
 way."* That last clause is the part that is not true. The baseline write at
-`crates/devflow-cli/src/pipeline_outcomes.rs:357` is **unconditional** ("regardless of which branch
+`crates/devflow-cli/src/pipeline_outcomes.rs:422` is **unconditional** ("regardless of which branch
 ran above"), so a `0` produced by a broken `git` is persisted as though it were a real measurement.
 
 **Failure sequence.** (1) `git` momentarily fails; count reads `0`; the streak correctly
@@ -630,11 +1225,39 @@ accumulates and the gate stays reachable."* That holds only while `git` stays br
 for exactly one transient failure, which is the likelier event. **Correct this comment even if the
 code fix is deferred** — it documents a safety property the code does not have.
 
-**Proposed fix:** distinguish "counted zero" from "could not count" — add a sibling returning
-`Option<u32>`, treat `None` as not-progress *without overwriting the baseline* so the next
+**Proposed fix:** distinguish "counted zero" from "could not count" — ~~add a sibling returning
+`Option<u32>`~~, treat `None` as not-progress *without overwriting the baseline* so the next
 successful measurement compares against the last real observation, and update
 `phase_commit_count`'s "every consumer treats all three the same way" line, which the fix
 deliberately falsifies. Full patch sketch in the Linear issue and in `33-REVIEW.md` WR-03.
+
+**DECIDED 2026-08-06 (operator): take the breaking change.** Escalated after adversarial review
+found this had been resolved without asking, despite being the same one-way class as 999.86's own
+public-API removal. `phase_commit_count`'s return type becomes `Option<u32>`. Rejected: a
+`#[deprecated]` delegating wrapper that would have kept it non-breaking — declined because the break
+is already bought by 999.86's deletions, and a major bump is a fixed cost rather than a per-item
+one. **Version, decided separately the same day: the release stays `v2.5.0`.** Strict semver would
+say `3.0.0`, declined because `devflow-core` has no external consumers — so the break is
+**documented** (a `CHANGELOG.md` entry naming every changed/removed `pub` item, plus a crate-doc
+deprecation note) rather than versioned. The milestone is **not** renamed.
+
+**Defect surfaced during that reasoning — now filed as 999.87 / DEN-108 (34/D-04).** `evaluate_layer2`
+(`agent_result.rs:1905`) sets `no_work_done = commit_gated && commits == 0` and routes it to
+`AgentStatus::Failed`. A transient `git` failure returns `0`, so an agent that exited 0 having
+committed real work reads as `Failed — no work done`. Same root cause as this entry, worse
+consequence: a misclassification rather than a weakened bound. The sibling proposal below would have
+left it silently intact, which is the concrete harm that decided the option above.
+
+**Revision to the sibling proposal (2026-08-06, Phase 35 discussion).** A *sibling* contradicts
+`phase_commit_count`'s own doc comment, which states the single implementation exists because
+"[re-deriving] the same two git commands … is what made the two counts able to silently diverge
+before this extraction." A sibling reinstates exactly that hazard, and nothing stops a future caller
+reaching for the lossy one. Phase 35 resolved instead to **change the single implementation's return
+type to `Option<u32>`**, so one implementation survives *and* the compiler enumerates every consumer
+once — continuing 34/D-06's structural-over-hand-audited line. `evaluate_layer2` maps `None` to its
+existing zero-treatment explicitly at the call site, with a comment, so the behaviour it retains is a
+visible choice rather than an inherited accident. **Note this makes it a public-API change** in a
+published crate, stacking with 999.86's own removal; both land in the same cut.
 
 **Test coverage the fix must add:** no current test exercises a failing `git`. The regression test
 is the two-cycle sequence itself — force a measurement failure, then a success with an unchanged
@@ -718,11 +1341,27 @@ worktrees, so a worktree commit is already visible from the main checkout. Decla
 the worktree, commit counting on the main checkout, is the correct end state; Phase 33 established
 exactly that asymmetry for the loop-back path.
 
-**Open question the fix should answer rather than assume:** no test in the workspace exercises a
+**Open question the fix should answer rather than assume:** ~~no test in the workspace exercises a
 real linked `git worktree` — the worktree-mode tests use plain `create_dir_all` directories with no
-git repository at all. Adequate for a filesystem stat, but the shared-refs property
-`phase_commit_count` depends on is asserted in comments and exercised by nothing. Decide whether
-this fix carries the first linked-worktree integration test.
+git repository at all.~~ The **worktree-mode tests for this defect class** use plain
+`create_dir_all` directories with no git repository. Adequate for a filesystem stat, but the
+shared-refs property `phase_commit_count` depends on is asserted in comments and exercised by
+nothing. Decide whether this fix carries ~~the first~~ a linked-worktree integration test.
+
+**Correction to the struck premise (2026-08-06, Phase 35 discussion).** "No test in the workspace
+exercises a real linked `git worktree`" is **false**. At least three real `git worktree add`
+fixtures exist: `crates/devflow-cli/src/staleness.rs`'s `worktree_staleness_fixture()` (a `develop`
+branch, a sibling feature-branch worktree, and commits made inside it),
+`crates/devflow-cli/src/preflight.rs:1198` (CR-02), and `crates/devflow-core/src/worktree.rs`'s own
+fixtures. The true statement is narrower: *the tests covering this defect class* use plain
+directories.
+
+**The open question survives, at lower cost.** It is genuinely unanswered — `phase_commit_count`'s
+shared-refs property is still asserted only in comments — but answering it means **adapting an
+existing fixture**, not building the workspace's first. Phase 35 declined to do it there (35 D-05):
+999.84's call-site guard resolves a path, and a linked worktree's files are ordinary files, so the
+machinery buys nothing for *that* test. This question is motivated by the commit-count property
+instead, and stays open on its own merits.
 
 ### Phase 999.75: `CloseRule` Treats an Unparseable `tasks` List on the FIRST Announcement as Permission to Close (RESOLVED 2026-08-04)
 
@@ -2147,6 +2786,164 @@ child's declared tokens instead of inferring concurrency from a gate that this p
 can miss it entirely.
 
 **Priority:** Medium. **Size:** M.
+
+---
+
+### Phase 999.96: `release --check` Cannot Catch a Forgotten Version Bump (BACKLOG)
+
+**Found:** 2026-08-07, during 35-verify-work, while dispositioning 35-06's deliberate
+version-vs-changelog skew.
+
+**The gap, in one line:** nothing mechanically checks that `CHANGELOG.md`'s top heading agrees with
+the version in `Cargo.toml`, so a forgotten bump ships a new changelog under an old version number
+and no preflight objects.
+
+**Why the existing check does not cover it.** `release --check`'s self-pin check compares workspace
+member pins against the workspace version. Measured on the current tree: `Cargo.toml:9`
+(`version = "2.4.0"`) and `Cargo.toml:20` (`devflow-core = { …, version = "2.4.0" }`) agree, so it
+reports `self-pin (workspace member versions) ✓ 1 member pin(s) match 2.4.0` — while `CHANGELOG.md`'s
+top heading reads `## 2.5.0 — 2026-08-07`. The check passes, and would pass in exactly the state this
+entry is about. It validates internal consistency of the manifests, never their agreement with the
+release the changelog announces.
+
+**This is not a defect in 35-06.** Leaving `Cargo.toml` at `2.4.0` is what that plan requires — the
+version is set at release time, in two places, with `devflow-core` publishing before `devflow-cli`.
+The skew is correct and transient. What is missing is the guard that catches it when the cut is
+*not* performed correctly.
+
+**Why the ship hooks are not sufficient on their own.** `VersionBump`/`ChangelogAppend` run on the
+ship path, but a manual or button merge to `main` bypasses them — a failure mode this project has
+hit before and already records. A preflight is the backstop that does not depend on which route the
+release took.
+
+**What to add.** A `release --check` row that reads `CHANGELOG.md`'s topmost `## <version>` heading
+and compares it to the workspace version, reporting NOT viable when they disagree — with the
+disagreement direction stated, since "changelog ahead of Cargo.toml" (bump not yet done, expected
+before a cut) and "Cargo.toml ahead of changelog" (release notes missing) are different problems.
+
+**Negative control it must carry.** The current tree is itself a ready-made positive fixture: the
+check must report NOT viable against `2.4.0` + a `2.5.0` heading. A version check that cannot fail
+is the same defect as the signing predictor 999.86 replaced.
+
+**Priority:** Medium — it guards a release-correctness step that is currently guarded only by
+memory. **Size:** S.
+
+---
+
+### Phase 999.95: `cargo doc` Is Not in This Repo's Definition of Green, and Carries a 33-Warning Baseline (BACKLOG)
+
+**Found:** 2026-08-07, phase 35-06 verification, when the plan's acceptance criterion required
+`cargo doc` to complete without warnings and it did not. Disposition set during 35-verify-work.
+
+**The gap, in one line:** `scripts/check.sh all` runs fmt + clippy + test and never invokes
+`cargo doc`, which is how a rustdoc warning baseline accumulated unnoticed since before 2.4.0.
+
+**Measured 2026-08-07, not transcribed.** `cargo doc --workspace --no-deps` reports **33 warnings,
+all in `devflow-core`'s lib doc**; `devflow-cli` contributes none. Every one is the same class —
+*"public documentation for `X` links to private item `Y`"*. Negative control run: filtering the
+warning lines for anything *other* than that class returns only the summary line, so the
+single-class claim is measured rather than assumed.
+
+> 35-06 reported 35; the count today is 33. The discrepancy is not investigated — it may be a
+> different counting basis (warning locations vs. emitted lines) or genuine drift. Whoever takes
+> this should re-measure rather than trust either figure.
+
+**Established as pre-existing, by 35-06, with evidence.** None of the 33 warning locations falls
+inside the ranges that plan edited, and seven sit in four files phase 35 never opened
+(`git diff --stat 749a151..HEAD` over those files is empty). This is old debt surfacing, not a
+regression.
+
+**Scope of the fix.** One mechanical class. Each site either re-points the doc link at a public
+item, drops the link while keeping the prose, or makes the linked item public where that is the
+honest answer. Low risk — documentation only, no behaviour change — but it touches many files, so
+it wants its own diff rather than riding along with unrelated work.
+
+**The gating question is deliberately NOT bundled, and stays open.** Adding a `cargo doc` step to
+`check.sh` changes what *every* future commit must satisfy, including commits in files unrelated to
+whatever a future author is changing. That is a policy decision, and it is much easier to make
+against a zero-warning baseline than against a 33-warning one — which is the whole argument for
+fixing first and gating second. Also worth deciding then: whether `check.sh` or the pre-push
+container gate is the right home, given doc builds are slow and `check.sh` runs far more often.
+
+**Priority:** Low — it is documentation quality, and nothing is silently wrong today. **Size:** S
+for the fix; the gating decision is separate and smaller.
+
+---
+
+### Phase 999.93: Unattended Runs Have No Preflight for the Conditions They Require (BACKLOG — HIGH)
+
+**Found:** 2026-08-07, phase 35 verify-work, tracing why 35-01 and 35-05 both hit a GSD checkpoint
+with no way to answer it.
+
+**The defect, in one line:** `devflow start --mode auto` will launch a run that is structurally
+guaranteed to park on the first ordinary GSD checkpoint, and nothing checks first.
+
+**What is missing.** GSD auto-approves `gate="blocking"` checkpoints only when `check auto-mode`
+reports active — which requires `workflow.auto_advance` or `workflow._auto_chain_active` to be true
+in `.planning/config.json`. On DevFlow today it reports
+`{"active": false, "source": "none", "auto_chain_active": false, "auto_advance": false}`. So an
+unattended run meets its first ordinary checkpoint and stalls into a gate. DevFlow already handles
+the *harder* case — `blocking-human` checkpoints, via resume plus `checkpoint_auto_decide_prompt`
+(28-03, D-03/D-07) — so the gap is only the ordinary ones, which is exactly why it went unnoticed.
+
+**Why a preflight rather than only a fix.** The plumbing fix (999.94's sibling work, below) makes
+auto-mode active for the Code stage. A preflight is what stops the *next* silent regression: it
+states the run's own prerequisites and refuses, loudly, when they do not hold. `devflow release
+--check` is the established precedent in this codebase for a read-only preflight that reports
+viability by checking rather than predicting (HARDEN-05, phase 35-03) — this is the same shape for
+`start --mode auto`.
+
+**What it should check.** At minimum: `check auto-mode` reports active for the stages that need it;
+the agent binary exists (already checked elsewhere — fold it in rather than duplicating); no
+unknown `workflow.*` keys that suggest a stale config (see G-04 in
+`.planning/UPSTREAM-GSD-ISSUES.md` — `workflow.auto_mode` is dead upstream and cost this project two
+escalations). Report each as viable/not-viable with a reason, and refuse the launch rather than
+warn, since a warning in an unattended run is read by nobody.
+
+**Negative control it must carry.** A preflight that cannot fail is the defect it exists to prevent
+(the 999.86 lesson, one phase earlier). Whatever ships must include a fixture where the check
+reports NOT viable.
+
+**Priority:** High — it gates the first real unattended end-to-end run (phase 36). **Size:** S–M.
+
+---
+
+### Phase 999.94: An Unattended `decision` Checkpoint Takes the First Option Without Reading It (BACKLOG — HIGH)
+
+**Found:** 2026-08-07, phase 35 verify-work, while assessing the downsides of enabling GSD auto-mode
+for DevFlow's Code stage.
+
+**The behaviour.** When auto-mode is active, GSD's `execute-phase` resolves a `decision` checkpoint
+by taking the **first** option: *"Auto-spawn continuation agent with `{user_response}` = first
+option from checkpoint details"* (`execute-phase.md`, `<checkpoint_handling>`). Not the best option
+on the merits, and not an option marked recommended — the first one listed.
+
+**Why it is not as safe as GSD assumes.** `checkpoints.md:18` describes `gate="blocking"` as *"safe
+to take the recommended path on when unattended"* — so upstream's intent is that first == recommended.
+Nothing enforces that. There is no explicit `recommended` marker in the checkpoint format (checked:
+`recommend` appears exactly once in `checkpoints.md`, in that prose), and no validation that a plan
+author ordered the options that way. The convention is unenforced and invisible at the point of use.
+
+**Why this project should care more than most.** Phase 26 established the pattern here — 11/11
+verification and 763 green tests while two review rounds found 7 then 5 Criticals on irreversible
+operations. A blind first-option pick on an implementation decision is the same class: cheap to get
+wrong, expensive to notice. DevFlow already has the better idiom in
+`prompt::checkpoint_auto_decide_prompt` — *"resolve the checkpoint yourself, using your own best
+judgment, and record your reasoning… so the decision is auditable after the fact"* — but it applies
+only to `blocking-human` checkpoints reached through DevFlow's own resume path.
+
+**Two routes, and the split matters.**
+
+- **DevFlow-side (available now):** extend the Code-stage prompt with a policy layer that overrides
+  the first-option rule — decide on merit, prefer an option the checkpoint marks or argues as
+  recommended, and record why. Same shape as `checkpoint_auto_decide_prompt`. Risk to weigh: it
+  instructs the agent to deviate from the workflow file it is concurrently executing.
+
+- **Upstream (better, slower):** an explicit `recommended` attribute in the checkpoint format, plus
+  auto-select honouring it. Belongs in `.planning/UPSTREAM-GSD-ISSUES.md` if pursued.
+
+**Priority:** High — it is a correctness risk on every unattended run, not a papercut. **Size:** S
+for the DevFlow-side prompt policy plus its tests; M if the upstream marker is pursued too.
 
 ---
 
