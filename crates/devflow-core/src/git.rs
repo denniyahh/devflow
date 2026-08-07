@@ -126,7 +126,7 @@ impl GitFlow {
     /// Create a feature branch from the develop branch.
     ///
     /// Returns an error if the branch already exists (use
-    /// [`feature_start_force`] to overwrite).
+    /// [`Self::feature_start_force`] to overwrite).
     pub fn feature_start(&self, phase: u32) -> Result<String, GitError> {
         let branch = format!("{}phase-{:02}", self.config.feature_prefix, phase);
         info!("creating feature branch: {branch}");

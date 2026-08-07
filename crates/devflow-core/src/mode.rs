@@ -95,7 +95,7 @@ pub const MAX_PREFLIGHT_RETRIES: u32 = 3;
 /// that.
 ///
 /// Any increment of `checkpoint_resumes` must use `saturating_add`, exactly
-/// like [`Self::infra_failures`] and [`Self::preflight_retries`], so a stuck
+/// like [`crate::state::State::infra_failures`] and [`crate::state::State::preflight_retries`], so a stuck
 /// loop cannot overflow `u32`. Reset to 0 by every ORDINARY fresh stage
 /// launch (`pipeline_launch::launch_stage_inner`) — never by `transition()`
 /// — so the ceiling bounds one stage's resume budget, not a phase's entire

@@ -446,7 +446,7 @@ fn emit_canary_outcome(state: &State, outcome: &canary::CanaryOutcome) {
 ///
 /// **The launch argv is stage-blind, so a per-stage capture is evidence about
 /// the AGENT and never about the transport** (ROADMAP criterion 1; 34-REVIEW.md
-/// R-02). [`agents::ClaudeAgent::exec_command`]
+/// R-02). [`devflow_core::agents::AgentAdapter::exec_command`]
 /// (`crates/devflow-core/src/agents/claude.rs:46`) ignores all three of its
 /// `_phase`, `_prompt` and `_extra_writable_roots` arguments — verified by
 /// reading the body, which returns a fixed `vec![...]`, not by the underscore
