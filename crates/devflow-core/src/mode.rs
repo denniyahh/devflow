@@ -17,6 +17,37 @@ use std::str::FromStr;
 /// Number of consecutive Validate failures in Auto mode before a gate is forced.
 pub const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
+/// Ceiling for [`crate::state::State::phase_validate_failures`] — the total
+/// number of Validate failures recorded for one PHASE, accumulated without
+/// regard to forward progress (999.78/WR-01, D-07).
+///
+/// **Why it sits meaningfully above [`MAX_CONSECUTIVE_FAILURES`] (3).** This
+/// is a backstop for the case where the streak keeps resetting, not a
+/// competing primary bound. `consecutive_failures` is cleared whenever
+/// [`consecutive_failures_made_progress`] reports new commits, and the Code
+/// stage's fix command is a GSD command that routinely commits `.planning/`
+/// artifacts even when no source changed — so "commits something trivial
+/// every cycle" is the ORDINARY behaviour of the thing in that slot. A phase
+/// in that state never reaches the streak ceiling. Setting this one low
+/// enough to compete would make the coarser signal primary and change when
+/// ordinary, genuinely-converging runs gate; ten leaves the streak ceiling
+/// the first thing a stuck loop meets, and catches only the loops the streak
+/// ceiling structurally cannot.
+///
+/// Exhausting it fires a human gate and the run stays alive (D-07). It must
+/// never introduce an abort path: aborting is destructive and irreversible
+/// relative to gating, and a phase one cycle from converging would be killed
+/// by a bound whose only purpose is to summon a human.
+pub const MAX_PHASE_VALIDATE_FAILURES: u32 = 10;
+
+/// 35-04: the phase ceiling must sit strictly above the streak ceiling, or it
+/// stops being a backstop and becomes a competing primary bound that changes
+/// when ordinary runs gate. A compile-time assertion rather than a `#[test]`
+/// for the reason [`MAX_CHECKPOINT_RESUMES`]' own const block gives: both
+/// operands are `const`, so a runtime test could never fail at runtime, and
+/// clippy's `assertions_on_constants` correctly says so.
+const _: () = assert!(MAX_PHASE_VALIDATE_FAILURES > MAX_CONSECUTIVE_FAILURES);
+
 /// Ceiling for [`crate::state::State::infra_failures`] before an
 /// infrastructure-class fault chain (OOM/`ResourceKilled`, missing agent
 /// binary/`AgentUnavailable`) forces a terminal gate (D-08, 17-01).
@@ -150,6 +181,32 @@ pub fn consecutive_failures_made_progress(previous: Option<u32>, current: u32) -
     previous.is_none_or(|p| current > p)
 }
 
+/// Whether the per-phase Validate-failure total has reached
+/// [`MAX_PHASE_VALIDATE_FAILURES`] (999.78, F-6).
+///
+/// **Why this exists as a named predicate rather than an inline comparison.**
+/// [`Mode::should_gate`]'s `Stage::Validate` arm returns `true`
+/// unconditionally in [`Mode::Supervise`], so in that mode the ceiling
+/// condition and the ordinary-gate condition overlap completely and "a gate
+/// fired" carries no information about WHY. Two sites need that distinction
+/// and cannot get it from `should_gate`'s boolean:
+///
+/// - the Validate gate message, whose ceiling clause must appear only at the
+///   ceiling — keyed on gating instead, it would appear on every Supervise
+///   message and mean nothing;
+/// - the reset of [`crate::state::State::phase_validate_failures`] on
+///   operator approval, which keyed on gating would clear the total at every
+///   Supervise failure so it could never accumulate at all — an unbounded
+///   loop wearing a gate on every cycle.
+///
+/// This is the SINGLE implementation of the comparison. No caller may
+/// re-derive it: a second copy is exactly the drift hazard that made
+/// `should_gate` take the total as a parameter instead of checking it at the
+/// call site, and it must not reappear in a new form here.
+pub fn phase_failure_ceiling_reached(phase_validate_failures: u32) -> bool {
+    phase_validate_failures >= MAX_PHASE_VALIDATE_FAILURES
+}
+
 /// How DevFlow drives the pipeline for a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -162,18 +219,42 @@ pub enum Mode {
 
 impl Mode {
     /// Whether `stage` should fire a gate, given how many consecutive Validate
-    /// failures have already occurred this session.
+    /// failures have already occurred this session and how many Validate
+    /// failures have been recorded for this PHASE in total.
     ///
     /// - Ship always gates (both modes).
+    /// - Validate gates in EITHER mode once the per-phase total reaches
+    ///   [`MAX_PHASE_VALIDATE_FAILURES`] (999.78/D-07) — evaluated ahead of
+    ///   the per-mode match, so it gates in Auto and is a harmless no-op in
+    ///   Supervise, which already gates.
     /// - Supervise gates at every Validate.
-    /// - Auto gates at Validate only after [`MAX_CONSECUTIVE_FAILURES`] failures.
-    pub fn should_gate(self, stage: Stage, consecutive_failures: u32) -> bool {
+    /// - Auto gates at Validate only after [`MAX_CONSECUTIVE_FAILURES`]
+    ///   consecutive failures.
+    ///
+    /// **Why `phase_validate_failures` is a parameter rather than an extra
+    /// disjunct at the call site.** Several tests re-derive this expression to
+    /// mirror the production gating decision. A disjunct added at the call
+    /// site would leave every one of those mirrors compiling untouched while
+    /// silently no longer mirroring anything — a hand-audited equality that
+    /// 34/D-06 already rejects in favour of structural guards. Taking the
+    /// number here makes the compiler enumerate every mirror instead.
+    /// Mirroring tests must pass the state's own value, never a literal zero,
+    /// or they restore the same silent drift by a shorter route.
+    pub fn should_gate(
+        self,
+        stage: Stage,
+        consecutive_failures: u32,
+        phase_validate_failures: u32,
+    ) -> bool {
         match stage {
             Stage::Ship => true,
-            Stage::Validate => match self {
-                Mode::Supervise => true,
-                Mode::Auto => consecutive_failures >= MAX_CONSECUTIVE_FAILURES,
-            },
+            Stage::Validate => {
+                phase_failure_ceiling_reached(phase_validate_failures)
+                    || match self {
+                        Mode::Supervise => true,
+                        Mode::Auto => consecutive_failures >= MAX_CONSECUTIVE_FAILURES,
+                    }
+            }
             _ => false,
         }
     }
@@ -232,29 +313,77 @@ mod tests {
 
     #[test]
     fn auto_does_not_gate_validate_until_failure_threshold() {
-        assert!(!Mode::Auto.should_gate(Stage::Validate, 0));
-        assert!(!Mode::Auto.should_gate(Stage::Validate, 2));
-        assert!(Mode::Auto.should_gate(Stage::Validate, MAX_CONSECUTIVE_FAILURES));
-        assert!(Mode::Auto.should_gate(Stage::Validate, 9));
+        assert!(!Mode::Auto.should_gate(Stage::Validate, 0, 0));
+        assert!(!Mode::Auto.should_gate(Stage::Validate, 2, 0));
+        assert!(Mode::Auto.should_gate(Stage::Validate, MAX_CONSECUTIVE_FAILURES, 0));
+        assert!(Mode::Auto.should_gate(Stage::Validate, 9, 0));
     }
 
     #[test]
     fn supervise_always_gates_validate() {
-        assert!(Mode::Supervise.should_gate(Stage::Validate, 0));
-        assert!(Mode::Supervise.should_gate(Stage::Validate, 5));
+        assert!(Mode::Supervise.should_gate(Stage::Validate, 0, 0));
+        assert!(Mode::Supervise.should_gate(Stage::Validate, 5, 0));
     }
 
     #[test]
     fn ship_always_gates_in_both_modes() {
-        assert!(Mode::Auto.should_gate(Stage::Ship, 0));
-        assert!(Mode::Supervise.should_gate(Stage::Ship, 0));
+        assert!(Mode::Auto.should_gate(Stage::Ship, 0, 0));
+        assert!(Mode::Supervise.should_gate(Stage::Ship, 0, 0));
     }
 
     #[test]
     fn non_gate_stages_never_gate() {
         for stage in [Stage::Define, Stage::Plan, Stage::Code] {
-            assert!(!Mode::Auto.should_gate(stage, 99));
-            assert!(!Mode::Supervise.should_gate(stage, 99));
+            assert!(!Mode::Auto.should_gate(stage, 99, 99));
+            assert!(!Mode::Supervise.should_gate(stage, 99, 99));
+        }
+    }
+
+    /// 999.78/D-07 boundary: the per-phase total gates in its OWN right. The
+    /// streak is held at zero throughout — below `MAX_CONSECUTIVE_FAILURES`,
+    /// so it cannot be what makes any of these gate — and Auto is the mode to
+    /// test in, because Supervise gates on every Validate and would report
+    /// `true` at all three points regardless of the new bound.
+    #[test]
+    fn phase_failure_ceiling_gates_at_the_ceiling_not_below_it() {
+        assert!(!Mode::Auto.should_gate(Stage::Validate, 0, MAX_PHASE_VALIDATE_FAILURES - 1));
+        assert!(Mode::Auto.should_gate(Stage::Validate, 0, MAX_PHASE_VALIDATE_FAILURES));
+        assert!(Mode::Auto.should_gate(Stage::Validate, 0, MAX_PHASE_VALIDATE_FAILURES + 1));
+    }
+
+    /// F-6: the predicate has the same boundary shape as the gate it feeds.
+    #[test]
+    fn phase_failure_ceiling_reached_has_the_same_boundary() {
+        assert!(!phase_failure_ceiling_reached(0));
+        assert!(!phase_failure_ceiling_reached(
+            MAX_PHASE_VALIDATE_FAILURES - 1
+        ));
+        assert!(phase_failure_ceiling_reached(MAX_PHASE_VALIDATE_FAILURES));
+        assert!(phase_failure_ceiling_reached(
+            MAX_PHASE_VALIDATE_FAILURES + 1
+        ));
+    }
+
+    /// F-6's agreement test — what stops the predicate and the gating decision
+    /// drifting apart later. The message's ceiling clause and the total's reset
+    /// both read the predicate directly rather than inferring from
+    /// `should_gate`, so the two must answer the same question at the boundary.
+    ///
+    /// Auto mode with a zero streak is the only setting where the two CAN
+    /// disagree observably: in Supervise, `should_gate` is `true` at every
+    /// point and the comparison would pass however the predicate behaved.
+    #[test]
+    fn phase_failure_ceiling_predicate_agrees_with_should_gate() {
+        for total in [
+            MAX_PHASE_VALIDATE_FAILURES - 1,
+            MAX_PHASE_VALIDATE_FAILURES,
+            MAX_PHASE_VALIDATE_FAILURES + 1,
+        ] {
+            assert_eq!(
+                phase_failure_ceiling_reached(total),
+                Mode::Auto.should_gate(Stage::Validate, 0, total),
+                "the ceiling predicate and the Auto-mode Validate gate must agree at {total}"
+            );
         }
     }
 

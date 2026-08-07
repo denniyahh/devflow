@@ -108,6 +108,46 @@ pub(crate) fn phase_artifact_on_develop(project_root: &Path, phase: u32, suffix:
     })
 }
 
+/// Build the fresh [`State`] a `devflow start` begins with, carrying the
+/// per-phase Validate-failure total forward from any persisted state for the
+/// SAME phase (999.78/A-11, D-07).
+///
+/// **Why exactly one field is treated differently from every other counter.**
+/// `State::new` zeroes all of them, and `start()` calls it unconditionally —
+/// `--force` included. A plain `State` field is therefore per-RUN, while D-07
+/// specifies a per-PHASE bound, and those are different lifetimes: a bound a
+/// restart resets does not bound the unattended case the bound was built for.
+/// Everything else on `State` genuinely is per-run and must keep starting at
+/// zero, so this copies `phase_validate_failures` and nothing else — a
+/// wholesale copy would silently resurrect a stale streak, a stale baseline
+/// and a stale stop point along with it.
+///
+/// An absent or unreadable persisted state means zero, which is the correct
+/// reading for both cases that produce it: a phase's genuine first start, and
+/// a phase whose completion already cleared the file.
+///
+/// **The two events that DO reset the total**, neither of which is "a new
+/// process started":
+///
+/// 1. **Phase completion** — `finish_workflow_with_gate_timeout` calls
+///    `workflow::clear_state`, deleting `.devflow/state-{NN}.json`, so the
+///    next start for this phase finds nothing to carry. No code here.
+/// 2. **Operator approval at the ceiling gate** — `handle_validate_outcome`
+///    zeroes the total when a human advances or loops back AND
+///    `mode::phase_failure_ceiling_reached` is true.
+pub(crate) fn fresh_state_carrying_phase_failures(
+    project_root: &Path,
+    phase: u32,
+    agent: AgentKind,
+    mode: Mode,
+) -> State {
+    let mut state = State::new(phase, agent, mode, project_root.to_path_buf());
+    if let Ok(persisted) = workflow::load_state(project_root, phase) {
+        state.phase_validate_failures = persisted.phase_validate_failures;
+    }
+    state
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start(
     project_root: &Path,
@@ -121,7 +161,10 @@ pub(crate) fn start(
     yes_ship: bool,
     legacy_claude_launch: bool,
 ) -> Result<(), CliError> {
-    let mut state = State::new(phase, agent, mode, project_root.to_path_buf());
+    // 999.78/A-11: NOT a bare `State::new`. See
+    // `fresh_state_carrying_phase_failures` for why one field survives a
+    // forced restart and every other counter does not.
+    let mut state = fresh_state_carrying_phase_failures(project_root, phase, agent, mode);
     state.stop_until = until;
     // The only assignment in the crate that ever sets `yes_ship` to a
     // non-default value. Provenance (D-12, `28-CONTEXT.md`): the typed
@@ -3251,6 +3294,97 @@ mod tests {
     use super::*;
     use crate::{Cli, Command, GateCmd};
     use clap::Parser;
+
+    /// 999.78/A-11, reset event ZERO — the one that must NOT happen. The
+    /// per-phase Validate-failure total survives a `devflow start --force`
+    /// restart of the same phase, because a bound a restart resets does not
+    /// bound the unattended case D-07 exists for.
+    ///
+    /// Exercises the function `start()` itself calls, not a reimplementation
+    /// of it — `start()`'s own body does git plumbing, agent-binary probes and
+    /// worktree scaffolding that have nothing to do with the carry-forward.
+    ///
+    /// **The second half of the assertion is the control.** A carry-forward
+    /// that copied the whole persisted state wholesale would satisfy the first
+    /// assertion for entirely the wrong reason, and would silently resurrect a
+    /// stale streak, a stale commit baseline and a stale stop point along with
+    /// the total. Every other counter is seeded non-zero on disk here
+    /// specifically so a wholesale copy cannot pass.
+    #[test]
+    fn phase_validate_failures_survive_a_forced_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 71;
+
+        let mut persisted = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        persisted.phase_validate_failures = 6;
+        persisted.consecutive_failures = 2;
+        persisted.infra_failures = 4;
+        persisted.preflight_retries = 3;
+        persisted.checkpoint_resumes = 1;
+        persisted.last_validate_failure_commit_count = Some(9);
+        persisted.stage = Stage::Validate;
+        persisted.stop_until = Some(Stage::Code);
+        workflow::save_state(&persisted).unwrap();
+
+        let fresh = fresh_state_carrying_phase_failures(root, phase, AgentKind::Claude, Mode::Auto);
+
+        assert_eq!(
+            fresh.phase_validate_failures, 6,
+            "the per-phase total must be carried across a forced restart — a new process \
+             starting is not one of A-11's two reset events"
+        );
+        assert_eq!(
+            fresh.consecutive_failures, 0,
+            "the streak is per-run and must start at zero"
+        );
+        assert_eq!(fresh.infra_failures, 0);
+        assert_eq!(fresh.preflight_retries, 0);
+        assert_eq!(fresh.checkpoint_resumes, 0);
+        assert_eq!(
+            fresh.last_validate_failure_commit_count, None,
+            "the commit baseline is per-run; carrying it would compare a new run's count \
+             against an old run's observation"
+        );
+        assert_eq!(fresh.stage, Stage::Define);
+        assert_eq!(fresh.stop_until, None);
+    }
+
+    /// A-11 reset event ONE: phase completion. `finish_workflow` calls
+    /// `workflow::clear_state`, which deletes the phase's state file — so the
+    /// next start for that phase finds nothing to carry and begins at zero.
+    ///
+    /// Written as clear-then-construct rather than never-write-at-all, so it is
+    /// the opposite-result case for the carry-forward test above: same phase,
+    /// same construction call, the ONLY difference being whether completion
+    /// removed the file.
+    #[test]
+    fn phase_validate_failures_reset_when_the_phase_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 72;
+
+        let mut persisted = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        persisted.phase_validate_failures = 8;
+        workflow::save_state(&persisted).unwrap();
+        assert_eq!(
+            fresh_state_carrying_phase_failures(root, phase, AgentKind::Claude, Mode::Auto)
+                .phase_validate_failures,
+            8,
+            "premise: while the state file exists, the total IS carried — otherwise the \
+             assertion below proves nothing about completion"
+        );
+
+        // What `finish_workflow_with_gate_timeout` does on genuine completion.
+        workflow::clear_state(root, phase).unwrap();
+
+        assert_eq!(
+            fresh_state_carrying_phase_failures(root, phase, AgentKind::Claude, Mode::Auto)
+                .phase_validate_failures,
+            0,
+            "phase completion cleared the state, so the next start begins with a full budget"
+        );
+    }
 
     #[test]
     fn gate_approve_arg_parsing_accepts_positional_stage() {
