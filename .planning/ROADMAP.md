@@ -344,6 +344,52 @@ Unsequenced items — not part of the active phase sequence. Promote with
 `/gsd-review-backlog` when ready; each carries accumulated context in its
 own `phases/999.N-*/CONTEXT.md`.
 
+### Phase 999.91: Add a Doc Gate to `check.sh` That Denies Only the Rustdoc Lints Which Catch Real Errors (BACKLOG)
+
+**Linear:** [DEN-112](https://linear.app/denniskim/issue/DEN-112/99991-add-a-doc-gate-to-checksh-that-denies-only-the-rustdoc-lints)
+**Found:** 2026-08-07, Phase 35. The five concrete falsehoods this surfaced were fixed in-phase
+(commit `8350340`); this entry is the **gate** that would have caught them when they were written.
+
+**Priority:** Low-Medium | **Size:** S — one line in `scripts/check.sh`, plus the CI equivalent.
+
+**The shape of it.** `cargo doc` runs nowhere in this repository — not in `scripts/check.sh`
+(`fmt` + `clippy` + `test` only), not in CI. Nothing has ever checked documentation correctness.
+Measured 2026-08-07 at `0c111d0`: **38 warnings**, in three classes (cross-checked two ways — a
+per-class tally of 33 + 4 + 1 against rustdoc's own per-crate totals of 36 + 2).
+
+| Class | Count | Assessment |
+|---|---|---|
+| `rustdoc::private_intra_doc_links` — public doc links to a private item | 33 | Stylistic. This codebase writes unusually detailed doc comments that name internal helpers; the link merely does not resolve in *public* docs. |
+| `rustdoc::broken_intra_doc_links` — link to an item that does not exist | 4 | **Real.** Documentation asserting something false about the code. |
+| `rustdoc::invalid_html_tags` | 1 | **Real.** Swallows following text in rendered output. |
+
+The five real ones were: `[`feature_start_force`]` missing its `Self::` qualifier (`git.rs:129`);
+two links treating the constant `MAX_CHECKPOINT_RESUMES` as if it had associated items
+(`mode.rs:98`); `ClaudeAgent::exec_command` linked through the struct when it is a **trait** method
+(`pipeline_launch.rs:449`); and an unclosed `<remote>` tag (`preflight.rs:354`). None was introduced
+by Phase 35 — all five predate it, verified against `749a151..HEAD`.
+
+**Why this repo in particular.** `CLAUDE.md` requires maintaining comments and docstrings, and
+Phase 35's 35-06 rested on the premise that *documentation is the deliverable*, standing in for the
+version bump D-08 declined. A repository that treats doc accuracy as a shippable artifact while
+four doc links point at nonexistent symbols has no mechanism matching its stated standard.
+
+**The proposal, and why it is cheap.** The choice is not "clean all 38" versus "no gate". Deny only
+the lints that catch real errors and the 33 stylistic ones are ignored by design:
+
+```bash
+RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links -D rustdoc::invalid_html_tags" \
+  cargo doc --workspace --no-deps
+```
+
+At `8350340` this passes with zero findings, so the gate can be added **without a cleanup phase
+first** — that is the whole argument for doing it. Adding it changes what every future commit must
+satisfy, which is why it is a policy call for the operator rather than a drive-by.
+
+**Open sub-question, not decided here.** Whether the 33 private-link warnings should eventually be
+resolved (by unlinking, or by `--document-private-items`) or accepted permanently as house style.
+The gate above is deliberately neutral on it.
+
 ### Phase 999.90: `handle_validate_outcome` Counts Commits Against `GitFlowConfig::default()`, Not the Project's Configured Git-Flow (BACKLOG)
 
 **Linear:** [DEN-111](https://linear.app/denniskim/issue/DEN-111/99990-handle-validate-outcome-counts-commits-against)
