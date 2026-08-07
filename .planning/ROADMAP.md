@@ -81,7 +81,7 @@ are fixed together rather than one being repaired while the other keeps collapsi
      treating "could not count" as evidence of no work. Verified by the same forced-`git`-failure
      harness criterion 1 requires, with the discriminating case being `exit_code = 0` +
      `Stage::Code` + unrunnable `git` (999.87).
-**Plans**: 3/6 plans executed
+**Plans**: 4/6 plans executed
 
 Plans:
 **Wave 1**
@@ -92,7 +92,7 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 35-04-PLAN.md — never-reset per-phase Validate-failure total that survives `--force`, a ceiling that gates without aborting, and a gate message led by the cumulative number (criterion 2)
+- [x] 35-04-PLAN.md — never-reset per-phase Validate-failure total that survives `--force`, a ceiling that gates without aborting, and a gate message led by the cumulative number (criterion 2)
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
@@ -182,7 +182,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 32 | 0/0 | Complete    | 2026-08-04 |
 | 33 | 6/6 | Complete    | 2026-08-05 |
 | 34 | 6/6 | Complete    | 2026-08-06 |
-| 35 | 3/6 | In Progress|  |
+| 35 | 4/6 | In Progress|  |
 | 36 | — | Not started | — |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
@@ -346,7 +346,7 @@ own `phases/999.N-*/CONTEXT.md`.
 
 ### Phase 999.88: The `setsid` Guard on the Tag-Signing Probe Has No Regression Test (BACKLOG)
 
-**Linear:** not yet filed.
+**Linear:** [DEN-109](https://linear.app/denniskim/issue/DEN-109/99988-the-setsid-guard-on-the-tag-signing-probe-has-no-regression-test)
 **Found:** 2026-08-07, Phase 35 execution, while folding 35-03's deferred `setsid` fix in on
 operator instruction.
 
