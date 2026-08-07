@@ -140,6 +140,13 @@ gather the live concurrency evidence its criterion 1 demands.
      end-to-end run anywhere in it; this criterion exists so the same gap is not repeated on the
      change whose entire purpose is making unattended runs work.
 
+  6. **Observation to collect while running, not a criterion to satisfy:** record the per-phase
+     Validate-failure count this run actually reaches. `MAX_PHASE_VALIDATE_FAILURES = 10` (35-04) is
+     an unmeasured judgement — the const assertion pins only its relation to
+     `MAX_CONSECUTIVE_FAILURES`, never the absolute value — and no history exists to mine because the
+     counter did not exist before Phase 35. This run is the first opportunity to observe the real
+     number. Record it even if the run never approaches the ceiling; "converged in 2" is data.
+
 **Not in scope**: the first-option `decision` checkpoint behaviour (filed as 999.94) — it is a
 correctness question about *how* an unattended agent decides, separable from *whether* it can
 proceed at all.
@@ -177,6 +184,12 @@ be planned and executed independently of Phase 35's completion.
      CLI version(s), workload shape(s) covered, and what conclusion that evidence can and cannot
      support — so a future reader cannot mistake a narrow result for a general guarantee about the
      drain gate.
+
+  5. **Observation to collect while running, not a criterion to satisfy:** record the per-phase
+     Validate-failure count this run reaches (same ask as Phase 35.1's criterion 6, repeated here so
+     whichever run happens first captures it). `MAX_PHASE_VALIDATE_FAILURES = 10` is an unmeasured
+     judgement carried provisionally from 35-04; these are the first runs able to say what the real
+     number looks like.
 **Plans**: TBD
 
 ## Progress

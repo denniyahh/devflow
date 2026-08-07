@@ -370,12 +370,26 @@ because the planned shape was unreachable — measured, recorded above.
 
 ## Still open — needs the operator's word, not my assumption
 
-1. **`MAX_PHASE_VALIDATE_FAILURES = 10` is unmeasured.** The plan authorised the planner to argue
+1. **RESOLVED AS PROVISIONAL 2026-08-07 (operator, during 35-verify-work).**
+   **`MAX_PHASE_VALIDATE_FAILURES = 10` is unmeasured.** The plan authorised the planner to argue
    the number and it adopted the orchestrator's suggestion. Nothing in this phase establishes how
    many Validate failures a genuinely-converging phase takes, so ten could be too tight (an
    unattended run parks on a gate that a human then rubber-stamps every time) or too loose (ten
-   wasted cycles before anyone is summoned). Worth one real dogfood observation before it is
-   treated as settled.
+   wasted cycles before anyone is summoned).
+
+   **Disposition: keep 10, explicitly provisional, revisit on evidence.** The two alternatives were
+   rejected for the same reason — neither produces data. Measuring retroactively is impossible:
+   `phase_validate_failures` did not exist before this phase, so there is no history to mine and any
+   reconstruction from event logs would be a proxy for the quantity of interest. Picking a different
+   number now would be a second guess, not a measurement.
+
+   **Where the evidence will come from.** Phase 35.1's simulated unattended run and Phase 36's live
+   run both exercise the Code↔Validate loop and will produce real per-phase Validate-failure counts
+   as a side effect. Recorded in both phases' records so the observation is collected rather than
+   left to memory. What is pinned today is only the *relation* — a const assertion keeps the ceiling
+   strictly above `MAX_CONSECUTIVE_FAILURES` — and that is unaffected by whatever the absolute value
+   becomes. The value is already documented as a judgement at `mode.rs:20-41` and in `CHANGELOG.md`'s
+   Known Issues, so nothing is silently wrong in the meantime.
 
 ## Self-Check: PASSED
 
