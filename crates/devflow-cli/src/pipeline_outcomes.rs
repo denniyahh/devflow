@@ -334,10 +334,23 @@ fn select_loop_back_fix(evidence_root: &Path, phase: u32) -> FixType {
 /// what Validate reported. This narrows the ceiling's guarantee to loops that
 /// produce no commits at all; it does not disable the ceiling. That is the
 /// accepted weakness of the commit-count signal recorded in
-/// `33-RESEARCH.md`'s D-03 Recommendation and Assumptions Log A1. The failure
-/// direction is toward gating: an unrunnable `git` or a missing branch counts
-/// zero every cycle, so once a baseline is recorded the counter accumulates
-/// and the gate stays reachable.
+/// `33-RESEARCH.md`'s D-03 Recommendation and Assumptions Log A1.
+///
+/// 999.77: this comment used to claim the failure direction was toward gating,
+/// on the grounds that an unrunnable `git` "counts zero every cycle" so the
+/// counter accumulates. **That guarantee held only while `git` stayed broken,
+/// and was false for exactly one transient failure — the likelier event.** One
+/// unmeasurable cycle wrote a `Some(0)` baseline; the next real count then
+/// exceeded it, read as forward progress, and reset the streak to 1, buying a
+/// free extension of the [`mode::MAX_CONSECUTIVE_FAILURES`] ceiling.
+///
+/// The guarantee the code now delivers instead: a cycle whose count could not
+/// be measured — [`agent_result::phase_commit_count`] returning `None` — is
+/// treated as not-progress AND leaves the recorded baseline untouched, so the
+/// next real measurement is compared against the last real observation. A
+/// single transient fault can no longer buy a reset. What is still NOT claimed
+/// is anything about the run boundary: `State::new` zeroes both the counter
+/// and the baseline on every `devflow start`, `--force` included.
 ///
 /// CR-01: the two root-consuming reads in this function are on deliberately
 /// **different** roots, and must stay that way. The `{N}-VERIFICATION.md`
@@ -397,29 +410,50 @@ pub(crate) fn handle_validate_outcome(
     };
 
     if result == ValidateResult::Failed {
-        let current =
-            agent_result::phase_commit_count(project_root, &GitFlowConfig::default(), state.phase);
-        if mode::consecutive_failures_made_progress(
-            state.last_validate_failure_commit_count,
-            current,
-        ) {
-            // New commits landed since the last recorded failure — this
-            // failure is the first of a new streak, not a continuation. Set
-            // to 1, not 0: the gate context rendered below interpolates the
-            // counter into a message naming how many times validation has
-            // failed, and zeroing it would make that message read zero on a
-            // real failure.
-            state.consecutive_failures = 1;
-        } else {
-            // Now that the counter genuinely accumulates (18d), an unbounded
-            // loop could otherwise overflow it and wrap to 0, silently
-            // restoring the unreachable-ceiling bug in a slower form.
-            state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        match agent_result::phase_commit_count(project_root, &GitFlowConfig::default(), state.phase)
+        {
+            Some(current) => {
+                if mode::consecutive_failures_made_progress(
+                    state.last_validate_failure_commit_count,
+                    current,
+                ) {
+                    // New commits landed since the last recorded failure —
+                    // this failure is the first of a new streak, not a
+                    // continuation. Set to 1, not 0: the gate context rendered
+                    // below interpolates the counter into a message naming how
+                    // many times validation has failed, and zeroing it would
+                    // make that message read zero on a real failure.
+                    state.consecutive_failures = 1;
+                } else {
+                    // Now that the counter genuinely accumulates (18d), an
+                    // unbounded loop could otherwise overflow it and wrap to
+                    // 0, silently restoring the unreachable-ceiling bug in a
+                    // slower form.
+                    state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+                }
+                // The baseline advances on every recorded failure whose count
+                // was actually MEASURED, regardless of which branch ran above
+                // — updating it only on the progress branch would let a stale
+                // low baseline report progress forever.
+                state.last_validate_failure_commit_count = Some(current);
+            }
+            // 999.77 / A-04: the count could not be measured. Treat the cycle
+            // as not-progress — an absent measurement is not evidence that
+            // work landed — and, crucially, do NOT touch the baseline. Writing
+            // a forged zero here is the defect: the next successful
+            // measurement would then compare a real count against that zero,
+            // read it as forward progress, and hand back one free reset of the
+            // MAX_CONSECUTIVE_FAILURES ceiling. Leaving the baseline alone
+            // means the next real measurement compares against the last real
+            // observation.
+            //
+            // `mode::consecutive_failures_made_progress` is deliberately not
+            // called on this arm and its signature is deliberately not widened
+            // — there is no count to compare.
+            None => {
+                state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+            }
         }
-        // The baseline advances on every recorded failure regardless of
-        // which branch ran above — updating it only on the progress branch
-        // would let a stale low baseline report progress forever.
-        state.last_validate_failure_commit_count = Some(current);
         workflow::save_state(state)?;
     }
 
@@ -1836,6 +1870,334 @@ mod tests {
                 .should_gate(Stage::Validate, state.consecutive_failures),
             "a genuinely stuck loop with no new commits must still reach the reachable ceiling"
         );
+    }
+
+    /// 999.77 / HARDEN-01, ROADMAP criterion 1 — **the two-cycle
+    /// discriminating sequence, and nothing less.**
+    ///
+    /// A single transient `git` fault used to buy one free reset of the
+    /// [`mode::MAX_CONSECUTIVE_FAILURES`] ceiling. The mechanism needs two
+    /// cycles to become visible, which is why a one-cycle test is a proxy
+    /// (NC-3) rather than weak coverage:
+    ///
+    ///   - **Cycle 1** — `git` cannot run. Pre-fix, `phase_commit_count`
+    ///     collapsed that to `0` and the unconditional baseline write recorded
+    ///     `Some(0)`. The streak still incremented, so a test that stopped
+    ///     here would look green against the buggy code.
+    ///   - **Cycle 2** — `git` runs and reports the SAME real count as before
+    ///     (nothing was committed between the cycles). Compared against the
+    ///     forged `Some(0)` baseline, `1 > 0` reads as forward progress, and
+    ///     the streak resets to 1. That reset is the defect, and it is only
+    ///     observable from the second cycle.
+    ///
+    /// Exactly two things vary across the cycles: whether `git` can be
+    /// executed, and nothing else. The commit count itself is held constant at
+    /// a real, non-zero value throughout, so a green result here cannot be
+    /// explained by the branch changing underneath the test.
+    ///
+    /// **`NoGitPath` for cycle 1, `NeutralPath` for cycle 2.** Cycle 1 needs
+    /// `git` to be UNRESOLVABLE — only a spawn that fails makes `.output()`
+    /// return `Err`, which is the sole could-not-measure condition (F-1); a
+    /// shim that ran and exited non-zero would be a real observation and would
+    /// exercise the already-correct `Some(0)` path (NC-4). Cycle 2 needs a
+    /// real `git` but still no resolvable agent CLI, which is exactly what
+    /// `NeutralPath`'s git-only `PATH` provides.
+    ///
+    /// **What this does NOT establish.** The run boundary. `State::new` zeroes
+    /// both `consecutive_failures` and the baseline on every `devflow start
+    /// --force`, and nothing here shows the streak surviving a restart.
+    #[test]
+    fn validate_failure_with_unmeasurable_count_accumulates_the_streak() {
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 89;
+        init_repo(root);
+        // One real commit on the feature branch, and no further commits for
+        // the rest of this test: the REAL count is a stable, non-zero 1.
+        commit_on_feature_branch(root, phase, "seed");
+        // C4 (review): `handle_validate_outcome` persists via
+        // `workflow::save_state`, which routes through `write_state_atomic` ->
+        // `ensure_devflow_dir` (a `create_dir_all`), so this directory is not
+        // strictly required. Created anyway, matching the sibling fixtures
+        // that already do so — it costs one line and stops this test's
+        // correctness depending on a detail two crates away.
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        // A real baseline from a real prior observation — one commit seen at
+        // the last recorded failure, one failure already on the streak.
+        state.last_validate_failure_commit_count = Some(1);
+        state.consecutive_failures = 1;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        let seed_gate_response = || {
+            std::fs::write(
+                &response_path,
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap();
+        };
+        seed_gate_response();
+
+        // CYCLE 1 — the measurement fails. The guard wraps exactly this call
+        // and nothing else.
+        {
+            let _no_git = NoGitPath::install();
+            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+        }
+
+        assert_eq!(
+            state.last_validate_failure_commit_count,
+            Some(1),
+            "a cycle whose commit count could NOT be measured must leave the baseline \
+             byte-identical to the last real observation — overwriting it with a forged \
+             zero is 999.77 itself"
+        );
+        assert_eq!(
+            state.consecutive_failures, 2,
+            "an unmeasurable count is not evidence of forward progress, so the streak \
+             must continue rather than restart"
+        );
+
+        // The loop-back moved the stage to Code and cleaned up the Validate
+        // gate; restore both so cycle 2 is the same shape as cycle 1.
+        state.stage = Stage::Validate;
+        seed_gate_response();
+
+        // CYCLE 2 — `git` runs again and reports the same real count as
+        // before. Nothing was committed in between, so this is not progress.
+        {
+            let _neutral = NeutralPath::install();
+            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+        }
+
+        assert_ne!(
+            state.consecutive_failures, 1,
+            "the streak must never be reset to 1 by this sequence — that reset is the \
+             one free ceiling reset a single transient git fault used to buy"
+        );
+        assert_eq!(
+            state.consecutive_failures, 3,
+            "failure-with-an-unmeasurable-count followed by \
+             failure-with-an-unchanged-real-count must accumulate"
+        );
+        assert!(
+            state
+                .mode
+                .should_gate(Stage::Validate, state.consecutive_failures),
+            "the human gate must stay reachable across a transient git fault"
+        );
+    }
+
+    /// HARDEN-07 / criterion 6 at the LAYER level (D-09): `exit_code = 0` +
+    /// `Stage::Code` (a commit-gated stage) + an unrunnable `git` must fall
+    /// through to Layer 3, not classify as `Failed — no work done`. An
+    /// unmeasurable count is not evidence that no work happened, and this is
+    /// the exact input that made a successful agent read as a failure.
+    ///
+    /// `agent_result::tests::evaluate_layer2_exit_zero_no_commits_is_failed`
+    /// is the required NC-11 opposite-result control and stays byte-unchanged:
+    /// real `git`, a genuinely empty branch, still `Failed`. Extending THAT
+    /// test instead of adding this sibling would have been the proxy NC-11
+    /// names — it covers the ordinary `commits == 0` case, which is a
+    /// different and already-correct path.
+    ///
+    /// # Why this test lives in `devflow-cli` rather than beside its subject
+    ///
+    /// **`NoGitPath` is unavoidable here**, unlike the Layer 3 tests which use
+    /// an unspawnable working directory: `evaluate_layer2` reads its exit file
+    /// from `project_root`, so a non-existent root would make the exit read
+    /// fail and return `Ok(None)` for the WRONG reason — an unreadable exit
+    /// file rather than an unmeasurable count — and the test would pass
+    /// against the unfixed code. The root must EXIST and `git` must still be
+    /// unresolvable, and only a `PATH` guard delivers that combination.
+    ///
+    /// A process-global `PATH` guard is not viable in `devflow-core`'s test
+    /// binary. That crate shells out to `git` from eight modules running in
+    /// parallel, and its tests call production code that spawns `git`
+    /// directly, so no fixture-helper lock can cover them — measured at 1-5
+    /// unrelated failures per run, and still 1 in 8 runs after that module's
+    /// own `git()` helper took a lock. `devflow-cli`'s binary routes every
+    /// `PATH` mutation through the single [`env_lock`] its `git`-touching
+    /// tests already hold, which is why the guard is safe here.
+    ///
+    /// `evaluate_layer2` is `pub`, so this drives exactly the same function
+    /// with exactly the same inputs; only the binary it runs in differs.
+    #[test]
+    fn evaluate_layer2_unrunnable_git_falls_through_to_layer3() {
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // The root EXISTS and carries a readable exit file recording a clean
+        // exit — so an `Ok(None)` return can only come from the commit count.
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        std::fs::write(agent_result::exit_code_path(root, 4), "0").unwrap();
+        assert!(
+            agent_result::exit_code_path(root, 4).exists(),
+            "the exit file must be readable, or Layer 2 returns Ok(None) for the wrong reason"
+        );
+
+        let result = {
+            let _no_git = NoGitPath::install();
+            agent_result::evaluate_layer2(root, 4, &GitFlowConfig::default(), Stage::Code).unwrap()
+        };
+
+        assert!(
+            result.is_none(),
+            "an unmeasurable commit count must fall through to Layer 3, got: {result:?}"
+        );
+        // Asserted separately and explicitly, so a future change that returns
+        // some other non-`Failed` classification from this layer still has to
+        // confront this test rather than slipping past an `is_none()` check.
+        assert_ne!(
+            result.as_ref().map(|r| r.status),
+            Some(devflow_core::agent_result::AgentStatus::Failed),
+            "Layer 2 must never classify an unmeasurable count as absent work"
+        );
+    }
+
+    /// **HARDEN-07 / criterion 6 as an OUTCOME rather than a property of one
+    /// function (F-4).** This is the test the operator ruled must exist, and
+    /// the one whose absence let the Layer 3 defect survive planning.
+    ///
+    /// A unit test on `evaluate_layer2` alone passes while the end-to-end
+    /// answer is unchanged: `evaluate_layer1` returns `None` when there is no
+    /// capture, so everything reaching Layer 2 also reaches Layer 3, and
+    /// Layer 3 used to carry its own copy of the same lossy count. Driving the
+    /// whole cascade is what distinguishes "the defect was removed" from "the
+    /// defect was moved one layer down". NC-12 is this test's control.
+    ///
+    /// Both cascade shortcuts are left unarmed deliberately, so the run really
+    /// does traverse Layer 2's fall-through: no operator-approved external
+    /// post-condition declarations (Layer 0 declines) and no stdout capture
+    /// (Layer 1 returns `None`). `decided_by_layer` is asserted for the same
+    /// reason — it is what proves the cascade reached Layer 3 rather than
+    /// short-circuiting somewhere harmless and passing for the wrong reason.
+    ///
+    /// **Nothing here asserts on `Action`, `decide_action`, or any gating
+    /// consequence (F-5).** `AgentStatus::Failed` and `AgentStatus::Unknown`
+    /// map identically to `Action::GateReview` today, deliberately, so such an
+    /// assertion would pass against the buggy code too. What this fix changes
+    /// is the recorded classification, the commit figure and the
+    /// operator-facing reason — not what the run does next.
+    #[test]
+    fn evaluate_agent_result_with_unrunnable_git_does_not_report_failed() {
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 96;
+        // A real repo with the feature branch present. Built BEFORE the guard
+        // goes on, because building it shells out to git.
+        init_repo(root);
+        commit_on_feature_branch(root, phase, "seed");
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        std::fs::write(agent_result::exit_code_path(root, phase), "0").unwrap();
+        // No stdout capture, so Layer 1 declines and the cascade reaches
+        // Layer 2 at all.
+        assert!(
+            !agent_result::stdout_path(root, phase).exists(),
+            "Layer 1 must decline, or this test never reaches the cascade under study"
+        );
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+
+        let result = {
+            let _no_git = NoGitPath::install();
+            agent_result::evaluate_agent_result(root, &state, &GitFlowConfig::default()).unwrap()
+        };
+
+        assert_ne!(
+            result.status,
+            devflow_core::agent_result::AgentStatus::Failed,
+            "END TO END: exit 0 + Stage::Code + an unrunnable git must not report Failed. \
+             This is the criterion-6 outcome, and a passing evaluate_layer2 unit test does \
+             not establish it"
+        );
+        assert_eq!(
+            result.status,
+            devflow_core::agent_result::AgentStatus::Unknown,
+            "asserted positively too, so a future non-Failed value still confronts this test"
+        );
+        assert_eq!(
+            result.decided_by_layer,
+            Some(3),
+            "the cascade must genuinely traverse Layer 2's fall-through into Layer 3 — \
+             any other layer means this passed for the wrong reason"
+        );
+        assert_eq!(
+            result.commits, None,
+            "'could not tell' must not be recorded as a measured zero"
+        );
+    }
+
+    /// The companion opposite-result case for
+    /// `evaluate_agent_result_with_unrunnable_git_does_not_report_failed`: the
+    /// same fixture shape with real `git` available and the feature branch
+    /// genuinely empty must still report `Failed`. Without it, a cascade that
+    /// returned `Unknown` unconditionally would pass the test above.
+    ///
+    /// Kept as its own `#[test]` rather than appended to that one, following
+    /// this file's own IN-06 precedent: packed into a single function, a
+    /// failure in the first half aborts before the control ever runs, and the
+    /// control is the half whose loss would be least visible.
+    ///
+    /// The decision lands at Layer 2 here, not Layer 3 — with a real
+    /// measurement the commit gate resolves the case before the fall-through
+    /// is reached. That difference is the point: the two tests differ in
+    /// exactly one input, whether `git` could run.
+    #[test]
+    fn evaluate_agent_result_with_real_git_and_empty_branch_still_reports_failed() {
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 97;
+        init_repo(root);
+        // The feature branch exists but sits at develop's tip: a real,
+        // measured zero rather than an unmeasurable one.
+        let branch = format!("feature/phase-{phase:02}");
+        assert!(
+            devflow_core::test_support::git_command(root)
+                .args(["checkout", "-b", &branch])
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "fixture must create the empty feature branch"
+        );
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        std::fs::write(agent_result::exit_code_path(root, phase), "0").unwrap();
+        assert!(
+            !agent_result::stdout_path(root, phase).exists(),
+            "Layer 1 must decline here too, matching the companion test's shape"
+        );
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+
+        // `NeutralPath`, not the raw environment: real `git` must resolve so
+        // the count is genuinely measured, while no real agent CLI can.
+        let result = {
+            let _neutral = NeutralPath::install();
+            agent_result::evaluate_agent_result(root, &state, &GitFlowConfig::default()).unwrap()
+        };
+
+        assert_eq!(
+            result.status,
+            devflow_core::agent_result::AgentStatus::Failed,
+            "a MEASURED zero on a commit-gated stage is still absent work — the fix must \
+             not have widened into 'never report Failed'"
+        );
+        assert_eq!(result.commits, Some(0));
+        assert_eq!(result.decided_by_layer, Some(2));
     }
 
     /// D-01 (33-CONTEXT.md), ROADMAP criterion 1: a Validate failure on a

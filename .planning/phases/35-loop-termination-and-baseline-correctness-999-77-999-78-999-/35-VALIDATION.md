@@ -29,9 +29,9 @@ below as suspect until its named negative control has been run and seen to fail.
 |----------|-------|
 | **Framework** | `cargo test` (standard Rust harness), workspace crates `devflow-core` and `devflow` |
 | **Config file** | none dedicated — `scripts/check.sh` is the single definition of "green": `fmt`, `clippy --all-targets -- -D warnings`, `test` |
-| **Quick run command** | `cargo test -p devflow-core --lib <module>::` or `cargo test -p devflow --lib <module>::` |
+| **Quick run command** | `cargo test -p devflow-core --lib <module>::` or `cargo test -p devflow --bin devflow <module>::`. **Corrected during 35-01:** `-p devflow --lib` does not work — `devflow` is a binary-only crate (`crates/devflow-cli/src/main.rs`, no `src/lib.rs`), and cargo exits with `error: no library targets found in package 'devflow'`. Every `-p devflow --lib` command written into 35-01's PLAN was unrunnable as specified. |
 | **Full suite command** | `scripts/check.sh all` (host) / `scripts/check-in-container.sh all` (pinned CI image) |
-| **Estimated runtime** | **unmeasured** — measure at Wave 0 and record here rather than assume |
+| **Measured runtime** | `scripts/check.sh all` **76.4s** (fmt + clippy + full workspace suite, 917 tests across 22 binaries, 0 failed). Targeted: `cargo test -p devflow-core --lib` **5.1-5.9s** (n=10), `cargo test -p devflow --bin devflow` **12.2-14.3s** (n=10). Measured 2026-08-07 during 35-01. **What these numbers do NOT cover:** all are *warm/incremental* — the workspace was already built, so they exclude a cold `cargo build` (minutes, dominated by `clap`/`tracing-subscriber`). They are one host, one run each for `check.sh`; the targeted figures are 10 runs and so carry a real spread, the `check.sh` figure is n=1 and carries none. |
 
 **Package-name trap (CLAUDE.md).** devflow-core's package is `devflow-core`; **devflow-cli's
 package is `devflow`**, not `devflow-cli` (`crates/devflow-cli/Cargo.toml:2`). `cargo test --exact
