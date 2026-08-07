@@ -81,7 +81,7 @@ are fixed together rather than one being repaired while the other keeps collapsi
      treating "could not count" as evidence of no work. Verified by the same forced-`git`-failure
      harness criterion 1 requires, with the discriminating case being `exit_code = 0` +
      `Stage::Code` + unrunnable `git` (999.87).
-**Plans**: 4/6 plans executed
+**Plans**: 5/6 plans executed
 
 Plans:
 **Wave 1**
@@ -96,7 +96,7 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 35-05-PLAN.md — run-scoped content fingerprint makes `{N}-VERIFICATION.md` go stale, so a `--force` re-run stops inheriting the previous run's verdict; both directions tested (criterion 3)
+- [x] 35-05-PLAN.md — run-scoped content fingerprint makes `{N}-VERIFICATION.md` go stale, so a `--force` re-run stops inheriting the previous run's verdict; both directions tested (criterion 3)
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
@@ -182,7 +182,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 32 | 0/0 | Complete    | 2026-08-04 |
 | 33 | 6/6 | Complete    | 2026-08-05 |
 | 34 | 6/6 | Complete    | 2026-08-06 |
-| 35 | 4/6 | In Progress|  |
+| 35 | 5/6 | In Progress|  |
 | 36 | — | Not started | — |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
