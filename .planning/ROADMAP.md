@@ -27,7 +27,7 @@ those five confirmed fixes down waiting on a harness.
 
 | Phase | Name | Status | Version |
 |---|---|---|---|
-| 35 | Loop-Termination and Baseline Correctness | Not started | — |
+| 35 | Loop-Termination and Baseline Correctness | Complete (2026-08-07) | — |
 | 35.1 | Unattended-Launch Prerequisites | Not started | — |
 | 35.2 | Verification Provenance | Not started | — |
 | 36 | Drain Gate Concurrency Measurement | Not started | — |
