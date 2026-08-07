@@ -911,7 +911,8 @@ fn sign_probe_within(workspace: &Path, key_path: &Path) -> SignProbeOutcome {
         return SignProbeOutcome::NotRun;
     };
 
-    let mut child = match Command::new("ssh-keygen")
+    let mut command = Command::new("ssh-keygen");
+    command
         .args([
             "-Y",
             "sign",
@@ -921,8 +922,9 @@ fn sign_probe_within(workspace: &Path, key_path: &Path) -> SignProbeOutcome {
             key_arg,
             payload_arg,
         ])
-        // D-01: closes the passphrase-prompt route, so an encrypted key
-        // cannot park an unattended preflight on an askpass helper.
+        // D-01: closes the ASKPASS route, so an encrypted key cannot park an
+        // unattended preflight on an askpass helper. It does NOT close the
+        // /dev/tty route — see the `setsid` call below.
         .env("SSH_ASKPASS_REQUIRE", "never")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -931,9 +933,35 @@ fn sign_probe_within(workspace: &Path, key_path: &Path) -> SignProbeOutcome {
         // key ./does-not-exist.pub`), so reproducing any part of it in a
         // reason string would violate D-08's redaction contract. The exit
         // code is the sole verdict (D-02).
-        .stderr(Stdio::null())
-        .spawn()
-    {
+        .stderr(Stdio::null());
+
+    // SAFETY: `setsid` is a bare syscall and async-signal-safe, which is the
+    // only requirement `pre_exec` imposes.
+    //
+    // Detach from any controlling terminal before exec. `SSH_ASKPASS_REQUIRE
+    // =never` alone is NOT sufficient: OpenSSH only consults it once
+    // `open("/dev/tty")` has failed, so on a host that HAS a controlling
+    // terminal `ssh-keygen` prompts for the passphrase on the terminal
+    // regardless of the variable and blocks there until the ceiling expires.
+    // Measured on this host with a real pty: 10.06s (i.e. the whole
+    // SSH_SIGN_PROBE_TIMEOUT) before the fix, 0.02s after. Dropping the
+    // controlling terminal makes that `open` fail, which is the condition
+    // the variable is gated on.
+    //
+    // The failure is ignored deliberately. `setsid` only fails when the
+    // caller is already a process-group leader, which a freshly forked child
+    // is not; and if it somehow did fail, the probe degrades to exactly the
+    // pre-fix behaviour, which the wall-clock ceiling already bounds. Turning
+    // it into a spawn error would be worse: `spawn` failure is classified as
+    // absent tooling, so it would surface as a false "ssh-keygen not found".
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(&mut command, || {
+            libc::setsid();
+            Ok(())
+        });
+    }
+
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(_) => return SignProbeOutcome::ToolMissing,
     };
