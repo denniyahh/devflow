@@ -4,17 +4,17 @@ milestone: v2.5.0
 milestone_name: milestone (Loop-Termination and Release Hardening, ACTIVE — declared 2026-08-06)
 current_phase: 35.1
 current_phase_name: Unattended-Launch Prerequisites (999.93)
-status: planning
+status: "Phase 35 shipped — PR #99"
 stopped_at: Phase 35 context gathered
-last_updated: "2026-08-07T22:39:32.623Z"
+last_updated: "2026-08-07T23:19:47.782Z"
 last_activity: 2026-08-07
-last_activity_desc: Phase 35 complete, transitioned to Phase 35.1
 progress:
   total_phases: 4
   completed_phases: 1
   total_plans: 6
   completed_plans: 6
   percent: 25
+last_activity_desc: Phase 35 complete, transitioned to Phase 35.1
 ---
 
 # DevFlow — Project State
@@ -156,8 +156,8 @@ change earns 2.0.
 
 Phase: 35.1 of 36 (Unattended-Launch Prerequisites (999.93))
 Plan: Not started
-Status: Ready to plan
-Last activity: 2026-08-07 — Phase 35 complete, transitioned to Phase 35.1
+Status: Phase 35 shipped — PR #99
+Last activity: 2026-08-07
 
 ## Recently Shipped
 
