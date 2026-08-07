@@ -2241,6 +2241,13 @@ mod tests {
     // never contains the literal `gate="blocking-human"`.
     const HUMAN_GATE_VALUE_FOR_TEST: &str = "blocking-human";
 
+    /// The PLAIN `blocking` gate — deliberately NOT the human-blocking one.
+    /// Used only by [`write_plan_without_checkpoint`]'s decoy body, so the
+    /// literal `verify::phase_has_blocking_human_checkpoint` searches for is
+    /// absent from it (the Phase 26 near-miss distinction that
+    /// `verify.rs`'s `..._false_for_plain_blocking_gate` already pins).
+    const PLAIN_GATE_VALUE_FOR_TEST: &str = "blocking";
+
     /// Write a synthetic phase's plan declaring a `blocking-human`
     /// checkpoint task, matching `verify::phase_plan_files`'s discovery
     /// pattern (`.planning/phases/{NN}-*/{NN}-*-PLAN.md`).
@@ -2251,6 +2258,32 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let body = format!(
             "---\nphase: {phase}\n---\n\n<task type=\"checkpoint:human-verify\" gate=\"{HUMAN_GATE_VALUE_FOR_TEST}\">\n</task>\n"
+        );
+        std::fs::write(dir.join(format!("{phase:02}-01-PLAN.md")), body).unwrap();
+    }
+
+    /// D-05 (35-02): the decoy PLAN.
+    ///
+    /// Identical to [`write_declared_checkpoint_plan`] in discovery shape —
+    /// same `.planning/phases/{NN}-checkpoint-fixture/{NN}-01-PLAN.md`
+    /// location under whatever root it is handed, same front-matter-plus-task
+    /// body — but declaring the plain `blocking` gate, so
+    /// `phase_has_blocking_human_checkpoint` does not match it.
+    ///
+    /// Written under `project_root` by the worktree-mode test so that
+    /// reverting the call site's root argument fails because the WRONG ROOT
+    /// was read, not because the main checkout happened to be empty. The
+    /// bare "leave `project_root` empty" alternative also discriminates, but
+    /// partly by a condition production never satisfies: a real main checkout
+    /// always carries `.planning/phases/`, often including a previous run's
+    /// copy of the very phase under test.
+    fn write_plan_without_checkpoint(root: &Path, phase: u32) {
+        let dir = root
+            .join(".planning/phases")
+            .join(format!("{phase:02}-checkpoint-fixture"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = format!(
+            "---\nphase: {phase}\n---\n\n<task type=\"checkpoint:decision\" gate=\"{PLAIN_GATE_VALUE_FOR_TEST}\">\n</task>\n"
         );
         std::fs::write(dir.join(format!("{phase:02}-01-PLAN.md")), body).unwrap();
     }
@@ -2346,6 +2379,117 @@ mod tests {
             "expected exactly one checkpoint_auto_decided event: {auto_decided:?}"
         );
         assert_eq!(auto_decided[0]["session_id"], "sess-checkpoint-1");
+        assert_eq!(auto_decided[0]["stage"], "code");
+
+        let gate_fired = events_of_kind(root, "gate_fired");
+        assert!(
+            gate_fired.iter().all(|e| e["stage"] != "code"),
+            "a confirmed, auto-resolved checkpoint must never also fire the \
+             generic gate for the same stage: {gate_fired:?}"
+        );
+    }
+
+    /// 999.84 / HARDEN-04 (35-02): the WORKTREE-MODE sibling of the test
+    /// above, which is deliberately left byte-unchanged rather than moved
+    /// under a worktree — extending it in place would have deleted the only
+    /// call-site-level coverage of the no-worktree path, trading one gap for
+    /// another.
+    ///
+    /// Same five preconditions, three differences: `state.worktree_path` is
+    /// set, the `blocking-human` PLAN exists ONLY inside that worktree, and
+    /// `project_root` carries a DECOY PLAN for the same phase declaring no
+    /// blocking-human gate (D-05).
+    ///
+    /// Reverting `Action::GateReview`'s
+    /// `verify::phase_has_blocking_human_checkpoint` argument from
+    /// `execution_root` back to `project_root` makes this test fail: the arm
+    /// finds only the decoy, never confirms the checkpoint, and falls through
+    /// to the generic gate instead of auto-deciding. The sibling above keeps
+    /// PASSING under that same revert (no worktree, PLAN at the root), which
+    /// localises the failure to root selection rather than to checkpoint
+    /// machinery in general. **That revert was performed and the failure
+    /// observed** (35-02 SUMMARY records both outputs verbatim).
+    ///
+    /// D-06: the performed revert is a one-time act nothing re-runs, so the
+    /// mechanical opposite-result control below ships inside this test and
+    /// re-runs on every `cargo test`. The two establish different things and
+    /// neither replaces the other — the control proves the two roots
+    /// DISAGREE for this fixture, which is what makes the revert meaningful;
+    /// only the performed revert establishes that the call site passes the
+    /// execution root.
+    #[test]
+    fn advance_with_worktree_declared_checkpoint_reads_the_execution_root() {
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let phase = 94;
+        // D-05: a plain directory, not a real `git worktree add`. The
+        // argument under test resolves a path, and a linked worktree's files
+        // are ordinary files — `monitor::spawn_monitor`'s own worktree test
+        // uses the same plain-directory fixture.
+        let worktree = root.join("phase-worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        write_declared_checkpoint_plan(&worktree, phase);
+        write_plan_without_checkpoint(root, phase);
+        write_confirmed_checkpoint_capture(root, phase);
+
+        // D-06's mechanical control, asserted BEFORE `advance()` so a fixture
+        // that has stopped discriminating reports as a fixture failure rather
+        // than as a checkpoint-machinery failure.
+        assert!(
+            verify::phase_has_blocking_human_checkpoint(&worktree, phase),
+            "the execution root holds the declaring PLAN, so the declaration must be found"
+        );
+        assert!(
+            !verify::phase_has_blocking_human_checkpoint(root, phase),
+            "opposite-result case: the project root holds ONLY the decoy, which declares \
+             no blocking-human gate, so it must return false — if both roots answered the \
+             same, this fixture would be measuring the presence of a PLAN somewhere rather \
+             than which root the call site reads"
+        );
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Code;
+        state.session_id = Some("sess-checkpoint-worktree".to_string());
+        state.worktree_path = Some(worktree.clone());
+        workflow::save_state(&state).unwrap();
+
+        let stub_dir = stub_agent_binary("claude");
+        let original_path = std::env::var_os("PATH");
+        let stubbed_path = prepend_path(&stub_dir, &original_path);
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", &stubbed_path);
+        }
+
+        let result = advance(root, Some(phase));
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        let reloaded_for_reap = workflow::load_state(root, phase).ok();
+        let _reap_guard = reloaded_for_reap
+            .as_ref()
+            .map(ReapMonitorOnDrop::after_launch);
+
+        result.unwrap();
+
+        let auto_decided = events_of_kind(root, "checkpoint_auto_decided");
+        assert_eq!(
+            auto_decided.len(),
+            1,
+            "expected exactly one checkpoint_auto_decided event — the declaration lives \
+             in the worktree, so the arm must read the EXECUTION root: {auto_decided:?}"
+        );
+        assert_eq!(auto_decided[0]["session_id"], "sess-checkpoint-worktree");
         assert_eq!(auto_decided[0]["stage"], "code");
 
         let gate_fired = events_of_kind(root, "gate_fired");
