@@ -306,7 +306,11 @@ pub(crate) fn run_gate_with_timeout(
     // A gate is "unexpected" when the active mode would not normally fire
     // one for this stage (e.g. a Define/Plan/Code failure in Auto mode) —
     // WR-11's never-silent path gates unconditionally, independent of mode.
-    let unexpected = !state.mode.should_gate(stage, state.consecutive_failures);
+    let unexpected = !state.mode.should_gate(
+        stage,
+        state.consecutive_failures,
+        state.phase_validate_failures,
+    );
     if unexpected {
         info!(
             "never-silent gate: {stage} failed in {:?} mode — surfacing an unattended gate this mode would not normally fire",
@@ -531,10 +535,48 @@ pub(crate) fn print_dry_run(state: &State) {
     let mut stage = Some(Stage::Define);
     while let Some(s) = stage {
         let command = s.gsd_command().replace("{N}", &state.phase.to_string());
-        let gate = if state.mode.should_gate(s, 0) {
+        // F-7: these are PREDICTION probes, not live reads. Every one passes
+        // literals rather than `state.consecutive_failures` /
+        // `state.phase_validate_failures` on purpose — the preview answers
+        // "what will this pipeline do", not "where is this run right now",
+        // and a dry run is printed before a run has any position to report.
+        // Widening `should_gate` forces these open; closing them with a
+        // placeholder would leave `--dry-run` silently no longer predicting
+        // the per-phase ceiling gate, which is the operator's only advance
+        // account of where a run will stop.
+        let unconditional = state.mode.should_gate(s, 0, 0);
+        let gate = if unconditional {
             " [GATE]".to_string()
-        } else if state.mode.should_gate(s, mode::MAX_CONSECUTIVE_FAILURES) {
-            format!(" [GATE after {} failures]", mode::MAX_CONSECUTIVE_FAILURES)
+        } else if state.mode.should_gate(s, mode::MAX_CONSECUTIVE_FAILURES, 0) {
+            format!(
+                " [GATE after {} consecutive failures]",
+                mode::MAX_CONSECUTIVE_FAILURES
+            )
+        } else {
+            String::new()
+        };
+        // The per-phase ceiling probe is a SEPARATE clause, not a third `else
+        // if`. As an `else if` after the streak probe it is unreachable for
+        // Validate in both modes — Auto's streak probe already returns true
+        // and Supervise's unconditional probe already returns true — so the
+        // preview would silently never name the new gate, which is precisely
+        // the T-35-20c harm F-7 exists to prevent. Measured before the fix:
+        // `devflow start --phase 7 --mode auto --dry-run` printed only
+        // `[GATE after 3 consecutive failures]` on the Validate line.
+        //
+        // `!unconditional` suppresses it where it would be noise rather than
+        // information: Ship and Supervise-mode Validate gate regardless of any
+        // failure count, so naming a failure ceiling there tells the operator
+        // nothing about where this run will stop.
+        let phase_gate = if !unconditional
+            && state
+                .mode
+                .should_gate(s, 0, mode::MAX_PHASE_VALIDATE_FAILURES)
+        {
+            format!(
+                " [GATE at {} validate failures for this phase]",
+                mode::MAX_PHASE_VALIDATE_FAILURES
+            )
         } else {
             String::new()
         };
@@ -546,7 +588,7 @@ pub(crate) fn print_dry_run(state: &State) {
         } else {
             ""
         };
-        println!("  {s:<9} {command}{gate}{stop_marker}");
+        println!("  {s:<9} {command}{gate}{phase_gate}{stop_marker}");
         if let Some(next) = s.next() {
             let transition_hooks = hooks::hooks_for_transition(s, next);
             if !transition_hooks.is_empty() {

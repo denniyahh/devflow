@@ -98,6 +98,56 @@ pub struct State {
     /// other numeric field on this struct.
     #[serde(default)]
     pub last_validate_failure_commit_count: Option<u32>,
+    /// Every Validate failure recorded for this PHASE, accumulated without
+    /// regard to forward progress (999.78/WR-01, D-07) — the backstop bound
+    /// [`crate::mode::MAX_PHASE_VALIDATE_FAILURES`] compares against, and the
+    /// leading number in the Supervise gate message (WR-04).
+    ///
+    /// A serde-absent value (state written by a binary predating this field)
+    /// deserializes to 0, which is exactly its "no failures recorded for this
+    /// phase" meaning — the same backward-compat pattern as every other
+    /// `#[serde(default)]` field added since 17-01. Unlike
+    /// [`Self::last_validate_failure_commit_count`], zero is not ambiguous
+    /// here: an upgraded binary and a genuine first failure both start the
+    /// budget at its full width, and that widening is what IN-02's distinct
+    /// loop-back reason exists to announce.
+    ///
+    /// Why it exists next to [`Self::consecutive_failures`] rather than
+    /// replacing it: `consecutive_failures` is reset whenever
+    /// [`crate::mode::consecutive_failures_made_progress`] reports that new
+    /// commits landed, and the Code stage's fix command is a GSD command
+    /// which routinely commits `.planning/` artifacts even when no source
+    /// changed. A loop that commits something trivial every cycle therefore
+    /// resets the streak every cycle and never reaches
+    /// [`crate::mode::MAX_CONSECUTIVE_FAILURES`]. This total cannot be reset
+    /// by a commit count.
+    ///
+    /// **Lifetime — deliberately unlike every other counter on this struct.**
+    /// It is NOT touched by the stage transition (`transition_resets_*` has no
+    /// say over it), matching how [`Self::preflight_retries`] and
+    /// [`Self::checkpoint_resumes`] are handled, because it is a per-phase
+    /// total rather than a per-streak counter. It is also carried across a
+    /// forced restart: `commands::start()` reads any persisted state for the
+    /// same phase and copies this one field into the fresh `State`, because a
+    /// bound a `devflow start --force` resets does not bound the unattended
+    /// case D-07 exists for. Exactly two events reset it to zero:
+    ///
+    /// 1. **Phase completion** — `finish_workflow_with_gate_timeout` calls
+    ///    `workflow::clear_state`, deleting `.devflow/state-{NN}.json`, so the
+    ///    next start for that phase finds nothing to carry.
+    /// 2. **Operator approval at the ceiling gate** — the Validate gate
+    ///    handling zeroes it when a human advances or loops back AND
+    ///    [`crate::mode::phase_failure_ceiling_reached`] is true. Keyed on that
+    ///    predicate and never on "a gate fired": Supervise gates on every
+    ///    Validate, so a gate-keyed reset would clear the total at every
+    ///    failure and it would never accumulate in the one mode where an
+    ///    operator watches every occurrence.
+    ///
+    /// Any increment must use `saturating_add`, like [`Self::infra_failures`]
+    /// and [`Self::checkpoint_resumes`], so an exhausted budget can never wrap
+    /// back to zero and silently restore itself.
+    #[serde(default)]
+    pub phase_validate_failures: u32,
     /// When the phase started (Unix seconds).
     pub started_at: String,
     /// Path to the project root.
@@ -264,6 +314,7 @@ impl State {
             infra_failures: 0,
             preflight_retries: 0,
             last_validate_failure_commit_count: None,
+            phase_validate_failures: 0,
             started_at: timestamp_now(),
             project_root,
             worktree_path: None,
@@ -336,6 +387,7 @@ mod tests {
         assert_eq!(state.consecutive_failures, 0);
         assert_eq!(state.infra_failures, 0);
         assert_eq!(state.preflight_retries, 0);
+        assert_eq!(state.phase_validate_failures, 0);
         assert!(!state.started_at.is_empty());
         assert_eq!(state.monitor_pid, None);
         assert_eq!(state.stop_until, None);
@@ -444,6 +496,45 @@ mod tests {
         }"#;
         let loaded: State = serde_json::from_str(json).unwrap();
         assert_eq!(loaded.last_validate_failure_commit_count, None);
+    }
+
+    /// 999.78/D-07: `phase_validate_failures` round-trips through serde. The
+    /// key-presence assertion comes BEFORE the value round-trip deliberately —
+    /// a field that never actually persists still passes a naive in-memory
+    /// round trip, and a bound that lives only in memory does not bound a
+    /// phase whose whole failure mode spans separate `devflow` processes.
+    #[test]
+    fn phase_validate_failures_round_trips_through_serde() {
+        let mut state = State::new(1, AgentKind::Claude, Mode::Auto, PathBuf::from("/repo"));
+        state.phase_validate_failures = 7;
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(
+            json.contains("phase_validate_failures"),
+            "phase_validate_failures must appear in persisted JSON"
+        );
+        let loaded: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            loaded.phase_validate_failures, 7,
+            "phase_validate_failures must round-trip through serde"
+        );
+    }
+
+    /// A serde-absent `phase_validate_failures` (state written by a binary
+    /// predating this field) deserializes to 0 — "no failures recorded for
+    /// this phase" — rather than failing the load outright, which would make
+    /// an upgrade mid-phase unrecoverable.
+    #[test]
+    fn phase_validate_failures_absent_from_json_defaults_to_zero() {
+        let json = r#"{
+            "stage": "code",
+            "phase": 1,
+            "agent": "claude",
+            "mode": "auto",
+            "started_at": "0",
+            "project_root": "/repo"
+        }"#;
+        let loaded: State = serde_json::from_str(json).unwrap();
+        assert_eq!(loaded.phase_validate_failures, 0);
     }
 
     /// D-18f: `preflight_retries` round-trips through serde (its own key

@@ -457,10 +457,11 @@ pub(crate) fn handle_validate_outcome(
         workflow::save_state(state)?;
     }
 
-    if state
-        .mode
-        .should_gate(Stage::Validate, state.consecutive_failures)
-    {
+    if state.mode.should_gate(
+        Stage::Validate,
+        state.consecutive_failures,
+        state.phase_validate_failures,
+    ) {
         let context = match result {
             ValidateResult::Passed => "Validation passed — approve to ship?".to_string(),
             ValidateResult::Failed => format!(
@@ -1711,9 +1712,11 @@ mod tests {
 
         assert_eq!(state.consecutive_failures, mode::MAX_CONSECUTIVE_FAILURES);
         assert!(
-            state
-                .mode
-                .should_gate(Stage::Validate, state.consecutive_failures),
+            state.mode.should_gate(
+                Stage::Validate,
+                state.consecutive_failures,
+                state.phase_validate_failures
+            ),
             "reaching the ceiling must force the Auto-mode Validate gate"
         );
         assert_eq!(
@@ -1793,9 +1796,11 @@ mod tests {
             "a new commit before every failure must restart the streak at 1, not accumulate it"
         );
         assert!(
-            !state
-                .mode
-                .should_gate(Stage::Validate, state.consecutive_failures),
+            !state.mode.should_gate(
+                Stage::Validate,
+                state.consecutive_failures,
+                state.phase_validate_failures
+            ),
             "genuine forward progress must never force the Auto-mode Validate gate"
         );
     }
@@ -1865,9 +1870,11 @@ mod tests {
 
         assert_eq!(state.consecutive_failures, mode::MAX_CONSECUTIVE_FAILURES);
         assert!(
-            state
-                .mode
-                .should_gate(Stage::Validate, state.consecutive_failures),
+            state.mode.should_gate(
+                Stage::Validate,
+                state.consecutive_failures,
+                state.phase_validate_failures
+            ),
             "a genuinely stuck loop with no new commits must still reach the reachable ceiling"
         );
     }
@@ -1987,9 +1994,11 @@ mod tests {
              failure-with-an-unchanged-real-count must accumulate"
         );
         assert!(
-            state
-                .mode
-                .should_gate(Stage::Validate, state.consecutive_failures),
+            state.mode.should_gate(
+                Stage::Validate,
+                state.consecutive_failures,
+                state.phase_validate_failures
+            ),
             "the human gate must stay reachable across a transient git fault"
         );
     }
@@ -2785,9 +2794,11 @@ mod tests {
 
         assert_eq!(state.consecutive_failures, mode::MAX_CONSECUTIVE_FAILURES);
         assert!(
-            state
-                .mode
-                .should_gate(Stage::Validate, state.consecutive_failures),
+            state.mode.should_gate(
+                Stage::Validate,
+                state.consecutive_failures,
+                state.phase_validate_failures
+            ),
             "a genuine repeated failure must still reach the reachable ceiling (18d)"
         );
     }
@@ -3319,11 +3330,11 @@ mod tests {
         // A Code-stage failure in Auto mode is exactly the "unexpected" case
         // `run_gate` computes (`!should_gate(..)`) and passes to
         // `fire_gate_notify` — asserted here as a pure, race-free check.
-        assert!(
-            !state
-                .mode
-                .should_gate(Stage::Code, state.consecutive_failures)
-        );
+        assert!(!state.mode.should_gate(
+            Stage::Code,
+            state.consecutive_failures,
+            state.phase_validate_failures
+        ));
 
         // Pre-write an Abort response so the call resolves without spawning
         // a monitor (the notify hook already fired by the time `run_gate`
