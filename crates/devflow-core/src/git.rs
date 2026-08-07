@@ -2080,4 +2080,53 @@ mod tests {
         assert_eq!(inline_key_fingerprint(""), None);
         assert_eq!(inline_key_fingerprint("not a key\n"), None);
     }
+
+    // -----------------------------------------------------------------
+    // 35-03: the `ssh-keygen -Y sign` probe
+    // -----------------------------------------------------------------
+
+    /// F-8: the probe workspace name must be unique per CALL, not per
+    /// process. `cargo test` runs tests as parallel THREADS inside a single
+    /// process, so a name derived from the process id is shared by every
+    /// concurrent probe: two probes collide, the loser's non-recursive
+    /// `create_dir` fails with an already-exists error, and it fails soft to
+    /// `Unknown` — a flaky test whose failure points at the probe rather
+    /// than at the harness.
+    ///
+    /// The two-thread half is load-bearing. The single-thread half alone
+    /// passes against a name built from the process id plus a thread id,
+    /// which is the near-miss fix this test exists to reject.
+    #[test]
+    fn probe_workspace_name_is_unique_per_call() {
+        let first = probe_workspace_name();
+        let second = probe_workspace_name();
+        assert_ne!(
+            first, second,
+            "two successive calls on one thread produced the same probe workspace name"
+        );
+
+        const PER_THREAD: usize = 64;
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    (0..PER_THREAD)
+                        .map(|_| probe_workspace_name())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut names: Vec<String> = handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("probe-name thread panicked"))
+            .collect();
+        let total = names.len();
+        assert_eq!(total, 2 * PER_THREAD, "fixture did not produce every name");
+        names.sort();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            total,
+            "two concurrently spawned threads produced duplicate probe workspace names"
+        );
+    }
 }
