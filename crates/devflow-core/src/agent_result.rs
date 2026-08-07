@@ -1860,6 +1860,24 @@ fn rate_limited_result(retry: String) -> AgentResult {
 /// to [`evaluate_layer3`], which classifies an unmeasurable count as
 /// [`AgentStatus::Unknown`] rather than asserting the negative that no work
 /// was done.
+///
+/// # Changed in v2.5.0 — breaking
+///
+/// The return type was `u32` before this release; it is now `Option<u32>`
+/// (999.77 / 999.87). A call site updating from the old form must decide which
+/// of the two states it means, because the old type conflated them:
+///
+/// - `Some(0)` — git RAN and the branch genuinely has no commits. This is the
+///   old `0` in its legitimate sense, and is normal on a phase's first Validate.
+/// - `None` — no count was established at all. This is the case the old
+///   signature could not express, and `.unwrap_or(0)` is precisely the wrong
+///   way to restore it: collapsing it back to zero is the defect this change
+///   exists to remove. A transient `git` failure then reads as "no work done",
+///   which forged a `consecutive_failures` baseline reset (999.77) and made the
+///   result cascade classify a successful agent as `Failed` (999.87).
+///
+/// The enumeration of this and every other public-surface change in the release
+/// is in `CHANGELOG.md` under 2.5.0.
 pub fn phase_commit_count(
     project_root: &Path,
     git_flow: &GitFlowConfig,
