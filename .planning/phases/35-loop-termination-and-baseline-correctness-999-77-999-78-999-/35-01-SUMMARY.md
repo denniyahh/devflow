@@ -325,11 +325,14 @@ and is stronger for it.
 
 ## Still open — needs the operator's word, not my assumption
 
-1. **The `devflow-core` `NoGitPath` removal contradicts an explicit plan artifact and truth #7.**
-   I took it on measurement, and the measurement has a control. But deleting a named plan
-   deliverable is the operator's call to ratify or reverse. The alternatives I rejected were:
-   keep it with its NC-1 test (a live 1-in-8 flake source), or keep it with NC-1 `#[ignore]`d (a
-   skipped test, which this project's broken-windows ledger treats as a defect).
+1. **RATIFIED 2026-08-07 (operator, during 35-verify-work).** The `devflow-core` `NoGitPath`
+   removal contradicted an explicit plan artifact and truth #7. Taken on measurement (1-in-8
+   flake with the guard, 0-in-10 without it), and the operator ratified the removal rather than
+   reverting to either rejected alternative — restoring it with its NC-1 sanity test (reintroduces
+   the measured flake) or with NC-1 `#[ignore]`d (a skipped test, itself a defect on this
+   project's broken-windows ledger). One `PATH` guard now exists in the workspace, in
+   `devflow-cli`, under one shared mutex; nothing downstream depends on `devflow-core` having its
+   own.
 2. **The tracer feedback gate was run as the autonomous variant, not the interactive one.**
    `workflow.auto_advance` is absent from `.planning/config.json` (so the executor spec's
    detection reads "not auto"), while `workflow.auto_mode` is `true` and I was spawned into a
