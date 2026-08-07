@@ -721,6 +721,34 @@ fn topo_sort(names: Vec<String>, edges: Vec<(String, String)>) -> Vec<String> {
 // tag-signing viability (20d, Pattern 4)
 // ---------------------------------------------------------------------------
 
+// REMOVED in v2.5.0 (999.86, D-04/D-08) — `pub enum SigningStatus` and
+// `pub fn classify_ssh_add_status` used to live here, immediately below this
+// banner. Both were `pub` items of this crate, so their removal is a breaking
+// change; it is enumerated in `CHANGELOG.md` under 2.5.0. The private
+// `inline_key_fingerprint` helper went with them, orphaned by D-03.
+//
+// Why they are gone: they PREDICTED tag-signing viability by classifying
+// `ssh-add -l`'s exit code and comparing fingerprints — that is, they inferred
+// it from the agent's identity list. An agent listing cannot see private key
+// material sitting unencrypted on disk, so the predictor tested a condition the
+// real signing operation does not require, and reported `NotViable` for a
+// perfectly signable key that no agent happened to hold. That is not a
+// hypothetical: it false-negatived on two separate release cuts with the
+// correct key present.
+//
+// What replaced them: `check_signing_viability` below, which establishes
+// viability by PERFORMING the operation — a bounded, non-interactive
+// `ssh-keygen -Y sign` over throwaway bytes in a private per-call workspace,
+// whose exit code is the whole verdict. A probe has no independent behaviour to
+// drift out of sync with what `git tag -s` actually does, which is the
+// structural property the predictor lacked rather than a bug it happened to
+// have.
+//
+// This note exists because a bare absence invites the mistake in reverse. Dead
+// public API that still reads like the sanctioned way to judge signing
+// viability is how the predictor survived review twice; do not reintroduce an
+// agent-membership check here under a new name.
+
 /// Outcome of the tag-signing viability check. Carries only a boolean-ish
 /// status plus an optional PUBLIC key fingerprint — never private key
 /// material or a full filesystem path (T-20-04, ASVS V6 / WR-02 — mirrors
