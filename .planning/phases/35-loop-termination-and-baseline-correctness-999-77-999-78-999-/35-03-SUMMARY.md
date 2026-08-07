@@ -86,8 +86,11 @@ coverage:
       - kind: manual_procedural
         ref: "pty.fork() harness, real controlling terminal: raw ssh-keygen blocked past a 3s window without setsid vs 8.1ms with it; devflow release --check 10.06s -> 0.065s; paired no-tty control shows no difference"
         status: pass
-    human_judgment: true
-    rationale: "No committed test covers this — removing the pre_exec would not fail the suite. A regression test needs a pty fixture with TIOCSCTTY, which the operator's narrow-scope instruction excluded. Until such a test exists, this deliverable rests on a single out-of-band measurement and needs a human to decide whether that is sufficient."
+      - kind: unit
+        ref: "crates/devflow-core/src/git.rs#the_signing_probe_is_not_captured_by_a_controlling_terminal (999.88, commit 8917dcd, arm-0 correction d33a837)"
+        status: pass
+    human_judgment: false
+    rationale: "SUPERSEDED 2026-08-07 (35-UAT G-35-11): a committed regression test now exists, filed and resolved as 999.88/DEN-109. Original rationale ('no committed test covers this') is stale and kept below for history only — a pty fixture with TIOCSCTTY was in fact built, and removing the pre_exec produces a REGRESSION: panic. Residual limit, carried to CHANGELOG.md's Known Issues rather than repeated here: n=1 per arm, one host, one container, timing-based."
   - id: D4
     description: "Inline key:: / raw ssh- values return Unknown with a fixed reason and are never probed"
     requirement: HARDEN-05

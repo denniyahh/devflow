@@ -136,9 +136,11 @@ Every row below was verified against the source tree, not transcribed from the p
   artifact whose content changes for any reason other than this run's Validate agent — a worktree
   merge-back, an operator edit — reads as authored-this-run and dispatches `--gaps-only`, which is
   the failure direction 999.79 exists to prevent, reached by a different route. Tracked as 999.89.
-- **The `setsid` guard on the signing probe has no regression test.** Its evidence is a one-off
-  out-of-band measurement under a real pty with a paired control; removing the `pre_exec` would not
-  fail the suite. Tracked as 999.88.
+- **The `setsid` guard on the signing probe's regression test is n=1 per arm, one host, one
+  container.** `git::tests::the_signing_probe_is_not_captured_by_a_controlling_terminal` was added
+  and confirmed to fail (`REGRESSION:` panic) when the `pre_exec` is removed — 999.88 is resolved,
+  not open — but the test is timing-based (a pathologically loaded box could false-red it) against
+  one OpenSSH build and one encrypted key.
 - **`MAX_PHASE_VALIDATE_FAILURES = 10` is a judgement, not a measurement.** Nothing establishes how
   many Validate failures a genuinely-converging phase takes.
 - **Two in-source comments (`idle_timeout_result` and a test-module comment) still describe a

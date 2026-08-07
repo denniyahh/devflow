@@ -123,7 +123,7 @@ blocked: 0
 
 - gap_id: G-35-11
   truth: "Every entry under `### Known Issues` in the 2.5.0 changelog entry is still true as of the release date"
-  status: failed
+  status: resolved
   reason: "User reported: CHANGELOG.md:139-141 reports 999.88 (the setsid guard has no regression test) as an open known issue. ROADMAP.md:539 marks 999.88 RESOLVED 2026-08-07, delivered as git::tests::the_signing_probe_is_not_captured_by_a_controlling_terminal — re-run during this UAT at `1 passed; 575 filtered out`, and its resolution note records the performed mutation producing a REGRESSION: panic. Commit fb46f9d updated ROADMAP.md and closed DEN-109 without updating the 35-06 changelog entry."
   severity: minor
   test: 11
@@ -132,7 +132,7 @@ blocked: 0
       issue: "Known Issues bullet at :139-141 reports a resolved gap (999.88) as open"
     - path: ".planning/phases/35-loop-termination-and-baseline-correctness-999-77-999-78-999-/35-03-SUMMARY.md"
       issue: "coverage block D8 still carries human_judgment: true with the rationale 'No committed test covers this — removing the pre_exec would not fail the suite', which is the same stale claim. This is what caused uat.classify-coverage to present D8 as a human checkpoint during this UAT."
-  missing:
-    - "Correct or remove the 999.88 bullet in CHANGELOG.md's 2.5.0 Known Issues; if kept, restate it as the residual limit the resolution note actually records (n=1 per arm, one host, one container, timing-based) rather than 'has no regression test'."
-    - "Update 35-03-SUMMARY.md's D8 coverage entry to human_judgment: false with a unit verification ref, so the classifier stops presenting a covered deliverable as needing human judgment."
-  root_cause: "Not diagnosed by subagent — per standing operator instruction this session did not spawn diagnosis or gap-closure planner agents. Cause is evident from the git history and recorded above: a resolution landed in ROADMAP.md without a companion edit to the changelog entry a different plan had already written."
+  missing: []
+  root_cause: "A resolution landed in ROADMAP.md (999.88, commit fb46f9d) without a companion edit to the CHANGELOG.md entry 35-06 had already written, and without updating 35-03-SUMMARY.md's own coverage block, which still carried the pre-resolution rationale."
+  resolved_by: "operator-directed direct edit (not a gap-closure plan): CHANGELOG.md's 999.88 bullet restated as resolved-with-residual-limit (n=1 per arm, one host, one container, timing-based); 35-03-SUMMARY.md's D8 coverage entry set to human_judgment: false with the unit test added as a verification ref."
+  resolved_at: 2026-08-07
