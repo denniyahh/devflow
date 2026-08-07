@@ -3,10 +3,11 @@ phase: 35
 slug: loop-termination-and-baseline-correctness-999-77-999-78-999
 # status lifecycle: draft (seeded by plan-phase) → validated (set by validate-phase §6)
 # audit-milestone §5.5 distinguishes NOT-VALIDATED (draft) from PARTIAL (validated + nyquist_compliant: false) (#2117)
-status: draft
-nyquist_compliant: false
-wave_0_complete: false
+status: validated
+nyquist_compliant: true
+wave_0_complete: true
 created: 2026-08-06
+validated: 2026-08-07
 ---
 
 # Phase 35 — Validation Strategy
@@ -61,13 +62,50 @@ offender.
 
 ## Per-Task Verification Map
 
-| Task ID | Plan | Wave | Requirement | Threat Ref | Secure Behavior | Test Type | Automated Command | File Exists | Status |
-|---------|------|------|-------------|------------|-----------------|-----------|-------------------|-------------|--------|
-| *(pending — filled once PLAN.md task IDs exist)* | | | | | | | | | ⬜ pending |
+Filled by `/gsd-validate-phase` on 2026-08-07, after all 6 plans reported `status: complete`.
+
+**Every row below was re-run live during the audit — none is transcribed from a SUMMARY's
+self-reported `status: pass`.** Test *names* were confirmed against `cargo test -- --list` before
+being run, and every targeted run was asserted on a real `N passed` line with a **non-zero
+`filtered out`** count, because `cargo test --exact <name>` exits 0 when the name matches nothing.
+
+| Task ID | Plan | Wave | Requirement | Secure Behavior | Test Type | Automated Command (`cargo test …`) | Status |
+|---------|------|------|-------------|-----------------|-----------|------------------------------------|--------|
+| T1 | 35-01 | 1 | HARDEN-01/07 · NC-1 | The absent-`git` harness genuinely disarms `git`, and restores `PATH` byte-identically on drop | unit | `-p devflow --bin devflow -- --exact test_support::tests::no_git_path_makes_git_unresolvable_and_restores_it` | ✅ green |
+| T2 | 35-01 | 1 | HARDEN-01 · c1 · 999.77 | An unmeasurable count is `None`, never a forged `Some(0)`; a real branch-absent/invalid-range case still measures `Some(0)` | unit ×3 | `-p devflow-core --lib -- --exact agent_result::tests::phase_commit_count_reports_none_when_git_cannot_run agent_result::tests::phase_commit_count_reports_zero_without_a_branch agent_result::tests::phase_commit_count_reports_zero_when_the_range_is_invalid` | ✅ green |
+| T2 | 35-01 | 1 | HARDEN-01 · c1 · 999.77 | Across a multi-cycle sequence a `None` does not overwrite the baseline — the streak accumulates | unit | `-p devflow --bin devflow -- --exact pipeline_outcomes::tests::validate_failure_with_unmeasurable_count_accumulates_the_streak` | ✅ green |
+| T3 | 35-01 | 1 | HARDEN-07 · c6 · 999.87 | Layer 2 with exit 0 + `Stage::Code` + unrunnable `git` falls through instead of forging `Failed`; exit 137 still classifies `resource_killed`; a non-commit-gated stage keeps success | unit ×3 | `-p devflow --bin devflow -- --exact pipeline_outcomes::tests::evaluate_layer2_unrunnable_git_falls_through_to_layer3 pipeline_outcomes::tests::evaluate_layer2_unrunnable_git_still_classifies_exit_137_as_resource_killed pipeline_outcomes::tests::evaluate_layer2_unrunnable_git_keeps_success_for_a_non_commit_gated_stage` | ✅ green |
+| T3 | 35-01 | 1 | HARDEN-07 · c6 · NC-12 | **The cascade** — the defect was removed, not pushed one layer down | unit | `-p devflow --bin devflow -- --exact pipeline_outcomes::tests::evaluate_agent_result_with_unrunnable_git_does_not_report_failed` | ✅ green |
+| T3 | 35-01 | 1 | HARDEN-07 · c6 | Layer 3's unmeasurable arm is `Unknown` with no commit figure; its two pre-existing siblings pass byte-unchanged as opposite-result controls | unit ×3 | `-p devflow-core --lib -- --exact agent_result::tests::evaluate_layer3_unmeasurable_count_is_unknown_not_failed agent_result::tests::evaluate_layer3_falls_back_to_commit_count agent_result::tests::evaluate_layer3_zero_commits_is_failed_and_flags_human_review` | ✅ green |
+| T1 | 35-02 | 1 | HARDEN-04 · c4 · 999.84 | Worktree-mode `GateReview` auto-decide reads `execution_root`, with D-05's decoy PLAN at `project_root` | integration | `-p devflow --bin devflow -- --exact pipeline_launch::tests::advance_with_worktree_declared_checkpoint_reads_the_execution_root` | ✅ green |
+| T1 | 35-02 | 1 | HARDEN-04 · c4 | The predicate itself reads the execution root in worktree mode **and** still reads the project root without one — the two-direction pair | unit ×2 | `-p devflow-core --lib -- --exact verify::tests::phase_has_blocking_human_checkpoint_reads_the_execution_root_in_worktree_mode verify::tests::phase_has_blocking_human_checkpoint_still_reads_the_project_root_without_a_worktree` | ✅ green |
+| T1–2 | 35-03 | 1 | HARDEN-05 · c5 · D1/D2 | `release --check` reports Viable/NotViable from a real `ssh-keygen -Y sign` probe, never from an `ssh-add -l` comparison; a key no agent holds is **Viable** (the 999.86 false negative) | unit ×2 | `-p devflow-core --lib -- --exact git::tests::ssh_signing_probe_reports_viable_with_on_disk_private_key git::tests::ssh_signing_probe_reports_not_viable_without_a_private_key` | ✅ green |
+| T2 | 35-03 | 1 | HARDEN-05 · D3 · NC-10 | The probe cannot hang an unattended preflight, and the **calibrated** control proves `SSH_ASKPASS_REQUIRE` is what prevents it | unit ×2 | `-p devflow-core --lib -- --exact git::tests::ssh_signing_probe_does_not_block_on_an_encrypted_key git::tests::encrypted_key_blocks_without_the_askpass_require_env_var` | ✅ green |
+| T2 | 35-03 | 1 | HARDEN-05 · D8 | **The probe is not captured by a controlling terminal's `/dev/tty` prompt** — the production `setsid` at `git.rs:1026` is load-bearing | unit (pty, 3 arms) | `-p devflow-core --lib -- --exact git::tests::the_signing_probe_is_not_captured_by_a_controlling_terminal` | ✅ green |
+| T1–3 | 35-03 | 1 | HARDEN-05 · D4/D5/D7 · WR-01/WR-07 | Inline keys return `Unknown` unprobed; a timeout is `Unknown` while a rejection stays `NotViable`; no reason string leaks key or path; the probe workspace is unique, owner-only and panic-safe | unit ×5 | `-p devflow-core --lib -- --exact git::tests::inline_signing_key_returns_unknown_without_probing git::tests::a_probe_timeout_is_unknown_while_a_rejection_stays_not_viable git::tests::probe_workspace_name_is_unique_per_call git::tests::the_probe_workspace_is_owner_only_and_refuses_an_existing_path git::tests::the_probe_workspace_guard_removes_its_directory_on_unwind` | ✅ green |
+| T3 | 35-03 | 1 | HARDEN-05 · c5 deletion | CLI-boundary behaviour survives the predictor's removal; no key material or path in output | integration ×10 | `-p devflow --test release_check` (whole target) | ✅ green |
+| T1 | 35-04 | 2 | HARDEN-02 · c2 · 999.78 | The per-phase ceiling gates *at* the ceiling and not below it; the named predicate and `should_gate` agree on the boundary | unit ×3 | `-p devflow-core --lib -- --exact mode::tests::phase_failure_ceiling_gates_at_the_ceiling_not_below_it mode::tests::phase_failure_ceiling_predicate_agrees_with_should_gate mode::tests::phase_failure_ceiling_reached_has_the_same_boundary` | ✅ green |
+| T1 | 35-04 | 2 | HARDEN-02 · c2 | `phase_validate_failures` round-trips through serde and defaults to zero when absent | unit ×2 | `-p devflow-core --lib -- --exact state::tests::phase_validate_failures_round_trips_through_serde state::tests::phase_validate_failures_absent_from_json_defaults_to_zero` | ✅ green |
+| T2 | 35-04 | 2 | HARDEN-02 · c2 counter | A loop committing trivial `.planning/` artifacts every cycle **still** reaches the bound; healthy multi-wave progress does not | unit ×3 | `-p devflow --bin devflow -- --exact pipeline_outcomes::tests::phase_validate_failure_ceiling_gates_despite_trivial_commit_progress pipeline_outcomes::tests::repeated_failure_without_new_commits_still_reaches_the_ceiling pipeline_outcomes::tests::healthy_multi_wave_progress_does_not_reach_the_ceiling` | ✅ green |
+| T2 | 35-04 | 2 | HARDEN-02 · c2 message · WR-03/WR-04 | The gate message reports the cumulative total (≠ the streak); the ceiling clause appears only at the ceiling; a *passing* Validate at the ceiling explains itself; the reset records what it spent | unit ×4 | `-p devflow --bin devflow -- --exact pipeline_outcomes::tests::ceiling_clause_appears_only_at_the_ceiling_even_in_supervise_mode pipeline_outcomes::tests::a_passing_validate_at_the_ceiling_explains_why_it_gated pipeline_outcomes::tests::the_ceiling_reset_records_the_total_it_spent pipeline_outcomes::tests::phase_validate_failures_increment_saturates` | ✅ green |
+| T3 | 35-04 | 2 | HARDEN-02 · c2 `--force` | **The Open Risk, closed** — the total survives a forced restart and resets only on the two real events | unit ×3 | `-p devflow --bin devflow -- --exact commands::tests::phase_validate_failures_survive_a_forced_restart commands::tests::phase_validate_failures_reset_when_the_phase_completes pipeline_outcomes::tests::phase_validate_failures_reset_on_operator_approval_at_the_ceiling_gate` | ✅ green |
+| T1 | 35-05 | 3 | HARDEN-03 · c3 · 999.79 | The verification fingerprint is stable, differs on content change, and is `None` when the artifact is absent | unit ×2 | `-p devflow-core --lib -- --exact agent_result::tests::phase_verification_fingerprint_differs_when_content_differs agent_result::tests::phase_verification_fingerprint_is_none_when_the_artifact_is_absent` | ✅ green |
+| T2 | 35-05 | 3 | HARDEN-03 · c3 · WR-05 | `last_verification_fingerprint` round-trips and distinguishes an uncaptured baseline from an empty one | unit ×2 | `-p devflow-core --lib -- --exact state::tests::last_verification_fingerprint_round_trips_through_serde state::tests::last_verification_fingerprint_absent_from_json_defaults_to_none` | ✅ green |
+| T3 | 35-05 | 3 | HARDEN-03 · c3 · NC-7 | **Two-directional**: a stale artifact dispatches `FullExecute`, a fresh one dispatches `GapsOnly`, and the four-row freshness truth table is exhaustive | unit ×3 | `-p devflow --bin devflow -- --exact pipeline_outcomes::tests::stale_verification_artifact_dispatches_full_execute pipeline_outcomes::tests::verification_written_this_run_dispatches_gaps_only pipeline_outcomes::tests::verification_freshness_truth_table_is_exhaustive` | ✅ green |
+| T1–2 | 35-06 | 4 | D-08 release record | The `2.5.0` public-surface delta is accurate against source | diff review + `cargo doc` | *(editorial — see Manual-Only)* | ✅ manual |
 
 *Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
 
+**Whole-suite baseline re-measured during this audit:** `./scripts/check.sh all` → **exit 0**,
+`956 passed; 0 failed` across 22 binaries (fmt + `clippy --all-targets -- -D warnings` + full
+workspace suite). The pre-audit figure was 954; the two added are D8's test and its re-entry helper.
+
 ### Requirement → verification, ahead of task IDs
+
+> **Superseded 2026-08-07 by the Per-Task Verification Map above.** This table was written at plan
+> time, so its `Exists?` column records what existed *then* (`❌ W0` = "to be built in Wave 0"). It
+> is retained unedited as the record of what was predicted. Every `❌ W0` row in it now has a green
+> committed test in the map above; nothing in it remains unbuilt.
 
 | Req / Criterion | Behavior | Test Type | Command or artifact | Exists? |
 |---|---|---|---|---|
@@ -156,7 +194,26 @@ Carried as a standing obligation on the phase summary:
 
 ---
 
-## Open Risk Carried Into Planning
+## Open Risk Carried Into Planning — **RESOLVED 2026-08-07**
+
+> **Closed, and closed the way A-11 demanded: stated *and* tested, not papered over.** 35-04
+> Task 3 implemented F-3 as **carry-forward** — `start()` reads persisted state for the same phase
+> and copies `phase_validate_failures` only (`commands::fresh_state_carrying_phase_failures`), so
+> the bound outlives the `State::new` zeroing that `--force` triggers. The reset is tied to two
+> real events (phase completion, operator approval at the ceiling gate), not to process start.
+>
+> Verified live by the audit, not read from the SUMMARY — three green tests:
+> `commands::tests::phase_validate_failures_survive_a_forced_restart`,
+> `commands::tests::phase_validate_failures_reset_when_the_phase_completes`,
+> `pipeline_outcomes::tests::phase_validate_failures_reset_on_operator_approval_at_the_ceiling_gate`.
+>
+> **What that does NOT establish:** all three drive the state helpers directly. No real `--force`
+> re-run against a live repository was performed (35-05 records the same limit). The persistence
+> *rule* is tested; the end-to-end restart is not.
+
+The original entry is retained below as the record of the risk as it stood at plan time.
+
+### Original entry (plan time)
 
 **The 999.78 counter's lifetime is per-RUN, but the bound is specified as per-PHASE.** `State::new`
 (`state.rs:263-272`) zeroes every counter and `start()` calls it unconditionally on every run,
@@ -176,7 +233,23 @@ tested or explicitly recorded as accepted-not-tested. Silence here is a validati
 
 ## Wave 0 Requirements
 
-- [ ] **One `NoGitPath` RAII guard per crate** (empty-directory `PATH`, mirroring `NeutralPath` at
+> **Complete (`wave_0_complete: true`), with one recorded deviation.** Every item below landed
+> except the "one guard per crate" clause, which was **deliberately reduced to devflow-cli only**.
+>
+> **The deviation, and why it is not a hole.** 35-01 measured that a process-global `PATH` guard is
+> not viable inside devflow-core's test binary, so `NoGitPath` exists only in
+> `crates/devflow-cli/src/test_support.rs:389`. devflow-core reaches the same states by a different
+> mechanism — an **unspawnable working directory** — and carries its own premise assertion
+> (`agent_result.rs:6912`: *"the fixture depends on this path being absent"*) so the fixture cannot
+> pass for the wrong reason. The decision is documented **in source** at
+> `crates/devflow-core/src/test_support.rs:142` under the heading *"Why there is no absent-`git`
+> (`NoGitPath`) harness in THIS crate"* — recorded where a future reader trips over it, not only in
+> a planning file. Criterion 6's layer- and cascade-level tests were moved to devflow-cli, where the
+> guard does exist, and call the same `pub` functions. NC-1's sanity control is green there.
+>
+> Verified by the audit at both sites rather than accepted from the SUMMARY.
+
+- [x] **One `NoGitPath` RAII guard per crate** — *deviated, see above: devflow-cli only* (empty-directory `PATH`, mirroring `NeutralPath` at
       `crates/devflow-cli/src/test_support.rs:327`, each holding its own crate's single `PATH`
       mutex). Prerequisite for **both** criterion 1's and criterion 6's tests.
       - `crates/devflow-cli/src/test_support.rs` — beside `NeutralPath`, under `env_lock()` (`:94`)
@@ -223,6 +296,18 @@ tested or explicitly recorded as accepted-not-tested. Silence here is a validati
 
 ## Manual-Only Verifications
 
+> **Audit note (2026-08-07).** Every row below was **performed** during execution and its evidence
+> recorded in the owning SUMMARY — the audit re-read each one rather than trusting the checkbox.
+> **No row here represents uncovered behaviour.** Each is either (a) a one-time *performed
+> mutation*, which is a property of a mutated tree and therefore cannot by construction be a
+> committed test asserting it about itself — and each is backed by a committed test in the map
+> above — or (b) an editorial/prose accuracy check no assertion can judge. That is why
+> `nyquist_compliant: true` is set despite this table being non-empty; see the audit trail.
+>
+> **One row left this table.** D8 (the signing probe's controlling-terminal behaviour) was
+> Manual-Only when this phase closed, on the strength of a single out-of-band pty measurement.
+> It is now covered by a committed test and has moved into the Per-Task Map.
+
 | Behavior | Requirement | Why Manual | Test Instructions |
 |----------|-------------|------------|-------------------|
 | `execution_root` reaches `phase_has_blocking_human_checkpoint`, proven by a performed revert | HARDEN-04 c4 | "This test fails when the fix is reverted" is a property of a mutation, not of the committed tree; no committed test can assert it about itself | The binding is `pipeline_launch.rs:1068` (`let execution_root = state.worktree_path.as_deref().unwrap_or(project_root);`); the call the ROADMAP criterion cites is `:1070` (`&& verify::phase_has_blocking_human_checkpoint(execution_root, phase)`). Revert **either** — bind `execution_root = project_root`, or pass `project_root` at the call — run the new test, record the failure output, revert the revert, re-run and record the pass. Both halves go in the SUMMARY. |
@@ -235,23 +320,111 @@ tested or explicitly recorded as accepted-not-tested. Silence here is a validati
 
 ## Validation Sign-Off
 
-- [ ] All tasks have `<automated>` verify or a Wave 0 dependency
-- [ ] Sampling continuity: no 3 consecutive tasks without automated verify
-- [ ] Wave 0 covers all ❌ references above
-- [ ] No watch-mode flags
-- [ ] Every measurement in "Mandatory Negative Controls" has its opposite-result case present, run,
-      and **seen to fail** — not asserted from reading the fix
-- [ ] NC-1 passed before any criterion-1 or criterion-6 result was believed
-- [ ] The 999.78 `--force` persistence choice is stated in a PLAN.md and either tested or recorded
-      as accepted-not-tested
-- [ ] NC-12 performed: the Layer-3-only revert run and its failure recorded, so criterion 6 is
+- [x] All tasks have `<automated>` verify or a Wave 0 dependency
+- [x] Sampling continuity: no 3 consecutive tasks without automated verify
+- [x] Wave 0 covers all ❌ references above — *one recorded deviation, see Wave 0*
+- [x] No watch-mode flags
+- [x] Every measurement in "Mandatory Negative Controls" has its opposite-result case present, run,
+      and **seen to fail** — not asserted from reading the fix — **all 12 confirmed by the audit
+      against the owning SUMMARY's verbatim output** (NC-1/2/3/4/11/12 → 35-01; NC-8 → 35-02, where
+      it is performed correctly but never labelled `NC-8`; NC-9/10 → 35-03; NC-5/6 → 35-04;
+      NC-7 → 35-05)
+- [x] NC-1 passed before any criterion-1 or criterion-6 result was believed
+- [x] The 999.78 `--force` persistence choice is stated in a PLAN.md and either tested or recorded
+      as accepted-not-tested — **stated AND tested**; see the resolved Open Risk
+- [x] NC-12 performed: the Layer-3-only revert run and its failure recorded, so criterion 6 is
       established as an outcome and not as a property of one function
-- [ ] NC-7's automated half (the four-row truth table) is committed and was demonstrated to fail
-      under both an always-stale and an always-fresh stub; NC-7's performed mutation has an owner in
-      the Manual-Only table and was run
-- [ ] NC-10's measured non-blocking exit duration is recorded beside the observation window it
-      calibrated — a window with no measured baseline beside it does not satisfy this control
-- [ ] Full-suite runtime measured and recorded (not assumed)
-- [ ] `nyquist_compliant: true` set in frontmatter
+- [x] NC-7's automated half (the four-row truth table) is committed and was demonstrated to fail
+      under both an always-stale and an always-fresh stub — **and the two stubs failed on
+      *different rows*, which is the exhaustiveness evidence**; NC-7's performed mutation has an
+      owner in the Manual-Only table and was run
+- [x] NC-10's measured non-blocking exit duration is recorded beside the observation window it
+      calibrated — baseline 10.63 ms, window 1000 ms (8×, floored), ratio ≈94× against an asserted
+      ≥4×; the control was itself shown capable of failing by sabotaging arm 2
+- [x] Full-suite runtime measured and recorded (not assumed) — re-measured this audit
+- [x] `nyquist_compliant: true` set in frontmatter
 
-**Approval:** pending
+**Approval:** validated 2026-08-07 by `/gsd-validate-phase`. Automated coverage complete; the
+Manual-Only table is non-empty by construction, not by omission (see its audit note).
+
+---
+
+## Validation Audit 2026-08-07
+
+| Metric | Count |
+|--------|-------|
+| Gaps found | 1 |
+| Resolved | 1 |
+| Escalated | 0 |
+
+**Input state:** A (VALIDATION.md existed, seeded at plan time with an unfilled Per-Task Map).
+All 6 plans reported `status: complete`, so this was a fully-executed phase — *not* the mid-arc
+case that requires blocked rows.
+
+### The gap, and how it was closed
+
+**D8 — the signing probe's `setsid`.** The production `pre_exec`/`setsid` at `git.rs:1026` drops the
+controlling terminal, which is the precondition `SSH_ASKPASS_REQUIRE=never` is gated on. Both
+existing NC-10 arms install **their own** `setsid` in the fixture (`git.rs:2641`), so they would
+have passed byte-unchanged had the production call been deleted. 35-03 recorded this honestly as
+`human_judgment: true` — "removing the `pre_exec` would not fail the suite" — and the operator had
+scoped a pty fixture out at the time.
+
+The audit confirmed the claim structurally before acting on it (production `setsid` at `:1026` sits
+above the `#[cfg(test)]` boundary at `:1218`; the test-side one at `:2641` is below it), then, on
+the operator's instruction, spawned `gsd-nyquist-auditor` to close it rather than record it
+Manual-Only a second time.
+
+**Added:** `git::tests::the_signing_probe_is_not_captured_by_a_controlling_terminal` (+ a re-entry
+helper), 339 test-only lines. Three arms, of which the first two **must disagree**: a no-terminal
+baseline (exits in ~10 ms), a premise arm holding a real pty acquired via `TIOCSCTTY` **without**
+`setsid` (must still be blocked at window close), and the measurement arm through the production
+path (must exit promptly with a real verdict). If arms 0 and 1 ever agree the test fails as
+`PREMISE FAILED`, not as a regression — the measurement reports itself broken instead of reporting
+on the subject. `libc` was already a regular dependency of devflow-core, so nothing was added.
+
+### The audit did not take the auditor's word for it
+
+Per this repo's standing rule, the subagent's report was treated as a claim:
+
+- **Production code is untouched** — `md5sum` of lines 1–2773 matches `HEAD` exactly; the sole diff
+  hunk is `@@ -2773,0 +2774,339 @@`, inside `mod tests`.
+- **The mutation was re-performed independently.** Commenting out `git.rs:1024-1029` and re-running
+  produced `test result: FAILED. 0 passed; 1 failed; … 575 filtered out`, panicking with
+  `REGRESSION:` — *not* `PREMISE FAILED` — while the no-terminal control still exited in 10.4 ms,
+  which is what establishes that the terminal handling changed and the fixture did not. Restored
+  from a checksummed copy; `md5sum` matches byte-for-byte.
+- **Every other row in the map was re-run live**, not transcribed: 18 exact-filtered devflow-core
+  tests (556 filtered out), 20 devflow-cli tests (283 filtered out), 9 signing tests (565 filtered
+  out), the 10-test `release_check` target, and `./scripts/check.sh all` → exit 0, **956 passed;
+  0 failed** across 22 binaries.
+
+### What this audit does NOT establish
+
+- **D8's test is n=1 per arm, one host**, Fedora, OpenSSH 10.4p1, one ed25519 encrypted key. The
+  auditor corroborated the *mechanism* in the pinned CI image (Debian bookworm, OpenSSH 9.2p1) with
+  an equivalent C harness, but **the Rust test itself has never run under the container gate or on
+  a CI runner.** Its first container run is unobserved.
+- **It is timing-based.** A pathologically loaded host could push the measurement arm past its 3 s
+  cap and produce a false red. It cannot silently pass — both failure directions are loud.
+- **It proves the production code drops the terminal; the *mutation* is what ties that to the
+  `setsid` line.** The test alone would also pass if some future mechanism achieved the same thing.
+- **A green suite is n=1 for flakiness.** No repeated-run stability measurement was taken for the
+  new test beyond the runs above.
+
+### Carried forward — not fixed here
+
+- **`agent::tests::discover_stray_devflow_processes_rejects_the_999_47_false_positive_shape` is
+  flaky.** The auditor observed one failure and diagnosed it: the fixture is `sh -c 'sleep 30'`,
+  `/bin/sh` is bash, and bash `exec`s a lone simple command, so `argv[0]` becomes `sleep` within
+  ~1 ms while `wait_for_exec_visibility(pid, "sh", …)` polls for `sh` every 2 ms. Miss the window
+  and the barrier burns its 10 s ceiling. **The audit did not reproduce it** — 10/10 targeted runs
+  and 2/2 full-suite runs green — and targeted runs lack the parallel contention the race needs, so
+  that is weak counter-evidence, not a refutation. Pre-existing, unrelated to this phase's diff,
+  and a member of the 999.47 class (ROADMAP:2132). **Implementation defect, not a validation gap.**
+- **`35-REVIEW.md` frontmatter still reads `status: issues_found`** with `critical: 1, warning: 7`,
+  although CR-01 and WR-01…WR-07 each have a landed fix commit (`cf462ec`…`f8dac07`). The artifact
+  is stale, not the code. Out of scope for validate-phase.
+- **`35-03-SUMMARY.md`'s D8 row still reads `kind: manual_procedural` / `human_judgment: true`**
+  with the rationale "No committed test covers this" — now false. Left unedited: a SUMMARY is the
+  executing agent's record of what it did at the time, and this document supersedes it.
