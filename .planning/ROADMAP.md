@@ -344,6 +344,40 @@ Unsequenced items — not part of the active phase sequence. Promote with
 `/gsd-review-backlog` when ready; each carries accumulated context in its
 own `phases/999.N-*/CONTEXT.md`.
 
+### Phase 999.88: The `setsid` Guard on the Tag-Signing Probe Has No Regression Test (BACKLOG)
+
+**Linear:** not yet filed.
+**Found:** 2026-08-07, Phase 35 execution, while folding 35-03's deferred `setsid` fix in on
+operator instruction.
+
+**Priority:** Medium | **Size:** S–M — one test, but it needs a pty fixture this workspace does not
+yet have.
+
+**The shape of it.** 35-03 replaced `release --check`'s signing predictor with a real probe, then
+`34aab4f` detached that probe from any controlling terminal via `libc::setsid()` in a `pre_exec`
+hook. The fix is correct and was measured with a proper control — under a real `pty.fork()` session
+leader the un-detached arm was still alive when the window closed while the detached arm exited in
+8.1 ms, and the paired no-terminal control had both arms agree at 7.7 ms vs 8.3 ms, which is what
+proves the variable is doing the work. But **deleting the `pre_exec` block would not fail the
+suite.** The guard is held in place by nothing.
+
+**Why this is the same class Phase 35 exists to close.** 35-02 was a whole plan written because the
+worktree-mode `GateReview` call site was "correct by construction" with no test behind it (999.84).
+Landing a second unguarded correctness-by-construction fix three plans later, in the same phase,
+would be incoherent. The coverage entry is already marked `human_judgment: true` in `35-03-SUMMARY.md`
+for exactly this reason.
+
+**What the test needs.** A Rust fixture that allocates a pty and calls `TIOCSCTTY` so the child has
+a genuine controlling terminal, then asserts the probe terminates promptly with `setsid` and does
+not without it. The measurement harness must assert `open("/dev/tty")` succeeds before measuring,
+so a silent degradation into the no-terminal case voids the run instead of passing it — that guard
+is what made 35-03's own measurement trustworthy and it belongs in the committed test too.
+
+**Deliberately not in scope.** Widening 35-03 to build this was excluded at execution time on
+scope-discipline grounds, and that call was right; it is a real piece of work, not a one-liner.
+
+**Related:** 999.86 (the probe itself, PROMOTED — Phase 35).
+
 ### Phase 999.87: `evaluate_layer2` Reads an Unrunnable `git` as "No Work Done", Misclassifying a Successful Agent as `Failed` (PROMOTED — Phase 35)
 
 **Linear:** [DEN-108](https://linear.app/denniskim/issue/DEN-108/99987-evaluate-layer2-reads-an-unrunnable-git-as-no-work-done)
