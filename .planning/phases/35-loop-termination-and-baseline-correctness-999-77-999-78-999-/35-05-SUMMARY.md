@@ -381,7 +381,8 @@ T-35-SC are accepted as planned (this plan installs no packages).
 
 ## Still open — needs the operator's word, not my assumption
 
-1. **The freshness rule's inability to establish provenance is a live, unclosed gap, not a
+1. **RESOLVED 2026-08-07 (operator, during 35-verify-work) — scheduled as Phase 35.2.**
+   **The freshness rule's inability to establish provenance is a live, unclosed gap, not a
    theoretical one.** The plan records it as `must_haves` "HARDEN-03 unclassified" with
    `verification: backstop`, so it ships knowingly. But the concrete scenario — a worktree
    merge-back changing the artifact's bytes mid-run, after which the rule reads it as
@@ -389,7 +390,27 @@ T-35-SC are accepted as planned (this plan installs no packages).
    prevent, reached by a different route. Whether that is acceptable for the release cut, or wants
    a run identifier embedded in the artifact, is a scope decision I should not settle by inference.
 
-2. **The tracer feedback gate was run as the autonomous variant, not the interactive one.**
+   **Disposition: fix it, in its own phase (35.2), not in this release and not folded into 35.1.**
+   The escalation was right to refuse inference, and the answer turned out to depend on a fact the
+   plan did not have: **DevFlow does not write `{N}-VERIFICATION.md`.** Its only `fs::write` of that
+   artifact is two test fixtures (`agent_result.rs:7532`, `:7602`) — GSD's verifier agent is the
+   writer. So "embed a run identifier in the artifact" is not a change DevFlow can make on its own,
+   and asking the agent to embed one would make provenance depend on an instruction being followed.
+   35.2 is scoped instead to a **run-owned marker DevFlow itself writes** around the Validate stage.
+
+   **The review also found the risk is understated here.** This SUMMARY names an operator edit or a
+   merge-back as the trigger. 999.89 establishes a sharper one: GSD's `execute-phase` performs branch
+   checkouts, and a checkout replaces working-tree contents wholesale. It does not fire today *only*
+   because DevFlow's `feature/phase-{phase:02}` and GSD's independently-computed branch name happen
+   to emit the identical string, so GSD's branching degenerates to a no-op `git switch`. Two
+   conventions, two repositories, nothing enforcing the agreement. 35.2's criterion 3 pins it with a
+   test — that is the cheap half, and it defends the route that would turn this from rare to routine.
+
+   **`mtime` was considered and rejected:** `phase_verification_mtime_nanos` already exists, but a
+   checkout or merge-back updates mtime exactly as it updates content, so it fails identically.
+
+2. **RESOLVED 2026-08-07 (35-verify-work investigation) — see the disposition below.**
+   **The tracer feedback gate was run as the autonomous variant, not the interactive one.**
    Same condition 35-01 reported and the operator has not yet ruled on: `workflow.auto_advance` is
    absent from `.planning/config.json` (so the executor spec's detection reads "not auto") while
    `workflow.auto_mode` is `true`, and I was spawned into a worktree with no channel to receive a

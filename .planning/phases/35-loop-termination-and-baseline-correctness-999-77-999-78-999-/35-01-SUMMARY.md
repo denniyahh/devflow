@@ -333,7 +333,8 @@ and is stronger for it.
    project's broken-windows ledger). One `PATH` guard now exists in the workspace, in
    `devflow-cli`, under one shared mutex; nothing downstream depends on `devflow-core` having its
    own.
-2. **The tracer feedback gate was run as the autonomous variant, not the interactive one.**
+2. **RESOLVED 2026-08-07 (35-verify-work investigation) — see the disposition below.**
+   **The tracer feedback gate was run as the autonomous variant, not the interactive one.**
    `workflow.auto_advance` is absent from `.planning/config.json` (so the executor spec's
    detection reads "not auto"), while `workflow.auto_mode` is `true` and I was spawned into a
    worktree with no channel to receive a checkpoint answer. I ran the gate's substantive check —
