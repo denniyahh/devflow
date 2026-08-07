@@ -1,8 +1,8 @@
 ---
 phase: 35
-reviewers: [opencode, hermes]
-reviewers_attempted: [codex, cursor, opencode, antigravity, hermes, agycli, qwen]
-reviewed_at: 2026-08-07T00:30:22Z
+reviewers: [opencode, agycli, hermes]
+reviewers_attempted: [codex, cursor, opencode, antigravity, hermes, agycli, qwen, pi]
+reviewed_at: 2026-08-07T02:33:27Z
 plans_reviewed:
   - 35-01-PLAN.md
   - 35-02-PLAN.md
@@ -16,10 +16,20 @@ note: "Second adversarial pass, plans. The first pass ran on CONTEXT.md (opencod
 
 # Cross-AI Plan Review — Phase 35
 
-> **This pass is effectively single-lane. Read the roster before weighting anything below.**
-> Five of seven attempted lanes produced no usable review, and the one that did agree with the
-> plans (hermes) is a demonstrated false negative. Treat this as **one** substantive external
-> opinion — corroborated by the orchestrator's own source verification, not by a second reviewer.
+> **Three substantive lanes, reached across several attempts. Read the roster before weighting.**
+> opencode, agycli (Gemini 3.1 Pro) and hermes (DeepSeek v4 Pro) each produced a source-grounded
+> review with ~21 `file:line` citations. Every HIGH/MEDIUM finding was independently re-verified
+> against source by the orchestrator before being recorded here; the two exceptions are labelled
+> in place. Earlier hermes attempts that returned a null result or silently routed to the wrong
+> provider are discarded, not counted.
+>
+> **The lanes were genuinely complementary — each found something the others missed**, which is
+> the case for running more than one:
+> - **agycli only:** `evaluate_layer3` carries the same defect criterion 6 is fixing (A-H1), and
+>   two `should_gate` call sites opencode's enumeration explicitly counted and missed (A-M2).
+> - **opencode only:** the `#[non_exhaustive]` breaking-change misclassification (C1).
+> - **hermes only:** NC-7, the sole control on the always-stale over-correction, is unautomated
+>   and unowned (H-1).
 
 ## Lane roster — what actually ran
 
@@ -145,6 +155,96 @@ Recorded in full for the record. **Do not weight its verdict.** See the roster n
 
 Suggestion 3 is worth keeping — it is a genuine boundary the edge-probe row `HARDEN-02 precision`
 already flagged, and an explicit test is cheap.
+
+---
+
+---
+
+## Antigravity Review (agycli, `gemini-3.1-pro-high`)
+
+Ran 11 min, source-grounded. **Overall risk: MEDIUM.** All three findings below were
+independently verified against source by the orchestrator.
+
+### A-H1 — HIGH — criterion 6's fix relocates the defect instead of removing it
+
+`35-01` makes `evaluate_layer2` return `Ok(None)` on an unmeasurable count so it "falls through
+to Layer 3". But `evaluate_layer3` (`crates/devflow-core/src/agent_result.rs:1977-1986`) runs its
+**own inline** git call with the identical lossy collapse:
+
+```rust
+.output().ok().and_then(|o| ...parse().ok()).unwrap_or(0)   // Err → None → 0
+```
+
+then `:1988` classifies `commits == 0` as `AgentStatus::Failed`. The cascade is wired
+`:2390` (`Some` → return) → `:2395` (`None` → `evaluate_layer3`), and `evaluate_layer1:1799`
+returns `None` without a capture — so **anything reaching Layer 2 also reaches Layer 3**.
+
+End-to-end, `exit_code = 0` + `Stage::Code` + unrunnable `git` still yields `Failed`. No plan
+touches `evaluate_layer3` (control: `evaluate_layer2` appears 19× across the plans;
+`evaluate_layer3` appears 0× as a change target). `35-01`'s unit test on `evaluate_layer2` passes
+while the cascade stays broken — a proxy measurement, which criterion 6 explicitly forbids.
+
+HARDEN-07's requirement text promises the **outcome**; criterion 6's wording names only
+`evaluate_layer2`. **Operator decision required:** extend `35-01` to give `evaluate_layer3` the
+same treatment, or narrow criterion 6 and record what it does not establish.
+
+### A-M1 — MEDIUM — probe temp dir races across parallel test threads
+
+`35-03:155` specifies a probe workspace "unique to this process" via non-recursive `create_dir`.
+`cargo test` runs tests as parallel **threads in one process**, so `std::process::id()` is shared:
+two concurrent probe tests collide, the loser gets `AlreadyExists` and fails soft to `Unknown` —
+a flaky test. (opencode raised the same area as C6 but framed it as cross-*process* PID reuse and
+rated it LOW; the intra-process thread case is the likelier one.)
+
+### A-M2 — MEDIUM — `print_dry_run` omitted from the `should_gate` widening
+
+`crates/devflow-cli/src/pipeline_gate.rs:534,536` call `should_gate`. **opencode's own
+enumeration claimed 10 call sites and missed these two.** The compiler forces them open, but the
+plan does not say what value to pass, so `devflow start --dry-run` would stop predicting the new
+ceiling gate.
+
+---
+
+## Hermes Review (`--provider deepseek`, `deepseek-v4-pro`)
+
+Ran 22 min, 21 `file:line` citations. **Note:** an earlier hermes attempt this session returned a
+2-citation null result, and a second silently routed to OpenAI Codex because `--provider deepseek`
+was missing. Only this third run is a valid DeepSeek review; the first two are discarded.
+
+### H-1 — the criterion-3 negative control is unautomated and unowned  *(finding accepted; hermes's framing corrected)*
+
+**What hermes claimed:** criterion 3's test pair "passes against both buggy and fixed code — THIS
+IS THE DEFECT THIS PHASE EXISTS TO ELIMINATE."
+
+**Corrected on verification.** That is overstated. The pair **does** discriminate the real 999.79
+bug: `stale_verification_artifact_dispatches_full_execute` (`35-05:250`) fails under an
+existence-only rule and passes under the fix — hermes's own table marks it `FAILS ✓`. The sibling
+`verification_written_this_run_dispatches_gaps_only` (`35-05:252`) passing under both is *by
+design*: it guards against the opposite mutation (always-stale), not against the original defect.
+
+**What survives, and is worth fixing.** The always-stale over-correction is caught **only** by
+NC-7, and NC-7 is neither automated nor owned: it sits in `35-VALIDATION.md`'s Mandatory Negative
+Controls table (`:103`) but is **absent from the Manual-Only Verifications table** and is not a
+test. If it is skipped, an always-stale regression ships silently and the loop over-executes
+forever. Cheap fix: make it an automated test with an always-stale rule injected, or at minimum
+add it to the manual table so it has an owner.
+
+### H-2 — the fingerprint baseline has an untested crash window
+
+`select_loop_back_fix` mutates `state.last_verification_fingerprint` in memory **after**
+`save_state` (`pipeline_outcomes.rs:423`); the mutation is only persisted later via
+`loop_back_to_code` → `prepare_loop_back_to_code` → `save_state` (`pipeline_gate.rs:143`). At two
+call sites that span a blocking `run_gate` wait, a process kill in between loses the update.
+Consequence is fail-safe (over-execute), but the plan's round-trip test does not exercise the
+window. *Not independently verified by the orchestrator — recorded at the reviewer's confidence.*
+
+### H-3 — NC-10 is the weakest control
+
+The askpass-blocking control has no measured baseline for the *non-blocking* exit duration. If
+`ssh-keygen` normally takes 2–3s to fail when it cannot reach an agent and the observation window
+is shorter, the control reports "blocked" for the wrong reason and passes. The plan requires the
+control to fail loudly if it does not block, but does not pin a minimum expected block duration.
+*Not independently verified — recorded at the reviewer's confidence.*
 
 ---
 
