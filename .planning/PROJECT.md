@@ -187,13 +187,26 @@ version is still derived automatically from conventional-commit classification a
   exhaustive classifier, both with live tests and negative controls. **Not fully ticked:** its
   traceability row stayed `Pending` at close because 999.76's second call site has no regression
   guard (999.84 / DEN-106).
+- ✓ **HARDEN-01, HARDEN-02, HARDEN-03, HARDEN-04, HARDEN-05, HARDEN-07** — the Code↔Validate loop's
+  failure-gating mechanics and the release signing preflight are now enforced by regression tests
+  rather than correctness-by-construction: an unmeasurable `git` failure no longer forges a fresh
+  baseline or misclassifies a successful agent (999.77/999.87), a never-reset per-phase
+  Validate-failure total bounds the loop independent of trivial commits (999.78), a run-scoped
+  content fingerprint makes a stale `{N}-VERIFICATION.md` detectable so `--force` no longer inherits
+  a stale verdict (999.79), the worktree-mode `GateReview` checkpoint call site is
+  revert-and-fail regression-tested (999.84), and `release --check`'s signing result comes from a
+  real `ssh-keygen -Y sign` probe, not a predictor that had already false-negatived live twice
+  (999.86) — Phase 35, v2.5.0. HARDEN-03's fingerprint keys on artifact bytes rather than run
+  identity; that residual gap is filed as its own follow-up, Phase 35.2 (999.89).
 
 ### Active
 
-- 6 requirements for **v2.5.0 Loop-Termination and Release Hardening** (declared 2026-08-06) — see
-  `.planning/REQUIREMENTS.md` and Phases 35/36 in ROADMAP.md.
+- **HARDEN-06** (999.83) — the drain gate's concurrency guarantee, held back from Phase 35's bundle
+  specifically to avoid slowing HARDEN-01..05/07 on a harness — Phase 36, not yet started.
 - **999.85 / DEN-107** (two comments justifying themselves by mechanisms v2.4.0 deleted) — low
   severity, not folded into v2.5.0's scope; remains backlog for a future pass.
+- Phase 35.1 (999.93, unattended-launch prerequisites) and Phase 35.2 (999.89/HARDEN-03
+  provenance) — inserted 2026-08-07, not yet planned.
 
 *(Historical note on how the project reached this point: **The v2.3.0 milestone was CLOSED
 2026-08-04**,
@@ -373,3 +386,13 @@ milestone **v2.5.0 Loop-Termination and Release Hardening** started — Phase 35
 domain research (five confirmed pre-existing defects with fix directions already decided, plus one
 investigation-shaped item, none new user-facing capability). Scope agreed with the operator before
 this workflow ran; confirmed rather than re-derived at the milestone-summary checkpoint.*
+
+---
+*Last updated: 2026-08-07 after Phase 35 (Loop-Termination and Baseline Correctness) completed and
+verified — 6/6 plans, 6/6 ROADMAP success criteria, `cargo test --workspace` clean (576 + 303
+passed, 0 failed). Code review's 1 Critical (CR-01) and 7 Warnings (WR-01..07) all independently
+re-confirmed resolved against current source, not just commit presence. UAT 17/18 passed, 1 issue
+resolved. HARDEN-01, 02, 03, 04, 05, 07 now Complete in REQUIREMENTS.md traceability. Scope grew
+mid-phase: Phase 35.1 (999.93, unattended-launch prerequisites) and Phase 35.2 (999.89/HARDEN-03
+provenance, a residual gap in the fingerprint-keys-on-bytes-not-run-identity limitation) were
+inserted into the roadmap 2026-08-07, not yet planned or executed.*
