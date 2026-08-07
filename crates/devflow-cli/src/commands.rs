@@ -122,9 +122,17 @@ pub(crate) fn phase_artifact_on_develop(project_root: &Path, phase: u32, suffix:
 /// wholesale copy would silently resurrect a stale streak, a stale baseline
 /// and a stale stop point along with it.
 ///
-/// An absent or unreadable persisted state means zero, which is the correct
-/// reading for both cases that produce it: a phase's genuine first start, and
-/// a phase whose completion already cleared the file.
+/// An **absent** persisted state means zero, which is the correct reading for
+/// both cases that produce it: a phase's genuine first start, and a phase
+/// whose completion already cleared the file.
+///
+/// An **unreadable** one is a third case and does not mean zero (WR-02,
+/// 35-REVIEW). A state file that exists but does not deserialize — hand-edited,
+/// truncated by a full disk, or written by a future schema — carries a total
+/// this function cannot see, and treating it as zero hands the phase a fresh
+/// full budget silently, defeating the bound whose entire purpose is to survive
+/// a restart. The total still restarts at zero, because there is nothing else
+/// it could do, but the operator is told so rather than left to infer it.
 ///
 /// **The two events that DO reset the total**, neither of which is "a new
 /// process started":
@@ -142,10 +150,47 @@ pub(crate) fn fresh_state_carrying_phase_failures(
     mode: Mode,
 ) -> State {
     let mut state = State::new(phase, agent, mode, project_root.to_path_buf());
-    if let Ok(persisted) = workflow::load_state(project_root, phase) {
-        state.phase_validate_failures = persisted.phase_validate_failures;
+    let (carried, warning) =
+        carried_phase_failures(phase, workflow::load_state(project_root, phase));
+    state.phase_validate_failures = carried;
+    if let Some(warning) = warning {
+        println!("{warning}");
     }
     state
+}
+
+/// The three-way carry-forward decision, split from its I/O so each case can
+/// be asserted without reaching for a stdout capture (WR-02, 35-REVIEW).
+///
+/// This was `if let Ok(persisted) = load_state(..)`, which discarded every
+/// `WorkflowError` identically. `load_state` returns `MissingState` for an
+/// absent file and a `serde_json` error for one that exists but does not
+/// deserialize, and only the first means "no failures recorded". The second
+/// silently handed the phase a fresh full budget — defeating, with no operator
+/// signal at all, the bound whose entire purpose is to survive a restart.
+///
+/// The corrupt case still yields zero, because the total it should have
+/// carried is exactly what could not be read. What changes is that the
+/// operator is told.
+fn carried_phase_failures(
+    phase: u32,
+    loaded: Result<State, workflow::WorkflowError>,
+) -> (u32, Option<String>) {
+    match loaded {
+        Ok(persisted) => (persisted.phase_validate_failures, None),
+        // Genuine zero: a phase's first start, or one whose completion already
+        // cleared the file.
+        // Genuine zero: a phase's first start, or one whose completion already
+        // cleared the file.
+        Err(workflow::WorkflowError::MissingState(_)) => (0, None),
+        Err(err) => (
+            0,
+            Some(format!(
+                "warning: phase {phase} state could not be read ({err}) — the per-phase \
+                 Validate-failure budget restarts at zero"
+            )),
+        ),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3422,6 +3467,71 @@ mod tests {
                 .phase_validate_failures,
             0,
             "phase completion cleared the state, so the next start begins with a full budget"
+        );
+    }
+
+    /// WR-02 (35-REVIEW): a state file that EXISTS but does not deserialize is
+    /// a third case, and the old `if let Ok(..)` collapsed it into the absent
+    /// case. Both still produce a zero total — the number that should have been
+    /// carried is precisely what could not be read — so the ONLY observable
+    /// difference is whether the operator is told, which is why the decision
+    /// was split out from its `println!`.
+    ///
+    /// All three cases in one test with real `load_state` calls, because the
+    /// pair is the measurement: an implementation that warned on every `Err`,
+    /// or on none, fails one half. The absent case is the negative control and
+    /// is the one a reader should check first.
+    #[test]
+    fn a_corrupt_state_file_warns_while_an_absent_one_is_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 73;
+
+        // NEGATIVE CONTROL: nothing on disk — a genuine zero, no warning.
+        let (absent_total, absent_warning) =
+            carried_phase_failures(phase, workflow::load_state(root, phase));
+        assert_eq!(absent_total, 0);
+        assert_eq!(
+            absent_warning, None,
+            "a phase's first start is not an anomaly and must stay silent"
+        );
+
+        // A readable file: the total is carried and, again, nothing is said.
+        let mut persisted = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        persisted.phase_validate_failures = 6;
+        workflow::save_state(&persisted).unwrap();
+        let (ok_total, ok_warning) =
+            carried_phase_failures(phase, workflow::load_state(root, phase));
+        assert_eq!(ok_total, 6);
+        assert_eq!(ok_warning, None);
+
+        // Truncate the same file in place — the shape a full disk leaves.
+        let state_path = workflow::state_path(root, phase);
+        assert!(
+            state_path.exists(),
+            "the fixture must corrupt an EXISTING file; a missing one is the case above"
+        );
+        std::fs::write(&state_path, "{\"phase\": 73, \"stage\":").unwrap();
+        assert!(
+            !matches!(
+                workflow::load_state(root, phase),
+                Err(workflow::WorkflowError::MissingState(_))
+            ),
+            "premise: a corrupt file must be a DIFFERENT error from an absent one, or \
+             nothing downstream could tell them apart"
+        );
+
+        let (corrupt_total, corrupt_warning) =
+            carried_phase_failures(phase, workflow::load_state(root, phase));
+        assert_eq!(
+            corrupt_total, 0,
+            "there is no total to carry — that is the point of the warning"
+        );
+        let corrupt_warning =
+            corrupt_warning.expect("an unreadable budget must not restart at zero silently");
+        assert!(
+            corrupt_warning.contains("restarts at zero"),
+            "the operator must be told what the consequence is, got: {corrupt_warning:?}"
         );
     }
 
