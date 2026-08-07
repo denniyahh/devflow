@@ -1824,40 +1824,68 @@ fn rate_limited_result(retry: String) -> AgentResult {
 /// Derives the branch name from `git_flow.feature_prefix` and the zero-padded
 /// `phase`, verifies the branch exists with `rev-parse --verify`, and on
 /// success counts `{git_flow.develop}..{branch}` with `rev-list --count`.
-/// This is the single implementation of that count — [`evaluate_layer2`] and
-/// `pipeline_outcomes::handle_validate_outcome`'s forward-progress check both
-/// call it rather than each re-deriving the branch name and re-running the
-/// same two git commands, which is what made the two counts able to silently
-/// diverge before this extraction.
+/// This is the single implementation of that count — [`evaluate_layer2`],
+/// [`evaluate_layer3`] and `pipeline_outcomes::handle_validate_outcome`'s
+/// forward-progress check all call it rather than each re-deriving the branch
+/// name and re-running the same two git commands, which is what made the
+/// counts able to silently diverge before this extraction. That claim was
+/// aspirational until 35-01: [`evaluate_layer3`] carried its own inline
+/// `rev-list --count` with an independent copy of the lossy zero collapse, and
+/// deleting it is what makes "single implementation" true.
 ///
 /// Must be called with the main `project_root`, never a worktree path — git
 /// worktrees share refs and the object database, so a commit made inside a
 /// linked worktree is immediately visible to a count run from the main
 /// checkout, which is the property every caller already relies on.
 ///
-/// A `0` return is deliberately indistinguishable across three causes:
-/// genuinely no commits, the branch does not exist, or `git` could not be
-/// run. Every consumer treats all three the same way.
-pub fn phase_commit_count(project_root: &Path, git_flow: &GitFlowConfig, phase: u32) -> u32 {
+/// The return distinguishes a MEASUREMENT from a measurement FAILURE, which
+/// is the whole point of the `Option` (999.77 / D-08, A-06):
+///
+/// - `Some(n)` — git ran and reported a real number. This includes
+///   `Some(0)` for a branch that genuinely does not exist yet, which is
+///   normal on a phase's first Validate and is a real observation, not a
+///   failure to observe.
+/// - `None` — the count could not be established: either the `git` child
+///   could not be executed at all (`.output()` returned `Err`), or it ran but
+///   produced stdout that does not parse as a `u32`. A-06 splits only the
+///   ran/did-not-run axis; the unparseable case is mapped to `None` here
+///   because the child produced no usable count, and reporting a forged zero
+///   for it would recreate exactly the hazard this signature removes.
+///
+/// **The two consumers now handle `None` distinctly, and neither collapses it
+/// to zero.** `pipeline_outcomes::handle_validate_outcome` treats an
+/// unmeasurable cycle as not-progress and leaves its persisted baseline
+/// untouched, so the next real measurement still compares against the last
+/// real observation. [`evaluate_layer2`] returns `Ok(None)` and falls through
+/// to [`evaluate_layer3`], which classifies an unmeasurable count as
+/// [`AgentStatus::Unknown`] rather than asserting the negative that no work
+/// was done.
+pub fn phase_commit_count(
+    project_root: &Path,
+    git_flow: &GitFlowConfig,
+    phase: u32,
+) -> Option<u32> {
     let branch = format!("{}phase-{:02}", git_flow.feature_prefix, phase);
 
-    let branch_exists = git_command(project_root)
+    // A-06: split on whether the command RAN, not on what it answered. An
+    // `Err` means the child could not be executed — a measurement failure. An
+    // `Ok` with an unsuccessful status means git ran and reported the branch
+    // absent, which is a real observation of zero commits.
+    match git_command(project_root)
         .args(["rev-parse", "--verify", &branch])
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
-    if !branch_exists {
-        return 0;
+    {
+        Err(_) => return None,
+        Ok(output) if !output.status.success() => return Some(0),
+        Ok(_) => {}
     }
 
     let range = format!("{}..{branch}", git_flow.develop);
-    git_command(project_root)
+    let output = git_command(project_root)
         .args(["rev-list", "--count", &range])
         .output()
-        .ok()
-        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
-        .unwrap_or(0)
+        .ok()?;
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
 /// Layer 2: Use exit code + commit count to determine result.
@@ -1902,7 +1930,15 @@ pub fn evaluate_layer2(
     };
 
     let branch = format!("{}phase-{:02}", git_flow.feature_prefix, phase);
-    let commits: u32 = phase_commit_count(project_root, git_flow, phase);
+    // D-09 (999.87): an unmeasurable commit count is NOT evidence that no work
+    // was done, and the commit gate below would classify it as
+    // `Failed — no work done` if it were collapsed to zero. Fall through to
+    // Layer 3 instead, using the identical construction this function already
+    // uses a few lines above for an unreadable exit file — "I could not read
+    // my input" already has an established answer here.
+    let Some(commits) = phase_commit_count(project_root, git_flow, phase) else {
+        return Ok(None); // fall to Layer 3
+    };
 
     let commit_gated = matches!(stage, Stage::Plan | Stage::Code);
     let no_work_done = commit_gated && commits == 0;
@@ -1974,39 +2010,52 @@ pub fn evaluate_layer3(
     git_flow: &GitFlowConfig,
 ) -> Result<AgentResult, ResultError> {
     let branch = format!("{}phase-{:02}", git_flow.feature_prefix, phase);
-    let commits = git_command(project_root)
-        .args([
-            "rev-list",
-            "--count",
-            &format!("{}..{branch}", git_flow.develop),
-        ])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
-        .unwrap_or(0);
+    // F-4 (35-01): this layer used to run its OWN inline `rev-list --count`
+    // that fell soft to a zero default, an independent copy of the same lossy
+    // collapse `phase_commit_count` carried. Because every path that reaches
+    // Layer 2 also reaches Layer 3, fixing only Layer 2 relocated the
+    // misclassification here instead of removing it. Routed through the shared
+    // counter so the cascade's last layer measures the same way every other
+    // consumer does.
+    let commits = phase_commit_count(project_root, git_flow, phase);
 
-    let (status, reason) = if commits > 0 {
-        (
+    let (status, reason) = match commits {
+        Some(n) if n > 0 => (
             AgentStatus::Unknown,
             format!(
                 "unverified — agent process is gone but {} commits exist on {}",
-                commits, branch
+                n, branch
             ),
-        )
-    } else {
-        (
+        ),
+        Some(_) => (
             AgentStatus::Failed,
             "no work accounted for — agent process is gone with no commits and no declared \
              external post-condition; human review needed"
                 .to_string(),
-        )
+        ),
+        // F-4: an unmeasurable count is not evidence of absent work here
+        // either. `Failed` asserts a negative the evidence does not support,
+        // and it is the classification this phase exists to stop producing on
+        // a transient fault. Layer 3 already reserves `Unknown` for "there is
+        // something here I cannot verify"; a count that could not be taken at
+        // all is strictly less certain than that, so `Unknown` is the
+        // consistent answer. `commits` is left absent rather than forged to
+        // zero — "no work" and "could not tell" are different facts.
+        None => (
+            AgentStatus::Unknown,
+            format!(
+                "unverified — agent process is gone and the work could not be accounted for: \
+                 the commit count on {} could not be measured; human review needed",
+                branch
+            ),
+        ),
     };
 
     Ok(AgentResult {
         status,
         exit_code: None,
         reason: Some(reason),
-        commits: Some(commits),
+        commits,
         summary: None,
         verdict: None,
         decided_by_layer: Some(3),
@@ -6643,7 +6692,66 @@ mod tests {
 
         let count = phase_commit_count(dir.path(), &GitFlowConfig::default(), 999);
 
-        assert_eq!(count, 0, "no feature/phase-99 branch exists in this repo");
+        assert_eq!(
+            count,
+            Some(0),
+            "git RAN and reported the branch absent — a real observation of zero, \
+             not a failure to measure"
+        );
+    }
+
+    /// The paired opposite-result case for
+    /// `phase_commit_count_reports_zero_without_a_branch` directly above, and
+    /// the pair is what makes either one mean anything (NC-4).
+    ///
+    /// The two differ in exactly one respect: whether the `git` child could be
+    /// executed at all. The repository is identical in both — no
+    /// `feature/phase-NN` branch — so a `Some(0)` here would prove the split
+    /// was made on "was the answer zero" rather than on "did the command run",
+    /// which is the distinction the whole `Option` exists to carry.
+    ///
+    /// Deliberately NOT built on a `git` shim that runs and exits non-zero:
+    /// that path returns `Ok(status)` from `.output()` and is a real
+    /// observation, so it would exercise the case above while appearing to
+    /// cover this one (F-1).
+    ///
+    /// **Why an unspawnable working directory rather than `NoGitPath` here —
+    /// F-1b's recorded fallback, taken on measured evidence.** `NoGitPath`
+    /// makes `git` unresolvable *process-wide*, and `devflow-core`'s tests
+    /// shell out to `git` from eight modules that all compile into ONE
+    /// parallel test binary. Installing it here failed 1-5 unrelated sibling
+    /// tests per run, nondeterministically, depending on which of them
+    /// happened to invoke `git` inside the guarded window. Serializing them
+    /// would mean every present and future `git`-touching test in the crate
+    /// opting into the same mutex — discipline, not structure, and silently
+    /// reopened by the next test that forgets.
+    ///
+    /// `hermetic_command` sets `cmd.current_dir(dir)`, so a directory that
+    /// does not exist makes the spawn itself fail and `.output()` return
+    /// `Err` — the identical arm, reached with no environment mutation at all
+    /// and therefore no effect on any other test. `phase_commit_count` cannot
+    /// tell the two causes apart: it sees only `Err`.
+    ///
+    /// This route is also independent of the PATH-resolution property C5
+    /// flags as a latent fragility of `NoGitPath` (a future refactor to an
+    /// absolute `git` path would disarm that guard silently; it would not
+    /// disarm this).
+    #[test]
+    fn phase_commit_count_reports_none_when_git_cannot_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let unspawnable_root = dir.path().join("this-directory-does-not-exist");
+        assert!(
+            !unspawnable_root.exists(),
+            "the fixture depends on this path being absent"
+        );
+
+        let count = phase_commit_count(&unspawnable_root, &GitFlowConfig::default(), 999);
+
+        assert_eq!(
+            count, None,
+            "a git child that could not be executed is a measurement FAILURE and must \
+             never be reported as a measured zero"
+        );
     }
 
     #[test]
@@ -6792,6 +6900,73 @@ mod tests {
         assert!(
             reason.to_ascii_lowercase().contains("human review"),
             "reason was: {reason}"
+        );
+    }
+
+    /// F-4 (35-01) / HARDEN-07: Layer 3 used to carry its OWN inline commit
+    /// count with the same lossy `.unwrap_or(0)` collapse `phase_commit_count`
+    /// had, and classified the resulting zero as `Failed`. Since every path
+    /// that reaches Layer 2 also reaches Layer 3, fixing only Layer 2 would
+    /// have relocated the misclassification one layer down rather than
+    /// removing it.
+    ///
+    /// A count that could not be measured is not evidence of absent work. It
+    /// is strictly less certain than the `commits > 0` case Layer 3 already
+    /// calls `Unknown`, so `Unknown` is the consistent classification and
+    /// `Failed` — which asserts a negative — is not.
+    ///
+    /// The two tests directly above are this one's required opposite-result
+    /// controls, and they run in the same suite with their bodies unedited: a
+    /// branch with one commit still gives `Unknown`/`Some(1)`, and a branch
+    /// with no commits still gives `Failed`/`Some(0)`. Without them, an
+    /// implementation that returned `Unknown` unconditionally would pass this
+    /// test.
+    ///
+    /// **No assertion here touches `Action` or anything downstream of
+    /// `outcome_policy::decide_action` (F-5).** `Failed` and `Unknown` map
+    /// identically to `Action::GateReview` today, so a dispatch-level
+    /// assertion would pass against the buggy code too. The observable
+    /// difference is entirely in the `AgentResult`.
+    ///
+    /// Uses the same unspawnable-working-directory route as
+    /// `phase_commit_count_reports_none_when_git_cannot_run`, for the reason
+    /// recorded there (F-1b): a process-wide `PATH` guard broke unrelated
+    /// sibling tests in this crate nondeterministically, and this route
+    /// reaches the identical `Err` arm with no environment mutation.
+    #[test]
+    fn evaluate_layer3_unmeasurable_count_is_unknown_not_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let unspawnable_root = dir.path().join("this-directory-does-not-exist");
+        assert!(
+            !unspawnable_root.exists(),
+            "the fixture depends on this path being absent"
+        );
+
+        let result = evaluate_layer3(&unspawnable_root, 5, &GitFlowConfig::default()).unwrap();
+
+        assert_ne!(
+            result.status,
+            AgentStatus::Failed,
+            "an unmeasurable commit count must never be classified as absent work — \
+             this is the outcome criterion 6 exists to remove"
+        );
+        assert_eq!(
+            result.status,
+            AgentStatus::Unknown,
+            "asserted positively as well as negatively, so a future change to some \
+             other non-Failed value still has to confront this test"
+        );
+        assert_eq!(
+            result.commits, None,
+            "the commit figure must be absent, not a forged Some(0) — the difference \
+             between 'no work' and 'could not tell' is the whole point"
+        );
+        assert_eq!(result.decided_by_layer, Some(3));
+        let reason = result.reason.unwrap();
+        assert!(
+            reason.contains("could not be measured"),
+            "the reason must name the measurement failure rather than absent work, \
+             reason was: {reason}"
         );
     }
 

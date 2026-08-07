@@ -397,29 +397,50 @@ pub(crate) fn handle_validate_outcome(
     };
 
     if result == ValidateResult::Failed {
-        let current =
-            agent_result::phase_commit_count(project_root, &GitFlowConfig::default(), state.phase);
-        if mode::consecutive_failures_made_progress(
-            state.last_validate_failure_commit_count,
-            current,
-        ) {
-            // New commits landed since the last recorded failure — this
-            // failure is the first of a new streak, not a continuation. Set
-            // to 1, not 0: the gate context rendered below interpolates the
-            // counter into a message naming how many times validation has
-            // failed, and zeroing it would make that message read zero on a
-            // real failure.
-            state.consecutive_failures = 1;
-        } else {
-            // Now that the counter genuinely accumulates (18d), an unbounded
-            // loop could otherwise overflow it and wrap to 0, silently
-            // restoring the unreachable-ceiling bug in a slower form.
-            state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        match agent_result::phase_commit_count(project_root, &GitFlowConfig::default(), state.phase)
+        {
+            Some(current) => {
+                if mode::consecutive_failures_made_progress(
+                    state.last_validate_failure_commit_count,
+                    current,
+                ) {
+                    // New commits landed since the last recorded failure —
+                    // this failure is the first of a new streak, not a
+                    // continuation. Set to 1, not 0: the gate context rendered
+                    // below interpolates the counter into a message naming how
+                    // many times validation has failed, and zeroing it would
+                    // make that message read zero on a real failure.
+                    state.consecutive_failures = 1;
+                } else {
+                    // Now that the counter genuinely accumulates (18d), an
+                    // unbounded loop could otherwise overflow it and wrap to
+                    // 0, silently restoring the unreachable-ceiling bug in a
+                    // slower form.
+                    state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+                }
+                // The baseline advances on every recorded failure whose count
+                // was actually MEASURED, regardless of which branch ran above
+                // — updating it only on the progress branch would let a stale
+                // low baseline report progress forever.
+                state.last_validate_failure_commit_count = Some(current);
+            }
+            // 999.77 / A-04: the count could not be measured. Treat the cycle
+            // as not-progress — an absent measurement is not evidence that
+            // work landed — and, crucially, do NOT touch the baseline. Writing
+            // a forged zero here is the defect: the next successful
+            // measurement would then compare a real count against that zero,
+            // read it as forward progress, and hand back one free reset of the
+            // MAX_CONSECUTIVE_FAILURES ceiling. Leaving the baseline alone
+            // means the next real measurement compares against the last real
+            // observation.
+            //
+            // `mode::consecutive_failures_made_progress` is deliberately not
+            // called on this arm and its signature is deliberately not widened
+            // — there is no count to compare.
+            None => {
+                state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+            }
         }
-        // The baseline advances on every recorded failure regardless of
-        // which branch ran above — updating it only on the progress branch
-        // would let a stale low baseline report progress forever.
-        state.last_validate_failure_commit_count = Some(current);
         workflow::save_state(state)?;
     }
 
@@ -1835,6 +1856,128 @@ mod tests {
                 .mode
                 .should_gate(Stage::Validate, state.consecutive_failures),
             "a genuinely stuck loop with no new commits must still reach the reachable ceiling"
+        );
+    }
+
+    /// 999.77 / HARDEN-01, ROADMAP criterion 1 — **the two-cycle
+    /// discriminating sequence, and nothing less.**
+    ///
+    /// A single transient `git` fault used to buy one free reset of the
+    /// [`mode::MAX_CONSECUTIVE_FAILURES`] ceiling. The mechanism needs two
+    /// cycles to become visible, which is why a one-cycle test is a proxy
+    /// (NC-3) rather than weak coverage:
+    ///
+    ///   - **Cycle 1** — `git` cannot run. Pre-fix, `phase_commit_count`
+    ///     collapsed that to `0` and the unconditional baseline write recorded
+    ///     `Some(0)`. The streak still incremented, so a test that stopped
+    ///     here would look green against the buggy code.
+    ///   - **Cycle 2** — `git` runs and reports the SAME real count as before
+    ///     (nothing was committed between the cycles). Compared against the
+    ///     forged `Some(0)` baseline, `1 > 0` reads as forward progress, and
+    ///     the streak resets to 1. That reset is the defect, and it is only
+    ///     observable from the second cycle.
+    ///
+    /// Exactly two things vary across the cycles: whether `git` can be
+    /// executed, and nothing else. The commit count itself is held constant at
+    /// a real, non-zero value throughout, so a green result here cannot be
+    /// explained by the branch changing underneath the test.
+    ///
+    /// **`NoGitPath` for cycle 1, `NeutralPath` for cycle 2.** Cycle 1 needs
+    /// `git` to be UNRESOLVABLE — only a spawn that fails makes `.output()`
+    /// return `Err`, which is the sole could-not-measure condition (F-1); a
+    /// shim that ran and exited non-zero would be a real observation and would
+    /// exercise the already-correct `Some(0)` path (NC-4). Cycle 2 needs a
+    /// real `git` but still no resolvable agent CLI, which is exactly what
+    /// `NeutralPath`'s git-only `PATH` provides.
+    ///
+    /// **What this does NOT establish.** The run boundary. `State::new` zeroes
+    /// both `consecutive_failures` and the baseline on every `devflow start
+    /// --force`, and nothing here shows the streak surviving a restart.
+    #[test]
+    fn validate_failure_with_unmeasurable_count_accumulates_the_streak() {
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 89;
+        init_repo(root);
+        // One real commit on the feature branch, and no further commits for
+        // the rest of this test: the REAL count is a stable, non-zero 1.
+        commit_on_feature_branch(root, phase, "seed");
+        // C4 (review): `handle_validate_outcome` persists via
+        // `workflow::save_state`, which routes through `write_state_atomic` ->
+        // `ensure_devflow_dir` (a `create_dir_all`), so this directory is not
+        // strictly required. Created anyway, matching the sibling fixtures
+        // that already do so — it costs one line and stops this test's
+        // correctness depending on a detail two crates away.
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        // A real baseline from a real prior observation — one commit seen at
+        // the last recorded failure, one failure already on the streak.
+        state.last_validate_failure_commit_count = Some(1);
+        state.consecutive_failures = 1;
+        workflow::save_state(&state).unwrap();
+
+        let response_path = Gates::response_path(root, phase, Stage::Validate);
+        std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
+        let seed_gate_response = || {
+            std::fs::write(
+                &response_path,
+                r#"{"approved":false,"note":"abort: test cleanup","responded_by":"test"}"#,
+            )
+            .unwrap();
+        };
+        seed_gate_response();
+
+        // CYCLE 1 — the measurement fails. The guard wraps exactly this call
+        // and nothing else.
+        {
+            let _no_git = NoGitPath::install();
+            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+        }
+
+        assert_eq!(
+            state.last_validate_failure_commit_count,
+            Some(1),
+            "a cycle whose commit count could NOT be measured must leave the baseline \
+             byte-identical to the last real observation — overwriting it with a forged \
+             zero is 999.77 itself"
+        );
+        assert_eq!(
+            state.consecutive_failures, 2,
+            "an unmeasurable count is not evidence of forward progress, so the streak \
+             must continue rather than restart"
+        );
+
+        // The loop-back moved the stage to Code and cleaned up the Validate
+        // gate; restore both so cycle 2 is the same shape as cycle 1.
+        state.stage = Stage::Validate;
+        seed_gate_response();
+
+        // CYCLE 2 — `git` runs again and reports the same real count as
+        // before. Nothing was committed in between, so this is not progress.
+        {
+            let _neutral = NeutralPath::install();
+            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+        }
+
+        assert_ne!(
+            state.consecutive_failures, 1,
+            "the streak must never be reset to 1 by this sequence — that reset is the \
+             one free ceiling reset a single transient git fault used to buy"
+        );
+        assert_eq!(
+            state.consecutive_failures, 3,
+            "failure-with-an-unmeasurable-count followed by \
+             failure-with-an-unchanged-real-count must accumulate"
+        );
+        assert!(
+            state
+                .mode
+                .should_gate(Stage::Validate, state.consecutive_failures),
+            "the human gate must stay reachable across a transient git fault"
         );
     }
 

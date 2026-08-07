@@ -229,10 +229,34 @@ pub(crate) fn path_lock() -> std::sync::MutexGuard<'static, ()> {
 /// **The caller must already hold [`PATH_MUTEX`]** (via [`path_lock`]).
 /// `set_var` is process-wide and `cargo test` runs in parallel; this guard
 /// makes the restore unconditional, it does not make the mutation safe on its
-/// own. Hold it over exactly the one call under test and nothing more: this is
-/// the first fixture in this crate that makes `git` unresolvable process-wide,
-/// and sibling tests shelling out to `git` inside the guarded window fail
-/// spuriously.
+/// own.
+///
+/// # Read this before using it in a new test
+///
+/// **Measured, not hypothetical (35-01, F-1b): using this guard in
+/// `agent_result`'s tests failed 1-5 UNRELATED sibling tests per run,
+/// nondeterministically.** `devflow-core` shells out to `git` from eight
+/// modules (`git`, `version`, `worktree`, `agent_result`, `monitor`,
+/// `ship_evidence`, `hooks`, and this one), all of which compile into a single
+/// test binary that `cargo test` runs in parallel. Holding [`PATH_MUTEX`]
+/// serializes only the tests that opt into it; every other test that invokes
+/// `git` inside the guarded window sees an empty `PATH` and fails for a reason
+/// that does not point anywhere near the offender.
+///
+/// **Prefer an unspawnable working directory.** `hermetic_command` sets
+/// `cmd.current_dir(dir)`, so passing a path that does not exist makes the
+/// spawn itself fail and `.output()` return `Err` — the same arm this guard
+/// produces, reached with no environment mutation and therefore no effect on
+/// any other test. `phase_commit_count_reports_none_when_git_cannot_run` and
+/// `evaluate_layer3_unmeasurable_count_is_unknown_not_failed` both take that
+/// route, and their doc comments record why.
+///
+/// This guard is retained because
+/// `tests::no_git_path_makes_git_unresolvable_and_restores_it` is what
+/// establishes that the `PATH`-replacement mechanism works at all — the
+/// control `devflow-cli`'s own `NoGitPath` (which IS used by a regression
+/// test, under the single `ENV_MUTEX` its sibling tests already hold) depends
+/// on. If you reach for it here, scope it to one call and expect flakes.
 #[cfg(test)]
 pub(crate) struct NoGitPath {
     _dir: tempfile::TempDir,
