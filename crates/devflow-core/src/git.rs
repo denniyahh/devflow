@@ -900,27 +900,66 @@ enum SignProbeOutcome {
     NotRun,
 }
 
+/// Removes its directory when dropped, so the workspace goes away on EVERY
+/// exit path from [`run_ssh_sign_probe`] — including an unwind (WR-07,
+/// 35-REVIEW).
+///
+/// The plain `remove_dir_all` statement this replaces covered every `return`
+/// inside `sign_probe_within`, which is what its comment was written for, but a
+/// panic anywhere in that function skipped it. Over many `release --check` runs
+/// on a long-lived host that is unbounded accumulation of
+/// `devflow-sign-probe-*` directories in `/tmp`.
+struct ProbeWorkspace(PathBuf);
+
+impl Drop for ProbeWorkspace {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Sign throwaway bytes with the configured key and report only how that
 /// went. Creates a private workspace, runs the probe inside it, and removes
 /// the workspace on every exit path — including the timeout path, since
 /// `ssh-keygen -Y sign` writes its signature as a sibling of the payload
-/// (T-35-13: both live and die inside this one directory).
+/// (T-35-13: both live and die inside this one directory) — and including an
+/// unwind, via [`ProbeWorkspace`]'s `Drop`.
 fn run_ssh_sign_probe(key_path: &Path) -> SignProbeOutcome {
     let workspace = std::env::temp_dir().join(probe_workspace_name());
 
-    // Non-recursive on purpose (T-35-12). `create_dir` FAILS when the path
-    // already exists, so a pre-planted directory or symlink cannot redirect
-    // where the payload is written; `create_dir_all` would accept one
-    // silently. `tempfile` is a dev-dependency of this crate and is
-    // unavailable to production code, and no dependency may be added, so
-    // this is `std` only.
-    if std::fs::create_dir(&workspace).is_err() {
+    // Non-recursive on purpose (T-35-12). `DirBuilder::create` FAILS when the
+    // path already exists — `recursive(true)` is never set — so a pre-planted
+    // directory or symlink cannot redirect where the payload is written;
+    // `create_dir_all` would accept one silently. `tempfile` is a
+    // dev-dependency of this crate and is unavailable to production code, and
+    // no dependency may be added, so this is `std` only.
+    //
+    // WR-07: mode 0o700, so "private" is implemented rather than merely
+    // claimed. `std::fs::create_dir` applies `0o777 & !umask` — typically
+    // 0o755, world-readable and world-traversable inside a shared
+    // `std::env::temp_dir()`. Nothing secret lands here (the payload is fixed
+    // bytes and `payload.sig` signs those bytes), so this was not an exposure
+    // of key material; it is that a future author extending the probe would
+    // read the comment rather than the mode bits.
+    if !create_probe_workspace(&workspace) {
         return SignProbeOutcome::NotRun;
     }
+    let _cleanup = ProbeWorkspace(workspace.clone());
 
-    let outcome = sign_probe_within(&workspace, key_path);
-    let _ = std::fs::remove_dir_all(&workspace);
-    outcome
+    sign_probe_within(&workspace, key_path)
+}
+
+/// Create the probe's workspace directory, owner-only and non-recursively.
+/// `false` means it could not be created — including because something was
+/// already there.
+///
+/// Split from [`run_ssh_sign_probe`] so both properties can be asserted on a
+/// directory that still exists: the probe removes its workspace before
+/// returning, so nothing downstream can inspect the mode bits (WR-07).
+fn create_probe_workspace(workspace: &Path) -> bool {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(workspace).is_ok()
 }
 
 /// The probe proper, with `workspace` already created and guaranteed to be
@@ -2248,6 +2287,124 @@ mod tests {
             names.len(),
             total,
             "two concurrently spawned threads produced duplicate probe workspace names"
+        );
+    }
+
+    /// WR-07 (35-REVIEW): "creates a **private** workspace" must be
+    /// implemented, not merely claimed. `std::fs::create_dir` applies
+    /// `0o777 & !umask` — typically 0o755 — inside a shared
+    /// `std::env::temp_dir()`, leaving the directory world-readable and
+    /// world-traversable. Nothing secret lands in it, so this was never an
+    /// exposure of key material; the hazard is a future author extending the
+    /// probe on the strength of the comment.
+    ///
+    /// **The umask is neutralized, and that is the whole measurement.** Asserted
+    /// naively this test is VACUOUS on any host whose umask is already 0o077 —
+    /// `0o777 & !0o077` is 0o700, so a plain `std::fs::create_dir` produces the
+    /// expected mode and the assertion passes against the unfixed code. That was
+    /// observed here, not reasoned about: the first version of this test passed
+    /// with the `DirBuilderExt::mode` call removed. Setting the umask to 0 makes
+    /// a plain creation 0o777, so the two really do differ, and the sibling
+    /// created that way is the negative control.
+    ///
+    /// The window spans two `create_dir` calls with no I/O between them. A
+    /// concurrent test creating a file inside it would get a laxer mode than
+    /// usual — every such file is a tempdir artifact in a test process, so there
+    /// is no consequence beyond the mode bits themselves.
+    ///
+    /// The non-recursive refusal is asserted here too: `create_dir_all` would
+    /// accept a pre-planted directory or symlink silently and redirect where the
+    /// payload is written (T-35-12).
+    #[test]
+    fn the_probe_workspace_is_owner_only_and_refuses_an_existing_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("probe");
+        let plain = dir.path().join("plain");
+
+        // SAFETY: `umask` is a plain syscall with no preconditions. Restored
+        // immediately below, before any assertion can unwind past it.
+        let previous_umask = unsafe { libc::umask(0) };
+        let created = create_probe_workspace(&workspace);
+        let plain_created = std::fs::create_dir(&plain).is_ok();
+        // SAFETY: restoring the value the call above returned.
+        unsafe {
+            libc::umask(previous_umask);
+        }
+
+        assert!(created, "the fixture needs the creation to succeed");
+        assert!(plain_created, "the fixture needs the control to be created");
+
+        let control = std::fs::metadata(&plain).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            control, 0o777,
+            "NEGATIVE CONTROL: with the umask neutralized a default creation must be wide \
+             open. If it is not, the umask window did not take and the assertion below \
+             cannot distinguish the fix from the default"
+        );
+
+        let mode = std::fs::metadata(&workspace).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "the workspace must be owner-only by request, not by whatever the umask happened \
+             to strip"
+        );
+
+        // The path now exists, so the same call must refuse it.
+        assert!(
+            !create_probe_workspace(&workspace),
+            "a pre-planted directory or symlink must not be adopted — that is how a payload \
+             gets written somewhere the probe did not choose"
+        );
+    }
+
+    /// WR-07's second half: "removes the workspace on **every** exit path" was
+    /// a plain statement after the call, which an unwind skips. Repeated over
+    /// many `release --check` runs on a long-lived host that is unbounded
+    /// accumulation of `devflow-sign-probe-*` directories in `/tmp`.
+    ///
+    /// Driven through a real `catch_unwind` rather than by calling `drop`:
+    /// dropping the guard by hand proves only that `Drop` removes a directory,
+    /// which was never in question. The claim is that the removal survives a
+    /// panic, and only an unwind establishes that.
+    ///
+    /// The control is the directory's existence before the panic — without it a
+    /// test that never created anything would pass.
+    ///
+    /// # What this does NOT establish
+    ///
+    /// Its subject is [`ProbeWorkspace`], not [`run_ssh_sign_probe`]. Measured,
+    /// not assumed: reverting `run_ssh_sign_probe` to the trailing
+    /// `remove_dir_all` statement leaves this test PASSING. Nothing here can
+    /// panic on demand inside `sign_probe_within`, so the link from the
+    /// production function to the guard rests on there being exactly one
+    /// construction site, checked by reading. A future refactor that stops
+    /// binding the guard would not be caught here.
+    #[test]
+    fn the_probe_workspace_guard_removes_its_directory_on_unwind() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("probe");
+        assert!(create_probe_workspace(&workspace));
+        assert!(
+            workspace.exists(),
+            "premise: the directory must exist before the panic, or its later absence \
+             establishes nothing"
+        );
+
+        let panicked = std::panic::catch_unwind({
+            let workspace = workspace.clone();
+            move || {
+                let _cleanup = ProbeWorkspace(workspace);
+                panic!("the probe panicked mid-flight");
+            }
+        })
+        .is_err();
+
+        assert!(panicked, "the fixture must actually unwind");
+        assert!(
+            !workspace.exists(),
+            "a panic inside the probe must not leak its workspace into the shared temp dir"
         );
     }
 
