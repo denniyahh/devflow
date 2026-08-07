@@ -2739,6 +2739,47 @@ can miss it entirely.
 
 ---
 
+### Phase 999.96: `release --check` Cannot Catch a Forgotten Version Bump (BACKLOG)
+
+**Found:** 2026-08-07, during 35-verify-work, while dispositioning 35-06's deliberate
+version-vs-changelog skew.
+
+**The gap, in one line:** nothing mechanically checks that `CHANGELOG.md`'s top heading agrees with
+the version in `Cargo.toml`, so a forgotten bump ships a new changelog under an old version number
+and no preflight objects.
+
+**Why the existing check does not cover it.** `release --check`'s self-pin check compares workspace
+member pins against the workspace version. Measured on the current tree: `Cargo.toml:9`
+(`version = "2.4.0"`) and `Cargo.toml:20` (`devflow-core = { …, version = "2.4.0" }`) agree, so it
+reports `self-pin (workspace member versions) ✓ 1 member pin(s) match 2.4.0` — while `CHANGELOG.md`'s
+top heading reads `## 2.5.0 — 2026-08-07`. The check passes, and would pass in exactly the state this
+entry is about. It validates internal consistency of the manifests, never their agreement with the
+release the changelog announces.
+
+**This is not a defect in 35-06.** Leaving `Cargo.toml` at `2.4.0` is what that plan requires — the
+version is set at release time, in two places, with `devflow-core` publishing before `devflow-cli`.
+The skew is correct and transient. What is missing is the guard that catches it when the cut is
+*not* performed correctly.
+
+**Why the ship hooks are not sufficient on their own.** `VersionBump`/`ChangelogAppend` run on the
+ship path, but a manual or button merge to `main` bypasses them — a failure mode this project has
+hit before and already records. A preflight is the backstop that does not depend on which route the
+release took.
+
+**What to add.** A `release --check` row that reads `CHANGELOG.md`'s topmost `## <version>` heading
+and compares it to the workspace version, reporting NOT viable when they disagree — with the
+disagreement direction stated, since "changelog ahead of Cargo.toml" (bump not yet done, expected
+before a cut) and "Cargo.toml ahead of changelog" (release notes missing) are different problems.
+
+**Negative control it must carry.** The current tree is itself a ready-made positive fixture: the
+check must report NOT viable against `2.4.0` + a `2.5.0` heading. A version check that cannot fail
+is the same defect as the signing predictor 999.86 replaced.
+
+**Priority:** Medium — it guards a release-correctness step that is currently guarded only by
+memory. **Size:** S.
+
+---
+
 ### Phase 999.95: `cargo doc` Is Not in This Repo's Definition of Green, and Carries a 33-Warning Baseline (BACKLOG)
 
 **Found:** 2026-08-07, phase 35-06 verification, when the plan's acceptance criterion required

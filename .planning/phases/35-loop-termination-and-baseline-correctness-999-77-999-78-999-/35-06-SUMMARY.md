@@ -363,11 +363,22 @@ T-35-SC accepted — no packages installed, and this plan does not perform the r
    The single-class claim was re-checked with a negative control (filtering for any other warning
    kind returns only the summary line). The 35-vs-33 discrepancy is unexplained and recorded in
    999.95 as something to re-measure rather than inherit.
-2. **The version step is deliberately NOT done.** `Cargo.toml` remains at `2.4.0` while
+2. **RESOLVED 2026-08-07 (operator, during 35-verify-work) — no change made; gap filed as 999.96.**
+   **The version step is deliberately NOT done.** `Cargo.toml` remains at `2.4.0` while
    `CHANGELOG.md` now has a `2.5.0` heading. That is what the plan requires — the version is set in
    two places at release time, with `devflow-core` publishing before `devflow-cli` — but it does
    mean the tree is momentarily inconsistent between now and the release cut, and anyone reading
    `Cargo.toml` in between will see the older number.
+
+   **Disposition: leave the version alone. Bumping early would claim a version that has not shipped,
+   and any interim build would report a number never published.** The skew is correct and transient.
+
+   **What the review surfaced instead, and it is the part that matters:** nothing mechanically
+   checks changelog-vs-manifest agreement. `release --check`'s self-pin row compares member pins to
+   the workspace version — verified on this tree, both `2.4.0` (`Cargo.toml:9` and `:20`), so it
+   reports `✓ 1 member pin(s) match 2.4.0` while the changelog announces `2.5.0`. It passes in
+   exactly the state a forgotten bump would produce. Filed as **999.96**, which specifies the check
+   and requires a not-viable fixture — the current tree serves as one.
 
 ## Self-Check: PASSED
 
