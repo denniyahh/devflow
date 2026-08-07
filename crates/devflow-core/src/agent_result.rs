@@ -1899,10 +1899,28 @@ pub fn phase_commit_count(
     }
 
     let range = format!("{}..{branch}", git_flow.develop);
-    let output = git_command(project_root)
+    // A-06 again, applied to the second step (CR-01, 35-REVIEW). This arm used
+    // to be `.output().ok()?` followed by `.parse().ok()`, which split on
+    // whether the output PARSED rather than on whether the command RAN — the
+    // opposite of the rule the `rev-parse` step above states and follows. A
+    // `rev-list` that runs and exits non-zero writes an empty stdout, so any
+    // condition making the range invalid (the configured `develop` absent from
+    // the checkout, a shallow clone) parsed to nothing and returned `None`
+    // *permanently*, not transiently. That is a measurement the command DID
+    // make; it belongs with the branch-absent case above as a real zero.
+    let output = match git_command(project_root)
         .args(["rev-list", "--count", &range])
         .output()
-        .ok()?;
+    {
+        Err(_) => return None,
+        Ok(output) => output,
+    };
+    if !output.status.success() {
+        return Some(0);
+    }
+    // A success whose stdout does not parse is a different animal: git ran,
+    // succeeded, and said something this function cannot read. Nothing was
+    // established, so it stays `None` rather than being asserted as zero.
     String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
@@ -1929,6 +1947,10 @@ pub fn phase_commit_count(
 ///           (not commit-gated; Validate's real pass signal is its verdict,
 ///           not a bare zero-commit — see Task 2's turn.completed deferral)
 ///   exit unknown                                         → fall to Layer 3 (return None)
+///   exit=0, stage in {Plan, Code}, commits UNMEASURABLE  → fall to Layer 3 (return None)
+///           (CR-01: the ONLY row an unmeasurable count changes. Every other
+///           row above is decided by the exit code alone and keeps its verdict
+///           with the count rendered as "unknown" in the reason string.)
 ///
 /// WR-06 (13-REVIEW.md): takes only the explicit `project_root` parameter
 /// for both the `.devflow/` file paths and the git subprocess `current_dir`
@@ -1948,18 +1970,38 @@ pub fn evaluate_layer2(
     };
 
     let branch = format!("{}phase-{:02}", git_flow.feature_prefix, phase);
+    let commits = phase_commit_count(project_root, git_flow, phase);
+    let commit_gated = matches!(stage, Stage::Plan | Stage::Code);
+
     // D-09 (999.87): an unmeasurable commit count is NOT evidence that no work
     // was done, and the commit gate below would classify it as
-    // `Failed — no work done` if it were collapsed to zero. Fall through to
-    // Layer 3 instead, using the identical construction this function already
-    // uses a few lines above for an unreadable exit file — "I could not read
-    // my input" already has an established answer here.
-    let Some(commits) = phase_commit_count(project_root, git_flow, phase) else {
+    // `Failed — no work done` if it were collapsed to zero.
+    //
+    // CR-01 (35-REVIEW): the guard belongs HERE, not above the exit-code
+    // classification. `commits` is load-bearing for exactly one term —
+    // `no_work_done`, which only exists when `commit_gated` holds. Returning
+    // early on any `None` also discarded the 137 / 127 / `exit != 0` verdicts
+    // and the non-commit-gated `Success`, none of which read the count at all.
+    // That mattered because Layer 2 is the SOLE classifier for 137 and 127
+    // (Layer 1 sees no marker from a SIGKILLed or never-launched agent, and
+    // Layer 3 has no ResourceKilled/AgentUnavailable arm), and the same host
+    // fault that OOM-kills an agent also makes the `fork` for `git` fail — so
+    // the two observations arrive together, and an infra fault was routed into
+    // the Validate loop it is explicitly forbidden from entering
+    // (`pipeline_launch.rs`, review consensus #4 / D-08).
+    //
+    // Fall through ONLY when the missing count is what would have decided.
+    if commit_gated && exit_code == 0 && commits.is_none() {
         return Ok(None); // fall to Layer 3
-    };
+    }
 
-    let commit_gated = matches!(stage, Stage::Plan | Stage::Code);
-    let no_work_done = commit_gated && commits == 0;
+    let no_work_done = commit_gated && commits == Some(0);
+    // Reason strings must not invent a number they do not have. Every
+    // surviving arm below interpolates the count for context only.
+    let commits_desc = match commits {
+        Some(n) => format!("{n} commits"),
+        None => "an unmeasurable number of commits".to_string(),
+    };
 
     // 137 (SIGKILL, typically OOM) and 127 (command not found) are classified
     // BEFORE the generic `exit_code != 0 -> Failed` catch-all, using the same
@@ -1980,31 +2022,27 @@ pub fn evaluate_layer2(
         exit_code: Some(exit_code),
         reason: if exit_code == 137 {
             Some(format!(
-                "agent process was killed (exit code 137, likely OOM) ({} commits on {})",
-                commits, branch
+                "agent process was killed (exit code 137, likely OOM) ({commits_desc} on {branch})"
             ))
         } else if exit_code == 127 {
             Some(format!(
-                "agent command was unavailable (exit code 127, command not found) ({} commits on {})",
-                commits, branch
+                "agent command was unavailable (exit code 127, command not found) \
+                 ({commits_desc} on {branch})"
             ))
         } else if exit_code != 0 {
             Some(format!(
-                "agent exited with code {} ({} commits on {})",
-                exit_code, commits, branch
+                "agent exited with code {exit_code} ({commits_desc} on {branch})"
             ))
         } else if no_work_done {
             Some(format!(
-                "no commits found on {} (agent exit code was {})",
-                branch, exit_code
+                "no commits found on {branch} (agent exit code was {exit_code})"
             ))
         } else {
             Some(format!(
-                "{} commits on {} (agent exit code was {})",
-                commits, branch, exit_code
+                "{commits_desc} on {branch} (agent exit code was {exit_code})"
             ))
         },
-        commits: Some(commits),
+        commits,
         summary: None,
         verdict: None,
         decided_by_layer: Some(2),
@@ -6839,6 +6877,59 @@ mod tests {
             count, None,
             "a git child that could not be executed is a measurement FAILURE and must \
              never be reported as a measured zero"
+        );
+    }
+
+    /// CR-01 (35-REVIEW), the `rev-list` half. The branch EXISTS, so the
+    /// `rev-parse` step succeeds and the function reaches its second git call
+    /// — but `develop` is absent from the checkout, so `A..B` is an invalid
+    /// range and `rev-list` runs, exits non-zero, and writes nothing to
+    /// stdout. That used to fall out of `.parse().ok()` as `None`, splitting
+    /// on whether the output PARSED rather than on whether the command RAN,
+    /// which contradicts this function's own A-06 rule and the `rev-parse`
+    /// step directly above it.
+    ///
+    /// It is the *permanence* that makes this worth a test: unlike a fork
+    /// failure, a misconfigured or absent `develop` does not clear on retry,
+    /// so before the fix every stage of every phase in such a checkout
+    /// measured as unmeasurable, forever.
+    ///
+    /// `phase_commit_count_reports_none_when_git_cannot_run` is the NC-4
+    /// control — the one case that must still be `None`.
+    #[test]
+    fn phase_commit_count_reports_zero_when_the_range_is_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init"]);
+        git(dir.path(), &["config", "user.email", "devflow@example.com"]);
+        git(dir.path(), &["config", "user.name", "DevFlow Tests"]);
+        git(dir.path(), &["config", "commit.gpgsign", "false"]);
+        git(dir.path(), &["config", "tag.gpgsign", "false"]);
+        git(dir.path(), &["config", "core.hooksPath", "/dev/null"]);
+        // The feature branch exists; `develop` deliberately does not.
+        git(dir.path(), &["checkout", "-b", "feature/phase-999"]);
+        std::fs::write(dir.path().join("README.md"), "base\n").unwrap();
+        git(dir.path(), &["add", "README.md"]);
+        git(dir.path(), &["commit", "-m", "base"]);
+
+        // The fixture is only meaningful if the second git call really is the
+        // one that fails, so assert the first one would have succeeded.
+        assert!(
+            git_command(dir.path())
+                .args(["rev-parse", "--verify", "feature/phase-999"])
+                .output()
+                .expect("git must be runnable for this fixture")
+                .status
+                .success(),
+            "the branch must verify, or this test exercises the rev-parse arm instead"
+        );
+
+        let count = phase_commit_count(dir.path(), &GitFlowConfig::default(), 999);
+
+        assert_eq!(
+            count,
+            Some(0),
+            "git RAN and reported the range unusable — a measurement, not a failure to \
+             measure; `None` here is permanent for the whole checkout"
         );
     }
 

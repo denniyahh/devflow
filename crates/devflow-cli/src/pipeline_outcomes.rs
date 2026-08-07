@@ -2782,6 +2782,112 @@ mod tests {
         );
     }
 
+    /// **CR-01 (35-REVIEW), the direction whose absence let the defect ship.**
+    ///
+    /// The fall-through above was placed ABOVE the exit-code classification,
+    /// so an unmeasurable count discarded the `ResourceKilled` verdict too.
+    /// That is not a cosmetic loss: Layer 2 is the SOLE classifier for exit
+    /// 137 and 127 (a SIGKILLed agent writes no `DEVFLOW_RESULT` marker, so
+    /// Layer 1 declines, and Layer 3 has no `ResourceKilled` arm), and the
+    /// host fault that OOM-kills an agent is the same one that makes the
+    /// `fork` for `git` fail — the two arrive TOGETHER, which is why no test
+    /// pairing them existed and why the case is not exotic.
+    ///
+    /// # This test and its predecessor are one measurement, not two
+    ///
+    /// `evaluate_layer2_unrunnable_git_falls_through_to_layer3` directly above
+    /// is this test's NC-4 negative control and vice versa. They install the
+    /// **same** `NoGitPath` guard against the **same** fixture shape and
+    /// differ in exactly one byte of input — the exit code written to
+    /// `phase-NN-exit`. One must return `None`; the other must return
+    /// `ResourceKilled`. A suite asserting only the fall-through cannot tell
+    /// those apart, which is precisely how six executors, 942 passing tests
+    /// and four clean gates all missed this.
+    ///
+    /// `Action::GateInfra` is asserted rather than left implicit because the
+    /// routing is the harm: `GateReview` sends an infra fault into
+    /// `handle_validate_outcome`, which `pipeline_launch.rs` documents as
+    /// forbidden (review consensus #4 / D-08) — it bumps `consecutive_failures`
+    /// and the per-phase Validate budget for a fault the agent did not cause,
+    /// while `infra_failures` never accumulates and the infra abort ceiling
+    /// becomes unreachable.
+    #[test]
+    fn evaluate_layer2_unrunnable_git_still_classifies_exit_137_as_resource_killed() {
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Identical to the fall-through test's fixture except for the exit
+        // code: the root EXISTS and the exit file is readable, so `git` being
+        // unrunnable is the only difference from a healthy run.
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        std::fs::write(agent_result::exit_code_path(root, 4), "137").unwrap();
+
+        let result = {
+            let _no_git = NoGitPath::install();
+            agent_result::evaluate_layer2(root, 4, &GitFlowConfig::default(), Stage::Code).unwrap()
+        };
+
+        let result = result.expect(
+            "exit 137 is classified from the exit code alone — an unmeasurable commit \
+             count must not discard the verdict and fall to a layer that cannot produce it",
+        );
+        assert_eq!(
+            result.status,
+            AgentStatus::ResourceKilled,
+            "Layer 2 is the only classifier for 137; losing it here loses it everywhere"
+        );
+        assert_eq!(result.exit_code, Some(137));
+        assert_eq!(
+            result.commits, None,
+            "'could not tell' must not be recorded as a measured zero"
+        );
+        assert_eq!(
+            devflow_core::outcome_policy::decide_action(Stage::Code, result.status),
+            devflow_core::outcome_policy::Action::GateInfra,
+            "an OOM-killed agent must route to the infra gate, NOT into the Validate loop"
+        );
+    }
+
+    /// CR-01's second, independent harm, in the same shape: a NON-commit-gated
+    /// stage that exited 0 never consulted the commit count in the first
+    /// place, so an unmeasurable count must not turn its documented `Success`
+    /// into `Unknown` → `GateReview`. For `Stage::Validate` that mis-routing
+    /// dispatches a cleanly-exited Validate agent as `ValidateOutcome::Failed`.
+    ///
+    /// The negative control is
+    /// `evaluate_layer2_unrunnable_git_falls_through_to_layer3`: same guard,
+    /// same exit code 0, and the ONLY difference is the stage — `Code` (commit
+    /// gated, must fall through) versus `Validate` (not gated, must succeed).
+    /// If both stages produced the same answer, the stage scoping would be
+    /// doing nothing and neither test would mean anything.
+    #[test]
+    fn evaluate_layer2_unrunnable_git_keeps_success_for_a_non_commit_gated_stage() {
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+        std::fs::write(agent_result::exit_code_path(root, 4), "0").unwrap();
+
+        let result = {
+            let _no_git = NoGitPath::install();
+            agent_result::evaluate_layer2(root, 4, &GitFlowConfig::default(), Stage::Validate)
+                .unwrap()
+        };
+
+        let result = result.expect(
+            "a stage that is not commit-gated never read the count, so an unmeasurable \
+             count cannot change its answer",
+        );
+        assert_eq!(result.status, AgentStatus::Success);
+        assert_eq!(result.commits, None);
+        assert_eq!(
+            devflow_core::outcome_policy::decide_action(Stage::Validate, result.status),
+            devflow_core::outcome_policy::Action::Advance
+        );
+    }
+
     /// **HARDEN-07 / criterion 6 as an OUTCOME rather than a property of one
     /// function (F-4).** This is the test the operator ruled must exist, and
     /// the one whose absence let the Layer 3 defect survive planning.
