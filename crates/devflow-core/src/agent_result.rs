@@ -2834,6 +2834,17 @@ fn phase_verification_path(evidence_root: &Path, phase: u32) -> Option<PathBuf> 
 /// collision-resistant and must never be used to authenticate anything; an
 /// adversary who can write the artifact can already write whatever verdict they
 /// like into it.
+///
+/// # Companion: [`phase_verification_mtime_nanos`]
+///
+/// Content alone cannot see an IDEMPOTENT rewrite (WR-06, 35-REVIEW): a
+/// Validate agent that re-authors byte-identical content on a later cycle
+/// produces the same fingerprint as an artifact nobody touched, and the
+/// consumer then classifies its own agent's work as inherited. The mtime is
+/// the second input that separates "unchanged because inherited" from
+/// "unchanged because idempotent"; it is read from the same resolved path and
+/// returns `None` on exactly the same "no artifact" condition, so the two are
+/// always consistent about whether an artifact exists.
 pub fn phase_verification_fingerprint(evidence_root: &Path, phase: u32) -> Option<u64> {
     let path = phase_verification_path(evidence_root, phase)?;
     let bytes = std::fs::read(path).ok()?;
@@ -2844,6 +2855,38 @@ pub fn phase_verification_fingerprint(evidence_root: &Path, phase: u32) -> Optio
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     Some(hash)
+}
+
+/// The mtime of the same `{phase:02}-VERIFICATION.md`
+/// [`phase_verification_fingerprint`] hashes, in nanoseconds since the Unix
+/// epoch, or `None` when no such artifact exists under `evidence_root`.
+///
+/// WR-06 (35-REVIEW): the second input the freshness rule needs. A content
+/// fingerprint cannot see an IDEMPOTENT rewrite — a Validate agent that
+/// re-authors byte-identical content on a later cycle produces the same hash as
+/// an artifact nobody touched — so a hash-only rule classifies its own agent's
+/// work as inherited and re-runs every plan in the phase from then on. An
+/// inherited file's mtime does not advance during a run; a rewritten one's
+/// does, whatever the bytes say.
+///
+/// Resolved through the same [`phase_verification_path`] and returning `None`
+/// on the same "no artifact" condition, so the two readings can never disagree
+/// about whether the artifact exists.
+///
+/// **This is not provenance either.** Any writer advances an mtime, so the
+/// limitation the fingerprint's doc comment records — a mid-run branch switch
+/// or an operator edit reading as authored-this-run — is not closed by this and
+/// is marginally widened by it: a checkout restoring byte-identical content
+/// used to read as inherited and now reads as authored. That is accepted
+/// deliberately, because the case it fixes (a deterministic verification writer
+/// on cycle 2 of an unresolved gap) is ordinary rather than exotic.
+pub fn phase_verification_mtime_nanos(evidence_root: &Path, phase: u32) -> Option<u64> {
+    let path = phase_verification_path(evidence_root, phase)?;
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let since_epoch = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    // `as` would silently wrap past year 2554; a `None` here degrades to the
+    // content-only comparison, which is the pre-WR-06 behaviour.
+    u64::try_from(since_epoch.as_nanos()).ok()
 }
 
 /// Keep only the newest `retain` capture generations under `history_dir`,

@@ -388,6 +388,11 @@ pub(crate) fn start(
         .unwrap_or_else(|| project_root.to_path_buf());
     state.last_verification_fingerprint =
         agent_result::phase_verification_fingerprint(&evidence_root, phase);
+    // WR-06: read from the SAME evidence root in the same breath, so the pair
+    // is one observation of one file rather than two readings that could
+    // disagree about which artifact they saw.
+    state.last_verification_mtime_nanos =
+        agent_result::phase_verification_mtime_nanos(&evidence_root, phase);
     // WR-05: the observation happened. Without this flag a `None` fingerprint
     // from an old state file is indistinguishable from a `None` that means
     // "looked, found nothing", and the two demand opposite dispatches.

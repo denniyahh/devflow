@@ -333,6 +333,9 @@ fn select_loop_back_fix(evidence_root: &Path, phase: u32, state: &mut State) -> 
     //   gate for a loop that re-runs every plan in the phase, forever. It
     //   would pass every test asserting only the stale direction.
     let current = agent_result::phase_verification_fingerprint(evidence_root, phase);
+    // WR-06: read from the SAME evidence root immediately after the content, so
+    // the pair is one observation of one file.
+    let current_mtime = agent_result::phase_verification_mtime_nanos(evidence_root, phase);
     // WR-05: an artifact with no captured baseline is dispatched conservatively
     // (below), but silently doing so would leave an operator who upgraded a
     // binary mid-phase wondering why a gaps-only pass became a full execute.
@@ -351,8 +354,11 @@ fn select_loop_back_fix(evidence_root: &Path, phase: u32, state: &mut State) -> 
         );
     }
     if verification_authored_this_run(
-        current,
-        state.last_verification_fingerprint,
+        (current, current_mtime),
+        (
+            state.last_verification_fingerprint,
+            state.last_verification_mtime_nanos,
+        ),
         state.verification_baseline_captured,
     ) {
         // Record the new observation as the baseline, so a SUBSEQUENT
@@ -376,7 +382,11 @@ fn select_loop_back_fix(evidence_root: &Path, phase: u32, state: &mut State) -> 
         // and the only alternative is a second `save_state` on every single
         // loop-back — doubling the persistence cost of the common path to
         // defend an interval a kill can barely land in. Do not add one.
+        // WR-06: both halves of the observation advance together, or the next
+        // cycle would compare a new mtime against a stale one and read every
+        // artifact as rewritten.
         state.last_verification_fingerprint = current;
+        state.last_verification_mtime_nanos = current_mtime;
         FixType::GapsOnly
     } else {
         FixType::FullExecute
@@ -406,32 +416,55 @@ fn select_loop_back_fix(evidence_root: &Path, phase: u32, state: &mut State) -> 
 ///   artifact may well be the previous run's, and reading it as this run's is
 ///   the 999.79 stall. Answered "inherited", the conservative direction: a full
 ///   execute is wasteful, an unresolvable gate is not recoverable.
-/// * fingerprints are EQUAL — the artifact is byte-identical to what this run
-///   started with, so it was inherited from a previous run and its verdict must
-///   not be reused (999.79). Catches an always-fresh rule.
+/// * fingerprints are EQUAL and the mtimes are equal — the artifact is
+///   byte-identical to what this run last observed AND nothing has written it
+///   since, so it was inherited from a previous run and its verdict must not be
+///   reused (999.79). Catches an always-fresh rule.
 /// * fingerprints DIFFER — Validate rewrote it during this run. Catches an
 ///   always-stale rule.
+/// * fingerprints are equal but the MTIME advanced (WR-06) — an IDEMPOTENT
+///   rewrite: the agent re-authored byte-identical content on a later failing
+///   cycle. Hash-only, this read as inherited and dispatched a full execute,
+///   re-running every plan in the phase on every subsequent cycle instead of
+///   the gaps-only pass Phase 33 built. That is the "too strict" over-correction
+///   the paragraph above claims to guard against, and it did not.
 ///
 /// **What this cannot establish (HARDEN-03, unclassified).** It keys on content
-/// change alone and has no notion of provenance. An artifact whose bytes change
-/// for any reason OTHER than this run's Validate agent — a mid-run branch
-/// switch, a worktree merge-back, an operator editing the file — reads as
+/// change and mtime, and has no notion of provenance. An artifact written for
+/// any reason OTHER than this run's Validate agent — a mid-run branch switch, a
+/// worktree merge-back, an operator editing the file — reads as
 /// authored-this-run and dispatches `--gaps-only`, which is the failure
-/// direction HARDEN-03 exists to prevent. Establishing real provenance would
-/// need the artifact to carry a run identifier, which is a larger change than
-/// 999.79 asks for.
+/// direction HARDEN-03 exists to prevent. **The mtime input marginally WIDENS
+/// that exposure**: a checkout restoring byte-identical content used to read as
+/// inherited and now reads as authored. Accepted deliberately, because the case
+/// it fixes is ordinary (a deterministic verification writer on cycle 2 of an
+/// unresolved gap) while the cases it widens are exotic, and because the
+/// too-strict direction is otherwise unbounded. Establishing real provenance
+/// would need the artifact to carry a run identifier, which is a larger change
+/// than 999.79 asks for.
 fn verification_authored_this_run(
-    current: Option<u64>,
-    run_start_baseline: Option<u64>,
+    current: (Option<u64>, Option<u64>),
+    run_start_baseline: (Option<u64>, Option<u64>),
     baseline_captured: bool,
 ) -> bool {
-    match (current, run_start_baseline) {
+    let (current_hash, current_mtime) = current;
+    let (baseline_hash, baseline_mtime) = run_start_baseline;
+    // WR-06. Compared ONLY when both readings exist: an mtime is unavailable on
+    // a platform without `modified()`, on unreadable metadata, or past year
+    // 2554, and `Some != None` would then read as "written since" on every
+    // single cycle. Absent either half this degrades to content alone, which is
+    // the pre-WR-06 behaviour rather than a new failure mode.
+    let written_since_baseline = match (current_mtime, baseline_mtime) {
+        (Some(now), Some(baseline)) => now != baseline,
+        _ => false,
+    };
+    match (current_hash, baseline_hash) {
         (None, _) => false,
         // WR-05: `baseline_captured` is what separates "the run looked and
         // found nothing" from "this state predates the field, so nobody
         // looked". Only the first licenses reading the artifact as this run's.
         (Some(_), None) => baseline_captured,
-        (Some(now), Some(baseline)) => now != baseline,
+        (Some(now), Some(baseline)) => now != baseline || written_since_baseline,
     }
 }
 
@@ -3845,28 +3878,34 @@ mod tests {
     ///
     /// The row set is chosen so BOTH over-corrections are caught, not one:
     ///
-    /// | current      | baseline     | captured | fresh? | fails under |
-    /// |--------------|--------------|----------|--------|-------------|
-    /// | `None`       | `None`       | true     | no     | always-fresh|
-    /// | `Some(h)`    | `None`       | true     | yes    | always-stale|
-    /// | `Some(h)`    | `None`       | **false**| **no** | always-fresh|
-    /// | `Some(h)`    | `Some(h)`    | true     | no     | always-fresh|
-    /// | `Some(h)`    | `Some(g≠h)`  | true     | yes    | always-stale|
+    /// | current       | baseline      | captured | fresh? | fails under |
+    /// |---------------|---------------|----------|--------|-------------|
+    /// | `None`        | `None`        | true     | no     | always-fresh|
+    /// | `(h, t)`      | `None`        | true     | yes    | always-stale|
+    /// | `(h, t)`      | `None`        | **false**| **no** | always-fresh|
+    /// | `(h, t)`      | `(h, t)`      | true     | no     | always-fresh|
+    /// | `(h, **t2**)` | `(h, t)`      | true     | **yes**| always-stale|
+    /// | `(h2, t2)`    | `(h, t)`      | true     | yes    | always-stale|
     ///
-    /// Two rows fail an always-stale stub and the others fail an always-fresh
+    /// Three rows fail an always-stale stub and the others fail an always-fresh
     /// stub. A table that only fails one of the two would not be exhaustive and
     /// the row set would be wrong.
     ///
     /// Row 2b is WR-05's (35-REVIEW): it and row 2 differ in exactly one input,
     /// and a predicate ignoring `baseline_captured` collapses them — which is
     /// how an upgraded in-flight phase reproduced the 999.79 stall.
+    ///
+    /// Row 3b is WR-06's: it and row 3 differ in exactly one input, and a
+    /// predicate ignoring the mtime collapses them — which is how an idempotent
+    /// rewrite read as inherited and turned every later cycle into a full
+    /// execute.
     #[test]
     fn verification_freshness_truth_table_is_exhaustive() {
         // Row 1 — no artifact at all. Not "authored this run": there is
         // nothing to have authored. The phase is mid-arc and D-01's original
         // FullExecute answer stands, unchanged by 999.79.
         assert!(
-            !verification_authored_this_run(None, None, true),
+            !verification_authored_this_run((None, None), (None, None), true),
             "row 1: an absent artifact is never 'authored this run'"
         );
 
@@ -3874,7 +3913,7 @@ mod tests {
         // a verdict from; grouped with row 1 rather than given its own row
         // because the predicate cannot distinguish them and must not try.
         assert!(
-            !verification_authored_this_run(None, Some(7), true),
+            !verification_authored_this_run((None, None), (Some(7), Some(100)), true),
             "row 1b: an artifact that is absent NOW is never 'authored this run', whatever the \
              baseline recorded"
         );
@@ -3883,7 +3922,7 @@ mod tests {
         // look. The ordinary first-verification case: Validate authored it
         // during this run.
         assert!(
-            verification_authored_this_run(Some(7), None, true),
+            verification_authored_this_run((Some(7), Some(100)), (None, None), true),
             "row 2: an artifact existing where the baseline recorded none was authored this run"
         );
 
@@ -3891,22 +3930,42 @@ mod tests {
         // state written by a binary predating the baseline field. The artifact
         // may be the PREVIOUS run's, so its verdict must not be reused.
         assert!(
-            !verification_authored_this_run(Some(7), None, false),
+            !verification_authored_this_run((Some(7), Some(100)), (None, None), false),
             "row 2b: with no captured baseline the artifact's provenance is unknown, and \
              reading it as this run's is the 999.79 stall reproduced across an upgrade"
         );
 
-        // Row 3 — unchanged since run start. The 999.79 case: inherited from a
-        // previous run, its verdict must not be reused.
+        // Row 3 — unchanged since run start, in BOTH content and mtime. The
+        // 999.79 case: inherited from a previous run, its verdict must not be
+        // reused.
         assert!(
-            !verification_authored_this_run(Some(7), Some(7), true),
-            "row 3: an artifact whose fingerprint equals the run-start baseline is INHERITED, \
-             not authored this run"
+            !verification_authored_this_run((Some(7), Some(100)), (Some(7), Some(100)), true),
+            "row 3: an artifact whose fingerprint AND mtime equal the run-start baseline is \
+             INHERITED, not authored this run"
+        );
+
+        // Row 3b (WR-06) — identical to row 3 except that the file was written
+        // since: the Validate agent re-authored byte-identical content on a
+        // later failing cycle. Hash-only this read as inherited, and every
+        // subsequent cycle re-ran every plan in the phase.
+        assert!(
+            verification_authored_this_run((Some(7), Some(200)), (Some(7), Some(100)), true),
+            "row 3b: an IDEMPOTENT rewrite is still a rewrite — unchanged bytes with an \
+             advanced mtime were written by this run's agent"
+        );
+
+        // Row 3c — the degrade. With either mtime unavailable the comparison
+        // falls back to content alone, which is the pre-WR-06 behaviour; a
+        // `Some != None` mtime test would instead read EVERY cycle as rewritten.
+        assert!(
+            !verification_authored_this_run((Some(7), None), (Some(7), Some(100)), true),
+            "row 3c: an unavailable mtime must degrade to the content comparison, not \
+             manufacture a difference"
         );
 
         // Row 4 — content changed since run start. Validate rewrote it.
         assert!(
-            verification_authored_this_run(Some(7), Some(8), true),
+            verification_authored_this_run((Some(7), Some(200)), (Some(8), Some(100)), true),
             "row 4: an artifact whose fingerprint differs from the run-start baseline was \
              rewritten during this run"
         );
@@ -4001,6 +4060,110 @@ mod tests {
             )
             .is_none(),
             "a signal emitted on the ordinary case too would carry no information"
+        );
+    }
+
+    /// WR-06 (35-REVIEW) end to end: a Validate agent that re-authors
+    /// BYTE-IDENTICAL content on a later failing cycle must still reach the
+    /// gaps-only path.
+    ///
+    /// Cycle 1 writes a verification listing gap G and the selector records its
+    /// fingerprint as the baseline. Cycle 2's gaps-only fix does not close G,
+    /// Validate re-runs and writes the identical document — and with a
+    /// content-only rule `current == baseline` read as INHERITED, dispatching a
+    /// full execute. Every subsequent cycle then re-ran every plan in the phase
+    /// instead of the gaps-only pass Phase 33 built. That is the "too strict"
+    /// over-correction the selector's own comment claims to guard against.
+    ///
+    /// **The mtime is forced rather than observed.** `File::set_modified` makes
+    /// the advance exact, so the test measures the freshness rule instead of
+    /// the host filesystem's timestamp granularity — a coarse-granularity FS
+    /// would otherwise make this pass or fail for a reason that has nothing to
+    /// do with the subject.
+    ///
+    /// The control is the untouched artifact: same content, same baseline, and
+    /// the ONLY difference is whether anything wrote the file. Without it a rule
+    /// that simply always answered "authored" would pass the first half — and
+    /// that rule is the 999.79 stall.
+    #[test]
+    fn an_idempotent_rewrite_is_authored_not_inherited() {
+        let _guard = env_lock();
+
+        /// Seed a phase whose artifact already exists and whose baseline
+        /// records it, optionally rewriting it with identical bytes afterwards.
+        fn dispatch_with(root: &Path, phase: u32, rewrite_identically: bool) -> String {
+            let phase_dir = root
+                .join(".planning/phases")
+                .join(format!("{phase:02}-test"));
+            std::fs::create_dir_all(&phase_dir).unwrap();
+            let artifact = phase_dir.join(format!("{phase:02}-VERIFICATION.md"));
+            let contents = "verdict: gaps -- G is still open\n";
+            std::fs::write(&artifact, contents).unwrap();
+
+            // What the selector recorded on the previous cycle of THIS run.
+            let baseline_hash =
+                devflow_core::agent_result::phase_verification_fingerprint(root, phase);
+            let baseline_mtime =
+                devflow_core::agent_result::phase_verification_mtime_nanos(root, phase)
+                    .expect("the fixture needs a readable mtime");
+
+            if rewrite_identically {
+                std::fs::write(&artifact, contents).unwrap();
+                let advanced = std::time::UNIX_EPOCH
+                    + std::time::Duration::from_nanos(baseline_mtime)
+                    + std::time::Duration::from_secs(1);
+                std::fs::File::options()
+                    .write(true)
+                    .open(&artifact)
+                    .unwrap()
+                    .set_modified(advanced)
+                    .unwrap();
+                assert_eq!(
+                    devflow_core::agent_result::phase_verification_fingerprint(root, phase),
+                    baseline_hash,
+                    "premise: the rewrite must be byte-IDENTICAL, or this exercises row 4"
+                );
+                assert_ne!(
+                    devflow_core::agent_result::phase_verification_mtime_nanos(root, phase),
+                    Some(baseline_mtime),
+                    "premise: the rewrite must advance the mtime, or there is nothing to see"
+                );
+            }
+
+            let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+            state.stage = Stage::Validate;
+            state.verification_baseline_captured = true;
+            state.last_verification_fingerprint = baseline_hash;
+            state.last_verification_mtime_nanos = Some(baseline_mtime);
+            workflow::save_state(&state).unwrap();
+
+            {
+                let _path_guard = NeutralPath::install();
+                let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+            }
+
+            devflow_core::events::last_event_of_kind_for_phase(root, phase, "loop_back")
+                .expect("loop_back event must be recorded")["fix"]
+                .as_str()
+                .expect("the fix must be recorded as a string")
+                .to_string()
+        }
+
+        let rewritten_dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            dispatch_with(rewritten_dir.path(), 76, true),
+            "GapsOnly",
+            "an idempotent rewrite is still a rewrite; reading it as inherited re-runs every \
+             plan in the phase on every later cycle"
+        );
+
+        // NEGATIVE CONTROL: nothing wrote the file after the baseline was taken.
+        let untouched_dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            dispatch_with(untouched_dir.path(), 77, false),
+            "FullExecute",
+            "an artifact nobody touched since the baseline is INHERITED — a rule that always \
+             answered 'authored' would be the 999.79 stall"
         );
     }
 

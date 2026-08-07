@@ -215,6 +215,24 @@ pub struct State {
     /// after `state.worktree_path` holds its final value.
     #[serde(default)]
     pub verification_baseline_captured: bool,
+    /// The mtime of the same artifact [`Self::last_verification_fingerprint`]
+    /// hashes, in nanoseconds since the Unix epoch, as of the same observation.
+    ///
+    /// WR-06 (35-REVIEW): a content fingerprint cannot see an IDEMPOTENT
+    /// rewrite. A Validate agent that re-authors byte-identical content on a
+    /// later failing cycle produces the same hash as an artifact nobody
+    /// touched, so a hash-only rule reads its own agent's work as inherited and
+    /// dispatches a full execute — re-running every plan in the phase on every
+    /// subsequent cycle instead of the gaps-only pass Phase 33 built. That is
+    /// the "too strict" direction the freshness rule's own comment claims to
+    /// guard against and did not.
+    ///
+    /// Moves in lockstep with the fingerprint: written at the same capture
+    /// site, replaced at the same update site, and never read on its own — the
+    /// pair is the observation, and either one differing means the artifact was
+    /// written during this run.
+    #[serde(default)]
+    pub last_verification_mtime_nanos: Option<u64>,
     /// When the phase started (Unix seconds).
     pub started_at: String,
     /// Path to the project root.
@@ -384,6 +402,7 @@ impl State {
             phase_validate_failures: 0,
             last_verification_fingerprint: None,
             verification_baseline_captured: false,
+            last_verification_mtime_nanos: None,
             started_at: timestamp_now(),
             project_root,
             worktree_path: None,
