@@ -28,6 +28,7 @@ those five confirmed fixes down waiting on a harness.
 | Phase | Name | Status | Version |
 |---|---|---|---|
 | 35 | Loop-Termination and Baseline Correctness | Not started | — |
+| 35.1 | Unattended-Launch Prerequisites | Not started | — |
 | 36 | Drain Gate Concurrency Measurement | Not started | — |
 
 ### Phase 35: Loop-Termination and Baseline Correctness (999.77 + 999.78 + 999.79 + 999.84 + 999.86 + 999.87)
@@ -101,6 +102,48 @@ Plans:
 **Wave 4** *(blocked on Wave 3 completion)*
 
 - [x] 35-06-PLAN.md — enumerate and document the public-API break: verified `CHANGELOG.md` entry plus removal notes at each site; release stays `v2.5.0`, milestone unrenamed (D-04 / D-08)
+
+### Phase 35.1: Unattended-Launch Prerequisites (999.93)
+
+**Goal**: `devflow start --mode auto` can actually complete a phase with no human present — ordinary
+GSD `blocking` checkpoints resolve instead of stalling the run — and a preflight refuses the launch,
+loudly, when the conditions that make that true do not hold.
+**Depends on**: Phase 35 (whose `phase_validate_failures` accounting is what a stalled unattended run
+currently burns through). Sequenced **before** Phase 36, which needs a working unattended run to
+gather the live concurrency evidence its criterion 1 demands.
+**Requirements**: HARDEN-07
+**Success Criteria** (what must be TRUE):
+
+  1. During the Code stage and the `--gaps-only` fix loop, `check auto-mode` reports active, so GSD
+     auto-approves ordinary `gate="blocking"` checkpoints instead of the run stalling into a gate.
+     Established by driving a real checkpoint, not by asserting the flag's value.
+
+  2. The chain flag DevFlow sets is cleared again on **every** exit path from those stages, including
+     error and kill paths. `.planning/config.json` is tracked and `commit_docs` is on, so a leaked
+     `_auto_chain_active: true` is committed and then fires GSD's plan-phase chaining on the *next*
+     phase (upstream G-03: the clear at `plan-phase.md:1547` does not affect the decision at `:1563`,
+     which reads the pre-clear value). A test must demonstrate the leak is closed on a failure path,
+     not only on the happy path.
+
+  3. DevFlow's Plan stage does not chain into execute-phase. `workflow.auto_advance` is NOT set
+     persistently — that flag conflates checkpoint-bypass with stage-chaining (upstream G-01), and
+     setting it makes plan-phase launch execute-phase itself, double-executing the Code stage and
+     misattributing its commits to the Plan stage.
+
+  4. A preflight reports, per condition, whether an unattended run's prerequisites hold, and
+     **refuses** the launch when they do not — a warning is read by nobody in an unattended run. It
+     carries a negative control: a fixture where the check reports NOT viable. A preflight that
+     cannot fail is the defect it exists to prevent (the 999.86 lesson, one phase earlier).
+
+  5. The work is demonstrated by a simulated unattended run that crosses the seams under test —
+     Plan → Code with a real checkpoint — rather than by unit tests alone. Phase 35 shipped with no
+     end-to-end run anywhere in it; this criterion exists so the same gap is not repeated on the
+     change whose entire purpose is making unattended runs work.
+
+**Not in scope**: the first-option `decision` checkpoint behaviour (filed as 999.94) — it is a
+correctness question about *how* an unattended agent decides, separable from *whether* it can
+proceed at all.
+**Plans**: TBD
 
 ### Phase 36: Drain Gate Concurrency Measurement (999.83)
 
@@ -183,6 +226,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 33 | 6/6 | Complete    | 2026-08-05 |
 | 34 | 6/6 | Complete    | 2026-08-06 |
 | 35 | 6/6 | In Progress|  |
+| 35.1 | — | Not started | — |
 | 36 | — | Not started | — |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
@@ -2745,10 +2789,12 @@ judgment, and record your reasoning… so the decision is auditable after the fa
 only to `blocking-human` checkpoints reached through DevFlow's own resume path.
 
 **Two routes, and the split matters.**
+
 - **DevFlow-side (available now):** extend the Code-stage prompt with a policy layer that overrides
   the first-option rule — decide on merit, prefer an option the checkpoint marks or argues as
   recommended, and record why. Same shape as `checkpoint_auto_decide_prompt`. Risk to weigh: it
   instructs the agent to deviate from the workflow file it is concurrently executing.
+
 - **Upstream (better, slower):** an explicit `recommended` attribute in the checkpoint format, plus
   auto-select honouring it. Belongs in `.planning/UPSTREAM-GSD-ISSUES.md` if pursued.
 
