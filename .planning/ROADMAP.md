@@ -344,6 +344,64 @@ Unsequenced items — not part of the active phase sequence. Promote with
 `/gsd-review-backlog` when ready; each carries accumulated context in its
 own `phases/999.N-*/CONTEXT.md`.
 
+### Phase 999.89: The Verification-Freshness Rule Infers Provenance From Bytes, and Is Only Safe Because Two Branch-Naming Conventions Happen to Agree (BACKLOG)
+
+**Linear:** [DEN-110](https://linear.app/denniskim/issue/DEN-110/99989-verification-freshness-infers-provenance-from-bytes-and-is-only)
+**Found:** 2026-08-07, Phase 35 execution, reviewing what 35-05 shipped.
+
+**Priority:** Medium | **Size:** M — a run identifier in the artifact, plus one convention-pinning
+test.
+
+**The shape of it.** 35-05 closed 999.79 by fingerprinting `{N}-VERIFICATION.md` at run start and
+treating an unchanged artifact as inherited. The predicate
+(`verification_authored_this_run`, `pipeline_outcomes.rs:396`) keys on **content change alone**:
+
+```rust
+(None, _)              => false,
+(Some(_), None)        => true,   // absent at run start, present now
+(Some(now), Some(base)) => now != base,
+```
+
+It therefore cannot distinguish "this run's Validate agent wrote a verdict" from "these bytes
+changed for some other reason". Anything that alters the artifact under the evidence root reads as
+authored-this-run and dispatches `--gaps-only` — mid-arc that matches zero plans and gates
+unresolvably, which is the exact 999.79 failure reached by a different route. The plan ships this
+knowingly (`must_haves`, `verification: backstop`).
+
+**Why it is not currently common — and why that is the worrying part.** The obvious trigger would
+be the Code stage, which runs `/gsd-execute-phase {N}`: that workflow performs branch checkouts and
+worktree merges, and a checkout replaces working-tree contents wholesale. It does not fire today
+only because of a coincidence:
+
+- DevFlow creates its phase worktree on `feature/phase-{phase:02}` (`worktree.rs:42`,
+  `commands.rs:2740`, `pipeline_gate.rs:695`) **before** the baseline is captured
+  (`commands.rs:344`, placed after the worktree fork by A-05 — that placement is deliberate).
+- GSD's `execute-phase` independently computes `branch_name` and produces the identical string.
+  Verified 2026-08-07 including the single-digit case, where DevFlow zero-pads and GSD takes a bare
+  number: `init.execute-phase 7` returns `feature/phase-07`.
+- So GSD's branching step finds the branch already present and degenerates to a no-op `git switch`.
+
+**Nothing enforces that agreement.** Two conventions maintained in two different repositories happen
+to emit the same string. If either drifts, GSD's branching step forks off `origin/<default>`
+instead, replacing the worktree contents — including the artifact — and lands directly on the
+`(Some(_), None) => true` row. The failure would go from rare to routine, silently, from a change in
+a *different repo* that has no reason to know this invariant exists.
+
+**Two-part fix, and the second part is the cheap one.**
+
+1. Embed a run identifier in `{N}-VERIFICATION.md` (or alongside it) so provenance is *checked*
+   rather than inferred from bytes. The predicate then asks "was this authored by this run",
+   which is the question it is actually trying to answer.
+2. Add a test pinning that DevFlow's phase-branch name matches the convention GSD computes,
+   including the single-digit padding case. This is small and defends the route that would make
+   the defect common.
+
+**Live routes today** (with the branch route closed): an operator editing the artifact mid-run, or
+external tooling touching the repo while a phase is in flight. Both real, both uncommon.
+
+**Related:** 999.79 (closed by 35-05, this is its residual), 999.84, DOGFOOD-01 (same unattended
+stall class).
+
 ### Phase 999.88: The `setsid` Guard on the Tag-Signing Probe Has No Regression Test (BACKLOG)
 
 **Linear:** [DEN-109](https://linear.app/denniskim/issue/DEN-109/99988-the-setsid-guard-on-the-tag-signing-probe-has-no-regression-test)
