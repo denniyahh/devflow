@@ -2682,6 +2682,81 @@ can miss it entirely.
 
 ---
 
+### Phase 999.93: Unattended Runs Have No Preflight for the Conditions They Require (BACKLOG — HIGH)
+
+**Found:** 2026-08-07, phase 35 verify-work, tracing why 35-01 and 35-05 both hit a GSD checkpoint
+with no way to answer it.
+
+**The defect, in one line:** `devflow start --mode auto` will launch a run that is structurally
+guaranteed to park on the first ordinary GSD checkpoint, and nothing checks first.
+
+**What is missing.** GSD auto-approves `gate="blocking"` checkpoints only when `check auto-mode`
+reports active — which requires `workflow.auto_advance` or `workflow._auto_chain_active` to be true
+in `.planning/config.json`. On DevFlow today it reports
+`{"active": false, "source": "none", "auto_chain_active": false, "auto_advance": false}`. So an
+unattended run meets its first ordinary checkpoint and stalls into a gate. DevFlow already handles
+the *harder* case — `blocking-human` checkpoints, via resume plus `checkpoint_auto_decide_prompt`
+(28-03, D-03/D-07) — so the gap is only the ordinary ones, which is exactly why it went unnoticed.
+
+**Why a preflight rather than only a fix.** The plumbing fix (999.94's sibling work, below) makes
+auto-mode active for the Code stage. A preflight is what stops the *next* silent regression: it
+states the run's own prerequisites and refuses, loudly, when they do not hold. `devflow release
+--check` is the established precedent in this codebase for a read-only preflight that reports
+viability by checking rather than predicting (HARDEN-05, phase 35-03) — this is the same shape for
+`start --mode auto`.
+
+**What it should check.** At minimum: `check auto-mode` reports active for the stages that need it;
+the agent binary exists (already checked elsewhere — fold it in rather than duplicating); no
+unknown `workflow.*` keys that suggest a stale config (see G-04 in
+`.planning/UPSTREAM-GSD-ISSUES.md` — `workflow.auto_mode` is dead upstream and cost this project two
+escalations). Report each as viable/not-viable with a reason, and refuse the launch rather than
+warn, since a warning in an unattended run is read by nobody.
+
+**Negative control it must carry.** A preflight that cannot fail is the defect it exists to prevent
+(the 999.86 lesson, one phase earlier). Whatever ships must include a fixture where the check
+reports NOT viable.
+
+**Priority:** High — it gates the first real unattended end-to-end run (phase 36). **Size:** S–M.
+
+---
+
+### Phase 999.94: An Unattended `decision` Checkpoint Takes the First Option Without Reading It (BACKLOG — HIGH)
+
+**Found:** 2026-08-07, phase 35 verify-work, while assessing the downsides of enabling GSD auto-mode
+for DevFlow's Code stage.
+
+**The behaviour.** When auto-mode is active, GSD's `execute-phase` resolves a `decision` checkpoint
+by taking the **first** option: *"Auto-spawn continuation agent with `{user_response}` = first
+option from checkpoint details"* (`execute-phase.md`, `<checkpoint_handling>`). Not the best option
+on the merits, and not an option marked recommended — the first one listed.
+
+**Why it is not as safe as GSD assumes.** `checkpoints.md:18` describes `gate="blocking"` as *"safe
+to take the recommended path on when unattended"* — so upstream's intent is that first == recommended.
+Nothing enforces that. There is no explicit `recommended` marker in the checkpoint format (checked:
+`recommend` appears exactly once in `checkpoints.md`, in that prose), and no validation that a plan
+author ordered the options that way. The convention is unenforced and invisible at the point of use.
+
+**Why this project should care more than most.** Phase 26 established the pattern here — 11/11
+verification and 763 green tests while two review rounds found 7 then 5 Criticals on irreversible
+operations. A blind first-option pick on an implementation decision is the same class: cheap to get
+wrong, expensive to notice. DevFlow already has the better idiom in
+`prompt::checkpoint_auto_decide_prompt` — *"resolve the checkpoint yourself, using your own best
+judgment, and record your reasoning… so the decision is auditable after the fact"* — but it applies
+only to `blocking-human` checkpoints reached through DevFlow's own resume path.
+
+**Two routes, and the split matters.**
+- **DevFlow-side (available now):** extend the Code-stage prompt with a policy layer that overrides
+  the first-option rule — decide on merit, prefer an option the checkpoint marks or argues as
+  recommended, and record why. Same shape as `checkpoint_auto_decide_prompt`. Risk to weigh: it
+  instructs the agent to deviate from the workflow file it is concurrently executing.
+- **Upstream (better, slower):** an explicit `recommended` attribute in the checkpoint format, plus
+  auto-select honouring it. Belongs in `.planning/UPSTREAM-GSD-ISSUES.md` if pursued.
+
+**Priority:** High — it is a correctness risk on every unattended run, not a papercut. **Size:** S
+for the DevFlow-side prompt policy plus its tests; M if the upstream marker is pursued too.
+
+---
+
 ### Phase 999.71: Measure Whether the Capture Writer Actually Leaves Torn Terminal Lines (BACKLOG)
 
 **Linear:** [DEN-92](https://linear.app/denniskim/issue/DEN-92/99971-measure-whether-the-capture-writer-actually-leaves-torn-terminal)
