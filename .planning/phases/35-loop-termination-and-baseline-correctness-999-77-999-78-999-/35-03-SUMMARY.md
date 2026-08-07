@@ -14,6 +14,7 @@ provides:
   - "check_ssh_signing_viability establishes tag-signing viability by performing the operation — a bounded, non-interactive `ssh-keygen -Y sign` over throwaway bytes — instead of predicting it from `ssh-add -l`"
   - "SSH_SIGN_NAMESPACE, decoded byte-for-byte from this repository's own v2.4.0 SSHSIG blob"
   - "a per-call probe workspace name (pid + atomic counter + sub-millisecond time), std-only"
+  - "the probe runs in its own session (setsid), so a controlling terminal's /dev/tty passphrase prompt cannot capture it — folded in post-completion on operator instruction"
   - "NC-9 and a calibrated NC-10 as committed tests, plus a leak-assertion helper over the rendered verdict"
   - "removal of pub SigningStatus and pub classify_ssh_add_status from devflow_core::git — a breaking change to a published crate (D-04/D-08)"
 affects: [35-06, release, ship, DEN-50]
@@ -21,7 +22,7 @@ affects: [35-06, release, ship, DEN-50]
 actuals:
   tokens: 32592
   tasks: 3
-  commits: 4
+  commits: 5  # 4 task commits + the post-completion setsid fix folded in on operator instruction
 
 tech-stack:
   added: []
@@ -78,6 +79,15 @@ coverage:
         ref: "crates/devflow-core/src/git.rs#encrypted_key_blocks_without_the_askpass_require_env_var"
         status: pass
     human_judgment: false
+  - id: D8
+    description: "The probe is not captured by a controlling terminal's /dev/tty passphrase prompt (setsid, folded in post-completion on operator instruction)"
+    requirement: HARDEN-05
+    verification:
+      - kind: manual_procedural
+        ref: "pty.fork() harness, real controlling terminal: raw ssh-keygen blocked past a 3s window without setsid vs 8.1ms with it; devflow release --check 10.06s -> 0.065s; paired no-tty control shows no difference"
+        status: pass
+    human_judgment: true
+    rationale: "No committed test covers this — removing the pre_exec would not fail the suite. A regression test needs a pty fixture with TIOCSCTTY, which the operator's narrow-scope instruction excluded. Until such a test exists, this deliverable rests on a single out-of-band measurement and needs a human to decide whether that is sufficient."
   - id: D4
     description: "Inline key:: / raw ssh- values return Unknown with a fixed reason and are never probed"
     requirement: HARDEN-05
@@ -145,6 +155,9 @@ status: complete
 2. **Task 1 (GREEN): probe tag-signing viability instead of predicting it** — `6fe8862` (feat)
 3. **Task 2: probe fixtures with their two mandatory negative controls** — `d7527b8` (test)
 4. **Task 3: retire every test and comment the deletion falsified** — `a5ed1e9` (test)
+
+**Post-completion, on operator instruction:** `34aab4f` (fix: detach the probe from any controlling
+terminal — see "Post-completion deviation")
 
 **Plan metadata:** `3feb06a` (docs: SUMMARY), `6160dee` (docs: HARDEN-05 marked complete)
 
@@ -231,7 +244,12 @@ Carried forward from `35-VALIDATION.md` and `35-CONTEXT.md`, and stated here rat
 - **n=1 on every axis.** One host, one OpenSSH build (`OpenSSH_10.4p1, OpenSSL 3.6.3`), one key type (ed25519). Nothing here establishes behaviour for RSA, ECDSA or PKCS11-backed keys, or for other OpenSSH builds. The operator's measured 8-row table from the discussion is explicitly **not** coverage and is not cited as such.
 - **NC-10 is a single observation of each arm**, even calibrated. That is a weak bound on the environment variable's effect, not a reliability claim. It supports "the variable changed the outcome in this run"; it does not support "the variable prevents hangs reliably".
 - **HARDEN-05 is met for the path form only.** Under D-03 inline `key::` and raw `ssh-` values return `Unknown` without being probed, so those operators get *no* viability verdict at all, where the predictor gave them a fingerprint comparison. Deliberate and recorded (A-10), not an oversight.
-- **The timeout, not the environment variable, is what covers a host with a controlling terminal.** Measured this session: with a controlling terminal available, `ssh-keygen` prompts on `/dev/tty` regardless of `SSH_ASKPASS_REQUIRE`, so an interactive `release --check` against an encrypted key would block until the 10 s ceiling. Unattended runs have no controlling terminal, which is the case D-01 targets — but the env var's protection is narrower than its name suggests. See Deferred Items.
+- **The environment variable's protection is narrower than its name suggests** — it closes the
+  askpass route only, because OpenSSH consults it after `open("/dev/tty")` has already failed. With
+  a controlling terminal present, `ssh-keygen` prompts on the terminal regardless of the variable.
+  **This was subsequently closed by the `setsid` fix folded in on operator instruction** — see
+  "Post-completion deviation" below. The bullet is kept rather than deleted because it is the
+  reasoning that motivated the fix.
 - **Two claimed timeout justifications remain unmeasured** (A-16): a wedged `ssh-agent` and a stalled PKCS11 provider are reasoned defence-in-depth, not tested scenarios.
 
 ## Decisions Made
@@ -292,7 +310,90 @@ Carried forward from `35-VALIDATION.md` and `35-CONTEXT.md`, and stated here rat
 
 ## Deferred Items
 
-- **The production probe does not detach from a controlling terminal.** On an interactive host with an encrypted key, `release --check` would prompt on `/dev/tty` and then eat the full 10 s ceiling, returning `NotViable`. D-01 scopes the mechanism to the env var plus the timeout, and "do not widen the scope" is explicit in the plan, so this was **not** implemented. If interactive `release --check` latency ever bites, a `pre_exec(setsid)` on the probe is the recorded way to close it — the same one-line change the NC-10 fixtures already use.
+- ~~**The production probe does not detach from a controlling terminal.**~~ **Folded in after plan
+  completion on operator instruction — see "Post-completion deviation" below.** Originally deferred
+  because D-01 scopes the mechanism to the env var plus the timeout and the plan says not to widen
+  scope.
+
+## Post-completion deviation: `setsid` on the production probe
+
+**Folded in on operator instruction after this plan was already marked complete.** Landed as
+`34aab4f`, on the same branch and worktree, deliberately narrow: the probe's `Command` gains a
+`pre_exec` that calls `setsid()`. Nothing else changed — in particular D-03's `key::` / raw `ssh-`
+routing to `Unknown` is untouched.
+
+### Why the env var alone was not enough
+
+OpenSSH consults `SSH_ASKPASS_REQUIRE` only **after** `open("/dev/tty")` has already failed. So the
+variable closes the askpass route and leaves the terminal route wide open: on a host with a
+controlling terminal, `ssh-keygen` prompts for the passphrase on the terminal regardless of the
+variable, and blocks there until the probe's ceiling expires. `setsid()` before `exec` makes that
+`open` fail, which is the precondition the variable is gated on.
+
+### The measurement, with its negative control
+
+This environment has **no controlling terminal by default** (`open("/dev/tty")` → `ENXIO`), so the
+measurement was run inside a `pty.fork()` child — a real session leader whose controlling terminal
+is a pty slave, **not** a proxy for one. The harness asserts `open("/dev/tty")` succeeds before
+measuring anything; every run below reported `has_controlling_tty: true`.
+
+**Raw `ssh-keygen`, with a controlling terminal** — the case under test:
+
+| arm | result |
+|---|---|
+| without `setsid` | **still alive when the 3 s window closed** |
+| with `setsid` | exit 255 in **8.1 ms** |
+
+**Paired control — the same two arms with NO controlling terminal:**
+
+| arm | result |
+|---|---|
+| without `setsid` | exit 255 in **7.7 ms** |
+| with `setsid` | exit 255 in **8.3 ms** |
+
+The two cases disagree, which is what makes the measurement meaningful: `setsid` does nothing on
+its own, and only matters when there is a controlling terminal to drop. Had both agreed, the
+measurement would have been broken rather than the subject.
+
+**End to end, `devflow release --check` against a repo whose signing key is an encrypted ed25519
+key, run under the same real pty:**
+
+| | pre-fix binary | post-fix binary |
+|---|---|---|
+| elapsed | 10.060 s | **0.065 s** |
+| reported reason | `the signing probe did not finish within its time limit` | `the configured signing key could not sign a test payload` |
+| exit code | 1 | 1 |
+| reached the signing check | true | true |
+
+`reached_signing_check` is the control on this arm: without it, a run that failed before ever
+reaching the probe would produce a duration that says nothing about the probe.
+
+**Regression control — the unattended path the fix was NOT aimed at** (no controlling terminal),
+pre-fix vs post-fix: 37 ms vs 34 ms, identical reason string, identical exit code. The change is
+confined to the with-terminal path.
+
+### What this evidence does NOT establish
+
+- **The 10.060 s figure is measuring the timeout constant, not the interaction.** It is
+  `SSH_SIGN_PROBE_TIMEOUT` (10 s) plus process overhead; the probe was killed at the ceiling. The
+  only information it carries is "it ran to the ceiling." The substantive change is the **reason
+  string**: pre-fix the operator was told the probe timed out, which is a misleading diagnosis of a
+  key that simply cannot sign unattended. Post-fix they get the accurate reason.
+- **The verdict did not change** — `NotViable` before and after. This fix removes a 10-second stall
+  and corrects a diagnosis; it does not change any pass/fail outcome.
+- **Weaker evidence than the rest of this plan, in one specific way: there is no committed
+  regression test for the production `setsid`.** Every other claim in this SUMMARY rests on a test
+  that runs on every `cargo test`; this one rests on an out-of-band pty measurement taken once, and
+  a later refactor that dropped the `pre_exec` would not fail the suite. A committed test would need
+  a pty fixture with `TIOCSCTTY` in Rust, which is exactly the widening the operator's instruction
+  excluded. Recorded rather than papered over.
+- **n=1 again, on the same axes** — one host, one OpenSSH build (10.4p1), one key type (ed25519),
+  one observation per arm.
+- **`setsid`'s return value is ignored,** so a failure would be silent. It only fails for a process
+  that is already a process-group leader, which a freshly forked child is not; and the degraded
+  behaviour is exactly the pre-fix behaviour, which the ceiling already bounds. Propagating it was
+  rejected because `spawn` failure is classified as absent tooling, so it would surface as a false
+  "ssh-keygen not found" — a wrong message in place of a slow but correct one.
 
 ## Threat Flags
 
@@ -312,15 +413,23 @@ None.
 - `scripts/check.sh all` is green end to end: fmt clean, clippy clean under `-D warnings`, and `0 failed` across all binaries (558 in `devflow-core`, 279 + integration suites in `devflow-cli`).
 - **DEN-50 is unaffected and must stay that way** — `devflow release`'s real signing executor must still run the real signed `git tag`. This probe is a preflight and must never be substituted for it.
 
-## Self-Check: PASSED
+## Self-Check: PASSED, with one claim weaker than the others
 
 Every file and commit claimed above was verified to exist on disk and in this worktree's history,
 rather than asserted from memory:
 
 - `crates/devflow-core/src/git.rs`, `crates/devflow-cli/tests/release_check.rs` and
   `35-03-SUMMARY.md` — all present.
-- `ae1dee8`, `6fe8862`, `d7527b8`, `a5ed1e9`, `3feb06a`, `6160dee` — all present in
+- `ae1dee8`, `6fe8862`, `d7527b8`, `a5ed1e9`, `3feb06a`, `6160dee`, `34aab4f` — all present in
   `git log 749a151..HEAD`.
+
+**Not all claims in this document rest on equally strong evidence, and the difference matters.**
+Everything from the plan proper is pinned by a test that runs on every `cargo test`, and both of
+its negative controls were verified capable of failing by deliberate sabotage. The
+post-completion `setsid` fix is not: its evidence is a one-off out-of-band pty measurement with a
+paired control, and **no committed test would fail if the `pre_exec` were removed**. Treat the
+`setsid` claim as "measured once, under a real controlling terminal, with a control" — not as
+"guarded by the suite" like the rest.
 
 ---
 *Phase: 35-loop-termination-and-baseline-correctness-999-77-999-78-999-*
