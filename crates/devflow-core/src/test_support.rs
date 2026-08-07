@@ -139,9 +139,197 @@ pub use crate::git::{
     ALSO_REDIRECTING_GIT_VARS, REPO_LOCAL_GIT_VARS, git_command, hermetic_command,
 };
 
+// ## The absent-`git` harness (35-01, criteria 1 and 6)
+//
+// **The `#[cfg(test)]` gate on this whole region is load-bearing and is the
+// reason there are two `NoGitPath` types in this workspace rather than one
+// shared one (35-01/F-2).**
+//
+// The enclosing module is gated `#[cfg(any(test, feature = "test-support"))]`
+// (`lib.rs`), so `devflow-cli` CAN reach it — it depends on `devflow-core`
+// with `features = ["test-support"]`. Two consequences, either of which alone
+// would rule out sharing:
+//
+//   1. `tempfile` is a DEV-dependency of `devflow-core`. In the
+//      `test-support`-feature build `devflow-cli` links, `cfg(test)` is false
+//      for this crate and its dev-dependencies are absent, so a
+//      `tempfile`-based guard exposed under the feature gate would not
+//      compile. Making it compile would mean promoting `tempfile` to an
+//      optional real dependency of a published crate.
+//   2. A guard reachable from `devflow-cli` would give a single test binary
+//      access to two guards backed by two different mutexes, which is exactly
+//      the `PATH` race the one-var-one-mutex invariant exists to prevent.
+//
+// The narrower `#[cfg(test)]` gate closes both: this region exists only in
+// `devflow-core`'s OWN test binary. `devflow-cli` cannot reach it in any
+// build, so no test binary can ever hold two `PATH` guards under two mutexes
+// — the race is prevented structurally, not by discipline. `devflow-cli`
+// carries its own identically-shaped `NoGitPath` guarded by its own single
+// `ENV_MUTEX`. Criterion 6 gets the same harness SHAPE rather than the same
+// symbol, deliberately.
+
+/// This crate's first and only `PATH` mutex.
+///
+/// `devflow-core` had zero `PATH` mutations before 35-01 (verified: `rg` for
+/// `set_var("PATH"` over `crates/devflow-core/src/` returned nothing, against
+/// six files in `crates/devflow-cli/src/`). It follows the same
+/// one-static-per-test-binary shape as the two other module-scoped env mutexes
+/// in this crate (`gates.rs`, `config.rs`), each of which guards a disjoint
+/// set of variables — `PATH` is guarded here and nowhere else in this crate.
+///
+/// A future author adding a second `PATH`-mutating fixture to `devflow-core`'s
+/// tests is joining this mutex, not creating another one.
+#[cfg(test)]
+pub(crate) static PATH_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquire [`PATH_MUTEX`], recovering the guard if a previous holder panicked.
+///
+/// **This is the intended entry point; do not call `PATH_MUTEX.lock().unwrap()`
+/// directly.** Mirrors `devflow-cli`'s `test_support::env_lock()`, including
+/// its reasoning for tolerating poison: the state this mutex guards is the
+/// process environment, and the only thing that mutates it here is
+/// [`NoGitPath`], which restores `PATH` in its `Drop` — and `Drop` runs during
+/// unwinding. By the time a poisoned guard reaches the next test, the state
+/// poisoning would warn about has already been restored.
+///
+/// That argument is conditional on the restore being an RAII `Drop` and not a
+/// trailing statement. Replacing [`NoGitPath`] with a trailing
+/// `set_var("PATH", original)` would convert this function from "tolerates
+/// poison because cleanup already happened" into "silently hands the next test
+/// a `PATH` naming a deleted directory", with no compiler error and no failing
+/// test to say so.
+#[cfg(test)]
+pub(crate) fn path_lock() -> std::sync::MutexGuard<'static, ()> {
+    PATH_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// RAII guard that REPLACES `PATH` with a deliberately EMPTY directory, so
+/// `git` cannot be resolved at all for the scope it is bound in.
+///
+/// **Why empty rather than a failing shim (35-01/F-1).** The consumers of
+/// [`crate::agent_result::phase_commit_count`] must distinguish "the git child
+/// could not be executed" from "git ran and reported zero". Only the first is
+/// a measurement failure, and only an UNRESOLVABLE binary produces it:
+/// `Command::output()` returns `Err(NotFound)` when the program cannot be
+/// spawned, whereas a shim that runs and exits non-zero returns `Ok(status)` —
+/// a real observation, which this crate deliberately maps to `Some(0)`. A test
+/// built on a failing shim would exercise the already-correct path while
+/// appearing to cover the new one.
+///
+/// Structurally identical to `devflow-cli`'s `test_support::NeutralPath` and
+/// `NoGitPath`: the guard owns the `TempDir`, so the directory outlives every
+/// use of the `PATH` that names it, and `Drop` restores the captured value
+/// before the `TempDir` is dropped (a type's own `Drop::drop` runs before its
+/// fields are dropped), so `PATH` never transiently names a deleted directory.
+/// The restore runs on EVERY exit path including a panicking one, which a
+/// trailing statement would not.
+///
+/// **The caller must already hold [`PATH_MUTEX`]** (via [`path_lock`]).
+/// `set_var` is process-wide and `cargo test` runs in parallel; this guard
+/// makes the restore unconditional, it does not make the mutation safe on its
+/// own. Hold it over exactly the one call under test and nothing more: this is
+/// the first fixture in this crate that makes `git` unresolvable process-wide,
+/// and sibling tests shelling out to `git` inside the guarded window fail
+/// spuriously.
+#[cfg(test)]
+pub(crate) struct NoGitPath {
+    _dir: tempfile::TempDir,
+    original: Option<std::ffi::OsString>,
+}
+
+#[cfg(test)]
+impl NoGitPath {
+    /// Named `install`, not `new`: binding it is not bookkeeping, it mutates
+    /// process-global state at the moment of the call.
+    pub(crate) fn install() -> Self {
+        // Deliberately empty — see the type's doc comment. Nothing is written
+        // into this directory, by design.
+        let dir = tempfile::tempdir().unwrap();
+        let original = std::env::var_os("PATH");
+        // SAFETY: the caller holds PATH_MUTEX (documented precondition), so
+        // no other test thread is reading or writing PATH concurrently.
+        unsafe { std::env::set_var("PATH", dir.path()) };
+        Self {
+            _dir: dir,
+            original,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for NoGitPath {
+    fn drop(&mut self) {
+        // SAFETY: still serialized under the PATH_MUTEX guard the caller holds
+        // for at least as long as this guard's own scope.
+        unsafe {
+            match &self.original {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NC-1 (35-VALIDATION.md), this crate's copy, and the reason it is
+    /// load-bearing rather than ceremony: criteria 1 and 6 both assert on
+    /// behaviour that occurs ONLY when `git` cannot be executed. If
+    /// [`NoGitPath`] silently failed to take effect — wrong `PATH` ordering, a
+    /// guard dropped early, an absolute-path `git` invocation — every
+    /// downstream assertion would still run and every one of them would pass
+    /// for the wrong reason. It must pass before any criterion-1 or
+    /// criterion-6 result is believed.
+    ///
+    /// The control is inside the test: the pre-guard call must succeed and the
+    /// post-drop call must succeed, so a guard that did nothing at all cannot
+    /// produce a green result — all three observations would agree and the
+    /// middle assertion would fail.
+    ///
+    /// `git` is invoked through [`git_command`], the same PATH-resolved
+    /// constructor production code uses (`git.rs`'s `git_command` ->
+    /// `hermetic_command` -> `Command::new("git")`), so this measures the
+    /// harness against the real spawn path rather than an approximation of it.
+    #[test]
+    fn no_git_path_makes_git_unresolvable_and_restores_it() {
+        let _guard = path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let path_before = std::env::var_os("PATH");
+
+        let before = git_command(dir.path()).arg("--version").output();
+        assert!(
+            before.is_ok(),
+            "control: `git` must be resolvable BEFORE the guard is installed, \
+             otherwise the middle assertion below proves nothing"
+        );
+
+        let during = {
+            let _no_git = NoGitPath::install();
+            git_command(dir.path()).arg("--version").output()
+        };
+        let err = during.expect_err("NoGitPath must make `git` unresolvable");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "the spawn must fail because the binary cannot be found — any other \
+             error kind means the guard blocked git for the wrong reason"
+        );
+
+        let after = git_command(dir.path()).arg("--version").output();
+        assert!(
+            after.is_ok(),
+            "control: `git` must be resolvable again once the guard has dropped"
+        );
+        assert_eq!(
+            std::env::var_os("PATH"),
+            path_before,
+            "PATH must be byte-identical to its pre-guard value after the guard drops"
+        );
+    }
 
     /// Positive case (25-11/999.47, the whole point of the barrier): a real
     /// child whose argv[0] basename is known and differs from this test
