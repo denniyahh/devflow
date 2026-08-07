@@ -344,6 +344,60 @@ Unsequenced items — not part of the active phase sequence. Promote with
 `/gsd-review-backlog` when ready; each carries accumulated context in its
 own `phases/999.N-*/CONTEXT.md`.
 
+### Phase 999.92: The 999.47 Regression Test Loses Its Own Fixture Shape Before It Asserts — Flaky, and Weak When Green (BACKLOG)
+
+**Linear:** [DEN-113](https://linear.app/denniskim/issue/DEN-113/99992-the-99947-regression-test-loses-its-own-fixture-shape-before-it)
+**Found:** 2026-08-07 by `/gsd-validate-phase 35`. Surfaced as a one-off flake during the phase
+audit; the weak-coverage half was found while diagnosing the flake, and is the more serious of the two.
+
+**Priority:** Medium | **Size:** S — one fixture, but the obvious one-line fix is the *wrong* fix
+(see below).
+
+**Not a recurrence of 999.47, and deliberately not filed there.** 999.47/DEN-72 is closed and
+`PROMOTED — Phase 25`: its production defect (`looks_like_devflow_process` returning `true` for a
+non-devflow process) was fixed, the barrier landed 2026-07-28, and CI failures went to zero. This is
+a defect in the *test fixture* that guards it — a different thing, and reopening a delivered entry
+would misfile it.
+
+**Two defects in one test**, `agent::tests::discover_stray_devflow_processes_rejects_the_999_47_false_positive_shape`
+(`crates/devflow-core/src/agent.rs:774`).
+
+**(1) The flake.** The fixture is `sh -c 'sleep 30' /tmp/devflow-scratch/looks-like-devflow`, and
+the test crosses `test_support::wait_for_exec_visibility(pid, "sh", …)` (`test_support.rs:92`)
+before asserting. But `/bin/sh` is bash, and bash `exec`s a lone simple command rather than forking
+for it — so `argv[0]` becomes `sleep` almost immediately, while the barrier polls for `sh` every
+2 ms. Measured directly on 2026-08-07: `argv[0]` is `sh` at t≈2 ms and `sleep` from t≈4 ms onward,
+so roughly one poll iteration ever sees the expected value. Miss it and the barrier burns its full
+`EXEC_VISIBILITY_WAIT` ceiling and fails the assertion.
+
+**(2) The serious half — the test is weak even when it passes.** After bash's second `exec` the
+process cmdline is plain `sleep 30`: **the devflow-looking path is gone from argv entirely.**
+Confirmed twice, by reading `/proc/PID/cmdline` after settle — the `looks-like-devflow` fragment is
+absent. So whenever this test goes green it is asserting that a plain `sleep 30` is not discovered,
+which is trivially true and is *not* the "999.47 false-positive shape" the test is named for: a
+process that merely mentions a devflow-looking path as an argument. The shape it exists to reject
+evaporates ~2 ms after spawn, before the census ever runs.
+
+**Why the obvious fix is wrong.** Changing the barrier to wait for `sleep` instead of `sh` removes
+the flake and makes the *wrong* test pass reliably — the fixture still holds no devflow-looking
+argv. The fixture itself has to keep that shape for the census's duration (e.g. a helper whose real
+argv contains the path, or a command bash will not optimise into an `exec`), and the fix should
+carry an assertion that the fragment is actually present in `/proc/PID/cmdline` at assert time — a
+premise check, so the test voids itself rather than passing vacuously if the shape is lost again.
+
+**This is the proxy-measurement class Phase 35 exists to close**, sitting inside the regression test
+for 999.47. A measurement adjacent to the question, reported as the answer.
+
+**Evidence status — read before acting.** The flake was observed **once**, by the phase-35 nyquist
+auditor. The validate-phase audit did **not** reproduce it: 10/10 targeted runs and 3/3 full-suite
+runs green, including two under the pinned container gate. Targeted runs lack the parallel
+contention the race needs, so that is weak counter-evidence rather than a refutation — but the
+frequency is unestablished and should not be assumed high. **Defect (2) is not probabilistic and
+does not depend on reproducing the flake**; it was verified directly and holds on every run.
+
+**Related:** 999.47/DEN-72 (the closed original), Phase 25's 25-11 (which added the barrier),
+999.88/DEN-109 (the sibling "assumed the ambient environment" mistake found the same day).
+
 ### Phase 999.91: Add a Doc Gate to `check.sh` That Denies Only the Rustdoc Lints Which Catch Real Errors (BACKLOG)
 
 **Linear:** [DEN-112](https://linear.app/denniskim/issue/DEN-112/99991-add-a-doc-gate-to-checksh-that-denies-only-the-rustdoc-lints)
@@ -482,7 +536,33 @@ external tooling touching the repo while a phase is in flight. Both real, both u
 **Related:** 999.79 (closed by 35-05, this is its residual), 999.84, DOGFOOD-01 (same unattended
 stall class).
 
-### Phase 999.88: The `setsid` Guard on the Tag-Signing Probe Has No Regression Test (BACKLOG)
+### Phase 999.88: The `setsid` Guard on the Tag-Signing Probe Has No Regression Test (RESOLVED 2026-08-07)
+
+> **RESOLVED 2026-08-07 by `/gsd-validate-phase 35`**, which found this same gap independently as
+> Phase 35's only outstanding Nyquist gap (35-03's D8, `human_judgment: true`) and closed it rather
+> than record it Manual-Only a second time.
+>
+> **Delivered:** `git::tests::the_signing_probe_is_not_captured_by_a_controlling_terminal`
+> (commit `8917dcd`, +339 test-only lines; arm-0 correction in `d33a837`). It builds exactly what
+> "What the test needs" below specifies — a pty acquired via `TIOCSCTTY`, and an `open("/dev/tty")`
+> premise check in the child that voids the run instead of passing it if the terminal did not take.
+> Three arms, of which the first two must disagree or the test fails as `PREMISE FAILED` rather than
+> reporting a regression.
+>
+> **The guard is no longer held in place by nothing** — verified by performing the mutation, not by
+> reading the fix: commenting out the `pre_exec` block yields `test result: FAILED. 0 passed;
+> 1 failed` with a `REGRESSION:` panic, against a no-terminal control that still exits in ~5 ms.
+> Re-performed after the arm-0 correction. Green on host and under the pinned container gate
+> (`scripts/check-in-container.sh all`, exit 0, 956 passed across 22 binaries).
+>
+> **What it still does not establish:** n=1 per arm, one host and one container, OpenSSH 10.4p1 /
+> 9.2p1, one ed25519 encrypted key. It is timing-based, so a pathologically loaded box could false-red
+> it; it cannot silently pass, because both failure directions are loud.
+>
+> **Cost of the lesson:** the first version passed on a terminal-less host and hard-failed the
+> container gate, because `check-in-container.sh` runs `docker run --rm -t` and the test inherited
+> that pty as its controlling terminal. See 999.92 — the same "assumed the ambient environment"
+> mistake, in a different fixture.
 
 **Linear:** [DEN-109](https://linear.app/denniskim/issue/DEN-109/99988-the-setsid-guard-on-the-tag-signing-probe-has-no-regression-test)
 **Found:** 2026-08-07, Phase 35 execution, while folding 35-03's deferred `setsid` fix in on

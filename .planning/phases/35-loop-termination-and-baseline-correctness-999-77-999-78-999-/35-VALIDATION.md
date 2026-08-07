@@ -399,12 +399,45 @@ Per this repo's standing rule, the subagent's report was treated as a claim:
   out), the 10-test `release_check` target, and `./scripts/check.sh all` → exit 0, **956 passed;
   0 failed** across 22 binaries.
 
+### The container gate caught what the host run could not
+
+**The first version of D8's test passed on this host and hard-failed the pre-push gate.** Running
+`scripts/check-in-container.sh all` — the exact command `pre-push` runs, pinned image, `taskset -c
+0,1` — returned exit 101 with:
+
+```
+control uncalibrated: ssh-keygen blocked with NO controlling terminal,
+so nothing measured below can be attributed to the terminal
+```
+
+**Root cause, confirmed with a negative control.** The gate runs `docker run --rm -t`; the `-t`
+allocates a pty, so the test binary *inherits* a controlling terminal. Arm 0 assumed the ambient
+environment had none — true under this session's host shell, false in the container. Verified
+directly against the same image: **with** `-t` → "HAS controlling terminal"; **without** `-t` →
+"no controlling terminal".
+
+The calibration guard behaved correctly — it refused to attribute a block to `setsid` once its own
+baseline was contaminated, rather than passing or emitting a false regression. But the result was a
+red gate for an environmental reason.
+
+**Fixed in `d33a837`:** arm 0 now spawns via `spawn_detached_from_terminal`, putting the child in a
+fresh session with no pty to acquire, so "no controlling terminal" holds *by construction* rather
+than by inheritance. Arm 1 was already correct (`setsid` then `TIOCSCTTY` on the pty it owns).
+The mutation was **re-performed after this change** — still `1 failed` with `REGRESSION:`, not
+`PREMISE FAILED`, on a 5.08 ms baseline — because a change to the control arm invalidates the
+earlier demonstration. Container gate re-run: **exit 0, 956 passed across 22 binaries.**
+
+**The lesson generalises, and it is this phase's own thesis.** The auditor had "corroborated" the
+mechanism in the container with an equivalent C harness and reported it green. That corroboration
+was a **proxy**: it did not reproduce the `-t` condition, so it agreed with the host result and
+disagreed with the real thing. A second measurement that cannot fail where the first would is not a
+control. Filed as the sibling of 999.92/DEN-113, which is the same mistake in a different fixture.
+
 ### What this audit does NOT establish
 
-- **D8's test is n=1 per arm, one host**, Fedora, OpenSSH 10.4p1, one ed25519 encrypted key. The
-  auditor corroborated the *mechanism* in the pinned CI image (Debian bookworm, OpenSSH 9.2p1) with
-  an equivalent C harness, but **the Rust test itself has never run under the container gate or on
-  a CI runner.** Its first container run is unobserved.
+- **D8's test is n=1 per arm, one host and one container**, Fedora/OpenSSH 10.4p1 and Debian
+  bookworm/OpenSSH 9.2p1, one ed25519 encrypted key. **It has now run under the pinned container
+  gate** (green after `d33a837`), but never on a GitHub runner.
 - **It is timing-based.** A pathologically loaded host could push the measurement arm past its 3 s
   cap and produce a false red. It cannot silently pass — both failure directions are loud.
 - **It proves the production code drops the terminal; the *mutation* is what ties that to the
@@ -414,14 +447,26 @@ Per this repo's standing rule, the subagent's report was treated as a claim:
 
 ### Carried forward — not fixed here
 
-- **`agent::tests::discover_stray_devflow_processes_rejects_the_999_47_false_positive_shape` is
-  flaky.** The auditor observed one failure and diagnosed it: the fixture is `sh -c 'sleep 30'`,
-  `/bin/sh` is bash, and bash `exec`s a lone simple command, so `argv[0]` becomes `sleep` within
-  ~1 ms while `wait_for_exec_visibility(pid, "sh", …)` polls for `sh` every 2 ms. Miss the window
-  and the barrier burns its 10 s ceiling. **The audit did not reproduce it** — 10/10 targeted runs
-  and 2/2 full-suite runs green — and targeted runs lack the parallel contention the race needs, so
-  that is weak counter-evidence, not a refutation. Pre-existing, unrelated to this phase's diff,
-  and a member of the 999.47 class (ROADMAP:2132). **Implementation defect, not a validation gap.**
+- **`agent::tests::discover_stray_devflow_processes_rejects_the_999_47_false_positive_shape` —
+  filed as 999.92/DEN-113.** Two defects, and the second is the serious one. (1) The flake: `/bin/sh`
+  is bash, bash `exec`s a lone simple command, so `argv[0]` becomes `sleep` at t≈4 ms while
+  `wait_for_exec_visibility(pid, "sh", …)` polls for `sh` every 2 ms — measured directly.
+  (2) **The test is weak even when green:** after that `exec` the cmdline is plain `sleep 30` and the
+  devflow-looking path is *gone from argv entirely* (confirmed twice), so a passing run asserts that
+  a plain `sleep` is not discovered — not the 999.47 shape the test is named for. The obvious fix
+  (wait for `sleep`) would make the wrong test pass reliably. **The audit did not reproduce the
+  flake** — 10/10 targeted and 3/3 full-suite runs green, two of them in the container — and
+  targeted runs lack the parallel contention the race needs, so that is weak counter-evidence rather
+  than a refutation; defect (2) does not depend on it. Pre-existing, not in this phase's diff.
+  **Implementation defect, not a validation gap.**
+- **`staleness::tests::wr01_clean_tree_strict_ancestor_build_is_stale_and_hard_blocks` failed once
+  in the container** (`unwrap_err()` on an `Ok`) and passed on the re-run, with no change to that
+  file. `staleness.rs` was last touched in Phase 34 and is not in Phase 35's diff. Flaky and
+  state-dependent rather than broken; **not root-caused**, and left unfiled pending a second
+  observation.
+- **999.88/DEN-109 is resolved by this audit** — it had already filed the D8 gap independently
+  during 35-03, and the test built here matches its "What the test needs" specification. Marked
+  RESOLVED in ROADMAP.md and closed in Linear.
 - **`35-REVIEW.md` frontmatter still reads `status: issues_found`** with `critical: 1, warning: 7`,
   although CR-01 and WR-01…WR-07 each have a landed fix commit (`cf462ec`…`f8dac07`). The artifact
   is stale, not the code. Out of scope for validate-phase.
