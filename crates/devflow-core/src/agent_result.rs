@@ -2004,6 +2004,23 @@ pub fn evaluate_layer2(
 /// masquerade as ambiguous-but-fine; the reason flags that human review is
 /// needed. This only fires when neither Layer 1 nor Layer 2 produced a
 /// definitive result.
+///
+/// **The split is three-way, not two-way (35-01/F-4).** The two cases above
+/// both assume the commit count was actually established. A third case —
+/// the count could not be MEASURED at all — is classified `Unknown` with
+/// `commits` left absent and a reason naming the measurement failure. It is
+/// not `Failed`: that asserts a negative the evidence does not support, and
+/// on a transient `git` fault it is the exact misclassification this layer
+/// used to produce. An unmeasurable count is strictly less certain than the
+/// `commits > 0` case already called `Unknown`, so `Unknown` is the
+/// consistent answer.
+///
+/// The count now comes from [`phase_commit_count`] rather than a second
+/// inline derivation. This layer previously ran its own `rev-list --count`
+/// that fell soft to a zero default, an independent copy of the same lossy
+/// collapse — so fixing only [`evaluate_layer2`] relocated the
+/// misclassification here instead of removing it. The two measurable arms'
+/// behaviour and reason strings are unchanged.
 pub fn evaluate_layer3(
     project_root: &Path,
     phase: u32,
@@ -6791,6 +6808,30 @@ mod tests {
         assert_eq!(result.commits, Some(0));
         assert!(result.reason.unwrap().contains("no commits"));
     }
+
+    // HARDEN-07 / criterion 6's two discriminating tests — the layer-level one
+    // on `evaluate_layer2` and the cascade-level one on
+    // `evaluate_agent_result` — do NOT live here. They need `git` to be
+    // unresolvable while `project_root` still EXISTS (Layer 2 reads its exit
+    // file from that root, so an unspawnable working directory would make the
+    // exit read fail and return `Ok(None)` for the wrong reason), and only a
+    // `PATH` guard delivers that combination.
+    //
+    // A process-global `PATH` guard is not viable in THIS test binary:
+    // `devflow-core` shells out to `git` from eight modules that run in
+    // parallel, and tests call production code that spawns `git` directly, so
+    // no fixture-helper lock can cover them. Measured twice — 1-5 unrelated
+    // failures per run before any serialization, and still 1 failure in 8 runs
+    // after this module's own `git()` helper took the lock
+    // (`evaluate_layer2_exit_zero_no_commits_is_failed`, whose `git` call
+    // happens inside `evaluate_layer2` itself).
+    //
+    // Both tests therefore live in `devflow-cli`'s `pipeline_outcomes.rs`,
+    // whose test binary routes every `PATH` mutation through one `ENV_MUTEX`
+    // its `git`-touching tests already hold. They call these same `pub`
+    // functions directly, so the assertion is unchanged — only the binary it
+    // runs in differs. `evaluate_layer2_exit_zero_no_commits_is_failed` below
+    // remains their NC-11 opposite-result control and is unedited.
 
     #[test]
     fn evaluate_layer2_nonzero_exit_is_failed() {
