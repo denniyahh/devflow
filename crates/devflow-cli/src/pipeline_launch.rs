@@ -2436,6 +2436,16 @@ mod tests {
         write_declared_checkpoint_plan(&worktree, phase);
         write_plan_without_checkpoint(root, phase);
         write_confirmed_checkpoint_capture(root, phase);
+        // Inert on the path this test asserts — the auto-decide arm returns
+        // before `run_gate` is ever reached, so nothing reads this response.
+        // It exists so that the REVERTED form of the call site (the D-06
+        // demonstration) produces a real assertion failure instead of
+        // hanging: falling through to the never-silent gate makes `run_gate`
+        // poll for an operator response that no test will ever write, and an
+        // unbounded hang cannot distinguish a failed assertion from a wedged
+        // harness. The three negative siblings below pre-write it for the
+        // same reason.
+        write_abort_gate_response(root, phase, Stage::Code);
 
         // D-06's mechanical control, asserted BEFORE `advance()` so a fixture
         // that has stopped discriminating reports as a fixture failure rather
