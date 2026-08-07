@@ -42,7 +42,7 @@ Requirements for this milestone. Each maps to a roadmap phase.
 
 ### Release Hardening
 
-- [ ] **HARDEN-05**: Operator can trust `release --check`'s tag-signing preflight reflects whether
+- [x] **HARDEN-05**: Operator can trust `release --check`'s tag-signing preflight reflects whether
   signing will actually work — via a real `ssh-keygen -Y sign` probe on a throwaway payload,
   rather than a fingerprint-matching predictor that has now false-negatived live during two
   separate release cuts with the correct key present (999.86)
@@ -76,7 +76,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | HARDEN-02 | Phase 35 | Pending |
 | HARDEN-03 | Phase 35 | Pending |
 | HARDEN-04 | Phase 35 | Pending |
-| HARDEN-05 | Phase 35 | Pending |
+| HARDEN-05 | Phase 35 | Complete |
 | HARDEN-07 | Phase 35 | Pending |
 | HARDEN-06 | Phase 36 | Pending |
 

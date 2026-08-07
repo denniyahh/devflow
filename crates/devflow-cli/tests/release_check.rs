@@ -250,9 +250,14 @@ fn release_check_states_publish_order() {
 /// filesystem path — a REAL disposable ed25519 keypair (private + public)
 /// is written directly inside the fixture, proving the check never echoes
 /// either, regardless of what's sitting alongside the public key on disk.
-/// `SSH_AUTH_SOCK` is removed (via `run_release`'s isolation) so this
-/// resolves deterministically to the "no ssh-agent reachable" branch
-/// rather than depending on any locally running agent.
+///
+/// Which branch this reaches changed with 35-03 and the redaction contract
+/// did not. The unencrypted private half sits beside the configured public
+/// key, so the probe signs and this now resolves to `Viable` — carrying
+/// only a `SHA256:` fingerprint. It no longer depends on agent state in
+/// either direction: the fixture key is generated fresh into a temporary
+/// directory, so no agent can be holding it, and the verdict comes from the
+/// on-disk key alone.
 #[test]
 fn release_check_signing_output_leaks_no_key_material_or_path() {
     let dir = tempfile::tempdir().unwrap();
@@ -309,12 +314,15 @@ fn release_check_signing_output_leaks_no_key_material_or_path() {
 /// reported as a missing key file — a false hard fail. This test proves
 /// both inline forms are now classified correctly at the CLI boundary and
 /// that the configured blob never reaches stdout, in whole or in part.
-/// `SSH_AUTH_SOCK`/`SSH_AGENT_PID` are removed (via `run_release`'s
-/// isolation), so both runs deterministically reach the shared
-/// "no ssh-agent reachable" arm rather than depending on a locally running
-/// agent — which also proves the inline value travelled all the way to
-/// that shared code path instead of short-circuiting on the path-existence
-/// check.
+///
+/// The arm both forms land on changed with 35-03. They used to reach the
+/// shared "no ssh-agent reachable" arm, which is the string this test
+/// asserted on; that reason no longer exists, because the predictor that
+/// produced it is gone. Under D-03 both forms now reach the fixed
+/// unprobed-inline `Unknown` arm instead. The discriminating property is
+/// unchanged and is what the assertion still tests: reaching that arm at
+/// all proves the inline value travelled past the path branch rather than
+/// short-circuiting on its path-existence check.
 #[test]
 fn release_check_inline_signingkey_is_not_reported_missing_and_leaks_no_key_material() {
     let dir = tempfile::tempdir().unwrap();
@@ -393,8 +401,8 @@ fn release_check_inline_signingkey_is_not_reported_missing_and_leaks_no_key_mate
         "key:: form: must never panic, got: {stdout}"
     );
     assert!(
-        stdout.contains("no ssh-agent reachable"),
-        "key:: form: expected the inline value to reach the shared agent-status arm, got: {stdout}"
+        stdout.contains("an inline user.signingkey is not probed"),
+        "key:: form: expected the inline value to reach the unprobed-inline arm, got: {stdout}"
     );
 
     // Form 2 (D-01 rule 2): the raw deprecated `ssh-` form (no `key::` prefix).
@@ -434,15 +442,15 @@ fn release_check_inline_signingkey_is_not_reported_missing_and_leaks_no_key_mate
         "raw ssh- form: must never panic, got: {stdout}"
     );
     assert!(
-        stdout.contains("no ssh-agent reachable"),
-        "raw ssh- form: expected the inline value to reach the shared agent-status arm, got: {stdout}"
+        stdout.contains("an inline user.signingkey is not probed"),
+        "raw ssh- form: expected the inline value to reach the unprobed-inline arm, got: {stdout}"
     );
 }
 
 /// A `PATH` containing ONLY a symlink to the real `git` binary — unlike a
-/// bare directory restriction (e.g. `/usr/bin`), this guarantees `ssh-add`/
-/// `ssh-keygen` are genuinely absent regardless of the host (some distros,
-/// including this one, ship both alongside `git` in `/usr/bin`).
+/// bare directory restriction (e.g. `/usr/bin`), this guarantees
+/// `ssh-keygen` is genuinely absent regardless of the host (some distros,
+/// including this one, ship it alongside `git` in `/usr/bin`).
 fn git_only_path() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let which = Command::new("which")
@@ -456,10 +464,14 @@ fn git_only_path() -> tempfile::TempDir {
     dir
 }
 
-/// Task 3 fail-soft edge (20d/empty): `ssh-add` itself is unavailable. The
-/// check must degrade to an actionable message, never crash.
+/// Fail-soft edge (20d/empty, rewritten by 35-03): the tool the check now
+/// actually needs — `ssh-keygen`, which performs the signing probe — is
+/// unavailable. The check must degrade to an actionable message, never
+/// crash. `git_only_path` already produces exactly the PATH shape required
+/// (only `git` resolves); only the tool whose absence is being exercised
+/// has changed.
 #[test]
-fn release_check_signing_degrades_when_ssh_add_absent() {
+fn release_check_signing_degrades_when_ssh_keygen_absent() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     init_repo(root);
@@ -485,9 +497,13 @@ fn release_check_signing_degrades_when_ssh_add_absent() {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(
-        stdout.contains("ssh-add not found"),
+        stdout.contains("ssh-keygen not found"),
         "expected a fail-soft 'tool not found' message, got: {stdout}\nstderr: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !stdout.contains(root.to_str().unwrap()),
+        "fail-soft signing output must never contain a filesystem path, got: {stdout}"
     );
     assert!(
         !stdout.contains("panicked"),
@@ -495,13 +511,20 @@ fn release_check_signing_degrades_when_ssh_add_absent() {
     );
 }
 
-/// D-06/D-08/D-10/D-11 (24-02 Task 2): the fail-soft proof for an inline
-/// `user.signingkey` when the ssh tooling itself is absent from `PATH`. No
-/// real keypair is generated — the point under test is the classification
-/// (inline vs. path), not fingerprinting, and the tooling that would
-/// fingerprint it is deliberately absent here.
+/// D-06/D-08/D-10/D-11 (24-02 Task 2), premise rewritten by 35-03: an
+/// inline `user.signingkey` degrades to a fail-soft warn **without being
+/// probed at all**.
 ///
-/// The load-bearing assertion is the absence of the signing check's
+/// The old version of this test proved an inline value degraded when the
+/// ssh tooling was absent from `PATH`. That premise no longer exists: under
+/// D-03 an inline value returns `Unknown` regardless of tooling, because it
+/// never reaches the probe. So this runs with a NORMAL `PATH` — every tool
+/// present — which is what makes the result a proof of "never probed"
+/// rather than of "failed to probe". Swapping the tool name in the old
+/// assertion would have left a test whose name and body claimed a
+/// tooling-dependence the code no longer has.
+///
+/// The load-bearing assertion remains the absence of the signing check's
 /// `NotViable` remediation hint (copied character-for-character from
 /// `check_signing` in `commands.rs`): `install_hint` is `None` on the
 /// `Unknown` arm and `Some(...)` only on `NotViable`, so a hard-failing
@@ -510,7 +533,7 @@ fn release_check_signing_degrades_when_ssh_add_absent() {
 /// missing-key-file `NotViable` and printed exactly this hint — that is the
 /// headline defect this assertion falsifies.
 #[test]
-fn release_check_inline_signingkey_degrades_to_warn_when_ssh_tooling_absent() {
+fn release_check_inline_signingkey_warns_without_probing() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     init_repo(root);
@@ -519,21 +542,12 @@ fn release_check_inline_signingkey_degrades_to_warn_when_ssh_tooling_absent() {
     let inline_blob = "key::ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFAKEFIXTUREKEYMATERIALZZZZZZZZZZZZZZZZZZZZZZ devflow-fixture";
     git(root, &["config", "user.signingkey", inline_blob]);
 
-    let isolated_home = tempfile::tempdir().unwrap();
-    let path_dir = git_only_path();
-    let output = Command::new(devflow_bin())
-        .arg("release")
-        .arg("--check")
-        .arg(root)
-        .env("HOME", isolated_home.path())
-        .env("PATH", path_dir.path())
-        .output()
-        .expect("spawn devflow release");
+    let output = run_release(root, &["--check"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(
-        stdout.contains("ssh-add not found"),
-        "expected the fail-soft 'ssh-add not found' reason (D-06), got: {stdout}\nstderr: {}",
+        stdout.contains("an inline user.signingkey is not probed"),
+        "expected the fixed inline fail-soft reason (D-03/A-17), got: {stdout}\nstderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(

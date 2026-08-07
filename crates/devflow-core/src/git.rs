@@ -1,9 +1,9 @@
 //! Git-flow operations implemented with plain `git` commands.
 
 use crate::config::GitFlowConfig;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 /// Errors produced by git-flow operations.
@@ -721,34 +721,6 @@ fn topo_sort(names: Vec<String>, edges: Vec<(String, String)>) -> Vec<String> {
 // tag-signing viability (20d, Pattern 4)
 // ---------------------------------------------------------------------------
 
-/// Pure classification of `ssh-add -l`'s exit code into an actionable
-/// signing-viability status. Isolated from any I/O so it can be
-/// unit-tested for all three documented exit codes without a live agent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SigningStatus {
-    /// Exit 2 — no ssh-agent reachable (`SSH_AUTH_SOCK` unset or dead).
-    NoAgent,
-    /// Exit 1 — agent reachable but has no identities loaded.
-    AgentEmpty,
-    /// Exit 0 — agent has at least one key loaded (caller still must check
-    /// whether it's THIS key, via a fingerprint match).
-    KeysListed,
-    /// Any other exit code — genuinely unexpected; degrade rather than
-    /// crash or silently misclassify.
-    Unknown(i32),
-}
-
-/// Map `ssh-add -l`'s exit code to a [`SigningStatus`] (Pattern 4: exit
-/// 2 = no agent, 1 = agent-but-empty, 0 = keys listed).
-pub fn classify_ssh_add_status(exit_code: i32) -> SigningStatus {
-    match exit_code {
-        2 => SigningStatus::NoAgent,
-        1 => SigningStatus::AgentEmpty,
-        0 => SigningStatus::KeysListed,
-        other => SigningStatus::Unknown(other),
-    }
-}
-
 /// Outcome of the tag-signing viability check. Carries only a boolean-ish
 /// status plus an optional PUBLIC key fingerprint — never private key
 /// material or a full filesystem path (T-20-04, ASVS V6 / WR-02 — mirrors
@@ -822,55 +794,227 @@ fn inline_signing_key_blob(signingkey: &str) -> Option<&str> {
     }
 }
 
-/// `ssh-keygen -lf -`'s fingerprint (`SHA256:...`) for an inline key blob
-/// piped over stdin — mirrors [`public_key_fingerprint`]'s `Option<String>`
-/// return, fail-soft `.ok()?` chain, and identical output parse (D-05: the
-/// output shape is the same whether the key arrived by path or by stdin).
+/// The SSHSIG namespace `git` itself writes into a tag signature.
 ///
-/// The blob is written to the child's stdin ONLY — never as an argv element
-/// and never through a temp file (D-09): argv is world-readable via
-/// `/proc/<pid>/cmdline`. A later refactor that passes the blob as a
-/// `Command` argument is a security regression, not a cleanup.
+/// Decoded byte-for-byte out of a real git-produced SSHSIG blob — this
+/// repository's own `v2.4.0` signed tag. After the `SSHSIG` magic and the
+/// uint32 version come the length-prefixed public key and then the
+/// namespace field, which reads `\0\0\0\x03git`; the following `sha512`
+/// hash-algorithm field lands exactly where that length says it should,
+/// which is what makes the offset reading self-checking rather than a
+/// guess.
 ///
-/// Every failure mode — `ssh-keygen` absent, a non-zero exit, unparseable
-/// stdout, or the empty blob produced by a bare `key::` value — returns
-/// `None` here, which the caller routes to `SigningViability::Unknown`,
-/// never a hard-fail `NotViable` (D-06). That includes the empty-blob case:
-/// `ssh-keygen` exits non-zero on empty stdin, which this function surfaces
-/// as `None` with no special-case branch.
-fn inline_key_fingerprint(key_blob: &str) -> Option<String> {
-    let mut child = Command::new("ssh-keygen")
-        .args(["-lf", "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
+/// Do NOT re-derive this value from documentation or from memory. The
+/// probe's entire worth is that it performs the operation git performs
+/// rather than approximating it, and a namespace that differs from git's
+/// would silently make the probe measure something git never does.
+const SSH_SIGN_NAMESPACE: &str = "git";
 
-    // `.take()` then `drop()` positively closes the stdin pipe before
-    // `wait_with_output()` — a borrow via `.as_mut()` happens to work on
-    // this host but is not a documented guarantee and could hang on a
-    // differently-shaped input.
-    let mut stdin = child.stdin.take()?;
-    stdin.write_all(key_blob.as_bytes()).ok()?;
-    drop(stdin);
+/// Wall-clock ceiling for the signing probe (D-01).
+///
+/// `SSH_ASKPASS_REQUIRE=never` closes the passphrase-prompt route; this
+/// closes the rest. Both are required: the env var alone leaves non-askpass
+/// blocking routes open (a wedged `ssh-agent`, a stalled PKCS11 provider —
+/// reasoned, not measured), and a timeout alone would turn a working
+/// graphical askpass into a false `NotViable`.
+const SSH_SIGN_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
-    let output = child.wait_with_output().ok()?;
-    if !output.status.success() {
-        return None;
+/// Poll interval while waiting for the probe child to exit.
+const SSH_SIGN_PROBE_POLL: Duration = Duration::from_millis(25);
+
+/// A probe-workspace directory name unique to each individual CALL (F-8).
+///
+/// Per-*process* uniqueness is not enough: `cargo test` runs tests as
+/// parallel threads inside one process, so a name derived from the process
+/// id alone is shared by every concurrent probe. Two probes would collide,
+/// the loser's non-recursive `create_dir` would fail, and it would fail
+/// soft to `Unknown` — a flaky result that points at the probe rather than
+/// at the caller.
+///
+/// Three parts, `std` only (this crate adds no dependency): the process id,
+/// a process-wide counter incremented on every call, and a sub-millisecond
+/// time component. Extracted as its own function so the uniqueness property
+/// can be asserted directly rather than inferred from a probe result.
+fn probe_workspace_name() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let seq = PROBE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "devflow-sign-probe-{}-{}-{}",
+        std::process::id(),
+        seq,
+        nanos
+    )
+}
+
+/// What one run of the signing probe established. Five outcomes, mapped to
+/// fixed reason strings by class at the single call site — never composed
+/// from `ssh-keygen`'s own output (D-02, D-08).
+enum SignProbeOutcome {
+    /// The child exited zero: this key really can sign.
+    Signed,
+    /// The child exited non-zero: this key really cannot sign.
+    Rejected,
+    /// The child outlived [`SSH_SIGN_PROBE_TIMEOUT`] and was killed and
+    /// reaped.
+    TimedOut,
+    /// The child could not be spawned — `ssh-keygen` is absent.
+    ToolMissing,
+    /// The probe could not be set up or supervised at all (its workspace
+    /// could not be created, the payload could not be written, or the child
+    /// could not be polled). Fail-soft: an infrastructure problem is not
+    /// evidence about the key.
+    NotRun,
+}
+
+/// Sign throwaway bytes with the configured key and report only how that
+/// went. Creates a private workspace, runs the probe inside it, and removes
+/// the workspace on every exit path — including the timeout path, since
+/// `ssh-keygen -Y sign` writes its signature as a sibling of the payload
+/// (T-35-13: both live and die inside this one directory).
+fn run_ssh_sign_probe(key_path: &Path) -> SignProbeOutcome {
+    let workspace = std::env::temp_dir().join(probe_workspace_name());
+
+    // Non-recursive on purpose (T-35-12). `create_dir` FAILS when the path
+    // already exists, so a pre-planted directory or symlink cannot redirect
+    // where the payload is written; `create_dir_all` would accept one
+    // silently. `tempfile` is a dev-dependency of this crate and is
+    // unavailable to production code, and no dependency may be added, so
+    // this is `std` only.
+    if std::fs::create_dir(&workspace).is_err() {
+        return SignProbeOutcome::NotRun;
     }
-    String::from_utf8_lossy(&output.stdout)
-        .split_whitespace()
-        .nth(1)
-        .map(str::to_string)
+
+    let outcome = sign_probe_within(&workspace, key_path);
+    let _ = std::fs::remove_dir_all(&workspace);
+    outcome
+}
+
+/// The probe proper, with `workspace` already created and guaranteed to be
+/// removed by the caller.
+fn sign_probe_within(workspace: &Path, key_path: &Path) -> SignProbeOutcome {
+    // Bytes the probe generated itself, inside its own private directory
+    // (T-35-13). A viability check must never become an unauthorised
+    // signing operation over real content, so nothing from the operator's
+    // working tree is ever signed or even read here.
+    let payload = workspace.join("payload");
+    if std::fs::write(&payload, b"devflow signing viability probe\n").is_err() {
+        return SignProbeOutcome::NotRun;
+    }
+
+    let (Some(key_arg), Some(payload_arg)) = (key_path.to_str(), payload.to_str()) else {
+        return SignProbeOutcome::NotRun;
+    };
+
+    let mut command = Command::new("ssh-keygen");
+    command
+        .args([
+            "-Y",
+            "sign",
+            "-n",
+            SSH_SIGN_NAMESPACE,
+            "-f",
+            key_arg,
+            payload_arg,
+        ])
+        // D-01: closes the ASKPASS route, so an encrypted key cannot park an
+        // unattended preflight on an askpass helper. It does NOT close the
+        // /dev/tty route — see the `setsid` call below.
+        .env("SSH_ASKPASS_REQUIRE", "never")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        // The child's stderr is discarded here and read by nobody: it
+        // embeds the configured key path verbatim (`Couldn't load public
+        // key ./does-not-exist.pub`), so reproducing any part of it in a
+        // reason string would violate D-08's redaction contract. The exit
+        // code is the sole verdict (D-02).
+        .stderr(Stdio::null());
+
+    // SAFETY: `setsid` is a bare syscall and async-signal-safe, which is the
+    // only requirement `pre_exec` imposes.
+    //
+    // Detach from any controlling terminal before exec. `SSH_ASKPASS_REQUIRE
+    // =never` alone is NOT sufficient: OpenSSH only consults it once
+    // `open("/dev/tty")` has failed, so on a host that HAS a controlling
+    // terminal `ssh-keygen` prompts for the passphrase on the terminal
+    // regardless of the variable and blocks there until the ceiling expires.
+    // Measured on this host with a real pty: 10.06s (i.e. the whole
+    // SSH_SIGN_PROBE_TIMEOUT) before the fix, 0.02s after. Dropping the
+    // controlling terminal makes that `open` fail, which is the condition
+    // the variable is gated on.
+    //
+    // The failure is ignored deliberately. `setsid` only fails when the
+    // caller is already a process-group leader, which a freshly forked child
+    // is not; and if it somehow did fail, the probe degrades to exactly the
+    // pre-fix behaviour, which the wall-clock ceiling already bounds. Turning
+    // it into a spawn error would be worse: `spawn` failure is classified as
+    // absent tooling, so it would surface as a false "ssh-keygen not found".
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(&mut command, || {
+            libc::setsid();
+            Ok(())
+        });
+    }
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => return SignProbeOutcome::ToolMissing,
+    };
+
+    // Bounded wait, following `canary.rs`'s `reap` shape: poll until the
+    // deadline, then kill and wait so no child is left behind.
+    let deadline = Instant::now() + SSH_SIGN_PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return if status.success() {
+                    SignProbeOutcome::Signed
+                } else {
+                    SignProbeOutcome::Rejected
+                };
+            }
+            Ok(None) => {}
+            Err(_) => {
+                // Could not poll: nothing was established about the key, so
+                // reap the child and degrade rather than inventing a verdict.
+                let _ = child.kill();
+                let _ = child.wait();
+                return SignProbeOutcome::NotRun;
+            }
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(SSH_SIGN_PROBE_POLL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    SignProbeOutcome::TimedOut
 }
 
 /// `gpg.format == "ssh"` branch (Pattern 4): `user.signingkey` must be set.
 /// Its value is classified by git's own prefix rules (D-01) into either an
 /// inline key blob or a filesystem path; only a path value is required to
-/// exist. `ssh-add -l`'s exit code then determines viability. On a match,
-/// only the matched public key's `SHA256:` fingerprint is reported — never
-/// the configured value in any form (D-08's redaction contract, unchanged).
+/// exist, and only a path value is probed (D-03).
+///
+/// Viability is then established by **performing the operation** — signing
+/// throwaway bytes with `ssh-keygen -Y sign` — rather than by predicting it
+/// from `ssh-add -l`. The predictor this replaced inferred viability from
+/// agent membership, which is not a necessary condition for `git tag -s` to
+/// succeed: an unencrypted private key sitting beside the configured public
+/// key signs fine with no agent at all. That gap false-negatived live on
+/// two separate release cuts (999.86). A probe cannot drift out of sync
+/// with git's real behaviour because it has no independent behaviour.
+///
+/// The probe's exit code is the sole verdict (D-02) and its stderr is never
+/// re-emitted; on success only the public key's `SHA256:` fingerprint is
+/// reported, never the configured value in any form (D-08's redaction
+/// contract, unchanged).
 fn check_ssh_signing_viability(project_root: &Path) -> SigningViability {
     let Some(signingkey) = git_config(project_root, "user.signingkey") else {
         return SigningViability::NotViable {
@@ -880,66 +1024,49 @@ fn check_ssh_signing_viability(project_root: &Path) -> SigningViability {
 
     // Mirrors `man git-config`'s user.signingKey precedence (D-01): key::
     // form, then deprecated raw ssh- form, else a path. Never stat a path
-    // for a prefix-matched value (D-02).
-    let inline_blob = inline_signing_key_blob(&signingkey);
+    // for a prefix-matched value (D-02). Classification runs BEFORE the
+    // value is treated as a filesystem path, so an inline value never
+    // reaches the `.exists()` check below.
+    if inline_signing_key_blob(&signingkey).is_some() {
+        // D-03/A-17: inline values are not probed at all. Probing one would
+        // mean materialising the blob to a temp file — measured to work,
+        // declined on surface cost. The operator gets no verdict here
+        // rather than a wrong one.
+        return SigningViability::Unknown {
+            reason: "cannot verify signing viability — an inline user.signingkey is not probed"
+                .into(),
+        };
+    }
 
     // Path branch keeps today's early return, byte-for-byte (D-12): the
     // `.exists()` check runs first and a missing file still returns the
-    // existing missing-key-file `NotViable` before `ssh-add` is ever
-    // spawned. No `.exists()` call executes for a prefix-matched value
-    // (RESEARCH Pitfall 3: an extra defensive stat here is exactly the
-    // divergence-from-git this phase exists to remove).
-    if inline_blob.is_none() {
-        let key_path = Path::new(&signingkey);
-        if !key_path.exists() {
-            return SigningViability::NotViable {
-                reason: "user.signingkey is set but the key file does not exist".into(),
-            };
-        }
+    // existing missing-key-file `NotViable` before anything is spawned.
+    let key_path = Path::new(&signingkey);
+    if !key_path.exists() {
+        return SigningViability::NotViable {
+            reason: "user.signingkey is set but the key file does not exist".into(),
+        };
     }
 
-    let output = match Command::new("ssh-add").arg("-l").output() {
-        Ok(out) => out,
-        Err(_) => {
-            return SigningViability::Unknown {
-                reason: "cannot verify signing viability — ssh-add not found".into(),
-            };
-        }
-    };
-    let exit_code = output.status.code().unwrap_or(-1);
-    match classify_ssh_add_status(exit_code) {
-        SigningStatus::NoAgent => SigningViability::NotViable {
-            reason: "no ssh-agent reachable (SSH_AUTH_SOCK unset or dead)".into(),
+    // Fixed reason strings keyed by failure class (D-02) — none is composed
+    // from `ssh-keygen`'s output, and none names the configured key, a path,
+    // or any part of the child's stderr. The two fail-soft classes keep the
+    // file's existing "cannot verify signing viability — " prefix.
+    match run_ssh_sign_probe(key_path) {
+        SignProbeOutcome::Signed => SigningViability::Viable {
+            fingerprint: public_key_fingerprint(key_path),
         },
-        SigningStatus::AgentEmpty => SigningViability::NotViable {
-            reason: "ssh-agent reachable but has no identities loaded".into(),
+        SignProbeOutcome::Rejected => SigningViability::NotViable {
+            reason: "the configured signing key could not sign a test payload".into(),
         },
-        SigningStatus::KeysListed => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // Fingerprint acquisition stays lazy, inside this arm only
-            // (D-12): the path branch must still spawn exactly the same
-            // processes in the same order as today, so this selection
-            // cannot be hoisted above the `ssh-add -l` spawn.
-            let fingerprint = match inline_blob {
-                Some(blob) => inline_key_fingerprint(blob),
-                None => public_key_fingerprint(Path::new(&signingkey)),
-            };
-            match fingerprint {
-                Some(fingerprint) if stdout.contains(&fingerprint) => SigningViability::Viable {
-                    fingerprint: Some(fingerprint),
-                },
-                Some(_) => SigningViability::NotViable {
-                    reason: "ssh-agent has keys loaded, but not the configured signing key".into(),
-                },
-                None => SigningViability::Unknown {
-                    reason: "cannot verify signing viability — ssh-keygen not found or the key \
-                             is unreadable"
-                        .into(),
-                },
-            }
-        }
-        SigningStatus::Unknown(code) => SigningViability::Unknown {
-            reason: format!("ssh-add -l exited with an unexpected code {code}"),
+        SignProbeOutcome::TimedOut => SigningViability::NotViable {
+            reason: "the signing probe did not finish within its time limit".into(),
+        },
+        SignProbeOutcome::ToolMissing => SigningViability::Unknown {
+            reason: "cannot verify signing viability — ssh-keygen not found".into(),
+        },
+        SignProbeOutcome::NotRun => SigningViability::Unknown {
+            reason: "cannot verify signing viability — the signing probe could not be run".into(),
         },
     }
 }
@@ -1825,14 +1952,6 @@ mod tests {
     // 20d: signing-viability helpers
     // -----------------------------------------------------------------
 
-    #[test]
-    fn classify_ssh_add_status_maps_all_three_documented_exit_codes() {
-        assert_eq!(classify_ssh_add_status(2), SigningStatus::NoAgent);
-        assert_eq!(classify_ssh_add_status(1), SigningStatus::AgentEmpty);
-        assert_eq!(classify_ssh_add_status(0), SigningStatus::KeysListed);
-        assert_eq!(classify_ssh_add_status(7), SigningStatus::Unknown(7));
-    }
-
     /// Guards tests that temporarily override the process-global `HOME`
     /// env var (same idiom as `config.rs`'s test-local `ENV_MUTEX`) — this
     /// project's own dev machine sets `gpg.format=ssh` / `user.signingkey`
@@ -1877,9 +1996,14 @@ mod tests {
     /// `key::`-prefixed form or the raw deprecated `ssh-` compat form — must
     /// never be classified as a missing filesystem path. Git never stats an
     /// inline value, so this must never return the missing-key-file
-    /// `NotViable`. This test intentionally does NOT assert which of
-    /// `Viable`/agent-`NotViable`/`Unknown` is returned, since that depends
-    /// on the host's ssh-agent state (D-10).
+    /// `NotViable`.
+    ///
+    /// This test deliberately keeps its narrow assertion — only that the
+    /// missing-file reason is absent. It used to be narrow because the
+    /// outcome depended on the host's ssh-agent state (D-10); it is narrow
+    /// now because that is the single property it exists to guard, and
+    /// `inline_signing_key_returns_unknown_without_probing` pins the exact
+    /// arm. Leaving the assertion here narrow keeps one falsifier per test.
     #[test]
     fn check_signing_viability_never_reports_key_file_missing_for_inline_key() {
         const MISSING_FILE_REASON: &str = "user.signingkey is set but the key file does not exist";
@@ -1955,9 +2079,12 @@ mod tests {
 
     /// D-03/D-12: values that neither start with `key::` nor `ssh-` still
     /// take the path branch and keep today's byte-for-byte behavior — the
-    /// early `.exists()` return, before `ssh-add` is ever spawned. This is
-    /// the D-03 falsifier: bare `ecdsa-`/`sk-` forms must NOT be treated as
-    /// inline.
+    /// early `.exists()` return, which still fires before anything is
+    /// spawned. What follows that early return is now the signing probe
+    /// rather than the deleted `ssh-add` predictor; the guarantee under
+    /// test is that a missing file is answered without reaching it at all.
+    /// This is the D-03 falsifier: bare `ecdsa-`/`sk-` forms must NOT be
+    /// treated as inline.
     #[test]
     fn check_signing_viability_still_reports_missing_file_for_a_path_value() {
         const MISSING_FILE_REASON: &str = "user.signingkey is set but the key file does not exist";
@@ -1984,82 +2111,25 @@ mod tests {
         }
     }
 
-    /// D-04/D-05/D-09: `inline_key_fingerprint` (stdin) must produce the
-    /// EXACT SAME `SHA256:` fingerprint as `public_key_fingerprint` (path)
-    /// for the same real key — proving the D-01 -> D-05 chain and that the
-    /// blob genuinely reached `ssh-keygen` via stdin. `ssh-keygen -lf`
-    /// interprets a `-f` argument as a filename, so a blob passed on argv
-    /// (or never written to the pipe) could not produce a correct
-    /// fingerprint; a green assertion here is only reachable if the blob
-    /// went to stdin.
-    #[test]
-    fn inline_key_fingerprint_matches_the_path_branch_for_the_same_key() {
-        let dir = tempfile::tempdir().unwrap();
-        let key_path = dir.path().join("devflow-fixture-key");
-        let keygen = Command::new("ssh-keygen")
-            .args([
-                "-t",
-                "ed25519",
-                "-f",
-                key_path.to_str().unwrap(),
-                "-N",
-                "",
-                "-q",
-            ])
-            .output()
-            .expect("spawn ssh-keygen");
-        assert!(
-            keygen.status.success(),
-            "ssh-keygen fixture setup failed: {}",
-            String::from_utf8_lossy(&keygen.stderr)
-        );
-        let pub_key_path = dir.path().join("devflow-fixture-key.pub");
-        let blob = std::fs::read_to_string(&pub_key_path)
-            .unwrap()
-            .trim()
-            .to_string();
-
-        // Assert the inline result FIRST and independently, before any
-        // comparison — a both-`None` result must never pass tautologically.
-        let inline_fp = inline_key_fingerprint(&blob);
-        assert!(
-            inline_fp.is_some(),
-            "inline_key_fingerprint returned None for a real key"
-        );
-        let inline_fp = inline_fp.unwrap();
-        assert!(
-            inline_fp.starts_with("SHA256:"),
-            "unexpected fingerprint shape: {inline_fp}"
-        );
-
-        let path_fp = public_key_fingerprint(&pub_key_path);
-        assert!(
-            path_fp.is_some(),
-            "public_key_fingerprint returned None for a real key"
-        );
-        let path_fp = path_fp.unwrap();
-
-        assert_eq!(inline_fp, path_fp);
-
-        // Closing the D-01 -> D-05 chain: feeding the key:: prefixed form
-        // through the classifier and then the fingerprint helper yields the
-        // same fingerprint.
-        let prefixed = format!("key::{blob}");
-        let classified_blob = inline_signing_key_blob(&prefixed).unwrap();
-        let chained_fp = inline_key_fingerprint(classified_blob).unwrap();
-        assert_eq!(chained_fp, path_fp);
-    }
-
-    /// D-06: every inline-branch failure mode must degrade to `Unknown`
-    /// (or, at the `pub` boundary, one of the two shared agent-state
-    /// `NotViable` reasons that both branches can legitimately reach) —
-    /// never a NEW hard fail introduced by this phase. Agent-independent:
-    /// these values are unparseable/empty regardless of host ssh-agent
-    /// state.
+    /// D-06: every inline-branch failure mode must degrade to `Unknown`,
+    /// never a NEW hard fail introduced by this phase. That guarantee is
+    /// what this test preserves; only the reasons it accepts changed.
+    ///
+    /// It used to pin a two-reason set built from the predictor's no-agent
+    /// and agent-empty strings, neither of which the code can produce any
+    /// more — a test that referenced the deleted mechanism through its
+    /// output rather than its symbols, so nothing but a run would have
+    /// caught it. Under D-03 an unparseable inline value classifies as
+    /// inline and returns the single fixed inline reason without being
+    /// probed at all.
+    ///
+    /// Its agent-independence note survives, now true by construction
+    /// rather than by argument: these values never reach a probe, so no
+    /// host's agent state can reach this result.
     #[test]
     fn check_signing_viability_never_hard_fails_on_an_unparseable_inline_key() {
-        const NO_AGENT_REASON: &str = "no ssh-agent reachable (SSH_AUTH_SOCK unset or dead)";
-        const AGENT_EMPTY_REASON: &str = "ssh-agent reachable but has no identities loaded";
+        const INLINE_REASON: &str =
+            "cannot verify signing viability — an inline user.signingkey is not probed";
         let unparseable_values = ["key::", "key::this is not a key at all"];
         for value in unparseable_values {
             let repo = init_repo();
@@ -2069,15 +2139,407 @@ mod tests {
 
             let result = check_signing_viability(root);
 
-            if let SigningViability::NotViable { reason } = &result {
+            assert_eq!(
+                result,
+                SigningViability::Unknown {
+                    reason: INLINE_REASON.into(),
+                },
+                "value {value:?} produced an unexpected hard fail: {result:?}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // 35-03: the `ssh-keygen -Y sign` probe
+    // -----------------------------------------------------------------
+
+    /// F-8: the probe workspace name must be unique per CALL, not per
+    /// process. `cargo test` runs tests as parallel THREADS inside a single
+    /// process, so a name derived from the process id is shared by every
+    /// concurrent probe: two probes collide, the loser's non-recursive
+    /// `create_dir` fails with an already-exists error, and it fails soft to
+    /// `Unknown` — a flaky test whose failure points at the probe rather
+    /// than at the harness.
+    ///
+    /// The two-thread half is load-bearing. The single-thread half alone
+    /// passes against a name built from the process id plus a thread id,
+    /// which is the near-miss fix this test exists to reject.
+    #[test]
+    fn probe_workspace_name_is_unique_per_call() {
+        let first = probe_workspace_name();
+        let second = probe_workspace_name();
+        assert_ne!(
+            first, second,
+            "two successive calls on one thread produced the same probe workspace name"
+        );
+
+        const PER_THREAD: usize = 64;
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    (0..PER_THREAD)
+                        .map(|_| probe_workspace_name())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut names: Vec<String> = handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("probe-name thread panicked"))
+            .collect();
+        let total = names.len();
+        assert_eq!(total, 2 * PER_THREAD, "fixture did not produce every name");
+        names.sort();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            total,
+            "two concurrently spawned threads produced duplicate probe workspace names"
+        );
+    }
+
+    /// Generate a real ed25519 keypair at `stem`, with `passphrase` (empty
+    /// for an unencrypted key). Returns the public half's path.
+    fn generate_keypair(stem: &Path, passphrase: &str) -> PathBuf {
+        let keygen = Command::new("ssh-keygen")
+            .args([
+                "-t",
+                "ed25519",
+                "-f",
+                stem.to_str().unwrap(),
+                "-N",
+                passphrase,
+                "-q",
+            ])
+            .output()
+            .expect("spawn ssh-keygen");
+        assert!(
+            keygen.status.success(),
+            "ssh-keygen fixture setup failed: {}",
+            String::from_utf8_lossy(&keygen.stderr)
+        );
+        let pub_path = stem.with_extension("pub");
+        assert!(pub_path.exists(), "ssh-keygen wrote no public key");
+        pub_path
+    }
+
+    /// Point a repo's `user.signingkey` at `key` under `gpg.format=ssh`.
+    fn configure_ssh_signing(root: &Path, key: &Path) {
+        git(root, &["config", "gpg.format", "ssh"]);
+        git(root, &["config", "user.signingkey", key.to_str().unwrap()]);
+    }
+
+    /// D-08's redaction contract, asserted on the rendered result: neither
+    /// the reason nor the fingerprint may carry the configured key path, any
+    /// private key material, or any fragment of `ssh-keygen`'s own stderr
+    /// (which embeds the path verbatim — see the probe's own comment).
+    fn assert_no_leak(result: &SigningViability, secret_dir: &Path) {
+        let rendered = format!("{result:?}");
+        assert!(
+            !rendered.contains(secret_dir.to_str().unwrap()),
+            "signing viability leaked a filesystem path: {rendered}"
+        );
+        for fragment in [
+            "PRIVATE KEY",
+            "No private key found",
+            "Couldn't load public key",
+            "Enter passphrase",
+            "incorrect passphrase",
+        ] {
+            assert!(
+                !rendered.contains(fragment),
+                "signing viability leaked key material or ssh-keygen stderr ({fragment:?}): \
+                 {rendered}"
+            );
+        }
+    }
+
+    /// The headline case, and the exact live false negative 999.86 was filed
+    /// for twice: a configured signing key whose unencrypted private sibling
+    /// is on disk signs fine with NO agent involvement at all. The predictor
+    /// this replaced asked `ssh-add -l` whether the agent held the key and
+    /// reported `NotViable` when it did not — agent membership is simply not
+    /// a necessary condition for `git tag -s` to succeed.
+    ///
+    /// This test therefore reads, sets and depends on NO agent state. The
+    /// fixture key is generated fresh into a temporary directory, so no
+    /// agent on any host can be holding it; a `Viable` verdict here is only
+    /// reachable through the on-disk private key.
+    #[test]
+    fn ssh_signing_probe_reports_viable_with_on_disk_private_key() {
+        let repo = init_repo();
+        let root = repo.path();
+        let keys = tempfile::tempdir().unwrap();
+        let pub_key = generate_keypair(&keys.path().join("probe-key"), "");
+        configure_ssh_signing(root, &pub_key);
+
+        let result = check_signing_viability(root);
+
+        match &result {
+            SigningViability::Viable { fingerprint } => {
+                let fingerprint = fingerprint
+                    .as_deref()
+                    .expect("Viable must carry the public key fingerprint");
                 assert!(
-                    reason == NO_AGENT_REASON || reason == AGENT_EMPTY_REASON,
-                    "value {value:?} produced an unexpected hard fail: {result:?}"
+                    fingerprint.starts_with("SHA256:"),
+                    "unexpected fingerprint shape: {fingerprint}"
                 );
             }
+            other => panic!("expected Viable for an on-disk private key, got: {other:?}"),
         }
+        assert_no_leak(&result, keys.path());
+    }
 
-        assert_eq!(inline_key_fingerprint(""), None);
-        assert_eq!(inline_key_fingerprint("not a key\n"), None);
+    /// NC-9, the negative control for the test above. Same fixture with the
+    /// private half deleted, leaving only the `.pub` file: the verdict must
+    /// FLIP to `NotViable`. Without this the positive assertion is vacuously
+    /// true — a probe that returned `Viable` unconditionally would pass the
+    /// positive case and fail here.
+    #[test]
+    fn ssh_signing_probe_reports_not_viable_without_a_private_key() {
+        let repo = init_repo();
+        let root = repo.path();
+        let keys = tempfile::tempdir().unwrap();
+        let stem = keys.path().join("probe-key");
+        let pub_key = generate_keypair(&stem, "");
+        std::fs::remove_file(&stem).expect("remove the private half");
+        assert!(!stem.exists(), "fixture still has a private key");
+        configure_ssh_signing(root, &pub_key);
+
+        let result = check_signing_viability(root);
+
+        assert_eq!(
+            result,
+            SigningViability::NotViable {
+                reason: "the configured signing key could not sign a test payload".into(),
+            },
+            "expected the verdict to flip without a private key, got: {result:?}"
+        );
+        assert_no_leak(&result, keys.path());
+    }
+
+    /// Build one raw `ssh-keygen -Y sign` invocation for NC-10.
+    ///
+    /// Deliberately drives the raw command rather than the probe: the
+    /// observation must be of `SSH_ASKPASS_REQUIRE`'s effect, and a run
+    /// through the probe would have its duration pinned by
+    /// [`SSH_SIGN_PROBE_TIMEOUT`] instead — measuring the constant, not the
+    /// variable.
+    fn askpass_arm(dir: &Path, askpass_require: Option<&str>) -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+
+        let payload = dir.join(probe_workspace_name());
+        std::fs::write(&payload, b"nc-10 payload\n").expect("write nc-10 payload");
+
+        let mut command = Command::new("ssh-keygen");
+        command
+            .args([
+                "-Y",
+                "sign",
+                "-n",
+                SSH_SIGN_NAMESPACE,
+                "-f",
+                dir.join("encrypted-key.pub").to_str().unwrap(),
+                payload.to_str().unwrap(),
+            ])
+            .env("SSH_ASKPASS", dir.join("askpass.sh"))
+            // `read_passphrase` only consults SSH_ASKPASS when DISPLAY or
+            // SSH_ASKPASS is set; both arms get the same askpass route so
+            // the ONLY difference between them is the variable under test.
+            .env("DISPLAY", ":0")
+            // Agent state is deliberately neither read nor cleared here.
+            // The fixture key is generated microseconds earlier into a fresh
+            // temporary directory, so no agent on any host can hold it, and
+            // a test that reaches for agent state near a signing assertion
+            // has reproduced the very premise that produced 999.86.
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        match askpass_require {
+            Some(value) => command.env("SSH_ASKPASS_REQUIRE", value),
+            None => command.env_remove("SSH_ASKPASS_REQUIRE"),
+        };
+
+        // SAFETY: `setsid` is a bare syscall and async-signal-safe, which is
+        // the only requirement `pre_exec` imposes.
+        //
+        // This is load-bearing, not hygiene. With a controlling terminal
+        // available, `ssh-keygen` prompts for the passphrase on `/dev/tty`
+        // regardless of SSH_ASKPASS_REQUIRE, so BOTH arms would block and
+        // the control would agree with its positive case for a reason that
+        // has nothing to do with the variable. Dropping the terminal forces
+        // the askpass route, which is the route the variable governs. It
+        // also stops a killed child from leaving an operator's terminal
+        // with echo disabled.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command.spawn().expect("spawn ssh-keygen for NC-10")
+    }
+
+    /// Write the NC-10 fixture: an encrypted ed25519 key and an askpass
+    /// helper that takes far longer than any observation window here.
+    fn encrypted_key_fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        generate_keypair(&dir.path().join("encrypted-key"), "devflow-nc10-passphrase");
+        let askpass = dir.path().join("askpass.sh");
+        std::fs::write(
+            &askpass,
+            "#!/bin/sh\nsleep 5\necho devflow-nc10-passphrase\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&askpass).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&askpass, perms).unwrap();
+        dir
+    }
+
+    /// Poll `child` for up to `window`, returning how long it took to exit
+    /// or `None` if it was still running when the window closed.
+    fn wait_bounded(child: &mut std::process::Child, window: Duration) -> Option<Duration> {
+        let started = Instant::now();
+        let deadline = started + window;
+        loop {
+            match child.try_wait().expect("poll nc-10 child") {
+                Some(_) => return Some(started.elapsed()),
+                None => {
+                    if Instant::now() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+    }
+
+    /// NC-10, positive arm: with `SSH_ASKPASS_REQUIRE=never` an encrypted
+    /// key does NOT park on the askpass helper — it gives up promptly.
+    #[test]
+    fn ssh_signing_probe_does_not_block_on_an_encrypted_key() {
+        let dir = encrypted_key_fixture();
+        let mut child = askpass_arm(dir.path(), Some("never"));
+        let elapsed = wait_bounded(&mut child, SSH_SIGN_PROBE_TIMEOUT / 2);
+        if elapsed.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let elapsed = elapsed.expect(
+            "SSH_ASKPASS_REQUIRE=never did not stop ssh-keygen blocking on the askpass helper",
+        );
+        eprintln!("NC-10 non-blocking arm exited in {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the non-blocking arm took {elapsed:?}, which is too slow to calibrate a control"
+        );
+    }
+
+    /// NC-10's control (D-01). The env var, not the fixture and not the
+    /// timeout, is what prevents the hang — so the SAME fixture is run with
+    /// the variable OMITTED and must still be alive when the window closes.
+    ///
+    /// **The window is calibrated, not assumed (F-9).** The non-blocking arm
+    /// runs first and its wall-clock exit is measured; the window is derived
+    /// from that measurement at a stated multiple. An uncalibrated window
+    /// shorter than the time `ssh-keygen` ordinarily takes to give up would
+    /// report "blocked" for a reason that has nothing to do with the
+    /// variable, and the control would pass while measuring the wrong thing.
+    /// The window is also held well under [`SSH_SIGN_PROBE_TIMEOUT`], so the
+    /// measurement is of the variable's effect rather than of the ceiling.
+    ///
+    /// A control that agrees with its positive case is a broken measurement,
+    /// not evidence: if the blocking arm does NOT block, this test fails
+    /// loudly rather than passing.
+    #[test]
+    fn encrypted_key_blocks_without_the_askpass_require_env_var() {
+        const CALIBRATION_MULTIPLE: u32 = 8;
+        const MIN_WINDOW: Duration = Duration::from_millis(1000);
+
+        let dir = encrypted_key_fixture();
+
+        // Arm 1 — measure. Same fixture, variable set.
+        let mut baseline_child = askpass_arm(dir.path(), Some("never"));
+        let baseline = wait_bounded(&mut baseline_child, SSH_SIGN_PROBE_TIMEOUT / 2);
+        if baseline.is_none() {
+            let _ = baseline_child.kill();
+            let _ = baseline_child.wait();
+        }
+        let baseline = baseline.expect(
+            "control uncalibrated: the non-blocking arm never exited, so there is no baseline \
+             to derive an observation window from",
+        );
+
+        // Derive the window from the measurement rather than assuming one.
+        let window = std::cmp::max(baseline * CALIBRATION_MULTIPLE, MIN_WINDOW);
+        assert!(
+            window >= baseline * 4,
+            "control uncalibrated: observation window {window:?} is not at least four times \
+             the measured non-blocking exit of {baseline:?}"
+        );
+        assert!(
+            window < SSH_SIGN_PROBE_TIMEOUT / 2,
+            "control uncalibrated: observation window {window:?} is not comfortably under the \
+             probe's own {SSH_SIGN_PROBE_TIMEOUT:?} ceiling, so it would measure the ceiling \
+             rather than SSH_ASKPASS_REQUIRE"
+        );
+
+        // Arm 2 — the control. Same fixture, variable omitted.
+        let mut blocking_child = askpass_arm(dir.path(), None);
+        let blocked = wait_bounded(&mut blocking_child, window);
+        let _ = blocking_child.kill();
+        let _ = blocking_child.wait();
+
+        eprintln!(
+            "NC-10 calibration: non-blocking exit {baseline:?}, observation window {window:?} \
+             ({CALIBRATION_MULTIPLE}x, floored at {MIN_WINDOW:?}), blocking arm {blocked:?}"
+        );
+        assert!(
+            blocked.is_none(),
+            "NC-10 control FAILED: with SSH_ASKPASS_REQUIRE omitted the child still exited in \
+             {blocked:?}, inside the {window:?} window. A control that agrees with its positive \
+             case is a broken measurement, not evidence — nothing here supports the conclusion \
+             that the environment variable is what prevents the hang"
+        );
+    }
+
+    /// D-03/A-17: an inline `user.signingkey` returns `Unknown` with the
+    /// fixed inline reason and is never probed.
+    ///
+    /// Run with a NORMAL `PATH`, so `ssh-keygen` is present throughout. That
+    /// is what makes this a proof of "never probed" rather than of "failed
+    /// to probe" — the surface test that removes the tooling cannot tell the
+    /// two apart.
+    #[test]
+    fn inline_signing_key_returns_unknown_without_probing() {
+        const INLINE_REASON: &str =
+            "cannot verify signing viability — an inline user.signingkey is not probed";
+        let keys = tempfile::tempdir().unwrap();
+        let pub_key = generate_keypair(&keys.path().join("inline-key"), "");
+        let blob = std::fs::read_to_string(&pub_key)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        for value in [format!("key::{blob}"), blob.clone()] {
+            let repo = init_repo();
+            let root = repo.path();
+            git(root, &["config", "gpg.format", "ssh"]);
+            git(root, &["config", "user.signingkey", &value]);
+
+            let result = check_signing_viability(root);
+
+            assert_eq!(
+                result,
+                SigningViability::Unknown {
+                    reason: INLINE_REASON.into(),
+                },
+                "inline value {value:?} was not routed to the unprobed Unknown arm: {result:?}"
+            );
+            assert_no_leak(&result, keys.path());
+        }
     }
 }
