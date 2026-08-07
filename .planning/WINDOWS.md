@@ -1,10 +1,10 @@
 ---
 schema_version: 1
-open_count: 1
+open_count: 0
 waived_count: 1
-fixed_count: 4
+fixed_count: 5
 total_count: 6
-last_updated: 2026-07-31T02:38:49.879Z
+last_updated: 2026-08-07T00:00:00.000Z
 ---
 
 # Broken Windows Ledger
