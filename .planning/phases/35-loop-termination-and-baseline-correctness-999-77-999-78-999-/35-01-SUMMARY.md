@@ -165,6 +165,20 @@ operator-facing reason string; it does **not** change what the run does next. No
 asserts on `Action`, `decide_action`, or any gating consequence — confirmed by inspection, and
 such an assertion would pass against the buggy code too.
 
+> **Correction (2026-08-07, 35-REVIEW CR-01/IN-03).** This limit was **false as 35-01 originally
+> shipped**, and is recorded here rather than silently rewritten. The claim held for the Layer 3
+> edit but not for the Layer 2 one: that edit placed the unmeasurable-count guard *above* the
+> exit-code classification, so an unmeasurable count also turned `Success → Unknown`
+> (`Advance → GateReview`) and `ResourceKilled → Unknown` (`GateInfra → GateReview`) — the second
+> of which violates `pipeline_launch.rs`'s explicit prohibition on routing infra faults through
+> `handle_validate_outcome`. Commit `cf462ec` narrowed the guard to
+> `commit_gated && exit_code == 0 && commits.is_none()`, after which the limit as written is true
+> again: the sole remaining fall-through was `Failed → GateReview` before this phase and is
+> `Unknown → GateReview` after it. **Why it went unnoticed:** the very inspection this paragraph
+> cites is what missed it, and no test paired an unmeasurable count with a non-zero exit. Two
+> tests now do (`evaluate_layer2_unrunnable_git_still_classifies_exit_137_as_resource_killed`,
+> `evaluate_layer2_unrunnable_git_keeps_success_for_a_non_commit_gated_stage`).
+
 **D-09's stated "accepted cost" is corrected, without reopening the decision.** D-09 predicted
 that falling through to Layer 3 means "the run continues rather than gating". It does not: Layer
 3's `Failed` and its post-fix `Unknown` both gate for review. The decision's *action* (`Ok(None)`)

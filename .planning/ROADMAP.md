@@ -344,6 +344,37 @@ Unsequenced items — not part of the active phase sequence. Promote with
 `/gsd-review-backlog` when ready; each carries accumulated context in its
 own `phases/999.N-*/CONTEXT.md`.
 
+### Phase 999.90: `handle_validate_outcome` Counts Commits Against `GitFlowConfig::default()`, Not the Project's Configured Git-Flow (BACKLOG)
+
+**Linear:** [DEN-111](https://linear.app/denniskim/issue/DEN-111/99990-handle-validate-outcome-counts-commits-against)
+**Found:** 2026-08-07, Phase 35 code review (35-REVIEW.md, IN-02). **Pre-existing** — the line was
+moved by 35-04, not introduced by it. Filed rather than fixed in-phase per the 34/D-04 precedent
+(a defect a fix *reveals* is filed, not fixed in the same phase).
+
+**Priority:** Low-Medium | **Size:** S — thread the configured value through one call site.
+
+**The shape of it.** `pipeline_outcomes.rs:523` calls `phase_commit_count` with
+`GitFlowConfig::default()` rather than the project's configured git-flow. A project that configures
+a non-default `develop` or `feature_prefix` therefore counts commits against branch names that do
+not exist in its checkout.
+
+**Why Phase 35 makes this worse, not better.** Before this phase, the resulting `rev-list` failure
+produced an unparseable empty stdout and a `None` count, which fell through to Layer 3 and gated for
+review — wrong, but visible and safe. CR-01's fix (commit `cf462ec`) correctly made a `rev-list`
+that *ran and failed* return `Some(0)`, matching the `rev-parse` step and the function's own A-06
+rule. For a correctly-configured project that is right. For a project hitting this defect it means
+the count is now a confident **zero** rather than an absent measurement — so a commit-gated stage
+reads `Failed — no work done` and loops back, instead of gating.
+
+That is a strictly worse failure mode for the misconfigured case, and it is the direct interaction
+the review flagged: the two defects are individually defensible and jointly produce a silent wrong
+answer.
+
+**Fix.** Thread the project's `GitFlowConfig` to the call site instead of constructing a default.
+Add a test with a non-default `develop` asserting the count is taken against the configured branch.
+
+**Related:** CR-01 in 35-REVIEW.md (fixed in-phase, `cf462ec`), 999.77, 999.87.
+
 ### Phase 999.89: The Verification-Freshness Rule Infers Provenance From Bytes, and Is Only Safe Because Two Branch-Naming Conventions Happen to Agree (BACKLOG)
 
 **Linear:** [DEN-110](https://linear.app/denniskim/issue/DEN-110/99989-verification-freshness-infers-provenance-from-bytes-and-is-only)
