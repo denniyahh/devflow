@@ -2771,6 +2771,345 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------
+    // D8 / HARDEN-05 — the PRODUCTION probe drops its controlling terminal.
+    //
+    // The two NC-10 arms above install their OWN `setsid`, so both would pass
+    // byte-unchanged if the production `pre_exec` were deleted: 35-03's
+    // SUMMARY records exactly that, as `human_judgment: true`. The test below
+    // is the missing guard. It runs the production probe from a child that has
+    // ACQUIRED a pty as its controlling terminal, which is the only condition
+    // under which the production `setsid` does anything observable at all.
+    // ------------------------------------------------------------------
+
+    /// Carries the fixture key into the re-executed child.
+    const TTY_PROBE_KEY_ENV: &str = "DEVFLOW_TTY_PROBE_KEY";
+
+    /// The child entrypoint's name, as libtest's `--exact` filter sees it.
+    const TTY_PROBE_CHILD: &str = "git::tests::ssh_sign_probe_tty_child_entrypoint";
+
+    // Exit codes for that child. **None of them is 0, deliberately.** `cargo
+    // test --exact <name>` exits 0 when the name matches nothing (CLAUDE.md;
+    // this repo has already paid for it), so a renamed entrypoint would make
+    // the measuring arm below "succeed" in milliseconds while running no probe
+    // whatsoever. A 0 exit therefore means "the child never ran" and is
+    // asserted against explicitly.
+    const EXIT_PROBE_REJECTED: i32 = 42;
+    const EXIT_PROBE_TIMED_OUT: i32 = 43;
+    const EXIT_PROBE_OTHER: i32 = 44;
+    const EXIT_NO_CONTROLLING_TTY: i32 = 97;
+
+    /// A pty pair whose fds are closed on every exit path, including unwind.
+    ///
+    /// Closing the master hangs up the line, which is also the backstop that
+    /// stops anything still sitting on a passphrase prompt from outliving this
+    /// test: the session leader's death sends `SIGHUP` to the foreground
+    /// process group.
+    struct Pty {
+        master: libc::c_int,
+        slave: libc::c_int,
+    }
+
+    impl Pty {
+        /// Allocate a pty pair. `O_NOCTTY` throughout — *this* process must
+        /// not acquire the terminal; only the child spawned by
+        /// [`spawn_owning_controlling_tty`] may, and only via an explicit
+        /// `TIOCSCTTY`.
+        fn open() -> Pty {
+            // SAFETY: each call below is a bare libc entry point with
+            // in-bounds arguments (`name` is sized and its length passed), and
+            // the `Pty` is constructed as soon as the first fd exists, so its
+            // `Drop` owns every descriptor from that point on — including
+            // across the assertion unwinds between here and the return.
+            unsafe {
+                let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+                assert!(
+                    master >= 0,
+                    "posix_openpt failed: {}",
+                    std::io::Error::last_os_error()
+                );
+                let mut pty = Pty { master, slave: -1 };
+                assert!(
+                    libc::grantpt(master) == 0,
+                    "grantpt failed: {}",
+                    std::io::Error::last_os_error()
+                );
+                assert!(
+                    libc::unlockpt(master) == 0,
+                    "unlockpt failed: {}",
+                    std::io::Error::last_os_error()
+                );
+                let mut name = [0 as libc::c_char; 128];
+                assert!(
+                    libc::ptsname_r(master, name.as_mut_ptr(), name.len()) == 0,
+                    "ptsname_r failed: {}",
+                    std::io::Error::last_os_error()
+                );
+                let slave = libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
+                assert!(
+                    slave >= 0,
+                    "opening the pty slave failed: {}",
+                    std::io::Error::last_os_error()
+                );
+                pty.slave = slave;
+                pty
+            }
+        }
+    }
+
+    impl Drop for Pty {
+        fn drop(&mut self) {
+            // SAFETY: both descriptors were opened by `Pty::open` and are
+            // closed exactly once, here.
+            unsafe {
+                if self.slave >= 0 {
+                    libc::close(self.slave);
+                }
+                libc::close(self.master);
+            }
+        }
+    }
+
+    /// Spawn `command` as the leader of a NEW session that has acquired
+    /// `pty`'s slave as its **controlling terminal**.
+    ///
+    /// Both syscalls are checked here, unlike the production probe's
+    /// deliberate ignore. A silently failed `TIOCSCTTY` would leave the child
+    /// with no controlling terminal — the single condition under which every
+    /// assertion in this test passes for the wrong reason — so a failure is
+    /// returned as an error and surfaces as a loud `spawn` failure instead.
+    fn spawn_owning_controlling_tty(command: &mut Command, pty: &Pty) -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+
+        let slave = pty.slave;
+        // SAFETY: `setsid` and `ioctl` are bare syscalls and async-signal-safe,
+        // which is the only requirement `pre_exec` imposes. `slave` is owned by
+        // the `Pty` the caller holds for the child's whole lifetime, and it is
+        // inherited across the fork because it was opened without `CLOEXEC`.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::ioctl(slave, libc::TIOCSCTTY, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command
+            .spawn()
+            .expect("spawn a child owning the pty as its controlling terminal")
+    }
+
+    /// One raw `ssh-keygen -Y sign` against an encrypted key, mirroring the
+    /// production probe's environment and stdio EXACTLY — and deliberately
+    /// **not** calling `setsid`. The only thing that differs between the two
+    /// arms built from it is whether the child holds a controlling terminal.
+    fn tty_control_arm(key_pub: &Path, payload: &Path) -> Command {
+        let mut command = Command::new("ssh-keygen");
+        command
+            .args([
+                "-Y",
+                "sign",
+                "-n",
+                SSH_SIGN_NAMESPACE,
+                "-f",
+                key_pub.to_str().unwrap(),
+                payload.to_str().unwrap(),
+            ])
+            .env("SSH_ASKPASS_REQUIRE", "never")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command
+    }
+
+    /// Re-entry point for the D8 test below: runs the **production** probe
+    /// inside whatever session its caller placed this process in, and reports
+    /// the verdict as a process exit code.
+    ///
+    /// A no-op unless [`TTY_PROBE_KEY_ENV`] is set, so an ordinary `cargo test`
+    /// run spawns nothing and costs nothing here.
+    ///
+    /// The `/dev/tty` open is a **premise check, not hygiene**: without it a
+    /// `TIOCSCTTY` that silently failed would leave this child with no
+    /// terminal, the probe would return promptly for a reason having nothing to
+    /// do with `setsid`, and the test would pass while measuring nothing.
+    #[test]
+    fn ssh_sign_probe_tty_child_entrypoint() {
+        let Ok(key) = std::env::var(TTY_PROBE_KEY_ENV) else {
+            return;
+        };
+
+        let tty_path = std::ffi::CString::new("/dev/tty").unwrap();
+        // SAFETY: `tty_path` is a valid NUL-terminated C string that outlives
+        // the call, and the descriptor is closed on the one path that opens it.
+        let tty = unsafe { libc::open(tty_path.as_ptr(), libc::O_RDWR) };
+        if tty < 0 {
+            std::process::exit(EXIT_NO_CONTROLLING_TTY);
+        }
+        // SAFETY: `tty` was just opened by this thread and is closed once.
+        unsafe { libc::close(tty) };
+
+        std::process::exit(match run_ssh_sign_probe(Path::new(&key)) {
+            SignProbeOutcome::Rejected => EXIT_PROBE_REJECTED,
+            SignProbeOutcome::TimedOut => EXIT_PROBE_TIMED_OUT,
+            _ => EXIT_PROBE_OTHER,
+        });
+    }
+
+    /// **D8 (HARDEN-05): the production signing probe is not captured by a
+    /// controlling terminal's `/dev/tty` passphrase prompt.**
+    ///
+    /// `SSH_ASKPASS_REQUIRE=never` is not sufficient on its own — OpenSSH only
+    /// consults it after `open("/dev/tty")` has already failed. The production
+    /// `pre_exec`/`setsid` is what makes that open fail. Delete it and this
+    /// test fails: the probe blocks on the terminal until its own 10 s ceiling.
+    ///
+    /// Three arms, and the first two are a **matched pair that must disagree**:
+    ///
+    /// | arm | terminal | `setsid` | required result |
+    /// |---|---|---|---|
+    /// | 0 — baseline/control | none | none | exits promptly |
+    /// | 1 — premise | pty, acquired | none | still blocked when the window closes |
+    /// | 2 — measurement | pty, acquired | production's | exits promptly, with a real verdict |
+    ///
+    /// If arms 0 and 1 agreed, the harness would have established nothing —
+    /// either the terminal never took effect, or this OpenSSH build does not
+    /// use it — and arm 2 would be fast for a reason unrelated to `setsid`.
+    /// Arm 1 therefore runs BEFORE the measurement and fails as a PREMISE
+    /// failure, not as a regression.
+    ///
+    /// The observation window is derived from arm 0's measured exit, at a
+    /// stated multiple, following NC-10's calibration shape; every wait is
+    /// bounded and every child is killed and reaped on every path.
+    #[test]
+    fn the_signing_probe_is_not_captured_by_a_controlling_terminal() {
+        const CALIBRATION_MULTIPLE: u32 = 8;
+        const MIN_WINDOW: Duration = Duration::from_millis(1000);
+        /// Bound for the production arm: far above a real verdict (tens of
+        /// milliseconds plus one process spawn) and far below the probe's own
+        /// [`SSH_SIGN_PROBE_TIMEOUT`], so exceeding it means "ran to the
+        /// ceiling on the terminal", not "this host is slow".
+        const PROBE_ARM_CAP: Duration = Duration::from_millis(3000);
+
+        let dir = tempfile::tempdir().unwrap();
+        let key_pub = generate_keypair(&dir.path().join("tty-key"), "devflow-d8-passphrase");
+        let payload = dir.path().join("payload");
+        std::fs::write(&payload, b"devflow d8 tty payload\n").unwrap();
+
+        // --- Arm 0: the paired control. Same command, same environment, NO
+        // controlling terminal. `readpassphrase` falls back to a nulled stdin
+        // and gives up at once.
+        let mut baseline_child = tty_control_arm(&key_pub, &payload)
+            .spawn()
+            .expect("spawn the no-terminal control arm");
+        let baseline = wait_bounded(&mut baseline_child, SSH_SIGN_PROBE_TIMEOUT / 2);
+        if baseline.is_none() {
+            let _ = baseline_child.kill();
+            let _ = baseline_child.wait();
+        }
+        let baseline = baseline.expect(
+            "control uncalibrated: ssh-keygen blocked with NO controlling terminal, so nothing \
+             measured below can be attributed to the terminal",
+        );
+
+        let window = std::cmp::max(baseline * CALIBRATION_MULTIPLE, MIN_WINDOW);
+        assert!(
+            window >= baseline * 4,
+            "control uncalibrated: observation window {window:?} is not at least four times the \
+             measured no-terminal exit of {baseline:?}"
+        );
+        assert!(
+            window < SSH_SIGN_PROBE_TIMEOUT / 2,
+            "control uncalibrated: observation window {window:?} is not comfortably under the \
+             probe's own {SSH_SIGN_PROBE_TIMEOUT:?} ceiling, so it would measure the ceiling"
+        );
+
+        // --- Arm 1: the premise, and the other half of the pair. Same command
+        // again, WITH the pty acquired as a controlling terminal and no
+        // `setsid`: it must still be blocked when the window closes.
+        let blocked = {
+            let pty = Pty::open();
+            let mut child =
+                spawn_owning_controlling_tty(&mut tty_control_arm(&key_pub, &payload), &pty);
+            let blocked = wait_bounded(&mut child, window);
+            let _ = child.kill();
+            let _ = child.wait();
+            blocked
+        };
+        assert!(
+            blocked.is_none(),
+            "PREMISE FAILED: with a controlling terminal and no setsid, ssh-keygen exited in \
+             {blocked:?} — the same result as the no-terminal control ({baseline:?}). Either the \
+             pty was never acquired or this build does not consult /dev/tty, and either way the \
+             arm below would be fast for a reason unrelated to the production setsid. A control \
+             that agrees with its positive case is a broken measurement, not evidence"
+        );
+
+        // --- Arm 2: the measurement. The PRODUCTION probe, same fixture, same
+        // kind of controlling terminal — re-executed as a child because only a
+        // separate process can be made a session leader.
+        let (elapsed, status) = {
+            let pty = Pty::open();
+            let mut command = Command::new(
+                std::env::current_exe().expect("locate this test binary for re-execution"),
+            );
+            command
+                .args([TTY_PROBE_CHILD, "--exact", "--test-threads=1"])
+                .env(TTY_PROBE_KEY_ENV, &key_pub)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let mut child = spawn_owning_controlling_tty(&mut command, &pty);
+            let elapsed = wait_bounded(&mut child, PROBE_ARM_CAP);
+            if elapsed.is_none() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            let status = elapsed.map(|_| child.wait().expect("reap the production probe arm"));
+            (elapsed, status)
+        };
+        let code = status.and_then(|status| status.code());
+        eprintln!(
+            "D8: no-terminal baseline {baseline:?}; window {window:?} \
+             ({CALIBRATION_MULTIPLE}x, floored at {MIN_WINDOW:?}); with-terminal control \
+             {blocked:?}; production probe {elapsed:?} exiting {code:?}"
+        );
+
+        let elapsed = elapsed.unwrap_or_else(|| {
+            panic!(
+                "REGRESSION: the production signing probe did not return within {PROBE_ARM_CAP:?} \
+                 while its caller held a controlling terminal. That is the pre-setsid behaviour — \
+                 it is parked on /dev/tty waiting for a passphrase nobody can type, and will stay \
+                 there until SSH_SIGN_PROBE_TIMEOUT ({SSH_SIGN_PROBE_TIMEOUT:?}) expires. The \
+                 no-terminal control exited in {baseline:?}, so the fixture and the environment \
+                 are not what changed"
+            )
+        });
+        assert_ne!(
+            code,
+            Some(EXIT_NO_CONTROLLING_TTY),
+            "PREMISE FAILED: the re-executed child could not open /dev/tty, so it never held a \
+             controlling terminal and its {elapsed:?} says nothing about setsid"
+        );
+        assert_ne!(
+            code,
+            Some(0),
+            "the child exited 0, which no path in ssh_sign_probe_tty_child_entrypoint does: \
+             `--exact {TTY_PROBE_CHILD}` matched no test, so no probe ran at all"
+        );
+        assert_eq!(
+            code,
+            Some(EXIT_PROBE_REJECTED),
+            "the probe returned in {elapsed:?} but with the wrong verdict: {} means it hit its \
+             own ceiling and {} means it never reached one",
+            EXIT_PROBE_TIMED_OUT,
+            EXIT_PROBE_OTHER
+        );
+    }
+
     /// D-03/A-17: an inline `user.signingkey` returns `Unknown` with the
     /// fixed inline reason and is never probed.
     ///
