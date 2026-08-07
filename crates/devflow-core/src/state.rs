@@ -148,6 +148,11 @@ pub struct State {
     /// back to zero and silently restore itself.
     #[serde(default)]
     pub phase_validate_failures: u32,
+    /// RED stub (999.79, 35-05 Task 1): deliberately `#[serde(skip)]` so the
+    /// round-trip test fails until the real `#[serde(default)]` treatment
+    /// lands. Replaced in the GREEN step.
+    #[serde(skip)]
+    pub last_verification_fingerprint: Option<u64>,
     /// When the phase started (Unix seconds).
     pub started_at: String,
     /// Path to the project root.
@@ -315,6 +320,7 @@ impl State {
             preflight_retries: 0,
             last_validate_failure_commit_count: None,
             phase_validate_failures: 0,
+            last_verification_fingerprint: None,
             started_at: timestamp_now(),
             project_root,
             worktree_path: None,
@@ -535,6 +541,47 @@ mod tests {
         }"#;
         let loaded: State = serde_json::from_str(json).unwrap();
         assert_eq!(loaded.phase_validate_failures, 0);
+    }
+
+    /// 999.79 (35-05): `last_verification_fingerprint` round-trips through
+    /// serde. The key-presence assertion comes BEFORE the value round-trip for
+    /// the same reason the two fields above give — this baseline is written by
+    /// `devflow start` and compared by a later `devflow advance`, which is a
+    /// different process, so a field that never reaches disk would leave every
+    /// comparison reading `None` and defeat the whole rule.
+    #[test]
+    fn last_verification_fingerprint_round_trips_through_serde() {
+        let mut state = State::new(1, AgentKind::Claude, Mode::Auto, PathBuf::from("/repo"));
+        state.last_verification_fingerprint = Some(0x0123_4567_89ab_cdef);
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(
+            json.contains("last_verification_fingerprint"),
+            "last_verification_fingerprint must appear in persisted JSON"
+        );
+        let loaded: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            loaded.last_verification_fingerprint,
+            Some(0x0123_4567_89ab_cdef),
+            "last_verification_fingerprint must round-trip through serde"
+        );
+    }
+
+    /// A serde-absent `last_verification_fingerprint` (state written by a
+    /// binary predating this field) deserializes to `None` — "no artifact was
+    /// observed at the start of this run" — rather than failing the load, which
+    /// would make an upgrade mid-phase unrecoverable.
+    #[test]
+    fn last_verification_fingerprint_absent_from_json_defaults_to_none() {
+        let json = r#"{
+            "stage": "code",
+            "phase": 1,
+            "agent": "claude",
+            "mode": "auto",
+            "started_at": "0",
+            "project_root": "/repo"
+        }"#;
+        let loaded: State = serde_json::from_str(json).unwrap();
+        assert_eq!(loaded.last_verification_fingerprint, None);
     }
 
     /// D-18f: `preflight_retries` round-trips through serde (its own key

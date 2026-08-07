@@ -2737,6 +2737,20 @@ pub fn phase_verification_exists(evidence_root: &Path, phase: u32) -> bool {
     false
 }
 
+/// RED stub (999.79, 35-05 Task 1): a deliberately CONSTANT fingerprint.
+///
+/// This is the negative control the plan asks for made executable — an
+/// implementation that returns the same value for every artifact must fail
+/// `phase_verification_fingerprint_differs_when_content_differs`. Replaced by
+/// the real content hash in the GREEN step.
+pub fn phase_verification_fingerprint(evidence_root: &Path, phase: u32) -> Option<u64> {
+    if phase_verification_exists(evidence_root, phase) {
+        Some(0)
+    } else {
+        None
+    }
+}
+
 /// Keep only the newest `retain` capture generations under `history_dir`,
 /// deleting older ones. Generations are grouped by their stamp (the shared
 /// prefix of a `{stamp}-stdout`/`{stamp}-exit` pair, split off the trailing
@@ -7328,6 +7342,78 @@ mod tests {
         assert!(
             phase_verification_exists(root, 82),
             "a phase directory holding {{N}}-VERIFICATION.md must return true"
+        );
+    }
+
+    /// 999.79 (35-05): the fingerprint must be a function of the artifact's
+    /// BYTES, not of its existence.
+    ///
+    /// Both halves are required and neither is redundant. The first half
+    /// (different bytes → different values) is satisfied by any hash. The
+    /// second half (identical bytes → identical values) is what rules out a
+    /// value derived from something incidental — a timestamp, an inode, a
+    /// counter — which would make every check read "changed" and permanently
+    /// disable the gaps-only path. A constant-returning implementation fails
+    /// the first half; a nondeterministic one fails the second.
+    #[test]
+    fn phase_verification_fingerprint_differs_when_content_differs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase_dir = root.join(".planning/phases/84-fingerprint");
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        let artifact = phase_dir.join("84-VERIFICATION.md");
+
+        std::fs::write(&artifact, "verdict: gaps\n").unwrap();
+        let first = phase_verification_fingerprint(root, 84)
+            .expect("an artifact that exists must produce a fingerprint");
+
+        let first_again = phase_verification_fingerprint(root, 84)
+            .expect("an artifact that exists must produce a fingerprint");
+        assert_eq!(
+            first, first_again,
+            "identical bytes must produce identical fingerprints — a value that changes on \
+             its own would mark every artifact fresh forever and disable the stale check"
+        );
+
+        std::fs::write(&artifact, "verdict: pass\n").unwrap();
+        let second = phase_verification_fingerprint(root, 84)
+            .expect("an artifact that exists must produce a fingerprint");
+        assert_ne!(
+            first, second,
+            "different bytes must produce different fingerprints — a constant implementation \
+             would report every re-authored artifact as unchanged"
+        );
+    }
+
+    /// 999.79 (35-05): an absent artifact yields no fingerprint, which is
+    /// distinguishable from an artifact whose content happens to hash to zero.
+    /// Both are asserted here so "absent" can never be conflated with "hashed
+    /// to the zero value".
+    #[test]
+    fn phase_verification_fingerprint_is_none_when_the_artifact_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        assert_eq!(
+            phase_verification_fingerprint(root, 85),
+            None,
+            "no .planning/phases directory at all must yield None, not panic"
+        );
+
+        let phase_dir = root.join(".planning/phases/85-fingerprint");
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        assert_eq!(
+            phase_verification_fingerprint(root, 85),
+            None,
+            "a phase directory with no {{N}}-VERIFICATION.md must yield None"
+        );
+
+        std::fs::write(phase_dir.join("85-VERIFICATION.md"), "").unwrap();
+        let empty = phase_verification_fingerprint(root, 85);
+        assert!(
+            empty.is_some(),
+            "an EMPTY artifact still exists and must yield Some — the control against an \
+             implementation that conflates 'absent' with 'no bytes'"
         );
     }
 }
