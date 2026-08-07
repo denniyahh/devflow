@@ -314,8 +314,47 @@ pub(crate) enum ValidateResult {
 /// makes the predicate read `false` unconditionally, which is exactly the
 /// defect this parameter's name now guards against.
 fn select_loop_back_fix(evidence_root: &Path, phase: u32, state: &mut State) -> FixType {
+    // 999.79 / HARDEN-03: existence alone is no longer the answer. Nothing
+    // deletes, dates or invalidates `{N}-VERIFICATION.md`, so a
+    // `devflow start --phase N --force` re-run checks out a branch still
+    // carrying the PREVIOUS run's committed copy, and an existence-only probe
+    // reads that inherited file as this run's verdict.
+    //
+    // What the comparison protects against, in BOTH directions — neither
+    // failure is acceptable and only the pair of tests below distinguishes
+    // them:
+    //
+    // * Too permissive (the pre-999.79 behaviour): a forced re-run inherits a
+    //   previous run's verdict and dispatches `--gaps-only` against zero
+    //   matching plans, which gates unresolvably. That is the same unattended
+    //   stall class as DOGFOOD-01, reached from a new direction.
+    // * Too strict (an always-stale rule): `--gaps-only` never fires again.
+    //   That silently reverts what Phase 33 built and trades an unresolvable
+    //   gate for a loop that re-runs every plan in the phase, forever. It
+    //   would pass every test asserting only the stale direction.
     let current = agent_result::phase_verification_fingerprint(evidence_root, phase);
     if verification_authored_this_run(current, state.last_verification_fingerprint) {
+        // Record the new observation as the baseline, so a SUBSEQUENT
+        // loop-back that finds the artifact unchanged is in turn correctly
+        // treated as stale. Without this, one rewrite would mark the artifact
+        // fresh for the rest of the run.
+        //
+        // F-11: this update does NOT reach disk through the `save_state`
+        // earlier in `handle_validate_outcome` — that one runs before this
+        // point. It is persisted a few statements later, by the `save_state`
+        // inside `prepare_loop_back_to_code`, reached via the
+        // `loop_back_to_code` call on the next line at every call site. A
+        // process killed in that interval loses the update, and the
+        // consequence is NOT fail-safe: a later same-run check would then
+        // compare against the older baseline, read an unchanged artifact as
+        // fresh, and dispatch `--gaps-only` where a full execute was correct —
+        // the exact 999.79 direction this rule exists to close.
+        //
+        // The window is ACCEPTED, not closed. It spans a handful of statements
+        // with no blocking wait in it (the gate wait precedes this mutation),
+        // and the only alternative is a second `save_state` on every single
+        // loop-back — doubling the persistence cost of the common path to
+        // defend an interval a kill can barely land in. Do not add one.
         state.last_verification_fingerprint = current;
         FixType::GapsOnly
     } else {
@@ -323,15 +362,43 @@ fn select_loop_back_fix(evidence_root: &Path, phase: u32, state: &mut State) -> 
     }
 }
 
-/// RED stub (999.79, 35-05 Task 3): ALWAYS STALE.
+/// Was the phase's `{N}-VERIFICATION.md` authored during THIS run?
 ///
-/// This is NC-7's performed mutation used as the RED step. It must fail the
-/// truth table's fresh rows and `verification_written_this_run_dispatches_gaps_only`
-/// while leaving `stale_verification_artifact_dispatches_full_execute` passing —
-/// that asymmetry is the evidence the direction pair discriminates. Replaced by
-/// the real predicate in the GREEN step.
-fn verification_authored_this_run(_current: Option<u64>, _run_start_baseline: Option<u64>) -> bool {
-    false
+/// A pure predicate over the pair (`current` fingerprint, `run_start_baseline`),
+/// deliberately separated from the file read and from the [`FixType`] mapping
+/// so its four rows can be pinned by a committed, re-running test
+/// (`verification_freshness_truth_table_is_exhaustive`, H-1/T-35-22b). It must
+/// touch neither the filesystem nor [`State`] — the moment it does, the truth
+/// table stops being able to enumerate it.
+///
+/// The rows, and which over-correction each one catches:
+///
+/// * `current` is `None` — no artifact exists, so nothing was authored. The
+///   phase is mid-arc and D-01's original `FullExecute` answer stands
+///   unchanged. Catches an always-fresh rule.
+/// * `current` is `Some`, baseline is `None` — an artifact exists where the run
+///   start saw none, so this run's Validate agent created it. The ordinary
+///   first-verification case. Catches an always-stale rule.
+/// * fingerprints are EQUAL — the artifact is byte-identical to what this run
+///   started with, so it was inherited from a previous run and its verdict must
+///   not be reused (999.79). Catches an always-fresh rule.
+/// * fingerprints DIFFER — Validate rewrote it during this run. Catches an
+///   always-stale rule.
+///
+/// **What this cannot establish (HARDEN-03, unclassified).** It keys on content
+/// change alone and has no notion of provenance. An artifact whose bytes change
+/// for any reason OTHER than this run's Validate agent — a mid-run branch
+/// switch, a worktree merge-back, an operator editing the file — reads as
+/// authored-this-run and dispatches `--gaps-only`, which is the failure
+/// direction HARDEN-03 exists to prevent. Establishing real provenance would
+/// need the artifact to carry a run identifier, which is a larger change than
+/// 999.79 asks for.
+fn verification_authored_this_run(current: Option<u64>, run_start_baseline: Option<u64>) -> bool {
+    match (current, run_start_baseline) {
+        (None, _) => false,
+        (Some(_), None) => true,
+        (Some(now), Some(baseline)) => now != baseline,
+    }
 }
 
 /// Decide what happens after a Validate stage, honoring the active mode's
