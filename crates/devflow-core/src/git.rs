@@ -2151,4 +2151,349 @@ mod tests {
             "two concurrently spawned threads produced duplicate probe workspace names"
         );
     }
+
+    /// Generate a real ed25519 keypair at `stem`, with `passphrase` (empty
+    /// for an unencrypted key). Returns the public half's path.
+    fn generate_keypair(stem: &Path, passphrase: &str) -> PathBuf {
+        let keygen = Command::new("ssh-keygen")
+            .args([
+                "-t",
+                "ed25519",
+                "-f",
+                stem.to_str().unwrap(),
+                "-N",
+                passphrase,
+                "-q",
+            ])
+            .output()
+            .expect("spawn ssh-keygen");
+        assert!(
+            keygen.status.success(),
+            "ssh-keygen fixture setup failed: {}",
+            String::from_utf8_lossy(&keygen.stderr)
+        );
+        let pub_path = stem.with_extension("pub");
+        assert!(pub_path.exists(), "ssh-keygen wrote no public key");
+        pub_path
+    }
+
+    /// Point a repo's `user.signingkey` at `key` under `gpg.format=ssh`.
+    fn configure_ssh_signing(root: &Path, key: &Path) {
+        git(root, &["config", "gpg.format", "ssh"]);
+        git(root, &["config", "user.signingkey", key.to_str().unwrap()]);
+    }
+
+    /// D-08's redaction contract, asserted on the rendered result: neither
+    /// the reason nor the fingerprint may carry the configured key path, any
+    /// private key material, or any fragment of `ssh-keygen`'s own stderr
+    /// (which embeds the path verbatim — see the probe's own comment).
+    fn assert_no_leak(result: &SigningViability, secret_dir: &Path) {
+        let rendered = format!("{result:?}");
+        assert!(
+            !rendered.contains(secret_dir.to_str().unwrap()),
+            "signing viability leaked a filesystem path: {rendered}"
+        );
+        for fragment in [
+            "PRIVATE KEY",
+            "No private key found",
+            "Couldn't load public key",
+            "Enter passphrase",
+            "incorrect passphrase",
+        ] {
+            assert!(
+                !rendered.contains(fragment),
+                "signing viability leaked key material or ssh-keygen stderr ({fragment:?}): \
+                 {rendered}"
+            );
+        }
+    }
+
+    /// The headline case, and the exact live false negative 999.86 was filed
+    /// for twice: a configured signing key whose unencrypted private sibling
+    /// is on disk signs fine with NO agent involvement at all. The predictor
+    /// this replaced asked `ssh-add -l` whether the agent held the key and
+    /// reported `NotViable` when it did not — agent membership is simply not
+    /// a necessary condition for `git tag -s` to succeed.
+    ///
+    /// This test therefore reads, sets and depends on NO agent state. The
+    /// fixture key is generated fresh into a temporary directory, so no
+    /// agent on any host can be holding it; a `Viable` verdict here is only
+    /// reachable through the on-disk private key.
+    #[test]
+    fn ssh_signing_probe_reports_viable_with_on_disk_private_key() {
+        let repo = init_repo();
+        let root = repo.path();
+        let keys = tempfile::tempdir().unwrap();
+        let pub_key = generate_keypair(&keys.path().join("probe-key"), "");
+        configure_ssh_signing(root, &pub_key);
+
+        let result = check_signing_viability(root);
+
+        match &result {
+            SigningViability::Viable { fingerprint } => {
+                let fingerprint = fingerprint
+                    .as_deref()
+                    .expect("Viable must carry the public key fingerprint");
+                assert!(
+                    fingerprint.starts_with("SHA256:"),
+                    "unexpected fingerprint shape: {fingerprint}"
+                );
+            }
+            other => panic!("expected Viable for an on-disk private key, got: {other:?}"),
+        }
+        assert_no_leak(&result, keys.path());
+    }
+
+    /// NC-9, the negative control for the test above. Same fixture with the
+    /// private half deleted, leaving only the `.pub` file: the verdict must
+    /// FLIP to `NotViable`. Without this the positive assertion is vacuously
+    /// true — a probe that returned `Viable` unconditionally would pass the
+    /// positive case and fail here.
+    #[test]
+    fn ssh_signing_probe_reports_not_viable_without_a_private_key() {
+        let repo = init_repo();
+        let root = repo.path();
+        let keys = tempfile::tempdir().unwrap();
+        let stem = keys.path().join("probe-key");
+        let pub_key = generate_keypair(&stem, "");
+        std::fs::remove_file(&stem).expect("remove the private half");
+        assert!(!stem.exists(), "fixture still has a private key");
+        configure_ssh_signing(root, &pub_key);
+
+        let result = check_signing_viability(root);
+
+        assert_eq!(
+            result,
+            SigningViability::NotViable {
+                reason: "the configured signing key could not sign a test payload".into(),
+            },
+            "expected the verdict to flip without a private key, got: {result:?}"
+        );
+        assert_no_leak(&result, keys.path());
+    }
+
+    /// Build one raw `ssh-keygen -Y sign` invocation for NC-10.
+    ///
+    /// Deliberately drives the raw command rather than the probe: the
+    /// observation must be of `SSH_ASKPASS_REQUIRE`'s effect, and a run
+    /// through the probe would have its duration pinned by
+    /// [`SSH_SIGN_PROBE_TIMEOUT`] instead — measuring the constant, not the
+    /// variable.
+    fn askpass_arm(dir: &Path, askpass_require: Option<&str>) -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+
+        let payload = dir.join(probe_workspace_name());
+        std::fs::write(&payload, b"nc-10 payload\n").expect("write nc-10 payload");
+
+        let mut command = Command::new("ssh-keygen");
+        command
+            .args([
+                "-Y",
+                "sign",
+                "-n",
+                SSH_SIGN_NAMESPACE,
+                "-f",
+                dir.join("encrypted-key.pub").to_str().unwrap(),
+                payload.to_str().unwrap(),
+            ])
+            .env("SSH_ASKPASS", dir.join("askpass.sh"))
+            // `read_passphrase` only consults SSH_ASKPASS when DISPLAY or
+            // SSH_ASKPASS is set; both arms get the same askpass route so
+            // the ONLY difference between them is the variable under test.
+            .env("DISPLAY", ":0")
+            // Agent state is deliberately neither read nor cleared here.
+            // The fixture key is generated microseconds earlier into a fresh
+            // temporary directory, so no agent on any host can hold it, and
+            // a test that reaches for agent state near a signing assertion
+            // has reproduced the very premise that produced 999.86.
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        match askpass_require {
+            Some(value) => command.env("SSH_ASKPASS_REQUIRE", value),
+            None => command.env_remove("SSH_ASKPASS_REQUIRE"),
+        };
+
+        // SAFETY: `setsid` is a bare syscall and async-signal-safe, which is
+        // the only requirement `pre_exec` imposes.
+        //
+        // This is load-bearing, not hygiene. With a controlling terminal
+        // available, `ssh-keygen` prompts for the passphrase on `/dev/tty`
+        // regardless of SSH_ASKPASS_REQUIRE, so BOTH arms would block and
+        // the control would agree with its positive case for a reason that
+        // has nothing to do with the variable. Dropping the terminal forces
+        // the askpass route, which is the route the variable governs. It
+        // also stops a killed child from leaving an operator's terminal
+        // with echo disabled.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command.spawn().expect("spawn ssh-keygen for NC-10")
+    }
+
+    /// Write the NC-10 fixture: an encrypted ed25519 key and an askpass
+    /// helper that takes far longer than any observation window here.
+    fn encrypted_key_fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        generate_keypair(&dir.path().join("encrypted-key"), "devflow-nc10-passphrase");
+        let askpass = dir.path().join("askpass.sh");
+        std::fs::write(
+            &askpass,
+            "#!/bin/sh\nsleep 5\necho devflow-nc10-passphrase\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&askpass).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&askpass, perms).unwrap();
+        dir
+    }
+
+    /// Poll `child` for up to `window`, returning how long it took to exit
+    /// or `None` if it was still running when the window closed.
+    fn wait_bounded(child: &mut std::process::Child, window: Duration) -> Option<Duration> {
+        let started = Instant::now();
+        let deadline = started + window;
+        loop {
+            match child.try_wait().expect("poll nc-10 child") {
+                Some(_) => return Some(started.elapsed()),
+                None => {
+                    if Instant::now() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+    }
+
+    /// NC-10, positive arm: with `SSH_ASKPASS_REQUIRE=never` an encrypted
+    /// key does NOT park on the askpass helper — it gives up promptly.
+    #[test]
+    fn ssh_signing_probe_does_not_block_on_an_encrypted_key() {
+        let dir = encrypted_key_fixture();
+        let mut child = askpass_arm(dir.path(), Some("never"));
+        let elapsed = wait_bounded(&mut child, SSH_SIGN_PROBE_TIMEOUT / 2);
+        if elapsed.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let elapsed = elapsed.expect(
+            "SSH_ASKPASS_REQUIRE=never did not stop ssh-keygen blocking on the askpass helper",
+        );
+        eprintln!("NC-10 non-blocking arm exited in {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the non-blocking arm took {elapsed:?}, which is too slow to calibrate a control"
+        );
+    }
+
+    /// NC-10's control (D-01). The env var, not the fixture and not the
+    /// timeout, is what prevents the hang — so the SAME fixture is run with
+    /// the variable OMITTED and must still be alive when the window closes.
+    ///
+    /// **The window is calibrated, not assumed (F-9).** The non-blocking arm
+    /// runs first and its wall-clock exit is measured; the window is derived
+    /// from that measurement at a stated multiple. An uncalibrated window
+    /// shorter than the time `ssh-keygen` ordinarily takes to give up would
+    /// report "blocked" for a reason that has nothing to do with the
+    /// variable, and the control would pass while measuring the wrong thing.
+    /// The window is also held well under [`SSH_SIGN_PROBE_TIMEOUT`], so the
+    /// measurement is of the variable's effect rather than of the ceiling.
+    ///
+    /// A control that agrees with its positive case is a broken measurement,
+    /// not evidence: if the blocking arm does NOT block, this test fails
+    /// loudly rather than passing.
+    #[test]
+    fn encrypted_key_blocks_without_the_askpass_require_env_var() {
+        const CALIBRATION_MULTIPLE: u32 = 8;
+        const MIN_WINDOW: Duration = Duration::from_millis(1000);
+
+        let dir = encrypted_key_fixture();
+
+        // Arm 1 — measure. Same fixture, variable set.
+        let mut baseline_child = askpass_arm(dir.path(), Some("never"));
+        let baseline = wait_bounded(&mut baseline_child, SSH_SIGN_PROBE_TIMEOUT / 2);
+        if baseline.is_none() {
+            let _ = baseline_child.kill();
+            let _ = baseline_child.wait();
+        }
+        let baseline = baseline.expect(
+            "control uncalibrated: the non-blocking arm never exited, so there is no baseline \
+             to derive an observation window from",
+        );
+
+        // Derive the window from the measurement rather than assuming one.
+        let window = std::cmp::max(baseline * CALIBRATION_MULTIPLE, MIN_WINDOW);
+        assert!(
+            window >= baseline * 4,
+            "control uncalibrated: observation window {window:?} is not at least four times \
+             the measured non-blocking exit of {baseline:?}"
+        );
+        assert!(
+            window < SSH_SIGN_PROBE_TIMEOUT / 2,
+            "control uncalibrated: observation window {window:?} is not comfortably under the \
+             probe's own {SSH_SIGN_PROBE_TIMEOUT:?} ceiling, so it would measure the ceiling \
+             rather than SSH_ASKPASS_REQUIRE"
+        );
+
+        // Arm 2 — the control. Same fixture, variable omitted.
+        let mut blocking_child = askpass_arm(dir.path(), None);
+        let blocked = wait_bounded(&mut blocking_child, window);
+        let _ = blocking_child.kill();
+        let _ = blocking_child.wait();
+
+        eprintln!(
+            "NC-10 calibration: non-blocking exit {baseline:?}, observation window {window:?} \
+             ({CALIBRATION_MULTIPLE}x, floored at {MIN_WINDOW:?}), blocking arm {blocked:?}"
+        );
+        assert!(
+            blocked.is_none(),
+            "NC-10 control FAILED: with SSH_ASKPASS_REQUIRE omitted the child still exited in \
+             {blocked:?}, inside the {window:?} window. A control that agrees with its positive \
+             case is a broken measurement, not evidence — nothing here supports the conclusion \
+             that the environment variable is what prevents the hang"
+        );
+    }
+
+    /// D-03/A-17: an inline `user.signingkey` returns `Unknown` with the
+    /// fixed inline reason and is never probed.
+    ///
+    /// Run with a NORMAL `PATH`, so `ssh-keygen` is present throughout. That
+    /// is what makes this a proof of "never probed" rather than of "failed
+    /// to probe" — the surface test that removes the tooling cannot tell the
+    /// two apart.
+    #[test]
+    fn inline_signing_key_returns_unknown_without_probing() {
+        const INLINE_REASON: &str =
+            "cannot verify signing viability — an inline user.signingkey is not probed";
+        let keys = tempfile::tempdir().unwrap();
+        let pub_key = generate_keypair(&keys.path().join("inline-key"), "");
+        let blob = std::fs::read_to_string(&pub_key)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        for value in [format!("key::{blob}"), blob.clone()] {
+            let repo = init_repo();
+            let root = repo.path();
+            git(root, &["config", "gpg.format", "ssh"]);
+            git(root, &["config", "user.signingkey", &value]);
+
+            let result = check_signing_viability(root);
+
+            assert_eq!(
+                result,
+                SigningViability::Unknown {
+                    reason: INLINE_REASON.into(),
+                },
+                "inline value {value:?} was not routed to the unprobed Unknown arm: {result:?}"
+            );
+            assert_no_leak(&result, keys.path());
+        }
+    }
 }
