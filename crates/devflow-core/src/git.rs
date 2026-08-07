@@ -1076,19 +1076,44 @@ fn check_ssh_signing_viability(project_root: &Path) -> SigningViability {
         };
     }
 
-    // Fixed reason strings keyed by failure class (D-02) — none is composed
-    // from `ssh-keygen`'s output, and none names the configured key, a path,
-    // or any part of the child's stderr. The two fail-soft classes keep the
-    // file's existing "cannot verify signing viability — " prefix.
-    match run_ssh_sign_probe(key_path) {
+    sign_probe_verdict(run_ssh_sign_probe(key_path), key_path)
+}
+
+/// The probe outcome → operator-facing verdict mapping, split out from
+/// [`check_ssh_signing_viability`] so it can be asserted for every variant
+/// without spawning anything (WR-01). Forcing a real `TimedOut` needs a
+/// 10-second wedged `ssh-keygen`; the classification that was wrong is right
+/// here, and this is the level it can be pinned at.
+///
+/// Fixed reason strings keyed by failure class (D-02) — none is composed
+/// from `ssh-keygen`'s output, and none names the configured key, a path,
+/// or any part of the child's stderr. Every fail-soft class keeps the
+/// file's existing "cannot verify signing viability — " prefix.
+fn sign_probe_verdict(outcome: SignProbeOutcome, key_path: &Path) -> SigningViability {
+    match outcome {
         SignProbeOutcome::Signed => SigningViability::Viable {
             fingerprint: public_key_fingerprint(key_path),
         },
         SignProbeOutcome::Rejected => SigningViability::NotViable {
             reason: "the configured signing key could not sign a test payload".into(),
         },
-        SignProbeOutcome::TimedOut => SigningViability::NotViable {
-            reason: "the signing probe did not finish within its time limit".into(),
+        // WR-01 (35-REVIEW): a timeout is a MEASUREMENT failure, and this
+        // file argues that twice already — `NotRun`'s doc comment ("an
+        // infrastructure problem is not evidence about the key") and 20d/D-06
+        // (an unavailable tool yields `Unknown`, never a hard-fail
+        // `NotViable`). D-01's own justification for the ceiling names a
+        // wedged `ssh-agent` and a stalled PKCS11 provider; both are
+        // infrastructure, and neither says anything about whether the key
+        // signs. A FIDO/`sk-` key is the concrete case: `ssh-keygen -Y sign`
+        // waits for a physical touch, the prompt reaches nobody (stdio is
+        // nulled and `setsid` dropped the terminal), and ten seconds later a
+        // key that `git tag -s` signs with fine would have hard-failed a
+        // release cut — the 999.86 defect class reintroduced by the
+        // replacement.
+        SignProbeOutcome::TimedOut => SigningViability::Unknown {
+            reason: "cannot verify signing viability — the signing probe did not finish \
+                     within its time limit"
+                .into(),
         },
         SignProbeOutcome::ToolMissing => SigningViability::Unknown {
             reason: "cannot verify signing viability — ssh-keygen not found".into(),
@@ -2224,6 +2249,61 @@ mod tests {
             total,
             "two concurrently spawned threads produced duplicate probe workspace names"
         );
+    }
+
+    /// WR-01 (35-REVIEW): a probe timeout is a measurement failure, so it
+    /// must land on `Unknown`/`warn` beside the other two non-verdicts — not
+    /// on a hard `NotViable`, which asserts something about the key and
+    /// attaches `release --check`'s "resolve before attempting the signed
+    /// release tag" hint to a key that may sign perfectly well.
+    ///
+    /// `Rejected` is the NC-4 negative control and is checked in the same
+    /// function on purpose here: it is the one outcome that genuinely IS
+    /// evidence about the key, so a mapping that returned `Unknown`
+    /// unconditionally — the obvious over-correction — fails on it. If both
+    /// halves agreed, this test would be measuring nothing.
+    ///
+    /// Asserted on the classification rather than by wedging a real
+    /// `ssh-keygen` for ten seconds: the defect was in the mapping, and a
+    /// wall-clock probe would make this a slow test of the timeout mechanism
+    /// (which `SSH_SIGN_PROBE_TIMEOUT`'s own tests already cover) instead of
+    /// a fast test of the verdict.
+    #[test]
+    fn a_probe_timeout_is_unknown_while_a_rejection_stays_not_viable() {
+        // Never read: no arm below reaches `public_key_fingerprint`.
+        let unused_key = Path::new("/nonexistent/devflow-wr01");
+
+        let timed_out = sign_probe_verdict(SignProbeOutcome::TimedOut, unused_key);
+        match &timed_out {
+            SigningViability::Unknown { reason } => assert!(
+                reason.starts_with("cannot verify signing viability — "),
+                "a non-verdict must carry the file's fail-soft prefix, got: {reason:?}"
+            ),
+            other => panic!(
+                "a timeout establishes nothing about the key and must not be a hard \
+                 verdict, got: {other:?}"
+            ),
+        }
+
+        let rejected = sign_probe_verdict(SignProbeOutcome::Rejected, unused_key);
+        assert!(
+            matches!(rejected, SigningViability::NotViable { .. }),
+            "NEGATIVE CONTROL: a key that ran the probe and could not sign IS evidence \
+             about the key and must stay a hard verdict, got: {rejected:?}"
+        );
+
+        // The other two fail-soft classes, pinned in the same place so the
+        // three "could not establish anything" outcomes cannot drift apart
+        // again.
+        for outcome in [SignProbeOutcome::ToolMissing, SignProbeOutcome::NotRun] {
+            assert!(
+                matches!(
+                    sign_probe_verdict(outcome, unused_key),
+                    SigningViability::Unknown { .. }
+                ),
+                "every measurement failure maps to Unknown"
+            );
+        }
     }
 
     /// Generate a real ed25519 keypair at `stem`, with `passphrase` (empty
