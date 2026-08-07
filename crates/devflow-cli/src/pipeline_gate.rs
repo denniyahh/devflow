@@ -110,15 +110,51 @@ pub(crate) fn transition(
     launch_stage(state, None, Some(from))
 }
 
+/// Why the pipeline is looping back to Code, recorded on the `loop_back`
+/// event so `events.jsonl` distinguishes cases that are indistinguishable
+/// from the counters alone (IN-02, 999.78).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoopBackReason {
+    /// A Validate failure recorded against an existing commit-count baseline
+    /// — the ordinary case.
+    ValidateFailure,
+    /// A Validate failure recorded while NO commit-count baseline existed for
+    /// this phase (IN-02). `last_validate_failure_commit_count`'s `None` means
+    /// both "genuine first failure of this phase" and "state written by a
+    /// binary predating that field", and nothing in `events.jsonl` told the
+    /// two apart — so an operator who upgraded a binary mid-phase got no
+    /// signal that the failure budget had widened back to its full width.
+    /// This reason is that signal.
+    ValidateFailureNoBaseline,
+    /// A human answered a gate with a loop-back — a Ship `review:` rejection,
+    /// an ambiguous Validate adjudication, or a finalization retry. Makes no
+    /// claim about the commit-count baseline, because none was consulted.
+    GateResponse,
+}
+
+impl LoopBackReason {
+    /// The stable string recorded on the `loop_back` event. Distinct per
+    /// variant by construction: an operator greps these, so two variants
+    /// sharing a string would silently re-merge the cases IN-02 separated.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            LoopBackReason::ValidateFailure => "validate_failure",
+            LoopBackReason::ValidateFailureNoBaseline => "validate_failure_no_commit_baseline",
+            LoopBackReason::GateResponse => "gate_response",
+        }
+    }
+}
+
 /// Loop the pipeline back to Code with the given fix prompt (`GapsOnly` for a
 /// Validate rejection, `AuditFix` for a Ship `review:` rejection).
 pub(crate) fn loop_back_to_code(
     project_root: &Path,
     state: &mut State,
     fix: FixType,
+    reason: LoopBackReason,
 ) -> Result<(), CliError> {
     let from = state.stage;
-    let prompt = prepare_loop_back_to_code(project_root, state, fix)?;
+    let prompt = prepare_loop_back_to_code(project_root, state, fix, reason)?;
     launch_stage(state, Some(prompt), Some(from))
 }
 
@@ -131,6 +167,7 @@ pub(crate) fn prepare_loop_back_to_code(
     project_root: &Path,
     state: &mut State,
     fix: FixType,
+    reason: LoopBackReason,
 ) -> Result<String, CliError> {
     // Capture the stage the gate actually fired on before it's mutated below,
     // so cleanup targets the right stage's gate files (see CR-01: a stale
@@ -148,12 +185,14 @@ pub(crate) fn prepare_loop_back_to_code(
         serde_json::json!({
             "from": gate_stage.to_string(),
             "consecutive_failures": state.consecutive_failures,
+            "phase_validate_failures": state.phase_validate_failures,
+            "reason": reason.as_str(),
             "fix": format!("{fix:?}"),
         }),
     );
     println!(
-        "looping back to Code (validate failures: {})",
-        state.consecutive_failures
+        "looping back to Code ({} validate failure(s) this phase, {} in the current streak)",
+        state.phase_validate_failures, state.consecutive_failures
     );
     Ok(prompt::fix_prompt(fix, state.phase))
 }
@@ -215,7 +254,12 @@ pub(crate) fn finish_workflow_with_gate_timeout(
                 let _ = Gates::cleanup(project_root, state.phase, Stage::Ship);
             }
             GateAction::LoopBack(_) => {
-                return loop_back_to_code(project_root, state, FixType::AuditFix);
+                return loop_back_to_code(
+                    project_root,
+                    state,
+                    FixType::AuditFix,
+                    LoopBackReason::GateResponse,
+                );
             }
             GateAction::Abort(reason) => return abort(project_root, state, &reason),
         }
@@ -519,7 +563,12 @@ pub(crate) fn ship_override(project_root: &Path, phase: u32, force: bool) -> Res
                 "phase {phase}: Ship response loops back to Code — launching a new, detached \
                  monitor agent to drive the retry"
             );
-            loop_back_to_code(project_root, &mut state, FixType::AuditFix)
+            loop_back_to_code(
+                project_root,
+                &mut state,
+                FixType::AuditFix,
+                LoopBackReason::GateResponse,
+            )
         }
         GateAction::Abort(reason) => abort(project_root, &state, &reason),
     }
