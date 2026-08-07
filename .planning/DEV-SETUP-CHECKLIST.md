@@ -133,14 +133,26 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
 - [ ] **[GLOBAL, currently empty]** Auto-memory directory convention:
   `~/.claude/projects/<project-path>/memory/` — per-project persistent memory, keyed by encoded
   filesystem path, so it naturally travels with wherever the project lives on disk.
-- [ ] **[PROJECT, enabled 2026-08-04]** MemPalace — `.planning/config.json`'s `mempalace` block:
-  `enabled: true`, `capture_artifacts: true`, `wing: "devflow"`, `memory_mode: "augment"`,
-  `mirror_kg: false`, `recall_on_plan: true`. Requires the `mempalace` CLI on `PATH` (this
-  machine: v3.6.0, installed via `~/.local/bin/mempalace`) — no MCP server registered yet, so
-  transport falls back to CLI-only, which the GSD skills support as a first-class path, not a
-  degraded one. **The palace itself starts empty** (`mempalace status` reported no palace at
+- [ ] **[PROJECT, enabled 2026-08-04, curation widened 2026-08-07]** MemPalace —
+  `.planning/config.json`'s `mempalace` block: `enabled: true`, `capture_artifacts: true`,
+  `wing: "devflow"`, `memory_mode: "augment"`, `recall_on_plan: true`, plus as of 2026-08-07
+  `mirror_kg: true`, `diary_journal: true`, `cross_project_tunnels: true` — the three `ship:post`
+  curation tasks the `gsd-mempalace-curator` agent independently gates on (diary entry per phase,
+  extract-learnings → temporal-KG mirror, cross-project tunnel proposals; a fourth,
+  wing-scoped-prune, is unconditional). Requires the `mempalace` CLI on `PATH` (this machine:
+  v3.6.0, installed via `~/.local/bin/mempalace`) — no MCP server registered yet, so transport
+  falls back to CLI-only, which the GSD skills support as a first-class path, not a degraded one.
+  **The palace itself starts empty** (`mempalace status` reported no palace at
   `~/.mempalace/palace` as of enabling) — capture accrues from new phases going forward; nothing
   was backfilled from this repo's existing `.planning/` history.
+- [ ] **[PROJECT, enabled 2026-08-07]** Broken-windows ship gate — `.planning/config.json`'s
+  `workflow.windows_enforce: true`. Blocks `/gsd-ship` while `.planning/WINDOWS.md`'s
+  `open_count > 0`, and fails closed (blocks) if the ledger's frontmatter counts don't match its
+  own entries rather than trusting an unreadable/inconsistent count — caught and fixed once
+  already (frontmatter claimed 1 open when the entries showed 0, stale since a Phase 28 fix landed
+  without a recount). Resolve items with `gsd-tools windows fixed <id>` or
+  `gsd-tools windows waive <id> "<reason>"` (reason required); no automatic recompute verb exists,
+  so a frontmatter/entries mismatch needs a manual counter fix.
 - [ ] **[PROJECT, enabled 2026-08-05]** TDD capability — `.planning/config.json`'s
   `workflow.tdd_mode: true`. The `tdd` capability ships installed/enabled/active by default, but
   **both** its hooks gate on this key, so it is inert until the key is set: a `plan:pre`
