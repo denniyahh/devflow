@@ -146,6 +146,12 @@ status: complete
 3. **Task 2: probe fixtures with their two mandatory negative controls** — `d7527b8` (test)
 4. **Task 3: retire every test and comment the deletion falsified** — `a5ed1e9` (test)
 
+**Plan metadata:** `3feb06a` (docs: SUMMARY), `6160dee` (docs: HARDEN-05 marked complete)
+
+`STATE.md` and `ROADMAP.md` were deliberately NOT touched — this plan ran as a worktree-isolated
+parallel executor and the orchestrator owns those writes after the wave merges. The post-commit
+hook's "STATE.md may now be stale" warning is expected here, not a defect.
+
 ## Files Created/Modified
 
 - `crates/devflow-core/src/git.rs` — `check_ssh_signing_viability` rewritten as a bounded probe; `SSH_SIGN_NAMESPACE` / `SSH_SIGN_PROBE_TIMEOUT` / `SSH_SIGN_PROBE_POLL`; `probe_workspace_name`, `run_ssh_sign_probe`, `sign_probe_within`, `SignProbeOutcome`; predictor and orphan deleted; five new tests plus three restated ones.
@@ -305,6 +311,16 @@ None.
 - The public-API removals are complete and `cargo build --workspace --all-targets` is clean, so **35-06**'s enumeration of every changed/removed `pub` item can record `devflow_core::git::classify_ssh_add_status` and `devflow_core::git::SigningStatus` as removed.
 - `scripts/check.sh all` is green end to end: fmt clean, clippy clean under `-D warnings`, and `0 failed` across all binaries (558 in `devflow-core`, 279 + integration suites in `devflow-cli`).
 - **DEN-50 is unaffected and must stay that way** — `devflow release`'s real signing executor must still run the real signed `git tag`. This probe is a preflight and must never be substituted for it.
+
+## Self-Check: PASSED
+
+Every file and commit claimed above was verified to exist on disk and in this worktree's history,
+rather than asserted from memory:
+
+- `crates/devflow-core/src/git.rs`, `crates/devflow-cli/tests/release_check.rs` and
+  `35-03-SUMMARY.md` — all present.
+- `ae1dee8`, `6fe8862`, `d7527b8`, `a5ed1e9`, `3feb06a`, `6160dee` — all present in
+  `git log 749a151..HEAD`.
 
 ---
 *Phase: 35-loop-termination-and-baseline-correctness-999-77-999-78-999-*
