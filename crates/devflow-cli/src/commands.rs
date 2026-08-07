@@ -305,6 +305,45 @@ pub(crate) fn start(
         }
     }
 
+    // 999.79 (35-05, A-05): record what this phase's `{N}-VERIFICATION.md`
+    // looked like BEFORE this run's Validate agent has had any opportunity to
+    // rewrite it. `handle_validate_outcome`'s loop-back selector compares the
+    // artifact against this baseline: unchanged means it was inherited from a
+    // previous run and its verdict must not be reused; changed (or newly
+    // present) means the Validate agent authored it during this run.
+    //
+    // Nothing deletes, dates or invalidates the artifact, and a
+    // `devflow start --phase N --force` checks out a branch that still carries
+    // the previous run's committed copy. Without this baseline that re-run —
+    // mid-arc by construction — reads the inherited artifact as a verdict and
+    // dispatches a `--gaps-only` pass against zero matching plans, gating
+    // unresolvably.
+    //
+    // PLACEMENT IS LOAD-BEARING, and this is A-05's whole point: the capture
+    // sits AFTER the `if worktree { ... }` fork above, where
+    // `state.worktree_path` holds its final value for this run. The artifact
+    // lives under the EVIDENCE ROOT, and in worktree mode that directory is
+    // created by `ensure_phase_worktree` inside that fork — it does not exist
+    // when `fresh_state_carrying_phase_failures` builds the state near the top
+    // of this function. Capturing there would record "absent" for every
+    // worktree run and make the very first freshness check read as fresh,
+    // which is the failure direction this baseline exists to prevent.
+    //
+    // The evidence root is resolved the same way every loop-back arm resolves
+    // it — the worktree path when present, the project root otherwise — and
+    // NOT unconditionally as the project root. `.planning/` is tracked and the
+    // Validate agent runs in the worktree, so the artifact lands on
+    // `feature/phase-{N}` inside the worktree and is invisible from the main
+    // checkout; reading the project root here is exactly the defect plan 33-05
+    // closed (CR-01) and must not be reintroduced. Persisted by the
+    // `workflow::save_state` below rather than by a second write.
+    let evidence_root: PathBuf = state
+        .worktree_path
+        .clone()
+        .unwrap_or_else(|| project_root.to_path_buf());
+    state.last_verification_fingerprint =
+        agent_result::phase_verification_fingerprint(&evidence_root, phase);
+
     // 25b (D-03): the self-dogfood build-staleness gate, hoisted here from
     // `pipeline_launch::launch_stage_inner` (17d originally placed it there,
     // re-running it before every stage launch — which meant a phase that
