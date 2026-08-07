@@ -623,13 +623,13 @@ pub(crate) fn handle_validate_outcome(
             // aborting is destructive and irreversible relative to gating and
             // would kill a phase that may be one cycle from converging.
             GateAction::Advance => {
-                reset_phase_failures_at_ceiling(state, ceiling_gate);
+                reset_phase_failures_at_ceiling(project_root, state, ceiling_gate);
                 transition(project_root, state, Stage::Ship)
             }
             GateAction::LoopBack(_) => {
                 // Evidence root: see the single binding at the top.
                 let fix = select_loop_back_fix(&evidence_root, state.phase, state);
-                reset_phase_failures_at_ceiling(state, ceiling_gate);
+                reset_phase_failures_at_ceiling(project_root, state, ceiling_gate);
                 loop_back_to_code(project_root, state, fix, loop_back_reason(baseline_absent))
             }
             // No reset on abort: the phase is ending and `abort` clears its
@@ -663,10 +663,44 @@ pub(crate) fn handle_validate_outcome(
 /// would never accumulate at all — an unbounded loop wearing a gate on every
 /// cycle. The persisting write is the caller's: both arms that call this go on
 /// to `transition` or `loop_back_to_code`, each of which saves state.
-fn reset_phase_failures_at_ceiling(state: &mut State, ceiling_gate: bool) {
-    if ceiling_gate {
-        state.phase_validate_failures = 0;
+///
+/// # Why the reset announces itself (WR-03, WR-04, 35-REVIEW)
+///
+/// This runs BEFORE `loop_back_to_code`, and `prepare_loop_back_to_code` reads
+/// `state.phase_validate_failures` for both its `loop_back` event and its
+/// console line. Those therefore report `0` — correctly, since the budget by
+/// then really is zero, but it left the one moment in the run that should mark
+/// the ceiling being reached with no record of the number that was reached.
+/// The `Advance` arm was worse: nothing at all marked the reset.
+///
+/// So the pre-reset total is reported here, at the moment it is spent, on both
+/// channels. The alternative the review proposed — moving the reset after
+/// `loop_back_to_code` and adding a `save_state` — is NOT taken, and the reason
+/// is specific: `loop_back_to_code` reaches `run_preflight`, which can `abort()`
+/// (clearing the phase's state file) and return `Ok(false)`, so a following
+/// `save_state` would resurrect the state file of an aborted phase as a phantom
+/// active run. Reporting rather than reordering keeps the existing single
+/// persisting write.
+fn reset_phase_failures_at_ceiling(project_root: &Path, state: &mut State, ceiling_gate: bool) {
+    if !ceiling_gate {
+        return;
     }
+    let spent = state.phase_validate_failures;
+    state.phase_validate_failures = 0;
+    events::emit(
+        project_root,
+        state.phase,
+        "phase_failure_budget_reset",
+        serde_json::json!({
+            "phase_validate_failures_before": spent,
+            "ceiling": mode::MAX_PHASE_VALIDATE_FAILURES,
+        }),
+    );
+    println!(
+        "per-phase Validate-failure budget reset: {spent} failure(s) recorded, \
+         ceiling {} reached and answered by a human — the count restarts at zero",
+        mode::MAX_PHASE_VALIDATE_FAILURES
+    );
 }
 
 /// IN-02: map "was there a commit baseline when this Validate failure was
@@ -2652,6 +2686,110 @@ mod tests {
                 .phase_validate_failures,
             0,
             "the reset must be persisted, not merely in memory — the next process reads the file"
+        );
+    }
+
+    /// WR-03 (35-REVIEW): the run's record of the ceiling being reached must
+    /// carry the number that was reached.
+    ///
+    /// The reset runs before `loop_back_to_code`, and `prepare_loop_back_to_code`
+    /// reads the already-zeroed total for both its `loop_back` event and its
+    /// console line — so `events.jsonl` recorded `"phase_validate_failures": 0`
+    /// for the one loop-back in the phase that spent the whole budget, and the
+    /// operator read `looping back to Code (0 validate failure(s) this phase)`
+    /// immediately after being told the ceiling was hit. In the `Advance` arm
+    /// nothing marked the reset at all.
+    ///
+    /// Asserted on `events.jsonl` rather than the console, since that is the
+    /// durable record and the one a later reconciliation reads.
+    ///
+    /// **The below-ceiling half is the negative control**, and it is what
+    /// distinguishes this from an event emitted on every gate: an ordinary
+    /// Supervise Validate gate spends no budget, so it must emit nothing. Both
+    /// halves run in Supervise for the reason the sibling reset test documents
+    /// — in Auto the below-ceiling failure would not gate at all and the
+    /// control would prove only that a gate which never fired stayed silent.
+    #[test]
+    fn the_ceiling_reset_records_the_total_it_spent() {
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let neutral_path_dir = agent_free_git_only_path_dir();
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: serialized under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("PATH", neutral_path_dir.path());
+        }
+
+        // AT the ceiling: this failure takes the total to exactly MAX.
+        let at_ceiling_phase = 91;
+        let mut at_ceiling = State::new(
+            at_ceiling_phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        at_ceiling.stage = Stage::Validate;
+        at_ceiling.phase_validate_failures = mode::MAX_PHASE_VALIDATE_FAILURES - 1;
+        workflow::save_state(&at_ceiling).unwrap();
+        let at_ceiling_response = Gates::response_path(root, at_ceiling_phase, Stage::Validate);
+        std::fs::create_dir_all(at_ceiling_response.parent().unwrap()).unwrap();
+        std::fs::write(&at_ceiling_response, LOOP_BACK_RESPONSE).unwrap();
+        let _ = handle_validate_outcome(root, &mut at_ceiling, ValidateOutcome::Failed);
+
+        // NEGATIVE CONTROL — below the ceiling, everything else identical.
+        let below_phase = 92;
+        let mut below = State::new(
+            below_phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
+        below.stage = Stage::Validate;
+        below.phase_validate_failures = 2;
+        workflow::save_state(&below).unwrap();
+        let below_response = Gates::response_path(root, below_phase, Stage::Validate);
+        std::fs::create_dir_all(below_response.parent().unwrap()).unwrap();
+        std::fs::write(&below_response, LOOP_BACK_RESPONSE).unwrap();
+        let _ = handle_validate_outcome(root, &mut below, ValidateOutcome::Failed);
+
+        // SAFETY: still serialized under ENV_MUTEX from above.
+        unsafe {
+            match &original_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        assert!(
+            last_gate_context(root, below_phase).is_some(),
+            "premise for the control: Supervise gates on a below-ceiling failure too"
+        );
+
+        let reset = devflow_core::events::last_event_of_kind_for_phase(
+            root,
+            at_ceiling_phase,
+            "phase_failure_budget_reset",
+        )
+        .expect("spending the whole per-phase budget must leave a record of it");
+        assert_eq!(
+            reset["phase_validate_failures_before"].as_u64(),
+            Some(u64::from(mode::MAX_PHASE_VALIDATE_FAILURES)),
+            "the record must carry the total that was SPENT, not the zero it was reset to"
+        );
+
+        assert!(
+            devflow_core::events::last_event_of_kind_for_phase(
+                root,
+                below_phase,
+                "phase_failure_budget_reset",
+            )
+            .is_none(),
+            "NEGATIVE CONTROL: an ordinary below-ceiling gate spends no budget and must \
+             emit nothing — an event on every gate would carry no information"
         );
     }
 
