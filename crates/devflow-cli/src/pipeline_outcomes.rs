@@ -313,12 +313,25 @@ pub(crate) enum ValidateResult {
 /// the project root and are unaffected. Passing the bare `project_root` here in worktree mode
 /// makes the predicate read `false` unconditionally, which is exactly the
 /// defect this parameter's name now guards against.
-fn select_loop_back_fix(evidence_root: &Path, phase: u32) -> FixType {
-    if agent_result::phase_verification_exists(evidence_root, phase) {
+fn select_loop_back_fix(evidence_root: &Path, phase: u32, state: &mut State) -> FixType {
+    let current = agent_result::phase_verification_fingerprint(evidence_root, phase);
+    if verification_authored_this_run(current, state.last_verification_fingerprint) {
+        state.last_verification_fingerprint = current;
         FixType::GapsOnly
     } else {
         FixType::FullExecute
     }
+}
+
+/// RED stub (999.79, 35-05 Task 3): ALWAYS STALE.
+///
+/// This is NC-7's performed mutation used as the RED step. It must fail the
+/// truth table's fresh rows and `verification_written_this_run_dispatches_gaps_only`
+/// while leaving `stale_verification_artifact_dispatches_full_execute` passing —
+/// that asymmetry is the evidence the direction pair discriminates. Replaced by
+/// the real predicate in the GREEN step.
+fn verification_authored_this_run(_current: Option<u64>, _run_start_baseline: Option<u64>) -> bool {
+    false
 }
 
 /// Decide what happens after a Validate stage, honoring the active mode's
@@ -400,7 +413,7 @@ pub(crate) fn handle_validate_outcome(
                 GateAction::Advance => transition(project_root, state, Stage::Ship),
                 GateAction::LoopBack(_) => {
                     // Evidence root: see the single binding at the top.
-                    let fix = select_loop_back_fix(&evidence_root, state.phase);
+                    let fix = select_loop_back_fix(&evidence_root, state.phase, state);
                     // A human adjudicated an ambiguous outcome; no commit
                     // baseline was consulted, so this arm makes no claim
                     // about one.
@@ -548,7 +561,7 @@ pub(crate) fn handle_validate_outcome(
             }
             GateAction::LoopBack(_) => {
                 // Evidence root: see the single binding at the top.
-                let fix = select_loop_back_fix(&evidence_root, state.phase);
+                let fix = select_loop_back_fix(&evidence_root, state.phase, state);
                 reset_phase_failures_at_ceiling(state, ceiling_gate);
                 loop_back_to_code(project_root, state, fix, loop_back_reason(baseline_absent))
             }
@@ -564,7 +577,7 @@ pub(crate) fn handle_validate_outcome(
             // The plain-Failed tail arm — the common auto-loop path, and the
             // one the Phase 29 dogfood actually hit. Evidence root: see the
             // single binding at the top.
-            let fix = select_loop_back_fix(&evidence_root, state.phase);
+            let fix = select_loop_back_fix(&evidence_root, state.phase, state);
             loop_back_to_code(project_root, state, fix, loop_back_reason(baseline_absent))
         }
     }
@@ -3128,6 +3141,280 @@ mod tests {
         assert_eq!(
             last_b["fix"], "FullExecute",
             "a {{N}}-VERIFICATION.md visible only from the main checkout belongs to a different run and must NOT resurrect GapsOnly"
+        );
+    }
+
+    /// 999.79 / HARDEN-03, ROADMAP criterion 3 — the STALE direction. A
+    /// `devflow start --phase N --force` checks out a branch that still
+    /// carries the PREVIOUS run's committed `{N}-VERIFICATION.md`. That re-run
+    /// is mid-arc by construction, so inheriting the artifact's verdict
+    /// dispatches a `--gaps-only` pass against zero matching plans and gates
+    /// unresolvably.
+    ///
+    /// The fixture is the forced-re-run shape exactly: the artifact is on disk
+    /// AND `state.last_verification_fingerprint` already holds its fingerprint,
+    /// because `start()` recorded it before this run's Validate agent had any
+    /// opportunity to rewrite it. Unchanged since run start ⇒ inherited ⇒
+    /// FullExecute.
+    ///
+    /// **Not meaningful without `verification_written_this_run_dispatches_gaps_only`
+    /// below.** This test passes against a rule that reports every artifact
+    /// stale forever — which would silently disable the gaps-only path Phase 33
+    /// built, trading an unresolvable gate for a loop that re-runs every plan.
+    /// Only the paired test detects that. One direction alone is not acceptance.
+    #[test]
+    fn stale_verification_artifact_dispatches_full_execute() {
+        let _guard = env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 86;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        // IN-07: Validate is the only stage production reaches this call from.
+        state.stage = Stage::Validate;
+        let worktree = root.join(format!(".worktrees/phase-{phase}"));
+        std::fs::create_dir_all(&worktree).unwrap();
+        state.worktree_path = Some(worktree.clone());
+
+        // The inherited artifact, committed by the PREVIOUS run and still on
+        // the branch this forced re-run checked out.
+        let phase_dir = worktree
+            .join(".planning/phases")
+            .join(format!("{phase:02}-test"));
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        std::fs::write(
+            phase_dir.join(format!("{phase:02}-VERIFICATION.md")),
+            "verdict: pass -- authored by a PREVIOUS run\n",
+        )
+        .unwrap();
+
+        // What `start()` records once the evidence root is resolved (A-05).
+        let baseline = devflow_core::agent_result::phase_verification_fingerprint(&worktree, phase);
+        assert!(
+            baseline.is_some(),
+            "premise: the inherited artifact must be visible from the evidence root, otherwise \
+             this test would assert FullExecute for the mid-arc reason instead of the stale one"
+        );
+        state.last_verification_fingerprint = baseline;
+        workflow::save_state(&state).unwrap();
+
+        {
+            let _path_guard = NeutralPath::install();
+            let _ = handle_validate_outcome(root, &mut state, ValidateOutcome::Failed);
+        }
+
+        let last = devflow_core::events::last_event_of_kind_for_phase(root, phase, "loop_back")
+            .expect("loop_back event must be recorded");
+        assert_eq!(
+            last["fix"], "FullExecute",
+            "an artifact unchanged since this run started was inherited from a previous run; \
+             its verdict must NOT be reused, so the loop-back must dispatch FullExecute"
+        );
+    }
+
+    /// 999.79 / HARDEN-03, ROADMAP criterion 3 — the FRESH direction, and the
+    /// reason this fix is distinguishable from one that disables `--gaps-only`
+    /// forever (A-12, NC-7, T-35-22).
+    ///
+    /// Two sub-cases, both of which mean "the Validate agent authored this
+    /// during THIS run" and must reach the gaps-only path:
+    ///
+    /// 1. the artifact's fingerprint DIFFERS from the run-start baseline — a
+    ///    stale copy was on disk at run start and Validate rewrote it;
+    /// 2. the artifact EXISTS where the baseline recorded none — the ordinary
+    ///    first-verification case, and the one every pre-999.79 test exercised
+    ///    implicitly by leaving the baseline at `State::new`'s `None`.
+    ///
+    /// Sub-case 1 additionally closes **F-11's testable half**: it round-trips
+    /// state through the persisted file rather than reading the in-memory
+    /// `State`, then asserts the baseline the selector recorded is present on
+    /// disk after the loop-back completed. The risk being covered is a selector
+    /// that updates a value nothing ever writes out — `handle_validate_outcome`
+    /// saves state BEFORE the selector runs, so the update reaches disk only
+    /// via `prepare_loop_back_to_code`'s own save. Reading the in-memory
+    /// `State` would not distinguish those.
+    ///
+    /// Sub-case 2 deliberately does NOT round-trip, and therefore establishes
+    /// nothing about multi-process behaviour on its own.
+    #[test]
+    fn verification_written_this_run_dispatches_gaps_only() {
+        let _guard = env_lock();
+
+        // ---- sub-case 1: content differs from the run-start baseline ----
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = 87;
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        let worktree = root.join(format!(".worktrees/phase-{phase}"));
+        std::fs::create_dir_all(&worktree).unwrap();
+        state.worktree_path = Some(worktree.clone());
+
+        let phase_dir = worktree
+            .join(".planning/phases")
+            .join(format!("{phase:02}-test"));
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        let artifact = phase_dir.join(format!("{phase:02}-VERIFICATION.md"));
+
+        // The previous run's copy, present when this run started.
+        std::fs::write(&artifact, "verdict: pass -- from a PREVIOUS run\n").unwrap();
+        let run_start =
+            devflow_core::agent_result::phase_verification_fingerprint(&worktree, phase);
+        state.last_verification_fingerprint = run_start;
+        workflow::save_state(&state).unwrap();
+
+        // This run's Validate agent rewrites it.
+        std::fs::write(&artifact, "verdict: gaps -- authored by THIS run\n").unwrap();
+        let rewritten =
+            devflow_core::agent_result::phase_verification_fingerprint(&worktree, phase);
+        assert_ne!(
+            run_start, rewritten,
+            "premise: the rewrite must actually change the fingerprint, otherwise this test \
+             is silently exercising the stale case with a fresh label"
+        );
+
+        // F-11: reload from disk, so the drive below operates on state that
+        // genuinely crossed a process boundary rather than on the in-memory
+        // value this test just mutated.
+        let mut reloaded = workflow::load_state(root, phase).expect("state must persist");
+        assert_eq!(
+            reloaded.last_verification_fingerprint, run_start,
+            "premise: the run-start baseline must survive the save/load round trip, or the \
+             comparison below is against an in-memory value the real pipeline never sees"
+        );
+
+        {
+            let _path_guard = NeutralPath::install();
+            let _ = handle_validate_outcome(root, &mut reloaded, ValidateOutcome::Failed);
+        }
+
+        let last = devflow_core::events::last_event_of_kind_for_phase(root, phase, "loop_back")
+            .expect("loop_back event must be recorded");
+        assert_eq!(
+            last["fix"], "GapsOnly",
+            "an artifact whose content changed since this run started was authored by THIS \
+             run's Validate agent and must still reach the gaps-only path — a rule that marks \
+             everything stale would pass the stale test and fail here, which is the whole point \
+             of the pair"
+        );
+
+        // F-11's testable half: the selector's baseline update must be OBSERVABLE
+        // IN THE PERSISTED FILE, not merely in the in-memory State. The save in
+        // `handle_validate_outcome` runs BEFORE the selector, so this can only
+        // have been written by `prepare_loop_back_to_code`'s own save.
+        let persisted = workflow::load_state(root, phase)
+            .expect("state must still exist after the loop-back completed");
+        assert_eq!(
+            persisted.last_verification_fingerprint, rewritten,
+            "the baseline the selector recorded must reach DISK — a selector that updates a \
+             value nothing ever writes out would leave a later same-run check comparing against \
+             the old baseline and reading an unchanged artifact as fresh (F-11's fail-open \
+             direction)"
+        );
+
+        // ---- sub-case 2: artifact exists where the baseline recorded none ----
+        let dir_b = tempfile::tempdir().unwrap();
+        let root_b = dir_b.path();
+        let phase_b = 88;
+        let mut state_b = State::new(phase_b, AgentKind::Claude, Mode::Auto, root_b.to_path_buf());
+        state_b.stage = Stage::Validate;
+        let worktree_b = root_b.join(format!(".worktrees/phase-{phase_b}"));
+        std::fs::create_dir_all(&worktree_b).unwrap();
+        state_b.worktree_path = Some(worktree_b.clone());
+        // No artifact existed when this run started.
+        assert_eq!(
+            state_b.last_verification_fingerprint, None,
+            "premise: sub-case 2 requires an absent run-start baseline"
+        );
+        workflow::save_state(&state_b).unwrap();
+
+        let phase_dir_b = worktree_b
+            .join(".planning/phases")
+            .join(format!("{phase_b:02}-test"));
+        std::fs::create_dir_all(&phase_dir_b).unwrap();
+        std::fs::write(
+            phase_dir_b.join(format!("{phase_b:02}-VERIFICATION.md")),
+            "verdict: gaps -- first verification of this phase\n",
+        )
+        .unwrap();
+
+        {
+            let _path_guard = NeutralPath::install();
+            let _ = handle_validate_outcome(root_b, &mut state_b, ValidateOutcome::Failed);
+        }
+
+        let last_b =
+            devflow_core::events::last_event_of_kind_for_phase(root_b, phase_b, "loop_back")
+                .expect("sub-case 2 loop_back event must be recorded");
+        assert_eq!(
+            last_b["fix"], "GapsOnly",
+            "an artifact that exists where the run-start baseline recorded none was authored \
+             this run and must dispatch GapsOnly — this is the ordinary first-verification case \
+             Phase 33 built, and a too-strict freshness rule breaks it"
+        );
+    }
+
+    /// H-1 / NC-7's AUTOMATED half (T-35-22b): the stale/fresh decision is a
+    /// pure predicate over the pair (current fingerprint, run-start baseline),
+    /// and all four of its rows are pinned here in one place.
+    ///
+    /// Why this exists as well as the two direction tests above: NC-7's
+    /// performed mutation is a one-time act that nothing re-runs, so an
+    /// always-stale regression introduced later would ship with nothing to
+    /// catch it — and an always-stale rule makes the loop re-run every plan
+    /// forever, which is a worse failure than the stall 999.79 fixes.
+    ///
+    /// The row set is chosen so BOTH over-corrections are caught, not one:
+    ///
+    /// | current      | baseline     | fresh? | fails under |
+    /// |--------------|--------------|--------|-------------|
+    /// | `None`       | `None`       | no     | always-fresh|
+    /// | `Some(h)`    | `None`       | yes    | always-stale|
+    /// | `Some(h)`    | `Some(h)`    | no     | always-fresh|
+    /// | `Some(h)`    | `Some(g≠h)`  | yes    | always-stale|
+    ///
+    /// Two rows fail an always-stale stub and the other two fail an
+    /// always-fresh stub. A table that only fails one of the two would not be
+    /// exhaustive and the row set would be wrong.
+    #[test]
+    fn verification_freshness_truth_table_is_exhaustive() {
+        // Row 1 — no artifact at all. Not "authored this run": there is
+        // nothing to have authored. The phase is mid-arc and D-01's original
+        // FullExecute answer stands, unchanged by 999.79.
+        assert!(
+            !verification_authored_this_run(None, None),
+            "row 1: an absent artifact is never 'authored this run'"
+        );
+
+        // Row 1b — absent now, present at run start. Still nothing to inherit
+        // a verdict from; grouped with row 1 rather than given its own row
+        // because the predicate cannot distinguish them and must not try.
+        assert!(
+            !verification_authored_this_run(None, Some(7)),
+            "row 1b: an artifact that is absent NOW is never 'authored this run', whatever the \
+             baseline recorded"
+        );
+
+        // Row 2 — exists now, nothing recorded at run start. The ordinary
+        // first-verification case: Validate authored it during this run.
+        assert!(
+            verification_authored_this_run(Some(7), None),
+            "row 2: an artifact existing where the baseline recorded none was authored this run"
+        );
+
+        // Row 3 — unchanged since run start. The 999.79 case: inherited from a
+        // previous run, its verdict must not be reused.
+        assert!(
+            !verification_authored_this_run(Some(7), Some(7)),
+            "row 3: an artifact whose fingerprint equals the run-start baseline is INHERITED, \
+             not authored this run"
+        );
+
+        // Row 4 — content changed since run start. Validate rewrote it.
+        assert!(
+            verification_authored_this_run(Some(7), Some(8)),
+            "row 4: an artifact whose fingerprint differs from the run-start baseline was \
+             rewritten during this run"
         );
     }
 
