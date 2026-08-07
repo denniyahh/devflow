@@ -81,14 +81,14 @@ are fixed together rather than one being repaired while the other keeps collapsi
      treating "could not count" as evidence of no work. Verified by the same forced-`git`-failure
      harness criterion 1 requires, with the discriminating case being `exit_code = 0` +
      `Stage::Code` + unrunnable `git` (999.87).
-**Plans**: 6 plans across 4 waves
+**Plans**: 3/6 plans executed
 
 Plans:
 **Wave 1**
 
-- [ ] 35-01-PLAN.md — tracer: the unmeasurable-`git` spine end to end — `NoGitPath` harness in both crates, `phase_commit_count` becomes `Option<u32>`, **all three** consumers honour it, two-cycle regression test, corrected doc comments (criteria 1 + 6). **Scope grew 2026-08-07 (cross-AI review, A-H1):** `evaluate_layer3` carried its own inline copy of the same lossy count, so criterion 6's `Ok(None)` fall-through only relocated the misclassification into Layer 3. Layer 3 is now fixed in the same plan and verified at the **cascade** level (`evaluate_agent_result`), since a per-layer test on `evaluate_layer2` alone is the proxy that hid it. Note `Failed` and `Unknown` both route to `Action::GateReview` (`outcome_policy.rs:53-54`), so this corrects the recorded classification and reason string, not the dispatch — no dispatch-level assertion is admissible as evidence here.
-- [ ] 35-02-PLAN.md — worktree-mode `GateReview` checkpoint regression test with D-05's decoy PLAN, D-06's re-running control, and the performed revert demonstration (criterion 4)
-- [ ] 35-03-PLAN.md — replace `release --check`'s signing predictor with a bounded, non-interactive `ssh-keygen -Y sign` probe; delete the predictor, its enum and the orphaned helper (criterion 5)
+- [x] 35-01-PLAN.md — tracer: the unmeasurable-`git` spine end to end — `NoGitPath` harness in both crates, `phase_commit_count` becomes `Option<u32>`, **all three** consumers honour it, two-cycle regression test, corrected doc comments (criteria 1 + 6). **Scope grew 2026-08-07 (cross-AI review, A-H1):** `evaluate_layer3` carried its own inline copy of the same lossy count, so criterion 6's `Ok(None)` fall-through only relocated the misclassification into Layer 3. Layer 3 is now fixed in the same plan and verified at the **cascade** level (`evaluate_agent_result`), since a per-layer test on `evaluate_layer2` alone is the proxy that hid it. Note `Failed` and `Unknown` both route to `Action::GateReview` (`outcome_policy.rs:53-54`), so this corrects the recorded classification and reason string, not the dispatch — no dispatch-level assertion is admissible as evidence here.
+- [x] 35-02-PLAN.md — worktree-mode `GateReview` checkpoint regression test with D-05's decoy PLAN, D-06's re-running control, and the performed revert demonstration (criterion 4)
+- [x] 35-03-PLAN.md — replace `release --check`'s signing predictor with a bounded, non-interactive `ssh-keygen -Y sign` probe; delete the predictor, its enum and the orphaned helper (criterion 5)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
@@ -182,7 +182,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 32 | 0/0 | Complete    | 2026-08-04 |
 | 33 | 6/6 | Complete    | 2026-08-05 |
 | 34 | 6/6 | Complete    | 2026-08-06 |
-| 35 | — | Not started | — |
+| 35 | 3/6 | In Progress|  |
 | 36 | — | Not started | — |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)
