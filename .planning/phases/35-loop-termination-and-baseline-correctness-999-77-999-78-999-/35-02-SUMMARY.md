@@ -255,3 +255,9 @@ None.
 None. This plan adds test code only; no production behaviour changed, and `T-35-09` (the
 temporarily-reverted working tree) was mitigated as planned — the revert was never committed, and
 `git diff --exit-code` on the file is recorded above.
+
+## Self-Check: PASSED
+
+- `35-02-SUMMARY.md` present on disk at the plan directory.
+- Commits present on `worktree-agent-ac1663c0a172d05e6`: `999696b`, `adf0e5f`, `be7fcb3`.
+- Working tree clean (`git status --short` empty).
