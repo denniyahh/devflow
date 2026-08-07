@@ -2902,10 +2902,50 @@ mod tests {
             .expect("spawn a child owning the pty as its controlling terminal")
     }
 
+    /// Spawn a child GUARANTEED to have no controlling terminal, by putting it
+    /// in a fresh session and giving it no pty to acquire.
+    ///
+    /// Arm 0 must not merely *assume* the ambient environment lacks a terminal
+    /// — that assumption is environment-dependent and it is false under the
+    /// pre-push gate, which runs `docker run --rm -t` (`check-in-container.sh`)
+    /// and therefore hands the test binary a pty as its controlling terminal.
+    /// Inheriting it made the control arm block on `/dev/tty`, which the
+    /// calibration guard correctly reported as `control uncalibrated` rather
+    /// than mis-attributing it to `setsid` — a hard red in the container while
+    /// this same test passed on a terminal-less host.
+    ///
+    /// Detaching explicitly makes the arm mean the same thing in both places.
+    fn spawn_detached_from_terminal(command: &mut Command) -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+
+        // SAFETY: `setsid` is a bare syscall and async-signal-safe, which is
+        // the only requirement `pre_exec` imposes. A freshly forked child is
+        // never already a process-group leader, so the call cannot fail for
+        // the one reason `setsid` fails; it is still checked rather than
+        // ignored, because a silent failure here would leave the child holding
+        // an inherited terminal and turn this control back into the very
+        // environment-dependent arm it exists to replace.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command
+            .spawn()
+            .expect("spawn a child detached from any controlling terminal")
+    }
+
     /// One raw `ssh-keygen -Y sign` against an encrypted key, mirroring the
     /// production probe's environment and stdio EXACTLY — and deliberately
-    /// **not** calling `setsid`. The only thing that differs between the two
-    /// arms built from it is whether the child holds a controlling terminal.
+    /// **not** calling `setsid` itself. Each arm decides its own session: arm 0
+    /// via [`spawn_detached_from_terminal`] (fresh session, no pty), arm 1 via
+    /// [`spawn_owning_controlling_tty`] (fresh session, then `TIOCSCTTY`). The
+    /// only thing that differs between the two arms built from it is therefore
+    /// whether the child holds a controlling terminal — and now that holds by
+    /// construction rather than by inheritance from whatever spawned the tests.
     fn tty_control_arm(key_pub: &Path, payload: &Path) -> Command {
         let mut command = Command::new("ssh-keygen");
         command
@@ -3001,10 +3041,11 @@ mod tests {
 
         // --- Arm 0: the paired control. Same command, same environment, NO
         // controlling terminal. `readpassphrase` falls back to a nulled stdin
-        // and gives up at once.
-        let mut baseline_child = tty_control_arm(&key_pub, &payload)
-            .spawn()
-            .expect("spawn the no-terminal control arm");
+        // and gives up at once. The child is detached into its own session
+        // explicitly rather than trusting the ambient environment to lack a
+        // terminal — see `spawn_detached_from_terminal`.
+        let mut baseline_child =
+            spawn_detached_from_terminal(&mut tty_control_arm(&key_pub, &payload));
         let baseline = wait_bounded(&mut baseline_child, SSH_SIGN_PROBE_TIMEOUT / 2);
         if baseline.is_none() {
             let _ = baseline_child.kill();
