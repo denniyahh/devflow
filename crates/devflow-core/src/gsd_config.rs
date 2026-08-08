@@ -189,3 +189,321 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), GsdConfigError> {
     std::fs::rename(&tmp, path)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// This project's REAL config shape — every top-level key the operator
+    /// owns, in the order the file has them, plus `workflow.auto_advance` and
+    /// the nested integer `workflow.subagent_timeout`.
+    ///
+    /// The top-level order is deliberately NOT alphabetical (`workflow` comes
+    /// second, `git` third), because an alphabetical fixture would satisfy the
+    /// key-order assertion below even under a `BTreeMap`-backed round trip and
+    /// prove nothing about `preserve_order`.
+    ///
+    /// Written in `serde_json::to_string_pretty`'s exact rendering (two-space
+    /// indent, one array element per line) so the whole-file byte comparison
+    /// below can be an equality rather than a normalized diff.
+    const REAL_SHAPE: &str = r#"{
+  "commit_docs": true,
+  "workflow": {
+    "granularity": "medium",
+    "auto_mode": true,
+    "auto_advance": true,
+    "commit_docs": true,
+    "subagent_timeout": 300000,
+    "_auto_chain_active": false,
+    "nyquist_validation": true,
+    "tdd_mode": true
+  },
+  "git": {
+    "main": "main",
+    "develop": "develop"
+  },
+  "intel": {
+    "enabled": true
+  },
+  "review": {
+    "default_reviewers": [
+      "codex"
+    ]
+  },
+  "model_overrides": {
+    "gsd-executor": "inherit"
+  },
+  "mempalace": {
+    "enabled": true
+  }
+}
+"#;
+
+    /// Write `contents` as a project's `.planning/config.json` and hand back
+    /// the root (the temp dir is returned too, so it outlives the test body).
+    fn project(contents: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".planning")).unwrap();
+        std::fs::write(config_path(&root), contents).unwrap();
+        (dir, root)
+    }
+
+    /// A project whose `.planning/` exists but holds no config file.
+    fn empty_project() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".planning")).unwrap();
+        (dir, root)
+    }
+
+    /// Everything except the one key this module owns must survive a write
+    /// unchanged — value, position, and serialized form.
+    ///
+    /// **The assertion is on the file's BYTES, not on a re-parse.** An earlier
+    /// version of this test compared `keys()` from two `serde_json::Value`
+    /// parses and passed with `preserve_order` REMOVED — because without that
+    /// feature both parses go through a `BTreeMap`, so both key lists come out
+    /// alphabetized and agree with each other. The comparison normalized away
+    /// the exact property it claimed to measure. Comparing raw text is what
+    /// makes this discriminating, and it subsumes numeric re-rendering
+    /// (`subagent_timeout: 300000`) as well as ordering.
+    #[test]
+    fn writing_the_flag_leaves_every_other_key_byte_identical() {
+        let (_dir, root) = project(REAL_SHAPE);
+        let before = std::fs::read_to_string(config_path(&root)).unwrap();
+
+        assert!(set_auto_chain_active(&root, true).unwrap());
+
+        let after = std::fs::read_to_string(config_path(&root)).unwrap();
+        let expected = before.replace(
+            "\"_auto_chain_active\": false",
+            "\"_auto_chain_active\": true",
+        );
+        assert_ne!(
+            expected, before,
+            "the fixture must actually contain the key this test flips, or the \
+             comparison below is vacuous"
+        );
+        assert_eq!(
+            after, expected,
+            "the written file must differ from the original in EXACTLY the one \
+             value this module owns — same key order, same number rendering, \
+             same whitespace"
+        );
+
+        // And the flag really did flip, read back through this module's own
+        // accessor rather than by re-reading the text just compared.
+        assert!(auto_chain_active(&root).unwrap());
+    }
+
+    /// Criterion 3b / D-06: this phase buys checkpoint APPROVAL, not workflow
+    /// chaining. Nothing in this codebase may write `workflow.auto_advance`.
+    ///
+    /// Why it matters concretely: GSD's `check auto-mode` ORs the two flags
+    /// (`check-command-router.cjs:107`), so a write that clobbered
+    /// `auto_advance` would silently enable the stage-chaining ROADMAP
+    /// criterion 3 forbids — and it would do so through a key DevFlow never
+    /// intended to touch.
+    #[test]
+    fn writing_the_flag_never_touches_auto_advance() {
+        let (_dir, root) = project(REAL_SHAPE);
+        // The fixture has `auto_advance: true` BEFORE the call, deliberately.
+        // A fixture where it were `false` would prove nothing: `false` is also
+        // what a dropped key deserializes to.
+        assert_eq!(
+            serde_json::from_str::<Value>(REAL_SHAPE).unwrap()["workflow"]["auto_advance"],
+            Value::Bool(true)
+        );
+
+        set_auto_chain_active(&root, true).unwrap();
+        set_auto_chain_active(&root, false).unwrap();
+
+        let after: Value =
+            serde_json::from_str(&std::fs::read_to_string(config_path(&root)).unwrap()).unwrap();
+        assert_eq!(
+            after["workflow"]["auto_advance"],
+            Value::Bool(true),
+            "auto_advance is the operator's, and neither setting nor clearing \
+             the chain flag may disturb it"
+        );
+    }
+
+    /// F-3: the ineligible-launch path asserts `false` on every stage launch,
+    /// so writing a value the file already holds must cost nothing — otherwise
+    /// a tracked file is rewritten on every run of every stage.
+    #[test]
+    fn setting_the_value_it_already_holds_is_a_no_op() {
+        let (_dir, root) = project(REAL_SHAPE);
+        let path = config_path(&root);
+        let before = std::fs::read(&path).unwrap();
+        let before_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        // REAL_SHAPE holds `false`; ask for `false`.
+        assert!(
+            !set_auto_chain_active(&root, false).unwrap(),
+            "a write that changes nothing must report that it changed nothing"
+        );
+
+        assert_eq!(before, std::fs::read(&path).unwrap());
+        assert_eq!(
+            before_mtime,
+            std::fs::metadata(&path).unwrap().modified().unwrap()
+        );
+
+        // Negative control: the same call with the OTHER value must report a
+        // change. Without this, a `set_auto_chain_active` that always returned
+        // `false` and never wrote would satisfy the assertions above.
+        assert!(set_auto_chain_active(&root, true).unwrap());
+    }
+
+    /// A config that simply has not grown a `workflow` object yet is a normal
+    /// shape, not a corrupt one.
+    #[test]
+    fn a_missing_workflow_object_is_created_rather_than_rejected() {
+        let (_dir, root) = project("{\n  \"commit_docs\": true\n}\n");
+
+        assert!(set_auto_chain_active(&root, true).unwrap());
+        assert!(auto_chain_active(&root).unwrap());
+
+        let after: Value =
+            serde_json::from_str(&std::fs::read_to_string(config_path(&root)).unwrap()).unwrap();
+        assert_eq!(
+            after["commit_docs"],
+            Value::Bool(true),
+            "creating the workflow object must not disturb the keys already there"
+        );
+    }
+
+    /// ASVS V5: a hand-edited config is untrusted input. It must produce an
+    /// `Err` the caller can log and skip, never a panic that would kill a long
+    /// unattended run — and the atomic write must not have truncated anything
+    /// on the way to failing.
+    #[test]
+    fn a_malformed_config_is_an_error_not_a_panic() {
+        let malformed = "{ \"workflow\": { \"auto_advance\": tru";
+        let (_dir, root) = project(malformed);
+
+        // Asserted on the returned Err, never on a caught panic.
+        assert!(matches!(
+            set_auto_chain_active(&root, true),
+            Err(GsdConfigError::Json(_))
+        ));
+        assert!(matches!(
+            auto_chain_active(&root),
+            Err(GsdConfigError::Json(_))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(config_path(&root)).unwrap(),
+            malformed,
+            "a failed write must leave the operator's file exactly as it was"
+        );
+    }
+
+    /// A JSON document whose root is not an object has nowhere for the key to
+    /// live. Refuse rather than replace the operator's file wholesale.
+    #[test]
+    fn a_non_object_config_root_is_an_error_not_a_replacement() {
+        let (_dir, root) = project("[1, 2, 3]\n");
+
+        assert!(matches!(
+            set_auto_chain_active(&root, true),
+            Err(GsdConfigError::Json(_))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(config_path(&root)).unwrap(),
+            "[1, 2, 3]\n"
+        );
+    }
+
+    /// No file at all is an explicit `Err`, not a silent create — DevFlow does
+    /// not own this file and must not conjure one into a project that has no
+    /// GSD config.
+    #[test]
+    fn an_absent_config_is_an_error_not_a_panic() {
+        let (_dir, root) = empty_project();
+
+        assert!(matches!(
+            set_auto_chain_active(&root, true),
+            Err(GsdConfigError::Missing(_))
+        ));
+        assert!(matches!(
+            auto_chain_active(&root),
+            Err(GsdConfigError::Missing(_))
+        ));
+        assert!(
+            !config_path(&root).exists(),
+            "a failed write must not leave a file behind"
+        );
+    }
+
+    /// The V5 defensive-default row: three shapes this module does not model,
+    /// all of which must read as the INACTIVE value rather than panic.
+    ///
+    /// Reading via `value["workflow"]["_auto_chain_active"]` would panic on the
+    /// first of these; that is exactly the indexing this module forbids on a
+    /// read path.
+    #[test]
+    fn reading_the_flag_defaults_to_the_inactive_value_on_a_shape_it_does_not_recognise() {
+        for shape in [
+            // `workflow` absent entirely.
+            "{ \"commit_docs\": true }",
+            // `workflow` present but not an object.
+            "{ \"workflow\": \"medium\" }",
+            // the key present but not a boolean.
+            "{ \"workflow\": { \"_auto_chain_active\": \"true\" } }",
+        ] {
+            let (_dir, root) = project(shape);
+            assert!(
+                !auto_chain_active(&root).unwrap(),
+                "unrecognised shape must read inactive, not panic: {shape}"
+            );
+        }
+
+        // Negative control: the shape this module DOES recognise still reads
+        // active, so the three assertions above are discriminating rather than
+        // a function that always returns `false`.
+        let (_dir, root) = project("{ \"workflow\": { \"_auto_chain_active\": true } }");
+        assert!(auto_chain_active(&root).unwrap());
+    }
+
+    /// The file's trailing-newline convention survives a write, so the diff
+    /// stays one line instead of gaining a spurious no-newline-at-EOF marker.
+    #[test]
+    fn the_trailing_newline_convention_survives_a_write() {
+        let (_dir, root) = project(REAL_SHAPE);
+        set_auto_chain_active(&root, true).unwrap();
+        assert!(
+            std::fs::read_to_string(config_path(&root))
+                .unwrap()
+                .ends_with('\n')
+        );
+
+        let without = REAL_SHAPE.trim_end_matches('\n').to_string();
+        let (_dir2, root2) = project(&without);
+        set_auto_chain_active(&root2, true).unwrap();
+        assert!(
+            !std::fs::read_to_string(config_path(&root2))
+                .unwrap()
+                .ends_with('\n')
+        );
+    }
+
+    /// The write leaves no temporary file behind for a `git add` to sweep up.
+    #[test]
+    fn the_atomic_write_leaves_no_temp_file_behind() {
+        let (_dir, root) = project(REAL_SHAPE);
+        set_auto_chain_active(&root, true).unwrap();
+
+        let leftovers: Vec<_> = std::fs::read_dir(root.join(".planning"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "config.json")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "stray files in .planning: {leftovers:?}"
+        );
+    }
+}
