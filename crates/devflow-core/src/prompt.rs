@@ -17,6 +17,28 @@ const SHIP_REVIEW_ANGLES: &[&str] = &[
     "one generalist deep pass",
 ];
 
+/// The token that stops GSD from wiping `workflow._auto_chain_active` before
+/// it is read (35.1-01, RESEARCH Pitfall 1).
+///
+/// `execute-phase.md:161-165` clears that flag at the top of every invocation
+/// whose `$ARGUMENTS` does not carry this token. DevFlow sets the flag in the
+/// monitor immediately before launching the child, so without this the flag is
+/// wiped by the very command it was set for and `checkpoint_handling` never
+/// auto-approves anything.
+///
+/// **The token alone enables nothing.** GSD's `check auto-mode` reads
+/// `.planning/config.json` and nothing else — a full grep of
+/// `execute-phase.md` for `--auto` / `--chain` / `AUTO_CHAIN` / `auto_advance`
+/// returns exactly three hits, all inside that sync-clear block. So within
+/// `execute-phase.md` this token's only effect is to skip the clear. The
+/// mode gate that decides whether checkpoints may actually be auto-approved
+/// lives on the config write, in `pipeline_launch::auto_chain_flag_eligible`.
+///
+/// Named rather than inlined so the three command strings that must carry it
+/// (Code, and `fix_prompt`'s two `execute-phase` arms) cannot drift apart, and
+/// so a reader of any one of them can find this explanation.
+const AUTO_CHAIN_PRESERVING_FLAG: &str = "--auto";
+
 /// The completion contract every agent must honor as its final message.
 const COMPLETION_PROTOCOL: &str = "\
 ## Completion Protocol (REQUIRED)\n\
@@ -251,6 +273,21 @@ fn stage_prompt_with_project(stage: Stage, phase: PhaseId, project_root: Option<
     }
     let command = gsd_command_for(stage, phase);
     if stage == Stage::Code {
+        // The Code arm ONLY (D-04/D-05, 35.1-01 Pitfall 1). `execute-phase.md`
+        // wipes `workflow._auto_chain_active` at the top of every invocation
+        // whose `$ARGUMENTS` lacks this token, which would clear the flag
+        // DevFlow just set before `checkpoint_handling` ever reads it. Within
+        // `execute-phase.md` the token's only effect is to skip that clear — it
+        // does not chain and it sets nothing, so it is safe to send
+        // unconditionally here even though the config write that gives it
+        // meaning is gated on `Mode::Auto` (F-2).
+        //
+        // Deliberately NOT applied to `gsd_command_for` or
+        // `Stage::gsd_command`: both are shared with Plan via
+        // `idempotent_stage_prompt`, and the same flag makes `plan-phase.md`
+        // chain into `execute-phase.md`. Leaking the token into the Plan prompt
+        // is precisely the D-04 defect.
+        let command = format!("{command} {AUTO_CHAIN_PRESERVING_FLAG}");
         return format!(
             "Run the GSD workflow command for this stage:\n\n    {command}\n\n\
             ## Advisory incremental self-review\n\
