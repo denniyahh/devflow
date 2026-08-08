@@ -1693,6 +1693,40 @@ pub struct IdleTimeoutRecord {
 /// **Nothing here rolls anything back** (D-07, T-31-09). The commits are read
 /// and named, never reverted: an idle timeout may be a false positive, and
 /// destroying real work on a false positive is unrecoverable.
+/// Whether the phase's live capture already carries an explicit quota DENIAL.
+///
+/// Exists for exactly one caller: [`crate::monitor`]'s idle-timeout path, which
+/// must know *why* the stream went quiet before it records a verdict about the
+/// silence.
+///
+/// **The problem this solves.** A quota denial makes the agent go silent — it
+/// has nothing left to say. The monitor's idle timer then fires, writes an
+/// idle-timeout record, and kills the child. Because
+/// [`parse_idle_timeout_side_channel`] is `evaluate_layer1`'s first statement
+/// and returns unconditionally (T-31-06), that record shadows
+/// [`detect_claude_stream_rate_limit`] — which was sitting in the same capture
+/// with the answer. The run is then reported as an idle timeout, "TERMINAL and
+/// not retried automatically", when the truth is `RateLimited`, which
+/// `outcome_policy` routes to auto-resume.
+///
+/// Observed 2026-08-08 on a real Code stage: `rate_limit_event` with
+/// `status: "rejected"`, `rateLimitType: "seven_day"`,
+/// `overageDisabledReason: "out_of_credits"`. Replaying the classifier over that
+/// capture returns the denial; the operator was instead told the stream had been
+/// silent for 120s. Running out of quota is the likeliest way a long unattended
+/// run stops, so it is the failure this phase can least afford to misreport.
+///
+/// Deliberately delegates to the SAME detector the read path uses rather than
+/// re-implementing the check. Two independent notions of "is this a rate limit"
+/// would be free to disagree, and the disagreement would be invisible.
+#[must_use]
+pub fn capture_shows_rate_limit_denial(project_root: &Path, phase: PhaseId) -> bool {
+    let Some(raw) = read_capture(&stdout_path(project_root, phase)) else {
+        return false;
+    };
+    detect_claude_stream_rate_limit(&ParsedCapture::parse(&raw).events).is_some()
+}
+
 fn parse_idle_timeout_side_channel(project_root: &Path, phase: PhaseId) -> Option<AgentResult> {
     let path = idle_timeout_path(project_root, phase);
     let raw = read_capture(&path)?;
@@ -6315,6 +6349,70 @@ mod tests {
         .unwrap();
         assert_eq!(result_c.status, AgentStatus::Success);
         assert_eq!(result_c.decided_by_layer, Some(0));
+    }
+
+    /// A quota denial in the capture must be visible to the monitor BEFORE it
+    /// records a verdict about the silence that denial caused.
+    ///
+    /// The positive arm of the 2026-08-08 misclassification: a real `seven_day`
+    /// / `out_of_credits` denial silenced the agent, the idle timer fired, and
+    /// the resulting record shadowed the classifier that had the right answer.
+    #[test]
+    fn a_quota_denial_in_the_capture_is_visible_to_the_monitor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(3);
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        std::fs::write(
+            stdout_path(root, phase),
+            format!("{V3_INIT_EVENT}\n{}\n", v3_rate_limit_event("rejected")),
+        )
+        .unwrap();
+
+        assert!(
+            capture_shows_rate_limit_denial(root, phase),
+            "an explicit `rejected` quota denial must be detectable, or the monitor \
+             will record a hang for a pause that is resumable"
+        );
+    }
+
+    /// Negative control, and the more important half: this must NOT fire on an
+    /// ordinary capture, or every genuine hang stops being recorded as one.
+    ///
+    /// The `allowed` arm is the specific trap — the CLI emits `rate_limit_event`
+    /// routinely while healthy, and `overageStatus: "rejected"` sits one level
+    /// below `status: "allowed"`, so any loose nested search matches it.
+    #[test]
+    fn an_ordinary_capture_is_not_mistaken_for_a_quota_denial() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        let quiet = PhaseId::new(4);
+        std::fs::write(stdout_path(root, quiet), format!("{V3_INIT_EVENT}\n")).unwrap();
+        assert!(
+            !capture_shows_rate_limit_denial(root, quiet),
+            "a capture with no rate-limit event at all must read as no denial"
+        );
+
+        let healthy = PhaseId::new(5);
+        std::fs::write(
+            stdout_path(root, healthy),
+            format!("{V3_INIT_EVENT}\n{V3_RATE_LIMIT_EVENT_ALLOWED}\n"),
+        )
+        .unwrap();
+        assert!(
+            !capture_shows_rate_limit_denial(root, healthy),
+            "a healthy `status: allowed` event carries `overageStatus: rejected` one \
+             level down — matching it would suppress the idle timeout on every run"
+        );
+
+        let absent = PhaseId::new(6);
+        assert!(
+            !capture_shows_rate_limit_denial(root, absent),
+            "a missing capture must read as no denial, never as one"
+        );
     }
 
     /// A stage attempt's idle-timeout verdict must not survive into the next

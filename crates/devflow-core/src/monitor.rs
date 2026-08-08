@@ -1032,6 +1032,45 @@ fn fire_idle_timeout(
     let idle_secs = idle.as_secs();
     warn!("idle timeout: no output from the supervised child for {idle_secs}s");
 
+    // 0. Ask WHY the stream went quiet before recording a verdict about the
+    //    silence. A quota denial silences the agent — it has nothing left to
+    //    say — and the capture already carries the answer in a form
+    //    `detect_claude_stream_rate_limit` classifies as `RateLimited`, which
+    //    `outcome_policy` routes to auto-resume. Writing an idle-timeout record
+    //    here would bury that: `parse_idle_timeout_side_channel` is
+    //    `evaluate_layer1`'s first statement and returns unconditionally
+    //    (T-31-06), so the record outranks the better classification sitting in
+    //    the same capture, and a resumable pause is reported as "TERMINAL and
+    //    not retried automatically".
+    //
+    //    Observed 2026-08-08 on a real Code stage that hit a `seven_day`
+    //    `out_of_credits` denial: the operator was told the stream had been
+    //    silent for 120s. Running out of quota is the likeliest way a long
+    //    unattended run stops.
+    //
+    //    The child is still terminated below — it is wedged either way. Only
+    //    the VERDICT changes, and it changes by omission: with no record
+    //    written, the cascade reaches the rate-limit classifier and returns the
+    //    right answer. Never silent — this is logged loudly and lands in the
+    //    monitor log alongside the kill.
+    if crate::agent_result::capture_shows_rate_limit_denial(project_root, phase) {
+        warn!(
+            "idle timeout after {idle_secs}s, but the capture carries an explicit quota \
+             denial — NOT recording an idle-timeout verdict, so the rate-limit \
+             classifier decides and the run stays resumable"
+        );
+        append_monitor_log(
+            project_root,
+            phase,
+            &format!(
+                "[idle-timeout] suppressed after {idle_secs}s: capture carries a quota \
+                 denial; classified as rate-limited (resumable), not as a hang"
+            ),
+        );
+        terminate_child_group(child_pid);
+        return;
+    }
+
     // 1. Enumerate. A failure degrades to an empty list plus a note; it never
     //    aborts, because a missing commit list must not cost the verdict.
     let (commits, enumeration_note) = enumerate_phase_commits(workdir, phase);
@@ -1843,6 +1882,56 @@ exit 0
              demonstrably alive — this is the false kill the extension exists to \
              prevent, and because evaluate_layer1 reads that side channel FIRST \
              the bogus verdict would outrank the stage's real success"
+        );
+    }
+
+    /// A quota denial must not be recorded as a hang.
+    ///
+    /// End-to-end counterpart of `capture_shows_rate_limit_denial`'s unit
+    /// tests: the stub announces an explicit `rejected` denial and then goes
+    /// silent, exactly as a real agent does when it runs out of credits. No
+    /// idle-timeout verdict may be written, because that record would outrank
+    /// the rate-limit classifier and turn a resumable pause into "TERMINAL and
+    /// not retried automatically".
+    ///
+    /// Note the stub has NO open background task — this is the arm the
+    /// drain-gate extension does not cover, and the arm a real quota denial
+    /// lands in.
+    #[test]
+    fn a_quota_denial_is_not_recorded_as_an_idle_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(53);
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        let denial = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1786222800,"rateLimitType":"seven_day","overageStatus":"rejected","overageDisabledReason":"out_of_credits","isUsingOverage":false},"uuid":"u-rl","session_id":"s-rl"}"#;
+        let script = format!(
+            r#"
+set -u
+IFS= read -r _turn || exit 91
+printf '%s\n' '{INIT_LINE}'
+printf '%s\n' '{denial}'
+sleep 3
+exit 0
+"#
+        );
+
+        let _ = run_pipe_owning_monitor(
+            root,
+            phase,
+            root,
+            "prompt",
+            Duration::from_secs(1),
+            "sh",
+            &["-c".to_string(), script],
+            &[],
+        );
+
+        assert!(
+            !crate::agent_result::idle_timeout_path(root, phase).exists(),
+            "a quota denial was recorded as an idle timeout — the operator is told the \
+             stream went silent when the truth is 'out of credits', and the run is \
+             marked terminal instead of resumable"
         );
     }
 
