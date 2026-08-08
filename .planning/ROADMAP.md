@@ -151,7 +151,35 @@ gather the live concurrency evidence its criterion 1 demands.
 **Not in scope**: the first-option `decision` checkpoint behaviour (filed as 999.94) — it is a
 correctness question about *how* an unattended agent decides, separable from *whether* it can
 proceed at all.
-**Plans**: TBD
+**Plans**: 4 plans across 3 waves
+
+Plans:
+
+**Wave 1**
+
+- [ ] 35.1-01-PLAN.md — TRACER: the chain-flag lifecycle end to end on one path — `gsd_config` (the
+  sole writer of `workflow._auto_chain_active`), `serde_json`'s `preserve_order`,
+  `AUTO_CHAIN_ELIGIBLE_STAGES` + its eligibility predicate, the RAII guard inside `run_monitor`, and
+  the flag-preserving token on the Code and fix prompts — proven by a real `devflow __monitor` run
+  whose supervised child reports the flag it saw, with a supervise-mode negative control. Closes
+  criterion 3 in full (D-04/D-05/D-06)
+
+**Wave 2** *(both blocked on Wave 1; disjoint file sets, so they run in parallel)*
+
+- [ ] 35.1-02-PLAN.md — leak repair: `force_clear_auto_chain` at `start` and `resume`, reaching the
+  committed tree and refusing to sweep an operator's edit, the loud stdout notice plus
+  `auto_chain_flag_repaired` event, and the SIGKILL regression test built on a demonstrated leak
+  (criterion 2, D-01/D-02/D-03)
+- [ ] 35.1-03-PLAN.md — the fail-closed preflight: three conditions to a four-state report, refusing
+  in `--mode auto` and reporting in `--mode supervise`, with three NOT-viable fixtures each
+  demonstrated failing and no override of any kind (criterion 4, D-07/D-08/D-09)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
+- [ ] 35.1-04-PLAN.md — the live drill against a real Claude agent with a real GSD blocking
+  checkpoint and a real `--gaps-only` loop, its supervise-mode negative control, the criterion 6
+  observation recorded in `35.1-DRILL.md`, and the operator guide stating both known limitations
+  (criteria 5 and 6, D-10/D-11)
 
 ### Phase 35.2: Verification Provenance (999.89 / HARDEN-03)
 
