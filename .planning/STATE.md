@@ -4,9 +4,9 @@ milestone: v2.5.0
 milestone_name: milestone (Loop-Termination and Release Hardening, ACTIVE — declared 2026-08-06)
 current_phase: 35.1
 current_phase_name: Unattended-Launch Prerequisites (999.93)
-status: "Phase 35 shipped — PR #99; 999.97 hotfix in flight to unblock 35.1"
-stopped_at: Phase 35 context gathered
-last_updated: "2026-08-08T00:20:00.000Z"
+status: "999.97 hotfix merged (PR #101); Phase 35.1 context gathered, ready for planning"
+stopped_at: Phase 35.1 context gathered
+last_updated: "2026-08-08T01:44:50.337Z"
 last_activity: 2026-08-07
 progress:
   total_phases: 4
@@ -838,9 +838,9 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 
 ## Session
 
-**Last session:** 2026-08-06T15:41:26.736Z
-**Stopped at:** Phase 35 context gathered
-**Resume file:** .planning/phases/35-loop-termination-and-baseline-correctness-999-77-999-78-999-/35-CONTEXT.md
+**Last session:** 2026-08-08T01:44:50.269Z
+**Stopped at:** Phase 35.1 context gathered
+**Resume file:** .planning/phases/35.1-unattended-launch-prerequisites/35.1-CONTEXT.md
 
 ## Operator Next Steps
 
