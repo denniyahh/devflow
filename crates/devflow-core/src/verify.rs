@@ -4,6 +4,7 @@
 //! files are agent-writable, execution additionally requires the parent
 //! process's [`TRUST_EXTERNAL_VERIFY_ENV`] authorization.
 
+use crate::phase_id::PhaseId;
 use std::path::{Path, PathBuf};
 
 /// Explicit operator-owned approval for executing PLAN-declared shell.
@@ -33,10 +34,10 @@ fn parse_external_verification_approval(value: &str) -> Option<Vec<String>> {
 /// [`phase_has_blocking_human_checkpoint`] so PLAN.md discovery lives in
 /// exactly one place; a second, slightly-different implementation would
 /// drift the moment one is updated and the other isn't.
-pub fn phase_plan_files(project_root: &Path, phase: u32) -> Vec<PathBuf> {
+pub fn phase_plan_files(project_root: &Path, phase: PhaseId) -> Vec<PathBuf> {
     let phases_dir = project_root.join(".planning/phases");
-    let phase_prefix = format!("{phase:02}-");
-    let plan_prefix = format!("{phase:02}-");
+    let phase_prefix = format!("{padded}-", padded = phase.padded());
+    let plan_prefix = format!("{padded}-", padded = phase.padded());
     let mut plans = Vec::<PathBuf>::new();
 
     let Ok(phase_entries) = std::fs::read_dir(phases_dir) else {
@@ -69,7 +70,7 @@ pub fn phase_plan_files(project_root: &Path, phase: u32) -> Vec<PathBuf> {
 /// small parser recognizes the scalar shape established by Phase 16:
 /// `external_verify: "command"` (single-quoted and unquoted scalars are also
 /// accepted). Runtime captures and agent output are never read here.
-pub fn external_verify_commands(project_root: &Path, phase: u32) -> Vec<String> {
+pub fn external_verify_commands(project_root: &Path, phase: PhaseId) -> Vec<String> {
     phase_plan_files(project_root, phase)
         .into_iter()
         .filter_map(|path| std::fs::read_to_string(path).ok())
@@ -127,7 +128,7 @@ fn command_from_frontmatter(contents: &str) -> Option<String> {
 /// silent `false` rather than an error (999.76, ROADMAP criterion 6). The
 /// caller that does this correctly is `pipeline_launch.rs`'s
 /// `Action::GateReview` arm, which resolves `state.worktree_path` first.
-pub fn phase_has_blocking_human_checkpoint(project_root: &Path, phase: u32) -> bool {
+pub fn phase_has_blocking_human_checkpoint(project_root: &Path, phase: PhaseId) -> bool {
     const HUMAN_BLOCKING_GATE: &str = r#"gate="blocking-human""#;
     phase_plan_files(project_root, phase)
         .into_iter()
@@ -199,7 +200,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            external_verify_commands(dir.path(), 16),
+            external_verify_commands(dir.path(), PhaseId::new(16)),
             vec!["test -f shipped.txt"]
         );
     }
@@ -212,7 +213,7 @@ mod tests {
             "---\nphase: 16\n---\n\nexternal_verify: \"false\"\n",
         );
 
-        assert!(external_verify_commands(dir.path(), 16).is_empty());
+        assert!(external_verify_commands(dir.path(), PhaseId::new(16)).is_empty());
     }
 
     #[test]
@@ -224,7 +225,7 @@ mod tests {
                 &format!("---\nphase: 16\nexternal_verify: {value}\n---\n"),
             );
             assert!(
-                external_verify_commands(dir.path(), 16).is_empty(),
+                external_verify_commands(dir.path(), PhaseId::new(16)).is_empty(),
                 "empty command {value:?} must not count as affirmative verification"
             );
         }
@@ -262,7 +263,10 @@ mod tests {
         );
         write_phase_file(dir.path(), "91-probe", "91-01-PLAN.md", &body);
 
-        assert!(phase_has_blocking_human_checkpoint(dir.path(), 91));
+        assert!(phase_has_blocking_human_checkpoint(
+            dir.path(),
+            PhaseId::new(91)
+        ));
     }
 
     #[test]
@@ -274,7 +278,7 @@ mod tests {
         write_phase_file(dir.path(), "91-probe", "91-01-PLAN.md", &body);
 
         assert!(
-            !phase_has_blocking_human_checkpoint(dir.path(), 91),
+            !phase_has_blocking_human_checkpoint(dir.path(), PhaseId::new(91)),
             "the plain `blocking` gate (no -human suffix) must not match — Phase 26 near-miss distinction"
         );
     }
@@ -289,14 +293,20 @@ mod tests {
             "---\nphase: 91\n---\n\n<task type=\"auto\">\n</task>\n",
         );
 
-        assert!(!phase_has_blocking_human_checkpoint(dir.path(), 91));
+        assert!(!phase_has_blocking_human_checkpoint(
+            dir.path(),
+            PhaseId::new(91)
+        ));
     }
 
     #[test]
     fn phase_has_blocking_human_checkpoint_false_for_missing_phase_directory() {
         let dir = tempfile::tempdir().unwrap();
 
-        assert!(!phase_has_blocking_human_checkpoint(dir.path(), 404));
+        assert!(!phase_has_blocking_human_checkpoint(
+            dir.path(),
+            PhaseId::new(404)
+        ));
     }
 
     #[test]
@@ -314,7 +324,7 @@ mod tests {
         write_phase_file(dir.path(), "91-probe", "91-02-PLAN.md", &body);
 
         assert!(
-            phase_has_blocking_human_checkpoint(dir.path(), 91),
+            phase_has_blocking_human_checkpoint(dir.path(), PhaseId::new(91)),
             "every plan must be inspected, not just the first"
         );
     }
@@ -328,7 +338,7 @@ mod tests {
         write_phase_file(dir.path(), "91-probe", "91-01-SUMMARY.md", &body);
 
         assert!(
-            !phase_has_blocking_human_checkpoint(dir.path(), 91),
+            !phase_has_blocking_human_checkpoint(dir.path(), PhaseId::new(91)),
             "only *-PLAN.md files are scanned, not SUMMARY/RESEARCH files"
         );
     }
@@ -360,11 +370,11 @@ mod tests {
         write_phase_file(&worktree, "91-probe", "91-01-PLAN.md", &body);
 
         assert!(
-            phase_has_blocking_human_checkpoint(&worktree, 91),
+            phase_has_blocking_human_checkpoint(&worktree, PhaseId::new(91)),
             "the execution root holds the PLAN, so the declaration must be found"
         );
         assert!(
-            !phase_has_blocking_human_checkpoint(dir.path(), 91),
+            !phase_has_blocking_human_checkpoint(dir.path(), PhaseId::new(91)),
             "opposite-result case: the project root has no PLAN and must return false — \
              if both roots returned true, this pair would be measuring the presence of a \
              file somewhere rather than which root is read"
@@ -384,11 +394,11 @@ mod tests {
         write_phase_file(dir.path(), "91-probe", "91-01-PLAN.md", &body);
 
         assert!(
-            phase_has_blocking_human_checkpoint(dir.path(), 91),
+            phase_has_blocking_human_checkpoint(dir.path(), PhaseId::new(91)),
             "without a worktree the execution root IS the project root"
         );
         assert!(
-            !phase_has_blocking_human_checkpoint(&empty_sibling, 91),
+            !phase_has_blocking_human_checkpoint(&empty_sibling, PhaseId::new(91)),
             "opposite-result case: a root without the PLAN must return false, so the \
              assertion above is about which root is read and not about the file existing"
         );

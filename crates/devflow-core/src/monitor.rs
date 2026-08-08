@@ -13,6 +13,7 @@
 
 use crate::agent_result::{IdleTimeoutCommit, IdleTimeoutRecord};
 use crate::git::hermetic_command;
+use crate::phase_id::PhaseId;
 use crate::state::State;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
@@ -637,7 +638,7 @@ pub fn user_turn_line(prompt: &str) -> String {
 #[allow(clippy::too_many_arguments)]
 pub fn run_pipe_owning_monitor(
     project_root: &Path,
-    phase: u32,
+    phase: PhaseId,
     workdir: &Path,
     prompt: &str,
     idle_timeout: Duration,
@@ -876,7 +877,7 @@ pub fn run_pipe_owning_monitor(
 /// never the verdict.
 fn fire_idle_timeout(
     project_root: &Path,
-    phase: u32,
+    phase: PhaseId,
     workdir: &Path,
     child_pid: u32,
     idle: Duration,
@@ -941,9 +942,12 @@ fn fire_idle_timeout(
 /// naming what went wrong: the operator losing the commit NAMES is bad, the
 /// operator losing the VERDICT is the failure this whole plan exists to
 /// prevent.
-fn enumerate_phase_commits(workdir: &Path, phase: u32) -> (Vec<IdleTimeoutCommit>, Option<String>) {
+fn enumerate_phase_commits(
+    workdir: &Path,
+    phase: PhaseId,
+) -> (Vec<IdleTimeoutCommit>, Option<String>) {
     let git_flow = crate::config::GitFlowConfig::default();
-    let branch = format!("{}phase-{:02}", git_flow.feature_prefix, phase);
+    let branch = format!("{}phase-{}", git_flow.feature_prefix, phase.padded());
     let range = format!("{}..{branch}", git_flow.develop);
 
     let output = match crate::git::git_command(workdir)
@@ -991,7 +995,7 @@ fn enumerate_phase_commits(workdir: &Path, phase: u32) -> (Vec<IdleTimeoutCommit
 /// cache when the process is signalled has not achieved that.
 fn write_idle_timeout_record(
     project_root: &Path,
-    phase: u32,
+    phase: PhaseId,
     idle_secs: u64,
     child_pid: u32,
     commits: &[IdleTimeoutCommit],
@@ -1089,7 +1093,7 @@ fn terminate_child_group(child_pid: u32) -> bool {
 /// Best-effort: the monitor's stdio is null, so this file is the only place a
 /// "log loudly" obligation can actually land, but failing to write it must
 /// never abort a termination sequence already in progress.
-fn append_monitor_log(project_root: &Path, phase: u32, entry: &str) {
+fn append_monitor_log(project_root: &Path, phase: PhaseId, entry: &str) {
     let path = crate::agent_result::monitor_log_path(project_root, phase);
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
@@ -1104,7 +1108,7 @@ fn append_monitor_log(project_root: &Path, phase: u32, entry: &str) {
 ///
 /// Returns the PID once the monitor has launched the agent, or `None` if it
 /// does not appear in time (the monitor still runs; only the display PID is lost).
-pub fn wait_for_agent_pid(project_root: &Path, phase: u32) -> Option<u32> {
+pub fn wait_for_agent_pid(project_root: &Path, phase: PhaseId) -> Option<u32> {
     let path = crate::agent_result::agent_pid_path(project_root, phase);
     debug!("polling for agent PID for phase {phase}");
     for _ in 0..50 {
@@ -1132,7 +1136,12 @@ mod tests {
     use crate::state::{AgentKind, State};
 
     fn state_in(root: &Path) -> State {
-        let mut state = State::new(4, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let mut state = State::new(
+            PhaseId::new(4),
+            AgentKind::Claude,
+            Mode::Auto,
+            root.to_path_buf(),
+        );
         state.stage = Stage::Code;
         state
     }
@@ -1422,7 +1431,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 4u32;
+        let phase = PhaseId::new(4);
         std::fs::create_dir_all(root.join(".devflow")).unwrap();
 
         let eof_file = root.join("stdin-eof");
@@ -1554,7 +1563,7 @@ exit 0
     fn non_utf8_byte_does_not_truncate_the_capture() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 11u32;
+        let phase = PhaseId::new(11);
         std::fs::create_dir_all(root.join(".devflow")).unwrap();
 
         // A raw 0xFF is invalid UTF-8 in any position. It sits BETWEEN two good
@@ -1618,7 +1627,7 @@ exit 0
     fn no_idle_timeout_is_recorded_when_the_child_is_merely_slow_to_exit() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 12u32;
+        let phase = PhaseId::new(12);
         std::fs::create_dir_all(root.join(".devflow")).unwrap();
 
         let script = r#"
@@ -1677,7 +1686,7 @@ exit 0
     fn a_signal_killed_child_records_128_plus_signal_not_minus_one() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 13u32;
+        let phase = PhaseId::new(13);
         std::fs::create_dir_all(root.join(".devflow")).unwrap();
 
         // SIGKILL itself: no exit code exists, only a termination signal.
@@ -1727,19 +1736,19 @@ kill -9 $$
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
         std::fs::write(
-            crate::agent_result::agent_pid_path(dir.path(), 4),
+            crate::agent_result::agent_pid_path(dir.path(), PhaseId::new(4)),
             "12345\n",
         )
         .unwrap();
 
-        assert_eq!(wait_for_agent_pid(dir.path(), 4), Some(12345));
+        assert_eq!(wait_for_agent_pid(dir.path(), PhaseId::new(4)), Some(12345));
     }
 
     #[test]
     fn wait_for_agent_pid_returns_none_when_file_missing() {
         let dir = tempfile::tempdir().unwrap();
 
-        assert_eq!(wait_for_agent_pid(dir.path(), 4), None);
+        assert_eq!(wait_for_agent_pid(dir.path(), PhaseId::new(4)), None);
     }
 
     #[test]
@@ -1747,12 +1756,12 @@ kill -9 $$
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
         std::fs::write(
-            crate::agent_result::agent_pid_path(dir.path(), 4),
+            crate::agent_result::agent_pid_path(dir.path(), PhaseId::new(4)),
             "not-a-pid",
         )
         .unwrap();
 
-        assert_eq!(wait_for_agent_pid(dir.path(), 4), None);
+        assert_eq!(wait_for_agent_pid(dir.path(), PhaseId::new(4)), None);
     }
 
     #[test]
@@ -2219,7 +2228,7 @@ kill -9 $$
     fn idle_timer_resets_on_every_stream_line() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 6u32;
+        let phase = PhaseId::new(6);
         std::fs::create_dir_all(root.join(".devflow")).unwrap();
 
         // 12 lines x 100ms = 1.2s of talking against a 400ms window. Any
@@ -2293,7 +2302,7 @@ exit 0
     fn idle_timeout_writes_side_channel_before_terminating_child() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        let phase = 7u32;
+        let phase = PhaseId::new(7);
         std::fs::create_dir_all(root.join(".devflow")).unwrap();
 
         // One line, then silence. `trap '' TERM` widens the observation
@@ -2382,7 +2391,7 @@ sleep 120
 
     /// Minimal git repo: `develop` plus a `feature/phase-NN` branch carrying
     /// `commits` extra commits.
-    fn init_repo_with_feature_commits(root: &Path, phase: u32, commits: usize) {
+    fn init_repo_with_feature_commits(root: &Path, phase: PhaseId, commits: usize) {
         let git = |args: &[&str]| {
             let output = crate::git::git_command(root).args(args).output().unwrap();
             assert!(
@@ -2401,7 +2410,7 @@ sleep 120
         git(&["add", "README.md"]);
         git(&["commit", "-m", "base"]);
 
-        let branch = format!("feature/phase-{phase:02}");
+        let branch = format!("feature/phase-{padded}", padded = phase.padded());
         git(&["checkout", "-b", &branch]);
         for i in 0..commits {
             let name = format!("work-{i}.txt");
@@ -2411,8 +2420,8 @@ sleep 120
         }
     }
 
-    fn commit_count(root: &Path, phase: u32) -> u32 {
-        let range = format!("develop..feature/phase-{phase:02}");
+    fn commit_count(root: &Path, phase: PhaseId) -> u32 {
+        let range = format!("develop..feature/phase-{padded}", padded = phase.padded());
         let output = crate::git::git_command(root)
             .args(["rev-list", "--count", &range])
             .output()
@@ -2434,7 +2443,7 @@ sleep 120
     fn idle_timeout_does_not_roll_back_commits() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 8u32;
+        let phase = PhaseId::new(8);
         init_repo_with_feature_commits(root, phase, 2);
         std::fs::create_dir_all(root.join(".devflow")).unwrap();
 

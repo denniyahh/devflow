@@ -14,6 +14,7 @@
 //! rather than inside any one cluster.
 
 use devflow_core::agents;
+use devflow_core::phase_id::PhaseId;
 use devflow_core::state::State;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -157,7 +158,7 @@ pub(crate) fn init_repo_no_version_file(root: &Path) {
 /// Uses plain `checkout`, never `checkout -B`, when the branch already
 /// exists: `-B` resets an existing branch to `HEAD`, which would silently
 /// discard the commits an earlier call in the same test already made.
-pub(crate) fn commit_on_feature_branch(root: &Path, phase: u32, label: &str) {
+pub(crate) fn commit_on_feature_branch(root: &Path, phase: PhaseId, label: &str) {
     let git = |args: &[&str]| {
         let ok = devflow_core::test_support::git_command(root)
             .args(args)
@@ -167,7 +168,7 @@ pub(crate) fn commit_on_feature_branch(root: &Path, phase: u32, label: &str) {
             .success();
         assert!(ok, "git {args:?} failed");
     };
-    let branch = format!("feature/phase-{phase:02}");
+    let branch = format!("feature/phase-{padded}", padded = phase.padded());
     let branch_exists = devflow_core::test_support::git_command(root)
         .args(["rev-parse", "--verify", &branch])
         .output()
@@ -207,7 +208,7 @@ impl agents::AgentAdapter for AlwaysFailAdapter {
     }
     fn exec_command(
         &self,
-        _phase: u32,
+        _phase: PhaseId,
         _prompt: &str,
         _roots: &[PathBuf],
     ) -> (&'static str, Vec<String>) {
@@ -246,7 +247,7 @@ impl agents::AgentAdapter for FailOnceAdapter {
     }
     fn exec_command(
         &self,
-        _phase: u32,
+        _phase: PhaseId,
         _prompt: &str,
         _roots: &[PathBuf],
     ) -> (&'static str, Vec<String>) {
@@ -482,13 +483,13 @@ pub(crate) fn prepend_path(
 /// Count `stage_launched` events recorded for `phase` across the WHOLE
 /// event log — `last_event_for_phase` only sees the most recent line and
 /// cannot distinguish one launch from two.
-pub(crate) fn stage_launched_count(root: &Path, phase: u32) -> usize {
+pub(crate) fn stage_launched_count(root: &Path, phase: PhaseId) -> usize {
     std::fs::read_to_string(devflow_core::events::events_path(root))
         .unwrap_or_default()
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .filter(|event| {
-            event.get("phase").and_then(serde_json::Value::as_u64) == Some(u64::from(phase))
+            phase.matches_json(event.get("phase"))
                 && event.get("event").and_then(serde_json::Value::as_str) == Some("stage_launched")
         })
         .count()
@@ -746,7 +747,7 @@ mod tests {
     /// touches disk.
     fn state_holding(pid: u32) -> State {
         let mut state = State::new(
-            0,
+            PhaseId::new(0),
             AgentKind::Claude,
             Mode::Auto,
             PathBuf::from("/nonexistent"),

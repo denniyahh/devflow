@@ -22,6 +22,7 @@
 //! makes when a phase's own attestation claims a completed Ship.
 
 use crate::git::GitFlow;
+use crate::phase_id::PhaseId;
 use crate::stage::Stage;
 use crate::{events, workflow};
 use serde::Serialize;
@@ -53,7 +54,7 @@ const WORKFLOW_FINISHED_EVENT: &str = "workflow_finished";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ShipEvidence {
     /// The phase this evidence was collected for.
-    pub phase: u32,
+    pub phase: PhaseId,
     /// The strict shipped predicate: whether the terminal-only
     /// `workflow_shipped` event has been emitted for this phase.
     ///
@@ -134,7 +135,7 @@ pub struct ShipEvidence {
 /// failing: a root with no `.devflow` directory at all still returns a valid
 /// `ShipEvidence` with `shipped: false` and `state_present: false`, never a
 /// panic.
-pub fn collect(project_root: &Path, phase: u32) -> ShipEvidence {
+pub fn collect(project_root: &Path, phase: PhaseId) -> ShipEvidence {
     // The strict predicate, and nothing else — see `ShipEvidence::shipped`'s
     // doc comment for why this must never consult `workflow_finished_seen`,
     // `finished_reason`, or any git field.
@@ -156,9 +157,9 @@ pub fn collect(project_root: &Path, phase: u32) -> ShipEvidence {
 
     let git = GitFlow::new(project_root);
     let branch = format!(
-        "{}phase-{:02}",
+        "{}phase-{}",
         crate::config::GitFlowConfig::default().feature_prefix,
-        phase
+        phase.padded()
     );
     let feature_branch_exists = git.branch_exists(&branch);
     let merged_into_develop = git.is_merged_into_develop(phase);
@@ -221,12 +222,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         events::emit(
             dir.path(),
-            42,
+            PhaseId::new(42),
             "workflow_finished",
             serde_json::json!({"reason": "stopped_at", "stage": "plan"}),
         );
 
-        let evidence = collect(dir.path(), 42);
+        let evidence = collect(dir.path(), PhaseId::new(42));
         assert!(
             !evidence.shipped,
             "a phase that only stopped must not read as shipped"
@@ -241,13 +242,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         events::emit(
             dir.path(),
-            7,
+            PhaseId::new(7),
             "workflow_shipped",
             serde_json::json!({"stage": "ship"}),
         );
 
-        assert!(collect(dir.path(), 7).shipped);
-        assert!(!collect(dir.path(), 8).shipped);
+        assert!(collect(dir.path(), PhaseId::new(7)).shipped);
+        assert!(!collect(dir.path(), PhaseId::new(8)).shipped);
     }
 
     #[test]
@@ -271,7 +272,7 @@ mod tests {
             .status()
             .unwrap();
 
-        let evidence = collect(dir.path(), 5);
+        let evidence = collect(dir.path(), PhaseId::new(5));
         assert!(evidence.feature_branch_exists);
         assert!(evidence.merged_into_develop);
         assert!(evidence.has_remote);
@@ -286,7 +287,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         events::emit(
             dir.path(),
-            9,
+            PhaseId::new(9),
             "workflow_shipped",
             serde_json::json!({"stage": "ship"}),
         );
@@ -295,13 +296,13 @@ mod tests {
         contents.push_str("{truncated\n");
         std::fs::write(&path, contents).unwrap();
 
-        assert!(collect(dir.path(), 9).shipped);
+        assert!(collect(dir.path(), PhaseId::new(9)).shipped);
     }
 
     #[test]
     fn missing_devflow_dir_degrades_safely_without_panicking() {
         let dir = tempfile::tempdir().unwrap();
-        let evidence = collect(dir.path(), 1);
+        let evidence = collect(dir.path(), PhaseId::new(1));
         assert!(!evidence.shipped);
         assert!(!evidence.state_present);
         assert!(evidence.stage.is_none());
@@ -312,14 +313,14 @@ mod tests {
     fn collect_reports_stage_and_state_present_from_live_state() {
         let dir = tempfile::tempdir().unwrap();
         let state = State::new(
-            3,
+            PhaseId::new(3),
             AgentKind::Claude,
             crate::mode::Mode::Auto,
             dir.path().to_path_buf(),
         );
         workflow::save_state(&state).unwrap();
 
-        let evidence = collect(dir.path(), 3);
+        let evidence = collect(dir.path(), PhaseId::new(3));
         assert!(evidence.state_present);
         assert_eq!(evidence.stage, Some(Stage::Define));
         assert!(!evidence.shipped);

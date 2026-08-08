@@ -9,6 +9,7 @@
 
 use crate::config::GitFlowConfig;
 use crate::git::git_command;
+use crate::phase_id::PhaseId;
 use crate::stage::Stage;
 use crate::state::State;
 use std::path::{Path, PathBuf};
@@ -407,7 +408,7 @@ pub fn claude_stream_session_id(stdout: &str) -> Option<String> {
 /// bit-for-bit. Without this chain the Phase 28 checkpoint-resume path — whose
 /// whole delivery is reconstructing a session via `claude --resume` — returns
 /// `None` for every `stream-json` capture.
-pub fn session_id_from_capture(project_root: &Path, phase: u32) -> Option<String> {
+pub fn session_id_from_capture(project_root: &Path, phase: PhaseId) -> Option<String> {
     let stdout = read_capture(&stdout_path(project_root, phase))?;
     claude_stream_session_id(&stdout).or_else(|| claude_session_id(&stdout))
 }
@@ -698,7 +699,7 @@ fn text_reports_human_gate(text: &str) -> bool {
 /// Thin file-reading wrapper over [`blocking_human_checkpoint_reported`]:
 /// reads the phase's captured stdout file (via [`stdout_path`]) and
 /// delegates. `false` for a missing capture file, never an error.
-pub fn checkpoint_reported_in_capture(project_root: &Path, phase: u32) -> bool {
+pub fn checkpoint_reported_in_capture(project_root: &Path, phase: PhaseId) -> bool {
     let Some(stdout) = read_capture(&stdout_path(project_root, phase)) else {
         return false;
     };
@@ -1692,7 +1693,7 @@ pub struct IdleTimeoutRecord {
 /// **Nothing here rolls anything back** (D-07, T-31-09). The commits are read
 /// and named, never reverted: an idle timeout may be a false positive, and
 /// destroying real work on a false positive is unrecoverable.
-fn parse_idle_timeout_side_channel(project_root: &Path, phase: u32) -> Option<AgentResult> {
+fn parse_idle_timeout_side_channel(project_root: &Path, phase: PhaseId) -> Option<AgentResult> {
     let path = idle_timeout_path(project_root, phase);
     let raw = read_capture(&path)?;
 
@@ -1786,7 +1787,7 @@ fn idle_timeout_result(reason: String, commits: Option<u32>) -> AgentResult {
 /// stream capture is owned whole by the parser that understands its framing,
 /// rather than letting the generic 4000-character tail scan take a bite of a
 /// mid-line window of JSONL first.
-pub fn evaluate_layer1(project_root: &Path, phase: u32) -> Option<AgentResult> {
+pub fn evaluate_layer1(project_root: &Path, phase: PhaseId) -> Option<AgentResult> {
     // FIRST STATEMENT, before `read_capture` and before every parser below.
     // Do not move this into the `.or_else` chain: `parse_claude_event_result`
     // resolves the LAST top-level `result` event and would shadow it on any
@@ -1881,9 +1882,9 @@ fn rate_limited_result(retry: String) -> AgentResult {
 pub fn phase_commit_count(
     project_root: &Path,
     git_flow: &GitFlowConfig,
-    phase: u32,
+    phase: PhaseId,
 ) -> Option<u32> {
-    let branch = format!("{}phase-{:02}", git_flow.feature_prefix, phase);
+    let branch = format!("{}phase-{}", git_flow.feature_prefix, phase.padded());
 
     // A-06: split on whether the command RAN, not on what it answered. An
     // `Err` means the child could not be executed — a measurement failure. An
@@ -1959,17 +1960,17 @@ pub fn phase_commit_count(
 /// `project_root` but which the function itself had no way to enforce.
 pub fn evaluate_layer2(
     project_root: &Path,
-    phase: u32,
+    phase: PhaseId,
     git_flow: &GitFlowConfig,
     stage: Stage,
 ) -> Result<Option<AgentResult>, ResultError> {
-    let exit_path = devflow_dir(project_root).join(format!("phase-{:02}-exit", phase));
+    let exit_path = devflow_dir(project_root).join(format!("phase-{}-exit", phase.padded()));
     let exit_code: i32 = match std::fs::read_to_string(&exit_path) {
         Ok(s) => s.trim().parse().unwrap_or(-1),
         Err(_) => return Ok(None), // fall to Layer 3
     };
 
-    let branch = format!("{}phase-{:02}", git_flow.feature_prefix, phase);
+    let branch = format!("{}phase-{}", git_flow.feature_prefix, phase.padded());
     let commits = phase_commit_count(project_root, git_flow, phase);
     let commit_gated = matches!(stage, Stage::Plan | Stage::Code);
 
@@ -2079,10 +2080,10 @@ pub fn evaluate_layer2(
 /// behaviour and reason strings are unchanged.
 pub fn evaluate_layer3(
     project_root: &Path,
-    phase: u32,
+    phase: PhaseId,
     git_flow: &GitFlowConfig,
 ) -> Result<AgentResult, ResultError> {
-    let branch = format!("{}phase-{:02}", git_flow.feature_prefix, phase);
+    let branch = format!("{}phase-{}", git_flow.feature_prefix, phase.padded());
     // F-4 (35-01): this layer used to run its OWN inline `rev-list --count`
     // that fell soft to a zero default, an independent copy of the same lossy
     // collapse `phase_commit_count` carried. Because every path that reaches
@@ -2417,7 +2418,7 @@ fn reconcile_layer0_verdict(
 /// `-1`. Neither is invented behaviour; both match the sibling reader.
 fn reconcile_stream_success_against_exit_code(
     project_root: &Path,
-    phase: u32,
+    phase: PhaseId,
     result: AgentResult,
 ) -> AgentResult {
     if result.status != AgentStatus::Success {
@@ -2523,24 +2524,27 @@ fn devflow_dir(project_root: &Path) -> PathBuf {
 }
 
 /// Path to the stdout file for a given phase.
-pub fn stdout_path(project_root: &Path, phase: u32) -> PathBuf {
-    devflow_dir(project_root).join(format!("phase-{:02}-stdout", phase))
+pub fn stdout_path(project_root: &Path, phase: PhaseId) -> PathBuf {
+    devflow_dir(project_root).join(format!("phase-{}-stdout", phase.padded()))
 }
 
 /// Path where the agent's stderr is captured for a given phase.
 /// Lives alongside `stdout_path` under `.devflow/`.
-pub fn stderr_path(project_root: &Path, phase: u32) -> PathBuf {
-    devflow_dir(project_root).join(format!("phase-{phase:02}-stderr.log"))
+pub fn stderr_path(project_root: &Path, phase: PhaseId) -> PathBuf {
+    devflow_dir(project_root).join(format!(
+        "phase-{padded}-stderr.log",
+        padded = phase.padded()
+    ))
 }
 
 /// Path to the exit code file for a given phase.
-pub fn exit_code_path(project_root: &Path, phase: u32) -> PathBuf {
-    devflow_dir(project_root).join(format!("phase-{:02}-exit", phase))
+pub fn exit_code_path(project_root: &Path, phase: PhaseId) -> PathBuf {
+    devflow_dir(project_root).join(format!("phase-{}-exit", phase.padded()))
 }
 
 /// Path to the file where the monitor records the launched agent's PID.
-pub fn agent_pid_path(project_root: &Path, phase: u32) -> PathBuf {
-    devflow_dir(project_root).join(format!("phase-{:02}-agent-pid", phase))
+pub fn agent_pid_path(project_root: &Path, phase: PhaseId) -> PathBuf {
+    devflow_dir(project_root).join(format!("phase-{}-agent-pid", phase.padded()))
 }
 
 /// Path to the file holding the stage prompt handed to the pipe-owning
@@ -2550,8 +2554,8 @@ pub fn agent_pid_path(project_root: &Path, phase: u32) -> PathBuf {
 /// never as argv: DevFlow stage prompts are large and argv has a hard length
 /// ceiling, so a prompt passed positionally would fail on exactly the
 /// context-heavy stages that matter most.
-pub fn prompt_path(project_root: &Path, phase: u32) -> PathBuf {
-    devflow_dir(project_root).join(format!("phase-{:02}-prompt", phase))
+pub fn prompt_path(project_root: &Path, phase: PhaseId) -> PathBuf {
+    devflow_dir(project_root).join(format!("phase-{}-prompt", phase.padded()))
 }
 
 /// Path to the pipe-owning monitor's own log for a phase (Phase 31).
@@ -2561,8 +2565,8 @@ pub fn prompt_path(project_root: &Path, phase: u32) -> PathBuf {
 /// loudly" obligation in this phase (the D-04 idle-timeout clamp, the D-11
 /// opt-out notice) writes here instead, so a loud message is actually
 /// readable after the fact.
-pub fn monitor_log_path(project_root: &Path, phase: u32) -> PathBuf {
-    devflow_dir(project_root).join(format!("phase-{:02}-monitor.log", phase))
+pub fn monitor_log_path(project_root: &Path, phase: PhaseId) -> PathBuf {
+    devflow_dir(project_root).join(format!("phase-{}-monitor.log", phase.padded()))
 }
 
 /// Path to the pipe-owning monitor's idle-timeout verdict for a phase
@@ -2576,8 +2580,8 @@ pub fn monitor_log_path(project_root: &Path, phase: u32) -> PathBuf {
 ///
 /// Holds a JSON [`IdleTimeoutRecord`]. Written and fsynced by the monitor
 /// BEFORE the child is signalled, so nothing can race the verdict.
-pub fn idle_timeout_path(project_root: &Path, phase: u32) -> PathBuf {
-    devflow_dir(project_root).join(format!("phase-{:02}-idle-timeout", phase))
+pub fn idle_timeout_path(project_root: &Path, phase: PhaseId) -> PathBuf {
+    devflow_dir(project_root).join(format!("phase-{}-idle-timeout", phase.padded()))
 }
 
 /// Path to the archived-capture-history directory for a phase (16b).
@@ -2587,10 +2591,10 @@ pub fn idle_timeout_path(project_root: &Path, phase: u32) -> PathBuf {
 /// as a constructor (rather than inlined at each call site) so downstream
 /// tooling (16h in 16-07's correlation, 16i in 16-05's enumeration) always
 /// derives the path from here instead of hardcoding it.
-pub fn history_dir(project_root: &Path, phase: u32) -> PathBuf {
+pub fn history_dir(project_root: &Path, phase: PhaseId) -> PathBuf {
     devflow_dir(project_root)
         .join("history")
-        .join(format!("phase-{:02}", phase))
+        .join(format!("phase-{}", phase.padded()))
 }
 
 /// Monotonically increasing tie-breaker appended to the nanosecond timestamp
@@ -2623,7 +2627,7 @@ fn archive_stamp() -> String {
 pub fn archive_phase_files(
     project_root: &Path,
     evidence_root: &Path,
-    phase: u32,
+    phase: PhaseId,
     retain: usize,
 ) -> Result<Option<String>, std::io::Error> {
     archive_phase_files_with_stamp(project_root, evidence_root, phase, retain, &archive_stamp())
@@ -2632,7 +2636,7 @@ pub fn archive_phase_files(
 fn archive_phase_files_with_stamp(
     project_root: &Path,
     evidence_root: &Path,
-    phase: u32,
+    phase: PhaseId,
     retain: usize,
     stamp: &str,
 ) -> Result<Option<String>, std::io::Error> {
@@ -2734,16 +2738,18 @@ fn archive_phase_files_with_stamp(
     Ok(Some(stamp.to_string()))
 }
 
-fn phase_review_path(evidence_root: &Path, phase: u32) -> Option<PathBuf> {
+fn phase_review_path(evidence_root: &Path, phase: PhaseId) -> Option<PathBuf> {
     let phases = std::fs::read_dir(evidence_root.join(".planning/phases")).ok()?;
-    let prefix = format!("{phase:02}-");
+    let prefix = format!("{padded}-", padded = phase.padded());
     for entry in phases.flatten() {
         if entry
             .file_name()
             .to_str()
             .is_some_and(|name| name.starts_with(&prefix))
         {
-            let review = entry.path().join(format!("{phase:02}-REVIEW.md"));
+            let review = entry
+                .path()
+                .join(format!("{padded}-REVIEW.md", padded = phase.padded()));
             if review.exists() {
                 return Some(review);
             }
@@ -2773,7 +2779,7 @@ fn phase_review_path(evidence_root: &Path, phase: u32) -> Option<PathBuf> {
 /// CR-01); it is NOT interchangeable with the root used for git reads such as
 /// [`phase_commit_count`], whose refs and object database are shared across
 /// worktrees and which therefore correctly takes the project root.
-pub fn phase_verification_exists(evidence_root: &Path, phase: u32) -> bool {
+pub fn phase_verification_exists(evidence_root: &Path, phase: PhaseId) -> bool {
     phase_verification_path(evidence_root, phase).is_some()
 }
 
@@ -2790,16 +2796,18 @@ pub fn phase_verification_exists(evidence_root: &Path, phase: u32) -> bool {
 /// `evidence_root` carries the same meaning and the same prohibition as it does
 /// for [`phase_verification_exists`]: it is the root the Validate agent
 /// actually wrote to, never the main checkout in worktree mode.
-fn phase_verification_path(evidence_root: &Path, phase: u32) -> Option<PathBuf> {
+fn phase_verification_path(evidence_root: &Path, phase: PhaseId) -> Option<PathBuf> {
     let phases = std::fs::read_dir(evidence_root.join(".planning/phases")).ok()?;
-    let prefix = format!("{phase:02}-");
+    let prefix = format!("{padded}-", padded = phase.padded());
     for entry in phases.flatten() {
         if entry
             .file_name()
             .to_str()
             .is_some_and(|name| name.starts_with(&prefix))
         {
-            let verification = entry.path().join(format!("{phase:02}-VERIFICATION.md"));
+            let verification = entry
+                .path()
+                .join(format!("{padded}-VERIFICATION.md", padded = phase.padded()));
             if verification.exists() {
                 return Some(verification);
             }
@@ -2845,7 +2853,7 @@ fn phase_verification_path(evidence_root: &Path, phase: u32) -> Option<PathBuf> 
 /// "unchanged because idempotent"; it is read from the same resolved path and
 /// returns `None` on exactly the same "no artifact" condition, so the two are
 /// always consistent about whether an artifact exists.
-pub fn phase_verification_fingerprint(evidence_root: &Path, phase: u32) -> Option<u64> {
+pub fn phase_verification_fingerprint(evidence_root: &Path, phase: PhaseId) -> Option<u64> {
     let path = phase_verification_path(evidence_root, phase)?;
     let bytes = std::fs::read(path).ok()?;
     // FNV-1a, 64-bit: offset basis and prime are the published constants.
@@ -2880,7 +2888,7 @@ pub fn phase_verification_fingerprint(evidence_root: &Path, phase: u32) -> Optio
 /// used to read as inherited and now reads as authored. That is accepted
 /// deliberately, because the case it fixes (a deterministic verification writer
 /// on cycle 2 of an unresolved gap) is ordinary rather than exotic.
-pub fn phase_verification_mtime_nanos(evidence_root: &Path, phase: u32) -> Option<u64> {
+pub fn phase_verification_mtime_nanos(evidence_root: &Path, phase: PhaseId) -> Option<u64> {
     let path = phase_verification_path(evidence_root, phase)?;
     let modified = std::fs::metadata(path).ok()?.modified().ok()?;
     let since_epoch = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
@@ -2943,7 +2951,7 @@ mod tests {
     use crate::stage::Stage;
     use crate::state::{AgentKind, State};
 
-    fn state_in(root: &Path, phase: u32) -> State {
+    fn state_in(root: &Path, phase: PhaseId) -> State {
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
         state
@@ -2963,7 +2971,7 @@ mod tests {
         );
     }
 
-    fn init_repo_with_feature_commit(root: &Path, phase: u32) {
+    fn init_repo_with_feature_commit(root: &Path, phase: PhaseId) {
         git(root, &["init"]);
         git(root, &["config", "user.email", "devflow@example.com"]);
         git(root, &["config", "user.name", "DevFlow Tests"]);
@@ -2975,7 +2983,7 @@ mod tests {
         git(root, &["add", "README.md"]);
         git(root, &["commit", "-m", "base"]);
 
-        let branch = format!("feature/phase-{phase:02}");
+        let branch = format!("feature/phase-{padded}", padded = phase.padded());
         git(root, &["checkout", "-b", &branch]);
         std::fs::write(root.join("phase.txt"), "feature work\n").unwrap();
         git(root, &["add", "phase.txt"]);
@@ -2984,7 +2992,7 @@ mod tests {
 
     /// Like `init_repo_with_feature_commit`, but the feature branch sits at
     /// develop's tip with **no** extra commit (0 commits ahead).
-    fn init_repo_with_feature_no_commit(root: &Path, phase: u32) {
+    fn init_repo_with_feature_no_commit(root: &Path, phase: PhaseId) {
         git(root, &["init"]);
         git(root, &["config", "user.email", "devflow@example.com"]);
         git(root, &["config", "user.name", "DevFlow Tests"]);
@@ -2996,7 +3004,7 @@ mod tests {
         git(root, &["add", "README.md"]);
         git(root, &["commit", "-m", "base"]);
 
-        let branch = format!("feature/phase-{phase:02}");
+        let branch = format!("feature/phase-{padded}", padded = phase.padded());
         git(root, &["checkout", "-b", &branch]);
     }
 
@@ -3183,12 +3191,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
         std::fs::write(
-            stdout_path(dir.path(), 9),
+            stdout_path(dir.path(), PhaseId::new(9)),
             r#"{"type":"result","is_error":true,"num_turns":3,"result":"oops\nDEVFLOW_RESULT: {\"status\":\"success\"}","session_id":"abc"}"#,
         )
         .unwrap();
 
-        let result = evaluate_layer1(dir.path(), 9).unwrap();
+        let result = evaluate_layer1(dir.path(), PhaseId::new(9)).unwrap();
 
         assert_eq!(result.status, AgentStatus::Failed);
     }
@@ -3252,7 +3260,7 @@ mod tests {
     #[test]
     fn session_id_from_capture_missing_file_returns_none() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(session_id_from_capture(dir.path(), 42).is_none());
+        assert!(session_id_from_capture(dir.path(), PhaseId::new(42)).is_none());
     }
 
     #[test]
@@ -3262,10 +3270,10 @@ mod tests {
         let mut bytes = br#"{"type":"result","result":"done "#.to_vec();
         bytes.push(0xFF); // invalid UTF-8 byte
         bytes.extend_from_slice(br#"","session_id":"lossy-ok"}"#);
-        std::fs::write(stdout_path(dir.path(), 5), bytes).unwrap();
+        std::fs::write(stdout_path(dir.path(), PhaseId::new(5)), bytes).unwrap();
 
         assert_eq!(
-            session_id_from_capture(dir.path(), 5).as_deref(),
+            session_id_from_capture(dir.path(), PhaseId::new(5)).as_deref(),
             Some("lossy-ok")
         );
     }
@@ -3379,7 +3387,10 @@ mod tests {
     #[test]
     fn checkpoint_reported_in_capture_missing_file_returns_false() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(!checkpoint_reported_in_capture(dir.path(), 42));
+        assert!(!checkpoint_reported_in_capture(
+            dir.path(),
+            PhaseId::new(42)
+        ));
     }
 
     #[test]
@@ -3387,11 +3398,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
         std::fs::write(
-            stdout_path(dir.path(), 11),
+            stdout_path(dir.path(), PhaseId::new(11)),
             format!("**Gate:** {HUMAN_GATE_VALUE}\n"),
         )
         .unwrap();
-        assert!(checkpoint_reported_in_capture(dir.path(), 11));
+        assert!(checkpoint_reported_in_capture(dir.path(), PhaseId::new(11)));
     }
 
     // ---- stream-capture gate scoping (plan 30-05) --------------------------
@@ -3562,9 +3573,9 @@ mod tests {
             &v3_message_event(V3_USER_EVENT, &gate_documenting_text()),
             &v3_result_event(V3_RESULT_TURN1, NO_MARKER),
         ]);
-        std::fs::write(stdout_path(dir.path(), 30), &echo_only).unwrap();
+        std::fs::write(stdout_path(dir.path(), PhaseId::new(30)), &echo_only).unwrap();
         assert!(
-            !checkpoint_reported_in_capture(dir.path(), 30),
+            !checkpoint_reported_in_capture(dir.path(), PhaseId::new(30)),
             "an echoed gate mention read from the capture file must not report \
              a checkpoint"
         );
@@ -3573,9 +3584,9 @@ mod tests {
             &v3_message_event(V3_USER_EVENT, &gate_documenting_text()),
             &v3_result_event(V3_RESULT_TURN1, &gate_declaration_text()),
         ]);
-        std::fs::write(stdout_path(dir.path(), 31), &declared).unwrap();
+        std::fs::write(stdout_path(dir.path(), PhaseId::new(31)), &declared).unwrap();
         assert!(
-            checkpoint_reported_in_capture(dir.path(), 31),
+            checkpoint_reported_in_capture(dir.path(), PhaseId::new(31)),
             "a genuine declaration read from the capture file must still \
              report a checkpoint"
         );
@@ -3705,9 +3716,9 @@ mod tests {
         let mut poisoned = b"DEVFLOW_RESULT: {\"status\":\"suc".to_vec();
         poisoned.push(0xff);
         poisoned.extend_from_slice(b"cess\"}");
-        std::fs::write(stdout_path(dir.path(), 30), &poisoned).unwrap();
+        std::fs::write(stdout_path(dir.path(), PhaseId::new(30)), &poisoned).unwrap();
         assert_ne!(
-            evaluate_layer1(dir.path(), 30).map(|r| r.status),
+            evaluate_layer1(dir.path(), PhaseId::new(30)).map(|r| r.status),
             Some(AgentStatus::Success),
             "a corrupt capture with no valid success marker must not be \
              repaired into an authoritative one"
@@ -3715,12 +3726,12 @@ mod tests {
 
         // Control: the same marker with the byte absent IS a real success.
         std::fs::write(
-            stdout_path(dir.path(), 31),
+            stdout_path(dir.path(), PhaseId::new(31)),
             br#"DEVFLOW_RESULT: {"status":"success"}"#,
         )
         .unwrap();
         assert_eq!(
-            evaluate_layer1(dir.path(), 31).map(|r| r.status),
+            evaluate_layer1(dir.path(), PhaseId::new(31)).map(|r| r.status),
             Some(AgentStatus::Success),
             "control: the intact marker must still parse as success"
         );
@@ -3741,18 +3752,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
 
-        std::fs::write(stdout_path(dir.path(), 30), envelope).unwrap();
+        std::fs::write(stdout_path(dir.path(), PhaseId::new(30)), envelope).unwrap();
         assert_eq!(
-            evaluate_layer1(dir.path(), 30).map(|r| r.status),
+            evaluate_layer1(dir.path(), PhaseId::new(30)).map(|r| r.status),
             Some(AgentStatus::Failed),
             "control: the intact envelope is an authoritative Layer-1 failure"
         );
 
         let mut poisoned = vec![0xffu8];
         poisoned.extend_from_slice(envelope);
-        std::fs::write(stdout_path(dir.path(), 31), &poisoned).unwrap();
+        std::fs::write(stdout_path(dir.path(), PhaseId::new(31)), &poisoned).unwrap();
         assert_eq!(
-            evaluate_layer1(dir.path(), 31).map(|r| r.status),
+            evaluate_layer1(dir.path(), PhaseId::new(31)).map(|r| r.status),
             Some(AgentStatus::Failed),
             "one invalid byte before the envelope must not make Layer 1 abstain \
              and hand a FAILURE to the exit-code fallback"
@@ -5100,13 +5111,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
         std::fs::write(
-            stdout_path(dir.path(), 30),
+            stdout_path(dir.path(), PhaseId::new(30)),
             v3_stream_capture(NO_MARKER, NO_MARKER, MARKER_SUCCESS),
         )
         .unwrap();
 
         assert_eq!(
-            session_id_from_capture(dir.path(), 30).as_deref(),
+            session_id_from_capture(dir.path(), PhaseId::new(30)).as_deref(),
             Some(V3_SESSION_ID)
         );
     }
@@ -5119,14 +5130,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
         let envelope = r#"{"type":"result","subtype":"success","result":"All done.","session_id":"cf29bfec-69e8-45df-a4f3-3da08ab6f66e"}"#;
-        std::fs::write(stdout_path(dir.path(), 8), envelope).unwrap();
+        std::fs::write(stdout_path(dir.path(), PhaseId::new(8)), envelope).unwrap();
 
         assert_eq!(
-            session_id_from_capture(dir.path(), 8).as_deref(),
+            session_id_from_capture(dir.path(), PhaseId::new(8)).as_deref(),
             claude_session_id(envelope).as_deref()
         );
         assert_eq!(
-            session_id_from_capture(dir.path(), 8).as_deref(),
+            session_id_from_capture(dir.path(), PhaseId::new(8)).as_deref(),
             Some("cf29bfec-69e8-45df-a4f3-3da08ab6f66e")
         );
     }
@@ -5146,12 +5157,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
         std::fs::write(
-            stdout_path(dir.path(), 30),
+            stdout_path(dir.path(), PhaseId::new(30)),
             v3_stream_capture(NO_MARKER, NO_MARKER, MARKER_SUCCESS),
         )
         .unwrap();
 
-        let result = evaluate_layer1(dir.path(), 30).unwrap();
+        let result = evaluate_layer1(dir.path(), PhaseId::new(30)).unwrap();
 
         assert_eq!(result.status, AgentStatus::Success);
         assert_eq!(result.decided_by_layer, Some(1));
@@ -5173,7 +5184,7 @@ mod tests {
     /// Write a monitor-shaped idle-timeout record. Field names and types match
     /// `IdleTimeoutRecord` exactly; the monitor writes it via serde, so a drift
     /// between the two shows up as a failing deserialize here.
-    fn write_idle_timeout_record(root: &Path, phase: u32, commits: &[(&str, &str)]) {
+    fn write_idle_timeout_record(root: &Path, phase: PhaseId, commits: &[(&str, &str)]) {
         let record = IdleTimeoutRecord {
             status: AgentStatus::IdleTimeout.as_wire_str().to_string(),
             idle_secs: 30,
@@ -5211,14 +5222,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
         std::fs::write(
-            stdout_path(dir.path(), 40),
+            stdout_path(dir.path(), PhaseId::new(40)),
             v3_stream_capture(MARKER_SUCCESS, MARKER_SUCCESS, MARKER_SUCCESS),
         )
         .unwrap();
 
         // NEGATIVE CONTROL — must produce the OPPOSITE result.
         assert_eq!(
-            evaluate_layer1(dir.path(), 40).unwrap().status,
+            evaluate_layer1(dir.path(), PhaseId::new(40))
+                .unwrap()
+                .status,
             AgentStatus::Success,
             "negative control: without the side channel this fixture must decide Success, \
              otherwise the assertion below is vacuous"
@@ -5226,11 +5239,11 @@ mod tests {
 
         write_idle_timeout_record(
             dir.path(),
-            40,
+            PhaseId::new(40),
             &[("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "feat: partial")],
         );
 
-        let result = evaluate_layer1(dir.path(), 40).unwrap();
+        let result = evaluate_layer1(dir.path(), PhaseId::new(40)).unwrap();
         assert_eq!(
             result.status,
             AgentStatus::IdleTimeout,
@@ -5247,17 +5260,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
         assert!(
-            !stdout_path(dir.path(), 41).exists(),
+            !stdout_path(dir.path(), PhaseId::new(41)).exists(),
             "fixture precondition: there must be no capture at all"
         );
 
         // NEGATIVE CONTROL: with neither file present Layer 1 abstains, so the
         // verdict below can only have come from the side channel.
-        assert!(evaluate_layer1(dir.path(), 41).is_none());
+        assert!(evaluate_layer1(dir.path(), PhaseId::new(41)).is_none());
 
-        write_idle_timeout_record(dir.path(), 41, &[]);
+        write_idle_timeout_record(dir.path(), PhaseId::new(41), &[]);
 
-        let result = evaluate_layer1(dir.path(), 41).unwrap();
+        let result = evaluate_layer1(dir.path(), PhaseId::new(41)).unwrap();
         assert_eq!(result.status, AgentStatus::IdleTimeout);
         assert_eq!(result.commits, Some(0));
     }
@@ -5269,14 +5282,14 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
         write_idle_timeout_record(
             dir.path(),
-            42,
+            PhaseId::new(42),
             &[
                 ("1111111abcdef0000000000000000000000000000", "feat: first"),
                 ("2222222abcdef0000000000000000000000000000", "fix: second"),
             ],
         );
 
-        let result = evaluate_layer1(dir.path(), 42).unwrap();
+        let result = evaluate_layer1(dir.path(), PhaseId::new(42)).unwrap();
 
         assert_eq!(result.commits, Some(2));
         let reason = result.reason.expect("an idle timeout must explain itself");
@@ -5307,20 +5320,20 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
 
         std::fs::write(
-            stdout_path(dir.path(), 43),
+            stdout_path(dir.path(), PhaseId::new(43)),
             v3_stream_capture(NO_MARKER, NO_MARKER, MARKER_SUCCESS),
         )
         .unwrap();
         std::fs::write(
-            stdout_path(dir.path(), 44),
+            stdout_path(dir.path(), PhaseId::new(44)),
             v3_stream_capture(MARKER_SUCCESS, MARKER_SUCCESS, MARKER_FAILED),
         )
         .unwrap();
 
         for (phase, expected) in [
-            (43, Some(AgentStatus::Success)),
-            (44, Some(AgentStatus::Failed)),
-            (45, None), // no capture, no side channel
+            (PhaseId::new(43), Some(AgentStatus::Success)),
+            (PhaseId::new(44), Some(AgentStatus::Failed)),
+            (PhaseId::new(45), None), // no capture, no side channel
         ] {
             assert!(
                 !idle_timeout_path(dir.path(), phase).exists(),
@@ -5346,20 +5359,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
         std::fs::write(
-            stdout_path(dir.path(), 46),
+            stdout_path(dir.path(), PhaseId::new(46)),
             v3_stream_capture(MARKER_SUCCESS, MARKER_SUCCESS, MARKER_SUCCESS),
         )
         .unwrap();
 
         // NEGATIVE CONTROL: this capture decides Success on its own.
         assert_eq!(
-            evaluate_layer1(dir.path(), 46).unwrap().status,
+            evaluate_layer1(dir.path(), PhaseId::new(46))
+                .unwrap()
+                .status,
             AgentStatus::Success
         );
 
-        std::fs::write(idle_timeout_path(dir.path(), 46), "{ this is not json").unwrap();
+        std::fs::write(
+            idle_timeout_path(dir.path(), PhaseId::new(46)),
+            "{ this is not json",
+        )
+        .unwrap();
 
-        let result = evaluate_layer1(dir.path(), 46).unwrap();
+        let result = evaluate_layer1(dir.path(), PhaseId::new(46)).unwrap();
         assert_eq!(result.status, AgentStatus::IdleTimeout);
         assert_eq!(
             result.commits, None,
@@ -5446,12 +5465,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
         std::fs::write(
-            stdout_path(dir.path(), 7),
+            stdout_path(dir.path(), PhaseId::new(7)),
             r#"{"type":"result","subtype":"error_rate_limit","retry_after":"2026-06-18T15:45:30Z"}"#,
         )
         .unwrap();
 
-        let result = evaluate_layer1(dir.path(), 7).unwrap();
+        let result = evaluate_layer1(dir.path(), PhaseId::new(7)).unwrap();
 
         assert_eq!(result.status, AgentStatus::RateLimited);
         assert_eq!(
@@ -5469,12 +5488,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
         std::fs::write(
-            stdout_path(dir.path(), 7),
+            stdout_path(dir.path(), PhaseId::new(7)),
             r#"{"type":"result","subtype":"error_rate_limit","is_error":true,"retry_after":"2026-06-18T15:45:30Z"}"#,
         )
         .unwrap();
 
-        let result = evaluate_layer1(dir.path(), 7).unwrap();
+        let result = evaluate_layer1(dir.path(), PhaseId::new(7)).unwrap();
 
         assert_eq!(result.status, AgentStatus::RateLimited);
         assert_eq!(
@@ -5496,9 +5515,9 @@ mod tests {
         bytes.extend_from_slice(
             b"DEVFLOW_RESULT: {\"status\":\"failed\",\"reason\":\"review: bad\"}\n",
         );
-        std::fs::write(stdout_path(dir.path(), 5), bytes).unwrap();
+        std::fs::write(stdout_path(dir.path(), PhaseId::new(5)), bytes).unwrap();
 
-        let result = evaluate_layer1(dir.path(), 5).unwrap();
+        let result = evaluate_layer1(dir.path(), PhaseId::new(5)).unwrap();
 
         assert_eq!(result.status, AgentStatus::Failed);
         assert_eq!(result.reason.as_deref(), Some("review: bad"));
@@ -5518,11 +5537,11 @@ mod tests {
         .unwrap();
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
         std::fs::write(
-            stdout_path(dir.path(), 16),
+            stdout_path(dir.path(), PhaseId::new(16)),
             "DEVFLOW_RESULT: {\"status\":\"success\"}\n",
         )
         .unwrap();
-        let state = state_in(dir.path(), 16);
+        let state = state_in(dir.path(), PhaseId::new(16));
 
         let approval = vec!["test -f externally-shipped".to_string()];
         let result = evaluate_agent_result_inner(
@@ -5573,11 +5592,11 @@ mod tests {
         .unwrap();
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
         std::fs::write(
-            stdout_path(dir.path(), 16),
+            stdout_path(dir.path(), PhaseId::new(16)),
             "DEVFLOW_RESULT: {\"status\":\"success\"}\n",
         )
         .unwrap();
-        let mut state = state_in(dir.path(), 16);
+        let mut state = state_in(dir.path(), PhaseId::new(16));
         // No worktree: `execution_root` falls back to `project_root`, so
         // discovery and probe execution read the same directory.
         state.worktree_path = None;
@@ -5660,11 +5679,11 @@ mod tests {
         // Captures live in the project root, not the worktree.
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
         std::fs::write(
-            stdout_path(dir.path(), 16),
+            stdout_path(dir.path(), PhaseId::new(16)),
             "DEVFLOW_RESULT: {\"status\":\"success\"}\n",
         )
         .unwrap();
-        let mut state = state_in(dir.path(), 16);
+        let mut state = state_in(dir.path(), PhaseId::new(16));
         state.worktree_path = Some(worktree.clone());
 
         let approval = vec!["test -f implemented".to_string()];
@@ -5711,7 +5730,7 @@ mod tests {
             "---\nexternal_verify: \"touch escaped\"\n---\n",
         )
         .unwrap();
-        let state = state_in(dir.path(), 16);
+        let state = state_in(dir.path(), PhaseId::new(16));
         let approved = vec!["test -f reviewed-artifact".to_string()];
 
         let result = evaluate_agent_result_inner(
@@ -5732,11 +5751,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
         std::fs::write(
-            stdout_path(dir.path(), 16),
+            stdout_path(dir.path(), PhaseId::new(16)),
             "DEVFLOW_RESULT: {\"status\":\"success\"}\n",
         )
         .unwrap();
-        let state = state_in(dir.path(), 16);
+        let state = state_in(dir.path(), PhaseId::new(16));
         let approved = vec!["test -f shipped".to_string()];
 
         let result = evaluate_agent_result_inner(
@@ -5756,12 +5775,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
         std::fs::write(
-            stdout_path(dir.path(), 16),
+            stdout_path(dir.path(), PhaseId::new(16)),
             "DEVFLOW_RESULT: {\"status\":\"success\",\"commits\":2,\"summary\":\"done\"}\n",
         )
         .unwrap();
-        let state = state_in(dir.path(), 16);
-        let layer1 = evaluate_layer1(dir.path(), 16).unwrap();
+        let state = state_in(dir.path(), PhaseId::new(16));
+        let layer1 = evaluate_layer1(dir.path(), PhaseId::new(16)).unwrap();
 
         let full = evaluate_agent_result(dir.path(), &state, &GitFlowConfig::default()).unwrap();
 
@@ -5788,7 +5807,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.path().join("shipped"), "done").unwrap();
-        let mut state = state_in(dir.path(), 16);
+        let mut state = state_in(dir.path(), PhaseId::new(16));
         state.stage = Stage::Define;
 
         let approval = vec!["test -f shipped".to_string()];
@@ -5826,11 +5845,11 @@ mod tests {
         std::fs::write(dir.path().join("externally-shipped"), "done").unwrap();
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
         std::fs::write(
-            stdout_path(dir.path(), 16),
+            stdout_path(dir.path(), PhaseId::new(16)),
             "DEVFLOW_RESULT: {\"status\":\"failed\",\"reason\":\"agent self-reported failure\"}\n",
         )
         .unwrap();
-        let state = state_in(dir.path(), 16);
+        let state = state_in(dir.path(), PhaseId::new(16));
 
         let approval = vec!["test -f externally-shipped".to_string()];
         let result = evaluate_agent_result_inner(
@@ -5872,12 +5891,12 @@ mod tests {
         .unwrap();
         std::fs::write(dir.path().join("shipped"), "done").unwrap();
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
-        let mut state = state_in(dir.path(), 16);
+        let mut state = state_in(dir.path(), PhaseId::new(16));
         state.stage = Stage::Validate;
         let approval = vec!["test -f shipped".to_string()];
 
         std::fs::write(
-            stdout_path(dir.path(), 16),
+            stdout_path(dir.path(), PhaseId::new(16)),
             "DEVFLOW_RESULT: {\"status\":\"success\",\"verdict\":\"pass\"}\n",
         )
         .unwrap();
@@ -5893,7 +5912,7 @@ mod tests {
         assert_eq!(result.verdict, Some(Verdict::Pass));
 
         std::fs::write(
-            stdout_path(dir.path(), 16),
+            stdout_path(dir.path(), PhaseId::new(16)),
             "DEVFLOW_RESULT: {\"status\":\"success\",\"verdict\":\"gaps\"}\n",
         )
         .unwrap();
@@ -5906,7 +5925,7 @@ mod tests {
         .unwrap();
         assert_eq!(result.verdict, Some(Verdict::Gaps));
 
-        std::fs::remove_file(stdout_path(dir.path(), 16)).unwrap();
+        std::fs::remove_file(stdout_path(dir.path(), PhaseId::new(16))).unwrap();
         let result = evaluate_agent_result_inner(
             dir.path(),
             &state,
@@ -5922,7 +5941,7 @@ mod tests {
         // pair `decide_action` advances and `classify_validate_outcome` reads
         // as Passed — Ship, unattended, on a run whose agent reported failure.
         std::fs::write(
-            stdout_path(dir.path(), 16),
+            stdout_path(dir.path(), PhaseId::new(16)),
             "DEVFLOW_RESULT: {\"status\":\"failed\",\"verdict\":\"pass\"}\n",
         )
         .unwrap();
@@ -5968,13 +5987,13 @@ mod tests {
         .unwrap();
         std::fs::write(dir.path().join("shipped"), "done").unwrap();
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
-        let mut state = state_in(dir.path(), 16);
+        let mut state = state_in(dir.path(), PhaseId::new(16));
         state.stage = Stage::Validate;
         let approval = vec!["test -f shipped".to_string()];
 
         // The exploit itself: both fields present and mutually contradictory.
         std::fs::write(
-            stdout_path(dir.path(), 16),
+            stdout_path(dir.path(), PhaseId::new(16)),
             "DEVFLOW_RESULT: {\"status\":\"failed\",\"verdict\":\"pass\"}\n",
         )
         .unwrap();
@@ -5996,7 +6015,7 @@ mod tests {
         // both pre- and post-fix, so this case cannot discriminate the fix —
         // that is the point. The failed status alone is not the exploit.
         std::fs::write(
-            stdout_path(dir.path(), 16),
+            stdout_path(dir.path(), PhaseId::new(16)),
             "DEVFLOW_RESULT: {\"status\":\"failed\"}\n",
         )
         .unwrap();
@@ -6019,7 +6038,7 @@ mod tests {
         // Layer 1. Neither state is an affirmative pair — the exploit needs
         // `pass`, not merely any verdict.
         std::fs::write(
-            stdout_path(dir.path(), 16),
+            stdout_path(dir.path(), PhaseId::new(16)),
             "DEVFLOW_RESULT: {\"status\":\"failed\",\"verdict\":\"gaps\"}\n",
         )
         .unwrap();
@@ -6061,12 +6080,12 @@ mod tests {
         .unwrap();
         std::fs::write(dir.path().join("shipped"), "done").unwrap();
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
-        let mut state = state_in(dir.path(), 16);
+        let mut state = state_in(dir.path(), PhaseId::new(16));
         state.stage = Stage::Validate;
         let approval = vec!["test -f shipped".to_string()];
 
         std::fs::write(
-            stdout_path(dir.path(), 16),
+            stdout_path(dir.path(), PhaseId::new(16)),
             "DEVFLOW_RESULT: {\"status\":\"success\",\"verdict\":\"pass\"}\n",
         )
         .unwrap();
@@ -6127,11 +6146,11 @@ mod tests {
         // so this test is deterministic under every value of the variable.
         std::fs::write(phase_dir.join("16-01-PLAN.md"), "---\nplan: 01\n---\n").unwrap();
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
-        let mut state = state_in(dir.path(), 16);
+        let mut state = state_in(dir.path(), PhaseId::new(16));
         state.stage = Stage::Validate;
 
         std::fs::write(
-            stdout_path(dir.path(), 16),
+            stdout_path(dir.path(), PhaseId::new(16)),
             "DEVFLOW_RESULT: {\"status\":\"failed\",\"verdict\":\"pass\"}\n",
         )
         .unwrap();
@@ -6172,11 +6191,11 @@ mod tests {
         std::fs::write(dir.path().join("shipped"), "done").unwrap();
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
         std::fs::write(
-            stdout_path(dir.path(), 16),
+            stdout_path(dir.path(), PhaseId::new(16)),
             "DEVFLOW_RESULT: {\"status\":\"success\",\"verdict\":\"pass\"}\n",
         )
         .unwrap();
-        let state = state_in(dir.path(), 16); // Stage::Code by default
+        let state = state_in(dir.path(), PhaseId::new(16)); // Stage::Code by default
         let approval = vec!["test -f shipped".to_string()];
 
         let result = evaluate_agent_result_inner(
@@ -6212,7 +6231,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.path().join("passing-artifact"), "done").unwrap();
-        let mut state = state_in(dir.path(), 16);
+        let mut state = state_in(dir.path(), PhaseId::new(16));
         state.stage = Stage::Define;
 
         let approval = vec![
@@ -6286,7 +6305,7 @@ mod tests {
         std::fs::write(root.join(".devflow/phase-01-exit"), "0").unwrap();
         std::fs::write(root.join(".devflow/phase-01-agent-pid"), "1234").unwrap();
 
-        archive_phase_files(root, root, 1, 5).unwrap();
+        archive_phase_files(root, root, PhaseId::new(1), 5).unwrap();
 
         // The live capture paths are gone (moved, not merely deleted).
         assert!(!root.join(".devflow/phase-01-stdout").exists());
@@ -6294,7 +6313,7 @@ mod tests {
         // Agent-pid is bookkeeping, not diagnostic — still removed outright.
         assert!(!root.join(".devflow/phase-01-agent-pid").exists());
 
-        let history = history_dir(root, 1);
+        let history = history_dir(root, PhaseId::new(1));
         let archived: Vec<_> = std::fs::read_dir(&history)
             .unwrap()
             .flatten()
@@ -6314,8 +6333,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         // Should not panic when there is nothing to archive (first launch).
-        archive_phase_files(root, root, 1, 5).unwrap();
-        assert!(!history_dir(root, 1).exists());
+        archive_phase_files(root, root, PhaseId::new(1), 5).unwrap();
+        assert!(!history_dir(root, PhaseId::new(1)).exists());
     }
 
     #[test]
@@ -6323,7 +6342,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         // No .devflow dir at all — should not panic.
-        archive_phase_files(root, root, 1, 5).unwrap();
+        archive_phase_files(root, root, PhaseId::new(1), 5).unwrap();
     }
 
     #[test]
@@ -6331,14 +6350,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir_all(root.join(".devflow")).unwrap();
-        std::fs::write(stdout_path(root, 1), "evidence").unwrap();
+        std::fs::write(stdout_path(root, PhaseId::new(1)), "evidence").unwrap();
         // A file where the history directory must be forces create_dir_all
         // to fail before the live capture is moved or a monitor can truncate it.
         std::fs::write(root.join(".devflow/history"), "blocked").unwrap();
 
-        assert!(archive_phase_files(root, root, 1, 5).is_err());
+        assert!(archive_phase_files(root, root, PhaseId::new(1), 5).is_err());
         assert_eq!(
-            std::fs::read_to_string(stdout_path(root, 1)).unwrap(),
+            std::fs::read_to_string(stdout_path(root, PhaseId::new(1))).unwrap(),
             "evidence"
         );
     }
@@ -6348,19 +6367,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir_all(root.join(".devflow")).unwrap();
-        std::fs::write(stdout_path(root, 1), "stdout evidence").unwrap();
-        std::fs::write(exit_code_path(root, 1), "17").unwrap();
-        let history = history_dir(root, 1);
+        std::fs::write(stdout_path(root, PhaseId::new(1)), "stdout evidence").unwrap();
+        std::fs::write(exit_code_path(root, PhaseId::new(1)), "17").unwrap();
+        let history = history_dir(root, PhaseId::new(1));
         std::fs::create_dir_all(history.join("fixed-exit/blocker")).unwrap();
 
-        assert!(archive_phase_files_with_stamp(root, root, 1, 5, "fixed").is_err());
+        assert!(archive_phase_files_with_stamp(root, root, PhaseId::new(1), 5, "fixed").is_err());
 
         assert_eq!(
-            std::fs::read_to_string(stdout_path(root, 1)).unwrap(),
+            std::fs::read_to_string(stdout_path(root, PhaseId::new(1))).unwrap(),
             "stdout evidence"
         );
         assert_eq!(
-            std::fs::read_to_string(exit_code_path(root, 1)).unwrap(),
+            std::fs::read_to_string(exit_code_path(root, PhaseId::new(1))).unwrap(),
             "17"
         );
         assert!(!history.join("fixed-stdout").exists());
@@ -6373,22 +6392,25 @@ mod tests {
         let root = dir.path();
         let evidence_root = root.join("phase-worktree");
         std::fs::create_dir_all(root.join(".devflow")).unwrap();
-        std::fs::write(stdout_path(root, 1), "stdout evidence").unwrap();
-        std::fs::write(exit_code_path(root, 1), "23").unwrap();
+        std::fs::write(stdout_path(root, PhaseId::new(1)), "stdout evidence").unwrap();
+        std::fs::write(exit_code_path(root, PhaseId::new(1)), "23").unwrap();
         let review = evidence_root.join(".planning/phases/01-example/01-REVIEW.md");
         std::fs::create_dir_all(&review).unwrap();
 
-        assert!(archive_phase_files_with_stamp(root, &evidence_root, 1, 5, "review-copy").is_err());
+        assert!(
+            archive_phase_files_with_stamp(root, &evidence_root, PhaseId::new(1), 5, "review-copy")
+                .is_err()
+        );
 
         assert_eq!(
-            std::fs::read_to_string(stdout_path(root, 1)).unwrap(),
+            std::fs::read_to_string(stdout_path(root, PhaseId::new(1))).unwrap(),
             "stdout evidence"
         );
         assert_eq!(
-            std::fs::read_to_string(exit_code_path(root, 1)).unwrap(),
+            std::fs::read_to_string(exit_code_path(root, PhaseId::new(1))).unwrap(),
             "23"
         );
-        let history = history_dir(root, 1);
+        let history = history_dir(root, PhaseId::new(1));
         assert!(!history.join("review-copy-stdout").exists());
         assert!(!history.join("review-copy-exit").exists());
         assert!(!history.join(".pending-review-copy").exists());
@@ -6400,18 +6422,20 @@ mod tests {
         let root = dir.path();
         let evidence_root = root.join("phase-worktree");
         std::fs::create_dir_all(root.join(".devflow")).unwrap();
-        std::fs::write(stdout_path(root, 1), "attempt").unwrap();
+        std::fs::write(stdout_path(root, PhaseId::new(1)), "attempt").unwrap();
         let phase_dir = evidence_root.join(".planning/phases/01-example");
         std::fs::create_dir_all(&phase_dir).unwrap();
         std::fs::write(phase_dir.join("01-REVIEW.md"), "review one").unwrap();
 
-        let stamp = archive_phase_files(root, &evidence_root, 1, 5)
+        let stamp = archive_phase_files(root, &evidence_root, PhaseId::new(1), 5)
             .unwrap()
             .unwrap();
 
         assert_eq!(
-            std::fs::read_to_string(history_dir(root, 1).join(format!("{stamp}-REVIEW.md")))
-                .unwrap(),
+            std::fs::read_to_string(
+                history_dir(root, PhaseId::new(1)).join(format!("{stamp}-REVIEW.md"))
+            )
+            .unwrap(),
             "review one"
         );
     }
@@ -6425,10 +6449,10 @@ mod tests {
         for i in 0..7 {
             std::fs::write(root.join(".devflow/phase-01-stdout"), format!("gen {i}")).unwrap();
             std::fs::write(root.join(".devflow/phase-01-exit"), "0").unwrap();
-            archive_phase_files(root, root, 1, 3).unwrap();
+            archive_phase_files(root, root, PhaseId::new(1), 3).unwrap();
         }
 
-        let history = history_dir(root, 1);
+        let history = history_dir(root, PhaseId::new(1));
         let stdout_count = std::fs::read_dir(&history)
             .unwrap()
             .flatten()
@@ -6473,7 +6497,7 @@ mod tests {
     fn prune_history_retains_a_full_five_stage_run_with_loop_backs() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let history = history_dir(root, 1);
+        let history = history_dir(root, PhaseId::new(1));
         std::fs::create_dir_all(&history).unwrap();
 
         let retain = crate::config::DEFAULT_CAPTURE_RETENTION;
@@ -6548,12 +6572,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
         std::fs::write(
-            stdout_path(dir.path(), 6),
+            stdout_path(dir.path(), PhaseId::new(6)),
             "done\nDEVFLOW_RESULT: {\"status\":\"success\",\"commits\":2,\"summary\":\"ok\"}\n",
         )
         .unwrap();
-        std::fs::write(exit_code_path(dir.path(), 6), "0").unwrap();
-        let state = state_in(dir.path(), 6);
+        std::fs::write(exit_code_path(dir.path(), PhaseId::new(6)), "0").unwrap();
+        let state = state_in(dir.path(), PhaseId::new(6));
 
         let result = evaluate_agent_result(dir.path(), &state, &GitFlowConfig::default()).unwrap();
 
@@ -6598,7 +6622,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
         std::fs::write(
-            stdout_path(dir.path(), 31),
+            stdout_path(dir.path(), PhaseId::new(31)),
             v3_stream_capture(NO_MARKER, NO_MARKER, MARKER_SUCCESS_CLAIMING_PASS),
         )
         .unwrap();
@@ -6608,12 +6632,12 @@ mod tests {
         // Without this the assertions below cannot distinguish "the arbitration
         // downgraded a success" from "nothing ever claimed success", nor
         // "`verdict` was dropped" from "`verdict` was never set".
-        let layer1 = evaluate_layer1(dir.path(), 31).unwrap();
+        let layer1 = evaluate_layer1(dir.path(), PhaseId::new(31)).unwrap();
         assert_eq!(layer1.status, AgentStatus::Success);
         assert_eq!(layer1.verdict, Some(Verdict::Pass));
 
-        std::fs::write(exit_code_path(dir.path(), 31), "1\n").unwrap();
-        let state = state_in(dir.path(), 31);
+        std::fs::write(exit_code_path(dir.path(), PhaseId::new(31)), "1\n").unwrap();
+        let state = state_in(dir.path(), PhaseId::new(31));
 
         let result =
             evaluate_agent_result_inner(dir.path(), &state, &GitFlowConfig::default(), None)
@@ -6644,12 +6668,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
         std::fs::write(
-            stdout_path(dir.path(), 32),
+            stdout_path(dir.path(), PhaseId::new(32)),
             v3_stream_capture(NO_MARKER, NO_MARKER, MARKER_SUCCESS_CLAIMING_PASS),
         )
         .unwrap();
-        std::fs::write(exit_code_path(dir.path(), 32), "0\n").unwrap();
-        let state = state_in(dir.path(), 32);
+        std::fs::write(exit_code_path(dir.path(), PhaseId::new(32)), "0\n").unwrap();
+        let state = state_in(dir.path(), PhaseId::new(32));
 
         let result =
             evaluate_agent_result_inner(dir.path(), &state, &GitFlowConfig::default(), None)
@@ -6672,15 +6696,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
         std::fs::write(
-            stdout_path(dir.path(), 33),
+            stdout_path(dir.path(), PhaseId::new(33)),
             v3_stream_capture(NO_MARKER, NO_MARKER, MARKER_SUCCESS),
         )
         .unwrap();
         assert!(
-            !exit_code_path(dir.path(), 33).exists(),
+            !exit_code_path(dir.path(), PhaseId::new(33)).exists(),
             "fixture precondition: there must be no exit file"
         );
-        let state = state_in(dir.path(), 33);
+        let state = state_in(dir.path(), PhaseId::new(33));
 
         let result =
             evaluate_agent_result_inner(dir.path(), &state, &GitFlowConfig::default(), None)
@@ -6699,12 +6723,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
         std::fs::write(
-            stdout_path(dir.path(), 34),
+            stdout_path(dir.path(), PhaseId::new(34)),
             r#"{"type":"result","subtype":"error_rate_limit","is_error":true,"retry_after":"2026-06-18T15:45:30Z"}"#,
         )
         .unwrap();
-        std::fs::write(exit_code_path(dir.path(), 34), "1\n").unwrap();
-        let state = state_in(dir.path(), 34);
+        std::fs::write(exit_code_path(dir.path(), PhaseId::new(34)), "1\n").unwrap();
+        let state = state_in(dir.path(), PhaseId::new(34));
 
         let result =
             evaluate_agent_result_inner(dir.path(), &state, &GitFlowConfig::default(), None)
@@ -6727,17 +6751,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
         std::fs::write(
-            stdout_path(dir.path(), 35),
+            stdout_path(dir.path(), PhaseId::new(35)),
             v3_stream_capture(MARKER_SUCCESS, MARKER_SUCCESS, MARKER_SUCCESS),
         )
         .unwrap();
         write_idle_timeout_record(
             dir.path(),
-            35,
+            PhaseId::new(35),
             &[("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "feat: partial")],
         );
-        std::fs::write(exit_code_path(dir.path(), 35), "143\n").unwrap();
-        let state = state_in(dir.path(), 35);
+        std::fs::write(exit_code_path(dir.path(), PhaseId::new(35)), "143\n").unwrap();
+        let state = state_in(dir.path(), PhaseId::new(35));
 
         let result =
             evaluate_agent_result_inner(dir.path(), &state, &GitFlowConfig::default(), None)
@@ -6765,12 +6789,16 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
             std::fs::write(
-                stdout_path(dir.path(), 36),
+                stdout_path(dir.path(), PhaseId::new(36)),
                 v3_stream_capture(NO_MARKER, NO_MARKER, MARKER_SUCCESS),
             )
             .unwrap();
-            std::fs::write(exit_code_path(dir.path(), 36), format!("{code}\n")).unwrap();
-            let state = state_in(dir.path(), 36);
+            std::fs::write(
+                exit_code_path(dir.path(), PhaseId::new(36)),
+                format!("{code}\n"),
+            )
+            .unwrap();
+            let state = state_in(dir.path(), PhaseId::new(36));
 
             let arbitrated =
                 evaluate_agent_result_inner(dir.path(), &state, &GitFlowConfig::default(), None)
@@ -6831,12 +6859,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
         std::fs::write(
-            stdout_path(dir.path(), 3),
+            stdout_path(dir.path(), PhaseId::new(3)),
             "output\ndevflow_result: {\"status\":\"failed\",\"reason\":\"bad output\"}\n",
         )
         .unwrap();
 
-        let result = evaluate_layer1(dir.path(), 3).unwrap();
+        let result = evaluate_layer1(dir.path(), PhaseId::new(3)).unwrap();
 
         assert_eq!(result.status, AgentStatus::Failed);
         assert_eq!(result.reason.as_deref(), Some("bad output"));
@@ -6859,7 +6887,7 @@ mod tests {
         git(dir.path(), &["add", "README.md"]);
         git(dir.path(), &["commit", "-m", "base"]);
 
-        let count = phase_commit_count(dir.path(), &GitFlowConfig::default(), 999);
+        let count = phase_commit_count(dir.path(), &GitFlowConfig::default(), PhaseId::new(999));
 
         assert_eq!(
             count,
@@ -6914,7 +6942,11 @@ mod tests {
             "the fixture depends on this path being absent"
         );
 
-        let count = phase_commit_count(&unspawnable_root, &GitFlowConfig::default(), 999);
+        let count = phase_commit_count(
+            &unspawnable_root,
+            &GitFlowConfig::default(),
+            PhaseId::new(999),
+        );
 
         assert_eq!(
             count, None,
@@ -6966,7 +6998,7 @@ mod tests {
             "the branch must verify, or this test exercises the rev-parse arm instead"
         );
 
-        let count = phase_commit_count(dir.path(), &GitFlowConfig::default(), 999);
+        let count = phase_commit_count(dir.path(), &GitFlowConfig::default(), PhaseId::new(999));
 
         assert_eq!(
             count,
@@ -6979,14 +7011,19 @@ mod tests {
     #[test]
     fn evaluate_layer2_falls_back_to_exit_code_and_commit_count() {
         let dir = tempfile::tempdir().unwrap();
-        init_repo_with_feature_commit(dir.path(), 4);
+        init_repo_with_feature_commit(dir.path(), PhaseId::new(4));
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
-        std::fs::write(exit_code_path(dir.path(), 4), "0").unwrap();
-        let state = state_in(dir.path(), 4);
+        std::fs::write(exit_code_path(dir.path(), PhaseId::new(4)), "0").unwrap();
+        let state = state_in(dir.path(), PhaseId::new(4));
 
-        let result = evaluate_layer2(dir.path(), 4, &GitFlowConfig::default(), state.stage)
-            .unwrap()
-            .unwrap();
+        let result = evaluate_layer2(
+            dir.path(),
+            PhaseId::new(4),
+            &GitFlowConfig::default(),
+            state.stage,
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(result.status, AgentStatus::Success);
         assert_eq!(result.exit_code, Some(0));
@@ -6999,14 +7036,19 @@ mod tests {
         // exit=0 but the feature branch has 0 commits ahead of develop →
         // "no work done" failure (the Layer 2 middle branch).
         let dir = tempfile::tempdir().unwrap();
-        init_repo_with_feature_no_commit(dir.path(), 4);
+        init_repo_with_feature_no_commit(dir.path(), PhaseId::new(4));
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
-        std::fs::write(exit_code_path(dir.path(), 4), "0").unwrap();
-        let state = state_in(dir.path(), 4);
+        std::fs::write(exit_code_path(dir.path(), PhaseId::new(4)), "0").unwrap();
+        let state = state_in(dir.path(), PhaseId::new(4));
 
-        let result = evaluate_layer2(dir.path(), 4, &GitFlowConfig::default(), state.stage)
-            .unwrap()
-            .unwrap();
+        let result = evaluate_layer2(
+            dir.path(),
+            PhaseId::new(4),
+            &GitFlowConfig::default(),
+            state.stage,
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(result.status, AgentStatus::Failed);
         assert_eq!(result.exit_code, Some(0));
@@ -7042,14 +7084,19 @@ mod tests {
     fn evaluate_layer2_nonzero_exit_is_failed() {
         // Non-zero exit code → failure regardless of commit count.
         let dir = tempfile::tempdir().unwrap();
-        init_repo_with_feature_commit(dir.path(), 4);
+        init_repo_with_feature_commit(dir.path(), PhaseId::new(4));
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
-        std::fs::write(exit_code_path(dir.path(), 4), "1").unwrap();
-        let state = state_in(dir.path(), 4);
+        std::fs::write(exit_code_path(dir.path(), PhaseId::new(4)), "1").unwrap();
+        let state = state_in(dir.path(), PhaseId::new(4));
 
-        let result = evaluate_layer2(dir.path(), 4, &GitFlowConfig::default(), state.stage)
-            .unwrap()
-            .unwrap();
+        let result = evaluate_layer2(
+            dir.path(),
+            PhaseId::new(4),
+            &GitFlowConfig::default(),
+            state.stage,
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(result.status, AgentStatus::Failed);
         assert_eq!(result.exit_code, Some(1));
@@ -7062,9 +7109,9 @@ mod tests {
         // Validate, which are exempt from the zero-commit gate but NOT from
         // the exit-code check.
         let dir = tempfile::tempdir().unwrap();
-        init_repo_with_feature_no_commit(dir.path(), 10);
+        init_repo_with_feature_no_commit(dir.path(), PhaseId::new(10));
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
-        std::fs::write(exit_code_path(dir.path(), 10), "1").unwrap();
+        std::fs::write(exit_code_path(dir.path(), PhaseId::new(10)), "1").unwrap();
 
         for stage in [
             Stage::Define,
@@ -7073,9 +7120,14 @@ mod tests {
             Stage::Validate,
             Stage::Ship,
         ] {
-            let result = evaluate_layer2(dir.path(), 10, &GitFlowConfig::default(), stage)
-                .unwrap()
-                .unwrap();
+            let result = evaluate_layer2(
+                dir.path(),
+                PhaseId::new(10),
+                &GitFlowConfig::default(),
+                stage,
+            )
+            .unwrap()
+            .unwrap();
             assert_eq!(
                 result.status,
                 AgentStatus::Failed,
@@ -7087,14 +7139,19 @@ mod tests {
     #[test]
     fn layer2_skips_commit_gate_for_define_and_validate() {
         let dir = tempfile::tempdir().unwrap();
-        init_repo_with_feature_no_commit(dir.path(), 11);
+        init_repo_with_feature_no_commit(dir.path(), PhaseId::new(11));
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
-        std::fs::write(exit_code_path(dir.path(), 11), "0").unwrap();
+        std::fs::write(exit_code_path(dir.path(), PhaseId::new(11)), "0").unwrap();
 
         for stage in [Stage::Define, Stage::Validate] {
-            let result = evaluate_layer2(dir.path(), 11, &GitFlowConfig::default(), stage)
-                .unwrap()
-                .unwrap();
+            let result = evaluate_layer2(
+                dir.path(),
+                PhaseId::new(11),
+                &GitFlowConfig::default(),
+                stage,
+            )
+            .unwrap()
+            .unwrap();
             assert_ne!(
                 result.status,
                 AgentStatus::Failed,
@@ -7104,18 +7161,24 @@ mod tests {
 
         // Code stage with the same zero-commit inputs is still Failed
         // (existing behavior preserved).
-        let result = evaluate_layer2(dir.path(), 11, &GitFlowConfig::default(), Stage::Code)
-            .unwrap()
-            .unwrap();
+        let result = evaluate_layer2(
+            dir.path(),
+            PhaseId::new(11),
+            &GitFlowConfig::default(),
+            Stage::Code,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(result.status, AgentStatus::Failed);
     }
 
     #[test]
     fn evaluate_layer3_falls_back_to_commit_count() {
         let dir = tempfile::tempdir().unwrap();
-        init_repo_with_feature_commit(dir.path(), 5);
+        init_repo_with_feature_commit(dir.path(), PhaseId::new(5));
 
-        let result = evaluate_layer3(dir.path(), 5, &GitFlowConfig::default()).unwrap();
+        let result =
+            evaluate_layer3(dir.path(), PhaseId::new(5), &GitFlowConfig::default()).unwrap();
 
         assert_eq!(result.status, AgentStatus::Unknown);
         assert_eq!(result.exit_code, None);
@@ -7133,9 +7196,10 @@ mod tests {
     #[test]
     fn evaluate_layer3_zero_commits_is_failed_and_flags_human_review() {
         let dir = tempfile::tempdir().unwrap();
-        init_repo_with_feature_no_commit(dir.path(), 5);
+        init_repo_with_feature_no_commit(dir.path(), PhaseId::new(5));
 
-        let result = evaluate_layer3(dir.path(), 5, &GitFlowConfig::default()).unwrap();
+        let result =
+            evaluate_layer3(dir.path(), PhaseId::new(5), &GitFlowConfig::default()).unwrap();
 
         assert_eq!(result.status, AgentStatus::Failed);
         assert_eq!(result.exit_code, None);
@@ -7188,7 +7252,12 @@ mod tests {
             "the fixture depends on this path being absent"
         );
 
-        let result = evaluate_layer3(&unspawnable_root, 5, &GitFlowConfig::default()).unwrap();
+        let result = evaluate_layer3(
+            &unspawnable_root,
+            PhaseId::new(5),
+            &GitFlowConfig::default(),
+        )
+        .unwrap();
 
         assert_ne!(
             result.status,
@@ -7358,14 +7427,19 @@ mod tests {
     #[test]
     fn evaluate_layer2_exit_137_is_resource_killed() {
         let dir = tempfile::tempdir().unwrap();
-        init_repo_with_feature_commit(dir.path(), 20);
+        init_repo_with_feature_commit(dir.path(), PhaseId::new(20));
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
-        std::fs::write(exit_code_path(dir.path(), 20), "137").unwrap();
-        let state = state_in(dir.path(), 20);
+        std::fs::write(exit_code_path(dir.path(), PhaseId::new(20)), "137").unwrap();
+        let state = state_in(dir.path(), PhaseId::new(20));
 
-        let result = evaluate_layer2(dir.path(), 20, &GitFlowConfig::default(), state.stage)
-            .unwrap()
-            .unwrap();
+        let result = evaluate_layer2(
+            dir.path(),
+            PhaseId::new(20),
+            &GitFlowConfig::default(),
+            state.stage,
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(result.status, AgentStatus::ResourceKilled);
         assert_eq!(result.exit_code, Some(137));
@@ -7374,14 +7448,19 @@ mod tests {
     #[test]
     fn evaluate_layer2_exit_127_is_agent_unavailable() {
         let dir = tempfile::tempdir().unwrap();
-        init_repo_with_feature_commit(dir.path(), 21);
+        init_repo_with_feature_commit(dir.path(), PhaseId::new(21));
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
-        std::fs::write(exit_code_path(dir.path(), 21), "127").unwrap();
-        let state = state_in(dir.path(), 21);
+        std::fs::write(exit_code_path(dir.path(), PhaseId::new(21)), "127").unwrap();
+        let state = state_in(dir.path(), PhaseId::new(21));
 
-        let result = evaluate_layer2(dir.path(), 21, &GitFlowConfig::default(), state.stage)
-            .unwrap()
-            .unwrap();
+        let result = evaluate_layer2(
+            dir.path(),
+            PhaseId::new(21),
+            &GitFlowConfig::default(),
+            state.stage,
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(result.status, AgentStatus::AgentUnavailable);
         assert_eq!(result.exit_code, Some(127));
@@ -7445,7 +7524,7 @@ mod tests {
             // pointed at an unrelated foreign repository, scoped to this
             // child process only.
             let root = std::path::PathBuf::from(root);
-            let phase = 27;
+            let phase = PhaseId::new(27);
             let state = state_in(&root, phase);
 
             let result = evaluate_layer2(&root, phase, &GitFlowConfig::default(), state.stage)
@@ -7468,7 +7547,7 @@ mod tests {
         // foreign repo, find no branch, count zero commits, and misreport a
         // real agent's completed work as Failed.
         let dir = tempfile::tempdir().unwrap();
-        let phase = 27;
+        let phase = PhaseId::new(27);
         init_repo_with_feature_commit(dir.path(), phase);
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
         std::fs::write(exit_code_path(dir.path(), phase), "0").unwrap();
@@ -7518,20 +7597,20 @@ mod tests {
         let root = dir.path();
 
         assert!(
-            !phase_verification_exists(root, 82),
+            !phase_verification_exists(root, PhaseId::new(82)),
             "no .planning/phases directory at all must return false, not panic"
         );
 
         let phase_dir = root.join(".planning/phases/82-loop-back-fix");
         std::fs::create_dir_all(&phase_dir).unwrap();
         assert!(
-            !phase_verification_exists(root, 82),
+            !phase_verification_exists(root, PhaseId::new(82)),
             "a phase directory with no {{N}}-VERIFICATION.md must return false"
         );
 
         std::fs::write(phase_dir.join("82-VERIFICATION.md"), "verified\n").unwrap();
         assert!(
-            phase_verification_exists(root, 82),
+            phase_verification_exists(root, PhaseId::new(82)),
             "a phase directory holding {{N}}-VERIFICATION.md must return true"
         );
     }
@@ -7555,10 +7634,10 @@ mod tests {
         let artifact = phase_dir.join("84-VERIFICATION.md");
 
         std::fs::write(&artifact, "verdict: gaps\n").unwrap();
-        let first = phase_verification_fingerprint(root, 84)
+        let first = phase_verification_fingerprint(root, PhaseId::new(84))
             .expect("an artifact that exists must produce a fingerprint");
 
-        let first_again = phase_verification_fingerprint(root, 84)
+        let first_again = phase_verification_fingerprint(root, PhaseId::new(84))
             .expect("an artifact that exists must produce a fingerprint");
         assert_eq!(
             first, first_again,
@@ -7567,7 +7646,7 @@ mod tests {
         );
 
         std::fs::write(&artifact, "verdict: pass\n").unwrap();
-        let second = phase_verification_fingerprint(root, 84)
+        let second = phase_verification_fingerprint(root, PhaseId::new(84))
             .expect("an artifact that exists must produce a fingerprint");
         assert_ne!(
             first, second,
@@ -7586,7 +7665,7 @@ mod tests {
         let root = dir.path();
 
         assert_eq!(
-            phase_verification_fingerprint(root, 85),
+            phase_verification_fingerprint(root, PhaseId::new(85)),
             None,
             "no .planning/phases directory at all must yield None, not panic"
         );
@@ -7594,13 +7673,13 @@ mod tests {
         let phase_dir = root.join(".planning/phases/85-fingerprint");
         std::fs::create_dir_all(&phase_dir).unwrap();
         assert_eq!(
-            phase_verification_fingerprint(root, 85),
+            phase_verification_fingerprint(root, PhaseId::new(85)),
             None,
             "a phase directory with no {{N}}-VERIFICATION.md must yield None"
         );
 
         std::fs::write(phase_dir.join("85-VERIFICATION.md"), "").unwrap();
-        let empty = phase_verification_fingerprint(root, 85);
+        let empty = phase_verification_fingerprint(root, PhaseId::new(85));
         assert!(
             empty.is_some(),
             "an EMPTY artifact still exists and must yield Some — the control against an \

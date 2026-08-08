@@ -1,6 +1,7 @@
 //! Git-flow operations implemented with plain `git` commands.
 
 use crate::config::GitFlowConfig;
+use crate::phase_id::PhaseId;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -127,8 +128,8 @@ impl GitFlow {
     ///
     /// Returns an error if the branch already exists (use
     /// [`Self::feature_start_force`] to overwrite).
-    pub fn feature_start(&self, phase: u32) -> Result<String, GitError> {
-        let branch = format!("{}phase-{:02}", self.config.feature_prefix, phase);
+    pub fn feature_start(&self, phase: PhaseId) -> Result<String, GitError> {
+        let branch = format!("{}phase-{}", self.config.feature_prefix, phase.padded());
         info!("creating feature branch: {branch}");
         self.git(["checkout", &self.config.develop])?;
         self.git(["checkout", "-b", &branch])?;
@@ -136,8 +137,8 @@ impl GitFlow {
     }
 
     /// Create or reset a feature branch, overwriting it if it already exists.
-    pub fn feature_start_force(&self, phase: u32) -> Result<String, GitError> {
-        let branch = format!("{}phase-{:02}", self.config.feature_prefix, phase);
+    pub fn feature_start_force(&self, phase: PhaseId) -> Result<String, GitError> {
+        let branch = format!("{}phase-{}", self.config.feature_prefix, phase.padded());
         warn!("force-creating feature branch: {branch}");
         self.git(["checkout", &self.config.develop])?;
         self.git(["checkout", "-B", &branch])?;
@@ -145,7 +146,7 @@ impl GitFlow {
     }
 
     /// Merge a feature branch into develop and delete it.
-    pub fn feature_finish(&self, phase: u32) -> Result<String, GitError> {
+    pub fn feature_finish(&self, phase: PhaseId) -> Result<String, GitError> {
         let branch = self.merge_feature_into_develop(phase)?;
         self.git(["branch", "-d", &branch])?;
         Ok(branch)
@@ -155,8 +156,8 @@ impl GitFlow {
     ///
     /// Default DevFlow runs keep the feature branch checked out in a linked
     /// worktree, so deletion belongs to the later best-effort cleanup hook.
-    pub fn merge_feature_into_develop(&self, phase: u32) -> Result<String, GitError> {
-        let branch = format!("{}phase-{:02}", self.config.feature_prefix, phase);
+    pub fn merge_feature_into_develop(&self, phase: PhaseId) -> Result<String, GitError> {
+        let branch = format!("{}phase-{}", self.config.feature_prefix, phase.padded());
         info!("merging feature branch: {branch}");
         self.git(["checkout", &self.config.develop])?;
         self.git(["merge", "--no-ff", &branch])?;
@@ -167,8 +168,8 @@ impl GitFlow {
     ///
     /// An absent branch is not proof of a merge. Callers must fail closed
     /// rather than treating a deleted or never-created branch as shipped.
-    pub fn is_merged_into_develop(&self, phase: u32) -> bool {
-        let branch = format!("{}phase-{:02}", self.config.feature_prefix, phase);
+    pub fn is_merged_into_develop(&self, phase: PhaseId) -> bool {
+        let branch = format!("{}phase-{}", self.config.feature_prefix, phase.padded());
         if !self.branch_exists(&branch) {
             return false;
         }
@@ -1272,7 +1273,9 @@ mod tests {
     fn feature_start_branches_from_develop() {
         let repo = init_repo();
         let root = repo.path();
-        let branch = flow(root).feature_start(3).expect("feature_start");
+        let branch = flow(root)
+            .feature_start(PhaseId::new(3))
+            .expect("feature_start");
         assert_eq!(branch, "feature/phase-03");
         assert_eq!(current_branch(root), "feature/phase-03");
     }
@@ -1283,7 +1286,7 @@ mod tests {
         let root = repo.path();
         let gf = flow(root);
 
-        gf.feature_start(12).expect("feature_start");
+        gf.feature_start(PhaseId::new(12)).expect("feature_start");
         commit_file(root, "feature-one.txt");
         commit_file(root, "feature-two.txt");
         git(root, &["checkout", "-q", "develop"]);
@@ -1305,10 +1308,10 @@ mod tests {
         let root = repo.path();
         let gf = flow(root);
 
-        gf.feature_start(1).expect("start");
+        gf.feature_start(PhaseId::new(1)).expect("start");
         commit_file(root, "feature.txt");
 
-        let branch = gf.feature_finish(1).expect("finish");
+        let branch = gf.feature_finish(PhaseId::new(1)).expect("finish");
         assert_eq!(branch, "feature/phase-01");
         assert_eq!(current_branch(root), "develop");
 
@@ -1535,7 +1538,7 @@ mod tests {
         let gf = flow(root);
 
         // Ship from a feature branch carrying a commit that is NOT on develop.
-        gf.feature_start(5).expect("feature_start");
+        gf.feature_start(PhaseId::new(5)).expect("feature_start");
         commit_file(root, "feature-only.txt");
         let feature_tip = gf.branch_tip("feature/phase-05").expect("feature tip");
 
@@ -1566,9 +1569,9 @@ mod tests {
         let gf = flow(root);
 
         // Create and merge a feature branch into develop.
-        gf.feature_start(2).expect("start");
+        gf.feature_start(PhaseId::new(2)).expect("start");
         commit_file(root, "f.txt");
-        gf.feature_finish(2).expect("finish");
+        gf.feature_finish(PhaseId::new(2)).expect("finish");
 
         // Create an already-merged stray branch off develop.
         git(root, &["branch", "stale-merged"]);
@@ -1705,7 +1708,7 @@ mod tests {
         let gf = flow(root);
 
         // Create a feature branch with an unmerged commit.
-        gf.feature_start(8).expect("start");
+        gf.feature_start(PhaseId::new(8)).expect("start");
         commit_file(root, "unmerged.txt");
         // Switch back to develop so the branch isn't checked out.
         git(root, &["checkout", "-q", "develop"]);
@@ -1731,7 +1734,7 @@ mod tests {
         let root = repo.path();
         // feature_finish for a phase that was never started: checkout develop
         // succeeds, but merging the nonexistent feature branch fails.
-        let err = flow(root).feature_finish(99).unwrap_err();
+        let err = flow(root).feature_finish(PhaseId::new(99)).unwrap_err();
         assert!(matches!(err, GitError::Command(_)));
     }
 

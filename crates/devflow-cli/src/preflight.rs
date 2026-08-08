@@ -26,6 +26,7 @@ use crate::pipeline_outcomes::truncate_reason;
 use devflow_core::gates::{GateAction, Gates};
 use devflow_core::git::git_command;
 use devflow_core::mode::{self, Mode};
+use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
 use devflow_core::{agents, events, version, workflow};
@@ -79,7 +80,9 @@ fn agent_binary_available(program: &str) -> bool {
 /// scaffolding. The prompt/roots passed here are throwaways — adapters
 /// return a static program name regardless.
 pub(crate) fn agent_program(agent: AgentKind) -> &'static str {
-    agents::adapter_for(agent).exec_command(0, "", &[]).0
+    agents::adapter_for(agent)
+        .exec_command(PhaseId::new(0), "", &[])
+        .0
 }
 
 pub(crate) fn ensure_agent_binary(program: &str) -> Result<(), CliError> {
@@ -140,7 +143,7 @@ pub(crate) enum PhaseReachability {
 /// must be re-pointed at that configuration alongside it.
 pub(crate) fn phase_reachability_on_base(
     project_root: &Path,
-    phase: u32,
+    phase: PhaseId,
     base: &str,
 ) -> PhaseReachability {
     // Step 1: does the base branch even exist here?
@@ -191,7 +194,7 @@ pub(crate) fn phase_reachability_on_base(
         .output();
     let phase_dir_found = match ls_tree {
         Ok(out) if out.status.success() => {
-            let prefix = format!(".planning/phases/{phase:02}-");
+            let prefix = format!(".planning/phases/{padded}-", padded = phase.padded());
             String::from_utf8_lossy(&out.stdout).lines().any(|path| {
                 path.strip_prefix(&prefix)
                     .is_some_and(|rest| rest.contains('/'))
@@ -218,7 +221,7 @@ pub(crate) fn phase_reachability_on_base(
 /// operator-facing strings three times (999.10, and again in 18-07's
 /// `self_dogfood_stale_blocked` reason); this must not be a fourth.
 pub(crate) fn unreachable_message(
-    phase: u32,
+    phase: PhaseId,
     base: &str,
     roadmap_entry_found: bool,
     phase_dir_found: bool,
@@ -234,7 +237,8 @@ pub(crate) fn unreachable_message(
     }
     if !phase_dir_found {
         msg.push_str(&format!(
-            "  missing: a `.planning/phases/{phase:02}-*/` directory on `{base}`\n"
+            "  missing: a `.planning/phases/{padded}-*/` directory on `{base}`\n",
+            padded = phase.padded()
         ));
     }
     msg.push_str(&format!(
@@ -279,7 +283,7 @@ pub(crate) fn unreachable_message(
 /// the directory half.
 pub(crate) fn ensure_phase_reachable_on_base(
     project_root: &Path,
-    phase: u32,
+    phase: PhaseId,
     base: &str,
 ) -> Result<(), CliError> {
     match phase_reachability_on_base(project_root, phase, base) {
@@ -1026,7 +1030,12 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let mut state = State::new(60, AgentKind::Codex, Mode::Auto, root.to_path_buf());
+        let mut state = State::new(
+            PhaseId::new(60),
+            AgentKind::Codex,
+            Mode::Auto,
+            root.to_path_buf(),
+        );
         state.stage = Stage::Define;
         assert!(preflight_interactivity_check(root, &state).is_err());
 
@@ -1122,7 +1131,12 @@ mod tests {
     fn major_bump_short_circuits_for_non_ship_stage() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let mut state = State::new(70, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let mut state = State::new(
+            PhaseId::new(70),
+            AgentKind::Claude,
+            Mode::Auto,
+            root.to_path_buf(),
+        );
         for stage in [Stage::Define, Stage::Plan, Stage::Code, Stage::Validate] {
             state.stage = stage;
             assert!(
@@ -1139,7 +1153,12 @@ mod tests {
         let root = dir.path();
         commit_msg(root, "b.txt", "fix(x): correct off-by-one");
 
-        let mut state = State::new(71, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let mut state = State::new(
+            PhaseId::new(71),
+            AgentKind::Claude,
+            Mode::Auto,
+            root.to_path_buf(),
+        );
         state.stage = Stage::Ship;
         assert!(preflight_major_bump_check(root, &state).is_ok());
 
@@ -1155,7 +1174,12 @@ mod tests {
         let root = dir.path();
         commit_msg(root, "b.txt", "feat(scope)!: drop legacy api");
 
-        let mut state = State::new(72, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let mut state = State::new(
+            PhaseId::new(72),
+            AgentKind::Claude,
+            Mode::Auto,
+            root.to_path_buf(),
+        );
         state.stage = Stage::Ship;
         let err = preflight_major_bump_check(root, &state).unwrap_err();
         assert!(err.contains("MAJOR"), "{err}");
@@ -1188,7 +1212,12 @@ mod tests {
         tag(root, "v9.9.9");
         run_git(root, &["checkout", &main_branch]);
 
-        let mut state = State::new(73, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let mut state = State::new(
+            PhaseId::new(73),
+            AgentKind::Claude,
+            Mode::Auto,
+            root.to_path_buf(),
+        );
         state.stage = Stage::Ship;
         let err = preflight_major_bump_check(root, &state).unwrap_err();
         assert!(err.contains("v9.9.9"), "{err}");
@@ -1273,7 +1302,12 @@ mod tests {
         let (outer, worktree_path) = major_bump_worktree_fixture();
         let project_root = outer.path().join("project");
 
-        let mut state = State::new(76, AgentKind::Claude, Mode::Auto, project_root.clone());
+        let mut state = State::new(
+            PhaseId::new(76),
+            AgentKind::Claude,
+            Mode::Auto,
+            project_root.clone(),
+        );
         state.stage = Stage::Ship;
         state.worktree_path = Some(worktree_path.clone());
 
@@ -1320,7 +1354,7 @@ mod tests {
         let root = dir.path();
         commit_msg(root, "b.txt", "feat(scope)!: drop legacy api");
 
-        let phase = 74;
+        let phase = PhaseId::new(74);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Ship;
         state.yes_ship = true;
@@ -1386,7 +1420,7 @@ mod tests {
         let root = dir.path();
         commit_msg(root, "b.txt", "feat(scope)!: drop legacy api");
 
-        let phase = 75;
+        let phase = PhaseId::new(75);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Ship;
         state.yes_ship = true;
@@ -1450,7 +1484,12 @@ mod tests {
 
         let (outer, worktree_path) = major_bump_worktree_fixture();
         let project_root = outer.path().join("project");
-        let mut state = State::new(77, AgentKind::Claude, Mode::Auto, project_root.clone());
+        let mut state = State::new(
+            PhaseId::new(77),
+            AgentKind::Claude,
+            Mode::Auto,
+            project_root.clone(),
+        );
         state.stage = Stage::Ship;
         state.worktree_path = Some(worktree_path);
 
@@ -1488,7 +1527,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 61;
+        let phase = PhaseId::new(61);
         let mut state = State::new(phase, AgentKind::Codex, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Define;
         workflow::save_state(&state).unwrap();
@@ -1525,7 +1564,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        let phase = 62;
+        let phase = PhaseId::new(62);
         // Plan is unaffected by the interactivity/gh-auth generic checks, so
         // only the adapter hook can be the source of this failure.
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
@@ -1572,7 +1611,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 63;
+        let phase = PhaseId::new(63);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         // Plan is unaffected by the interactivity/gh-auth generic checks
         // (D-14) — only the injected adapter's `preflight` fails; the real
@@ -1669,7 +1708,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 64;
+        let phase = PhaseId::new(64);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Plan;
         // Premise moved off `STREAM_JSON_STAGES` membership deliberately
@@ -1797,7 +1836,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 620;
+        let phase = PhaseId::new(620);
         // Codex + Auto + Define + no `.planning/phases/620-*/620-CONTEXT.md`
         // on `develop` deterministically fails `preflight_interactivity_check`
         // — see the section doc comment above for why this (not the adapter
@@ -1891,7 +1930,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 621;
+        let phase = PhaseId::new(621);
         let mut state = State::new(phase, AgentKind::Codex, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Define;
         state.preflight_retries = mode::MAX_PREFLIGHT_RETRIES - 1;
@@ -1953,7 +1992,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        let phase = 622;
+        let phase = PhaseId::new(622);
         // Plan + Claude bypasses the generic checks and the real Claude
         // adapter's default preflight passes — the same "unaffected" shape
         // used by `run_preflight_adapter_hook_override_fires` above.
@@ -1990,7 +2029,10 @@ mod tests {
     /// Builds a git repo with a `develop` branch whose `.planning/ROADMAP.md`
     /// content is controlled per-test, optionally committing a
     /// `.planning/phases/{phase:02}-{slug}/.gitkeep` alongside it.
-    fn reachability_fixture(roadmap: &str, phase_dir: Option<(u32, &str)>) -> tempfile::TempDir {
+    fn reachability_fixture(
+        roadmap: &str,
+        phase_dir: Option<(PhaseId, &str)>,
+    ) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let run = |args: &[&str]| {
@@ -2014,7 +2056,10 @@ mod tests {
         std::fs::create_dir_all(root.join(".planning")).unwrap();
         std::fs::write(root.join(".planning/ROADMAP.md"), roadmap).unwrap();
         if let Some((phase, slug)) = phase_dir {
-            let d = root.join(format!(".planning/phases/{phase:02}-{slug}"));
+            let d = root.join(format!(
+                ".planning/phases/{padded}-{slug}",
+                padded = phase.padded()
+            ));
             std::fs::create_dir_all(&d).unwrap();
             std::fs::write(d.join(".gitkeep"), "").unwrap();
         }
@@ -2025,13 +2070,16 @@ mod tests {
 
     #[test]
     fn reachability_is_reachable_when_roadmap_entry_and_phase_dir_are_both_on_base() {
-        let dir = reachability_fixture("### Phase 24: Something\n", Some((24, "something")));
+        let dir = reachability_fixture(
+            "### Phase 24: Something\n",
+            Some((PhaseId::new(24), "something")),
+        );
         let root = dir.path();
         assert_eq!(
-            phase_reachability_on_base(root, 24, "develop"),
+            phase_reachability_on_base(root, PhaseId::new(24), "develop"),
             PhaseReachability::Reachable
         );
-        assert!(ensure_phase_reachable_on_base(root, 24, "develop").is_ok());
+        assert!(ensure_phase_reachable_on_base(root, PhaseId::new(24), "develop").is_ok());
     }
 
     #[test]
@@ -2039,7 +2087,7 @@ mod tests {
         let dir = reachability_fixture("### Phase 24: Something\n", None);
         let root = dir.path();
         assert_eq!(
-            phase_reachability_on_base(root, 24, "develop"),
+            phase_reachability_on_base(root, PhaseId::new(24), "develop"),
             PhaseReachability::Unreachable {
                 roadmap_entry_found: true,
                 phase_dir_found: false,
@@ -2064,7 +2112,7 @@ mod tests {
         // Precondition: this is genuinely the dir-only-missing shape, not a
         // fixture that accidentally satisfies the guard some other way.
         assert_eq!(
-            phase_reachability_on_base(root, 24, "develop"),
+            phase_reachability_on_base(root, PhaseId::new(24), "develop"),
             PhaseReachability::Unreachable {
                 roadmap_entry_found: true,
                 phase_dir_found: false,
@@ -2072,7 +2120,7 @@ mod tests {
         );
 
         assert!(
-            ensure_phase_reachable_on_base(root, 24, "develop").is_ok(),
+            ensure_phase_reachable_on_base(root, PhaseId::new(24), "develop").is_ok(),
             "a present ROADMAP heading with no phase directory is the legitimate \
              bootstrap state — Define has not run yet, and running it is what \
              creates that directory. The guard must not refuse it (999.63)."
@@ -2084,9 +2132,12 @@ mod tests {
     /// invisible to its own run) would regress open.
     #[test]
     fn enforcement_still_refuses_when_the_roadmap_heading_is_absent() {
-        let dir = reachability_fixture("### Phase 1: Something else\n", Some((24, "something")));
+        let dir = reachability_fixture(
+            "### Phase 1: Something else\n",
+            Some((PhaseId::new(24), "something")),
+        );
         let root = dir.path();
-        let err = ensure_phase_reachable_on_base(root, 24, "develop")
+        let err = ensure_phase_reachable_on_base(root, PhaseId::new(24), "develop")
             .expect_err("a missing ROADMAP heading must still refuse (23-12's failure class)");
         assert!(
             err.to_string().contains("### Phase 24:"),
@@ -2096,10 +2147,13 @@ mod tests {
 
     #[test]
     fn reachability_is_unreachable_when_the_roadmap_entry_is_absent_from_base() {
-        let dir = reachability_fixture("### Phase 1: Something else\n", Some((24, "something")));
+        let dir = reachability_fixture(
+            "### Phase 1: Something else\n",
+            Some((PhaseId::new(24), "something")),
+        );
         let root = dir.path();
         assert_eq!(
-            phase_reachability_on_base(root, 24, "develop"),
+            phase_reachability_on_base(root, PhaseId::new(24), "develop"),
             PhaseReachability::Unreachable {
                 roadmap_entry_found: false,
                 phase_dir_found: true,
@@ -2113,11 +2167,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         assert_eq!(
-            phase_reachability_on_base(root, 24, "develop"),
+            phase_reachability_on_base(root, PhaseId::new(24), "develop"),
             PhaseReachability::Undeterminable
         );
         assert!(
-            ensure_phase_reachable_on_base(root, 24, "develop").is_ok(),
+            ensure_phase_reachable_on_base(root, PhaseId::new(24), "develop").is_ok(),
             "a probe that cannot see must never refuse (fail-open contract)"
         );
     }
@@ -2151,10 +2205,10 @@ mod tests {
         run(&["commit", "-q", "-m", "no roadmap"]);
 
         assert_eq!(
-            phase_reachability_on_base(root, 24, "develop"),
+            phase_reachability_on_base(root, PhaseId::new(24), "develop"),
             PhaseReachability::Undeterminable
         );
-        assert!(ensure_phase_reachable_on_base(root, 24, "develop").is_ok());
+        assert!(ensure_phase_reachable_on_base(root, PhaseId::new(24), "develop").is_ok());
     }
 
     /// Pins the trailing colon's job: it stops a probe for phase 24 from
@@ -2162,10 +2216,13 @@ mod tests {
     /// with the same digits.
     #[test]
     fn phase_heading_probe_does_not_confuse_a_phase_number_prefix() {
-        let dir = reachability_fixture("### Phase 240: Later\n", Some((24, "something")));
+        let dir = reachability_fixture(
+            "### Phase 240: Later\n",
+            Some((PhaseId::new(24), "something")),
+        );
         let root = dir.path();
         assert_eq!(
-            phase_reachability_on_base(root, 24, "develop"),
+            phase_reachability_on_base(root, PhaseId::new(24), "develop"),
             PhaseReachability::Unreachable {
                 roadmap_entry_found: false,
                 phase_dir_found: true,
@@ -2175,19 +2232,19 @@ mod tests {
 
     #[test]
     fn unreachable_message_names_the_base_branch_and_each_missing_half() {
-        let roadmap_missing = unreachable_message(24, "develop", false, true);
+        let roadmap_missing = unreachable_message(PhaseId::new(24), "develop", false, true);
         assert!(roadmap_missing.contains("is not reachable from"));
         assert!(roadmap_missing.contains("develop"));
         assert!(roadmap_missing.contains("### Phase 24:"));
         assert!(!roadmap_missing.contains(".planning/phases/24-"));
 
-        let dir_missing = unreachable_message(24, "develop", true, false);
+        let dir_missing = unreachable_message(PhaseId::new(24), "develop", true, false);
         assert!(dir_missing.contains("is not reachable from"));
         assert!(dir_missing.contains("develop"));
         assert!(!dir_missing.contains("### Phase 24:"));
         assert!(dir_missing.contains(".planning/phases/24-"));
 
-        let both_missing = unreachable_message(24, "develop", false, false);
+        let both_missing = unreachable_message(PhaseId::new(24), "develop", false, false);
         assert!(both_missing.contains("is not reachable from"));
         assert!(both_missing.contains("develop"));
         assert!(both_missing.contains("### Phase 24:"));
@@ -2200,7 +2257,7 @@ mod tests {
     fn unreachable_message_contains_no_absolute_path() {
         let dir = tempfile::tempdir().unwrap();
         let fixture_root = dir.path().to_string_lossy().into_owned();
-        let msg = unreachable_message(24, "develop", false, false);
+        let msg = unreachable_message(PhaseId::new(24), "develop", false, false);
         assert!(!msg.contains(&fixture_root));
         assert!(!msg.contains("/home/"));
         assert!(!msg.contains("/Users/"));
@@ -2266,8 +2323,10 @@ mod tests {
         let real_dir = reachability_fixture("### Phase 500: Something\n", None);
         let real_root = real_dir.path();
 
-        let foreign_dir =
-            reachability_fixture("### Phase 500: Something\n", Some((500, "something")));
+        let foreign_dir = reachability_fixture(
+            "### Phase 500: Something\n",
+            Some((PhaseId::new(500), "something")),
+        );
         let foreign_root = foreign_dir.path();
 
         // (a) the vulnerability class, reproduced directly: an unscrubbed
@@ -2308,7 +2367,7 @@ mod tests {
         // doc comment above for how this becomes RED-before/GREEN-after when
         // run under this plan's hostile-GIT_DIR-wrapped `<verify>` command.
         assert_eq!(
-            phase_reachability_on_base(real_root, 500, "develop"),
+            phase_reachability_on_base(real_root, PhaseId::new(500), "develop"),
             PhaseReachability::Unreachable {
                 roadmap_entry_found: true,
                 phase_dir_found: false,

@@ -15,6 +15,7 @@
 //! defend. A corrupt or truncated entry costs one entry, never the whole
 //! registry.
 
+use crate::phase_id::PhaseId;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -25,7 +26,7 @@ pub struct RegisteredRoot {
     /// The project's root directory.
     pub project_root: PathBuf,
     /// Phase number registered.
-    pub phase: u32,
+    pub phase: PhaseId,
     /// Unix timestamp (seconds) when this entry was written, as a string —
     /// matches `GateFile.timestamp`'s existing wire shape.
     pub registered_at: String,
@@ -71,9 +72,12 @@ pub fn roots_dir_in(cache_dir: &Path) -> PathBuf {
 /// `project_root` lives inside the file itself, and `load_roots_in` reads it
 /// from there, so a digest collision costs at most one shadowed entry and
 /// never a wrong path.
-pub fn entry_path_in(cache_dir: &Path, project_root: &Path, phase: u32) -> PathBuf {
+pub fn entry_path_in(cache_dir: &Path, project_root: &Path, phase: PhaseId) -> PathBuf {
     let digest = path_digest(project_root);
-    roots_dir_in(cache_dir).join(format!("{digest:016x}-{phase:02}.json"))
+    roots_dir_in(cache_dir).join(format!(
+        "{digest:016x}-{padded}.json",
+        padded = phase.padded()
+    ))
 }
 
 /// Inline FNV-1a 64-bit hash over `path`'s OS-string bytes, used only to
@@ -107,7 +111,11 @@ fn path_digest(path: &Path) -> u64 {
 /// for a lost update — the per-file shape has no read-modify-write step to
 /// lose one in, so two concurrent registrations of DIFFERENT pairs both
 /// survive by construction, not by locking.
-pub fn register_in(cache_dir: &Path, project_root: &Path, phase: u32) -> Result<(), RegistryError> {
+pub fn register_in(
+    cache_dir: &Path,
+    project_root: &Path,
+    phase: PhaseId,
+) -> Result<(), RegistryError> {
     ensure_private_dir(cache_dir)?;
     let dir = roots_dir_in(cache_dir);
     ensure_private_dir(&dir)?;
@@ -171,7 +179,7 @@ pub fn prune_missing() -> usize {
 pub fn deregister_in(
     cache_dir: &Path,
     project_root: &Path,
-    phase: u32,
+    phase: PhaseId,
 ) -> Result<(), RegistryError> {
     let path = entry_path_in(cache_dir, project_root, phase);
     match std::fs::remove_file(path) {
@@ -185,7 +193,7 @@ pub fn deregister_in(
 /// Deregistration is best-effort observability cleanup, so any error
 /// (including [`cache_dir`] resolving to `None`) is swallowed — mirrors
 /// how every call site invokes this with `let _ =`.
-pub fn deregister(project_root: &Path, phase: u32) {
+pub fn deregister(project_root: &Path, phase: PhaseId) {
     let Some(dir) = cache_dir() else {
         return;
     };
@@ -254,7 +262,7 @@ pub fn load_roots_in(cache_dir: &Path) -> Vec<RegisteredRoot> {
 /// dir. A silent `Ok(())` no-op when [`cache_dir`] resolves to `None` —
 /// registration is best-effort observability, never a reason to fail a
 /// launch.
-pub fn register(project_root: &Path, phase: u32) -> Result<(), RegistryError> {
+pub fn register(project_root: &Path, phase: PhaseId) -> Result<(), RegistryError> {
     let Some(dir) = cache_dir() else {
         return Ok(());
     };
@@ -288,20 +296,20 @@ mod tests {
         let root_a = PathBuf::from("/tmp/project-a");
         let root_b = PathBuf::from("/tmp/project-b");
 
-        register_in(cache, &root_a, 5).unwrap();
-        register_in(cache, &root_b, 7).unwrap();
+        register_in(cache, &root_a, PhaseId::new(5)).unwrap();
+        register_in(cache, &root_b, PhaseId::new(7)).unwrap();
 
         let roots = load_roots_in(cache);
         assert_eq!(roots.len(), 2);
         assert!(
             roots
                 .iter()
-                .any(|r| r.project_root == root_a && r.phase == 5)
+                .any(|r| r.project_root == root_a && r.phase == PhaseId::new(5))
         );
         assert!(
             roots
                 .iter()
-                .any(|r| r.project_root == root_b && r.phase == 7)
+                .any(|r| r.project_root == root_b && r.phase == PhaseId::new(7))
         );
         // Sorted by (project_root, phase).
         assert!(roots[0].project_root <= roots[1].project_root);
@@ -313,13 +321,13 @@ mod tests {
         let cache = dir.path();
         let root = PathBuf::from("/tmp/project-multi-phase");
 
-        register_in(cache, &root, 1).unwrap();
-        register_in(cache, &root, 2).unwrap();
+        register_in(cache, &root, PhaseId::new(1)).unwrap();
+        register_in(cache, &root, PhaseId::new(2)).unwrap();
 
         let roots = load_roots_in(cache);
         assert_eq!(roots.len(), 2);
-        assert!(roots.iter().any(|r| r.phase == 1));
-        assert!(roots.iter().any(|r| r.phase == 2));
+        assert!(roots.iter().any(|r| r.phase == PhaseId::new(1)));
+        assert!(roots.iter().any(|r| r.phase == PhaseId::new(2)));
     }
 
     #[test]
@@ -327,7 +335,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = dir.path();
         let root = PathBuf::from("/tmp/project-good");
-        register_in(cache, &root, 3).unwrap();
+        register_in(cache, &root, PhaseId::new(3)).unwrap();
 
         let junk_path = roots_dir_in(cache).join("junk-entry.json");
         std::fs::write(&junk_path, "{not json").unwrap();
@@ -335,7 +343,7 @@ mod tests {
         let roots = load_roots_in(cache);
         assert_eq!(roots.len(), 1);
         assert_eq!(roots[0].project_root, root);
-        assert_eq!(roots[0].phase, 3);
+        assert_eq!(roots[0].phase, PhaseId::new(3));
     }
 
     #[test]
@@ -351,8 +359,8 @@ mod tests {
         let cache = dir.path();
         let root = PathBuf::from("/tmp/project-reregister");
 
-        register_in(cache, &root, 9).unwrap();
-        register_in(cache, &root, 9).unwrap();
+        register_in(cache, &root, PhaseId::new(9)).unwrap();
+        register_in(cache, &root, PhaseId::new(9)).unwrap();
 
         let roots = load_roots_in(cache);
         assert_eq!(roots.len(), 1);
@@ -370,8 +378,8 @@ mod tests {
         let root_b = PathBuf::from("/tmp/concurrent-project-b");
 
         std::thread::scope(|scope| {
-            let a = scope.spawn(|| register_in(&cache_path, &root_a, 1));
-            let b = scope.spawn(|| register_in(&cache_path, &root_b, 1));
+            let a = scope.spawn(|| register_in(&cache_path, &root_a, PhaseId::new(1)));
+            let b = scope.spawn(|| register_in(&cache_path, &root_b, PhaseId::new(1)));
             a.join().unwrap().unwrap();
             b.join().unwrap().unwrap();
         });
@@ -392,13 +400,13 @@ mod tests {
         let root = PathBuf::from("/tmp/concurrent-project-same");
 
         std::thread::scope(|scope| {
-            let a = scope.spawn(|| register_in(&cache_path, &root, 1));
-            let b = scope.spawn(|| register_in(&cache_path, &root, 1));
+            let a = scope.spawn(|| register_in(&cache_path, &root, PhaseId::new(1)));
+            let b = scope.spawn(|| register_in(&cache_path, &root, PhaseId::new(1)));
             a.join().unwrap().unwrap();
             b.join().unwrap().unwrap();
         });
 
-        let entry_path = entry_path_in(&cache_path, &root, 1);
+        let entry_path = entry_path_in(&cache_path, &root, PhaseId::new(1));
         let contents = std::fs::read_to_string(&entry_path).unwrap();
         let parsed: RegisteredRoot =
             serde_json::from_str(&contents).expect("entry must not be torn");
@@ -418,7 +426,7 @@ mod tests {
         let cache_path = base.path().join("nested-cache");
         let root = PathBuf::from("/tmp/project-perm");
 
-        register_in(&cache_path, &root, 1).unwrap();
+        register_in(&cache_path, &root, PhaseId::new(1)).unwrap();
 
         let cache_mode = std::fs::metadata(&cache_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(
@@ -442,7 +450,7 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         let project_path = project.path().to_path_buf();
-        register_in(cache.path(), &project_path, 1).unwrap();
+        register_in(cache.path(), &project_path, PhaseId::new(1)).unwrap();
         drop(project); // deletes the project's directory from disk
 
         let removed = prune_missing_in(cache.path());
@@ -455,7 +463,7 @@ mod tests {
     fn prune_missing_in_keeps_entry_for_existing_root() {
         let cache = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        register_in(cache.path(), project.path(), 1).unwrap();
+        register_in(cache.path(), project.path(), PhaseId::new(1)).unwrap();
 
         let removed = prune_missing_in(cache.path());
 
@@ -480,14 +488,14 @@ mod tests {
     fn dereg_removes_matching_pair_and_leaves_sibling_phase_intact() {
         let cache = tempfile::tempdir().unwrap();
         let root = PathBuf::from("/tmp/project-dereg-phase");
-        register_in(cache.path(), &root, 1).unwrap();
-        register_in(cache.path(), &root, 2).unwrap();
+        register_in(cache.path(), &root, PhaseId::new(1)).unwrap();
+        register_in(cache.path(), &root, PhaseId::new(2)).unwrap();
 
-        deregister_in(cache.path(), &root, 1).unwrap();
+        deregister_in(cache.path(), &root, PhaseId::new(1)).unwrap();
 
         let roots = load_roots_in(cache.path());
         assert_eq!(roots.len(), 1);
-        assert_eq!(roots[0].phase, 2);
+        assert_eq!(roots[0].phase, PhaseId::new(2));
     }
 
     /// Deregistration must be scoped to one root as well as one phase —
@@ -497,10 +505,10 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         let root_a = PathBuf::from("/tmp/project-dereg-root-a");
         let root_b = PathBuf::from("/tmp/project-dereg-root-b");
-        register_in(cache.path(), &root_a, 1).unwrap();
-        register_in(cache.path(), &root_b, 1).unwrap();
+        register_in(cache.path(), &root_a, PhaseId::new(1)).unwrap();
+        register_in(cache.path(), &root_b, PhaseId::new(1)).unwrap();
 
-        deregister_in(cache.path(), &root_a, 1).unwrap();
+        deregister_in(cache.path(), &root_a, PhaseId::new(1)).unwrap();
 
         let roots = load_roots_in(cache.path());
         assert_eq!(roots.len(), 1);
@@ -512,7 +520,7 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         let root = PathBuf::from("/tmp/project-never-registered");
 
-        deregister_in(cache.path(), &root, 1).unwrap();
+        deregister_in(cache.path(), &root, PhaseId::new(1)).unwrap();
 
         assert!(load_roots_in(cache.path()).is_empty());
     }
@@ -523,10 +531,10 @@ mod tests {
     fn dereg_is_idempotent_when_entry_already_removed() {
         let cache = tempfile::tempdir().unwrap();
         let root = PathBuf::from("/tmp/project-dereg-idempotent");
-        register_in(cache.path(), &root, 1).unwrap();
+        register_in(cache.path(), &root, PhaseId::new(1)).unwrap();
 
-        deregister_in(cache.path(), &root, 1).unwrap();
-        deregister_in(cache.path(), &root, 1).unwrap();
+        deregister_in(cache.path(), &root, PhaseId::new(1)).unwrap();
+        deregister_in(cache.path(), &root, PhaseId::new(1)).unwrap();
 
         assert!(load_roots_in(cache.path()).is_empty());
     }
@@ -545,8 +553,8 @@ mod tests {
 
         let cache = Path::new("/tmp/cache");
         assert_ne!(
-            entry_path_in(cache, a, 1),
-            entry_path_in(cache, b, 1),
+            entry_path_in(cache, a, PhaseId::new(1)),
+            entry_path_in(cache, b, PhaseId::new(1)),
             "different project roots must yield different entry paths"
         );
     }

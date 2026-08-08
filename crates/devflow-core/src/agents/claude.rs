@@ -6,6 +6,7 @@
 //! dialogs, no user prompts.
 
 use super::AgentAdapter;
+use crate::phase_id::PhaseId;
 
 pub struct ClaudeAgent;
 
@@ -45,7 +46,7 @@ impl AgentAdapter for ClaudeAgent {
     /// rather than a deprecated one.
     fn exec_command(
         &self,
-        _phase: u32,
+        _phase: PhaseId,
         _prompt: &str,
         _extra_writable_roots: &[std::path::PathBuf],
     ) -> (&'static str, Vec<String>) {
@@ -162,7 +163,7 @@ mod tests {
     /// agent asking what to do.
     #[test]
     fn exec_command_uses_stream_json_on_both_input_and_output() {
-        let (program, args) = ClaudeAgent.exec_command(7, PROMPT, &[]);
+        let (program, args) = ClaudeAgent.exec_command(PhaseId::new(7), PROMPT, &[]);
         assert_eq!(program, "claude");
         assert!(
             args.windows(2)
@@ -193,7 +194,7 @@ mod tests {
     /// tested in Phase 30.
     #[test]
     fn exec_command_carries_no_positional_prompt() {
-        let (_program, args) = ClaudeAgent.exec_command(7, PROMPT, &[]);
+        let (_program, args) = ClaudeAgent.exec_command(PhaseId::new(7), PROMPT, &[]);
         assert!(
             !args.iter().any(|arg| arg.contains("DEVFLOW_RESULT")),
             "the prompt must not appear in argv at all — it travels as a JSON \

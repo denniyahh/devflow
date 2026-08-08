@@ -30,6 +30,7 @@ use crate::pipeline_outcomes::{
 use crate::preflight::{ensure_agent_binary, run_preflight, worktree_writable_roots};
 use devflow_core::config::{GitFlowConfig, capture_retention};
 use devflow_core::outcome_policy::{self, Action};
+use devflow_core::phase_id::PhaseId;
 use devflow_core::prompt;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
@@ -158,7 +159,7 @@ pub(crate) fn launch_stage_inner(
 fn resolve_launch_shape(
     agent: AgentKind,
     adapter: &dyn agents::AgentAdapter,
-    phase: u32,
+    phase: PhaseId,
     prompt: String,
     roots: &[std::path::PathBuf],
     stream_launch: bool,
@@ -279,7 +280,7 @@ fn announce_forced_legacy_launch(state: &State) {
 /// A local five-line helper rather than a widened `devflow-core` API — the core
 /// monitor has its own private equivalent for its own writes, and exporting it
 /// for one CLI caller would grow the crate's public surface for no other gain.
-fn append_monitor_log(project_root: &Path, phase: u32, entry: &str) {
+fn append_monitor_log(project_root: &Path, phase: PhaseId, entry: &str) {
     use std::io::Write;
     let path = agent_result::monitor_log_path(project_root, phase);
     if let Some(parent) = path.parent() {
@@ -592,7 +593,7 @@ fn claude_stream_launch_enabled(agent: AgentKind, stage: Stage, legacy_opt_out: 
 /// `PipeOwning` arm before widening it.
 pub(crate) fn run_monitor(
     project_root: &Path,
-    phase: u32,
+    phase: PhaseId,
     workdir: &Path,
     prompt_file: &Path,
     idle_timeout_secs: u64,
@@ -859,7 +860,7 @@ pub(crate) fn launch_stage(
 /// chose.
 pub(crate) fn resume(
     project_root: &Path,
-    phase: u32,
+    phase: PhaseId,
     legacy_claude_launch: bool,
 ) -> Result<(), CliError> {
     let _lock = match lock::acquire(project_root, phase) {
@@ -893,7 +894,7 @@ pub(crate) fn resume(
 /// when none, and an error naming the candidates when several are — shared by
 /// `advance`'s legacy fallback and `logs`'s default-phase resolution so the
 /// ambiguity rule and message live in one place.
-pub(crate) fn single_active_phase(project_root: &Path) -> Result<Option<u32>, CliError> {
+pub(crate) fn single_active_phase(project_root: &Path) -> Result<Option<PhaseId>, CliError> {
     let states = workflow::list_states(project_root);
     match states.as_slice() {
         [] => Ok(None),
@@ -911,7 +912,7 @@ pub(crate) fn single_active_phase(project_root: &Path) -> Result<Option<u32>, Cl
 /// Resolve which phase a bare `devflow advance` (no `--phase`) refers to:
 /// only unambiguous when exactly one phase is active. Exists for monitors
 /// spawned by a pre-14a binary that doesn't pass `--phase`.
-pub(crate) fn resolve_sole_active_phase(project_root: &Path) -> Result<u32, CliError> {
+pub(crate) fn resolve_sole_active_phase(project_root: &Path) -> Result<PhaseId, CliError> {
     single_active_phase(project_root)?
         .ok_or_else(|| CliError::Message("no active DevFlow state — nothing to advance".into()))
 }
@@ -933,7 +934,7 @@ fn augment_unresolved_checkpoint_reason(reason: Option<String>, why: &str) -> St
 
 /// Advance the stage machine after a monitored agent for `state.stage` exits.
 /// Invoked by the monitor process; not normally run by a human.
-pub(crate) fn advance(project_root: &Path, phase: Option<u32>) -> Result<(), CliError> {
+pub(crate) fn advance(project_root: &Path, phase: Option<PhaseId>) -> Result<(), CliError> {
     // 13-DEFERRED-CR-03 fix shape #2: the phase is threaded in by the monitor
     // (recorded at spawn time), so advance's identity never depends on a
     // shared state singleton — under `devflow parallel`, each monitor
@@ -951,7 +952,7 @@ pub(crate) fn advance(project_root: &Path, phase: Option<u32>) -> Result<(), Cli
                 // attribute a phase" sentinel; no real phase is 0.
                 events::emit(
                     project_root,
-                    0,
+                    PhaseId::new(0),
                     "advance_failed",
                     serde_json::json!({ "reason": err.to_string() }),
                 );
@@ -1155,7 +1156,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 65;
+        let phase = PhaseId::new(65);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         // Not because this test wants legacy behaviour, but because its
         // subject is orthogonal to the launch path (34-06).
@@ -1227,7 +1228,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 66;
+        let phase = PhaseId::new(66);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Plan;
         state.stop_until = Some(Stage::Plan);
@@ -1319,7 +1320,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 67;
+        let phase = PhaseId::new(67);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         // Current stage is earlier than the cap (Define < Plan), and the
         // phase was NOT stopped by the cap — this is the rate-limit/infra
@@ -1395,7 +1396,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 68;
+        let phase = PhaseId::new(68);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stop_until = None;
         state.stopped = false;
@@ -1454,8 +1455,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
-        let phase = 72;
-        let branch = format!("feature/phase-{phase:02}");
+        let phase = PhaseId::new(72);
+        let branch = format!("feature/phase-{padded}", padded = phase.padded());
         let git = |args: &[&str]| {
             assert!(
                 devflow_core::test_support::git_command(root)
@@ -1527,7 +1528,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 93;
+        let phase = PhaseId::new(93);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
         // A stale pid from a prior stage's now-dead monitor — this is what
@@ -1575,7 +1576,7 @@ mod tests {
     fn advance_evaluated_emits_wire_status_and_decided_by_layer_for_resource_killed() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 78;
+        let phase = PhaseId::new(78);
         std::fs::create_dir_all(root.join(".devflow")).unwrap();
         std::fs::write(agent_result::exit_code_path(root, phase), "137").unwrap();
 
@@ -1630,7 +1631,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 84;
+        let phase = PhaseId::new(84);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();
@@ -1679,7 +1680,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 85;
+        let phase = PhaseId::new(85);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
         state.checkpoint_resumes = 1;
@@ -1725,7 +1726,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 86;
+        let phase = PhaseId::new(86);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();
@@ -1771,7 +1772,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 87;
+        let phase = PhaseId::new(87);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
         state.checkpoint_resumes = 2;
@@ -1834,7 +1835,7 @@ mod tests {
         }
     }
 
-    fn canary_state(root: &Path, phase: u32) -> State {
+    fn canary_state(root: &Path, phase: PhaseId) -> State {
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();
@@ -1853,7 +1854,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 120;
+        let phase = PhaseId::new(120);
         let mut state = canary_state(root, phase);
         let calls = std::cell::Cell::new(0usize);
 
@@ -1886,7 +1887,7 @@ mod tests {
         // Negative control: the counter CAN reach 2. Without this, a
         // `counting_canary` that was never wired in at all would produce the
         // same reading as a correctly once-per-run guard.
-        let mut fresh_run = canary_state(root, phase + 1);
+        let mut fresh_run = canary_state(root, PhaseId::new(phase.major() + 1));
         canary_gate(
             &mut fresh_run,
             true,
@@ -1927,7 +1928,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 121;
+        let phase = PhaseId::new(121);
         let mut state = canary_state(root, phase);
         // `Stage::Code` is on the stream path today and stays on it. The
         // variable under test is the opt-out, not the stage.
@@ -1994,7 +1995,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 123;
+        let phase = PhaseId::new(123);
         let mut state = canary_state(root, phase);
         state.stage = Stage::Code;
         state.legacy_claude_launch = false;
@@ -2038,7 +2039,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 122;
+        let phase = PhaseId::new(122);
         let mut state = canary_state(root, phase);
         // The previous stage's monitor pid, as `transition()` would leave it.
         state.monitor_pid = Some(4_294_967_000);
@@ -2092,7 +2093,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let mut unverified_state = canary_state(root, 123);
+        let mut unverified_state = canary_state(root, PhaseId::new(123));
         let calls = std::cell::Cell::new(0usize);
         let unverified = canary_gate(
             &mut unverified_state,
@@ -2118,7 +2119,7 @@ mod tests {
 
         // The comparison that makes "distinct" a measurement rather than a
         // claim: the same gate, the other failure mode, a different message.
-        let mut absent_state = canary_state(root, 124);
+        let mut absent_state = canary_state(root, PhaseId::new(124));
         let absent = canary_gate(&mut absent_state, true, || canary::CanaryOutcome::Absent)
             .unwrap_err()
             .to_string();
@@ -2137,7 +2138,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 125;
+        let phase = PhaseId::new(125);
         let mut state = canary_state(root, phase);
         let calls = std::cell::Cell::new(0usize);
 
@@ -2162,7 +2163,7 @@ mod tests {
             .expect("the run's provenance must carry the canary outcome");
         let event: serde_json::Value = serde_json::from_str(line).unwrap();
         assert_eq!(event["event"], "claude_delivery_canary_confirmed");
-        assert_eq!(event["phase"], phase);
+        assert!(phase.matches_json(event.get("phase")));
 
         // T-31-13: the PREFIX, exactly — never a whole token. An exact
         // comparison against the constant is what catches a later change that
@@ -2192,7 +2193,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 126;
+        let phase = PhaseId::new(126);
         let mut state = canary_state(root, phase);
 
         let stub_dir = stub_agent_binary("claude");
@@ -2251,15 +2252,20 @@ mod tests {
     /// Write a synthetic phase's plan declaring a `blocking-human`
     /// checkpoint task, matching `verify::phase_plan_files`'s discovery
     /// pattern (`.planning/phases/{NN}-*/{NN}-*-PLAN.md`).
-    fn write_declared_checkpoint_plan(root: &Path, phase: u32) {
-        let dir = root
-            .join(".planning/phases")
-            .join(format!("{phase:02}-checkpoint-fixture"));
+    fn write_declared_checkpoint_plan(root: &Path, phase: PhaseId) {
+        let dir = root.join(".planning/phases").join(format!(
+            "{padded}-checkpoint-fixture",
+            padded = phase.padded()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let body = format!(
             "---\nphase: {phase}\n---\n\n<task type=\"checkpoint:human-verify\" gate=\"{HUMAN_GATE_VALUE_FOR_TEST}\">\n</task>\n"
         );
-        std::fs::write(dir.join(format!("{phase:02}-01-PLAN.md")), body).unwrap();
+        std::fs::write(
+            dir.join(format!("{padded}-01-PLAN.md", padded = phase.padded())),
+            body,
+        )
+        .unwrap();
     }
 
     /// D-05 (35-02): the decoy PLAN.
@@ -2277,15 +2283,20 @@ mod tests {
     /// partly by a condition production never satisfies: a real main checkout
     /// always carries `.planning/phases/`, often including a previous run's
     /// copy of the very phase under test.
-    fn write_plan_without_checkpoint(root: &Path, phase: u32) {
-        let dir = root
-            .join(".planning/phases")
-            .join(format!("{phase:02}-checkpoint-fixture"));
+    fn write_plan_without_checkpoint(root: &Path, phase: PhaseId) {
+        let dir = root.join(".planning/phases").join(format!(
+            "{padded}-checkpoint-fixture",
+            padded = phase.padded()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let body = format!(
             "---\nphase: {phase}\n---\n\n<task type=\"checkpoint:decision\" gate=\"{PLAIN_GATE_VALUE_FOR_TEST}\">\n</task>\n"
         );
-        std::fs::write(dir.join(format!("{phase:02}-01-PLAN.md")), body).unwrap();
+        std::fs::write(
+            dir.join(format!("{padded}-01-PLAN.md", padded = phase.padded())),
+            body,
+        )
+        .unwrap();
     }
 
     /// Write a captured stdout containing BOTH the `**Gate:**
@@ -2293,7 +2304,7 @@ mod tests {
     /// marker, so `advance()`'s Layer 1 deterministically classifies the
     /// outcome as `Failed` (-> `Action::GateReview`) with no exit-code/pid
     /// file or background thread needed.
-    fn write_confirmed_checkpoint_capture(root: &Path, phase: u32) {
+    fn write_confirmed_checkpoint_capture(root: &Path, phase: PhaseId) {
         std::fs::create_dir_all(root.join(".devflow")).unwrap();
         let stdout = format!(
             "## CHECKPOINT REACHED\n\n**Type:** human-verify\n**Gate:** {HUMAN_GATE_VALUE_FOR_TEST}\n\nDEVFLOW_RESULT: {{\"status\": \"failed\", \"reason\": \"checkpoint pending\"}}\n"
@@ -2304,7 +2315,7 @@ mod tests {
     /// A capture whose `DEVFLOW_RESULT` marker fails but never reports the
     /// human-blocking `Gate:` literal — an ordinary failure, not a
     /// checkpoint.
-    fn write_unreported_failure_capture(root: &Path, phase: u32) {
+    fn write_unreported_failure_capture(root: &Path, phase: PhaseId) {
         std::fs::create_dir_all(root.join(".devflow")).unwrap();
         std::fs::write(
             agent_result::stdout_path(root, phase),
@@ -2318,7 +2329,7 @@ mod tests {
     /// instead of blocking — mirrors
     /// `advance_evaluated_emits_wire_status_and_decided_by_layer_for_resource_killed`'s
     /// fixture pattern.
-    fn write_abort_gate_response(root: &Path, phase: u32, stage: Stage) {
+    fn write_abort_gate_response(root: &Path, phase: PhaseId, stage: Stage) {
         let response_path = Gates::response_path(root, phase, stage);
         std::fs::create_dir_all(response_path.parent().unwrap()).unwrap();
         std::fs::write(
@@ -2339,7 +2350,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 88;
+        let phase = PhaseId::new(88);
         write_declared_checkpoint_plan(root, phase);
         write_confirmed_checkpoint_capture(root, phase);
 
@@ -2425,7 +2436,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 94;
+        let phase = PhaseId::new(94);
         // D-05: a plain directory, not a real `git worktree add`. The
         // argument under test resolves a path, and a linked worktree's files
         // are ordinary files — `monitor::spawn_monitor`'s own worktree test
@@ -2520,7 +2531,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 89;
+        let phase = PhaseId::new(89);
         // Deliberately no write_declared_checkpoint_plan call.
         write_confirmed_checkpoint_capture(root, phase);
         write_abort_gate_response(root, phase, Stage::Code);
@@ -2551,7 +2562,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 90;
+        let phase = PhaseId::new(90);
         write_declared_checkpoint_plan(root, phase);
         write_unreported_failure_capture(root, phase);
         write_abort_gate_response(root, phase, Stage::Code);
@@ -2575,7 +2586,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 91;
+        let phase = PhaseId::new(91);
         write_declared_checkpoint_plan(root, phase);
         write_confirmed_checkpoint_capture(root, phase);
         write_abort_gate_response(root, phase, Stage::Code);
@@ -2608,7 +2619,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 92;
+        let phase = PhaseId::new(92);
         write_declared_checkpoint_plan(root, phase);
         write_confirmed_checkpoint_capture(root, phase);
         write_abort_gate_response(root, phase, Stage::Code);
@@ -2642,7 +2653,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 93;
+        let phase = PhaseId::new(93);
         write_declared_checkpoint_plan(root, phase);
         write_confirmed_checkpoint_capture(root, phase);
         write_abort_gate_response(root, phase, Stage::Code);
@@ -2688,7 +2699,7 @@ mod tests {
         }
     }
 
-    fn legacy_state(root: &Path, phase: u32, opt_out: bool) -> State {
+    fn legacy_state(root: &Path, phase: PhaseId, opt_out: bool) -> State {
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
         state.legacy_claude_launch = opt_out;
@@ -2701,7 +2712,7 @@ mod tests {
     #[test]
     fn legacy_launch_flag_forces_the_single_document_path() {
         let dir = tempfile::tempdir().unwrap();
-        let state = legacy_state(dir.path(), 130, true);
+        let state = legacy_state(dir.path(), PhaseId::new(130), true);
 
         // Precondition: without the opt-out this stage IS in the rollout, so
         // the assertion below is a real discrimination and not a stage that
@@ -2747,7 +2758,7 @@ mod tests {
         unsafe { std::env::remove_var("DEVFLOW_CLAUDE_LEGACY_LAUNCH") };
 
         let dir = tempfile::tempdir().unwrap();
-        let state = legacy_state(dir.path(), 131, false);
+        let state = legacy_state(dir.path(), PhaseId::new(131), false);
 
         assert!(
             !state.legacy_claude_launch,
@@ -2785,7 +2796,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
-        let state = legacy_state(root, 132, true);
+        let state = legacy_state(root, PhaseId::new(132), true);
 
         announce_forced_legacy_launch(&state);
 
@@ -2800,7 +2811,7 @@ mod tests {
             "with no env var set in this process, the source is the persisted flag"
         );
 
-        let log = std::fs::read_to_string(agent_result::monitor_log_path(root, 132))
+        let log = std::fs::read_to_string(agent_result::monitor_log_path(root, PhaseId::new(132)))
             .expect("the monitor log must exist — it is the only channel a detached run has");
         assert!(log.contains("legacy launch"), "monitor log: {log}");
 
@@ -2839,7 +2850,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 133;
+        let phase = PhaseId::new(133);
         let mut state = canary_state(root, phase);
         state.legacy_claude_launch = true;
 
@@ -2898,7 +2909,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 134;
+        let phase = PhaseId::new(134);
         let state = legacy_state(root, phase, false);
         workflow::save_state(&state).unwrap();
 
@@ -2993,7 +3004,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 135;
+        let phase = PhaseId::new(135);
         let mut state = legacy_state(root, phase, true);
         workflow::save_state(&state).unwrap();
 
@@ -3007,7 +3018,7 @@ mod tests {
 
         // Negative control: the combination is not a constant `true` — a state
         // that never had the opt-out stays off.
-        let mut never_opted_out = legacy_state(root, phase + 1, false);
+        let mut never_opted_out = legacy_state(root, PhaseId::new(phase.major() + 1), false);
         apply_legacy_launch_opt_out(&mut never_opted_out, false);
         assert!(!never_opted_out.legacy_claude_launch);
     }

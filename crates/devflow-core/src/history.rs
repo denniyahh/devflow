@@ -1,5 +1,6 @@
 //! Read-only per-phase attempt history assembled from existing DevFlow stores.
 
+use crate::phase_id::PhaseId;
 use crate::{agent_result, events};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -18,13 +19,13 @@ pub struct AttemptEntry {
 /// The complete read-only attempt view for one phase.
 #[derive(Debug, Clone)]
 pub struct AttemptTimeline {
-    pub phase: u32,
+    pub phase: PhaseId,
     pub entries: Vec<AttemptEntry>,
 }
 
 /// Correlate schema-v1 events, retained capture generations, and review
 /// artifacts without creating a second history store.
-pub fn attempt_timeline(project_root: &Path, phase: u32) -> AttemptTimeline {
+pub fn attempt_timeline(project_root: &Path, phase: PhaseId) -> AttemptTimeline {
     let mut indexed_events = std::fs::read_to_string(events::events_path(project_root))
         .unwrap_or_default()
         .lines()
@@ -32,7 +33,7 @@ pub fn attempt_timeline(project_root: &Path, phase: u32) -> AttemptTimeline {
         .filter_map(|(index, line)| {
             let event = serde_json::from_str::<serde_json::Value>(line).ok()?;
             (event.get("v").and_then(|v| v.as_u64()) == Some(1)
-                && event.get("phase").and_then(|p| p.as_u64()) == Some(phase as u64))
+                && phase.matches_json(event.get("phase")))
             .then(|| {
                 let timestamp = event.get("ts").and_then(|ts| ts.as_u64()).unwrap_or(0);
                 (timestamp, index, event)
@@ -121,7 +122,7 @@ struct CaptureGeneration {
     review_files: Vec<PathBuf>,
 }
 
-fn capture_generations(project_root: &Path, phase: u32) -> Vec<CaptureGeneration> {
+fn capture_generations(project_root: &Path, phase: PhaseId) -> Vec<CaptureGeneration> {
     let dir = agent_result::history_dir(project_root, phase);
     let Ok(files) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -175,9 +176,9 @@ fn capture_generations(project_root: &Path, phase: u32) -> Vec<CaptureGeneration
     generations
 }
 
-fn review_files(project_root: &Path, phase: u32) -> Vec<PathBuf> {
+fn review_files(project_root: &Path, phase: PhaseId) -> Vec<PathBuf> {
     let phases = project_root.join(".planning").join("phases");
-    let prefix = format!("{phase:02}-");
+    let prefix = format!("{padded}-", padded = phase.padded());
     let mut reviews = Vec::new();
     let Ok(dirs) = std::fs::read_dir(phases) else {
         return reviews;
@@ -278,12 +279,12 @@ mod tests {
     fn timeline_orders_events_and_correlates_retained_captures() {
         let dir = tempfile::tempdir().unwrap();
         seed_event_log(dir.path());
-        let captures = agent_result::history_dir(dir.path(), 16);
+        let captures = agent_result::history_dir(dir.path(), PhaseId::new(16));
         std::fs::create_dir_all(&captures).unwrap();
         std::fs::write(captures.join("20000000000-0-stdout"), "attempt output").unwrap();
         std::fs::write(captures.join("20000000000-0-exit"), "1").unwrap();
 
-        let timeline = attempt_timeline(dir.path(), 16);
+        let timeline = attempt_timeline(dir.path(), PhaseId::new(16));
 
         assert_eq!(timeline.entries.len(), 4);
         assert_eq!(timeline.entries[0].timestamp, 10);
@@ -306,7 +307,7 @@ mod tests {
     #[test]
     fn empty_phase_has_clean_no_attempts_result() {
         let dir = tempfile::tempdir().unwrap();
-        let timeline = attempt_timeline(dir.path(), 42);
+        let timeline = attempt_timeline(dir.path(), PhaseId::new(42));
 
         assert!(timeline.entries.is_empty());
         assert_eq!(
@@ -318,7 +319,7 @@ mod tests {
     #[test]
     fn orphaned_capture_and_review_artifacts_remain_visible() {
         let dir = tempfile::tempdir().unwrap();
-        let captures = agent_result::history_dir(dir.path(), 16);
+        let captures = agent_result::history_dir(dir.path(), PhaseId::new(16));
         std::fs::create_dir_all(&captures).unwrap();
         let archived_capture = captures.join("20000000000-2-stdout");
         let archived_review = captures.join("20000000000-2-REVIEW.md");
@@ -331,7 +332,7 @@ mod tests {
         std::fs::create_dir_all(live_review.parent().unwrap()).unwrap();
         std::fs::write(&live_review, "current review").unwrap();
 
-        let timeline = attempt_timeline(dir.path(), 16);
+        let timeline = attempt_timeline(dir.path(), PhaseId::new(16));
 
         assert_eq!(timeline.entries.len(), 1);
         let entry = &timeline.entries[0];

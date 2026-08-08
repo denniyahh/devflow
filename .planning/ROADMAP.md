@@ -2789,6 +2789,37 @@ can miss it entirely.
 
 ---
 
+### Phase 999.97: DevFlow Cannot Launch Any Phase GSD Numbers With a Decimal (HOTFIX — 2026-08-07)
+
+**Found:** 2026-08-07, attempting to dogfood Phase 35.1 — the first decimal-numbered phase this
+project has tried to run through `devflow start`.
+
+**The gap, in one line:** DevFlow's phase identifier is an integer, but GSD's own `--insert` mode
+numbers inserted phases with a decimal (`35.1`, `35.2`), so any phase created that way is
+unreachable by the tool that is supposed to run it.
+
+**Measured, not inferred.** `devflow start --phase 35.1 --mode auto --dry-run` exits with
+`error: invalid value '35.1' for '--phase <PHASE>': invalid digit found in string`. The identifier
+is declared `phase: u32` / `Option<u32>` at 182 sites across 36 files, including `State::phase`,
+which is what `.devflow/state-NN.json` is keyed by.
+
+**Why relaxing the parse alone would be worse than the current failure.** `prompt.rs:171` builds
+the artifact glob as `format!("{phase:02}")` → `.planning/phases/{padded}-*/{padded}-*{artifact}`.
+A parser widened without widening that glob turns a loud clap rejection into a silent
+misresolution: `35.1` truncated or coerced to `35` reads the **completed** Phase 35 directory's
+plans and verification. The visible error is currently the only thing preventing that.
+
+**Blast radius beyond the glob:** feature-branch names (`feature/phase-NN`), the per-phase lock
+file `.devflow/lock-{phase:02}`, `.devflow/events.jsonl` records, and every GSD skill string the
+prompt builder emits (`/gsd-code-review {phase}`, `/gsd-ship {phase}`,
+`/gsd-execute-phase {phase} --gaps-only`).
+
+**Blocks:** Phase 35.1 (HARDEN-07) and Phase 35.2 (HARDEN-03), both decimal-numbered.
+
+**Disposition:** fixed as a direct hotfix on 2026-08-07, without a phase cycle — operator's call,
+made after first choosing widening over renumbering 35.1/35.2 to integers. Phase 35.1 could not
+start until it landed, and a phase to unblock a phase was not worth the ceremony.
+
 ### Phase 999.96: `release --check` Cannot Catch a Forgotten Version Bump (BACKLOG)
 
 **Found:** 2026-08-07, during 35-verify-work, while dispositioning 35-06's deliberate

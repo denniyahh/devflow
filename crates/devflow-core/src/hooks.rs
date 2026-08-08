@@ -7,6 +7,7 @@
 
 use crate::config::GitFlowConfig;
 use crate::git::GitFlow;
+use crate::phase_id::PhaseId;
 use crate::stage::Stage;
 use crate::version;
 use std::path::{Path, PathBuf};
@@ -34,7 +35,7 @@ pub enum Hook {
 #[derive(Debug, Clone)]
 pub struct HookContext {
     /// Phase the workflow is on.
-    pub phase: u32,
+    pub phase: PhaseId,
     /// Project root.
     pub project_root: PathBuf,
     /// Stage the workflow is entering.
@@ -129,7 +130,11 @@ fn branch_create(ctx: &HookContext) -> Result<(), HookError> {
 
 fn branch_cleanup(ctx: &HookContext) -> Result<(), HookError> {
     let git = GitFlow::new(&ctx.project_root);
-    let branch = format!("{}phase-{:02}", ctx.git_flow.feature_prefix, ctx.phase);
+    let branch = format!(
+        "{}phase-{}",
+        ctx.git_flow.feature_prefix,
+        ctx.phase.padded()
+    );
     if git.branch_exists(&branch) {
         // Non-force cleanup is intentional: never discard unmerged work.
         match git.delete_branch(&branch, false) {
@@ -174,7 +179,11 @@ fn branch_cleanup(ctx: &HookContext) -> Result<(), HookError> {
 /// must know this exact state.
 fn merge_feature(ctx: &HookContext) -> Result<(), HookError> {
     let git = GitFlow::new(&ctx.project_root);
-    let branch = format!("{}phase-{:02}", ctx.git_flow.feature_prefix, ctx.phase);
+    let branch = format!(
+        "{}phase-{}",
+        ctx.git_flow.feature_prefix,
+        ctx.phase.padded()
+    );
     if !git.branch_exists(&branch) {
         return Err(crate::git::GitError::Command(format!(
             "feature branch `{branch}` is missing; refusing to report an unproven merge"
@@ -398,7 +407,7 @@ mod tests {
 
     fn ctx(root: &Path, stage: Stage) -> HookContext {
         HookContext {
-            phase: 11,
+            phase: PhaseId::new(11),
             project_root: root.to_path_buf(),
             stage,
             git_flow: GitFlowConfig::default(),
@@ -737,8 +746,8 @@ mod tests {
 
         Hook::Merge.run(&mut ctx(dir.path(), Stage::Ship)).unwrap();
 
-        assert!(GitFlow::new(dir.path()).is_merged_into_develop(11));
-        let last = crate::events::last_event_for_phase(dir.path(), 11)
+        assert!(GitFlow::new(dir.path()).is_merged_into_develop(PhaseId::new(11)));
+        let last = crate::events::last_event_for_phase(dir.path(), PhaseId::new(11))
             .expect("merge_result event recorded");
         assert_eq!(last["event"], "merge_result");
         assert_eq!(last["merged"], true);
@@ -756,7 +765,7 @@ mod tests {
         let _ = Hook::Merge.run(&mut ctx(dir.path(), Stage::Ship));
 
         assert!(
-            crate::events::last_event_for_phase(dir.path(), 11).is_none(),
+            crate::events::last_event_for_phase(dir.path(), PhaseId::new(11)).is_none(),
             "a missing feature branch must short-circuit before any event is emitted"
         );
     }

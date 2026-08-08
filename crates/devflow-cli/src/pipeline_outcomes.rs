@@ -24,6 +24,7 @@ use devflow_core::config::GitFlowConfig;
 use devflow_core::gates::{GateAction, GateResponse, Gates};
 use devflow_core::hooks::{self, HookContext};
 use devflow_core::mode;
+use devflow_core::phase_id::PhaseId;
 use devflow_core::prompt::FixType;
 use devflow_core::stage::Stage;
 use devflow_core::state::State;
@@ -88,7 +89,7 @@ pub(crate) fn gate_or_abort_infra(
 pub(crate) fn handle_rate_limited_outcome(
     project_root: &Path,
     state: &mut State,
-    phase: u32,
+    phase: PhaseId,
     stage: Stage,
     reason: Option<String>,
 ) -> Result<(), CliError> {
@@ -313,7 +314,7 @@ pub(crate) enum ValidateResult {
 /// the project root and are unaffected. Passing the bare `project_root` here in worktree mode
 /// makes the predicate read `false` unconditionally, which is exactly the
 /// defect this parameter's name now guards against.
-fn select_loop_back_fix(evidence_root: &Path, phase: u32, state: &mut State) -> FixType {
+fn select_loop_back_fix(evidence_root: &Path, phase: PhaseId, state: &mut State) -> FixType {
     // 999.79 / HARDEN-03: existence alone is no longer the answer. Nothing
     // deletes, dates or invalidates `{N}-VERIFICATION.md`, so a
     // `devflow start --phase N --force` re-run checks out a branch still
@@ -1112,7 +1113,12 @@ mod tests {
             std::env::set_var("DEVFLOW_CHECKOUT_LOCK_TIMEOUT_SECS", "0");
         }
 
-        let state = State::new(33, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let state = State::new(
+            PhaseId::new(33),
+            AgentKind::Claude,
+            Mode::Auto,
+            root.to_path_buf(),
+        );
         run_checkout_hooks(root, &state, &hooks::hooks_after_ship(), Stage::Ship);
 
         // SAFETY: still serialized under ENV_MUTEX from above.
@@ -1124,7 +1130,7 @@ mod tests {
             !root.join("CHANGELOG.md").exists(),
             "hooks must not run while the checkout lock is held elsewhere"
         );
-        let last = devflow_core::events::last_event_for_phase(root, 33)
+        let last = devflow_core::events::last_event_for_phase(root, PhaseId::new(33))
             .expect("skip must be recorded in events.jsonl");
         assert_eq!(last["event"], "hook_run");
         assert_eq!(last["ok"], false);
@@ -1136,7 +1142,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
-        let phase = 34;
+        let phase = PhaseId::new(34);
         let branch = "feature/phase-34";
         let git = |args: &[&str]| {
             let output = devflow_core::test_support::git_command(root)
@@ -1177,8 +1183,8 @@ mod tests {
         let root = dir.path();
         init_repo_no_version_file(root);
 
-        let phase = 47;
-        let branch = format!("feature/phase-{phase:02}");
+        let phase = PhaseId::new(47);
+        let branch = format!("feature/phase-{padded}", padded = phase.padded());
         let git = |args: &[&str]| {
             let output = devflow_core::test_support::git_command(root)
                 .args(args)
@@ -1242,7 +1248,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        let phase = 22;
+        let phase = PhaseId::new(22);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         state.consecutive_failures = mode::MAX_CONSECUTIVE_FAILURES - 1;
@@ -1293,7 +1299,7 @@ mod tests {
     /// must never fire from a unit test (see `ship_review_failed_loops_to_code`).
     fn drive_validate_advance_and_read_gate_context(
         root: &Path,
-        phase: u32,
+        phase: PhaseId,
         consecutive_failures: u32,
         verdict_json: Option<&str>,
     ) -> String {
@@ -1360,7 +1366,7 @@ mod tests {
         let root = dir.path();
         let context = drive_validate_advance_and_read_gate_context(
             root,
-            60,
+            PhaseId::new(60),
             mode::MAX_CONSECUTIVE_FAILURES - 1,
             Some("gaps"),
         );
@@ -1380,7 +1386,7 @@ mod tests {
         let root = dir.path();
         let context = drive_validate_advance_and_read_gate_context(
             root,
-            61,
+            PhaseId::new(61),
             mode::MAX_CONSECUTIVE_FAILURES - 1,
             None,
         );
@@ -1402,7 +1408,7 @@ mod tests {
         let root = dir.path();
         let context = drive_validate_advance_and_read_gate_context(
             root,
-            62,
+            PhaseId::new(62),
             mode::MAX_CONSECUTIVE_FAILURES,
             Some("pass"),
         );
@@ -1428,7 +1434,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 90;
+        let phase = PhaseId::new(90);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         workflow::save_state(&state).unwrap();
@@ -1480,7 +1486,7 @@ mod tests {
     fn external_verify_disagreement_gates_immediately() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 91;
+        let phase = PhaseId::new(91);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         workflow::save_state(&state).unwrap();
@@ -1524,7 +1530,7 @@ mod tests {
     fn external_verify_no_verdict_gates_immediately() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 92;
+        let phase = PhaseId::new(92);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         workflow::save_state(&state).unwrap();
@@ -1842,7 +1848,7 @@ mod tests {
         // `external_verify_disagreement_gates_immediately`).
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 93;
+        let phase = PhaseId::new(93);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         workflow::save_state(&state).unwrap();
@@ -1879,7 +1885,7 @@ mod tests {
     fn resource_killed_on_code_bumps_infra_failures_not_consecutive_failures() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 73;
+        let phase = PhaseId::new(73);
         std::fs::create_dir_all(root.join(".devflow")).unwrap();
         std::fs::write(agent_result::exit_code_path(root, phase), "137").unwrap();
 
@@ -1918,7 +1924,7 @@ mod tests {
     fn resource_killed_on_validate_bumps_infra_not_consecutive_failures() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 74;
+        let phase = PhaseId::new(74);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         state.consecutive_failures = 2;
@@ -1953,7 +1959,7 @@ mod tests {
     fn infra_ceiling_aborts_instead_of_gating() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 75;
+        let phase = PhaseId::new(75);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
         state.infra_failures = mode::MAX_INFRA_FAILURES - 1;
@@ -2003,7 +2009,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 81;
+        let phase = PhaseId::new(81);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();
@@ -2078,7 +2084,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 87;
+        let phase = PhaseId::new(87);
         init_repo(root);
 
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
@@ -2156,7 +2162,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 88;
+        let phase = PhaseId::new(88);
         init_repo(root);
         // Establish the branch with a stable, non-zero commit count. No
         // further commits land during the loop below.
@@ -2246,7 +2252,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 89;
+        let phase = PhaseId::new(89);
         init_repo(root);
         // One real commit on the feature branch, and no further commits for
         // the rest of this test: the REAL count is a stable, non-zero 1.
@@ -2342,7 +2348,7 @@ mod tests {
     /// `events.jsonl` rather than from the gate file, because
     /// `prepare_loop_back_to_code` deletes the gate file on its way back to
     /// Code — a fixture reading the file would be racing its own cleanup.
-    fn last_gate_context(root: &Path, phase: u32) -> Option<String> {
+    fn last_gate_context(root: &Path, phase: PhaseId) -> Option<String> {
         devflow_core::events::last_event_of_kind_for_phase(root, phase, "gate_fired")
             .and_then(|event| event["context"].as_str().map(str::to_string))
     }
@@ -2375,7 +2381,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 90;
+        let phase = PhaseId::new(90);
         init_repo(root);
 
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
@@ -2467,7 +2473,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 91;
+        let phase = PhaseId::new(91);
         init_repo(root);
 
         let mut state = State::new(
@@ -2556,7 +2562,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 92;
+        let phase = PhaseId::new(92);
         init_repo(root);
 
         let mut state = State::new(
@@ -2631,7 +2637,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 93;
+        let phase = PhaseId::new(93);
         init_repo(root);
 
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
@@ -2718,7 +2724,7 @@ mod tests {
 
         // HALF ONE — at the ceiling. One more recorded failure takes the total
         // to exactly MAX, the gate fires, and the operator loops back.
-        let at_ceiling_phase = 95;
+        let at_ceiling_phase = PhaseId::new(95);
         let mut at_ceiling = State::new(
             at_ceiling_phase,
             AgentKind::Claude,
@@ -2735,7 +2741,7 @@ mod tests {
 
         // HALF TWO — below the ceiling, everything else identical. Supervise
         // gates here too, and the operator answers with the same loop-back.
-        let below_phase = 96;
+        let below_phase = PhaseId::new(96);
         let mut below = State::new(
             below_phase,
             AgentKind::Claude,
@@ -2816,7 +2822,7 @@ mod tests {
         // AUTO, at the ceiling, and the Validate PASSED. Nothing here is a
         // failure: the budget is spent from earlier cycles and no increment
         // happens on this call.
-        let auto_phase = 88;
+        let auto_phase = PhaseId::new(88);
         let mut auto = State::new(
             auto_phase,
             AgentKind::Claude,
@@ -2834,7 +2840,7 @@ mod tests {
         // CONTROL — SUPERVISE, below the ceiling, also a pass. Gates (Supervise
         // always does), so there IS a message, and it must not blame a ceiling
         // that was never reached.
-        let supervise_phase = 89;
+        let supervise_phase = PhaseId::new(89);
         let mut supervise = State::new(
             supervise_phase,
             AgentKind::Claude,
@@ -2910,7 +2916,7 @@ mod tests {
         }
 
         // AT the ceiling: this failure takes the total to exactly MAX.
-        let at_ceiling_phase = 91;
+        let at_ceiling_phase = PhaseId::new(91);
         let mut at_ceiling = State::new(
             at_ceiling_phase,
             AgentKind::Claude,
@@ -2926,7 +2932,7 @@ mod tests {
         let _ = handle_validate_outcome(root, &mut at_ceiling, ValidateOutcome::Failed);
 
         // NEGATIVE CONTROL — below the ceiling, everything else identical.
-        let below_phase = 92;
+        let below_phase = PhaseId::new(92);
         let mut below = State::new(
             below_phase,
             AgentKind::Claude,
@@ -2996,7 +3002,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 94;
+        let phase = PhaseId::new(94);
         init_repo(root);
 
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
@@ -3080,15 +3086,21 @@ mod tests {
         // The root EXISTS and carries a readable exit file recording a clean
         // exit — so an `Ok(None)` return can only come from the commit count.
         std::fs::create_dir_all(root.join(".devflow")).unwrap();
-        std::fs::write(agent_result::exit_code_path(root, 4), "0").unwrap();
+        std::fs::write(agent_result::exit_code_path(root, PhaseId::new(4)), "0").unwrap();
         assert!(
-            agent_result::exit_code_path(root, 4).exists(),
+            agent_result::exit_code_path(root, PhaseId::new(4)).exists(),
             "the exit file must be readable, or Layer 2 returns Ok(None) for the wrong reason"
         );
 
         let result = {
             let _no_git = NoGitPath::install();
-            agent_result::evaluate_layer2(root, 4, &GitFlowConfig::default(), Stage::Code).unwrap()
+            agent_result::evaluate_layer2(
+                root,
+                PhaseId::new(4),
+                &GitFlowConfig::default(),
+                Stage::Code,
+            )
+            .unwrap()
         };
 
         assert!(
@@ -3144,11 +3156,17 @@ mod tests {
         // code: the root EXISTS and the exit file is readable, so `git` being
         // unrunnable is the only difference from a healthy run.
         std::fs::create_dir_all(root.join(".devflow")).unwrap();
-        std::fs::write(agent_result::exit_code_path(root, 4), "137").unwrap();
+        std::fs::write(agent_result::exit_code_path(root, PhaseId::new(4)), "137").unwrap();
 
         let result = {
             let _no_git = NoGitPath::install();
-            agent_result::evaluate_layer2(root, 4, &GitFlowConfig::default(), Stage::Code).unwrap()
+            agent_result::evaluate_layer2(
+                root,
+                PhaseId::new(4),
+                &GitFlowConfig::default(),
+                Stage::Code,
+            )
+            .unwrap()
         };
 
         let result = result.expect(
@@ -3191,12 +3209,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir_all(root.join(".devflow")).unwrap();
-        std::fs::write(agent_result::exit_code_path(root, 4), "0").unwrap();
+        std::fs::write(agent_result::exit_code_path(root, PhaseId::new(4)), "0").unwrap();
 
         let result = {
             let _no_git = NoGitPath::install();
-            agent_result::evaluate_layer2(root, 4, &GitFlowConfig::default(), Stage::Validate)
-                .unwrap()
+            agent_result::evaluate_layer2(
+                root,
+                PhaseId::new(4),
+                &GitFlowConfig::default(),
+                Stage::Validate,
+            )
+            .unwrap()
         };
 
         let result = result.expect(
@@ -3241,7 +3264,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 96;
+        let phase = PhaseId::new(96);
         // A real repo with the feature branch present. Built BEFORE the guard
         // goes on, because building it shells out to git.
         init_repo(root);
@@ -3308,11 +3331,11 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 97;
+        let phase = PhaseId::new(97);
         init_repo(root);
         // The feature branch exists but sits at develop's tip: a real,
         // measured zero rather than an unmeasurable one.
-        let branch = format!("feature/phase-{phase:02}");
+        let branch = format!("feature/phase-{padded}", padded = phase.padded());
         assert!(
             devflow_core::test_support::git_command(root)
                 .args(["checkout", "-b", &branch])
@@ -3361,7 +3384,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 82;
+        let phase = PhaseId::new(82);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();
@@ -3410,7 +3433,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 83;
+        let phase = PhaseId::new(83);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
         // WR-05 (35-REVIEW): stands in for `start()`'s run-start capture,
@@ -3423,10 +3446,10 @@ mod tests {
 
         let phase_dir = root
             .join(".planning/phases")
-            .join(format!("{phase:02}-test"));
+            .join(format!("{padded}-test", padded = phase.padded()));
         std::fs::create_dir_all(&phase_dir).unwrap();
         std::fs::write(
-            phase_dir.join(format!("{phase:02}-VERIFICATION.md")),
+            phase_dir.join(format!("{padded}-VERIFICATION.md", padded = phase.padded())),
             "verified\n",
         )
         .unwrap();
@@ -3482,7 +3505,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 93;
+        let phase = PhaseId::new(93);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         // IN-07: `handle_validate_outcome` is only reached from `advance` with
         // `stage == Validate`, so that is the only stage this fixture may
@@ -3506,10 +3529,10 @@ mod tests {
         // checkout — that is the entire point of this test.
         let phase_dir = worktree
             .join(".planning/phases")
-            .join(format!("{phase:02}-test"));
+            .join(format!("{padded}-test", padded = phase.padded()));
         std::fs::create_dir_all(&phase_dir).unwrap();
         std::fs::write(
-            phase_dir.join(format!("{phase:02}-VERIFICATION.md")),
+            phase_dir.join(format!("{padded}-VERIFICATION.md", padded = phase.padded())),
             "verified\n",
         )
         .unwrap();
@@ -3558,7 +3581,7 @@ mod tests {
 
         let dir_a = tempfile::tempdir().unwrap();
         let root_a = dir_a.path();
-        let phase_a = 94;
+        let phase_a = PhaseId::new(94);
         let mut state_a = State::new(phase_a, AgentKind::Claude, Mode::Auto, root_a.to_path_buf());
         // IN-07: Validate is the only stage production reaches this call from.
         state_a.stage = Stage::Validate;
@@ -3614,7 +3637,7 @@ mod tests {
 
         let dir_b = tempfile::tempdir().unwrap();
         let root_b = dir_b.path();
-        let phase_b = 95;
+        let phase_b = PhaseId::new(95);
         let mut state_b = State::new(phase_b, AgentKind::Claude, Mode::Auto, root_b.to_path_buf());
         // IN-07: Validate is the only stage production reaches this call from.
         state_b.stage = Stage::Validate;
@@ -3676,7 +3699,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 86;
+        let phase = PhaseId::new(86);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         // IN-07: Validate is the only stage production reaches this call from.
         state.stage = Stage::Validate;
@@ -3688,10 +3711,10 @@ mod tests {
         // the branch this forced re-run checked out.
         let phase_dir = worktree
             .join(".planning/phases")
-            .join(format!("{phase:02}-test"));
+            .join(format!("{padded}-test", padded = phase.padded()));
         std::fs::create_dir_all(&phase_dir).unwrap();
         std::fs::write(
-            phase_dir.join(format!("{phase:02}-VERIFICATION.md")),
+            phase_dir.join(format!("{padded}-VERIFICATION.md", padded = phase.padded())),
             "verdict: pass -- authored by a PREVIOUS run\n",
         )
         .unwrap();
@@ -3751,7 +3774,7 @@ mod tests {
         // ---- sub-case 1: content differs from the run-start baseline ----
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 87;
+        let phase = PhaseId::new(87);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         let worktree = root.join(format!(".worktrees/phase-{phase}"));
@@ -3760,9 +3783,9 @@ mod tests {
 
         let phase_dir = worktree
             .join(".planning/phases")
-            .join(format!("{phase:02}-test"));
+            .join(format!("{padded}-test", padded = phase.padded()));
         std::fs::create_dir_all(&phase_dir).unwrap();
-        let artifact = phase_dir.join(format!("{phase:02}-VERIFICATION.md"));
+        let artifact = phase_dir.join(format!("{padded}-VERIFICATION.md", padded = phase.padded()));
 
         // The previous run's copy, present when this run started.
         std::fs::write(&artifact, "verdict: pass -- from a PREVIOUS run\n").unwrap();
@@ -3823,7 +3846,7 @@ mod tests {
         // ---- sub-case 2: artifact exists where the baseline recorded none ----
         let dir_b = tempfile::tempdir().unwrap();
         let root_b = dir_b.path();
-        let phase_b = 88;
+        let phase_b = PhaseId::new(88);
         let mut state_b = State::new(phase_b, AgentKind::Claude, Mode::Auto, root_b.to_path_buf());
         state_b.stage = Stage::Validate;
         let worktree_b = root_b.join(format!(".worktrees/phase-{phase_b}"));
@@ -3993,7 +4016,7 @@ mod tests {
 
         /// Drive one Validate failure against a phase whose artifact already
         /// exists, and report the dispatched fix.
-        fn dispatch_with(root: &Path, phase: u32, baseline_captured: bool) -> String {
+        fn dispatch_with(root: &Path, phase: PhaseId, baseline_captured: bool) -> String {
             let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
             state.stage = Stage::Validate;
             state.verification_baseline_captured = baseline_captured;
@@ -4001,10 +4024,10 @@ mod tests {
 
             let phase_dir = root
                 .join(".planning/phases")
-                .join(format!("{phase:02}-test"));
+                .join(format!("{padded}-test", padded = phase.padded()));
             std::fs::create_dir_all(&phase_dir).unwrap();
             std::fs::write(
-                phase_dir.join(format!("{phase:02}-VERIFICATION.md")),
+                phase_dir.join(format!("{padded}-VERIFICATION.md", padded = phase.padded())),
                 "verdict: pass -- committed by a PREVIOUS run\n",
             )
             .unwrap();
@@ -4026,7 +4049,7 @@ mod tests {
         let upgraded_dir = tempfile::tempdir().unwrap();
         let upgraded_root = upgraded_dir.path();
         assert_eq!(
-            dispatch_with(upgraded_root, 78, false),
+            dispatch_with(upgraded_root, PhaseId::new(78), false),
             "FullExecute",
             "with no captured baseline the artifact's provenance is unknown; --gaps-only \
              would match zero plans and gate unresolvably"
@@ -4034,7 +4057,7 @@ mod tests {
         assert!(
             devflow_core::events::last_event_of_kind_for_phase(
                 upgraded_root,
-                78,
+                PhaseId::new(78),
                 "verification_baseline_absent",
             )
             .is_some(),
@@ -4046,7 +4069,7 @@ mod tests {
         let captured_dir = tempfile::tempdir().unwrap();
         let captured_root = captured_dir.path();
         assert_eq!(
-            dispatch_with(captured_root, 79, true),
+            dispatch_with(captured_root, PhaseId::new(79), true),
             "GapsOnly",
             "the ordinary first-verification case must be untouched — an always-stale rule \
              re-runs every plan in the phase forever, which the selector's own comment calls \
@@ -4055,7 +4078,7 @@ mod tests {
         assert!(
             devflow_core::events::last_event_of_kind_for_phase(
                 captured_root,
-                79,
+                PhaseId::new(79),
                 "verification_baseline_absent",
             )
             .is_none(),
@@ -4091,12 +4114,13 @@ mod tests {
 
         /// Seed a phase whose artifact already exists and whose baseline
         /// records it, optionally rewriting it with identical bytes afterwards.
-        fn dispatch_with(root: &Path, phase: u32, rewrite_identically: bool) -> String {
+        fn dispatch_with(root: &Path, phase: PhaseId, rewrite_identically: bool) -> String {
             let phase_dir = root
                 .join(".planning/phases")
-                .join(format!("{phase:02}-test"));
+                .join(format!("{padded}-test", padded = phase.padded()));
             std::fs::create_dir_all(&phase_dir).unwrap();
-            let artifact = phase_dir.join(format!("{phase:02}-VERIFICATION.md"));
+            let artifact =
+                phase_dir.join(format!("{padded}-VERIFICATION.md", padded = phase.padded()));
             let contents = "verdict: gaps -- G is still open\n";
             std::fs::write(&artifact, contents).unwrap();
 
@@ -4151,7 +4175,7 @@ mod tests {
 
         let rewritten_dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            dispatch_with(rewritten_dir.path(), 76, true),
+            dispatch_with(rewritten_dir.path(), PhaseId::new(76), true),
             "GapsOnly",
             "an idempotent rewrite is still a rewrite; reading it as inherited re-runs every \
              plan in the phase on every later cycle"
@@ -4160,7 +4184,7 @@ mod tests {
         // NEGATIVE CONTROL: nothing wrote the file after the baseline was taken.
         let untouched_dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            dispatch_with(untouched_dir.path(), 77, false),
+            dispatch_with(untouched_dir.path(), PhaseId::new(77), false),
             "FullExecute",
             "an artifact nobody touched since the baseline is INHERITED — a rule that always \
              answered 'authored' would be the 999.79 stall"
@@ -4182,7 +4206,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 84;
+        let phase = PhaseId::new(84);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         workflow::save_state(&state).unwrap();
@@ -4247,7 +4271,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 85;
+        let phase = PhaseId::new(85);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         state.consecutive_failures = mode::MAX_CONSECUTIVE_FAILURES;
@@ -4313,7 +4337,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 86;
+        let phase = PhaseId::new(86);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Ship;
         assert!(
@@ -4375,8 +4399,8 @@ mod tests {
         // Arm A: an Ambiguous outcome gates on cycle one, never touching
         // consecutive_failures. Arm B: a genuine failure still reaches
         // MAX_CONSECUTIVE_FAILURES and forces the gate.
-        arm_a_ambiguous_outcome_gates_on_cycle_one(root, 93);
-        arm_b_genuine_failures_reach_the_ceiling(root, 94);
+        arm_a_ambiguous_outcome_gates_on_cycle_one(root, PhaseId::new(93));
+        arm_b_genuine_failures_reach_the_ceiling(root, PhaseId::new(94));
     }
 
     /// Arm A (18e dominates): an ambiguous `external_verify` outcome gates
@@ -4384,7 +4408,7 @@ mod tests {
     /// irrelevant here and must stay untouched. Asserting that prevents a
     /// future refactor from quietly routing ambiguity back through the
     /// counter-based auto-loop.
-    fn arm_a_ambiguous_outcome_gates_on_cycle_one(root: &Path, phase: u32) {
+    fn arm_a_ambiguous_outcome_gates_on_cycle_one(root: &Path, phase: PhaseId) {
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         workflow::save_state(&state).unwrap();
@@ -4423,7 +4447,7 @@ mod tests {
     /// under `ENV_MUTEX` (matching `consecutive_failures_reaches_ceiling_across_cycles`)
     /// so neither `handle_validate_outcome`'s loop-back nor `transition`'s
     /// own `launch_stage` risk spawning a real agent CLI.
-    fn arm_b_genuine_failures_reach_the_ceiling(root: &Path, phase: u32) {
+    fn arm_b_genuine_failures_reach_the_ceiling(root: &Path, phase: PhaseId) {
         let _guard = env_lock();
 
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
@@ -4480,7 +4504,7 @@ mod tests {
     fn consecutive_failures_increment_saturates() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 82;
+        let phase = PhaseId::new(82);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         state.consecutive_failures = u32::MAX;
@@ -4510,7 +4534,7 @@ mod tests {
     fn primary_loop_rate_limited_writes_single_agent_cron_instructions() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 76;
+        let phase = PhaseId::new(76);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();
@@ -4553,7 +4577,7 @@ mod tests {
     fn rate_limited_at_infra_ceiling_stops_resuming_and_aborts() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 77;
+        let phase = PhaseId::new(77);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
         state.infra_failures = mode::MAX_INFRA_FAILURES - 1;
@@ -4589,7 +4613,7 @@ mod tests {
     fn rate_limited_with_unparseable_retry_hint_gates_instead_of_stalling_silently() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 81;
+        let phase = PhaseId::new(81);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();
@@ -4651,7 +4675,12 @@ mod tests {
         let worktree = root.join(".worktrees/phase-70");
         std::fs::create_dir_all(&worktree).unwrap();
 
-        let mut state = State::new(70, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let mut state = State::new(
+            PhaseId::new(70),
+            AgentKind::Claude,
+            Mode::Auto,
+            root.to_path_buf(),
+        );
         state.worktree_path = Some(worktree.clone());
 
         assert_eq!(
@@ -4712,7 +4741,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        let phase = 40;
+        let phase = PhaseId::new(40);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Ship;
         workflow::save_state(&state).unwrap();
@@ -4765,7 +4794,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        let phase = 41;
+        let phase = PhaseId::new(41);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Ship;
         workflow::save_state(&state).unwrap();
@@ -4799,7 +4828,7 @@ mod tests {
         assert!(!is_ship_review_failure(&Some("agent crashed".into())));
         assert!(!is_ship_review_failure(&None));
 
-        let prompt = prompt::fix_prompt(FixType::AuditFix, 11);
+        let prompt = prompt::fix_prompt(FixType::AuditFix, PhaseId::new(11));
         assert!(prompt.contains("/gsd-audit-fix"));
         assert!(!prompt.contains("--gaps-only"));
     }
@@ -4834,7 +4863,12 @@ mod tests {
         // State::new takes no project_root-derived config input at all, so
         // no devflow.toml key — including yes_ship, now a real config field
         // — can reach it through this constructor.
-        let state = State::new(1, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let state = State::new(
+            PhaseId::new(1),
+            AgentKind::Claude,
+            Mode::Auto,
+            root.to_path_buf(),
+        );
         assert!(
             !state.yes_ship,
             "State::new alone must never derive the Ship pre-authorization from \
@@ -4854,8 +4888,8 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 50;
-        let branch = format!("feature/phase-{phase:02}");
+        let phase = PhaseId::new(50);
+        let branch = format!("feature/phase-{padded}", padded = phase.padded());
         let branch_created = devflow_core::test_support::git_command(root)
             .args(["branch", &branch, "develop"])
             .status()
@@ -4891,7 +4925,7 @@ mod tests {
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
             .filter(|event| {
                 event["event"] == "gate_fired"
-                    && event["phase"] == phase
+                    && phase.matches_json(event.get("phase"))
                     && event["stage"] == "ship"
             })
             .count();
@@ -4921,7 +4955,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        let phase = 51;
+        let phase = PhaseId::new(51);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Ship;
         assert!(!state.yes_ship, "yes_ship must default to false");
@@ -4995,7 +5029,7 @@ mod tests {
             );
         }
 
-        let phase = 42;
+        let phase = PhaseId::new(42);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();
@@ -5045,7 +5079,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        let phase = 43;
+        let phase = PhaseId::new(43);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
         workflow::save_state(&state).unwrap();

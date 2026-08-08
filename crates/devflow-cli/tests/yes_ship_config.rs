@@ -9,6 +9,7 @@
 //! binary here runs as a separate process so this suite stays out of the
 //! `ENV_MUTEX`-guarded unit-test convention.
 
+use devflow_core::phase_id::PhaseId;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -52,7 +53,7 @@ fn init_repo(root: &Path) {
     git(root, &["branch", "main"]);
 }
 
-fn run_dry_run(root: &Path, phase: u32, extra_args: &[&str]) -> String {
+fn run_dry_run(root: &Path, phase: PhaseId, extra_args: &[&str]) -> String {
     let mut args = vec![
         "start".to_string(),
         "--phase".to_string(),
@@ -87,7 +88,7 @@ fn no_config_no_flag_is_not_preauthorized() {
     let root = repo.path();
     init_repo(root);
 
-    let stdout = run_dry_run(root, 60, &[]);
+    let stdout = run_dry_run(root, PhaseId::new(60), &[]);
 
     assert!(
         stdout.contains("ship gate: not pre-authorized"),
@@ -108,7 +109,7 @@ fn config_true_no_flag_is_preauthorized_and_announces_source() {
     init_repo(root);
     fs::write(root.join("devflow.toml"), "yes_ship = true\n").unwrap();
 
-    let stdout = run_dry_run(root, 61, &[]);
+    let stdout = run_dry_run(root, PhaseId::new(61), &[]);
 
     assert!(
         stdout.contains("ship gate: pre-authorized"),
@@ -128,7 +129,7 @@ fn flag_no_config_is_preauthorized_without_config_claim() {
     let root = repo.path();
     init_repo(root);
 
-    let stdout = run_dry_run(root, 62, &["--yes-ship"]);
+    let stdout = run_dry_run(root, PhaseId::new(62), &["--yes-ship"]);
 
     assert!(
         stdout.contains("ship gate: pre-authorized"),
@@ -149,7 +150,7 @@ fn flag_overrides_false_config() {
     init_repo(root);
     fs::write(root.join("devflow.toml"), "yes_ship = false\n").unwrap();
 
-    let stdout = run_dry_run(root, 63, &["--yes-ship"]);
+    let stdout = run_dry_run(root, PhaseId::new(63), &["--yes-ship"]);
 
     assert!(
         stdout.contains("ship gate: pre-authorized"),
@@ -166,7 +167,7 @@ fn config_false_no_flag_is_not_preauthorized() {
     init_repo(root);
     fs::write(root.join("devflow.toml"), "yes_ship = false\n").unwrap();
 
-    let stdout = run_dry_run(root, 64, &[]);
+    let stdout = run_dry_run(root, PhaseId::new(64), &[]);
 
     assert!(
         stdout.contains("ship gate: not pre-authorized"),

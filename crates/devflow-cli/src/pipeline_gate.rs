@@ -26,6 +26,7 @@ use crate::pipeline_outcomes::{run_checkout_hooks, truncate_reason};
 use devflow_core::gates::{self, GateAction, GateError, GateResponse, Gates};
 use devflow_core::hooks;
 use devflow_core::mode;
+use devflow_core::phase_id::PhaseId;
 use devflow_core::prompt::{self, FixType};
 use devflow_core::stage::Stage;
 use devflow_core::state::State;
@@ -344,8 +345,8 @@ pub(crate) fn run_gate_with_timeout(
     workflow::save_state(state)?;
     Gates::write_gate(project_root, state.phase, stage, context)?;
     println!(
-        "gate written: .devflow/gates/{:02}-{stage}.json — awaiting response",
-        state.phase
+        "gate written: .devflow/gates/{}-{stage}.json — awaiting response",
+        state.phase.padded()
     );
     // A gate is "unexpected" when the active mode would not normally fire
     // one for this stage (e.g. a Define/Plan/Code failure in Auto mode) —
@@ -484,7 +485,11 @@ pub(crate) fn abort(project_root: &Path, state: &State, reason: &str) -> Result<
 /// currently changes no observable behavior; it exists so the flag is never
 /// silently ignored and cannot later be wired to widen scope without an
 /// explicit, reviewed change to this function.
-pub(crate) fn ship_override(project_root: &Path, phase: u32, force: bool) -> Result<(), CliError> {
+pub(crate) fn ship_override(
+    project_root: &Path,
+    phase: PhaseId,
+    force: bool,
+) -> Result<(), CliError> {
     let _lock = match lock::acquire(project_root, phase) {
         Ok(guard) => guard,
         Err(lock::LockError::Contended { pid, .. }) => {
@@ -691,8 +696,8 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 21;
-        let branch = format!("feature/phase-{phase:02}");
+        let phase = PhaseId::new(21);
+        let branch = format!("feature/phase-{padded}", padded = phase.padded());
         let branch_created = devflow_core::test_support::git_command(root)
             .args(["branch", &branch, "develop"])
             .status()
@@ -741,8 +746,8 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 23;
-        let branch = format!("feature/phase-{phase:02}");
+        let phase = PhaseId::new(23);
+        let branch = format!("feature/phase-{padded}", padded = phase.padded());
         let branch_created = devflow_core::test_support::git_command(root)
             .args(["branch", &branch, "develop"])
             .status()
@@ -800,7 +805,7 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 24;
+        let phase = PhaseId::new(24);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Plan;
         state.stop_until = Some(Stage::Plan);
@@ -843,16 +848,21 @@ mod tests {
         git(&["add", "conflict.txt"]);
         git(&["commit", "-q", "-m", "develop change"]);
 
-        let mut state = State::new(22, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let mut state = State::new(
+            PhaseId::new(22),
+            AgentKind::Claude,
+            Mode::Auto,
+            root.to_path_buf(),
+        );
         state.stage = Stage::Ship;
         workflow::save_state(&state).unwrap();
 
         let root_owned = root.to_path_buf();
         let handle = std::thread::spawn(move || {
-            let mut state = workflow::load_state(&root_owned, 22).unwrap();
+            let mut state = workflow::load_state(&root_owned, PhaseId::new(22)).unwrap();
             finish_workflow(&root_owned, &mut state)
         });
-        let gate_path = Gates::gate_path(root, 22, Stage::Ship);
+        let gate_path = Gates::gate_path(root, PhaseId::new(22), Stage::Ship);
         for _ in 0..100 {
             if gate_path.exists() {
                 break;
@@ -864,10 +874,14 @@ mod tests {
             gate_path.exists(),
             "finalization failure must reopen Ship gate"
         );
-        assert!(workflow::load_state(root, 22).unwrap().gate_pending);
+        assert!(
+            workflow::load_state(root, PhaseId::new(22))
+                .unwrap()
+                .gate_pending
+        );
         Gates::respond(
             root,
-            22,
+            PhaseId::new(22),
             Stage::Ship,
             &GateResponse {
                 approved: false,
@@ -879,7 +893,7 @@ mod tests {
         handle.join().unwrap().unwrap();
 
         assert_ne!(
-            events::last_event_for_phase(root, 22)
+            events::last_event_for_phase(root, PhaseId::new(22))
                 .and_then(|event| event["event"].as_str().map(str::to_owned))
                 .as_deref(),
             Some("workflow_finished")
@@ -974,8 +988,8 @@ mod tests {
              VersionBump ever gets to its own git.tag(&tag) call"
         );
 
-        let phase = 60;
-        let branch = format!("feature/phase-{phase:02}");
+        let phase = PhaseId::new(60);
+        let branch = format!("feature/phase-{padded}", padded = phase.padded());
         let branch_created = devflow_core::test_support::git_command(root)
             .args(["branch", &branch, "develop"])
             .status()
@@ -1091,9 +1105,9 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phases = [31u32, 32u32];
+        let phases = [PhaseId::new(31), PhaseId::new(32)];
         for &phase in &phases {
-            let branch = format!("feature/phase-{phase:02}");
+            let branch = format!("feature/phase-{padded}", padded = phase.padded());
             let branch_created = devflow_core::test_support::git_command(root)
                 .args(["branch", &branch, "develop"])
                 .status()
@@ -1117,7 +1131,7 @@ mod tests {
             .unwrap();
         }
 
-        let results: Vec<(u32, Result<(), CliError>)> = std::thread::scope(|scope| {
+        let results: Vec<(PhaseId, Result<(), CliError>)> = std::thread::scope(|scope| {
             let handles: Vec<_> = phases
                 .iter()
                 .map(|&phase| (phase, scope.spawn(move || advance(root, Some(phase)))))
@@ -1204,7 +1218,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        let phase = 23;
+        let phase = PhaseId::new(23);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         state.consecutive_failures = mode::MAX_CONSECUTIVE_FAILURES - 1;
@@ -1313,7 +1327,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 80;
+        let phase = PhaseId::new(80);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
         state.infra_failures = mode::MAX_INFRA_FAILURES - 1;
@@ -1372,7 +1386,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 83;
+        let phase = PhaseId::new(83);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
         state.consecutive_failures = 2;
@@ -1411,8 +1425,8 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let phase = 90;
-        let branch = format!("feature/phase-{phase:02}");
+        let phase = PhaseId::new(90);
+        let branch = format!("feature/phase-{padded}", padded = phase.padded());
         let branch_created = devflow_core::test_support::git_command(root)
             .args(["branch", &branch, "develop"])
             .status()
@@ -1481,8 +1495,8 @@ mod tests {
                 .unwrap();
             assert!(output.status.success(), "git {args:?} failed");
         };
-        let phase = 96;
-        let branch = format!("feature/phase-{phase:02}");
+        let phase = PhaseId::new(96);
+        let branch = format!("feature/phase-{padded}", padded = phase.padded());
         git(&["checkout", "-q", "-b", &branch]);
         std::fs::write(root.join("conflict.txt"), "feature\n").unwrap();
         git(&["add", "conflict.txt"]);
@@ -1553,7 +1567,7 @@ mod tests {
     fn ship_override_abort_routes_through_abort() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 95;
+        let phase = PhaseId::new(95);
 
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Ship;
@@ -1593,7 +1607,7 @@ mod tests {
             for force in [true, false] {
                 let dir = tempfile::tempdir().unwrap();
                 let root = dir.path();
-                let phase = 91;
+                let phase = PhaseId::new(91);
 
                 let mut state =
                     State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
@@ -1624,7 +1638,7 @@ mod tests {
         for force in [true, false] {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path();
-            let phase = 92;
+            let phase = PhaseId::new(92);
 
             let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
             state.stage = Stage::Ship;
@@ -1656,7 +1670,7 @@ mod tests {
     fn ship_override_refuses_when_lock_contended() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 93;
+        let phase = PhaseId::new(93);
 
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Ship;
@@ -1682,7 +1696,7 @@ mod tests {
         for force in [true, false] {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path();
-            let phase = 94;
+            let phase = PhaseId::new(94);
 
             let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
             state.stage = Stage::Ship;
@@ -1724,12 +1738,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        let mut state_a = State::new(84, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let mut state_a = State::new(
+            PhaseId::new(84),
+            AgentKind::Claude,
+            Mode::Auto,
+            root.to_path_buf(),
+        );
         state_a.stage = Stage::Code;
         state_a.consecutive_failures = 1;
         workflow::save_state(&state_a).unwrap();
 
-        let mut state_b = State::new(85, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let mut state_b = State::new(
+            PhaseId::new(85),
+            AgentKind::Claude,
+            Mode::Auto,
+            root.to_path_buf(),
+        );
         state_b.stage = Stage::Code;
         state_b.consecutive_failures = 2;
         workflow::save_state(&state_b).unwrap();
@@ -1751,8 +1775,8 @@ mod tests {
             }
         }
 
-        let reloaded_a = workflow::load_state(root, 84).unwrap();
-        let reloaded_b = workflow::load_state(root, 85).unwrap();
+        let reloaded_a = workflow::load_state(root, PhaseId::new(84)).unwrap();
+        let reloaded_b = workflow::load_state(root, PhaseId::new(85)).unwrap();
 
         assert_eq!(
             reloaded_a.consecutive_failures, 1,
