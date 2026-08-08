@@ -3,12 +3,12 @@ gsd_state_version: 1.0
 milestone: v2.5.0
 milestone_name: milestone (Loop-Termination and Release Hardening, ACTIVE — declared 2026-08-06)
 current_phase: 35.1
-current_phase_name: Unattended-Launch Prerequisites (999.93)
-status: "Phase 35.1 planned — 4 plans in 3 waves, ready to execute"
+current_phase_name: unattended-launch-prerequisites
+status: executing
 stopped_at: Phase 35.1 planned
-last_updated: "2026-08-08T13:43:25.210Z"
+last_updated: "2026-08-08T14:14:34.590Z"
 last_activity: 2026-08-08
-last_activity_desc: Phase 35.1 planning complete
+last_activity_desc: Phase 35.1 execution started
 progress:
   total_phases: 4
   completed_phases: 1
@@ -154,10 +154,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 35.1 of 36 (Unattended-Launch Prerequisites (999.93))
-Plan: 0 of 4 complete (waves 1/2/3)
-Status: Ready to execute
-Last activity: 2026-08-08 — Phase 35.1 planning complete
+Phase: 35.1 (unattended-launch-prerequisites) — EXECUTING
+Plan: 1 of 4
+Status: Executing Phase 35.1
+Last activity: 2026-08-08 — Phase 35.1 execution started
 
 ## Recently Shipped
 
