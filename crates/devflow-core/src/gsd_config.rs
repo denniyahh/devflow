@@ -30,6 +30,7 @@
 //! is an `Err` the caller can log and skip rather than an abort that would kill
 //! a long unattended run.
 
+use crate::git::GitFlow;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -242,8 +243,182 @@ const CONFIG_PATHSPEC: &str = ".planning/config.json";
 /// config has nothing to leak, and failing here would break `devflow start` for
 /// every non-GSD project.
 pub fn force_clear_auto_chain(root: &Path) -> Result<ClearOutcome, GsdConfigError> {
-    let _ = root;
-    Ok(ClearOutcome::default())
+    let mut outcome = ClearOutcome::default();
+
+    match set_auto_chain_active(root, false) {
+        Ok(changed) => outcome.working_tree_repaired = changed,
+        // Absent and malformed are different facts. A project with no GSD
+        // config has nothing to leak; a config that cannot be parsed cannot be
+        // certified clean and must reach the caller.
+        Err(GsdConfigError::Missing(_)) => return Ok(outcome),
+        Err(err) => return Err(err),
+    }
+
+    // F-7: ask the branch tip whether it still disagrees with the corrected
+    // file, in one call, rather than parsing HEAD's copy a second time. This
+    // answers correctly in BOTH directions that matter — a working tree that
+    // was already clear but a HEAD that carries the leak still shows a
+    // difference and still gets repaired.
+    match probe_head(root) {
+        HeadProbe::Agrees => return Ok(outcome),
+        HeadProbe::Differs => {}
+        HeadProbe::Unknown(reason) => {
+            // Unreachable is not absent. A probe that could not run tells us
+            // nothing about the tip, and assuming agreement from a failed
+            // measurement is exactly the class of error this project runs on
+            // negative controls to avoid.
+            outcome.commit_refused = Some(reason);
+            return Ok(outcome);
+        }
+    }
+
+    // F-8 / T-35.1-08: `commit_path` is path-scoped but still commits whatever
+    // else is dirty IN that path. Compare HEAD's copy against the corrected
+    // working copy with the one key DevFlow owns removed from both; if the
+    // remainder differs, the file carries an edit DevFlow was not asked to
+    // touch. Refuse — the working-tree clear already disarmed the bypass for
+    // THIS run, so all that is deferred is the branch-tip half, and deferring
+    // it visibly is strictly better than committing an operator's unfinished
+    // work.
+    let head_text = match head_copy(root) {
+        Ok(text) => text,
+        Err(reason) => {
+            outcome.commit_refused = Some(reason);
+            return Ok(outcome);
+        }
+    };
+    let working_text = std::fs::read_to_string(config_path(root))?;
+    match (
+        serde_json::from_str::<Value>(&head_text),
+        serde_json::from_str::<Value>(&working_text),
+    ) {
+        (Ok(mut head), Ok(mut working)) => {
+            without_flag(&mut head);
+            without_flag(&mut working);
+            if head != working {
+                outcome.commit_refused = Some(format!(
+                    "{CONFIG_PATHSPEC} carries changes beyond the chain flag — the \
+                     branch-tip repair was deferred rather than sweep an unrelated \
+                     edit into a DevFlow commit"
+                ));
+                return Ok(outcome);
+            }
+        }
+        _ => {
+            outcome.commit_refused = Some(format!(
+                "could not parse both copies of {CONFIG_PATHSPEC} — the branch-tip \
+                 repair was deferred rather than committed unverified"
+            ));
+            return Ok(outcome);
+        }
+    }
+
+    // F-9: a commit failure is a loud warning, not a run-killer. Hooks, a
+    // detached HEAD, an unexpected git state — any of these can make this fail,
+    // and the working tree is already repaired, so the bypass is already off.
+    // Do not "harden" this into a `?`.
+    if let Err(err) = GitFlow::new(root).commit_path(CONFIG_PATHSPEC, REPAIR_COMMIT_MESSAGE) {
+        outcome.commit_refused = Some(format!(
+            "the branch-tip repair could not be committed ({err}) — the working \
+             tree is corrected, but this branch still carries the leaked value"
+        ));
+        return Ok(outcome);
+    }
+
+    // Confirm rather than assume. `commit_path` converts git's "nothing to
+    // commit" into `Ok(())`, so a bare `Ok` is not evidence that the tip moved;
+    // re-probing is what makes `committed_tree_repaired` a measurement.
+    match probe_head(root) {
+        HeadProbe::Agrees => outcome.committed_tree_repaired = true,
+        HeadProbe::Differs => {
+            outcome.commit_refused = Some(format!(
+                "the branch-tip repair reported success but {CONFIG_PATHSPEC} still \
+                 disagrees with HEAD — this branch may still carry the leaked value"
+            ));
+        }
+        HeadProbe::Unknown(reason) => outcome.commit_refused = Some(reason),
+    }
+    Ok(outcome)
+}
+
+/// The commit the repair writes on the operator's behalf. A Conventional
+/// Commit subject under 72 characters, and a body that says what a stale flag
+/// MEANS rather than merely that a value changed.
+const REPAIR_COMMIT_MESSAGE: &str = "\
+fix(gsd): clear a leaked auto-chain flag before launch
+
+A previous run for this phase was killed before its in-process guard could
+clear workflow._auto_chain_active, and the leaked value reached this branch.
+Left in place it travels through Ship into develop, where a later phase's
+plan-phase invocation reads the same boolean as \"chain into execute-phase\"
+rather than \"approve this checkpoint\".
+
+Repaired forward by devflow start/resume (35.1 D-01).";
+
+/// What the branch tip says about the corrected file. Three answers, not two:
+/// a probe that could not run is its own case and must never collapse into
+/// "agrees".
+enum HeadProbe {
+    /// The tip already matches the corrected working copy.
+    Agrees,
+    /// The tip still differs — there is a branch-tip repair to make.
+    Differs,
+    /// The question could not be answered; the reason is operator-facing.
+    Unknown(String),
+}
+
+/// `git diff --quiet HEAD -- .planning/config.json`, read by exit code: 0 means
+/// no difference, 1 means a difference, and anything else (128 for "not a
+/// repository", "unknown revision", and friends) means the probe itself failed.
+fn probe_head(root: &Path) -> HeadProbe {
+    match crate::git::git_command(root)
+        .args(["diff", "--quiet", "HEAD", "--", CONFIG_PATHSPEC])
+        .output()
+    {
+        Ok(output) => match output.status.code() {
+            Some(0) => HeadProbe::Agrees,
+            Some(1) => HeadProbe::Differs,
+            other => HeadProbe::Unknown(format!(
+                "could not compare {CONFIG_PATHSPEC} against HEAD (git exited \
+                 {other:?}) — the branch-tip repair was deferred rather than \
+                 assumed unnecessary"
+            )),
+        },
+        Err(err) => HeadProbe::Unknown(format!(
+            "could not run git to compare {CONFIG_PATHSPEC} against HEAD ({err}) — \
+             the branch-tip repair was deferred rather than assumed unnecessary"
+        )),
+    }
+}
+
+/// HEAD's copy of the config as text, or an operator-facing reason it could not
+/// be read. A tip that holds no readable copy is a refusal, not a licence to
+/// commit blind.
+fn head_copy(root: &Path) -> Result<String, String> {
+    match crate::git::git_command(root)
+        .args(["show", &format!("HEAD:{CONFIG_PATHSPEC}")])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        }
+        Ok(_) => Err(format!(
+            "HEAD holds no readable {CONFIG_PATHSPEC} to compare against — the \
+             branch-tip repair was deferred rather than committed unverified"
+        )),
+        Err(err) => Err(format!(
+            "could not read HEAD's copy of {CONFIG_PATHSPEC} ({err}) — the \
+             branch-tip repair was deferred rather than committed unverified"
+        )),
+    }
+}
+
+/// Remove the one key DevFlow owns, so what remains is exactly the part of the
+/// file that belongs to GSD and the operator.
+fn without_flag(value: &mut Value) {
+    if let Some(workflow) = value.get_mut(WORKFLOW_KEY).and_then(Value::as_object_mut) {
+        workflow.remove(AUTO_CHAIN_KEY);
+    }
 }
 
 /// Write through a sibling temporary file so a live GSD process never observes
