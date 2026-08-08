@@ -10,6 +10,7 @@ use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::mode::Mode;
+use crate::phase_id::PhaseId;
 use crate::stage::Stage;
 
 /// Full workflow state persisted to `.devflow/state.json`.
@@ -35,7 +36,7 @@ pub struct State {
     /// Current workflow stage.
     pub stage: Stage,
     /// Phase number being worked on.
-    pub phase: u32,
+    pub phase: PhaseId,
     /// Which coding agent was launched.
     pub agent: AgentKind,
     /// How the pipeline is driven (auto vs. supervise).
@@ -388,7 +389,7 @@ pub struct AgentParseError(String);
 
 impl State {
     /// Create a new state for starting a phase at the [`Stage::Define`] stage.
-    pub fn new(phase: u32, agent: AgentKind, mode: Mode, project_root: PathBuf) -> Self {
+    pub fn new(phase: PhaseId, agent: AgentKind, mode: Mode, project_root: PathBuf) -> Self {
         State {
             stage: Stage::Define,
             phase,
@@ -466,9 +467,14 @@ mod tests {
 
     #[test]
     fn new_state_starts_at_define() {
-        let state = State::new(2, AgentKind::Claude, Mode::Auto, PathBuf::from("/repo"));
+        let state = State::new(
+            PhaseId::new(2),
+            AgentKind::Claude,
+            Mode::Auto,
+            PathBuf::from("/repo"),
+        );
         assert_eq!(state.stage, Stage::Define);
-        assert_eq!(state.phase, 2);
+        assert_eq!(state.phase, PhaseId::new(2));
         assert_eq!(state.agent, AgentKind::Claude);
         assert_eq!(state.mode, Mode::Auto);
         assert!(!state.gate_pending);
@@ -486,10 +492,15 @@ mod tests {
 
     #[test]
     fn state_serde_round_trips() {
-        let state = State::new(9, AgentKind::Codex, Mode::Supervise, PathBuf::from("/repo"));
+        let state = State::new(
+            PhaseId::new(9),
+            AgentKind::Codex,
+            Mode::Supervise,
+            PathBuf::from("/repo"),
+        );
         let json = serde_json::to_string(&state).unwrap();
         let back: State = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.phase, 9);
+        assert_eq!(back.phase, PhaseId::new(9));
         assert_eq!(back.agent, AgentKind::Codex);
         assert_eq!(back.stage, Stage::Define);
         assert_eq!(back.mode, Mode::Supervise);
@@ -497,7 +508,12 @@ mod tests {
 
     #[test]
     fn consecutive_failures_persists_across_advance_calls() {
-        let mut state = State::new(1, AgentKind::Claude, Mode::Auto, PathBuf::from("/repo"));
+        let mut state = State::new(
+            PhaseId::new(1),
+            AgentKind::Claude,
+            Mode::Auto,
+            PathBuf::from("/repo"),
+        );
         state.consecutive_failures = 3;
         let json = serde_json::to_string(&state).unwrap();
         assert!(
@@ -515,7 +531,12 @@ mod tests {
     /// serde and its own key appears in the persisted JSON.
     #[test]
     fn infra_failures_round_trips_through_serde() {
-        let mut state = State::new(1, AgentKind::Claude, Mode::Auto, PathBuf::from("/repo"));
+        let mut state = State::new(
+            PhaseId::new(1),
+            AgentKind::Claude,
+            Mode::Auto,
+            PathBuf::from("/repo"),
+        );
         state.infra_failures = 4;
         let json = serde_json::to_string(&state).unwrap();
         assert!(
@@ -553,7 +574,12 @@ mod tests {
     /// caught.
     #[test]
     fn last_validate_failure_commit_count_round_trips_through_serde() {
-        let mut state = State::new(1, AgentKind::Claude, Mode::Auto, PathBuf::from("/repo"));
+        let mut state = State::new(
+            PhaseId::new(1),
+            AgentKind::Claude,
+            Mode::Auto,
+            PathBuf::from("/repo"),
+        );
         state.last_validate_failure_commit_count = Some(3);
         let json = serde_json::to_string(&state).unwrap();
         assert!(
@@ -593,7 +619,12 @@ mod tests {
     /// phase whose whole failure mode spans separate `devflow` processes.
     #[test]
     fn phase_validate_failures_round_trips_through_serde() {
-        let mut state = State::new(1, AgentKind::Claude, Mode::Auto, PathBuf::from("/repo"));
+        let mut state = State::new(
+            PhaseId::new(1),
+            AgentKind::Claude,
+            Mode::Auto,
+            PathBuf::from("/repo"),
+        );
         state.phase_validate_failures = 7;
         let json = serde_json::to_string(&state).unwrap();
         assert!(
@@ -633,7 +664,12 @@ mod tests {
     /// comparison reading `None` and defeat the whole rule.
     #[test]
     fn last_verification_fingerprint_round_trips_through_serde() {
-        let mut state = State::new(1, AgentKind::Claude, Mode::Auto, PathBuf::from("/repo"));
+        let mut state = State::new(
+            PhaseId::new(1),
+            AgentKind::Claude,
+            Mode::Auto,
+            PathBuf::from("/repo"),
+        );
         state.last_verification_fingerprint = Some(0x0123_4567_89ab_cdef);
         let json = serde_json::to_string(&state).unwrap();
         assert!(
@@ -680,7 +716,12 @@ mod tests {
     /// hardcoded `false` and the absent-JSON assertion above would still pass.
     #[test]
     fn verification_baseline_captured_round_trips_through_serde() {
-        let mut state = State::new(1, AgentKind::Claude, Mode::Auto, PathBuf::from("/repo"));
+        let mut state = State::new(
+            PhaseId::new(1),
+            AgentKind::Claude,
+            Mode::Auto,
+            PathBuf::from("/repo"),
+        );
         state.verification_baseline_captured = true;
         let json = serde_json::to_string(&state).unwrap();
         assert!(
@@ -701,7 +742,12 @@ mod tests {
     /// written by a pre-18f binary) deserializes to 0, not a hard error.
     #[test]
     fn preflight_retries_round_trips_through_serde() {
-        let mut state = State::new(1, AgentKind::Claude, Mode::Auto, PathBuf::from("/repo"));
+        let mut state = State::new(
+            PhaseId::new(1),
+            AgentKind::Claude,
+            Mode::Auto,
+            PathBuf::from("/repo"),
+        );
         state.preflight_retries = 2;
         let json = serde_json::to_string(&state).unwrap();
         assert!(
@@ -729,7 +775,12 @@ mod tests {
     /// `monitor_pid` round-trips through serde as an exact `u32` (18b).
     #[test]
     fn monitor_pid_round_trips_through_serde() {
-        let mut state = State::new(1, AgentKind::Claude, Mode::Auto, PathBuf::from("/repo"));
+        let mut state = State::new(
+            PhaseId::new(1),
+            AgentKind::Claude,
+            Mode::Auto,
+            PathBuf::from("/repo"),
+        );
         state.monitor_pid = Some(4242);
         let json = serde_json::to_string(&state).unwrap();
         assert!(
@@ -765,7 +816,12 @@ mod tests {
     /// (D-04, 28-02) — mirrors the `monitor_pid` pair above.
     #[test]
     fn session_id_round_trips_through_serde() {
-        let mut state = State::new(1, AgentKind::Claude, Mode::Auto, PathBuf::from("/repo"));
+        let mut state = State::new(
+            PhaseId::new(1),
+            AgentKind::Claude,
+            Mode::Auto,
+            PathBuf::from("/repo"),
+        );
         state.session_id = Some("cf29bfec-69e8-45df-a4f3-3da08ab6f66e".to_string());
         let json = serde_json::to_string(&state).unwrap();
         assert!(
@@ -800,7 +856,12 @@ mod tests {
     /// (D-04, 28-02).
     #[test]
     fn checkpoint_resumes_round_trips_through_serde() {
-        let mut state = State::new(1, AgentKind::Claude, Mode::Auto, PathBuf::from("/repo"));
+        let mut state = State::new(
+            PhaseId::new(1),
+            AgentKind::Claude,
+            Mode::Auto,
+            PathBuf::from("/repo"),
+        );
         state.checkpoint_resumes = 2;
         let json = serde_json::to_string(&state).unwrap();
         assert!(
@@ -835,7 +896,12 @@ mod tests {
     /// recovers the value set, mirroring the `monitor_pid` pair above.
     #[test]
     fn yes_ship_round_trips_through_serde() {
-        let mut state = State::new(1, AgentKind::Claude, Mode::Auto, PathBuf::from("/repo"));
+        let mut state = State::new(
+            PhaseId::new(1),
+            AgentKind::Claude,
+            Mode::Auto,
+            PathBuf::from("/repo"),
+        );
         state.yes_ship = true;
         let json = serde_json::to_string(&state).unwrap();
         assert!(
@@ -869,7 +935,12 @@ mod tests {
     /// fresh deserialize recovers the exact values set.
     #[test]
     fn stop_fields_round_trip_through_serde() {
-        let mut state = State::new(1, AgentKind::Claude, Mode::Auto, PathBuf::from("/repo"));
+        let mut state = State::new(
+            PhaseId::new(1),
+            AgentKind::Claude,
+            Mode::Auto,
+            PathBuf::from("/repo"),
+        );
         state.stop_until = Some(Stage::Plan);
         state.stopped = true;
         state.stop_reason = Some("stopped after plan completed (--until plan)".to_string());

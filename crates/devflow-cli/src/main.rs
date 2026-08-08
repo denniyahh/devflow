@@ -28,6 +28,7 @@ use commands::{
     logs, recover_cmd, reference, release_check, resolve_gate_target, start, status, stop,
     test_cmd,
 };
+use devflow_core::phase_id::PhaseId;
 
 mod config_parse;
 
@@ -48,7 +49,7 @@ enum Command {
     Start {
         /// Phase number to work on.
         #[arg(long)]
-        phase: u32,
+        phase: PhaseId,
         /// Agent to launch.
         #[arg(long, default_value = "claude")]
         agent: AgentKind,
@@ -122,7 +123,7 @@ enum Command {
         /// Phase whose stage machine to advance. Recorded by the monitor at
         /// spawn time so advance never depends on a shared state singleton.
         #[arg(long)]
-        phase: Option<u32>,
+        phase: Option<PhaseId>,
     },
     /// Internal: the pipe-owning monitor's own process entry point (Phase 31).
     ///
@@ -137,7 +138,7 @@ enum Command {
         project: PathBuf,
         /// Phase whose stage machine to advance once the child is reaped.
         #[arg(long)]
-        phase: u32,
+        phase: PhaseId,
         /// Directory the supervised child runs in (the phase worktree when
         /// worktree mode is active, else the project root).
         #[arg(long)]
@@ -162,7 +163,7 @@ enum Command {
     Resume {
         /// Phase to resume.
         #[arg(long)]
-        phase: u32,
+        phase: PhaseId,
         /// Force the pre-31 single-document Claude launch for the rest of this
         /// run (D-11, `31-CONTEXT.md`). Same semantics as `devflow start
         /// --legacy-claude-launch`, offered here so a run already in flight can
@@ -185,7 +186,7 @@ enum Command {
         /// Phase to show (defaults to the single active phase, else the
         /// most recently written capture file).
         #[arg(long)]
-        phase: Option<u32>,
+        phase: Option<PhaseId>,
         /// Keep watching for new output until the agent exits.
         #[arg(long, short = 'f')]
         follow: bool,
@@ -199,7 +200,7 @@ enum Command {
     /// Show a phase's chronological events and retained attempt evidence.
     History {
         /// Phase to show (defaults to the single active phase).
-        phase: Option<u32>,
+        phase: Option<PhaseId>,
         /// Project root.
         #[arg(default_value = ".")]
         project: PathBuf,
@@ -267,7 +268,7 @@ enum Command {
         clean: bool,
         /// Restrict the command to one phase.
         #[arg(long)]
-        phase: Option<u32>,
+        phase: Option<PhaseId>,
     },
     /// Run local quality checks: cargo test, clippy, and fmt --check.
     Test {
@@ -311,7 +312,7 @@ enum Command {
     Ship {
         /// Phase to ship.
         #[arg(long)]
-        phase: u32,
+        phase: PhaseId,
         /// Accepted for explicit, auditable operator intent. Does NOT skip
         /// the stage, lock, gate-existence, or ack checks (D-02) — see
         /// `pipeline_gate::ship_override`'s doc comment for exact scope.
@@ -332,7 +333,7 @@ enum Command {
     Stop {
         /// Phase to stop.
         #[arg(long)]
-        phase: u32,
+        phase: PhaseId,
         /// Project root. Defaults to the current directory.
         #[arg(long)]
         root: Option<PathBuf>,
@@ -344,7 +345,7 @@ enum Command {
     Evidence {
         /// Phase to report on.
         #[arg(long)]
-        phase: u32,
+        phase: PhaseId,
         /// Output as JSON.
         #[arg(long)]
         json: bool,
@@ -374,7 +375,7 @@ enum GateCmd {
     /// Approve an open gate — the workflow advances.
     Approve {
         /// Phase whose gate to approve.
-        phase: u32,
+        phase: PhaseId,
         /// Optional stage or legacy project path (`approve 15 ship` or
         /// `approve 15 /repo`).
         #[arg(value_name = "STAGE_OR_PROJECT")]
@@ -397,7 +398,7 @@ enum GateCmd {
     /// the note contains "abort".
     Reject {
         /// Phase whose gate to reject.
-        phase: u32,
+        phase: PhaseId,
         /// Optional stage or legacy project path (`reject 15 ship` or
         /// `reject 15 /repo`).
         #[arg(value_name = "STAGE_OR_PROJECT")]
@@ -422,7 +423,7 @@ enum GateCmd {
     /// full, control-char sanitized.
     Show {
         /// Phase whose gate to show.
-        phase: u32,
+        phase: PhaseId,
         /// Stage of the gate (auto-resolved when the phase has exactly one
         /// open gate).
         #[arg(long = "stage")]

@@ -31,6 +31,7 @@ use devflow_core::git::{GitFlow, git_command, hermetic_command};
 use devflow_core::history;
 use devflow_core::lock;
 use devflow_core::mode::Mode;
+use devflow_core::phase_id::PhaseId;
 use devflow_core::recover;
 use devflow_core::registry;
 use devflow_core::ship_evidence;
@@ -86,8 +87,8 @@ pub(crate) fn resolve_gate_target(
 /// branch phase worktrees fork from. Fail-open on git errors (missing
 /// develop, not a repo): pre-flight must never block a run the later, more
 /// specific checks would allow.
-pub(crate) fn phase_artifact_on_develop(project_root: &Path, phase: u32, suffix: &str) -> bool {
-    let prefix = format!(".planning/phases/{phase:02}-");
+pub(crate) fn phase_artifact_on_develop(project_root: &Path, phase: PhaseId, suffix: &str) -> bool {
+    let prefix = format!(".planning/phases/{padded}-", padded = phase.padded());
     let output = git_command(project_root)
         .args([
             "ls-tree",
@@ -145,7 +146,7 @@ pub(crate) fn phase_artifact_on_develop(project_root: &Path, phase: u32, suffix:
 ///    `mode::phase_failure_ceiling_reached` is true.
 pub(crate) fn fresh_state_carrying_phase_failures(
     project_root: &Path,
-    phase: u32,
+    phase: PhaseId,
     agent: AgentKind,
     mode: Mode,
 ) -> State {
@@ -173,7 +174,7 @@ pub(crate) fn fresh_state_carrying_phase_failures(
 /// carried is exactly what could not be read. What changes is that the
 /// operator is told.
 fn carried_phase_failures(
-    phase: u32,
+    phase: PhaseId,
     loaded: Result<State, workflow::WorkflowError>,
 ) -> (u32, Option<String>) {
     match loaded {
@@ -196,7 +197,7 @@ fn carried_phase_failures(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start(
     project_root: &Path,
-    phase: u32,
+    phase: PhaseId,
     agent: AgentKind,
     mode: Mode,
     force: bool,
@@ -326,8 +327,9 @@ pub(crate) fn start(
     if worktree {
         let wt = ensure_phase_worktree(project_root, phase, force)?;
         println!(
-            "created worktree: {} (branch {FEATURE_PREFIX}phase-{phase:02})",
+            "created worktree: {} (branch {FEATURE_PREFIX}phase-{padded})",
             wt.display(),
+            padded = phase.padded(),
         );
         state.worktree_path = Some(wt);
     } else {
@@ -545,14 +547,18 @@ pub(crate) fn reference(
 /// Returns `None` for paths that don't follow this naming (e.g. the static
 /// `reference` worktree), which correctly excludes it from the liveness
 /// guard — a snapshot has no owning phase/agent to be alive.
-fn phase_from_worktree_path(worktrees_dir: &Path, path: &Path) -> Option<u32> {
+fn phase_from_worktree_path(worktrees_dir: &Path, path: &Path) -> Option<PhaseId> {
     let name = path.strip_prefix(worktrees_dir).ok()?.to_str()?;
     let rest = name.strip_prefix("phase-")?;
-    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    if digits.is_empty() {
-        return None;
-    }
-    digits.parse().ok()
+    // A dot is part of the identifier (`phase-35.1`), so it must be consumed
+    // here; stopping at the first non-digit would read `phase-35.1` as phase
+    // 35 and join a decimal phase's worktree to its integer sibling's state.
+    // The agent suffix (`phase-07-claude`) still terminates the run.
+    let label: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    label.parse().ok()
 }
 
 /// Join a `git worktree list` entry to its owning phase `State`, preferring
@@ -581,7 +587,7 @@ fn state_for_worktree<'a>(
     if let Some(branch) = &wt.branch {
         return states
             .iter()
-            .find(|s| *branch == format!("{FEATURE_PREFIX}phase-{:02}", s.phase));
+            .find(|s| *branch == format!("{FEATURE_PREFIX}phase-{}", s.phase.padded()));
     }
     None
 }
@@ -947,7 +953,7 @@ pub(crate) fn status(project_root: &Path) -> Result<(), CliError> {
 ///    times as "the only site emitting `workflow_finished`."
 pub(crate) fn evidence(
     project_root: &Path,
-    phase: u32,
+    phase: PhaseId,
     json: bool,
     require_shipped: bool,
 ) -> Result<(), CliError> {
@@ -1137,7 +1143,7 @@ fn render_gate_age(timestamp: &str, now: u64) -> String {
 /// need, kept in one place so it cannot drift between them (Phase 21 review
 /// WR-01). Callers own the `Gates::list_open` read so `gate_show` can resolve
 /// and select from one fetched collection instead of reading twice (WR-03).
-fn resolve_single_open_gate_stage(open: &[OpenGate], phase: u32) -> Result<Stage, CliError> {
+fn resolve_single_open_gate_stage(open: &[OpenGate], phase: PhaseId) -> Result<Stage, CliError> {
     let matching: Vec<&OpenGate> = open.iter().filter(|g| g.phase == phase).collect();
     match matching.as_slice() {
         [] => Err(CliError::Message(format!(
@@ -1156,7 +1162,7 @@ fn resolve_single_open_gate_stage(open: &[OpenGate], phase: u32) -> Result<Stage
 
 pub(crate) fn gate_respond(
     project_root: &Path,
-    phase: u32,
+    phase: PhaseId,
     stage: Option<Stage>,
     approved: bool,
     note: Option<String>,
@@ -1359,7 +1365,7 @@ pub(crate) fn gate_sweep(
                             // meaning "not tied to any specific phase" —
                             // never a real phase number, which this
                             // project's phases never assign.
-                            0,
+                            PhaseId::new(0),
                             "stray_reaped",
                             serde_json::json!({
                                 "pid": result.pid,
@@ -1560,7 +1566,7 @@ fn reap_stray_candidates(
 /// trailing `advance` invocation, so by the time `advance` is the shell's
 /// foreground child, `monitor_pid` already names a process that exited long
 /// ago; `lock::holder`'s recorded pid is the only correct target).
-pub(crate) fn stop(project_root: &Path, phase: u32) -> Result<(), CliError> {
+pub(crate) fn stop(project_root: &Path, phase: PhaseId) -> Result<(), CliError> {
     if !stop_via_gate(project_root, phase)? {
         stop_via_lock(project_root, phase)?;
     }
@@ -1579,7 +1585,7 @@ pub(crate) fn stop(project_root: &Path, phase: u32) -> Result<(), CliError> {
 /// reports `NoOpenGate` after this function's own `Gates::list_open` scan
 /// found one; that is the signal to fall through, not an error (cross-AI
 /// review 23-10).
-fn stop_via_gate(project_root: &Path, phase: u32) -> Result<bool, CliError> {
+fn stop_via_gate(project_root: &Path, phase: PhaseId) -> Result<bool, CliError> {
     let Some(gate) = Gates::list_open(project_root)
         .into_iter()
         .find(|g| g.phase == phase)
@@ -1625,7 +1631,7 @@ fn stop_via_gate(project_root: &Path, phase: u32) -> Result<bool, CliError> {
 /// does not look like a devflow process is refused, not signalled, since
 /// the lock may be stale with a recycled pid. Never reads
 /// `state.monitor_pid` — see [`stop`]'s doc comment.
-fn stop_via_lock(project_root: &Path, phase: u32) -> Result<(), CliError> {
+fn stop_via_lock(project_root: &Path, phase: PhaseId) -> Result<(), CliError> {
     let Some((pid_str, _path)) = lock::holder(project_root, phase) else {
         println!("stop: no lock held for phase {phase} — nothing is running `advance()`");
         return Ok(());
@@ -1676,7 +1682,8 @@ fn stop_via_lock(project_root: &Path, phase: u32) -> Result<(), CliError> {
                  no start time, so this process's identity cannot be confirmed. The lock \
                  predates identity recording; if the run is genuinely stuck, inspect the \
                  pid manually (e.g. `ps -p {pid}`) and remove \
-                 .devflow/lock-{phase:02} once you are satisfied."
+                 .devflow/lock-{padded} once you are satisfied.",
+                padded = phase.padded()
             )));
         }
         _ => {
@@ -1702,7 +1709,7 @@ fn stop_via_lock(project_root: &Path, phase: u32) -> Result<(), CliError> {
 /// --until`) and `transition()` reads it. A phase with no persisted state
 /// at all — never started, or already cleared by a completed abort — is
 /// already stopped; that is success, not an error.
-fn persist_stopped_state(project_root: &Path, phase: u32) -> Result<(), CliError> {
+fn persist_stopped_state(project_root: &Path, phase: PhaseId) -> Result<(), CliError> {
     let mut state = match workflow::load_state(project_root, phase) {
         Ok(state) => state,
         Err(workflow::WorkflowError::MissingState(_)) => {
@@ -1729,7 +1736,7 @@ fn persist_stopped_state(project_root: &Path, phase: u32) -> Result<(), CliError
 /// instead of reading twice (WR-03).
 pub(crate) fn gate_show(
     project_root: &Path,
-    phase: u32,
+    phase: PhaseId,
     stage: Option<Stage>,
 ) -> Result<(), CliError> {
     let open = Gates::list_open(project_root);
@@ -1767,7 +1774,7 @@ fn render_gate_show(gate: &OpenGate) -> String {
 /// Print (or follow) a phase's captured agent output.
 pub(crate) fn logs(
     project_root: &Path,
-    phase: Option<u32>,
+    phase: Option<PhaseId>,
     follow: bool,
     stderr: bool,
 ) -> Result<(), CliError> {
@@ -1818,7 +1825,7 @@ pub(crate) fn logs(
 }
 
 /// Render the read-only cross-attempt view for one phase.
-pub(crate) fn history_cmd(project_root: &Path, phase: Option<u32>) -> Result<(), CliError> {
+pub(crate) fn history_cmd(project_root: &Path, phase: Option<PhaseId>) -> Result<(), CliError> {
     let phase = match phase {
         Some(phase) => phase,
         None => single_active_phase(project_root)?.ok_or_else(|| {
@@ -1874,13 +1881,13 @@ fn write_capture_from(
 
 /// Pick the phase `devflow logs` should show when none is given: the single
 /// active phase, else the phase with the most recently modified capture file.
-fn default_logs_phase(project_root: &Path) -> Result<u32, CliError> {
+fn default_logs_phase(project_root: &Path) -> Result<PhaseId, CliError> {
     if let Some(phase) = single_active_phase(project_root)? {
         return Ok(phase);
     }
     // No active state: fall back to the newest capture file on disk.
     let devflow = workflow::devflow_dir(project_root);
-    let mut newest: Option<(std::time::SystemTime, u32)> = None;
+    let mut newest: Option<(std::time::SystemTime, PhaseId)> = None;
     if let Ok(entries) = std::fs::read_dir(&devflow) {
         for entry in entries.flatten() {
             let name = entry.file_name();
@@ -1888,7 +1895,7 @@ fn default_logs_phase(project_root: &Path) -> Result<u32, CliError> {
             let Some(phase) = name
                 .strip_prefix("phase-")
                 .and_then(|rest| rest.strip_suffix("-stdout"))
-                .and_then(|num| num.parse::<u32>().ok())
+                .and_then(|num| num.parse::<PhaseId>().ok())
             else {
                 continue;
             };
@@ -1906,7 +1913,7 @@ fn default_logs_phase(project_root: &Path) -> Result<u32, CliError> {
 }
 
 /// Read the launched agent PID the monitor recorded for `phase`, if present.
-fn agent_pid_from_file(project_root: &Path, phase: u32) -> Option<u32> {
+fn agent_pid_from_file(project_root: &Path, phase: PhaseId) -> Option<u32> {
     let path = agent_result::agent_pid_path(project_root, phase);
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
@@ -2028,7 +2035,7 @@ fn print_open_branches(project_root: &Path) {
 pub(crate) fn recover_cmd(
     project_root: &Path,
     do_clean: bool,
-    phase: Option<u32>,
+    phase: Option<PhaseId>,
 ) -> Result<(), CliError> {
     if do_clean {
         let warnings = match phase {
@@ -2567,7 +2574,7 @@ impl Severity {
 /// reconciling them. Collected by `collect_phase_facts` (all I/O); consumed
 /// with zero I/O by `reconcile_phase`.
 pub(crate) struct PhaseFacts {
-    pub(crate) phase: u32,
+    pub(crate) phase: PhaseId,
     pub(crate) stage: Stage,
     pub(crate) gate_pending: bool,
     pub(crate) agent_pid: Option<u32>,
@@ -2597,7 +2604,7 @@ pub(crate) struct PhaseFacts {
 /// when one exists. Never carries a filesystem path or username (T-18-01) —
 /// only phase numbers, stage names, and pids identify the disagreement.
 pub(crate) struct PhaseFinding {
-    pub(crate) phase: u32,
+    pub(crate) phase: PhaseId,
     pub(crate) severity: Severity,
     pub(crate) detail: String,
     pub(crate) repair: Option<String>,
@@ -2717,8 +2724,10 @@ fn check_missing_branch(facts: &PhaseFacts) -> Option<PhaseFinding> {
         phase: facts.phase,
         severity: Severity::Warn,
         detail: format!(
-            "phase {}: feature/phase-{:02} does not exist but stage is {}",
-            facts.phase, facts.phase, facts.stage
+            "phase {}: feature/phase-{} does not exist but stage is {}",
+            facts.phase,
+            facts.phase.padded(),
+            facts.stage
         ),
         repair: None,
     })
@@ -2770,7 +2779,7 @@ fn collect_phase_facts(project_root: &Path) -> Vec<PhaseFacts> {
 fn build_phase_facts(
     project_root: &Path,
     state: State,
-    last_events: &mut std::collections::HashMap<u32, events::PhaseEventSummary>,
+    last_events: &mut std::collections::HashMap<PhaseId, events::PhaseEventSummary>,
     open_gates: &[OpenGate],
 ) -> PhaseFacts {
     let phase = state.phase;
@@ -2791,7 +2800,7 @@ fn build_phase_facts(
         .filter(|g| g.phase == phase)
         .map(|g| g.stage)
         .collect();
-    let branch_ref = format!("refs/heads/feature/phase-{phase:02}");
+    let branch_ref = format!("refs/heads/feature/phase-{padded}", padded = phase.padded());
     let feature_branch_exists =
         run_git_stdout(project_root, &["rev-parse", "--verify", &branch_ref]).is_some();
 
@@ -3407,7 +3416,7 @@ mod tests {
     fn phase_validate_failures_survive_a_forced_restart() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 71;
+        let phase = PhaseId::new(71);
 
         let mut persisted = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         persisted.phase_validate_failures = 6;
@@ -3455,7 +3464,7 @@ mod tests {
     fn phase_validate_failures_reset_when_the_phase_completes() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 72;
+        let phase = PhaseId::new(72);
 
         let mut persisted = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         persisted.phase_validate_failures = 8;
@@ -3494,7 +3503,7 @@ mod tests {
     fn a_corrupt_state_file_warns_while_an_absent_one_is_silent() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 73;
+        let phase = PhaseId::new(73);
 
         // NEGATIVE CONTROL: nothing on disk — a genuine zero, no warning.
         let (absent_total, absent_warning) =
@@ -3619,7 +3628,7 @@ mod tests {
         else {
             panic!("expected gate show command");
         };
-        assert_eq!(phase, 15);
+        assert_eq!(phase, PhaseId::new(15));
         assert_eq!(stage, None);
 
         let flagged =
@@ -3630,7 +3639,7 @@ mod tests {
         else {
             panic!("expected gate show command with stage");
         };
-        assert_eq!(phase, 15);
+        assert_eq!(phase, PhaseId::new(15));
         assert_eq!(stage, Some(Stage::Ship));
     }
 
@@ -3638,10 +3647,10 @@ mod tests {
     fn gate_show_renders_full_untruncated_sanitized_context() {
         let dir = tempfile::tempdir().unwrap();
         let context = format!("first line\n\u{1b}[2J{}", "x".repeat(150));
-        Gates::write_gate(dir.path(), 15, Stage::Ship, &context).unwrap();
+        Gates::write_gate(dir.path(), PhaseId::new(15), Stage::Ship, &context).unwrap();
         let gate = Gates::list_open(dir.path())
             .into_iter()
-            .find(|g| g.phase == 15)
+            .find(|g| g.phase == PhaseId::new(15))
             .unwrap();
 
         let rendered = render_gate_show(&gate);
@@ -3654,17 +3663,17 @@ mod tests {
     #[test]
     fn gate_show_errors_naming_gate_list_when_no_open_gate() {
         let dir = tempfile::tempdir().unwrap();
-        let err = gate_show(dir.path(), 15, None).unwrap_err();
+        let err = gate_show(dir.path(), PhaseId::new(15), None).unwrap_err();
         assert!(err.to_string().contains("devflow gate list"));
     }
 
     #[test]
     fn gate_show_errors_asking_for_stage_with_several_open_gates() {
         let dir = tempfile::tempdir().unwrap();
-        Gates::write_gate(dir.path(), 15, Stage::Ship, "ctx1").unwrap();
-        Gates::write_gate(dir.path(), 15, Stage::Validate, "ctx2").unwrap();
+        Gates::write_gate(dir.path(), PhaseId::new(15), Stage::Ship, "ctx1").unwrap();
+        Gates::write_gate(dir.path(), PhaseId::new(15), Stage::Validate, "ctx2").unwrap();
 
-        let err = gate_show(dir.path(), 15, None).unwrap_err();
+        let err = gate_show(dir.path(), PhaseId::new(15), None).unwrap_err();
 
         assert!(err.to_string().contains("--stage"));
     }
@@ -3672,9 +3681,15 @@ mod tests {
     #[test]
     fn gate_show_auto_resolves_single_open_gate() {
         let dir = tempfile::tempdir().unwrap();
-        Gates::write_gate(dir.path(), 15, Stage::Ship, "the only open gate").unwrap();
+        Gates::write_gate(
+            dir.path(),
+            PhaseId::new(15),
+            Stage::Ship,
+            "the only open gate",
+        )
+        .unwrap();
 
-        assert!(gate_show(dir.path(), 15, None).is_ok());
+        assert!(gate_show(dir.path(), PhaseId::new(15), None).is_ok());
     }
 
     #[test]
@@ -3693,7 +3708,7 @@ mod tests {
         // Empty retry_after here so the exact-match assertion below isolates
         // the base hermes-command hint from 21a's reset-time fragment
         // (covered separately by cron_hint_line_* below).
-        for phase in [7, 9] {
+        for phase in [PhaseId::new(7), PhaseId::new(9)] {
             let instructions =
                 devflow_core::ship::build_single_agent_cron_instructions(dir.path(), phase, "");
             devflow_core::ship::write_cron_instructions(dir.path(), &instructions).unwrap();
@@ -3717,7 +3732,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let instructions = devflow_core::ship::build_single_agent_cron_instructions(
             dir.path(),
-            7,
+            PhaseId::new(7),
             "2026-06-18T15:45:30Z",
         );
 
@@ -3733,8 +3748,11 @@ mod tests {
     #[test]
     fn cron_hint_line_omits_reset_fragment_when_retry_after_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let instructions =
-            devflow_core::ship::build_single_agent_cron_instructions(dir.path(), 7, "");
+        let instructions = devflow_core::ship::build_single_agent_cron_instructions(
+            dir.path(),
+            PhaseId::new(7),
+            "",
+        );
 
         let hint = cron_hint_line(&instructions, dir.path());
 
@@ -3751,16 +3769,21 @@ mod tests {
     #[test]
     fn default_logs_phase_prefers_single_active_state() {
         let dir = tempfile::tempdir().unwrap();
-        let state = State::new(6, AgentKind::Claude, Mode::Auto, dir.path().to_path_buf());
+        let state = State::new(
+            PhaseId::new(6),
+            AgentKind::Claude,
+            Mode::Auto,
+            dir.path().to_path_buf(),
+        );
         workflow::save_state(&state).unwrap();
 
-        assert_eq!(default_logs_phase(dir.path()).unwrap(), 6);
+        assert_eq!(default_logs_phase(dir.path()).unwrap(), PhaseId::new(6));
     }
 
     #[test]
     fn default_logs_phase_is_ambiguous_with_two_active_states() {
         let dir = tempfile::tempdir().unwrap();
-        for phase in [6, 7] {
+        for phase in [PhaseId::new(6), PhaseId::new(7)] {
             let state = State::new(
                 phase,
                 AgentKind::Claude,
@@ -3778,12 +3801,20 @@ mod tests {
     fn default_logs_phase_falls_back_to_newest_capture_file() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".devflow")).unwrap();
-        std::fs::write(agent_result::stdout_path(dir.path(), 3), "old").unwrap();
+        std::fs::write(
+            agent_result::stdout_path(dir.path(), PhaseId::new(3)),
+            "old",
+        )
+        .unwrap();
         // Ensure a strictly newer mtime on the second capture.
         std::thread::sleep(std::time::Duration::from_millis(20));
-        std::fs::write(agent_result::stdout_path(dir.path(), 5), "new").unwrap();
+        std::fs::write(
+            agent_result::stdout_path(dir.path(), PhaseId::new(5)),
+            "new",
+        )
+        .unwrap();
 
-        assert_eq!(default_logs_phase(dir.path()).unwrap(), 5);
+        assert_eq!(default_logs_phase(dir.path()).unwrap(), PhaseId::new(5));
     }
 
     #[test]
@@ -3835,16 +3866,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        let mut phase7 = State::new(7, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let mut phase7 = State::new(
+            PhaseId::new(7),
+            AgentKind::Claude,
+            Mode::Auto,
+            root.to_path_buf(),
+        );
         phase7.monitor_pid = Some(111);
         workflow::save_state(&phase7).unwrap();
 
-        let mut phase8 = State::new(8, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let mut phase8 = State::new(
+            PhaseId::new(8),
+            AgentKind::Claude,
+            Mode::Auto,
+            root.to_path_buf(),
+        );
         phase8.monitor_pid = Some(222);
         workflow::save_state(&phase8).unwrap();
 
-        let reloaded7 = workflow::load_state(root, 7).unwrap();
-        let reloaded8 = workflow::load_state(root, 8).unwrap();
+        let reloaded7 = workflow::load_state(root, PhaseId::new(7)).unwrap();
+        let reloaded8 = workflow::load_state(root, PhaseId::new(8)).unwrap();
         assert_eq!(reloaded7.monitor_pid, Some(111));
         assert_eq!(reloaded8.monitor_pid, Some(222));
     }
@@ -3859,7 +3900,7 @@ mod tests {
     fn status_reading_monitor_liveness_writes_no_state_and_no_event() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 66;
+        let phase = PhaseId::new(66);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.monitor_pid = Some(u32::MAX);
         workflow::save_state(&state).unwrap();
@@ -3904,14 +3945,15 @@ mod tests {
     fn gate_respond_auto_resolves_single_open_gate() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        Gates::write_gate(root, 15, Stage::Ship, "approve merge?").unwrap();
+        Gates::write_gate(root, PhaseId::new(15), Stage::Ship, "approve merge?").unwrap();
 
-        gate_respond(root, 15, None, true, Some("lgtm".into())).unwrap();
+        gate_respond(root, PhaseId::new(15), None, true, Some("lgtm".into())).unwrap();
 
-        let polled = Gates::poll_response(root, 15, Stage::Ship, 1).expect("response readable");
+        let polled = Gates::poll_response(root, PhaseId::new(15), Stage::Ship, 1)
+            .expect("response readable");
         assert!(polled.approved);
         assert_eq!(polled.note.as_deref(), Some("lgtm"));
-        let event = devflow_core::events::last_event_for_phase(root, 15).unwrap();
+        let event = devflow_core::events::last_event_for_phase(root, PhaseId::new(15)).unwrap();
         assert_eq!(event["event"], "gate_response_written");
         assert_eq!(event["stage"], "ship");
     }
@@ -3921,27 +3963,35 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        let err = gate_respond(root, 15, None, true, None).unwrap_err();
+        let err = gate_respond(root, PhaseId::new(15), None, true, None).unwrap_err();
         assert!(err.to_string().contains("no open gate"), "{err}");
 
-        Gates::write_gate(root, 15, Stage::Validate, "a").unwrap();
-        Gates::write_gate(root, 15, Stage::Ship, "b").unwrap();
-        let err = gate_respond(root, 15, None, false, Some("nope".into())).unwrap_err();
+        Gates::write_gate(root, PhaseId::new(15), Stage::Validate, "a").unwrap();
+        Gates::write_gate(root, PhaseId::new(15), Stage::Ship, "b").unwrap();
+        let err =
+            gate_respond(root, PhaseId::new(15), None, false, Some("nope".into())).unwrap_err();
         assert!(err.to_string().contains("--stage"), "{err}");
 
         // Explicit --stage disambiguates.
-        gate_respond(root, 15, Some(Stage::Validate), false, Some("gaps".into())).unwrap();
+        gate_respond(
+            root,
+            PhaseId::new(15),
+            Some(Stage::Validate),
+            false,
+            Some("gaps".into()),
+        )
+        .unwrap();
         assert!(
-            Gates::response_path(root, 15, Stage::Validate).exists(),
+            Gates::response_path(root, PhaseId::new(15), Stage::Validate).exists(),
             "explicit-stage rejection must land"
         );
-        assert!(!Gates::response_path(root, 15, Stage::Ship).exists());
+        assert!(!Gates::response_path(root, PhaseId::new(15), Stage::Ship).exists());
     }
 
     /// Backdate an already-written gate's `timestamp` so it reads as
     /// `age_secs` old — the deterministic way `gate_sweep` tests make a gate
     /// look abandoned without sleeping.
-    fn backdate_gate(root: &Path, phase: u32, stage: Stage, age_secs: u64) {
+    fn backdate_gate(root: &Path, phase: PhaseId, stage: Stage, age_secs: u64) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -3965,13 +4015,13 @@ mod tests {
     fn gate_sweep_dry_run_does_not_write_a_response() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        Gates::write_gate(root, 30, Stage::Ship, "ctx").unwrap();
-        backdate_gate(root, 30, Stage::Ship, 7 * 60 * 60);
+        Gates::write_gate(root, PhaseId::new(30), Stage::Ship, "ctx").unwrap();
+        backdate_gate(root, PhaseId::new(30), Stage::Ship, 7 * 60 * 60);
 
         gate_sweep(None, true, Some(root.to_path_buf()), false).unwrap();
 
         assert!(
-            !Gates::response_path(root, 30, Stage::Ship).exists(),
+            !Gates::response_path(root, PhaseId::new(30), Stage::Ship).exists(),
             "dry-run must never write a response file"
         );
         let open = Gates::list_open(root);
@@ -3986,20 +4036,24 @@ mod tests {
     fn gate_sweep_skips_already_responded_gate_without_clobbering() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        Gates::write_gate(root, 31, Stage::Ship, "ctx").unwrap();
-        backdate_gate(root, 31, Stage::Ship, 7 * 60 * 60);
+        Gates::write_gate(root, PhaseId::new(31), Stage::Ship, "ctx").unwrap();
+        backdate_gate(root, PhaseId::new(31), Stage::Ship, 7 * 60 * 60);
         let response = GateResponse {
             approved: true,
             note: None,
             responded_by: Some("human".into()),
         };
-        Gates::respond(root, 31, Stage::Ship, &response).unwrap();
-        let before = std::fs::read_to_string(Gates::response_path(root, 31, Stage::Ship)).unwrap();
+        Gates::respond(root, PhaseId::new(31), Stage::Ship, &response).unwrap();
+        let before =
+            std::fs::read_to_string(Gates::response_path(root, PhaseId::new(31), Stage::Ship))
+                .unwrap();
 
         let result = gate_sweep(None, false, Some(root.to_path_buf()), false);
 
         assert!(result.is_ok(), "an already-answered gate must not error");
-        let after = std::fs::read_to_string(Gates::response_path(root, 31, Stage::Ship)).unwrap();
+        let after =
+            std::fs::read_to_string(Gates::response_path(root, PhaseId::new(31), Stage::Ship))
+                .unwrap();
         assert_eq!(
             before, after,
             "the pre-existing response must be byte-identical afterwards"
@@ -4013,12 +4067,12 @@ mod tests {
     fn gate_sweep_emits_gate_reaped_event_on_reap() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        Gates::write_gate(root, 32, Stage::Ship, "ctx").unwrap();
-        backdate_gate(root, 32, Stage::Ship, 7 * 60 * 60);
+        Gates::write_gate(root, PhaseId::new(32), Stage::Ship, "ctx").unwrap();
+        backdate_gate(root, PhaseId::new(32), Stage::Ship, 7 * 60 * 60);
 
         gate_sweep(None, false, Some(root.to_path_buf()), false).unwrap();
 
-        let event = devflow_core::events::last_event_for_phase(root, 32).unwrap();
+        let event = devflow_core::events::last_event_for_phase(root, PhaseId::new(32)).unwrap();
         assert_eq!(event["event"], "gate_reaped");
         assert_eq!(event["stage"], "ship");
     }
@@ -4424,13 +4478,15 @@ mod tests {
     fn stop_refuses_to_signal_a_live_pid_that_fails_the_identity_check() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 200;
+        let phase = PhaseId::new(200);
 
         // Our own pid is genuinely alive throughout — no spawn, so no
         // execve to race. The lock records ONLY the pid, matching every
         // lock file written before start times were recorded (999.47).
         let pid = std::process::id();
-        let lock_path = root.join(".devflow").join(format!("lock-{phase:02}"));
+        let lock_path = root
+            .join(".devflow")
+            .join(format!("lock-{padded}", padded = phase.padded()));
         std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
         std::fs::write(&lock_path, pid.to_string()).unwrap();
 
@@ -4473,7 +4529,7 @@ mod tests {
     fn stop_refuses_when_the_recorded_start_time_does_not_match() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 201;
+        let phase = PhaseId::new(201);
 
         // Our own pid is genuinely alive and genuinely devflow-named, so the
         // old cmdline check would have happily signalled it. Only the start
@@ -4483,7 +4539,9 @@ mod tests {
             .expect("read our own start time from /proc");
         let wrong_start = real_start + 1;
 
-        let lock_path = root.join(".devflow").join(format!("lock-{phase:02}"));
+        let lock_path = root
+            .join(".devflow")
+            .join(format!("lock-{padded}", padded = phase.padded()));
         std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
         std::fs::write(&lock_path, format!("{pid}\n{wrong_start}")).unwrap();
 
@@ -4510,7 +4568,7 @@ mod tests {
     fn stop_signals_the_holder_when_the_recorded_identity_matches() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 202;
+        let phase = PhaseId::new(202);
 
         let mut child = std::process::Command::new("sleep")
             .arg("30")
@@ -4531,7 +4589,9 @@ mod tests {
         }
         let child_start = child_start.expect("read the child's start time");
 
-        let lock_path = root.join(".devflow").join(format!("lock-{phase:02}"));
+        let lock_path = root
+            .join(".devflow")
+            .join(format!("lock-{padded}", padded = phase.padded()));
         std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
         std::fs::write(&lock_path, format!("{child_pid}\n{child_start}")).unwrap();
 
@@ -4554,8 +4614,10 @@ mod tests {
     fn stop_is_a_success_no_op_when_the_lock_names_a_dead_pid() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 202;
-        let lock_path = root.join(".devflow").join(format!("lock-{phase:02}"));
+        let phase = PhaseId::new(202);
+        let lock_path = root
+            .join(".devflow")
+            .join(format!("lock-{padded}", padded = phase.padded()));
         std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
         // Above default kernel pid_max — guaranteed not alive.
         std::fs::write(&lock_path, "9999999").unwrap();
@@ -4572,7 +4634,7 @@ mod tests {
     fn stop_never_treats_monitor_pid_as_a_signalling_target() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let phase = 203;
+        let phase = PhaseId::new(203);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.monitor_pid = Some(std::process::id());
         workflow::save_state(&state).unwrap();
@@ -4590,7 +4652,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        stop(root, 201).expect("stop against nothing present must succeed");
+        stop(root, PhaseId::new(201)).expect("stop against nothing present must succeed");
     }
 
     /// 14-CR-03: a capture file SHORTER than the follower's offset means the
@@ -4671,14 +4733,30 @@ mod tests {
         run(&["commit", "-q", "-m", "init"]);
         run(&["branch", "develop"]);
 
-        assert!(phase_artifact_on_develop(root, 3, "-CONTEXT.md"));
-        assert!(!phase_artifact_on_develop(root, 3, "-PLAN.md"));
-        assert!(!phase_artifact_on_develop(root, 4, "-CONTEXT.md"));
+        assert!(phase_artifact_on_develop(
+            root,
+            PhaseId::new(3),
+            "-CONTEXT.md"
+        ));
+        assert!(!phase_artifact_on_develop(
+            root,
+            PhaseId::new(3),
+            "-PLAN.md"
+        ));
+        assert!(!phase_artifact_on_develop(
+            root,
+            PhaseId::new(4),
+            "-CONTEXT.md"
+        ));
 
         // Fail-open: outside a repo (or with no develop branch) the
         // pre-flight must not block.
         let empty = tempfile::tempdir().unwrap();
-        assert!(phase_artifact_on_develop(empty.path(), 3, "-CONTEXT.md"));
+        assert!(phase_artifact_on_develop(
+            empty.path(),
+            PhaseId::new(3),
+            "-CONTEXT.md"
+        ));
     }
 
     // -----------------------------------------------------------------
@@ -4694,7 +4772,12 @@ mod tests {
     /// documents `events.jsonl` as a file that's safe to tail and paste.
     #[test]
     fn workflow_started_payload_carries_build_provenance() {
-        let state = State::new(66, AgentKind::Claude, Mode::Auto, PathBuf::from("/repo"));
+        let state = State::new(
+            PhaseId::new(66),
+            AgentKind::Claude,
+            Mode::Auto,
+            PathBuf::from("/repo"),
+        );
         let payload = workflow_started_payload(&state);
         assert_eq!(payload["agent"], "claude");
         assert_eq!(payload["mode"], "auto");
@@ -4726,7 +4809,7 @@ mod tests {
     fn status_shows_pending_gate_prominently() {
         let dir = tempfile::tempdir().unwrap();
         let context = format!("first line\n\u{1b}[2J{}", "sensitive detail ".repeat(80));
-        Gates::write_gate(dir.path(), 16, Stage::Ship, &context).unwrap();
+        Gates::write_gate(dir.path(), PhaseId::new(16), Stage::Ship, &context).unwrap();
         let open = Gates::list_open(dir.path());
 
         let banner = render_pending_gate_banner(&open, u64::MAX).unwrap();
@@ -4788,7 +4871,7 @@ mod tests {
     #[test]
     fn all_roots_row_includes_gate_with_non_numeric_timestamp() {
         let gate = OpenGate {
-            phase: 42,
+            phase: PhaseId::new(42),
             stage: Stage::Ship,
             context: "ctx".to_string(),
             timestamp: "not-a-number".to_string(),
@@ -4806,7 +4889,12 @@ mod tests {
     #[test]
     fn recovery_hints_includes_resume_for_stuck() {
         let dir = tempfile::tempdir().unwrap();
-        let state = State::new(7, AgentKind::Claude, Mode::Auto, dir.path().to_path_buf());
+        let state = State::new(
+            PhaseId::new(7),
+            AgentKind::Claude,
+            Mode::Auto,
+            dir.path().to_path_buf(),
+        );
 
         let hints = recovery_hints(&state, Liveness::Stuck);
 
@@ -4816,7 +4904,12 @@ mod tests {
     #[test]
     fn recovery_hints_includes_advance_when_stuck_and_gate_pending() {
         let dir = tempfile::tempdir().unwrap();
-        let mut state = State::new(7, AgentKind::Claude, Mode::Auto, dir.path().to_path_buf());
+        let mut state = State::new(
+            PhaseId::new(7),
+            AgentKind::Claude,
+            Mode::Auto,
+            dir.path().to_path_buf(),
+        );
         state.gate_pending = true;
 
         let hints = recovery_hints(&state, Liveness::Stuck);
@@ -4833,7 +4926,12 @@ mod tests {
     #[test]
     fn recovery_hints_empty_for_healthy() {
         let dir = tempfile::tempdir().unwrap();
-        let state = State::new(7, AgentKind::Claude, Mode::Auto, dir.path().to_path_buf());
+        let state = State::new(
+            PhaseId::new(7),
+            AgentKind::Claude,
+            Mode::Auto,
+            dir.path().to_path_buf(),
+        );
 
         assert!(recovery_hints(&state, Liveness::Healthy).is_empty());
     }
@@ -4848,7 +4946,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
             events::last_events_by_phase(dir.path())
-                .get(&7)
+                .get(&PhaseId::new(7))
                 .and_then(|s| s.stage_launched_ts),
             None
         );
@@ -4870,13 +4968,18 @@ mod tests {
         let stage_ts = now - 90;
         let phase_started_at = now - 30 * 60;
 
-        let mut state = State::new(7, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let mut state = State::new(
+            PhaseId::new(7),
+            AgentKind::Claude,
+            Mode::Auto,
+            root.to_path_buf(),
+        );
         state.started_at = phase_started_at.to_string();
         workflow::save_state(&state).unwrap();
 
         events::emit(
             root,
-            7,
+            PhaseId::new(7),
             "stage_launched",
             serde_json::json!({"stage": "code", "agent": "claude", "monitor_pid": 1}),
         );
@@ -4898,7 +5001,7 @@ mod tests {
         std::fs::write(&events_path, rewritten).unwrap();
 
         let ts = events::last_events_by_phase(root)
-            .get(&7)
+            .get(&PhaseId::new(7))
             .and_then(|s| s.stage_launched_ts);
         assert_eq!(ts, Some(stage_ts));
 
@@ -4928,7 +5031,7 @@ mod tests {
         /// A fully-agreeing baseline: `reconcile_phase` over this returns
         /// zero findings. Each test overrides only the field(s) needed to
         /// trigger the one check it's proving.
-        fn agreeing_facts(phase: u32) -> PhaseFacts {
+        fn agreeing_facts(phase: PhaseId) -> PhaseFacts {
             PhaseFacts {
                 phase,
                 stage: Stage::Code,
@@ -4947,7 +5050,7 @@ mod tests {
 
         #[test]
         fn reconcile_phase_returns_no_findings_when_all_agree() {
-            let facts = agreeing_facts(1);
+            let facts = agreeing_facts(PhaseId::new(1));
             assert!(reconcile_phase(&facts).is_empty());
         }
 
@@ -4956,7 +5059,7 @@ mod tests {
             let facts = PhaseFacts {
                 gate_pending: true,
                 open_gate_stages: Vec::new(),
-                ..agreeing_facts(2)
+                ..agreeing_facts(PhaseId::new(2))
             };
             let findings = reconcile_phase(&facts);
             assert_eq!(findings.len(), 1);
@@ -4973,7 +5076,7 @@ mod tests {
             let facts = PhaseFacts {
                 gate_pending: false,
                 open_gate_stages: vec![Stage::Validate],
-                ..agreeing_facts(3)
+                ..agreeing_facts(PhaseId::new(3))
             };
             let findings = reconcile_phase(&facts);
             assert_eq!(findings.len(), 1);
@@ -4990,7 +5093,7 @@ mod tests {
             let facts = PhaseFacts {
                 agent_pid: Some(999_999),
                 agent_alive: false,
-                ..agreeing_facts(4)
+                ..agreeing_facts(PhaseId::new(4))
             };
             let findings = reconcile_phase(&facts);
             assert_eq!(findings.len(), 1);
@@ -5007,7 +5110,7 @@ mod tests {
             let facts = PhaseFacts {
                 stage: Stage::Validate,
                 last_launched_stage: Some(Stage::Code),
-                ..agreeing_facts(5)
+                ..agreeing_facts(PhaseId::new(5))
             };
             let findings = reconcile_phase(&facts);
             assert_eq!(findings.len(), 1);
@@ -5026,7 +5129,7 @@ mod tests {
                 stage: Stage::Plan,
                 last_launched_stage: Some(Stage::Plan),
                 feature_branch_exists: false,
-                ..agreeing_facts(6)
+                ..agreeing_facts(PhaseId::new(6))
             };
             let findings = reconcile_phase(&facts);
             assert_eq!(findings.len(), 1);
@@ -5045,7 +5148,7 @@ mod tests {
                 monitor_alive: false,
                 agent_pid: Some(4242),
                 agent_alive: false,
-                ..agreeing_facts(8)
+                ..agreeing_facts(PhaseId::new(8))
             };
             let findings = reconcile_phase(&facts);
             let monitor_finding = findings
@@ -5072,7 +5175,7 @@ mod tests {
                 agent_pid: Some(999_999),
                 agent_alive: false,
                 stopped: true,
-                ..agreeing_facts(11)
+                ..agreeing_facts(PhaseId::new(11))
             };
             let findings = reconcile_phase(&facts);
             assert!(
@@ -5098,7 +5201,7 @@ mod tests {
                 agent_pid: Some(4242),
                 agent_alive: false,
                 stopped: true,
-                ..agreeing_facts(12)
+                ..agreeing_facts(PhaseId::new(12))
             };
             let findings = reconcile_phase(&facts);
             assert!(
@@ -5117,7 +5220,7 @@ mod tests {
             let facts = PhaseFacts {
                 monitor_pid: None,
                 monitor_alive: false,
-                ..agreeing_facts(9)
+                ..agreeing_facts(PhaseId::new(9))
             };
             assert!(
                 reconcile_phase(&facts).is_empty(),
@@ -5136,7 +5239,7 @@ mod tests {
                 monitor_pid: Some(5150),
                 monitor_alive: true,
                 agent_alive: false,
-                ..agreeing_facts(10)
+                ..agreeing_facts(PhaseId::new(10))
             };
             let findings = reconcile_phase(&facts);
             assert!(
@@ -5159,7 +5262,7 @@ mod tests {
                 last_launched_stage: Some(Stage::Validate),
                 open_gate_stages: Vec::new(),
                 feature_branch_exists: false,
-                ..agreeing_facts(7)
+                ..agreeing_facts(PhaseId::new(7))
             };
             let findings = reconcile_phase(&facts);
             let severities: Vec<Severity> = findings.iter().map(|f| f.severity).collect();
@@ -5202,7 +5305,7 @@ mod tests {
         fn doctor_reports_gate_pending_without_gate_file() {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path();
-            let phase = 90;
+            let phase = PhaseId::new(90);
             let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
             state.stage = Stage::Validate;
             state.gate_pending = true;
@@ -5234,7 +5337,7 @@ mod tests {
 
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path();
-            let phase = 92;
+            let phase = PhaseId::new(92);
             let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
             state.stage = Stage::Validate;
             state.gate_pending = true; // mismatched: no gate file — produces a finding
@@ -5294,7 +5397,7 @@ mod tests {
         fn doctor_is_read_only_on_a_mismatched_project() {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path();
-            let phase = 91;
+            let phase = PhaseId::new(91);
             let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
             state.stage = Stage::Validate;
             state.gate_pending = true; // mismatched: no gate file will exist
@@ -5611,7 +5714,12 @@ mod tests {
         let project_root = project_root_guard.path().to_path_buf();
 
         // Phase 1: a real `State` naming `state_pid` as its monitor.
-        let mut state = State::new(1, AgentKind::Claude, Mode::Auto, project_root.clone());
+        let mut state = State::new(
+            PhaseId::new(1),
+            AgentKind::Claude,
+            Mode::Auto,
+            project_root.clone(),
+        );
         state.monitor_pid = Some(state_pid);
         workflow::save_state(&state).unwrap();
 
@@ -5621,7 +5729,12 @@ mod tests {
         // `monitor_pid`, so this phase's only path into the reachable
         // set is the lock file below, not the monitor_pid path Phase 1
         // already exercises.
-        let state_2 = State::new(2, AgentKind::Claude, Mode::Auto, project_root.clone());
+        let state_2 = State::new(
+            PhaseId::new(2),
+            AgentKind::Claude,
+            Mode::Auto,
+            project_root.clone(),
+        );
         workflow::save_state(&state_2).unwrap();
 
         // A lock file for phase 2, written directly in the documented
@@ -5640,13 +5753,13 @@ mod tests {
         // into a self-checking one — a future format change fails this
         // test loudly instead of silently exercising only half of it.
         assert_eq!(
-            lock::holder_identity(&project_root, 2),
+            lock::holder_identity(&project_root, PhaseId::new(2)),
             Some((lock_pid, Some(lock_start_time))),
             "the directly-written lock file must read back through holder_identity exactly \
              as one lock::acquire itself wrote would"
         );
 
-        registry::register_in(cache_dir.path(), &project_root, 1).unwrap();
+        registry::register_in(cache_dir.path(), &project_root, PhaseId::new(1)).unwrap();
         let registered_roots: Vec<PathBuf> = registry::load_roots_in(cache_dir.path())
             .into_iter()
             .map(|r| r.project_root)
@@ -5740,7 +5853,7 @@ mod tests {
         let mut child = spawn_wrapper_shaped_fixture();
         let pid = child.id();
 
-        let mut state = State::new(1, AgentKind::Claude, Mode::Auto, root.clone());
+        let mut state = State::new(PhaseId::new(1), AgentKind::Claude, Mode::Auto, root.clone());
         state.monitor_pid = Some(pid);
         workflow::save_state(&state).unwrap();
 
@@ -6204,13 +6317,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         events::emit(
             dir.path(),
-            30,
+            PhaseId::new(30),
             "workflow_shipped",
             serde_json::json!({"stage": "ship"}),
         );
 
-        assert!(evidence(dir.path(), 30, false, true).is_ok());
-        assert!(evidence(dir.path(), 31, false, true).is_err());
+        assert!(evidence(dir.path(), PhaseId::new(30), false, true).is_ok());
+        assert!(evidence(dir.path(), PhaseId::new(31), false, true).is_err());
     }
 
     /// 23-06 Task 3 acceptance: a phase that only stopped (`--until`) must
@@ -6222,12 +6335,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         events::emit(
             dir.path(),
-            32,
+            PhaseId::new(32),
             "workflow_finished",
             serde_json::json!({"reason": "stopped_at", "stage": "plan"}),
         );
 
-        let err = evidence(dir.path(), 32, false, true).unwrap_err();
+        let err = evidence(dir.path(), PhaseId::new(32), false, true).unwrap_err();
         let message = err.to_string();
         assert!(
             message.contains("stopped"),
@@ -6242,7 +6355,7 @@ mod tests {
     fn evidence_require_shipped_failure_message_is_single_line_and_names_phase() {
         let dir = tempfile::tempdir().unwrap();
 
-        let err = evidence(dir.path(), 33, false, true).unwrap_err();
+        let err = evidence(dir.path(), PhaseId::new(33), false, true).unwrap_err();
         let message = err.to_string();
         assert!(
             !message.contains('\n'),

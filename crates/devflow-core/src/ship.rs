@@ -4,6 +4,7 @@
 //! DevFlow run later) plus the pure document-finalization transform
 //! (CHANGELOG) used on ship completion.
 
+use crate::phase_id::PhaseId;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -13,7 +14,7 @@ pub struct CronInstructions {
     /// Absolute project root.
     pub project: String,
     /// Phase that should resume.
-    pub phase: u32,
+    pub phase: PhaseId,
     /// Current handoff status, e.g. "rate_limited".
     pub status: String,
     /// Upstream retry timestamp or description.
@@ -63,10 +64,11 @@ pub enum ShipError {
 /// Path to a phase's cron-instructions record. Per-phase since 14a
 /// (13-DEFERRED-CR-03): the old single-slot `cron-instructions.json` let one
 /// phase's rate-limit record clobber another's under `devflow parallel`.
-pub fn cron_instructions_path(project_root: &Path, phase: u32) -> PathBuf {
-    project_root
-        .join(".devflow")
-        .join(format!("cron-instructions-{phase:02}.json"))
+pub fn cron_instructions_path(project_root: &Path, phase: PhaseId) -> PathBuf {
+    project_root.join(".devflow").join(format!(
+        "cron-instructions-{padded}.json",
+        padded = phase.padded()
+    ))
 }
 
 /// Path of the legacy single-slot record written by pre-14a binaries. Still
@@ -92,7 +94,7 @@ pub fn write_cron_instructions(
 /// absent. Falls back to a legacy single-slot record when it names this phase.
 pub fn load_cron_instructions(
     project_root: &Path,
-    phase: u32,
+    phase: PhaseId,
 ) -> Result<CronInstructions, ShipError> {
     let path = cron_instructions_path(project_root, phase);
     if path.exists() {
@@ -134,7 +136,7 @@ pub fn list_cron_instructions(project_root: &Path) -> Vec<CronInstructions> {
 
 /// Remove a phase's cron-instructions record (and a legacy single-slot record
 /// naming the same phase). Idempotent.
-pub fn delete_cron_instructions(project_root: &Path, phase: u32) -> Result<(), ShipError> {
+pub fn delete_cron_instructions(project_root: &Path, phase: PhaseId) -> Result<(), ShipError> {
     let path = cron_instructions_path(project_root, phase);
     if path.exists() {
         std::fs::remove_file(path)?;
@@ -158,7 +160,7 @@ pub fn delete_cron_instructions(project_root: &Path, phase: u32) -> Result<(), S
 /// from the phase's saved state.
 pub fn build_single_agent_cron_instructions(
     project_root: &Path,
-    phase: u32,
+    phase: PhaseId,
     retry_after: &str,
 ) -> CronInstructions {
     let project = project_root.display().to_string();
@@ -178,7 +180,7 @@ pub fn build_single_agent_cron_instructions(
         },
         hermes_cron: HermesCronJob {
             schedule: cron_schedule_from_retry_after(retry_after).unwrap_or_default(),
-            name: format!("devflow-phase-{phase:02}-resume"),
+            name: format!("devflow-phase-{padded}-resume", padded = phase.padded()),
             command: format!(
                 "cd {} && devflow resume --phase {phase}",
                 shell_quote(&project)
@@ -427,22 +429,33 @@ mod tests {
     #[test]
     fn cron_instructions_save_load_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let record = build_single_agent_cron_instructions(dir.path(), 7, "2026-06-18T15:45:30Z");
+        let record = build_single_agent_cron_instructions(
+            dir.path(),
+            PhaseId::new(7),
+            "2026-06-18T15:45:30Z",
+        );
 
         write_cron_instructions(dir.path(), &record).unwrap();
 
-        assert_eq!(load_cron_instructions(dir.path(), 7).unwrap(), record);
+        assert_eq!(
+            load_cron_instructions(dir.path(), PhaseId::new(7)).unwrap(),
+            record
+        );
     }
 
     #[test]
     fn delete_cron_instructions_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
-        let record = build_single_agent_cron_instructions(dir.path(), 7, "2026-06-18T15:45:30Z");
+        let record = build_single_agent_cron_instructions(
+            dir.path(),
+            PhaseId::new(7),
+            "2026-06-18T15:45:30Z",
+        );
         write_cron_instructions(dir.path(), &record).unwrap();
 
-        delete_cron_instructions(dir.path(), 7).unwrap();
-        assert!(!cron_instructions_path(dir.path(), 7).exists());
-        delete_cron_instructions(dir.path(), 7).unwrap();
+        delete_cron_instructions(dir.path(), PhaseId::new(7)).unwrap();
+        assert!(!cron_instructions_path(dir.path(), PhaseId::new(7)).exists());
+        delete_cron_instructions(dir.path(), PhaseId::new(7)).unwrap();
     }
 
     /// 13-DEFERRED-CR-03 re-check: two phases' rate-limit records must
@@ -450,19 +463,39 @@ mod tests {
     #[test]
     fn cron_instructions_are_per_phase() {
         let dir = tempfile::tempdir().unwrap();
-        let a = build_single_agent_cron_instructions(dir.path(), 7, "2026-06-18T15:45:30Z");
-        let b = build_single_agent_cron_instructions(dir.path(), 8, "2026-06-18T16:45:30Z");
+        let a = build_single_agent_cron_instructions(
+            dir.path(),
+            PhaseId::new(7),
+            "2026-06-18T15:45:30Z",
+        );
+        let b = build_single_agent_cron_instructions(
+            dir.path(),
+            PhaseId::new(8),
+            "2026-06-18T16:45:30Z",
+        );
         write_cron_instructions(dir.path(), &a).unwrap();
         write_cron_instructions(dir.path(), &b).unwrap();
 
-        assert_eq!(load_cron_instructions(dir.path(), 7).unwrap(), a);
-        assert_eq!(load_cron_instructions(dir.path(), 8).unwrap(), b);
+        assert_eq!(
+            load_cron_instructions(dir.path(), PhaseId::new(7)).unwrap(),
+            a
+        );
+        assert_eq!(
+            load_cron_instructions(dir.path(), PhaseId::new(8)).unwrap(),
+            b
+        );
         let listed = list_cron_instructions(dir.path());
-        assert_eq!(listed.iter().map(|i| i.phase).collect::<Vec<_>>(), [7, 8]);
+        assert_eq!(
+            listed.iter().map(|i| i.phase).collect::<Vec<_>>(),
+            [PhaseId::new(7), PhaseId::new(8)]
+        );
 
-        delete_cron_instructions(dir.path(), 7).unwrap();
-        assert!(load_cron_instructions(dir.path(), 7).is_err());
-        assert_eq!(load_cron_instructions(dir.path(), 8).unwrap(), b);
+        delete_cron_instructions(dir.path(), PhaseId::new(7)).unwrap();
+        assert!(load_cron_instructions(dir.path(), PhaseId::new(7)).is_err());
+        assert_eq!(
+            load_cron_instructions(dir.path(), PhaseId::new(8)).unwrap(),
+            b
+        );
     }
 
     /// Upgrade path: a legacy single-slot `cron-instructions.json` written by
@@ -470,16 +503,23 @@ mod tests {
     #[test]
     fn legacy_cron_instructions_are_read_and_deleted() {
         let dir = tempfile::tempdir().unwrap();
-        let record = build_single_agent_cron_instructions(dir.path(), 5, "2026-06-18T15:45:30Z");
+        let record = build_single_agent_cron_instructions(
+            dir.path(),
+            PhaseId::new(5),
+            "2026-06-18T15:45:30Z",
+        );
         let legacy = legacy_cron_instructions_path(dir.path());
         std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
         std::fs::write(&legacy, serde_json::to_string_pretty(&record).unwrap()).unwrap();
 
-        assert_eq!(load_cron_instructions(dir.path(), 5).unwrap(), record);
-        assert!(load_cron_instructions(dir.path(), 6).is_err());
+        assert_eq!(
+            load_cron_instructions(dir.path(), PhaseId::new(5)).unwrap(),
+            record
+        );
+        assert!(load_cron_instructions(dir.path(), PhaseId::new(6)).is_err());
         assert_eq!(list_cron_instructions(dir.path()).len(), 1);
 
-        delete_cron_instructions(dir.path(), 5).unwrap();
+        delete_cron_instructions(dir.path(), PhaseId::new(5)).unwrap();
         assert!(!legacy.exists());
     }
 
@@ -574,7 +614,11 @@ mod tests {
     #[test]
     fn single_agent_cron_instructions_resume_command_is_devflow_resume() {
         let dir = tempfile::tempdir().unwrap();
-        let record = build_single_agent_cron_instructions(dir.path(), 9, "2026-06-18T15:45:30Z");
+        let record = build_single_agent_cron_instructions(
+            dir.path(),
+            PhaseId::new(9),
+            "2026-06-18T15:45:30Z",
+        );
 
         assert_eq!(record.resume.command, "devflow");
         assert_eq!(record.resume.args, ["resume", "--phase", "9"]);
@@ -592,7 +636,7 @@ mod tests {
     #[test]
     fn cron_instructions_reject_unparseable_retry_time() {
         let dir = tempfile::tempdir().unwrap();
-        let record = build_single_agent_cron_instructions(dir.path(), 7, "unknown");
+        let record = build_single_agent_cron_instructions(dir.path(), PhaseId::new(7), "unknown");
 
         assert_ne!(record.hermes_cron.schedule, "* * * * *");
         assert!(record.hermes_cron.schedule.is_empty());

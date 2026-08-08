@@ -3,6 +3,7 @@
 //! Launches `opencode run "<prompt>"` in non-interactive mode.
 
 use super::AgentAdapter;
+use crate::phase_id::PhaseId;
 
 pub struct OpenCodeAgent;
 
@@ -13,7 +14,7 @@ impl AgentAdapter for OpenCodeAgent {
 
     fn exec_command(
         &self,
-        _phase: u32,
+        _phase: PhaseId,
         prompt: &str,
         _extra_writable_roots: &[std::path::PathBuf],
     ) -> (&'static str, Vec<String>) {

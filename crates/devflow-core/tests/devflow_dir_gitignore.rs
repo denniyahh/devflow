@@ -22,6 +22,7 @@ use devflow_core::events;
 use devflow_core::gates::Gates;
 use devflow_core::lock;
 use devflow_core::monitor;
+use devflow_core::phase_id::PhaseId;
 use devflow_core::ship;
 use devflow_core::workflow;
 use devflow_core::{AgentKind, Mode, Stage, State};
@@ -89,7 +90,12 @@ fn all_seven_devflow_constructors_produce_the_gitignore() {
     {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let state = State::new(1, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let state = State::new(
+            PhaseId::new(1),
+            AgentKind::Claude,
+            Mode::Auto,
+            root.to_path_buf(),
+        );
         workflow::save_state(&state).expect("save_state");
         if !gitignore_is_star(root) {
             failures.push("workflow::save_state (workflow.rs)");
@@ -100,7 +106,7 @@ fn all_seven_devflow_constructors_produce_the_gitignore() {
     {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        Gates::write_gate(root, 1, Stage::Validate, "context").expect("write_gate");
+        Gates::write_gate(root, PhaseId::new(1), Stage::Validate, "context").expect("write_gate");
         if !gitignore_is_star(root) {
             failures.push("gates::Gates::write_gate (gates.rs)");
         }
@@ -127,7 +133,12 @@ fn all_seven_devflow_constructors_produce_the_gitignore() {
     {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let state = State::new(1, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let state = State::new(
+            PhaseId::new(1),
+            AgentKind::Claude,
+            Mode::Auto,
+            root.to_path_buf(),
+        );
         let pid = monitor::spawn_monitor(
             &state,
             "sh",
@@ -138,7 +149,7 @@ fn all_seven_devflow_constructors_produce_the_gitignore() {
         .expect("spawn_monitor");
 
         wait_for_file(
-            &agent_result::exit_code_path(root, 1),
+            &agent_result::exit_code_path(root, PhaseId::new(1)),
             Duration::from_secs(5),
         );
         wait_for_pid_to_die(pid, Duration::from_secs(5));
@@ -155,8 +166,12 @@ fn all_seven_devflow_constructors_produce_the_gitignore() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir_all(root.join(".devflow")).unwrap();
-        std::fs::write(agent_result::stdout_path(root, 1), "stdout capture\n").unwrap();
-        archive_phase_files_or_panic(root, 1);
+        std::fs::write(
+            agent_result::stdout_path(root, PhaseId::new(1)),
+            "stdout capture\n",
+        )
+        .unwrap();
+        archive_phase_files_or_panic(root, PhaseId::new(1));
         if !gitignore_is_star(root) {
             failures.push("agent_result::archive_phase_files (agent_result.rs)");
         }
@@ -166,7 +181,7 @@ fn all_seven_devflow_constructors_produce_the_gitignore() {
     {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        events::emit(root, 1, "test_event", serde_json::json!({}));
+        events::emit(root, PhaseId::new(1), "test_event", serde_json::json!({}));
         if !gitignore_is_star(root) {
             failures.push("events::emit (events.rs)");
         }
@@ -176,8 +191,11 @@ fn all_seven_devflow_constructors_produce_the_gitignore() {
     {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let instructions =
-            ship::build_single_agent_cron_instructions(root, 1, "2026-01-01T00:00:00Z");
+        let instructions = ship::build_single_agent_cron_instructions(
+            root,
+            PhaseId::new(1),
+            "2026-01-01T00:00:00Z",
+        );
         ship::write_cron_instructions(root, &instructions).expect("write_cron_instructions");
         if !gitignore_is_star(root) {
             failures.push("ship::write_cron_instructions (ship.rs)");
@@ -188,7 +206,7 @@ fn all_seven_devflow_constructors_produce_the_gitignore() {
     {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let _guard = lock::acquire(root, 1).expect("lock::acquire");
+        let _guard = lock::acquire(root, PhaseId::new(1)).expect("lock::acquire");
         if !gitignore_is_star(root) {
             failures.push("lock::acquire (lock.rs)");
         }
@@ -203,7 +221,7 @@ fn all_seven_devflow_constructors_produce_the_gitignore() {
 /// Small helper so a failing `archive_phase_files` reports through the same
 /// accumulate-then-assert shape as the other 6 sites, instead of panicking
 /// mid-test via `.expect()` and hiding which of the 7 sites regressed.
-fn archive_phase_files_or_panic(root: &Path, phase: u32) {
+fn archive_phase_files_or_panic(root: &Path, phase: PhaseId) {
     agent_result::archive_phase_files(root, root, phase, 5).expect("archive_phase_files");
 }
 

@@ -11,6 +11,7 @@
 
 use devflow_core::gates::{GateAction, GateFile, Gates};
 use devflow_core::mode::Mode;
+use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
 use std::path::Path;
@@ -39,7 +40,7 @@ fn git(root: &Path, args: &[&str]) {
 /// commit, hooks disabled — the same shape `pipeline_launch.rs`'s
 /// `code_unknown_does_not_transition_to_validate` test uses to reach an
 /// `AgentStatus::Unknown` Code outcome (no exit-code capture file written).
-fn init_repo(root: &Path, phase: u32) {
+fn init_repo(root: &Path, phase: PhaseId) {
     git(root, &["init", "-q"]);
     git(root, &["config", "user.email", "devflow@example.com"]);
     git(root, &["config", "user.name", "DevFlow Tests"]);
@@ -50,7 +51,7 @@ fn init_repo(root: &Path, phase: u32) {
     git(root, &["add", "README.md"]);
     git(root, &["commit", "-q", "-m", "base"]);
 
-    let branch = format!("feature/phase-{phase:02}");
+    let branch = format!("feature/phase-{padded}", padded = phase.padded());
     git(root, &["checkout", "-q", "-b", &branch]);
     std::fs::write(root.join("work.txt"), "agent work\n").unwrap();
     git(root, &["add", "work.txt"]);
@@ -96,7 +97,7 @@ fn e2e_child_timeout() -> Duration {
 fn wait_for_child_exit(
     child: &mut std::process::Child,
     root: &Path,
-    phase: u32,
+    phase: PhaseId,
     deadline: Duration,
 ) -> std::process::ExitStatus {
     let start = Instant::now();
@@ -126,7 +127,7 @@ fn wait_for_child_exit(
 /// `age_secs` old — the deterministic way to make a gate look abandoned
 /// without sleeping in the test. Round-trips through the same [`GateFile`]
 /// shape `Gates::write_gate` itself writes.
-fn backdate_gate(root: &Path, phase: u32, stage: Stage, age_secs: u64) {
+fn backdate_gate(root: &Path, phase: PhaseId, stage: Stage, age_secs: u64) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -152,7 +153,7 @@ fn backdate_gate(root: &Path, phase: u32, stage: Stage, age_secs: u64) {
 fn sweep_reaps_an_aged_gate_and_a_real_poller_resolves_to_abort() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let phase = 91;
+    let phase = PhaseId::new(91);
     let stage = Stage::Ship;
 
     Gates::write_gate(root, phase, stage, "approve merge?").unwrap();
@@ -195,7 +196,7 @@ fn sweep_reaps_an_aged_gate_and_a_real_poller_resolves_to_abort() {
 fn sweep_leaves_a_fresh_gate_untouched() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let phase = 92;
+    let phase = PhaseId::new(92);
     let stage = Stage::Validate;
 
     // Freshly written — `unix_now()`'s age is ~0s, well under the 6h default.
@@ -262,7 +263,7 @@ fn sweep_help_documents_max_age_and_dry_run() {
 fn sweep_ends_a_real_advance_process_through_its_own_abort_path() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let phase = 95;
+    let phase = PhaseId::new(95);
 
     init_repo(root, phase);
 

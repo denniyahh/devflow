@@ -67,6 +67,7 @@ pub mod lock;
 pub mod mode;
 pub mod monitor;
 pub mod outcome_policy;
+pub mod phase_id;
 pub mod prompt;
 pub mod recover;
 pub mod registry;

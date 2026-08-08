@@ -17,6 +17,7 @@
 //! `write_all` of a complete line on an `O_APPEND` handle, so concurrent
 //! phase monitors' lines interleave without tearing.
 
+use crate::phase_id::PhaseId;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -32,7 +33,7 @@ const SCHEMA_VERSION: u32 = 1;
 
 /// Append one event line. `fields` supplies the kind-specific payload and
 /// must be a JSON object (anything else is recorded under a `"data"` key).
-pub fn emit(project_root: &Path, phase: u32, event: &str, fields: serde_json::Value) {
+pub fn emit(project_root: &Path, phase: PhaseId, event: &str, fields: serde_json::Value) {
     let mut line = serde_json::json!({
         "v": SCHEMA_VERSION,
         "ts": unix_now(),
@@ -89,10 +90,10 @@ pub struct PhaseEventSummary {
 /// already-recorded launch timestamp.
 pub fn last_events_by_phase(
     project_root: &Path,
-) -> std::collections::HashMap<u32, PhaseEventSummary> {
+) -> std::collections::HashMap<PhaseId, PhaseEventSummary> {
     use std::collections::hash_map::Entry;
 
-    let mut latest: std::collections::HashMap<u32, PhaseEventSummary> =
+    let mut latest: std::collections::HashMap<PhaseId, PhaseEventSummary> =
         std::collections::HashMap::new();
     let Ok(contents) = std::fs::read_to_string(events_path(project_root)) else {
         return latest;
@@ -101,10 +102,9 @@ pub fn last_events_by_phase(
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
     {
-        let Some(phase) = event.get("phase").and_then(|p| p.as_u64()) else {
+        let Some(phase) = PhaseId::from_json(event.get("phase")) else {
             continue;
         };
-        let phase = phase as u32;
         let launch_ts = (event.get("event").and_then(|e| e.as_str()) == Some("stage_launched"))
             .then(|| event.get("ts").and_then(|t| t.as_u64()))
             .flatten();
@@ -131,7 +131,7 @@ pub fn last_events_by_phase(
 }
 
 /// Read the last event line recorded for `phase`, if any.
-pub fn last_event_for_phase(project_root: &Path, phase: u32) -> Option<serde_json::Value> {
+pub fn last_event_for_phase(project_root: &Path, phase: PhaseId) -> Option<serde_json::Value> {
     last_events_by_phase(project_root)
         .remove(&phase)
         .map(|summary| summary.event)
@@ -149,7 +149,7 @@ pub fn last_event_for_phase(project_root: &Path, phase: u32) -> Option<serde_jso
 /// preserve once a later, different event overwrites it.
 pub fn last_event_of_kind_for_phase(
     project_root: &Path,
-    phase: u32,
+    phase: PhaseId,
     event: &str,
 ) -> Option<serde_json::Value> {
     let contents = std::fs::read_to_string(events_path(project_root)).ok()?;
@@ -158,7 +158,7 @@ pub fn last_event_of_kind_for_phase(
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
     {
-        if value.get("phase").and_then(|p| p.as_u64()) == Some(phase as u64)
+        if phase.matches_json(value.get("phase"))
             && value.get("event").and_then(|e| e.as_str()) == Some(event)
         {
             last = Some(value);
@@ -170,7 +170,7 @@ pub fn last_event_of_kind_for_phase(
 /// Whether `phase` has ever emitted an event named `event`. Implemented as
 /// [`last_event_of_kind_for_phase`]`.is_some()` so there is one scanner, not
 /// two.
-pub fn has_event_for_phase(project_root: &Path, phase: u32, event: &str) -> bool {
+pub fn has_event_for_phase(project_root: &Path, phase: PhaseId, event: &str) -> bool {
     last_event_of_kind_for_phase(project_root, phase, event).is_some()
 }
 
@@ -213,13 +213,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         emit(
             dir.path(),
-            14,
+            PhaseId::new(14),
             "transition",
             serde_json::json!({"from": "code", "to": "validate"}),
         );
         emit(
             dir.path(),
-            15,
+            PhaseId::new(15),
             "gate_fired",
             serde_json::json!({"stage": "ship"}),
         );
@@ -243,7 +243,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         emit(
             dir.path(),
-            7,
+            PhaseId::new(7),
             "transition",
             serde_json::json!({"phase": 99, "event": "forged", "note": "kept"}),
         );
@@ -257,45 +257,66 @@ mod tests {
     #[test]
     fn last_event_for_phase_filters_by_phase() {
         let dir = tempfile::tempdir().unwrap();
-        emit(dir.path(), 1, "workflow_started", serde_json::Value::Null);
-        emit(dir.path(), 2, "workflow_started", serde_json::Value::Null);
         emit(
             dir.path(),
-            1,
+            PhaseId::new(1),
+            "workflow_started",
+            serde_json::Value::Null,
+        );
+        emit(
+            dir.path(),
+            PhaseId::new(2),
+            "workflow_started",
+            serde_json::Value::Null,
+        );
+        emit(
+            dir.path(),
+            PhaseId::new(1),
             "transition",
             serde_json::json!({"to": "plan"}),
         );
 
-        let last = last_event_for_phase(dir.path(), 1).expect("phase 1 events exist");
+        let last = last_event_for_phase(dir.path(), PhaseId::new(1)).expect("phase 1 events exist");
         assert_eq!(last["event"], "transition");
-        let other = last_event_for_phase(dir.path(), 2).expect("phase 2 events exist");
+        let other =
+            last_event_for_phase(dir.path(), PhaseId::new(2)).expect("phase 2 events exist");
         assert_eq!(other["event"], "workflow_started");
-        assert!(last_event_for_phase(dir.path(), 3).is_none());
+        assert!(last_event_for_phase(dir.path(), PhaseId::new(3)).is_none());
     }
 
     /// 14-CR-10: one pass over the log yields every phase's latest event.
     #[test]
     fn last_events_by_phase_collects_latest_per_phase_in_one_pass() {
         let dir = tempfile::tempdir().unwrap();
-        emit(dir.path(), 1, "workflow_started", serde_json::Value::Null);
-        emit(dir.path(), 2, "workflow_started", serde_json::Value::Null);
         emit(
             dir.path(),
-            1,
+            PhaseId::new(1),
+            "workflow_started",
+            serde_json::Value::Null,
+        );
+        emit(
+            dir.path(),
+            PhaseId::new(2),
+            "workflow_started",
+            serde_json::Value::Null,
+        );
+        emit(
+            dir.path(),
+            PhaseId::new(1),
             "transition",
             serde_json::json!({"to": "plan"}),
         );
         emit(
             dir.path(),
-            2,
+            PhaseId::new(2),
             "gate_fired",
             serde_json::json!({"stage": "ship"}),
         );
 
         let latest = last_events_by_phase(dir.path());
         assert_eq!(latest.len(), 2);
-        assert_eq!(latest[&1].event["event"], "transition");
-        assert_eq!(latest[&2].event["event"], "gate_fired");
+        assert_eq!(latest[&PhaseId::new(1)].event["event"], "transition");
+        assert_eq!(latest[&PhaseId::new(2)].event["event"], "gate_fired");
         assert!(last_events_by_phase(&dir.path().join("empty")).is_empty());
     }
 
@@ -308,17 +329,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         // No stage_launched at all yet.
-        emit(dir.path(), 1, "workflow_started", serde_json::Value::Null);
-        assert_eq!(last_events_by_phase(dir.path())[&1].stage_launched_ts, None);
+        emit(
+            dir.path(),
+            PhaseId::new(1),
+            "workflow_started",
+            serde_json::Value::Null,
+        );
+        assert_eq!(
+            last_events_by_phase(dir.path())[&PhaseId::new(1)].stage_launched_ts,
+            None
+        );
 
         // First stage_launched.
         emit(
             dir.path(),
-            1,
+            PhaseId::new(1),
             "stage_launched",
             serde_json::json!({"stage": "define"}),
         );
-        let first_ts = last_events_by_phase(dir.path())[&1]
+        let first_ts = last_events_by_phase(dir.path())[&PhaseId::new(1)]
             .stage_launched_ts
             .expect("stage_launched recorded a timestamp");
 
@@ -326,18 +355,24 @@ mod tests {
         // even though it becomes the new latest event.
         emit(
             dir.path(),
-            1,
+            PhaseId::new(1),
             "transition",
             serde_json::json!({"to": "plan"}),
         );
         let after_transition = last_events_by_phase(dir.path());
-        assert_eq!(after_transition[&1].stage_launched_ts, Some(first_ts));
-        assert_eq!(after_transition[&1].event["event"], "transition");
+        assert_eq!(
+            after_transition[&PhaseId::new(1)].stage_launched_ts,
+            Some(first_ts)
+        );
+        assert_eq!(
+            after_transition[&PhaseId::new(1)].event["event"],
+            "transition"
+        );
 
         // A newer stage_launched wins over the first.
         emit(
             dir.path(),
-            1,
+            PhaseId::new(1),
             "stage_launched",
             serde_json::json!({"stage": "plan"}),
         );
@@ -348,23 +383,29 @@ mod tests {
         std::fs::write(&path, contents).unwrap();
 
         let latest = last_events_by_phase(dir.path());
-        let newest_ts = latest[&1]
+        let newest_ts = latest[&PhaseId::new(1)]
             .stage_launched_ts
             .expect("newest stage_launched timestamp present");
         assert!(newest_ts >= first_ts, "newest launch must not be older");
-        assert_eq!(latest[&1].event["event"], "stage_launched");
+        assert_eq!(latest[&PhaseId::new(1)].event["event"], "stage_launched");
     }
 
     #[test]
     fn last_event_skips_corrupt_lines() {
         let dir = tempfile::tempdir().unwrap();
-        emit(dir.path(), 4, "workflow_started", serde_json::Value::Null);
+        emit(
+            dir.path(),
+            PhaseId::new(4),
+            "workflow_started",
+            serde_json::Value::Null,
+        );
         let path = events_path(dir.path());
         let mut contents = std::fs::read_to_string(&path).unwrap();
         contents.push_str("{truncated\n");
         std::fs::write(&path, contents).unwrap();
 
-        let last = last_event_for_phase(dir.path(), 4).expect("valid line still found");
+        let last =
+            last_event_for_phase(dir.path(), PhaseId::new(4)).expect("valid line still found");
         assert_eq!(last["event"], "workflow_started");
     }
 
@@ -377,38 +418,60 @@ mod tests {
     #[test]
     fn last_event_of_kind_for_phase_filters_by_phase_and_event_name() {
         let dir = tempfile::tempdir().unwrap();
-        emit(dir.path(), 1, "workflow_finished", serde_json::Value::Null);
         emit(
             dir.path(),
-            1,
+            PhaseId::new(1),
+            "workflow_finished",
+            serde_json::Value::Null,
+        );
+        emit(
+            dir.path(),
+            PhaseId::new(1),
             MARKER_EVENT,
             serde_json::json!({"stage": "ship"}),
         );
         emit(
             dir.path(),
-            2,
+            PhaseId::new(2),
             MARKER_EVENT,
             serde_json::json!({"stage": "ship"}),
         );
 
-        let phase1 = last_event_of_kind_for_phase(dir.path(), 1, MARKER_EVENT)
+        let phase1 = last_event_of_kind_for_phase(dir.path(), PhaseId::new(1), MARKER_EVENT)
             .expect("phase 1 marker event exists");
         assert_eq!(phase1["stage"], "ship");
-        assert!(has_event_for_phase(dir.path(), 1, MARKER_EVENT));
-        assert!(!has_event_for_phase(dir.path(), 3, MARKER_EVENT));
-        assert!(last_event_of_kind_for_phase(dir.path(), 3, MARKER_EVENT).is_none());
+        assert!(has_event_for_phase(
+            dir.path(),
+            PhaseId::new(1),
+            MARKER_EVENT
+        ));
+        assert!(!has_event_for_phase(
+            dir.path(),
+            PhaseId::new(3),
+            MARKER_EVENT
+        ));
+        assert!(last_event_of_kind_for_phase(dir.path(), PhaseId::new(3), MARKER_EVENT).is_none());
     }
 
     #[test]
     fn last_event_of_kind_for_phase_skips_corrupt_lines() {
         let dir = tempfile::tempdir().unwrap();
-        emit(dir.path(), 4, MARKER_EVENT, serde_json::Value::Null);
+        emit(
+            dir.path(),
+            PhaseId::new(4),
+            MARKER_EVENT,
+            serde_json::Value::Null,
+        );
         let path = events_path(dir.path());
         let mut contents = std::fs::read_to_string(&path).unwrap();
         contents.push_str("{truncated\n");
         std::fs::write(&path, contents).unwrap();
 
-        assert!(has_event_for_phase(dir.path(), 4, MARKER_EVENT));
+        assert!(has_event_for_phase(
+            dir.path(),
+            PhaseId::new(4),
+            MARKER_EVENT
+        ));
     }
 
     #[test]
@@ -430,6 +493,11 @@ mod tests {
         // fail; emit must not panic.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".devflow"), "not a dir").unwrap();
-        emit(dir.path(), 1, "transition", serde_json::Value::Null);
+        emit(
+            dir.path(),
+            PhaseId::new(1),
+            "transition",
+            serde_json::Value::Null,
+        );
     }
 }

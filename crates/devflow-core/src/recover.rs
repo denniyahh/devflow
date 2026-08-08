@@ -4,6 +4,7 @@
 //! agent process is still running, and either reports status or
 //! offers to clean up / restart.
 
+use crate::phase_id::PhaseId;
 use crate::state::State;
 use crate::workflow::{self, WorkflowError};
 use std::path::Path;
@@ -126,7 +127,7 @@ pub fn clean(project_root: &Path) -> Result<Vec<String>, RecoverError> {
 /// Explicitly clean ONE phase, regardless of staleness — the operator's
 /// escape hatch for a wedged-but-fresh run. Clears its state and cron
 /// record; warns (but proceeds) when the recorded agent still looks alive.
-pub fn clean_phase(project_root: &Path, phase: u32) -> Result<Vec<String>, RecoverError> {
+pub fn clean_phase(project_root: &Path, phase: PhaseId) -> Result<Vec<String>, RecoverError> {
     let mut warnings = Vec::new();
     if let Ok(state) = workflow::load_state(project_root, phase)
         && agent_pid_for(&state).is_some_and(crate::agent::agent_running)
@@ -203,10 +204,15 @@ mod tests {
     /// Build a state in `root` whose `started_at` is `age_secs` in the past,
     /// optionally writing the monitor's agent-pid file with `agent_pid`.
     fn state_aged(root: &Path, age_secs: u64, agent_pid: Option<u32>) -> State {
-        state_aged_phase(root, 1, age_secs, agent_pid)
+        state_aged_phase(root, PhaseId::new(1), age_secs, agent_pid)
     }
 
-    fn state_aged_phase(root: &Path, phase: u32, age_secs: u64, agent_pid: Option<u32>) -> State {
+    fn state_aged_phase(
+        root: &Path,
+        phase: PhaseId,
+        age_secs: u64,
+        agent_pid: Option<u32>,
+    ) -> State {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -258,7 +264,12 @@ mod tests {
     #[test]
     fn unparseable_timestamp_is_never_stale() {
         let dir = tempfile::tempdir().unwrap();
-        let mut state = State::new(1, AgentKind::Claude, Mode::Auto, dir.path().to_path_buf());
+        let mut state = State::new(
+            PhaseId::new(1),
+            AgentKind::Claude,
+            Mode::Auto,
+            dir.path().to_path_buf(),
+        );
         state.started_at = "not-a-number".into();
         assert!(!is_stale_state(&state));
         assert_eq!(state_age_secs(&state.started_at), None);
@@ -307,13 +318,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         workflow::save_state(&state_aged(dir.path(), 60, None)).unwrap();
         let mut other = state_aged(dir.path(), 60, None);
-        other.phase = 2;
+        other.phase = PhaseId::new(2);
         workflow::save_state(&other).unwrap();
 
         let statuses = inspect_all(dir.path()).expect("two phases active");
         assert_eq!(
             statuses.iter().map(|s| s.state.phase).collect::<Vec<_>>(),
-            vec![1, 2]
+            vec![PhaseId::new(1), PhaseId::new(2)]
         );
     }
 
@@ -326,7 +337,7 @@ mod tests {
         // Stale-aged but the recorded agent (our own pid) is alive.
         let live = state_aged_phase(
             dir.path(),
-            1,
+            PhaseId::new(1),
             STALE_THRESHOLD.as_secs() + 60,
             Some(std::process::id()),
         );
@@ -334,7 +345,7 @@ mod tests {
         // Genuinely stale sibling: old and dead.
         let stale = state_aged_phase(
             dir.path(),
-            2,
+            PhaseId::new(2),
             STALE_THRESHOLD.as_secs() + 60,
             Some(DEAD_PID),
         );
@@ -342,11 +353,15 @@ mod tests {
 
         let warnings = clean(dir.path()).expect("clean");
 
-        let remaining: Vec<u32> = workflow::list_states(dir.path())
+        let remaining: Vec<PhaseId> = workflow::list_states(dir.path())
             .iter()
             .map(|s| s.phase)
             .collect();
-        assert_eq!(remaining, vec![1], "live phase must survive, stale cleared");
+        assert_eq!(
+            remaining,
+            vec![PhaseId::new(1)],
+            "live phase must survive, stale cleared"
+        );
         assert!(
             warnings.iter().any(|w| w.contains("phase 1")),
             "keeping a live phase must be reported: {warnings:?}"
@@ -358,7 +373,7 @@ mod tests {
     #[test]
     fn clean_keeps_fresh_phase() {
         let dir = tempfile::tempdir().unwrap();
-        workflow::save_state(&state_aged_phase(dir.path(), 3, 60, None)).unwrap();
+        workflow::save_state(&state_aged_phase(dir.path(), PhaseId::new(3), 60, None)).unwrap();
 
         let warnings = clean(dir.path()).expect("clean");
 
@@ -371,7 +386,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         workflow::save_state(&state_aged_phase(
             dir.path(),
-            2,
+            PhaseId::new(2),
             STALE_THRESHOLD.as_secs() + 60,
             Some(DEAD_PID),
         ))
@@ -405,15 +420,15 @@ mod tests {
     #[test]
     fn clean_phase_clears_only_the_named_phase() {
         let dir = tempfile::tempdir().unwrap();
-        workflow::save_state(&state_aged_phase(dir.path(), 4, 60, None)).unwrap();
-        workflow::save_state(&state_aged_phase(dir.path(), 5, 60, None)).unwrap();
+        workflow::save_state(&state_aged_phase(dir.path(), PhaseId::new(4), 60, None)).unwrap();
+        workflow::save_state(&state_aged_phase(dir.path(), PhaseId::new(5), 60, None)).unwrap();
 
-        clean_phase(dir.path(), 4).expect("clean_phase");
+        clean_phase(dir.path(), PhaseId::new(4)).expect("clean_phase");
 
-        let remaining: Vec<u32> = workflow::list_states(dir.path())
+        let remaining: Vec<PhaseId> = workflow::list_states(dir.path())
             .iter()
             .map(|s| s.phase)
             .collect();
-        assert_eq!(remaining, vec![5]);
+        assert_eq!(remaining, vec![PhaseId::new(5)]);
     }
 }

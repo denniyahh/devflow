@@ -4,9 +4,9 @@ milestone: v2.5.0
 milestone_name: milestone (Loop-Termination and Release Hardening, ACTIVE — declared 2026-08-06)
 current_phase: 35.1
 current_phase_name: Unattended-Launch Prerequisites (999.93)
-status: "Phase 35 shipped — PR #99"
+status: "Phase 35 shipped — PR #99; 999.97 hotfix in flight to unblock 35.1"
 stopped_at: Phase 35 context gathered
-last_updated: "2026-08-07T23:19:47.782Z"
+last_updated: "2026-08-08T00:20:00.000Z"
 last_activity: 2026-08-07
 progress:
   total_phases: 4
@@ -855,3 +855,4 @@ Provenance for the two entries removed 2026-08-03, neither of which was a live b
 ### Roadmap Evolution
 
 - Phase 34 edited: edited fields: title, goal, depends_on, requirements, success_criteria — rewritten after adversarial review (34-REVIEW.md); 999.76 folded in
+- 999.97 filed and hotfixed (2026-08-07), no phase cycle: `devflow start --phase 35.1` was rejected by clap (`invalid digit found in string`) — the phase identifier was `u32` at 182 sites and `prompt.rs` globbed it as `{phase:02}`, so decimal phases could not be launched at all. Briefly filed as Phase 37 via `phase.add` and then withdrawn on the operator's call to fix it directly. Recording the tool defect while it is fresh: `phase.add` again placed the new entry at the document's last `---` (inside archived 999.25 prose, outside the active milestone window) and wrote neither the phase-table nor the Progress-table row.

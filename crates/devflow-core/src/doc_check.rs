@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::phase_id::PhaseId;
 use crate::{agent_result, events, gates::Gates, lock, ship, workflow};
 
 const SCOPED_DOCS: &[&str] = &[
@@ -286,35 +287,38 @@ fn gitignore_covers_all_devflow_paths() {
         ("events::events_path", events::events_path(root)),
         (
             "agent_result::stdout_path",
-            agent_result::stdout_path(root, 16),
+            agent_result::stdout_path(root, PhaseId::new(16)),
         ),
         (
             "agent_result::stderr_path",
-            agent_result::stderr_path(root, 16),
+            agent_result::stderr_path(root, PhaseId::new(16)),
         ),
         (
             "agent_result::exit_code_path",
-            agent_result::exit_code_path(root, 16),
+            agent_result::exit_code_path(root, PhaseId::new(16)),
         ),
         (
             "agent_result::agent_pid_path",
-            agent_result::agent_pid_path(root, 16),
+            agent_result::agent_pid_path(root, PhaseId::new(16)),
         ),
         (
             "agent_result::history_dir",
-            agent_result::history_dir(root, 16),
+            agent_result::history_dir(root, PhaseId::new(16)),
         ),
-        ("workflow::state_path", workflow::state_path(root, 16)),
+        (
+            "workflow::state_path",
+            workflow::state_path(root, PhaseId::new(16)),
+        ),
         (
             "workflow::legacy_state_path",
             workflow::legacy_state_path(root),
         ),
         ("Gates::dir", Gates::dir(root)),
-        ("lock::lock_path", lock::lock_path(root, 16)),
+        ("lock::lock_path", lock::lock_path(root, PhaseId::new(16))),
         ("lock::project_lock_path", lock::project_lock_path(root)),
         (
             "ship::cron_instructions_path",
-            ship::cron_instructions_path(root, 16),
+            ship::cron_instructions_path(root, PhaseId::new(16)),
         ),
         (
             "ship::legacy_cron_instructions_path",

@@ -389,6 +389,7 @@ mod tests {
     use crate::pipeline_launch::launch_stage_inner;
     use crate::test_support::*;
     use devflow_core::mode::Mode;
+    use devflow_core::phase_id::PhaseId;
     use devflow_core::stage::Stage;
     use devflow_core::state::AgentKind;
     use devflow_core::workflow;
@@ -698,7 +699,7 @@ mod tests {
         .unwrap();
         assert!(is_self_dogfood_workspace(&project_root));
 
-        let phase = 90;
+        let phase = PhaseId::new(90);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, project_root.clone());
         state.stage = Stage::Code;
         state.worktree_path = Some(worktree_path.clone());
@@ -782,7 +783,7 @@ mod tests {
         )
         .unwrap();
 
-        let phase = 94;
+        let phase = PhaseId::new(94);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, project_root.clone());
         state.stage = Stage::Code;
         state.worktree_path = Some(worktree_path.clone());
@@ -871,7 +872,9 @@ mod tests {
         let blocked_count = all_events
             .lines()
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .filter(|e| e["phase"] == phase && e["event"] == "self_dogfood_stale_blocked")
+            .filter(|e| {
+                phase.matches_json(e.get("phase")) && e["event"] == "self_dogfood_stale_blocked"
+            })
             .count();
         assert_eq!(
             blocked_count, 1,
@@ -900,7 +903,7 @@ mod tests {
         )
         .unwrap();
 
-        let phase = 91;
+        let phase = PhaseId::new(91);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, project_root.clone());
         state.stage = Stage::Code;
         assert!(
@@ -1158,7 +1161,7 @@ mod tests {
         );
         assert!(is_self_dogfood_workspace(root));
 
-        let phase = 66;
+        let phase = PhaseId::new(66);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
 
@@ -1284,7 +1287,7 @@ mod tests {
             "an ahead build must warn, never hard-block, even for self-dogfood"
         );
 
-        let phase = 67;
+        let phase = PhaseId::new(67);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Validate;
         assert!(
@@ -1365,7 +1368,7 @@ mod tests {
             "a doc-only dirty tree must not be Stale"
         );
 
-        let phase = 68;
+        let phase = PhaseId::new(68);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Ship;
         assert!(
@@ -1732,7 +1735,7 @@ mod tests {
             "cannot distinguish \"same dirt\" from \"more dirt\" without a timestamp"
         );
 
-        let phase = 71;
+        let phase = PhaseId::new(71);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
         assert!(
@@ -1771,7 +1774,7 @@ mod tests {
         git(&["commit", "-q", "-m", "add workspace cargo toml"]);
         assert!(is_self_dogfood_workspace(root));
 
-        let phase = 63;
+        let phase = PhaseId::new(63);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
 
@@ -1810,7 +1813,7 @@ mod tests {
         let (_base, side) = init_repo_with_diverged_commit(root);
         assert!(!is_self_dogfood_workspace(root));
 
-        let phase = 64;
+        let phase = PhaseId::new(64);
         let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
 
         let result = enforce_build_staleness(root, &state, &side, false);
@@ -1855,7 +1858,7 @@ mod tests {
         git(&["commit", "-q", "-m", "init"]);
         assert!(is_self_dogfood_workspace(root));
 
-        let phase = 65;
+        let phase = PhaseId::new(65);
         let state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
 
         let result = enforce_build_staleness(
@@ -2124,7 +2127,7 @@ mod tests {
             "fixture precondition: this workspace must be classified self-dogfood"
         );
 
-        let phase = 66;
+        let phase = PhaseId::new(66);
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = Stage::Code;
 

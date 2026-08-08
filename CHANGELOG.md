@@ -36,6 +36,13 @@ full enumeration.
   (999.86).** It now signs throwaway bytes with `ssh-keygen -Y sign` in a private per-call
   workspace and reports the exit code. The probe runs under `setsid`, so a controlling terminal's
   `/dev/tty` passphrase prompt cannot capture it, and it is bounded by a wall-clock ceiling.
+- **`devflow start --phase 35.1` works — a decimal-numbered phase can be run at all (999.97).**
+  GSD's `--insert` mode numbers an inserted phase `35.1`, but DevFlow's phase identifier was a
+  `u32`, so clap rejected the value outright and every such phase was unreachable by the tool
+  meant to run it. The identifier is now `devflow_core::phase_id::PhaseId`, carried end to end
+  through state and lock filenames, branch and worktree names, the `.planning/phases/` artifact
+  glob, the event log, and the GSD skill strings the prompt builder emits. Landed as a direct
+  hotfix rather than a phase, because Phase 35.1 could not start without it.
 
 ### Fixed
 
@@ -72,6 +79,22 @@ Every row below was verified against the source tree, not transcribed from the p
 
 #### Changed — breaking
 
+- **The phase identifier is `devflow_core::phase_id::PhaseId`, not `u32` (999.97).** Every public
+  function, struct field, and return type that named a phase changed accordingly — including
+  `State::phase`, `ShipEvidence::phase`, `workflow::state_path`, `Gates::gate_path`,
+  `worktree::phase_path`, `events::emit`, `events::last_events_by_phase` (whose `HashMap` key
+  changed with it), and the `agent_result` path helpers. `PhaseId` is `Copy`, so call sites pass
+  it by value exactly as they passed the `u32`.
+
+  Two renderings replace what used to be one integer, and the distinction is load-bearing:
+  `Display` gives the canonical label (`7`, `35.1`) for prompts and messages, while
+  `PhaseId::padded()` gives the zero-padded path form (`07`, `35.1`) for filenames and globs.
+  `Display` deliberately ignores width specifiers, so a `{phase:02}` left over from the `u32` era
+  cannot quietly build a path that is right for `35` and wrong for `35.1`.
+
+  **Persisted state is compatible in both directions.** An integer phase still serializes as a
+  JSON number, so every `state-NN.json` and `events.jsonl` line written before this change reads
+  back unchanged; a decimal phase serializes as a string. Reading accepts either shape.
 - **`devflow_core::agent_result::phase_commit_count`** — return type `u32` → `Option<u32>`.
   `None` means the count could not be established (the `git` child could not be executed, or its
   stdout did not parse); `Some(0)` means git ran and the branch genuinely has no commits. Closes

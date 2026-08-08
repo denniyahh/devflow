@@ -6,6 +6,7 @@
 //! (13-DEFERRED-CR-03). A legacy single-slot `.devflow/state.json` from an
 //! older binary is migrated to its per-phase name on first read.
 
+use crate::phase_id::PhaseId;
 use crate::state::State;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -123,8 +124,11 @@ pub fn ensure_devflow_dir(dir: &Path) -> std::io::Result<()> {
 }
 
 /// Return the persisted state path for a phase of a project.
-pub fn state_path(project_root: &Path, phase: u32) -> PathBuf {
-    devflow_dir(project_root).join(format!("{STATE_FILE_PREFIX}{phase:02}.json"))
+pub fn state_path(project_root: &Path, phase: PhaseId) -> PathBuf {
+    devflow_dir(project_root).join(format!(
+        "{STATE_FILE_PREFIX}{padded}.json",
+        padded = phase.padded()
+    ))
 }
 
 /// Path of the legacy single-slot state file written by pre-14a binaries.
@@ -189,7 +193,7 @@ fn write_state_atomic(path: &Path, contents: &str) -> Result<(), WorkflowError> 
 }
 
 /// Load workflow state for a phase from `.devflow/state-{NN}.json`.
-pub fn load_state(project_root: &Path, phase: u32) -> Result<State, WorkflowError> {
+pub fn load_state(project_root: &Path, phase: PhaseId) -> Result<State, WorkflowError> {
     migrate_legacy_state(project_root);
     let path = state_path(project_root, phase);
     debug!("loading state from {}", path.display());
@@ -250,7 +254,7 @@ pub fn remove_corrupt_legacy_state(project_root: &Path) -> Result<bool, Workflow
 }
 
 /// Remove a phase's persisted state if present.
-pub fn clear_state(project_root: &Path, phase: u32) -> Result<(), WorkflowError> {
+pub fn clear_state(project_root: &Path, phase: PhaseId) -> Result<(), WorkflowError> {
     let path = state_path(project_root, phase);
     if path.exists() {
         debug!("clearing state at {}", path.display());
@@ -393,7 +397,7 @@ mod tests {
     use crate::stage::Stage;
     use crate::state::AgentKind;
 
-    fn state_in(root: &Path, phase: u32, stage: Stage) -> State {
+    fn state_in(root: &Path, phase: PhaseId, stage: Stage) -> State {
         let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
         state.stage = stage;
         state
@@ -404,11 +408,11 @@ mod tests {
         let root = Path::new("/repo");
         assert_eq!(devflow_dir(root), Path::new("/repo/.devflow"));
         assert_eq!(
-            state_path(root, 7),
+            state_path(root, PhaseId::new(7)),
             Path::new("/repo/.devflow/state-07.json")
         );
         assert_eq!(
-            state_path(root, 14),
+            state_path(root, PhaseId::new(14)),
             Path::new("/repo/.devflow/state-14.json")
         );
     }
@@ -416,12 +420,12 @@ mod tests {
     #[test]
     fn save_then_load_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let state = state_in(dir.path(), 1, Stage::Code);
+        let state = state_in(dir.path(), PhaseId::new(1), Stage::Code);
         save_state(&state).expect("save");
 
-        let loaded = load_state(dir.path(), 1).expect("load");
+        let loaded = load_state(dir.path(), PhaseId::new(1)).expect("load");
         assert_eq!(loaded.stage, Stage::Code);
-        assert_eq!(loaded.phase, 1);
+        assert_eq!(loaded.phase, PhaseId::new(1));
         assert_eq!(loaded.agent, AgentKind::Claude);
         assert_eq!(loaded.mode, Mode::Auto);
     }
@@ -431,27 +435,27 @@ mod tests {
     #[test]
     fn two_phases_states_coexist_without_clobbering() {
         let dir = tempfile::tempdir().unwrap();
-        save_state(&state_in(dir.path(), 13, Stage::Code)).unwrap();
-        save_state(&state_in(dir.path(), 14, Stage::Validate)).unwrap();
+        save_state(&state_in(dir.path(), PhaseId::new(13), Stage::Code)).unwrap();
+        save_state(&state_in(dir.path(), PhaseId::new(14), Stage::Validate)).unwrap();
 
-        let a = load_state(dir.path(), 13).expect("phase 13 state");
-        let b = load_state(dir.path(), 14).expect("phase 14 state");
-        assert_eq!(a.phase, 13);
+        let a = load_state(dir.path(), PhaseId::new(13)).expect("phase 13 state");
+        let b = load_state(dir.path(), PhaseId::new(14)).expect("phase 14 state");
+        assert_eq!(a.phase, PhaseId::new(13));
         assert_eq!(a.stage, Stage::Code);
-        assert_eq!(b.phase, 14);
+        assert_eq!(b.phase, PhaseId::new(14));
         assert_eq!(b.stage, Stage::Validate);
     }
 
     #[test]
     fn save_state_writes_atomically_and_leaves_no_temp() {
         let dir = tempfile::tempdir().unwrap();
-        let state = state_in(dir.path(), 1, Stage::Validate);
+        let state = state_in(dir.path(), PhaseId::new(1), Stage::Validate);
 
         save_state(&state).expect("save");
 
-        let path = state_path(dir.path(), 1);
+        let path = state_path(dir.path(), PhaseId::new(1));
         assert!(path.exists());
-        let loaded = load_state(dir.path(), 1).expect("load");
+        let loaded = load_state(dir.path(), PhaseId::new(1)).expect("load");
         assert_eq!(loaded.stage, Stage::Validate);
         assert_eq!(loaded.phase, state.phase);
         assert!(!path.with_extension("tmp").exists());
@@ -460,45 +464,48 @@ mod tests {
     #[test]
     fn load_missing_state_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let err = load_state(dir.path(), 1).unwrap_err();
+        let err = load_state(dir.path(), PhaseId::new(1)).unwrap_err();
         assert!(matches!(err, WorkflowError::MissingState(_)));
     }
 
     #[test]
     fn clear_removes_state_and_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
-        let state = state_in(dir.path(), 1, Stage::Validate);
+        let state = state_in(dir.path(), PhaseId::new(1), Stage::Validate);
         save_state(&state).unwrap();
-        assert!(state_path(dir.path(), 1).exists());
+        assert!(state_path(dir.path(), PhaseId::new(1)).exists());
 
-        clear_state(dir.path(), 1).expect("clear");
-        assert!(!state_path(dir.path(), 1).exists());
+        clear_state(dir.path(), PhaseId::new(1)).expect("clear");
+        assert!(!state_path(dir.path(), PhaseId::new(1)).exists());
         // Clearing when nothing is present is a no-op success.
-        clear_state(dir.path(), 1).expect("clear again");
+        clear_state(dir.path(), PhaseId::new(1)).expect("clear again");
     }
 
     #[test]
     fn clear_only_touches_its_own_phase() {
         let dir = tempfile::tempdir().unwrap();
-        save_state(&state_in(dir.path(), 13, Stage::Code)).unwrap();
-        save_state(&state_in(dir.path(), 14, Stage::Ship)).unwrap();
+        save_state(&state_in(dir.path(), PhaseId::new(13), Stage::Code)).unwrap();
+        save_state(&state_in(dir.path(), PhaseId::new(14), Stage::Ship)).unwrap();
 
-        clear_state(dir.path(), 13).unwrap();
+        clear_state(dir.path(), PhaseId::new(13)).unwrap();
 
-        assert!(!state_path(dir.path(), 13).exists());
-        assert!(load_state(dir.path(), 14).is_ok(), "phase 14 must survive");
+        assert!(!state_path(dir.path(), PhaseId::new(13)).exists());
+        assert!(
+            load_state(dir.path(), PhaseId::new(14)).is_ok(),
+            "phase 14 must survive"
+        );
     }
 
     #[test]
     fn list_states_enumerates_sorted_by_phase() {
         let dir = tempfile::tempdir().unwrap();
-        save_state(&state_in(dir.path(), 14, Stage::Ship)).unwrap();
-        save_state(&state_in(dir.path(), 3, Stage::Code)).unwrap();
+        save_state(&state_in(dir.path(), PhaseId::new(14), Stage::Ship)).unwrap();
+        save_state(&state_in(dir.path(), PhaseId::new(3), Stage::Code)).unwrap();
 
         let states = list_states(dir.path());
         assert_eq!(
             states.iter().map(|s| s.phase).collect::<Vec<_>>(),
-            vec![3, 14]
+            vec![PhaseId::new(3), PhaseId::new(14)]
         );
     }
 
@@ -511,12 +518,12 @@ mod tests {
     #[test]
     fn list_states_skips_corrupt_files() {
         let dir = tempfile::tempdir().unwrap();
-        save_state(&state_in(dir.path(), 5, Stage::Code)).unwrap();
-        std::fs::write(state_path(dir.path(), 6), "not json").unwrap();
+        save_state(&state_in(dir.path(), PhaseId::new(5), Stage::Code)).unwrap();
+        std::fs::write(state_path(dir.path(), PhaseId::new(6)), "not json").unwrap();
 
         let states = list_states(dir.path());
         assert_eq!(states.len(), 1);
-        assert_eq!(states[0].phase, 5);
+        assert_eq!(states[0].phase, PhaseId::new(5));
     }
 
     /// Upgrade path: a legacy single-slot `state.json` written by an older
@@ -525,29 +532,29 @@ mod tests {
     #[test]
     fn legacy_state_json_migrates_on_load() {
         let dir = tempfile::tempdir().unwrap();
-        let state = state_in(dir.path(), 9, Stage::Validate);
+        let state = state_in(dir.path(), PhaseId::new(9), Stage::Validate);
         let legacy = legacy_state_path(dir.path());
         std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
         std::fs::write(&legacy, serde_json::to_string_pretty(&state).unwrap()).unwrap();
 
-        let loaded = load_state(dir.path(), 9).expect("legacy state must migrate");
-        assert_eq!(loaded.phase, 9);
+        let loaded = load_state(dir.path(), PhaseId::new(9)).expect("legacy state must migrate");
+        assert_eq!(loaded.phase, PhaseId::new(9));
         assert_eq!(loaded.stage, Stage::Validate);
         assert!(!legacy.exists(), "legacy file must be gone after migration");
-        assert!(state_path(dir.path(), 9).exists());
+        assert!(state_path(dir.path(), PhaseId::new(9)).exists());
     }
 
     #[test]
     fn legacy_state_json_migrates_on_list() {
         let dir = tempfile::tempdir().unwrap();
-        let state = state_in(dir.path(), 4, Stage::Code);
+        let state = state_in(dir.path(), PhaseId::new(4), Stage::Code);
         let legacy = legacy_state_path(dir.path());
         std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
         std::fs::write(&legacy, serde_json::to_string_pretty(&state).unwrap()).unwrap();
 
         let states = list_states(dir.path());
         assert_eq!(states.len(), 1);
-        assert_eq!(states[0].phase, 4);
+        assert_eq!(states[0].phase, PhaseId::new(4));
         assert!(!legacy.exists());
     }
 
@@ -555,16 +562,17 @@ mod tests {
     fn legacy_migration_never_overwrites_existing_per_phase_state() {
         let dir = tempfile::tempdir().unwrap();
         // Newer per-phase state at Ship...
-        save_state(&state_in(dir.path(), 9, Stage::Ship)).unwrap();
+        save_state(&state_in(dir.path(), PhaseId::new(9), Stage::Ship)).unwrap();
         // ...and a stale legacy file for the same phase still at Code.
         let legacy = legacy_state_path(dir.path());
         std::fs::write(
             &legacy,
-            serde_json::to_string_pretty(&state_in(dir.path(), 9, Stage::Code)).unwrap(),
+            serde_json::to_string_pretty(&state_in(dir.path(), PhaseId::new(9), Stage::Code))
+                .unwrap(),
         )
         .unwrap();
 
-        let loaded = load_state(dir.path(), 9).unwrap();
+        let loaded = load_state(dir.path(), PhaseId::new(9)).unwrap();
         assert_eq!(loaded.stage, Stage::Ship, "per-phase state must win");
         assert!(!legacy.exists(), "stale legacy file must be dropped");
     }

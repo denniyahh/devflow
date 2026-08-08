@@ -4,6 +4,7 @@
 //! launch command. The prompt text itself comes from [`crate::prompt`] — the
 //! adapter only formats it into the right flags for its agent.
 
+use crate::phase_id::PhaseId;
 use crate::state::AgentKind;
 use std::path::PathBuf;
 
@@ -25,7 +26,7 @@ pub trait AgentAdapter {
     /// sandbox ignore it.
     fn exec_command(
         &self,
-        phase: u32,
+        phase: PhaseId,
         prompt: &str,
         extra_writable_roots: &[PathBuf],
     ) -> (&'static str, Vec<String>);
@@ -107,7 +108,7 @@ mod tests {
                 .expect("the user turn must carry the prompt as message.content")
                 .to_string();
         }
-        let (_program, args) = adapter_for(kind).exec_command(7, prompt, &[]);
+        let (_program, args) = adapter_for(kind).exec_command(PhaseId::new(7), prompt, &[]);
         args.into_iter()
             .find(|arg| arg.contains("DEVFLOW_RESULT"))
             .expect("agent command should carry the prompt with the DEVFLOW_RESULT contract")
@@ -124,7 +125,7 @@ mod tests {
     /// initial turn.
     #[test]
     fn every_adapter_receives_identical_prompt_text() {
-        let prompt = stage_prompt(Stage::Code, 7);
+        let prompt = stage_prompt(Stage::Code, PhaseId::new(7));
         for kind in [AgentKind::Claude, AgentKind::Codex, AgentKind::OpenCode] {
             assert_eq!(
                 delivered_prompt(kind, &prompt),
@@ -133,7 +134,8 @@ mod tests {
             );
         }
 
-        let (_program, args) = adapter_for(AgentKind::Claude).exec_command(7, &prompt, &[]);
+        let (_program, args) =
+            adapter_for(AgentKind::Claude).exec_command(PhaseId::new(7), &prompt, &[]);
         assert!(
             !args.iter().any(|arg| arg.contains("DEVFLOW_RESULT")),
             "Claude's prompt must travel on stdin ONLY; a copy left in argv \
@@ -147,8 +149,9 @@ mod tests {
     /// positional argument at all.
     #[test]
     fn claude_launches_headless_stream_json_without_positional_prompt() {
-        let prompt = stage_prompt(Stage::Code, 3);
-        let (program, args) = adapter_for(AgentKind::Claude).exec_command(3, &prompt, &[]);
+        let prompt = stage_prompt(Stage::Code, PhaseId::new(3));
+        let (program, args) =
+            adapter_for(AgentKind::Claude).exec_command(PhaseId::new(3), &prompt, &[]);
         assert_eq!(program, "claude");
         assert!(args.iter().any(|a| a == "-p"));
         assert!(
@@ -174,8 +177,9 @@ mod tests {
 
     #[test]
     fn codex_wraps_prompt_in_exec_and_json() {
-        let prompt = stage_prompt(Stage::Code, 7);
-        let (program, args) = adapter_for(AgentKind::Codex).exec_command(7, &prompt, &[]);
+        let prompt = stage_prompt(Stage::Code, PhaseId::new(7));
+        let (program, args) =
+            adapter_for(AgentKind::Codex).exec_command(PhaseId::new(7), &prompt, &[]);
         assert_eq!(program, "codex");
         let joined = args.join(" ");
         assert!(joined.contains("exec"));
@@ -185,8 +189,9 @@ mod tests {
 
     #[test]
     fn opencode_wraps_prompt_in_run() {
-        let prompt = stage_prompt(Stage::Code, 7);
-        let (program, args) = adapter_for(AgentKind::OpenCode).exec_command(7, &prompt, &[]);
+        let prompt = stage_prompt(Stage::Code, PhaseId::new(7));
+        let (program, args) =
+            adapter_for(AgentKind::OpenCode).exec_command(PhaseId::new(7), &prompt, &[]);
         assert_eq!(program, "opencode");
         assert_eq!(args, ["run", prompt.as_str()]);
     }
@@ -198,12 +203,13 @@ mod tests {
     /// (verified with `codex sandbox` probes). Without roots, no override.
     #[test]
     fn codex_grants_writable_roots_for_worktree_git_metadata() {
-        let prompt = stage_prompt(Stage::Code, 7);
+        let prompt = stage_prompt(Stage::Code, PhaseId::new(7));
         let roots = vec![
             PathBuf::from("/repo/.git"),
             PathBuf::from("/repo/.git/worktrees/phase-07"),
         ];
-        let (_, args) = adapter_for(AgentKind::Codex).exec_command(7, &prompt, &roots);
+        let (_, args) =
+            adapter_for(AgentKind::Codex).exec_command(PhaseId::new(7), &prompt, &roots);
         let joined = args.join(" ");
         assert!(
             joined.contains(
@@ -212,7 +218,7 @@ mod tests {
             "codex must whitelist the common .git AND the worktree admin dir: {joined}"
         );
 
-        let (_, args) = adapter_for(AgentKind::Codex).exec_command(7, &prompt, &[]);
+        let (_, args) = adapter_for(AgentKind::Codex).exec_command(PhaseId::new(7), &prompt, &[]);
         assert!(
             !args.join(" ").contains("writable_roots"),
             "no override without an extra root"
@@ -239,7 +245,7 @@ mod tests {
     #[test]
     fn default_preflight_is_ok_for_built_in_adapters() {
         let state = crate::state::State::new(
-            1,
+            PhaseId::new(1),
             AgentKind::Claude,
             crate::mode::Mode::Auto,
             PathBuf::from("/repo"),

@@ -21,6 +21,7 @@
 
 use devflow_core::gates::Gates;
 use devflow_core::mode::Mode;
+use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
 use std::path::PathBuf;
@@ -42,7 +43,12 @@ fn project_with_legacy_state() -> tempfile::TempDir {
     // via `State::new` and overrides only what this fixture actually depends on.
     // `new` already supplies every other field with the same value the previous
     // struct literal spelled out by hand.
-    let mut state = State::new(1, AgentKind::Claude, Mode::Auto, dir.path().to_path_buf());
+    let mut state = State::new(
+        PhaseId::new(1),
+        AgentKind::Claude,
+        Mode::Auto,
+        dir.path().to_path_buf(),
+    );
     state.stage = Stage::Code; // `new` starts at Define; this fixture needs Code
     state.started_at = "0".to_string(); // fixed, not `timestamp_now()`, so the fixture is deterministic
     let json = serde_json::to_string_pretty(&state).expect("serialize legacy state");
@@ -131,7 +137,7 @@ fn rust_log_default_suppresses_debug_under_json_log_format() {
 /// successful approval, giving a real INFO-level log line to assert on. If
 /// commit 50db857 were reverted (back to the bare `from_default_env()`),
 /// this line would default to being suppressed and this test would fail.
-fn project_with_open_gate(phase: u32, stage: Stage) -> tempfile::TempDir {
+fn project_with_open_gate(phase: PhaseId, stage: Stage) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("create tempdir");
     Gates::write_gate(dir.path(), phase, stage, "test gate").expect("write gate");
     dir
@@ -139,7 +145,7 @@ fn project_with_open_gate(phase: u32, stage: Stage) -> tempfile::TempDir {
 
 #[test]
 fn rust_log_unset_still_shows_info_level_logs_by_default() {
-    let dir = project_with_open_gate(15, Stage::Ship);
+    let dir = project_with_open_gate(PhaseId::new(15), Stage::Ship);
 
     let mut cmd = Command::new(devflow_bin());
     cmd.arg("gate")

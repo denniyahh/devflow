@@ -3,6 +3,7 @@
 //! Launches `codex exec "<prompt>"` in non-interactive mode with JSON output.
 
 use super::AgentAdapter;
+use crate::phase_id::PhaseId;
 use std::path::PathBuf;
 
 pub struct CodexAgent;
@@ -14,7 +15,7 @@ impl AgentAdapter for CodexAgent {
 
     fn exec_command(
         &self,
-        _phase: u32,
+        _phase: PhaseId,
         prompt: &str,
         extra_writable_roots: &[PathBuf],
     ) -> (&'static str, Vec<String>) {
