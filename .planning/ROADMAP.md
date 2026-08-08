@@ -158,13 +158,13 @@ of 35.1's success criteria rather than in service of them, so a reader comparing
 against the diff will find more than the criteria ask for — that is why, not drift. Both are
 prerequisites in the literal sense: an unattended run cannot be made to work while the monitor
 kills any stage that backgrounds work.
-**Plans**: 4 plans across 3 waves
+**Plans**: 1/4 plans executed across 3 waves
 
 Plans:
 
 **Wave 1**
 
-- [ ] 35.1-01-PLAN.md — TRACER: the chain-flag lifecycle end to end on one path — `gsd_config` (the
+- [x] 35.1-01-PLAN.md — TRACER: the chain-flag lifecycle end to end on one path — `gsd_config` (the
   sole writer of `workflow._auto_chain_active`), `serde_json`'s `preserve_order`,
   `AUTO_CHAIN_ELIGIBLE_STAGES` + its eligibility predicate, the RAII guard inside `run_monitor`, and
   the flag-preserving token on the Code and fix prompts — proven by a real `devflow __monitor` run
@@ -177,6 +177,7 @@ Plans:
   committed tree and refusing to sweep an operator's edit, the loud stdout notice plus
   `auto_chain_flag_repaired` event, and the SIGKILL regression test built on a demonstrated leak
   (criterion 2, D-01/D-02/D-03)
+
 - [ ] 35.1-03-PLAN.md — the fail-closed preflight: three conditions to a four-state report, refusing
   in `--mode auto` and reporting in `--mode supervise`, with three NOT-viable fixtures each
   demonstrated failing and no override of any kind (criterion 4, D-07/D-08/D-09)
@@ -323,7 +324,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 33 | 6/6 | Complete    | 2026-08-05 |
 | 34 | 6/6 | Complete    | 2026-08-06 |
 | 35 | 6/6 | Complete    | 2026-08-07 |
-| 35.1 | — | Not started | — |
+| 35.1 | 1/4 | In Progress|  |
 | 35.2 | — | Not started | — |
 | 36 | — | Not started | — |
 
