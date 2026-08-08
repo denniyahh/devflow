@@ -2641,6 +2641,29 @@ fn archive_phase_files_with_stamp(
     stamp: &str,
 ) -> Result<Option<String>, std::io::Error> {
     let _ = std::fs::remove_file(agent_pid_path(project_root, phase));
+    // The idle-timeout record has the SAME lifetime as the pid file above: it
+    // describes one stage attempt and must not outlive it. Clearing it here was
+    // simply missed when the side channel was introduced (31-02), and the
+    // omission is not benign — [`parse_idle_timeout_side_channel`] is
+    // `evaluate_layer1`'s FIRST statement and returns unconditionally
+    // (T-31-06), by design, so that nothing can shadow a real timeout. A record
+    // that survives its attempt therefore outranks every later stage's real
+    // result, forever, for that phase.
+    //
+    // Observed 2026-08-08: a record written at 22:48 by a killed Plan stage
+    // condemned a Define stage that had succeeded 15s earlier, in a 22-second
+    // stage, with a message quoting a 120s silence and a pid dead for 14
+    // minutes. It survived both `gate reject --note abort` and
+    // `devflow start --force`, because nothing anywhere unlinked it.
+    //
+    // Deleting rather than archiving loses nothing: the verdict is already
+    // durable in `advance_evaluated`'s `reason` in `events.jsonl` and in the
+    // gate context that quotes it.
+    //
+    // This must stay ABOVE the "nothing to archive" early return below — the
+    // case with a stale record and no capture beside it is exactly the one that
+    // needs clearing.
+    let _ = std::fs::remove_file(idle_timeout_path(project_root, phase));
 
     let stdout_src = stdout_path(project_root, phase);
     let exit_src = exit_code_path(project_root, phase);
@@ -6292,6 +6315,75 @@ mod tests {
         .unwrap();
         assert_eq!(result_c.status, AgentStatus::Success);
         assert_eq!(result_c.decided_by_layer, Some(0));
+    }
+
+    /// A stage attempt's idle-timeout verdict must not survive into the next
+    /// attempt.
+    ///
+    /// Reproduces the 2026-08-08 observation directly: a record written by a
+    /// killed Plan stage was still authoritative when the next stage launched,
+    /// and because `evaluate_layer1` consults it FIRST and returns
+    /// unconditionally, it overrode a stage that had genuinely succeeded.
+    #[test]
+    fn archive_clears_a_previous_attempts_idle_timeout_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(1);
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        // A verdict left behind by an earlier, killed attempt.
+        std::fs::write(
+            idle_timeout_path(root, phase),
+            r#"{"status":"idle_timeout","idle_secs":120,"agent_pid":501757,"written_at":1786157328,"commits":[]}"#,
+        )
+        .unwrap();
+        // Precondition, asserted rather than assumed: while it exists it is
+        // authoritative, which is precisely why it must not persist.
+        assert!(
+            evaluate_layer1(root, phase).is_some(),
+            "fixture precondition: the stale record must be readable as a verdict"
+        );
+
+        archive_phase_files(root, root, phase, 5).unwrap();
+
+        assert!(
+            !idle_timeout_path(root, phase).exists(),
+            "a previous attempt's timeout verdict survived a stage launch — it \
+             will now outrank the next stage's real result, for this phase, forever"
+        );
+    }
+
+    /// Negative control for the test above. The clearing happens at stage
+    /// LAUNCH, and it must not be reachable in a way that discards a verdict
+    /// before it has been read: a record with no capture beside it is the
+    /// stale case, but a record is only ever written mid-attempt, after the
+    /// launch that would have cleared it.
+    ///
+    /// This pins the other half — that clearing the file did not neuter the
+    /// mechanism, only its lifetime.
+    #[test]
+    fn a_current_attempts_idle_timeout_verdict_is_still_authoritative() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(2);
+        std::fs::create_dir_all(root.join(".devflow")).unwrap();
+
+        // Stage launched (archive ran), THEN the monitor recorded a timeout —
+        // the real ordering within one attempt.
+        archive_phase_files(root, root, phase, 5).unwrap();
+        std::fs::write(
+            idle_timeout_path(root, phase),
+            r#"{"status":"idle_timeout","idle_secs":120,"agent_pid":4242,"written_at":1786159637,"commits":[]}"#,
+        )
+        .unwrap();
+
+        let verdict = evaluate_layer1(root, phase)
+            .expect("a verdict recorded during this attempt must still be honoured");
+        assert_eq!(
+            verdict.status,
+            AgentStatus::IdleTimeout,
+            "the timeout mechanism itself must survive the lifetime fix"
+        );
     }
 
     #[test]
