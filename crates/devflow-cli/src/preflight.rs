@@ -977,8 +977,14 @@ fn unattended_launch_shape_condition(state: &State) -> ConditionState {
         // exclude Code. Reporting "no cause" would be worse than saying so.
         causes.push("Code is not on the stream-json launch path".to_string());
     }
+    // The reason names the CAUSE that applied, and then the consequence in
+    // terms true of every cause. An earlier wording said "the legacy arm has
+    // no process to bound the chain flag's lifetime" unconditionally, which
+    // misattributed a non-Claude refusal to a legacy opt-out the operator had
+    // not set.
     ConditionState::DoesNotHold(format!(
-        "{} — the legacy arm has no process to bound the chain flag's lifetime",
+        "{} — the chain-flag guard binds only inside the pipe-owning monitor, which this \
+         launch shape never starts",
         causes.join(" and ")
     ))
 }
@@ -1126,11 +1132,20 @@ fn unattended_launch_check_reporting_to(
         return Ok(());
     }
 
+    // The LABEL is carried into the refusal string, not left in the report
+    // alone. "does not hold" and "could not be determined" call for different
+    // operator actions — fix the condition versus go and look at why it could
+    // not be observed — and the gate context is the only place some operators
+    // will ever read. Keeping the distinction internal would make the
+    // three-state design unobservable from outside, which is indistinguishable
+    // from not having it.
     let refusals: Vec<String> = conditions
         .iter()
         .filter(|(_, condition)| condition.refuses())
         .filter_map(|(name, condition)| {
-            condition.detail().map(|detail| format!("{name}: {detail}"))
+            condition
+                .detail()
+                .map(|detail| format!("{} [{}] — {detail}", name, condition.label()))
         })
         .collect();
     if refusals.is_empty() {
@@ -3366,6 +3381,240 @@ mod tests {
             auto_report.contains("mode auto") && supervise_report.contains("mode supervise"),
             "the reports must differ in the one field that differs, or they are not \
              evidence that both modes were exercised"
+        );
+    }
+
+    /// C1, NOT-viable fixture 1 of 3. An absent GSD config refuses; creating a
+    /// valid one — the single change between the two halves — passes. Without
+    /// the second half, an `Err` here could equally mean the fixture was broken
+    /// in some way that has nothing to do with the config.
+    #[test]
+    fn unattended_check_refuses_when_the_gsd_config_is_absent() {
+        let (dir, state) = viable_unattended_fixture(PhaseId::new(83));
+        let config = dir.path().join(".planning/config.json");
+        std::fs::remove_file(&config).unwrap();
+
+        let err = preflight_unattended_launch_check(dir.path(), &state).unwrap_err();
+        assert!(err.contains("GSD config can hold the chain flag"), "{err}");
+        assert!(err.contains("DOES NOT HOLD"), "{err}");
+
+        std::fs::write(&config, VIABLE_GSD_CONFIG).unwrap();
+        assert!(
+            preflight_unattended_launch_check(dir.path(), &state).is_ok(),
+            "restoring the config — the ONLY change — must make the same fixture pass"
+        );
+    }
+
+    /// C1, and the observability of the three-state design. A malformed config
+    /// is COULD NOT BE DETERMINED, not DOES NOT HOLD: unreadable and absent are
+    /// different facts and the operator's next action differs. If the two
+    /// collapsed to one label, the fourth `ConditionState` variant and the
+    /// distinction it encodes would be unobservable from outside the module.
+    #[test]
+    fn unattended_check_refuses_when_the_gsd_config_is_malformed() {
+        let (dir, state) = viable_unattended_fixture(PhaseId::new(84));
+        let config = dir.path().join(".planning/config.json");
+        std::fs::write(&config, "{ this is not json").unwrap();
+
+        let err = preflight_unattended_launch_check(dir.path(), &state).unwrap_err();
+        assert!(
+            err.contains("COULD NOT BE DETERMINED"),
+            "a malformed config is undetermined, not does-not-hold: {err}"
+        );
+        assert!(
+            !err.contains("DOES NOT HOLD"),
+            "the absent-file label must not be reused for an unreadable file: {err}"
+        );
+
+        std::fs::write(&config, VIABLE_GSD_CONFIG).unwrap();
+        assert!(
+            preflight_unattended_launch_check(dir.path(), &state).is_ok(),
+            "valid JSON — the ONLY change — must make the same fixture pass"
+        );
+    }
+
+    /// C2, NOT-viable fixture 2 of 3, and `35.1-RESEARCH.md` Pitfall 4's
+    /// accepted gap becoming a refusal. Every arm that cannot host the
+    /// chain-flag guard is walked, then the viable arm is restored.
+    #[test]
+    fn unattended_check_refuses_a_legacy_or_non_claude_launch_shape() {
+        let (dir, mut state) = viable_unattended_fixture(PhaseId::new(85));
+
+        state.legacy_claude_launch = true;
+        let err = preflight_unattended_launch_check(dir.path(), &state).unwrap_err();
+        assert!(err.contains("legacy launch opt-out"), "{err}");
+        assert!(
+            err.contains("Code would launch on the pipe-owning arm"),
+            "{err}"
+        );
+
+        state.legacy_claude_launch = false;
+        for agent in [AgentKind::Codex, AgentKind::OpenCode] {
+            state.agent = agent;
+            let err = preflight_unattended_launch_check(dir.path(), &state).unwrap_err();
+            assert!(
+                err.contains(&format!("the agent is `{agent}`")),
+                "agent {agent} must be named in its own refusal: {err}"
+            );
+        }
+
+        state.agent = AgentKind::Claude;
+        assert!(
+            preflight_unattended_launch_check(dir.path(), &state).is_ok(),
+            "claude with the opt-out clear is the one viable shape and must pass"
+        );
+    }
+
+    /// C3, NOT-viable fixture 3 of 3. The two halves differ only in the plan's
+    /// gate value, which is what proves the check DISCRIMINATES between the
+    /// checkpoint class phase 35.1 makes auto-approvable and the class no mode
+    /// can approve — rather than refusing any phase that plans a checkpoint.
+    #[test]
+    fn unattended_check_refuses_a_phase_whose_plan_declares_a_human_only_checkpoint() {
+        let phase = PhaseId::new(86);
+        let (dir, state) = viable_unattended_fixture(phase);
+        write_plan_for_phase(
+            dir.path(),
+            phase,
+            "---\nphase: probe\n---\n\n<task type=\"checkpoint:human-verify\" gate=\"blocking-human\">\n</task>\n",
+        );
+
+        let err = preflight_unattended_launch_check(dir.path(), &state).unwrap_err();
+        assert!(
+            err.contains("no plan declares a human-only checkpoint"),
+            "{err}"
+        );
+        assert!(err.contains("rule 6"), "{err}");
+
+        write_plan_for_phase(
+            dir.path(),
+            phase,
+            "---\nphase: probe\n---\n\n<task type=\"checkpoint:human-verify\" gate=\"blocking\">\n</task>\n",
+        );
+        assert!(
+            preflight_unattended_launch_check(dir.path(), &state).is_ok(),
+            "the ordinary blocking gate — the ONLY change — is exactly what this \
+             phase makes auto-approvable and must pass"
+        );
+    }
+
+    /// Without this, "refuse on anything that is not a definite pass" would
+    /// refuse every launch made before the phase was planned, and the check
+    /// would be unusable at the stage where refusing is cheapest.
+    #[test]
+    fn unattended_check_treats_an_unplanned_phase_as_pending_at_define_and_undetermined_at_code() {
+        let phase = PhaseId::new(87);
+        let (dir, mut state) = viable_unattended_fixture(phase);
+        std::fs::remove_dir_all(dir.path().join(".planning/phases")).unwrap();
+
+        state.stage = Stage::Define;
+        assert!(
+            preflight_unattended_launch_check(dir.path(), &state).is_ok(),
+            "an unplanned phase at Define is pending, not failing"
+        );
+
+        state.stage = Stage::Code;
+        let err = preflight_unattended_launch_check(dir.path(), &state).unwrap_err();
+        assert!(
+            err.contains("COULD NOT BE DETERMINED"),
+            "by Code the plans should exist; their absence is an anomaly, not a pass: {err}"
+        );
+    }
+
+    /// D-08. The two halves differ by EXACTLY one field assignment, which is
+    /// what makes this a control rather than two unrelated cases. The fixture
+    /// is the most comprehensively NOT-viable one available: all three
+    /// conditions refuse.
+    #[test]
+    fn unattended_check_reports_but_does_not_refuse_in_supervise_mode() {
+        let phase = PhaseId::new(88);
+        let (dir, mut state) = viable_unattended_fixture(phase);
+        std::fs::remove_file(dir.path().join(".planning/config.json")).unwrap();
+        std::fs::remove_dir_all(dir.path().join(".planning/phases")).unwrap();
+        state.legacy_claude_launch = true;
+
+        let err = preflight_unattended_launch_check(dir.path(), &state).unwrap_err();
+        assert!(err.contains("GSD config can hold the chain flag"), "{err}");
+        assert!(
+            err.contains("Code would launch on the pipe-owning arm"),
+            "{err}"
+        );
+        assert!(
+            err.contains("no plan declares a human-only checkpoint"),
+            "{err}"
+        );
+
+        state.mode = Mode::Supervise; // the one and only change
+        assert!(
+            preflight_unattended_launch_check(dir.path(), &state).is_ok(),
+            "D-08: an operator rehearsing viability must not be blocked out of a \
+             supervised run by the rehearsal"
+        );
+    }
+
+    /// F-13 / D-09. `state.yes_ship` authorizes the Ship gate and NOTHING else.
+    /// A launch-prerequisite bypass arriving through it would be D-09's
+    /// prohibition through a side door, so the non-interaction is pinned here
+    /// rather than left to the reader of `run_gate`'s signature. Mirrors
+    /// `run_preflight_major_bump_gate_not_auto_approved_by_yes_ship`.
+    #[test]
+    fn unattended_check_is_not_bypassed_by_yes_ship() {
+        let (dir, mut state) = viable_unattended_fixture(PhaseId::new(89));
+        std::fs::remove_file(dir.path().join(".planning/config.json")).unwrap();
+
+        assert!(
+            preflight_unattended_launch_check(dir.path(), &state).is_err(),
+            "precondition: the fixture must refuse before yes_ship is involved"
+        );
+        state.yes_ship = true;
+        assert!(
+            preflight_unattended_launch_check(dir.path(), &state).is_err(),
+            "yes_ship must not convert a refusal into a pass — it authorizes the \
+             Ship gate and nothing else (F-13)"
+        );
+    }
+
+    /// CR-01's property, extended to this check: an earlier failing check must
+    /// not hide this one. That is what makes `run_preflight`'s `Advance` arm
+    /// safe to skip the re-check — the human approving the gate has already
+    /// been shown every applicable reason.
+    ///
+    /// The fixture fails BOTH: Codex at Define with no CONTEXT.md on develop
+    /// trips `preflight_interactivity_check`, and Codex also trips this check's
+    /// C2 (no non-Claude agent can host the chain-flag guard).
+    #[test]
+    fn generic_preflight_checks_surfaces_the_unattended_reason_alongside_an_earlier_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        write_gsd_config(root, VIABLE_GSD_CONFIG);
+
+        let phase = PhaseId::new(90);
+        write_plan_for_phase(
+            root,
+            phase,
+            "---\nphase: probe\n---\n\n<task type=\"auto\">\n</task>\n",
+        );
+        let mut state = State::new(phase, AgentKind::Codex, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Define;
+
+        let err = generic_preflight_checks(root, &state).unwrap_err();
+        assert!(
+            err.contains("codex cannot run Define's"),
+            "the interactivity reason must survive aggregation: {err}"
+        );
+        assert!(
+            err.contains("Code would launch on the pipe-owning arm"),
+            "the unattended reason must survive aggregation: {err}"
+        );
+
+        // The unattended reason is ordered ahead of interactivity precisely so
+        // the 300-character cap cannot elide it (see the placement comment in
+        // `generic_preflight_checks`).
+        assert!(
+            truncate_reason(&err).contains("Code would launch on the pipe-owning arm"),
+            "{}",
+            truncate_reason(&err)
         );
     }
 
