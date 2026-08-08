@@ -104,7 +104,7 @@ Plans:
 
 - [x] 35-06-PLAN.md — enumerate and document the public-API break: verified `CHANGELOG.md` entry plus removal notes at each site; release stays `v2.5.0`, milestone unrenamed (D-04 / D-08)
 
-### Phase 35.1: Unattended-Launch Prerequisites (999.93)
+### Phase 35.1: Unattended-Launch Prerequisites (999.93 + 999.98 + 999.99)
 
 **Goal**: `devflow start --mode auto` can actually complete a phase with no human present — ordinary
 GSD `blocking` checkpoints resolve instead of stalling the run — and a preflight refuses the launch,
@@ -151,6 +151,13 @@ gather the live concurrency evidence its criterion 1 demands.
 **Not in scope**: the first-option `decision` checkpoint behaviour (filed as 999.94) — it is a
 correctness question about *how* an unattended agent decides, separable from *whether* it can
 proceed at all.
+
+**Promoted into this phase mid-flight (2026-08-08):** 999.99 and 999.98, both found by dogfooding
+this phase's own Plan stage and both fixed before the plans were executed. Their code landed ahead
+of 35.1's success criteria rather than in service of them, so a reader comparing the criteria
+against the diff will find more than the criteria ask for — that is why, not drift. Both are
+prerequisites in the literal sense: an unattended run cannot be made to work while the monitor
+kills any stage that backgrounds work.
 **Plans**: 4 plans across 3 waves
 
 Plans:
@@ -2816,6 +2823,94 @@ can miss it entirely.
 **Priority:** Medium. **Size:** M.
 
 ---
+
+### Phase 999.99: The Idle Timeout Kills Any Stage That Backgrounds Work, Because the Drain Gate Reads an Event Production Never Emits (PROMOTED — Phase 35.1)
+
+**Found:** 2026-08-08, dogfooding Phase 35.1's own Plan stage. Two consecutive Plan runs died at
+~8.4 and ~8.8 minutes, ~$4.50 each, producing zero artifacts.
+
+**The defect, in one line:** DevFlow's close rule tracks background tasks by reading
+`background_tasks_changed`, and the Claude CLI does not emit that event — so DevFlow never knows a
+subagent is running, and its 120s idle timeout kills the parent for being correctly quiet.
+
+**Measured, not inferred.** A real Plan capture contained `task_started` ×1, `task_progress` ×61,
+`task_notification` ×1, `task_updated` ×1 — and `background_tasks_changed` ×0. Every occurrence of
+that event name in this repository is a test fixture synthesising it, which is exactly why the
+blindness never surfaced in the suite. **This is 999.83's "the fixture's shape doesn't match what
+production actually emits", with the capture that proves it.**
+
+**How it presents, and why it misleads.** The largest gap in the stream was exactly 120.0s — the
+timeout firing at its deadline, not an organic pause; the next largest was 44.5s. DevFlow killed
+the child, and the CLI then reported the task as `{"status":"killed"}` and the tool use as
+`"The user doesn't want to proceed with this tool use"` with `non_execution_kind: "user-rejected"`.
+That reads like an external failure or an operator action. It is our own signal coming back at us,
+and it cost two misdiagnoses before the timestamps settled it.
+
+**Two consequences, one cause.** `should_close` could release stdin while a subagent was still
+running — the 999.64 orphan shape, reachable through the guard built to prevent it. And the
+idle-timeout arm never consulted task state at all.
+
+**Why the existing design did not cover it.** D-03 rejected an outer wall-clock bound on the
+grounds that "there is no single wall-clock value that is safe for both a hang and a legitimately
+long stage", and relied instead on every stream line resetting the window — "a healthy 47-minute
+stage that keeps emitting is never touched". That reasoning is still right. Its unstated
+assumption is *healthy ⇒ still emitting*, which backgrounding breaks: the parent is correctly
+silent while the child works. The drain gate was supposed to cover that case and could not.
+
+**Fixed in Phase 35.1.** `CloseRule` now tracks open task ids from the vocabulary the CLI really
+emits, and the timeout arm extends rather than kills while work is outstanding. The extension is
+bounded (`MAX_IDLE_EXTENSIONS_WITH_TASKS_OPEN`) because an open task is not proof of progress — a
+wedged subagent never reports a terminal status, and an unbounded wait trades a false kill for an
+immortal run. An unrecognised task status leaves the task OPEN: being wrong that way delays a
+stage, being wrong the other way orphans its work.
+
+**Verification note for whoever revisits this.** The fix is proven by test, including a negative
+control that reproduced the real symptom when disabled. It was NOT exercised in production by the
+run during which it was written — that run logged zero extensions because its stream stayed busy.
+Proven in tests, untested live.
+
+---
+
+### Phase 999.98: The Idle-Timeout Verdict Has No Lifetime, So One Attempt's Death Certificate Condemns Every Later Run of That Phase (PROMOTED — Phase 35.1)
+
+**Found:** 2026-08-08, immediately after 999.99, when a relaunched run failed at a stage that had
+demonstrably succeeded.
+
+**The defect, in one line:** `.devflow/phase-NN-idle-timeout` had one writer, one reader, and no
+deleter — nothing in the codebase ever unlinked it — so a verdict about one stage attempt stayed
+authoritative for that phase forever.
+
+**Why the file is authoritative by design.** It is the monitor's death certificate, written
+*before* it kills a silent child so that `evaluate_layer1` cannot later parse the capture and score
+a killed agent as a success. `fire_idle_timeout` is blunt about the stakes: "this completing is the
+ONLY thing that stops Layer 2 from later scoring partial commits as Success". It is read FIRST and
+returns unconditionally (T-31-06) precisely so that nothing can shadow a real timeout. **The
+severity comes from the same property that makes it useful:** anything that outranks all other
+evidence and never expires is a loaded gun.
+
+**Measured.** A record written at 22:48 by a killed Plan stage condemned a Define stage that had
+genuinely succeeded 15 seconds earlier. The gate quoted a 120s silence inside a 22-second stage and
+named an agent pid that had been dead for 14 minutes. Every clause of the diagnostic was false, and
+an operator following it would have run `ps -p 501757` against a dead process. It survived
+`gate reject --note abort` and `devflow start --force`; it had to be removed by hand, twice.
+
+**This is a known defect class through an unguarded door.** `monitor.rs` already documents the same
+shape for a different path — a bogus `IdleTimeout` verdict written over a completed, successful
+stage, which "outranked the real success and could not be recovered from". That door was closed for
+the post-close case. The previous-run case was not.
+
+**Interaction with 999.99, worth recording.** Fixing the drain gate makes this bug *rarer and
+harder to diagnose*: the surviving trigger becomes a genuine timeout, possibly days earlier on
+unrelated work, resurfacing as an inexplicable failure on a healthy run naming a pid that no longer
+exists. The two defects are independent — a perfect drain gate still writes a certificate on a real
+timeout — but they must not be fixed one without the other.
+
+**Fixed in Phase 35.1.** The record now has the same lifetime as the per-attempt agent-pid file,
+which `archive_phase_files_with_stamp` already clears on its first line; it is cleared beside it,
+above the "nothing to archive" early return. Ordering is safe: a stage's verdict is consumed by
+`advance_evaluated` before the next `capture_archived` runs. Deleting rather than archiving loses
+nothing — the verdict is already durable in `advance_evaluated`'s `reason` in `events.jsonl` and in
+the gate context that quotes it.
 
 ### Phase 999.97: DevFlow Cannot Launch Any Phase GSD Numbers With a Decimal (HOTFIX — 2026-08-07)
 
