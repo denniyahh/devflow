@@ -20,16 +20,18 @@
 use crate::CliError;
 use crate::commands::phase_artifact_on_develop;
 use crate::pipeline_gate::{abort, run_gate};
+use crate::pipeline_launch::claude_stream_launch_enabled;
 use crate::pipeline_launch::launch_stage;
 use crate::pipeline_launch::launch_stage_inner;
 use crate::pipeline_outcomes::truncate_reason;
 use devflow_core::gates::{GateAction, Gates};
 use devflow_core::git::git_command;
+use devflow_core::gsd_config::{self, GsdConfigError};
 use devflow_core::mode::{self, Mode};
 use devflow_core::phase_id::PhaseId;
 use devflow_core::stage::Stage;
 use devflow_core::state::{AgentKind, State};
-use devflow_core::{agents, events, version, workflow};
+use devflow_core::{agents, events, verify, version, workflow};
 use std::path::{Path, PathBuf};
 
 /// The sandbox writable roots a worktree-hosted agent needs to commit: the
@@ -838,6 +840,308 @@ fn breaking_commit_subjects(execution_root: &Path, range_start: &str) -> Vec<Str
     subjects
 }
 
+// ---------------------------------------------------------------------------
+// D-07 (35.1-03): refuse an unattended launch, before any agent time is spent,
+// when the conditions that let it FINISH do not hold.
+//
+// Phase 35.1 makes checkpoint auto-approval possible; it does not make it
+// universal. Three things each independently defeat it, silently, and each one
+// turns an overnight run into a stall discovered the next morning.
+// ---------------------------------------------------------------------------
+
+/// The four states one unattended-launch prerequisite can be in.
+///
+/// The fourth variant is not a nicety (F-12, C3): at Define a phase genuinely
+/// has no plans yet, and folding that into [`Self::Undetermined`] would refuse
+/// every unattended launch ever started.
+///
+/// Reasons are kept SHORT on purpose. [`run_preflight`] passes the joined
+/// refusal string through [`truncate_reason`] — a hard 300-character cap that
+/// includes a 39-character truncation marker — and three verbose reasons would
+/// not survive it. The unbounded detail lives in the printed report instead,
+/// which is exactly the split [`truncate_reason`]'s own doc comment describes.
+#[derive(Debug)]
+enum ConditionState {
+    /// Observed to hold.
+    Holds,
+    /// Observed NOT to hold.
+    DoesNotHold(String),
+    /// Could not be observed either way. Refuses, per D-07's fail-closed rule:
+    /// "unreadable" is a different fact from "absent", and neither is a pass.
+    Undetermined(String),
+    /// Not yet determinable at this stage, and legitimately so.
+    NotYetApplicable(String),
+}
+
+impl ConditionState {
+    /// The report label. Refusing states are shouted so a skim of a monitor log
+    /// finds them.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Holds => "holds",
+            Self::DoesNotHold(_) => "DOES NOT HOLD",
+            Self::Undetermined(_) => "COULD NOT BE DETERMINED",
+            Self::NotYetApplicable(_) => "not yet applicable",
+        }
+    }
+
+    /// Whether this state refuses an unattended launch — exactly
+    /// [`Self::DoesNotHold`] and [`Self::Undetermined`].
+    fn refuses(&self) -> bool {
+        matches!(self, Self::DoesNotHold(_) | Self::Undetermined(_))
+    }
+
+    /// The explanation carried by every state but [`Self::Holds`].
+    fn detail(&self) -> Option<&str> {
+        match self {
+            Self::Holds => None,
+            Self::DoesNotHold(reason)
+            | Self::Undetermined(reason)
+            | Self::NotYetApplicable(reason) => Some(reason),
+        }
+    }
+}
+
+/// D-07: whether the unattended-launch check applies to `stage` — `Define` and
+/// `Code`, split out as its own pure predicate exactly the way
+/// [`gh_auth_check_applies`] and [`major_bump_check_applies`] are, so "does not
+/// run for a non-applicable stage" is unit-testable with no fixture at all.
+///
+/// `Define` is the earliest stage `devflow start` launches, so a refusal there
+/// costs zero agent time. `Code` is where C3 first becomes determinable and
+/// where the mechanism is actually used.
+fn unattended_launch_check_applies(stage: Stage) -> bool {
+    matches!(stage, Stage::Define | Stage::Code)
+}
+
+/// C1: the GSD config at the launch root exists, parses, and can hold the flag.
+///
+/// DevFlow cannot set the chain flag in a file it cannot read or write, and
+/// GSD's `check auto-mode` reads nothing else.
+///
+/// Absent and unreadable are reported as DIFFERENT states on purpose. A file
+/// that is not there is a different fact from a file that cannot be read, and
+/// collapsing them is the "unreachable is not absent" error this project
+/// already has a rule about (see [`preflight_major_bump_check`]'s D-10 branch).
+///
+/// T-35.1-16: no reason below embeds the absolute config path.
+/// [`gsd_config::GsdConfigError::Missing`] carries a `PathBuf` and renders it,
+/// so its `Display` is deliberately NOT used; the `Io` arm reports
+/// [`std::io::ErrorKind`] rather than the error's own message for the same
+/// reason.
+fn unattended_config_condition(launch_root: &Path) -> ConditionState {
+    match gsd_config::auto_chain_active(launch_root) {
+        Ok(_) => ConditionState::Holds,
+        Err(GsdConfigError::Missing(_)) => ConditionState::DoesNotHold(
+            "no `.planning/config.json` under the launch root — nowhere for the chain flag \
+             to live"
+                .to_string(),
+        ),
+        Err(GsdConfigError::Json(err)) => ConditionState::Undetermined(format!(
+            "`.planning/config.json` does not parse ({err}) — unreadable is not absent"
+        )),
+        Err(GsdConfigError::Io(err)) => ConditionState::Undetermined(format!(
+            "`.planning/config.json` could not be read ({}) — unreadable is not absent",
+            err.kind()
+        )),
+    }
+}
+
+/// C2: the Code stage would launch on the pipe-owning arm — Claude, no legacy
+/// opt-out.
+///
+/// The chain-flag guard lives in a Rust process's stack frame; the legacy arm
+/// is a detached shell script with no frame to hang a `Drop` on
+/// (`35.1-RESEARCH.md` Pitfall 4). This turns that accepted gap from a silent
+/// stall hours into an unattended run into a refusal before the first agent is
+/// spawned.
+///
+/// Asks [`claude_stream_launch_enabled`] — the launch path's OWN predicate —
+/// rather than re-deriving the answer, so the preflight and the launch cannot
+/// disagree about whether a guard will exist. `Stage::Code` is passed
+/// explicitly rather than `state.stage`: the question is about the stage where
+/// the mechanism is USED, not about the stage being launched right now.
+fn unattended_launch_shape_condition(state: &State) -> ConditionState {
+    if claude_stream_launch_enabled(state.agent, Stage::Code, state.legacy_claude_launch) {
+        return ConditionState::Holds;
+    }
+    let mut causes = Vec::new();
+    if state.legacy_claude_launch {
+        causes.push("the legacy launch opt-out is active".to_string());
+    }
+    if state.agent != AgentKind::Claude {
+        causes.push(format!("the agent is `{}`, not claude", state.agent));
+    }
+    if causes.is_empty() {
+        // Defensive: reachable only if `STREAM_JSON_STAGES` ever narrows to
+        // exclude Code. Reporting "no cause" would be worse than saying so.
+        causes.push("Code is not on the stream-json launch path".to_string());
+    }
+    ConditionState::DoesNotHold(format!(
+        "{} — the legacy arm has no process to bound the chain flag's lifetime",
+        causes.join(" and ")
+    ))
+}
+
+/// C3: no plan for this phase declares a checkpoint GSD never auto-approves.
+///
+/// Those two markers block in EVERY mode (`checkpoints.md` rule 6), so their
+/// presence makes an unattended stall certain regardless of everything this
+/// phase builds.
+///
+/// "No plans yet" is deliberately read differently at the two applicable
+/// stages: pending at Define (the phase is not planned yet — normal), and
+/// undetermined at Code (plans should exist by then, and their absence is an
+/// anomaly, not a pass).
+fn unattended_planned_checkpoint_condition(launch_root: &Path, state: &State) -> ConditionState {
+    if verify::phase_plan_files(launch_root, state.phase).is_empty() {
+        let reason = "the phase has no plan files yet".to_string();
+        return if state.stage == Stage::Define {
+            ConditionState::NotYetApplicable(format!("{reason} — re-evaluated at Code"))
+        } else {
+            ConditionState::Undetermined(format!("{reason}, but Code expects them"))
+        };
+    }
+    if verify::phase_has_human_only_checkpoint(launch_root, state.phase) {
+        return ConditionState::DoesNotHold(
+            "a plan declares a `blocking-human` gate or a `human-action` checkpoint, which \
+             no mode auto-approves (checkpoints.md rule 6)"
+                .to_string(),
+        );
+    }
+    ConditionState::Holds
+}
+
+/// D-07: refuse an unattended launch whose prerequisites do not definitely
+/// hold, and report them either way.
+///
+/// **D-07 is fail-CLOSED, and warn-and-proceed was rejected rather than
+/// overlooked.** Anything that is not a definite pass — including "could not be
+/// determined" — refuses. A warning is read by nobody in an unattended run,
+/// which is the only kind of run this check exists for.
+///
+/// **D-08, one path with two consequences.** The identical evaluation runs in
+/// both modes and prints the identical per-condition report; only the
+/// disposition differs. `Mode::Supervise` always returns `Ok(())`, so an
+/// operator can rehearse an unattended run's viability without being blocked
+/// out of a supervised one. Printing in both modes is the whole point of the
+/// supervise arm — do not "optimize" the report behind the auto branch.
+///
+/// **D-09: there is no override, and its absence is a decision, not an
+/// oversight.** No flag, no environment variable, no config key, and no
+/// parameter beyond `(&Path, &State)` turns this refusal into a warning.
+/// `state.yes_ship` authorizes the Ship gate and nothing else; that
+/// non-interaction is pinned by `unattended_check_is_not_bypassed_by_yes_ship`.
+/// **Both external review lanes objected to this on record** — a false-positive
+/// refusal has no in-product recovery — and the operator heard the objection
+/// and let the decision stand (registered as T-35.1-15, disposition `accept`).
+/// If it bites in practice, reopen D-09 as a decision; do not quietly add the
+/// escape hatch a later reader might assume was simply forgotten.
+///
+/// **What "refuses" actually does (F-15), stated rather than implied.** This
+/// plugs into [`generic_preflight_checks`], so a refusal takes that framework's
+/// existing disposition: the agent is never spawned ([`run_preflight`] returns
+/// `Ok(false)` and `launch_stage` returns without reaching
+/// `launch_stage_inner`), and the run PARKS at a named preflight gate + notify,
+/// bounded by `state.preflight_retries` / [`mode::MAX_PREFLIGHT_RETRIES`],
+/// after which it aborts with a logged `preflight_retry_ceiling_reached`. It is
+/// NOT a process exit — Phase 17's decision 15 forbids a hard exit from this
+/// framework and this check gets no exception. So the unattended run stops and
+/// waits for a human rather than pushing on.
+///
+/// **Where the report is actually seen (F-16).** [`run_preflight`] runs from
+/// `launch_stage`, which runs in the operator's own `devflow start` process for
+/// the FIRST stage and in the detached `__monitor` process for every later one.
+/// The Define-stage report therefore prints to the operator's TERMINAL — which
+/// is what makes D-08's rehearsal useful — and the Code-stage report prints to
+/// the MONITOR LOG. Nobody should later "fix" a report they could not find.
+///
+/// The signature is exactly `(&Path, &State) -> Result<(), String>` and must
+/// stay that way (D-09, T-35.1-14): a parameter surface is where a future
+/// bypass gets wired in.
+fn preflight_unattended_launch_check(project_root: &Path, state: &State) -> Result<(), String> {
+    unattended_launch_check_reporting_to(project_root, state, &mut std::io::stdout())
+}
+
+/// [`preflight_unattended_launch_check`]'s body, with the report's destination
+/// made injectable so a test can assert on the bytes actually emitted rather
+/// than on a re-derivation of what they ought to be.
+///
+/// **This does not weaken D-09.** The one extra parameter is a byte sink; it
+/// cannot reach the disposition, which is decided entirely by
+/// [`ConditionState::refuses`] and `state.mode` below. The function callers
+/// actually reach, and the only one wired into
+/// [`generic_preflight_checks`], keeps the fixed `(&Path, &State)` signature.
+///
+/// A write failure on the sink is deliberately IGNORED rather than propagated:
+/// a closed stdout must not convert a viable launch into a refusal, nor a
+/// refusal into a pass. The disposition is computed from the conditions, never
+/// from whether the report reached anyone.
+fn unattended_launch_check_reporting_to(
+    project_root: &Path,
+    state: &State,
+    report: &mut dyn std::io::Write,
+) -> Result<(), String> {
+    if !unattended_launch_check_applies(state.stage) {
+        return Ok(());
+    }
+    // The same spelling the chain-flag guard and the force-clear use: in
+    // worktree mode the tracked `.planning/` the agent actually reads is the
+    // WORKTREE's copy, not the main checkout's (999.76).
+    let launch_root = state.worktree_path.as_deref().unwrap_or(project_root);
+
+    let conditions = [
+        (
+            "GSD config can hold the chain flag",
+            unattended_config_condition(launch_root),
+        ),
+        (
+            "Code would launch on the pipe-owning arm",
+            unattended_launch_shape_condition(state),
+        ),
+        (
+            "no plan declares a human-only checkpoint",
+            unattended_planned_checkpoint_condition(launch_root, state),
+        ),
+    ];
+
+    // UNCONDITIONAL, and above the mode branch below on purpose (D-08).
+    let _ = writeln!(
+        report,
+        "unattended-launch prerequisites — phase {phase}, stage {stage}, mode {mode}:",
+        phase = state.phase,
+        stage = state.stage,
+        mode = state.mode
+    );
+    for (name, condition) in &conditions {
+        let _ = match condition.detail() {
+            Some(detail) => writeln!(report, "  [{}] {name} — {detail}", condition.label()),
+            None => writeln!(report, "  [{}] {name}", condition.label()),
+        };
+    }
+
+    // D-08: supervise reports and proceeds. The evaluation above already ran,
+    // so the rehearsal is of the real check and not of a cheaper stand-in.
+    if state.mode != Mode::Auto {
+        return Ok(());
+    }
+
+    let refusals: Vec<String> = conditions
+        .iter()
+        .filter(|(_, condition)| condition.refuses())
+        .filter_map(|(name, condition)| {
+            condition.detail().map(|detail| format!("{name}: {detail}"))
+        })
+        .collect();
+    if refusals.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "unattended launch refused (D-07) — {}",
+        refusals.join("; ")
+    ))
+}
+
 /// The generic (universal) preflight checks (D-14) — the adapter-specific
 /// hook is composed separately in [`run_preflight`].
 ///
@@ -870,6 +1174,26 @@ fn breaking_commit_subjects(execution_root: &Path, range_start: &str) -> Vec<Str
 fn generic_preflight_checks(project_root: &Path, state: &State) -> Result<(), String> {
     let mut reasons = Vec::new();
     if let Err(reason) = preflight_major_bump_check(project_root, state) {
+        reasons.push(reason);
+    }
+    // D-07 (35.1-03) sits SECOND, and the position was chosen rather than
+    // defaulted to. It can never co-occur with the major-bump or gh-auth
+    // reasons — those apply only at `Stage::Ship`, and
+    // `unattended_launch_check_applies` covers only Define and Code — so
+    // second is effectively FIRST on every launch where this reason exists at
+    // all, and `truncate_reason`'s 300-character cap cannot elide it.
+    //
+    // The one check it CAN co-occur with is interactivity (Codex, Auto,
+    // Define), and it outranks that deliberately: interactivity reports a
+    // symptom this check's C2 also reports, with more actionable detail and a
+    // per-condition breakdown. Losing the shorter, more-redundant reason to
+    // truncation costs less than losing this one.
+    //
+    // Aggregated with `if let Err`, never `?` — see this function's CR-01 doc
+    // comment above. A `?` here would mean a human approving the major-bump
+    // gate at some future Ship-and-Code-composing stage never sees why the
+    // unattended launch was refused.
+    if let Err(reason) = preflight_unattended_launch_check(project_root, state) {
         reasons.push(reason);
     }
     if let Err(reason) = preflight_interactivity_check(project_root, state) {
@@ -2906,5 +3230,157 @@ mod tests {
         assert!(msg.contains("develop"));
         assert!(msg.contains("origin/develop"));
         assert!(msg.contains('3'));
+    }
+
+    // -----------------------------------------------------------------
+    // D-07 (35.1-03): the unattended-launch check.
+    //
+    // Every refusing test below carries its PASSING counterpart inside the
+    // same function, reached by changing exactly one thing. A test that only
+    // ever asserts `Err` cannot tell a working condition from a fixture that
+    // was broken for an unrelated reason.
+    // -----------------------------------------------------------------
+
+    /// The GSD config shape a real project has, reduced to the keys that
+    /// matter here. `set_auto_chain_active` must find somewhere to put the
+    /// flag, so a parsing object is the whole requirement.
+    const VIABLE_GSD_CONFIG: &str = "{\n  \"workflow\": {\n    \"auto_advance\": false\n  }\n}\n";
+
+    fn write_gsd_config(root: &Path, contents: &str) {
+        let dir = root.join(".planning");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), contents).unwrap();
+    }
+
+    /// A plan file for `phase`, written where `verify::phase_plan_files` looks.
+    fn write_plan_for_phase(root: &Path, phase: PhaseId, body: &str) {
+        let padded = phase.padded();
+        let dir = root
+            .join(".planning/phases")
+            .join(format!("{padded}-probe"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{padded}-01-PLAN.md")), body).unwrap();
+    }
+
+    /// A wholly VIABLE fixture: a parsing GSD config, Claude with no legacy
+    /// opt-out, and a plan declaring only an ordinary blocking checkpoint.
+    /// Every test below starts from this and breaks exactly one thing, so a
+    /// refusal is attributable to the condition under test.
+    fn viable_unattended_fixture(phase: PhaseId) -> (tempfile::TempDir, State) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write_gsd_config(&root, VIABLE_GSD_CONFIG);
+        write_plan_for_phase(
+            &root,
+            phase,
+            "---\nphase: probe\n---\n\n<task type=\"checkpoint:human-verify\" gate=\"blocking\">\n</task>\n",
+        );
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root);
+        state.stage = Stage::Code;
+        (dir, state)
+    }
+
+    /// D-07 scope: Define and Code only, mirroring `gh_auth_check_applies` and
+    /// `major_bump_check_applies`. Stages named explicitly rather than
+    /// iterated, so adding a `Stage` variant surfaces here as a compile-time
+    /// prompt to decide rather than as a silently-widened set.
+    #[test]
+    fn unattended_check_does_not_apply_outside_define_and_code() {
+        assert!(unattended_launch_check_applies(Stage::Define));
+        assert!(unattended_launch_check_applies(Stage::Code));
+        assert!(!unattended_launch_check_applies(Stage::Plan));
+        assert!(!unattended_launch_check_applies(Stage::Validate));
+        assert!(!unattended_launch_check_applies(Stage::Ship));
+
+        // A wholly NOT-viable fixture parked at a non-applicable stage still
+        // passes — the early return is what is being measured, so the fixture
+        // is deliberately one that would otherwise refuse three times over.
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::new(
+            PhaseId::new(80),
+            AgentKind::Codex,
+            Mode::Auto,
+            dir.path().to_path_buf(),
+        );
+        state.legacy_claude_launch = true;
+        for stage in [Stage::Plan, Stage::Validate, Stage::Ship] {
+            state.stage = stage;
+            assert!(
+                preflight_unattended_launch_check(dir.path(), &state).is_ok(),
+                "stage {stage} must return before evaluating any condition"
+            );
+        }
+        state.stage = Stage::Code;
+        assert!(
+            preflight_unattended_launch_check(dir.path(), &state).is_err(),
+            "opposite-result case: the SAME fixture at an applicable stage must refuse — \
+             without this, the assertions above would also pass for a check that never \
+             refuses anything"
+        );
+    }
+
+    /// D-08: the report prints in BOTH modes, and is asserted on the bytes the
+    /// check actually emitted rather than on a re-derivation of them.
+    #[test]
+    fn unattended_check_reports_every_condition_in_both_modes() {
+        let (dir, mut state) = viable_unattended_fixture(PhaseId::new(81));
+        state.legacy_claude_launch = true; // one condition failing, two holding
+
+        let mut auto_report = Vec::new();
+        let auto = unattended_launch_check_reporting_to(dir.path(), &state, &mut auto_report);
+        let auto_report = String::from_utf8(auto_report).unwrap();
+
+        state.mode = Mode::Supervise;
+        let mut supervise_report = Vec::new();
+        let supervise =
+            unattended_launch_check_reporting_to(dir.path(), &state, &mut supervise_report);
+        let supervise_report = String::from_utf8(supervise_report).unwrap();
+
+        assert!(auto.is_err(), "auto must refuse the failing condition");
+        assert!(supervise.is_ok(), "D-08: supervise reports and proceeds");
+
+        for report in [&auto_report, &supervise_report] {
+            assert!(
+                report.contains("unattended-launch prerequisites"),
+                "header missing from {report}"
+            );
+            assert!(
+                report.contains("GSD config can hold the chain flag"),
+                "{report}"
+            );
+            assert!(
+                report.contains("Code would launch on the pipe-owning arm"),
+                "{report}"
+            );
+            assert!(
+                report.contains("no plan declares a human-only checkpoint"),
+                "{report}"
+            );
+            assert_eq!(
+                report.lines().count(),
+                4,
+                "one header plus exactly three condition lines: {report}"
+            );
+        }
+        assert!(
+            auto_report.contains("mode auto") && supervise_report.contains("mode supervise"),
+            "the reports must differ in the one field that differs, or they are not \
+             evidence that both modes were exercised"
+        );
+    }
+
+    /// T-35.1-16: no reason may embed the absolute config path. The refusal
+    /// string reaches a persisted gate file and the operator's notification.
+    #[test]
+    fn unattended_refusal_reason_contains_no_absolute_path() {
+        let (dir, state) = viable_unattended_fixture(PhaseId::new(82));
+        std::fs::remove_file(dir.path().join(".planning/config.json")).unwrap();
+        let fixture_root = dir.path().to_string_lossy().into_owned();
+
+        let err = preflight_unattended_launch_check(dir.path(), &state).unwrap_err();
+        assert!(!err.contains(&fixture_root), "{err}");
+        assert!(!err.contains("/home/"), "{err}");
+        assert!(!err.contains("/Users/"), "{err}");
+        assert!(!err.contains("/tmp/"), "{err}");
     }
 }

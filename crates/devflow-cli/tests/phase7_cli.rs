@@ -57,6 +57,17 @@ fn init_repo(root: &Path) {
         fs::write(dir.join(format!("{phase}-CONTEXT.md")), "ctx\n").unwrap();
         fs::write(dir.join(format!("{phase}-01-PLAN.md")), "plan\n").unwrap();
     }
+    // A GSD project config, because a real GSD-driven project has one and
+    // 35.1-03's `preflight_unattended_launch_check` refuses an unattended
+    // launch whose chain flag has nowhere to live. Written here rather than in
+    // the individual tests so the fixture keeps modelling a real project
+    // rather than a project that happens to satisfy one preflight condition.
+    fs::create_dir_all(root.join(".planning")).unwrap();
+    fs::write(
+        root.join(".planning/config.json"),
+        "{\n  \"workflow\": {\n    \"auto_advance\": false\n  }\n}\n",
+    )
+    .unwrap();
     git(root, &["add", "."]);
     git(root, &["commit", "-q", "-m", "base"]);
     git(root, &["branch", "main"]);
@@ -255,10 +266,24 @@ esac
         ),
     ]);
 
+    // `--mode supervise` (35.1-03): phase 8 runs on `codex`, and
+    // `preflight_unattended_launch_check`'s C2 refuses a `Mode::Auto` launch on
+    // any agent that cannot host the chain-flag guard — the guard binds inside
+    // the pipe-owning monitor, which is the Claude stream path only. This
+    // test's subject is two worktrees and two monitors, which is
+    // mode-independent; the agent diversity is the point and is preserved.
     let output = run_devflow(
         root,
         &fake_bin.path,
-        &["parallel", "--phases", "7,8", "--agents", "claude,codex"],
+        &[
+            "parallel",
+            "--phases",
+            "7,8",
+            "--agents",
+            "claude,codex",
+            "--mode",
+            "supervise",
+        ],
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("phase 7"));
@@ -320,7 +345,16 @@ fn start_defaults_to_worktree() {
         root,
         &fake_bin.path,
         &[
-            "start", "--phase", "11", "--agent", "claude", "--mode", "auto",
+            // `supervise` (35.1-03): the legacy opt-out pinned above is
+            // exactly what C2 refuses in `Mode::Auto`, and where `start` puts
+            // the phase is mode-independent.
+            "start",
+            "--phase",
+            "11",
+            "--agent",
+            "claude",
+            "--mode",
+            "supervise",
         ],
     );
 
@@ -382,7 +416,16 @@ fn start_worktree_mode_ignores_main_checkout_divergence() {
         root,
         &fake_bin.path,
         &[
-            "start", "--phase", "13", "--agent", "claude", "--mode", "auto",
+            // `supervise` (35.1-03): same reason as phase 11 above — the
+            // legacy opt-out is refused in `Mode::Auto`, and this test's
+            // subject (main-checkout divergence) is mode-independent.
+            "start",
+            "--phase",
+            "13",
+            "--agent",
+            "claude",
+            "--mode",
+            "supervise",
         ],
     );
 
@@ -412,8 +455,11 @@ fn start_no_worktree_uses_feature_branch() {
             "12",
             "--agent",
             "claude",
+            // `supervise` (35.1-03): same reason as phase 11 — the legacy
+            // opt-out pinned above is refused in `Mode::Auto`, and
+            // `--no-worktree`'s branch placement is mode-independent.
             "--mode",
-            "auto",
+            "supervise",
             "--no-worktree",
         ],
     );
@@ -457,7 +503,18 @@ fn start_until_plan_halts_cleanly() {
         root,
         &fake_bin.path,
         &[
-            "start", "--phase", "44", "--agent", "claude", "--mode", "auto", "--until", "plan",
+            // `supervise` (35.1-03): same reason as phase 11 above — the
+            // legacy opt-out is refused in `Mode::Auto`, and the `--until` cap
+            // halts at Plan, well before supervise's Validate gate.
+            "start",
+            "--phase",
+            "44",
+            "--agent",
+            "claude",
+            "--mode",
+            "supervise",
+            "--until",
+            "plan",
         ],
     );
 
