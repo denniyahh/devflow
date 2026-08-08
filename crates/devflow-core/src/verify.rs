@@ -136,6 +136,23 @@ pub fn phase_has_blocking_human_checkpoint(project_root: &Path, phase: PhaseId) 
         .any(|contents| contents.contains(HUMAN_BLOCKING_GATE))
 }
 
+/// Return `true` if any plan declared for `phase` declares a checkpoint task
+/// GSD will not auto-approve in ANY mode.
+///
+/// NAIVE FIRST CUT (35.1-03 Task 1, RED): a plain whole-file `contains`, by
+/// analogy to [`phase_has_blocking_human_checkpoint`] above. The anchoring
+/// test in this module's test section proves this shape wrong.
+pub fn phase_has_human_only_checkpoint(project_root: &Path, phase: PhaseId) -> bool {
+    const HUMAN_ONLY_GATE: &str = concat!("gate=\"", "blocking-human", "\"");
+    const HUMAN_ACTION_TYPE: &str = concat!("type=\"", "checkpoint:human-action", "\"");
+    phase_plan_files(project_root, phase)
+        .into_iter()
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .any(|contents| {
+            contents.contains(HUMAN_ONLY_GATE) || contents.contains(HUMAN_ACTION_TYPE)
+        })
+}
+
 /// Run one explicitly operator-approved external verification command.
 ///
 /// `sh -c` is intentional because probes may contain pipelines. The caller
@@ -248,6 +265,9 @@ mod tests {
     // the raw `gate="blocking-human"` string (28-01 Task 2 action note).
     const HUMAN_GATE_VALUE: &str = "blocking-human";
     const PLAIN_GATE_VALUE: &str = "blocking";
+    /// The second marker GSD never auto-approves in any mode
+    /// (`checkpoints.md` rule 5: "human-action still stops").
+    const HUMAN_ACTION_TYPE_VALUE: &str = "checkpoint:human-action";
 
     fn write_phase_file(root: &std::path::Path, phase_dir: &str, file_name: &str, contents: &str) {
         let dir = root.join(".planning/phases").join(phase_dir);
@@ -401,6 +421,109 @@ mod tests {
             !phase_has_blocking_human_checkpoint(&empty_sibling, PhaseId::new(91)),
             "opposite-result case: a root without the PLAN must return false, so the \
              assertion above is about which root is read and not about the file existing"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // 35.1-03 Task 1: `phase_has_human_only_checkpoint` — the ANCHORED
+    // scan for the two markers GSD never auto-approves in any mode.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn human_only_checkpoint_detects_the_gate_marker_on_a_task_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            "---\nphase: 92\n---\n\n<task type=\"checkpoint:human-verify\" gate=\"{HUMAN_GATE_VALUE}\">\n</task>\n"
+        );
+        write_phase_file(dir.path(), "92-probe", "92-01-PLAN.md", &body);
+
+        assert!(phase_has_human_only_checkpoint(
+            dir.path(),
+            PhaseId::new(92)
+        ));
+    }
+
+    #[test]
+    fn human_only_checkpoint_detects_the_human_action_type_on_a_task_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        // No `gate` attribute at all: `checkpoints.md` rule 5 stops a
+        // human-action checkpoint in auto-mode on its TYPE alone, so the
+        // second marker must be sufficient by itself.
+        let body = format!(
+            "---\nphase: 92\n---\n\n<task type=\"{HUMAN_ACTION_TYPE_VALUE}\">\n</task>\n"
+        );
+        write_phase_file(dir.path(), "92-probe", "92-01-PLAN.md", &body);
+
+        assert!(phase_has_human_only_checkpoint(
+            dir.path(),
+            PhaseId::new(92)
+        ));
+    }
+
+    /// The control that keeps this function off the checkpoint class phase
+    /// 35.1 exists to make auto-approvable. A substring match that dropped the
+    /// closing quote would match `blocking` inside `blocking-human` and, worse,
+    /// report every ordinary blocking checkpoint as human-only — refusing every
+    /// unattended launch of a phase that plans one.
+    #[test]
+    fn human_only_checkpoint_ignores_an_ordinary_blocking_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            "---\nphase: 92\n---\n\n<task type=\"checkpoint:human-verify\" gate=\"{PLAIN_GATE_VALUE}\">\n</task>\n"
+        );
+        write_phase_file(dir.path(), "92-probe", "92-01-PLAN.md", &body);
+
+        assert!(
+            !phase_has_human_only_checkpoint(dir.path(), PhaseId::new(92)),
+            "the ordinary `blocking` gate is exactly the class auto-mode may approve \
+             (checkpoints.md rule 5) — matching it here would refuse launches that are fine"
+        );
+    }
+
+    /// F-14's motivating case, and it is not hypothetical: the real-world
+    /// instance is `.planning/phases/35.1-unattended-launch-prerequisites/
+    /// 35.1-03-PLAN.md` — this function's own plan file, which names both
+    /// markers repeatedly in prose while declaring no such task. An unanchored
+    /// whole-file `contains` reports that phase NOT viable for reasons that do
+    /// not exist.
+    #[test]
+    fn human_only_checkpoint_ignores_a_marker_mentioned_only_in_prose() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            "---\nphase: 92\n---\n\n\
+             The two markers GSD never auto-approves are gate=\"{HUMAN_GATE_VALUE}\" \
+             and type=\"{HUMAN_ACTION_TYPE_VALUE}\", per checkpoints.md rule 6.\n\n\
+             ```text\n\
+             <task gate=\"{HUMAN_GATE_VALUE}\">   <- an EXAMPLE, inside a fence\n\
+             ```\n\n\
+             <task type=\"auto\">\n</task>\n"
+        );
+        write_phase_file(dir.path(), "92-probe", "92-01-PLAN.md", &body);
+
+        assert!(
+            !phase_has_human_only_checkpoint(dir.path(), PhaseId::new(92)),
+            "a marker discussed in prose is not a marker declared on a task — \
+             this plan's own file is the real instance (F-14)"
+        );
+    }
+
+    /// "No plans at all" and "plans that declare no such checkpoint" are
+    /// DIFFERENT facts, and this boolean deliberately reports both as `false`.
+    /// The caller that needs to tell them apart asks [`phase_plan_files`]
+    /// separately rather than reading a third state out of this one bit —
+    /// `preflight.rs`'s unattended-launch check does exactly that, because at
+    /// Define an unplanned phase is pending, not failing.
+    #[test]
+    fn human_only_checkpoint_is_false_for_a_phase_with_no_plans() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert!(!phase_has_human_only_checkpoint(
+            dir.path(),
+            PhaseId::new(404)
+        ));
+        assert!(
+            phase_plan_files(dir.path(), PhaseId::new(404)).is_empty(),
+            "the companion fact the caller reads to distinguish the two cases"
         );
     }
 }
