@@ -1285,6 +1285,49 @@ mod tests {
     use devflow_core::mode::Mode;
     use devflow_core::state::AgentKind;
 
+    /// D-04/D-05/F-1: the chain flag is engaged for `Stage::Code` under
+    /// `Mode::Auto` and for nothing else.
+    ///
+    /// Every `Stage` variant is named EXPLICITLY rather than iterated over a
+    /// slice. That is the point: adding a variant to `Stage` must become a
+    /// compile error here — forcing whoever adds it to decide, on the record,
+    /// whether the new stage may auto-approve checkpoints — instead of a
+    /// silently-unexercised case that the iteration would have swallowed.
+    #[test]
+    fn auto_chain_eligibility_is_code_and_auto_mode_only() {
+        // The one eligible combination.
+        assert!(auto_chain_flag_eligible(Stage::Code, Mode::Auto));
+
+        // Right stage, wrong mode. A run the operator chose to SUPERVISE must
+        // never have its checkpoints auto-approved (F-1).
+        assert!(!auto_chain_flag_eligible(Stage::Code, Mode::Supervise));
+
+        // Every other stage, under the mode that would otherwise qualify.
+        // `Stage::Plan` is the load-bearing one: the same flag makes
+        // `plan-phase.md` chain into `execute-phase.md` (ROADMAP criterion 3).
+        assert!(!auto_chain_flag_eligible(Stage::Define, Mode::Auto));
+        assert!(!auto_chain_flag_eligible(Stage::Plan, Mode::Auto));
+        assert!(!auto_chain_flag_eligible(Stage::Validate, Mode::Auto));
+        assert!(!auto_chain_flag_eligible(Stage::Ship, Mode::Auto));
+
+        // Exhaustiveness tripwire: this match names all five variants with no
+        // wildcard arm, so a new `Stage` fails to compile here rather than
+        // slipping past the five assertions above.
+        for stage in [
+            Stage::Define,
+            Stage::Plan,
+            Stage::Code,
+            Stage::Validate,
+            Stage::Ship,
+        ] {
+            let expected = match stage {
+                Stage::Code => true,
+                Stage::Define | Stage::Plan | Stage::Validate | Stage::Ship => false,
+            };
+            assert_eq!(auto_chain_flag_eligible(stage, Mode::Auto), expected);
+        }
+    }
+
     /// 18b: after `launch_stage` spawns a monitor, the persisted state file
     /// for that phase carries the monitor's pid — `transition()` saves state
     /// BEFORE calling `launch_stage`, so the pid must be saved again inside

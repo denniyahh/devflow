@@ -333,11 +333,30 @@ pub fn checkpoint_auto_decide_prompt(phase: PhaseId) -> String {
 }
 
 /// Build a fix prompt used on Code → Validate loop-backs.
+///
+/// Both arms that dispatch to `execute-phase` carry
+/// [`AUTO_CHAIN_PRESERVING_FLAG`], for the same reason the Code prompt does:
+/// they reach `execute-phase.md`'s sync-clear step, and without the token that
+/// step wipes the chain flag DevFlow just set. The `--gaps-only` loop is
+/// named explicitly by ROADMAP criterion 1 — a fix pass gets exactly the same
+/// treatment as the first Code pass, or the phase's unattended behaviour
+/// changes the moment validation reports a gap.
+///
+/// `AuditFix` is deliberately left alone: it routes to `/gsd-audit-fix`, never
+/// reaches `execute-phase.md`, and so never meets the sync-clear step.
+///
+/// Flag ORDER within the command string does not matter — GSD extracts
+/// `--`-prefixed tokens position-independently
+/// (`references/phase-argument-parsing.md`).
 pub fn fix_prompt(fix_type: FixType, phase: PhaseId) -> String {
     let command = match fix_type {
         FixType::AuditFix => format!("/gsd-audit-fix {phase}"),
-        FixType::GapsOnly => format!("/gsd-execute-phase {phase} --gaps-only"),
-        FixType::FullExecute => format!("/gsd-execute-phase {phase}"),
+        FixType::GapsOnly => {
+            format!("/gsd-execute-phase {phase} --gaps-only {AUTO_CHAIN_PRESERVING_FLAG}")
+        }
+        FixType::FullExecute => {
+            format!("/gsd-execute-phase {phase} {AUTO_CHAIN_PRESERVING_FLAG}")
+        }
     };
     format!(
         "Validation reported issues. Run the fix command for this loop:\n\n    {command}\n\n{COMPLETION_PROTOCOL}"
@@ -562,6 +581,63 @@ mod tests {
         // actually distinguishable, not that FullExecute merely contains
         // GapsOnly's prefix.
         assert!(!full_execute_prompt.contains("--gaps-only"));
+    }
+
+    /// The flag-preserving token belongs on exactly the command strings that
+    /// reach `execute-phase.md`'s sync-clear step, and nowhere else.
+    ///
+    /// All three `FixType` arms are asserted, present AND absent, so this test
+    /// distinguishes "added where it belongs" from "added everywhere" — the
+    /// same habit `fix_prompts_select_the_right_command` above already uses for
+    /// `--gaps-only`.
+    #[test]
+    fn fix_prompts_carry_the_chain_flag_token_only_where_it_reaches_execute_phase() {
+        let phase = PhaseId::new(11);
+
+        assert!(
+            fix_prompt(FixType::GapsOnly, phase).contains(AUTO_CHAIN_PRESERVING_FLAG),
+            "the --gaps-only fix loop reaches execute-phase.md, so it meets the \
+             sync-clear step and needs the token exactly as the first Code pass does"
+        );
+        assert!(
+            fix_prompt(FixType::FullExecute, phase).contains(AUTO_CHAIN_PRESERVING_FLAG),
+            "the full-execute loop-back reaches execute-phase.md too"
+        );
+        assert!(
+            !fix_prompt(FixType::AuditFix, phase).contains(AUTO_CHAIN_PRESERVING_FLAG),
+            "audit-fix routes to /gsd-audit-fix and never reaches execute-phase.md, \
+             so it never meets the sync-clear step the token exists to skip"
+        );
+    }
+
+    /// The first Code pass and the fix loop must be treated identically —
+    /// ROADMAP criterion 1 names the fix loop explicitly.
+    #[test]
+    fn the_code_prompt_carries_the_chain_flag_token() {
+        let prompt = stage_prompt(Stage::Code, PhaseId::new(11));
+        assert!(prompt.contains(&format!(
+            "/gsd-execute-phase 11 {AUTO_CHAIN_PRESERVING_FLAG}"
+        )));
+    }
+
+    /// Criterion 3a / D-04: the Plan prompt must NEVER carry the token.
+    ///
+    /// The flag that would enable checkpoint auto-approval at Plan is the same
+    /// flag that makes `plan-phase.md` chain into `execute-phase.md`
+    /// (`plan-phase.md:1564`) — which double-executes the Code stage and
+    /// misattributes its commits. This is ROADMAP criterion 3, and it is why
+    /// the token is appended inside the `Stage::Code` arm rather than in
+    /// `gsd_command_for`, which Plan shares.
+    #[test]
+    fn the_plan_prompt_never_carries_the_chain_flag_token() {
+        let plan = stage_prompt(Stage::Plan, PhaseId::new(11));
+        assert!(
+            !plan.contains(AUTO_CHAIN_PRESERVING_FLAG),
+            "the Plan prompt must not chain into execute-phase (D-04)"
+        );
+        // Negative control: the Plan prompt DOES carry its own command, so the
+        // assertion above is about the token and not about an empty string.
+        assert!(plan.contains("/gsd-plan-phase 11"));
     }
 
     /// D-03/D-07 (28-03): the audit event quotes this instruction verbatim,
