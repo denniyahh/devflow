@@ -2825,6 +2825,55 @@ can miss it entirely.
 
 ---
 
+### Phase 999.103: The Gate Notify Hook Has No Home, No Default, and No Way to Tell You It Is Broken (BACKLOG)
+
+**Found:** 2026-08-09, dogfooding Phase 35.1. Three consecutive Code-stage failures fired
+never-silent gates that reached nobody. The gates were correct; the operator simply had no channel.
+`DEVFLOW_GATE_NOTIFY_CMD` was unset, and nothing anywhere would have said so.
+
+**Why it was unset, which is the actual defect.** Four compounding reasons, each verified rather
+than assumed:
+
+1. **No default.** `fire_gate_notify` returns immediately when the variable is unset or empty — a
+   silent no-op, by design. Correct as a default; invisible as a state.
+2. **No config-file home.** `load_config` reads `devflow.toml` into a `DevflowConfig` carrying
+   exactly `capture_retention`, `review_angles`, `external_verify_enabled` and `yes_ship`. The
+   notify command is not among them, so it cannot be set where every other DevFlow setting lives.
+   It is environment-only.
+3. **Nothing in this repo's own setup sets it.** Not `.planning/DEV-SETUP-CHECKLIST.md` — the file
+   that exists precisely so this project's setup can be replicated — not the fish config, not
+   `.devcontainer`, no `.env`, no Makefile. The one variable that makes an unattended run visible
+   is absent from the checklist whose job is exactly that.
+4. **A shell export would not have been enough anyway.** The detached monitor inherits the
+   environment of whatever launched it, so a one-off `export` in another terminal never reaches it.
+   It has to be in persistent shell config to be reliable.
+
+**The trap that makes it worse.** It is a *command string*, not a boolean. Setting it to `true` —
+the obvious guess for "turn notifications on" — executes `/bin/true`, exits 0, and is logged by
+`run_notify_command` as a **successful hook run**. Combined with the deliberate fail-soft posture
+(a non-zero exit or spawn failure is `warn!`-logged and otherwise ignored), a misconfigured hook is
+silent in *both* directions: no notification arrives, and nothing reports that none did. The warning
+goes only to the monitor's log, which is the one place an absent operator is not looking.
+
+**What to add.** Not a transport — DevFlow correctly has none, and shelling out to the operator's
+own `curl`/`notify-send`/webhook is the right design. What is missing is *legibility*:
+
+- Give the hook a home in `devflow.toml` beside the other settings, with the env var still winning,
+  matching `capture_retention`'s existing precedence idiom.
+- Surface configured-or-not in `devflow status` and in the unattended-launch preflight report. An
+  unattended run with no notify channel is a stated risk, not a silent one.
+- Validate at launch rather than at first gate: spawn the hook once with a synthetic payload and
+  report the outcome, so a broken command is found when the operator is present.
+- Add it to `DEV-SETUP-CHECKLIST.md` so a replicated setup gets it.
+
+**Scope of the claim.** This is about discoverability and feedback, not about the hook mechanism,
+which works as designed. The env-var-only decision may well be deliberate; what is not defensible is
+that an operator can run unattended for nine hours believing they are covered.
+
+**Priority:** Medium. **Size:** S–M.
+
+---
+
 ### Phase 999.102: The Idle-Timeout Verdict Discards Diagnostics That Are Already Sitting in the Capture (BACKLOG)
 
 **Found:** 2026-08-09, while diagnosing why three stages of Phase 35.1 died with
