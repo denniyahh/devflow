@@ -2825,6 +2825,74 @@ can miss it entirely.
 
 ---
 
+### Phase 999.102: The Idle-Timeout Verdict Discards Diagnostics That Are Already Sitting in the Capture (BACKLOG)
+
+**Found:** 2026-08-09, while diagnosing why three stages of Phase 35.1 died with
+`error_during_execution`.
+
+**The gap, in one line:** DevFlow's failure reason says *"the agent's output stream was silent for
+120s"* while the capture it just read contains `terminal_reason`, `errors[]` and `origin` — fields
+that name the actual cause.
+
+**Measured.** The final `result` event of the killed Code stage carried:
+
+```
+terminal_reason : "aborted_tools"
+errors          : ["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use"]
+origin          : {"kind": "task-notification"}
+```
+
+None of it reached the operator. Three separate failures were investigated as "the agent went
+quiet" before anyone read those keys, and the pattern (999.101) was invisible until they were.
+
+**Same class as 999.98 and 999.100, third instance.** All three are *better information exists in
+the capture than in the verdict*. 999.98: a stale record outranks a success. 999.100: a fresh record
+outranks a better classification. This one: the record is correct but throws away the detail that
+makes it actionable. The idle-timeout verdict is the right verdict here — the process really was mute
+with no work outstanding — it is simply mute itself about why.
+
+**What to add.** Include `terminal_reason` and `errors[]` (and `origin.kind` when present) in the
+idle-timeout reason string and the gate context, when the capture's last `result` event carries
+them. No new infrastructure: the capture is already read, the fields are already parsed as JSON, and
+`IdleTimeoutRecord` already carries free-text. Degrade silently when absent — an older CLI, or a
+child killed before emitting a `result`, must still produce today's message.
+
+**Deliberately not fixed inside Phase 35.1.** The phase already absorbed three unplanned defects
+(999.98, 999.99, 999.100); a fourth would make its scope unreadable against its success criteria.
+
+### Phase 999.101: The Task-Notification Turn Errors Under Parallel-Executor Load, Aborting Its Tools (BACKLOG — upstream Claude Code, not DevFlow)
+
+**Found:** 2026-08-09, dogfooding Phase 35.1. Three of roughly five stages died to the same
+signature: `result` with `is_error: true`, `subtype: "error_during_execution"`,
+`stop_reason: "tool_use"`, then a mute-but-alive process that DevFlow terminated on its idle timer.
+
+**What the evidence says.** On the one capture that still exists, the dying turn carried
+`origin: {"kind": "task-notification"}` and `terminal_reason: "aborted_tools"`. That is the CLI
+waking the session to deliver a background-task completion — **the undocumented mechanism Phase
+30/31 is built on**, and which `canary.rs` already warns "a CLI update can withdraw without any
+announcement". The Code stage that hit it had 43 background tasks and 326 `task_progress` events.
+
+**Scope of the claim, stated because the same mistake was already made once today.** The
+`error_during_execution` signature matched all three failures, but only ONE capture retains the
+diagnostic fields — the other two were archived and overwritten before anyone thought to look. So
+"task-notification turns abort their tools under load" is a hypothesis fitted to a single sample,
+not a measured pattern. 999.102 exists partly so the next occurrence is legible without forensics.
+
+**Why it is filed but not fixed.** It is upstream, inside Claude Code, not DevFlow. DevFlow's
+handling is already correct: the never-silent gate fires, commits are preserved (`32 commit(s) on
+the phase branch, NONE rolled back`), and `devflow resume` recovers. It is a tax on long unattended
+runs, not a blocker — the affected run still completed 3 of 4 plans.
+
+**The consequence worth carrying into Phase 35.1's completion notes.** 35.1's goal is that an
+unattended run can complete a phase with no human present. If the notification-delivery path errors
+under exactly the parallel-executor load that long phases generate, there is a ceiling on unattended
+runs that DevFlow cannot raise from its own side. The phase can meet its success criteria and still
+leave that ceiling in place; saying so up front is better than rediscovering it.
+
+**Where it should be revisited:** Phase 36 (999.83, drain gate concurrency measurement) is already
+about real sub-agent concurrency and already needs a production capture. This belongs in the same
+experiment rather than in its own phase.
+
 ### Phase 999.100: A Quota Denial Is Recorded as an Idle Timeout, Turning a Resumable Pause Into a Terminal Verdict (PROMOTED — Phase 35.1)
 
 **Found:** 2026-08-08, when a Code stage of this phase ran out of credits mid-run.
