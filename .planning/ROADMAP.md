@@ -104,7 +104,7 @@ Plans:
 
 - [x] 35-06-PLAN.md — enumerate and document the public-API break: verified `CHANGELOG.md` entry plus removal notes at each site; release stays `v2.5.0`, milestone unrenamed (D-04 / D-08)
 
-### Phase 35.1: Unattended-Launch Prerequisites (999.93 + 999.98 + 999.99)
+### Phase 35.1: Unattended-Launch Prerequisites (999.93 + 999.98 + 999.99 + 999.100)
 
 **Goal**: `devflow start --mode auto` can actually complete a phase with no human present — ordinary
 GSD `blocking` checkpoints resolve instead of stalling the run — and a preflight refuses the launch,
@@ -2825,7 +2825,44 @@ can miss it entirely.
 
 ---
 
-### Phase 999.99: The Idle Timeout Kills Any Stage That Backgrounds Work, Because the Drain Gate Reads an Event Production Never Emits (PROMOTED — Phase 35.1)
+### Phase 999.100: A Quota Denial Is Recorded as an Idle Timeout, Turning a Resumable Pause Into a Terminal Verdict (PROMOTED — Phase 35.1)
+
+**Found:** 2026-08-08, when a Code stage of this phase ran out of credits mid-run.
+
+**The defect, in one line:** a rate-limit denial silences the agent, the idle timer fires and writes
+an idle-timeout record, and that record shadows `detect_claude_stream_rate_limit` — which was
+sitting in the same capture with the right answer.
+
+**Why it matters more than it looks.** `AgentStatus::RateLimited` routes to auto-resume.
+`IdleTimeout` reports *"this run is TERMINAL and is not retried automatically."* So a run that
+merely needs to wait for a quota reset halts permanently, and the operator is told the stream went
+silent rather than that they are out of credits until a stated time. **Running out of quota is the
+likeliest way a long unattended run stops**, which makes this the failure an unattended-launch phase
+can least afford to misreport.
+
+**Measured.** `rate_limit_event` with `status: "rejected"`, `rateLimitType: "seven_day"`,
+`overageDisabledReason: "out_of_credits"`. Replaying the classifier's own logic over that capture
+returns the denial — `CLAUDE_STREAM_RATE_LIMIT_DENIAL_STATUSES` is `["rejected"]`, and the eligible
+window held two `rate_limit_event`s with the last one rejected. DevFlow reported `idle_timeout`.
+
+**Shared root, distinct consequence — the reason this is its own entry and not part of 999.98.**
+Both are the side channel's unconditional precedence (`evaluate_layer1`'s first statement, returning
+before anything else reads the capture — T-31-06). 999.98 is a *stale* record outranking a later
+success. This is a *fresh, legitimate* record outranking a better classification of the same event.
+Fixing one does not fix the other.
+
+**Fixed in Phase 35.1.** `fire_idle_timeout` now asks why the stream went quiet before recording a
+verdict about the silence. On an explicit denial it suppresses the record and returns; the child is
+still terminated, since it is wedged either way. Only the verdict changes, and it changes by
+omission — with no record written the cascade reaches the rate-limit classifier. The check delegates
+to the same detector the read path uses, so two notions of "is this a rate limit" cannot drift apart.
+
+**Negative control that matters here.** A healthy `rate_limit_event` carries `status: "allowed"` with
+`overageStatus: "rejected"` one level below it. Matching loosely would suppress the idle timeout on
+every run and silently disable the hang guard entirely — so the test asserts the healthy shape is
+NOT treated as a denial, alongside the positive case.
+
+### Phase 999.99: The Idle Timeout Kills a Stage That Backgrounds Work, Because the Drain Gate Reads an Event the Plan Stage Never Emits (PROMOTED — Phase 35.1)
 
 **Found:** 2026-08-08, dogfooding Phase 35.1's own Plan stage. Two consecutive Plan runs died at
 ~8.4 and ~8.8 minutes, ~$4.50 each, producing zero artifacts.
@@ -2839,6 +2876,18 @@ subagent is running, and its 120s idle timeout kills the parent for being correc
 that event name in this repository is a test fixture synthesising it, which is exactly why the
 blindness never surfaced in the suite. **This is 999.83's "the fixture's shape doesn't match what
 production actually emits", with the capture that proves it.**
+
+**CORRECTION (2026-08-08, same day, from a later capture).** The first write-up of this entry — and
+the commit message of the fix — said *"production never emits it"*. **That is false, and the
+overstatement is recorded here rather than quietly edited away.** A Code-stage capture from the same
+phase emitted `background_tasks_changed` twice, carrying real task lists. The accurate scope is
+narrower: the **Plan** stage emits only `task_started`/`task_progress`, so the drain gate is blind
+there; the **Code** stage does announce, so the gate works there. The fix — tracking both
+vocabularies — is still correct and still needed, because the stage that actually got killed was the
+blind one. What was wrong was generalising from a single capture to "production", which is the
+proxy-measurement error this project's own rules exist to catch. The fix commit's body carries the
+original overstatement; it is buried under later commits and was not rewritten, so this note is the
+correction of record.
 
 **How it presents, and why it misleads.** The largest gap in the stream was exactly 120.0s — the
 timeout firing at its deadline, not an organic pause; the next largest was 44.5s. DevFlow killed
