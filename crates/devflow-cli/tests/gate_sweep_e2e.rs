@@ -145,10 +145,21 @@ fn backdate_gate(root: &Path, phase: PhaseId, stage: Stage, age_secs: u64) {
     .unwrap();
 }
 
-/// The plan's core claim: a gate older than the default six-hour threshold
-/// is answered with a rejection, and a real `Gates::poll_response` thread —
-/// the exact live-poller seam `run_gate_with_timeout` blocks on in
-/// production — picks it up and resolves to `GateAction::Abort`.
+/// An age past any plausible `DEVFLOW_GATE_MAX_UNATTENDED_AGE_SECS` default.
+///
+/// Deliberately a wide margin rather than "just past the threshold": this is
+/// an integration test, so it cannot read `config_parse`'s private default,
+/// and the previous literal (7h, chosen against a six-hour default) silently
+/// stopped reaching the reap path when that default moved to three days. The
+/// boundary itself is covered by the unit tests in `commands.rs`; what this
+/// test exists to prove is the live-poller seam, which needs only that the
+/// gate be unambiguously aged.
+const AGED_WELL_PAST_DEFAULT_THRESHOLD_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// The plan's core claim: a gate older than the default threshold is answered
+/// with a rejection, and a real `Gates::poll_response` thread — the exact
+/// live-poller seam `run_gate_with_timeout` blocks on in production — picks
+/// it up and resolves to `GateAction::Abort`.
 #[test]
 fn sweep_reaps_an_aged_gate_and_a_real_poller_resolves_to_abort() {
     let dir = tempfile::tempdir().unwrap();
@@ -157,7 +168,7 @@ fn sweep_reaps_an_aged_gate_and_a_real_poller_resolves_to_abort() {
     let stage = Stage::Ship;
 
     Gates::write_gate(root, phase, stage, "approve merge?").unwrap();
-    backdate_gate(root, phase, stage, 7 * 60 * 60); // 7h, past the 6h default.
+    backdate_gate(root, phase, stage, AGED_WELL_PAST_DEFAULT_THRESHOLD_SECS);
 
     std::thread::scope(|scope| {
         let poller = scope.spawn(move || Gates::poll_response(root, phase, stage, 30));

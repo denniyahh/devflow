@@ -4021,6 +4021,21 @@ mod tests {
     /// Backdate an already-written gate's `timestamp` so it reads as
     /// `age_secs` old — the deterministic way `gate_sweep` tests make a gate
     /// look abandoned without sleeping.
+    /// An age comfortably past whatever the sweep's threshold currently is,
+    /// derived from the same default `gate_sweep` reads instead of hard-coded.
+    ///
+    /// The literal `7 * 60 * 60` these tests used before outlived the six-hour
+    /// default it had been chosen against. When the threshold moved to three
+    /// days (equality with the gate poll timeout, so a sweep cannot reap a
+    /// gate a live monitor is still polling), a seven-hour backdate stopped
+    /// reaching the reap path entirely — and only ONE of the three tests below
+    /// noticed. The other two kept passing while asserting nothing, because
+    /// "no response was written" is equally true of a gate the sweep declined
+    /// to consider.
+    fn aged_past_threshold() -> u64 {
+        config_parse::gate_max_unattended_age_secs() + 60 * 60
+    }
+
     fn backdate_gate(root: &Path, phase: PhaseId, stage: Stage, age_secs: u64) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -4046,7 +4061,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         Gates::write_gate(root, PhaseId::new(30), Stage::Ship, "ctx").unwrap();
-        backdate_gate(root, PhaseId::new(30), Stage::Ship, 7 * 60 * 60);
+        backdate_gate(root, PhaseId::new(30), Stage::Ship, aged_past_threshold());
 
         gate_sweep(None, true, Some(root.to_path_buf()), false).unwrap();
 
@@ -4067,7 +4082,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         Gates::write_gate(root, PhaseId::new(31), Stage::Ship, "ctx").unwrap();
-        backdate_gate(root, PhaseId::new(31), Stage::Ship, 7 * 60 * 60);
+        backdate_gate(root, PhaseId::new(31), Stage::Ship, aged_past_threshold());
         let response = GateResponse {
             approved: true,
             note: None,
@@ -4098,7 +4113,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         Gates::write_gate(root, PhaseId::new(32), Stage::Ship, "ctx").unwrap();
-        backdate_gate(root, PhaseId::new(32), Stage::Ship, 7 * 60 * 60);
+        backdate_gate(root, PhaseId::new(32), Stage::Ship, aged_past_threshold());
 
         gate_sweep(None, false, Some(root.to_path_buf()), false).unwrap();
 
