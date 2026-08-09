@@ -318,6 +318,101 @@ pub(crate) fn apply_legacy_launch_opt_out(state: &mut State, flag: bool) -> bool
     env && !flag
 }
 
+/// Entry-point name recorded in the `auto_chain_flag_repaired` payload by
+/// [`commands::start`](crate::commands::start).
+pub(crate) const AUTO_CHAIN_REPAIR_FROM_START: &str = "start";
+/// Entry-point name recorded by [`resume`].
+pub(crate) const AUTO_CHAIN_REPAIR_FROM_RESUME: &str = "resume";
+
+/// Repair a leaked `workflow._auto_chain_active` before this launch spawns
+/// anything, and say so on both channels when it found one (35.1 D-01/D-03).
+///
+/// **One helper, two call sites**, for the reason
+/// [`apply_legacy_launch_opt_out`] gives about its own pair: `start` and
+/// `resume` must not be able to drift into repairing on different terms, and a
+/// second copy of the emit/print block is exactly how that drift happens.
+///
+/// `35.1 D-01` — why the repair exists at all: the in-process `AutoChainGuard`
+/// covers a normal return, a `?` early-return and a panic-unwind, and
+/// structurally cannot cover a `SIGKILL`, because `Drop` never runs. Repairing
+/// forward at both launch entry points is the second, independent mechanism.
+/// `start`'s call is the one that catches a leak that already reached
+/// `develop`, since a freshly forked worktree inherits whatever the base branch
+/// carries; `resume`'s is the one that catches a leak a killed run left behind
+/// in its own worktree.
+///
+/// `35.1 D-03` — why it is loud: a stale flag is EVIDENCE that a previous run
+/// for this phase was killed before it could clean up. Repairing it quietly
+/// would discard that signal. The notice therefore says what the stale value
+/// means, not merely that a value changed.
+///
+/// **These are 35.1's own `D-` numbers**, a different decision namespace from
+/// phase 31's `D-11` cited a few lines above in `commands.rs` — the two
+/// sequences must not be read as one.
+///
+/// A clean launch — nothing repaired and nothing refused — makes no notice, no
+/// event and no write. Loudness is about repairs, not about launches.
+///
+/// Never fails the launch. A config DevFlow cannot parse warns and proceeds
+/// here; `35.1-03`'s preflight is the layer where an unlaunchable shape becomes
+/// a refusal.
+pub(crate) fn repair_leaked_auto_chain_flag(
+    project_root: &Path,
+    launch_root: &Path,
+    phase: PhaseId,
+    entry_point: &'static str,
+) {
+    let outcome = match gsd_config::force_clear_auto_chain(launch_root) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            println!(
+                "warning: could not certify phase {phase}'s GSD chain flag clear at {} \
+                 ({err}) — launching without the repair",
+                gsd_config::config_path(launch_root).display()
+            );
+            return;
+        }
+    };
+
+    if !outcome.repaired_anything() && outcome.commit_refused.is_none() {
+        return;
+    }
+
+    events::emit(
+        project_root,
+        phase,
+        "auto_chain_flag_repaired",
+        serde_json::json!({
+            "entry_point": entry_point,
+            "working_tree_repaired": outcome.working_tree_repaired,
+            "committed_tree_repaired": outcome.committed_tree_repaired,
+            "commit_refused": outcome.commit_refused,
+        }),
+    );
+
+    if outcome.repaired_anything() {
+        println!(
+            "note: devflow {entry_point} found phase {phase}'s GSD chain flag \
+             (workflow._auto_chain_active) still set — a previous run for this phase \
+             was killed before it could clear it. Cleared before launching \
+             (working tree: {}, this branch's tip: {})",
+            repaired_word(outcome.working_tree_repaired),
+            repaired_word(outcome.committed_tree_repaired),
+        );
+    }
+    if let Some(reason) = &outcome.commit_refused {
+        println!("warning: {reason}");
+    }
+}
+
+fn repaired_word(repaired: bool) -> &'static str {
+    if repaired {
+        "repaired"
+    } else {
+        "already clear"
+    }
+}
+
 /// The D-15 gate: run the delivery canary at most once per run, record what it
 /// found, and refuse to launch when it did not confirm.
 ///
@@ -1038,6 +1133,25 @@ pub(crate) fn resume(
              (D-11, 31-CONTEXT.md) — a persisted default is never a silent one"
         );
     }
+    // 35.1 D-01, `resume`'s half: this is the entry point that catches a leak a
+    // SIGKILLed run left behind in its own worktree — the case the in-process
+    // guard structurally cannot cover, because `Drop` never runs on a kill.
+    // Placed after `load_state` (the state is what names the launch root) and
+    // before the `save_state` below, so the repair is complete before anything
+    // is spawned. Root resolved with the same
+    // `worktree_path.unwrap_or(project_root)` idiom `spawn_monitor` uses for
+    // `--workdir` (F-11) — a second spelling here would repair a different copy
+    // of the file from the one the agent reads.
+    let launch_root = state
+        .worktree_path
+        .clone()
+        .unwrap_or_else(|| project_root.to_path_buf());
+    repair_leaked_auto_chain_flag(
+        project_root,
+        &launch_root,
+        phase,
+        AUTO_CHAIN_REPAIR_FROM_RESUME,
+    );
     workflow::save_state(&state)?;
     launch_stage(&mut state, None, None)
 }
@@ -1326,6 +1440,94 @@ mod tests {
             };
             assert_eq!(auto_chain_flag_eligible(stage, Mode::Auto), expected);
         }
+    }
+
+    /// A real-shape `.planning/config.json` under `root`, committed, with the
+    /// chain flag seeded either way.
+    fn seed_gsd_config(root: &Path, active: bool) {
+        std::fs::create_dir_all(root.join(".planning")).unwrap();
+        std::fs::write(
+            root.join(".planning/config.json"),
+            format!(
+                "{{\n  \"commit_docs\": true,\n  \"workflow\": {{\n    \
+                 \"granularity\": \"medium\",\n    \"auto_advance\": true,\n    \
+                 \"_auto_chain_active\": {active}\n  }}\n}}\n"
+            ),
+        )
+        .unwrap();
+        let git = |args: &[&str]| {
+            let ok = devflow_core::test_support::git_command(root)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        git(&["add", ".planning/config.json"]);
+        git(&["commit", "-q", "-m", "add gsd config"]);
+    }
+
+    /// Every `auto_chain_flag_repaired` line in a project's event log.
+    fn repair_events(root: &Path) -> Vec<serde_json::Value> {
+        let path = devflow_core::events::events_path(root);
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            return Vec::new();
+        };
+        raw.lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|line| line["event"] == "auto_chain_flag_repaired")
+            .collect()
+    }
+
+    /// D-03: a genuine repair announces itself in `.devflow/events.jsonl`, and
+    /// the payload names WHICH entry point found the leak — without that, a
+    /// reader cannot tell a leak inherited from `develop` by a fresh worktree
+    /// (`start`) from one a killed run left in its own worktree (`resume`).
+    #[test]
+    fn auto_chain_flag_repaired_event_names_the_entry_point_that_found_the_leak() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        seed_gsd_config(root, true);
+        assert!(
+            gsd_config::auto_chain_active(root).unwrap(),
+            "the fixture must actually carry the leak, or this test is vacuous"
+        );
+
+        repair_leaked_auto_chain_flag(root, root, PhaseId::new(81), "resume");
+
+        let events = repair_events(root);
+        assert_eq!(events.len(), 1, "exactly one repair event: {events:?}");
+        assert_eq!(events[0]["entry_point"], "resume");
+        assert_eq!(events[0]["working_tree_repaired"], true);
+        assert!(
+            !gsd_config::auto_chain_active(root).unwrap(),
+            "the repair must actually clear the flag, not merely report it"
+        );
+    }
+
+    /// THE CONTROL. Without it, an implementation that emitted on every launch
+    /// would satisfy the test above — the event would be there either way, and
+    /// "emitted for the right reason" and "emits unconditionally" would be
+    /// indistinguishable.
+    ///
+    /// D-03 is about repairs, not about launches: an ordinary clean launch must
+    /// write no event at all.
+    #[test]
+    fn auto_chain_flag_repaired_event_is_absent_on_a_clean_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        seed_gsd_config(root, false);
+
+        repair_leaked_auto_chain_flag(root, root, PhaseId::new(82), "start");
+
+        assert!(
+            repair_events(root).is_empty(),
+            "a launch that found nothing to repair must write no event: {:?}",
+            repair_events(root)
+        );
     }
 
     /// 18b: after `launch_stage` spawns a monitor, the persisted state file

@@ -30,6 +30,7 @@
 //! is an `Err` the caller can log and skip rather than an abort that would kill
 //! a long unattended run.
 
+use crate::git::GitFlow;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -177,6 +178,249 @@ pub fn set_auto_chain_active(root: &Path, active: bool) -> Result<bool, GsdConfi
     Ok(true)
 }
 
+/// What [`force_clear_auto_chain`] actually did, so the CLI call sites can
+/// decide whether to be loud without re-deriving any of it.
+///
+/// Three independent facts, deliberately not collapsed into one enum: a repair
+/// can touch the working tree only, the working tree AND the branch tip, or the
+/// working tree while explicitly DECLINING the branch tip. The third is not a
+/// failure — it is the correct answer when committing would sweep in an edit
+/// DevFlow does not own (F-8) — and a call site that could not tell it apart
+/// from "nothing happened" would report the deferral as silence.
+#[derive(Debug, Default)]
+pub struct ClearOutcome {
+    /// The file on disk carried a set flag and now does not.
+    pub working_tree_repaired: bool,
+    /// The branch tip carried a set flag and a commit was made so it no longer
+    /// does. Confirmed by re-probing the tip after the commit, never inferred
+    /// from `commit_path` returning `Ok`.
+    pub committed_tree_repaired: bool,
+    /// Why the branch-tip half was NOT attempted or did not land. Populated
+    /// whenever the working tree was corrected but the committed copy was left
+    /// alone for a reason the operator needs to hear.
+    pub commit_refused: Option<String>,
+}
+
+impl ClearOutcome {
+    /// Whether either half of the repair actually changed something.
+    ///
+    /// Deliberately excludes `commit_refused`: a refusal is a separate thing to
+    /// be loud about, and folding it in here would make "we fixed something"
+    /// and "we declined to fix something" indistinguishable at the call site.
+    #[must_use]
+    pub fn repaired_anything(&self) -> bool {
+        self.working_tree_repaired || self.committed_tree_repaired
+    }
+}
+
+/// The config's path as a git pathspec — relative, because that is what
+/// `commit_path` and `git show HEAD:<path>` both need.
+const CONFIG_PATHSPEC: &str = ".planning/config.json";
+
+/// Clear `workflow._auto_chain_active` under `root` unconditionally, repairing
+/// the branch tip too when that can be done without sweeping in anything else.
+///
+/// **This is the second, independent mechanism (35.1 D-01).** The in-process
+/// [`crate::gsd_config`] guard held by `devflow`'s monitor covers a normal
+/// return, a `?` early-return and a panic-unwind — and structurally cannot
+/// cover a `SIGKILL`, because `Drop` never runs. A killed monitor therefore
+/// leaves a set flag in a TRACKED file, from where `commit_docs` or any
+/// sweeping `git add` can carry it onto `develop` and into the next phase's
+/// `plan-phase` invocation, where the same boolean no longer means "approve
+/// this checkpoint" but "chain into execute-phase". Rather than try to make
+/// the guard cover the uncoverable, both launch entry points repair forward.
+///
+/// Emits nothing and prints nothing: this is `devflow-core` and it returns a
+/// report. The operator-facing notice and the `events.jsonl` entry belong to
+/// the CLI call sites, which is what lets this function's tests assert on an
+/// outcome value rather than on captured stdout.
+///
+/// # Errors
+///
+/// Returns [`GsdConfigError::Json`] when the config exists but cannot be
+/// parsed — a file DevFlow cannot read cannot be certified clear, so the caller
+/// must hear about it. An ABSENT config is not an error: a project with no GSD
+/// config has nothing to leak, and failing here would break `devflow start` for
+/// every non-GSD project.
+pub fn force_clear_auto_chain(root: &Path) -> Result<ClearOutcome, GsdConfigError> {
+    let mut outcome = ClearOutcome::default();
+
+    match set_auto_chain_active(root, false) {
+        Ok(changed) => outcome.working_tree_repaired = changed,
+        // Absent and malformed are different facts. A project with no GSD
+        // config has nothing to leak; a config that cannot be parsed cannot be
+        // certified clean and must reach the caller.
+        Err(GsdConfigError::Missing(_)) => return Ok(outcome),
+        Err(err) => return Err(err),
+    }
+
+    // F-7: ask the branch tip whether it still disagrees with the corrected
+    // file, in one call, rather than parsing HEAD's copy a second time. This
+    // answers correctly in BOTH directions that matter — a working tree that
+    // was already clear but a HEAD that carries the leak still shows a
+    // difference and still gets repaired.
+    match probe_head(root) {
+        HeadProbe::Agrees => return Ok(outcome),
+        HeadProbe::Differs => {}
+        HeadProbe::Unknown(reason) => {
+            // Unreachable is not absent. A probe that could not run tells us
+            // nothing about the tip, and assuming agreement from a failed
+            // measurement is exactly the class of error this project runs on
+            // negative controls to avoid.
+            outcome.commit_refused = Some(reason);
+            return Ok(outcome);
+        }
+    }
+
+    // F-8 / T-35.1-08: `commit_path` is path-scoped but still commits whatever
+    // else is dirty IN that path. Compare HEAD's copy against the corrected
+    // working copy with the one key DevFlow owns removed from both; if the
+    // remainder differs, the file carries an edit DevFlow was not asked to
+    // touch. Refuse — the working-tree clear already disarmed the bypass for
+    // THIS run, so all that is deferred is the branch-tip half, and deferring
+    // it visibly is strictly better than committing an operator's unfinished
+    // work.
+    let head_text = match head_copy(root) {
+        Ok(text) => text,
+        Err(reason) => {
+            outcome.commit_refused = Some(reason);
+            return Ok(outcome);
+        }
+    };
+    let working_text = std::fs::read_to_string(config_path(root))?;
+    match (
+        serde_json::from_str::<Value>(&head_text),
+        serde_json::from_str::<Value>(&working_text),
+    ) {
+        (Ok(mut head), Ok(mut working)) => {
+            without_flag(&mut head);
+            without_flag(&mut working);
+            if head != working {
+                outcome.commit_refused = Some(format!(
+                    "{CONFIG_PATHSPEC} carries changes beyond the chain flag — the \
+                     branch-tip repair was deferred rather than sweep an unrelated \
+                     edit into a DevFlow commit"
+                ));
+                return Ok(outcome);
+            }
+        }
+        _ => {
+            outcome.commit_refused = Some(format!(
+                "could not parse both copies of {CONFIG_PATHSPEC} — the branch-tip \
+                 repair was deferred rather than committed unverified"
+            ));
+            return Ok(outcome);
+        }
+    }
+
+    // F-9: a commit failure is a loud warning, not a run-killer. Hooks, a
+    // detached HEAD, an unexpected git state — any of these can make this fail,
+    // and the working tree is already repaired, so the bypass is already off.
+    // Do not "harden" this into a `?`.
+    if let Err(err) = GitFlow::new(root).commit_path(CONFIG_PATHSPEC, REPAIR_COMMIT_MESSAGE) {
+        outcome.commit_refused = Some(format!(
+            "the branch-tip repair could not be committed ({err}) — the working \
+             tree is corrected, but this branch still carries the leaked value"
+        ));
+        return Ok(outcome);
+    }
+
+    // Confirm rather than assume. `commit_path` converts git's "nothing to
+    // commit" into `Ok(())`, so a bare `Ok` is not evidence that the tip moved;
+    // re-probing is what makes `committed_tree_repaired` a measurement.
+    match probe_head(root) {
+        HeadProbe::Agrees => outcome.committed_tree_repaired = true,
+        HeadProbe::Differs => {
+            outcome.commit_refused = Some(format!(
+                "the branch-tip repair reported success but {CONFIG_PATHSPEC} still \
+                 disagrees with HEAD — this branch may still carry the leaked value"
+            ));
+        }
+        HeadProbe::Unknown(reason) => outcome.commit_refused = Some(reason),
+    }
+    Ok(outcome)
+}
+
+/// The commit the repair writes on the operator's behalf. A Conventional
+/// Commit subject under 72 characters, and a body that says what a stale flag
+/// MEANS rather than merely that a value changed.
+const REPAIR_COMMIT_MESSAGE: &str = "\
+fix(gsd): clear a leaked auto-chain flag before launch
+
+A previous run for this phase was killed before its in-process guard could
+clear workflow._auto_chain_active, and the leaked value reached this branch.
+Left in place it travels through Ship into develop, where a later phase's
+plan-phase invocation reads the same boolean as \"chain into execute-phase\"
+rather than \"approve this checkpoint\".
+
+Repaired forward by devflow start/resume (35.1 D-01).";
+
+/// What the branch tip says about the corrected file. Three answers, not two:
+/// a probe that could not run is its own case and must never collapse into
+/// "agrees".
+enum HeadProbe {
+    /// The tip already matches the corrected working copy.
+    Agrees,
+    /// The tip still differs — there is a branch-tip repair to make.
+    Differs,
+    /// The question could not be answered; the reason is operator-facing.
+    Unknown(String),
+}
+
+/// `git diff --quiet HEAD -- .planning/config.json`, read by exit code: 0 means
+/// no difference, 1 means a difference, and anything else (128 for "not a
+/// repository", "unknown revision", and friends) means the probe itself failed.
+fn probe_head(root: &Path) -> HeadProbe {
+    match crate::git::git_command(root)
+        .args(["diff", "--quiet", "HEAD", "--", CONFIG_PATHSPEC])
+        .output()
+    {
+        Ok(output) => match output.status.code() {
+            Some(0) => HeadProbe::Agrees,
+            Some(1) => HeadProbe::Differs,
+            other => HeadProbe::Unknown(format!(
+                "could not compare {CONFIG_PATHSPEC} against HEAD (git exited \
+                 {other:?}) — the branch-tip repair was deferred rather than \
+                 assumed unnecessary"
+            )),
+        },
+        Err(err) => HeadProbe::Unknown(format!(
+            "could not run git to compare {CONFIG_PATHSPEC} against HEAD ({err}) — \
+             the branch-tip repair was deferred rather than assumed unnecessary"
+        )),
+    }
+}
+
+/// HEAD's copy of the config as text, or an operator-facing reason it could not
+/// be read. A tip that holds no readable copy is a refusal, not a licence to
+/// commit blind.
+fn head_copy(root: &Path) -> Result<String, String> {
+    match crate::git::git_command(root)
+        .args(["show", &format!("HEAD:{CONFIG_PATHSPEC}")])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        }
+        Ok(_) => Err(format!(
+            "HEAD holds no readable {CONFIG_PATHSPEC} to compare against — the \
+             branch-tip repair was deferred rather than committed unverified"
+        )),
+        Err(err) => Err(format!(
+            "could not read HEAD's copy of {CONFIG_PATHSPEC} ({err}) — the \
+             branch-tip repair was deferred rather than committed unverified"
+        )),
+    }
+}
+
+/// Remove the one key DevFlow owns, so what remains is exactly the part of the
+/// file that belongs to GSD and the operator.
+fn without_flag(value: &mut Value) {
+    if let Some(workflow) = value.get_mut(WORKFLOW_KEY).and_then(Value::as_object_mut) {
+        workflow.remove(AUTO_CHAIN_KEY);
+    }
+}
+
 /// Write through a sibling temporary file so a live GSD process never observes
 /// a truncated or partially written config (T-35.1-04) — the same idiom
 /// [`crate::workflow`] already uses for `.devflow/state-{NN}.json`.
@@ -247,6 +491,273 @@ mod tests {
         std::fs::create_dir_all(root.join(".planning")).unwrap();
         std::fs::write(config_path(&root), contents).unwrap();
         (dir, root)
+    }
+
+    /// [`REAL_SHAPE`] with the one owned value set either way, so a fixture can
+    /// carry the leak without a second near-duplicate literal drifting from the
+    /// first.
+    fn real_shape(active: bool) -> String {
+        let replaced = REAL_SHAPE.replace(
+            "\"_auto_chain_active\": false",
+            &format!("\"_auto_chain_active\": {active}"),
+        );
+        assert!(
+            replaced.contains(&format!("\"_auto_chain_active\": {active}")),
+            "the fixture must actually carry the requested flag value"
+        );
+        replaced
+    }
+
+    /// Hermetic git invocation pinned to `root` (999.37) — never a bare
+    /// `Command::new(\"git\")`.
+    fn git(root: &Path, args: &[&str]) {
+        let output = crate::git::git_command(root)
+            .args(args)
+            .output()
+            .expect("spawn git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn git_output(root: &Path, args: &[&str]) -> String {
+        let output = crate::git::git_command(root)
+            .args(args)
+            .output()
+            .expect("spawn git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// A real temp repository with one commit, so `HEAD` exists — every probe
+    /// in `force_clear_auto_chain` is expressed against `HEAD`, and a repo with
+    /// no commits would exercise the could-not-certify arm instead of the arm
+    /// under test.
+    fn git_project() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        git(&root, &["init", "-q"]);
+        git(&root, &["config", "user.email", "devflow@example.com"]);
+        git(&root, &["config", "user.name", "DevFlow Tests"]);
+        git(&root, &["config", "commit.gpgsign", "false"]);
+        git(&root, &["config", "core.hooksPath", "/dev/null"]);
+        std::fs::write(root.join("README.md"), "base\n").unwrap();
+        git(&root, &["add", "README.md"]);
+        git(&root, &["commit", "-q", "-m", "base"]);
+        std::fs::create_dir_all(root.join(".planning")).unwrap();
+        (dir, root)
+    }
+
+    fn write_config(root: &Path, contents: &str) {
+        std::fs::write(config_path(root), contents).unwrap();
+    }
+
+    fn commit_config(root: &Path, message: &str) {
+        git(root, &["add", CONFIG_PATHSPEC]);
+        git(root, &["commit", "-q", "-m", message]);
+    }
+
+    fn head_sha(root: &Path) -> String {
+        git_output(root, &["rev-parse", "HEAD"])
+    }
+
+    /// The flag as the BRANCH TIP holds it — read out of git, never out of the
+    /// working tree. A working-tree read cannot tell "committed the fix" from
+    /// "wrote the fix and forgot to commit", which is the exact gap the
+    /// committed half of this repair exists to close.
+    fn flag_at_head(root: &Path) -> Value {
+        let raw = git_output(root, &["show", &format!("HEAD:{CONFIG_PATHSPEC}")]);
+        let value: Value = serde_json::from_str(&raw).unwrap();
+        // Indexing, not `.get()`: an absent key must raise here rather than
+        // quietly render as `false` and agree with a correct cleared result.
+        value["workflow"]["_auto_chain_active"].clone()
+    }
+
+    /// The common case a killed monitor leaves behind: the leak is on disk but
+    /// never reached a commit. The working tree is repaired; the branch tip is
+    /// already in agreement afterwards, so nothing is committed.
+    #[test]
+    fn force_clear_repairs_a_leaked_working_tree_value() {
+        let (_dir, root) = git_project();
+        write_config(&root, &real_shape(false));
+        commit_config(&root, "add gsd config");
+        let head_before = head_sha(&root);
+        // The leak: written into the working tree after the commit, exactly as
+        // a SIGKILLed monitor leaves it.
+        write_config(&root, &real_shape(true));
+
+        let outcome = force_clear_auto_chain(&root).unwrap();
+
+        assert!(
+            outcome.working_tree_repaired,
+            "a set flag on disk must be reported as a working-tree repair"
+        );
+        assert!(
+            !outcome.committed_tree_repaired,
+            "the branch tip never carried the leak, so nothing may be committed"
+        );
+        assert_eq!(outcome.commit_refused, None);
+        assert!(
+            !auto_chain_active(&root).unwrap(),
+            "a subsequent read must see the cleared value"
+        );
+        assert_eq!(
+            head_sha(&root),
+            head_before,
+            "a working-tree-only repair must not add a commit"
+        );
+    }
+
+    /// Criterion 2's committed half: when the leak reached `HEAD`, the value
+    /// Ship would merge into `develop` is the CLEARED one. Read back out of git
+    /// rather than out of the working tree, for the reason [`flag_at_head`]
+    /// gives.
+    #[test]
+    fn force_clear_commits_when_the_leak_reached_head() {
+        let (_dir, root) = git_project();
+        write_config(&root, &real_shape(true));
+        commit_config(&root, "add gsd config carrying the leak");
+        assert_eq!(
+            flag_at_head(&root),
+            Value::Bool(true),
+            "the fixture must actually commit the leak, or the assertions below \
+             are vacuous"
+        );
+
+        let outcome = force_clear_auto_chain(&root).unwrap();
+
+        assert!(outcome.working_tree_repaired);
+        assert!(
+            outcome.committed_tree_repaired,
+            "a leak that reached HEAD must be repaired in the commit too, not \
+             only in the working tree — otherwise the branch → merge → develop \
+             → next-phase-chains path stays open (35.1 D-01)"
+        );
+        assert_eq!(outcome.commit_refused, None);
+        assert_eq!(flag_at_head(&root), Value::Bool(false));
+    }
+
+    /// F-8 / T-35.1-08: `commit_path` is path-scoped but still commits whatever
+    /// else is dirty IN that path. This repository has already had an incident
+    /// where an in-progress file was swept into an unrelated commit
+    /// (`CLAUDE.md`), and the correct posture is to refuse rather than sweep.
+    ///
+    /// **The `HEAD` comparison is the load-bearing assertion.** Asserting only
+    /// on the returned `commit_refused` would pass against an implementation
+    /// that committed the operator's edit and then reported a refusal.
+    #[test]
+    fn force_clear_refuses_to_commit_when_the_file_carries_other_changes() {
+        let (_dir, root) = git_project();
+        write_config(&root, &real_shape(true));
+        commit_config(&root, "add gsd config carrying the leak");
+        let head_before = head_sha(&root);
+        // An operator edit in flight, in the same file, beyond the one key
+        // DevFlow owns.
+        write_config(
+            &root,
+            &real_shape(true).replace("\"granularity\": \"medium\"", "\"granularity\": \"large\""),
+        );
+
+        let outcome = force_clear_auto_chain(&root).unwrap();
+
+        assert!(
+            outcome.working_tree_repaired,
+            "the working-tree clear disarms the bypass for THIS run and must \
+             happen even when the commit is declined"
+        );
+        assert!(
+            !outcome.committed_tree_repaired,
+            "the branch-tip repair must be deferred, not attempted"
+        );
+        let reason = outcome
+            .commit_refused
+            .expect("a declined commit must say why, loudly");
+        assert!(
+            reason.contains("beyond"),
+            "the refusal must name the cause — got: {reason}"
+        );
+        assert!(
+            !auto_chain_active(&root).unwrap(),
+            "the working tree is still cleared"
+        );
+        assert!(
+            std::fs::read_to_string(config_path(&root))
+                .unwrap()
+                .contains("\"granularity\": \"large\""),
+            "the operator's in-flight edit must survive untouched"
+        );
+        assert_eq!(
+            head_sha(&root),
+            head_before,
+            "nothing may be committed — this assertion, not the returned \
+             refusal, is what distinguishes a genuine refusal from a commit \
+             that reported one"
+        );
+    }
+
+    /// The no-op control. Without it, an implementation that always reported a
+    /// repair — or always committed — would satisfy every test above.
+    #[test]
+    fn force_clear_on_an_already_clean_config_reports_nothing_and_writes_nothing() {
+        let (_dir, root) = git_project();
+        write_config(&root, &real_shape(false));
+        commit_config(&root, "add a clean gsd config");
+        let head_before = head_sha(&root);
+        let bytes_before = std::fs::read(config_path(&root)).unwrap();
+
+        let outcome = force_clear_auto_chain(&root).unwrap();
+
+        assert!(!outcome.working_tree_repaired);
+        assert!(!outcome.committed_tree_repaired);
+        assert_eq!(outcome.commit_refused, None);
+        assert!(
+            !outcome.repaired_anything(),
+            "an ordinary clean launch must have nothing to be loud about"
+        );
+        assert_eq!(std::fs::read(config_path(&root)).unwrap(), bytes_before);
+        assert_eq!(head_sha(&root), head_before);
+    }
+
+    /// A project that never had GSD config has nothing to leak. A hard error
+    /// here would break `devflow start` for every non-GSD project, which is a
+    /// far worse failure than the one this repair prevents.
+    #[test]
+    fn force_clear_on_a_project_without_a_gsd_config_is_a_clean_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        let outcome = force_clear_auto_chain(&root).expect("an absent config is not an error");
+
+        assert!(!outcome.working_tree_repaired);
+        assert!(!outcome.committed_tree_repaired);
+        assert_eq!(outcome.commit_refused, None);
+    }
+
+    /// Absent and malformed are different facts and get different answers: a
+    /// file that cannot be parsed cannot be certified clear, so it propagates
+    /// rather than silently reading as a clean no-op.
+    #[test]
+    fn force_clear_on_a_malformed_config_is_an_error() {
+        let (_dir, root) = git_project();
+        let malformed = "{ \"workflow\": { \"_auto_chain_active\": tru";
+        write_config(&root, malformed);
+
+        assert!(matches!(
+            force_clear_auto_chain(&root),
+            Err(GsdConfigError::Json(_))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(config_path(&root)).unwrap(),
+            malformed,
+            "a failed certification must leave the operator's file exactly as \
+             it was"
+        );
     }
 
     /// A project whose `.planning/` exists but holds no config file.
