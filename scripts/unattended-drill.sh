@@ -257,12 +257,27 @@ STATE_EOF
 
     # A real GSD config, with the chain flag PRESENT and CLEAR so plan
     # 35.1-03's preflight condition C1 holds.
+    #
+    # `auto_mode` MUST be false, and this is the whole ballgame for the negative
+    # control (2026-08-09: the first executed run set it true and the drill
+    # measured nothing as a result).
+    #
+    # GSD's `checkpoint_handling` reads `check auto-mode --pick active`, which is
+    # documented as "chain flag OR user preference — same boolean". With
+    # `auto_mode: true` the PERSISTENT PREFERENCE alone satisfies that OR, so
+    # BOTH arms auto-approve and the ephemeral chain flag — the only thing this
+    # drill exists to test — is never the deciding variable. The run comes back
+    # green-ish and establishes nothing.
+    #
+    # Setting it false makes `_auto_chain_active` the sole path to auto-approval,
+    # which is exactly the isolation F-20 requires: one variable changes between
+    # the arms, and it is the one under test.
     cat > "$dest_abs/.planning/config.json" <<'CONFIG_EOF'
 {
   "commit_docs": true,
   "workflow": {
     "granularity": "small",
-    "auto_mode": true,
+    "auto_mode": false,
     "commit_docs": true,
     "subagent_timeout": 300000,
     "_auto_chain_active": false,
@@ -654,14 +669,27 @@ collect() {
     OBS["${arm}.strays"]="${live:-none}"
 }
 
-# A compact, comparable rendering of the checkpoint observation. If the two
-# arms produce the SAME string, the measurement is broken, not the subject.
+# A compact, comparable rendering of the CHECKPOINT observation. If the two arms
+# produce the SAME string, the measurement is broken, not the subject.
+#
+# `reached_validate` was deliberately REMOVED from this string on 2026-08-09.
+# It is a downstream consequence, not a checkpoint observation, and including it
+# let the arms register as "different" on a difference that had nothing to do
+# with auto-approval: the first executed run recorded
+#
+#     arm A: auto_approved=yes surfaced=yes reached_validate=no
+#     arm B: auto_approved=yes surfaced=yes reached_validate=yes
+#
+# — two strings that differ, so FAILURE 3/3 stayed silent, while the fact that
+# actually mattered (BOTH arms auto-approved) passed straight through the gate.
+# The comparison must be over the checkpoint behaviour alone, or the negative
+# control can be satisfied by noise. `reached_validate` is still reported in the
+# evidence table; it is simply not part of the discrimination test.
 checkpoint_observation() {
     local arm="$1"
-    printf 'auto_approved=%s surfaced=%s reached_validate=%s' \
+    printf 'auto_approved=%s surfaced=%s' \
         "${OBS["${arm}.auto_approved_loose"]}" \
-        "${OBS["${arm}.checkpoint_surfaced"]}" \
-        "${OBS["${arm}.reached_validate"]}"
+        "${OBS["${arm}.checkpoint_surfaced"]}"
 }
 
 # ---------------------------------------------------------------------------
