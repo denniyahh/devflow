@@ -158,7 +158,7 @@ of 35.1's success criteria rather than in service of them, so a reader comparing
 against the diff will find more than the criteria ask for — that is why, not drift. Both are
 prerequisites in the literal sense: an unattended run cannot be made to work while the monitor
 kills any stage that backgrounds work.
-**Plans**: 1/4 plans executed across 3 waves
+**Plans**: 3/4 plans executed across 3 waves
 
 Plans:
 
@@ -173,12 +173,12 @@ Plans:
 
 **Wave 2** *(both blocked on Wave 1; disjoint file sets, so they run in parallel)*
 
-- [ ] 35.1-02-PLAN.md — leak repair: `force_clear_auto_chain` at `start` and `resume`, reaching the
+- [x] 35.1-02-PLAN.md — leak repair: `force_clear_auto_chain` at `start` and `resume`, reaching the
   committed tree and refusing to sweep an operator's edit, the loud stdout notice plus
   `auto_chain_flag_repaired` event, and the SIGKILL regression test built on a demonstrated leak
   (criterion 2, D-01/D-02/D-03)
 
-- [ ] 35.1-03-PLAN.md — the fail-closed preflight: three conditions to a four-state report, refusing
+- [x] 35.1-03-PLAN.md — the fail-closed preflight: three conditions to a four-state report, refusing
   in `--mode auto` and reporting in `--mode supervise`, with three NOT-viable fixtures each
   demonstrated failing and no override of any kind (criterion 4, D-07/D-08/D-09)
 
@@ -324,7 +324,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 33 | 6/6 | Complete    | 2026-08-05 |
 | 34 | 6/6 | Complete    | 2026-08-06 |
 | 35 | 6/6 | Complete    | 2026-08-07 |
-| 35.1 | 1/4 | In Progress|  |
+| 35.1 | 3/4 | In Progress|  |
 | 35.2 | — | Not started | — |
 | 36 | — | Not started | — |
 
