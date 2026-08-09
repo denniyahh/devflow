@@ -675,7 +675,11 @@ const STREAM_JSON_STAGES: &[Stage] = &[
 /// directly, so it never consults this predicate at all. That is a
 /// pre-existing, deliberate legacy route (see `MonitorLaunch::Legacy`'s own
 /// doc), recorded rather than silently covered.
-fn claude_stream_launch_enabled(agent: AgentKind, stage: Stage, legacy_opt_out: bool) -> bool {
+pub(crate) fn claude_stream_launch_enabled(
+    agent: AgentKind,
+    stage: Stage,
+    legacy_opt_out: bool,
+) -> bool {
     !legacy_opt_out && agent == AgentKind::Claude && STREAM_JSON_STAGES.contains(&stage)
 }
 
@@ -1554,7 +1558,20 @@ mod tests {
         init_repo(root);
 
         let phase = PhaseId::new(65);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        // `Mode::Supervise`, and the mode is now load-bearing (35.1-03): the
+        // legacy opt-out set below makes this a launch shape whose Code stage
+        // cannot bound the chain flag's lifetime, and
+        // `preflight_unattended_launch_check` refuses exactly that combination
+        // in `Mode::Auto`. This test's subject — pid persistence — is
+        // mode-independent, so supervise keeps the premise the 34-06 note
+        // below establishes without asking the preflight to permit a launch
+        // D-07 exists to refuse.
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
         // Not because this test wants legacy behaviour, but because its
         // subject is orthogonal to the launch path (34-06).
         state.legacy_claude_launch = true;
@@ -1718,7 +1735,17 @@ mod tests {
         init_repo(root);
 
         let phase = PhaseId::new(67);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        // `Mode::Supervise` for the same 35.1-03 reason as
+        // `launch_stage_persists_monitor_pid_for_reload` above: the legacy
+        // opt-out set below is refused in `Mode::Auto` by
+        // `preflight_unattended_launch_check`, and this test's subject — the
+        // unfired `stop_until` cap surviving a resume — is mode-independent.
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
         // Current stage is earlier than the cap (Define < Plan), and the
         // phase was NOT stopped by the cap — this is the rate-limit/infra
         // recovery shape, not the "cap already fired" shape.
@@ -1794,7 +1821,15 @@ mod tests {
         init_repo(root);
 
         let phase = PhaseId::new(68);
-        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        // `Mode::Supervise` for the same 35.1-03 reason as the two tests
+        // above — the legacy opt-out below is refused in `Mode::Auto`, and the
+        // absence of a `stop_until` cap is mode-independent.
+        let mut state = State::new(
+            phase,
+            AgentKind::Claude,
+            Mode::Supervise,
+            root.to_path_buf(),
+        );
         state.stop_until = None;
         state.stopped = false;
         state.stop_reason = None;
