@@ -172,10 +172,11 @@ Where the two diverge, `CONTRIBUTING.md` wins; update it first, then this file.
   per milestone), `phases/`, `milestones/` (archives), `debug/` (+ `debug/resolved/`),
   `superseded/`, `codebase/` — the standard GSD document set; content is project-specific but the
   *shape* is entirely reusable via `/gsd-new-project`.
-- [ ] **[PATTERN]** `.planning/UPSTREAM-GSD-ISSUES.md` as a **symlink** into a sibling `gsd-core`
-  checkout (`../../gsd-core/scratch/UPSTREAM-GSD-ISSUES.md`) — gitignored, self-healed by the
-  post-commit hook (§3). Only makes sense if you keep a local `gsd-core` source checkout
-  alongside your projects; otherwise this is DevFlow-specific plumbing to skip.
+- [ ] **[PATTERN]** `.planning/UPSTREAM-GSD-ISSUES.md` as a **symlink** into a sibling
+  `gsd-core-personal-workspace` checkout (`../../gsd-core-personal-workspace/scratch/UPSTREAM-GSD-ISSUES.md`)
+  — gitignored, self-healed by the post-commit hook (§3). Only makes sense if you keep a local
+  `gsd-core-personal-workspace` source checkout alongside your projects; otherwise this is
+  DevFlow-specific plumbing to skip.
 - [ ] **[PROJECT]** Linear integration: team `Denniskim`, project `DevFlow` — ROADMAP.md backlog
   items are meant to stay in sync with Linear issues (per your own stated convention).
 

@@ -130,10 +130,10 @@ root-cause history.
 ## Where the upstream GSD issue ledger lives
 
 `.planning/UPSTREAM-GSD-ISSUES.md` is a **symlink**, not a file. The tracked copy lives in the
-sibling gsd-core checkout:
+sibling `gsd-core-personal-workspace` checkout:
 
 ```
-.planning/UPSTREAM-GSD-ISSUES.md -> ../../gsd-core/scratch/UPSTREAM-GSD-ISSUES.md
+.planning/UPSTREAM-GSD-ISSUES.md -> ../../gsd-core-personal-workspace/scratch/UPSTREAM-GSD-ISSUES.md
 ```
 
 File new GSD-core defects there, not in a new file here. If the path reads as missing, the
