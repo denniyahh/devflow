@@ -28,7 +28,7 @@ those five confirmed fixes down waiting on a harness.
 | Phase | Name | Status | Version |
 |---|---|---|---|
 | 35 | Loop-Termination and Baseline Correctness | Complete (2026-08-07) | — |
-| 35.1 | Unattended-Launch Prerequisites | Not started | — |
+| 35.1 | Unattended-Launch Prerequisites | Complete | — |
 | 35.2 | Verification Provenance | Not started | — |
 | 36 | Drain Gate Concurrency Measurement | Not started | — |
 
@@ -184,10 +184,12 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 35.1-04-PLAN.md — the live drill against a real Claude agent with a real GSD blocking
+- [x] 35.1-04-PLAN.md — the live drill against a real Claude agent with a real GSD blocking
   checkpoint and a real `--gaps-only` loop, its supervise-mode negative control, the criterion 6
-  observation recorded in `35.1-DRILL.md`, and the operator guide stating both known limitations
-  (criteria 5 and 6, D-10/D-11)
+  observation recorded in `35.1-DRILL.md`, and the operator guide stating all three known limitations
+  (criteria 5 and 6, D-10/D-11). Completed 2026-08-12 — chain-flag mechanism confirmed working;
+  auto-approval blocked by upstream GSD #3370 (orchestrator conflates `gate="blocking"` with
+  `gate="blocking-human"`); GSD #3370 filed; stale live-run gate rejected.
 
 ### Phase 35.2: Verification Provenance (999.89 / HARDEN-03)
 
@@ -324,7 +326,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 33 | 6/6 | Complete    | 2026-08-05 |
 | 34 | 6/6 | Complete    | 2026-08-06 |
 | 35 | 6/6 | Complete    | 2026-08-07 |
-| 35.1 | 3/4 | In Progress|  |
+| 35.1 | 4/4 | Complete    | 2026-08-12 |
 | 35.2 | — | Not started | — |
 | 36 | — | Not started | — |
 
