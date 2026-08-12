@@ -2,17 +2,17 @@
 gsd_state_version: 1.0
 milestone: v2.5.0
 milestone_name: milestone (Loop-Termination and Release Hardening, ACTIVE — declared 2026-08-06)
-current_phase: 35.3
+current_phase: 35.1
 current_phase_name: drain-gate-concurrency-measurement
 status: discussed
 stopped_at: Beginning Phase 35.3 — Drain Gate Concurrency Measurement (999.83)
-last_updated: "2026-08-12T12:30:00.000Z"
+last_updated: "2026-08-12T19:37:27.780Z"
 last_activity: 2026-08-12
 last_activity_desc: Phase 35.3 discussion started — measurement of whether the drain gate observes real sub-agent concurrency
 progress:
   total_phases: 4
   completed_phases: 3
-  total_plans: 12
+  total_plans: 15
   completed_plans: 12
   percent: 75
 ---
