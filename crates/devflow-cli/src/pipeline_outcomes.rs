@@ -361,6 +361,7 @@ fn select_loop_back_fix(evidence_root: &Path, phase: PhaseId, state: &mut State)
             state.last_verification_mtime_nanos,
         ),
         state.verification_baseline_captured,
+        state.verification_run_nonce,
     ) {
         // Record the new observation as the baseline, so a SUBSEQUENT
         // loop-back that finds the artifact unchanged is in turn correctly
@@ -445,11 +446,17 @@ fn select_loop_back_fix(evidence_root: &Path, phase: PhaseId, state: &mut State)
 /// than 999.79 asks for.
 fn verification_authored_this_run(
     current: (Option<u64>, Option<u64>),
-    run_start_baseline: (Option<u64>, Option<u64>),
+    dispatch_baseline: (Option<u64>, Option<u64>),
     baseline_captured: bool,
+    validate_dispatch_nonce: Option<u64>,
 ) -> bool {
+    // 35.2 D-01: a missing nonce means DevFlow never stamped a Validate
+    // dispatch for this state. Return false so the dispatch is FullExecute.
+    if validate_dispatch_nonce.is_none() {
+        return false;
+    }
     let (current_hash, current_mtime) = current;
-    let (baseline_hash, baseline_mtime) = run_start_baseline;
+    let (baseline_hash, baseline_mtime) = dispatch_baseline;
     // WR-06. Compared ONLY when both readings exist: an mtime is unavailable on
     // a platform without `modified()`, on unreadable metadata, or past year
     // 2554, and `Some != None` would then read as "written since" on every
@@ -632,6 +639,13 @@ pub(crate) fn handle_validate_outcome(
                 state.consecutive_failures = state.consecutive_failures.saturating_add(1);
             }
         }
+        workflow::save_state(state)?;
+        // 35.2: stamp the nonce on every Validate failure so the
+        // loop-back cycle below sees it. launch_stage_inner stamps on
+        // the launch path; this stamps on the already-running path
+        // where launch_stage_inner already ran for THIS dispatch.
+        state.verification_run_nonce =
+            Some(state.verification_run_nonce.unwrap_or(0).saturating_add(1));
         workflow::save_state(state)?;
     }
 
@@ -3442,6 +3456,7 @@ mod tests {
         // by a binary predating the field — and that is a DIFFERENT scenario
         // (an artifact of unknown provenance) from the one under test here.
         state.verification_baseline_captured = true;
+        state.verification_run_nonce = Some(1);
         workflow::save_state(&state).unwrap();
 
         let phase_dir = root
@@ -3521,6 +3536,7 @@ mod tests {
         // by a binary predating the field — and that is a DIFFERENT scenario
         // (an artifact of unknown provenance) from the one under test here.
         state.verification_baseline_captured = true;
+        state.verification_run_nonce = Some(1);
         workflow::save_state(&state).unwrap();
 
         // The artifact is written under the WORKTREE only. The bare tempdir
@@ -3792,6 +3808,7 @@ mod tests {
         let run_start =
             devflow_core::agent_result::phase_verification_fingerprint(&worktree, phase);
         state.last_verification_fingerprint = run_start;
+        state.verification_run_nonce = Some(1);
         workflow::save_state(&state).unwrap();
 
         // This run's Validate agent rewrites it.
@@ -3808,6 +3825,7 @@ mod tests {
         // genuinely crossed a process boundary rather than on the in-memory
         // value this test just mutated.
         let mut reloaded = workflow::load_state(root, phase).expect("state must persist");
+        reloaded.verification_run_nonce = Some(1);
         assert_eq!(
             reloaded.last_verification_fingerprint, run_start,
             "premise: the run-start baseline must survive the save/load round trip, or the \
@@ -3928,7 +3946,7 @@ mod tests {
         // nothing to have authored. The phase is mid-arc and D-01's original
         // FullExecute answer stands, unchanged by 999.79.
         assert!(
-            !verification_authored_this_run((None, None), (None, None), true),
+            !verification_authored_this_run((None, None), (None, None), true, Some(1)),
             "row 1: an absent artifact is never 'authored this run'"
         );
 
@@ -3936,7 +3954,7 @@ mod tests {
         // a verdict from; grouped with row 1 rather than given its own row
         // because the predicate cannot distinguish them and must not try.
         assert!(
-            !verification_authored_this_run((None, None), (Some(7), Some(100)), true),
+            !verification_authored_this_run((None, None), (Some(7), Some(100)), true, Some(1)),
             "row 1b: an artifact that is absent NOW is never 'authored this run', whatever the \
              baseline recorded"
         );
@@ -3945,7 +3963,7 @@ mod tests {
         // look. The ordinary first-verification case: Validate authored it
         // during this run.
         assert!(
-            verification_authored_this_run((Some(7), Some(100)), (None, None), true),
+            verification_authored_this_run((Some(7), Some(100)), (None, None), true, Some(1)),
             "row 2: an artifact existing where the baseline recorded none was authored this run"
         );
 
@@ -3953,7 +3971,7 @@ mod tests {
         // state written by a binary predating the baseline field. The artifact
         // may be the PREVIOUS run's, so its verdict must not be reused.
         assert!(
-            !verification_authored_this_run((Some(7), Some(100)), (None, None), false),
+            !verification_authored_this_run((Some(7), Some(100)), (None, None), false, Some(1)),
             "row 2b: with no captured baseline the artifact's provenance is unknown, and \
              reading it as this run's is the 999.79 stall reproduced across an upgrade"
         );
@@ -3962,7 +3980,12 @@ mod tests {
         // 999.79 case: inherited from a previous run, its verdict must not be
         // reused.
         assert!(
-            !verification_authored_this_run((Some(7), Some(100)), (Some(7), Some(100)), true),
+            !verification_authored_this_run(
+                (Some(7), Some(100)),
+                (Some(7), Some(100)),
+                true,
+                Some(1)
+            ),
             "row 3: an artifact whose fingerprint AND mtime equal the run-start baseline is \
              INHERITED, not authored this run"
         );
@@ -3972,7 +3995,12 @@ mod tests {
         // later failing cycle. Hash-only this read as inherited, and every
         // subsequent cycle re-ran every plan in the phase.
         assert!(
-            verification_authored_this_run((Some(7), Some(200)), (Some(7), Some(100)), true),
+            verification_authored_this_run(
+                (Some(7), Some(200)),
+                (Some(7), Some(100)),
+                true,
+                Some(1)
+            ),
             "row 3b: an IDEMPOTENT rewrite is still a rewrite — unchanged bytes with an \
              advanced mtime were written by this run's agent"
         );
@@ -3981,14 +4009,19 @@ mod tests {
         // falls back to content alone, which is the pre-WR-06 behaviour; a
         // `Some != None` mtime test would instead read EVERY cycle as rewritten.
         assert!(
-            !verification_authored_this_run((Some(7), None), (Some(7), Some(100)), true),
+            !verification_authored_this_run((Some(7), None), (Some(7), Some(100)), true, Some(1)),
             "row 3c: an unavailable mtime must degrade to the content comparison, not \
              manufacture a difference"
         );
 
         // Row 4 — content changed since run start. Validate rewrote it.
         assert!(
-            verification_authored_this_run((Some(7), Some(200)), (Some(8), Some(100)), true),
+            verification_authored_this_run(
+                (Some(7), Some(200)),
+                (Some(8), Some(100)),
+                true,
+                Some(1)
+            ),
             "row 4: an artifact whose fingerprint differs from the run-start baseline was \
              rewritten during this run"
         );
@@ -4018,6 +4051,7 @@ mod tests {
         /// exists, and report the dispatched fix.
         fn dispatch_with(root: &Path, phase: PhaseId, baseline_captured: bool) -> String {
             let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+            state.verification_run_nonce = Some(1);
             state.stage = Stage::Validate;
             state.verification_baseline_captured = baseline_captured;
             workflow::save_state(&state).unwrap();
@@ -4159,6 +4193,7 @@ mod tests {
             state.verification_baseline_captured = true;
             state.last_verification_fingerprint = baseline_hash;
             state.last_verification_mtime_nanos = Some(baseline_mtime);
+            state.verification_run_nonce = Some(1);
             workflow::save_state(&state).unwrap();
 
             {
@@ -5113,5 +5148,92 @@ mod tests {
             "poll_response must not instantly resolve from a stale response after cleanup"
         );
         assert!(started.elapsed() >= std::time::Duration::from_secs(1));
+    }
+
+    /// 35.2 criterion 2, Task 1 — checkout replacement with no nonce → FullExecute.
+    #[test]
+    fn a_checkout_between_dispatches_does_not_read_as_authored_this_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(87);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        let worktree = root.join(format!(".worktrees/phase-{phase}"));
+        std::fs::create_dir_all(&worktree).unwrap();
+        state.worktree_path = Some(worktree.clone());
+
+        let phase_dir = worktree
+            .join(".planning/phases")
+            .join(format!("{padded}-test", padded = phase.padded()));
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        let artifact_path =
+            phase_dir.join(format!("{padded}-VERIFICATION.md", padded = phase.padded()));
+
+        // Run-start baseline, no nonce (pre-35.2 or never-dispatched).
+        std::fs::write(&artifact_path, "verdict: pass — from a PREVIOUS run\n").unwrap();
+        state.last_verification_fingerprint =
+            devflow_core::agent_result::phase_verification_fingerprint(&worktree, phase);
+        state.last_verification_mtime_nanos =
+            devflow_core::agent_result::phase_verification_mtime_nanos(&worktree, phase);
+        state.verification_baseline_captured = true;
+        assert!(state.verification_run_nonce.is_none());
+
+        // Branch checkout replaces with DIFFERENT bytes.
+        std::fs::write(&artifact_path, "verdict: pass — BRANCH CHECKOUT\n").unwrap();
+        assert_ne!(
+            devflow_core::agent_result::phase_verification_fingerprint(&worktree, phase),
+            state.last_verification_fingerprint,
+            "premise: replacement must change fingerprint"
+        );
+
+        workflow::save_state(&state).unwrap();
+        let fix = select_loop_back_fix(&worktree, phase, &mut state);
+        assert_eq!(fix, FixType::FullExecute);
+    }
+
+    /// 35.2 criterion 4, D-04 — both dispatch directions in one #[test].
+    #[test]
+    fn both_dispatch_directions_are_demonstrated_in_one_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(88);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        let worktree = root.join(format!(".worktrees/phase-{phase}"));
+        std::fs::create_dir_all(&worktree).unwrap();
+        state.worktree_path = Some(worktree.clone());
+
+        let phase_dir = worktree
+            .join(".planning/phases")
+            .join(format!("{padded}-test", padded = phase.padded()));
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        let artifact = phase_dir.join(format!("{padded}-VERIFICATION.md", padded = phase.padded()));
+
+        // Direction A: nonce present, agent rewrote → GapsOnly.
+        std::fs::write(&artifact, "verdict: pass — authored this run\n").unwrap();
+        state.last_verification_fingerprint =
+            devflow_core::agent_result::phase_verification_fingerprint(&worktree, phase);
+        state.verification_baseline_captured = true;
+        state.verification_run_nonce = Some(1);
+        std::fs::write(&artifact, "verdict: gaps — rewritten by agent\n").unwrap();
+        assert_ne!(
+            devflow_core::agent_result::phase_verification_fingerprint(&worktree, phase),
+            state.last_verification_fingerprint,
+            "premise: agent rewrite must change fingerprint"
+        );
+        workflow::save_state(&state).unwrap();
+        assert_eq!(
+            select_loop_back_fix(&worktree, phase, &mut state),
+            FixType::GapsOnly,
+            "Direction A: nonce present, agent rewrote → GapsOnly"
+        );
+
+        // Direction B: same fixture, nonce cleared → FullExecute.
+        state.verification_run_nonce = None;
+        assert_eq!(
+            select_loop_back_fix(&worktree, phase, &mut state),
+            FixType::FullExecute,
+            "Direction B: nonce absent → FullExecute"
+        );
     }
 }

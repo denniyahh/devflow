@@ -51,6 +51,29 @@ use tracing::{info, warn};
 /// other caller keeps going through [`launch_stage`]'s full path (readiness
 /// resolution, `ensure_agent_binary`, then `run_preflight`).
 ///
+/// 35.2 (999.89 / HARDEN-03, P-01/P-02): stamp the run-owned nonce and
+/// re-observe the artifact baseline into a window scoped to THIS Validate
+/// dispatch.
+///
+/// The stamp and the re-observation are ONE mechanism — do not separate.
+/// Extracted so the co-location is testable without spawning an agent.
+fn stamp_validate_dispatch_window(state: &mut State) {
+    if state.stage != Stage::Validate {
+        return;
+    }
+    let evidence_root = state
+        .worktree_path
+        .as_deref()
+        .unwrap_or(&state.project_root);
+    state.verification_run_nonce =
+        Some(state.verification_run_nonce.unwrap_or(0).saturating_add(1));
+    state.last_verification_fingerprint =
+        devflow_core::agent_result::phase_verification_fingerprint(evidence_root, state.phase);
+    state.last_verification_mtime_nanos =
+        devflow_core::agent_result::phase_verification_mtime_nanos(evidence_root, state.phase);
+    state.verification_baseline_captured = true;
+}
+
 /// Recomputes `prompt`/`adapter`/`roots`/`program`/`args` from `state` and
 /// `prompt_override` — deliberately NOT threaded through as parameters.
 /// They are pure functions of `state` and the prompt override; recomputing
@@ -141,6 +164,8 @@ pub(crate) fn launch_stage_inner(
     // `infra_failures`). Persisted below by `spawn_agent_and_record`'s own
     // `save_state` calls — no extra save needed here.
     state.checkpoint_resumes = 0;
+
+    stamp_validate_dispatch_window(state);
 
     spawn_agent_and_record(
         state,
@@ -2244,6 +2269,59 @@ mod tests {
         );
         let reloaded = workflow::load_state(root, phase).unwrap();
         assert_eq!(reloaded.checkpoint_resumes, 0);
+    }
+
+    /// 35.2 P-02: the nonce stamp and baseline re-observation are co-located
+    /// and gated on Validate. Both arms must disagree — a stamp on every
+    /// stage re-widens the window at the Code stage.
+    #[test]
+    fn launch_stage_inner_stamps_the_validate_dispatch_nonce_with_its_baseline() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(92);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let worktree = root.join(format!(".worktrees/phase-{phase}"));
+        std::fs::create_dir_all(&worktree).unwrap();
+        state.worktree_path = Some(worktree.clone());
+
+        // Write an artifact under the evidence root.
+        let phase_dir = worktree
+            .join(".planning/phases")
+            .join(format!("{padded}-stamp", padded = phase.padded()));
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        std::fs::write(
+            phase_dir.join(format!("{padded}-VERIFICATION.md", padded = phase.padded())),
+            "verdict: pass\n",
+        )
+        .unwrap();
+
+        let fingerprint_before =
+            devflow_core::agent_result::phase_verification_fingerprint(&worktree, phase);
+
+        // Validate stage: nonce advances, fingerprint refreshed.
+        state.stage = Stage::Validate;
+        stamp_validate_dispatch_window(&mut state);
+        assert_eq!(state.verification_run_nonce, Some(1));
+        assert_eq!(
+            state.last_verification_fingerprint, fingerprint_before,
+            "fingerprint must match the on-disk artifact after stamp"
+        );
+        assert!(state.verification_baseline_captured);
+
+        // Non-Validate stage: nothing changes.
+        let nonce_after_validate = state.verification_run_nonce;
+        let fp_after_validate = state.last_verification_fingerprint;
+        state.stage = Stage::Code;
+        stamp_validate_dispatch_window(&mut state);
+        assert_eq!(
+            state.verification_run_nonce, nonce_after_validate,
+            "nonce must not change on non-Validate stages"
+        );
+        assert_eq!(
+            state.last_verification_fingerprint, fp_after_validate,
+            "fingerprint must not change on non-Validate stages"
+        );
     }
 
     // ---- D-15 delivery-canary gate (31-03) ------------------------------

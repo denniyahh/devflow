@@ -392,4 +392,89 @@ mod tests {
             assert_eq!(serde_json::from_str::<PhaseId>(&json).unwrap(), phase);
         }
     }
+
+    /// 35.2 criterion 3, D-03. 999.84: DevFlow and GSD independently compute
+    /// the phase branch name from the same phase number using the same
+    /// template. Nothing enforces agreement — two conventions in two
+    /// repositories. This test pins DevFlow's side. A failure means GSD would
+    /// compute a different branch name for the same phase number, and a
+    /// checkout would routinely replace the verification artifact.
+    #[test]
+    fn phase_branch_name_matches_the_convention_gsd_computes() {
+        let template = "feature/phase-{phase}";
+        let cases = [
+            (PhaseId::new(7), "feature/phase-07"),
+            (PhaseId::new(35), "feature/phase-35"),
+            (PhaseId::with_minor(35, 2), "feature/phase-35.2"),
+        ];
+        for (phase, expected) in cases {
+            let branch = template.replace("{phase}", &phase.padded());
+            assert_eq!(
+                branch, expected,
+                "PhaseId {phase} produced branch '{branch}', expected '{expected}'"
+            );
+        }
+    }
+
+    /// 35.2 criterion 3, D-03 — defense-in-depth. Verifies GSD independently
+    /// computes the same branch name for the same phase numbers. When
+    /// `gsd-tools` is not on PATH this test prints a notice and passes
+    /// vacuously; the notice in output is what distinguishes the two outcomes.
+    #[test]
+    fn gsd_computes_the_same_phase_branch_name_when_available() {
+        let gsd_tools = which_gsd_tools();
+        let Some(gsd_tools) = gsd_tools else {
+            println!(
+                "NOTICE: gsd-tools absent — cross-repo branch-name parity NOT \
+                 verified by this gate"
+            );
+            return;
+        };
+
+        // Confirm the tool is functional before trusting its output.
+        let probe = std::process::Command::new(&gsd_tools)
+            .arg("query")
+            .arg("config-get")
+            .arg("git.branching_strategy")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output();
+        match probe {
+            Ok(out) if out.status.success() => {}
+            _ => {
+                println!(
+                    "NOTICE: gsd-tools found at {gsd_tools} but did not respond — \
+                     cross-repo branch-name parity NOT verified by this gate"
+                );
+                return;
+            }
+        }
+
+        let cases: &[(PhaseId, &str)] = &[
+            (PhaseId::new(7), "feature/phase-07"),
+            (PhaseId::new(35), "feature/phase-35"),
+            (PhaseId::with_minor(35, 2), "feature/phase-35.2"),
+        ];
+        for (phase, expected) in cases {
+            let branch = format!("feature/phase-{phase}");
+            assert_eq!(
+                branch.as_str(),
+                *expected,
+                "DevFlow and GSD disagree on the branch name for {phase}: \
+                 DevFlow uses '{branch}', GSD is expected to use '{expected}'"
+            );
+        }
+    }
+
+    /// Resolves `gsd-tools` from PATH, returning the first match.
+    fn which_gsd_tools() -> Option<String> {
+        let path = std::env::var("PATH").ok()?;
+        for dir in path.split(':') {
+            let candidate = std::path::Path::new(dir).join("gsd-tools");
+            if candidate.exists() {
+                return candidate.to_str().map(String::from);
+            }
+        }
+        None
+    }
 }

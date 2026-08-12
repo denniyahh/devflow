@@ -29,7 +29,7 @@ those five confirmed fixes down waiting on a harness.
 |---|---|---|---|
 | 35 | Loop-Termination and Baseline Correctness | Complete (2026-08-07) | — |
 | 35.1 | Unattended-Launch Prerequisites | Complete | — |
-| 35.2 | Verification Provenance | Not started | — |
+| 35.2 | Verification Provenance | Complete | — |
 | 36 | Drain Gate Concurrency Measurement | Not started | — |
 
 ### Phase 35: Loop-Termination and Baseline Correctness (999.77 + 999.78 + 999.79 + 999.84 + 999.86 + 999.87)
@@ -327,7 +327,7 @@ exists to fix, only the (unused-by-HYGIENE-03) plans-total figure.
 | 34 | 6/6 | Complete    | 2026-08-06 |
 | 35 | 6/6 | Complete    | 2026-08-07 |
 | 35.1 | 4/4 | Complete    | 2026-08-12 |
-| 35.2 | — | Not started | — |
+| 35.2 | 2/2 | Complete    | 2026-08-12 |
 | 36 | — | Not started | — |
 
 ## v2.4.0 milestone (CLOSED 2026-08-06 — Resume Unattended Dogfooding)

@@ -437,7 +437,9 @@ enum GateCmd {
     /// without a supervisor. On-demand only: nothing schedules this for you.
     Sweep {
         /// Age threshold in seconds — a gate older than this is reaped.
-        /// Defaults to `DEVFLOW_GATE_MAX_UNATTENDED_AGE_SECS` (six hours).
+        /// Defaults to `DEVFLOW_GATE_MAX_UNATTENDED_AGE_SECS` (three days,
+        /// held equal to `DEVFLOW_GATE_TIMEOUT_SECS` so a sweep cannot reap a
+        /// gate a live monitor is still polling).
         #[arg(long = "max-age-secs")]
         max_age_secs: Option<u64>,
         /// Report what would be reaped without writing anything.
