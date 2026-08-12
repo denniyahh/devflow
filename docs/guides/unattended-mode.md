@@ -173,6 +173,32 @@ mode instead of letting the run start and stall later. That is an improvement
 in legibility, not a removal of the limitation: `--mode auto` remains
 Claude-only, and remains incompatible with the legacy launch opt-out.
 
+### 3. GSD orchestrator may block auto-approval of `gate="blocking"` checkpoints
+
+When a plan contains a `checkpoint:human-verify` task with `gate="blocking"`
+(as opposed to `blocking-human`), GSD's own rules say it should auto-approve
+in auto mode. In practice, the `execute-phase.md` orchestrator may inject a
+conflicting instruction into the executor's prompt telling it to never
+auto-approve — treating `gate="blocking"` as if it were the exception rather
+than the auto-approvable default.
+
+**Cause.** The GSD orchestrator (the parent agent running `execute-phase.md`)
+generates the executor subagent prompt dynamically. When it sees
+`checkpoint:human-verify` + `gate="blocking"`, it sometimes adds a
+`<critical_gate>` block that overrides the executor's own checkpoint protocol.
+This is an upstream GSD behavioral issue, not a DevFlow defect —
+[open-gsd/gsd-core#3370](https://github.com/open-gsd/gsd-core/issues/3370).
+
+**Practical impact is narrow.** GSD's default `human_verify_mode`
+(`end-of-phase`, #3309) suppresses `checkpoint:human-verify` tasks from plans
+entirely. A normal unattended run never contains these tasks and never hits
+this. The limitation only affects phases whose CONTEXT.md locked decisions
+or `human_verify_mode = mid-flight` setting force these checkpoints into plans.
+
+**Fix owner: GSD.** The orchestrator's dispatch instructions should explicitly
+state that `gate="blocking"` checkpoints are auto-approvable and the
+executor's own protocol is authoritative.
+
 ## How this was verified
 
 The mechanism was driven end-to-end against a real Claude agent running real
@@ -186,4 +212,6 @@ verbatim capture lines, is in
 **What that drill does not establish:** it does not establish that DevFlow sets
 and clears the flag at the right moments — that is covered separately by
 DevFlow's own end-to-end tests, including a real-`SIGKILL` leak demonstration —
-and one run is one sample.
+and one run is one sample. The drill also surfaced an upstream GSD behavioral
+issue (#3370) where the orchestrator blocks auto-approval of correctly-authored
+`gate="blocking"` checkpoints; this is recorded as known limitation #3 above.
