@@ -232,6 +232,14 @@ pub struct State {
     /// site, replaced at the same update site, and never read on its own — the
     /// pair is the observation, and either one differing means the artifact was
     /// written during this run.
+    ///
+    /// 35.2 D-05: mtime was considered as the provenance signal and REJECTED.
+    /// A branch checkout or worktree merge-back updates mtime exactly as a
+    /// real write does — it fails on the identical scenario
+    /// [`Self::verification_run_nonce`] exists to catch, which is why 999.89
+    /// survived 35-05's WR-06 fix. mtime is still what detects a byte-identical
+    /// rewrite INSIDE the Validate dispatch window whose bounds the nonce
+    /// establishes — provenance and freshness are different questions.
     #[serde(default)]
     pub last_verification_mtime_nanos: Option<u64>,
     /// A run-owned marker stamped per Validate dispatch proving DevFlow itself
@@ -760,6 +768,49 @@ mod tests {
         assert!(
             loaded.verification_baseline_captured,
             "a captured baseline must survive the save/load the real pipeline performs"
+        );
+    }
+
+    /// 35.2 D-01: verification_run_nonce must survive the save/load cycle
+    /// `handle_validate_outcome` → `select_loop_back_fix` performs.
+    #[test]
+    fn verification_run_nonce_round_trips_through_serde() {
+        let mut state = State::new(
+            PhaseId::new(1),
+            AgentKind::Claude,
+            Mode::Auto,
+            PathBuf::from("/repo"),
+        );
+        state.verification_run_nonce = Some(42);
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(
+            json.contains("verification_run_nonce"),
+            "verification_run_nonce must appear in persisted JSON"
+        );
+        let loaded: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            loaded.verification_run_nonce,
+            Some(42),
+            "verification_run_nonce must round-trip through serde"
+        );
+    }
+
+    /// 35.2 D-01: a serde-absent verification_run_nonce (state written by
+    /// a pre-35.2 binary) deserializes to None — the conservative direction.
+    #[test]
+    fn verification_run_nonce_absent_from_json_defaults_to_none() {
+        let json = r#"{
+            "stage": "code",
+            "phase": 1,
+            "agent": "claude",
+            "mode": "auto",
+            "started_at": "0",
+            "project_root": "/repo"
+        }"#;
+        let loaded: State = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            loaded.verification_run_nonce, None,
+            "pre-35.2 state must default to None — the conservative provenance reading"
         );
     }
 
