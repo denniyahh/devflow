@@ -5134,4 +5134,92 @@ mod tests {
         );
         assert!(started.elapsed() >= std::time::Duration::from_secs(1));
     }
+
+    /// 35.2 criterion 2, Task 1 — checkout replacement with no nonce → FullExecute.
+    #[test]
+    fn a_checkout_between_dispatches_does_not_read_as_authored_this_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(87);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        let worktree = root.join(format!(".worktrees/phase-{phase}"));
+        std::fs::create_dir_all(&worktree).unwrap();
+        state.worktree_path = Some(worktree.clone());
+
+        let phase_dir = worktree
+            .join(".planning/phases")
+            .join(format!("{padded}-test", padded = phase.padded()));
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        let artifact_path =
+            phase_dir.join(format!("{padded}-VERIFICATION.md", padded = phase.padded()));
+
+        // Run-start baseline, no nonce (pre-35.2 or never-dispatched).
+        std::fs::write(&artifact_path, "verdict: pass — from a PREVIOUS run\n").unwrap();
+        state.last_verification_fingerprint =
+            devflow_core::agent_result::phase_verification_fingerprint(&worktree, phase);
+        state.last_verification_mtime_nanos =
+            devflow_core::agent_result::phase_verification_mtime_nanos(&worktree, phase);
+        state.verification_baseline_captured = true;
+        assert!(state.verification_run_nonce.is_none());
+
+        // Branch checkout replaces with DIFFERENT bytes.
+        std::fs::write(&artifact_path, "verdict: pass — BRANCH CHECKOUT\n").unwrap();
+        assert_ne!(
+            devflow_core::agent_result::phase_verification_fingerprint(&worktree, phase),
+            state.last_verification_fingerprint,
+            "premise: replacement must change fingerprint"
+        );
+
+        workflow::save_state(&state).unwrap();
+        let fix = select_loop_back_fix(&worktree, phase, &mut state);
+        assert_eq!(fix, FixType::FullExecute);
+    }
+
+    /// 35.2 criterion 4, D-04 — both dispatch directions in one #[test].
+    #[test]
+    fn both_dispatch_directions_are_demonstrated_in_one_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(88);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        state.stage = Stage::Validate;
+        let worktree = root.join(format!(".worktrees/phase-{phase}"));
+        std::fs::create_dir_all(&worktree).unwrap();
+        state.worktree_path = Some(worktree.clone());
+
+        let phase_dir = worktree
+            .join(".planning/phases")
+            .join(format!("{padded}-test", padded = phase.padded()));
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        let artifact =
+            phase_dir.join(format!("{padded}-VERIFICATION.md", padded = phase.padded()));
+
+        // Direction A: nonce present, agent rewrote → GapsOnly.
+        std::fs::write(&artifact, "verdict: pass — authored this run\n").unwrap();
+        state.last_verification_fingerprint =
+            devflow_core::agent_result::phase_verification_fingerprint(&worktree, phase);
+        state.verification_baseline_captured = true;
+        state.verification_run_nonce = Some(1);
+        std::fs::write(&artifact, "verdict: gaps — rewritten by agent\n").unwrap();
+        assert_ne!(
+            devflow_core::agent_result::phase_verification_fingerprint(&worktree, phase),
+            state.last_verification_fingerprint,
+            "premise: agent rewrite must change fingerprint"
+        );
+        workflow::save_state(&state).unwrap();
+        assert_eq!(
+            select_loop_back_fix(&worktree, phase, &mut state),
+            FixType::GapsOnly,
+            "Direction A: nonce present, agent rewrote → GapsOnly"
+        );
+
+        // Direction B: same fixture, nonce cleared → FullExecute.
+        state.verification_run_nonce = None;
+        assert_eq!(
+            select_loop_back_fix(&worktree, phase, &mut state),
+            FixType::FullExecute,
+            "Direction B: nonce absent → FullExecute"
+        );
+    }
 }
