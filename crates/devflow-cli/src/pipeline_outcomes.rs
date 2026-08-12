@@ -640,6 +640,13 @@ pub(crate) fn handle_validate_outcome(
             }
         }
         workflow::save_state(state)?;
+        // 35.2: stamp the nonce on every Validate failure so the
+        // loop-back cycle below sees it. launch_stage_inner stamps on
+        // the launch path; this stamps on the already-running path
+        // where launch_stage_inner already ran for THIS dispatch.
+        state.verification_run_nonce =
+            Some(state.verification_run_nonce.unwrap_or(0).saturating_add(1));
+        workflow::save_state(state)?;
     }
 
     // F-6: read ONCE, and used for both the message's ceiling clause and the
@@ -4029,6 +4036,7 @@ mod tests {
         /// exists, and report the dispatched fix.
         fn dispatch_with(root: &Path, phase: PhaseId, baseline_captured: bool) -> String {
             let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+            state.verification_run_nonce = Some(1);
             state.stage = Stage::Validate;
             state.verification_baseline_captured = baseline_captured;
             workflow::save_state(&state).unwrap();
