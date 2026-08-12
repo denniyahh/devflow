@@ -4,17 +4,17 @@ milestone: v2.5.0
 milestone_name: milestone (Loop-Termination and Release Hardening, ACTIVE — declared 2026-08-06)
 current_phase: 35.1
 current_phase_name: unattended-launch-prerequisites
-status: executing
-stopped_at: Phase 35.1 planned
-last_updated: "2026-08-08T22:16:37.919Z"
-last_activity: 2026-08-08
-last_activity_desc: Phase 35.1 execution started
+status: complete
+stopped_at: Phase 35.1 complete — hand-completed after dogfood Code-stage stall; chain-flag mechanism confirmed working, auto-approval blocked by upstream GSD #3370
+last_updated: "2026-08-12T02:14:49.915Z"
+last_activity: 2026-08-12
+last_activity_desc: Phase 35.1 complete — 4/4 plans, chain-flag mechanism confirmed, unattended-launch preflight active, GSD #3370 filed
 progress:
   total_phases: 4
-  completed_phases: 1
+  completed_phases: 2
   total_plans: 10
-  completed_plans: 6
-  percent: 25
+  completed_plans: 10
+  percent: 50
 ---
 
 # DevFlow — Project State
@@ -154,10 +154,10 @@ change earns 2.0.
 
 ## Current Position
 
-Phase: 35.1 (unattended-launch-prerequisites) — EXECUTING
-Plan: 1 of 4
-Status: Executing Phase 35.1
-Last activity: 2026-08-08 — Phase 35.1 execution resumed (wave continue)
+Phase: 35.1 (unattended-launch-prerequisites) — COMPLETE (4/4 plans)
+Plan: 4 of 4
+Status: Phase 35.1 complete — chain-flag mechanism confirmed working; unattended-launch preflight active; GSD #3370 (orchestrator conflates gate="blocking" with gate="blocking-human") filed upstream
+Last activity: 2026-08-12 — Phase 35.1 complete; drill run + forensic analysis; stale live-run gate rejected
 
 ## Recently Shipped
 
