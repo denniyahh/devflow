@@ -59,6 +59,36 @@ use tracing::{info, warn};
 /// callable entirely on its own, which is exactly what `run_preflight`'s
 /// `Advance` arm needs. This does not duplicate `worktree_writable_roots`'s
 /// logic — both call sites call the same shared helper.
+
+/// 35.2 (999.89 / HARDEN-03, P-01/P-02): stamp the run-owned nonce and
+/// re-observe the artifact baseline into a window scoped to THIS Validate
+/// dispatch.
+///
+/// The stamp and the re-observation are ONE mechanism — do not separate.
+/// Extracted so the co-location is testable without spawning an agent.
+fn stamp_validate_dispatch_window(state: &mut State) {
+    if state.stage != Stage::Validate {
+        return;
+    }
+    let evidence_root = state
+        .worktree_path
+        .as_deref()
+        .unwrap_or(&state.project_root);
+    state.verification_run_nonce =
+        Some(state.verification_run_nonce.unwrap_or(0).saturating_add(1));
+    state.last_verification_fingerprint =
+        devflow_core::agent_result::phase_verification_fingerprint(
+            evidence_root,
+            state.phase,
+        );
+    state.last_verification_mtime_nanos =
+        devflow_core::agent_result::phase_verification_mtime_nanos(
+            evidence_root,
+            state.phase,
+        );
+    state.verification_baseline_captured = true;
+}
+
 pub(crate) fn launch_stage_inner(
     state: &mut State,
     prompt_override: Option<String>,
@@ -142,39 +172,7 @@ pub(crate) fn launch_stage_inner(
     // `save_state` calls — no extra save needed here.
     state.checkpoint_resumes = 0;
 
-    // 35.2 (999.89 / HARDEN-03, P-01/P-02): on a Validate dispatch, stamp the
-    // run-owned nonce and re-observe the artifact baseline into a window
-    // scoped to THIS dispatch rather than to the whole `devflow start` run.
-    //
-    // P-01 — why this site, not commands.rs: the once-per-run capture site
-    // cannot discriminate the second Validate dispatch of a run from the
-    // first, and 999.89's scenario is a checkout landing BETWEEN two Validate
-    // dispatches. `launch_stage_inner` is reached by every Validate dispatch
-    // via `transition()` (pipeline_gate.rs:95, :111).
-    //
-    // The stamp and the re-observation are ONE mechanism — do not separate
-    // them. A stamp without a fresh baseline silently restores the run-wide
-    // observation window; a fresh baseline without a stamp widens it to the
-    // whole Validate stage.
-    if state.stage == Stage::Validate {
-        let evidence_root = state
-            .worktree_path
-            .as_deref()
-            .unwrap_or(&state.project_root);
-        state.verification_run_nonce =
-            Some(state.verification_run_nonce.unwrap_or(0).saturating_add(1));
-        state.last_verification_fingerprint =
-            devflow_core::agent_result::phase_verification_fingerprint(
-                evidence_root,
-                state.phase,
-            );
-        state.last_verification_mtime_nanos =
-            devflow_core::agent_result::phase_verification_mtime_nanos(
-                evidence_root,
-                state.phase,
-            );
-        state.verification_baseline_captured = true;
-    }
+    stamp_validate_dispatch_window(state);
 
     spawn_agent_and_record(
         state,
@@ -2278,6 +2276,58 @@ mod tests {
         );
         let reloaded = workflow::load_state(root, phase).unwrap();
         assert_eq!(reloaded.checkpoint_resumes, 0);
+    }
+
+    /// 35.2 P-02: the nonce stamp and baseline re-observation are co-located
+    /// and gated on Validate. Both arms must disagree — a stamp on every
+    /// stage re-widens the window at the Code stage.
+    #[test]
+    fn launch_stage_inner_stamps_the_validate_dispatch_nonce_with_its_baseline() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let phase = PhaseId::new(92);
+        let mut state = State::new(phase, AgentKind::Claude, Mode::Auto, root.to_path_buf());
+        let worktree = root.join(format!(".worktrees/phase-{phase}"));
+        std::fs::create_dir_all(&worktree).unwrap();
+        state.worktree_path = Some(worktree.clone());
+
+        // Write an artifact under the evidence root.
+        let phase_dir = worktree
+            .join(".planning/phases")
+            .join(format!("{padded}-stamp", padded = phase.padded()));
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        std::fs::write(
+            phase_dir.join(format!("{padded}-VERIFICATION.md", padded = phase.padded())),
+            "verdict: pass\n",
+        ).unwrap();
+
+        let fingerprint_before =
+            devflow_core::agent_result::phase_verification_fingerprint(&worktree, phase);
+
+        // Validate stage: nonce advances, fingerprint refreshed.
+        state.stage = Stage::Validate;
+        stamp_validate_dispatch_window(&mut state);
+        assert_eq!(state.verification_run_nonce, Some(1));
+        assert_eq!(
+            state.last_verification_fingerprint, fingerprint_before,
+            "fingerprint must match the on-disk artifact after stamp"
+        );
+        assert!(state.verification_baseline_captured);
+
+        // Non-Validate stage: nothing changes.
+        let nonce_after_validate = state.verification_run_nonce;
+        let fp_after_validate = state.last_verification_fingerprint;
+        state.stage = Stage::Code;
+        stamp_validate_dispatch_window(&mut state);
+        assert_eq!(
+            state.verification_run_nonce, nonce_after_validate,
+            "nonce must not change on non-Validate stages"
+        );
+        assert_eq!(
+            state.last_verification_fingerprint, fp_after_validate,
+            "fingerprint must not change on non-Validate stages"
+        );
     }
 
     // ---- D-15 delivery-canary gate (31-03) ------------------------------
