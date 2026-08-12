@@ -32,7 +32,7 @@ none are new regressions from v2.4.0.
   re-run gates unresolvably) + 999.84 (nothing guards the `GateReview` checkpoint call site's root
   argument) + 999.86 (`release --check`'s tag-signing predictor false-negatived live, twice across
   two releases — replace with a real `ssh-keygen -Y sign` probe)
-- Phase 36 — 999.83 (the drain gate has never observed real sub-agent concurrency; its fixture's
+- Phase 35.3 — 999.83 (the drain gate has never observed real sub-agent concurrency; its fixture's
   shape doesn't match production). Standalone: investigation-shaped, not a quick patch, so it does
   not bundle with the confirmed fixes above.
 
@@ -202,7 +202,7 @@ version is still derived automatically from conventional-commit classification a
 ### Active
 
 - **HARDEN-06** (999.83) — the drain gate's concurrency guarantee, held back from Phase 35's bundle
-  specifically to avoid slowing HARDEN-01..05/07 on a harness — Phase 36, not yet started.
+  specifically to avoid slowing HARDEN-01..05/07 on a harness — Phase 35.3, planned (not yet executed).
 - **999.85 / DEN-107** (two comments justifying themselves by mechanisms v2.4.0 deleted) — low
   severity, not folded into v2.5.0's scope; remains backlog for a future pass.
 - Phase 35.1 (999.93, unattended-launch prerequisites) and Phase 35.2 (999.89/HARDEN-03
@@ -382,7 +382,7 @@ the standing gap.
 *Last updated: 2026-08-06, same day, v2.4.0 released (signed tag, GitHub Release, `devflow-core`
 and `devflow` published to crates.io — separate operation from the planning close above) and
 milestone **v2.5.0 Loop-Termination and Release Hardening** started — Phase 35 (999.77 + 999.78 +
-999.79 + 999.84 + 999.86) and Phase 36 (999.83), scoped through conversation rather than fresh
+999.79 + 999.84 + 999.86) and Phase 35.3 (999.83), scoped through conversation rather than fresh
 domain research (five confirmed pre-existing defects with fix directions already decided, plus one
 investigation-shaped item, none new user-facing capability). Scope agreed with the operator before
 this workflow ran; confirmed rather than re-derived at the milestone-summary checkpoint.*
