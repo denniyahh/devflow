@@ -4,17 +4,17 @@ milestone: v2.5.0
 milestone_name: milestone (Loop-Termination and Release Hardening, ACTIVE — declared 2026-08-06)
 current_phase: 35.2
 current_phase_name: verification-provenance
-status: discussed
-stopped_at: Beginning Phase 35.2 — Verification Provenance (999.89 / HARDEN-03)
-last_updated: "2026-08-12T02:30:00.000Z"
+status: complete
+stopped_at: Phase 35.2 complete — run-owned verification nonce + branch-naming pin (999.89 / HARDEN-03)
+last_updated: "2026-08-12T12:10:00.000Z"
 last_activity: 2026-08-12
-last_activity_desc: Phase 35.2 discussion started — loop-back decision knows whether this run's Validate agent authored the verification artifact
+last_activity_desc: Phase 35.2 complete — 2/2 plans, nonce marker gates the loop-back dispatch, branch-naming convention pinned by tests
 progress:
   total_phases: 4
-  completed_phases: 2
-  total_plans: 10
-  completed_plans: 10
-  percent: 50
+  completed_phases: 3
+  total_plans: 12
+  completed_plans: 12
+  percent: 75
 ---
 
 # DevFlow — Project State
