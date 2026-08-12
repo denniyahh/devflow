@@ -77,15 +77,9 @@ fn stamp_validate_dispatch_window(state: &mut State) {
     state.verification_run_nonce =
         Some(state.verification_run_nonce.unwrap_or(0).saturating_add(1));
     state.last_verification_fingerprint =
-        devflow_core::agent_result::phase_verification_fingerprint(
-            evidence_root,
-            state.phase,
-        );
+        devflow_core::agent_result::phase_verification_fingerprint(evidence_root, state.phase);
     state.last_verification_mtime_nanos =
-        devflow_core::agent_result::phase_verification_mtime_nanos(
-            evidence_root,
-            state.phase,
-        );
+        devflow_core::agent_result::phase_verification_mtime_nanos(evidence_root, state.phase);
     state.verification_baseline_captured = true;
 }
 
@@ -2300,7 +2294,8 @@ mod tests {
         std::fs::write(
             phase_dir.join(format!("{padded}-VERIFICATION.md", padded = phase.padded())),
             "verdict: pass\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         let fingerprint_before =
             devflow_core::agent_result::phase_verification_fingerprint(&worktree, phase);

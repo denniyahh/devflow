@@ -3980,7 +3980,12 @@ mod tests {
         // 999.79 case: inherited from a previous run, its verdict must not be
         // reused.
         assert!(
-            !verification_authored_this_run((Some(7), Some(100)), (Some(7), Some(100)), true, Some(1)),
+            !verification_authored_this_run(
+                (Some(7), Some(100)),
+                (Some(7), Some(100)),
+                true,
+                Some(1)
+            ),
             "row 3: an artifact whose fingerprint AND mtime equal the run-start baseline is \
              INHERITED, not authored this run"
         );
@@ -3990,7 +3995,12 @@ mod tests {
         // later failing cycle. Hash-only this read as inherited, and every
         // subsequent cycle re-ran every plan in the phase.
         assert!(
-            verification_authored_this_run((Some(7), Some(200)), (Some(7), Some(100)), true, Some(1)),
+            verification_authored_this_run(
+                (Some(7), Some(200)),
+                (Some(7), Some(100)),
+                true,
+                Some(1)
+            ),
             "row 3b: an IDEMPOTENT rewrite is still a rewrite — unchanged bytes with an \
              advanced mtime were written by this run's agent"
         );
@@ -4006,7 +4016,12 @@ mod tests {
 
         // Row 4 — content changed since run start. Validate rewrote it.
         assert!(
-            verification_authored_this_run((Some(7), Some(200)), (Some(8), Some(100)), true, Some(1)),
+            verification_authored_this_run(
+                (Some(7), Some(200)),
+                (Some(8), Some(100)),
+                true,
+                Some(1)
+            ),
             "row 4: an artifact whose fingerprint differs from the run-start baseline was \
              rewritten during this run"
         );
@@ -4178,7 +4193,7 @@ mod tests {
             state.verification_baseline_captured = true;
             state.last_verification_fingerprint = baseline_hash;
             state.last_verification_mtime_nanos = Some(baseline_mtime);
-        state.verification_run_nonce = Some(1);
+            state.verification_run_nonce = Some(1);
             workflow::save_state(&state).unwrap();
 
             {
@@ -5192,8 +5207,7 @@ mod tests {
             .join(".planning/phases")
             .join(format!("{padded}-test", padded = phase.padded()));
         std::fs::create_dir_all(&phase_dir).unwrap();
-        let artifact =
-            phase_dir.join(format!("{padded}-VERIFICATION.md", padded = phase.padded()));
+        let artifact = phase_dir.join(format!("{padded}-VERIFICATION.md", padded = phase.padded()));
 
         // Direction A: nonce present, agent rewrote → GapsOnly.
         std::fs::write(&artifact, "verdict: pass — authored this run\n").unwrap();
